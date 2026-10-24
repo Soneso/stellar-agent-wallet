@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `stellar_agent_core::audit_log::reader` exposes `try_value_action_settlement`
+  and `try_submission_receipt_cleared_exists`, which return
+  `AuditLogIntegrityError` when a visited file cannot be read or fails its
+  chain check. `AuditWriter::require_anchor_current` repairs a tip anchor left
+  behind or refuses. `InMemoryTipAnchorStore::fail_next_writes`,
+  `audit_log::test_helpers::rotated_archives_newest_first`, and
+  `audit_log::test_helpers::break_newest_archive_link` serve tests under
+  `test-helpers`.
 - New wire code `profile.key_scope_conflict` refuses mainnet loading and warns
   on testnet for shared wallet or derived keyring entries, self-collisions,
   out-of-scope overlays, or an owner account other than `default`.
@@ -132,6 +140,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetch time lies more than five minutes in the future. It never writes them back.
   `CounterpartyError::FetchFailed` gains `transient`; code that constructs the
   variant or matches it without `..` must add the field.
+- A keyed audit append retries its tip anchor once immediately. A submission
+  recorded through the pending row, the window-state reset, and an x402 payment
+  refuse to send or wipe while the anchor cannot be written
+  (`audit.tip_anchor_unavailable`). A refusal before the pending row writes
+  nothing. After the row, the recorder attempts to close it, release the
+  reservation, and remove the receipt, each best-effort and logged; a resend
+  that the reservation's duplicate check refuses leaves its row open for the
+  original submission's settlement. An x402 refusal after the authorized row
+  records the withheld stage `anchor_unavailable`, and every x402 refusal keeps
+  the admitted spend. MPP's charge row retains its existing flow.
+- `WriterError::TipAnchorStore` displays the sub-code
+  `audit.tip_anchor_unavailable` ahead of its message.
+- Settlement and receipt-clear lookups walk the archives newest first and verify
+  each visited file's chain. They stop at the first file with a matching row.
+- When the settlement lookup cannot read the retained audit history,
+  `tx status` and `stellar_transaction_status` log the error and write no
+  settled row. Where the profile has an audit writer, `tx receipt clear`
+  refuses with the verifier's code, such as `audit.chain_broken` for a broken
+  chain, and keeps the receipt.
 - `profile reset-window-state` writes its audit row before wiping the store,
   under the audit writer and store lock. The row carries live wiped accrual,
   per-bucket totals, the generation pair and the profile's chain.
@@ -232,6 +259,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `SUCCESS` or `FAILED` status that arrives after the submission deadline is
   not accepted. The submission reports its timeout, and `tx status` settles the
   transaction hash.
+- The `submission.tx_timeout` message names the recovery: the outcome is
+  unknown, settle the transaction by its hash and do not resubmit. The
+  descriptions of `stellar_pay_commit`, `stellar_claim_commit`,
+  `stellar_trustline_commit` and `stellar_create_account_commit` say the same.
+- `tx receipt clear --acknowledge` reconciles the submission before it clears
+  it. A sent transaction that is still `pending` after that reconciliation,
+  with a time bound that has not passed on the endpoint's latest ledger and an
+  unconsumed sequence, is refused with `submission.still_pending`. A release on
+  chain evidence and a closed retention window are cleared instead. A
+  failed ledger-time read refuses sent, timed submissions with
+  `network.rpc_unreachable`. Other failed reconciliation reads also refuse.
+  Without `--acknowledge`, the refusal names the next step.
+- `stellar_transaction_status` settles a submission whose receipt is missing by
+  its reservation, as `tx status` does, and returns `reservation`
+  `{envelope_hash, operator_required}` when a hold remains. A receipt store
+  that cannot be read after reconciliation is reported as
+  `submission.record_unavailable`.
+- `stellar_transaction_status` refuses with `submission.record_unavailable`
+  when the spending-window file cannot be read.
+- Reconciliation writes the receipt before settling the window. A failed
+  receipt write leaves the reservation pending for a later pass.
+  `ReconcileReport` gains `receipt_write_failed` and `receipt_write_error`,
+  which carries the first receipt-store error for the clear refusal.
+  Struct literals must supply `ReconcileReport.endpoint_failure`,
+  `ReconcileReport.receipt_write_failed`, `ReconcileReport.receipt_write_error`,
+  and `SettledSubmission.release_code`.
+- The `record` of `tx status` and `stellar_transaction_status` carries
+  `release_code` for a reservation released on chain evidence.
+- A resubmission of signed bytes the spending window already holds is refused
+  with `submission.tx_already_submitted` before the pending audit row and the
+  send, under a policy with a stateful criterion. The original submission's
+  settlement stays owed.
+- Submission receipts gain `release_code`. A receipt without it keeps its
+  serialized form. An older binary reads a receipt that carries it and drops
+  the field when it rewrites the receipt store.
+- A `submission_receipt_cleared` row with `evidence` verifies with this release
+  or later. An older binary refuses once a checked root HMAC, later row or tip
+  anchor covers that row. It can read an uncovered tail with `evidence`
+  dropped; a row it then appends makes this release refuse the extended log at
+  that row. Rows without `evidence` retain their serialized form.
+- `stellar_agent_core::profile::receipt` gains `ReleaseEvidence`,
+  `SEQUENCE_CONSUMED_CODE`, and `TIME_BOUND_PASSED_CODE`.
+  It adds `ReceiptStore::finalize_released`, `ReceiptStatus::settled_row`, and `SettledRow`;
+  `SubmissionReceipt` gains `release_code`.
+  `AuditEntry::new_submission_receipt_cleared` takes the evidence, and
+  `EventKind::SubmissionReceiptCleared` gains `evidence`. `WindowStoreError`
+  gains `DuplicateReservation`. `PersistedWindowStore::holds_reservation` and
+  `ReconcileFailure` are new; `ReconcileReport` gains `endpoint_failure` and
+  `SettledSubmission` gains `release_code`.
 - `pay`, `claim`, sponsored `accounts create`, `trustline`, and `pool init`, and
   the MCP commit tools for pay, create-account, trustline, and claim, check the
   RPC endpoint on the client that sends. The check runs before the fee,
@@ -284,18 +360,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Sep10Session::parse` refuses a token longer than 8192 bytes, a token with an
   empty header or payload segment, and a token with a character outside the
   base64url alphabet, with `sep10.jwt_parse_error`.
+- `PolicyError::OwnerSignatureInvalid` gains `rules_with_signed_optional_keys`,
+  the indexes of the rules that carry a signed optional rule key. A downstream
+  pattern or constructor that names the variant's fields must add it.
+- `stellar_agent_core::policy::v1` exposes `validate_policy_keys`, which refuses
+  a key outside the policy schema, and `validate_unsigned_policy`, which applies
+  the loader's body checks to a policy that is not yet signed.
+- `profile sign-policy` refuses a policy body the V1 loader would refuse, such
+  as an out-of-range `ttl_secs` or a `scope` for another profile, with
+  `sign_policy.policy_body_invalid`. A refused file is left unchanged.
+- The MCP server's startup message for a V1 policy whose owner signature fails
+  asks to review the policy and re-sign it. A policy file that fails a body
+  check, such as an unknown key, gets no signing hint.
+- The V1 policy loader refuses a policy file without a `[signature]` table with
+  a message that names `stellar-agent profile sign-policy` with the profile.
 
 ### Removed
 
 - `StellarRpcClient::verify_network_passphrase`, replaced by
   `StellarRpcClient::endpoint_identity`.
+- `stellar_agent_core::audit_log::reader::value_action_settlement` and
+  `stellar_agent_core::audit_log::reader::submission_receipt_cleared_exists`,
+  replaced by `try_value_action_settlement` and
+  `try_submission_receipt_cleared_exists`.
 - `ProviderAttestationRejection::PrimaryReserved`. A `[providers.primary]`
   record loads.
 
 ### Fixed
 
+- The `minimum_reserve` criterion counts the transaction fee of a decoded
+  envelope in the MCP pay, create-account, trustline, and claim commits and
+  in CLI `pay --sign-only`, `pay --submit-only`, and staged `claim`.
+  A debit that leaves exactly the reserve plus `margin_stroops` refuses with
+  `policy.deny.minimum_reserve_breached` when the envelope carries a fee.
+  The CLI full pipeline and the MCP simulate steps count no fee.
+  Thanks to @huong8373tt-beep.
 - `counterparty warm-up` skips Stellar strkeys and `CODE:ISSUER` values in
   mixed-kind allowlists.
+- A reservation released on chain evidence writes its settled
+  `value_action_failed` row under `submission.sequence_consumed` or
+  `submission.time_bound_passed`. The receipt keeps the reason, so a later
+  `tx status` or `stellar_transaction_status` writes the row when the append
+  failed, and a missing receipt is restored with it.
+- A release drops only the pending records of a reservation, so confirmed
+  spend under the same envelope hash keeps counting.
+- A status rerun after audit rotation writes no duplicate settled row.
+  A cleared receipt is recognized after rotation.
 - The counterparty cache reads and mints its HMAC key at the profile's
   `counterparty_cache_key_id`, the entry `profile rotate-counterparty-key` writes.
   With an explicit reference, cached entries read as absent until a refresh
@@ -410,6 +520,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this root. `webpki-root-certs` 0.26.11 stays in the lock as a re-export of
   1.0.10. The `reqwest` HTTPS clients verify server certificates with
   `rustls-webpki` against the `webpki-roots` set.
+- `ctutils` 0.4.2 to 0.4.5, which resolves RUSTSEC-2026-0385: the mask
+  generation of `ctutils::Choice` and its `u128` comparisons were not
+  constant-time. The wallet reaches it through `hmac` 0.13 and `sha2` 0.11,
+  and through `chacha20poly1305` 0.11 in `stellar-agent-headless-keyring`.
+- `tokio` 1.52.3 to 1.54.1, which resolves RUSTSEC-2026-0386: the safe
+  `AsyncFd` constructors accepted any raw file descriptor without proof of
+  ownership. No wallet crate constructs `AsyncFd`.
+- `deny.toml` accepts RUSTSEC-2026-0387 on `crypto-bigint` 0.5.5 with its
+  rationale: operations intended to be constant-time can branch on secret
+  values. The fix exists only in 0.7.6, which `elliptic-curve` 0.14 uses, and
+  `soroban-env-host` still requires `elliptic-curve` 0.13 in its newest
+  release, 30.0.0. The wallet reaches `crypto-bigint` only when it parses and
+  normalizes an authenticator's P-256 signature, which is public data; passkey
+  private keys never enter the wallet. The entry goes when `soroban-env-host`
+  accepts `elliptic-curve` 0.14 and the workspace `p256` pin moves to 0.14.
 - `mppx` 0.6.31 to 0.8.19 in the MPP interoperability harness, and
   `follow-redirects` 1.16.0 to 1.16.1 in the `@stellar/stellar-sdk` 17
   harness, which resolve four advisories. GHSA-727h-3vm5-qwq6 affects `mppx`
@@ -417,6 +542,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GHSA-8r9p-f939-6h3c and GHSA-q3jh-wrc6-jgq8 affect `follow-redirects`
   1.16.0. The harnesses compare the wallet's fixtures with the released
   JavaScript SDKs in CI, and no wallet crate depends on them.
+- `toml` 4.3.0 to 5.0.1 in the MPP interoperability harness, which resolves
+  GHSA-4qx8-w7c3-pj3p, GHSA-9j65-hcg3-gc64, and GHSA-9qmh-m7c6-f92p.
+  The harness checks wallet fixtures against released JavaScript SDKs in CI.
+  No wallet crate uses this npm package at runtime.
+- `zod` 4.6.5 to 4.6.7 in the MPP interoperability harness, which resolves
+  GHSA-mrhx-c7xc-m3w5. Validating an oversized array, set, or map that has a
+  maximum size can exhaust memory: `zod` records an issue for every failing
+  element before it checks that maximum. `mppx` and `@stellar/mpp` in the
+  harness depend on `zod`, and no wallet crate uses this npm package at
+  runtime.
+- V1 policy signatures cover `reason`, `ttl_secs`, and `allow_opaque_signing`
+  on each rule that carries them. A policy signed by an earlier release whose
+  rules carry these keys fails verification with
+  `policy.owner_signature_invalid`, and the message names those rules. Review
+  such a policy and re-sign it with `stellar-agent profile sign-policy`. A
+  policy whose rules carry none of them keeps its signature.
+- The V1 policy loader refuses a key outside the policy schema with
+  `policy.policy_file_parse_failed`, naming the key and its location, before it
+  checks the signature. Each criterion kind accepts only its own keys.
+  `profile sign-policy` refuses such a key in the policy body with
+  `sign_policy.canonicalization_failed` and replaces the `[signature]` table
+  whole, dropping any extra key in that table.
+- The context-rule reader refuses a `Delegated` signer with more than two
+  items and an `External` signer with more than three
+  (`SignerDecodeError::TooManyItems`). It requires `policies` and
+  `policy_ids` as lists of equal length, every policy an address, and every
+  id a `u32`, with no repeated policy or id. Such a rule reads as
+  `sa.deployment_failed` wherever a rule is read, and the verifier-migration
+  planner refuses it. Thanks to @ngybnc.
+- Context-rule listings and the signer and policy cap pre-checks take their
+  counts from the shared context-rule decoder. A rule with misaligned or
+  malformed signer or policy lists fails with `sa.deployment_failed`, and a
+  listing names the rule id. Thanks to @huong8373tt-beep.
 
 ## [0.1.0-alpha.12] - 2026-10-15
 

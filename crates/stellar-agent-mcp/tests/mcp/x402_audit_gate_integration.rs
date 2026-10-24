@@ -128,6 +128,10 @@ struct X402Rpc {
     /// The keyring entry the unsigned simulate deletes: the signer loaded
     /// before it then fails at the sign call.
     forget_on_first: Option<(String, String)>,
+    /// A row the unsigned simulate queues in the audit outbox, once: a consent
+    /// row that arrives after the audit pre-flight and before the transmit
+    /// gate, so the gate's own acquisition drains it.
+    queue_on_first: Arc<Mutex<Option<stellar_agent_core::audit_log::AuditEntry>>>,
     observed: Arc<Mutex<Observed>>,
 }
 
@@ -142,6 +146,7 @@ impl X402Rpc {
             network: NetworkAnswer::Passphrase(TESTNET_PASSPHRASE),
             roll_back_to: Arc::new(Mutex::new(None)),
             forget_on_first: None,
+            queue_on_first: Arc::new(Mutex::new(None)),
             observed: Arc::new(Mutex::new(Observed::default())),
         }
     }
@@ -284,6 +289,11 @@ impl Respond for X402Rpc {
         if !signed {
             if let Some(bytes) = self.roll_back_to.lock().unwrap().take() {
                 std::fs::write(&self.log_path, bytes).expect("roll the audit log back");
+            }
+            if let Some(row) = self.queue_on_first.lock().unwrap().take() {
+                stellar_agent_core::audit_log::AuditOutbox::for_log(&self.log_path)
+                    .append(&row)
+                    .expect("queue the consent row");
             }
             if let Some((service, account)) = &self.forget_on_first {
                 keyring_core::Entry::new(service, account)
@@ -2643,7 +2653,7 @@ async fn x402_oracle_texts_reach_no_tool_result_or_log() {
                 .with_writer_factory(Some(Box::new(move || Box::new(writer.clone())))),
         )
         .expect("the wallet subscriber builds");
-        let inert = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let inert = stellar_agent_test_support::inert_dispatcher();
         let dispatch = tracing::Dispatch::new(subscriber);
         tracing::callsite::rebuild_interest_cache();
         let result = call(&witness.fixture, tool).with_subscriber(dispatch).await;
@@ -2658,6 +2668,186 @@ async fn x402_oracle_texts_reach_no_tool_result_or_log() {
         assert!(
             logs.contains("x402"),
             "{tool:?}: the capture holds the tool's own events: {logs}"
+        );
+    }
+}
+
+/// Caches the fixture's keyed audit writer over an in-memory tip-anchor store
+/// the test scripts to fail. The tools' later acquisitions hit the cache and
+/// keep that store.
+fn cache_writer_over_scripted_anchor(
+    fixture: &Fixture,
+) -> (
+    Arc<Mutex<stellar_agent_core::audit_log::AuditWriter>>,
+    Arc<stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore>,
+) {
+    use stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore;
+    use stellar_agent_core::audit_log::{AuditWriterRegistry, KeyedAuditAccess};
+    let store = Arc::new(InMemoryTipAnchorStore::new());
+    let writer = AuditWriterRegistry::get_or_open_keyed(
+        &fixture.server.profile_name_for_approval(),
+        &fixture.profile.audit_log_path,
+        KeyedAuditAccess::new(zeroize::Zeroizing::new([0x37; 32]), store.clone()),
+    )
+    .unwrap();
+    (writer, store)
+}
+
+/// A consent row as `approve --id` queues it beside a running server.
+fn queued_consent_row() -> stellar_agent_core::audit_log::AuditEntry {
+    stellar_agent_core::audit_log::AuditEntry::new_approval_attested(
+        "PaymentSimulated",
+        "stellar_pay_commit",
+        None,
+        "queued-consent-nonce",
+        "cli",
+        "queued-consent",
+    )
+}
+
+/// Asserts that `result` is the gate's anchor refusal and that the payment
+/// left nothing behind: no signature returned, no signed request sent, and
+/// neither x402 row written.
+fn assert_withheld_before_the_authorized_row(
+    tool: Tool,
+    fixture: &Fixture,
+    result: &rmcp::model::CallToolResult,
+) {
+    let (code, message, text) = crate::common::assert_business_envelope(result);
+    assert_eq!(code, "audit.chain_key_unavailable", "{tool:?}: {text}");
+    assert!(
+        message.contains("audit.tip_anchor_unavailable"),
+        "{tool:?}: {text}"
+    );
+    assert!(!text.contains("paymentSignature"), "{tool:?}: {text}");
+    assert_eq!(
+        fixture.rpc.observed.lock().unwrap().signed,
+        [false],
+        "{tool:?}: only the unsigned simulation reached the RPC"
+    );
+    let rows = crate::common::audit_rows(&fixture.profile);
+    assert_eq!(
+        crate::common::rows_of_kind(&rows, "approval_attested").len(),
+        1,
+        "{tool:?}: the queued consent row was drained: {rows:?}"
+    );
+    let (authorized, withheld) = verified_x402_rows(&fixture.profile);
+    assert!(
+        authorized.is_empty() && withheld.is_empty(),
+        "{tool:?}: a refusal before the authorized row writes no x402 row: \
+         {authorized:?} {withheld:?}"
+    );
+}
+
+/// Both transmit gates withhold the signature while the authorization anchor
+/// fails after the authorized row, and pair that row with an
+/// `anchor_unavailable` withheld row.
+///
+/// Three anchor writes fail: the authorized row's two attempts and the gate's
+/// repair after the row. The withheld row's own retry then lands.
+#[tokio::test]
+#[serial]
+async fn an_unavailable_anchor_withholds_both_x402_transmissions() {
+    for (tool, seed) in [
+        (Tool::CreatePayment, 0x61),
+        (Tool::AuthenticatedPayment, 0x62),
+    ] {
+        let name = format!("x402-anchor-{}", tool.name());
+        let fixture = fixture(&name, [seed; 32], |_| {}).await;
+        let (_writer, store) = cache_writer_over_scripted_anchor(&fixture);
+        store.fail_next_writes(3);
+        let result = call(&fixture, tool).await;
+        let (code, message, text) = crate::common::assert_business_envelope(&result);
+        assert_eq!(code, "audit.chain_key_unavailable", "{text}");
+        assert!(message.contains("audit.tip_anchor_unavailable"), "{text}");
+        assert!(!text.contains("paymentSignature"));
+        assert_eq!(fixture.rpc.observed.lock().unwrap().signed, [false]);
+        let (authorized, withheld) = verified_x402_rows(&fixture.profile);
+        assert_eq!(authorized.len(), 1);
+        assert_eq!(withheld.len(), 1);
+        assert_eq!(withheld[0]["failure_stage"], "anchor_unavailable");
+        assert_eq!(authorized[0]["request_id"], withheld[0]["request_id"]);
+    }
+}
+
+/// A tip anchor that falls behind before the authorized row is written
+/// refuses both payments at the gate's first anchor check: nothing signed is
+/// sent and neither x402 row is written.
+///
+/// The consent row the unsigned simulation queues is drained by the gate's
+/// own acquisition, after that acquisition's anchor check. The drained row's
+/// two anchor attempts fail, and the gate's repair before the row is the third
+/// failure.
+#[tokio::test]
+#[serial]
+async fn an_anchor_behind_before_the_authorized_row_withholds_both_x402_transmissions() {
+    for (tool, seed) in [
+        (Tool::CreatePayment, 0x81),
+        (Tool::AuthenticatedPayment, 0x82),
+    ] {
+        let name = format!("x402-anchor-before-{}", tool.name());
+        let fixture = fixture(&name, [seed; 32], |_| {}).await;
+        *fixture.rpc.queue_on_first.lock().unwrap() = Some(queued_consent_row());
+        let (_writer, store) = cache_writer_over_scripted_anchor(&fixture);
+        store.fail_next_writes(3);
+        let result = call(&fixture, tool).await;
+        assert_withheld_before_the_authorized_row(tool, &fixture, &result);
+    }
+}
+
+/// A row the audit pre-flight drains whose anchor cannot be written refuses
+/// both payments when the transmit gate acquires the writer: nothing signed is
+/// sent and neither x402 row is written.
+///
+/// The consent row is queued before the call, so the tool's pre-flight
+/// acquisition drains it. Its two anchor attempts fail, and the gate's
+/// acquisition repairs before it reconciles: that third failure refuses the
+/// acquisition.
+#[tokio::test]
+#[serial]
+async fn an_anchor_left_behind_by_the_pre_flight_drain_withholds_both_x402_transmissions() {
+    for (tool, seed) in [
+        (Tool::CreatePayment, 0x83),
+        (Tool::AuthenticatedPayment, 0x84),
+    ] {
+        let name = format!("x402-anchor-drain-{}", tool.name());
+        let fixture = fixture(&name, [seed; 32], |_| {}).await;
+        let (_writer, store) = cache_writer_over_scripted_anchor(&fixture);
+        stellar_agent_core::audit_log::AuditOutbox::for_log(&fixture.profile.audit_log_path)
+            .append(&queued_consent_row())
+            .expect("queue the consent row");
+        store.fail_next_writes(3);
+        let result = call(&fixture, tool).await;
+        assert_withheld_before_the_authorized_row(tool, &fixture, &result);
+    }
+}
+
+/// An authorized row whose two anchor attempts fail is repaired by the gate's
+/// check after the row, and the payment then completes.
+#[tokio::test]
+#[serial]
+async fn the_repair_after_the_authorized_row_lets_both_x402_payments_complete() {
+    for (tool, seed) in [
+        (Tool::CreatePayment, 0x8b),
+        (Tool::AuthenticatedPayment, 0x8c),
+    ] {
+        let name = format!("x402-anchor-repair-{}", tool.name());
+        let fixture = fixture(&name, [seed; 32], |_| {}).await;
+        let (_writer, store) = cache_writer_over_scripted_anchor(&fixture);
+        store.fail_next_writes(2);
+        let result = call(&fixture, tool).await;
+        let envelope = result_json(&result);
+        assert_ne!(result.is_error, Some(true), "{tool:?}: {envelope}");
+        assert!(envelope["data"]["paymentSignature"].is_string(), "{tool:?}");
+        assert_eq!(fixture.rpc.observed.lock().unwrap().signed, [false, true]);
+        let (authorized, withheld) = verified_x402_rows(&fixture.profile);
+        assert_eq!(authorized.len(), 1, "{tool:?}");
+        assert!(withheld.is_empty(), "{tool:?}: {withheld:?}");
+        let rows = crate::common::audit_rows(&fixture.profile);
+        assert_eq!(
+            store.peek().map(|anchor| anchor.entry_count),
+            Some(rows.len() as u64),
+            "{tool:?}: the repair anchored the authorized row"
         );
     }
 }

@@ -45,7 +45,8 @@ use stellar_agent_smart_account::verifier_allowlist::{VERIFIER_ALLOWLIST, Verifi
 use stellar_xdr::LedgerEntryData;
 use stellar_xdr::{
     ContractDataDurability, ContractDataEntry, ContractExecutable, ContractId, ExtensionPoint,
-    Hash, Limits, ScAddress, ScContractInstance, ScMap, ScMapEntry, ScSymbol, ScVal, WriteXdr,
+    Hash, Limits, ScAddress, ScBytes, ScContractInstance, ScMap, ScMapEntry, ScSymbol, ScVal,
+    ScVec, VecM, WriteXdr,
 };
 use uuid::Uuid;
 use wiremock::{
@@ -697,11 +698,12 @@ async fn t9_sparse_id_migration_planner() {
 ///
 /// # Mock sequence
 ///
-/// `simulateTransaction`: `get_context_rules_count` returns `2`, `get_rule(0)`
-/// and `get_rule(1)` return the two rules, then `get_context_rule(0)` and
-/// `get_context_rule(1)` return them again. Rule 0 holds one External signer
-/// (id `10`); rule 1 holds one External signer (id `20`) and a signer with id
-/// `21` whose tag is unknown.
+/// `simulateTransaction`: `get_context_rules_count` returns `2`, then
+/// `get_rule(0)` and `get_rule(1)` return the two rules. Rule 0 holds one
+/// External signer (id `10`); rule 1 holds one External signer (id `20`) and
+/// a signer with id `21` whose tag is unknown. The rule enumeration decodes
+/// rule 1 with the shared context-rule decoder and refuses it, so no per-rule
+/// read follows.
 #[tokio::test]
 async fn a_rule_with_an_undecodable_signer_refuses_the_plan() {
     let server = MockServer::start().await;
@@ -721,8 +723,161 @@ async fn a_rule_with_an_undecodable_signer_refuses_the_plan() {
         build_simulate_response(&u32_xdr(2)),
         build_simulate_response(&rule_0_xdr),
         build_simulate_response(&rule_1_xdr),
+    ];
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(SorobanRpcDispatcher::new_multi_simulate(
+            ledger_resp,
+            sim_responses,
+        ))
+        .mount(&server)
+        .await;
+
+    let (manager, _tmp_dir) = manager_with_server(&server).await;
+    let result = MigrationPlanner::new(&manager)
+        .with_max_scan_id(10)
+        .build(
+            smart_account,
+            OZ_VERIFIER_HASH,
+            dest_addr,
+            &Uuid::new_v4().to_string(),
+        )
+        .await;
+
+    let err = match result {
+        Err(err) => err,
+        Ok(plan) => panic!(
+            "the plan must be refused; got {} affected rules and rules_skipped_count {}",
+            plan.affected_rules.len(),
+            plan.rules_skipped_count
+        ),
+    };
+    let SaError::VerifierMigrationFailed { phase, detail, .. } = &err else {
+        panic!("expected VerifierMigrationFailed, got {err:?}");
+    };
+    assert_eq!(*phase, "plan_build");
+    assert_eq!(
+        detail,
+        "rule-signer inventory failed: smart-account deployment failed at phase simulate: \
+         parse ContextRule id=1: get_context_rule: signer at index 1 (id 21) is not a \
+         recognised Signer: unknown signer tag \"Future\""
+    );
+    assert_eq!(err.wire_code(), "sa.verifier_migration_failed");
+}
+
+/// `MigrationPlanner::build` refuses the whole plan when one enumerated rule
+/// holds an `External` signer whose `Vec` carries a fourth item, naming the
+/// rule, the signer's index and id, and the surplus item count.
+///
+/// # Mock sequence
+///
+/// As in [`a_rule_with_an_undecodable_signer_refuses_the_plan`]: rule 0 holds
+/// one External signer (id `10`); rule 1 holds one External signer (id `20`)
+/// and a signer with id `21` that encodes `External` with four items.
+#[tokio::test]
+async fn a_rule_with_a_surplus_item_signer_refuses_the_plan() {
+    let server = MockServer::start().await;
+    let smart_account = addr(0x01);
+    let dest_addr = addr(0xCD);
+    let key_data = [0xABu8; 32];
+
+    let surplus_items: VecM<ScVal> = vec![
+        ScVal::Symbol(ScSymbol::try_from("External").expect("tag fits in ScSymbol")),
+        ScVal::Address(dest_addr.clone()),
+        ScVal::Bytes(ScBytes(
+            key_data.to_vec().try_into().expect("key data fits"),
+        )),
+        ScVal::U32(0),
+    ]
+    .try_into()
+    .expect("signer Vec fits");
+    let rule_0_xdr = build_context_rule_external_signers_xdr(0, &[10], &dest_addr, &key_data);
+    let rule_1_xdr = append_signer_to_rule_xdr(
+        &build_context_rule_external_signers_xdr(1, &[20], &dest_addr, &key_data),
+        21,
+        &ScVal::Vec(Some(ScVec(surplus_items))),
+    );
+    let ledger_resp =
+        build_ledger_entries_account_and_contract(SOURCE_G, &dest_addr, OZ_VERIFIER_HASH);
+    let sim_responses = vec![
+        build_simulate_response(&u32_xdr(2)),
         build_simulate_response(&rule_0_xdr),
         build_simulate_response(&rule_1_xdr),
+    ];
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(SorobanRpcDispatcher::new_multi_simulate(
+            ledger_resp,
+            sim_responses,
+        ))
+        .mount(&server)
+        .await;
+
+    let (manager, _tmp_dir) = manager_with_server(&server).await;
+    let result = MigrationPlanner::new(&manager)
+        .with_max_scan_id(10)
+        .build(
+            smart_account,
+            OZ_VERIFIER_HASH,
+            dest_addr,
+            &Uuid::new_v4().to_string(),
+        )
+        .await;
+
+    let err = match result {
+        Err(err) => err,
+        Ok(plan) => panic!(
+            "the plan must be refused; got {} affected rules and rules_skipped_count {}",
+            plan.affected_rules.len(),
+            plan.rules_skipped_count
+        ),
+    };
+    let SaError::VerifierMigrationFailed { phase, detail, .. } = &err else {
+        panic!("expected VerifierMigrationFailed, got {err:?}");
+    };
+    assert_eq!(*phase, "plan_build");
+    assert_eq!(
+        detail,
+        "rule-signer inventory failed: smart-account deployment failed at phase simulate: \
+         parse ContextRule id=1: get_context_rule: signer at index 1 (id 21) is not a \
+         recognised Signer: External signer expected 3 items, got 4"
+    );
+    assert_eq!(err.wire_code(), "sa.verifier_migration_failed");
+}
+
+/// `MigrationPlanner::build` refuses the whole plan when its own read of a
+/// rule holds a signer the wallet cannot decode, naming the rule, the
+/// signer's index and id, and the decoder's reason.
+///
+/// # Mock sequence
+///
+/// `simulateTransaction`: `get_context_rules_count` returns `2`. Then
+/// `get_rule(0)` and `get_rule(1)` return the two rules, and
+/// `get_context_rule(0)` and `get_context_rule(1)` return them again. Rule 0
+/// holds one External signer (id `10`) at both reads. The enumeration reads
+/// rule 1 with one External signer (id `20`); the planner's read of rule 1
+/// also holds a signer with id `21` whose tag is unknown, so the rule changed
+/// between the two reads.
+#[tokio::test]
+async fn a_rule_that_gains_an_undecodable_signer_after_the_listing_refuses_the_plan() {
+    let server = MockServer::start().await;
+    let smart_account = addr(0x01);
+    let dest_addr = addr(0xCD);
+    let key_data = [0xABu8; 32];
+
+    let rule_0_xdr = build_context_rule_external_signers_xdr(0, &[10], &dest_addr, &key_data);
+    let listed_rule_1_xdr =
+        build_context_rule_external_signers_xdr(1, &[20], &dest_addr, &key_data);
+    let read_rule_1_xdr =
+        append_signer_to_rule_xdr(&listed_rule_1_xdr, 21, &unknown_tag_signer_scval());
+    let ledger_resp =
+        build_ledger_entries_account_and_contract(SOURCE_G, &dest_addr, OZ_VERIFIER_HASH);
+    let sim_responses = vec![
+        build_simulate_response(&u32_xdr(2)),
+        build_simulate_response(&rule_0_xdr),
+        build_simulate_response(&listed_rule_1_xdr),
+        build_simulate_response(&rule_0_xdr),
+        build_simulate_response(&read_rule_1_xdr),
     ];
     Mock::given(method("POST"))
         .and(path("/"))

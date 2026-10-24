@@ -36,7 +36,7 @@
 //! If no credentials exist for the profile, a warning banner is printed
 //! explaining the RP-ID binding risk. The operator must confirm `[y/N]`
 //! before the ceremony begins. Declining prints a pointer to
-//! `docs/runbooks/passkey-rp-id-recovery.md` and exits with code 1.
+//! `docs/remote-approval.md#making-rp_id-resolve` and exits with code 1.
 
 use std::{
     io::{self, BufRead as _, Write as _},
@@ -112,7 +112,7 @@ pub struct AddPasskeyArgs {
     /// domain (e.g. `"wallet.example.com"`).
     ///
     /// WARNING: changing the RP-ID after registration renders existing
-    /// passkeys unusable. Read `docs/runbooks/passkey-rp-id-recovery.md`
+    /// passkeys unusable. Read `docs/remote-approval.md#making-rp_id-resolve`
     /// before proceeding.
     #[arg(long = "rp-id", value_name = "DOMAIN", default_value = "localhost")]
     pub rp_id: String,
@@ -124,7 +124,7 @@ pub struct AddPasskeyArgs {
     /// Skip the first-registration RP-ID binding warning prompt.
     ///
     /// DANGER: only set this flag if you understand the RP-ID binding risks
-    /// documented in `docs/runbooks/passkey-rp-id-recovery.md`.
+    /// documented in `docs/remote-approval.md#making-rp_id-resolve`.
     #[arg(long = "accept-rp-id-binding-risk")]
     pub accept_rp_id_binding_risk: bool,
 }
@@ -381,7 +381,7 @@ fn show_rp_id_binding_warning(rp_id: &str) -> bool {
         println!(
             "  so you can still sign transactions if this passkey is ever lost or inaccessible."
         );
-        println!("  See: docs/runbooks/passkey-rp-id-recovery.md for recovery options.");
+        println!("  See: docs/remote-approval.md#making-rp_id-resolve for recovery options.");
         println!();
         println!("  Do you have a Delegated-fallback signer, or understand the RP-ID binding");
         print!("  risk and wish to proceed? [y/N]: ");
@@ -404,7 +404,7 @@ fn emit_rp_id_binding_warning_declined() -> i32 {
         "credentials.rp_id_binding_warning_declined",
         "operator declined the RP-ID binding warning; set up a Delegated-fallback signer first \
          (stellar-agent accounts add-signer-delegated) — see \
-         docs/runbooks/passkey-rp-id-recovery.md"
+         docs/remote-approval.md#making-rp_id-resolve"
             .to_owned(),
     )
 }

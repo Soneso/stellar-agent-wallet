@@ -6,10 +6,11 @@
 //! action has already committed, so a row-write failure logs a
 //! `tracing::warn!` and never changes the tool result or exit path.
 //!
-//! The x402 authorizers and the MPP commit write their authorization row
-//! through [`emit_value_audit_row_strict`] before the signed authorization
-//! leaves the wallet or the credential is released. A failure there withholds
-//! it.
+//! The MPP commit writes its authorization row through
+//! [`emit_value_audit_row_strict`] before the credential is released. The x402
+//! transmit gate writes its row through [`emit_anchored_value_audit_row_strict`]
+//! before the signed authorization leaves the wallet, with a current tip anchor
+//! required before and after the row. A failure in either withholds it.
 //!
 //! The legs carried in a row are the SAME `ValueEffects` the policy gate sized
 //! (single-derivation invariant); this module only serialises what the caller
@@ -184,10 +185,10 @@ pub(crate) fn emit_value_audit_row_with_writer(
 /// Writes an authorization audit row and fails closed on every acquisition,
 /// locking, or persistence error.
 ///
-/// MPP calls this before releasing a credential, and the x402 transmit gate
-/// calls it before the signed authorization leaves the wallet. Unlike the
-/// post-submit helper above, which writes after an action already committed,
-/// a failure here withholds the artifact.
+/// MPP calls this before releasing a credential, and the x402 tools call it
+/// for the withheld row of a payment that failed after its transmit gate.
+/// Unlike the post-submit helper above, which writes after an action already
+/// committed, a failure here withholds the artifact.
 ///
 /// Acquiring the writer runs the anchor check, so a log rolled back, truncated,
 /// or replaced under the running server refuses HERE and nothing is released.
@@ -247,6 +248,77 @@ pub(crate) fn emit_value_audit_row_strict(
         // a live writer refuses here as well as at acquisition. It carries the
         // code that names that condition, the way the acquisition path does:
         // an operator sent after a registration conflict never finds one.
+        audit_writer_acquisition_error(profile_name, &e)
+    })
+}
+
+/// Writes an authorization row under one writer guard, between two tip-anchor
+/// checks, and fails closed on every acquisition, locking, persistence, or
+/// anchor error.
+///
+/// The x402 transmit gate calls this before the signed authorization leaves
+/// the wallet. Acquisition, locking, and the append fail as they do in
+/// [`emit_value_audit_row_strict`]. Around the append runs the anchor rule of
+/// a value action: [`AuditWriter::require_anchor_current`] before the row, so
+/// a behind anchor refuses with nothing written, and again after it, so the
+/// artifact never leaves on a row whose anchor write failed, whether the
+/// row's own write or that of a row the outbox drain appended ahead of it.
+///
+/// A refusal of the second check leaves the row durable. When the anchor store
+/// refused there, `after_unanchored_row` runs with the writer still held, so
+/// the caller appends the row that pairs with the durable one through that
+/// writer without acquiring it again. The paired row carries the durable
+/// row's `request_id`, which is what pairs the two; its append can drain
+/// queued outbox rows ahead of it, and it is best-effort for its own anchor
+/// like every append. Every other refusal returns without calling it, so a
+/// refusal before the row writes no row at all.
+///
+/// # Errors
+///
+/// [`WalletError::Validation`], with the variants and wire codes
+/// [`emit_value_audit_row_strict`] produces. An anchor that cannot be written
+/// carries [`ValidationError::AuditLogUnusable`] with the
+/// `audit.tip_anchor_unavailable` sub-code at the head of its detail.
+pub(crate) fn emit_anchored_value_audit_row_strict(
+    profile: &Profile,
+    profile_name: &str,
+    binding: BindingCheck,
+    entry: AuditEntry,
+    after_unanchored_row: impl FnOnce(&mut AuditWriter),
+) -> Result<(), WalletError> {
+    let writer = require_value_audit_writer(profile, profile_name, binding)?;
+    let mut guard = writer.lock().map_err(|_| {
+        tracing::warn!(
+            profile = %profile_name,
+            "value audit: audit writer mutex poisoned; withholding the authorization"
+        );
+        audit_writer_open_failed(profile_name)
+    })?;
+    guard.require_anchor_current().map_err(|e| {
+        tracing::warn!(
+            profile = %profile_name,
+            error = %e,
+            "value audit: tip anchor behind; authorization row NOT emitted, withholding it"
+        );
+        audit_writer_acquisition_error(profile_name, &e)
+    })?;
+    guard.write_entry(entry).map_err(|e| {
+        tracing::warn!(
+            profile = %profile_name,
+            error = %e,
+            "value audit: authorization row NOT emitted; withholding the authorization"
+        );
+        audit_writer_acquisition_error(profile_name, &e)
+    })?;
+    guard.require_anchor_current().map_err(|e| {
+        tracing::warn!(
+            profile = %profile_name,
+            error = %e,
+            "value audit: authorization row is not anchored; withholding the authorization"
+        );
+        if matches!(e, WriterError::TipAnchorStore(_)) {
+            after_unanchored_row(&mut guard);
+        }
         audit_writer_acquisition_error(profile_name, &e)
     })
 }

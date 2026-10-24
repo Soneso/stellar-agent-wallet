@@ -15,6 +15,18 @@
 //! `canonical_bytes` excludes the `[signature]` table.  See
 //! `stellar_agent_core::policy::v1::{canonical, signature}`.
 //!
+//! # Body checks
+//!
+//! The command signs only a body the V1 loader accepts. Before canonicalising,
+//! it refuses a key outside the policy schema
+//! (`sign_policy.canonicalization_failed`, naming the key and its location).
+//! Before signing, it runs the loader's body checks for the engine's profile
+//! name and refuses a body the loader would refuse
+//! (`sign_policy.policy_body_invalid`, with the loader's detail). The existing
+//! `[signature]` table is not checked: signing replaces it whole, so a stale or
+//! malformed signature is repaired by signing again. Every refusal leaves the
+//! file unchanged.
+//!
 //! # Owner-key cross-check
 //!
 //! Before writing, the derived public key is compared against the owner public
@@ -62,6 +74,7 @@ use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::WalletError;
 use stellar_agent_core::policy::v1::canonical::canonical_bytes;
 use stellar_agent_core::policy::v1::signature::{digest, sign};
+use stellar_agent_core::policy::v1::{validate_policy_keys, validate_unsigned_policy};
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile, default_policy_dir};
 use stellar_agent_core::wallet::{MlockRequired, Wallet};
@@ -232,6 +245,26 @@ where
         }
     };
 
+    // ── Refuse keys outside the policy schema ─────────────────────────────────
+    // The loader refuses such a key before it verifies the signature, so a
+    // file signed with one is never accepted. The `[signature]` table is left
+    // out of the check because signing replaces it whole. A document that is
+    // not valid TOML is refused by canonicalisation below, with the TOML error.
+    if let Ok(mut body) = raw.parse::<toml_edit::DocumentMut>() {
+        body.remove("signature");
+        if let Err(e) = validate_policy_keys(&body) {
+            render::render_json(&Envelope::<()>::err_raw(
+                "sign_policy.canonicalization_failed",
+                format!(
+                    "policy file {} holds a key outside the V1 policy schema ({e}); correct \
+                     the key, then sign again. No file was written.",
+                    policy_path.display()
+                ),
+            ));
+            return 1;
+        }
+    }
+
     // ── Canonicalise the policy body (excludes the [signature] table) ─────────
     let canon = match canonical_bytes(&raw) {
         Ok(c) => c,
@@ -246,6 +279,21 @@ where
             return 1;
         }
     };
+
+    // ── Refuse a body the loader refuses ──────────────────────────────────────
+    // The same body checks the engine applies after verifying the signature,
+    // with the scope compared against the engine's profile name.
+    if let Err(e) = validate_unsigned_policy(&raw, &engine_profile_name) {
+        render::render_json(&Envelope::<()>::err_raw(
+            "sign_policy.policy_body_invalid",
+            format!(
+                "the V1 policy loader refuses the body of policy file {} ({e}); correct the \
+                 policy, then sign again. No file was written.",
+                policy_path.display()
+            ),
+        ));
+        return 1;
+    }
     let d = digest(&canon);
     let digest_hex = to_hex(&d);
 
@@ -847,6 +895,145 @@ mod tests {
             "re-signing must not duplicate the [signature] table"
         );
         load_signed_policy(&path, PROFILE_NAME, &pk).expect("re-signed file must verify");
+    }
+
+    /// Runs `sign-policy` with the enrolled owner seed on `policy.toml`
+    /// holding `body`. Returns the exit code, the one rendered envelope, the
+    /// file contents afterwards, the enrolled owner public key, and the
+    /// directory that holds the file.
+    async fn sign_file_holding(
+        tag: &str,
+        body: &str,
+    ) -> (i32, serde_json::Value, String, [u8; 32], TempDir) {
+        keyring_mock::install().expect("mock store");
+        let (s_strkey, pk, _g) = seed_material([0x66u8; 32]);
+        enroll_owner_pubkey(PROFILE_NAME, &pk);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("policy.toml");
+        std::fs::write(&path, body).unwrap();
+        let var = unique_var(tag);
+        let _guard = EnvGuard::set(var.clone(), &s_strkey);
+        crate::common::render::take_rendered_for_test();
+        let profile = profile_for(PROFILE_NAME);
+        let code =
+            run_with_dependencies(&args(&path, &var), move |_n| Ok(profile.clone()), || Ok(()))
+                .await;
+        let mut rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1, "one envelope per run: {rendered:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        (code, rendered.remove(0), after, pk, dir)
+    }
+
+    /// A key outside the policy schema is refused before signing with the
+    /// canonicalisation code, naming the key and its location, and the file is
+    /// left byte-identical. The canonical form drops an unknown rule key, so
+    /// this check is what refuses it.
+    #[tokio::test]
+    #[serial]
+    async fn unknown_policy_key_is_refused_and_the_file_is_unchanged() {
+        let body = format!(
+            "{}decision_override = \"deny\"\n",
+            policy_body(PROFILE_NAME)
+        );
+        let (code, envelope, after, _pk, _dir) = sign_file_holding("UNKNOWNKEY", &body).await;
+        assert_eq!(code, 1, "an unknown key must refuse: {envelope}");
+        assert_eq!(
+            envelope["error"]["code"], "sign_policy.canonicalization_failed",
+            "{envelope}"
+        );
+        let message = envelope["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("rule[0]: unknown key `decision_override`"),
+            "the refusal must name the key and its location: {message}"
+        );
+        assert_eq!(after, body, "a refused file must be left byte-identical");
+    }
+
+    /// A body the loader refuses, but that canonicalises, is refused with
+    /// `sign_policy.policy_body_invalid` carrying the loader's detail, and the
+    /// file is left byte-identical: an approval `ttl_secs` out of range, and a
+    /// scope for another profile.
+    #[tokio::test]
+    #[serial]
+    async fn body_the_loader_refuses_is_refused_and_the_file_is_unchanged() {
+        let out_of_range_ttl = format!(
+            "{}\n[[rules]]\nmatch = {{ tool = \"*\", chain = \"*\" }}\ncriteria = []\n\
+             decision = \"require_approval\"\nttl_secs = 0\n",
+            policy_body(PROFILE_NAME)
+        );
+        let other_scope = policy_body("another-profile");
+        for (body, detail) in [
+            (
+                out_of_range_ttl.as_str(),
+                "rule[1] `ttl_secs` must be between 1 and 604800",
+            ),
+            (
+                other_scope.as_str(),
+                "policy scope does not match profile `sign-policy-test`",
+            ),
+        ] {
+            canonical_bytes(body).expect("the body must canonicalise");
+            let (code, envelope, after, _pk, _dir) = sign_file_holding("BODYINVALID", body).await;
+            assert_eq!(code, 1, "{detail}: {envelope}");
+            assert_eq!(
+                envelope["error"]["code"], "sign_policy.policy_body_invalid",
+                "{envelope}"
+            );
+            let message = envelope["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains(detail),
+                "the refusal must carry the loader's detail: {message}"
+            );
+            assert_eq!(after, body, "a refused file must be left byte-identical");
+        }
+    }
+
+    /// Signing does not require a valid previous signature: a signature made
+    /// over an earlier body, and a malformed `[signature]` table with a bad
+    /// `sig` and an extra key, are both replaced, and the result loads.
+    #[tokio::test]
+    #[serial]
+    async fn resign_repairs_a_stale_or_malformed_previous_signature() {
+        let body = policy_body(PROFILE_NAME);
+        let (code, envelope, signed, pk, dir) = sign_file_holding("STALE", &body).await;
+        assert_eq!(code, 0, "{envelope}");
+        let edited = signed.replace("stellar_balances", "stellar_pay");
+        assert_ne!(edited, signed, "the body edit must apply");
+        let stale_path = dir.path().join("stale.toml");
+        std::fs::write(&stale_path, &edited).unwrap();
+        assert!(
+            matches!(
+                load_signed_policy(&stale_path, PROFILE_NAME, &pk),
+                Err(PolicyError::OwnerSignatureInvalid { .. })
+            ),
+            "the edited body must not verify under the old signature"
+        );
+
+        let malformed = format!(
+            "{body}\n[signature]\nowner_id = \"GOLD\"\nsig = \"not-hex\"\nnote = \"stale\"\n"
+        );
+        let mut failures = Vec::new();
+        for (case, previous) in [("stale", edited), ("malformed", malformed)] {
+            let (code, envelope, resigned, pk, dir) =
+                sign_file_holding("RESIGNOLD", &previous).await;
+            if code != 0 {
+                failures.push(format!("{case}: re-signing must succeed: {envelope}"));
+                continue;
+            }
+            assert_eq!(envelope["data"]["replaced"], true, "{case}: {envelope}");
+            assert!(
+                !resigned.contains("note"),
+                "{case}: the old table must be replaced"
+            );
+            let path = dir.path().join("policy.toml");
+            let loaded = load_signed_policy(&path, PROFILE_NAME, &pk);
+            assert!(
+                loaded.is_ok(),
+                "{case}: the re-signed file must load: {:?}",
+                loaded.err()
+            );
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[tokio::test]

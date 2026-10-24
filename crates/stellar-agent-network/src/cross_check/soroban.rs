@@ -629,7 +629,7 @@ mod tests {
         // An inert dispatcher kept alive for the capture makes `tracing`
         // compute every callsite's interest from the registered dispatchers,
         // and the rebuild refreshes callsites cached before this capture.
-        let inert = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let inert = stellar_agent_test_support::inert_dispatcher();
         let dispatch = tracing::Dispatch::new(subscriber);
         tracing::callsite::rebuild_interest_cache();
         let output = future.with_subscriber(dispatch).await;

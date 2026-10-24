@@ -77,7 +77,7 @@ pub use echo_id_responder::SubmissionEchoResponder;
 pub use echo_id_responder::{EchoIdResponder, KeyedLedgerEntriesResponder, rpc_request_count};
 pub use env_guard::{ProfileEnvVarGuard, StellarAgentHomeGuard};
 pub use log_capture::{
-    CaptureWriter, RedactionStrictSubscriber, WarningCapture, with_captured_logs,
+    CaptureWriter, RedactionStrictSubscriber, WarningCapture, inert_dispatcher, with_captured_logs,
 };
 pub use secret_patterns::assert_no_secret_bytes;
 #[cfg(feature = "test-helpers")]

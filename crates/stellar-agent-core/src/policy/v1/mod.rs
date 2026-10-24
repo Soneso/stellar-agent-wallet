@@ -94,6 +94,9 @@ pub mod canonical;
 /// Owner-signature verification.
 pub mod signature;
 
+/// Closed key sets of the policy file, checked before the owner signature.
+pub mod schema;
+
 /// Proptest strategy generators for property tests.  Gate-guarded; excluded
 /// from release builds.
 ///
@@ -113,7 +116,8 @@ mod proptest_properties;
 
 pub use criteria::Criterion;
 pub use criteria::PolicyStateStore;
-pub use loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
+pub use loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId, validate_unsigned_policy};
+pub use schema::validate_policy_keys;
 pub use value::{
     ActionKind, OpaqueReason, ValueClass, ValueEffects, ValueGate, ValueLeg, classify_value,
 };

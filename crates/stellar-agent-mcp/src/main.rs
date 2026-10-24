@@ -17,7 +17,7 @@
 //!
 //! On Linux the process sets `PR_SET_DUMPABLE 0` and `PR_SET_NO_NEW_PRIVS 1`
 //! via raw `libc::prctl` at startup.  Details and the macOS / Windows operator
-//! discipline are documented in `docs/runbooks/mcp-process-isolation.md`.
+//! discipline are documented in `docs/mcp.md#launching-the-server`.
 //!
 //! # Transport safety
 //!
@@ -66,7 +66,7 @@ use stellar_agent_network::keyring::init_platform_keyring_store;
 /// setuid must analyse compatibility before landing.
 ///
 /// macOS / Windows: operator discipline described in
-/// `docs/runbooks/mcp-process-isolation.md`.
+/// `docs/mcp.md#launching-the-server`.
 #[cfg(target_os = "linux")]
 fn harden_process() {
     // SAFETY: prctl is a pure syscall that modifies only process-level kernel
@@ -107,7 +107,7 @@ fn harden_process() {
 #[cfg(not(target_os = "linux"))]
 fn harden_process() {
     // macOS / Windows: operator discipline documented in
-    // docs/runbooks/mcp-process-isolation.md.  Neither platform provides a
+    // docs/mcp.md#launching-the-server.  Neither platform provides a
     // direct equivalent of PR_SET_DUMPABLE; relying on the keyring backend's
     // per-app entitlement model and operator policy.
 }
@@ -484,14 +484,41 @@ async fn main() {
 ///
 /// The V1 engine is what `stellar-agent profile init` writes by default, and
 /// bringing it up is a ceremony: the owner key must be enrolled, then the policy
-/// file signed, before the server will start. Each of those steps is a distinct
-/// `BuildRegistryError`, so each gets the command that clears it. Variants that
-/// already carry a classified code and their own recovery text — a keyring that
-/// cannot be read at all, a policy-window store that must be reset — are logged
-/// as they are.
+/// file signed, before the server will start. The owner-key step gets its
+/// command here. The loader refuses a policy file without a `[signature]` table
+/// with a message that names `stellar-agent profile sign-policy` with the profile.
+/// A policy file that fails any other check gets no hint.
+/// Variants that carry their own recovery text, such as a policy-window store
+/// that must be reset, are logged as they are.
 fn report_build_failure(err: &stellar_agent_core::policy::BuildRegistryError, profile_name: &str) {
+    match build_failure_next_step(err, profile_name) {
+        Some(next_step) => tracing::error!(
+            error = %err,
+            profile = %profile_name,
+            "stellar-agent-mcp: cannot start the server for profile '{profile_name}': {err}; \
+             {next_step}"
+        ),
+        None => tracing::error!(
+            error = %err,
+            profile = %profile_name,
+            "stellar-agent-mcp: cannot start the server for profile '{profile_name}': {err}"
+        ),
+    }
+}
+
+/// Returns the command that clears a server-construction failure, or `None`
+/// for a failure whose own message is the guidance.
+///
+/// A V1 policy file that is read but fails a body check, such as an unknown
+/// key, gets no hint: re-signing does not clear it, and the error names the
+/// key.
+fn build_failure_next_step(
+    err: &stellar_agent_core::policy::BuildRegistryError,
+    profile_name: &str,
+) -> Option<String> {
     use stellar_agent_core::policy::BuildRegistryError as E;
-    let next_step = match err {
+    use stellar_agent_core::policy::PolicyError;
+    match err {
         E::OwnerKeyAbsent { .. } => Some(format!(
             "enrol the policy owner key with `stellar-agent profile enroll-owner-key \
              --profile {profile_name}`, then sign the policy file with \
@@ -513,31 +540,81 @@ fn report_build_failure(err: &stellar_agent_core::policy::BuildRegistryError, pr
             "the stored owner key is not a usable ed25519 public key; re-enrol it with \
              `stellar-agent profile enroll-owner-key --profile {profile_name}`"
         )),
-        E::PolicyFileLoadFailed { .. } => Some(format!(
-            "the V1 policy file is missing, unreadable, or not signed by the enrolled \
-             owner key; write and sign it with `stellar-agent profile sign-policy \
-             --profile {profile_name}`"
+        E::PolicyFileLoadFailed {
+            source: PolicyError::PolicyFileLoadFailed { .. },
+            ..
+        } => Some(format!(
+            "the V1 policy file could not be read; create it if it is missing, then sign it with \
+             `stellar-agent profile sign-policy --profile {profile_name}`"
+        )),
+        E::PolicyFileLoadFailed {
+            source: PolicyError::OwnerSignatureInvalid { .. },
+            ..
+        } => Some(format!(
+            "review the V1 policy file and re-sign it with `stellar-agent profile \
+             sign-policy --profile {profile_name}`"
         )),
         _ => None,
-    };
-    match next_step {
-        Some(next_step) => tracing::error!(
-            error = %err,
-            profile = %profile_name,
-            "stellar-agent-mcp: cannot start the server for profile '{profile_name}': {err}; \
-             {next_step}"
-        ),
-        None => tracing::error!(
-            error = %err,
-            profile = %profile_name,
-            "stellar-agent-mcp: cannot start the server for profile '{profile_name}': {err}"
-        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ArgvError, Invocation, parse_argv};
+    use stellar_agent_core::policy::{BuildRegistryError, PolicyError};
+
+    use super::{ArgvError, Invocation, build_failure_next_step, parse_argv};
+
+    fn policy_load_failure(source: PolicyError) -> BuildRegistryError {
+        BuildRegistryError::PolicyFileLoadFailed {
+            profile: "alice".to_owned(),
+            source,
+        }
+    }
+
+    /// An owner-signature failure, with or without rule indexes, points at
+    /// review and re-signing.
+    #[test]
+    fn owner_signature_failure_hint_asks_to_review_and_re_sign() {
+        for rules_with_signed_optional_keys in [vec![], vec![0, 2]] {
+            let err = policy_load_failure(PolicyError::OwnerSignatureInvalid {
+                profile: "alice".to_owned(),
+                rules_with_signed_optional_keys,
+            });
+            assert_eq!(
+                build_failure_next_step(&err, "alice").as_deref(),
+                Some(
+                    "review the V1 policy file and re-sign it with `stellar-agent profile \
+                     sign-policy --profile alice`"
+                )
+            );
+        }
+    }
+
+    /// A policy file that fails a body check, such as an unknown key, gets no
+    /// signing hint: re-signing does not clear it.
+    #[test]
+    fn policy_parse_failure_gets_no_signing_hint() {
+        let err = policy_load_failure(PolicyError::PolicyFileParseFailed {
+            detail: "rule[0]: unknown key `foo`".to_owned(),
+        });
+        assert_eq!(build_failure_next_step(&err, "alice"), None);
+    }
+
+    /// A policy file that cannot be read points at creating it if missing,
+    /// then signing it.
+    #[test]
+    fn unreadable_policy_file_hint_asks_to_create_and_sign_it() {
+        let err = policy_load_failure(PolicyError::PolicyFileLoadFailed {
+            detail: "alice.toml: No such file or directory".to_owned(),
+        });
+        assert_eq!(
+            build_failure_next_step(&err, "alice").as_deref(),
+            Some(
+                "the V1 policy file could not be read; create it if it is missing, \
+                 then sign it with `stellar-agent profile sign-policy --profile alice`"
+            )
+        );
+    }
 
     /// Parses a borrowed token list the way `std::env::args().skip(1)` yields
     /// argv.

@@ -89,7 +89,7 @@
 //!   the active signer set to guard against configurations where the threshold
 //!   exceeds the number of available signers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -9160,41 +9160,59 @@ impl OnChainContextRule {
 /// The `get_context_rule` entrypoint returns a `ContextRule` contracttype.
 /// In Soroban simulation, contracttype structs are returned as `ScVal::Map`
 /// with sorted keys. We decode the relevant fields: `id`, `signers`,
-/// `signer_ids`, and `policies`. `ContextRule` carries no threshold: a
-/// simple-threshold policy stores it keyed by `(context_rule_id,
-/// smart_account)`, and the signer-set observation reads it there.
+/// `signer_ids`, `policies`, and `policy_ids`. `ContextRule` carries no
+/// threshold: a simple-threshold policy stores it keyed by
+/// `(context_rule_id, smart_account)`, and the signer-set observation reads
+/// it there.
 ///
 /// # Complete signer set
 ///
 /// An observed signer set describes every signer the rule holds. The map
-/// must carry both `signer_ids` and `signers` as `Vec`s; the two lists are
-/// parallel, so they must have the same length, every id must be a `u32` and
-/// every signer must decode through [`decode_signer_scval_full`]. A signer the
-/// wallet cannot represent (an unknown `Signer` variant, a malformed
-/// encoding, a `Delegated` address that is neither an account nor a
-/// contract, or an `External` signer with empty key data) refuses the
-/// observation, so every read of the rule's signer set fails closed: the
-/// baseline comparison, `signers list` and `signers refresh`, the signer verbs
-/// and their post-submit reads, policy identification for threshold,
-/// spending-limit and weighted-threshold policies, the executable pin check on
-/// every rule-authorized signing verb, the passkey path and the policy
-/// classification of the MCP `stellar_rules_get` tool. Every signer of the
-/// rule can authorize its transactions, so the baseline, the threshold
-/// arithmetic and the operator's view each need all of them.
-/// Such a rule is removed with `smart-account rules delete`, authorized by a
-/// rule the wallet can read; the delete reads only its authorizing rules.
+/// must carry both `signer_ids` and `signers` as `Vec`s. The two lists are
+/// parallel, so they must have the same length, every id must be a `u32`,
+/// and every signer must decode through [`decode_signer_scval_full`].
+///
+/// A signer the wallet cannot represent refuses the observation. This
+/// includes an unknown `Signer` variant, a malformed encoding, a `Delegated`
+/// address that is neither an account nor a contract, or an `External`
+/// signer with empty key data. Every read of the rule's signer set therefore
+/// fails closed:
+///
+/// - the baseline comparison
+/// - `signers list` and `signers refresh`
+/// - the signer verbs and their post-submit reads
+/// - policy identification for threshold, spending-limit, and
+///   weighted-threshold policies
+/// - the executable pin check on every rule-authorized signing verb
+/// - the passkey path
+/// - the policy classification of the MCP `stellar_rules_get` tool
+/// - the rule listing
+/// - the cap pre-checks of `signers add` and `rules add-policy`
+///
+/// The listing and the cap pre-checks take their signer and policy counts
+/// from this decoder. Every signer of the rule can authorize its
+/// transactions, so the baseline, the threshold arithmetic, and the
+/// operator's view each need all of them. Such a rule is removed with
+/// `smart-account rules delete`, authorized by a rule the wallet can read;
+/// the delete reads only its authorizing rules.
 ///
 /// # Errors
 ///
-/// Returns [`SaError::DeploymentFailed`] (phase `"simulate"`) if the `ScVal`
-/// cannot be decoded as a `ContextRule`: not a map, no `id`, a missing or
-/// non-`Vec` `signer_ids` or `signers` field, a `signer_ids` item that is not
-/// a `u32`, `signer_ids` and `signers` of different lengths, or a signer that
-/// does not decode. The reason names the offending field or index and never
-/// renders the value.
+/// Returns [`SaError::DeploymentFailed`] (phase `"simulate"`) when the
+/// `ScVal` is not a `ContextRule`:
+///
+/// - not a map, or no `id`,
+/// - a missing or non-`Vec` `signer_ids` or `signers` field,
+/// - a `signer_ids` item that is not a `u32`,
+/// - `signer_ids` and `signers` of different lengths,
+/// - a signer that does not decode,
+/// - a malformed policy field, as [`context_rule_policies`] lists.
+///
+/// The signer fields are checked before the policy fields. The reason names
+/// the offending field or index and never renders the value.
 fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> {
     // The simulation returns a ScVal::Map for a contracttype struct.
-    // We extract id, signers, signer_ids, policies.
+    // We extract id, signers, signer_ids, policies, policy_ids.
     // We also preserve the raw ScVal for round-trip use in set_threshold args.
     let map = match &val {
         ScVal::Map(Some(m)) => m.clone(),
@@ -9220,7 +9238,8 @@ fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> 
     let mut id: Option<u32> = None;
     let mut signer_ids: Option<Vec<u32>> = None;
     let mut signers_scvals: Option<Vec<ScVal>> = None;
-    let mut policies: Vec<ScAddress> = vec![];
+    let mut policies_val: Option<&ScVal> = None;
+    let mut policy_ids_val: Option<&ScVal> = None;
 
     for entry in map.iter() {
         let key_str = match &entry.key {
@@ -9254,15 +9273,8 @@ fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> 
                     .map_err(|e| refuse(format!("get_context_rule: {e}")))?;
                 signers_scvals = Some(items.into_iter().cloned().collect());
             }
-            "policy_ids" | "policies" => {
-                if let ScVal::Vec(Some(v)) = &entry.val {
-                    for item in v.iter() {
-                        if let ScVal::Address(addr) = item {
-                            policies.push(addr.clone());
-                        }
-                    }
-                }
-            }
+            "policies" => policies_val = Some(&entry.val),
+            "policy_ids" => policy_ids_val = Some(&entry.val),
             _ => {}
         }
     }
@@ -9300,6 +9312,9 @@ fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> 
         })
         .collect::<Result<_, _>>()?;
 
+    let policies = context_rule_policies(policies_val, policy_ids_val)
+        .map_err(|e| refuse(format!("get_context_rule: {e}")))?;
+
     Ok(OnChainContextRule {
         id: rule_id,
         signers,
@@ -9308,7 +9323,100 @@ fn decode_context_rule_scval(val: ScVal) -> Result<OnChainContextRule, SaError> 
     })
 }
 
-/// Returns the items of a `ContextRule` list field (`signer_ids`, `signers`).
+/// Returns the signer count and the policy count of a context rule the shared
+/// decoder accepts.
+///
+/// # Errors
+///
+/// Returns the [`SaError::DeploymentFailed`] (phase `"simulate"`) refusal of
+/// the shared context-rule decoder.
+pub(crate) fn decode_context_rule_counts(scval: &ScVal) -> Result<(u32, u32), SaError> {
+    let rule = decode_context_rule_scval(scval.clone())?;
+    // invariant: each decoded list holds one entry per item of an `ScVec`, a
+    // `VecM` of at most `u32::MAX` items, so neither conversion fails. The
+    // shared refusal keeps the function free of a panic path.
+    let count = |field: &str, len: usize| {
+        u32::try_from(len).map_err(|_| SaError::DeploymentFailed {
+            phase: "simulate",
+            redacted_reason: format!("get_context_rule: {field} length {len} overflows u32"),
+        })
+    };
+    Ok((
+        count("signers", rule.signers.len())?,
+        count("policies", rule.policies.len())?,
+    ))
+}
+
+/// Returns the policies of a `ContextRule` from its `policies` and
+/// `policy_ids` fields.
+///
+/// OZ keeps the two lists aligned: `policy_ids[i]` is the id of
+/// `policies[i]`, and a rule holds each policy once. Both lists may be empty.
+///
+/// # Errors
+///
+/// Returns the refusal reason, without the caller's prefix, for the first of:
+///
+/// - a missing `policies` or `policy_ids` field, or one that is not a `Vec`,
+/// - a policy that is not an `Address`, or a repeated policy,
+/// - an id that is not a `u32`, or a repeated id,
+/// - lists of different lengths.
+///
+/// The reason names the field, and the index and the `ScVal` variant where
+/// they apply. It never renders a value.
+fn context_rule_policies(
+    policies_val: Option<&ScVal>,
+    policy_ids_val: Option<&ScVal>,
+) -> Result<Vec<ScAddress>, String> {
+    let policies_val = policies_val.ok_or("missing 'policies' field in ContextRule map")?;
+    let policy_ids_val = policy_ids_val.ok_or("missing 'policy_ids' field in ContextRule map")?;
+    let policy_items = context_rule_list_items(policies_val, "policies")?;
+    let id_items = context_rule_list_items(policy_ids_val, "policy_ids")?;
+
+    // The repeat checks look up a set, so the work stays near-linear in the
+    // length of a list the RPC answer chooses.
+    let mut policies: Vec<ScAddress> = Vec::with_capacity(policy_items.len());
+    let mut seen_policies: BTreeSet<&ScAddress> = BTreeSet::new();
+    for (i, item) in policy_items.into_iter().enumerate() {
+        let ScVal::Address(address) = item else {
+            return Err(format!(
+                "policies[{i}] is not an Address: {}",
+                scval_variant_name(item)
+            ));
+        };
+        if !seen_policies.insert(address) {
+            return Err(format!("policies[{i}] repeats an earlier policy"));
+        }
+        policies.push(address.clone());
+    }
+
+    // A repeated id returns early, so past the loop `ids` holds one entry
+    // per list item.
+    let mut ids: BTreeSet<u32> = BTreeSet::new();
+    for (i, item) in id_items.into_iter().enumerate() {
+        let ScVal::U32(id) = item else {
+            return Err(format!(
+                "policy_ids[{i}] is not a u32: {}",
+                scval_variant_name(item)
+            ));
+        };
+        if !ids.insert(*id) {
+            return Err(format!("policy_ids[{i}] repeats an earlier id"));
+        }
+    }
+
+    if ids.len() != policies.len() {
+        return Err(format!(
+            "policy_ids has {} entries and policies has {}",
+            ids.len(),
+            policies.len()
+        ));
+    }
+    Ok(policies)
+}
+
+/// Returns the items of a `ContextRule` list field (`signer_ids`, `signers`,
+/// `policies`, `policy_ids`).
 ///
 /// An absent `Vec` body (`ScVal::Vec(None)`) is an empty list.
 ///
@@ -9480,6 +9588,17 @@ pub enum SignerDecodeError {
         /// Number of items in the `Vec`.
         count: usize,
     },
+    /// The `Vec` holds more items than its variant encodes: 2 for
+    /// `Delegated`, 3 for `External`.
+    #[error("{tag} signer expected {expected} items, got {count}")]
+    TooManyItems {
+        /// The variant tag, `"Delegated"` or `"External"`.
+        tag: &'static str,
+        /// Number of items the variant encodes.
+        expected: usize,
+        /// Number of items in the `Vec`.
+        count: usize,
+    },
     /// The first item, the variant tag, is not an `ScVal::Symbol`.
     #[error("tag is not a Symbol: {variant}")]
     TagNotASymbol {
@@ -9547,11 +9666,13 @@ pub enum SignerDecodeError {
 /// # Errors
 ///
 /// Returns the [`SignerDecodeError`] variant naming the first malformed part:
-/// a value that is not a `Vec`, a `Vec` shorter than its variant requires, a
-/// tag that is not a `Symbol` or names an unknown variant, a `Delegated`
-/// address that is neither an account nor a contract, or an `External`
-/// verifier that is not a contract address or key data that is not `Bytes`
-/// or is empty.
+///
+/// - a value that is not a `Vec`,
+/// - a `Vec` shorter or longer than its variant encodes,
+/// - a tag that is not a `Symbol`, or one that names an unknown variant,
+/// - a `Delegated` address that is neither an account nor a contract,
+/// - an `External` verifier that is not a contract address,
+/// - `External` key data that is not `Bytes`, or is empty.
 pub fn decode_signer_scval_full(val: &ScVal) -> Result<DecodedOnChainSigner, SignerDecodeError> {
     let ScVal::Vec(vec) = val else {
         return Err(SignerDecodeError::NotAVec {
@@ -9572,6 +9693,13 @@ pub fn decode_signer_scval_full(val: &ScVal) -> Result<DecodedOnChainSigner, Sig
 
     match tag.as_slice() {
         b"Delegated" => {
+            if items.len() > 2 {
+                return Err(SignerDecodeError::TooManyItems {
+                    tag: "Delegated",
+                    expected: 2,
+                    count: items.len(),
+                });
+            }
             // OZ `Signer::Delegated(Address)`: an account (G) or a contract
             // (C) address.
             match items[1] {
@@ -9596,6 +9724,13 @@ pub fn decode_signer_scval_full(val: &ScVal) -> Result<DecodedOnChainSigner, Sig
         b"External" => {
             if items.len() < 3 {
                 return Err(SignerDecodeError::ExternalTooFewItems { count: items.len() });
+            }
+            if items.len() > 3 {
+                return Err(SignerDecodeError::TooManyItems {
+                    tag: "External",
+                    expected: 3,
+                    count: items.len(),
+                });
             }
             // OZ `Signer::External(Address, Bytes)`.
             let ScVal::Address(verifier_address) = items[1] else {
@@ -11962,6 +12097,51 @@ pub(crate) mod tests {
         );
     }
 
+    /// `decode_signer_scval_full` refuses a `Delegated` signer with more than
+    /// its 2 items.
+    #[test]
+    fn decode_signer_scval_full_refuses_a_delegated_signer_with_surplus_items() {
+        use stellar_xdr::{AccountId, ScAddress, ScSymbol, ScVec, Uint256};
+
+        let sym = ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap());
+        let addr = ScVal::Address(ScAddress::Account(AccountId(
+            PublicKey::PublicKeyTypeEd25519(Uint256([0xaau8; 32])),
+        )));
+        let three_elem = ScVal::Vec(Some(ScVec(
+            VecM::try_from(vec![sym, addr, ScVal::U32(0)]).unwrap(),
+        )));
+        assert_eq!(
+            decode_signer_scval_full(&three_elem).err(),
+            Some(SignerDecodeError::TooManyItems {
+                tag: "Delegated",
+                expected: 2,
+                count: 3,
+            })
+        );
+    }
+
+    /// `decode_signer_scval_full` refuses an `External` signer with more than
+    /// its 3 items.
+    #[test]
+    fn decode_signer_scval_full_refuses_an_external_signer_with_surplus_items() {
+        use stellar_xdr::{ContractId, Hash, ScAddress, ScBytes, ScSymbol, ScVec};
+
+        let sym = ScVal::Symbol(ScSymbol::try_from("External").unwrap());
+        let addr = ScVal::Address(ScAddress::Contract(ContractId(Hash([0x22u8; 32]))));
+        let bytes = ScVal::Bytes(ScBytes(vec![0x01, 0x02].try_into().unwrap()));
+        let four_elem = ScVal::Vec(Some(ScVec(
+            VecM::try_from(vec![sym, addr, bytes, ScVal::U32(0)]).unwrap(),
+        )));
+        assert_eq!(
+            decode_signer_scval_full(&four_elem).err(),
+            Some(SignerDecodeError::TooManyItems {
+                tag: "External",
+                expected: 3,
+                count: 4,
+            })
+        );
+    }
+
     /// `decode_signer_scval_full` decodes a `Delegated` signer whose address
     /// is a contract as `DelegatedContract`, keeping the contract id and the
     /// verbatim address.
@@ -12053,6 +12233,14 @@ pub(crate) mod tests {
             (
                 SignerDecodeError::TooFewItems { count: 1 },
                 "expected at least 2 items, got 1",
+            ),
+            (
+                SignerDecodeError::TooManyItems {
+                    tag: "Delegated",
+                    expected: 2,
+                    count: 3,
+                },
+                "Delegated signer expected 2 items, got 3",
             ),
             (
                 SignerDecodeError::TagNotASymbol { variant: "U32" },
@@ -12154,71 +12342,56 @@ pub(crate) mod tests {
         }
     }
 
-    /// `decode_context_rule_scval` must correctly parse the `policy_ids` key
-    /// as well as the `policies` key (both map to `policies` in the decoded result).
-    ///
-    /// The OZ `ContextRule` struct uses `policy_ids` in some contract versions
-    /// and `policies` in others; both must be accepted.
+    /// Aligned `policies` and `policy_ids` decode to the policies in the
+    /// rule's order; two empty lists decode to no policy.
     #[test]
-    fn decode_context_rule_scval_accepts_policy_ids_key() {
-        use stellar_xdr::{ContractId, Hash, ScAddress, ScMap, ScMapEntry, ScSymbol, ScVec};
+    fn decode_context_rule_scval_reads_aligned_policy_lists() {
+        let rule = decode_context_rule_scval(rule_with_policy_lists(
+            vec![policy_item(0x55), policy_item(0x66)],
+            vec![ScVal::U32(4), ScVal::U32(9)],
+        ))
+        .expect("aligned policy lists must decode");
+        assert_eq!(rule.id, 7);
+        assert_eq!(
+            rule.policies,
+            vec![policy_address(0x55), policy_address(0x66)]
+        );
 
-        // Build a policy address to include.
-        let policy_addr = ScAddress::Contract(ContractId(Hash([0x55u8; 32])));
-
-        let id_key = ScVal::Symbol(ScSymbol::try_from("id").unwrap());
-        let id_val = ScVal::U32(3);
-        let policy_ids_key = ScVal::Symbol(ScSymbol::try_from("policy_ids").unwrap());
-        let policy_ids_val = ScVal::Vec(Some(ScVec(
-            vec![ScVal::Address(policy_addr.clone())]
-                .try_into()
-                .unwrap(),
-        )));
-        let signers_key = ScVal::Symbol(ScSymbol::try_from("signers").unwrap());
-        let signers_val = ScVal::Vec(Some(ScVec(VecM::default())));
-        let signer_ids_key = ScVal::Symbol(ScSymbol::try_from("signer_ids").unwrap());
-        let signer_ids_val = ScVal::Vec(Some(ScVec(VecM::default())));
-
-        let map_entries: Vec<ScMapEntry> = vec![
-            ScMapEntry {
-                key: id_key,
-                val: id_val,
-            },
-            ScMapEntry {
-                key: policy_ids_key,
-                val: policy_ids_val,
-            },
-            ScMapEntry {
-                key: signer_ids_key,
-                val: signer_ids_val,
-            },
-            ScMapEntry {
-                key: signers_key,
-                val: signers_val,
-            },
-        ];
-        let sc_map = ScMap(map_entries.try_into().unwrap());
-        let val = ScVal::Map(Some(sc_map));
-
-        let rule = decode_context_rule_scval(val).expect("must succeed with policy_ids key");
-        assert_eq!(rule.id, 3, "rule.id must be 3");
-        assert_eq!(rule.policies.len(), 1, "policies must have one entry");
-        assert_eq!(rule.policies[0], policy_addr, "policy address must match");
+        let rule = decode_context_rule_scval(rule_with_policy_lists(vec![], vec![]))
+            .expect("empty policy lists must decode");
+        assert!(rule.policies.is_empty());
     }
 
-    /// Builds a `ContextRule` map with id `7` and the given parallel lists.
+    /// Builds a `ContextRule` map with id `7`, the given parallel signer
+    /// lists and empty policy lists.
     fn rule_with_signer_lists(signer_ids: Vec<ScVal>, signers: Vec<ScVal>) -> ScVal {
-        use stellar_xdr::ScVec;
         rule_with_entries(vec![
-            (
-                "signer_ids",
-                ScVal::Vec(Some(ScVec(signer_ids.try_into().unwrap()))),
-            ),
-            (
-                "signers",
-                ScVal::Vec(Some(ScVec(signers.try_into().unwrap()))),
-            ),
+            ("policies", scval_list(vec![])),
+            ("policy_ids", scval_list(vec![])),
+            ("signer_ids", scval_list(signer_ids)),
+            ("signers", scval_list(signers)),
         ])
+    }
+
+    /// Builds a `ContextRule` map with id `7`, no signer and the given policy
+    /// lists.
+    fn rule_with_policy_lists(policies: Vec<ScVal>, policy_ids: Vec<ScVal>) -> ScVal {
+        rule_with_entries(vec![
+            ("policies", scval_list(policies)),
+            ("policy_ids", scval_list(policy_ids)),
+            ("signer_ids", scval_list(vec![])),
+            ("signers", scval_list(vec![])),
+        ])
+    }
+
+    /// An `ScVal::Vec` holding `items`.
+    fn scval_list(items: Vec<ScVal>) -> ScVal {
+        ScVal::Vec(Some(stellar_xdr::ScVec(items.try_into().unwrap())))
+    }
+
+    /// A policy list item holding the contract address with id `[byte; 32]`.
+    fn policy_item(byte: u8) -> ScVal {
+        ScVal::Address(policy_address(byte))
     }
 
     /// A `Delegated` signer for the ed25519 key `[byte; 32]`.
@@ -12386,11 +12559,141 @@ pub(crate) mod tests {
             "get_context_rule: signers is not a Vec: String"
         );
         let rule = decode_context_rule_scval(rule_with_entries(vec![
+            ("policies", ScVal::Vec(None)),
+            ("policy_ids", ScVal::Vec(None)),
             ("signer_ids", ScVal::Vec(None)),
             ("signers", ScVal::Vec(None)),
         ]))
         .expect("absent Vec bodies are empty lists");
         assert!(rule.signers.is_empty());
+    }
+
+    /// A signer with more items than its variant encodes refuses the rule
+    /// with the per-index reason.
+    #[test]
+    fn decode_context_rule_scval_refuses_a_signer_with_surplus_items() {
+        let surplus = scval_list(vec![
+            ScVal::Symbol(ScSymbol::try_from("Delegated").unwrap()),
+            ScVal::Address(ScAddress::Contract(ContractId(Hash([0x44; 32])))),
+            ScVal::U32(0),
+        ]);
+        assert_eq!(
+            refused_rule_reason(rule_with_signer_lists(vec![ScVal::U32(0)], vec![surplus])),
+            "get_context_rule: signer at index 0 (id 0) is not a recognised Signer: \
+             Delegated signer expected 2 items, got 3"
+        );
+    }
+
+    /// A map without a `policies` or a `policy_ids` key refuses the rule: an
+    /// absent list is not an empty one.
+    #[test]
+    fn decode_context_rule_scval_refuses_a_missing_policy_list() {
+        assert_eq!(
+            refused_rule_reason(rule_with_entries(vec![
+                ("policy_ids", scval_list(vec![])),
+                ("signer_ids", scval_list(vec![])),
+                ("signers", scval_list(vec![])),
+            ])),
+            "get_context_rule: missing 'policies' field in ContextRule map"
+        );
+        assert_eq!(
+            refused_rule_reason(rule_with_entries(vec![
+                ("policies", scval_list(vec![])),
+                ("signer_ids", scval_list(vec![])),
+                ("signers", scval_list(vec![])),
+            ])),
+            "get_context_rule: missing 'policy_ids' field in ContextRule map"
+        );
+    }
+
+    /// A `policies` or `policy_ids` value that is not a `Vec` refuses the
+    /// rule, naming its variant; `Vec(None)` is an empty list.
+    #[test]
+    fn decode_context_rule_scval_refuses_a_non_vec_policy_list() {
+        let rule = |policies: ScVal, policy_ids: ScVal| {
+            rule_with_entries(vec![
+                ("policies", policies),
+                ("policy_ids", policy_ids),
+                ("signer_ids", scval_list(vec![])),
+                ("signers", scval_list(vec![])),
+            ])
+        };
+        assert_eq!(
+            refused_rule_reason(rule(ScVal::U32(1), ScVal::Vec(None))),
+            "get_context_rule: policies is not a Vec: U32"
+        );
+        assert_eq!(
+            refused_rule_reason(rule(ScVal::Vec(None), large_string_scval())),
+            "get_context_rule: policy_ids is not a Vec: String"
+        );
+        let decoded = decode_context_rule_scval(rule(ScVal::Vec(None), ScVal::Vec(None)))
+            .expect("absent Vec bodies are empty lists");
+        assert!(decoded.policies.is_empty());
+    }
+
+    /// A `policies` item that is not an `Address` refuses the rule, naming
+    /// its index and variant.
+    #[test]
+    fn decode_context_rule_scval_refuses_a_non_address_policy() {
+        assert_eq!(
+            refused_rule_reason(rule_with_policy_lists(
+                vec![policy_item(0x55), ScVal::U32(1)],
+                vec![ScVal::U32(0), ScVal::U32(1)],
+            )),
+            "get_context_rule: policies[1] is not an Address: U32"
+        );
+    }
+
+    /// A `policy_ids` item that is not a `u32` refuses the rule, naming its
+    /// index and variant.
+    #[test]
+    fn decode_context_rule_scval_refuses_a_non_u32_policy_id() {
+        assert_eq!(
+            refused_rule_reason(rule_with_policy_lists(
+                vec![policy_item(0x55)],
+                vec![policy_item(0x66)],
+            )),
+            "get_context_rule: policy_ids[0] is not a u32: Address"
+        );
+    }
+
+    /// `policies` and `policy_ids` of different lengths refuse the rule.
+    #[test]
+    fn decode_context_rule_scval_refuses_unequal_policy_lists() {
+        assert_eq!(
+            refused_rule_reason(rule_with_policy_lists(
+                vec![policy_item(0x55)],
+                vec![ScVal::U32(0), ScVal::U32(1)],
+            )),
+            "get_context_rule: policy_ids has 2 entries and policies has 1"
+        );
+        assert_eq!(
+            refused_rule_reason(rule_with_policy_lists(
+                vec![policy_item(0x55), policy_item(0x66)],
+                vec![ScVal::U32(0)],
+            )),
+            "get_context_rule: policy_ids has 1 entries and policies has 2"
+        );
+    }
+
+    /// A repeated policy address or policy id refuses the rule, naming the
+    /// index of the repeat.
+    #[test]
+    fn decode_context_rule_scval_refuses_a_repeated_policy() {
+        assert_eq!(
+            refused_rule_reason(rule_with_policy_lists(
+                vec![policy_item(0x55), policy_item(0x55)],
+                vec![ScVal::U32(0), ScVal::U32(1)],
+            )),
+            "get_context_rule: policies[1] repeats an earlier policy"
+        );
+        assert_eq!(
+            refused_rule_reason(rule_with_policy_lists(
+                vec![policy_item(0x55), policy_item(0x66)],
+                vec![ScVal::U32(3), ScVal::U32(3)],
+            )),
+            "get_context_rule: policy_ids[1] repeats an earlier id"
+        );
     }
 
     /// A `Delegated` signer whose address is a contract decodes in version 2,

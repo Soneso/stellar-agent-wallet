@@ -1,8 +1,8 @@
 //! Integration tests for audit-log emission from `deploy_smart_account`.
 //!
 //! Each test wires an `AuditWriter` backed by a `tempfile::NamedTempFile`, runs
-//! `deploy_smart_account` in dry-run or error mode, then reads back the JSONL
-//! output and asserts on the entry fields.
+//! `deploy_smart_account` in dry-run or error mode, then reads back the verified
+//! audit chain and asserts on the entry fields.
 //!
 //! # Coverage
 //!
@@ -37,10 +37,9 @@
     reason = "test-only"
 )]
 
-use std::io::BufRead as _;
-use std::path::PathBuf;
 use std::time::Duration;
 
+use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_smart_account::deployment::{
     DeploymentArgs, ResolvedFeePerOp, deploy_smart_account, interop_deployer,
@@ -114,17 +113,11 @@ fn build_failure_args() -> DeploymentArgs {
     }
 }
 
-/// Reads all JSONL lines from the temp file and parses each as `serde_json::Value`.
+/// Returns the verified audit chain under `dir` as JSON values, in chain order.
 fn read_entries(dir: &TempDir) -> Vec<serde_json::Value> {
-    let path: PathBuf = dir.path().join("audit.jsonl");
-    let file = std::fs::File::open(&path).expect("audit.jsonl");
-    let reader = std::io::BufReader::new(file);
-    reader
-        .lines()
-        .map(|l| {
-            let line = l.expect("line");
-            serde_json::from_str(&line).expect("valid JSON per line")
-        })
+    verified_audit_entries_from_path(&dir.path().join("audit.jsonl"))
+        .into_iter()
+        .map(|entry| serde_json::to_value(entry).expect("verified audit entry must serialize"))
         .collect()
 }
 

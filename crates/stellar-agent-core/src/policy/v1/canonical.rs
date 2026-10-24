@@ -9,9 +9,19 @@
 //! 1. The `[signature]` table is **excluded** from the output.
 //! 2. Included keys: `version` (top-level integer), `scope` (top-level string),
 //!    `[[rules]]` array (in original declaration order).
-//! 3. Field order within each rule is fixed: `match`, `criteria`, `decision`.
-//! 4. All comments stripped.
-//! 5. Whitespace normalised; no trailing whitespace; no BOM.
+//! 3. Field order within each rule is fixed: `match`, `criteria`, `decision`,
+//!    then `reason`, `ttl_secs` and `allow_opaque_signing`. The last three are
+//!    emitted only when the rule carries them, so the canonical bytes of a rule
+//!    without them depend on `match`, `criteria` and `decision` alone. A
+//!    present empty `reason` and a present `allow_opaque_signing = false` are
+//!    emitted.
+//! 4. Other rule keys are not emitted. Criterion tables are copied whole,
+//!    unknown members included. The loader refuses every key outside the
+//!    policy schema before it verifies the signature (see
+//!    [`crate::policy::v1::schema::validate_policy_keys`]), so every key the
+//!    loader reads, the `[signature]` table excepted, is in the signed bytes.
+//! 5. All comments stripped.
+//! 6. Whitespace normalised; no trailing whitespace; no BOM.
 //!
 //! ## Determinism guarantee
 //!
@@ -45,8 +55,10 @@ use crate::policy::PolicyError;
 /// `blake3(canonical_bytes(policy_toml))`.
 ///
 /// The `[signature]` table is excluded.  Only `version`, `scope`, and
-/// `[[rules]]` (in original declaration order) are included.  All comments are
-/// stripped and whitespace is normalised.
+/// `[[rules]]` (in original declaration order) are included.  Each rule
+/// carries `match`, `criteria` and `decision`, then whichever of `reason`,
+/// `ttl_secs` and `allow_opaque_signing` it holds, in that order.  All
+/// comments are stripped and whitespace is normalised.
 ///
 /// # Errors
 ///
@@ -86,6 +98,16 @@ pub fn canonical_bytes(toml_text: &str) -> Result<Vec<u8>, PolicyError> {
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Rule keys every canonical rule carries, in emission order.
+pub(crate) const REQUIRED_RULE_KEYS: [&str; 3] = ["match", "criteria", "decision"];
+
+/// Optional rule keys the canonical form signs, in emission order after
+/// [`REQUIRED_RULE_KEYS`].
+///
+/// Each is emitted only when the rule carries it, with no default inserted, so
+/// the canonical bytes of a rule without them do not depend on this list.
+pub(crate) const OPTIONAL_RULE_KEYS: [&str; 3] = ["reason", "ttl_secs", "allow_opaque_signing"];
 
 /// Builds the canonical TOML string from the parsed document.
 ///
@@ -230,38 +252,26 @@ fn strip_value_decor(val: &Value) -> Value {
 
 /// Builds a canonical [`Table`] for a `[[rules]]` entry.
 ///
-/// Field order is fixed: `match`, `criteria`, `decision`.
+/// Field order is fixed: `match`, `criteria`, `decision` (each required),
+/// then `reason`, `ttl_secs` and `allow_opaque_signing`, each emitted only
+/// when the rule carries it. Values are emitted without decoration; an
+/// integer is re-emitted as plain decimal. Other rule keys are not emitted.
 fn canonical_rule_table(src: &Table) -> Result<Table, PolicyError> {
     let mut out = Table::new();
 
-    // `match` is required in every rule.
-    if let Some(m) = src.get("match") {
-        let mv = canonical_item_as_value(m)?;
-        out.insert("match", Item::Value(mv));
-    } else {
-        return Err(PolicyError::PolicyFileParseFailed {
-            detail: "rule missing required `match` key".into(),
-        });
+    for key in REQUIRED_RULE_KEYS {
+        let item = src
+            .get(key)
+            .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                detail: format!("rule missing required `{key}` key"),
+            })?;
+        out.insert(key, Item::Value(canonical_item_as_value(item)?));
     }
 
-    // `criteria` is required (may be an empty array).
-    if let Some(c) = src.get("criteria") {
-        let cv = canonical_item_as_value(c)?;
-        out.insert("criteria", Item::Value(cv));
-    } else {
-        return Err(PolicyError::PolicyFileParseFailed {
-            detail: "rule missing required `criteria` key".into(),
-        });
-    }
-
-    // `decision` is required.
-    if let Some(d) = src.get("decision") {
-        let dv = canonical_item_as_value(d)?;
-        out.insert("decision", Item::Value(dv));
-    } else {
-        return Err(PolicyError::PolicyFileParseFailed {
-            detail: "rule missing required `decision` key".into(),
-        });
+    for key in OPTIONAL_RULE_KEYS {
+        if let Some(item) = src.get(key) {
+            out.insert(key, Item::Value(canonical_item_as_value(item)?));
+        }
     }
 
     // Remove all table-level decor (comments, extra whitespace).
@@ -270,10 +280,13 @@ fn canonical_rule_table(src: &Table) -> Result<Table, PolicyError> {
 }
 
 /// Builds a canonical [`InlineTable`] for a rule expressed as an inline table.
+///
+/// Copies the required and optional rule keys the rule carries, in canonical
+/// order; other keys are not copied.
 fn canonical_inline_rule(src: &InlineTable) -> Result<InlineTable, PolicyError> {
     let mut out = InlineTable::new();
 
-    for key in ["match", "criteria", "decision"] {
+    for key in REQUIRED_RULE_KEYS.into_iter().chain(OPTIONAL_RULE_KEYS) {
         if let Some(v) = src.get(key) {
             out.insert(key, strip_value_decor(v));
         }
@@ -284,16 +297,24 @@ fn canonical_inline_rule(src: &InlineTable) -> Result<InlineTable, PolicyError> 
 }
 
 /// Builds a canonical [`Table`] for an inline-array rule.
+///
+/// The same field order as [`canonical_rule_table`]: a missing required key
+/// fails, a missing optional key emits nothing.
 fn canonical_table_from_inline_rule(src: &InlineTable) -> Result<Table, PolicyError> {
     let inline = canonical_inline_rule(src)?;
     let mut out = Table::new();
-    for key in ["match", "criteria", "decision"] {
+    for key in REQUIRED_RULE_KEYS {
         if let Some(v) = inline.get(key) {
             out.insert(key, Item::Value(strip_value_decor(v)));
         } else {
             return Err(PolicyError::PolicyFileParseFailed {
                 detail: format!("rule missing required `{key}` key"),
             });
+        }
+    }
+    for key in OPTIONAL_RULE_KEYS {
+        if let Some(v) = inline.get(key) {
+            out.insert(key, Item::Value(strip_value_decor(v)));
         }
     }
     out.decor_mut().clear();
@@ -949,6 +970,209 @@ decision = "deny"
         );
     }
 
+    // ── golden canonical bytes for rules without optional keys ────────────────
+
+    /// Array-of-tables golden fixture: three rules, a dotted-key `match`, a
+    /// standard sub-table `match`, a rule whose keys are out of canonical
+    /// order, criteria with nested arrays and underscore integers, and comments.
+    const GOLDEN_ARRAY_OF_TABLES_FIXTURE: &str = r#"# Owner policy for alice.
+version = 1 # schema version
+scope = "profile:alice"
+
+[[rules]]
+# Dotted-key match.
+match.tool = "stellar_pay"
+match.chain = "stellar:testnet"
+criteria = [
+  # Per-transaction cap of 100 XLM.
+  { kind = "per_tx_cap", asset = "native", max_stroops = 1_000_000_000 },
+  { kind = "counterparty_allowlist", kinds = [ "G_ACCOUNT", "C_ACCOUNT" ], allowlist = ["GAAAA", "CBBBB"], gate_inflows = false },
+]
+decision = "allow"
+
+[[rules]]
+decision = "require_approval"
+criteria = [{ kind = "rate_limit", window = "1h", max_calls = 1_0 }]   # hourly
+match = { tool = "*", chain = "*" }
+
+[[rules]]
+criteria = []
+decision = "deny"
+
+[rules.match]
+tool = "stellar_create_account"
+chain = "*"
+
+[signature]
+owner_id = "GOWNER"
+sig = "00"
+"#;
+
+    /// Inline `rules = [...]` golden fixture: two rules, one with its keys
+    /// out of canonical order, an underscore integer, and comments inside the
+    /// array.
+    const GOLDEN_INLINE_RULES_FIXTURE: &str = r#"# Inline rules.
+version = 1
+scope = "profile:*"
+rules = [
+  # Daily cap.
+  { match = { tool = "stellar_pay", chain = "*" }, criteria = [{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 50_000_000 }], decision = "allow" },
+  { decision = "require_approval", criteria = [], match = { chain = "*", tool = "*" } }, # catch-all
+]
+"#;
+
+    /// The canonical bytes of a policy whose rules carry none of `reason`,
+    /// `ttl_secs` and `allow_opaque_signing` are the signature pre-image of
+    /// every such policy already signed. A canonicalizer change must not alter
+    /// these bytes, or those signatures stop verifying. The expected literal is
+    /// the oracle; it is never regenerated through the canonicalizer.
+    #[test]
+    fn golden_canonical_bytes_of_array_of_tables_rules_without_optional_keys() {
+        const EXPECTED: &str = r#"version = 1
+scope = "profile:alice"
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "stellar:testnet" }
+criteria = [{ kind = "per_tx_cap", asset = "native", max_stroops = 1000000000 }, { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT", "C_ACCOUNT"], allowlist = ["GAAAA", "CBBBB"], gate_inflows = false }]
+decision = "allow"
+
+[[rules]]
+match = { tool = "*", chain = "*" }
+criteria = [{ kind = "rate_limit", window = "1h", max_calls = 10 }]
+decision = "require_approval"
+
+[[rules]]
+match = { tool = "stellar_create_account", chain = "*" }
+criteria = []
+decision = "deny"
+"#;
+        let bytes = canonical_bytes(GOLDEN_ARRAY_OF_TABLES_FIXTURE).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), EXPECTED);
+    }
+
+    /// The inline `rules = [...]` counterpart of
+    /// [`golden_canonical_bytes_of_array_of_tables_rules_without_optional_keys`]:
+    /// the same invariant for rules the canonical form collapses to
+    /// `[[rules]]`.
+    #[test]
+    fn golden_canonical_bytes_of_inline_rules_without_optional_keys() {
+        const EXPECTED: &str = r#"version = 1
+scope = "profile:*"
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = [{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 50000000 }]
+decision = "allow"
+
+[[rules]]
+match = { chain = "*", tool = "*" }
+criteria = []
+decision = "require_approval"
+"#;
+        let bytes = canonical_bytes(GOLDEN_INLINE_RULES_FIXTURE).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), EXPECTED);
+    }
+
+    // ── optional rule keys in the canonical bytes ─────────────────────────────
+
+    /// The canonical bytes of [`OPTIONAL_KEYS_ARRAY_OF_TABLES`] and
+    /// [`OPTIONAL_KEYS_INLINE_RULES`], written by hand from the canonical form
+    /// rules. The keys `reason`, `ttl_secs` and `allow_opaque_signing` follow
+    /// `decision` in that order, each only when present. An integer is plain
+    /// decimal, and a string is basic-quoted. A present empty `reason`, a present
+    /// default TTL and a present `false` are emitted. An absent key emits nothing.
+    const EXPECTED_WITH_OPTIONAL_KEYS: &str = r#"version = 1
+scope = "profile:alice"
+
+[[rules]]
+match = { tool = "stellar_sep43_sign_transaction", chain = "*" }
+criteria = []
+decision = "require_approval"
+reason = "manual review"
+ttl_secs = 3600
+allow_opaque_signing = true
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = []
+decision = "require_approval"
+reason = ""
+allow_opaque_signing = false
+
+[[rules]]
+match = { tool = "*", chain = "*" }
+criteria = []
+decision = "require_approval"
+ttl_secs = 86400
+
+[[rules]]
+match = { tool = "*", chain = "*" }
+criteria = []
+decision = "deny"
+"#;
+
+    /// Array-of-tables rules carrying the optional keys out of canonical order,
+    /// with an underscore integer and a present `false`.
+    const OPTIONAL_KEYS_ARRAY_OF_TABLES: &str = r#"version = 1
+scope = "profile:alice"
+
+[[rules]]
+allow_opaque_signing = true
+ttl_secs = 3_600 # one hour
+reason = "manual review"
+decision = "require_approval"
+criteria = []
+match = { tool = "stellar_sep43_sign_transaction", chain = "*" }
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "*" }
+criteria = []
+decision = "require_approval"
+allow_opaque_signing = false
+reason = ""
+
+[[rules]]
+match = { tool = "*", chain = "*" }
+criteria = []
+decision = "require_approval"
+ttl_secs = 86400
+
+[[rules]]
+match = { tool = "*", chain = "*" }
+criteria = []
+decision = "deny"
+"#;
+
+    /// The rules of [`OPTIONAL_KEYS_ARRAY_OF_TABLES`] as an inline array, with a
+    /// hexadecimal integer and literal-quoted strings.
+    const OPTIONAL_KEYS_INLINE_RULES: &str = r#"version = 1
+scope = "profile:alice"
+rules = [
+  { allow_opaque_signing = true, ttl_secs = 0xe10, reason = 'manual review', decision = "require_approval", criteria = [], match = { tool = "stellar_sep43_sign_transaction", chain = "*" } },
+  { match = { tool = "stellar_pay", chain = "*" }, criteria = [], decision = "require_approval", allow_opaque_signing = false, reason = '' },
+  { match = { tool = "*", chain = "*" }, criteria = [], decision = "require_approval", ttl_secs = 86400 },
+  { match = { tool = "*", chain = "*" }, criteria = [], decision = "deny" },
+]
+"#;
+
+    #[test]
+    fn canonical_bytes_sign_optional_rule_keys_of_array_of_tables_rules() {
+        let bytes = canonical_bytes(OPTIONAL_KEYS_ARRAY_OF_TABLES).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            EXPECTED_WITH_OPTIONAL_KEYS
+        );
+    }
+
+    #[test]
+    fn canonical_bytes_sign_optional_rule_keys_of_inline_rules() {
+        let bytes = canonical_bytes(OPTIONAL_KEYS_INLINE_RULES).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            EXPECTED_WITH_OPTIONAL_KEYS
+        );
+    }
+
     proptest! {
         /// (a) Tab vs space indentation around `=` signs.
         ///
@@ -1021,18 +1245,45 @@ decision = "deny"
         }
 
         /// Inline `rules = [...]` and `[[rules]]` array-of-tables syntax with
-        /// identical semantic content must have the same signature pre-image.
+        /// identical semantic content must have the same signature pre-image,
+        /// with any subset of the optional rule keys present. The two forms
+        /// list the optional keys in opposite orders.
         #[test]
         fn prop_canonical_inline_rules_array_matches_array_of_tables(
-            decision in "(allow|deny)",
+            decision in "(allow|deny|require_approval)",
             tool in "[a-z_]{3,20}",
-            max_stroops in 0i64..1_000_000_000i64
+            max_stroops in 0i64..1_000_000_000i64,
+            reason in proptest::option::of("[a-z ]{0,24}"),
+            ttl_secs in proptest::option::of(1i64..=604_800i64),
+            allow_opaque_signing in proptest::option::of(any::<bool>())
         ) {
+            let reason = reason.map(|r| format!("reason = \"{r}\""));
+            let ttl_secs = ttl_secs.map(|t| format!("ttl_secs = {t}"));
+            let allow_opaque_signing =
+                allow_opaque_signing.map(|b| format!("allow_opaque_signing = {b}"));
+            let inline_optional: String = [&reason, &ttl_secs, &allow_opaque_signing]
+                .into_iter()
+                .flatten()
+                .map(|kv| format!(", {kv}"))
+                .collect();
+            let table_optional: String = [&allow_opaque_signing, &ttl_secs, &reason]
+                .into_iter()
+                .flatten()
+                .map(|kv| format!("{kv}\n"))
+                .collect();
             let inline = format!(
-                "version = 1\nscope = \"profile:default\"\nrules = [{{ match = {{ tool = \"{tool}\", chain = \"*\" }}, criteria = [{{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = {max_stroops} }}], decision = \"{decision}\" }}]\n"
+                "version = 1\nscope = \"profile:default\"\n\
+                 rules = [{{ match = {{ tool = \"{tool}\", \
+                 chain = \"*\" }}, criteria = [{{ kind = \"per_tx_cap\", \
+                 asset = \"native\", max_stroops = {max_stroops} }}], \
+                 decision = \"{decision}\"{inline_optional} }}]\n"
             );
             let array_of_tables = format!(
-                "version = 1\nscope = \"profile:default\"\n\n[[rules]]\nmatch = {{ tool = \"{tool}\", chain = \"*\" }}\ncriteria = [{{ kind = \"per_tx_cap\", asset = \"native\", max_stroops = {max_stroops} }}]\ndecision = \"{decision}\"\n"
+                "version = 1\nscope = \"profile:default\"\n\n[[rules]]\n\
+                 {table_optional}match = {{ tool = \"{tool}\", chain = \"*\" }}\n\
+                 criteria = [{{ kind = \"per_tx_cap\", asset = \"native\", \
+                 max_stroops = {max_stroops} }}]\n\
+                 decision = \"{decision}\"\n"
             );
             let b1 = canonical_bytes(&inline).unwrap();
             let b2 = canonical_bytes(&array_of_tables).unwrap();

@@ -19,6 +19,8 @@ mod approval_spine_integration;
 mod approve_hint_source_scan;
 #[path = "mcp/audit_binding_integration.rs"]
 mod audit_binding_integration;
+#[path = "mcp/audit_history_integration.rs"]
+mod audit_history_integration;
 #[path = "mcp/balances_integration.rs"]
 mod balances_integration;
 #[path = "mcp/claim_integration.rs"]
@@ -65,6 +67,8 @@ mod toolset_args_validation_integration;
 mod toolset_sign_payment_gated_integration;
 #[path = "mcp/toolsets_matrix_invariants.rs"]
 mod toolsets_matrix_invariants;
+#[path = "mcp/transaction_status_integration.rs"]
+mod transaction_status_integration;
 #[path = "mcp/trustline_integration.rs"]
 mod trustline_integration;
 #[path = "mcp/version_marker.rs"]
