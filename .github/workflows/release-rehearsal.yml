@@ -12,11 +12,18 @@ name: Release rehearsal
 # rehearsal-<target> for 7 days. Nothing is signed, notarized, hashed,
 # attested, or published.
 #
+# Each verify-packaged leg unpacks one archive on a runner of its target,
+# the Intel macOS archive under Rosetta 2, and checks the mainnet-write
+# marker of both binaries. The verify-crates job packages every workspace
+# crate with RELEASE_TOOLCHAIN, the toolchain publish.yml packages with, and
+# checks the markers of the binaries that cargo's package verification
+# builds.
+#
 # The workflow holds no credential: every job's token reads the repository
 # contents and nothing else, and no job uses an environment, a secret, or the
-# workflow token. check-workflow-invariants.py enforces that, and it requires
-# the build lines and the Windows setup scripts to equal those of the build
-# job in release.yml.
+# workflow token. check-workflow-invariants.py enforces that. It also requires
+# both build jobs to call the shared scripts and RELEASE_TOOLCHAIN to equal
+# the value in publish.yml.
 
 on:
   workflow_dispatch:
@@ -27,10 +34,14 @@ permissions:
 env:
   # The expected mainnet-write state is off.
   EXPECTED_MAINNET_WRITE: "off"
+  # The toolchain publish.yml packages with.
+  RELEASE_TOOLCHAIN: "1.99.0"
 
 jobs:
   build:
     name: build ${{ matrix.target }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     permissions:
@@ -80,6 +91,12 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cargo install cross --version 0.2.5 --locked
 
+      # The environment guard of build.sh runs python3, 3.11 or later for
+      # tomllib, so each leg installs it instead of relying on the image.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
       - name: Provide a native Perl for the vendored OpenSSL build (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
@@ -89,6 +106,12 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: bash
         run: bash .github/scripts/release/sodium.sh
+
+      - name: Build binaries
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash .github/scripts/release/build.sh "$TARGET"
 
       - name: Read the workspace version
         id: version
@@ -104,12 +127,6 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Rehearsing version: $VERSION"
-
-      - name: Build binaries
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-        run: bash .github/scripts/release/build.sh "$TARGET"
 
       # The packing script of the signing action, run on the unsigned
       # binaries: the archive has the layout of the signed release archive.
@@ -159,3 +176,68 @@ jobs:
           path: ${{ steps.pack-macos.outputs.archive || steps.prepare.outputs.archive }}
           retention-days: 7
           if-no-files-found: error
+
+  verify-packaged:
+    name: verify-packaged ${{ matrix.target }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-26
+          - target: aarch64-apple-darwin
+            os: macos-26
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+    steps:
+      - name: Require Rosetta
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: arch -x86_64 /usr/bin/true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rehearsal-${{ matrix.target }}
+          path: archives
+      - name: Verify packaged binaries
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: bash .github/scripts/release/verify-archive.sh archives "$VERSION" "$TARGET" "$EXPECTED_MAINNET_WRITE"
+
+  verify-crates:
+    name: verify packaged crates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RELEASE_TOOLCHAIN }}
+      # RUSTUP_TOOLCHAIN overrides the checkout's rust-toolchain.toml.
+      - name: Pin the toolchain for every later step
+        run: echo "RUSTUP_TOOLCHAIN=$RELEASE_TOOLCHAIN" >> "$GITHUB_ENV"
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - name: Build and package every crate
+        run: |
+          mkdir -p target
+          touch target/package-verification-start
+          cargo package --workspace --locked
+      - name: Verify packaged feature state
+        run: bash .github/scripts/check-packaged-markers.sh target target/package-verification-start "$EXPECTED_MAINNET_WRITE"

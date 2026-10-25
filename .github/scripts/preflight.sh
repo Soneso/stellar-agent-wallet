@@ -40,7 +40,9 @@
 # dependents when every changed Rust path belongs to a workspace member.
 # Unowned paths, including root manifests, the lockfile, the toolchain, and
 # deleted members, select workspace commands. Tests use the declared subset
-# of the offline features; clippy and rustdoc use all features.
+# of the offline features; clippy and rustdoc use every declared feature
+# except mainnet-write. Feature-on rows add mainnet-write only when a
+# selected package declares it.
 #
 # A selected gate whose tool or Python module is missing is unavailable: its
 # row names the requirement and an install hint, and the later gates still
@@ -65,7 +67,7 @@ OFFLINE_FEATURES=test-helpers,test-hooks,test-loopback,verifier-registry
 VENDORED_CRATE=stellar-agent-smart-account
 # The workflows that check-workflow-invariants.py reads, as its docstring
 # names them.
-INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal"
+INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci"
 
 die() {
   echo "preflight: $*" >&2
@@ -85,11 +87,36 @@ usage() {
 # workflows. The line order is the order of --list, of the run, and of the
 # table.
 registry_records() {
+  local FEATURES_EXCEPT_MAINNET_WRITE
+  FEATURES_EXCEPT_MAINNET_WRITE=$(python3 - <<'PYFEATURES'
+import glob
+import pathlib
+import tomllib
+import sys
+root = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+features = set()
+for pattern in root["workspace"]["members"]:
+    for member in glob.glob(pattern):
+        path = pathlib.Path(member) / "Cargo.toml"
+        if path.exists():
+            try:
+                features.update(tomllib.loads(path.read_text()).get("features", {}))
+            except (OSError, ValueError) as error:
+                print(f"preflight: cannot read {path}: {error}", file=sys.stderr)
+                raise SystemExit(2)
+print(",".join(sorted(features - {"default", "mainnet-write"})))
+PYFEATURES
+  )
   cat <<EOF
 docs-style	python3 .github/scripts/check-docs-style.py	-	install-surface.yml	install-surface	Check the docs style
 install-surface	python3 .github/scripts/check-install-surface.py	-	install-surface.yml	install-surface	Check the install surface
 gate-tool-versions	bash .github/scripts/check-gate-tool-versions.sh	-	install-surface.yml	install-surface	Check the gate tool versions
 actionlint	actionlint	actionlint	install-surface.yml	install-surface	Check workflows
+feature-discipline	cargo fetch --locked && python3 .github/scripts/check-feature-discipline.py	cargo,yaml	ci.yml	feature-discipline	Check feature discipline and assertions
+self-test:test-check-feature-discipline.py	python3 .github/scripts/test-check-feature-discipline.py --mutations	cargo,yaml	ci.yml	feature-discipline	Check feature discipline and assertions
+self-test:test-check-binary-marker.sh	bash .github/scripts/test-check-binary-marker.sh	-	ci.yml	feature-discipline	Check feature discipline and assertions
+self-test:test-release-checks.sh	bash .github/scripts/test-release-checks.sh	-	ci.yml	feature-discipline	Check feature discipline and assertions
+self-test:test-check-provenance.py	python3 .github/scripts/test-check-provenance.py	-	ci.yml	feature-discipline	Check feature discipline and assertions
 workflow-invariants	python3 .github/scripts/check-workflow-invariants.py	yaml	ci.yml	release-contracts	Check the workflow structure and the label sync
 self-test:test-check-coverage.py	python3 .github/scripts/test-check-coverage.py	-	ci.yml	release-contracts	Self-test the coverage floor gate
 self-test:test-check-crates-exist.sh	bash .github/scripts/test-check-crates-exist.sh	jq	ci.yml	release-contracts	Self-test the crates.io existence check
@@ -116,14 +143,21 @@ vendored-tree-check	bash .github/scripts/rebuild-vendored-wasm.sh --check-tree -
 publish-check	.github/scripts/publish-crates.sh --check	cargo	ci.yml	release-contracts	Check the publish tiers
 baseline-gate	bash .github/scripts/check-no-direct-sasignersetbaselined-emit.sh	-	ci.yml	release-contracts	Check the signer-set baseline gate
 fmt	cargo fmt --all -- --check	cargo	ci.yml	fmt	Check formatting
-clippy	cargo clippy --all-targets --all-features -- -D warnings	cargo	ci.yml	clippy	Run clippy
-rustdoc	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features	cargo	ci.yml	doc	Build the rustdoc
+clippy	cargo clippy --workspace --all-targets --features $FEATURES_EXCEPT_MAINNET_WRITE -- -D warnings	cargo	ci.yml	clippy	Run clippy
+rustdoc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features $FEATURES_EXCEPT_MAINNET_WRITE	cargo	ci.yml	doc	Build the rustdoc
 test	cargo test --workspace --features $OFFLINE_FEATURES	cargo	ci.yml	test	Run the offline tests
+feature-on:clippy	cargo clippy --workspace --all-targets --features mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE -- -D warnings	cargo	ci.yml	feature-on-clippy	Run clippy
+feature-on:doc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE	cargo	ci.yml	feature-on-doc	Build the rustdoc
+feature-on:test	cargo test --workspace --features mainnet-write,$OFFLINE_FEATURES	cargo	ci.yml	feature-on-test	Run the offline tests
+feature-on:network	cargo check -p stellar-agent-network --features mainnet-write	cargo	ci.yml	feature-on-test	Check network feature forwarding in isolation
+release-shape	bash .github/scripts/release/check-host.sh	cargo,libudev	ci.yml	release-shape	Build and check the release binaries
 test-vendored-release-cfg	cargo test -p $VENDORED_CRATE --test vendored_wasm_release_cfg	cargo	ci.yml	test	Test the vendored Wasm release configuration
 machete	cargo machete	cargo,cargo-machete	ci.yml	machete	Check for unused dependencies
 deny	cargo deny check	cargo,cargo-deny	ci.yml	deny	Check licenses and advisories
-coverage	cargo llvm-cov --workspace --features $OFFLINE_FEATURES --json --output-path cov.json	cargo,cargo-llvm-cov	coverage.yml	coverage	Measure offline line coverage
-coverage-floors	python3 .github/scripts/check-coverage.py cov.json	-	coverage.yml	coverage	Enforce per-crate line-coverage floors
+coverage	cargo llvm-cov --workspace --features $OFFLINE_FEATURES --json --output-path cov-feature-off.json	cargo,cargo-llvm-cov	coverage.yml	coverage	Measure offline line coverage
+coverage-floors	python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off	-	coverage.yml	coverage	Enforce per-crate line-coverage floors
+coverage:feature-on	cargo llvm-cov --workspace --features mainnet-write,$OFFLINE_FEATURES --json --output-path cov-feature-on.json	cargo,cargo-llvm-cov	coverage.yml	coverage	Measure feature-on offline line coverage
+coverage-floors:feature-on	python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on	-	coverage.yml	coverage	Enforce feature-on line-coverage floors
 inbox-js	node --test crates/stellar-agent-approval-ui/src/web/app_shared.test.mjs	node	ci.yml	inbox-js	Test the inbox renderers
 interop:mpp	.github/scripts/test-mpp-interop.sh	node,corepack	ci.yml	mpp-interop	Run the MPP interop harness
 interop:sdk-v17	.github/scripts/test-sdk-v17-interop.sh	node,corepack	ci.yml	sdk-v17-interop	Run the stellar-sdk v17 interop harness
@@ -135,14 +169,15 @@ EOF
 # clippy, rustdoc, and test commands. The planner appends the operands of
 # the shellcheck-changed command.
 load_registry() {
-  local id command requirements
+  local id command requirements records
+  records=$(registry_records) || die "cannot read workspace manifests"
   REG_COUNT=0
   while IFS=$'\t' read -r id command requirements _; do
     REG_ID[REG_COUNT]=$id
     REG_CMD[REG_COUNT]=$command
     REG_REQ[REG_COUNT]=$requirements
     REG_COUNT=$((REG_COUNT + 1))
-  done < <(registry_records)
+  done <<<"$records"
 }
 
 # Sets GATE to the registry position of gate id $1, or to -1.
@@ -324,6 +359,17 @@ select_invariant_gates() {
 select_for_path() {
   local path=$1 name
   case "$path" in
+    Cargo.toml | */Cargo.toml | Cargo.lock | .github/workflows/* | .github/actions/* | .github/scripts/* | Cross.toml | .cargo/config* | */.cargo/config* | */build.rs | crates/*.rs | docs/maintainers/building.md)
+      select_gate feature-discipline
+      select_gate self-test:test-check-feature-discipline.py
+      ;;
+  esac
+  case "$path" in
+    .github/scripts/check-binary-marker.sh) select_gate self-test:test-check-binary-marker.sh; select_gate self-test:test-release-checks.sh ;;
+    .github/scripts/check-packaged-markers.sh | .github/scripts/release/verify-*.sh) select_gate self-test:test-release-checks.sh ;;
+    .github/scripts/check-provenance.py | .github/scripts/fixtures/*) select_gate self-test:test-check-provenance.py ;;
+  esac
+  case "$path" in
     .github/workflows/*.yml | .github/actions/* | .github/labels.yml) select_gate actionlint ;;
   esac
   case "$path" in
@@ -368,6 +414,10 @@ select_for_path() {
       select_gate clippy
       select_gate rustdoc
       select_gate test
+      select_gate feature-on:clippy
+      select_gate feature-on:doc
+      select_gate feature-on:test
+      select_gate feature-on:network
       printf '%s\0' "$path" >>"$SCRATCH/rust"
       ;;
   esac
@@ -412,7 +462,7 @@ PY
 # crate's release configuration test when the packages include it or the
 # workspace command applies.
 plan_rust_gates() {
-  local clippy rustdoc command vendored
+  local clippy rustdoc command vendored on_clippy on_doc on_test
   # Any planner failure, an unexpected exception included, exits 2.
   python3 - "$OFFLINE_FEATURES" "$VENDORED_CRATE" "$SCRATCH/rust" >"$SCRATCH/plan" <<'PY' || exit 2
 import pathlib
@@ -472,8 +522,9 @@ def owner(path):
     return names.get(max(containing, key=len)) if containing else None
 
 
-# The output has four lines: clippy, rustdoc, and test commands, then 1 when
-# the vendored crate's release configuration test applies, else 0.
+# The output has seven lines: the clippy, rustdoc, and test commands, then
+# 1 when the vendored crate's release configuration test applies, else 0,
+# then the feature-on clippy, rustdoc, and test commands.
 # Empty command lines retain the workspace commands.
 owners = []
 for path in changed:
@@ -483,6 +534,9 @@ for path in changed:
         print()
         print()
         print(1)
+        print()
+        print()
+        print()
         raise SystemExit(0)
     if name not in owners:
         owners.append(name)
@@ -531,17 +585,24 @@ features = [feature for feature in offline_features if feature in declared]
 packages = []
 for package in selected:
     packages += ["-p", package]
-print(shlex.join(["cargo", "clippy", *packages, "--all-targets", "--all-features", "--", "-D", "warnings"]))
-print('RUSTDOCFLAGS="-D warnings" ' + shlex.join(["cargo", "doc", "--no-deps", *packages, "--all-features"]))
+all_features = sorted(declared - {"default", "mainnet-write"})
+feature_args = ["--features", ",".join(all_features)] if all_features else []
+print(shlex.join(["cargo", "clippy", *packages, "--all-targets", *feature_args, "--", "-D", "warnings"]))
+print('RUSTDOCFLAGS="-D warnings" ' + shlex.join(["cargo", "doc", "--no-deps", *packages, *feature_args]))
 command = ["cargo", "test", *packages]
-if features:
-    command += ["--features", ",".join(features)]
-print(shlex.join(command))
+print(shlex.join(command + (["--features", ",".join(features)] if features else [])))
 print(1 if vendored_crate in selected else 0)
+on_features = (["mainnet-write"] if "mainnet-write" in declared else []) + all_features
+on_args = ["--features", ",".join(on_features)] if on_features else []
+print(shlex.join(["cargo", "clippy", *packages, "--all-targets", *on_args, "--", "-D", "warnings"]))
+print('RUSTDOCFLAGS="-D warnings" ' + shlex.join(["cargo", "doc", "--no-deps", *packages, *on_args]))
+on_test = (["mainnet-write"] if "mainnet-write" in declared else []) + features
+print(shlex.join(command + (["--features", ",".join(on_test)] if on_test else [])))
 PY
   {
     IFS= read -r clippy && IFS= read -r rustdoc &&
-      IFS= read -r command && IFS= read -r vendored
+      IFS= read -r command && IFS= read -r vendored &&
+      IFS= read -r on_clippy && IFS= read -r on_doc && IFS= read -r on_test
   } <"$SCRATCH/plan"
   if [ -n "$command" ]; then
     find_gate clippy
@@ -550,6 +611,12 @@ PY
     REG_CMD[GATE]=$rustdoc
     find_gate test
     REG_CMD[GATE]=$command
+    find_gate feature-on:clippy
+    REG_CMD[GATE]=$on_clippy
+    find_gate feature-on:doc
+    REG_CMD[GATE]=$on_doc
+    find_gate feature-on:test
+    REG_CMD[GATE]=$on_test
   fi
   if [ "$vendored" = 1 ]; then
     select_gate test-vendored-release-cfg
@@ -677,6 +744,7 @@ install_hint() {
       echo 'python3 -m venv .venv && .venv/bin/python -m pip install --require-hashes -r .github/scripts/workflow-check-requirements.txt && export PATH=$PWD/.venv/bin:$PATH'
       ;;
     jq | zip) echo "brew install $1 or apt-get install $1" ;;
+    libudev) echo "apt-get install libudev-dev pkg-config" ;;
     unzip | zipinfo) echo "brew install unzip or apt-get install unzip" ;;
     shasum) echo "brew install perl or apt-get install perl" ;;
     node) echo "install Node $(version_or_file "$(node_version)" "$ci")" ;;
@@ -702,6 +770,13 @@ missing_requirement() {
           echo "$requirement"
           return 0
         }
+        ;;
+      libudev)
+        # Only a Linux build links libudev, through hidapi.
+        if [ "$(uname -s 2>/dev/null)" = Linux ] && ! pkg-config --exists libudev 2>/dev/null; then
+          echo "$requirement"
+          return 0
+        fi
         ;;
       *)
         command -v "$requirement" >/dev/null 2>&1 || {
@@ -732,15 +807,20 @@ print_list() {
 }
 
 # Runs the selected gates in registry order, prints the table, and exits.
-# coverage-floors reads the cov.json that coverage writes, so it runs only
-# after coverage ran and passed in this run.
+# Each floor check reads the report its measurement writes,
+# cov-feature-off.json or cov-feature-on.json, so it runs only after that
+# measurement ran and passed in this run.
 run_gates() {
   local full=$1 position id command missing rc
-  local table="" run=0 failed=0 unavailable=0 coverage_written=0
+  local table="" run=0 failed=0 unavailable=0 coverage_written=0 coverage_on_written=0
   for position in $SELECTED_POSITIONS; do
     id=${REG_ID[position]}
     command=${REG_CMD[position]}
     if [ "$id" = coverage-floors ] && [ "$coverage_written" -eq 0 ]; then
+      table+="- \`$command\`: not run (no coverage file from this run)"$'\n'
+      continue
+    fi
+    if [ "$id" = coverage-floors:feature-on ] && [ "$coverage_on_written" -eq 0 ]; then
       table+="- \`$command\`: not run (no coverage file from this run)"$'\n'
       continue
     fi
@@ -759,6 +839,8 @@ run_gates() {
       failed=$((failed + 1))
     elif [ "$id" = coverage ]; then
       coverage_written=1
+    elif [ "$id" = coverage:feature-on ]; then
+      coverage_on_written=1
     fi
     table+="- \`$command\`: exit $rc"$'\n'
   done

@@ -36,6 +36,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  EXPECTED_MAINNET_WRITE: "off"
+
 jobs:
   preflight:
     name: preflight
@@ -191,6 +194,12 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cargo install cross --version 0.2.5 --locked
 
+      # The environment guard of build.sh runs python3, 3.11 or later for
+      # tomllib, so each leg installs it instead of relying on the image.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
       # stellar-baselib links libsodium; on MSVC its build script fetches the
       # prebuilt archive from download.libsodium.org over plain HTTP with no
       # retry, which is flaky from Windows runners. Pre-fetching the same
@@ -206,42 +215,18 @@ jobs:
       - name: Provide a native Perl for the vendored OpenSSL build (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
-        run: |
-          if (-not (Test-Path 'C:\Strawberry\perl\bin\perl.exe')) {
-            choco install strawberryperl --no-progress -y
-          }
-          if (-not (Test-Path 'C:\Strawberry\perl\bin\perl.exe')) {
-            Write-Error 'Strawberry Perl unavailable'
-            exit 1
-          }
-          Add-Content $env:GITHUB_ENV "OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe"
+        run: ./.github/scripts/release/windows-perl.ps1
 
       - name: Prefetch libsodium dist (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: bash
-        run: |
-          set -euo pipefail
-          DIST_DIR="$RUNNER_TEMP/sodium-dist"
-          mkdir -p "$DIST_DIR"
-          BASE="https://download.libsodium.org/libsodium/releases"
-          for f in libsodium-1.0.22-stable-msvc.zip libsodium-1.0.22-stable-msvc.zip.minisig \
-                   LATEST.tar.gz LATEST.tar.gz.minisig; do
-            curl --fail --silent --show-error --location --retry 5 --retry-all-errors \
-              --output "$DIST_DIR/$f" "$BASE/$f"
-          done
-          echo "SODIUM_DIST_DIR=$DIST_DIR" >> "$GITHUB_ENV"
+        run: bash .github/scripts/release/sodium.sh
 
       - name: Build binaries
-        # The aarch64 leg's image pin and its libudev pre-build hook live in
-        # Cross.toml.
         shell: bash
-        run: |
-          set -euo pipefail
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            cross build --release --locked --target ${{ matrix.target }} --bin stellar-agent --bin stellar-agent-mcp
-          else
-            cargo build --release --locked --target ${{ matrix.target }} --bin stellar-agent --bin stellar-agent-mcp
-          fi
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash .github/scripts/release/build.sh "$TARGET"
 
       # The macOS legs hand both unsigned binaries to the sign-macos job in one
       # tar, which keeps the executable bit. That job validates the tar before
@@ -402,9 +387,48 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  verify-packaged:
+    name: verify-packaged ${{ matrix.target }}
+    needs: [preflight, build, sign-macos]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-26
+          - target: aarch64-apple-darwin
+            os: macos-26
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+    steps:
+      - name: Require Rosetta
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: arch -x86_64 /usr/bin/true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: archives
+      - name: Verify packaged binaries
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: bash .github/scripts/release/verify-archive.sh archives "$VERSION" "$TARGET" "$EXPECTED_MAINNET_WRITE"
+
   hashes:
     name: hashes
-    needs: [preflight, build, sign-macos]
+    needs: [preflight, build, sign-macos, verify-packaged]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -525,9 +549,50 @@ jobs:
       upload-assets: false
       provenance-name: stellar-agent-${{ needs.preflight.outputs.version }}.intoto.jsonl
 
+  verify-provenance:
+    name: verify-provenance
+    needs: [preflight, provenance, hashes]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stellar-agent-${{ needs.preflight.outputs.version }}.intoto.jsonl
+          path: provenance
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-hashes
+          path: provenance
+      - name: Verify provenance content
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: python3 .github/scripts/check-provenance.py "provenance/stellar-agent-$VERSION.intoto.jsonl" provenance/SHA256SUMS "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$GITHUB_REF"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Fetch the locked graph
+        run: cargo fetch --locked
+      - name: Verify source feature discipline
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/feature-check"
+          "$RUNNER_TEMP/feature-check/bin/pip" install --quiet --disable-pip-version-check \
+            --require-hashes --only-binary :all: \
+            -r .github/scripts/workflow-check-requirements.txt
+          "$RUNNER_TEMP/feature-check/bin/python" .github/scripts/check-feature-discipline.py
+
   publish:
     name: publish
-    needs: [preflight, build, sign-macos, sign, hashes, provenance]
+    needs: [preflight, build, sign-macos, sign, hashes, provenance, verify-provenance]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

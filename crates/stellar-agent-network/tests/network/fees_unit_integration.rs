@@ -853,8 +853,8 @@ fn validate_rpc_url_loopback_https_is_rejected_as_not_allow_listed() {
 
 // Integration test binaries are separate compilation units; cfg(test) is not
 // set for them. The `validate_rpc_url_allowing_loopback` symbol is only present
-// when the `test-loopback` feature is enabled. The coverage run uses
-// --all-features, so these tests are included under coverage.
+// when the `test-loopback` feature is enabled. Both coverage runs enable
+// test-loopback, so coverage includes these tests.
 #[cfg(feature = "test-loopback")]
 mod loopback_tests {
     use stellar_agent_network::validate_rpc_url_allowing_loopback;

@@ -65,15 +65,20 @@ No job that holds a credential compiles code or runs dependency code.
 | `release.yml` | `preflight` | none | no |
 | `release.yml` | `build` | none | yes |
 | `release.yml` | `sign-macos` | Apple secrets of `release-signing` | no |
+| `release.yml` | `verify-packaged` | none | no |
+| `release.yml` | `verify-provenance` | none | no |
 | `release.yml` | `hashes` | none | no |
 | `release.yml` | `sign` | OIDC token for cosign | no |
 | `release.yml` | `provenance` | OIDC token, `contents: write` | no |
 | `release.yml` | `publish` | `contents: write` | no |
 | `publish.yml` | `verify` | none | yes |
 | `publish.yml` | `publish` | OIDC token for crates.io, in `crates-io` | no |
+| `publish.yml` | `verify-install` | none | yes |
 | `notarize-smoke.yml` | `build` | none | yes |
 | `notarize-smoke.yml` | `sign` | Apple secrets of `release-signing` | no |
 | `release-rehearsal.yml` | `build` | none | yes |
+| `release-rehearsal.yml` | `verify-packaged` | none | no |
+| `release-rehearsal.yml` | `verify-crates` | none | yes |
 
 A credentialed job downloads artifacts of other jobs under the runner's temp
 directory and reads them as data. It reads outputs of other jobs only through
@@ -92,14 +97,31 @@ check the checkout again before they sign. The publish job must check the
 checkout after the download and run the ancestry, checksum, and toolchain
 checks. It must check the checkout again after the checksum comparison and
 before it mints the registry token. None of these steps may be conditional,
-turn off errexit, or chain a check with a shell operator.
+turn off errexit, or chain a check with a shell operator, and a line before a
+check that ends in `&&`, `||`, `|`, or `|&` fails the check. An inline comment
+after the operator, as in `false && # note`, hides the operator from that
+test, so the check on the next line is counted although the shell may skip it
+or pipe into it. A function defined earlier in the step that shadows the
+checked command, such as `bash() { return 0; }`, makes the check count a call
+that runs the function.
 
 The same check holds every job of `release-rehearsal.yml` to a token that
 reads the repository contents and nothing else, with no environment, no
-secret, and no expression that reads the workflow token. It also requires the
-build scripts under `.github/scripts/release/` to equal the build job of
-`release.yml`: the same `cargo build` and `cross build` lines, and the Perl
-and libsodium setup steps line for line.
+secret, and no expression that reads the workflow token. Both build jobs must
+call the shared build, Perl and libsodium scripts under `.github/scripts/release/`.
+The build immediately follows the environment setup, and its first action
+checks compiler overrides and cargo configuration files.
+
+Each release verification step must run its check as an unconditional
+command: the archive check, the provenance content and source discipline
+checks, the packaged marker check, and the install check. A comment, an
+operator that ignores the status, or a condition fails the check. The
+verification jobs hold no publishing or signing credential, their token has
+`contents: read`, and they download the run's artifacts and the registry
+dependencies. The archive checks run on a runner of each release target, and
+the rehearsal packages with the toolchain that `publish.yml` packages with.
+The feature jobs of `ci.yml` run unconditionally and run their defining
+commands.
 
 The `sign-macos` job receives the unsigned binaries as a tar.
 `.github/scripts/validate-unsigned-archive.py` refuses the tar unless it holds
@@ -279,3 +301,21 @@ Store Connect API key, and before the first release that relies on either.
 The build job builds `aarch64-apple-darwin` with no secrets. The sign job runs
 in `release-signing`, signs and notarizes the binaries with the version
 `0.0.0-smoke`, and checks the archive layout and the signature authority.
+
+### Feature-state checks
+
+Release, publish and rehearsal expect `mainnet-write` to be off. The shared
+build script runs the environment guard immediately before the release recipe.
+Archive verification executes both packaged binaries and checks their embedded
+markers. Hashing depends on archive verification; publication depends on the
+provenance content check and the discipline check of its source commit.
+
+The publish verification job checks the binaries produced from unpacked crate
+sources, including their freshness. The install check runs only after a real
+publish, retries index propagation a bounded number of times, and verifies both
+installed binaries. It holds no publishing credential.
+
+The checks that the ruleset of `main` requires include the five feature jobs
+of `ci.yml`: `feature-on-clippy`, `feature-on-test`, `feature-on-doc`,
+`feature-discipline`, and `release-shape`. The `coverage` required check
+measures and enforces both feature configurations.

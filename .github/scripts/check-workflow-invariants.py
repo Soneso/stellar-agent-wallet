@@ -6,11 +6,12 @@ Usage: ``check-workflow-invariants.py [repository-root]``
 
 Reads ``release.yml``, ``publish.yml``, ``notarize-smoke.yml``, ``labels.yml``,
 ``stale.yml``, ``triage.yml``, ``triage-review.yml``, ``triage-sweep.yml``,
-``welcome.yml``, ``coverage.yml``, and ``release-rehearsal.yml`` under
-``.github/workflows/``.
+``welcome.yml``, ``coverage.yml``, ``release-rehearsal.yml``, and ``ci.yml``
+under ``.github/workflows/``.
 Also reads the composite action
-``.github/actions/macos-sign-notarize/action.yml`` and the release build
-scripts under ``.github/scripts/release/``. Needs PyYAML.
+``.github/actions/macos-sign-notarize/action.yml``, the shared build script
+``.github/scripts/release/build.sh``, and the host recipe
+``.github/scripts/release/check-host.sh``. Needs PyYAML.
 
 A job is credentialed when it references ``secrets.``, passes secrets to a
 reusable workflow, declares ``environment:``, or holds ``id-token: write``,
@@ -92,18 +93,69 @@ and comment lines skipped. The check fails when any of these holds:
   value other than a mapping, list, string, number, boolean, date or null.
   A double quote outside a single-quoted string is refused as well, because
   GitHub rejects one in an expression.
-- ``release-script-drift``: the scripts under ``.github/scripts/release/``
-  differ from the ``build`` job of ``release.yml``. The ``cargo build`` and
-  ``cross build`` lines of ``build.sh`` and of that job's ``run:`` blocks,
-  with ``${{ matrix.target }}`` read as ``"$TARGET"`` and whitespace
-  normalized, are not the same set, or the job has none. The body of
-  ``windows-perl.ps1`` or ``sodium.sh``, after its leading comment lines,
-  differs line for line from the ``run:`` block of the one step of that job
-  that writes ``OPENSSL_SRC_PERL`` or ``SODIUM_DIST_DIR`` to ``GITHUB_ENV``.
+
+A command below runs unconditionally when a logical line of a step equals
+it, outside any compound command and after no line that exits, returns, or
+turns off errexit, in a step whose shell is bash with errexit. No comment,
+prefix, operator, substitution, or variable can then skip the command or
+discard its status. In a step that names the command, a line before the
+call that leaves a quote, a substitution, a subshell, or a group open, that
+opens a heredoc, that ends in &&, ||, | or |& and so makes the next line
+conditional or piped, or that holds the command inside a longer line, is
+reported as unmodelled shell syntax under the rule that looks for the
+command. A function defined earlier in the step that shadows the counted
+command, as bash() { return 0; } does, makes the check count a call that
+runs the function.
+
+- ``release-shared-scripts``: a build job of ``release.yml`` or
+  ``release-rehearsal.yml`` does not call the shared Perl, sodium, and build
+  scripts once each, or ``build.sh`` does not run the environment guard on
+  its own checkout as its first command.
+- ``release-guard-order``: the build does not immediately follow the Perl
+  and sodium setup steps, so a command could follow their environment writes
+  unguarded.
+- ``release-packaged-gate``: ``hashes`` does not need ``verify-packaged``,
+  ``verify-packaged`` does not need ``preflight``, ``build``, and
+  ``sign-macos``, or a ``verify-packaged`` job of ``release.yml`` or
+  ``release-rehearsal.yml`` does not run ``ARCHIVE_CHECK`` unconditionally.
+- ``release-provenance-gate``: ``publish`` does not need
+  ``verify-provenance``, ``verify-provenance`` does not need ``preflight``,
+  ``provenance``, and ``hashes``, or it does not run each command of
+  ``PROVENANCE_CHECKS`` unconditionally.
+- ``publish-dry-gate``: the ``publish.yml`` publish job does not need
+  ``verify``, or in ``verify`` and the rehearsal's ``verify-crates`` the
+  packaging step does not create the start timestamp before it packages,
+  unconditionally, or the next step does not run the packaged marker check.
+- ``publish-install-gate``: ``verify-install`` does not need ``publish``, or
+  does not run the install check of the dispatched commit unconditionally.
+- ``release-check-unconditional``: a job of ``GUARDED_JOBS`` or one of its
+  steps sets ``if`` or ``continue-on-error``, or a step turns off errexit or
+  ends a line with ``|| true``, ``|| :``, or ``|| exit 0``. The publish
+  dispatch's verify_only condition and the Rosetta step's target condition
+  are the only exceptions.
+- ``verification-credentials``: a job of ``VERIFY_JOBS`` is credentialed as
+  above, has permissions other than exactly ``contents: read``, receives
+  ``GH_TOKEN`` or ``GITHUB_TOKEN`` from the workflow, job, or step
+  ``env``, or holds or inherits from the workflow ``env`` or ``defaults``
+  an expression that reads the ``secrets`` context, the workflow token, or
+  the ``github`` context other than by a named property, read as for
+  ``rehearsal-credentials``, which covers the rehearsal's inherited level.
+- ``release-verify-matrix``: a ``verify-packaged`` matrix of ``release.yml``
+  or ``release-rehearsal.yml`` differs from ``VERIFY_RUNNERS``, the job does
+  not run on ``${{ matrix.os }}``, the archive check does not take
+  ``TARGET`` from ``${{ matrix.target }}``, or the job's first step is not
+  the Rosetta check of the Intel macOS target.
+- ``release-toolchain``: ``RELEASE_TOOLCHAIN`` of ``release-rehearsal.yml``
+  differs from that of ``publish.yml``, or ``verify-crates`` does not
+  install it, does not pin ``RUSTUP_TOOLCHAIN`` to it, or pins it outside
+  the steps between the install and the packaging.
+- ``ci-feature-jobs``: a job of ``CI_FEATURE_JOBS`` is missing, it or one of
+  its steps sets ``if`` or ``continue-on-error``, or it does not run each of
+  its commands unconditionally; or ``check-host.sh`` does not run each
+  command of ``HOST_CHECKS`` unconditionally.
 """
 
 import fnmatch
-import itertools
 import pathlib
 import re
 import sys
@@ -115,7 +167,8 @@ except ImportError:
     sys.exit("check-workflow-invariants.py needs PyYAML (pip install PyYAML)")
 
 WORKFLOWS = ("release.yml", "publish.yml", "notarize-smoke.yml", "labels.yml", "stale.yml", "triage.yml",
-             "triage-review.yml", "triage-sweep.yml", "welcome.yml", "coverage.yml", "release-rehearsal.yml")
+             "triage-review.yml", "triage-sweep.yml", "welcome.yml", "coverage.yml", "release-rehearsal.yml",
+             "ci.yml")
 COMPOSITE = pathlib.PurePosixPath(".github/actions/macos-sign-notarize")
 SIGNING_JOBS = {("release.yml", "sign-macos"), ("notarize-smoke.yml", "sign")}
 TOOLCHAIN_ALLOWED = {("publish.yml", "publish")}
@@ -144,14 +197,76 @@ COVERAGE_CONDITION = ("github.event_name != 'pull_request' || "
 # expression of the workflow reads a secret or the workflow token.
 REHEARSAL_WORKFLOW = "release-rehearsal.yml"
 REHEARSAL_PERMISSIONS = {"contents": "read"}
-# The rehearsal requires the build lines and the Windows setup scripts to
-# equal those of the build job in release.yml. Each setup script copies the
-# run: block of the release build step that writes its variable to GITHUB_ENV;
-# the variable finds that step.
+# Shared release build and platform setup scripts.
 RELEASE_SCRIPTS = pathlib.PurePosixPath(".github/scripts/release")
 BUILD_SCRIPT = RELEASE_SCRIPTS / "build.sh"
-SETUP_SCRIPTS = (("OPENSSL_SRC_PERL", RELEASE_SCRIPTS / "windows-perl.ps1"),
-                 ("SODIUM_DIST_DIR", RELEASE_SCRIPTS / "sodium.sh"))
+HOST_SCRIPT = RELEASE_SCRIPTS / "check-host.sh"
+# The Perl and sodium setup calls and the build call that follows them.
+BUILD_CALLS = ("./.github/scripts/release/windows-perl.ps1",
+               "bash .github/scripts/release/sodium.sh",
+               'bash .github/scripts/release/build.sh "$TARGET"')
+BUILD_GUARD = ('python3 "$(dirname "${BASH_SOURCE[0]}")/../check-feature-discipline.py" '
+               '--env-guard "$(dirname "${BASH_SOURCE[0]}")/../../.."')
+# The release targets and the runner that executes each one's archive: the
+# Intel macOS archive runs under Rosetta 2 on the Apple silicon runner.
+VERIFY_RUNNERS = {
+    "x86_64-unknown-linux-gnu": "ubuntu-24.04",
+    "aarch64-unknown-linux-gnu": "ubuntu-24.04-arm",
+    "x86_64-apple-darwin": "macos-26",
+    "aarch64-apple-darwin": "macos-26",
+    "x86_64-pc-windows-msvc": "windows-2025",
+}
+ROSETTA = {"run": "arch -x86_64 /usr/bin/true", "if": "matrix.target == 'x86_64-apple-darwin'"}
+ARCHIVE_CHECK = ('bash .github/scripts/release/verify-archive.sh archives "$VERSION" "$TARGET" '
+                 '"$EXPECTED_MAINNET_WRITE"')
+PROVENANCE_CHECKS = (
+    'python3 .github/scripts/check-provenance.py "provenance/stellar-agent-$VERSION.intoto.jsonl" '
+    'provenance/SHA256SUMS "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$GITHUB_REF"',
+    "cargo fetch --locked",
+    '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/check-feature-discipline.py')
+PACKAGE_START = "touch target/package-verification-start"
+PACKAGE_BUILD = "cargo package --workspace --locked"
+PACKAGE_CHECKS = {
+    "publish.yml": ('bash "$GITHUB_WORKSPACE/wf/.github/scripts/check-packaged-markers.sh" target '
+                    'target/package-verification-start "$EXPECTED_MAINNET_WRITE"'),
+    "release-rehearsal.yml": ('bash .github/scripts/check-packaged-markers.sh target '
+                              'target/package-verification-start "$EXPECTED_MAINNET_WRITE"'),
+}
+INSTALL_CHECK = ('bash "$GITHUB_WORKSPACE/wf/.github/scripts/release/verify-install.sh" "$TAG" '
+                 '"$EXPECTED_MAINNET_WRITE"')
+TOOLCHAIN_PIN = 'echo "RUSTUP_TOOLCHAIN=$RELEASE_TOOLCHAIN" >> "$GITHUB_ENV"'
+# The release checks, which no condition may skip and no command may ignore.
+GUARDED_JOBS = {"release.yml": ("verify-packaged", "verify-provenance", "hashes", "publish"),
+                "publish.yml": ("verify", "publish", "verify-install"),
+                "release-rehearsal.yml": ("verify-packaged", "verify-crates")}
+# The verification jobs, which hold no credential.
+VERIFY_JOBS = (("release.yml", "verify-packaged"), ("release.yml", "verify-provenance"),
+               ("publish.yml", "verify"), ("publish.yml", "verify-install"),
+               ("release-rehearsal.yml", "verify-packaged"), ("release-rehearsal.yml", "verify-crates"))
+TOKEN_ENV = {"GH_TOKEN", "GITHUB_TOKEN"}
+# The feature jobs of ci.yml and the commands that define each of them.
+CI_FEATURE_JOBS = {
+    "feature-on-clippy": (
+        'cargo clippy --workspace --all-targets --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE" '
+        '-- -D warnings',),
+    "feature-on-doc": ('cargo doc --workspace --no-deps --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE"',),
+    "feature-on-test": (
+        "cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry",
+        "cargo check -p stellar-agent-network --features mainnet-write"),
+    "feature-discipline": (
+        "cargo fetch --locked",
+        '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/check-feature-discipline.py',
+        '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-feature-discipline.py --mutations',
+        "bash .github/scripts/test-check-binary-marker.sh",
+        "bash .github/scripts/test-release-checks.sh",
+        '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-provenance.py'),
+    "release-shape": ("bash .github/scripts/release/check-host.sh",),
+}
+# The host recipe: the release build for the host target and the marker
+# check of both binaries.
+HOST_CHECKS = ('bash .github/scripts/release/build.sh "$target"',
+               'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent" off',
+               'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" off')
 # For each job: the action that receives a credential, and the text of the
 # checks that earlier steps must hold. The third entry is the text of the
 # workspace code that reads the downloaded data. A clean-checkout check must
@@ -177,26 +292,36 @@ SCRIPT_REF = re.compile(r"\.github/(?:scripts|actions)/[A-Za-z0-9_.-]+(?:/[A-Za-
 COMMAND_WORD = r"(?<![\w.-]){}[\"']?"
 # A cargo call up to its subcommand. Matching stops there, so every later
 # cargo call on the same line is found as well.
-CARGO_CALL = re.compile(COMMAND_WORD.format("cargo") + r"(?:\s+\+\S+)?\s+([^\s;&|)`]+)")
-CROSS_CALL = re.compile(COMMAND_WORD.format("cross") + r"(?:\s+\+\S+)?\s+[a-z]")
+CARGO_CALL = re.compile(COMMAND_WORD.format("cargo") + r"(?:[ \t]+\+[^ \t]+)?[ \t]+([^ \t;&|)`]+)")
+CROSS_CALL = re.compile(COMMAND_WORD.format("cross") + r"(?:[ \t]+\+[^ \t]+)?[ \t]+[a-z]")
 # Where the arguments of one command end: a shell operator, the end of a
 # command substitution or subshell, or a comment.
-ARGUMENTS_END = re.compile(r"[;&|)`]|(?<!\S)#")
+ARGUMENTS_END = re.compile(r"[;&|)`]|(?<![^ \t])#")
 ALLOWED_CARGO = {"metadata", "-V", "--version"}
 NO_VERIFY_CARGO = {"package", "publish"}
 # A shell operator on a line that holds a check, which could chain the check,
 # skip it, or discard its result.
 SHELL_OPERATOR = re.compile(r"[;&|]")
+# The blanks that separate shell words.
+BLANKS = " \t"
 # The set builtin turning off errexit.
-ERREXIT_OFF = re.compile(r"(?<![\w-])set\s+(?:\+\w*e|\+o\s+errexit\b)")
+ERREXIT_OFF = re.compile(r"(?<![\w-])set[ \t]+(?:\+\w*e|\+o[ \t]+errexit\b)")
 # The ancestry script as the command of a line. Its path is the first word
 # with or without quotes and holds only directory names and variables. No
 # shell operator after it can chain or discard its result.
 ANCESTRY_CALL = re.compile(
-    r"""^\s*["']?(?:\$\{?[A-Za-z_]\w*\}?/|[\w.-]+/)*\.github/scripts/check-ref-on-main\.sh["']?(?:\s[^;&|]*)?$""")
-# A cargo build or cross build call, with the command word as in CARGO_CALL.
-BUILD_CALL = re.compile(COMMAND_WORD.format("(?:cargo|cross)") + r"(?:\s+\+\S+)?\s+build(?![\w-])")
-MATRIX_TARGET = re.compile(r"\$\{\{\s*matrix\.target\s*\}\}")
+    r"""^[ \t]*["']?(?:\$\{?[A-Za-z_]\w*\}?/|[\w.-]+/)*"""
+    r"""\.github/scripts/check-ref-on-main\.sh["']?(?:[ \t][^;&|]*)?$""")
+# A line that ends a check with an operator whose right side succeeds.
+SUPPRESSION = re.compile(r"\|\|[ \t]*(?:true\b|:(?=[ \t;]|$)|exit[ \t]+0\b)")
+# The runner and target expressions of a verification matrix leg.
+MATRIX_RUNNER = re.compile(r"^\$\{\{\s*matrix\.os\s*\}\}$")
+MATRIX_TARGET = re.compile(r"^\$\{\{\s*matrix\.target\s*\}\}$")
+# The words that open and close a shell compound command, and the end of a
+# line that closes the compound command it opens.
+COMPOUND_OPEN = {"if", "case", "while", "until", "for", "select", "{"}
+COMPOUND_CLOSE = {"fi", "esac", "done", "}"}
+COMPOUND_END = re.compile(r"(?:^|[; \t])(?:fi|esac|done|\})$")
 # A string literal of the expression syntax, whose text names no context.
 EXPRESSION_STRING = re.compile(r"'(?:[^']|'')*'")
 # A context name where a property chain starts. Expressions ignore case.
@@ -211,6 +336,7 @@ class Checker:
         self.violations = []
         self.jobs_checked = 0
         self.docs = {}
+        self.unmodelled = set()
 
     def report(self, where, rule, message):
         self.violations.append(f"{where}: {rule}: {message}")
@@ -237,7 +363,7 @@ class Checker:
         a double quote outside a single-quoted string, an unfinished
         expression, and an unfinished string each raise ValueError.
         """
-        text = text or ""
+        text = "" if text is None else str(text)
         expressions = []
         position = 0
         while (start := text.find("${{", position)) != -1:
@@ -268,9 +394,15 @@ class Checker:
         return any(re.search(pattern, e) for e in Checker.expressions(str(value)))
 
     @staticmethod
+    def run_text(step):
+        """The text of a step's run: value; YAML can parse one as another
+        scalar type."""
+        return "" if step.get("run") is None else str(step["run"])
+
+    @staticmethod
     def logical_lines(text):
-        joined = re.sub(r"\\\n", " ", text or "")
-        return [line for line in joined.split("\n") if not line.lstrip().startswith("#")]
+        joined = re.sub(r"\\\n", " ", "" if text is None else str(text))
+        return [line for line in joined.split("\n") if not line.lstrip(BLANKS).startswith("#")]
 
     def runs(self, run, text):
         """Whether a run: block holds text on a line that is not a comment."""
@@ -284,21 +416,21 @@ class Checker:
     def check_shell(self, where, text):
         for line in self.logical_lines(text):
             if CROSS_CALL.search(line):
-                self.report(where, "cred-compile", f"runs cross: {line.strip()}")
+                self.report(where, "cred-compile", f"runs cross: {line.strip(BLANKS)}")
             for match in CARGO_CALL.finditer(line):
                 sub = match.group(1).strip("\"'")
                 arguments = ARGUMENTS_END.split(line[match.end():], maxsplit=1)[0]
-                call = f"cargo {sub}{arguments}".strip()
+                call = f"cargo {sub}{arguments}".strip(BLANKS)
                 if sub in ALLOWED_CARGO:
                     continue
                 if sub in NO_VERIFY_CARGO:
-                    if "--no-verify" not in arguments.split():
+                    if "--no-verify" not in re.split(r"[ \t]+", arguments):
                         self.report(where, "cred-compile", f"cargo {sub} without --no-verify: {call}")
                     continue
                 self.report(where, "cred-compile", f"runs cargo {sub}: {call}")
 
     def check_referenced_files(self, where, text, seen):
-        for ref in SCRIPT_REF.findall(text or ""):
+        for ref in SCRIPT_REF.findall("" if text is None else str(text)):
             relative = pathlib.PurePosixPath(ref)
             if relative in seen:
                 continue
@@ -578,23 +710,23 @@ class Checker:
         elif node is not None and not isinstance(node, (int, float, date)):
             raise ValueError(f"unsupported workflow node type: {type(node).__name__}")
 
-    def check_rehearsal_expressions(self, where, node):
+    def check_credential_expressions(self, where, node, rule):
         try:
             expressions = list(self.expression_values(node))
         except ValueError as err:
-            self.report(where, "rehearsal-credentials", str(err))
+            self.report(where, rule, str(err))
             return
         for expression in expressions:
             text = EXPRESSION_STRING.sub("''", expression)
             if SECRETS_CONTEXT.search(text):
-                self.report(where, "rehearsal-credentials", f"an expression reads secrets: {expression}")
+                self.report(where, rule, f"an expression reads secrets: {expression}")
             for context in GITHUB_CONTEXT.finditer(text):
                 name = NAMED_PROPERTY.match(text, context.end())
                 if name is None:
-                    self.report(where, "rehearsal-credentials",
+                    self.report(where, rule,
                                 f"an expression reads the github context other than by a named property: {expression}")
                 elif name.group(1).lower() == "token":
-                    self.report(where, "rehearsal-credentials", f"an expression reads the workflow token: {expression}")
+                    self.report(where, rule, f"an expression reads the workflow token: {expression}")
 
     def check_rehearsal_credentials(self, workflow, doc, jobs):
         workflow_permissions = doc.get("permissions")
@@ -604,7 +736,7 @@ class Checker:
                         "expected exactly contents: read")
         for key, value in doc.items():
             if key != "jobs":
-                self.check_rehearsal_expressions(workflow, {key: value})
+                self.check_credential_expressions(workflow, {key: value}, "rehearsal-credentials")
         for job_id, job in jobs.items():
             where = f"{workflow}:{job_id}"
             if not isinstance(job, dict):
@@ -616,79 +748,284 @@ class Checker:
                 self.report(where, "rehearsal-credentials",
                             f"effective permissions are {self.describe_permissions(permissions)}, "
                             "expected exactly contents: read")
-            self.check_rehearsal_expressions(where, {job_id: job})
+            self.check_credential_expressions(where, {job_id: job}, "rehearsal-credentials")
 
-    def read_script(self, relative):
+    def read_script(self, relative, rule):
         try:
             return (self.root / relative).read_text(errors="replace")
         except OSError as err:
-            self.report(str(relative), "release-script-drift", f"cannot be read: {err}")
+            self.report(str(relative), rule, f"cannot be read: {err}")
             return None
 
-    @staticmethod
-    def normalized(line):
-        return " ".join(line.split())
+    def job(self, workflow, name):
+        return (self.docs.get(workflow, {}).get("jobs") or {}).get(name)
 
     @staticmethod
-    def body_lines(text):
-        """Returns the lines of a script or run: block, without trailing
-        whitespace.
+    def line_syntax(line):
+        """Returns whether a line holds syntax the check does not model: an
+        open quote, substitution, subshell or group, a heredoc operator
+        outside quotes, or a closing &&, ||, | or |& that makes the next
+        line conditional or piped."""
+        quote, depth, backtick, group, heredoc, i = None, 0, False, 0, False, 0
+        while i < len(line):
+            char = line[i]
+            if char == "\\" and quote != "'":
+                i += 2
+                continue
+            if quote == "'":
+                quote = None if char == "'" else quote
+            elif line.startswith("$(", i):
+                depth += 1
+                i += 1
+            elif char == "`":
+                backtick = not backtick
+            elif quote == '"':
+                if char == '"':
+                    quote = None
+                elif char == ")" and depth:
+                    depth -= 1
+            elif char in "'\"":
+                quote = char
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            elif char in "{}" and (i == 0 or line[i - 1] in " \t;&|") and line[i + 1:i + 2] in ("", " ", ";"):
+                group += 1 if char == "{" else -1
+            elif line.startswith("<<<", i):
+                i += 3
+                continue
+            elif line.startswith("<<", i):
+                heredoc = True
+            i += 1
+        joins = line.endswith(("&&", "||", "|", "|&"))
+        return bool(quote or depth or backtick or group or heredoc or joins)
 
-        The leading comment and blank lines and the trailing blank lines are
-        left out, so a script's header and a block's final newline do not
-        count.
+    def runs_line(self, run, command):
+        """Returns (position, problem) for command in a run: block.
+
+        position is the index of the logical line that runs command
+        unconditionally, else -1. The line must equal command after each
+        run of spaces and tabs is collapsed to one space, so no comment,
+        prefix, operator, substitution or variable can skip it or discard
+        its status, and no other character counts as a blank. A line
+        inside a compound command, or after a line that exits, returns or
+        turns off errexit, does not count. When the block names command, a
+        line before the call whose syntax the check does not model fails
+        closed: problem names the line that leaves a quote, a substitution,
+        a subshell or a group open, opens a heredoc, ends in an operator
+        that joins it to the next line, or holds command inside a longer
+        line, so a heredoc in such a block is refused. Otherwise
+        problem is None. Whether the block names command is read from the
+        same joined logical lines that the match reads.
         """
-        lines = [line.rstrip() for line in (text or "").split("\n")]
-        start = 0
-        while start < len(lines) and (not lines[start] or lines[start].lstrip().startswith("#")):
-            start += 1
-        end = len(lines)
-        while end > start and not lines[end - 1]:
-            end -= 1
-        return lines[start:end]
+        text = "" if run is None else str(run)
+        lines = [" ".join(re.split(r"[ \t]+", line.strip(BLANKS))) for line in self.logical_lines(text)]
+        names, depth = any(command in line for line in lines), 0
+        for position, line in enumerate(lines):
+            if not line:
+                continue
+            if line == command:
+                return (position if depth == 0 else -1), None
+            if names and (self.line_syntax(line) or command in line):
+                return -1, f"logical line {position + 1}: {line}"
+            word = line.split(" ")[0]
+            if ERREXIT_OFF.search(line) or (word in ("exit", "return") and depth == 0):
+                return -1, None
+            if word in COMPOUND_OPEN or line.endswith("{"):
+                if not COMPOUND_END.search(line):
+                    depth += 1
+            elif word in COMPOUND_CLOSE:
+                depth -= 1
+        return -1, None
 
-    def check_release_script_drift(self):
-        release = self.docs.get("release.yml")
-        if not isinstance(release, dict):
-            return
-        job = (release.get("jobs") or {}).get("build")
-        if not isinstance(job, dict):
-            self.report("release.yml", "release-script-drift", "no build job")
-            return
-        where = "release.yml:build"
-        steps = [step for step in job.get("steps", []) or [] if isinstance(step, dict)]
-        release_lines = [self.normalized(MATRIX_TARGET.sub('"$TARGET"', line))
-                         for step in steps for line in self.logical_lines(step.get("run")) if BUILD_CALL.search(line)]
-        if not release_lines:
-            self.report(where, "release-script-drift", "runs no cargo build or cross build line")
-        script = self.read_script(BUILD_SCRIPT)
-        if script is not None:
-            script_lines = [self.normalized(line) for line in self.logical_lines(script) if BUILD_CALL.search(line)]
-            for line in release_lines:
-                if line not in script_lines:
-                    self.report(str(BUILD_SCRIPT), "release-script-drift", f"lacks the release build line: {line}")
-            for line in script_lines:
-                if line not in release_lines:
-                    self.report(str(BUILD_SCRIPT), "release-script-drift",
-                                f"build line not in the release build job: {line}")
-        for variable, relative in SETUP_SCRIPTS:
-            writers = [step for step in steps if isinstance(step.get("run"), str)
-                       and f"{variable}=" in step["run"] and "GITHUB_ENV" in step["run"]]
-            if len(writers) != 1:
-                self.report(where, "release-script-drift",
-                            f"{len(writers)} steps write {variable} to GITHUB_ENV, expected one")
+    def step_position(self, workflow, name, index, step, command, rule):
+        """Returns where step index of a job runs command unconditionally
+        under errexit, or -1, and reports syntax the check does not model."""
+        job = self.job(workflow, name) or {}
+        defaults = [((owner.get("defaults") or {}).get("run") or {}).get("shell")
+                    for owner in (job, self.docs[workflow])]
+        shell = step.get("shell") or defaults[0] or defaults[1]
+        position, problem = self.runs_line(step.get("run"), command)
+        where = f"{workflow}:{name} step {index + 1}"
+        if problem and (where, problem) not in self.unmodelled:
+            self.unmodelled.add((where, problem))
+            self.report(where, rule, f"unmodelled shell syntax around {command}: {problem}")
+        return position if shell in (None, "bash") else -1
+
+    def runs_in_job(self, workflow, name, command, rule):
+        """Returns the index of the first step of a job that runs command
+        unconditionally, or -1."""
+        for index, step in enumerate((self.job(workflow, name) or {}).get("steps", [])):
+            if self.step_position(workflow, name, index, step, command, rule) >= 0:
+                return index
+        return -1
+
+    def needs(self, workflow, name, dependency, rule):
+        values = (self.job(workflow, name) or {}).get("needs", [])
+        values = [values] if isinstance(values, str) else values
+        if dependency not in values:
+            self.report(workflow, rule, f"{name} must need {dependency}")
+
+    def check_shared_build(self):
+        for workflow in ("release.yml", "release-rehearsal.yml"):
+            job = self.job(workflow, "build") or {}
+            steps = job.get("steps", [])
+            calls = [self.run_text(step).strip(BLANKS + "\n") for step in steps]
+            for call in BUILD_CALLS:
+                if calls.count(call) != 1:
+                    self.report(workflow, "release-shared-scripts", f"expected one call: {call}")
+            if BUILD_CALLS[-1] in calls:
+                index = calls.index(BUILD_CALLS[-1])
+                if calls[max(0, index - 2):index] != list(BUILD_CALLS[:-1]):
+                    self.report(workflow, "release-guard-order", "build must immediately follow Perl and sodium setup")
+                if self.may_skip(steps[index]) or self.may_skip(job):
+                    self.report(workflow, "release-check-unconditional", "build can be skipped")
+        script = self.read_script(BUILD_SCRIPT, "release-shared-scripts")
+        lines = list(self.logical_lines(script)) if script is not None else []
+        if lines[:2] != ["set -euo pipefail", BUILD_GUARD]:
+            self.report(str(BUILD_SCRIPT), "release-shared-scripts", "environment guard is not the first build action")
+
+    def check_release_gates(self):
+        self.needs("release.yml", "hashes", "verify-packaged", "release-packaged-gate")
+        for dependency in ("preflight", "build", "sign-macos"):
+            self.needs("release.yml", "verify-packaged", dependency, "release-packaged-gate")
+        for workflow in ("release.yml", "release-rehearsal.yml"):
+            if self.runs_in_job(workflow, "verify-packaged", ARCHIVE_CHECK, "release-packaged-gate") < 0:
+                self.report(workflow, "release-packaged-gate", "verify-packaged does not run the archive check unconditionally")
+        self.needs("release.yml", "publish", "verify-provenance", "release-provenance-gate")
+        for dependency in ("preflight", "provenance", "hashes"):
+            self.needs("release.yml", "verify-provenance", dependency, "release-provenance-gate")
+        for command in PROVENANCE_CHECKS:
+            if self.runs_in_job("release.yml", "verify-provenance", command, "release-provenance-gate") < 0:
+                self.report("release.yml", "release-provenance-gate", f"verify-provenance does not run unconditionally: {command}")
+        self.needs("publish.yml", "publish", "verify", "publish-dry-gate")
+        for workflow, name in (("publish.yml", "verify"), ("release-rehearsal.yml", "verify-crates")):
+            steps = (self.job(workflow, name) or {}).get("steps", [])
+            def runs(command):
+                return [i for i, step in enumerate(steps)
+                        if self.step_position(workflow, name, i, step, command, "publish-dry-gate") >= 0]
+            builds, checks = runs(PACKAGE_BUILD), runs(PACKAGE_CHECKS[workflow])
+            if len(builds) != 1 or len(checks) != 1 or checks[0] != builds[0] + 1:
+                self.report(workflow, "publish-dry-gate", "packaged marker check must immediately follow package verification")
+            if builds:
+                run = steps[builds[0]].get("run")
+                if not 0 <= self.runs_line(run, PACKAGE_START)[0] < self.runs_line(run, PACKAGE_BUILD)[0]:
+                    self.report(workflow, "publish-dry-gate", "package verification lacks the freshness timestamp")
+        self.needs("publish.yml", "verify-install", "publish", "publish-install-gate")
+        if self.runs_in_job("publish.yml", "verify-install", INSTALL_CHECK, "publish-install-gate") < 0:
+            self.report("publish.yml", "publish-install-gate", "verify-install does not run the install check unconditionally")
+
+    def check_unconditional(self):
+        for workflow, names in GUARDED_JOBS.items():
+            for name in names:
+                job = self.job(workflow, name)
+                if job is None:
+                    self.report(workflow, "release-check-unconditional", f"missing {name}")
+                    continue
+                allowed = workflow == "publish.yml" and name == "publish"
+                condition = str(job.get("if", "")).strip()
+                if "continue-on-error" in job or ("if" in job and not (allowed and condition == "${{ !inputs.verify_only }}")):
+                    self.report(workflow, "release-check-unconditional", f"{name} can be bypassed")
+                for step in job.get("steps", []):
+                    rosetta = step.get("run") == ROSETTA["run"] and step.get("if") == ROSETTA["if"]
+                    if "continue-on-error" in step or ("if" in step and not rosetta):
+                        self.report(workflow, "release-check-unconditional", f"{name} step can be bypassed")
+                    run = self.run_text(step)
+                    if ERREXIT_OFF.search(run) or any(SUPPRESSION.search(line) for line in self.logical_lines(run)):
+                        self.report(workflow, "release-check-unconditional", f"{name} suppresses failures")
+
+    def check_verification_credentials(self):
+        for workflow, name in VERIFY_JOBS:
+            job = self.job(workflow, name)
+            if job is None:
                 continue
-            script = self.read_script(relative)
-            if script is None:
+            where = f"{workflow}:{name}"
+            if self.credentialed(job, self.docs[workflow]) or job.get("permissions") != {"contents": "read"}:
+                self.report(where, "verification-credentials", "must be uncredentialed with contents: read")
+            self.check_credential_expressions(where, {name: job}, "verification-credentials")
+            # rehearsal-credentials reads every expression of the rehearsal.
+            if workflow != REHEARSAL_WORKFLOW:
+                inherited = {key: self.docs[workflow][key] for key in ("env", "defaults")
+                             if key in self.docs[workflow]}
+                self.check_credential_expressions(where, inherited, "verification-credentials")
+            environments = (self.docs[workflow].get("env"), job.get("env"),
+                            *(step.get("env") for step in job.get("steps", [])))
+            for env in environments:
+                for key in env or {}:
+                    if str(key).upper() in TOKEN_ENV:
+                        self.report(where, "verification-credentials", f"sets {key}")
+
+    def check_verify_matrix(self):
+        for workflow in ("release.yml", "release-rehearsal.yml"):
+            job = self.job(workflow, "verify-packaged") or {}
+            include = ((job.get("strategy") or {}).get("matrix") or {}).get("include") or []
+            legs = sorted(tuple(sorted(leg.items())) for leg in include if isinstance(leg, dict))
+            wanted = sorted((("os", runner), ("target", target)) for target, runner in VERIFY_RUNNERS.items())
+            if len(legs) != len(include) or legs != wanted:
+                self.report(workflow, "release-verify-matrix", "verify-packaged does not run each release target on its runner")
+            if not MATRIX_RUNNER.match(str(job.get("runs-on", "")).strip()):
+                self.report(workflow, "release-verify-matrix", "verify-packaged does not run on the runner of its matrix leg")
+            archive = [step for step in job.get("steps", [])
+                       if self.runs_line(step.get("run"), ARCHIVE_CHECK)[0] >= 0]
+            if any(not MATRIX_TARGET.match(str((step.get("env") or {}).get("TARGET", "")).strip())
+                   for step in archive):
+                self.report(workflow, "release-verify-matrix", "the archive check does not read TARGET from the matrix leg")
+            steps = job.get("steps") or [{}]
+            if steps[0].get("run") != ROSETTA["run"] or steps[0].get("if") != ROSETTA["if"]:
+                self.report(workflow, "release-verify-matrix", "the first verify-packaged step is not the Rosetta check")
+
+    def check_release_toolchain(self):
+        publish = (self.docs.get("publish.yml", {}).get("env") or {}).get("RELEASE_TOOLCHAIN")
+        rehearsal = (self.docs.get(REHEARSAL_WORKFLOW, {}).get("env") or {}).get("RELEASE_TOOLCHAIN")
+        if publish is None or rehearsal != publish:
+            self.report(REHEARSAL_WORKFLOW, "release-toolchain", "RELEASE_TOOLCHAIN differs from publish.yml")
+        job = self.job(REHEARSAL_WORKFLOW, "verify-crates") or {}
+        installs = [i for i, step in enumerate(job.get("steps", []))
+                    if re.match(r"dtolnay/rust-toolchain@", step.get("uses") or "")
+                    and (step.get("with") or {}).get("toolchain") == "${{ env.RELEASE_TOOLCHAIN }}"]
+        pin = self.runs_in_job(REHEARSAL_WORKFLOW, "verify-crates", TOOLCHAIN_PIN, "release-toolchain")
+        build = self.runs_in_job(REHEARSAL_WORKFLOW, "verify-crates", PACKAGE_BUILD, "release-toolchain")
+        install = installs[0] if installs else -1
+        problem = "verify-crates does not package with RELEASE_TOOLCHAIN"
+        if not installs:
+            self.report(REHEARSAL_WORKFLOW, "release-toolchain", f"{problem}: it installs another toolchain")
+        elif pin < 0:
+            self.report(REHEARSAL_WORKFLOW, "release-toolchain", f"{problem}: it does not pin RUSTUP_TOOLCHAIN")
+        elif not install < pin < build:
+            self.report(REHEARSAL_WORKFLOW, "release-toolchain",
+                        f"{problem}: RUSTUP_TOOLCHAIN is not pinned between the install and the packaging")
+
+    def check_ci_feature_jobs(self):
+        for name, commands in CI_FEATURE_JOBS.items():
+            job = self.job("ci.yml", name)
+            if job is None:
+                self.report("ci.yml", "ci-feature-jobs", f"missing {name}")
                 continue
-            pairs = itertools.zip_longest(self.body_lines(script), self.body_lines(writers[0]["run"]))
-            for number, (actual, expected) in enumerate(pairs, start=1):
-                if actual != expected:
-                    self.report(str(relative), "release-script-drift",
-                                f"body line {number} is {'no line' if actual is None else repr(actual)}, "
-                                f"the release step that writes {variable} has "
-                                f"{'no line' if expected is None else repr(expected)}")
-                    break
+            if "if" in job or "continue-on-error" in job:
+                self.report("ci.yml", "ci-feature-jobs", f"{name} can be bypassed")
+            for step in job.get("steps", []):
+                if "if" in step or "continue-on-error" in step:
+                    self.report("ci.yml", "ci-feature-jobs", f"{name} step can be bypassed")
+            for command in commands:
+                if self.runs_in_job("ci.yml", name, command, "ci-feature-jobs") < 0:
+                    self.report("ci.yml", "ci-feature-jobs", f"{name} does not run unconditionally: {command}")
+        script = self.read_script(HOST_SCRIPT, "ci-feature-jobs")
+        for command in HOST_CHECKS:
+            position, problem = self.runs_line(script, command) if script is not None else (0, None)
+            if problem:
+                self.report(str(HOST_SCRIPT), "ci-feature-jobs", f"unmodelled shell syntax around {command}: {problem}")
+            elif position < 0:
+                self.report(str(HOST_SCRIPT), "ci-feature-jobs", f"does not run unconditionally: {command}")
+
+    def check_release_checks(self):
+        self.check_shared_build()
+        self.check_release_gates()
+        self.check_unconditional()
+        self.check_verification_credentials()
+        self.check_verify_matrix()
+        self.check_release_toolchain()
+        self.check_ci_feature_jobs()
 
     def check_workflow(self, workflow):
         doc = self.load(pathlib.PurePosixPath(".github/workflows") / workflow)
@@ -724,7 +1061,7 @@ class Checker:
         for workflow in WORKFLOWS:
             self.check_workflow(workflow)
         self.check_composite_expressions()
-        self.check_release_script_drift()
+        self.check_release_checks()
         return self.violations
 
 

@@ -104,7 +104,7 @@ fn u32_xdr(n: u32) -> String {
 /// `indexer_server.verify().await` confirms zero calls.
 ///
 /// Per-test servers (not shared `OnceCell`) are used to eliminate mount-accumulation
-/// and `OnceCell::get_or_init` races under `--all-targets --all-features`.
+/// and `OnceCell::get_or_init` races when tests execute concurrently.
 ///
 /// # No-indexer invariant
 ///
@@ -115,7 +115,7 @@ fn u32_xdr(n: u32) -> String {
 async fn t8_no_indexer_call_during_enumeration() {
     // Per-test servers: each test call gets a fresh server on an ephemeral port.
     // This avoids mount-accumulation on a shared server and OnceCell-init races
-    // that can cause hangs under cargo test --all-targets --all-features.
+    // that can cause hangs when tests execute concurrently.
     let rpc_server = MockServer::start().await;
     let indexer_server = MockServer::start().await;
 

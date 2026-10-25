@@ -10,6 +10,8 @@ unmodified copy must pass, and so must each copy that a PASSING entry edits
 into another accepted form. Each replacement must match the expected number
 of times; a case whose text drifted fails. A fixture read from the live
 workflows must match exactly once, or the run stops before any case.
+With --case LABEL, the run checks the unmodified copy and that one failing
+case or PASSING entry.
 """
 
 import pathlib
@@ -30,9 +32,9 @@ TRIAGE_SWEEP = ".github/workflows/triage-sweep.yml"
 WELCOME = ".github/workflows/welcome.yml"
 COVERAGE = ".github/workflows/coverage.yml"
 REHEARSAL = ".github/workflows/release-rehearsal.yml"
+CI = ".github/workflows/ci.yml"
 BUILD_SCRIPT = ".github/scripts/release/build.sh"
-PERL_SCRIPT = ".github/scripts/release/windows-perl.ps1"
-SODIUM_SCRIPT = ".github/scripts/release/sodium.sh"
+HOST_SCRIPT = ".github/scripts/release/check-host.sh"
 ACTION = ".github/actions/macos-sign-notarize/action.yml"
 SIGN_SCRIPT = ".github/actions/macos-sign-notarize/sign-notarize.sh"
 PUBLISH_SCRIPT = ".github/scripts/publish-crates.sh"
@@ -47,7 +49,7 @@ COVERAGE_TYPES_LINE = "    types: [opened, synchronize, reopened, labeled, unlab
 COVERAGE_ON_BLOCK = (
     "on:\n"
     "  pull_request:\n"
-    "    branches: [main]\n"
+    "    branches: [main, mainnet-write]\n"
     + COVERAGE_TYPES_LINE +
     "  schedule:\n"
     "    # Weekly, Monday 04:41 UTC.\n"
@@ -84,14 +86,58 @@ def in_rehearsal_version_step(line):
     return (REHEARSAL, REHEARSAL_VERSION_ECHO, REHEARSAL_VERSION_ECHO + line, 1)
 
 
-RELEASE_CARGO_BUILD = (
-    "cargo build --release --locked --target ${{ matrix.target }} --bin stellar-agent --bin stellar-agent-mcp")
-RELEASE_CROSS_BUILD = (
-    "cross build --release --locked --target ${{ matrix.target }} --bin stellar-agent --bin stellar-agent-mcp")
-SCRIPT_CARGO_BUILD = 'cargo build --release --locked --target "$TARGET" --bin stellar-agent --bin stellar-agent-mcp'
-SCRIPT_CROSS_BUILD = 'cross build --release --locked --target "$TARGET" --bin stellar-agent --bin stellar-agent-mcp'
-PERL_INSTALL = "  choco install strawberryperl --no-progress -y"
-SODIUM_CURL = "  curl --fail --silent --show-error --location --retry 5 --retry-all-errors \\"
+RELEASE_BUILD_STEP = (
+    "      - name: Build binaries\n"
+    "        shell: bash\n"
+    "        env:\n"
+    "          TARGET: ${{ matrix.target }}\n"
+    '        run: bash .github/scripts/release/build.sh "$TARGET"\n'
+    "\n"
+)
+RELEASE_PERL_STEP = "      - name: Provide a native Perl for the vendored OpenSSL build (Windows)\n"
+ARCHIVE_RUN = 'run: bash .github/scripts/release/verify-archive.sh archives "$VERSION" "$TARGET" "$EXPECTED_MAINNET_WRITE"'
+ARCHIVE_ENV = "          TARGET: ${{ matrix.target }}\n          VERSION: ${{ needs.preflight.outputs.version }}\n" \
+    "        run: bash .github/scripts/release/verify-archive.sh"
+SOURCE_DISCIPLINE_LINE = '          "$RUNNER_TEMP/feature-check/bin/python" .github/scripts/check-feature-discipline.py\n'
+INSTALL_RUN = 'run: bash "$GITHUB_WORKSPACE/wf/.github/scripts/release/verify-install.sh" "$TAG" "$EXPECTED_MAINNET_WRITE"'
+PROVENANCE_RUN = ('run: python3 .github/scripts/check-provenance.py "provenance/stellar-agent-$VERSION.intoto.jsonl" '
+                  'provenance/SHA256SUMS "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$GITHUB_REF"')
+PACKAGE_CHECK_RUN = ('run: bash "$GITHUB_WORKSPACE/wf/.github/scripts/check-packaged-markers.sh" target '
+                     'target/package-verification-start "$EXPECTED_MAINNET_WRITE"')
+VERIFY_PACKAGED_STEP = "      - name: Verify packaged binaries\n"
+ROSETTA_STEP = (
+    "      - name: Require Rosetta\n"
+    "        if: matrix.target == 'x86_64-apple-darwin'\n"
+    "        run: arch -x86_64 /usr/bin/true\n"
+)
+REHEARSAL_ARCHIVE_DOWNLOAD = "          name: rehearsal-${{ matrix.target }}\n          path: archives\n"
+REHEARSAL_PIN_STEP = (
+    "      # RUSTUP_TOOLCHAIN overrides the checkout's rust-toolchain.toml.\n"
+    "      - name: Pin the toolchain for every later step\n"
+    '        run: echo "RUSTUP_TOOLCHAIN=$RELEASE_TOOLCHAIN" >> "$GITHUB_ENV"\n'
+)
+RELEASE_WORKFLOW_ENV = 'env:\n  EXPECTED_MAINNET_WRITE: "off"\n'
+REHEARSAL_MARKER_RUN = ('        run: bash .github/scripts/check-packaged-markers.sh target '
+                        'target/package-verification-start "$EXPECTED_MAINNET_WRITE"\n')
+# The defining command of each feature job of ci.yml, as its run: line.
+CI_FEATURE_JOBS = {
+    "feature-on-clippy": 'cargo clippy --workspace --all-targets --features "mainnet-write,',
+    "feature-on-doc": 'cargo doc --workspace --no-deps --features "mainnet-write,',
+    "feature-on-test": "cargo check -p stellar-agent-network --features mainnet-write",
+    "feature-discipline": "cargo fetch --locked",
+    "release-shape": "bash .github/scripts/release/check-host.sh",
+}
+
+
+def archive_block(suffix):
+    """The archive check as a block scalar with suffix after the command."""
+    return "run: |\n          " + ARCHIVE_RUN[len("run: "):] + suffix
+
+
+def commented(run):
+    """A run: line as a block scalar whose command follows true and a
+    shell comment, so the command text stays and never runs."""
+    return "run: |\n          true # " + run[len("run: "):]
 
 
 PUBLISH_CALL = 'cargo publish -p "$name" --locked --no-verify 2>&1 | tee "$log"'
@@ -281,7 +327,7 @@ PASSING = [
     ("coverage job condition with surrounding whitespace passes", [
         (COVERAGE, COVERAGE_IF_LINE, COVERAGE_IF_SPACED_LINE, 1)]),
     ("rehearsal job that inherits the workflow permissions passes", [
-        (REHEARSAL, REHEARSAL_JOB_PERMISSIONS, "    strategy:\n", 1)]),
+        (REHEARSAL, REHEARSAL_JOB_PERMISSIONS, "    strategy:\n", 2)]),
     ("rehearsal workflow env with a date and a float passes", [
         (REHEARSAL, REHEARSAL_ENV,
          REHEARSAL_ENV + "  RELEASE_DATE: 2026-10-21\n  RATIO: 1.5\n", 1)]),
@@ -289,9 +335,11 @@ PASSING = [
         in_rehearsal_version_step("          echo \"${{ format('{0}}}', 'x') }}\"\n")]),
     ("rehearsal quoted expression opener without credentials passes", [
         in_rehearsal_version_step("          echo \"${{ format('}} ${{ github', 'x') }}\"\n")]),
-    ("release build line with other whitespace passes", [
-        (RELEASE, RELEASE_CARGO_BUILD,
-         "cargo  build --release --locked --target ${{matrix.target}}  --bin stellar-agent --bin stellar-agent-mcp", 1)]),
+    ("archive check after a here-string passes", [
+        (RELEASE, ARCHIVE_RUN, "run: |\n          cat <<< \"x\"\n          " + ARCHIVE_RUN[len("run: "):], 1)]),
+    ("heredoc in a step without the archive check passes", [
+        (RELEASE, VERIFY_PACKAGED_STEP, "      - name: Write notes\n        shell: bash\n        run: |\n"
+         "          cat <<'EOF'\n          notes\n          EOF\n" + VERIFY_PACKAGED_STEP, 1)]),
 ]
 
 # label, expected rule, a fragment that one line naming the rule must hold,
@@ -406,13 +454,13 @@ CASES = [
          "        id: subjects\n        env:\n          LEAK: ${{ secrets.APPLE_ASC_KEY_ID }}\n", 1)]),
     ("checkout that persists credentials", "checkout-credentials",
      'release.yml:preflight step 1: checkout-credentials: actions/checkout without persist-credentials: false', [
-        (RELEASE, "          persist-credentials: false\n", "          persist-credentials: true\n", 4)]),
+        (RELEASE, "          persist-credentials: false\n", "          persist-credentials: true\n", 7)]),
     ("checkout without the persist-credentials input", "checkout-credentials",
      'notarize-smoke.yml:build step 1: checkout-credentials: actions/checkout without persist-credentials: false', [
         (SMOKE, "        with:\n          persist-credentials: false\n", "", 2)]),
     ("input interpolated into a run block", "run-inputs",
      'publish.yml:verify step 10 (Build and package every crate): run-inputs: run: reads ${{ inputs.tag }}', [
-        (PUBLISH, "        run: cargo package --workspace --locked\n",
+        (PUBLISH, "          cargo package --workspace --locked\n",
          "        run: echo \"${{ inputs.tag }}\" && cargo package --workspace --locked\n", 1)]),
     ("job output interpolated into a credentialed run block", "cred-run-outputs",
      'release.yml:publish step 1 (Validate the release version): cred-run-outputs: run: reads ${{ needs.preflight.outputs.version }}', [
@@ -429,8 +477,8 @@ CASES = [
     ("job output passed to a reusable workflow outside the allowlist", "cred-with-needs",
      'release.yml:attest: cred-with-needs: passes ${{ needs.hashes.outputs.subjects }} to the reusable workflow input base64-subjects', [
         (RELEASE, "  provenance:\n    name: provenance\n", "  attest:\n    name: provenance\n", 1),
-        (RELEASE, "needs: [preflight, build, sign-macos, sign, hashes, provenance]",
-         "needs: [preflight, build, sign-macos, sign, hashes, attest]", 1)]),
+        (RELEASE, "needs: [preflight, build, sign-macos, sign, hashes, provenance, verify-provenance]",
+         "needs: [preflight, build, sign-macos, sign, hashes, attest, verify-provenance]", 1)]),
     ("another job output passed to the provenance generator", "cred-with-needs",
      "release.yml:provenance: cred-with-needs: passes ${{ needs.build.result == 'success' }} to the reusable workflow input compile-generator", [
         (RELEASE, "      upload-assets: false\n",
@@ -614,10 +662,10 @@ CASES = [
          'run: /bin/bash "$ACTION_DIR/archive.sh" "${{ inputs.version }}"\n', 1)]),
     ("publish checkout of an unqualified tag", "publish-tag-ref",
      "publish.yml:verify step 2: publish-tag-ref: checkout ref '${{ steps.tag.outputs.tag }}' is neither refs/tags/... nor github.workflow_sha", [
-        (PUBLISH, "ref: refs/tags/${{ steps.tag.outputs.tag }}", "ref: ${{ steps.tag.outputs.tag }}", 2)]),
+        (PUBLISH, "ref: refs/tags/${{ steps.tag.outputs.tag }}", "ref: ${{ steps.tag.outputs.tag }}", 3)]),
     ("publish checkout without a ref", "publish-tag-ref",
      "publish.yml:verify step 3: publish-tag-ref: checkout ref '' is neither refs/tags/... nor github.workflow_sha", [
-        (PUBLISH, "          ref: ${{ github.workflow_sha }}\n", "", 2)]),
+        (PUBLISH, "          ref: ${{ github.workflow_sha }}\n", "", 3)]),
     ("release preflight without the ancestry check", "ancestry-check",
      'release.yml:preflight: ancestry-check: no line runs check-ref-on-main.sh as its command', [
         (RELEASE, '      - name: Refuse a tag whose commit is not on main\n'
@@ -680,15 +728,15 @@ CASES = [
      '.github/workflows/notarize-smoke.yml: unreadable: ', [
         (SMOKE, "name: Notarization smoke\n", "name: [Notarization smoke\n", 1)]),
     ("coverage pull_request trigger with a paths filter", "coverage-trigger", "paths filter", [
-        (COVERAGE, "    branches: [main]\n" + COVERAGE_TYPES_LINE,
-         "    branches: [main]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1)]),
+        (COVERAGE, "    branches: [main, mainnet-write]\n" + COVERAGE_TYPES_LINE,
+         "    branches: [main, mainnet-write]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1)]),
     ("coverage pull_request trigger with a paths-ignore filter", "coverage-trigger", "paths-ignore filter", [
-        (COVERAGE, "    branches: [main]\n" + COVERAGE_TYPES_LINE,
-         "    branches: [main]\n    paths-ignore: ['**.md']\n" + COVERAGE_TYPES_LINE, 1)]),
+        (COVERAGE, "    branches: [main, mainnet-write]\n" + COVERAGE_TYPES_LINE,
+         "    branches: [main, mainnet-write]\n    paths-ignore: ['**.md']\n" + COVERAGE_TYPES_LINE, 1)]),
     ("coverage pull_request trigger without unlabeled", "coverage-trigger", "lack unlabeled", [
         (COVERAGE, "labeled, unlabeled]", "labeled]", 1)]),
     ("coverage workflow without a pull_request trigger", "coverage-trigger", "trigger is absent", [
-        (COVERAGE, "  pull_request:\n    branches: [main]\n" + COVERAGE_TYPES_LINE, "", 1)]),
+        (COVERAGE, "  pull_request:\n    branches: [main, mainnet-write]\n" + COVERAGE_TYPES_LINE, "", 1)]),
     ("coverage job without the label condition", "coverage-condition", "label condition", [
         (COVERAGE, COVERAGE_IF_LINE, "", 1)]),
     ("coverage job that always measures", "coverage-condition", "label condition", [
@@ -709,7 +757,7 @@ CASES = [
         (COVERAGE, COVERAGE_ON_BLOCK, "on: pull_request\n", 1)]),
     ("coverage pull_request trigger without a configuration", "coverage-trigger",
      "coverage.yml: coverage-trigger: pull_request types are absent", [
-        (COVERAGE, "  pull_request:\n    branches: [main]\n" + COVERAGE_TYPES_LINE, "  pull_request:\n", 1)]),
+        (COVERAGE, "  pull_request:\n    branches: [main, mainnet-write]\n" + COVERAGE_TYPES_LINE, "  pull_request:\n", 1)]),
     ("coverage pull_request types as a string", "coverage-trigger",
      "coverage.yml: coverage-trigger: pull_request types are absent", [
         (COVERAGE, COVERAGE_TYPES_LINE, "    types: labeled\n", 1)]),
@@ -728,13 +776,13 @@ CASES = [
     ("coverage paths filter and a missing condition", ("coverage-trigger", "coverage-condition"), (
         "coverage.yml: coverage-trigger: pull_request trigger has a paths filter",
         "coverage.yml: coverage-condition: coverage job runs without the label condition"), [
-        (COVERAGE, "    branches: [main]\n" + COVERAGE_TYPES_LINE,
-         "    branches: [main]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1),
+        (COVERAGE, "    branches: [main, mainnet-write]\n" + COVERAGE_TYPES_LINE,
+         "    branches: [main, mainnet-write]\n    paths: ['**.rs']\n" + COVERAGE_TYPES_LINE, 1),
         (COVERAGE, COVERAGE_IF_LINE, "", 1)]),
     ("rehearsal job with id-token: write", "rehearsal-credentials",
      "release-rehearsal.yml:build: rehearsal-credentials: the job holds id-token: write", [
         (REHEARSAL, REHEARSAL_JOB_PERMISSIONS,
-         "    permissions:\n      contents: read\n      id-token: write\n    strategy:\n", 1)]),
+         "    permissions:\n      contents: read\n      id-token: write\n    strategy:\n", 2)]),
     ("rehearsal job in an environment", "rehearsal-credentials",
      "release-rehearsal.yml:build: rehearsal-credentials: the job declares an environment", [
         (REHEARSAL, REHEARSAL_TIMEOUT, REHEARSAL_TIMEOUT + "    environment: rehearsal\n", 1)]),
@@ -745,7 +793,7 @@ CASES = [
      f"release-rehearsal.yml:build: rehearsal-credentials: effective permissions are actions: write, "
      f"contents: read, {REHEARSAL_EXACT}", [
         (REHEARSAL, REHEARSAL_JOB_PERMISSIONS,
-         "    permissions:\n      actions: write\n      contents: read\n    strategy:\n", 1)]),
+         "    permissions:\n      actions: write\n      contents: read\n    strategy:\n", 2)]),
     ("rehearsal workflow with contents: write", "rehearsal-credentials",
      f"release-rehearsal.yml: rehearsal-credentials: workflow permissions are contents: write, {REHEARSAL_EXACT}", [
         (REHEARSAL, "\npermissions:\n  contents: read\n\nenv:\n", "\npermissions:\n  contents: write\n\nenv:\n", 1)]),
@@ -769,7 +817,7 @@ CASES = [
     ("rehearsal job ID that reads the workflow token", "rehearsal-credentials",
      "release-rehearsal.yml:${{ github.token }}: rehearsal-credentials: "
      "an expression reads the workflow token: github.token", [
-        (REHEARSAL, "  build:\n", "  '${{ github.token }}':\n", 1)], 1),
+        (REHEARSAL, "  build:\n", "  '${{ github.token }}':\n", 1)], 4),
     ("rehearsal step env key with an unterminated expression", "rehearsal-credentials",
      "release-rehearsal.yml:build: rehearsal-credentials: unterminated expression", [
         (REHEARSAL, REHEARSAL_SODIUM_STEP,
@@ -830,49 +878,205 @@ CASES = [
      "release-rehearsal.yml:build: rehearsal-credentials: an expression reads the github context other than by a "
      "named property: toJSON(github)", [
         in_rehearsal_version_step('          echo "${{ toJSON(github) }}"\n')]),
-    ("build script line that drifts from the release build line", ("release-script-drift", "release-script-drift"), (
-        f".github/scripts/release/build.sh: release-script-drift: lacks the release build line: {SCRIPT_CARGO_BUILD}",
-        f".github/scripts/release/build.sh: release-script-drift: build line not in the release build job: "
-        f"{SCRIPT_CARGO_BUILD} --features extra"), [
-        (BUILD_SCRIPT, SCRIPT_CARGO_BUILD, SCRIPT_CARGO_BUILD + " --features extra", 1)]),
-    ("build script with a build line the release lacks", "release-script-drift",
-     f".github/scripts/release/build.sh: release-script-drift: build line not in the release build job: "
-     f"{SCRIPT_CARGO_BUILD} --all-targets", [
-        (BUILD_SCRIPT, SCRIPT_CARGO_BUILD + "\n",
-         SCRIPT_CARGO_BUILD + "\n  " + SCRIPT_CARGO_BUILD + " --all-targets\n", 1)]),
-    ("release build line that drifts from the build script", ("release-script-drift", "release-script-drift"), (
-        f".github/scripts/release/build.sh: release-script-drift: lacks the release build line: "
-        f"{SCRIPT_CROSS_BUILD} --verbose",
-        f".github/scripts/release/build.sh: release-script-drift: build line not in the release build job: "
-        f"{SCRIPT_CROSS_BUILD}"), [
-        (RELEASE, RELEASE_CROSS_BUILD, RELEASE_CROSS_BUILD + " --verbose", 1)]),
-    ("release build job without a build line", "release-script-drift",
-     "release.yml:build: release-script-drift: runs no cargo build or cross build line", [
-        (RELEASE, RELEASE_CROSS_BUILD, RELEASE_CROSS_BUILD.replace("cross build", "cross check"), 1),
-        (RELEASE, RELEASE_CARGO_BUILD, RELEASE_CARGO_BUILD.replace("cargo build", "cargo check"), 1)]),
-    ("Perl script that drifts from the release step", "release-script-drift",
-     f".github/scripts/release/windows-perl.ps1: release-script-drift: body line 2 is "
-     f"{PERL_INSTALL.replace(' --no-progress', '')!r}, the release step that writes OPENSSL_SRC_PERL has "
-     f"{PERL_INSTALL!r}", [
-        (PERL_SCRIPT, PERL_INSTALL, PERL_INSTALL.replace(" --no-progress", ""), 1)]),
-    ("release libsodium step that drifts from the script", "release-script-drift",
-     f".github/scripts/release/sodium.sh: release-script-drift: body line 7 is {SODIUM_CURL!r}, the release step "
-     f"that writes SODIUM_DIST_DIR has {SODIUM_CURL.replace('--retry 5', '--retry 3')!r}", [
-        (RELEASE, "--retry 5 --retry-all-errors", "--retry 3 --retry-all-errors", 1)]),
-    ("libsodium script with a line the release step lacks", "release-script-drift",
-     ".github/scripts/release/sodium.sh: release-script-drift: body line 11 is 'ls \"$DIST_DIR\"', the release step "
-     "that writes SODIUM_DIST_DIR has no line", [
-        (SODIUM_SCRIPT, 'echo "SODIUM_DIST_DIR=$DIST_DIR" >> "$GITHUB_ENV"\n',
-         'echo "SODIUM_DIST_DIR=$DIST_DIR" >> "$GITHUB_ENV"\nls "$DIST_DIR"\n', 1)]),
-    ("release build job without the libsodium step", "release-script-drift",
-     "release.yml:build: release-script-drift: 0 steps write SODIUM_DIST_DIR to GITHUB_ENV, expected one", [
-        (RELEASE, 'echo "SODIUM_DIST_DIR=$DIST_DIR" >> "$GITHUB_ENV"', 'echo "SODIUM_DIR=$DIST_DIR" >> "$GITHUB_ENV"', 1)]),
-    ("release build job with two libsodium writers", "release-script-drift",
-     "release.yml:build: release-script-drift: 2 steps write SODIUM_DIST_DIR to GITHUB_ENV, expected one", [
-        (RELEASE, '          echo "SODIUM_DIST_DIR=$DIST_DIR" >> "$GITHUB_ENV"\n',
-         '          echo "SODIUM_DIST_DIR=$DIST_DIR" >> "$GITHUB_ENV"\n'
-         '\n      - name: Set libsodium directory\n'
-         '        run: echo "SODIUM_DIST_DIR=$RUNNER_TEMP/sodium-dist" >> "$GITHUB_ENV"\n', 1)]),
+    ("shared build call removed", "release-shared-scripts", "expected one call", [
+        (RELEASE, 'run: bash .github/scripts/release/build.sh "$TARGET"', 'run: echo skipped', 1)]),
+    ("rehearsal shared build call removed", "release-shared-scripts",
+     "release-rehearsal.yml: release-shared-scripts: expected one call", [
+        (REHEARSAL, 'run: bash .github/scripts/release/build.sh "$TARGET"', 'run: echo skipped', 1)]),
+    ("guard moved before Perl", "release-guard-order", "build must immediately follow", [
+        (RELEASE, RELEASE_BUILD_STEP, "", 1),
+        (RELEASE, RELEASE_PERL_STEP, RELEASE_BUILD_STEP + RELEASE_PERL_STEP, 1)], 1),
+    ("build guard removed", "release-shared-scripts", "environment guard is not", [
+        (BUILD_SCRIPT, ' --env-guard', ' --help', 1)]),
+    ("packaged dependency removed", "release-packaged-gate", "hashes must need verify-packaged", [
+        (RELEASE, 'needs: [preflight, build, sign-macos, verify-packaged]', 'needs: [preflight, build, sign-macos]', 1)]),
+    ("verify-packaged without sign-macos", "release-packaged-gate", "verify-packaged must need sign-macos", [
+        (RELEASE, "    needs: [preflight, build, sign-macos]\n    runs-on: ${{ matrix.os }}\n",
+         "    needs: [preflight, build]\n    runs-on: ${{ matrix.os }}\n", 1)]),
+    ("archive check behind a comment", "release-packaged-gate",
+     "release.yml: release-packaged-gate: verify-packaged does not run the archive check unconditionally", [
+        (RELEASE, ARCHIVE_RUN, commented(ARCHIVE_RUN), 1)]),
+    ("archive check through a variable", "release-packaged-gate",
+     "verify-packaged does not run the archive check unconditionally", [
+        (RELEASE, ARCHIVE_RUN, ARCHIVE_RUN.replace(".github/scripts/release/verify-archive.sh", '"$ARCHIVE_CHECK"'), 1)]),
+    ("archive check replaced by a YAML boolean", "release-packaged-gate",
+     "verify-packaged does not run the archive check unconditionally", [
+        (RELEASE, ARCHIVE_RUN, "run: true", 1)]),
+    ("archive check inside a condition", "release-packaged-gate",
+     "verify-packaged does not run the archive check unconditionally", [
+        (RELEASE, ARCHIVE_RUN, 'run: |\n          if [ -n "$TARGET" ]; then\n            '
+         + ARCHIVE_RUN[len("run: "):] + "\n          fi", 1)]),
+    ("archive check after an exit", "release-packaged-gate",
+     "verify-packaged does not run the archive check unconditionally", [
+        (RELEASE, ARCHIVE_RUN, "run: |\n          exit 0\n          " + ARCHIVE_RUN[len("run: "):], 1)]),
+    ("archive check after errexit is off", "release-packaged-gate",
+     "verify-packaged does not run the archive check unconditionally", [
+        (RELEASE, ARCHIVE_RUN, "run: |\n          set +e\n          " + ARCHIVE_RUN[len("run: "):], 1)]),
+    ("archive check under a shell without errexit", "release-packaged-gate",
+     "verify-packaged does not run the archive check unconditionally", [
+        (RELEASE, "      - name: Verify packaged binaries\n        shell: bash\n",
+         "      - name: Verify packaged binaries\n        shell: bash {0}\n", 1)]),
+    ("archive check ignored with echo", "release-packaged-gate",
+     "verify-packaged does not run the archive check unconditionally", [
+        (RELEASE, ARCHIVE_RUN, archive_block(" || echo skipped"), 1)]),
+    ("archive check ignored with a colon", "release-check-unconditional", "verify-packaged suppresses failures", [
+        (RELEASE, ARCHIVE_RUN, archive_block(" || :"), 1)]),
+    ("archive check ignored with true", "release-check-unconditional", "verify-packaged suppresses failures", [
+        (RELEASE, ARCHIVE_RUN, archive_block(" || true"), 1)]),
+    ("archive check ignored with exit 0", "release-check-unconditional", "verify-packaged suppresses failures", [
+        (RELEASE, ARCHIVE_RUN, archive_block(" || exit 0"), 1)]),
+    ("provenance dependency removed", "release-provenance-gate", "publish must need verify-provenance", [
+        (RELEASE, 'needs: [preflight, build, sign-macos, sign, hashes, provenance, verify-provenance]',
+         'needs: [preflight, build, sign-macos, sign, hashes, provenance]', 1)]),
+    ("verify-provenance without provenance", "release-provenance-gate", "verify-provenance must need provenance", [
+        (RELEASE, "needs: [preflight, provenance, hashes]", "needs: [preflight, hashes]", 1)]),
+    ("provenance check behind a comment", "release-provenance-gate",
+     "verify-provenance does not run unconditionally: python3 .github/scripts/check-provenance.py", [
+        (RELEASE, PROVENANCE_RUN, commented(PROVENANCE_RUN), 1)]),
+    ("provenance check with swapped arguments", "release-provenance-gate",
+     "verify-provenance does not run unconditionally: python3 .github/scripts/check-provenance.py", [
+        (RELEASE, '"$GITHUB_SHA" "$GITHUB_REPOSITORY"', '"$GITHUB_REPOSITORY" "$GITHUB_SHA"', 1)]),
+    ("source discipline behind a comment", "release-provenance-gate",
+     "verify-provenance does not run unconditionally: \"$RUNNER_TEMP/feature-check/bin/python\" "
+     ".github/scripts/check-feature-discipline.py", [
+        (RELEASE, SOURCE_DISCIPLINE_LINE, "          # " + SOURCE_DISCIPLINE_LINE.lstrip(), 1)]),
+    ("dry check removed", "publish-dry-gate", "packaged marker check must immediately follow", [
+        (PUBLISH, 'check-packaged-markers.sh', 'unused-markers.sh', 1)]),
+    ("dry check behind a comment", "publish-dry-gate", "packaged marker check must immediately follow", [
+        (PUBLISH, PACKAGE_CHECK_RUN, commented(PACKAGE_CHECK_RUN), 1)]),
+    ("package verification without the timestamp", "publish-dry-gate", "package verification lacks the freshness timestamp", [
+        (PUBLISH, "          touch target/package-verification-start\n", "", 1)]),
+    ("install check without publish", "publish-install-gate", "verify-install must need publish", [
+        (PUBLISH, "    needs: publish\n    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n", 1)]),
+    ("install check removed", "publish-install-gate", "verify-install does not run the install check unconditionally", [
+        (PUBLISH, INSTALL_RUN, commented(INSTALL_RUN), 1)]),
+    ("install check from the tag's tree", "publish-install-gate",
+     "verify-install does not run the install check unconditionally", [
+        (PUBLISH, INSTALL_RUN, INSTALL_RUN.replace('"$GITHUB_WORKSPACE/wf/', "src/").replace('verify-install.sh"', "verify-install.sh"), 1)]),
+    ("R2 continue on error", "release-check-unconditional", "verify-packaged can be bypassed", [
+        (RELEASE, '    name: verify-packaged ${{ matrix.target }}',
+         '    continue-on-error: true\n    name: verify-packaged ${{ matrix.target }}', 1)]),
+    ("conditional hashes", "release-check-unconditional", "hashes can be bypassed", [
+        (RELEASE, '    name: hashes\n', '    name: hashes\n    if: false\n', 1)]),
+    ("conditional verify-provenance step", "release-check-unconditional", "verify-provenance step can be bypassed", [
+        (RELEASE, "      - name: Fetch the locked graph\n", "      - name: Fetch the locked graph\n        if: false\n", 1)]),
+    ("verify step that continues on error", "release-check-unconditional", "verify step can be bypassed", [
+        (PUBLISH, "      - name: Verify packaged feature state\n",
+         "      - name: Verify packaged feature state\n        continue-on-error: true\n", 1)]),
+    ("verification job with contents: write", "verification-credentials",
+     "release.yml:verify-provenance: verification-credentials: must be uncredentialed with contents: read", [
+        (RELEASE, "    timeout-minutes: 20\n    permissions:\n      contents: read\n",
+         "    timeout-minutes: 20\n    permissions:\n      contents: write\n", 1)]),
+    ("workflow token on verify-packaged", "verification-credentials",
+     "release.yml:verify-packaged: verification-credentials: an expression reads the workflow token: github.token", [
+        (RELEASE, ARCHIVE_ENV, ARCHIVE_ENV.replace("        run:", "          GH_TOKEN: ${{ github.token }}\n        run:"), 1)]),
+    ("token variable on verify-install", "verification-credentials",
+     "publish.yml:verify-install: verification-credentials: sets GITHUB_TOKEN", [
+        (PUBLISH, "      - name: Verify registry installs\n        env:\n",
+         "      - name: Verify registry installs\n        env:\n          GITHUB_TOKEN: unused\n", 1)]),
+    ("verify-packaged matrix without a target", "release-verify-matrix",
+     "release.yml: release-verify-matrix: verify-packaged does not run each release target on its runner", [
+        (RELEASE, "          - target: aarch64-unknown-linux-gnu\n            os: ubuntu-24.04-arm\n", "", 1)]),
+    ("rehearsal verify-packaged on another runner", "release-verify-matrix",
+     "release-rehearsal.yml: release-verify-matrix: verify-packaged does not run each release target on its runner", [
+        (REHEARSAL, "            os: ubuntu-24.04-arm\n", "            os: ubuntu-24.04\n", 1)]),
+    ("rehearsal Rosetta step moved", "release-verify-matrix",
+     "release-rehearsal.yml: release-verify-matrix: the first verify-packaged step is not the Rosetta check", [
+        (REHEARSAL, ROSETTA_STEP, "", 1),
+        (REHEARSAL, REHEARSAL_ARCHIVE_DOWNLOAD, REHEARSAL_ARCHIVE_DOWNLOAD + ROSETTA_STEP, 1)], 1),
+    ("rehearsal toolchain differs", "release-toolchain", "RELEASE_TOOLCHAIN differs from publish.yml", [
+        (REHEARSAL, '  RELEASE_TOOLCHAIN: "1.99.0"\n', '  RELEASE_TOOLCHAIN: "1.98.0"\n', 1)]),
+    ("rehearsal crates on stable", "release-toolchain", "verify-crates does not package with RELEASE_TOOLCHAIN", [
+        (REHEARSAL, "          toolchain: ${{ env.RELEASE_TOOLCHAIN }}\n", "          toolchain: stable\n", 1)]),
+    ("rehearsal crates without the toolchain pin", "release-toolchain", "it does not pin RUSTUP_TOOLCHAIN", [
+        (REHEARSAL, REHEARSAL_PIN_STEP, "", 1)], 1),
+    ("rehearsal toolchain pinned after packaging", "release-toolchain",
+     "RUSTUP_TOOLCHAIN is not pinned between the install and the packaging", [
+        (REHEARSAL, REHEARSAL_PIN_STEP, "", 1),
+        (REHEARSAL, REHEARSAL_MARKER_RUN, REHEARSAL_MARKER_RUN + REHEARSAL_PIN_STEP, 1)], 1),
+    ("archive check inside a heredoc", "release-packaged-gate",
+     "release.yml:verify-packaged step 4: release-packaged-gate: unmodelled shell syntax around "
+     + ARCHIVE_RUN[len("run: "):] + ": logical line 1: cat <<'EOF'", [
+        (RELEASE, ARCHIVE_RUN, "run: |\n          cat <<'EOF'\n          " + ARCHIVE_RUN[len("run: "):]
+         + "\n          EOF", 1)]),
+    ("archive check after an indented heredoc delimiter", "release-packaged-gate",
+     "release.yml:verify-packaged step 4: release-packaged-gate: unmodelled shell syntax around "
+     + ARCHIVE_RUN[len("run: "):] + ": logical line 1: cat <<'EOF'", [
+        (RELEASE, ARCHIVE_RUN, "run: |\n          cat <<'EOF'\n            EOF\n          "
+         + ARCHIVE_RUN[len("run: "):] + "\n          EOF", 1)]),
+    ("archive check after a partly quoted heredoc delimiter", "release-packaged-gate",
+     "release.yml:verify-packaged step 4: release-packaged-gate: unmodelled shell syntax around "
+     + ARCHIVE_RUN[len("run: "):] + ": logical line 1: cat <<E\"OF\"", [
+        (RELEASE, ARCHIVE_RUN, "run: |\n          cat <<E\"OF\"\n          E\n          "
+         + ARCHIVE_RUN[len("run: "):] + "\n          EOF", 1)]),
+    ("archive check in a suppressed subshell", "release-packaged-gate",
+     "release.yml:verify-packaged step 4: release-packaged-gate: unmodelled shell syntax around", [
+        (RELEASE, ARCHIVE_RUN, "run: |\n          (\n            " + ARCHIVE_RUN[len("run: "):]
+         + "\n          ) || echo ignored", 1)]),
+    ("archive check as the second heredoc body", "release-packaged-gate",
+     "release.yml:verify-packaged step 4: release-packaged-gate: unmodelled shell syntax around "
+     + ARCHIVE_RUN[len("run: "):] + ": logical line 1: cat <<'A' <<'B'", [
+        (RELEASE, ARCHIVE_RUN, "run: |\n          cat <<'A' <<'B'\n          first\n          A\n          "
+         + ARCHIVE_RUN[len("run: "):] + "\n          B", 1)]),
+    ("archive check continued in a suppressed subshell", "release-packaged-gate",
+     "release.yml:verify-packaged step 4: release-packaged-gate: unmodelled shell syntax around "
+     + ARCHIVE_RUN[len("run: "):] + ": logical line 2: ( " + ARCHIVE_RUN[len("run: "):] + " ) || echo ignored", [
+        (RELEASE, ARCHIVE_RUN, archive_block(" ) || echo ignored").replace(
+            "run: |\n          ", "run: |\n          echo checking \\\n            archives\n          ( ")
+         .replace(" archives \"", " archives \\\n            \""), 1)]),
+    ("archive check after a conditional line", "release-packaged-gate",
+     "release.yml:verify-packaged step 4: release-packaged-gate: unmodelled shell syntax around "
+     + ARCHIVE_RUN[len("run: "):] + ": logical line 1: false &&", [
+        (RELEASE, ARCHIVE_RUN, "run: |\n          false &&\n          " + ARCHIVE_RUN[len("run: "):], 1)]),
+    ("archive check in a one-line subshell", "release-packaged-gate",
+     "release.yml:verify-packaged step 4: release-packaged-gate: unmodelled shell syntax around", [
+        (RELEASE, ARCHIVE_RUN, archive_block(" ) || echo ignored").replace("run: |\n          ", "run: |\n          ( "), 1)]),
+    ("archive check inside an unbalanced quote", "release-packaged-gate",
+     "release.yml:verify-packaged step 4: release-packaged-gate: unmodelled shell syntax around", [
+        (RELEASE, ARCHIVE_RUN, 'run: |\n          echo "\n          ' + ARCHIVE_RUN[len("run: "):] + '\n          "', 1)]),
+    ("verify-packaged on a fixed runner", "release-verify-matrix",
+     "release.yml: release-verify-matrix: verify-packaged does not run on the runner of its matrix leg", [
+        (RELEASE, "    runs-on: ${{ matrix.os }}\n    timeout-minutes: 15\n",
+         "    runs-on: ubuntu-24.04\n    timeout-minutes: 15\n", 1)], 1),
+    ("rehearsal archive check with a fixed target", "release-verify-matrix",
+     "release-rehearsal.yml: release-verify-matrix: the archive check does not read TARGET from the matrix leg", [
+        (REHEARSAL, "          TARGET: ${{ matrix.target }}\n          VERSION: ${{ needs.build.outputs.version }}\n",
+         "          TARGET: x86_64-unknown-linux-gnu\n          VERSION: ${{ needs.build.outputs.version }}\n", 1)], 1),
+    ("workflow token variable for the verification jobs", "verification-credentials",
+     "release.yml:verify-packaged: verification-credentials: sets GH_TOKEN", [
+        (RELEASE, RELEASE_WORKFLOW_ENV, RELEASE_WORKFLOW_ENV + "  GH_TOKEN: unused\n", 1)]),
+    ("workflow env expression for the verification jobs", "verification-credentials",
+     "release.yml:verify-packaged: verification-credentials: an expression reads the workflow token: github.token", [
+        (RELEASE, RELEASE_WORKFLOW_ENV, RELEASE_WORKFLOW_ENV + "  LEAK: ${{ github.token }}\n", 1)]),
+    ("workflow defaults expression for the verification jobs", "verification-credentials",
+     "release.yml:verify-packaged: verification-credentials: an expression reads the workflow token: github.token", [
+        (RELEASE, RELEASE_WORKFLOW_ENV,
+         RELEASE_WORKFLOW_ENV + "defaults:\n  run:\n    working-directory: ${{ github.token }}\n", 1)]),
+] + [
+    (f"conditional {job}", "ci-feature-jobs", f"ci.yml: ci-feature-jobs: {job} can be bypassed", [
+        (CI, f"  {job}:\n    name: {job}\n", f"  {job}:\n    name: {job}\n    if: false\n", 1)])
+    for job in CI_FEATURE_JOBS
+] + [
+    (f"{job} step that continues on error", "ci-feature-jobs", f"ci.yml: ci-feature-jobs: {job} step can be bypassed", [
+        (CI, f"        run: {command}", f"        continue-on-error: true\n        run: {command}", 1)])
+    for job, command in CI_FEATURE_JOBS.items()
+] + [
+    ("release-shape that continues on error", "ci-feature-jobs", "ci.yml: ci-feature-jobs: release-shape can be bypassed", [
+        (CI, "  release-shape:\n    name: release-shape\n",
+         "  release-shape:\n    name: release-shape\n    continue-on-error: true\n", 1)]),
+    ("conditional network forwarding check", "ci-feature-jobs", "feature-on-test step can be bypassed", [
+        (CI, "        run: cargo check -p stellar-agent-network", "        if: false\n        run: cargo check -p stellar-agent-network", 1)]),
+    ("feature-on clippy without mainnet-write", "ci-feature-jobs",
+     "ci.yml: ci-feature-jobs: feature-on-clippy does not run unconditionally", [
+        (CI, '--features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings',
+         '--features "$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings', 1)]),
+    ("host recipe with a marker check in a subshell", "ci-feature-jobs",
+     ".github/scripts/release/check-host.sh: ci-feature-jobs: unmodelled shell syntax around", [
+        (HOST_SCRIPT, 'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" off\n',
+         '( bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" off ) || true\n', 1)]),
+    ("host recipe without the MCP marker check", "ci-feature-jobs",
+     ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally", [
+        (HOST_SCRIPT, 'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" off\n', "", 1)]),
 ]
 
 
@@ -951,6 +1155,14 @@ def case_problems(output, case):
 
 
 def main():
+    selected = None
+    if len(sys.argv) == 3 and sys.argv[1] == '--case':
+        selected = sys.argv[2]
+        if selected not in [case[0] for case in CASES] + [label for label, _ in PASSING]:
+            print('unknown case', file=sys.stderr)
+            return 2
+    elif len(sys.argv) != 1:
+        return 2
     failures = []
     for label, output, exact_count, expected in COUNT_CASES:
         problem = violation_count_problem(output, exact_count)
@@ -978,6 +1190,8 @@ def main():
             print("ok   unmodified tree passes")
 
         for index, (label, edits) in enumerate(PASSING):
+            if selected and selected != label:
+                continue
             root = pathlib.Path(tmp) / f"passing{index}"
             copy_tree(root)
             problems = apply_edits(root, edits)
@@ -993,6 +1207,8 @@ def main():
 
         for index, case in enumerate(CASES):
             label, edits = case[0], case[3]
+            if selected and selected != label:
+                continue
             root = pathlib.Path(tmp) / f"case{index}"
             copy_tree(root)
             problems = apply_edits(root, edits)

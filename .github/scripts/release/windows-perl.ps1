@@ -2,12 +2,12 @@
 # OpenSSL's perl-based Configure, which needs a Perl with its full module set,
 # and the MSYS perl that Git for Windows puts on PATH lacks it. openssl-src
 # honors OPENSSL_SRC_PERL, so this script writes the path of Strawberry Perl
-# to $env:GITHUB_ENV. The runner image carries Strawberry Perl; the script
-# installs it when an image does not.
+# to the step's environment file. The runner image carries Strawberry Perl;
+# the script installs it when an image does not.
 #
-# check-workflow-invariants.py requires the body below to equal, line for
-# line, the run block of the release build job's step that writes
-# OPENSSL_SRC_PERL.
+# The build jobs of release.yml and release-rehearsal.yml run this script by
+# path, once each, and check-workflow-invariants.py requires their build step
+# to follow the Perl and sodium setup steps immediately.
 if (-not (Test-Path 'C:\Strawberry\perl\bin\perl.exe')) {
   choco install strawberryperl --no-progress -y
 }

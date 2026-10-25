@@ -14,9 +14,10 @@ only by the ``testnet-acceptance`` / ``testnet-integration`` suites, which do no
 run in this offline gate; those crates carry an explicit lower floor. A crate
 not listed here must clear ``DEFAULT_FLOOR``.
 
-Usage: ``check-coverage.py <cov.json>``
+Usage: ``check-coverage.py <cov.json> --configuration feature-off|feature-on``
 """
 
+import argparse
 import collections
 import json
 import pathlib
@@ -24,7 +25,7 @@ import re
 import sys
 
 # Minimum line-coverage percent per crate for the offline suite.
-FLOORS = {
+OFF_FLOORS = {
     "stellar-agent-anchor": 93,
     "stellar-agent-headless-keyring": 84,
     "stellar-agent-approval-remote": 83,
@@ -63,6 +64,8 @@ FLOORS = {
     "stellar-agent-xdr-limits": 97,
 }
 
+FLOORS = {"feature-off": OFF_FLOORS.copy(), "feature-on": OFF_FLOORS.copy()}
+
 # A crate with no explicit entry must clear this floor. New crates that are
 # legitimately testnet-covered below this bar must add an explicit entry above.
 DEFAULT_FLOOR = 85
@@ -79,7 +82,8 @@ def crate_of(filename: str) -> str | None:
     return match.group(1) if match else None
 
 
-def main(path: str) -> int:
+def main(path: str, configuration: str) -> int:
+    floors = FLOORS[configuration]
     document = json.loads(pathlib.Path(path).read_text())
     # covered, total
     per_crate: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0])
@@ -105,8 +109,8 @@ def main(path: str) -> int:
         total_covered += covered
         total_lines += count
         pct = 100.0 * covered / count if count else 100.0
-        floor = FLOORS.get(crate, DEFAULT_FLOOR)
-        if crate not in FLOORS:
+        floor = floors.get(crate, DEFAULT_FLOOR)
+        if crate not in floors:
             unlisted.append(crate)
         # 0.05 tolerance guards against float-formatting boundary noise.
         ok = pct >= floor - 0.05
@@ -133,7 +137,8 @@ def main(path: str) -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("usage: check-coverage.py <cov.json>", file=sys.stderr)
-        sys.exit(2)
-    sys.exit(main(sys.argv[1]))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("path")
+    parser.add_argument("--configuration", required=True, choices=tuple(FLOORS))
+    args = parser.parse_args()
+    sys.exit(main(args.path, args.configuration))
