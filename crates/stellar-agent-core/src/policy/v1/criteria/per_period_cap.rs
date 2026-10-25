@@ -58,6 +58,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::policy::v1::EvalContext;
+use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::v1::criteria::Criterion;
 use crate::policy::v1::criteria::state_store::{StateKey, WindowEntry, WindowLimit};
@@ -273,7 +274,7 @@ impl Criterion for PerPeriodCapCriterion {
                             "per_period_cap: debit leg of tool '{tool_name}' carries no asset"
                         ),
                     })?;
-            if asset_normalise(leg_asset) != criterion_asset {
+            if !assets_equivalent(leg_asset, &criterion_asset, &ctx.profile.network_passphrase) {
                 continue;
             }
             let amount = leg
@@ -304,8 +305,10 @@ impl Criterion for PerPeriodCapCriterion {
     /// call.
     ///
     /// Only accumulates for `InnerOpDescriptor::TokenTransfer` inners whose
-    /// asset matches `self.asset` (after normalisation).  `Generic` inners and
-    /// asset-mismatched inners contribute 0.
+    /// asset is equivalent to `self.asset` under the profile's network
+    /// passphrase: a native alias, the same pinned identity, or the Stellar
+    /// Asset Contract of either.  `Generic` inners and inners of another
+    /// asset contribute 0.
     ///
     /// The amount is accumulated as `i128` (no clamp): both the overlay and
     /// the on-chain token quantity it accounts for are `i128`.
@@ -322,7 +325,11 @@ impl Criterion for PerPeriodCapCriterion {
 
         let criterion_asset = asset_normalise(&self.asset);
         let inner_asset = asset_normalise(asset);
-        if criterion_asset != inner_asset {
+        if !assets_equivalent(
+            &inner_asset,
+            &criterion_asset,
+            &ctx.profile.network_passphrase,
+        ) {
             // Asset mismatch: this inner does not count toward this criterion.
             return;
         }
@@ -351,7 +358,7 @@ impl Criterion for PerPeriodCapCriterion {
             let Some(leg_asset) = leg.asset.as_deref() else {
                 continue;
             };
-            if asset_normalise(leg_asset) != criterion_asset {
+            if !assets_equivalent(leg_asset, &criterion_asset, &ctx.profile.network_passphrase) {
                 continue;
             }
             let Some(amount) = leg.amount else {

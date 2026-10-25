@@ -71,7 +71,6 @@ use rmcp::{
     tool_handler,
 };
 use serde_json::json;
-use stellar_agent_core::policy::v1::{PolicyEngineV1, PolicyStateStore};
 // `OWNER_KEY_SERVICE_PREFIX` is owned by `stellar-agent-core` beside
 // `KeyringEntryRef::default_owner_key`, the only writer of the coordinate this
 // module strips it from. Importing it keeps the strip and the construction on
@@ -79,14 +78,13 @@ use stellar_agent_core::policy::v1::{PolicyEngineV1, PolicyStateStore};
 use stellar_agent_core::profile::name::OWNER_KEY_SERVICE_PREFIX;
 use stellar_agent_core::{
     audit_log::BindingCheck,
-    policy::{BuildRegistryError, NoopPolicyEngine, PolicyEngine, ToolDescriptor},
+    policy::{BuildRegistryError, PolicyEngine, ToolDescriptor},
     profile::loader,
-    profile::schema::{KeyringEntryRef, PolicyEngineKind, Profile, default_policy_dir},
+    profile::schema::{KeyringEntryRef, PolicyEngineKind, Profile},
     timefmt::{Clock, default_clock},
 };
 use stellar_agent_network::counterparty::cache::DEFAULT_TTL;
 use stellar_agent_network::keyring::{KeyringOperation, map_keyring_operation_error};
-use stellar_agent_network::policy_state::PersistedWindowStore;
 use stellar_agent_network::{CounterpartyResolver, NoopCounterpartyResolver, StellarTomlResolver};
 use stellar_agent_nonce::{NonceMint, ReplayWindow};
 use tokio::sync::Mutex as TokioMutex;
@@ -468,7 +466,7 @@ fn build_counterparty_resolver(profile: &Profile) -> Arc<dyn CounterpartyResolve
 ///
 /// Dispatches on `profile.policy.engine`:
 ///
-/// - [`PolicyEngineKind::Noop`] → [`NoopPolicyEngine`].
+/// - [`PolicyEngineKind::Noop`] → [`stellar_agent_core::policy::NoopPolicyEngine`].
 /// - [`PolicyEngineKind::V1`] → derives the profile name from the owner-key
 ///   service entry (stripping [`OWNER_KEY_SERVICE_PREFIX`]), fetches the
 ///   owner public key from the keyring, and loads the owner-signed policy
@@ -477,89 +475,84 @@ fn build_counterparty_resolver(profile: &Profile) -> Arc<dyn CounterpartyResolve
 /// - Unknown variants → [`BuildRegistryError::UnsupportedEngineKind`]
 ///   (fail-closed).
 ///
+/// `selection` is the startup's name source and profile directory; `None`
+/// builds without installation verification and resolves no profile
+/// directory. The derived name serves as the selected name, the policy file
+/// stem, and the window-state store name.
+///
 /// # Errors
 ///
-/// - [`BuildRegistryError::PolicyEngineError`] — profile name cannot be
-///   derived from `policy_owner_key_id.service`.
-/// - [`BuildRegistryError::OwnerKeyringEntryUnreadable`] — keyring entry
+/// - [`BuildRegistryError::PolicyEngineError`]: profile name cannot be
+///   derived from `policy_owner_key_id.service`, the window state does not
+///   load, or the installation binding fails.
+/// - [`BuildRegistryError::OwnerKeyringEntryUnreadable`]: keyring entry
 ///   could not be opened.
-/// - [`BuildRegistryError::OwnerKeyAbsent`] — owner key not in keyring.
-/// - [`BuildRegistryError::OwnerKeyDecodeFailed`] — stored value is not
+/// - [`BuildRegistryError::OwnerKeyAbsent`]: owner key not in keyring.
+/// - [`BuildRegistryError::OwnerKeyDecodeFailed`]: stored value is not
 ///   valid base64.
-/// - [`BuildRegistryError::OwnerKeyLengthMismatch`] — decoded key is not
+/// - [`BuildRegistryError::OwnerKeyLengthMismatch`]: decoded key is not
 ///   32 bytes.
-/// - [`BuildRegistryError::PolicyDirResolutionFailed`] — OS state directory
+/// - [`BuildRegistryError::PolicyDirResolutionFailed`]: OS state directory
 ///   could not be determined.
-/// - [`BuildRegistryError::PolicyFileLoadFailed`] — policy file I/O or
-///   signature verification failed.
-/// - [`BuildRegistryError::UnsupportedEngineKind`] — unknown
-///   `PolicyEngineKind` variant.
+/// - [`BuildRegistryError::PolicyFileLoadFailed`]: policy file I/O,
+///   signature verification, the minimum mainnet policy, or the pin
+///   comparison failed.
+/// - [`BuildRegistryError::UnsupportedEngineKind`]: the profile names an
+///   unknown `PolicyEngineKind` variant.
 fn build_policy_engine(
     profile: &Profile,
     policy_dir_override: Option<&Path>,
+    selection: Option<(stellar_agent_core::profile::name::ProfileNameSource, &Path)>,
 ) -> Result<Arc<dyn PolicyEngine>, BuildRegistryError> {
-    match profile.policy.engine {
-        PolicyEngineKind::Noop => Ok(Arc::new(NoopPolicyEngine)),
-        PolicyEngineKind::V1 => {
-            // Derive the profile name from the service prefix, not from
-            // `account` which is always the literal "default".
-            let profile_name = profile_name_from_key_ref(profile)?;
-
-            // Fetch the owner public key from the keyring.  This validates
-            // that the operator has initialised the owner key before enabling V1.
-            let owner_pubkey = fetch_owner_pubkey_from_keyring(&profile_name)?;
-
-            let policy_dir = policy_dir_override.map_or_else(
-                || default_policy_dir().map_err(|_| BuildRegistryError::PolicyDirResolutionFailed),
-                |dir| Ok(dir.to_path_buf()),
-            )?;
-            let policy_path = policy_dir.join(format!("{profile_name}.toml"));
-
-            let document = stellar_agent_core::policy::v1::loader::load_signed_policy(
-                &policy_path,
-                &profile_name,
-                &owner_pubkey,
-            )
-            .map_err(|source| BuildRegistryError::PolicyFileLoadFailed {
-                profile: profile_name.clone(),
-                source,
-            })?;
-
-            crate::policy_advisory::warn_if_transaction_status_unmatched(&document, &profile_name);
-
-            // Hydrate the persisted window-state store BEFORE constructing the
-            // engine — see `stellar-agent-cli`'s `build_v1_policy_engine` for
-            // the identical rationale. Fail-closed on a tampered/unparseable
-            // store file: the server MUST NOT start with an unhydrated engine,
-            // which would silently under-count accumulated `per_period_cap` /
-            // `rate_limit` / `bundle_per_period_cap` / `bundle_rate_limit`
-            // history.
-            let state_store = PolicyStateStore::new();
-            let window_store = PersistedWindowStore::for_profile(&profile_name);
-            window_store
-                .load_into(&profile_name, profile, &state_store)
-                .map_err(|e| BuildRegistryError::PolicyEngineError {
-                    detail: format!(
-                        "policy-window-state store for profile '{profile_name}' failed to \
-                         load ({e}); run `stellar-agent profile reset-window-state \
-                         {profile_name} --reason <reason>` to recover"
-                    ),
-                })?;
-
-            Ok(Arc::new(PolicyEngineV1::new_with_store(
-                document,
-                profile_name,
-                state_store,
-            )))
-        }
-        // Fail-closed: unknown PolicyEngineKind variants are NOT silently
-        // downgraded to NoopPolicyEngine.  A silent downgrade would allow a
-        // malformed or future-version profile to bypass the operator's intended
-        // policy engine without any error.
-        _ => Err(BuildRegistryError::UnsupportedEngineKind {
-            kind: format!("{:?}", profile.policy.engine),
+    use stellar_agent_core::policy::v1::verified::OwnerKeySource;
+    use stellar_agent_network::policy_engine::{
+        PolicyEngineBuildError, ProfileSelection, build_policy_engine as build_engine,
+    };
+    let (name, owner, policy_dir) = if profile.policy.engine == PolicyEngineKind::V1 {
+        let name = profile_name_from_key_ref(profile)?;
+        let owner = fetch_owner_pubkey_from_keyring(&name)?;
+        let policy_dir = match policy_dir_override {
+            Some(dir) => dir.to_path_buf(),
+            None => stellar_agent_core::profile::schema::default_policy_dir()
+                .map_err(|_| BuildRegistryError::PolicyDirResolutionFailed)?,
+        };
+        (name, owner, Some(policy_dir))
+    } else {
+        (String::new(), [0; 32], None)
+    };
+    let built = build_engine(
+        profile,
+        selection.map(|(source, profile_dir)| ProfileSelection {
+            name: &name,
+            source,
+            profile_dir,
         }),
+        &name,
+        policy_dir.as_deref(),
+        owner,
+        OwnerKeySource::Keyring,
+    )
+    .map_err(|error| match error {
+        PolicyEngineBuildError::Policy(source) => BuildRegistryError::PolicyFileLoadFailed {
+            profile: name.clone(),
+            source,
+        },
+        PolicyEngineBuildError::UnsupportedEngineKind { kind } => {
+            BuildRegistryError::UnsupportedEngineKind {
+                kind: format!("{kind:?}"),
+            }
+        }
+        other => BuildRegistryError::PolicyEngineError {
+            detail: other.to_string(),
+        },
+    })?;
+    if let Some(verified) = &built.verified {
+        stellar_agent_core::policy::advisory::warn_if_transaction_status_unmatched(
+            &verified.engine(),
+            &name,
+        );
     }
+    Ok(built.engine)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -704,8 +697,10 @@ impl WalletServer {
     /// load to mint/verify time) and an empty `ReplayWindow`.
     ///
     /// The policy engine is selected by `build_policy_engine` per
-    /// `profile.policy.engine`: `Noop` → [`NoopPolicyEngine`]; `V1` →
-    /// [`PolicyEngineV1`] loaded from the OS-conventional policy directory.
+    /// `profile.policy.engine`: `Noop` →
+    /// [`stellar_agent_core::policy::NoopPolicyEngine`]; `V1` →
+    /// [`stellar_agent_core::policy::v1::PolicyEngineV1`] loaded from the
+    /// OS-conventional policy directory, without installation verification.
     /// Newly-minted profiles default to `V1`.
     ///
     /// `init_platform_keyring_store` MUST be called before `WalletServer::new`
@@ -727,6 +722,23 @@ impl WalletServer {
     /// Never panics.
     pub fn new(profile: Profile) -> Result<Self, BuildRegistryError> {
         Self::new_with_clock(profile, default_clock())
+    }
+
+    /// Constructs the server for the startup's profile selection: `source` is
+    /// how the profile name was selected and `profile_dir` holds the profile
+    /// file. In a `mainnet-write` build, the policy engine runs installation
+    /// verification for a mainnet profile with a verified mainnet body.
+    ///
+    /// # Errors
+    /// Returns the errors of [`WalletServer::new`], and
+    /// [`BuildRegistryError::PolicyEngineError`] when the installation binding
+    /// fails.
+    pub fn new_with_selection(
+        profile: Profile,
+        source: stellar_agent_core::profile::name::ProfileNameSource,
+        profile_dir: &Path,
+    ) -> Result<Self, BuildRegistryError> {
+        Self::new_with_selection_inner(profile, default_clock(), None, Some((source, profile_dir)))
     }
 
     /// Constructs a [`WalletServer`] with an injected [`Clock`].
@@ -751,6 +763,15 @@ impl WalletServer {
         clock: Arc<dyn Clock>,
         policy_dir_override: Option<&Path>,
     ) -> Result<Self, BuildRegistryError> {
+        Self::new_with_selection_inner(profile, clock, policy_dir_override, None)
+    }
+
+    fn new_with_selection_inner(
+        profile: Profile,
+        clock: Arc<dyn Clock>,
+        policy_dir_override: Option<&Path>,
+        selection: Option<(stellar_agent_core::profile::name::ProfileNameSource, &Path)>,
+    ) -> Result<Self, BuildRegistryError> {
         // NonceMint::from_profile is infallible in the current implementation
         // (no reachability probe at construction time).  The `?` is for forward
         // compatibility; the only currently-possible NonceError variants at
@@ -763,8 +784,7 @@ impl WalletServer {
             detail: e.to_string(),
         })?;
 
-        let policy_engine: Arc<dyn PolicyEngine> =
-            build_policy_engine(&profile, policy_dir_override)?;
+        let policy_engine = build_policy_engine(&profile, policy_dir_override, selection)?;
 
         let tool_registry = Arc::new(build_tool_registry()?);
         let tool_catalogue = Arc::new(ToolCatalogueAdapter::new(Arc::clone(&tool_registry)));
@@ -993,10 +1013,11 @@ impl WalletServer {
 impl WalletServer {
     /// Replaces the active [`PolicyEngine`] for cross-track integration testing.
     ///
-    /// The integration test in `tests/mcp/policy_v1_integration.rs` builds a real
-    /// [`PolicyEngineV1`] from a signed temp policy file and substitutes it
-    /// here so the dispatch gate can be exercised end-to-end without touching
-    /// the OS-conventional policy directory or the keyring.
+    /// The integration test in `tests/mcp/policy_v1_integration.rs` builds a
+    /// real [`stellar_agent_core::policy::v1::PolicyEngineV1`] from a signed
+    /// temp policy file and substitutes it here so the dispatch gate can be
+    /// exercised end-to-end without touching the OS-conventional policy
+    /// directory or the keyring.
     ///
     /// Gated on `test-helpers` feature or `#[cfg(test)]`.
     #[doc(hidden)]
@@ -1007,9 +1028,11 @@ impl WalletServer {
     /// Constructs a [`WalletServer`] with a test-local policy directory.
     ///
     /// Production construction passes `None` to [`build_policy_engine`], which
-    /// preserves the OS-conventional [`default_policy_dir`] behavior.  This
-    /// helper passes `Some(policy_dir)` so integration tests can exercise the
-    /// full V1 policy-engine startup path without writing to operator state.
+    /// preserves the OS-conventional
+    /// [`stellar_agent_core::profile::schema::default_policy_dir`] behavior.
+    /// This helper passes `Some(policy_dir)` so integration tests can exercise
+    /// the full V1 policy-engine startup path without writing to operator
+    /// state.
     ///
     /// The caller must keep the backing `tempfile::TempDir` alive for at least
     /// as long as construction can read the policy file.

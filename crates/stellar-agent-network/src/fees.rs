@@ -377,6 +377,38 @@ pub fn check_classic_fee_cap(
     }
 }
 
+/// Checks the tighter of the signed and profile classic fee caps.
+///
+/// # Errors
+/// Refuses a fee above the effective cap or a mainnet fee without any cap.
+pub fn check_classic_fee_cap_signed(
+    per_op: u32,
+    fee_source: FeeSource,
+    profile: &Profile,
+    signed: Option<u32>,
+) -> Result<(), WalletError> {
+    let cap = match (profile.classic_max_fee_per_op_stroops, signed) {
+        (Some(profile), Some(signed)) => {
+            if profile > signed {
+                tracing::warn!("profile classic fee cap exceeds signed cap; using signed cap");
+            }
+            Some(profile.min(signed))
+        }
+        (profile, signed) => profile.or(signed),
+    };
+    match cap {
+        None if profile.chain_id.is_mainnet() => Err(WalletError::Validation(
+            ValidationError::MainnetFeeCapRequired,
+        )),
+        Some(cap) if per_op > cap => Err(WalletError::Validation(ValidationError::FeeAboveCap {
+            per_op,
+            cap,
+            fee_source,
+        })),
+        _ => Ok(()),
+    }
+}
+
 /// Fetches fee stats through a [`StellarRpcClient`].
 ///
 /// # Errors

@@ -3141,6 +3141,18 @@ pub enum EventKind {
         wiped: Option<WipedAccrualRecord>,
     },
 
+    /// An installation binding was authorized before the nonce was written.
+    MainnetEnablementMinted {
+        /// The profile enabled by the ceremony.
+        profile: String,
+        /// The normalized RPC endpoint host.
+        endpoint_host: String,
+        /// SHA-256 of the installation nonce, in lowercase hex.
+        installation_nonce_sha256: String,
+        /// Whether the ceremony replaces an existing nonce.
+        rotated: bool,
+    },
+
     /// Verified MPP history was selected for generation anchoring. The row
     /// precedes the anchor write so the selected baseline remains auditable.
     MppStateAdopted {
@@ -3211,7 +3223,7 @@ pub enum EventKind {
 /// the test stays green, leaving the new variant unpinned by any tag assertion.
 /// Closing that would need the count derived from the enum itself, which needs a
 /// derive macro this workspace does not carry.
-pub const EVENT_KIND_VARIANT_COUNT: usize = 71;
+pub const EVENT_KIND_VARIANT_COUNT: usize = 72;
 
 /// Why an [`EventKind::AuditTipAnchored`] row was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -664,6 +664,7 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 
 | Kind tag | Purpose |
 |----------|---------|
+| `asset_allowlist` | Pinned `native`, classic `CODE:G...`, or contract `C...` identities; other valued legs refuse with `policy.deny.asset_not_allowlisted` |
 | `per_tx_cap` | Per-transaction value cap |
 | `per_period_cap` | Sliding-window per-period value cap |
 | `rate_limit` | Sliding-window call-rate limit |
@@ -681,6 +682,40 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | `sep45_session_active` | Active SEP-45 session for the contract |
 
 Multicall bundles also carry a hard floor independent of policy: `evaluate_bundle` denies any bundle with more than 50 inners (`DEFAULT_INNER_INVOCATION_COUNT_CAP`) before rule resolution. Policy authors may configure a lower cap but cannot raise it above the floor.
+
+The allowlist, single-call caps, bundle caps, and period accounting share
+network-aware asset identity. A classic asset and its SAC count together;
+a SAC derived on another network does not match the classic identity.
+Claim legs have no asset and are not covered by the allowlist.
+
+A `mainnet-write` build enforces the minimum policy when a mainnet profile
+loads or signs a v2 body with `[mainnet]`. It requires a positive sequence,
+a profile-specific scope, at least one rule, exact mainnet chain and tool
+matches, and no opaque signing or home-domain criteria.
+Approval rules require an explicit TTL of at most 3600 seconds.
+
+Non-deny value-out rules require one asset allowlist, a destination allowlist
+with `G_ACCOUNT` or `C_ACCOUNT`, per-transaction and per-period caps covering
+every allowed asset, and a rate limit. Trustline rules require one asset
+allowlist; claim rules must not carry one. Read-only rules need no value caps.
+Allow `stellar_balances` and `stellar_transaction_status` so MCP can reconcile
+a timed-out submission. Message-signing tools are outside the read-only set.
+
+The signed mainnet table requires a classic per-operation fee cap. Optional
+cross-check thresholds are positive i128 values with pinned keys; the native
+threshold respects `MINIMUM_FLOOR`. Native SAC aliases and duplicate classic/SAC
+keys refuse. The optional authorization TTL is 1 to 120 seconds.
+`ThresholdSet::from_profile_and_signed` and `check_classic_fee_cap_signed`
+combine a signed value with the profile's: the effective threshold and fee cap
+are the per-asset minimum, and a profile value above the signed one emits a
+warning. The transaction paths read the profile values through
+`ThresholdSet::from_profile` and `check_classic_fee_cap`.
+
+The policy criteria have no memo requirement. `stellar_pay` and `pay` refuse a
+payment without a memo to an account whose `config.memo_required` data entry
+is `1` (SEP-29). For a destination that needs a memo without that entry, such
+as an exchange deposit account, the operator supplies the memo with every
+payment; the policy cannot refuse its absence.
 
 ### Persisted window-state store
 

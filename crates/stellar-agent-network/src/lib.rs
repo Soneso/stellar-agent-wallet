@@ -56,6 +56,7 @@ pub mod idempotent_submit;
 pub mod keyring;
 pub mod mainnet;
 pub mod memo;
+pub mod policy_engine;
 pub mod policy_state;
 pub mod policy_view;
 #[cfg(test)]

@@ -26,9 +26,9 @@
 //!
 //! - `PolicyEngineKind::Noop` → `NoopPolicyEngine` (permissive; no key fetch).
 //! - `PolicyEngineKind::V1` → [`load_v1_policy_engine`]: full owner-key fetch,
-//!   base64 decode, length check, OS-state-dir resolve, `load_signed_policy`
-//!   signature verify, and window-state hydration; every failure arm returns
-//!   `Err`.
+//!   base64 decode, length check, OS-state-dir resolve, window-state
+//!   hydration, and the verified signed-policy load with its pin comparison;
+//!   every failure arm returns `Err`.
 //! - Unknown engine kinds → `Err` (fail-closed), matching the MCP server.
 //! - The `verb` argument appears verbatim in every `Err` message so callers
 //!   can attribute the failure to the right operation.
@@ -43,10 +43,9 @@
 //! owner public key without touching the OS keyring. There is no file-based
 //! owner **seed**/secret-key source anywhere in this codebase.
 
+use std::sync::Arc;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::policy::v1::{
-    AccountIdentityView, AccountReservesView, PolicyEngineV1, PolicyStateStore,
-};
+use stellar_agent_core::policy::v1::{AccountIdentityView, AccountReservesView, PolicyEngineV1};
 use stellar_agent_core::policy::{
     Decision, McpToolRegistration, NoopPolicyEngine, PolicyEngine, ToolDescriptor, ToolValueKind,
 };
@@ -54,6 +53,7 @@ use stellar_agent_core::policy::{
 // `stellar-agent-core`, beside `KeyringEntryRef::default_owner_key`, which is
 // the only writer of the coordinate. Both binaries import them, so the
 // construction and its inverse cannot drift apart.
+use stellar_agent_core::policy::v1::verified::OwnerKeySource;
 use stellar_agent_core::profile::name::{
     OWNER_KEY_SERVICE_PREFIX, derive_profile_name_from_owner_key,
 };
@@ -62,17 +62,7 @@ use stellar_agent_core::profile::owner_key::{
     rewrite_older_form_owner_entries_once, rewrite_owner_value_if_older,
 };
 use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile, default_policy_dir};
-use stellar_agent_network::policy_state::PersistedWindowStore;
-
-/// Where the V1 engine builder read the owner public key from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OwnerKeySource {
-    /// The profile's owner entry in the keyring.
-    Keyring,
-    /// The test-only file named by `STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE`.
-    #[cfg(any(test, feature = "test-helpers"))]
-    TestFile,
-}
+use stellar_agent_network::policy_engine::{PolicyEngineBuildError, build_policy_engine};
 
 /// Constructs the [`PolicyEngine`] for a value-moving CLI verb from the
 /// profile's `policy.engine` kind.
@@ -85,7 +75,7 @@ enum OwnerKeySource {
 /// policy-window-state FILE, and nothing else; see [`load_v1_policy_engine`].
 ///
 /// - [`PolicyEngineKind::Noop`] → [`NoopPolicyEngine`].
-/// - [`PolicyEngineKind::V1`] → [`load_v1_policy_engine`], boxed.
+/// - [`PolicyEngineKind::V1`] → [`load_v1_policy_engine`], shared through `Arc`.
 /// - Any failure for `V1` → `Err(human-readable message)`. The caller MUST
 ///   refuse the value-moving operation (render the error, exit non-zero).
 ///   It MUST NOT fall back to a permissive engine.
@@ -101,14 +91,14 @@ pub(crate) fn build_v1_policy_engine(
     kind: &PolicyEngineKind,
     profile: &stellar_agent_core::profile::schema::Profile,
     requested_profile_name: &str,
-) -> Result<Box<dyn PolicyEngine>, String> {
+) -> Result<Arc<dyn PolicyEngine>, String> {
     match kind {
-        PolicyEngineKind::Noop => Ok(Box::new(NoopPolicyEngine)),
-        PolicyEngineKind::V1 => Ok(Box::new(load_v1_policy_engine(
+        PolicyEngineKind::Noop => Ok(Arc::new(NoopPolicyEngine)),
+        PolicyEngineKind::V1 => Ok(load_v1_policy_engine(
             verb,
             profile,
             requested_profile_name,
-        )?)),
+        )?),
         _ => Err(format!(
             "unsupported policy engine kind {kind:?}; {verb} refuses (fail closed)"
         )),
@@ -182,10 +172,9 @@ pub(crate) fn load_v1_policy_engine(
     verb: &str,
     profile: &stellar_agent_core::profile::schema::Profile,
     requested_profile_name: &str,
-) -> Result<PolicyEngineV1, String> {
+) -> Result<Arc<PolicyEngineV1>, String> {
     use base64::Engine as _;
     use ed25519_dalek::PUBLIC_KEY_LENGTH;
-    use stellar_agent_core::policy::v1::loader::load_signed_policy;
 
     // Derive profile name from the service field (strips prefix).
     // `account` is always the literal "default", so we MUST use `service`.
@@ -256,47 +245,44 @@ pub(crate) fn load_v1_policy_engine(
     };
     let policy_path = policy_dir.join(format!("{profile_name}.toml"));
 
-    // Load and signature-verify the operator's policy document.
-    let document = match load_signed_policy(&policy_path, &profile_name, &owner_pubkey) {
-        Ok(doc) => doc,
-        Err(e) => {
-            return Err(format!(
-                "policy.engine is 'v1' but the policy file at {} failed to \
-                 load/verify ({e}); {verb} refuses (fail closed)",
-                policy_path.display()
-            ));
-        }
-    };
-
-    // Hydrate the persisted window-state store BEFORE constructing the
-    // engine so `per_period_cap` / `rate_limit` / `bundle_per_period_cap`
-    // / `bundle_rate_limit` evaluate against accumulated history, not an
-    // always-empty per-invocation store. Fail-closed on hydration
-    // error (tampered/unparseable store file): the caller MUST NOT
-    // fall back to an unhydrated engine, which would silently
-    // under-count and defeat the operator's configured caps.
-    // The FILE is selected by the requested name: the same file every
-    // write path appends to and `profile reset-window-state` resets.
-    // `load_into` and `new_with_store` below keep the DERIVED name and
-    // must stay equal to each other: the wire format carries no name,
-    // so the load re-attaches one, and the engine looks entries up
-    // under its own namespace.
-    let state_store = PolicyStateStore::new();
-    let window_store = PersistedWindowStore::for_profile(requested_profile_name);
-    if let Err(e) = window_store.load_into(&profile_name, profile, &state_store) {
-        return Err(format!(
+    // The CLI selects no profile for installation verification, so no profile
+    // directory is resolved. The owner-key source travels into the verified
+    // load, which refuses the test-only source for an enabled mainnet policy
+    // on the bytes it verifies.
+    let built = build_policy_engine(
+        profile,
+        None,
+        requested_profile_name,
+        Some(&policy_dir),
+        owner_pubkey,
+        source,
+    )
+    .map_err(|error| match error {
+        PolicyEngineBuildError::Policy(e) => format!(
+            "policy.engine is 'v1' but the policy file at {} failed to \
+             load/verify ({e}); {verb} refuses (fail closed)",
+            policy_path.display()
+        ),
+        PolicyEngineBuildError::WindowState { store_name, source } => format!(
             "policy.engine is 'v1' but the policy-window-state store for profile \
-             '{requested_profile_name}' failed to load ({e}); {verb} refuses \
+             '{store_name}' failed to load ({source}); {verb} refuses \
              (fail closed); run `stellar-agent profile reset-window-state \
-             {requested_profile_name} --reason <reason>` to recover"
-        ));
-    }
-
-    Ok(PolicyEngineV1::new_with_store(
-        document,
-        profile_name,
-        state_store,
-    ))
+             {store_name} --reason <reason>` to recover"
+        ),
+        PolicyEngineBuildError::UnsupportedEngineKind { kind } => {
+            format!("unsupported policy engine kind {kind:?}; {verb} refuses (fail closed)")
+        }
+        other => format!("policy.engine is 'v1' but {other}; {verb} refuses (fail closed)"),
+    })?;
+    built
+        .verified
+        .map(|verified| verified.engine())
+        .ok_or_else(|| {
+            format!(
+                "policy.engine is 'v1' but no verified policy was built; {verb} refuses \
+                 (fail closed)"
+            )
+        })
 }
 
 /// Resolves the operator's owner **PUBLIC** key, as stored, for
@@ -2347,7 +2333,7 @@ decision = "allow"
         std::fs::write(&fixture.requested_store, b"not a signed window-state file")
             .expect("corrupt the requested store");
 
-        // `err_msg` rather than `expect_err`: the Ok arm is `Box<dyn
+        // `err_msg` rather than `expect_err`: the Ok arm is `Arc<dyn
         // PolicyEngine>`, which is not `Debug`.
         let hint = err_msg(build_v1_policy_engine(
             "pay",
@@ -2365,5 +2351,104 @@ decision = "allow"
             "the hint must not send the operator to reset the derived profile's store \
              ({I114_DERIVED}), which is not the one that failed; got: {hint}"
         );
+    }
+    #[test]
+    #[serial_test::serial]
+    fn test_owner_file_is_refused_only_for_enabled_mainnet() {
+        use stellar_agent_core::policy::v1::{
+            canonical::canonical_bytes,
+            signature::{digest, sign},
+        };
+        let full = include_str!("../../../stellar-agent-core/tests/fixtures/policy-v2.toml");
+        for (mainnet, version, table) in [
+            (true, 1, false),
+            (true, 2, false),
+            (false, 2, false),
+            (true, 2, true),
+        ] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(directory.path());
+            let profile = if mainnet {
+                Profile::builder_mainnet_named(
+                    "operator",
+                    "https://rpc.example.invalid",
+                    "s",
+                    "a",
+                    "n",
+                    "a",
+                )
+                .build()
+            } else {
+                Profile::builder_testnet_named("operator", "s", "a", "n", "a").build()
+            };
+            let owner = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+            let key_file = directory.path().join("owner-public-key");
+            std::fs::write(
+                &key_file,
+                stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()).to_string(),
+            )
+            .unwrap();
+            let _source =
+                TestEnvVarGuard::set("STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE", key_file.as_os_str());
+            let mut body = full.parse::<toml_edit::DocumentMut>().unwrap();
+            body["version"] = toml_edit::value(version);
+            if version == 1 {
+                body.remove("sequence");
+            }
+            if !table {
+                body.remove("mainnet");
+            }
+            let body = body.to_string();
+            let signature = sign(&digest(&canonical_bytes(&body).unwrap()), &owner);
+            let directory = default_policy_dir().unwrap();
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("operator.toml"),
+                format!(
+                    "{body}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                    stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()),
+                    stellar_agent_core::hex::encode(&signature)
+                ),
+            )
+            .unwrap();
+            let pin = stellar_agent_core::profile::schema::policy_pin_entry_ref(
+                &profile.policy_window_state_key_id,
+            );
+            let pin_value = || {
+                keyring_core::Entry::new(&pin.service, &pin.account)
+                    .unwrap()
+                    .get_password()
+                    .ok()
+            };
+            let result = load_v1_policy_engine("pay", &profile, "operator");
+            let refused = cfg!(feature = "mainnet-write") && mainnet && version == 2 && table;
+            assert_eq!(result.is_err(), refused);
+            if let Err(detail) = result {
+                assert_eq!(
+                    detail,
+                    format!(
+                        "policy.engine is 'v1' but the policy file at {} failed to load/verify \
+                         (policy.engine_unavailable: test_owner_key); pay refuses (fail closed)",
+                        directory.join("operator.toml").display()
+                    )
+                );
+                assert_eq!(pin_value(), None, "a refused load writes no pin");
+                drop(_source);
+                put_owner_entry(
+                    "operator",
+                    &stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes())
+                        .to_string(),
+                );
+                assert!(
+                    load_v1_policy_engine("pay", &profile, "operator").is_ok(),
+                    "the same body loads with the keyring source"
+                );
+                assert!(
+                    pin_value().is_some(),
+                    "the keyring-source load pins the policy"
+                );
+            }
+        }
     }
 }

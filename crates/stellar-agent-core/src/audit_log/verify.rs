@@ -984,6 +984,7 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
             | EventKind::MppSettlementReconciled { .. }
             | EventKind::KeyringKeyWritten { .. }
             | EventKind::SignerIdentityEnrolled { .. }
+            | EventKind::MainnetEnablementMinted { .. }
             | EventKind::MppStateAdopted { .. }
             | EventKind::MppStateReset { .. }
             | EventKind::PolicyWindowStateReset { .. }
@@ -1537,6 +1538,7 @@ mod tests {
 
     fn verify_event_kind_explicit_arm_for_test(event_kind: &EventKind) -> &'static str {
         match event_kind {
+            EventKind::MainnetEnablementMinted { .. } => "mainnet_enablement_minted",
             EventKind::ToolInvocation => "tool_invocation",
             EventKind::PluginInvoked { .. } => "plugin_invoked",
             EventKind::WalletMlockFailed { .. } => "wallet_mlock_failed",
@@ -2167,6 +2169,12 @@ mod tests {
                 index: 0,
                 outcome: "success".to_owned(),
             },
+            EventKind::MainnetEnablementMinted {
+                profile: "operator".to_owned(),
+                endpoint_host: "rpc.example.invalid".to_owned(),
+                installation_nonce_sha256: "00".repeat(32),
+                rotated: false,
+            },
             EventKind::MppStateAdopted {
                 profile: "default".to_owned(),
                 generation: 1,
@@ -2442,6 +2450,7 @@ mod tests {
                 "channel_pool_initialised",
                 "channel_acquired",
                 "channel_released",
+                "mainnet_enablement_minted",
                 "mpp_state_adopted",
                 "mpp_state_reset",
                 "policy_window_state_reset",

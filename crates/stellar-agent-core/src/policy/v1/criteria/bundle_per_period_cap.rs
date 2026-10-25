@@ -53,6 +53,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::policy::v1::EvalContext;
+use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::bundle::InnerOpDescriptor;
 use crate::policy::v1::criteria::Criterion;
 use crate::policy::v1::criteria::per_period_cap::Window;
@@ -225,7 +226,11 @@ impl Criterion for BundlePerPeriodCapCriterion {
             };
 
             let inner_asset = asset_normalise(asset);
-            if inner_asset != criterion_asset {
+            if !assets_equivalent(
+                &inner_asset,
+                &criterion_asset,
+                &ctx.profile.network_passphrase,
+            ) {
                 // Asset mismatch: this inner does not count toward this criterion.
                 continue;
             }
@@ -282,7 +287,7 @@ impl Criterion for BundlePerPeriodCapCriterion {
             let InnerOpDescriptor::TokenTransfer { asset, amount, .. } = inner else {
                 continue;
             };
-            if asset_normalise(asset) != criterion_asset {
+            if !assets_equivalent(asset, &criterion_asset, &ctx.profile.network_passphrase) {
                 continue;
             }
             ctx.state_store

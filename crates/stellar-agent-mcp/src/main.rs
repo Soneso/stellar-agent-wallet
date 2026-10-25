@@ -464,7 +464,11 @@ async fn main() {
     // The origin fixes the audit binding check for the server's lifetime: a
     // profile read from a file records an absent binding, and the synthesized
     // fallback only compares.
-    let server = match transport::build_server(profile, origin.binding_check()) {
+    let server = match transport::build_selected_server(
+        profile,
+        resolved_profile.source,
+        origin.binding_check(),
+    ) {
         Ok(server) => server,
         Err(err) => {
             report_build_failure(&err, &resolved_profile.name);
@@ -737,5 +741,32 @@ mod tests {
             !super::USAGE.contains("Takes no arguments"),
             "the help text must not claim the binary takes no arguments"
         );
+    }
+    #[test]
+    fn new_policy_codes_are_rendered_from_typed_causes() {
+        let capture = stellar_agent_test_support::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        for error in [
+            PolicyError::SequenceRollback,
+            PolicyError::SequenceFork,
+            PolicyError::StateLockBusy,
+            PolicyError::StateLockIo {
+                kind: std::io::ErrorKind::PermissionDenied,
+            },
+            PolicyError::MainnetTableOnTestnet,
+            PolicyError::MainnetMinimumUnmet {
+                requirement: "scope",
+                rule: None,
+            },
+        ] {
+            let code = error.wire_code();
+            super::report_build_failure(&policy_load_failure(error), "operator");
+            assert!(capture.captured_str().contains(code));
+        }
     }
 }

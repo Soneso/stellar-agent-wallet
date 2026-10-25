@@ -293,6 +293,7 @@ fn enumerate_deny_reason_for_test(v: &DenyReason) -> &'static str {
         DenyReason::CounterpartyDenied { .. } => "counterparty_denied",
         DenyReason::MinimumReserveBreached { .. } => "minimum_reserve_breached",
         DenyReason::OwnerSignatureStale { .. } => "owner_signature_stale",
+        DenyReason::AssetNotAllowlisted => "asset_not_allowlisted",
         DenyReason::NoMatchingRule => "no_matching_rule",
         DenyReason::ExplicitRuleDeny => "explicit_rule_deny",
         DenyReason::CounterpartyKindUnsupported { .. } => "counterparty_kind_unsupported",
@@ -369,6 +370,7 @@ fn deny_reason_wire_codes_are_unique() {
         DenyReason::OwnerSignatureStale {
             rotated_at: "2026-01-01T00:00:00Z".into(),
         },
+        DenyReason::AssetNotAllowlisted,
         DenyReason::NoMatchingRule,
         DenyReason::ExplicitRuleDeny,
         DenyReason::CounterpartyKindUnsupported {
@@ -438,7 +440,7 @@ fn deny_reason_wire_codes_are_unique() {
     // but forgets the corresponding entry in `variants`, this catches it.
     assert_eq!(
         variants.len(),
-        19,
+        20,
         "variants list count drifted from DenyReason variant count.  \
          Update enumerate_deny_reason_for_test, the variants vec, and this assertion."
     );

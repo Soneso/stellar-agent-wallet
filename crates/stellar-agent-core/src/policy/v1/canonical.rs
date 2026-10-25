@@ -8,7 +8,8 @@
 //!
 //! 1. The `[signature]` table is **excluded** from the output.
 //! 2. Included keys: `version` (top-level integer), `scope` (top-level string),
-//!    `[[rules]]` array (in original declaration order).
+//!    `[[rules]]` array (in original declaration order). Version 2 also signs
+//!    `sequence` and the optional mainnet binding before the rules.
 //! 3. Field order within each rule is fixed: `match`, `criteria`, `decision`,
 //!    then `reason`, `ttl_secs` and `allow_opaque_signing`. The last three are
 //!    emitted only when the rule carries them, so the canonical bytes of a rule
@@ -54,8 +55,9 @@ use crate::policy::PolicyError;
 /// The canonical form is the pre-image for the owner signature:
 /// `blake3(canonical_bytes(policy_toml))`.
 ///
-/// The `[signature]` table is excluded.  Only `version`, `scope`, and
-/// `[[rules]]` (in original declaration order) are included.  Each rule
+/// The `[signature]` table is excluded. Version 1 signs `version`, `scope`,
+/// and `[[rules]]` in declaration order. Version 2 also signs `sequence` and
+/// `[mainnet]`, and sorts keys in match and criterion tables.  Each rule
 /// carries `match`, `criteria` and `decision`, then whichever of `reason`,
 /// `ttl_secs` and `allow_opaque_signing` it holds, in that order.  All
 /// comments are stripped and whitespace is normalised.
@@ -134,6 +136,47 @@ fn build_canonical_document(doc: &DocumentMut) -> Result<String, PolicyError> {
     let scope_val = canonical_scalar(scope_item)?;
     out.insert("scope", Item::Value(scope_val));
 
+    let v2 = version_item.as_integer() == Some(2);
+    if v2 {
+        let sequence = doc
+            .get("sequence")
+            .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                detail: "policy v2 requires `sequence`".into(),
+            })?;
+        out.insert("sequence", Item::Value(canonical_scalar(sequence)?));
+        if let Some(mainnet) = doc.get("mainnet") {
+            // The canonical form requires `mainnet` to be a table.
+            let mainnet =
+                mainnet
+                    .as_table_like()
+                    .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                        detail: "mainnet must be a table".into(),
+                    })?;
+            let mut table = Table::new();
+            for key in super::schema::MAINNET_KEYS {
+                if let Some(item) = mainnet.get(key) {
+                    if *key == "cross_check_thresholds" {
+                        let values = item.as_table_like().ok_or_else(|| {
+                            PolicyError::PolicyFileParseFailed {
+                                detail: "mainnet.cross_check_thresholds must be a table".into(),
+                            }
+                        })?;
+                        let mut thresholds = Table::new();
+                        let mut entries: Vec<_> = values.iter().collect();
+                        entries.sort_by_key(|(key, _)| *key);
+                        for (key, value) in entries {
+                            thresholds.insert(key, Item::Value(canonical_scalar(value)?));
+                        }
+                        table.insert(key, Item::Table(thresholds));
+                    } else {
+                        table.insert(key, Item::Value(canonical_scalar(item)?));
+                    }
+                }
+            }
+            out.insert("mainnet", Item::Table(table));
+        }
+    }
+
     // ── [[rules]] ─────────────────────────────────────────────────────────────
     // Walk the document's array-of-tables and reconstruct without decor.
     if let Some(rules_item) = doc.get("rules") {
@@ -142,7 +185,7 @@ fn build_canonical_document(doc: &DocumentMut) -> Result<String, PolicyError> {
                 use toml_edit::ArrayOfTables;
                 let mut canonical_aot = ArrayOfTables::new();
                 for table in aot.iter() {
-                    canonical_aot.push(canonical_rule_table(table)?);
+                    canonical_aot.push(canonical_rule_table(table, v2)?);
                 }
                 out.insert("rules", Item::ArrayOfTables(canonical_aot));
             }
@@ -159,7 +202,7 @@ fn build_canonical_document(doc: &DocumentMut) -> Result<String, PolicyError> {
                             detail: "rules array element is not a table".into(),
                         }
                     })?;
-                    canonical_aot.push(canonical_table_from_inline_rule(inline)?);
+                    canonical_aot.push(canonical_table_from_inline_rule(inline, v2)?);
                 }
                 out.insert("rules", Item::ArrayOfTables(canonical_aot));
             }
@@ -256,7 +299,7 @@ fn strip_value_decor(val: &Value) -> Value {
 /// then `reason`, `ttl_secs` and `allow_opaque_signing`, each emitted only
 /// when the rule carries it. Values are emitted without decoration; an
 /// integer is re-emitted as plain decimal. Other rule keys are not emitted.
-fn canonical_rule_table(src: &Table) -> Result<Table, PolicyError> {
+fn canonical_rule_table(src: &Table, sorted: bool) -> Result<Table, PolicyError> {
     let mut out = Table::new();
 
     for key in REQUIRED_RULE_KEYS {
@@ -265,12 +308,18 @@ fn canonical_rule_table(src: &Table) -> Result<Table, PolicyError> {
             .ok_or_else(|| PolicyError::PolicyFileParseFailed {
                 detail: format!("rule missing required `{key}` key"),
             })?;
-        out.insert(key, Item::Value(canonical_item_as_value(item)?));
+        out.insert(
+            key,
+            Item::Value(sort_value(canonical_item_as_value(item)?, sorted)),
+        );
     }
 
     for key in OPTIONAL_RULE_KEYS {
         if let Some(item) = src.get(key) {
-            out.insert(key, Item::Value(canonical_item_as_value(item)?));
+            out.insert(
+                key,
+                Item::Value(sort_value(canonical_item_as_value(item)?, sorted)),
+            );
         }
     }
 
@@ -300,12 +349,12 @@ fn canonical_inline_rule(src: &InlineTable) -> Result<InlineTable, PolicyError> 
 ///
 /// The same field order as [`canonical_rule_table`]: a missing required key
 /// fails, a missing optional key emits nothing.
-fn canonical_table_from_inline_rule(src: &InlineTable) -> Result<Table, PolicyError> {
+fn canonical_table_from_inline_rule(src: &InlineTable, sorted: bool) -> Result<Table, PolicyError> {
     let inline = canonical_inline_rule(src)?;
     let mut out = Table::new();
     for key in REQUIRED_RULE_KEYS {
         if let Some(v) = inline.get(key) {
-            out.insert(key, Item::Value(strip_value_decor(v)));
+            out.insert(key, Item::Value(sort_value(strip_value_decor(v), sorted)));
         } else {
             return Err(PolicyError::PolicyFileParseFailed {
                 detail: format!("rule missing required `{key}` key"),
@@ -314,11 +363,37 @@ fn canonical_table_from_inline_rule(src: &InlineTable) -> Result<Table, PolicyEr
     }
     for key in OPTIONAL_RULE_KEYS {
         if let Some(v) = inline.get(key) {
-            out.insert(key, Item::Value(strip_value_decor(v)));
+            out.insert(key, Item::Value(sort_value(strip_value_decor(v), sorted)));
         }
     }
     out.decor_mut().clear();
     Ok(out)
+}
+
+/// Sorts nested tables in the v2 signature preimage.
+fn sort_value(value: Value, sorted: bool) -> Value {
+    if !sorted {
+        return value;
+    }
+    match value {
+        Value::InlineTable(table) => {
+            let mut entries: Vec<_> = table.iter().collect();
+            entries.sort_by_key(|(key, _)| *key);
+            let mut out = InlineTable::new();
+            for (key, value) in entries {
+                out.insert(key, sort_value(value.clone(), true));
+            }
+            Value::InlineTable(out)
+        }
+        Value::Array(array) => {
+            let mut out = Array::new();
+            for value in &array {
+                out.push(sort_value(value.clone(), true));
+            }
+            Value::Array(out)
+        }
+        other => other,
+    }
 }
 
 /// Extracts a canonical [`Value`] from an [`Item`], converting inline tables
@@ -408,6 +483,21 @@ mod tests {
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { .. }),
             "non-array `rules` must be rejected, got {err:?}"
+        );
+    }
+
+    /// A version 2 `mainnet` value that is not a table is refused, never left
+    /// out of the signed bytes.
+    #[test]
+    fn canonical_bytes_rejects_non_table_mainnet() {
+        let toml = "version = 2\nscope = \"profile:default\"\nsequence = 1\nmainnet = 5\n";
+        let err = canonical_bytes(toml).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                PolicyError::PolicyFileParseFailed { detail } if detail == "mainnet must be a table"
+            ),
+            "a non-table mainnet value must be refused, got {err:?}"
         );
     }
 

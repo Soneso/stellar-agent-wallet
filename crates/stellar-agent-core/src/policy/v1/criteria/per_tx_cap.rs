@@ -34,6 +34,7 @@
 //!
 
 use crate::policy::v1::EvalContext;
+use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::criteria::Criterion;
 use crate::policy::v1::value::{ValueGate, asset_normalise, classify_value};
 use crate::policy::{DenyReason, PolicyError};
@@ -151,7 +152,7 @@ impl Criterion for PerTxCapCriterion {
                             "per_tx_cap: debit leg of tool '{tool_name}' carries no asset"
                         ),
                     })?;
-            if asset_normalise(leg_asset) != criterion_asset {
+            if !assets_equivalent(leg_asset, &criterion_asset, &ctx.profile.network_passphrase) {
                 continue;
             }
             let amount = leg

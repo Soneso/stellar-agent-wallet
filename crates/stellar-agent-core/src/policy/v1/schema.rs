@@ -19,6 +19,16 @@ use crate::policy::PolicyError;
 /// canonical form excludes.
 const ROOT_KEYS: &[&str] = &["version", "scope", "rules", "signature"];
 
+/// Keys of the signed mainnet installation binding, in canonical order.
+pub(crate) const MAINNET_KEYS: &[&str] = &[
+    "profile",
+    "endpoint_host",
+    "installation_nonce_sha256",
+    "classic_max_fee_per_op_stroops",
+    "authorization_ttl_seconds",
+    "cross_check_thresholds",
+];
+
 /// Keys of the `[signature]` envelope.
 const SIGNATURE_KEYS: &[&str] = &["owner_id", "sig"];
 
@@ -42,6 +52,7 @@ const MATCH_KEYS: &[&str] = &["tool", "chain"];
 /// The loader refuses a kind absent from this table, so a kind cannot be
 /// parsed without a closed key set.
 pub(crate) const CRITERION_KEY_SETS: &[(&str, &[&str])] = &[
+    ("asset_allowlist", &["kind", "assets"]),
     ("per_tx_cap", &["kind", "asset", "max_stroops"]),
     (
         "per_period_cap",
@@ -77,13 +88,17 @@ pub(crate) fn criterion_keys(kind: &str) -> Option<&'static [&'static str]> {
         .map(|(_, keys)| *keys)
 }
 
-/// Refuses a policy document that holds a key outside the V1 policy schema.
+/// Refuses a policy document that holds a key outside the policy schema for
+/// versions 1 and 2.
 ///
 /// Checks these containers in order:
 ///
-/// 1. The top level.
-/// 2. The `[signature]` table.
-/// 3. Each rule of a `[[rules]]` array or an inline `rules = [...]` array in
+/// 1. The top level, against the key set of the document's `version`: a
+///    version 2 document also accepts `sequence` and `mainnet`.
+/// 2. The `[mainnet]` table, then its `cross_check_thresholds` table, whose
+///    keys must be `native` or a pinned asset identity.
+/// 3. The `[signature]` table.
+/// 4. Each rule of a `[[rules]]` array or an inline `rules = [...]` array in
 ///    order, with its `match` table and its criteria. Each criterion is checked
 ///    against the key set of its `kind`.
 ///
@@ -92,7 +107,8 @@ pub(crate) fn criterion_keys(kind: &str) -> Option<&'static [&'static str]> {
 ///
 /// The first unknown key is reported with the loader's location form:
 /// ``rule[2].criteria[0]: unknown key `foo` ``,
-/// `rule[1]`, `rule[0].match`, `signature`, and no location for a top-level key.
+/// `rule[1]`, `rule[0].match`, `mainnet`, `mainnet.cross_check_thresholds`,
+/// `signature`, and no location for a top-level key.
 ///
 /// [`crate::policy::v1::loader::load_signed_policy`] runs this check before it
 /// verifies the owner signature.
@@ -125,7 +141,41 @@ pub(crate) fn criterion_keys(kind: &str) -> Option<&'static [&'static str]> {
 /// ));
 /// ```
 pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
-    reject_unknown_keys(doc.as_table(), ROOT_KEYS, None, "the policy file")?;
+    let v2 = doc.get("version").and_then(Item::as_integer) == Some(2);
+    let root = if v2 {
+        &[
+            "version",
+            "scope",
+            "sequence",
+            "mainnet",
+            "rules",
+            "signature",
+        ][..]
+    } else {
+        ROOT_KEYS
+    };
+    reject_unknown_keys(doc.as_table(), root, None, "the policy file")?;
+    if let Some(mainnet) = doc.get("mainnet").and_then(Item::as_table_like) {
+        reject_unknown_keys(mainnet, MAINNET_KEYS, Some("mainnet"), "the mainnet table")?;
+        if let Some(thresholds) = mainnet
+            .get("cross_check_thresholds")
+            .and_then(Item::as_table_like)
+        {
+            for (key, _) in thresholds.iter() {
+                if key != "native"
+                    && crate::asset_id::CanonicalAsset::parse_threshold_key(key).is_err()
+                {
+                    return Err(PolicyError::PolicyFileParseFailed {
+                        detail: format!(
+                            "mainnet.cross_check_thresholds: unknown key `{}`; the \
+                             thresholds table accepts native and asset identities",
+                            key.escape_debug()
+                        ),
+                    });
+                }
+            }
+        }
+    }
 
     if let Some(Item::Table(signature)) = doc.get("signature") {
         reject_unknown_keys(

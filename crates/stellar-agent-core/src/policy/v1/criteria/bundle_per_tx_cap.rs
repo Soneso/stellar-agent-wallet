@@ -37,6 +37,7 @@
 //! When `ctx.bundle` is `None`, the criterion passes unconditionally.
 
 use crate::policy::v1::EvalContext;
+use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::bundle::InnerOpDescriptor;
 use crate::policy::v1::criteria::Criterion;
 use crate::policy::v1::value::asset_normalise;
@@ -137,7 +138,11 @@ impl Criterion for BundlePerTxCapCriterion {
             };
 
             let inner_asset = asset_normalise(asset);
-            if inner_asset != criterion_asset {
+            if !assets_equivalent(
+                &inner_asset,
+                &criterion_asset,
+                &ctx.profile.network_passphrase,
+            ) {
                 continue;
             }
 

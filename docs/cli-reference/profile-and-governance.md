@@ -276,7 +276,7 @@ stellar-agent profile sign-policy --profile default --secret-env WALLET_OWNER_SK
 unset WALLET_OWNER_SK
 ```
 
-Signs a V1 policy file so the engine accepts it. The engine loads `<state_dir>/policies/<profile>.toml`, recomputes the canonical form (the `[signature]` table excluded), and verifies the signature against the enrolled owner public key. This command produces that `[signature]` table: it computes the same canonical BLAKE3 digest the loader computes, signs it with the owner seed, and writes `owner_id` (the owner G-strkey) and `sig` (hex) back into the file. State-changing (writes the policy file), no network. The owner seed is read from a named environment variable and held only in zeroizing memory; it is never printed, logged, or written to disk.
+Signs a v1 or v2 policy file so the engine accepts it. The engine loads `<state_dir>/policies/<profile>.toml`, recomputes the canonical form (the `[signature]` table excluded), and verifies the signature against the enrolled owner public key. This command produces that `[signature]` table: it computes the same canonical BLAKE3 digest the loader computes, signs it with the owner seed, and writes `owner_id` (the owner G-strkey) and `sig` (hex) back into the file. State-changing (writes the policy file), no network. The owner seed is read from a named environment variable and held only in zeroizing memory; it is never printed, logged, or written to disk.
 
 - `--secret-env <VAR>` (required) — name of the environment variable holding the owner `S...` strkey.
 - `--profile <NAME>`: profile whose policy file is signed (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
@@ -295,7 +295,7 @@ Exits `1` on refusal:
 - `sign_policy.owner_key_mismatch`: the seed does not match the enrolled owner key.
 - `sign_policy.policy_file_unreadable`: the policy file is missing.
 - `sign_policy.canonicalization_failed`: the policy file is malformed, or its
-  body holds a key outside the V1 policy schema. The message names the key and
+  body holds a key outside the policy schema. The message names the key and
   its location.
 - `sign_policy.policy_body_invalid`: the engine would refuse the policy body,
   for example an unsupported `version`, a `scope` for another profile, an
@@ -308,6 +308,75 @@ The signature covers each rule's `reason`, `ttl_secs`, and
 verify over the policy and rules carry these keys, the message names those
 rules and asks you to review the policy and re-sign it with this command.
 A `sig` value that is not 64 bytes of hex is refused without rule indexes.
+
+For v2, signing assigns `sequence = max(pin, body) + 1` and returns
+`sequence` and `previous_sequence`. An unsigned body may omit its sequence;
+signing treats it as zero. Signing reads the pin under the state lock and
+never advances it. It creates no window-state directory or lock file; when
+the lock file is absent, it reads no pin. Loading a verified v2 policy
+advances it.
+
+A v1 policy on mainnet produces a warning that writes require v2 with
+`[mainnet]`. If a pin exists, signing v1 also warns that its next load refuses
+with `policy.sequence_rollback`. Rotate the owner with `enroll-owner-key
+--force`, then run `sign-policy`.
+
+Additional refusals:
+
+- `sign_policy.sequence_exhausted`: the previous maximum is `i64::MAX`.
+- `policy.mainnet_table_on_testnet`: a testnet profile carries `[mainnet]`.
+- `policy.mainnet_minimum_unmet`: an enabled mainnet policy omits a restriction.
+- `policy.state_lock_busy`: another writer holds the lock through three attempts.
+- `policy.state_lock_io`: the lock file cannot be opened; the detail gives the I/O kind.
+- `policy.pin_unusable`: the installation's policy pin cannot be read or is malformed.
+
+### `profile enable-mainnet`
+
+```bash
+stellar-agent profile enable-mainnet --profile operator
+stellar-agent profile enable-mainnet --profile operator --check
+stellar-agent profile enable-mainnet --profile operator --rotate
+```
+
+Requires an explicit, nondefault mainnet profile, matching stored and merged
+chain and RPC URL, engine v1, an enrolled owner key and signer identity, and
+no key-scope findings. It records `mainnet_enablement_minted` through the
+strict audit writer, stores an installation nonce, then atomically rewrites
+the policy with the profile, normalized endpoint host, and nonce digest.
+A v1 body becomes v2. The operator supplies the fee cap, optional authorization
+TTL, and thresholds, then signs the policy as the output's `next` list directs.
+
+`--rotate` replaces the nonce and changes only the policy's nonce digest.
+The old nonce is gone; sign the updated policy before using its binding.
+On a policy without a `[mainnet]` table, `--rotate` binds in full, as the
+first run does. This recovers a run that stored the nonce but could not
+rewrite the policy. In a build without `mainnet-write`, the `next` list adds
+that writes require such a build.
+
+`--check` reports every check with the status `passed`, `failed`, or
+`not_evaluated` and a detail, and exits `1` when any check failed. The checks
+are the preconditions, `verified_policy`, `pin`, `enablement`, and every
+minimum restriction in either build. The restrictions are evaluated on the
+document the verified load read. Without a `[mainnet]` table the fee cap and
+every table restriction fail. When the policy does not verify, the
+restrictions and `enablement` are `not_evaluated`. The `enablement` check
+fails with `profile.mainnet_enablement_invalid` and the name of the binding
+that does not match, such as `endpoint_host` or `nonce_digest`. The `pin`
+check passes with the pinned sequence, or with `absent (first use)` when no
+pin or window-state lock file exists. It fails when the pin cannot be read or
+the comparison refuses, with `policy.sequence_rollback`,
+`policy.sequence_fork`, or the lock or pin error in its detail.
+`--check` creates and changes nothing: no window-state directory or lock
+file, and no policy, owner key, nonce, pin, or audit row.
+
+Exits `1` on refusal:
+
+- `profile.enable_mainnet_profile_flag_required`: supply `--profile`.
+- `profile.enable_mainnet_default_refused`: select a dedicated profile.
+- `profile.enable_mainnet_not_mainnet`: the selected chain is testnet.
+- `profile.enable_mainnet_precondition`: a named precondition or effect failed.
+- `profile.enable_mainnet_nonce_exists`: rerun with `--rotate` to replace the nonce.
+- Strict audit errors retain their own codes.
 
 ### Key-rotation subcommands
 

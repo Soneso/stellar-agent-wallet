@@ -2204,6 +2204,7 @@ fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
 fn deny_reason_wire_code(reason: &DenyReason) -> String {
     use stellar_agent_core::policy::DenyReason;
     match reason {
+        DenyReason::AssetNotAllowlisted => "asset_not_allowlisted".to_owned(),
         DenyReason::PerTxCapExceeded { .. } => "per_tx_cap_exceeded".to_owned(),
         DenyReason::PerPeriodCapExceeded { .. } => "per_period_cap_exceeded".to_owned(),
         DenyReason::RateLimitExceeded { .. } => "rate_limit_exceeded".to_owned(),
@@ -4752,5 +4753,12 @@ wasm_sha256 = "{drifted_sha}"
             .expect("unregister_force via direct match");
         assert_eq!(raw.network_passphrase, raw_safename);
         assert!(reg.entries.is_empty(), "entry must be removed");
+    }
+    #[test]
+    fn deny_reason_wire_code_asset_not_allowlisted() {
+        assert_eq!(
+            deny_reason_wire_code(&DenyReason::AssetNotAllowlisted),
+            "asset_not_allowlisted"
+        );
     }
 }

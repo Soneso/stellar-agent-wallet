@@ -4958,4 +4958,78 @@ mod tests {
             assert!(methods(&oracle).await.is_empty());
         }
     }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn policy_rollback_keeps_generic_cli_code_and_specific_detail() {
+        use stellar_agent_core::{
+            policy::{
+                pin::{self, Pin, PinScope},
+                state_lock::WindowStoreLock,
+                v1::{
+                    canonical::canonical_bytes,
+                    signature::{digest, sign},
+                },
+            },
+            profile::schema::{
+                KeyringEntryRef, default_policy_dir, default_policy_window_state_path_for,
+            },
+        };
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let profile = Profile::builder_testnet_named("operator", "s", "a", "n", "a").build();
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let key = owner.verifying_key().to_bytes();
+        let coordinate = KeyringEntryRef::default_owner_key("operator");
+        keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+            .unwrap()
+            .set_password(&stellar_strkey::ed25519::PublicKey(key).to_string())
+            .unwrap();
+        let raw = "version = 2\nscope = \"profile:operator\"\nsequence = 1\n[[rules]]\n\
+            match = {tool = \"stellar_pay_commit\", chain = \"*\"}\ncriteria = []\n\
+            decision = \"allow\"\n";
+        let signature = sign(&digest(&canonical_bytes(raw).unwrap()), &owner);
+        let policies = default_policy_dir().unwrap();
+        std::fs::create_dir_all(&policies).unwrap();
+        std::fs::write(
+            policies.join("operator.toml"),
+            format!(
+                "{raw}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                stellar_strkey::ed25519::PublicKey(key),
+                stellar_agent_core::hex::encode(&signature)
+            ),
+        )
+        .unwrap();
+        let window = default_policy_window_state_path_for("operator");
+        std::fs::create_dir_all(window.parent().unwrap()).unwrap();
+        let lock =
+            WindowStoreLock::acquire_for(&window, &profile.policy_window_state_key_id).unwrap();
+        pin::write(
+            &lock,
+            &PinScope::for_profile(&window, &profile),
+            &Pin::new(2, [0; 32], key).unwrap(),
+        )
+        .unwrap();
+        drop(lock);
+        crate::common::render::take_rendered_for_test();
+        let result = evaluate_staged_pay_policy(
+            None,
+            &NetworkContext::from_profile(&profile),
+            &minimal_args(),
+            "unused",
+            &profile,
+            "operator",
+        )
+        .await;
+        assert!(matches!(result, Err(1)));
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0]["error"]["code"], "policy.engine_unavailable");
+        assert!(
+            rendered[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("policy.sequence_rollback")
+        );
+    }
 }

@@ -2,8 +2,10 @@
 //!
 //! Provides `BoundedStdioTransport`, a wallet-owned `Transport<RoleServer>`
 //! implementation that enforces the 1 MiB max-line bound, and the startup
-//! functions that wire a `WalletServer` to it: [`crate::transport::build_server`] and [`crate::transport::serve`]
-//! as separate steps, with [`crate::transport::run`] composing them.
+//! functions that wire a `WalletServer` to it as separate steps:
+//! [`crate::transport::build_selected_server`] for the binary's startup,
+//! [`crate::transport::build_server`], and [`crate::transport::serve`], with
+//! [`crate::transport::run`] composing the latter two.
 //!
 //! It also holds the startup refusals that are decided from the loaded profile
 //! alone: [`crate::transport::mcp_disabled_refusal`] for the per-profile kill-switch and
@@ -63,7 +65,8 @@ pub use stellar_agent_core::profile::name::{
 /// for every profile read from a file, the unnamed `default.toml` included;
 /// only the synthesized fallback is
 /// [`ProfileOrigin::Synthesized`](stellar_agent_core::profile::loader::ProfileOrigin::Synthesized).
-/// [`build_server`] takes the binding check the origin implies.
+/// [`build_selected_server`] and [`build_server`] take the binding check the
+/// origin implies.
 ///
 /// # Errors
 ///
@@ -221,14 +224,9 @@ pub async fn run(
     serve(build_server(profile, binding)?).await
 }
 
-/// Constructs the [`WalletServer`] for `profile` without starting the MCP loop.
-///
-/// Split out from [`crate::transport::run`] so a caller can match the typed
-/// [`BuildRegistryError`] and translate it into an operator-facing recovery
-/// message. `run` erases the error into `Box<dyn Error>`, and the refusal class
-/// this seam exists for — an incomplete V1 ceremony — is a startup condition
-/// that is only actionable when the caller can name the missing step. Matching
-/// on the `Display` text instead would couple the binary to error wording.
+/// Constructs the [`WalletServer`] for `profile` without starting the MCP loop
+/// and without a profile selection, so installation verification does not
+/// run. The binary's startup uses [`build_selected_server`].
 ///
 /// `WalletServer::new` is fail-closed: a duplicate `McpToolRegistration` name
 /// causes [`BuildRegistryError::DuplicateRegistration`], and a V1 profile whose
@@ -246,6 +244,35 @@ pub fn build_server(
     binding: stellar_agent_core::audit_log::BindingCheck,
 ) -> Result<WalletServer, BuildRegistryError> {
     Ok(WalletServer::new(profile)?.with_audit_binding_check(binding))
+}
+
+/// Constructs the [`WalletServer`] for the startup's profile selection without
+/// starting the MCP loop. `source` is how the profile name was selected; the
+/// profile file is read from the OS-conventional profile directory, which
+/// installation verification binds to.
+///
+/// Returns typed startup errors so the binary can name the required recovery
+/// step before serving.
+///
+/// `binding` is the audit binding check the profile's origin implies; the
+/// server stores it and every keyed audit acquisition applies it.
+///
+/// # Errors
+///
+/// Returns [`BuildRegistryError::PolicyDirResolutionFailed`] when the profile
+/// directory cannot be resolved, and otherwise the [`BuildRegistryError`]
+/// produced by [`WalletServer::new_with_selection`].
+pub fn build_selected_server(
+    profile: Profile,
+    source: stellar_agent_core::profile::name::ProfileNameSource,
+    binding: stellar_agent_core::audit_log::BindingCheck,
+) -> Result<WalletServer, BuildRegistryError> {
+    let profile_dir = stellar_agent_core::profile::schema::default_profile_dir()
+        .map_err(|_| BuildRegistryError::PolicyDirResolutionFailed)?;
+    Ok(
+        WalletServer::new_with_selection(profile, source, &profile_dir)?
+            .with_audit_binding_check(binding),
+    )
 }
 
 /// Runs the MCP stdio loop for an already-constructed server until the client

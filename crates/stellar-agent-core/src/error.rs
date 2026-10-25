@@ -714,6 +714,12 @@ pub enum CapKind {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ValidationError {
+    /// The verified policy's installation bindings do not match the selected profile.
+    #[error("profile.mainnet_enablement_invalid: {binding}")]
+    MainnetEnablementInvalid {
+        /// The mismatched binding, without secret material.
+        binding: &'static str,
+    },
     /// The amount was specified without explicit units (e.g. `"100"` instead
     /// of `"100 XLM"` or `"100.0000000"`).
     #[error("amount must specify units (e.g. '100 XLM' or '100.0000000')")]
@@ -1757,6 +1763,7 @@ impl ValidationError {
             Self::SecretEnvNotSet { .. } => "validation.secret_env_not_set",
             Self::SecretEnvInvalid { .. } => "validation.secret_env_invalid",
             Self::SignerSourceRequired { .. } => "validation.signer_source_required",
+            Self::MainnetEnablementInvalid { .. } => "profile.mainnet_enablement_invalid",
             Self::MainnetFeeCapRequired => "validation.mainnet_fee_cap_required",
             // Fee taxonomy code on a validation-class variant: the code names
             // the subsystem (fees.*) while the category stays Validation.
@@ -3259,6 +3266,10 @@ mod tests {
         // Construct every variant; ensure the match is exhaustive.
         let cases: &[(ValidationError, &'static str)] = &[
             (
+                ValidationError::MainnetEnablementInvalid { binding: "profile" },
+                "profile.mainnet_enablement_invalid",
+            ),
+            (
                 ValidationError::NetworkFlagMismatch {
                     flag: "testnet".into(),
                     profile: "mainnet".into(),
@@ -3575,6 +3586,9 @@ mod tests {
 
         for (variant, expected_code) in cases {
             let wallet_err = WalletError::Validation(match variant {
+                ValidationError::MainnetEnablementInvalid { binding } => {
+                    ValidationError::MainnetEnablementInvalid { binding }
+                }
                 ValidationError::AmountUnitsRequired => ValidationError::AmountUnitsRequired,
                 ValidationError::AmountPrecisionExceeded { amount } => {
                     ValidationError::AmountPrecisionExceeded {

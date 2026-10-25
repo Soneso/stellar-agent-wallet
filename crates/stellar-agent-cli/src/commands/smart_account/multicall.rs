@@ -406,10 +406,10 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         .await;
     }
 
-    // Load and verify the signed policy, then hydrate its persisted window
-    // state. A load failure refuses; there is no permissive fallback.
+    // Hydrate persisted window state, then load and verify the signed policy.
+    // A load failure refuses; there is no permissive fallback.
     let policy_engine = match load_v1_policy_engine("multicall", &profile, &profile_name) {
-        Ok(engine) => Arc::new(engine),
+        Ok(engine) => engine,
         Err(msg) => {
             render_json(&Envelope::<()>::err_raw("policy.engine_unavailable", msg));
             return 1;
