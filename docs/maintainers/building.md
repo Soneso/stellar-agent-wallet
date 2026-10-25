@@ -301,7 +301,9 @@ Cargo builds the required dependency closures. A dependent names an owner by
 `path`, directly or through `workspace = true`, in `[dependencies]`,
 `[dev-dependencies]`, or a target-specific dependency table.
 
-Clippy and rustdoc use the same `-p` list as tests, with `--all-features`.
+Clippy and rustdoc use the same `-p` list as tests, with every declared feature
+except `default` and `mainnet-write`. Feature-on rows add `mainnet-write` only
+when a selected package declares it.
 Tests use the offline features that at least one selected package declares:
 `test-helpers`, `test-hooks`, `test-loopback`, and `verifier-registry`, in that
 order.
@@ -344,17 +346,26 @@ gate except `shellcheck-changed`, which needs a changed shell script.
 
 1. `docs-style`, `install-surface`, and `gate-tool-versions`: every run.
 2. `actionlint`: a workflow change.
-3. `workflow-invariants`: a change to `release.yml`, `publish.yml`,
+3. `feature-discipline` and its self-test: a change to a manifest, the
+   lockfile, a workflow, a composite action, a file under `.github/scripts/`,
+   `Cross.toml`, a cargo config path, a build script, a Rust source under
+   `crates/`, or this guide. The checker fetches the locked graph, then
+   checks the topology, the workflow commands, and the resolved features
+   offline.
+4. The self-tests of `check-binary-marker.sh`, of the release checks, and of
+   `check-provenance.py`: a change to the script they test, to a provenance
+   fixture, or to the self-test itself.
+5. `workflow-invariants`: a change to `release.yml`, `publish.yml`,
    `notarize-smoke.yml`, `labels.yml`, `stale.yml`, `triage.yml`,
-   `triage-review.yml`, `triage-sweep.yml`, `welcome.yml`, `coverage.yml`, or
-   `release-rehearsal.yml` under `.github/workflows/`, to
+   `triage-review.yml`, `triage-sweep.yml`, `welcome.yml`, `coverage.yml`,
+   `release-rehearsal.yml`, or `ci.yml` under `.github/workflows/`, to
    `.github/actions/`, or to a file under `.github/scripts/` that one of them
    names.
    `triage.yml` handles item events; `triage-review.yml` starts `triage-sweep.yml`
    after a submitted review, with a schedule as the fallback; an approving review
    leaves the labels alone.
-4. The self-tests, in filename order. Each runs when the file it tests or the
-   self-test itself changes:
+6. The other self-tests, in filename order. Each runs when the file it
+   tests or the self-test itself changes:
    - `test-check-coverage.py`: `check-coverage.py`
    - `test-check-crates-exist.sh`: `check-crates-exist.sh`
    - `test-check-docs-style.py`: `check-docs-style.py`
@@ -381,19 +392,28 @@ gate except `shellcheck-changed`, which needs a changed shell script.
      with a schedule as the fallback
    - `test-validate-unsigned-archive.py`: `validate-unsigned-archive.py`
    - `test-welcome-workflow.py`: `.github/workflows/welcome.yml`
-5. `shellcheck-preflight`: a change to `preflight.sh` or `test-preflight.sh`.
-6. `shellcheck-changed`: any other changed shell script under
+7. `shellcheck-preflight`: a change to `preflight.sh` or `test-preflight.sh`.
+8. `shellcheck-changed`: any other changed shell script under
    `.github/scripts/` or `.github/actions/` that still exists, under `--full`
    too.
-7. `package-skill`: a change under `skills/` or `.claude-plugin/`.
-8. `vendored-tree-check`: a change under `crates/stellar-agent-smart-account/`
-   or `contracts/`, or to `rebuild-vendored-wasm.sh`.
-9. `publish-check` and `baseline-gate`: `--full` only.
-10. `fmt`, `clippy`, `rustdoc`, and `test`: a Rust change.
-11. `test-vendored-release-cfg`: a Rust change whose test packages include
+9. `package-skill`: a change under `skills/` or `.claude-plugin/`.
+10. `vendored-tree-check`: a change under `crates/stellar-agent-smart-account/`
+    or `contracts/`, or to `rebuild-vendored-wasm.sh`.
+11. `publish-check` and `baseline-gate`: `--full` only.
+12. `fmt`, `clippy`, `rustdoc`, and `test`: a Rust change.
+13. `feature-on:clippy`, `feature-on:doc`, `feature-on:test`, and
+    `feature-on:network`: a Rust change. `feature-on:network` checks the
+    forwarding of the network crate without the CLI or MCP feature
+    unification.
+14. `release-shape`: `--full` only. It needs libudev on Linux; see
+    [Feature discipline and release markers](#feature-discipline-and-release-markers).
+15. `test-vendored-release-cfg`: a Rust change whose test packages include
     `stellar-agent-smart-account`, or that selects the workspace command.
-12. `machete`, `deny`, `coverage`, and `coverage-floors`: `--full` only.
-13. `interop:mpp` and `interop:sdk-v17`: `--full` only.
+16. `machete`, `deny`, `coverage`, `coverage-floors`, `coverage:feature-on`,
+    and `coverage-floors:feature-on`: `--full` only. Each floor check
+    requires its own successful measurement in the current run.
+17. `inbox-js`: a change under `crates/stellar-agent-approval-ui/src/web/`.
+18. `interop:mpp` and `interop:sdk-v17`: `--full` only.
 
 `package-skill.sh`, `run-testnet-acceptance.sh`, and
 `release-preflight-version-check.sh` have no self-test. The preflight runs the
@@ -432,7 +452,9 @@ Run `cargo fmt --all` to format Rust sources.
 #### Lint
 
 ```bash
-cargo clippy --all-targets --all-features -- -D warnings
+FEATURES_EXCEPT_MAINNET_WRITE=deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
+cargo clippy --workspace --all-targets --features "$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings
+cargo clippy --workspace --all-targets --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings
 ```
 
 Warnings are denied. The workspace lints (declared in the root `Cargo.toml`)
@@ -443,7 +465,8 @@ restriction lints `unwrap_used`, `expect_used`, `panic`, `print_stdout`,
 #### Rustdoc
 
 ```bash
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features "$FEATURES_EXCEPT_MAINNET_WRITE"
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE"
 ```
 
 Rustdoc warnings are denied.
@@ -452,6 +475,8 @@ Rustdoc warnings are denied.
 
 ```bash
 cargo test --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry
+cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry
+cargo check -p stellar-agent-network --features mainnet-write
 ```
 
 This runs the offline unit, integration, and doc-tests. Live acceptance uses
@@ -460,8 +485,10 @@ its separate workflow and feature selections; see [Test tiers](#test-tiers).
 #### Coverage
 
 ```bash
-cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov.json
-python3 .github/scripts/check-coverage.py cov.json
+cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json
+python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off
+cargo llvm-cov --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-on.json
+python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on
 ```
 
 Coverage enforces the per-crate floors in `.github/scripts/check-coverage.py`.
@@ -472,8 +499,10 @@ suites.
 
 The floors form a regression ratchet, set a few points below each crate's
 current offline coverage. The aspirational target for new code is 90% per
-crate. Coverage uses the offline feature set; `--all-features` enables the
-live tiers that attempt RPC and Friendbot access.
+crate. Coverage measures feature-off and feature-on independently. Each run
+resets its instrumentation data, writes a separate report and uses the selected
+configuration's floors. Live tiers that attempt RPC and Friendbot access remain
+disabled.
 
 CI runs this gate in the Coverage workflow: weekly on main, on a pull request
 that carries the `coverage` label, and on demand through `workflow_dispatch`.
@@ -1031,3 +1060,119 @@ a build dependency of `libsodium-sys-stable` that only unpacks the
 signature-verified prebuilt libsodium archive on Windows MSVC targets, and no
 `libsodium-sys-stable` release accepts `zip` 9. Unknown registries and unknown
 git sources are denied.
+
+### Feature discipline and release markers
+
+```bash
+cargo fetch --locked
+python3 .github/scripts/check-feature-discipline.py
+python3 .github/scripts/test-check-feature-discipline.py --mutations
+bash .github/scripts/test-check-binary-marker.sh
+bash .github/scripts/test-release-checks.sh
+python3 .github/scripts/test-check-provenance.py
+bash .github/scripts/release/check-host.sh
+```
+
+The checker reads metadata and Cargo trees with `--locked --offline`. Each
+error message names the rule that failed:
+
+- D1: the four `mainnet-write` declarations hold, and no other feature, no
+  `default`, and no normal dependency declaration reaches `mainnet-write`.
+- D2: no dev or build dependency declaration requests a feature that reaches
+  `mainnet-write`.
+- D3: every cargo and cross call of the workflows and of the scripts they name
+  matches the reviewed inventory in the checker, and each resolved graph has
+  `mainnet-write` in the state its record relies on. The scanner reads
+  spaces and tabs as the only blanks, and a physical line ends at a line
+  feed. It reads a heredoc only when its delimiter, after `<<` and at most
+  one space, is an identifier, an ASCII letter or underscore followed by
+  ASCII letters, digits, or underscores, alone or in one pair of single or
+  double quotes. It ends the body at the first line that equals the
+  delimiter. Any other text after `<<` fails the check, and so does a body
+  line of an unquoted heredoc that ends in a backslash, because the shell
+  joins it with the next line. A here-string whose text runs cargo passes
+  only when the command word of its segment, and of each command a pipe
+  after it feeds, is a bare word that names no interpreter or command
+  runner. A command substitution keeps its own pipeline. An interpreter
+  outside the scanner's table, such as `busybox sh`, reads a here-string
+  unseen. The scanner counts every unquoted parenthesis inside a command
+  substitution, so a `)` that the shell reads as the end of a `case` pattern
+  or as part of a parameter-expansion value ends the substitution early in
+  the scanner's reading. The rest of the substitution is then read as outer
+  text, where a `;` ends the here-string's pipeline, so the scanner admits
+  `cat <<< 'cargo build' $(case x in x) true;; esac) | sh` and
+  `cat <<< 'cargo build' $( : ${v:-)}; true) | sh`.
+- D4: no build script emits a feature cfg, and every line it prints is a
+  string literal or a formatted line whose placeholders are `{}` or `{name}`
+  and whose arguments are plain string literals or form a statement reviewed
+  in the checker.
+- D5: the tree holds no cargo configuration file.
+- D6: `Cross.toml` holds only a digest-pinned cross-rs aarch64 image and the
+  two pre-build commands.
+- D7: no workflow, composite action, or named script sets a variable that
+  injects compiler flags, compiler wrappers, or features. A text is a script
+  file, or a string of a workflow or action after YAML decoding, and its
+  physical lines end at line feeds. A text names the environment file when
+  it holds `GITHUB_ENV` in any case. In such a text, every line other than a
+  comment, a line whose first character after spaces and tabs is `#`, must
+  hold an even number of `"` and an even number of `'`, and no line that
+  holds `GITHUB_ENV` may follow a line that ends in a backslash or a
+  backtick, because the shell joins the two. Each line that holds
+  `GITHUB_ENV`, a comment included, must then be, after spaces and tabs at
+  both ends, one of two writes of one `NAME=VALUE` entry, with one or more
+  spaces or tabs between its words:
+  `echo` with one argument, bare or in double quotes, then `>>`, then one
+  of `$GITHUB_ENV`, `"$GITHUB_ENV"`, `${GITHUB_ENV}`, and `"${GITHUB_ENV}"`;
+  or `Add-Content` with `$env:GITHUB_ENV`, or with
+  `-Path $env:GITHUB_ENV -Value`, and one value in single or double quotes. `echo`, `Add-Content`, `-Path`, `-Value`, and
+  `$env:GITHUB_ENV` must appear in exactly this case. NAME is an ASCII
+  letter or underscore followed by ASCII letters, digits, or underscores.
+  The value holds ASCII letters, digits, and `_./:@+-`, plus `$NAME` and
+  `${NAME}` references in the `echo` form and backslashes in the
+  `Add-Content` form. Every other line that names the file fails the
+  check, including `printf`, `tee`, `Set-Content`, multiline entries, options
+  other than `-Path` and `-Value`, arrays, and reads. In a named Python
+  script no line may hold `GITHUB_ENV` in any case, apart from the two
+  workflow invariants files, which spell the toolchain pin as text they
+  compare. The scanner does not read the value of a referenced variable: a
+  variable whose value holds a line break, or backslashes under a shell
+  whose `echo` expands them, writes more than one entry. The `echo` form
+  admits references because the toolchain pins need them. A function or
+  alias defined earlier in the text that redefines `echo` or `Add-Content`
+  changes what a shape line writes. Escaped quotes keep the raw counts even
+  while an argument spans lines, as after `printf "\"`. A shape line inside a
+  heredoc body or a PowerShell block comment is data and writes nothing. A
+  write that reaches the file without spelling `GITHUB_ENV`, through another
+  variable or a path found at run time, is outside the scan.
+- D8: no workflow, named script, or this guide enables every feature.
+- D9: only the CI feature-on jobs and the coverage job activate
+  `mainnet-write`.
+- D10: the feature list of `ci.yml` and the list in this guide equal the
+  declared features except `default` and `mainnet-write`.
+- D11: the release, publish, and rehearsal workflows expect the marker off.
+- D12: the marker literal appears in `crates/` only in the two cfg arms of the
+  core crate.
+
+Release builds refuse compiler overrides and cargo configuration files
+through the checker's `--env-guard` mode, which `build.sh` runs on its own
+checkout. `check-binary-marker.sh <binary> off` checks the second version
+line, the embedded expected marker, and the absence of the opposite marker.
+
+`check-host.sh` builds the release binaries for the host target through
+`build.sh` and checks both markers; the preflight row `release-shape` runs it.
+It installs nothing, and it stops in these cases:
+
+- On Linux without libudev, it prints the install command and exits 2. The
+  preflight row reports itself unavailable with that command.
+- The environment guard of `build.sh` refuses a cargo configuration file in
+  `CARGO_HOME`, in the checkout, or in one of its parent directories, and a
+  compiler variable such as `RUSTC_WRAPPER`.
+- On an aarch64 Linux host, the host target is the cross target, so
+  `build.sh` builds through `cross`, which needs `cross` and a container
+  engine.
+
+The release rehearsal checks both binaries from every packed archive on a
+native runner, including Rosetta for the Intel macOS archive. Its crate job
+packages with the publish toolchain and checks fresh package-verification
+outputs. The live acceptance tier runs with `mainnet-write` off: none of the
+acceptance runner's selections enables it.

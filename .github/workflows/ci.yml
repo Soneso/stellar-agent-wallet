@@ -1,14 +1,15 @@
 name: CI
 
-# Every pull request to main runs the offline gate suite, including docs changes.
-# Pushes to main use the paths filter below. Skill changes run the archive checks.
+# Every pull request to main or mainnet-write runs the offline gate suite,
+# including docs changes. Pushes to those branches use the paths filter below.
+# Skill changes run the archive checks.
 # The suite covers format, lint, rustdoc, offline tests, dependencies, and licenses.
 # Coverage runs in coverage.yml.
 # Live testnet tests run in a separate workflow.
 
 on:
   push:
-    branches: [main]
+    branches: [main, mainnet-write]
     # Documentation, the license, and the plugin manifest cannot change a gate
     # result, so pushes skip them.
     # Skill changes run CI because release-contracts verifies the archive.
@@ -19,7 +20,7 @@ on:
       - '!.claude-plugin/**'
       - 'skills/**'
   pull_request:
-    branches: [main]
+    branches: [main, mainnet-write]
 
 # Supersede in-flight runs for the same ref so rapid pushes do not queue stale
 # work.
@@ -33,6 +34,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  FEATURES_EXCEPT_MAINNET_WRITE: test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance
 
 jobs:
   fmt:
@@ -67,12 +69,12 @@ jobs:
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # --all-features compile-checks the entire graph, including the code behind
+      # The explicit feature list compile-checks the code behind
       # the testnet-acceptance features, without executing any test. The
       # workspace lints declared in the root Cargo.toml deny warnings; -D
       # warnings turns any remaining warning into a failure.
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --features "$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings
 
   doc:
     name: rustdoc
@@ -91,7 +93,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build the rustdoc
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --workspace --no-deps --features "$FEATURES_EXCEPT_MAINNET_WRITE"
 
   test:
     name: test (offline)
@@ -125,8 +127,7 @@ jobs:
       # fixtures the integration suites depend on; none of them pulls the live
       # testnet client helpers. The testnet-acceptance / testnet-integration
       # features stay off and the heavy submit flows are #[ignore]d, so no test
-      # reaches the network. --all-features is deliberately avoided here: it
-      # would enable the live tiers and attempt real RPC and Friendbot access.
+      # reaches the network. The live tiers stay disabled.
       - name: Run the offline tests
         run: cargo test --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry
       # Without test-helpers, the integration target also checks that the library excludes the revoked test fixture.
@@ -140,6 +141,134 @@ jobs:
           for feature in test-helpers testnet-helpers verifier-registry wiremock-helpers; do
             cargo check -p stellar-agent-test-support --no-default-features --features "$feature"
           done
+
+  feature-on-clippy:
+    name: feature-on-clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: clippy
+      # stellar-ledger pulls hidapi, which links libudev on Linux for HID
+      # device enumeration. The runner ships pkg-config but not the libudev
+      # headers.
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The explicit feature list compile-checks the code behind
+      # the testnet-acceptance features, without executing any test. The
+      # workspace lints declared in the root Cargo.toml deny warnings; -D
+      # warnings turns any remaining warning into a failure.
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings
+
+  feature-on-doc:
+    name: feature-on-doc
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build the rustdoc
+        run: cargo doc --workspace --no-deps --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE"
+
+  feature-on-test:
+    name: feature-on-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # Dropping test-profile debuginfo roughly halves target/ size and link
+    # time, keeping the build closure within the runner's free disk.
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The smart-account dependency closure (Arkworks, wasmi,
+      # soroban-env-host) plus every compiled test binary is large; reclaim
+      # space the build does not need.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Offline tier only. The enabled features expose the test-only helpers
+      # and fixtures the integration suites depend on; none of them pulls the
+      # live testnet client helpers. The testnet-acceptance and
+      # testnet-integration features stay off and the heavy submit flows are
+      # ignored tests, so no test reaches the network. The live tiers stay
+      # disabled.
+      - name: Run the offline tests
+        run: cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry
+      - name: Check network feature forwarding in isolation
+        run: cargo check -p stellar-agent-network --features mainnet-write
+
+  feature-discipline:
+    name: feature-discipline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Fetch the locked graph
+        run: cargo fetch --locked
+      - name: Check feature discipline and assertions
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/feature-check"
+          "$RUNNER_TEMP/feature-check/bin/pip" install --quiet --disable-pip-version-check \
+            --require-hashes --only-binary :all: \
+            -r .github/scripts/workflow-check-requirements.txt
+          "$RUNNER_TEMP/feature-check/bin/python" .github/scripts/check-feature-discipline.py
+          "$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-feature-discipline.py --mutations
+          bash .github/scripts/test-check-binary-marker.sh
+          bash .github/scripts/test-release-checks.sh
+          "$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-provenance.py
+
+  release-shape:
+    name: release-shape
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Install libudev (Linux hidapi)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      # The host recipe that preflight's release-shape row runs too: the
+      # release build script for the host target, then the marker check of
+      # both binaries.
+      - name: Build and check the release binaries
+        run: bash .github/scripts/release/check-host.sh
 
   inbox-js:
     name: inbox renderers

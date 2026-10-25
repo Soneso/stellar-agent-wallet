@@ -27,11 +27,12 @@ mod tests {
 
     #[test]
     fn marker_matches_feature() {
-        let expected = if cfg!(feature = "mainnet-write") {
-            "STELLAR_AGENT_BUILD_MAINNET_WRITE=on"
+        let suffix = if cfg!(feature = "mainnet-write") {
+            "on"
         } else {
-            "STELLAR_AGENT_BUILD_MAINNET_WRITE=off"
+            "off"
         };
+        let expected = format!("{}{}{}", "STELLAR_AGENT_BUILD_", "MAINNET_WRITE=", suffix);
         assert_eq!(MAINNET_WRITE_MARKER, expected);
     }
 

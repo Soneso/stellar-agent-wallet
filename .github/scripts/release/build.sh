@@ -6,10 +6,11 @@
 # toolchain, so the toolchain the caller installed builds.
 #
 # Usage: build.sh <target>
-#
-# check-workflow-invariants.py requires the cargo build and cross build lines
-# below to equal those of the build job in release.yml.
 set -euo pipefail
+# The environment guard is the first action, before the argument checks, so
+# every caller is checked at the last point before cargo. It inspects the
+# checkout this script belongs to, where cargo builds after the cd below.
+python3 "$(dirname "${BASH_SOURCE[0]}")/../check-feature-discipline.py" --env-guard "$(dirname "${BASH_SOURCE[0]}")/../../.."
 
 if [ "$#" -ne 1 ]; then
   echo "usage: build.sh <target>" >&2

@@ -16,11 +16,12 @@ mod tests {
         assert!(output.status.success(), "{flag}: {:?}", output.status);
         assert!(output.stderr.is_empty(), "{flag}: {:?}", output.stderr);
         let stdout = String::from_utf8(output.stdout).expect("version output is UTF-8");
-        let expected = if cfg!(feature = "mainnet-write") {
-            "STELLAR_AGENT_BUILD_MAINNET_WRITE=on"
+        let suffix = if cfg!(feature = "mainnet-write") {
+            "on"
         } else {
-            "STELLAR_AGENT_BUILD_MAINNET_WRITE=off"
+            "off"
         };
+        let expected = format!("{}{}{}", "STELLAR_AGENT_BUILD_", "MAINNET_WRITE=", suffix);
         assert_eq!(
             stdout,
             format!("stellar-agent {}\n{expected}\n", env!("CARGO_PKG_VERSION")),

@@ -22,7 +22,8 @@
 //! `resolve_and_verify_counterparty_at` test seam (exposed only under
 //! `#[cfg(any(test, feature = "test-helpers"))]`). Without the feature this
 //! file compiles to nothing, so `cargo test -p stellar-agent-x402-identity`
-//! succeeds (CI runs `--all-features`, which enables it).
+//! succeeds; the offline test job enables `test-helpers` and runs these
+//! tests.
 
 #![cfg(feature = "test-helpers")]
 #![allow(

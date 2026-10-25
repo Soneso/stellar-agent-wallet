@@ -5,6 +5,9 @@ Each case writes a coverage document with the given file entries, runs the
 gate on it, and checks the exit status and the message.
 """
 
+import contextlib
+import importlib.util
+import io
 import json
 import pathlib
 import subprocess
@@ -59,7 +62,7 @@ def main():
             cov_path = pathlib.Path(tmp) / "cov.json"
             cov_path.write_text(json.dumps({"data": [{"files": files}]}))
             result = subprocess.run(
-                [sys.executable, str(SCRIPT), str(cov_path)],
+                [sys.executable, str(SCRIPT), str(cov_path), "--configuration", "feature-off"],
                 capture_output=True, text=True, check=False,
             )
             output = result.stdout + result.stderr
@@ -69,6 +72,23 @@ def main():
                                 f"missing {missing!r}: {output.strip()}")
             else:
                 print(f"ok   {label}")
+    spec = importlib.util.spec_from_file_location("coverage_gate", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.FLOORS = {"feature-off": {"stellar-agent-core": 40},
+                     "feature-on": {"stellar-agent-core": 60}}
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "cov.json"
+        path.write_text(json.dumps({"data": [{"files": [entry(f"{ROOT}/crates/stellar-agent-core/src/lib.rs", 50, 100)]}]}))
+        for configuration, expected in (("feature-off", 0), ("feature-on", 1)):
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = module.main(str(path), configuration)
+            if rc != expected:
+                failures.append(f"configuration-selection-{configuration}: exit {rc}, expected {expected}")
+        for args in ([], ["--configuration", "unknown"]):
+            result = subprocess.run([sys.executable, str(SCRIPT), str(path), *args], capture_output=True)
+            if result.returncode != 2:
+                failures.append("configuration-required: invalid configuration accepted")
     if failures:
         for failure in failures:
             print(f"FAIL {failure}", file=sys.stderr)

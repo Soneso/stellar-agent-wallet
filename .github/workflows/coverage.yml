@@ -6,11 +6,12 @@ name: Coverage
 #
 # The workflow has no paths filter: the required check `coverage` reports on
 # every pull request, and the job condition decides whether a run measures.
+# A measurement requires feature-off and feature-on to pass their own floors.
 # Branch protection accepts a coverage job skipped by its condition.
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, mainnet-write]
     types: [opened, synchronize, reopened, labeled, unlabeled]
   schedule:
     # Weekly, Monday 04:41 UTC.
@@ -39,7 +40,7 @@ jobs:
     # workflow token starts none; the triage and stale workflows use that token.
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'coverage')
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -74,10 +75,13 @@ jobs:
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: cargo-llvm-cov@0.8.7
-      # Offline tier only, matching the `test` job's feature set. --all-features
-      # is deliberately avoided so no live RPC / Friendbot test runs; coverage of
+      # Offline tier only, matching the test jobs. Coverage of
       # the remaining live-network lines is out of scope for this offline gate.
       - name: Measure offline line coverage
-        run: cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov.json
+        run: cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json
       - name: Enforce per-crate line-coverage floors
-        run: python3 .github/scripts/check-coverage.py cov.json
+        run: python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off
+      - name: Measure feature-on offline line coverage
+        run: cargo llvm-cov --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-on.json
+      - name: Enforce feature-on line-coverage floors
+        run: python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on

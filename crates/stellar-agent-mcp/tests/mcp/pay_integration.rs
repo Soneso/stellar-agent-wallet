@@ -1773,7 +1773,7 @@ async fn commit_invalid_memo_parse_matches_nonce_hmac_wire_response() {
 /// numbers.  Run with:
 ///
 /// ```text
-/// cargo test -p stellar-agent-mcp --all-features -- --ignored \
+/// cargo test -p stellar-agent-mcp --test mcp -- --ignored \
 ///     timing_expired_rebuild_vs_hmac_mismatch_rebuild
 /// ```
 ///

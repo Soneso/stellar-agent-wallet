@@ -62,7 +62,8 @@ deleted-shell-script deleted-self-test unavailable-tool
 exit-aggregation table bad-base malformed-manifest unloadable-install-surface-check
 the-preflight-itself registry-completeness
 drift drift-new-step drift-unnamed-step drift-removed-step drift-renamed-step
-install-hint coverage-suppression coverage-unavailable coverage-written"
+install-hint coverage-suppression coverage-unavailable coverage-written coverage-off-only-fails coverage-on-only-fails
+release-shape-libudev"
 
 ALWAYS=(docs-style install-surface gate-tool-versions)
 RUST=(fmt clippy rustdoc)
@@ -81,6 +82,11 @@ docs-style	python3 .github/scripts/check-docs-style.py
 install-surface	python3 .github/scripts/check-install-surface.py
 gate-tool-versions	bash .github/scripts/check-gate-tool-versions.sh
 actionlint	actionlint
+feature-discipline	cargo fetch --locked && python3 .github/scripts/check-feature-discipline.py
+self-test:test-check-feature-discipline.py	python3 .github/scripts/test-check-feature-discipline.py --mutations
+self-test:test-check-binary-marker.sh	bash .github/scripts/test-check-binary-marker.sh
+self-test:test-release-checks.sh	bash .github/scripts/test-release-checks.sh
+self-test:test-check-provenance.py	python3 .github/scripts/test-check-provenance.py
 workflow-invariants	python3 .github/scripts/check-workflow-invariants.py
 self-test:test-check-coverage.py	python3 .github/scripts/test-check-coverage.py
 self-test:test-check-crates-exist.sh	bash .github/scripts/test-check-crates-exist.sh
@@ -106,14 +112,21 @@ vendored-tree-check	bash .github/scripts/rebuild-vendored-wasm.sh --check-tree -
 publish-check	.github/scripts/publish-crates.sh --check
 baseline-gate	bash .github/scripts/check-no-direct-sasignersetbaselined-emit.sh
 fmt	cargo fmt --all -- --check
-clippy	cargo clippy --all-targets --all-features -- -D warnings
-rustdoc	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+clippy	cargo clippy --workspace --all-targets --features deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers -- -D warnings
+rustdoc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
 test	cargo test --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry
+feature-on:clippy	cargo clippy --workspace --all-targets --features mainnet-write,deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers -- -D warnings
+feature-on:doc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features mainnet-write,deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
+feature-on:test	cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry
+feature-on:network	cargo check -p stellar-agent-network --features mainnet-write
+release-shape	bash .github/scripts/release/check-host.sh
 test-vendored-release-cfg	cargo test -p stellar-agent-smart-account --test vendored_wasm_release_cfg
 machete	cargo machete
 deny	cargo deny check
-coverage	cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov.json
-coverage-floors	python3 .github/scripts/check-coverage.py cov.json
+coverage	cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json
+coverage-floors	python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off
+coverage:feature-on	cargo llvm-cov --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-on.json
+coverage-floors:feature-on	python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on
 inbox-js	node --test crates/stellar-agent-approval-ui/src/web/app_shared.test.mjs
 interop:mpp	.github/scripts/test-mpp-interop.sh
 interop:sdk-v17	.github/scripts/test-sdk-v17-interop.sh
@@ -124,6 +137,12 @@ EOF
 # workflow, job, step name, and the reason the preflight does not run them.
 NOT_CARRIED=$(
   cat <<'EOF'
+ci.yml	feature-on-clippy	Install libudev (Linux hidapi)	installs Linux system headers on the runner
+ci.yml	feature-on-doc	Install libudev (Linux hidapi)	installs Linux system headers on the runner
+ci.yml	feature-on-test	Free disk space	reclaims runner disk space
+ci.yml	feature-on-test	Install libudev (Linux hidapi)	installs Linux system headers on the runner
+ci.yml	feature-discipline	Fetch the locked graph	preflight includes fetch in the discipline row
+ci.yml	release-shape	Install libudev (Linux hidapi)	the row requires libudev instead of installing it
 ci.yml	clippy	Install libudev (Linux hidapi)	installs Linux system headers on the runner
 ci.yml	doc	Install libudev (Linux hidapi)	installs Linux system headers on the runner
 ci.yml	test	Free disk space	reclaims runner disk space
@@ -283,7 +302,22 @@ expect_list() {
     flags+=(--full)
     shift
   fi
-  expected_rows "$@" >"$CASE_DIR.expected"
+  local extra=() argument
+  case "$CASE_NAME" in
+    deleted-install-surface-doc | welcome-workflow | release-workflow | release-rehearsal-workflow | triage-workflow | triage-review-workflow | triage-sweep-workflow | ci-yml-only | python-check-script | shell-check-script | one-crate | two-owners | target-specific-edge | dev-dependency-edge | optional-dependency-edge | root-manifest | lockfile | wallet-manifest | removed-member | untracked-test-file | staged-rename-record | spaces-and-an-apostrophe | action-script | invariants-helper | release-build-scripts | duplicate-triggers | changed-self-test | deleted-shell-script | deleted-self-test | the-preflight-itself)
+      extra+=(feature-discipline self-test:test-check-feature-discipline.py)
+      ;;
+  esac
+  for argument in "$@"; do
+    if [ "$argument" = clippy ]; then
+      extra+=(feature-on:clippy feature-on:doc feature-on:test feature-on:network)
+    fi
+  done
+  expected_rows "$@" ${extra[@]+"${extra[@]}"} >"$CASE_DIR.unordered"
+  printf '%s\n' "$EXPECTED_REGISTRY" >"$CASE_DIR.registry"
+  awk -F '\t' 'FILENAME == ARGV[1] { rows[$1]=$0; next } $1 in rows { print rows[$1]; delete rows[$1] }
+    END { if ("shellcheck-changed" in rows) print rows["shellcheck-changed"] }' \
+    "$CASE_DIR.unordered" "$CASE_DIR.registry" >"$CASE_DIR.expected"
   "$REAL_BASH" "$SCRIPT_REL" "${flags[@]}" >"$CASE_DIR.actual" 2>"$CASE_DIR.stderr" || rc=$?
   if [ "$rc" -ne 0 ] || [ -s "$CASE_DIR.stderr" ]; then
     cat "$CASE_DIR.stderr" >&2
@@ -370,8 +404,33 @@ pin_packages() {
   if [ -n "$features" ]; then
     test_command="$test_command --features $features"
   fi
-  PACKAGE_GATES=(fmt "clippy=cargo clippy$operands --all-targets --all-features -- -D warnings"
-    "rustdoc=${RUSTDOC_PREFIX}cargo doc --no-deps$operands --all-features" "test=$test_command")
+  local declared on_declared all_args="" on_args="" on_test="$test_command"
+  declared=$(python3 - "$packages" <<'PYDECLARED'
+import pathlib, sys, tomllib
+selected = sys.argv[1].split()
+keys = set()
+for path in pathlib.Path("crates").glob("*/Cargo.toml"):
+    manifest = tomllib.loads(path.read_text())
+    if manifest["package"]["name"] in selected:
+        keys.update(manifest.get("features", {}))
+print(",".join(sorted(keys - {"default", "mainnet-write"})))
+print("mainnet-write" if "mainnet-write" in keys else "")
+PYDECLARED
+  )
+  on_declared=$(printf '%s\n' "$declared" | tail -n 1)
+  declared=$(printf '%s\n' "$declared" | head -n 1)
+  [ -z "$declared" ] || all_args=" --features $declared"
+  if [ "$on_declared" = mainnet-write ]; then
+    on_args=" --features mainnet-write${declared:+,$declared}"
+    on_test="cargo test$operands --features mainnet-write${features:+,$features}"
+  else
+    on_args=$all_args
+  fi
+  PACKAGE_GATES=(fmt "clippy=cargo clippy$operands --all-targets$all_args -- -D warnings"
+    "rustdoc=${RUSTDOC_PREFIX}cargo doc --no-deps$operands$all_args" "test=$test_command"
+    "feature-on:clippy=cargo clippy$operands --all-targets$on_args -- -D warnings"
+    "feature-on:doc=${RUSTDOC_PREFIX}cargo doc --no-deps$operands$on_args" "feature-on:test=$on_test"
+    feature-on:network)
 }
 
 # Prints the .github/scripts/ paths that EXPECTED_REGISTRY runs with
@@ -401,7 +460,7 @@ registry_scripts() {
 write_shim() {
   local file=$1 name=$2 kind=$3 gates=""
   case "$kind" in
-    python) gates=$(registry_scripts python3) ;;
+    python) gates=$(registry_scripts python3; echo .github/scripts/check-feature-discipline.py) ;;
     bash) gates=$(registry_scripts bash) ;;
   esac
   {
@@ -473,6 +532,12 @@ if [ "${2-}" = --version ]; then
   key="$key --version"
 fi
 status=$(status_of "$key")
+if [ "${1-}" = llvm-cov ] && [ "${2-}" != --version ] && [ "$status" = 0 ]; then
+  case "$*" in
+    *cov-feature-on.json*) status=$(status_of "cargo llvm-cov:feature-on") ;;
+    *cov-feature-off.json*) status=$(status_of "cargo llvm-cov:feature-off") ;;
+  esac
+fi
 if [ "${1-}" = llvm-cov ] && [ "$status" = 0 ]; then
   previous=""
   for argument in "$@"; do
@@ -621,11 +686,12 @@ assert_clean_calls() {
   {
     {
       while IFS=$'\t' read -r id command; do
-        if [ "$id" = rustdoc ]; then
+        if { [ "$id" = rustdoc ] || [ "$id" = feature-on:doc ]; }; then
           command=${command#"$RUSTDOC_PREFIX"}
         fi
         printf '%s\n' "$command"
       done <<<"$EXPECTED_REGISTRY"
+      printf '%s\n' "cargo fetch --locked" "python3 .github/scripts/check-feature-discipline.py"
       printf '%s\n' "cargo llvm-cov --version" "cargo machete --version" "cargo deny --version"
     } | command_records
     if [ "$#" -gt 0 ]; then
@@ -1008,7 +1074,7 @@ case_release_rehearsal_workflow() {
 case_ci_yml_only() {
   start_case
   edit .github/workflows/ci.yml
-  expect_list "${ALWAYS[@]}" actionlint
+  expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py
 }
 
 case_python_check_script() {
@@ -1193,7 +1259,7 @@ case_spaces_and_an_apostrophe() {
   : >".github/scripts/it's.sh"
   write_shim "$BIN/shellcheck" shellcheck plain
   run_preflight
-  expect_end 0 "preflight: 4 gates run, 0 failed, 0 unavailable"
+  expect_end 1 "preflight: 4 gates run, 0 failed, 2 unavailable"
   shellcheck_call=$(argv_record shellcheck -s bash ".github/scripts/it's.sh" ".github/scripts/with space.sh")
   record_gate_calls
   if [ "$(grep -c '^\["shellcheck"' "$CASE_DIR.calls")" -ne 1 ] ||
@@ -1209,8 +1275,8 @@ case_full() {
   start_case
   edit CONTRIBUTING.md
   read -r -a ids <<<"$(printf '%s\n' "$EXPECTED_REGISTRY" | awk -F '\t' '{ printf "%s ", $1 }')"
-  if [ "${#ids[@]}" -ne 40 ]; then
-    fail "the expected registry holds ${#ids[@]} rows, expected 40"
+  if [ "${#ids[@]}" -ne 52 ]; then
+    fail "the expected registry holds ${#ids[@]} rows, expected 52"
   fi
   expect_list --full "${ids[@]}"
 }
@@ -1286,7 +1352,8 @@ case_duplicate_triggers() {
 case_changed_self_test() {
   start_case
   edit .github/scripts/test-compare-crate-sums.py
-  expect_list "${ALWAYS[@]}" self-test:test-compare-crate-sums.py
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-compare-crate-sums.py \
+    self-test:test-check-workflow-invariants.py
 }
 
 # A deleted script still selects the gates of its scope, but it is never an
@@ -1301,11 +1368,12 @@ case_deleted_shell_script() {
 }
 
 # A deleted self-test file selects neither its own record nor shellcheck.
+# ci.yml names it, so the workflow checks run.
 case_deleted_self_test() {
   start_case
   git rm -q .github/scripts/test-check-ref-on-main.sh
   assert_changed .github/scripts/test-check-ref-on-main.sh
-  expect_list "${ALWAYS[@]}"
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py
 }
 
 case_unavailable_tool() {
@@ -1322,9 +1390,10 @@ case_unavailable_tool() {
   version=$(sed -n 's/.*actionlint_\([0-9][0-9.]*\)_linux_amd64.*/\1/p' .github/workflows/install-surface.yml)
   [ -n "$version" ] || fail "install-surface.yml pins no actionlint archive"
   expect_line "- \`actionlint\`: unavailable (actionlint: brew install actionlint, or the $version release archive for your platform (actionlint_${version}_<os>_<arch>.tar.gz))"
-  expect_end 1 "preflight: 3 gates run, 0 failed, 1 unavailable"
+  expect_end 1 "preflight: 5 gates run, 0 failed, 3 unavailable"
   expect_calls "python3 .github/scripts/check-docs-style.py" "python3 .github/scripts/check-install-surface.py" \
-    "bash .github/scripts/check-gate-tool-versions.sh"
+    "bash .github/scripts/check-gate-tool-versions.sh" "python3 .github/scripts/check-workflow-invariants.py" \
+    "python3 .github/scripts/test-check-workflow-invariants.py"
   assert_clean_calls
 }
 
@@ -1341,9 +1410,11 @@ run_exit_aggregation() {
 case_exit_aggregation() {
   run_exit_aggregation
   expect_line "- \`actionlint\`: exit 3"
-  expect_end 1 "preflight: 5 gates run, 1 failed, 0 unavailable"
+  expect_end 1 "preflight: 7 gates run, 1 failed, 2 unavailable"
   expect_calls "python3 .github/scripts/check-docs-style.py" "python3 .github/scripts/check-install-surface.py" \
-    "bash .github/scripts/check-gate-tool-versions.sh" "actionlint" "python3 .github/scripts/test-check-docs-style.py"
+    "bash .github/scripts/check-gate-tool-versions.sh" "actionlint" \
+    "python3 .github/scripts/check-workflow-invariants.py" "python3 .github/scripts/test-check-docs-style.py" \
+    "python3 .github/scripts/test-check-workflow-invariants.py"
   assert_clean_calls
 }
 
@@ -1365,17 +1436,21 @@ case_table() {
       "- \`python3 .github/scripts/check-install-surface.py\`: exit 0" \
       "- \`bash .github/scripts/check-gate-tool-versions.sh\`: exit 0" \
       "- \`actionlint\`: exit 3" \
+      "- \`cargo fetch --locked && python3 .github/scripts/check-feature-discipline.py\`: unavailable (cargo: install Rust with rustup from https://rustup.rs)" \
+      "- \`python3 .github/scripts/test-check-feature-discipline.py --mutations\`: unavailable (cargo: install Rust with rustup from https://rustup.rs)" \
+      "- \`python3 .github/scripts/check-workflow-invariants.py\`: exit 0" \
       "- \`python3 .github/scripts/test-check-docs-style.py\`: exit 0" \
+      "- \`python3 .github/scripts/test-check-workflow-invariants.py\`: exit 0" \
       "- \`.github/scripts/test-mpp-interop.sh\`: not run (--full; needs Node $node and Corepack)" \
       "- \`.github/scripts/test-sdk-v17-interop.sh\`: not run (--full; needs Node $node and Corepack)" \
-      "preflight: 5 gates run, 1 failed, 0 unavailable"
+      "preflight: 7 gates run, 1 failed, 2 unavailable"
   } >"$CASE_DIR.expected-table"
   if ! diff -u "$CASE_DIR.expected-table" "$CASE_DIR.table" >&2; then
     fail "the table differs"
   fi
   rows=$(grep -c '^- ' "$CASE_DIR.table" || true)
-  if [ "$rows" -ne 7 ]; then
-    fail "the table holds $rows rows, expected 7"
+  if [ "$rows" -ne 11 ]; then
+    fail "the table holds $rows rows, expected 11"
   fi
   # shellcheck disable=SC2016 # The backticks are literal row characters.
   if grep '^- ' "$CASE_DIR.table" |
@@ -1537,9 +1612,9 @@ case_install_hint() {
   [ -z "$missing" ] || fail "no install hint for: $missing"
 }
 
-# Starts a --full run on a branch that changes only Markdown, with a stale
-# cov.json in the work tree and cargo answering from the status lines $@,
-# each 0 by default.
+# Starts a --full run on a branch that changes only Markdown, with stale
+# reports of both coverage configurations in the work tree and cargo
+# answering from the status lines $@, each 0 by default.
 run_full_with_stale_coverage() {
   local status
   start_run_case
@@ -1548,8 +1623,9 @@ run_full_with_stale_coverage() {
   for status in "$@"; do
     echo "$status" >>"$STATE/status"
   done
-  printf '{"stale": true}\n' >cov.json
-  cp cov.json "$CASE_DIR.stale"
+  printf '{"stale": true}\n' >cov-feature-on.json
+  printf '{"stale": true}\n' >cov-feature-off.json
+  cp cov-feature-off.json "$CASE_DIR.stale"
   run_preflight --full
 }
 
@@ -1566,12 +1642,16 @@ case_coverage_suppression() {
   if grep -qxF -- "$(command_record "$floors")" "$CASE_DIR.calls"; then
     fail "check-coverage.py ran"
   fi
-  cmp -s cov.json "$CASE_DIR.stale" || fail "cov.json changed"
+  cmp -s cov-feature-off.json "$CASE_DIR.stale" || fail "cov-feature-off.json changed"
+  floors=$(registry_row coverage-floors:feature-on | cut -f 2)
+  coverage=$(registry_row coverage:feature-on | cut -f 2)
+  expect_line "- \`$floors\`: not run (no coverage file from this run)"
+  cmp -s cov-feature-on.json "$CASE_DIR.stale" || fail "feature-on stale report changed"
   assert_clean_calls
 }
 
-# A passing coverage run writes cov.json, and coverage-floors runs right
-# after it.
+# A passing coverage run writes cov-feature-off.json, and coverage-floors
+# runs right after it; the feature-on pair does the same with its report.
 case_coverage_written() {
   local coverage floors first second
   coverage=$(registry_row coverage | cut -f 2)
@@ -1587,7 +1667,7 @@ case_coverage_written() {
     tail -n 1 "$CASE_DIR.out" >&2
     fail "the summary line does not show 0 failed and unavailable gates"
   fi
-  grep -qxF '{"written by": "the cargo shim"}' cov.json || fail "coverage did not write cov.json"
+  grep -qxF '{"written by": "the cargo shim"}' cov-feature-off.json || fail "coverage did not write cov-feature-off.json"
   record_gate_calls
   first=$(grep -nxF -- "$(command_record "$coverage")" "$CASE_DIR.calls" | cut -d : -f 1)
   second=$(grep -nxF -- "$(command_record "$floors")" "$CASE_DIR.calls" | cut -d : -f 1)
@@ -1595,6 +1675,11 @@ case_coverage_written() {
     cat "$CASE_DIR.calls" >&2
     fail "coverage-floors did not run right after coverage"
   fi
+  floors=$(registry_row coverage-floors:feature-on | cut -f 2)
+  coverage=$(registry_row coverage:feature-on | cut -f 2)
+  expect_line "- \`$coverage\`: exit 0"
+  expect_line "- \`$floors\`: exit 0"
+  grep -qxF '{"written by": "the cargo shim"}' cov-feature-on.json || fail "feature-on coverage did not write its report"
   assert_clean_calls
 }
 
@@ -1616,7 +1701,47 @@ case_coverage_unavailable() {
     grep -qxF -- "$(command_record "$floors")" "$CASE_DIR.calls"; then
     fail "a coverage command ran"
   fi
-  cmp -s cov.json "$CASE_DIR.stale" || fail "cov.json changed"
+  cmp -s cov-feature-off.json "$CASE_DIR.stale" || fail "cov-feature-off.json changed"
+  floors=$(registry_row coverage-floors:feature-on | cut -f 2)
+  coverage=$(registry_row coverage:feature-on | cut -f 2)
+  expect_line "- \`$floors\`: not run (no coverage file from this run)"
+  cmp -s cov-feature-on.json "$CASE_DIR.stale" || fail "feature-on stale report changed"
+  assert_clean_calls
+}
+
+# On a Linux host without libudev, release-shape is unavailable with the
+# install command, and check-host.sh does not run.
+case_release_shape_libudev() {
+  local host
+  start_run_case
+  edit CONTRIBUTING.md
+  write_shim "$BIN/cargo" cargo cargo
+  printf '#!%s\necho Linux\n' "$REAL_BASH" >"$BIN/uname"
+  printf '#!%s\nexit 1\n' "$REAL_BASH" >"$BIN/pkg-config"
+  chmod +x "$BIN/uname" "$BIN/pkg-config"
+  run_preflight --full
+  host=$(registry_row release-shape | cut -f 2)
+  expect_line "- \`$host\`: unavailable (libudev: apt-get install libudev-dev pkg-config)"
+  assert_clean_calls
+}
+
+case_coverage_off_only_fails() {
+  local floors on_floors
+  run_full_with_stale_coverage "cargo llvm-cov:feature-off=1"
+  floors=$(registry_row coverage-floors | cut -f 2)
+  on_floors=$(registry_row coverage-floors:feature-on | cut -f 2)
+  expect_line "- \`$floors\`: not run (no coverage file from this run)"
+  expect_line "- \`$on_floors\`: exit 0"
+  assert_clean_calls
+}
+
+case_coverage_on_only_fails() {
+  local floors on_floors
+  run_full_with_stale_coverage "cargo llvm-cov:feature-on=1"
+  floors=$(registry_row coverage-floors | cut -f 2)
+  on_floors=$(registry_row coverage-floors:feature-on | cut -f 2)
+  expect_line "- \`$floors\`: exit 0"
+  expect_line "- \`$on_floors\`: not run (no coverage file from this run)"
   assert_clean_calls
 }
 
