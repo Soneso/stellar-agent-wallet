@@ -60,11 +60,15 @@ stellar-agent-network = { workspace = true }
 # so signMessage produces interoperable signatures.
 stellar-agent-sep53 = { workspace = true }
 
+# Verification of the signature the authorized signAuthEntry path returns,
+# under the authorization's signer key, and independent verification of
+# produced signatures in tests.
+ed25519-dalek = { workspace = true }
+
 [dev-dependencies]
+stellar-agent-network = { workspace = true, features = ["test-helpers"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-# Independent ed25519 verification of produced signatures in tests.
-ed25519-dalek = { workspace = true }
 # Run-local payer and source keys of the live interop suite.
 rand_core = { workspace = true }
 # Serializes the live interop suite against other testnet suites.

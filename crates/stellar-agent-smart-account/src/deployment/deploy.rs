@@ -47,6 +47,7 @@ use tracing::info;
 use crate::SaError;
 use crate::deployment::address::derive_smart_account_address;
 use crate::deployment::map_budget_elapsed;
+use crate::submit::refuse_mainnet_sa;
 
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::deployment::address::derive_interop_deployer_seed;
@@ -608,6 +609,11 @@ pub(crate) fn verify_post_deploy_wasm_hash(
 ///
 /// # Errors
 ///
+/// Refuses with [`SaError::MainnetWriteForbidden`] when
+/// `args.network_passphrase` names mainnet or `args.rpc_url` is a
+/// mainnet-pattern endpoint, at entry: before the deployer key is read, any
+/// request and any audit row, dry runs included.
+///
 /// Returns `SaError::DeploymentFailed { phase, redacted_reason }` where `phase` is one of
 /// the 7-value canonical set: `"build"`, `"simulate"`, `"upload"`, `"deploy"`,
 /// `"constructor"`, `"submit"`, `"post_deploy_verification"`.
@@ -625,6 +631,8 @@ pub async fn deploy_smart_account(
     args: DeploymentArgs,
     audit_writer: Option<&mut AuditWriter>,
 ) -> Result<DeploymentResult, SaError> {
+    refuse_mainnet_sa(&args.network_passphrase, &args.rpc_url)?;
+
     // Capture chain_id and dry_run before args is consumed.
     let chain_id = caip2_chain_id_for_passphrase(&args.network_passphrase);
     let is_dry_run = args.dry_run;
@@ -1872,5 +1880,57 @@ mod tests {
                 "ON_CHAIN_REJECTED_PHASES entry '{phase}' is not in ALL_EMITTED_PHASES"
             );
         }
+    }
+
+    // ── Mainnet refusal before the deployer and the endpoint ────────────────
+
+    /// Runs the deployment for `network_passphrase` with a counting deployer
+    /// and a mock endpoint that answers nothing. Returns the result, the
+    /// deployer's key accesses and the requests the endpoint received.
+    async fn deploy_on(
+        network_passphrase: &str,
+        dry_run: bool,
+    ) -> (Result<DeploymentResult, SaError>, usize, usize) {
+        let server = wiremock::MockServer::start().await;
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x61; 32]);
+        let mut args = dry_run_args(DeployerKeypair::from_signer(
+            "counting".to_owned(),
+            Box::new(signer.clone()),
+        ));
+        args.network_passphrase = network_passphrase.to_owned();
+        args.rpc_url = server.uri();
+        args.dry_run = dry_run;
+        let result = deploy_smart_account(args, None).await;
+        let requests = server.received_requests().await.unwrap().len();
+        (result, signer.key_accesses(), requests)
+    }
+
+    #[tokio::test]
+    async fn a_testnet_dry_run_reads_the_deployer_key_and_sends_nothing() {
+        let (result, key_accesses, requests) =
+            deploy_on(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE, true).await;
+
+        assert!(result.unwrap().tx_hash.is_none(), "a dry run sends nothing");
+        assert_eq!(
+            key_accesses, 1,
+            "the dry run reads the deployer's public key"
+        );
+        assert_eq!(requests, 0);
+    }
+
+    #[tokio::test]
+    async fn a_mainnet_deployment_is_refused_before_the_deployer_and_the_endpoint() {
+        let (result, key_accesses, requests) = deploy_on(
+            stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SaError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert_eq!(key_accesses, 0);
+        assert_eq!(requests, 0);
     }
 }

@@ -143,15 +143,16 @@ pub enum Sep53Error {
 
     /// A message-signing request targeted a mainnet profile.
     ///
-    /// The SEP-53 message-signing MCP tool returns a signature the caller can use
-    /// externally; on a mainnet profile it is refused structurally before any key
-    /// access, so no signature is produced. This is a client-invalid request: the
-    /// operation is not serviceable on the active network.
+    /// A SEP-53 message signature is used outside the wallet; on a mainnet
+    /// profile signing is refused structurally before any key access, so no
+    /// signature is produced. This is a client-invalid request: the operation
+    /// is not serviceable on the active network.
     ///
     /// # Errors
     ///
-    /// Constructed by the MCP consumer layer at tool entry; not returned by the
-    /// crate's own sign/verify functions.
+    /// Returned by [`super::sign_message`] for the mainnet passphrase, and
+    /// constructed by the MCP consumer layer at tool entry. Never returned by
+    /// [`super::verify_message`].
     ///
     /// # Redaction invariant
     ///

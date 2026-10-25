@@ -1739,6 +1739,25 @@ pub enum SaError {
         redacted_reason: String,
     },
 
+    /// A pre-signature auth entry does not match the facts it commits to, or
+    /// names another network than the passphrase of the call. Nothing was
+    /// signed.
+    ///
+    /// `field` is `"signature_payload"` or `"auth_digest"` when
+    /// `PartialSorobanAuthorizationEntry::validate` recomputes that digest
+    /// from the entry's network ID, nonce, expiration, root invocation and
+    /// context-rule IDs and the stored value differs, and `"network_id"` when
+    /// the entry's network ID differs from the network ID of the passphrase
+    /// a signing function was given. Every case is refused before any signer
+    /// key access.
+    #[error("auth entry {field} does not match its signing context; nothing was signed")]
+    #[serde(rename = "sa.auth_entry_binding_mismatch")]
+    AuthEntryBindingMismatch {
+        /// The mismatching field: `"signature_payload"`, `"auth_digest"` or
+        /// `"network_id"`.
+        field: &'static str,
+    },
+
     /// The rule has no simple-threshold policy, whether other policies are present or absent.
     ///
     /// Fired by the signers manager's signer-set observation when a
@@ -3042,6 +3061,7 @@ impl SaError {
             Self::MainnetWriteForbidden => "network.mainnet_write_forbidden",
             Self::ScAddressEncodingFailed { .. } => "sa.scaddress_encoding_failed",
             Self::AuthEntryConstructionFailed { .. } => "sa.auth_entry_construction_failed",
+            Self::AuthEntryBindingMismatch { .. } => "sa.auth_entry_binding_mismatch",
             Self::WebAuthnVerifierProvenanceMismatch { .. } => {
                 "sa.webauthn_verifier_provenance_mismatch"
             }
@@ -3420,6 +3440,12 @@ mod tests {
                 SaError::AuthEntryConstructionFailed {
                     stage: "context_rule_ids",
                     redacted_reason: "context_rule_ids XDR encode failed before signing".to_owned(),
+                },
+            ),
+            (
+                "sa.auth_entry_binding_mismatch",
+                SaError::AuthEntryBindingMismatch {
+                    field: "auth_digest",
                 },
             ),
             (
@@ -4297,6 +4323,13 @@ mod tests {
                 &["stage", "redacted_reason"],
             ),
             (
+                "sa.auth_entry_binding_mismatch",
+                SaError::AuthEntryBindingMismatch {
+                    field: "network_id",
+                },
+                &["field"],
+            ),
+            (
                 "sa.webauthn_assertion_invalid",
                 SaError::WebAuthnAssertionInvalid {
                     reason: WebAuthnInvalidReason::WrongType,
@@ -5087,6 +5120,9 @@ mod tests {
                 stage: "context_rule_ids",
                 redacted_reason: "context_rule_ids XDR encode failed before signing".to_owned(),
             },
+            SaError::AuthEntryBindingMismatch {
+                field: "signature_payload",
+            },
             SaError::WebAuthnAssertionInvalid {
                 reason: WebAuthnInvalidReason::WrongType,
             },
@@ -5383,6 +5419,7 @@ mod tests {
             "sa.deployment_failed",
             "sa.scaddress_encoding_failed",
             "sa.auth_entry_construction_failed",
+            "sa.auth_entry_binding_mismatch",
             "sa.webauthn_assertion_invalid:wrong_type",
             "sa.webauthn_assertion_invalid:challenge_mismatch",
             "sa.webauthn_assertion_invalid:wrong_rp_id",
@@ -5468,7 +5505,7 @@ mod tests {
             );
         }
 
-        assert_eq!(seen.len(), 80, "closed set must have exactly 80 wire codes");
+        assert_eq!(seen.len(), 81, "closed set must have exactly 81 wire codes");
     }
 
     /// Verifies the sub-code closed set is exhaustively matched by tests.

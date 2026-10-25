@@ -31,7 +31,9 @@
 //!   the single SEP-23 signing call site.
 //! - [`sign_soroban_auth_entry`] invokes
 //!   `Signer::sign_soroban_address_auth_payload` over the SHA-256 of the
-//!   supplied preimage bytes: the auth-entry signing primitive.
+//!   supplied preimage bytes: the auth-entry signing primitive. It refuses a
+//!   mainnet preimage; [`sign_soroban_auth_entry_authorized`] signs one under
+//!   a Soroban intent authorization.
 //! - [`sign_message_bytes`] computes the SEP-53 message digest then invokes
 //!   `Signer::sign_tx_payload` (the payload domain is the SEP-53 message digest,
 //!   not a SEP-23 transaction, but the ed25519 primitive is identical).
@@ -43,8 +45,14 @@
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
-use stellar_agent_core::error::WalletError;
+use stellar_agent_core::error::{MAINNET_SIGNING_REFUSAL_DETAIL, WalletError};
 use stellar_agent_core::observability::redact::redact_strkey_first5_last5;
+use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+use stellar_agent_network::mainnet::authorization::MainnetSorobanIntentAuthorization;
+use stellar_agent_network::mainnet::soroban::check_preimage_against_authorization;
+use stellar_agent_network::mainnet::{
+    MainnetAuthorizationError, MainnetConsumer, MainnetPrecondition, SignerRole,
+};
 use stellar_agent_network::signing::Signer;
 use stellar_agent_soroban_auth::preimage_parts;
 use stellar_xdr::{AccountId, HashIdPreimage, PublicKey, ReadXdr, ScAddress, Uint256};
@@ -71,6 +79,8 @@ use crate::error::Sep43Error;
 ///
 /// - [`Sep43Error::InvalidNetworkPassphrase`] — provided passphrase does not
 ///   match the profile's.
+/// - [`Sep43Error::MainnetSigningForbidden`]: the profile's network is
+///   mainnet; `attach_signature` refuses it before any key access.
 /// - [`Sep43Error::InvalidXdr`] — `transaction_xdr` is not a valid
 ///   base64-encoded `TransactionEnvelope`.
 /// - [`Sep43Error::UserRejected`] — the signer returned a user-rejection error.
@@ -139,7 +149,9 @@ pub async fn sign_classic_transaction(
 ///    `HashIdPreimage`.
 /// 3. The preimage must be envelope type 9 or 10.
 /// 4. Its `network_id` must equal `SHA256(expected_network_passphrase)`.
-/// 5. A type 10 preimage must be bound to `expected_signer`.
+/// 5. The network must not be mainnet: a mainnet preimage is signed only by
+///    [`sign_soroban_auth_entry_authorized`].
+/// 6. A type 10 preimage must be bound to `expected_signer`.
 ///
 /// `expected_signer` must be the public key of `signer`. Callers already hold
 /// it, so the address check needs no second signer round-trip.
@@ -152,6 +164,8 @@ pub async fn sign_classic_transaction(
 ///   well-formed `HashIdPreimage`.
 /// - [`Sep43Error::MalformedAuthEntry`]: the preimage is neither envelope
 ///   type 9 nor envelope type 10.
+/// - [`Sep43Error::MainnetSigningForbidden`]: the preimage is for mainnet; the
+///   signer is never called.
 /// - [`Sep43Error::InvalidAddress`]: a type 10 preimage is bound to an address
 ///   other than `ScAddress::Account(expected_signer)`.
 /// - [`Sep43Error::UserRejected`]: signer user-rejection.
@@ -167,6 +181,131 @@ pub async fn sign_soroban_auth_entry(
     expected_network_passphrase: &str,
     network_passphrase_override: Option<&str>,
 ) -> Result<String, Sep43Error> {
+    let received = decode_preimage(
+        preimage_xdr,
+        expected_network_passphrase,
+        network_passphrase_override,
+    )?;
+    if received.network_id == mainnet_network_id() {
+        return Err(mainnet_signing_forbidden());
+    }
+    check_bound_address(&received.preimage, &expected_signer.0)?;
+
+    // Sign SHA-256 of the received bytes with the auth-entry signing primitive.
+    let sig_bytes = signer
+        .sign_soroban_address_auth_payload(&received.payload)
+        .await
+        .map_err(wallet_error_to_sep43)?;
+
+    // Return the base64-encoded raw 64-byte signature.
+    Ok(base64::engine::general_purpose::STANDARD.encode(sig_bytes))
+}
+
+/// Signs a mainnet SEP-43 `signAuthEntry` request under a Soroban intent
+/// authorization.
+///
+/// The mainnet counterpart of [`sign_soroban_auth_entry`], with the same
+/// input, output, and preimage checks, in this order:
+///
+/// 1. The checks 1 to 4 of [`sign_soroban_auth_entry`].
+/// 2. A type 10 preimage must be bound to the authorization's signer.
+/// 3. `expected_signer` must be the authorization's signer.
+/// 4. The preimage must be the one `authorization` covers, for `consumer`, on
+///    the mainnet clock: the chain, the consuming verb, the expiry, and the
+///    intent digest of the preimage's invocation, through
+///    [`check_preimage_against_authorization`].
+/// 5. The signer's reported public key must be the authorization's agent
+///    signer. This is the only step that calls the signer before it signs.
+/// 6. The signature must verify under that key over `SHA256(preimage_bytes)`
+///    before it is returned.
+///
+/// Compiled in every build; without mainnet writes no authorization exists,
+/// so the function cannot be called.
+///
+/// # Errors
+///
+/// - [`Sep43Error::MainnetAuthorizationRefused`]: a check of the
+///   authorization fails, the preimage is not for mainnet, or the signature
+///   does not verify. The broken precondition is logged.
+/// - [`Sep43Error::MainnetSigningForbidden`]: this build has no mainnet
+///   writes.
+/// - [`Sep43Error::InvalidAddress`]: a type 10 preimage is bound to another
+///   address than the authorization's signer.
+/// - The other errors of [`sign_soroban_auth_entry`] for the input and the
+///   signer.
+///
+/// # Panics
+///
+/// Never panics.
+pub async fn sign_soroban_auth_entry_authorized(
+    preimage_xdr: &str,
+    signer: &(dyn Signer + Send + Sync),
+    expected_signer: &stellar_strkey::ed25519::PublicKey,
+    expected_network_passphrase: &str,
+    network_passphrase_override: Option<&str>,
+    consumer: MainnetConsumer,
+    authorization: &MainnetSorobanIntentAuthorization,
+) -> Result<String, Sep43Error> {
+    const PATH: &str = "sign_soroban_auth_entry_authorized";
+    let refuse = |error: MainnetAuthorizationError| wallet_error_to_sep43(error.report(PATH));
+
+    let received = decode_preimage(
+        preimage_xdr,
+        expected_network_passphrase,
+        network_passphrase_override,
+    )?;
+    let bound_key = authorization.signer_public_key();
+    check_bound_address(&received.preimage, &bound_key)?;
+    if expected_signer.0 != bound_key {
+        return Err(refuse(MainnetAuthorizationError::Refused(
+            MainnetPrecondition::SignerKeyMismatch,
+        )));
+    }
+    let now_ms = stellar_agent_network::mainnet::clock::now_ms().map_err(wallet_error_to_sep43)?;
+    check_preimage_against_authorization(
+        authorization,
+        consumer,
+        &received.preimage,
+        &received.network_id,
+        now_ms,
+    )
+    .map_err(refuse)?;
+
+    let public_key = signer.public_key().await.map_err(wallet_error_to_sep43)?;
+    authorization
+        .check_signer(&public_key.0, SignerRole::AgentSigner)
+        .map_err(refuse)?;
+
+    let sig_bytes = signer
+        .sign_soroban_address_auth_payload(&received.payload)
+        .await
+        .map_err(wallet_error_to_sep43)?;
+    if !signature_verifies(&public_key.0, &received.payload, &sig_bytes) {
+        return Err(refuse(MainnetAuthorizationError::Refused(
+            MainnetPrecondition::SignatureInvalid,
+        )));
+    }
+
+    Ok(base64::engine::general_purpose::STANDARD.encode(sig_bytes))
+}
+
+/// A received authorization-entry preimage that passed the input checks.
+struct ReceivedPreimage {
+    /// The decoded preimage.
+    preimage: HashIdPreimage,
+    /// Its `network_id`, equal to the expected network's.
+    network_id: [u8; 32],
+    /// `SHA-256` of the received bytes: the payload the signature covers.
+    payload: [u8; 32],
+}
+
+/// Runs the passphrase-override, decode, preimage-type, and network-id
+/// checks of a `signAuthEntry` request.
+fn decode_preimage(
+    preimage_xdr: &str,
+    expected_network_passphrase: &str,
+    network_passphrase_override: Option<&str>,
+) -> Result<ReceivedPreimage, Sep43Error> {
     // Network-passphrase guard.
     if let Some(provided) = network_passphrase_override
         && provided != expected_network_passphrase
@@ -195,7 +334,7 @@ pub async fn sign_soroban_auth_entry(
     .map_err(|e| Sep43Error::InvalidXdr {
         detail: format!("failed to decode HashIdPreimage: {e}"),
     })?;
-    let Some((_, network_id, bound_address)) = preimage_parts(&preimage) else {
+    let Some((_, network_id, _)) = preimage_parts(&preimage) else {
         return Err(Sep43Error::MalformedAuthEntry {
             detail: "preimage is not a Soroban authorization HashIdPreimage \
                      (envelope type 9 or 10)"
@@ -211,34 +350,69 @@ pub async fn sign_soroban_auth_entry(
         });
     }
 
-    // A type 10 preimage binds the signature to its address; sign only for the
-    // signing key's own account address.
-    if let Some(bound_address) = bound_address {
-        let signer_address = ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
-            Uint256(expected_signer.0),
-        )));
-        if *bound_address != signer_address {
-            let expected = expected_signer.to_string();
-            return Err(Sep43Error::InvalidAddress {
-                detail: format!(
-                    "authorization preimage is bound to another address (expected the signing \
-                     key {})",
-                    redact_strkey_first5_last5(expected.as_str())
-                ),
-                expected_type: "G-strkey matching the signing key",
-            });
-        }
+    Ok(ReceivedPreimage {
+        payload: Sha256::digest(&preimage_bytes).into(),
+        preimage,
+        network_id,
+    })
+}
+
+/// Requires a type 10 preimage to be bound to the account of `key`; a type 9
+/// preimage carries no address.
+fn check_bound_address(preimage: &HashIdPreimage, key: &[u8; 32]) -> Result<(), Sep43Error> {
+    let Some((_, _, Some(bound_address))) = preimage_parts(preimage) else {
+        return Ok(());
+    };
+    let signer_address =
+        ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*key))));
+    if *bound_address == signer_address {
+        return Ok(());
     }
+    let expected = stellar_strkey::ed25519::PublicKey(*key).to_string();
+    Err(Sep43Error::InvalidAddress {
+        detail: format!(
+            "authorization preimage is bound to another address (expected the signing \
+             key {})",
+            redact_strkey_first5_last5(expected.as_str())
+        ),
+        expected_type: "G-strkey matching the signing key",
+    })
+}
 
-    // Sign SHA-256 of the received bytes with the auth-entry signing primitive.
-    let payload: [u8; 32] = Sha256::digest(&preimage_bytes).into();
-    let sig_bytes = signer
-        .sign_soroban_address_auth_payload(&payload)
-        .await
-        .map_err(wallet_error_to_sep43)?;
+/// `SHA-256` of the mainnet passphrase: the mainnet network id.
+fn mainnet_network_id() -> [u8; 32] {
+    Sha256::digest(MAINNET_PASSPHRASE.as_bytes()).into()
+}
 
-    // Return the base64-encoded raw 64-byte signature.
-    Ok(base64::engine::general_purpose::STANDARD.encode(sig_bytes))
+/// Refuses `network_passphrase` when it is the mainnet passphrase, with the
+/// structural mainnet refusal.
+///
+/// The SEP-43 method entries call it with the module's configured network
+/// before they ask the signer for anything.
+///
+/// # Errors
+///
+/// [`Sep43Error::MainnetSigningForbidden`] for the mainnet passphrase.
+pub(crate) fn refuse_mainnet(network_passphrase: &str) -> Result<(), Sep43Error> {
+    if network_passphrase == MAINNET_PASSPHRASE {
+        return Err(mainnet_signing_forbidden());
+    }
+    Ok(())
+}
+
+/// The structural mainnet refusal of a signing primitive.
+fn mainnet_signing_forbidden() -> Sep43Error {
+    Sep43Error::MainnetSigningForbidden {
+        detail: MAINNET_SIGNING_REFUSAL_DETAIL.to_owned(),
+    }
+}
+
+/// Whether `signature` is a valid ed25519 signature by `key` over `payload`.
+fn signature_verifies(key: &[u8; 32], payload: &[u8; 32], signature: &[u8; 64]) -> bool {
+    ed25519_dalek::VerifyingKey::from_bytes(key).is_ok_and(|key| {
+        key.verify_strict(payload, &ed25519_dalek::Signature::from_bytes(signature))
+            .is_ok()
+    })
 }
 
 /// Signs an arbitrary message byte slice for SEP-43 `signMessage`.
@@ -258,11 +432,18 @@ pub async fn sign_soroban_auth_entry(
 ///
 /// # Message validation
 ///
+/// - Returns [`Sep43Error::MainnetSigningForbidden`] if `network_passphrase`
+///   is the mainnet passphrase, before any other check and before the signer
+///   is called. The SEP-53 digest carries no network, so the refusal rests on
+///   the network the caller declares; callers pass their profile's
+///   passphrase.
 /// - Returns [`Sep43Error::InvalidMessage`] if `message_bytes` is empty or
 ///   exceeds [`stellar_agent_sep53::MAX_MESSAGE_BYTES`].
 ///
 /// # Errors
 ///
+/// - [`Sep43Error::MainnetSigningForbidden`]: `network_passphrase` is the
+///   mainnet passphrase.
 /// - [`Sep43Error::InvalidMessage`] — `message_bytes` is empty or too large.
 /// - [`Sep43Error::UserRejected`] — signer user-rejection.
 /// - [`Sep43Error::SignerUnavailable`] — signer wallet-state error.
@@ -273,7 +454,9 @@ pub async fn sign_soroban_auth_entry(
 pub async fn sign_message_bytes(
     message_bytes: &[u8],
     signer: &(dyn Signer + Send + Sync),
+    network_passphrase: &str,
 ) -> Result<(String, String), Sep43Error> {
+    refuse_mainnet(network_passphrase)?;
     if message_bytes.is_empty() {
         return Err(Sep43Error::InvalidMessage {
             detail: "message must not be empty".to_owned(),
@@ -314,7 +497,7 @@ pub async fn sign_message_bytes(
 
 /// Maps a [`WalletError`] to a [`Sep43Error`].
 fn wallet_error_to_sep43(e: WalletError) -> Sep43Error {
-    use stellar_agent_core::error::{AuthError, WalletError as WE};
+    use stellar_agent_core::error::{AuthError, NetworkError, WalletError as WE};
     match e {
         WE::Auth(AuthError::HardwareUserRefused) => Sep43Error::UserRejected {
             reason: "user declined on hardware device".to_owned(),
@@ -328,6 +511,10 @@ fn wallet_error_to_sep43(e: WalletError) -> Sep43Error {
         WE::Protocol(p) => Sep43Error::InvalidXdr {
             detail: format!("XDR codec operation failed: {p}"),
         },
+        WE::Network(NetworkError::MainnetWriteForbidden) => mainnet_signing_forbidden(),
+        WE::Network(NetworkError::MainnetAuthorizationRefused) => {
+            Sep43Error::MainnetAuthorizationRefused
+        }
         other => Sep43Error::SignerUnavailable {
             detail: format!("signer error: {other}"),
         },
@@ -346,6 +533,7 @@ mod tests {
     )]
 
     use super::*;
+    use stellar_agent_network::signing::test_doubles::CountingSigner;
 
     // ── Fixture helpers ───────────────────────────────────────────────────────
 
@@ -470,67 +658,6 @@ mod tests {
             .try_into()
             .expect("signature must be 64 bytes");
         ed25519_dalek::Signature::from_bytes(&bytes)
-    }
-
-    /// Delegating signer that counts signature requests, so refusal tests can
-    /// prove no signature is produced.
-    struct CountingSigner {
-        inner: stellar_agent_network::signing::SoftwareSigningKey,
-        signatures: std::sync::atomic::AtomicUsize,
-    }
-
-    impl CountingSigner {
-        fn new(seed: [u8; 32]) -> Self {
-            Self {
-                inner: stellar_agent_network::signing::SoftwareSigningKey::new_from_bytes(seed),
-                signatures: std::sync::atomic::AtomicUsize::new(0),
-            }
-        }
-
-        fn count(&self) -> usize {
-            self.signatures.load(std::sync::atomic::Ordering::SeqCst)
-        }
-
-        fn record(&self) {
-            self.signatures
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Signer for CountingSigner {
-        async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
-            self.record();
-            self.inner.sign_tx_payload(payload).await
-        }
-
-        async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
-            self.record();
-            self.inner.sign_auth_digest(digest).await
-        }
-
-        async fn sign_soroban_address_auth_payload(
-            &self,
-            payload: &[u8; 32],
-        ) -> Result<[u8; 64], WalletError> {
-            self.record();
-            self.inner.sign_soroban_address_auth_payload(payload).await
-        }
-
-        async fn sign_webauthn_assertion(
-            &self,
-            auth_digest: &[u8; 32],
-            credential_id: &[u8],
-        ) -> Result<stellar_agent_network::signing::WebAuthnAssertion, WalletError> {
-            self.record();
-            self.inner
-                .sign_webauthn_assertion(auth_digest, credential_id)
-                .await
-        }
-
-        async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
-            self.inner.public_key().await
-        }
     }
 
     // ── sign_classic_transaction ──────────────────────────────────────────────
@@ -876,7 +1003,11 @@ mod tests {
         let vk = VerifyingKey::from_bytes(&pk.0).expect("signer pubkey must be valid ed25519");
         vk.verify_strict(&preimage_hash(&preimage_b64), &decode_signature(&sig_b64))
             .expect("signature must verify against SHA256(preimage_bytes)");
-        assert_eq!(signer.count(), 1, "exactly one signature must be requested");
+        assert_eq!(
+            signer.sign_calls(),
+            1,
+            "exactly one signature must be requested"
+        );
     }
 
     /// The type 9 and type 10 preimages of the same entry fields hash to
@@ -953,7 +1084,11 @@ mod tests {
         assert_eq!(expected_type, "G-strkey matching the signing key");
         assert_eq!(err.sep43_code(), -3);
         assert_eq!(err.wire_code(), "sep43.invalid_address");
-        assert_eq!(signer.count(), 0, "a refused preimage must not be signed");
+        assert_eq!(
+            signer.sign_calls(),
+            0,
+            "a refused preimage must not be signed"
+        );
     }
 
     #[tokio::test]
@@ -1008,7 +1143,11 @@ mod tests {
             );
             assert_eq!(err.sep43_code(), -3);
         }
-        assert_eq!(signer.count(), 0, "a refused preimage must not be signed");
+        assert_eq!(
+            signer.sign_calls(),
+            0,
+            "a refused preimage must not be signed"
+        );
     }
 
     // ── sign_message_bytes ────────────────────────────────────────────────────
@@ -1022,7 +1161,7 @@ mod tests {
         rt.block_on(async {
             use stellar_agent_network::signing::SoftwareSigningKey;
             let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
-            let err = sign_message_bytes(&[], &key).await.unwrap_err();
+            let err = sign_message_bytes(&[], &key, TESTNET).await.unwrap_err();
             assert!(matches!(err, Sep43Error::InvalidMessage { .. }));
             assert_eq!(err.sep43_code(), -3);
         });
@@ -1040,7 +1179,7 @@ mod tests {
         let pk = key.public_key().await.unwrap();
         let message = b"Hello, World!";
 
-        let (b64_sig, addr) = sign_message_bytes(message, &key)
+        let (b64_sig, addr) = sign_message_bytes(message, &key, TESTNET)
             .await
             .expect("sign_message_bytes must succeed with non-empty message");
 
@@ -1084,7 +1223,9 @@ mod tests {
 
         let key = SoftwareSigningKey::new_from_bytes([0x61u8; 32]);
         let oversized = vec![0u8; stellar_agent_sep53::MAX_MESSAGE_BYTES + 1];
-        let err = sign_message_bytes(&oversized, &key).await.unwrap_err();
+        let err = sign_message_bytes(&oversized, &key, TESTNET)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, Sep43Error::InvalidMessage { .. }),
             "oversized message must return InvalidMessage, got: {err:?}"
@@ -1236,6 +1377,119 @@ mod tests {
             err.sep43_code(),
             -3,
             "depth-exceeded decode must map to SEP-43 error code -3 (client-invalid)"
+        );
+    }
+
+    // ── Mainnet refusals ──────────────────────────────────────────────────────
+
+    const MAINNET: &str = "Public Global Stellar Network ; September 2015";
+
+    /// The classic primitive reports the SEP-43 mainnet refusal, before any
+    /// key access.
+    #[tokio::test]
+    async fn sign_classic_transaction_refuses_mainnet_before_any_key_access() {
+        let signer = CountingSigner::new([0x41u8; 32]);
+        let source =
+            stellar_agent_network::signing::SoftwareSigningKey::new_from_bytes([0x41u8; 32])
+                .public_key()
+                .await
+                .unwrap();
+        let err = sign_classic_transaction(&minimal_tx_v1_xdr(&source.0), &signer, MAINNET, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Sep43Error::MainnetSigningForbidden { .. }),
+            "got: {err:?}"
+        );
+        assert_eq!(err.wire_code(), "sep43.mainnet_signing_forbidden");
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    /// A mainnet preimage whose every other check passes is refused with
+    /// no signature.
+    #[tokio::test]
+    async fn sign_soroban_auth_entry_refuses_a_mainnet_preimage() {
+        let signer = CountingSigner::new([0x42u8; 32]);
+        let pk = stellar_agent_network::signing::SoftwareSigningKey::new_from_bytes([0x42u8; 32])
+            .public_key()
+            .await
+            .unwrap();
+        let preimage = minimal_soroban_auth_v2_preimage_xdr(MAINNET, account_address(&pk));
+
+        let err = sign_soroban_auth_entry(&preimage, &signer, &pk, MAINNET, None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Sep43Error::MainnetSigningForbidden { .. }),
+            "got: {err:?}"
+        );
+        assert_eq!(signer.sign_calls(), 0, "no signature on mainnet");
+        assert_eq!(signer.key_accesses(), 0, "no key access on mainnet");
+    }
+
+    /// The same preimage on testnet signs once, so the refusal above is the
+    /// network's.
+    #[tokio::test]
+    async fn sign_soroban_auth_entry_signs_the_same_preimage_on_testnet() {
+        let signer = CountingSigner::new([0x42u8; 32]);
+        let pk = stellar_agent_network::signing::SoftwareSigningKey::new_from_bytes([0x42u8; 32])
+            .public_key()
+            .await
+            .unwrap();
+        let preimage = minimal_soroban_auth_v2_preimage_xdr(TESTNET, account_address(&pk));
+
+        sign_soroban_auth_entry(&preimage, &signer, &pk, TESTNET, None)
+            .await
+            .expect("testnet signs");
+
+        assert_eq!(signer.sign_calls(), 1);
+    }
+
+    /// Message signing refuses mainnet before the signer is asked for its key
+    /// or a signature.
+    #[tokio::test]
+    async fn sign_message_bytes_refuses_mainnet_before_any_key_access() {
+        let signer = CountingSigner::new([0x43u8; 32]);
+        let err = sign_message_bytes(b"hello", &signer, MAINNET)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Sep43Error::MainnetSigningForbidden { .. }),
+            "got: {err:?}"
+        );
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    /// The same message on testnet signs, so the refusal above is the
+    /// network's.
+    #[tokio::test]
+    async fn sign_message_bytes_signs_on_testnet() {
+        let signer = CountingSigner::new([0x43u8; 32]);
+        sign_message_bytes(b"hello", &signer, TESTNET)
+            .await
+            .expect("testnet signs");
+        assert_eq!(signer.sign_calls(), 1);
+    }
+
+    /// The two network mainnet refusals map to their SEP-43 counterparts.
+    #[test]
+    fn the_network_mainnet_refusals_map_to_their_sep43_variants() {
+        use stellar_agent_core::error::NetworkError;
+
+        let forbidden =
+            wallet_error_to_sep43(WalletError::Network(NetworkError::MainnetWriteForbidden));
+        assert!(
+            matches!(&forbidden, Sep43Error::MainnetSigningForbidden { detail }
+                if detail == MAINNET_SIGNING_REFUSAL_DETAIL),
+            "got: {forbidden:?}"
+        );
+        let refused = wallet_error_to_sep43(WalletError::Network(
+            NetworkError::MainnetAuthorizationRefused,
+        ));
+        assert!(
+            matches!(refused, Sep43Error::MainnetAuthorizationRefused),
+            "got: {refused:?}"
         );
     }
 }

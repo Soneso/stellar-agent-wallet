@@ -25,6 +25,9 @@ thiserror = { workspace = true }
 # The signing primitive: SEP-53 builds the prefix + message preimage, SHA-256
 # digests it, then calls Signer::sign_tx_payload on the digest.
 stellar-agent-network = { workspace = true }
+# The mainnet passphrase and the mainnet signing refusal detail, from their
+# single definition, for the refusal of mainnet message signing.
+stellar-agent-core = { workspace = true }
 
 [features]
 # Exposes test-helper constructors to integration tests that cannot use
@@ -32,6 +35,7 @@ stellar-agent-network = { workspace = true }
 test-helpers = []
 
 [dev-dependencies]
+stellar-agent-network = { workspace = true, features = ["test-helpers"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 # base64 for decoding spec test-vector signatures in unit tests.

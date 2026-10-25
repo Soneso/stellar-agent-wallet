@@ -67,6 +67,7 @@ use crate::deployment::address::derive_smart_account_address;
 use crate::deployment::deploy::{ResolvedFeePerOp, decode_hex32, redact_wasm_hash, to_hex};
 use crate::deployment::map_budget_elapsed;
 use crate::managers::rules::parse_c_strkey_to_smart_account;
+use crate::submit::refuse_mainnet_sa;
 
 // ── Embedded WASM ─────────────────────────────────────────────────────────────
 
@@ -168,6 +169,10 @@ pub struct TimelockControllerDeployResult {
 ///
 /// # Errors
 ///
+/// - [`SaError::MainnetWriteForbidden`]: `args.network_passphrase` names
+///   mainnet or `args.rpc_url` is a mainnet-pattern endpoint; refused at
+///   entry, before the deployer key is read and any request, dry runs
+///   included.
 /// - [`SaError::DeploymentFailed`] — runtime SHA gate mismatch, encoding failure,
 ///   or Soroban deployment failed at one of the 7 canonical phases.
 ///
@@ -180,6 +185,8 @@ pub struct TimelockControllerDeployResult {
 pub async fn deploy_timelock_controller(
     args: TimelockControllerDeployArgs,
 ) -> Result<TimelockControllerDeployResult, SaError> {
+    refuse_mainnet_sa(&args.network_passphrase, &args.rpc_url)?;
+
     deploy_timelock_controller_body(args).await
 }
 
@@ -829,5 +836,72 @@ mod tests {
             "different passphrases must produce different salts"
         );
         assert_eq!(salt1, salt4, "same inputs must produce the same salt");
+    }
+
+    // ── Mainnet refusal before the deployer and the endpoint ────────────────
+
+    /// Runs the deployment for `network_passphrase` with a counting deployer
+    /// and a mock endpoint that answers nothing. Returns the result, the
+    /// deployer's key accesses and the requests the endpoint received.
+    async fn deploy_on(
+        network_passphrase: &str,
+        dry_run: bool,
+    ) -> (
+        Result<TimelockControllerDeployResult, SaError>,
+        usize,
+        usize,
+    ) {
+        let server = wiremock::MockServer::start().await;
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x61; 32]);
+        let result = deploy_timelock_controller(TimelockControllerDeployArgs {
+            deployer: crate::deployment::deploy::DeployerKeypair::from_signer(
+                "counting".to_owned(),
+                Box::new(signer.clone()),
+            ),
+            network_passphrase: network_passphrase.to_owned(),
+            rpc_url: server.uri(),
+            timeout: Duration::from_secs(1),
+            fee: ResolvedFeePerOp {
+                stroops: 100,
+                percentile_label: "profile_default".to_owned(),
+            },
+            min_delay: 0,
+            proposers: vec!["GAAH4OT36RRCCAGKARGPN2HLHT2NOBVFHO4GUHA6CF7UKQ4MMV24WQ4N".to_owned()],
+            executors: vec![],
+            admin: None,
+            dry_run,
+        })
+        .await;
+        let requests = server.received_requests().await.unwrap().len();
+        (result, signer.key_accesses(), requests)
+    }
+
+    #[tokio::test]
+    async fn a_testnet_dry_run_reads_the_deployer_key_and_sends_nothing() {
+        let (result, key_accesses, requests) =
+            deploy_on(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE, true).await;
+
+        assert_eq!(result.unwrap().status, "dry_run");
+        assert_eq!(
+            key_accesses, 1,
+            "the dry run reads the deployer's public key"
+        );
+        assert_eq!(requests, 0);
+    }
+
+    #[tokio::test]
+    async fn a_mainnet_deployment_is_refused_before_the_deployer_and_the_endpoint() {
+        let (result, key_accesses, requests) = deploy_on(
+            stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SaError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert_eq!(key_accesses, 0);
+        assert_eq!(requests, 0);
     }
 }

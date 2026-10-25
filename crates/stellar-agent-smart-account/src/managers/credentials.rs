@@ -73,6 +73,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::webauthn::passkey_signer::{PasskeyCredentialRecord, PasskeySignHandle};
+use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_network::signing::Signer as _;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -577,6 +578,38 @@ pub enum CredentialsError {
     AuditWriterPoisoned {
         /// Static context label for the write that could not be performed.
         context: AuditWriterPoisonContext,
+    },
+
+    /// Passkey signing was refused because the auth entry's network ID is the
+    /// mainnet network ID.
+    ///
+    /// Wire code: `sa.credentials.mainnet_write_forbidden`, carried in the
+    /// Display text because this type has no code method of its own.
+    ///
+    /// Returned by [`CredentialsManager::sign_with_passkey_rule`] at entry,
+    /// before the rule checks, the approval store and the bridge, so no
+    /// ceremony starts and no `PasskeyAssertion` audit row is written.
+    #[error("passkey signing on mainnet is not permitted (sa.credentials.mainnet_write_forbidden)")]
+    MainnetWriteForbidden,
+
+    /// Passkey signing was refused because the auth entry's digests are not
+    /// the values its own facts produce.
+    ///
+    /// Wraps the [`crate::SaError`] of
+    /// [`crate::managers::auth_entry::PartialSorobanAuthorizationEntry::validate`]:
+    /// `SaError::AuthEntryBindingMismatch`, or
+    /// `SaError::AuthEntryConstructionFailed` when the recomputation could not
+    /// encode its input. Returned at entry, like
+    /// [`CredentialsError::MainnetWriteForbidden`], so no ceremony starts and
+    /// no `PasskeyAssertion` audit row is written.
+    #[error("auth entry refused before passkey signing: {source}")]
+    AuthEntryInvalid {
+        /// The wrapped validation error.
+        ///
+        /// Named `source` so `thiserror` wires `std::error::Error::source()` for
+        /// correct error-chain traversal.
+        #[source]
+        source: Box<crate::SaError>,
     },
 }
 
@@ -1477,6 +1510,11 @@ impl CredentialsManager {
     ///
     /// # Overview
     ///
+    /// `partial` is validated first with
+    /// [`crate::managers::auth_entry::PartialSorobanAuthorizationEntry::validate`]:
+    /// a mainnet network ID, or digests that differ from the recomputed ones,
+    /// are refused before every step below, including the audit row of step 8.
+    ///
     /// 1. Resolve `credential_name` → `CredentialMetadata` from the passkeys
     ///    registry (fails with `CredentialsError::NotFound` if absent).
     /// 2. Decode `credential_id` + `public_key_uncompressed` from base64url;
@@ -1503,23 +1541,23 @@ impl CredentialsManager {
     ///    Early-exit paths (those that return before `poll_signing`) emit with
     ///    `credential_id_b64url = ""` and `rp_id = ""` because those fields are
     ///    only available after `show()` succeeds; `auth_digest_hex` is always
-    ///    derived from the caller-supplied `auth_digest` parameter.
+    ///    derived from `partial.auth_digest`.
     ///
     /// # Parameters
     ///
     /// - `credential_name`: name to look up in the passkeys registry.
-    /// - `smart_account`: the C-strkey of the smart account that this signing
-    ///   ceremony targets.  Redacted to first-5-last-5 in the approval store
-    ///   entry **and** the `PasskeyAssertion` audit-log entry to prevent
-    ///   sensitive data leaking into logs.
-    ///   The `smart_account_redacted` field in `EventKind::PasskeyAssertion`
+    /// - `partial`: the pre-signature auth entry the ceremony signs. Its
+    ///   `auth_digest` is the 32-byte Soroban auth digest the WebAuthn
+    ///   ceremony signs (the `challenge` the bridge encodes for the browser),
+    ///   its `context_rule_ids` are the rules the per-signing checks run for,
+    ///   and its `smart_account` is the smart account the ceremony targets.
+    ///   The smart account's strkey is redacted to first-5-last-5 in the
+    ///   approval store entry **and** the `PasskeyAssertion` audit-log entry;
+    ///   the `smart_account_redacted` field in `EventKind::PasskeyAssertion`
     ///   distinguishes ceremonies for different smart accounts in the audit
-    ///   trail.
-    /// - `auth_digest`: 32-byte Soroban auth digest that the WebAuthn
-    ///   ceremony must sign (the `challenge` the bridge encodes for the
-    ///   browser).
+    ///   trail. `partial` is validated at entry, before anything else runs.
     /// - `signers_manager`: the `SignersManager` through which the per-signing
-    ///   rule checks of every non-zero rule in `rule_ids` run: the rule locks,
+    ///   rule checks of every non-zero rule in `context_rule_ids` run: the rule locks,
     ///   the signer-set baseline reads, the pinned-hash drift check and the
     ///   signer-set comparison. It also provides the shared
     ///   `Arc<Mutex<AuditWriter>>` (via `SignersManager::audit_writer()`) that
@@ -1534,6 +1572,12 @@ impl CredentialsManager {
     ///
     /// # Errors
     ///
+    /// - [`CredentialsError::MainnetWriteForbidden`]: `partial.network_id` is
+    ///   the mainnet network ID. Refused at entry: no rule check, no store
+    ///   entry, no bridge I/O and no `PasskeyAssertion` audit row.
+    /// - [`CredentialsError::AuthEntryInvalid`]: `partial` fails
+    ///   [`crate::managers::auth_entry::PartialSorobanAuthorizationEntry::validate`]
+    ///   otherwise; refused at entry like the mainnet case.
     /// - [`CredentialsError::ApprovalStoreUnavailable`] — the manager was
     ///   constructed without an approval store (read-only path).
     /// - [`CredentialsError::NotFound`] — no credential with `credential_name`.
@@ -1573,16 +1617,14 @@ impl CredentialsManager {
     /// diversification enforce-default trigger.
     #[allow(
         clippy::too_many_arguments,
-        reason = "signing pipeline requires credential, account, digest, signers_manager, \
+        reason = "signing pipeline requires credential, auth entry, signers_manager, \
                   bridge, timeout, URL callback, and accept_single_verifier opt-in; \
                   accept_single_verifier bypasses the diversification enforce-default trigger"
     )]
     pub async fn sign_with_passkey_rule(
         &self,
         credential_name: &str,
-        smart_account: &str,
-        auth_digest: &[u8; 32],
-        rule_ids: Vec<u32>,
+        partial: &crate::managers::auth_entry::PartialSorobanAuthorizationEntry,
         // `signers_manager`: runs the per-signing divergence and drift checks
         // before the WebAuthn ceremony, and supplies the audit writer the
         // PasskeyAssertion row goes to. See
@@ -1600,6 +1642,27 @@ impl CredentialsManager {
         // single-verifier high-value or Undetermined-criteria rules.
         accept_single_verifier: bool,
     ) -> Result<SignWithPasskeyOutcome, CredentialsError> {
+        // The entry checks precede the ceremony and its audit machinery: a
+        // refused entry starts nothing, so it leaves no PasskeyAssertion row.
+        partial.validate().map_err(|e| match e {
+            crate::SaError::MainnetWriteForbidden => CredentialsError::MainnetWriteForbidden,
+            other => CredentialsError::AuthEntryInvalid {
+                source: Box::new(other),
+            },
+        })?;
+        // An address with no strkey form renders as a sentinel that the
+        // contract-strkey parse in the rule checks refuses, so it takes the
+        // same audited refusal as any other non-contract address.
+        let smart_account =
+            crate::managers::rules::xdr_scaddress_to_strkey_or_sentinel(&partial.smart_account);
+        let smart_account = smart_account.as_str();
+        let auth_digest = &partial.auth_digest;
+        let rule_ids: Vec<u32> = partial
+            .context_rule_ids
+            .iter()
+            .map(ContextRuleId::as_u32)
+            .collect();
+
         // Audit emission must fire on EVERY terminal path,
         // including early-exit errors that propagate before `poll_signing` is
         // called.  Pattern: delegate the signing pipeline to an inner helper that
@@ -3270,6 +3333,137 @@ registered_at_unix_ms = 1700000000000
     /// Passes `parse_c_strkey_to_smart_account` without triggering a network call.
     const ZERO_SA_STRKEY: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
+    /// An auth entry for [`ZERO_SA_STRKEY`] over `rule_ids`, with digests
+    /// derived for the network of `network_passphrase`.
+    fn partial_on(
+        network_passphrase: &str,
+        rule_ids: &[u32],
+    ) -> crate::managers::auth_entry::PartialSorobanAuthorizationEntry {
+        crate::managers::auth_entry::test_helpers::partial_authorization_entry(
+            crate::managers::rules::parse_c_strkey_to_smart_account(ZERO_SA_STRKEY).unwrap(),
+            network_passphrase,
+            rule_ids.iter().copied().map(ContextRuleId::new).collect(),
+        )
+        .unwrap()
+    }
+
+    /// A valid testnet auth entry for [`ZERO_SA_STRKEY`] over `rule_ids`.
+    fn testnet_partial(
+        rule_ids: &[u32],
+    ) -> crate::managers::auth_entry::PartialSorobanAuthorizationEntry {
+        partial_on(
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            rule_ids,
+        )
+    }
+
+    /// Every line of the test audit log, whatever its kind.
+    fn audit_line_count(dir: &TempDir) -> usize {
+        std::fs::read_to_string(dir.path().join("audit.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    }
+
+    /// Runs `sign_with_passkey_rule` for a registered credential with a valid
+    /// public key, an approval store and the bootstrap rule, so a valid entry
+    /// reaches the ceremony and times out. Returns the result, the number of
+    /// `on_url` calls (the ceremony starts exactly when it is called) and the
+    /// number of audit lines written.
+    async fn sign_entry(
+        partial: &crate::managers::auth_entry::PartialSorobanAuthorizationEntry,
+    ) -> (
+        Result<SignWithPasskeyOutcome, CredentialsError>,
+        usize,
+        usize,
+    ) {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let mgr = test_manager(&dir);
+        write_metadata(&mgr, &make_metadata("entry-check"));
+        let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
+        let url_calls = AtomicUsize::new(0);
+        let result = mgr
+            .sign_with_passkey_rule(
+                "entry-check",
+                partial,
+                sm,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19911),
+                Duration::from_millis(100),
+                |_| {
+                    url_calls.fetch_add(1, Ordering::SeqCst);
+                },
+                false,
+            )
+            .await;
+        (
+            result,
+            url_calls.load(Ordering::SeqCst),
+            audit_line_count(&dir),
+        )
+    }
+
+    #[tokio::test]
+    async fn sign_with_passkey_rule_starts_the_ceremony_for_a_valid_testnet_entry() {
+        let (result, url_calls, audit_lines) = sign_entry(&testnet_partial(&[0])).await;
+
+        assert!(
+            matches!(result, Ok(SignWithPasskeyOutcome::Timeout)),
+            "a valid testnet entry must reach the ceremony and time out, got {result:?}"
+        );
+        assert_eq!(url_calls, 1, "the ceremony starts once");
+        assert_eq!(
+            audit_lines, 1,
+            "the ceremony writes one PasskeyAssertion row"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_with_passkey_rule_refuses_a_mainnet_entry_before_the_ceremony() {
+        let partial = partial_on(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE, &[0]);
+
+        let (result, url_calls, audit_lines) = sign_entry(&partial).await;
+
+        let err = result.expect_err("a mainnet entry must be refused");
+        assert!(
+            matches!(err, CredentialsError::MainnetWriteForbidden),
+            "expected MainnetWriteForbidden, got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("sa.credentials.mainnet_write_forbidden"),
+            "the refusal carries its code: {err}"
+        );
+        assert_eq!(url_calls, 0, "no ceremony starts");
+        assert_eq!(audit_lines, 0, "no audit row is written for the refusal");
+    }
+
+    #[tokio::test]
+    async fn sign_with_passkey_rule_refuses_a_tampered_digest_before_the_ceremony() {
+        let mut partial = testnet_partial(&[0]);
+        partial.auth_digest[0] ^= 0x01;
+
+        let (result, url_calls, audit_lines) = sign_entry(&partial).await;
+
+        match result {
+            Err(CredentialsError::AuthEntryInvalid { source }) => assert!(
+                matches!(
+                    *source,
+                    crate::SaError::AuthEntryBindingMismatch {
+                        field: "auth_digest"
+                    }
+                ),
+                "expected an auth_digest mismatch, got {source:?}"
+            ),
+            other => panic!("expected AuthEntryInvalid, got {other:?}"),
+        }
+        assert_eq!(url_calls, 0, "no ceremony starts");
+        assert_eq!(audit_lines, 0, "no audit row is written for the refusal");
+    }
+
     #[tokio::test]
     async fn sign_with_passkey_rule_emits_audit_on_approval_store_unavailable() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -3277,7 +3471,6 @@ registered_at_unix_ms = 1700000000000
         // Read-only manager — no approval store.
         let mgr = test_manager_readonly(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19900);
-        let auth_digest = [0u8; 32];
         // Supply a SignersManager that provides the shared AuditWriter.
         // Use rule_id=0 (bootstrap skip) so no rule check runs (no testnet
         // needed).  The approval-store check fires
@@ -3287,9 +3480,7 @@ registered_at_unix_ms = 1700000000000
         let result = mgr
             .sign_with_passkey_rule(
                 "does-not-matter",
-                ZERO_SA_STRKEY, // valid C-strkey: parse passes; rule_id=0 skips network
-                &auth_digest,
-                vec![0], // rule_id=0: bootstrap-skip fires, no network call made
+                &testnet_partial(&[0]), // rule_id=0: bootstrap-skip fires, no network call made
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -3322,7 +3513,6 @@ registered_at_unix_ms = 1700000000000
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19901);
-        let auth_digest = [0u8; 32];
         // Writer sourced from SignersManager; rule_id=0 skips network.
         let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
 
@@ -3330,9 +3520,7 @@ registered_at_unix_ms = 1700000000000
         let result = mgr
             .sign_with_passkey_rule(
                 "nonexistent",
-                ZERO_SA_STRKEY, // valid C-strkey; rule_id=0 skips network
-                &auth_digest,
-                vec![0], // rule_id=0: bootstrap-skip, no network call
+                &testnet_partial(&[0]), // rule_id=0: bootstrap-skip, no network call
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -3373,7 +3561,6 @@ registered_at_unix_ms = 1700000000000
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19902);
-        let auth_digest = [0u8; 32];
 
         // Write a credential with empty public_key_sec1_b64.
         let mut meta = make_metadata("no-pubkey");
@@ -3388,9 +3575,7 @@ registered_at_unix_ms = 1700000000000
         let result = mgr
             .sign_with_passkey_rule(
                 "no-pubkey",
-                ZERO_SA_STRKEY, // valid C-strkey; rule_id=0 skips network
-                &auth_digest,
-                vec![0], // bootstrap-skip, no network call
+                &testnet_partial(&[0]), // bootstrap-skip, no network call
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -3428,7 +3613,6 @@ registered_at_unix_ms = 1700000000000
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19904);
-        let auth_digest = [0u8; 32];
         let meta = make_metadata("empty-rule-ids");
         write_metadata(&mgr, &meta);
         let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
@@ -3436,9 +3620,7 @@ registered_at_unix_ms = 1700000000000
         let result = mgr
             .sign_with_passkey_rule(
                 "empty-rule-ids",
-                "CDEPLOY1ABCDE2FGHIJ3KLMNO4PQRST5UVWXY",
-                &auth_digest,
-                vec![],
+                &testnet_partial(&[]),
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -3461,12 +3643,11 @@ registered_at_unix_ms = 1700000000000
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19903);
-        let auth_digest = [0u8; 32];
 
         // Use a NotFound error path (simpler fixture) to get the audit emitted
         // and assert the smart_account field is set correctly.
         //
-        // Use ZERO_SA_STRKEY (valid C-strkey, 56 chars) so that
+        // The partial targets ZERO_SA_STRKEY (valid C-strkey, 56 chars), so
         // parse_c_strkey_to_smart_account passes.  rule_id=0 bootstrap-skip
         // prevents any network call.  The credential "nonexistent" does not
         // exist → NotFound fires after the approval-store check.
@@ -3476,9 +3657,7 @@ registered_at_unix_ms = 1700000000000
         let _ = mgr
             .sign_with_passkey_rule(
                 "nonexistent",
-                smart_account,
-                &auth_digest,
-                vec![0], // bootstrap-skip, no network call; NotFound fires after
+                &testnet_partial(&[0]), // bootstrap-skip, no network call; NotFound fires after
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -3589,7 +3768,6 @@ registered_at_unix_ms = 1700000000000
         let mgr = test_manager_readonly(&dir);
         let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19910);
-        let auth_digest = [0u8; 32];
 
         // rule_id=1 (non-zero): the diversification check runs; empty audit-log
         // baseline → PinnedHashesRecord::default() → 0 pinned hashes →
@@ -3598,9 +3776,7 @@ registered_at_unix_ms = 1700000000000
         let _result = mgr
             .sign_with_passkey_rule(
                 "irrelevant",
-                ZERO_SA_STRKEY,
-                &auth_digest,
-                vec![1], // non-zero: diversification check runs
+                &testnet_partial(&[1]), // non-zero: diversification check runs
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -3655,7 +3831,6 @@ registered_at_unix_ms = 1700000000000
         let mgr = test_manager_readonly(&dir);
         let (arc_writer, sm) = test_signers_manager_with_writer(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19912);
-        let auth_digest = [0u8; 32];
 
         let _ = std::panic::catch_unwind({
             let arc_writer = std::sync::Arc::clone(&arc_writer);
@@ -3668,9 +3843,7 @@ registered_at_unix_ms = 1700000000000
         let result = mgr
             .sign_with_passkey_rule(
                 "irrelevant",
-                ZERO_SA_STRKEY,
-                &auth_digest,
-                vec![1],
+                &testnet_partial(&[1]),
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -3708,15 +3881,12 @@ registered_at_unix_ms = 1700000000000
         let mgr = test_manager_readonly(&dir);
         let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19911);
-        let auth_digest = [0u8; 32];
 
         // rule_id=1: diversification check runs; empty log → Required fires.
         let result = mgr
             .sign_with_passkey_rule(
                 "irrelevant",
-                ZERO_SA_STRKEY,
-                &auth_digest,
-                vec![1], // non-zero: diversification check runs
+                &testnet_partial(&[1]), // non-zero: diversification check runs
                 sm,
                 addr,
                 Duration::from_millis(100),
@@ -4162,15 +4332,12 @@ registered_at_unix_ms = 1700000000000
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19920);
-        let auth_digest = [0u8; 32];
         let (_arc_writer, sm) = test_signers_manager_with_writer(&dir);
 
         let result = mgr
             .sign_with_passkey_rule(
                 "does-not-matter",
-                ZERO_SA_STRKEY,
-                &auth_digest,
-                vec![], // empty rule_ids → InvalidRuleIds
+                &testnet_partial(&[]), // empty rule_ids → InvalidRuleIds
                 sm,
                 addr,
                 Duration::from_millis(100),

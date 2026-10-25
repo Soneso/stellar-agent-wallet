@@ -44,6 +44,9 @@ testnet-acceptance = ["test-helpers"]
 
 [dependencies]
 stellar-agent-core = { workspace = true }
+# The accessors of a Soroban authorization preimage, which the mainnet intent
+# check reads its network id and invocation through.
+stellar-agent-soroban-auth = { workspace = true }
 stellar-agent-xdr-limits = { workspace = true }
 # jsonrpsee-core issues the raw `getTransaction` request through the RPC
 # client's transport (`ClientT::request`, behind the `client` feature) and

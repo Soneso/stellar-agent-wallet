@@ -24,8 +24,12 @@ use stellar_agent_core::audit_log::schema::EventKind;
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
+use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+use stellar_agent_core::smart_account::rule_id::ContextRuleId;
+use stellar_agent_smart_account::managers::auth_entry::PartialSorobanAuthorizationEntry;
+use stellar_agent_smart_account::managers::auth_entry::test_helpers::partial_authorization_entry;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
-use stellar_xdr::{LedgerKey, Limits, ReadXdr};
+use stellar_xdr::{ContractId, Hash, LedgerKey, Limits, ReadXdr, ScAddress};
 use wiremock::{
     Mock, MockServer, Request, Respond, ResponseTemplate,
     matchers::{method, path},
@@ -39,6 +43,16 @@ use super::rpc_mock_helpers::{
 };
 
 const RULE_ID: u32 = 1;
+
+/// A valid testnet auth entry for the zero smart account over [`RULE_ID`].
+fn testnet_entry() -> PartialSorobanAuthorizationEntry {
+    partial_authorization_entry(
+        ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+        TESTNET_PASSPHRASE,
+        vec![ContextRuleId::new(RULE_ID)],
+    )
+    .expect("fixture auth entry builds")
+}
 
 struct SequencedLedgerResponder {
     source_g: &'static str,
@@ -190,9 +204,7 @@ async fn policy_rpc_divergence_routes_to_drift_check_unavailable() {
     let result = manager
         .sign_with_passkey_rule(
             "missing-before-show",
-            &smart_account_strkey,
-            &[0u8; 32],
-            vec![RULE_ID],
+            &testnet_entry(),
             signers_manager,
             "127.0.0.1:0".parse().expect("socket addr parses"),
             Duration::from_millis(10),

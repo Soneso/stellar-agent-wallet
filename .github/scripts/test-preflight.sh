@@ -1122,7 +1122,7 @@ case_two_owners() {
   start_case
   edit crates/stellar-agent-sep7/src/lib.rs crates/stellar-agent-sep5/src/lib.rs
   pin_packages "stellar-agent-sep5 stellar-agent-sep7 stellar-agent-cli stellar-agent-mcp stellar-agent-pool" \
-    test-helpers crates/stellar-agent-sep7/src/lib.rs crates/stellar-agent-sep5/src/lib.rs
+    test-helpers,test-hooks crates/stellar-agent-sep7/src/lib.rs crates/stellar-agent-sep5/src/lib.rs
   expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
 }
 

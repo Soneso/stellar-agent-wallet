@@ -25,7 +25,7 @@
 #
 # Usage: publish-crates.sh --check
 #        publish-crates.sh --sums <SHA256SUMS>
-# --check verifies only that the tier lists cover the publishable members.
+# --check verifies tier coverage and that dependencies are in earlier tiers.
 # Publishing requires CARGO_REGISTRY_TOKEN in the environment (in CI the
 # short-lived OIDC token minted by rust-lang/crates-io-auth-action) and runs
 # in the workspace root.
@@ -48,8 +48,8 @@ else
 fi
 
 TIER0="stellar-agent-loopback-http stellar-agent-mcp-macros stellar-agent-sep5 stellar-agent-soroban-auth stellar-agent-test-support stellar-agent-toolsets stellar-agent-windows-identity stellar-agent-xdr-limits"
-TIER1="stellar-agent-core stellar-agent-headless-keyring stellar-agent-sep10 stellar-agent-sep45"
-TIER2="stellar-agent-network stellar-agent-toolsets-install"
+TIER1="stellar-agent-core stellar-agent-headless-keyring stellar-agent-sep10"
+TIER2="stellar-agent-network stellar-agent-sep45 stellar-agent-toolsets-install"
 TIER3="stellar-agent-anchor stellar-agent-claimable stellar-agent-defi stellar-agent-nonce stellar-agent-pool stellar-agent-sep48 stellar-agent-sep53 stellar-agent-sep7 stellar-agent-smart-account stellar-agent-stablecoin stellar-agent-toolsets-runtime stellar-agent-x402-identity"
 TIER4="stellar-agent-approval-ui stellar-agent-defindex stellar-agent-dex stellar-agent-sep43 stellar-agent-webauthn-bridge"
 TIER5="stellar-agent-approval-remote stellar-agent-mpp stellar-agent-x402"
@@ -82,6 +82,39 @@ ALL_WORKSPACE=$(printf '%s\n' "$MEMBERS" | awk '{print $1}' | sort)
 if [ "$ALL_TIERED" != "$ALL_WORKSPACE" ]; then
   echo "Tier lists do not match the publishable workspace members:" >&2
   diff <(echo "$ALL_TIERED") <(echo "$ALL_WORKSPACE") >&2
+  exit 2
+fi
+
+# Read normal and build dependencies, including target-specific tables.
+# Development dependencies do not participate in cargo publish --no-verify.
+if ! python3 - "$TIER0" "$TIER1" "$TIER2" "$TIER3" "$TIER4" "$TIER5" "$TIER6" 3<<<"$METADATA" <<'PYTIERS'
+import json
+import os
+import pathlib
+import sys
+import tomllib
+
+metadata = json.load(os.fdopen(3))
+tiers = {name: tier for tier, names in enumerate(sys.argv[1:]) for name in names.split()}
+members = {package["name"]: package for package in metadata["packages"]}
+workspace = tomllib.loads((pathlib.Path(metadata["workspace_root"]) / "Cargo.toml").read_text())
+inherited = workspace["workspace"].get("dependencies", {})
+failed = False
+for name, tier in tiers.items():
+    manifest = tomllib.loads(pathlib.Path(members[name]["manifest_path"]).read_text())
+    for table in [manifest, *manifest.get("target", {}).values()]:
+        for kind in ("dependencies", "build-dependencies"):
+            for alias, spec in table.get(kind, {}).items():
+                if isinstance(spec, dict) and spec.get("workspace"):
+                    spec = inherited[alias]
+                dependency = spec.get("package", alias) if isinstance(spec, dict) else alias
+                if dependency in members and (dependency not in tiers or tiers[dependency] >= tier):
+                    print(f"Publish tier violation: {name} depends on {dependency}; "
+                          "workspace dependencies must be in an earlier tier", file=sys.stderr)
+                    failed = True
+raise SystemExit(1 if failed else 0)
+PYTIERS
+then
   exit 2
 fi
 

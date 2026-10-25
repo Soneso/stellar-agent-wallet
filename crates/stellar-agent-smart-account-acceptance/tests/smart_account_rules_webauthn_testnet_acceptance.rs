@@ -117,6 +117,7 @@ use stellar_agent_smart_account::deployment::{
     DeployerKeypair, DeploymentArgs, ResolvedFeePerOp, deploy_smart_account,
     deploy_webauthn_verifier,
 };
+use stellar_agent_smart_account::managers::auth_entry::test_helpers::partial_authorization_entry;
 use stellar_agent_smart_account::managers::credentials::{
     AddPasskeyOutcome, CredentialsManager, SignWithPasskeyOutcome,
 };
@@ -795,11 +796,15 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
 
     // ── Drive signing ceremony ────────────────────────────────────────────────
     //
-    // Build a synthetic 32-byte auth digest for the test.  In production this
-    // comes from `compute_auth_digest` (stellar-agent-core), but the signing
-    // manager accepts any 32-byte value.
-    let mut auth_digest = [0u8; 32];
-    rand_core::RngCore::fill_bytes(&mut OsRng, &mut auth_digest);
+    // The auth entry the ceremony signs, for the deployed smart account and the
+    // installed rule; its digest is derived from the entry's facts, which the
+    // signing manager validates before the ceremony.
+    let entry = partial_authorization_entry(
+        smart_account.clone(),
+        TESTNET_PASSPHRASE,
+        vec![ContextRuleId::new(webauthn_rule_id)],
+    )
+    .expect("auth entry builds");
 
     // Intercept the approval URL so we can navigate the browser to it.
     let (url_tx, url_rx) = tokio::sync::oneshot::channel::<String>();
@@ -820,17 +825,14 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
         let creds_manager = creds_manager.clone();
         let signers_manager = Arc::clone(&signers_manager);
         let bridge_addr_clone = bridge_addr;
-        // Clone the smart account strkey so it can be moved into the
-        // `'static` async task closure.
-        let smart_account_strkey_clone = smart_account_strkey.clone();
+        // Move a copy of the entry into the `'static` async task closure; its
+        // real smart account keeps the audit trail meaningful.
+        let entry = entry.clone();
         tokio::spawn(async move {
             creds_manager
                 .sign_with_passkey_rule(
                     credential_name,
-                    // Supply real smart account so the audit trail is meaningful.
-                    &smart_account_strkey_clone,
-                    &auth_digest,
-                    vec![webauthn_rule_id],
+                    &entry,
                     signers_manager,
                     bridge_addr_clone,
                     signing_deadline,

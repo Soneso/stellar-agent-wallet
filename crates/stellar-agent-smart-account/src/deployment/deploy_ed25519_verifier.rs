@@ -78,6 +78,7 @@ use crate::deployment::deploy::{
 };
 use crate::deployment::map_budget_elapsed;
 use crate::ed25519_verifier::{ED25519_VERIFIER_WASM, ED25519_VERIFIER_WASM_SHA256};
+use crate::submit::refuse_mainnet_sa;
 use crate::verifiers::VerifierRegistry;
 
 /// Deterministic-salt domain-prefix string for the Ed25519-verifier deploy.
@@ -144,6 +145,10 @@ pub struct Ed25519VerifierDeployResult {
 ///
 /// # Errors
 ///
+/// - [`SaError::MainnetWriteForbidden`]: `args.network_passphrase` names
+///   mainnet or `args.rpc_url` is a mainnet-pattern endpoint; refused at
+///   entry, before the deployer key is read, any request and any audit row,
+///   dry runs included.
 /// - [`SaError::Ed25519VerifierProvenanceMismatch`] — runtime SHA gate failed.
 /// - [`SaError::NetworksTomlIo`] — registry read/write failed.
 /// - [`SaError::NetworksTomlParse`] — registry TOML invalid.
@@ -158,6 +163,8 @@ pub async fn deploy_ed25519_verifier(
     args: Ed25519VerifierDeployArgs,
     audit_writer: Option<&mut AuditWriter>,
 ) -> Result<Ed25519VerifierDeployResult, SaError> {
+    refuse_mainnet_sa(&args.network_passphrase, &args.rpc_url)?;
+
     let chain_id = caip2_chain_id_for_passphrase(&args.network_passphrase);
     let is_dry_run = args.dry_run;
 
@@ -867,5 +874,69 @@ mod tests {
             ed25519_salt, webauthn_salt,
             "ed25519 and webauthn verifier salts must differ (distinct contracts)"
         );
+    }
+
+    // ── Mainnet refusal before the deployer and the endpoint ────────────────
+
+    /// Runs the deployment for `network_passphrase` with a counting deployer
+    /// and a mock endpoint that answers nothing. Returns the result, the
+    /// deployer's key accesses and the requests the endpoint received.
+    async fn deploy_on(
+        network_passphrase: &str,
+        dry_run: bool,
+    ) -> (Result<Ed25519VerifierDeployResult, SaError>, usize, usize) {
+        let server = wiremock::MockServer::start().await;
+        let registry = tempfile::TempDir::new().unwrap();
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x61; 32]);
+        let result = deploy_ed25519_verifier(
+            Ed25519VerifierDeployArgs {
+                deployer: crate::deployment::deploy::DeployerKeypair::from_signer(
+                    "counting".to_owned(),
+                    Box::new(signer.clone()),
+                ),
+                network_passphrase: network_passphrase.to_owned(),
+                rpc_url: server.uri(),
+                timeout: Duration::from_secs(1),
+                fee: ResolvedFeePerOp {
+                    stroops: 100,
+                    percentile_label: "profile_default".to_owned(),
+                },
+                dry_run,
+                registry_path_override: Some(registry.path().join("networks.toml")),
+            },
+            None,
+        )
+        .await;
+        let requests = server.received_requests().await.unwrap().len();
+        (result, signer.key_accesses(), requests)
+    }
+
+    #[tokio::test]
+    async fn a_testnet_dry_run_reads_the_deployer_key_and_sends_nothing() {
+        let (result, key_accesses, requests) =
+            deploy_on(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE, true).await;
+
+        assert_eq!(result.unwrap().status, "dry_run");
+        assert_eq!(
+            key_accesses, 1,
+            "the dry run reads the deployer's public key"
+        );
+        assert_eq!(requests, 0);
+    }
+
+    #[tokio::test]
+    async fn a_mainnet_deployment_is_refused_before_the_deployer_and_the_endpoint() {
+        let (result, key_accesses, requests) = deploy_on(
+            stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SaError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert_eq!(key_accesses, 0);
+        assert_eq!(requests, 0);
     }
 }

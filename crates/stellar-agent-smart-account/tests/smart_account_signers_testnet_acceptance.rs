@@ -88,6 +88,7 @@ use stellar_agent_smart_account::deployment::{
     derive_smart_account_address,
 };
 use stellar_agent_smart_account::error::SaError;
+use stellar_agent_smart_account::managers::auth_entry::test_helpers::partial_authorization_entry;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
@@ -1751,14 +1752,17 @@ async fn b6_audit_log_request_id_pairing_across_divergence_emit() {
 
     // Provide a fake bridge address (divergence fires before any bridge I/O).
     let bridge_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19906);
-    let auth_digest = [0u8; 32];
+    let entry = partial_authorization_entry(
+        parse_c_strkey_to_smart_account(&sa_strkey).expect("smart account strkey parses"),
+        TESTNET_PASSPHRASE,
+        vec![ContextRuleId::new(rule_id)],
+    )
+    .expect("auth entry builds");
 
     let outcome = creds_mgr
         .sign_with_passkey_rule(
             "does-not-matter", // credential lookup never reached
-            &sa_strkey,
-            &auth_digest,
-            vec![rule_id],
+            &entry,
             Arc::clone(&sm),
             bridge_addr,
             Duration::from_millis(500),

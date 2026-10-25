@@ -49,6 +49,7 @@ pub(crate) fn credentials_error_code(err: &CredentialsError) -> &'static str {
         CredentialsError::BridgeShutdown { .. } => "credentials.bridge_shutdown_failed",
         CredentialsError::ApprovalStoreUnavailable => "credentials.approval_store_unavailable",
         CredentialsError::AtomicWrite { .. } => "credentials.atomic_write_failed",
+        CredentialsError::MainnetWriteForbidden => "sa.credentials.mainnet_write_forbidden",
         CredentialsError::Signing { .. } => "credentials.signing_failed",
         CredentialsError::MissingPublicKey { .. } => "credentials.missing_public_key",
         CredentialsError::MalformedPublicKey { .. } => "credentials.malformed_public_key",
@@ -153,7 +154,7 @@ mod tests {
 
     /// Every `credentials` subcommand routes its `CredentialsError` through
     /// this single mapping, so the same underlying failure carries the same
-    /// dotted `credentials.*` code everywhere it can surface.
+    /// dotted error code everywhere it can surface.
     #[test]
     fn credentials_error_code_covers_common_variants() {
         let cases: &[(CredentialsError, &str)] = &[
@@ -179,6 +180,10 @@ mod tests {
             (
                 CredentialsError::StateDirUnavailable,
                 "credentials.state_dir_unavailable",
+            ),
+            (
+                CredentialsError::MainnetWriteForbidden,
+                "sa.credentials.mainnet_write_forbidden",
             ),
         ];
         for (err, expected_code) in cases {

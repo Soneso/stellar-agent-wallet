@@ -72,6 +72,7 @@ use crate::managers::rules::{
     AUTH_VALIDITY_LEDGERS, BASE_FEE_STROOPS, augment_with_oz_error_name, parse_min_resource_fee,
     validate_latest_ledger,
 };
+use crate::submit::refuse_mainnet_sa;
 
 // ── Public result type ────────────────────────────────────────────────────────
 
@@ -143,6 +144,9 @@ pub(crate) struct TimelockSubmitArgs<'a> {
 ///
 /// # Errors
 ///
+/// - [`SaError::MainnetWriteForbidden`]: `network_passphrase` names mainnet
+///   or `primary_rpc_url` is a mainnet-pattern endpoint; refused before the
+///   signer's public key is read and before any request.
 /// - [`SaError::AuthEntryConstructionFailed`] — pubkey fetch, XDR encoding,
 ///   simulate, or signing failure.
 /// - [`SaError::DeploymentFailed`] — re-simulate error or envelope construction.
@@ -161,6 +165,8 @@ pub(crate) struct TimelockSubmitArgs<'a> {
 pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
     args: TimelockSubmitArgs<'_>,
 ) -> Result<TimelockSubmitResult, SaError> {
+    refuse_mainnet_sa(args.network_passphrase, args.primary_rpc_url)?;
+
     let auth_err = |stage: &'static str, reason: String| SaError::AuthEntryConstructionFailed {
         stage,
         redacted_reason: reason,
@@ -655,5 +661,59 @@ mod tests {
         });
         // Confirm the HostFunction variant matches.
         assert!(matches!(hf, HostFunction::InvokeContract(_)));
+    }
+
+    // ── Mainnet refusal before the signer and the endpoint ──────────────────
+
+    /// Runs the submit for `network_passphrase` against a mock endpoint that
+    /// answers nothing, with a counting signer. Returns the result, the
+    /// signer's key accesses and the requests the endpoint received.
+    async fn submit_on(
+        network_passphrase: &str,
+    ) -> (Result<TimelockSubmitResult, SaError>, usize, usize) {
+        let server = wiremock::MockServer::start().await;
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x51; 32]);
+        let result = submit_timelock_invoke_with_g_key_auth(TimelockSubmitArgs {
+            host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([0x52; 32]))),
+                function_name: ScSymbol::try_from("schedule").unwrap(),
+                args: VecM::default(),
+            }),
+            signer: &signer,
+            primary_rpc_url: &server.uri(),
+            network_passphrase,
+            timeout: std::time::Duration::from_secs(1),
+            op_label: "schedule",
+            submission_recorder: None,
+        })
+        .await;
+        let requests = server.received_requests().await.unwrap().len();
+        (result, signer.key_accesses(), requests)
+    }
+
+    #[tokio::test]
+    async fn a_testnet_submit_reaches_the_signer_and_the_endpoint() {
+        let (result, key_accesses, requests) =
+            submit_on(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE).await;
+
+        assert!(
+            matches!(result, Err(SaError::AuthEntryConstructionFailed { .. })),
+            "the empty mock endpoint fails the source-account fetch: {result:?}"
+        );
+        assert_eq!(key_accesses, 1, "the signer's public key is read");
+        assert!(requests > 0, "the endpoint is asked for the source account");
+    }
+
+    #[tokio::test]
+    async fn a_mainnet_submit_is_refused_before_the_signer_and_the_endpoint() {
+        let (result, key_accesses, requests) =
+            submit_on(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE).await;
+
+        assert!(
+            matches!(result, Err(SaError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert_eq!(key_accesses, 0);
+        assert_eq!(requests, 0);
     }
 }

@@ -26,13 +26,27 @@ use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::schema::{EventKind, ExecutableRefPin};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
+use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 use stellar_agent_smart_account::error::SaError;
+use stellar_agent_smart_account::managers::auth_entry::PartialSorobanAuthorizationEntry;
+use stellar_agent_smart_account::managers::auth_entry::test_helpers::partial_authorization_entry;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
 use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
 
 use super::rpc_mock_helpers::{manager_one_url, tmp_audit_writer};
 
 const RULE_ID: u32 = 1;
+
+/// A valid testnet auth entry for the zero smart account over [`RULE_ID`].
+fn testnet_entry() -> PartialSorobanAuthorizationEntry {
+    partial_authorization_entry(
+        ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+        TESTNET_PASSPHRASE,
+        vec![ContextRuleId::new(RULE_ID)],
+    )
+    .expect("fixture auth entry builds")
+}
 const PINNED_FIRST8: &str = "4242424242424242";
 
 fn pin() -> ExecutableRefPin {
@@ -103,9 +117,7 @@ async fn malformed_pin_record_routes_to_drift_check_unavailable() {
             let result = manager
                 .sign_with_passkey_rule(
                     "laptop-passkey",
-                    &smart_account_strkey,
-                    &[0u8; 32],
-                    vec![RULE_ID],
+                    &testnet_entry(),
                     signers_manager,
                     "127.0.0.1:0".parse().expect("socket addr parses"),
                     Duration::from_millis(10),

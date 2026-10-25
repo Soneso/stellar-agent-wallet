@@ -637,23 +637,7 @@ impl StellarRpcClient {
         expected_passphrase: &str,
         deadline: Instant,
     ) -> Result<EndpointIdentity, WalletError> {
-        let policy = RetryPolicy::default();
-        let network =
-            retry_with_backoff(&policy, deadline, is_retryable_identity_error, || async {
-                self.inner.get_network().await
-            })
-            .await
-            .map_err(|e| {
-                WalletError::Network(match rejected_status(&e) {
-                    Some(status @ (401 | 403)) => NetworkError::RpcCredentialRejected {
-                        url: self.redacted_url(),
-                        status,
-                    },
-                    _ => NetworkError::EndpointIdentityUnavailable {
-                        url: self.redacted_url(),
-                    },
-                })
-            })?;
+        let network = self.reported_network(deadline).await?;
 
         // Agreement with a mainnet declaration is still a mainnet write.
         if network.passphrase == MAINNET_PASSPHRASE {
@@ -667,7 +651,73 @@ impl StellarRpcClient {
                 },
             ));
         }
+        self.checked_identity(&network)
+    }
 
+    /// Asks the endpoint which network it serves for a submission under a
+    /// mainnet grant, and returns that identity once the endpoint reports the
+    /// mainnet passphrase and passes the protocol rule.
+    ///
+    /// The same `getNetwork` request, retry classification, `deadline`, and
+    /// identity construction as [`Self::endpoint_identity`]; only the
+    /// passphrase verdict differs: mainnet is required, and every other
+    /// passphrase is refused.
+    ///
+    /// # Errors
+    ///
+    /// - [`NetworkError::RpcCredentialRejected`] and
+    ///   [`NetworkError::EndpointIdentityUnavailable`] as for
+    ///   [`Self::endpoint_identity`].
+    /// - [`NetworkError::EndpointNetworkMismatch`] if the endpoint reports a
+    ///   passphrase other than mainnet's.
+    /// - [`NetworkError::UnsupportedProtocolVersion`] if
+    ///   [`check_protocol_version`] refuses the reported version.
+    pub(crate) async fn mainnet_endpoint_identity(
+        &self,
+        deadline: Instant,
+    ) -> Result<EndpointIdentity, WalletError> {
+        let network = self.reported_network(deadline).await?;
+        if network.passphrase != MAINNET_PASSPHRASE {
+            return Err(WalletError::Network(
+                NetworkError::EndpointNetworkMismatch {
+                    expected: MAINNET_PASSPHRASE.to_owned(),
+                    server: ReportedPassphrase::from_reported(&network.passphrase),
+                },
+            ));
+        }
+        self.checked_identity(&network)
+    }
+
+    /// Issues the bounded, retried `getNetwork` request of the identity probes
+    /// and maps a failure to the probe's refusal.
+    async fn reported_network(
+        &self,
+        deadline: Instant,
+    ) -> Result<stellar_rpc_client::GetNetworkResponse, WalletError> {
+        let policy = RetryPolicy::default();
+        retry_with_backoff(&policy, deadline, is_retryable_identity_error, || async {
+            self.inner.get_network().await
+        })
+        .await
+        .map_err(|e| {
+            WalletError::Network(match rejected_status(&e) {
+                Some(status @ (401 | 403)) => NetworkError::RpcCredentialRejected {
+                    url: self.redacted_url(),
+                    status,
+                },
+                _ => NetworkError::EndpointIdentityUnavailable {
+                    url: self.redacted_url(),
+                },
+            })
+        })
+    }
+
+    /// Applies the protocol rule to a reported network whose passphrase the
+    /// caller accepted, and builds the identity on this client.
+    fn checked_identity(
+        &self,
+        network: &stellar_rpc_client::GetNetworkResponse,
+    ) -> Result<EndpointIdentity, WalletError> {
         let chain_id = Caip2::from_passphrase(&network.passphrase);
         check_protocol_version(chain_id, network.protocol_version).map_err(WalletError::Network)?;
         Ok(EndpointIdentity::checked(

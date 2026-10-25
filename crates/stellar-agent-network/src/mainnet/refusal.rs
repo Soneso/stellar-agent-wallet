@@ -126,6 +126,8 @@ pub enum MainnetPrecondition {
     NotOpen,
     /// The audit anchor does not cover the log's tip.
     AuditNotAnchored,
+    /// A signature does not verify under the bound signer's key.
+    SignatureInvalid,
 }
 
 impl MainnetPrecondition {
@@ -188,6 +190,7 @@ impl MainnetPrecondition {
             Self::UnknownAuthorization => "unknown_authorization",
             Self::NotOpen => "not_open",
             Self::AuditNotAnchored => "audit_not_anchored",
+            Self::SignatureInvalid => "signature_invalid",
         }
     }
 }
@@ -210,6 +213,18 @@ pub enum MainnetAuthorizationError {
     Refused(MainnetPrecondition),
 }
 
+impl MainnetAuthorizationError {
+    /// The agent-facing error, as the [`WalletError`] conversion gives it,
+    /// after a refused precondition is logged under `path` with its label.
+    ///
+    /// For a signing point outside this crate: the precondition never
+    /// crosses into the error, so the path that refuses logs it here.
+    #[must_use]
+    pub fn report(self, path: &'static str) -> WalletError {
+        AuthorizedPathError::from(self).report(path)
+    }
+}
+
 impl From<MainnetAuthorizationError> for WalletError {
     /// The agent-facing error: `network.mainnet_write_forbidden` for a build
     /// without mainnet writes, `network.mainnet_authorization_refused` for
@@ -224,6 +239,52 @@ impl From<MainnetAuthorizationError> for WalletError {
                 WalletError::Network(NetworkError::MainnetAuthorizationRefused)
             }
         }
+    }
+}
+
+/// The failure of an authorized signing or submit path: a broken
+/// precondition, which the path logs before it reports the generic refusal,
+/// or an error of the path itself, which passes through unchanged.
+#[derive(Debug)]
+pub(crate) enum AuthorizedPathError {
+    /// A precondition does not hold.
+    Refused(MainnetPrecondition),
+    /// The path failed for a reason of its own.
+    Wallet(WalletError),
+}
+
+impl AuthorizedPathError {
+    /// The agent-facing error. A refusal is logged under `path` with its
+    /// precondition's label and becomes `network.mainnet_authorization_refused`.
+    pub(crate) fn report(self, path: &'static str) -> WalletError {
+        match self {
+            Self::Refused(precondition) => {
+                tracing::warn!(
+                    path,
+                    precondition = precondition.label(),
+                    "mainnet authorization refused"
+                );
+                WalletError::Network(NetworkError::MainnetAuthorizationRefused)
+            }
+            Self::Wallet(error) => error,
+        }
+    }
+}
+
+impl From<MainnetAuthorizationError> for AuthorizedPathError {
+    fn from(error: MainnetAuthorizationError) -> Self {
+        match error {
+            MainnetAuthorizationError::Refused(precondition) => Self::Refused(precondition),
+            MainnetAuthorizationError::FeatureDisabled => {
+                Self::Wallet(WalletError::Network(NetworkError::MainnetWriteForbidden))
+            }
+        }
+    }
+}
+
+impl From<WalletError> for AuthorizedPathError {
+    fn from(error: WalletError) -> Self {
+        Self::Wallet(error)
     }
 }
 
@@ -303,6 +364,7 @@ mod tests {
             P::UnknownAuthorization,
             P::NotOpen,
             P::AuditNotAnchored,
+            P::SignatureInvalid,
         ];
         for precondition in all {
             match precondition {
@@ -360,7 +422,8 @@ mod tests {
                 | P::PolicyPinMismatch
                 | P::UnknownAuthorization
                 | P::NotOpen
-                | P::AuditNotAnchored => {}
+                | P::AuditNotAnchored
+                | P::SignatureInvalid => {}
             }
         }
         all.to_vec()
@@ -389,6 +452,25 @@ mod tests {
         }
         assert_eq!(
             WalletError::from(MainnetAuthorizationError::FeatureDisabled).code(),
+            "network.mainnet_write_forbidden"
+        );
+    }
+
+    /// The logging report gives the agent-facing error of the conversion.
+    #[test]
+    fn report_gives_the_converted_error() {
+        for precondition in every_precondition() {
+            let error = MainnetAuthorizationError::Refused(precondition);
+            assert_eq!(
+                error.report("test").code(),
+                WalletError::from(error).code(),
+                "{precondition}"
+            );
+        }
+        assert_eq!(
+            MainnetAuthorizationError::FeatureDisabled
+                .report("test")
+                .code(),
             "network.mainnet_write_forbidden"
         );
     }

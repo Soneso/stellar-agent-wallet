@@ -223,7 +223,13 @@ impl WalletServer {
         let signer: Arc<dyn stellar_agent_network::signing::Signer + Send + Sync> =
             Arc::new(signer_handle);
 
-        match stellar_agent_sep53::sign_message(&message_bytes, signer.as_ref()).await {
+        match stellar_agent_sep53::sign_message(
+            &message_bytes,
+            signer.as_ref(),
+            &self.profile.network_passphrase,
+        )
+        .await
+        {
             Ok(sig_bytes) => {
                 // Get the signer's public key for the response.
                 // The response MAY include the full public key (it is not secret).
@@ -272,6 +278,9 @@ impl WalletServer {
                     .to_json_pretty()
                     .unwrap_or_else(|_| String::from("{}"));
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
+            }
+            Err(stellar_agent_sep53::Sep53Error::MainnetSigningForbidden { .. }) => {
+                Ok(crate::tools::common::sep53_mainnet_signing_forbidden_result())
             }
             Err(err) => Ok(crate::tools::common::business_error_result(
                 "sep53.sign_failed",
@@ -451,5 +460,45 @@ mod tests {
             !text.contains("\"signature\""),
             "fail-closed approval refusal must not produce a signature; got: {text}"
         );
+    }
+
+    /// The passphrase guard refuses even when the declared chain is testnet.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn a_testnet_chain_with_a_mainnet_passphrase_reports_the_signing_refusal() {
+        use stellar_agent_network::signing::Signer;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let signer = stellar_agent_network::signing::SoftwareSigningKey::new_from_bytes([0x51; 32]);
+        let account = signer.public_key().await.unwrap().to_string().to_string();
+        let profile =
+            Profile::builder_testnet("sep53-mismatch", &account, "nonce-svc", "nonce-acct")
+                .with_noop_engine()
+                .build();
+        keyring_core::Entry::new("sep53-mismatch", &account)
+            .unwrap()
+            .set_password(
+                &stellar_strkey::ed25519::PrivateKey([0x51; 32])
+                    .as_unredacted()
+                    .to_string(),
+            )
+            .unwrap();
+        let mut server = crate::server::WalletServer::new(profile).unwrap();
+        std::sync::Arc::make_mut(&mut server.profile).network_passphrase =
+            stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE.to_owned();
+        let result = server
+            .call_stellar_sep53_sign_message(Sep53SignMessageArgs {
+                chain_id: "stellar:testnet".to_owned(),
+                message: "test message".to_owned(),
+                message_encoding: None,
+            })
+            .await
+            .unwrap();
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "network.mainnet_write_forbidden");
+        assert!(message.contains("network.mainnet_write_forbidden"));
+        assert!(!text.contains("\"signature\""));
     }
 }

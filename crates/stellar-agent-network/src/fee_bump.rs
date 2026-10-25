@@ -37,7 +37,10 @@
 //! CAP-0015 §"Validity of FeeBumpTransactions".
 
 use sha2::{Digest, Sha256};
-use stellar_agent_core::error::{ProtocolError, SubmissionError, ValidationError, WalletError};
+use stellar_agent_core::error::{
+    NetworkError, ProtocolError, SubmissionError, ValidationError, WalletError,
+};
+use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 use stellar_xdr::{
     DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
     FeeBumpTransactionInnerTx, Hash, Limits, MuxedAccount, ReadXdr, Signature, SignatureHint,
@@ -152,6 +155,14 @@ pub enum FeeBumpError {
     /// The underlying [`WalletError`] is propagated transparently.
     #[error("fee-payer signing failed: {0}")]
     SigningFailed(WalletError),
+
+    /// The network passphrase is the mainnet one.
+    ///
+    /// [`build_and_sign_fee_bump`] refuses mainnet before it decodes the
+    /// envelope or touches the fee-payer key; the fee-bump domain has no
+    /// authorized signing path.
+    #[error("fee-bump signing on mainnet is not permitted")]
+    MainnetSigningForbidden,
 }
 
 impl FeeBumpError {
@@ -167,6 +178,7 @@ impl FeeBumpError {
             Self::FeeSourceSignerMismatch => "feebump.fee_source_signer_mismatch",
             Self::EnvelopeEncodeFailed { .. } => "feebump.envelope_encode_failed",
             Self::SigningFailed(_) => "feebump.signing_failed",
+            Self::MainnetSigningForbidden => "feebump.mainnet_signing_forbidden",
         }
     }
 }
@@ -213,6 +225,10 @@ impl From<FeeBumpError> for WalletError {
             }
             // Signing failures contain a WalletError; unwrap and propagate directly.
             FeeBumpError::SigningFailed(source) => source,
+            // The mainnet refusal is the network's write refusal.
+            FeeBumpError::MainnetSigningForbidden => {
+                WalletError::Network(NetworkError::MainnetWriteForbidden)
+            }
         }
     }
 }
@@ -348,7 +364,16 @@ pub(crate) fn build_fee_bump(
 /// - `network_passphrase` — used to construct the SEP-23 signature payload.
 /// - `fee_payer_signer` — signer whose public key MUST match `fee_source`.
 ///
+/// # Mainnet
+///
+/// A mainnet `network_passphrase` is refused with
+/// [`FeeBumpError::MainnetSigningForbidden`] before the envelope is decoded
+/// and before `fee_payer_signer` is asked for its key or a signature.
+///
 /// # Errors
+///
+/// - [`FeeBumpError::MainnetSigningForbidden`]: `network_passphrase` is the
+///   mainnet passphrase.
 ///
 /// All errors from `build_fee_bump`, plus:
 ///
@@ -390,6 +415,9 @@ pub async fn build_and_sign_fee_bump(
     network_passphrase: &str,
     fee_payer_signer: &dyn Signer,
 ) -> Result<String, FeeBumpError> {
+    if network_passphrase == MAINNET_PASSPHRASE {
+        return Err(FeeBumpError::MainnetSigningForbidden);
+    }
     let v1_inner = decode_inner_v1(inner_envelope_xdr)?;
     validate_fee(outer_fee_stroops, policy_fee_cap_stroops, &v1_inner)?;
     let fee_source_muxed = parse_fee_source(fee_source)?;
@@ -1214,6 +1242,51 @@ mod tests {
             fb_env.signatures.len(),
             1,
             "outer envelope must have exactly 1 fee-payer signature"
+        );
+    }
+
+    // ── Tests: mainnet ────────────────────────────────────────────────────────
+
+    /// A mainnet passphrase is refused before the fee payer is asked for its
+    /// key or a signature, and the refusal converts to the network's write
+    /// refusal.
+    #[tokio::test]
+    async fn a_mainnet_passphrase_is_refused_before_any_key_access() {
+        let inner_xdr = make_inner_v1_xdr(1, 100);
+        let fee_payer = crate::signing::test_doubles::CountingSigner::new(FEE_PAYER_SEED);
+
+        let result = build_and_sign_fee_bump(
+            &inner_xdr,
+            FEE_PAYER_GSTRKEY,
+            /* outer_fee_stroops */ 300,
+            /* policy_fee_cap_stroops */ 100_000,
+            MAINNET_PASSPHRASE,
+            &fee_payer,
+        )
+        .await;
+
+        let Err(error) = result else {
+            panic!("mainnet must be refused, got {result:?}");
+        };
+        assert!(matches!(error, FeeBumpError::MainnetSigningForbidden));
+        assert_eq!(error.code(), "feebump.mainnet_signing_forbidden");
+        assert_eq!(
+            fee_payer.key_accesses(),
+            0,
+            "no key access before the refusal"
+        );
+        assert_eq!(
+            WalletError::from(error).code(),
+            "network.mainnet_write_forbidden"
+        );
+    }
+
+    /// The refusal's message names no precondition and no key material.
+    #[test]
+    fn the_mainnet_refusal_display_is_fixed() {
+        assert_eq!(
+            FeeBumpError::MainnetSigningForbidden.to_string(),
+            "fee-bump signing on mainnet is not permitted"
         );
     }
 }

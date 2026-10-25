@@ -51,10 +51,16 @@ use stellar_xdr::{
 };
 
 use crate::client::{RpcEndpoint, StellarRpcClient, rpc_unreachable, unexpected_status};
+use crate::mainnet::authorization::MainnetTxSignAuthorization;
+use crate::mainnet::consumed::AuthorizationConsumed;
+use crate::mainnet::refusal::AuthorizedPathError;
+use crate::mainnet::{AuthorizationDomain, MainnetConsumer, MainnetPrecondition};
 use crate::retry::{
     RetryPolicy, is_retryable_poll_error, is_retryable_send_error, retry_with_backoff,
 };
-use crate::signing::verify_binding::{reject_v0_envelope, verify_signature_network_binding};
+use crate::signing::verify_binding::{
+    grant_signer_signed, reject_v0_envelope, verify_signature_network_binding,
+};
 use crate::submission_record::{SubmissionIntent, SubmissionOutcome, SubmissionRecorder};
 use crate::transaction_record::TransactionRecord;
 
@@ -207,7 +213,6 @@ pub async fn submit_transaction_and_wait(
     })?;
 
     let send_deadline = tokio::time::Instant::now() + timeout;
-    let retry_policy = RetryPolicy::default();
 
     // A legacy V0 envelope has no SEP-23 tagged-transaction form, so neither
     // the signing path nor binding verification can construct a payload for
@@ -239,12 +244,11 @@ pub async fn submit_transaction_and_wait(
     // and can tell when the endpoint describes something else.
     let tx_hash_hex = compute_local_tx_hash_hex(&envelope, network_passphrase)?;
     let local_hash_bytes = tx_hash_bytes(&tx_hash_hex)?;
-    let redacted = redact_tx_hash(&tx_hash_hex);
 
     let (source, sequence) = replay_identity(&envelope)?;
     let intent = SubmissionIntent {
         envelope_hash: envelope_hash_hex(envelope_xdr),
-        tx_hash: tx_hash_hex.clone(),
+        tx_hash: tx_hash_hex,
         source,
         sequence,
         max_time: crate::idempotent_submit::extract_max_time(&envelope),
@@ -257,15 +261,290 @@ pub async fn submit_transaction_and_wait(
         rec.pre_send(&intent).await?;
     }
 
+    send_and_confirm(
+        client,
+        &envelope,
+        &intent,
+        local_hash_bytes,
+        send_deadline,
+        timeout,
+        recorder,
+        signer_kind,
+    )
+    .await
+}
+
+/// The authority a mainnet submission is sent under.
+///
+/// Consumed by [`submit_authorized_transaction_and_wait`]: the submit hands
+/// it to the recorder, whose consumption of the authorization in the ledger is
+/// what the send depends on.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum MainnetSubmitGrant {
+    /// A classic transaction signed under its transaction authorization.
+    Tx(MainnetTxSignAuthorization),
+}
+
+/// Submits a signed mainnet `Tx` envelope under a grant and polls until
+/// confirmed.
+///
+/// The mainnet counterpart of [`submit_transaction_and_wait`], with one
+/// budget `timeout` for the whole submission in the same way. In order:
+///
+/// 1. The local gate, before any request: `network_passphrase` and the bound
+///    chain must be mainnet's, `consumer` the bound consuming verb, the grant
+///    unexpired on the clock of [`crate::mainnet::clock::now_ms`], and the
+///    client's authority and identity the bound endpoint. The endpoint
+///    binding is the authority on the endpoint, so the URL heuristic of
+///    [`refuse_mainnet_write`] does not apply.
+/// 2. The envelope is decoded; a legacy `TxV0` envelope is refused, and only
+///    a `Tx` envelope is sent under a transaction grant.
+/// 3. The endpoint must report the mainnet passphrase.
+/// 4. Every signature must verify under the mainnet network id, as
+///    [`submit_transaction_and_wait`] requires for its network, and one of
+///    them must be the bound signer's.
+/// 5. The transaction hash recomputed under the mainnet passphrase must be
+///    the bound one.
+/// 6. The recorder consumes the grant
+///    ([`SubmissionRecorder::pre_send_authorized`]); the proof it returns must
+///    name this envelope, its transaction content, and the grant's
+///    authorization.
+/// 7. The envelope is sent once, through the retry of transport failures
+///    that resends the same bytes, and the confirmation is polled.
+///
+/// Compiled in every build; without mainnet writes no grant exists, so the
+/// function cannot be called.
+///
+/// # Errors
+///
+/// - [`WalletError::Network`] wrapping
+///   [`NetworkError::MainnetAuthorizationRefused`] if a check of the grant
+///   fails, the envelope is a fee bump, the bound signer did not sign, or the
+///   recorder's proof does not match. The broken precondition is logged.
+/// - [`WalletError::Network`] wrapping
+///   [`NetworkError::EndpointNetworkMismatch`] if the endpoint does not serve
+///   mainnet, and the other errors of [`submit_transaction_and_wait`] for the
+///   identity probe, the signature binding, the send, and the poll.
+/// - The recorder's refusal from
+///   [`SubmissionRecorder::pre_send_authorized`].
+///
+/// # Panics
+///
+/// Never panics.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the inputs of submit_transaction_and_wait plus the consuming verb and the grant"
+)]
+pub async fn submit_authorized_transaction_and_wait(
+    client: &StellarRpcClient,
+    envelope_xdr: &str,
+    timeout: Duration,
+    network_passphrase: &str,
+    signer_kind: Option<SubmissionSignerKind>,
+    recorder: &dyn SubmissionRecorder,
+    consumer: MainnetConsumer,
+    grant: MainnetSubmitGrant,
+) -> Result<SubmissionResult, WalletError> {
+    authorized_submission(
+        client,
+        envelope_xdr,
+        timeout,
+        network_passphrase,
+        signer_kind,
+        recorder,
+        consumer,
+        grant,
+    )
+    .await
+    .map_err(|error| error.report("submit_authorized_transaction_and_wait"))
+}
+
+/// [`submit_authorized_transaction_and_wait`] with the broken precondition
+/// kept for the caller.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the inputs of submit_authorized_transaction_and_wait"
+)]
+pub(crate) async fn authorized_submission(
+    client: &StellarRpcClient,
+    envelope_xdr: &str,
+    timeout: Duration,
+    network_passphrase: &str,
+    signer_kind: Option<SubmissionSignerKind>,
+    recorder: &dyn SubmissionRecorder,
+    consumer: MainnetConsumer,
+    grant: MainnetSubmitGrant,
+) -> Result<SubmissionResult, AuthorizedPathError> {
+    let MainnetSubmitGrant::Tx(authorization) = &grant;
+    let authority = client.url.authority();
+    mainnet_submit_gate(
+        network_passphrase,
+        &authority,
+        client.id(),
+        consumer,
+        authorization,
+        crate::mainnet::clock::now_ms()?,
+    )?;
+
+    let envelope = TransactionEnvelope::from_xdr_base64(
+        envelope_xdr,
+        stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr.len()),
+    )
+    .map_err(|e| {
+        WalletError::Protocol(ProtocolError::XdrCodecFailed {
+            detail: format!("failed to decode TransactionEnvelope from base64 XDR: {e}"),
+        })
+    })?;
+    let send_deadline = tokio::time::Instant::now() + timeout;
+    reject_v0_envelope(&envelope)?;
+    if !matches!(envelope, TransactionEnvelope::Tx(_)) {
+        return Err(AuthorizedPathError::Refused(
+            MainnetPrecondition::BindingMismatch,
+        ));
+    }
+
+    // The probe's contribution is the passphrase: the endpoint binding was
+    // compared against this client's authority and identity above.
+    client.mainnet_endpoint_identity(send_deadline).await?;
+    let submission_ledger =
+        verify_signature_network_binding(client, &envelope, MAINNET_PASSPHRASE, send_deadline)
+            .await?;
+    if !grant_signer_signed(&envelope, &authorization.signer_public_key())? {
+        return Err(AuthorizedPathError::Refused(
+            MainnetPrecondition::SignerKeyMismatch,
+        ));
+    }
+
+    let tx_hash_hex = compute_local_tx_hash_hex(&envelope, MAINNET_PASSPHRASE)?;
+    let local_hash_bytes = tx_hash_bytes(&tx_hash_hex)?;
+    authorization.check_tx_hash(&local_hash_bytes)?;
+
+    let (source, sequence) = replay_identity(&envelope)?;
+    let intent = SubmissionIntent {
+        envelope_hash: envelope_hash_hex(envelope_xdr),
+        tx_hash: tx_hash_hex,
+        source,
+        sequence,
+        max_time: crate::idempotent_submit::extract_max_time(&envelope),
+        submission_ledger,
+    };
+    let authorization_id = authorization.id();
+
+    // The consumption is the record: it runs once, before the send and its
+    // retries.
+    let proof = recorder.pre_send_authorized(&intent, grant).await?;
+    if let Err(precondition) = proof_matches(&proof, &intent, authorization_id) {
+        recorder
+            .outcome(
+                &intent,
+                &SubmissionOutcome::Rejected {
+                    code: WalletError::Network(NetworkError::MainnetAuthorizationRefused)
+                        .code()
+                        .to_owned(),
+                    error: format!(
+                        "the consumption proof does not name this submission ({})",
+                        precondition.label()
+                    ),
+                },
+            )
+            .await;
+        return Err(AuthorizedPathError::Refused(precondition));
+    }
+
+    Ok(send_and_confirm(
+        client,
+        &envelope,
+        &intent,
+        local_hash_bytes,
+        send_deadline,
+        timeout,
+        Some(recorder),
+        signer_kind,
+    )
+    .await?)
+}
+
+/// The local gate of a mainnet submission, before any request: the chain,
+/// the consuming verb, the expiry at `now_ms`, and the endpoint, in that
+/// order.
+pub(crate) fn mainnet_submit_gate(
+    network_passphrase: &str,
+    authority: &str,
+    client_id: u64,
+    consumer: MainnetConsumer,
+    authorization: &MainnetTxSignAuthorization,
+    now_ms: u64,
+) -> Result<(), AuthorizedPathError> {
+    let chain = stellar_agent_core::profile::caip2::Caip2::from_passphrase(network_passphrase)
+        .ok_or(AuthorizedPathError::Refused(
+            MainnetPrecondition::ChainNotMainnet,
+        ))?;
+    authorization.check_chain(chain)?;
+    authorization.check_consumer(consumer)?;
+    authorization.check_not_expired(now_ms)?;
+    authorization.check_endpoint(Some((authority, client_id)))?;
+    Ok(())
+}
+
+/// Requires the consumption proof to name the submission's envelope hash, its
+/// transaction content digest, and the granted authorization.
+///
+/// # Errors
+///
+/// The precondition the proof breaks.
+fn proof_matches(
+    proof: &AuthorizationConsumed,
+    intent: &SubmissionIntent,
+    authorization_id: crate::mainnet::AuthorizationId,
+) -> Result<(), MainnetPrecondition> {
+    let envelope_hash =
+        tx_hash_bytes(&intent.envelope_hash).map_err(|_| MainnetPrecondition::BindingMismatch)?;
+    let tx_hash =
+        tx_hash_bytes(&intent.tx_hash).map_err(|_| MainnetPrecondition::BindingMismatch)?;
+    let content =
+        crate::mainnet::digest::content_digest(AuthorizationDomain::Transaction, &tx_hash);
+    if *proof.envelope_hash() != envelope_hash {
+        return Err(MainnetPrecondition::BindingMismatch);
+    }
+    if *proof.content_digest() != content {
+        return Err(MainnetPrecondition::ContentDigest);
+    }
+    if proof.authorization_id() != authorization_id {
+        return Err(MainnetPrecondition::UnknownAuthorization);
+    }
+    Ok(())
+}
+
+/// Sends the recorded envelope once, through the retry of transport failures
+/// that resends the same bytes, compares the endpoint's hash with the local
+/// one, and polls for the confirmation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the facts both submit paths established before the send"
+)]
+async fn send_and_confirm(
+    client: &StellarRpcClient,
+    envelope: &TransactionEnvelope,
+    intent: &SubmissionIntent,
+    local_hash_bytes: [u8; 32],
+    send_deadline: tokio::time::Instant,
+    timeout: Duration,
+    recorder: Option<&dyn SubmissionRecorder>,
+    signer_kind: Option<SubmissionSignerKind>,
+) -> Result<SubmissionResult, WalletError> {
+    let retry_policy = RetryPolicy::default();
+    let redacted = redact_tx_hash(&intent.tx_hash);
+
     // Submit via `sendTransaction`, with bounded exponential-backoff retry for
     // transient transport errors.
     //
     // Safety: retrying the same signed envelope is safe because the receipt
-    // written by `pre_send` is keyed on the envelope hash and the submission's
-    // `(source, sequence)`: a retried send that already landed is caught by
-    // that record, and a second submission for the same sequence is refused
-    // before it is built. Do NOT remove or bypass the recorder when using this
-    // retry.
+    // the recorder wrote before the send is keyed on the envelope hash and
+    // the submission's `(source, sequence)`: a retried send that already
+    // landed is caught by that record, and a second submission for the same
+    // sequence is refused before it is built. Do NOT remove or bypass the
+    // recorder when using this retry.
     //
     // `TransactionSubmissionFailed` is NOT retried — it wraps both genuine
     // on-chain rejections AND transport-429-on-send, and those are
@@ -280,7 +559,7 @@ pub async fn submit_transaction_and_wait(
             &retry_policy,
             send_deadline,
             is_retryable_send_error,
-            || async { inner.send_transaction(&envelope).await },
+            || async { lose_send_answer(inner.send_transaction(envelope).await) },
         )
         .await
     };
@@ -289,7 +568,7 @@ pub async fn submit_transaction_and_wait(
         Ok(h) => h,
         Err(e) => {
             return Err(
-                handle_send_failure(recorder, &intent, &e, &client.url, timeout.as_secs()).await,
+                handle_send_failure(recorder, intent, &e, &client.url, timeout.as_secs()).await,
             );
         }
     };
@@ -298,14 +577,14 @@ pub async fn submit_transaction_and_wait(
     // transaction that was sent. The receipt stays keyed on the local hash and
     // stays pending: what the endpoint did with the bytes is unknown.
     let server_tx_hash_hex = bytes_to_hex(&server_tx_hash.0);
-    if server_tx_hash_hex != tx_hash_hex {
+    if server_tx_hash_hex != intent.tx_hash {
         let err = WalletError::Submission(SubmissionError::HashMismatch {
-            local: tx_hash_hex.clone(),
+            local: intent.tx_hash.clone(),
             server: server_tx_hash_hex.clone(),
         });
         if let Some(rec) = recorder {
             rec.outcome(
-                &intent,
+                intent,
                 &SubmissionOutcome::TransportAfterSend {
                     error: format!(
                         "the endpoint reported transaction hash {} for a transaction whose local hash is {}",
@@ -327,11 +606,51 @@ pub async fn submit_transaction_and_wait(
         &client.url,
         send_deadline,
         timeout.as_secs(),
-        &intent,
+        intent,
         recorder,
         signer_kind,
     )
     .await
+}
+
+/// Discards the endpoint's answer to this many accepted sends and reports a
+/// transport timeout in its place, so the resend of the same envelope after a
+/// lost answer is reachable from a test.
+///
+/// No endpoint answer makes the RPC client report a retryable send error: it
+/// reports every failed request as a submission failure. The toggle stands in
+/// for a transport that lost the answer after the endpoint took the bytes;
+/// the retry that follows it is the production one.
+///
+/// Only compiled when the `test-hooks` Cargo feature is enabled. Never include
+/// `test-hooks` in production or release builds.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub static LOSE_SEND_ANSWERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The send's answer, or a transport timeout in its place while
+/// [`LOSE_SEND_ANSWERS`] is above zero under `test-hooks`.
+#[allow(
+    clippy::result_large_err,
+    reason = "passes the RPC client's own send result through to its retry classification"
+)]
+fn lose_send_answer(
+    answer: Result<stellar_xdr::Hash, stellar_rpc_client::Error>,
+) -> Result<stellar_xdr::Hash, stellar_rpc_client::Error> {
+    #[cfg(feature = "test-hooks")]
+    if answer.is_ok()
+        && LOSE_SEND_ANSWERS
+            .try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |lost| lost.checked_sub(1),
+            )
+            .is_ok()
+    {
+        return Err(stellar_rpc_client::Error::TransactionSubmissionTimeout);
+    }
+    answer
 }
 
 /// Polls `getTransaction` through `poll` until the transaction settles or
@@ -1658,5 +1977,640 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn no_poll_starts_after_the_transient_sleep_reaches_the_deadline() {
         assert_no_poll_after_deadline(true).await;
+    }
+
+    // ── The authorized submission ─────────────────────────────────────────────
+
+    #[cfg(feature = "mainnet-write")]
+    mod authorized {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        use serde_json::json;
+        use serial_test::serial;
+        use stellar_agent_core::policy::v1::criteria::state_store::WindowEntry;
+        use stellar_agent_test_support::SubmissionEchoResponder;
+        use stellar_agent_test_support::signed_envelope::{
+            SignedTestEnvelope, TESTNET_PASSPHRASE, get_network_result,
+        };
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer};
+
+        use super::*;
+        use crate::mainnet::authorization::MainnetTxSignAuthorization;
+        use crate::mainnet::fixtures::{self, LedgerFixture, SEQUENCE, SIGNER_SEED, TTL_MS};
+        use crate::policy_state::DomainBinding;
+        use crate::submission_record::WalletSubmissionRecorder;
+
+        const NOW: u64 = 1_800_000_000_000;
+        const OTHER_SEED: [u8; 32] = [0x3b; 32];
+        const TIMEOUT: Duration = Duration::from_secs(10);
+
+        /// The proof field a [`CountingRecorder`] changes after the real
+        /// consumption.
+        #[derive(Clone, Copy)]
+        enum Tamper {
+            EnvelopeHash,
+            ContentDigest,
+            AuthorizationId,
+        }
+
+        /// The fixture's wallet recorder, counting the calls of each kind and
+        /// optionally changing one field of the proof it returns.
+        struct CountingRecorder<'a> {
+            inner: WalletSubmissionRecorder<'a>,
+            tamper: Option<Tamper>,
+            pre_sends: AtomicUsize,
+            consumes: AtomicUsize,
+            outcomes: Mutex<Vec<&'static str>>,
+        }
+
+        impl<'a> CountingRecorder<'a> {
+            fn new(inner: WalletSubmissionRecorder<'a>, tamper: Option<Tamper>) -> Self {
+                Self {
+                    inner,
+                    tamper,
+                    pre_sends: AtomicUsize::new(0),
+                    consumes: AtomicUsize::new(0),
+                    outcomes: Mutex::new(Vec::new()),
+                }
+            }
+
+            fn consumes(&self) -> usize {
+                self.consumes.load(Ordering::SeqCst)
+            }
+
+            fn pre_sends(&self) -> usize {
+                self.pre_sends.load(Ordering::SeqCst)
+            }
+
+            fn outcomes(&self) -> Vec<&'static str> {
+                self.outcomes.lock().unwrap().clone()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl SubmissionRecorder for CountingRecorder<'_> {
+            async fn pre_send(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
+                self.pre_sends.fetch_add(1, Ordering::SeqCst);
+                self.inner.pre_send(intent).await
+            }
+
+            async fn pre_send_authorized(
+                &self,
+                intent: &SubmissionIntent,
+                grant: MainnetSubmitGrant,
+            ) -> Result<AuthorizationConsumed, WalletError> {
+                self.consumes.fetch_add(1, Ordering::SeqCst);
+                let proof = self.inner.pre_send_authorized(intent, grant).await?;
+                let mut envelope_hash = *proof.envelope_hash();
+                let mut content_digest = *proof.content_digest();
+                let mut id = *proof.authorization_id().as_bytes();
+                match self.tamper {
+                    None => return Ok(proof),
+                    Some(Tamper::EnvelopeHash) => envelope_hash[0] ^= 1,
+                    Some(Tamper::ContentDigest) => content_digest[0] ^= 1,
+                    Some(Tamper::AuthorizationId) => id[0] ^= 1,
+                }
+                Ok(AuthorizationConsumed::new(
+                    envelope_hash,
+                    content_digest,
+                    crate::mainnet::AuthorizationId::from_bytes(id),
+                ))
+            }
+
+            async fn outcome(&self, intent: &SubmissionIntent, outcome: &SubmissionOutcome) {
+                self.outcomes.lock().unwrap().push(match outcome {
+                    SubmissionOutcome::Success { .. } => "success",
+                    SubmissionOutcome::OnChainFailed { .. } => "on_chain_failed",
+                    SubmissionOutcome::Rejected { .. } => "rejected",
+                    SubmissionOutcome::Timeout { .. } => "timeout",
+                    SubmissionOutcome::TransportAfterSend { .. } => "transport_after_send",
+                });
+                self.inner.outcome(intent, outcome).await;
+            }
+        }
+
+        /// Mounts the endpoint for `envelope`: it reports `passphrase`, the
+        /// envelope's signer sets, `sends` accepted sends, and the
+        /// transaction's success.
+        async fn mount(
+            server: &MockServer,
+            envelope: &SignedTestEnvelope,
+            passphrase: &str,
+            sends: u64,
+        ) {
+            for (rpc_method, result) in [
+                ("getNetwork", get_network_result(passphrase)),
+                ("getLedgerEntries", envelope.ledger_entries_result()),
+            ] {
+                Mock::given(method("POST"))
+                    .and(body_partial_json(json!({ "method": rpc_method })))
+                    .respond_with(SubmissionEchoResponder::new(result, MAINNET_PASSPHRASE))
+                    .mount(server)
+                    .await;
+            }
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({ "method": "sendTransaction" })))
+                .respond_with(SubmissionEchoResponder::new(
+                    json!({
+                        "hash": envelope.tx_hash_hex(),
+                        "status": "PENDING",
+                        "latestLedger": 1000,
+                        "latestLedgerCloseTime": "1699999999"
+                    }),
+                    MAINNET_PASSPHRASE,
+                ))
+                .expect(sends)
+                .named("sendTransaction")
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({ "method": "getTransaction" })))
+                .respond_with(SubmissionEchoResponder::new(
+                    json!({
+                        "status": "SUCCESS",
+                        "txHash": envelope.tx_hash_hex(),
+                        "ledger": 4567,
+                        "createdAt": "1700000000",
+                        "envelopeXdr": null,
+                        "resultXdr": null,
+                        "resultMetaXdr": null
+                    }),
+                    MAINNET_PASSPHRASE,
+                ))
+                .mount(server)
+                .await;
+        }
+
+        /// The number of requests `server` received.
+        async fn requests(server: &MockServer) -> usize {
+            server.received_requests().await.unwrap().len()
+        }
+
+        /// A mainnet ledger fixture, a mock endpoint, a client of it, and the
+        /// signed envelope a grant is minted over.
+        struct Case {
+            fx: LedgerFixture,
+            server: MockServer,
+            client: StellarRpcClient,
+            envelope: SignedTestEnvelope,
+            holds: Vec<WindowEntry>,
+        }
+
+        impl Case {
+            async fn new(label: &str) -> Self {
+                Self::with_envelope(label, fixtures::signed_envelope()).await
+            }
+
+            async fn with_envelope(label: &str, envelope: SignedTestEnvelope) -> Self {
+                let fx = LedgerFixture::new(label, NOW);
+                let server = MockServer::start().await;
+                let client = StellarRpcClient::new(&server.uri()).unwrap();
+                let holds = vec![fixtures::hold(&fx.name, NOW, 100)];
+                Self {
+                    fx,
+                    server,
+                    client,
+                    envelope,
+                    holds,
+                }
+            }
+
+            /// The binding of the approved unsigned envelope, after `edit`.
+            fn binding(&self, edit: impl FnOnce(&mut DomainBinding)) -> DomainBinding {
+                let unsigned = fixtures::unsigned_envelope();
+                let mut binding =
+                    fixtures::tx_binding(unsigned.envelope_xdr(), unsigned.tx_hash_hex());
+                edit(&mut binding);
+                binding
+            }
+
+            /// A grant minted for this client's endpoint.
+            fn grant(&self) -> MainnetTxSignAuthorization {
+                self.grant_for(self.endpoint(), self.binding(|_| {}))
+            }
+
+            fn grant_for(
+                &self,
+                endpoint: (String, u64),
+                binding: DomainBinding,
+            ) -> MainnetTxSignAuthorization {
+                self.fx
+                    .mint(binding, &self.holds, Some(endpoint), "approval-1")
+            }
+
+            fn endpoint(&self) -> (String, u64) {
+                (self.client.url.authority(), self.client.id())
+            }
+
+            fn recorder(&self, tamper: Option<Tamper>) -> CountingRecorder<'_> {
+                CountingRecorder::new(
+                    self.fx
+                        .recorder(self.holds.clone(), Some(Arc::clone(&self.fx.writer))),
+                    tamper,
+                )
+            }
+
+            async fn submit_with(
+                &self,
+                client: &StellarRpcClient,
+                passphrase: &str,
+                consumer: MainnetConsumer,
+                recorder: &CountingRecorder<'_>,
+                authorization: MainnetTxSignAuthorization,
+            ) -> Result<SubmissionResult, AuthorizedPathError> {
+                authorized_submission(
+                    client,
+                    self.envelope.envelope_xdr(),
+                    TIMEOUT,
+                    passphrase,
+                    None,
+                    recorder,
+                    consumer,
+                    MainnetSubmitGrant::Tx(authorization),
+                )
+                .await
+            }
+
+            async fn submit(
+                &self,
+                recorder: &CountingRecorder<'_>,
+                authorization: MainnetTxSignAuthorization,
+            ) -> Result<SubmissionResult, AuthorizedPathError> {
+                self.submit_with(
+                    &self.client,
+                    MAINNET_PASSPHRASE,
+                    MainnetConsumer::CliPay,
+                    recorder,
+                    authorization,
+                )
+                .await
+            }
+        }
+
+        fn refused(result: Result<SubmissionResult, AuthorizedPathError>) -> MainnetPrecondition {
+            match result {
+                Err(AuthorizedPathError::Refused(precondition)) => precondition,
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+
+        /// Asserts that a refused submission sent nothing and never entered
+        /// the consumption, and that the grant's record stays open.
+        fn assert_not_consumed(
+            case: &Case,
+            recorder: &CountingRecorder<'_>,
+            id: crate::mainnet::AuthorizationId,
+        ) {
+            assert_eq!(recorder.consumes(), 0, "the consumption is not entered");
+            assert_eq!(recorder.pre_sends(), 0);
+            assert!(case.fx.is_open(id), "the record stays open");
+        }
+
+        /// The valid grant is consumed once and the envelope sent once.
+        #[tokio::test]
+        #[serial]
+        async fn a_valid_grant_sends_once() {
+            let case = Case::new("submit-valid").await;
+            mount(&case.server, &case.envelope, MAINNET_PASSPHRASE, 1).await;
+            let recorder = case.recorder(None);
+            let authorization = case.grant();
+            let id = authorization.id();
+
+            let result = submit_authorized_transaction_and_wait(
+                &case.client,
+                case.envelope.envelope_xdr(),
+                TIMEOUT,
+                MAINNET_PASSPHRASE,
+                None,
+                &recorder,
+                MainnetConsumer::CliPay,
+                MainnetSubmitGrant::Tx(authorization),
+            )
+            .await
+            .expect("a valid grant submits");
+
+            assert_eq!(result.tx_hash, case.envelope.tx_hash_hex());
+            assert_eq!(recorder.consumes(), 1);
+            assert_eq!(
+                recorder.pre_sends(),
+                0,
+                "the ungranted record step is not used"
+            );
+            assert_eq!(recorder.outcomes(), ["success"]);
+            assert!(!case.fx.is_open(id), "the record is used");
+            assert_eq!(
+                case.fx.audit_kinds(),
+                ["value_action_pending", "value_action_submitted"]
+            );
+            case.server.verify().await;
+        }
+
+        /// A send whose answer is lost is resent with the same bytes, and the
+        /// grant is consumed once for both sends.
+        #[cfg(feature = "test-hooks")]
+        #[tokio::test]
+        #[serial]
+        async fn a_resent_envelope_is_consumed_once() {
+            struct Lost;
+            impl Drop for Lost {
+                fn drop(&mut self) {
+                    LOSE_SEND_ANSWERS.store(0, Ordering::SeqCst);
+                }
+            }
+
+            let case = Case::new("submit-resend").await;
+            mount(&case.server, &case.envelope, MAINNET_PASSPHRASE, 2).await;
+            let recorder = case.recorder(None);
+            let authorization = case.grant();
+
+            let _lost = Lost;
+            LOSE_SEND_ANSWERS.store(1, Ordering::SeqCst);
+            case.submit(&recorder, authorization)
+                .await
+                .expect("the resend confirms");
+
+            assert_eq!(recorder.consumes(), 1, "one consumption for both sends");
+            assert_eq!(recorder.outcomes(), ["success"]);
+            case.server.verify().await;
+        }
+
+        /// A grant for another client of the same endpoint is refused before
+        /// any request.
+        #[tokio::test]
+        #[serial]
+        async fn a_grant_for_another_client_is_refused_before_any_request() {
+            let case = Case::new("submit-client").await;
+            mount(&case.server, &case.envelope, MAINNET_PASSPHRASE, 0).await;
+            let recorder = case.recorder(None);
+            let other = StellarRpcClient::new(&case.server.uri()).unwrap();
+            let authorization =
+                case.grant_for((other.url.authority(), other.id()), case.binding(|_| {}));
+            let id = authorization.id();
+
+            assert_eq!(
+                refused(case.submit(&recorder, authorization).await),
+                MainnetPrecondition::EndpointClient
+            );
+            assert_eq!(requests(&case.server).await, 0);
+            assert_not_consumed(&case, &recorder, id);
+        }
+
+        /// A grant for another endpoint authority is refused before any
+        /// request.
+        #[tokio::test]
+        #[serial]
+        async fn a_grant_for_another_authority_is_refused_before_any_request() {
+            let case = Case::new("submit-authority").await;
+            mount(&case.server, &case.envelope, MAINNET_PASSPHRASE, 0).await;
+            let recorder = case.recorder(None);
+            let authorization = case.grant_for(
+                ("https://rpc.other.example".to_owned(), case.client.id()),
+                case.binding(|_| {}),
+            );
+            let id = authorization.id();
+
+            assert_eq!(
+                refused(case.submit(&recorder, authorization).await),
+                MainnetPrecondition::EndpointAuthority
+            );
+            assert_eq!(requests(&case.server).await, 0);
+            assert_not_consumed(&case, &recorder, id);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_grant_on_testnet_is_refused_before_any_request() {
+            let case = Case::new("submit-testnet").await;
+            mount(&case.server, &case.envelope, MAINNET_PASSPHRASE, 0).await;
+            let recorder = case.recorder(None);
+            let authorization = case.grant();
+            let id = authorization.id();
+
+            assert_eq!(
+                refused(
+                    case.submit_with(
+                        &case.client,
+                        TESTNET_PASSPHRASE,
+                        MainnetConsumer::CliPay,
+                        &recorder,
+                        authorization,
+                    )
+                    .await
+                ),
+                MainnetPrecondition::ChainNotMainnet
+            );
+            assert_eq!(requests(&case.server).await, 0);
+            assert_not_consumed(&case, &recorder, id);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn another_consumer_is_refused_before_any_request() {
+            let case = Case::new("submit-consumer").await;
+            mount(&case.server, &case.envelope, MAINNET_PASSPHRASE, 0).await;
+            let recorder = case.recorder(None);
+            let authorization = case.grant();
+            let id = authorization.id();
+
+            assert_eq!(
+                refused(
+                    case.submit_with(
+                        &case.client,
+                        MAINNET_PASSPHRASE,
+                        MainnetConsumer::McpPay,
+                        &recorder,
+                        authorization,
+                    )
+                    .await
+                ),
+                MainnetPrecondition::ConsumerMismatch
+            );
+            assert_eq!(requests(&case.server).await, 0);
+            assert_not_consumed(&case, &recorder, id);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn an_expired_grant_is_refused_before_any_request() {
+            let case = Case::new("submit-expired").await;
+            mount(&case.server, &case.envelope, MAINNET_PASSPHRASE, 0).await;
+            let recorder = case.recorder(None);
+            let authorization = case.grant();
+            case.fx.clock.set(NOW + TTL_MS);
+
+            assert_eq!(
+                refused(case.submit(&recorder, authorization).await),
+                MainnetPrecondition::Expired
+            );
+            assert_eq!(requests(&case.server).await, 0);
+            assert_eq!(recorder.consumes(), 0, "the consumption is not entered");
+            assert_eq!(recorder.pre_sends(), 0);
+        }
+
+        /// An endpoint that reports another network is refused after the
+        /// probe and before any send.
+        #[tokio::test]
+        #[serial]
+        async fn an_endpoint_on_another_network_is_refused_before_the_send() {
+            let case = Case::new("submit-probe").await;
+            mount(&case.server, &case.envelope, TESTNET_PASSPHRASE, 0).await;
+            let recorder = case.recorder(None);
+            let authorization = case.grant();
+            let id = authorization.id();
+
+            let result = case.submit(&recorder, authorization).await;
+            match result {
+                Err(AuthorizedPathError::Wallet(error)) => {
+                    assert_eq!(error.code(), "network.endpoint_network_mismatch");
+                }
+                other => panic!("expected the endpoint refusal, got {other:?}"),
+            }
+            assert_not_consumed(&case, &recorder, id);
+            case.server.verify().await;
+        }
+
+        /// A grant over another transaction hash is refused before the send.
+        #[tokio::test]
+        #[serial]
+        async fn another_transaction_hash_is_refused_before_the_send() {
+            let case = Case::new("submit-hash").await;
+            mount(&case.server, &case.envelope, MAINNET_PASSPHRASE, 0).await;
+            let recorder = case.recorder(None);
+            let authorization = case.grant_for(
+                case.endpoint(),
+                case.binding(|binding| {
+                    if let DomainBinding::Transaction { tx_hash, .. } = binding {
+                        *tx_hash = [0x22; 32];
+                    }
+                }),
+            );
+            let id = authorization.id();
+
+            assert_eq!(
+                refused(case.submit(&recorder, authorization).await),
+                MainnetPrecondition::TxHash
+            );
+            assert_not_consumed(&case, &recorder, id);
+            case.server.verify().await;
+        }
+
+        /// An envelope signed only by another of the source's signers, a
+        /// signature the network binding accepts, is refused because the
+        /// grant's signer did not sign it.
+        #[tokio::test]
+        #[serial]
+        async fn an_envelope_without_the_grant_signer_is_refused_before_the_send() {
+            let envelope = SignedTestEnvelope::builder(SIGNER_SEED)
+                .network_passphrase(MAINNET_PASSPHRASE)
+                .sequence(SEQUENCE)
+                .sign(OTHER_SEED, MAINNET_PASSPHRASE)
+                .ed25519_signer(&fixtures::account(SIGNER_SEED), OTHER_SEED)
+                .build();
+            let case = Case::with_envelope("submit-signer", envelope).await;
+            mount(&case.server, &case.envelope, MAINNET_PASSPHRASE, 0).await;
+            let recorder = case.recorder(None);
+            let authorization = case.grant();
+            let id = authorization.id();
+
+            assert_eq!(
+                refused(case.submit(&recorder, authorization).await),
+                MainnetPrecondition::SignerKeyMismatch
+            );
+            assert_not_consumed(&case, &recorder, id);
+            case.server.verify().await;
+        }
+
+        /// A proof that differs from the submission in one field is refused
+        /// before the send, after the consumption, and the record is settled
+        /// as rejected.
+        async fn assert_tampered_proof_refused(
+            label: &str,
+            tamper: Tamper,
+            expected: MainnetPrecondition,
+        ) {
+            let case = Case::new(label).await;
+            mount(&case.server, &case.envelope, MAINNET_PASSPHRASE, 0).await;
+            let recorder = case.recorder(Some(tamper));
+
+            let authorization = case.grant();
+            let id = authorization.id();
+            assert_eq!(
+                refused(case.submit(&recorder, authorization).await),
+                expected
+            );
+            assert_eq!(recorder.consumes(), 1);
+            assert_eq!(recorder.outcomes(), ["rejected"]);
+            case.fx.assert_used_without_holds(id);
+            assert!(
+                case.fx
+                    .window
+                    .pending_reservations(&case.fx.profile)
+                    .unwrap()
+                    .is_empty(),
+                "rejection settles the converted reservations"
+            );
+            case.server.verify().await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_proof_of_another_envelope_is_refused_before_the_send() {
+            assert_tampered_proof_refused(
+                "submit-proof-envelope",
+                Tamper::EnvelopeHash,
+                MainnetPrecondition::BindingMismatch,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_proof_of_other_content_is_refused_before_the_send() {
+            assert_tampered_proof_refused(
+                "submit-proof-content",
+                Tamper::ContentDigest,
+                MainnetPrecondition::ContentDigest,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_proof_of_another_authorization_is_refused_before_the_send() {
+            assert_tampered_proof_refused(
+                "submit-proof-id",
+                Tamper::AuthorizationId,
+                MainnetPrecondition::UnknownAuthorization,
+            )
+            .await;
+        }
+
+        /// A refusal leaves the public entry point as the generic mainnet
+        /// authorization refusal.
+        #[tokio::test]
+        #[serial]
+        async fn a_refused_grant_reports_the_authorization_refusal() {
+            let case = Case::new("submit-code").await;
+            mount(&case.server, &case.envelope, MAINNET_PASSPHRASE, 0).await;
+            let recorder = case.recorder(None);
+
+            let error = submit_authorized_transaction_and_wait(
+                &case.client,
+                case.envelope.envelope_xdr(),
+                TIMEOUT,
+                MAINNET_PASSPHRASE,
+                None,
+                &recorder,
+                MainnetConsumer::McpPay,
+                MainnetSubmitGrant::Tx(case.grant()),
+            )
+            .await
+            .expect_err("another consumer is refused");
+
+            assert_eq!(error.code(), "network.mainnet_authorization_refused");
+            assert_eq!(requests(&case.server).await, 0);
+        }
     }
 }

@@ -2059,11 +2059,11 @@ pub enum ValueActionSettlement {
 ///
 /// Two limits follow from that read. The eleventh rotation deletes the oldest
 /// archive, so a submission whose rows only that archive held reads as
-/// [`ValueActionSettlement::OwedWithoutLegs`]. The lookup runs outside the
-/// writer guard: two reconciliations of one hash can both find
-/// [`ValueActionSettlement::Owed`], and any concurrent in-process append can
-/// rotate the log between the file listing and the scan, renaming the matched
-/// file out of the walk.
+/// [`ValueActionSettlement::OwedWithoutLegs`]. Without a writer guard held by the
+/// caller, two reconciliations of one hash can both find
+/// [`ValueActionSettlement::Owed`]. A concurrent in-process append can also rotate
+/// the log between the file listing and the scan, renaming the matched file out
+/// of the walk.
 ///
 /// # Errors
 ///

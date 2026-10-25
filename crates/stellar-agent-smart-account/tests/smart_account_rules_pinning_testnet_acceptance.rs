@@ -119,6 +119,7 @@ use stellar_agent_smart_account::deployment::{
     deploy_smart_account, deploy_timelock_controller, derive_smart_account_address,
 };
 use stellar_agent_smart_account::error::SaError;
+use stellar_agent_smart_account::managers::auth_entry::test_helpers::partial_authorization_entry;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
 use stellar_agent_smart_account::managers::rules::RuleContext;
 use stellar_agent_smart_account::managers::rules::{
@@ -918,14 +919,17 @@ async fn p3_policy_hash_drift_detection_at_signing_time() {
 
     // Fake bridge address: drift fires before any bridge I/O.
     let bridge_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19907);
-    let auth_digest = [0u8; 32];
+    let entry = partial_authorization_entry(
+        parse_c_strkey_to_smart_account(&sa_strkey).expect("smart account strkey parses"),
+        TESTNET_PASSPHRASE,
+        vec![ContextRuleId::new(rule_id)],
+    )
+    .expect("auth entry builds");
 
     let outcome = creds_mgr
         .sign_with_passkey_rule(
             "does-not-matter", // credential lookup never reached (drift fires first)
-            &sa_strkey,
-            &auth_digest,
-            vec![rule_id],
+            &entry,
             Arc::clone(&sm),
             bridge_addr,
             Duration::from_millis(500),
@@ -1192,7 +1196,12 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
     );
 
     let bridge_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19908);
-    let auth_digest = [0u8; 32];
+    let entry = partial_authorization_entry(
+        parse_c_strkey_to_smart_account(&sa_strkey).expect("smart account strkey parses"),
+        TESTNET_PASSPHRASE,
+        vec![ContextRuleId::new(rule_id)],
+    )
+    .expect("auth entry builds");
 
     // Signing attempt 1: real-hash pin row → drift check MUST NOT fire.
     // The approval store is None so we get ApprovalStoreUnavailable, but
@@ -1200,9 +1209,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
     let outcome_real_hash = creds_mgr
         .sign_with_passkey_rule(
             "does-not-matter",
-            &sa_strkey,
-            &auth_digest,
-            vec![rule_id],
+            &entry,
             Arc::clone(&sm),
             bridge_addr,
             Duration::from_millis(500),
@@ -1256,9 +1263,7 @@ async fn p4_unknown_verifier_override_real_hash_stored_drift_regression() {
     let outcome_zero_pin = creds_mgr
         .sign_with_passkey_rule(
             "does-not-matter",
-            &sa_strkey,
-            &auth_digest,
-            vec![rule_id],
+            &entry,
             Arc::clone(&sm),
             bridge_addr,
             Duration::from_millis(500),
@@ -1478,14 +1483,17 @@ async fn p5_drift_check_infra_failure_routes_to_drift_check_unavailable_not_drif
 
     // Fake bridge address: multi-hash guard fires before any bridge I/O.
     let bridge_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19909);
-    let auth_digest = [0u8; 32];
+    let entry = partial_authorization_entry(
+        parse_c_strkey_to_smart_account(&sa_strkey).expect("smart account strkey parses"),
+        TESTNET_PASSPHRASE,
+        vec![ContextRuleId::new(rule_id)],
+    )
+    .expect("auth entry builds");
 
     let outcome = creds_mgr
         .sign_with_passkey_rule(
             "does-not-matter",
-            &sa_strkey,
-            &auth_digest,
-            vec![rule_id],
+            &entry,
             Arc::clone(&sm),
             bridge_addr,
             Duration::from_millis(500),

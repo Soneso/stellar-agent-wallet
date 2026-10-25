@@ -200,6 +200,23 @@ pub fn preimage_parts(
     }
 }
 
+/// Returns the invocation a Soroban authorization preimage commits to: the
+/// `root_invocation` of the entry it was built from.
+///
+/// Both authorization cases carry it; every other `HashIdPreimage` case
+/// returns `None`. A verifier that binds an approval to the invocation reads
+/// it here together with [`preimage_parts`].
+#[must_use]
+pub fn preimage_invocation(preimage: &HashIdPreimage) -> Option<&SorobanAuthorizedInvocation> {
+    match preimage {
+        HashIdPreimage::SorobanAuthorization(v1) => Some(&v1.invocation),
+        HashIdPreimage::SorobanAuthorizationWithAddress(v2) => Some(&v2.invocation),
+        HashIdPreimage::OpId(_)
+        | HashIdPreimage::PoolRevokeOpId(_)
+        | HashIdPreimage::ContractId(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -479,6 +496,29 @@ mod tests {
         // authorization preimage and returns None.
         for other in other_preimage_cases() {
             assert_eq!(preimage_parts(&other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn preimage_invocation_maps_all_five_cases() {
+        for version in [AuthCredentialsVersion::V1, AuthCredentialsVersion::V2] {
+            let preimage = build_auth_preimage(
+                version,
+                network_id(),
+                NONCE,
+                EXPIRATION,
+                &account(0x44),
+                invocation(),
+            );
+            assert_eq!(
+                preimage_invocation(&preimage),
+                Some(&invocation()),
+                "{version:?}"
+            );
+        }
+
+        for other in other_preimage_cases() {
+            assert_eq!(preimage_invocation(&other), None, "{other:?}");
         }
     }
 }

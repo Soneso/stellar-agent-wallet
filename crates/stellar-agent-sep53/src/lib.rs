@@ -57,6 +57,8 @@ pub mod error;
 pub use error::Sep53Error;
 
 use sha2::{Digest, Sha256};
+use stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL;
+use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 use stellar_agent_network::signing::Signer;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -140,8 +142,19 @@ pub fn message_digest(message: &[u8]) -> [u8; 32] {
 /// path) reuses this crate's [`message_digest`] for the same SEP-53 scheme, so
 /// signatures it produces verify with [`verify_message`].
 ///
+/// # Mainnet
+///
+/// `network_passphrase` is the network of the profile the message is signed
+/// for. The mainnet passphrase is refused before any other check and before
+/// `signer` is asked for a signature: a message signature leaves the wallet
+/// for use elsewhere, so no mainnet signature is produced. The SEP-53 digest
+/// carries no network, so the refusal rests on the network the caller
+/// declares; callers pass their profile's passphrase.
+///
 /// # Errors
 ///
+/// - [`Sep53Error::MainnetSigningForbidden`]: `network_passphrase` is the
+///   mainnet passphrase.
 /// - [`Sep53Error::MessageTooLarge`] — `message.len()` exceeds [`MAX_MESSAGE_BYTES`].
 /// - [`Sep53Error::SigningFailed`] — the signer returned an error.
 ///
@@ -157,14 +170,22 @@ pub fn message_digest(message: &[u8]) -> [u8; 32] {
 ///
 /// # tokio_test::block_on(async {
 /// let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
-/// let sig = sign_message(b"hello sep53", &key).await.unwrap();
+/// let sig = sign_message(b"hello sep53", &key, "Test SDF Network ; September 2015")
+///     .await
+///     .unwrap();
 /// assert_eq!(sig.len(), 64);
 /// # });
 /// ```
 pub async fn sign_message(
     message: &[u8],
     signer: &(dyn Signer + Send + Sync),
+    network_passphrase: &str,
 ) -> Result<[u8; 64], Sep53Error> {
+    if network_passphrase == MAINNET_PASSPHRASE {
+        return Err(Sep53Error::MainnetSigningForbidden {
+            detail: MAINNET_SIGNING_REFUSAL_DETAIL.to_owned(),
+        });
+    }
     if message.len() > MAX_MESSAGE_BYTES {
         return Err(Sep53Error::MessageTooLarge {
             len: message.len(),
@@ -238,7 +259,9 @@ pub async fn sign_message(
 /// let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
 /// let pk_bytes = key.public_key().await.unwrap();
 /// let public_key = PublicKey(pk_bytes.0);
-/// let sig = sign_message(b"hello", &key).await.unwrap();
+/// let sig = sign_message(b"hello", &key, "Test SDF Network ; September 2015")
+///     .await
+///     .unwrap();
 /// verify_message(b"hello", &sig, &public_key).unwrap();
 /// # });
 /// ```
@@ -290,6 +313,8 @@ mod tests {
 
     use super::*;
     use stellar_agent_network::signing::SoftwareSigningKey;
+
+    const TESTNET: &str = "Test SDF Network ; September 2015";
 
     // ── prefix is exactly 24 bytes with correct hex representation ────────
 
@@ -450,7 +475,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let msg = b"roundtrip test message";
-            let sig = sign_message(msg, &key)
+            let sig = sign_message(msg, &key, TESTNET)
                 .await
                 .expect("sign_message must succeed");
             let pk_bytes = key.public_key().await.expect("public_key must succeed");
@@ -469,7 +494,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let msg = b"original message";
-            let sig = sign_message(msg, &key)
+            let sig = sign_message(msg, &key, TESTNET)
                 .await
                 .expect("sign_message must succeed");
             let pk_bytes = key.public_key().await.expect("public_key must succeed");
@@ -497,7 +522,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let msg = b"test message";
-            let sig = sign_message(msg, &key)
+            let sig = sign_message(msg, &key, TESTNET)
                 .await
                 .expect("sign_message must succeed");
             let wrong_pk_bytes = wrong_key
@@ -527,7 +552,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let err = sign_message(&oversized, &key)
+            let err = sign_message(&oversized, &key, TESTNET)
                 .await
                 .expect_err("sign_message must fail for oversized message");
             assert!(
@@ -573,5 +598,48 @@ mod tests {
             result.is_err(),
             "a small-order public key must be rejected, got: {result:?}"
         );
+    }
+
+    // ── mainnet refusal ───────────────────────────────────────────────────
+
+    use stellar_agent_network::signing::test_doubles::CountingSigner;
+
+    /// The mainnet passphrase is refused before the signer is called, with
+    /// the canonical refusal detail.
+    #[test]
+    fn sign_message_refuses_mainnet_before_any_key_access() {
+        let signer = CountingSigner::new([7u8; 32]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let err = sign_message(b"hello", &signer, MAINNET_PASSPHRASE)
+                .await
+                .expect_err("mainnet must be refused");
+            assert!(
+                matches!(&err, Sep53Error::MainnetSigningForbidden { detail }
+                    if detail.contains("network.mainnet_write_forbidden")),
+                "got: {err:?}"
+            );
+        });
+        assert_eq!(signer.key_accesses(), 0, "no key access before the refusal");
+    }
+
+    /// The same message on testnet signs once, so the refusal above is the
+    /// network's.
+    #[test]
+    fn sign_message_signs_on_testnet() {
+        let signer = CountingSigner::new([7u8; 32]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            sign_message(b"hello", &signer, TESTNET)
+                .await
+                .expect("testnet signs");
+        });
+        assert_eq!(signer.key_accesses(), 1);
     }
 }
