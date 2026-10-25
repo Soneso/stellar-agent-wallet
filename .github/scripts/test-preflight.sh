@@ -58,7 +58,7 @@ unowned-rust-path
 wallet-manifest removed-member untracked-test-file fixture-markdown
 committed-cross-scope-rename staged-rename-record spaces-and-an-apostrophe
 full vendored contracts action-script invariants-helper release-build-scripts duplicate-triggers changed-self-test
-deleted-shell-script deleted-self-test unavailable-tool
+deleted-shell-script deleted-self-test unavailable-tool missing-pyyaml
 exit-aggregation table bad-base malformed-manifest unloadable-install-surface-check
 the-preflight-itself registry-completeness
 drift drift-new-step drift-unnamed-step drift-removed-step drift-renamed-step
@@ -445,10 +445,12 @@ registry_scripts() {
 # arguments to the case call log. Each argument is logged as "ARG <bytes>:"
 # and its exact bytes, so an argument cannot forge a log line. Kind $3
 # decides the rest.
-#   python  Runs the real python3 for a planner block (-) and for the two
-#           probes of preflight.sh. For a script that EXPECTED_REGISTRY runs
-#           with python3, it exits the configured status. Any other call
-#           logs UNEXPECTED and exits 97.
+#   python  Runs the real python3 for a planner block (-) and for the
+#           version probe of preflight.sh. The PyYAML probe exits the
+#           configured status of "import yaml", so the case, never the host,
+#           decides whether PyYAML is present. For a script that
+#           EXPECTED_REGISTRY runs with python3, it exits the configured
+#           status. Any other call logs UNEXPECTED and exits 97.
 #   bash    For a script that EXPECTED_REGISTRY runs with bash, it exits the
 #           configured status. Any other call runs the real bash.
 #   cargo   Exits the configured status of "cargo <subcommand>", or of
@@ -502,8 +504,11 @@ case "${1-}" in
   -) exec "$REAL_PYTHON" "$@" ;;
   -c)
     case "${2-}" in
-      'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' | 'import yaml')
+      'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)')
         exec "$REAL_PYTHON" "$@"
+        ;;
+      'import yaml')
+        exit "$(status_of "import yaml")"
         ;;
     esac
     ;;
@@ -1394,6 +1399,26 @@ case_unavailable_tool() {
   expect_calls "python3 .github/scripts/check-docs-style.py" "python3 .github/scripts/check-install-surface.py" \
     "bash .github/scripts/check-gate-tool-versions.sh" "python3 .github/scripts/check-workflow-invariants.py" \
     "python3 .github/scripts/test-check-workflow-invariants.py"
+  assert_clean_calls
+}
+
+# Without PyYAML, both workflow-invariants rows report unavailable with the
+# virtual-environment hint, and the summary counts them with the two cargo
+# rows. actionlint passes, so only those four rows are unavailable.
+case_missing_pyyaml() {
+  local hint
+  start_run_case
+  edit .github/workflows/ci.yml
+  write_shim "$BIN/actionlint" actionlint plain
+  echo "import yaml=1" >>"$STATE/status"
+  run_preflight
+  # shellcheck disable=SC2016 # The hint holds a literal $PWD and $PATH.
+  hint='python3 -m venv .venv && .venv/bin/python -m pip install --require-hashes -r .github/scripts/workflow-check-requirements.txt && export PATH=$PWD/.venv/bin:$PATH'
+  expect_line "- \`python3 .github/scripts/check-workflow-invariants.py\`: unavailable (yaml: $hint)"
+  expect_line "- \`python3 .github/scripts/test-check-workflow-invariants.py\`: unavailable (yaml: $hint)"
+  expect_end 1 "preflight: 4 gates run, 0 failed, 4 unavailable"
+  expect_calls "python3 .github/scripts/check-docs-style.py" "python3 .github/scripts/check-install-surface.py" \
+    "bash .github/scripts/check-gate-tool-versions.sh" "actionlint"
   assert_clean_calls
 }
 
