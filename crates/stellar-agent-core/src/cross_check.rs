@@ -128,6 +128,8 @@ pub enum CrossCheckRequirement {
 pub struct ThresholdSet<'a> {
     /// Effective native threshold, in stroops.
     pub native_stroops: u64,
+    /// Signed per-asset thresholds, which a profile may only tighten.
+    pub signed: Option<&'a BTreeMap<String, i128>>,
     /// Per-asset thresholds.
     pub table: &'a CrossCheckThresholds,
     /// Network used to derive SAC identities.
@@ -140,14 +142,58 @@ impl<'a> ThresholdSet<'a> {
     pub fn from_profile(profile: &'a Profile) -> Self {
         Self {
             native_stroops: profile.effective_cross_check_threshold_stroops(),
+            signed: None,
             table: &profile.cross_check_thresholds,
             network_passphrase: &profile.network_passphrase,
         }
     }
 
-    /// Looks up direct identities, classic SAC equivalents, then the native SAC.
+    /// Combines profile and signed restrictions without narrowing signed integers.
+    #[must_use]
+    pub fn from_profile_and_signed(
+        profile: &'a Profile,
+        signed: Option<&'a BTreeMap<String, i128>>,
+    ) -> Self {
+        Self {
+            signed,
+            ..Self::from_profile(profile)
+        }
+    }
+
+    /// Looks up each source using asset equivalence and chooses the smaller threshold.
     #[must_use]
     pub fn threshold_for(&self, asset: &CanonicalAsset) -> Option<i128> {
+        let profile = self.profile_threshold_for(asset);
+        let signed = self.signed.and_then(|table| {
+            table
+                .iter()
+                .filter(|(key, _)| {
+                    crate::policy::v1::asset_equivalence::assets_equivalent(
+                        key,
+                        &asset.to_string(),
+                        self.network_passphrase,
+                    )
+                })
+                .map(|(_, value)| *value)
+                .min()
+        });
+        match (profile, signed) {
+            (Some(profile), Some(signed)) => {
+                if profile > signed {
+                    tracing::warn!(
+                        "profile cross-check threshold exceeds signed threshold; using signed \
+                            threshold"
+                    );
+                }
+                Some(profile.min(signed))
+            }
+            (profile, signed) => profile.or(signed),
+        }
+    }
+
+    /// Looks up direct identities, classic SAC equivalents, then the native SAC.
+    #[must_use]
+    fn profile_threshold_for(&self, asset: &CanonicalAsset) -> Option<i128> {
         if *asset == CanonicalAsset::Native {
             return Some(i128::from(self.native_stroops));
         }
@@ -366,6 +412,7 @@ mod tests {
     ) -> Result<CrossCheckRequirement, NetworkError> {
         let table = CrossCheckThresholds::default();
         let thresholds = ThresholdSet {
+            signed: None,
             native_stroops: 100,
             table: &table,
             network_passphrase: TESTNET_PASSPHRASE,
@@ -468,6 +515,7 @@ mod tests {
     fn requirement_testnet_asset_without_threshold_skips() {
         let table = CrossCheckThresholds::default();
         let thresholds = ThresholdSet {
+            signed: None,
             native_stroops: 100,
             table: &table,
             network_passphrase: TESTNET_PASSPHRASE,
@@ -511,6 +559,7 @@ mod tests {
             CanonicalAsset::contract(&asset.sac_contract_id(TESTNET_PASSPHRASE).unwrap()).unwrap();
         let table = CrossCheckThresholds::new(BTreeMap::from([(asset, 200)])).unwrap();
         let thresholds = ThresholdSet {
+            signed: None,
             native_stroops: 100,
             table: &table,
             network_passphrase: TESTNET_PASSPHRASE,

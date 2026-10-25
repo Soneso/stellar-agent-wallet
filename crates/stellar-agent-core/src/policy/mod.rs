@@ -58,6 +58,9 @@ use crate::{approval::ApprovalError, profile::schema::Profile};
 // Sub-modules
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Startup advisories for verified policy tool coverage.
+pub mod advisory;
+
 /// `PolicyEngineV1` typed-criteria evaluator.
 ///
 /// Implements [`PolicyEngine`] over the typed schema (per-tx cap, per-period
@@ -553,6 +556,8 @@ pub enum Decision {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum DenyReason {
+    /// A value leg names an asset outside the signed allowlist.
+    AssetNotAllowlisted,
     /// The per-transaction amount cap was exceeded.
     PerTxCapExceeded {
         /// Asset code or canonical identifier (e.g. `"XLM"` or
@@ -839,6 +844,7 @@ impl DenyReason {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
+            Self::AssetNotAllowlisted => "asset_not_allowlisted",
             Self::PerTxCapExceeded { .. } => "per_tx_cap_exceeded",
             Self::PerPeriodCapExceeded { .. } => "per_period_cap_exceeded",
             Self::RateLimitExceeded { .. } => "rate_limit_exceeded",
@@ -890,6 +896,7 @@ impl DenyReason {
     #[must_use]
     pub fn wire_code(&self) -> &'static str {
         match self {
+            Self::AssetNotAllowlisted => "policy.deny.asset_not_allowlisted",
             Self::PerTxCapExceeded { .. } => "policy.deny.per_tx_cap_exceeded",
             Self::PerPeriodCapExceeded { .. } => "policy.deny.per_period_cap_exceeded",
             Self::RateLimitExceeded { .. } => "policy.deny.rate_limit_exceeded",
@@ -1096,6 +1103,43 @@ pub const TRANSACTION_STATUS_UNMATCHED_ADVISORY_CODE: &str = "policy.transaction
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum PolicyError {
+    /// A mainnet binding appeared on a testnet policy.
+    #[error("policy.mainnet_table_on_testnet")]
+    MainnetTableOnTestnet,
+    /// The policy predates the installation's pin.
+    #[error("policy.sequence_rollback")]
+    SequenceRollback,
+    /// Equal sequences name different bodies or owners.
+    #[error("policy.sequence_fork")]
+    SequenceFork,
+    /// The window-state lock remained held through the retry window.
+    #[error("policy.state_lock_busy")]
+    StateLockBusy,
+    /// The lock file could not be opened.
+    #[error("policy.state_lock_io: {kind:?}")]
+    StateLockIo {
+        /// The classified I/O failure.
+        kind: std::io::ErrorKind,
+    },
+    /// A mainnet policy omits a required restriction.
+    #[error("policy.mainnet_minimum_unmet: requirement={requirement}, rule={rule:?}")]
+    MainnetMinimumUnmet {
+        /// The failed requirement.
+        requirement: &'static str,
+        /// Zero-based rule index for a rule requirement.
+        rule: Option<usize>,
+    },
+    /// The installation's policy pin could not be read, parsed, or written.
+    #[error("policy.pin_unusable: {detail}")]
+    PinUnusable {
+        /// The pin operation's error, which never carries the pin value.
+        detail: String,
+    },
+    /// The owner key came from the test-only owner public-key file, which an
+    /// enabled mainnet policy refuses: only the keyring's owner entry
+    /// verifies a policy that can authorize mainnet writes.
+    #[error("policy.engine_unavailable: test_owner_key")]
+    TestOwnerKeyRefused,
     /// The full policy engine is not yet implemented.
     ///
     /// Returned by [`NoopPolicyEngine`] for destructive tools on mainnet
@@ -1201,6 +1245,16 @@ fn signed_optional_keys_remedy(rules: &[usize]) -> String {
     )
 }
 
+impl From<pin::PinError> for PolicyError {
+    /// A refused pin operation is `policy.pin_unusable` with the refusal's
+    /// rendering, which never carries the pin value.
+    fn from(error: pin::PinError) -> Self {
+        Self::PinUnusable {
+            detail: error.to_string(),
+        }
+    }
+}
+
 impl PolicyError {
     /// Returns the semver-stable JSON-RPC wire code for this policy error.
     ///
@@ -1233,6 +1287,14 @@ impl PolicyError {
     #[must_use]
     pub fn wire_code(&self) -> &'static str {
         match self {
+            Self::MainnetTableOnTestnet => "policy.mainnet_table_on_testnet",
+            Self::SequenceRollback => "policy.sequence_rollback",
+            Self::SequenceFork => "policy.sequence_fork",
+            Self::StateLockBusy => "policy.state_lock_busy",
+            Self::StateLockIo { .. } => "policy.state_lock_io",
+            Self::MainnetMinimumUnmet { .. } => "policy.mainnet_minimum_unmet",
+            Self::PinUnusable { .. } => "policy.pin_unusable",
+            Self::TestOwnerKeyRefused => "policy.engine_unavailable",
             Self::NotImplemented => "policy.engine_required",
             Self::PolicyFileLoadFailed { .. } => "policy.policy_file_load_failed",
             Self::PolicyFileParseFailed { .. } => "policy.policy_file_parse_failed",
@@ -1782,6 +1844,14 @@ mod tests {
         // guard makes the test driver's full-coverage dependency explicit.
         fn _exhaustiveness_guard(e: &PolicyError) {
             match e {
+                PolicyError::MainnetTableOnTestnet => {}
+                PolicyError::SequenceRollback => {}
+                PolicyError::SequenceFork => {}
+                PolicyError::StateLockBusy => {}
+                PolicyError::StateLockIo { .. } => {}
+                PolicyError::MainnetMinimumUnmet { .. } => {}
+                PolicyError::PinUnusable { .. } => {}
+                PolicyError::TestOwnerKeyRefused => {}
                 PolicyError::NotImplemented => {}
                 PolicyError::PolicyFileLoadFailed { .. } => {}
                 PolicyError::PolicyFileParseFailed { .. } => {}
@@ -1793,6 +1863,21 @@ mod tests {
         }
 
         vec![
+            PolicyError::MainnetTableOnTestnet,
+            PolicyError::SequenceRollback,
+            PolicyError::SequenceFork,
+            PolicyError::StateLockBusy,
+            PolicyError::StateLockIo {
+                kind: std::io::ErrorKind::PermissionDenied,
+            },
+            PolicyError::MainnetMinimumUnmet {
+                requirement: "scope",
+                rule: None,
+            },
+            PolicyError::PinUnusable {
+                detail: detail.to_owned(),
+            },
+            PolicyError::TestOwnerKeyRefused,
             PolicyError::NotImplemented,
             PolicyError::PolicyFileLoadFailed {
                 detail: detail.to_owned(),
@@ -1818,6 +1903,14 @@ mod tests {
 
     fn expected_policy_error_wire_code(err: &PolicyError) -> &'static str {
         match err {
+            PolicyError::MainnetTableOnTestnet => "policy.mainnet_table_on_testnet",
+            PolicyError::SequenceRollback => "policy.sequence_rollback",
+            PolicyError::SequenceFork => "policy.sequence_fork",
+            PolicyError::StateLockBusy => "policy.state_lock_busy",
+            PolicyError::StateLockIo { .. } => "policy.state_lock_io",
+            PolicyError::MainnetMinimumUnmet { .. } => "policy.mainnet_minimum_unmet",
+            PolicyError::PinUnusable { .. } => "policy.pin_unusable",
+            PolicyError::TestOwnerKeyRefused => "policy.engine_unavailable",
             PolicyError::NotImplemented => "policy.engine_required",
             PolicyError::PolicyFileLoadFailed { .. } => "policy.policy_file_load_failed",
             PolicyError::PolicyFileParseFailed { .. } => "policy.policy_file_parse_failed",

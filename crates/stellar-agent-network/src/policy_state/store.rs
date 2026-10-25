@@ -825,7 +825,7 @@ impl PersistedWindowStore {
         require_admission: bool,
     ) -> Result<MintOutcome, WindowStoreError> {
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire(&self.lock_path())?;
+        let _lock = WindowStoreLock::acquire_with_retry(&self.lock_path())?;
 
         let (key, mint_outcome) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
@@ -902,7 +902,7 @@ impl PersistedWindowStore {
         reservation: &SubmissionHold,
     ) -> Result<MintOutcome, WindowStoreError> {
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire(&self.lock_path())?;
+        let _lock = WindowStoreLock::acquire_with_retry(&self.lock_path())?;
 
         let (key, mint_outcome) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
@@ -1259,8 +1259,8 @@ impl PersistedWindowStore {
             minted: false,
         };
         self.ensure_parent_dir().map_err(before_mint)?;
-        let _lock =
-            WindowStoreLock::acquire(&self.lock_path()).map_err(|e| before_mint(e.into()))?;
+        let _lock = WindowStoreLock::acquire_with_retry(&self.lock_path())
+            .map_err(|e| before_mint(e.into()))?;
         let snapshot = self.reset_snapshot(profile, now_ms).map_err(before_mint)?;
         record(&ResetRecord {
             accrual: &snapshot.accrual,
@@ -1471,7 +1471,7 @@ impl PersistedWindowStore {
     /// existing file cannot be read or is shorter than the tag prefix.
     pub fn resign(&self, new_key: &[u8; 32]) -> Result<(), WindowStoreError> {
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire(&self.lock_path())?;
+        let _lock = WindowStoreLock::acquire_with_retry(&self.lock_path())?;
 
         let bytes = match fs::read(&self.path) {
             Ok(b) => b,
@@ -1503,7 +1503,7 @@ impl PersistedWindowStore {
         mutate: impl FnOnce(&mut WireFile) -> bool,
     ) -> Result<(), WindowStoreError> {
         self.ensure_parent_dir()?;
-        let _lock = WindowStoreLock::acquire(&self.lock_path())?;
+        let _lock = WindowStoreLock::acquire_with_retry(&self.lock_path())?;
 
         let (key, _mint) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);

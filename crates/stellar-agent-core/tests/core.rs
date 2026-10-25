@@ -10,6 +10,8 @@ mod panic_hook_message_bound;
 mod policy_descriptor_equivalence;
 #[path = "core/policy_fixtures_adversarial.rs"]
 mod policy_fixtures_adversarial;
+#[path = "core/policy_v2.rs"]
+mod policy_v2;
 #[path = "core/profile_horizon_bound_test.rs"]
 mod profile_horizon_bound_test;
 #[path = "core/profile_scan_id_bound_test.rs"]

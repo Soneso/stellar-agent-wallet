@@ -166,10 +166,6 @@ impl VerifiedPolicy {
     /// mainnet section.
     ///
     /// The digest is the BLAKE3 digest of `canonical_bytes`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "constructed by the policy loader")
-    )]
     pub(crate) fn from_verified(
         sequence: i64,
         canonical_bytes: &[u8],

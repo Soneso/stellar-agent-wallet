@@ -88,8 +88,14 @@ pub mod value;
 /// Owner-signed policy file loader.
 pub mod loader;
 
+/// Network-aware classic and contract asset identities.
+pub mod asset_equivalence;
 /// Canonical-form serializer for owner-signature pre-image.
 pub mod canonical;
+/// The required restrictions of a mainnet policy.
+pub mod mainnet_minimum;
+/// Signature verification and guarded policy pin advancement.
+pub mod verified;
 
 /// Owner-signature verification.
 pub mod signature;
@@ -929,6 +935,15 @@ pub struct PolicyEngineV1 {
 }
 
 impl PolicyEngineV1 {
+    /// Whether a rule explicitly names `tool` or matches all tools.
+    #[must_use]
+    pub fn has_rule_for_tool(&self, tool: &str) -> bool {
+        self.document
+            .rules
+            .iter()
+            .any(|rule| rule.r#match.tool == "*" || rule.r#match.tool == tool)
+    }
+
     /// Constructs a `PolicyEngineV1` from a verified [`PolicyDocument`] and
     /// the owning profile name.
     ///

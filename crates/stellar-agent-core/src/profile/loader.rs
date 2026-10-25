@@ -450,6 +450,17 @@ pub enum ProfileLoadError {
         detail: String,
     },
 
+    /// The stored `chain_id` and `rpc_url` of a profile file could not be
+    /// read.
+    ///
+    /// Produced by [`read_mainnet_view_on_disk`], which reads the stored
+    /// document without environment or CLI overlays.
+    #[error("profile chain and endpoint unreadable: {detail}")]
+    MainnetViewUnreadable {
+        /// Human-readable failure detail (path and cause; no secrets).
+        detail: String,
+    },
+
     /// figment failed to extract or merge the configuration sources.
     #[error("profile '{name}' could not be loaded: {source}")]
     Figment {
@@ -641,6 +652,7 @@ impl ProfileLoadError {
             | Self::InvalidCrossCheckThreshold { .. }
             | Self::MissingPolicySection { .. }
             | Self::SignerRefUnreadable { .. }
+            | Self::MainnetViewUnreadable { .. }
             | Self::Figment { .. }
             | Self::InvalidScanIdBound { .. }
             | Self::InvalidHorizonBound { .. }
@@ -1330,6 +1342,55 @@ pub fn read_signer_ref_on_disk(
             ),
         })?;
     Ok(super::schema::KeyringEntryRef::new(service, account))
+}
+
+/// The mainnet fields read directly from the profile file, without overlays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnDiskMainnetView {
+    /// The stored chain identity.
+    pub chain_id: super::caip2::Caip2,
+    /// The stored RPC endpoint.
+    pub rpc_url: String,
+}
+
+/// Reads the stored chain and endpoint without applying environment overlays.
+///
+/// # Errors
+///
+/// - [`ProfileLoadError::InvalidName`] for a name the loader refuses.
+/// - [`ProfileLoadError::NotFound`] when the profile file is absent.
+/// - [`ProfileLoadError::MainnetViewUnreadable`] on I/O or TOML parse
+///   failure, or when `chain_id` or `rpc_url` is missing or invalid.
+pub fn read_mainnet_view_on_disk(
+    name: &str,
+    dir: &Path,
+) -> Result<OnDiskMainnetView, ProfileLoadError> {
+    guard_name_for_load(name)?;
+    let path = dir.join(format!("{name}.toml"));
+    if !path.exists() {
+        return Err(ProfileLoadError::NotFound {
+            name: name.to_owned(),
+            path,
+        });
+    }
+    let failure = |detail: String| ProfileLoadError::MainnetViewUnreadable { detail };
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| failure(format!("failed to read '{}': {e}", path.display())))?;
+    let doc: toml::Value = toml::from_str(&raw)
+        .map_err(|e| failure(format!("failed to parse '{}': {e}", path.display())))?;
+    let field = |key: &str| {
+        doc.get(key)
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| failure(format!("'{}' has no string '{key}' key", path.display())))
+    };
+    let chain_id = field("chain_id")?.parse().map_err(|e| {
+        failure(format!(
+            "'{}' has an invalid 'chain_id' ({e})",
+            path.display()
+        ))
+    })?;
+    let rpc_url = field("rpc_url")?.to_owned();
+    Ok(OnDiskMainnetView { chain_id, rpc_url })
 }
 
 /// Sets ONLY `mcp_signer_default.account` in the profile's on-disk TOML
@@ -2465,26 +2526,67 @@ fn parse_cross_check_thresholds(
             })?;
         result.insert(asset, value);
     }
-    for asset in result.keys() {
+    if let Some(conflict) =
+        threshold_identity_conflict(&result.keys().cloned().collect::<Vec<_>>(), passphrase)
+    {
+        return Err(match conflict {
+            ThresholdIdentityConflict::NativeContract { asset } => failure(
+                Entry::Asset(asset),
+                "names the native asset's contract; set cross_check_threshold_stroops instead"
+                    .to_owned(),
+            ),
+            ThresholdIdentityConflict::SameAsset { asset, other } => failure(
+                Entry::Asset(asset),
+                format!("names the same asset as entry '{other}'"),
+            ),
+        });
+    }
+    CrossCheckThresholds::new(result).map_err(|error| failure(Entry::Field, error.to_string()))
+}
+
+/// Two threshold entries that name one asset under the network passphrase.
+pub(crate) enum ThresholdIdentityConflict {
+    /// `asset` is the native asset's contract, which the native threshold
+    /// already covers.
+    NativeContract {
+        /// The contract entry.
+        asset: CanonicalAsset,
+    },
+    /// `asset` is the contract of the classic asset `other`.
+    SameAsset {
+        /// The contract entry.
+        asset: CanonicalAsset,
+        /// The classic entry the contract wraps.
+        other: CanonicalAsset,
+    },
+}
+
+/// Returns the first contract entry that aliases the native asset or another
+/// entry's classic asset, so each caller can name the conflict in its own
+/// configuration terms.
+pub(crate) fn threshold_identity_conflict(
+    assets: &[CanonicalAsset],
+    passphrase: &str,
+) -> Option<ThresholdIdentityConflict> {
+    for asset in assets {
         if let CanonicalAsset::Contract(id) = asset {
             if CanonicalAsset::Native.sac_contract_id(passphrase).as_ref() == Some(id) {
-                return Err(failure(
-                    Entry::Asset(asset.clone()),
-                    "names the native asset's contract; set cross_check_threshold_stroops instead"
-                        .to_owned(),
-                ));
+                return Some(ThresholdIdentityConflict::NativeContract {
+                    asset: asset.clone(),
+                });
             }
-            for other in result.keys() {
-                if other.sac_contract_id(passphrase).as_ref() == Some(id) {
-                    return Err(failure(
-                        Entry::Asset(asset.clone()),
-                        format!("names the same asset as entry '{other}'"),
-                    ));
-                }
+            if let Some(other) = assets
+                .iter()
+                .find(|other| other.sac_contract_id(passphrase).as_ref() == Some(id))
+            {
+                return Some(ThresholdIdentityConflict::SameAsset {
+                    asset: asset.clone(),
+                    other: other.clone(),
+                });
             }
         }
     }
-    CrossCheckThresholds::new(result).map_err(|error| failure(Entry::Field, error.to_string()))
+    None
 }
 
 fn require_policy_section(
@@ -2643,8 +2745,15 @@ mod tests {
             assert!(error.to_string().contains("not a non-negative integer"));
         }
         for (asset, reason) in [
-            (CanonicalAsset::Native, "names the native asset's contract"),
-            (classic.clone(), "names the same asset as entry"),
+            (
+                CanonicalAsset::Native,
+                "names the native asset's contract; set cross_check_threshold_stroops instead"
+                    .to_owned(),
+            ),
+            (
+                classic.clone(),
+                format!("names the same asset as entry '{classic}'"),
+            ),
         ] {
             let sac = asset
                 .sac_contract_id(Caip2::Testnet.network_passphrase())
@@ -2656,8 +2765,28 @@ mod tests {
             );
             let (dir, name) = write_profile(&input);
             let error = load_from_dir(&name, dir.path(), None).unwrap_err();
-            assert!(error.to_string().contains(reason), "{error}");
+            assert_eq!(
+                error.to_string(),
+                format!("profile '{name}': [cross_check_thresholds] entry '{sac}' {reason}")
+            );
         }
+    }
+
+    /// The on-disk chain and endpoint reader reports its own error kind,
+    /// naming the file and the missing field.
+    #[test]
+    fn mainnet_view_failure_names_the_file_and_field() {
+        let (dir, name) = write_profile("chain_id = \"stellar:testnet\"\n");
+        let path = dir.path().join(format!("{name}.toml"));
+        let error = read_mainnet_view_on_disk(&name, dir.path()).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ProfileLoadError::MainnetViewUnreadable { detail }
+                    if *detail == format!("'{}' has no string 'rpc_url' key", path.display())
+            ),
+            "{error:?}"
+        );
     }
 
     /// One constructed value per [`ProfileLoadError`] variant.
@@ -2723,6 +2852,9 @@ mod tests {
             },
             ProfileLoadError::SignerRefUnreadable {
                 detail: "missing [mcp_signer_default]".to_owned(),
+            },
+            ProfileLoadError::MainnetViewUnreadable {
+                detail: "missing chain_id".to_owned(),
             },
             ProfileLoadError::InvalidScanIdBound {
                 name: "p".to_owned(),

@@ -112,10 +112,13 @@ impl Criterion for BundleAggregateCapCriterion {
             if let InnerOpDescriptor::TokenTransfer { asset, amount, .. } = descriptor {
                 // Apply asset filter: if `self.asset` is Some("X"), skip inners
                 // whose asset does not match.  None = cross-asset (match all).
-                let matches_asset = self
-                    .asset
-                    .as_deref()
-                    .is_none_or(|configured_asset| configured_asset == asset.as_str());
+                let matches_asset = self.asset.as_deref().is_none_or(|configured_asset| {
+                    crate::policy::v1::asset_equivalence::assets_equivalent(
+                        configured_asset,
+                        asset,
+                        &ctx.profile.network_passphrase,
+                    )
+                });
 
                 if matches_asset {
                     sum = sum.and_then(|s| s.checked_add(*amount));

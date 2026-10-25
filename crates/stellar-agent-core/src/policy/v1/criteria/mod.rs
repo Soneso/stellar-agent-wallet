@@ -8,6 +8,7 @@
 //!
 //! | Module | Struct | Kind tag |
 //! |---|---|---|
+//! | `asset_allowlist` | `AssetAllowlistCriterion` | `"asset_allowlist"` |
 //! | `per_tx_cap` | `PerTxCapCriterion` | `"per_tx_cap"` |
 //! | `per_period_cap` | `PerPeriodCapCriterion` | `"per_period_cap"` |
 //! | `rate_limit` | `RateLimitCriterion` | `"rate_limit"` |
@@ -29,6 +30,8 @@ use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
 use crate::policy::{DenyReason, PolicyError};
 
 pub(crate) mod amount_extract;
+/// Restricts every valued leg to pinned asset identities.
+pub mod asset_allowlist;
 pub mod bundle_aggregate_cap;
 pub mod bundle_per_period_cap;
 pub mod bundle_per_tx_cap;

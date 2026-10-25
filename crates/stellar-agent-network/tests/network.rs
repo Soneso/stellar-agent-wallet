@@ -46,6 +46,8 @@ mod keyring_integration;
 mod pay_integration;
 #[path = "network/pay_live.rs"]
 mod pay_live;
+#[path = "network/policy_engine.rs"]
+mod policy_engine;
 #[path = "network/redaction_audit.rs"]
 mod redaction_audit;
 #[path = "network/retention_poll_deadline.rs"]

@@ -62,7 +62,9 @@ keyring-core = { workspace = true }
 stellar-agent-windows-identity = { workspace = true }
 
 [features]
-# Reports mainnet-write feature state in build information. Disabled by default.
+# Mainnet write support: the minimum mainnet policy for a mainnet profile's
+# v2 policy with a [mainnet] table, the mainnet window-state and reset errors,
+# and the build information that reports the feature. Disabled by default.
 mainnet-write = []
 
 # Exposes policy strategies and verified audit reads to integration tests,

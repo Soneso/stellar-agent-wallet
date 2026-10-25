@@ -40,6 +40,15 @@
 //! need::<EnablementRecord>();
 //! ```
 
+//! A hand-built table cannot mint the private installation proof.
+//!
+//! ```compile_fail,E0624
+//! use stellar_agent_core::mainnet::enablement::EnablementRecord;
+//! let record = EnablementRecord::from_verified(
+//!     "operator".into(), "rpc.example.invalid".into(), [0; 32], 1, 100, None, None,
+//! );
+//! ```
+
 use std::collections::BTreeMap;
 
 use super::fact::{FACT_LABEL_ENABLEMENT, FactDigest};
@@ -155,10 +164,6 @@ impl EnablementRecord {
     /// verified policy it agrees with, the classic per-operation fee cap in
     /// stroops, the authorization lifetime in seconds, and the cross-check
     /// thresholds.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "constructed by the policy loader")
-    )]
     #[allow(
         clippy::too_many_arguments,
         reason = "one constructor records every verified enablement fact"
@@ -243,6 +248,91 @@ impl EnablementRecord {
             .thresholds(self.thresholds.as_ref());
         digest.finish()
     }
+}
+
+/// Normalizes an RPC URL to a lowercase host with a nondefault port, if any.
+/// Scheme, credentials, path, and query do not participate in this binding.
+///
+/// # Errors
+/// Refuses URLs without a host.
+pub fn normalize_endpoint_host(raw: &str) -> Result<String, crate::error::ValidationError> {
+    let invalid = || crate::error::ValidationError::MainnetEnablementInvalid {
+        binding: "endpoint_host",
+    };
+    let url = url::Url::parse(raw).map_err(|_| invalid())?;
+    let host = url.host_str().ok_or_else(invalid)?.to_ascii_lowercase();
+    Ok(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+/// Reads a nonce from its platform keyring coordinate.
+///
+/// # Errors
+/// Returns a redacted binding error if the entry is absent or unreadable.
+pub fn read_enablement_nonce(
+    coordinate: &crate::profile::schema::KeyringEntryRef,
+) -> Result<String, crate::error::ValidationError> {
+    keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+        .and_then(|entry| entry.get_password())
+        .map_err(|_| crate::error::ValidationError::MainnetEnablementInvalid { binding: "nonce" })
+}
+
+/// Verifies the installation bindings of a cryptographically verified policy.
+///
+/// # Errors
+/// Refuses any name, source, endpoint, or nonce binding mismatch.
+pub fn verify_enablement(
+    policy: &super::verified_policy::VerifiedPolicy,
+    profile_name: &str,
+    name_source: crate::profile::name::ProfileNameSource,
+    profile: &crate::profile::schema::Profile,
+    profile_dir: &std::path::Path,
+    keyring: &impl Fn(
+        &crate::profile::schema::KeyringEntryRef,
+    ) -> Result<String, crate::error::ValidationError>,
+) -> Result<EnablementRecord, crate::error::ValidationError> {
+    use crate::error::ValidationError;
+    use sha2::Digest as _;
+    let invalid = |binding| ValidationError::MainnetEnablementInvalid { binding };
+    let body = policy.mainnet().ok_or_else(|| invalid("mainnet_table"))?;
+    if body.profile != profile_name {
+        return Err(invalid("profile"));
+    }
+    if name_source != crate::profile::name::ProfileNameSource::Flag {
+        return Err(invalid("source"));
+    }
+    if profile_name == "default" {
+        return Err(invalid("default"));
+    }
+    let disk = crate::profile::loader::read_mainnet_view_on_disk(profile_name, profile_dir)
+        .map_err(|_| invalid("on_disk"))?;
+    if !disk.chain_id.is_mainnet() || !profile.chain_id.is_mainnet() {
+        return Err(invalid("chain_id"));
+    }
+    if normalize_endpoint_host(&disk.rpc_url)? != body.endpoint_host {
+        return Err(invalid("on_disk_host"));
+    }
+    if normalize_endpoint_host(&profile.rpc_url)? != body.endpoint_host {
+        return Err(invalid("merged_host"));
+    }
+    let coordinate =
+        crate::profile::schema::mainnet_enablement_entry_ref(&profile.policy_window_state_key_id);
+    let nonce = zeroize::Zeroizing::new(keyring(&coordinate)?);
+    let digest: [u8; 32] = sha2::Sha256::digest(nonce.as_bytes()).into();
+    if digest != body.installation_nonce_sha256 {
+        return Err(invalid("nonce_digest"));
+    }
+    Ok(EnablementRecord::from_verified(
+        body.profile.clone(),
+        body.endpoint_host.clone(),
+        digest,
+        policy.sequence(),
+        body.classic_max_fee_per_op_stroops,
+        body.authorization_ttl_seconds,
+        body.cross_check_thresholds.clone(),
+    ))
 }
 
 #[cfg(test)]

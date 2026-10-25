@@ -20,12 +20,18 @@
 //! The command signs only a body the V1 loader accepts. Before canonicalising,
 //! it refuses a key outside the policy schema
 //! (`sign_policy.canonicalization_failed`, naming the key and its location).
-//! Before signing, it runs the loader's body checks for the engine's profile
-//! name and refuses a body the loader would refuse
-//! (`sign_policy.policy_body_invalid`, with the loader's detail). The existing
+//! It reads the installation's policy pin, without creating any state file,
+//! and assigns a version 2 body the next sequence. Before signing, it runs the
+//! loader's body checks for the engine's profile name and refuses a body the
+//! loader would refuse (`sign_policy.policy_body_invalid`, with the loader's
+//! detail). It then applies the minimum mainnet policy when this build
+//! enforces it and checks the profile-dependent `[mainnet]` fields. The existing
 //! `[signature]` table is not checked: signing replaces it whole, so a stale or
-//! malformed signature is repaired by signing again. Every refusal leaves the
-//! file unchanged.
+//! malformed signature is repaired by signing again. The key and body
+//! refusals name the policy file and state that no file was written. A pin
+//! that cannot be read refuses with its state code: `policy.pin_unusable` for
+//! an unreadable or malformed pin entry, and `policy.state_lock_busy` or
+//! `policy.state_lock_io` for the state lock.
 //!
 //! # Owner-key cross-check
 //!
@@ -134,6 +140,15 @@ struct SignPolicyData {
     /// The `owner_id` of the replaced `[signature]` table, when one existed.
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_owner_id: Option<String>,
+    /// Assigned v2 sequence; absent for v1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sequence: Option<i64>,
+    /// Maximum of the input sequence and the installed pin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_sequence: Option<i64>,
+    /// Actions needed before mainnet writes or the next policy load.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 /// Runs `stellar-agent profile sign-policy`.
@@ -245,55 +260,21 @@ where
         }
     };
 
-    // ── Refuse keys outside the policy schema ─────────────────────────────────
-    // The loader refuses such a key before it verifies the signature, so a
-    // file signed with one is never accepted. The `[signature]` table is left
-    // out of the check because signing replaces it whole. A document that is
-    // not valid TOML is refused by canonicalisation below, with the TOML error.
-    if let Ok(mut body) = raw.parse::<toml_edit::DocumentMut>() {
-        body.remove("signature");
-        if let Err(e) = validate_policy_keys(&body) {
-            render::render_json(&Envelope::<()>::err_raw(
-                "sign_policy.canonicalization_failed",
-                format!(
-                    "policy file {} holds a key outside the V1 policy schema ({e}); correct \
-                     the key, then sign again. No file was written.",
-                    policy_path.display()
-                ),
-            ));
-            return 1;
-        }
-    }
-
-    // ── Canonicalise the policy body (excludes the [signature] table) ─────────
-    let canon = match canonical_bytes(&raw) {
-        Ok(c) => c,
-        Err(e) => {
-            render::render_json(&Envelope::<()>::err_raw(
-                "sign_policy.canonicalization_failed",
-                format!(
-                    "policy file {} could not be canonicalised for signing ({e})",
-                    policy_path.display()
-                ),
-            ));
+    let prepared = match prepare_policy(
+        &raw,
+        &profile,
+        &engine_profile_name,
+        &policy_path,
+        &stellar_agent_core::profile::schema::default_policy_window_state_path_for(&profile_name),
+    ) {
+        Ok(prepared) => prepared,
+        Err((code, detail)) => {
+            render::render_json(&Envelope::<()>::err_raw(code, detail));
             return 1;
         }
     };
-
-    // ── Refuse a body the loader refuses ──────────────────────────────────────
-    // The same body checks the engine applies after verifying the signature,
-    // with the scope compared against the engine's profile name.
-    if let Err(e) = validate_unsigned_policy(&raw, &engine_profile_name) {
-        render::render_json(&Envelope::<()>::err_raw(
-            "sign_policy.policy_body_invalid",
-            format!(
-                "the V1 policy loader refuses the body of policy file {} ({e}); correct the \
-                 policy, then sign again. No file was written.",
-                policy_path.display()
-            ),
-        ));
-        return 1;
-    }
+    let raw = prepared.raw;
+    let canon = prepared.canonical;
     let d = digest(&canon);
     let digest_hex = to_hex(&d);
 
@@ -386,8 +367,182 @@ where
         signature: sig_hex,
         replaced,
         previous_owner_id,
+        sequence: prepared.sequence,
+        previous_sequence: prepared.previous_sequence,
+        warnings: prepared.warnings,
     }));
     0
+}
+
+/// A policy body that passed every check signing applies, with its assigned
+/// sequence and canonical bytes.
+struct PreparedPolicy {
+    raw: String,
+    canonical: Vec<u8>,
+    sequence: Option<i64>,
+    previous_sequence: Option<i64>,
+    warnings: Vec<String>,
+}
+
+/// Checks the policy text at `policy_path` in the order the loader applies
+/// them and assigns a v2 sequence, so every refusal happens before the owner
+/// seed is read.
+///
+/// The checks run in this order: a key outside the policy schema, the
+/// installation's pin, the v2 sequence, and canonicalization. The loader's
+/// body checks for the engine's profile `name` follow, then the minimum
+/// mainnet policy when this build enforces it, then the profile-dependent
+/// `[mainnet]` fields. The `[signature]` table is not checked: signing
+/// replaces it whole.
+///
+/// The pin is read without creating the window-state directory or its lock
+/// file, and never written: an absent lock file reads as no pin.
+///
+/// # Errors
+///
+/// Returns the wire code and a message naming the policy file:
+///
+/// - A body that does not parse as TOML or cannot be canonicalized refuses
+///   with `sign_policy.canonicalization_failed`.
+/// - A key outside the schema refuses with
+///   `sign_policy.canonicalization_failed`.
+/// - A body the loader refuses refuses with `sign_policy.policy_body_invalid`.
+/// - An exhausted sequence refuses with `sign_policy.sequence_exhausted`.
+/// - The minimum and the `[mainnet]` fields keep their policy codes.
+/// - A pin entry that cannot be read or is malformed refuses with
+///   `policy.pin_unusable`.
+/// - A state lock that cannot be taken refuses with `policy.state_lock_busy`
+///   or `policy.state_lock_io`.
+///
+/// Every refusal except the parse and canonicalization failures states that
+/// no file was written.
+fn prepare_policy(
+    raw: &str,
+    profile: &Profile,
+    name: &str,
+    policy_path: &std::path::Path,
+    window_path: &std::path::Path,
+) -> Result<PreparedPolicy, (&'static str, String)> {
+    use stellar_agent_core::policy::{
+        PolicyError,
+        pin::PinState,
+        v1::{mainnet_minimum, verified::read_pin_without_creating},
+    };
+    let path = policy_path.display();
+    let not_canonical = |e: PolicyError| {
+        (
+            "sign_policy.canonicalization_failed",
+            format!("policy file {path} could not be canonicalised for signing ({e})"),
+        )
+    };
+    let body_invalid = |detail: &dyn std::fmt::Display| {
+        (
+            "sign_policy.policy_body_invalid",
+            format!(
+                "the V1 policy loader refuses the body of policy file {path} ({detail}); correct \
+                 the policy, then sign again. No file was written."
+            ),
+        )
+    };
+    let mut body = raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        not_canonical(PolicyError::PolicyFileParseFailed {
+            detail: e.to_string(),
+        })
+    })?;
+
+    // The loader refuses a key outside the schema before it verifies the
+    // signature, so a file signed with one is never accepted.
+    let mut unsigned = body.clone();
+    unsigned.remove("signature");
+    validate_policy_keys(&unsigned).map_err(|e| {
+        (
+            "sign_policy.canonicalization_failed",
+            format!(
+                "policy file {path} holds a key outside the V1 policy schema ({e}); correct the \
+                 key, then sign again. No file was written."
+            ),
+        )
+    })?;
+
+    let pin = match read_pin_without_creating(window_path, profile) {
+        Ok(PinState::Absent) => None,
+        Ok(PinState::Present(pin)) => Some(pin.sequence()),
+        Err(e) => {
+            return Err((
+                e.wire_code(),
+                format!(
+                    "could not read the installation's policy pin for policy file {path} ({e}). \
+                     No file was written."
+                ),
+            ));
+        }
+    };
+    let mut result = PreparedPolicy {
+        raw: raw.to_owned(),
+        canonical: Vec::new(),
+        sequence: None,
+        previous_sequence: None,
+        warnings: Vec::new(),
+    };
+    if body.get("version").and_then(toml_edit::Item::as_integer) == Some(2) {
+        let previous_body = match body.get("sequence") {
+            None => 0,
+            Some(value) => value
+                .as_integer()
+                .filter(|n| *n >= 1)
+                .ok_or_else(|| body_invalid(&"sequence must be in 1..=i64::MAX"))?,
+        };
+        let previous = pin.unwrap_or(0).max(previous_body);
+        let sequence = previous.checked_add(1).ok_or_else(|| {
+            (
+                "sign_policy.sequence_exhausted",
+                format!(
+                    "the sequence of policy file {path} cannot advance past i64::MAX. No file \
+                     was written."
+                ),
+            )
+        })?;
+        body["sequence"] = toml_edit::value(sequence);
+        result.sequence = Some(sequence);
+        result.previous_sequence = Some(previous);
+        result.raw = body.to_string();
+    } else {
+        if profile.chain_id.is_mainnet() {
+            result
+                .warnings
+                .push("Mainnet writes require a v2 policy body with [mainnet].".into());
+        }
+        if pin.is_some() {
+            result
+                .warnings
+                .push("The next load refuses this v1 body with policy.sequence_rollback.".into());
+        }
+    }
+    result.canonical = canonical_bytes(&result.raw).map_err(not_canonical)?;
+    validate_unsigned_policy(&result.raw, name).map_err(|e| body_invalid(&e))?;
+    if mainnet_minimum::required(&body, profile) {
+        mainnet_minimum::validate(&body, profile, name).map_err(|e| {
+            (
+                e.wire_code(),
+                format!(
+                    "policy file {path} does not meet the minimum mainnet policy ({e}); correct \
+                     the policy, then sign again. No file was written."
+                ),
+            )
+        })?;
+    }
+    stellar_agent_core::policy::v1::verified::validate_profile_body(&body, profile).map_err(
+        |e| {
+            (
+                e.wire_code(),
+                format!(
+                    "the [mainnet] table of policy file {path} does not fit this profile ({e}); \
+                     correct the policy, then sign again. No file was written."
+                ),
+            )
+        },
+    )?;
+    Ok(result)
 }
 
 /// Derives the engine's profile name from `policy_owner_key_id.service`,
@@ -557,7 +712,7 @@ fn derive_and_sign(
 /// truncate or corrupt the operator's body. `rename(2)` is atomic on a single
 /// host, mirroring the profile writer's approach
 /// (`stellar-agent-core::profile::migrate`).
-fn atomic_write_string(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+pub(crate) fn atomic_write_string(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
@@ -753,6 +908,7 @@ mod tests {
         enroll_owner_pubkey(PROFILE_NAME, &pk);
 
         let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let path = dir.path().join("policy.toml");
         std::fs::write(&path, policy_body(PROFILE_NAME)).unwrap();
 
@@ -797,6 +953,7 @@ mod tests {
         enroll_owner_pubkey(PROFILE_NAME, &pk);
 
         let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let path = dir.path().join("policy.toml");
         std::fs::write(&path, policy_body(PROFILE_NAME)).unwrap();
 
@@ -829,6 +986,7 @@ mod tests {
         let (wrong_s, _wrong_pk, _wrong_g) = seed_material([0x55u8; 32]);
 
         let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let path = dir.path().join("policy.toml");
         let body = policy_body(PROFILE_NAME);
         std::fs::write(&path, &body).unwrap();
@@ -862,6 +1020,7 @@ mod tests {
         enroll_owner_pubkey(PROFILE_NAME, &pk);
 
         let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let path = dir.path().join("policy.toml");
         std::fs::write(&path, policy_body(PROFILE_NAME)).unwrap();
 
@@ -909,6 +1068,7 @@ mod tests {
         let (s_strkey, pk, _g) = seed_material([0x66u8; 32]);
         enroll_owner_pubkey(PROFILE_NAME, &pk);
         let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let path = dir.path().join("policy.toml");
         std::fs::write(&path, body).unwrap();
         let var = unique_var(tag);
@@ -935,16 +1095,23 @@ mod tests {
             "{}decision_override = \"deny\"\n",
             policy_body(PROFILE_NAME)
         );
-        let (code, envelope, after, _pk, _dir) = sign_file_holding("UNKNOWNKEY", &body).await;
+        let (code, envelope, after, _pk, dir) = sign_file_holding("UNKNOWNKEY", &body).await;
         assert_eq!(code, 1, "an unknown key must refuse: {envelope}");
         assert_eq!(
             envelope["error"]["code"], "sign_policy.canonicalization_failed",
             "{envelope}"
         );
-        let message = envelope["error"]["message"].as_str().unwrap();
-        assert!(
-            message.contains("rule[0]: unknown key `decision_override`"),
-            "the refusal must name the key and its location: {message}"
+        let path = dir.path().join("policy.toml");
+        assert_eq!(
+            envelope["error"]["message"],
+            format!(
+                "policy file {} holds a key outside the V1 policy schema (policy file parse \
+                 failed: rule[0]: unknown key `decision_override`; a rule accepts match, \
+                 criteria, decision, reason, ttl_secs, allow_opaque_signing); correct the key, \
+                 then sign again. No file was written.",
+                path.display()
+            ),
+            "the refusal must name the file, the key, and its location"
         );
         assert_eq!(after, body, "a refused file must be left byte-identical");
     }
@@ -973,16 +1140,20 @@ mod tests {
             ),
         ] {
             canonical_bytes(body).expect("the body must canonicalise");
-            let (code, envelope, after, _pk, _dir) = sign_file_holding("BODYINVALID", body).await;
+            let (code, envelope, after, _pk, dir) = sign_file_holding("BODYINVALID", body).await;
             assert_eq!(code, 1, "{detail}: {envelope}");
             assert_eq!(
                 envelope["error"]["code"], "sign_policy.policy_body_invalid",
                 "{envelope}"
             );
-            let message = envelope["error"]["message"].as_str().unwrap();
-            assert!(
-                message.contains(detail),
-                "the refusal must carry the loader's detail: {message}"
+            assert_eq!(
+                envelope["error"]["message"],
+                format!(
+                    "the V1 policy loader refuses the body of policy file {} (policy file parse \
+                     failed: {detail}); correct the policy, then sign again. No file was written.",
+                    dir.path().join("policy.toml").display()
+                ),
+                "the refusal must name the file and carry the loader's detail"
             );
             assert_eq!(after, body, "a refused file must be left byte-identical");
         }
@@ -1043,6 +1214,7 @@ mod tests {
         // No owner key enrolled.
         let (s_strkey, _pk, _g) = seed_material([0x11u8; 32]);
         let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let path = dir.path().join("policy.toml");
         std::fs::write(&path, policy_body(PROFILE_NAME)).unwrap();
         let var = unique_var("NOOWNER");
@@ -1112,6 +1284,288 @@ mod tests {
             rendered.matches("[signature]").count(),
             1,
             "re-rendering must not duplicate the [signature] table"
+        );
+    }
+    #[test]
+    #[serial]
+    fn sequence_assignment_uses_pin_and_body_without_writing_pin() {
+        use stellar_agent_core::policy::{
+            pin::{self, Pin, PinScope, PinState},
+            state_lock::WindowStoreLock,
+        };
+        keyring_mock::install().unwrap();
+        let directory = TempDir::new().unwrap();
+        let window = directory.path().join("state.window");
+        let policy = directory.path().join("policy.toml");
+        let profile = profile_for("operator");
+        let body = "version = 2\nscope = \"profile:operator\"\nsequence = 7\n[[rules]]\n\
+            match = {tool = \"stellar_balances\", chain = \"*\"}\ncriteria = []\n\
+            decision = \"allow\"\n";
+        let prepared = prepare_policy(body, &profile, "operator", &policy, &window).unwrap();
+        assert_eq!(prepared.sequence, Some(8));
+        assert_eq!(prepared.previous_sequence, Some(7));
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "preparing writes no state file"
+        );
+        let absent = directory.path().join("absent").join("state.window");
+        assert_eq!(
+            prepare_policy(body, &profile, "operator", &policy, &absent)
+                .unwrap()
+                .sequence,
+            Some(8)
+        );
+        assert!(
+            !directory.path().join("absent").exists(),
+            "preparing creates no window-state directory"
+        );
+        let lock =
+            WindowStoreLock::acquire_for(&window, &profile.policy_window_state_key_id).unwrap();
+        let scope = PinScope::for_profile(&window, &profile);
+        assert_eq!(pin::read(&lock, &scope).unwrap(), PinState::Absent);
+        pin::write(&lock, &scope, &Pin::new(10, [0; 32], [0; 32]).unwrap()).unwrap();
+        drop(lock);
+        let prepared = prepare_policy(body, &profile, "operator", &policy, &window).unwrap();
+        assert_eq!(prepared.sequence, Some(11));
+        assert_eq!(prepared.previous_sequence, Some(10));
+        let lock =
+            WindowStoreLock::acquire_for(&window, &profile.policy_window_state_key_id).unwrap();
+        assert!(matches!(
+            pin::read(&lock, &scope).unwrap(),
+            PinState::Present(pin) if pin.sequence() == 10
+        ));
+    }
+    #[test]
+    #[serial]
+    fn sequence_missing_and_exhaustion_boundaries() {
+        keyring_mock::install().unwrap();
+        let directory = TempDir::new().unwrap();
+        let window = directory.path().join("state.window");
+        let policy = directory.path().join("policy.toml");
+        let profile = profile_for("operator");
+        let body = "version = 2\nscope = \"profile:operator\"\n[[rules]]\n\
+            match = {tool = \"stellar_balances\", chain = \"*\"}\ncriteria = []\n\
+            decision = \"allow\"\n";
+        let prepared = prepare_policy(body, &profile, "operator", &policy, &window).unwrap();
+        assert_eq!(prepared.sequence, Some(1));
+        assert_eq!(prepared.previous_sequence, Some(0));
+        let body = body.replace("version = 2", "version = 2\nsequence = 9223372036854775806");
+        let prepared = prepare_policy(&body, &profile, "operator", &policy, &window).unwrap();
+        assert_eq!(prepared.sequence, Some(i64::MAX));
+        assert_eq!(prepared.previous_sequence, Some(i64::MAX - 1));
+        let error = prepare_policy(&prepared.raw, &profile, "operator", &policy, &window)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            (
+                "sign_policy.sequence_exhausted",
+                format!(
+                    "the sequence of policy file {} cannot advance past i64::MAX. No file was \
+                     written.",
+                    policy.display()
+                )
+            )
+        );
+    }
+    #[test]
+    #[serial]
+    fn v1_warning_and_pin_rollback_warning() {
+        use stellar_agent_core::policy::{
+            pin::{self, Pin, PinScope},
+            state_lock::WindowStoreLock,
+        };
+        keyring_mock::install().unwrap();
+        let directory = TempDir::new().unwrap();
+        let window = directory.path().join("state.window");
+        let policy = directory.path().join("policy.toml");
+        let profile = Profile::builder_mainnet_named(
+            "operator",
+            "https://rpc.example.invalid",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .build();
+        let raw = policy_body("operator");
+        let prepared = prepare_policy(&raw, &profile, "operator", &policy, &window).unwrap();
+        assert_eq!(prepared.raw, raw);
+        assert_eq!(prepared.sequence, None);
+        assert!(prepared.warnings.iter().any(|w| w.contains("v2")));
+        let lock =
+            WindowStoreLock::acquire_for(&window, &profile.policy_window_state_key_id).unwrap();
+        pin::write(
+            &lock,
+            &PinScope::for_profile(&window, &profile),
+            &Pin::new(1, [0; 32], [0; 32]).unwrap(),
+        )
+        .unwrap();
+        drop(lock);
+        let prepared = prepare_policy(&raw, &profile, "operator", &policy, &window).unwrap();
+        assert!(
+            prepared
+                .warnings
+                .iter()
+                .any(|w| w.contains("policy.sequence_rollback"))
+        );
+    }
+    #[test]
+    #[serial]
+    fn unsigned_and_minimum_validation_precede_signing() {
+        keyring_mock::install().unwrap();
+        let directory = TempDir::new().unwrap();
+        let window = directory.path().join("state.window");
+        let policy = directory.path().join("policy.toml");
+        let profile = Profile::builder_mainnet_named(
+            "operator",
+            "https://rpc.example.invalid",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .build();
+        let full = include_str!("../../../../stellar-agent-core/tests/fixtures/policy-v2.toml");
+        let invalid = full.replace("max_calls = 10", "max_calls = -1");
+        let (code, message) = prepare_policy(&invalid, &profile, "operator", &policy, &window)
+            .err()
+            .unwrap();
+        assert_eq!(code, "sign_policy.policy_body_invalid");
+        let framing = format!(
+            "the V1 policy loader refuses the body of policy file {} (",
+            policy.display()
+        );
+        let ending = "); correct the policy, then sign again. No file was written.";
+        assert!(
+            message.starts_with(&framing) && message.ends_with(ending),
+            "{message}"
+        );
+        let unmet = full.replace("ttl_secs = 3600", "ttl_secs = 3601");
+        let result = prepare_policy(&unmet, &profile, "operator", &policy, &window);
+        assert_eq!(result.is_err(), cfg!(feature = "mainnet-write"));
+        if let Err(error) = result {
+            assert_eq!(
+                error,
+                (
+                    "policy.mainnet_minimum_unmet",
+                    format!(
+                        "policy file {} does not meet the minimum mainnet policy \
+                         (policy.mainnet_minimum_unmet: requirement=rule_ttl, rule=Some(0)); \
+                         correct the policy, then sign again. No file was written.",
+                        policy.display()
+                    )
+                )
+            );
+        }
+    }
+    #[tokio::test]
+    #[serial]
+    async fn rendered_sequence_fields_and_mainnet_warning_follow_the_signed_body() {
+        use stellar_agent_core::policy::pin::PinState;
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let (secret, pk, _) = seed_material([11; 32]);
+        enroll_owner_pubkey(PROFILE_NAME, &pk);
+        let var = unique_var("SEQUENCE");
+        let _secret = EnvGuard::set(var.clone(), &secret);
+        let path = dir.path().join("policy.toml");
+        std::fs::write(
+            &path,
+            policy_body(PROFILE_NAME).replace("version = 1", "version = 2"),
+        )
+        .unwrap();
+        let mut profile = profile_for(PROFILE_NAME);
+        for expected in [1, 2] {
+            render::take_rendered_for_test();
+            assert_eq!(
+                run_with_dependencies(&args(&path, &var), |_| Ok(profile.clone()), || Ok(())).await,
+                0
+            );
+            let output = render::take_rendered_for_test();
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0]["data"]["sequence"], expected);
+            assert_eq!(output[0]["data"]["previous_sequence"], expected - 1);
+            assert_eq!(
+                load_signed_policy(&path, PROFILE_NAME, &pk)
+                    .unwrap()
+                    .version,
+                2
+            );
+        }
+        let window =
+            stellar_agent_core::profile::schema::default_policy_window_state_path_for(PROFILE_NAME);
+        assert!(
+            !window.parent().unwrap().exists(),
+            "signing creates no window-state directory"
+        );
+        assert_eq!(
+            stellar_agent_core::policy::v1::verified::read_pin_without_creating(&window, &profile)
+                .unwrap(),
+            PinState::Absent
+        );
+        std::fs::write(&path, policy_body(PROFILE_NAME)).unwrap();
+        profile.chain_id = stellar_agent_core::profile::caip2::Caip2::Mainnet;
+        profile.network_passphrase = profile.chain_id.network_passphrase().into();
+        profile.rpc_url = "https://rpc.example.invalid".into();
+        render::take_rendered_for_test();
+        assert_eq!(
+            run_with_dependencies(&args(&path, &var), |_| Ok(profile.clone()), || Ok(())).await,
+            0
+        );
+        let output = render::take_rendered_for_test();
+        assert!(
+            output[0]["data"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().unwrap().contains("v2"))
+        );
+        assert!(output[0]["data"].get("sequence").is_none());
+    }
+    /// A pin that cannot be read refuses with its state code and the rendered
+    /// error, naming the policy file.
+    #[test]
+    #[serial]
+    fn unreadable_pin_keeps_its_state_code() {
+        keyring_mock::install().unwrap();
+        let directory = TempDir::new().unwrap();
+        let window = directory.path().join("state.window");
+        let policy = directory.path().join("policy.toml");
+        let profile = profile_for("operator");
+        drop(
+            stellar_agent_core::policy::state_lock::WindowStoreLock::acquire_for(
+                &window,
+                &profile.policy_window_state_key_id,
+            )
+            .unwrap(),
+        );
+        let coordinate = stellar_agent_core::profile::schema::policy_pin_entry_ref(
+            &profile.policy_window_state_key_id,
+        );
+        keyring_mock::inject_no_logon_session(&coordinate.service, &coordinate.account).unwrap();
+        let (code, message) = prepare_policy(
+            &policy_body("operator"),
+            &profile,
+            "operator",
+            &policy,
+            &window,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(code, "policy.pin_unusable");
+        let framing = format!(
+            "could not read the installation's policy pin for policy file {} \
+             (policy.pin_unusable: the policy pin keyring entry could not be used: ",
+            policy.display()
+        );
+        assert!(
+            message.starts_with(&framing) && message.ends_with("). No file was written."),
+            "{message}"
         );
     }
 }

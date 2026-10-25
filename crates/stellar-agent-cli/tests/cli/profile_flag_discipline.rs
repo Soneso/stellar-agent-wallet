@@ -76,7 +76,7 @@ const ALLOW_SET: &[AllowEntry] = &[];
 /// visibility class (say every `pub(crate)` field) would still clear a loose
 /// floor and report a clean tree. Adding or removing a profile-selecting
 /// subcommand is expected to move this number — update it in the same commit.
-const PROFILE_FIELDS: usize = 77;
+const PROFILE_FIELDS: usize = 78;
 
 /// Call-site shapes that substitute the literal `"default"` for an absent
 /// profile name, discarding the environment variable the flag left `None` for.
@@ -650,6 +650,7 @@ fn matching_brace(bytes: &[u8], open_idx: usize) -> Option<usize> {
 #[test]
 fn from_flag_is_confined_to_explicit_argument_boundaries() {
     let allowed = [
+        ("commands/profile/enable_mainnet.rs", "run"),
         (
             "commands/profile/rotate_nonce_key.rs",
             "run_with_dependencies",

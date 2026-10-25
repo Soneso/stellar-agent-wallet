@@ -55,7 +55,7 @@
 //! ## Version range
 //!
 //! Accepted policy file versions are `[MIN_POLICY_VERSION, MAX_POLICY_VERSION]`
-//! (currently `[1, 1]`).  Files with a version outside this range are rejected
+//! (currently `[1, 2]`).  Files with a version outside this range are rejected
 //! with [`crate::policy::PolicyError::PolicyFileParseFailed`] to prevent
 //! downgrade-replay attacks.
 
@@ -93,7 +93,7 @@ const MIN_POLICY_VERSION: u32 = 1;
 ///
 /// Files with `version > MAX_POLICY_VERSION` are rejected by [`extract_version`].
 /// Bump this constant when a new policy schema version is introduced.
-const MAX_POLICY_VERSION: u32 = 1;
+const MAX_POLICY_VERSION: u32 = 2;
 
 /// Default approval time-to-live for `require_approval` policy decisions, in seconds.
 const DEFAULT_APPROVAL_TTL_SECONDS: u32 = (crate::approval::store::DEFAULT_TTL_MS / 1_000) as u32;
@@ -462,7 +462,17 @@ pub fn load_signed_policy(
     owner_pubkey: &[u8; 32],
 ) -> Result<PolicyDocument, PolicyError> {
     // Step 1: read the file.
-    let raw = std::fs::read_to_string(path).map_err(|e| {
+    let raw = read_policy_file(path)?;
+
+    load_signed_policy_text(&raw, profile_name, owner_pubkey)
+}
+
+/// Reads a policy file, naming its file name and the I/O cause on failure.
+///
+/// The detail carries the base name only, never the directory, so a refusal
+/// does not disclose the state-directory layout.
+pub(crate) fn read_policy_file(path: &Path) -> Result<String, PolicyError> {
+    std::fs::read_to_string(path).map_err(|e| {
         let basename = path
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
@@ -470,16 +480,22 @@ pub fn load_signed_policy(
         PolicyError::PolicyFileLoadFailed {
             detail: format!("{basename}: {e}"),
         }
-    })?;
+    })
+}
 
+pub(crate) fn load_signed_policy_text(
+    raw: &str,
+    profile_name: &str,
+    owner_pubkey: &[u8; 32],
+) -> Result<PolicyDocument, PolicyError> {
     // Step 2: canonical bytes (excludes [signature] table).
-    let canon = canonical_bytes(&raw)?;
+    let canon = canonical_bytes(raw)?;
 
     // Step 3: BLAKE3 digest.
     let d = digest(&canon);
 
     // Parse the document to extract [signature].
-    let doc = DocumentMut::from_str(&raw).map_err(|e| PolicyError::PolicyFileParseFailed {
+    let doc = DocumentMut::from_str(raw).map_err(|e| PolicyError::PolicyFileParseFailed {
         detail: e.to_string(),
     })?;
 
@@ -592,6 +608,9 @@ struct PolicyBody {
 /// the same bodies.
 fn parse_policy_body(doc: &DocumentMut, profile_name: &str) -> Result<PolicyBody, PolicyError> {
     let version = extract_version(doc)?;
+    if version == 2 {
+        super::verified::sequence(doc)?;
+    }
     let scope = extract_scope(doc)?;
     reject_scope_profile_mismatch(&scope, profile_name)?;
     let rules = extract_rules(doc)?;
@@ -971,6 +990,27 @@ fn parse_criterion(
     }
 
     match kind {
+        "asset_allowlist" => {
+            let assets = table
+                .get("assets")
+                .and_then(Value::as_array)
+                .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                    detail: format!("{loc}: assets must be an array"),
+                })?;
+            let assets = assets
+                .iter()
+                .map(|asset| {
+                    asset.as_str().map(str::to_owned).ok_or_else(|| {
+                        PolicyError::PolicyFileParseFailed {
+                            detail: format!("{loc}: assets must contain strings"),
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Box::new(
+                super::criteria::asset_allowlist::AssetAllowlistCriterion::new(assets)?,
+            ))
+        }
         "per_tx_cap" => {
             let asset = require_str(table, "asset", &loc)?;
             let max_stroops = require_i128(table, "max_stroops", &loc)?;
@@ -1205,7 +1245,7 @@ fn unknown_criterion_kind(loc: &str, kind: &str) -> PolicyError {
     PolicyError::PolicyFileParseFailed {
         detail: format!(
             "{loc}: unknown criterion kind `{kind}`; accepted kinds: \
-             per_tx_cap, per_period_cap, rate_limit, counterparty_allowlist, \
+             asset_allowlist, per_tx_cap, per_period_cap, rate_limit, counterparty_allowlist, \
              minimum_reserve, inner_invocation_count_cap, \
              bundle_aggregate_cap, restrict_bundle_to_recognised_kinds, \
              bundle_per_period_cap, bundle_per_tx_cap, bundle_rate_limit, \
@@ -2012,14 +2052,14 @@ decision = "allow"
     fn version_above_max_rejected() {
         let (sk, pk) = make_keypair();
         let dir = TempDir::new().unwrap();
-        let body = "version = 2\nscope = \"profile:alice\"\n";
+        let body = "version = 3\nscope = \"profile:alice\"\n";
         let toml = make_signed_toml(body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
         let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("maximum")),
-            "version 2 should be rejected with PolicyFileParseFailed (maximum version), got {err:?}"
+            "version 3 should be rejected with PolicyFileParseFailed (maximum version), got {err:?}"
         );
     }
 
@@ -3380,6 +3420,7 @@ decision = "deny"
     #[test]
     fn every_key_of_each_criterion_key_set_loads() {
         let criteria = [
+            r#"{ kind = "asset_allowlist", assets = ["native"] }"#,
             r#"{ kind = "per_tx_cap", asset = "native", max_stroops = 100 }"#,
             r#"{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 100 }"#,
             r#"{ kind = "rate_limit", window = "1h", max_calls = 5 }"#,

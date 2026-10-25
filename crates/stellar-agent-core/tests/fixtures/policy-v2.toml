@@ -1,0 +1,27 @@
+version = 2
+scope = "profile:operator"
+sequence = 7
+
+[mainnet]
+endpoint_host = "rpc.example.invalid"
+profile = "operator"
+installation_nonce_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+classic_max_fee_per_op_stroops = 500
+authorization_ttl_seconds = 60
+[mainnet.cross_check_thresholds]
+native = "10000000000"
+"USD:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" = "100"
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "stellar:mainnet" }
+criteria = [
+    { kind = "asset_allowlist", assets = ["native"] },
+    { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"] },
+    { kind = "per_tx_cap", asset = "native", max_stroops = "100" },
+    { kind = "per_period_cap", window = "1d", asset = "native", max_stroops = "200" },
+    { kind = "rate_limit", window = "1d", max_calls = 10 },
+]
+decision = "require_approval"
+allow_opaque_signing = false
+ttl_secs = 3600
+reason = "review"

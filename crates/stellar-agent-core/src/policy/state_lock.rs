@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use crate::profile::schema::KeyringEntryRef;
 
 /// Why the window-state lock could not be taken.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum StateLockError {
     /// Another process or task holds the exclusive lock.
@@ -90,6 +90,31 @@ impl std::fmt::Debug for WindowStoreLock {
     }
 }
 
+/// Attempts a retried lock acquisition makes before it reports contention.
+pub const LOCK_ATTEMPTS: u32 = 3;
+
+/// The pause between two attempts of a retried lock acquisition.
+pub const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Runs `attempt` up to [`LOCK_ATTEMPTS`] times, sleeping
+/// [`LOCK_RETRY_DELAY`] after each [`StateLockError::WriterLocked`] but the
+/// last. Any other result, success or I/O error, returns at once: only
+/// contention is transient.
+fn with_retry<T>(
+    mut attempt: impl FnMut() -> Result<T, StateLockError>,
+) -> Result<T, StateLockError> {
+    let mut made = 0;
+    loop {
+        made += 1;
+        match attempt() {
+            Err(StateLockError::WriterLocked) if made < LOCK_ATTEMPTS => {
+                std::thread::sleep(LOCK_RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
+}
+
 impl WindowStoreLock {
     /// Acquires the exclusive OFD lock for the given lock-file path.
     ///
@@ -126,26 +151,80 @@ impl WindowStoreLock {
         Self::acquire_inner(&window_lock_path(window_path), Some(window_key.clone()))
     }
 
+    /// Acquires the scoped lock of [`WindowStoreLock::acquire_for`], retrying
+    /// contention with [`LOCK_ATTEMPTS`] attempts [`LOCK_RETRY_DELAY`] apart.
+    ///
+    /// # Errors
+    ///
+    /// The first I/O error, or [`StateLockError::WriterLocked`] when the lock
+    /// stays held through the final attempt.
+    pub fn acquire_for_with_retry(
+        window_path: &Path,
+        window_key: &KeyringEntryRef,
+    ) -> Result<Self, StateLockError> {
+        with_retry(|| Self::acquire_for(window_path, window_key))
+    }
+
+    /// Acquires the bare lock of [`WindowStoreLock::acquire`], retrying
+    /// contention with [`LOCK_ATTEMPTS`] attempts [`LOCK_RETRY_DELAY`] apart.
+    ///
+    /// # Errors
+    ///
+    /// The first I/O error, or [`StateLockError::WriterLocked`] when the lock
+    /// stays held through the final attempt.
+    pub fn acquire_with_retry(path: &Path) -> Result<Self, StateLockError> {
+        with_retry(|| Self::acquire(path))
+    }
+
+    /// Acquires the scoped lock of the store at `window_path` only when its
+    /// lock file exists, retrying contention like
+    /// [`WindowStoreLock::acquire_for_with_retry`].
+    ///
+    /// A reader that writes nothing uses this acquisition, so it creates
+    /// neither the lock file nor its directory. An absent lock file returns
+    /// `Ok(None)` without inspecting the keyring. An advancing load recreates
+    /// the lock and checks any existing pin.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`WindowStoreLock::acquire_for_with_retry`], except that
+    /// a missing lock file or directory is `Ok(None)`.
+    pub fn acquire_existing_for_with_retry(
+        window_path: &Path,
+        window_key: &KeyringEntryRef,
+    ) -> Result<Option<Self>, StateLockError> {
+        let path = window_lock_path(window_path);
+        match with_retry(|| Self::open_and_lock(&path, Some(window_key.clone()), false)) {
+            Ok(lock) => Ok(Some(lock)),
+            Err(StateLockError::Io {
+                kind: std::io::ErrorKind::NotFound,
+            }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     fn acquire_inner(
         path: &Path,
         window_key: Option<KeyringEntryRef>,
     ) -> Result<Self, StateLockError> {
+        Self::open_and_lock(path, window_key, true)
+    }
+
+    /// Opens the lock file, creating it when `create` is set, and takes the
+    /// exclusive lock without blocking.
+    fn open_and_lock(
+        path: &Path,
+        window_key: Option<KeyringEntryRef>,
+        create: bool,
+    ) -> Result<Self, StateLockError> {
+        let mut options = OpenOptions::new();
+        options.create(create).write(true).truncate(false);
         #[cfg(unix)]
-        let file = {
+        {
             use std::os::unix::fs::OpenOptionsExt as _;
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(path)
-                .map_err(|e| StateLockError::Io { kind: e.kind() })?
-        };
-        #[cfg(not(unix))]
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
+            options.mode(0o600);
+        }
+        let file = options
             .open(path)
             .map_err(|e| StateLockError::Io { kind: e.kind() })?;
 
