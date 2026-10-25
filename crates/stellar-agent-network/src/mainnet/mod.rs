@@ -7,8 +7,12 @@
 //!   checks.
 //! - [`clock`]: the clock the ledger, the signing points, and the submit gate
 //!   share.
+//! - [`consumed`]: the proof a mainnet send depends on, that the submission
+//!   consumed its authorization.
 //! - [`digest`]: the content, entries, and bindings digests, and the shared
 //!   subjects and labels by the names their consumers use.
+//! - [`soroban`]: the check of a Soroban authorization preimage against an
+//!   intent authorization.
 //!
 //! The authorization ledger lives in the window-state store,
 //! [`crate::policy_state::ledger`]. The proofs core owns are in
@@ -17,8 +21,12 @@
 pub mod audit_readiness;
 pub mod authorization;
 pub mod clock;
+pub mod consumed;
 pub mod digest;
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) mod fixtures;
 pub(crate) mod refusal;
+pub mod soroban;
 pub(crate) mod types;
 
 pub use refusal::{MainnetAuthorizationError, MainnetPrecondition};

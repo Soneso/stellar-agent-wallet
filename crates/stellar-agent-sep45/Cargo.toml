@@ -24,6 +24,9 @@ base64 = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
+# The mainnet passphrase and the mainnet signing refusal detail, from their
+# single definition, for the refusal of mainnet challenge signing.
+stellar-agent-core = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

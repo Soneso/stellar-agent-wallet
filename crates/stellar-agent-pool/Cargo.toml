@@ -59,6 +59,10 @@ test-helpers = []
 # Gate end-to-end testnet acceptance tests.
 # Run with: cargo test -p stellar-agent-pool --features testnet-acceptance
 testnet-acceptance = ["test-helpers"]
+# Exposes `submit::SEED_COPIES`, the count of master-seed copies
+# `submit_pooled` makes, for tests that assert a refusal comes before the
+# copy. Never enable in production or release builds.
+test-hooks = []
 
 [[test]]
 name = "init"
@@ -71,6 +75,10 @@ required-features = ["test-helpers"]
 [[test]]
 name = "pool_testnet_init"
 required-features = ["testnet-acceptance"]
+
+[[test]]
+name = "mainnet_refusal"
+required-features = ["test-hooks"]
 
 [[test]]
 name = "pool_concurrent_testnet"

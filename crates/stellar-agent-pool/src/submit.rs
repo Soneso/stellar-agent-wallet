@@ -42,7 +42,9 @@
 
 use std::time::Duration;
 
+use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
+use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 use stellar_agent_network::{
     ClassicOpBuilder, StellarRpcClient, SubmissionRecorder, submit::SubmissionResult,
     submit_transaction_and_wait,
@@ -108,8 +110,16 @@ pub struct PoolSubmitResult {
 /// first `.await`) and inside [`allocator::release`] (after the last `.await`).
 /// No lock guard crosses an `.await` boundary.
 ///
+/// # Mainnet
+///
+/// A mainnet `network_passphrase` is refused at entry, before a channel is
+/// acquired and before the seed is copied or a key derived from it.
+///
 /// # Errors
 ///
+/// - [`PoolError::Wallet`] wrapping
+///   [`NetworkError::MainnetWriteForbidden`]: `network_passphrase` is the
+///   mainnet passphrase.
 /// - [`PoolError::PoolExhausted`] — all channels in-flight; call returned immediately.
 /// - [`PoolError::NotInitialised`] — the pool has no channels.
 /// - [`PoolError::DeriveFailed`] — channel key derivation failed.
@@ -180,6 +190,12 @@ where
     // Internal error which maps to PoolError::Wallet.
     F: FnOnce(&mut ClassicOpBuilder),
 {
+    if network_passphrase == MAINNET_PASSPHRASE {
+        return Err(PoolError::Wallet(WalletError::Network(
+            NetworkError::MainnetWriteForbidden,
+        )));
+    }
+
     // ── Step 1: acquire a free channel ──────────────────────────────────────
     // Lock taken and dropped inside acquire(); returns ChannelLease by value.
     // No lock is held after this call returns.
@@ -199,6 +215,8 @@ where
     // caller's seed remains alive for subsequent concurrent calls).
     // The Zeroizing<[u8; 64]> clone ensures the copy is zeroed when it enters
     // derive_channel_signer and is dropped.
+    #[cfg(feature = "test-hooks")]
+    SEED_COPIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let seed_copy: Zeroizing<[u8; 64]> = Zeroizing::new(**seed);
     let signer = match derive_channel_signer(seed_copy, channel_index) {
         Ok(s) => s,
@@ -366,6 +384,15 @@ fn is_tx_bad_seq(e: &stellar_agent_core::WalletError) -> bool {
     (code.starts_with("submission.") || code.starts_with("ledger."))
         && (msg.contains("tx_bad_seq") || msg.contains("txbadseq"))
 }
+
+/// The number of master-seed copies [`submit_pooled`] has made in this
+/// process, one per call that reached the copy.
+///
+/// Only compiled when the `test-hooks` Cargo feature is enabled. Never include
+/// `test-hooks` in production or release builds.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub static SEED_COPIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
 mod tests {

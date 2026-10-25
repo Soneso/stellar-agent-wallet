@@ -104,6 +104,53 @@ elif mutate "$label" tiered-unpublished "s/^TIER6=\"/TIER6=\"$UNPUBLISHED_ALL /"
   check_case "$label" refuse "$TMP/tiered-unpublished.sh" "$MISMATCH" stub
 fi
 
+# Metadata travels through a file descriptor above Linux's per-argument limit
+# and macOS's total argument limit. Unpublished packages preserve tier membership.
+python3 - "$TMP/workspace.json" "$TMP/metadata.json" <<'PYLARGE'
+import json, pathlib, sys
+metadata = json.load(open(sys.argv[1]))
+metadata["packages"].append({
+    "name": "unpublished-padding",
+    "version": "0.0.0",
+    "publish": [],
+    "description": "x" * (1024 * 1024),
+})
+path = pathlib.Path(sys.argv[2])
+path.write_text(json.dumps(metadata))
+assert path.stat().st_size > 1024 * 1024
+PYLARGE
+check_case "metadata above 1 MiB" pass "$SCRIPT" "$MATCH" stub
+
+# The member manifests, rather than metadata's resolved dependency list,
+# determine normal and build edges, including aliases and target tables.
+for spec in same later build target renamed inherited dev earlier; do
+  python3 - "$TMP/workspace.json" "$TMP/metadata.json" "$TMP/member.toml" "$spec" <<'PYCASE'
+import json, pathlib, sys
+metadata = json.load(open(sys.argv[1]))
+case = sys.argv[4]
+entries = {
+    "same": '[dependencies]\nstellar-agent-network = "0.1"',
+    "later": '[dependencies]\nstellar-agent-sep43 = "0.1"',
+    "build": '[build-dependencies]\nstellar-agent-network = "0.1"',
+    "target": '[target.\'cfg(unix)\'.build-dependencies]\nstellar-agent-network = "0.1"',
+    "renamed": '[dependencies]\nnet = { package = "stellar-agent-network", version = "0.1", optional = true }',
+    "inherited": '[dependencies]\nstellar-agent-network = { workspace = true }',
+    "dev": '[dev-dependencies]\nstellar-agent-mcp = "0.1"',
+    "earlier": '[dependencies]\nstellar-agent-core = { workspace = true }',
+}
+pathlib.Path(sys.argv[3]).write_text(entries[case])
+for package in metadata["packages"]:
+    if package["name"] == "stellar-agent-sep45":
+        package["manifest_path"] = sys.argv[3]
+json.dump(metadata, open(sys.argv[2], "w"))
+PYCASE
+  case "$spec" in
+    dev|earlier) check_case "$spec dependency allowed" pass "$SCRIPT" "$MATCH" stub ;;
+    later) check_case "$spec dependency refused" refuse "$SCRIPT" "stellar-agent-sep45 depends on stellar-agent-sep43" stub ;;
+    *) check_case "$spec dependency refused" refuse "$SCRIPT" "stellar-agent-sep45 depends on stellar-agent-network" stub ;;
+  esac
+done
+
 if [ "$failures" -ne 0 ]; then
   echo "$failures publish check-mode case(s) failed" >&2
   exit 1

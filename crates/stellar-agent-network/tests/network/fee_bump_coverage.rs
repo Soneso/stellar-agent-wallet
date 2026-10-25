@@ -14,7 +14,9 @@
     reason = "test-only"
 )]
 
-use stellar_agent_core::error::{ProtocolError, SubmissionError, ValidationError, WalletError};
+use stellar_agent_core::error::{
+    NetworkError, ProtocolError, SubmissionError, ValidationError, WalletError,
+};
 use stellar_agent_network::fee_bump::{FeeBumpError, build_and_sign_fee_bump};
 use stellar_agent_network::signing::SoftwareSigningKey;
 use stellar_xdr::{
@@ -29,6 +31,7 @@ use stellar_xdr::{
 
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const PUBNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
+const FUTURENET_PASSPHRASE: &str = "Test SDF Future Network ; October 2022";
 
 // Public test keys — deterministic, NOT production keys.
 const FEE_PAYER_SEED: [u8; 32] = [0x10u8; 32];
@@ -231,6 +234,10 @@ fn fee_bump_error_code_all_variants() {
                 input: "signing error".to_owned(),
             })),
         ),
+        (
+            "feebump.mainnet_signing_forbidden",
+            FeeBumpError::MainnetSigningForbidden,
+        ),
     ];
 
     for (expected_code, err) in cases {
@@ -374,6 +381,21 @@ fn from_fee_source_signer_mismatch_yields_submission_tx_malformed() {
         "FeeSourceSignerMismatch must convert to WalletError::Submission(TxMalformed); got: {wallet_err:?}"
     );
     assert_eq!(wallet_err.code(), "submission.tx_malformed");
+}
+
+/// `FeeBumpError::MainnetSigningForbidden` converts to the network's mainnet
+/// write refusal.
+#[test]
+fn from_mainnet_signing_forbidden_maps_to_mainnet_write_forbidden() {
+    let wallet_err = WalletError::from(FeeBumpError::MainnetSigningForbidden);
+    assert!(
+        matches!(
+            wallet_err,
+            WalletError::Network(NetworkError::MainnetWriteForbidden)
+        ),
+        "MainnetSigningForbidden must map to MainnetWriteForbidden; got: {wallet_err:?}"
+    );
+    assert_eq!(wallet_err.code(), "network.mainnet_write_forbidden");
 }
 
 /// `FeeBumpError::SigningFailed(WalletError)` unwraps and propagates the inner `WalletError`.
@@ -571,29 +593,29 @@ async fn outer_hash_differs_under_different_network_passphrase() {
     .await
     .expect("testnet signing must succeed");
 
-    let pubnet_xdr = build_and_sign_fee_bump(
+    let futurenet_xdr = build_and_sign_fee_bump(
         &inner_xdr,
         &fp_g,
         300,
         100_000,
-        PUBNET_PASSPHRASE,
+        FUTURENET_PASSPHRASE,
         &fee_payer,
     )
     .await
-    .expect("pubnet signing must succeed");
+    .expect("futurenet signing must succeed");
 
     // Different passphrases → different outer transaction signature payloads →
     // different signatures → different base64 XDR outputs.
     assert_ne!(
-        testnet_xdr, pubnet_xdr,
+        testnet_xdr, futurenet_xdr,
         "different network passphrases must produce different signed outer envelopes"
     );
 
     // Both must decode as TxFeeBump and share the same inner tx body.
     let testnet_env = TransactionEnvelope::from_xdr_base64(&testnet_xdr, Limits::none())
         .expect("decode testnet outer");
-    let pubnet_env = TransactionEnvelope::from_xdr_base64(&pubnet_xdr, Limits::none())
-        .expect("decode pubnet outer");
+    let futurenet_env = TransactionEnvelope::from_xdr_base64(&futurenet_xdr, Limits::none())
+        .expect("decode futurenet outer");
 
     let testnet_inner = match testnet_env {
         TransactionEnvelope::TxFeeBump(ref fb) => match &fb.tx.inner_tx {
@@ -601,7 +623,7 @@ async fn outer_hash_differs_under_different_network_passphrase() {
         },
         _ => panic!("expected TxFeeBump"),
     };
-    let pubnet_inner = match pubnet_env {
+    let futurenet_inner = match futurenet_env {
         TransactionEnvelope::TxFeeBump(ref fb) => match &fb.tx.inner_tx {
             FeeBumpTransactionInnerTx::Tx(v1) => v1.tx.fee,
         },
@@ -610,8 +632,32 @@ async fn outer_hash_differs_under_different_network_passphrase() {
 
     // The inner tx fee field is identical regardless of network passphrase.
     assert_eq!(
-        testnet_inner, pubnet_inner,
+        testnet_inner, futurenet_inner,
         "inner tx fee must be equal regardless of passphrase (inner is not re-encoded)"
+    );
+}
+
+/// The same inner envelope and fee under the mainnet passphrase is refused
+/// with `MainnetSigningForbidden`.
+#[tokio::test]
+async fn mainnet_passphrase_is_refused() {
+    let inner_xdr = make_v1_xdr(1, 100);
+    let fp_g = fee_payer_gstrkey();
+    let fee_payer = SoftwareSigningKey::new_from_bytes(FEE_PAYER_SEED);
+
+    let result = build_and_sign_fee_bump(
+        &inner_xdr,
+        &fp_g,
+        300,
+        100_000,
+        PUBNET_PASSPHRASE,
+        &fee_payer,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(FeeBumpError::MainnetSigningForbidden)),
+        "the mainnet passphrase must be refused; got: {result:?}"
     );
 }
 

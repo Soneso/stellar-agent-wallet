@@ -145,7 +145,7 @@ use crate::signers::types::{
     FrozenChainStateTuple, PolicyIdentifiedKind, ThresholdAffectingOp, WasmHashSummary,
 };
 use crate::simple_threshold_policy::parse_simple_threshold_install_param;
-use crate::submit::ExpectedReturn;
+use crate::submit::{ExpectedReturn, refuse_mainnet_sa};
 use crate::weighted_threshold_policy::WEIGHTED_THRESHOLD_POLICY_WASM_HASHES;
 
 /// Weighted-threshold policy's on-chain view state: the current threshold
@@ -724,6 +724,23 @@ impl SignersManager {
     #[must_use]
     pub(crate) fn secondary_rpc_client(&self) -> &StellarRpcClient {
         &self.secondary_rpc_client
+    }
+
+    /// Refuses a write when the manager's passphrase names mainnet or its
+    /// primary endpoint is a mainnet-pattern URL.
+    ///
+    /// The managers also serve mainnet reads, so the refusal is not made at
+    /// construction: every write method calls this first, before any signer
+    /// key access and any request, and a caller holding the manager for a
+    /// multi-step write, such as `MigrationPlan::submit`, calls it before its
+    /// first step. Local checks only; no I/O.
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::MainnetWriteForbidden`] for a mainnet passphrase or a
+    /// mainnet-pattern primary endpoint.
+    pub(crate) fn refuse_mainnet_write(&self) -> Result<(), SaError> {
+        refuse_mainnet_sa(&self.network_passphrase, &self.primary_rpc_url)
     }
 
     /// Returns a clone of the shared `Arc<Mutex<AuditWriter>>`.
@@ -2272,6 +2289,9 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
     /// - [`SaError::VerifierWasmNotInAllowlist`] / [`SaError::VerifierMutable`] /
     ///   [`SaError::ContractInstanceUnsupported`]: a new verifier of a pinned
     ///   rule was refused under "Pin record".
@@ -2314,6 +2334,8 @@ impl SignersManager {
         accept_mutable_verifier: bool,
         accept_unknown_verifier: bool,
     ) -> Result<u32, SaError> {
+        self.refuse_mainnet_write()?;
+
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
@@ -2386,6 +2408,10 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
+    ///
     /// See [`Self::add_signer`] for the error taxonomy; the same variants
     /// apply, plus [`SaError::ThresholdPolicyIdentificationFailed`] for a rule
     /// whose policies include no simple-threshold policy.
@@ -2407,6 +2433,8 @@ impl SignersManager {
         signer: &(dyn Signer + Send + Sync),
         request_id: String,
     ) -> Result<(), SaError> {
+        self.refuse_mainnet_write()?;
+
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
@@ -2482,6 +2510,9 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
     /// - [`SaError::ThresholdUnreachable`]: new threshold would violate invariants.
     /// - [`SaError::ThresholdPolicyNotInstalled`]: the rule has no
     ///   simple-threshold policy.
@@ -2501,6 +2532,8 @@ impl SignersManager {
         signer: &(dyn Signer + Send + Sync),
         request_id: String,
     ) -> Result<(), SaError> {
+        self.refuse_mainnet_write()?;
+
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
@@ -3581,6 +3614,9 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
     /// - [`SaError::SpendingLimitInstallRefused`] — `new_limit <= 0`, or
     ///   `auth_rule_ids` empty.
     /// - [`SaError::SpendingLimitNotInstalled`] — no accessible spending-limit
@@ -3605,6 +3641,8 @@ impl SignersManager {
         signer: &(dyn Signer + Send + Sync),
         request_id: String,
     ) -> Result<(), SaError> {
+        self.refuse_mainnet_write()?;
+
         // The AUTHORIZING rule must be admin-capable (typically the genesis
         // Default rule): the retune's auth context is `execute` on the smart
         // account itself, and the CallContract-scoped rule being retuned can
@@ -4523,6 +4561,9 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
     /// - [`SaError::WeightedThresholdInstallRefused`] — `new_threshold == 0`
     ///   or exceeds the current weight sum, or `auth_rule_ids` is empty.
     /// - [`SaError::WeightedThresholdNotInstalled`] /
@@ -4539,6 +4580,8 @@ impl SignersManager {
         signer: &(dyn Signer + Send + Sync),
         request_id: String,
     ) -> Result<(), SaError> {
+        self.refuse_mainnet_write()?;
+
         if auth_rule_ids.is_empty() {
             return Err(SaError::WeightedThresholdInstallRefused {
                 reason: "set-weighted-threshold refused: auth_rule_ids must not be empty"
@@ -4773,6 +4816,10 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
+    ///
     /// See [`Self::set_weighted_threshold`] for the error taxonomy.
     #[allow(
         clippy::too_many_arguments,
@@ -4788,6 +4835,8 @@ impl SignersManager {
         signer: &(dyn Signer + Send + Sync),
         request_id: String,
     ) -> Result<(), SaError> {
+        self.refuse_mainnet_write()?;
+
         if auth_rule_ids.is_empty() {
             return Err(SaError::WeightedThresholdInstallRefused {
                 reason: "set-signer-weight refused: auth_rule_ids must not be empty".to_owned(),
@@ -5055,6 +5104,9 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
     /// - [`SaError::BatchSignerAddRefused`] — the batch is empty (nothing to
     ///   add), refused before acquiring the per-rule mutex, or one of its
     ///   signers is not a signer the wallet can decode.
@@ -5082,6 +5134,8 @@ impl SignersManager {
         accept_mutable_verifier: bool,
         accept_unknown_verifier: bool,
     ) -> Result<Vec<u32>, SaError> {
+        self.refuse_mainnet_write()?;
+
         if new_signers.is_empty() {
             return Err(SaError::BatchSignerAddRefused {
                 reason: "batch is empty: at least one signer is required".to_owned(),
@@ -13459,5 +13513,385 @@ pub(crate) mod tests {
             !error.contains("SENTINEL"),
             "construction error leaked: {error}"
         );
+    }
+
+    // ── Mainnet refusal before the signer and the endpoint ──────────────────
+
+    /// A signers manager declared for mainnet whose endpoints are the mock
+    /// `server`, with the audit log in `dir`.
+    fn mainnet_signers_manager(
+        server: &wiremock::MockServer,
+        dir: &tempfile::TempDir,
+    ) -> SignersManager {
+        let audit_log_path = dir.path().join("audit.jsonl");
+        let audit_writer = Arc::new(Mutex::new(
+            AuditWriter::open(audit_log_path.clone(), None).unwrap(),
+        ));
+        SignersManager::new(SignersManagerConfig::new(
+            server.uri(),
+            server.uri(),
+            audit_writer,
+            audit_log_path,
+            stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE.to_owned(),
+            "test".to_owned(),
+            Duration::from_secs(1),
+            "stellar:pubnet".to_owned(),
+        ))
+        .unwrap()
+    }
+
+    /// Writes the signer baselines required before a manager write reaches RPC.
+    pub(crate) fn write_entry_guard_baselines(manager: &SignersManager, target: &ScAddress) {
+        let account = scaddress_to_strkey(target).unwrap();
+        let observation = test_observation(SignerSetSnapshotV2 {
+            signers: vec![ed25519_entry(0, 0x71)],
+            threshold: None,
+        });
+        for rule in [0, 1] {
+            manager
+                .emit_baseline(
+                    &observation,
+                    rule,
+                    &account,
+                    &redact_strkey_first5_last5(&account),
+                    BaselineReason::FirstObservation,
+                    None,
+                    "entry-guard-baseline",
+                )
+                .unwrap();
+        }
+    }
+
+    fn mainnet_target() -> ScAddress {
+        ScAddress::Contract(ContractId(Hash([0x81; 32])))
+    }
+
+    /// A testnet contract target for the accepted manager writes.
+    pub(crate) fn testnet_target() -> ScAddress {
+        ScAddress::Contract(ContractId(Hash([0x91; 32])))
+    }
+
+    fn delegated_signer_scval() -> ScVal {
+        build_delegated_signer_scval(SIMULATE_SENTINEL_G).unwrap()
+    }
+
+    /// Runs `write` against a mainnet signers manager with a counting signer,
+    /// and asserts the canonical mainnet refusal with no signer method called
+    /// and no request sent.
+    async fn assert_mainnet_write_refused<F, Fut>(write: F)
+    where
+        F: FnOnce(
+            SignersManager,
+            stellar_agent_network::signing::test_doubles::CountingSigner,
+        ) -> Fut,
+        Fut: std::future::Future<Output = Result<(), SaError>>,
+    {
+        let server = wiremock::MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x71; 32]);
+
+        let manager = mainnet_signers_manager(&server, &dir);
+        write_entry_guard_baselines(&manager, &mainnet_target());
+        let result = write(manager, signer.clone()).await;
+
+        assert!(
+            matches!(result, Err(SaError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert_eq!(signer.key_accesses(), 0, "no signer method is called");
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no request is sent"
+        );
+    }
+
+    /// A testnet write passes its network guard, reads the key, and reaches RPC.
+    async fn assert_testnet_write_reaches_rpc<F, Fut>(write: F)
+    where
+        F: FnOnce(
+            Arc<SignersManager>,
+            stellar_agent_network::signing::test_doubles::CountingSigner,
+        ) -> Fut,
+        Fut: std::future::Future<Output = Result<(), SaError>>,
+    {
+        let server = stellar_agent_test_support::KeyedLedgerEntriesResponder::new()
+            .serve()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("audit.jsonl");
+        let manager = crate::test_helpers::signers_manager_for_tests(
+            &server.uri(),
+            &server.uri(),
+            Arc::new(Mutex::new(
+                AuditWriter::open(audit_path.clone(), None).unwrap(),
+            )),
+            audit_path,
+            Duration::from_secs(1),
+        );
+        write_entry_guard_baselines(&manager, &testnet_target());
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x71; 32]);
+        let result = write(manager, signer.clone()).await;
+        assert!(
+            !matches!(result, Err(SaError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert!(signer.key_accesses() > 0);
+        assert!(
+            !server.received_requests().await.unwrap().is_empty(),
+            "the call reaches its first RPC: {result:?}"
+        );
+    }
+
+    /// The manager guard refuses mainnet and accepts testnet.
+    #[tokio::test]
+    async fn refuse_mainnet_write_refuses_only_a_mainnet_manager() {
+        let server = wiremock::MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            mainnet_signers_manager(&server, &dir).refuse_mainnet_write(),
+            Err(SaError::MainnetWriteForbidden)
+        ));
+
+        let testnet = crate::test_helpers::signers_manager_for_tests(
+            &server.uri(),
+            &server.uri(),
+            Arc::new(Mutex::new(
+                AuditWriter::open(dir.path().join("testnet.jsonl"), None).unwrap(),
+            )),
+            dir.path().join("testnet.jsonl"),
+            Duration::from_secs(1),
+        );
+        testnet.refuse_mainnet_write().unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_signer_refuses_mainnet_before_any_key_access_or_request() {
+        assert_mainnet_write_refused(|manager, signer| async move {
+            manager
+                .add_signer(
+                    mainnet_target(),
+                    1,
+                    delegated_signer_scval(),
+                    &signer,
+                    "req-add".to_owned(),
+                    false,
+                    false,
+                )
+                .await
+                .map(drop)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn remove_signer_refuses_mainnet_before_any_key_access_or_request() {
+        assert_mainnet_write_refused(|manager, signer| async move {
+            manager
+                .remove_signer(mainnet_target(), 1, 2, &signer, "req-remove".to_owned())
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_threshold_refuses_mainnet_before_any_key_access_or_request() {
+        assert_mainnet_write_refused(|manager, signer| async move {
+            manager
+                .set_threshold(mainnet_target(), 1, 1, &signer, "req-threshold".to_owned())
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_spending_limit_refuses_mainnet_before_any_key_access_or_request() {
+        assert_mainnet_write_refused(|manager, signer| async move {
+            manager
+                .set_spending_limit(
+                    mainnet_target(),
+                    2,
+                    &[ContextRuleId::new(0)],
+                    1_000,
+                    &signer,
+                    "req-limit".to_owned(),
+                )
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_weighted_threshold_refuses_mainnet_before_any_key_access_or_request() {
+        assert_mainnet_write_refused(|manager, signer| async move {
+            manager
+                .set_weighted_threshold(
+                    mainnet_target(),
+                    1,
+                    1,
+                    &[ContextRuleId::new(0)],
+                    &signer,
+                    "req-weighted".to_owned(),
+                )
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_signer_weight_refuses_mainnet_before_any_key_access_or_request() {
+        assert_mainnet_write_refused(|manager, signer| async move {
+            manager
+                .set_signer_weight(
+                    mainnet_target(),
+                    1,
+                    crate::weighted_threshold_policy::WeightedThresholdSignerInput::Delegated {
+                        g_strkey: SIMULATE_SENTINEL_G.to_owned(),
+                    },
+                    2,
+                    &[ContextRuleId::new(0)],
+                    &signer,
+                    "req-weight".to_owned(),
+                )
+                .await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn batch_add_signers_refuses_mainnet_before_any_key_access_or_request() {
+        assert_mainnet_write_refused(|manager, signer| async move {
+            manager
+                .batch_add_signers(
+                    mainnet_target(),
+                    1,
+                    vec![delegated_signer_scval()],
+                    &signer,
+                    "req-batch".to_owned(),
+                    false,
+                    false,
+                )
+                .await
+                .map(drop)
+        })
+        .await;
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    async fn add_signer_reaches_rpc_on_testnet() {
+        assert_testnet_write_reaches_rpc(|manager, signer| async move {
+            manager
+                .add_signer(
+                    testnet_target(),
+                    1,
+                    delegated_signer_scval(),
+                    &signer,
+                    "req-add".to_owned(),
+                    false,
+                    false,
+                )
+                .await
+                .map(drop)
+        })
+        .await;
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    async fn remove_signer_reaches_rpc_on_testnet() {
+        assert_testnet_write_reaches_rpc(|manager, signer| async move {
+            manager
+                .remove_signer(testnet_target(), 1, 2, &signer, "req-remove".to_owned())
+                .await
+        })
+        .await;
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    async fn set_threshold_reaches_rpc_on_testnet() {
+        assert_testnet_write_reaches_rpc(|manager, signer| async move {
+            manager
+                .set_threshold(testnet_target(), 1, 1, &signer, "req-threshold".to_owned())
+                .await
+        })
+        .await;
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    async fn set_spending_limit_reaches_rpc_on_testnet() {
+        assert_testnet_write_reaches_rpc(|manager, signer| async move {
+            manager
+                .set_spending_limit(
+                    testnet_target(),
+                    2,
+                    &[ContextRuleId::new(0)],
+                    1_000,
+                    &signer,
+                    "req-limit".to_owned(),
+                )
+                .await
+        })
+        .await;
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    async fn set_weighted_threshold_reaches_rpc_on_testnet() {
+        assert_testnet_write_reaches_rpc(|manager, signer| async move {
+            manager
+                .set_weighted_threshold(
+                    testnet_target(),
+                    1,
+                    1,
+                    &[ContextRuleId::new(0)],
+                    &signer,
+                    "req-weighted".to_owned(),
+                )
+                .await
+        })
+        .await;
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    async fn set_signer_weight_reaches_rpc_on_testnet() {
+        assert_testnet_write_reaches_rpc(|manager, signer| async move {
+            manager
+                .set_signer_weight(
+                    testnet_target(),
+                    1,
+                    crate::weighted_threshold_policy::WeightedThresholdSignerInput::Delegated {
+                        g_strkey: SIMULATE_SENTINEL_G.to_owned(),
+                    },
+                    2,
+                    &[ContextRuleId::new(0)],
+                    &signer,
+                    "req-weight".to_owned(),
+                )
+                .await
+        })
+        .await;
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    async fn batch_add_signers_reaches_rpc_on_testnet() {
+        assert_testnet_write_reaches_rpc(|manager, signer| async move {
+            manager
+                .batch_add_signers(
+                    testnet_target(),
+                    1,
+                    vec![delegated_signer_scval()],
+                    &signer,
+                    "req-batch".to_owned(),
+                    false,
+                    false,
+                )
+                .await
+                .map(drop)
+        })
+        .await;
     }
 }

@@ -343,6 +343,23 @@ pub(crate) mod test_fixtures {
             ),
         }
     }
+
+    /// Asserts the outcome `pin` predicts for a mainnet signing attempt with a
+    /// signer derived from the test seed: the enrolled pin is checked first,
+    /// and a signer that passes it meets the signing primitive's mainnet
+    /// refusal.
+    pub(crate) fn assert_enrolled_mainnet_signing_outcome<T: std::fmt::Debug>(
+        pin: EnrolledPin,
+        result: Result<T, WalletError>,
+    ) {
+        let expected = pin
+            .expected_refusal()
+            .unwrap_or("network.mainnet_write_forbidden");
+        assert_eq!(
+            result.expect_err("mainnet signing is refused").code(),
+            expected
+        );
+    }
 }
 
 #[cfg(test)]

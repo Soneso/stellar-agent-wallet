@@ -19,11 +19,12 @@
 //! - **Extensibility.** A future smart-account signing path (multi-sig,
 //!   passkey) implements `Signer` without touching the enum arms and without
 //!   breaking callers that hold `&dyn Signer`.
-//! - **API boundary.** `ClassicOpBuilder::sign` and
-//!   `submit_transaction_and_wait` take `&(dyn Signer + Send + Sync)`, so the
-//!   concrete type is invisible to the calling crate. An enum would need to be
-//!   `pub` in full and would expose the `HardwareSigningKey` concrete type at
-//!   the module boundary even when callers do not need it.
+//! - **API boundary.** `ClassicOpBuilder::build_and_sign`,
+//!   `envelope_signing::attach_signature` and the other signing points take
+//!   `&dyn Signer`, so the concrete type is invisible to the calling crate.
+//!   Submission takes an already signed envelope and no signer. An enum would
+//!   need to be `pub` in full and would expose the `HardwareSigningKey`
+//!   concrete type at the module boundary even when callers do not need it.
 //! - **Parity with `stellar-ledger`.** `stellar_ledger::signer::Blob` is
 //!   already a trait; mirroring that style keeps the two surfaces parallel.
 //!
@@ -44,6 +45,8 @@ pub mod envelope_signing;
 pub mod hardware;
 pub mod software;
 pub mod source;
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_doubles;
 pub(crate) mod verify_binding;
 pub mod wallet;
 
@@ -101,8 +104,13 @@ pub trait Signer: Send + Sync {
     ///
     /// Sanctioned call sites:
     ///
-    /// - **Primary:** `ClassicOpBuilder::sign` — SEP-23 transaction envelope
-    ///   signing via `envelope_signing::attach_signature`.
+    /// - **Primary:** `envelope_signing::attach_signature`: SEP-23
+    ///   transaction envelope signing, reached from
+    ///   `ClassicOpBuilder::build_and_sign` and
+    ///   `ClassicOpBuilder::build_and_sign_multi`; it refuses mainnet before
+    ///   any key access. Its mainnet sibling
+    ///   `envelope_signing::attach_signature_authorized` signs under a
+    ///   transaction authorization after the authorization's checks.
     /// - **Secondary — SEP-43 `signTransaction`:**
     ///   `stellar_agent_sep43::signing::sign_classic_transaction` — delegates to
     ///   `attach_signature`, which is the primary call site; this is therefore an
@@ -127,9 +135,11 @@ pub trait Signer: Send + Sync {
     ///   `sha256(network_id ‖ XDR)` preimage mechanism are identical; only the
     ///   tagged-transaction variant differs (`TxFeeBump` vs `Tx`), giving the
     ///   fee-bump its own network-id-bound hash distinct from the inner tx hash.
-    ///   A separate signing site is required because `attach_signature` is
-    ///   hard-wired to `TaggedTransaction::Tx` and rejects non-`Tx` envelopes.
-    ///   See CAP-0015.
+    ///   A separate signing site is required because the fee-bump envelope is
+    ///   built around the signed inner transaction and its fee source is
+    ///   checked against the signer's key before the signature;
+    ///   `attach_signature` signs an envelope that already exists, `Tx` or
+    ///   `TxFeeBump`. See CAP-0015.
     ///
     /// # Errors
     ///
@@ -160,8 +170,11 @@ pub trait Signer: Send + Sync {
     /// auth-entry assembly invokes `sign_auth_digest`, classic transaction
     /// signing invokes `sign_tx_payload`.
     ///
-    /// The single call site is
-    /// `stellar_agent_smart_account::managers::auth_entry::complete_authorization_entry`.
+    /// The call sites are the smart-account entry assemblers in
+    /// `stellar_agent_smart_account::managers::auth_entry`:
+    /// `complete_authorization_entry`,
+    /// `complete_authorization_entry_multi_signer`, and the mixed-signer
+    /// collector `collect_mixed_signer_entries`.
     ///
     /// # Errors
     ///

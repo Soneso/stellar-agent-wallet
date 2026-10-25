@@ -366,13 +366,22 @@ pub enum WindowStoreError {
 
     /// The file already holds a record under the reservation's id.
     ///
-    /// Produced by [`PersistedWindowStore::record_pending`], under the
-    /// store's lock. The id is the envelope hash of the signed bytes, so the
-    /// window has already counted these bytes: the submission that wrote the
-    /// record settles them. The duplicate is refused before another reservation
-    /// can count that spend. Nothing is written.
+    /// Produced by [`PersistedWindowStore::record_pending`], and by
+    /// [`PersistedWindowStore::consume_authorizations`] for an envelope the
+    /// window holds, under the store's lock. The id is the envelope hash of the
+    /// signed bytes, so the window has already counted these bytes: the
+    /// submission that wrote the record settles them. The duplicate is refused
+    /// before another reservation can count that spend. Nothing is written.
     #[error("the spending window already holds a reservation for these signed bytes")]
     DuplicateReservation,
+
+    /// An earlier authorization consumed this transaction's envelope hash.
+    ///
+    /// Produced by [`PersistedWindowStore::consume_authorizations`] under the
+    /// store's lock, even when the earlier authorization had no holds.
+    /// Nothing is written.
+    #[error("the authorization ledger already consumed these signed bytes")]
+    DuplicateConsumption,
 
     /// A mainnet authorization transition refused: a precondition of the mint,
     /// the consumption, or the invalidation does not hold. The store file is not written.

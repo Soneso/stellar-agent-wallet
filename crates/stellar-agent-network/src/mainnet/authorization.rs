@@ -959,6 +959,13 @@ debug_impl!(
 impl MainnetTxSignAuthorization {
     shared_methods!();
 
+    /// An authorization over directly assembled facts, for this crate's tests
+    /// of the paths that consume one.
+    #[cfg(all(test, feature = "mainnet-write"))]
+    pub(crate) fn for_crate_tests(inner: TxSignInner) -> Self {
+        Self(inner)
+    }
+
     gated_method! {
         /// Requires `sha256` to be the bound unsigned envelope digest.
         ///
@@ -1010,6 +1017,13 @@ impl MainnetTxSignAuthorization {
 
 impl MainnetSorobanIntentAuthorization {
     shared_methods!();
+
+    /// An authorization over directly assembled facts, for this crate's tests
+    /// of the paths that consume one.
+    #[cfg(all(test, feature = "mainnet-write"))]
+    pub(crate) fn for_crate_tests(inner: SorobanIntentInner) -> Self {
+        Self(inner)
+    }
 
     gated_method! {
         /// Requires `digest` to be the bound Soroban intent digest.

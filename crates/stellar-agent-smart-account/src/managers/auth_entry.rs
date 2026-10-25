@@ -6,6 +6,7 @@
 //! `Signer::sign_auth_digest` sibling primitive.
 
 use sha2::{Digest as _, Sha256};
+use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 use stellar_agent_core::smart_account::auth_digest::compute_auth_digest;
 use stellar_agent_core::smart_account::rule_id::{ContextRuleId, encode_context_rule_ids};
 use stellar_agent_network::signing::Signer;
@@ -122,11 +123,19 @@ pub struct AuthorizationSimulation {
 /// Stores the digest bytes that must be signed for OZ v0.7.2 `__check_auth`.
 /// Preserves the Soroban-side root invocation and address-credential fields
 /// needed to complete the auth entry.
+///
+/// The fields are public, so the digests are only as trustworthy as the
+/// facts they were computed from: [`Self::validate`] recomputes both from
+/// `network_id`, `nonce`, `signature_expiration_ledger`, `root_invocation`
+/// and `context_rule_ids`, and every function in this crate that signs a
+/// partial calls it before any signer key access.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PartialSorobanAuthorizationEntry {
     /// Smart-account contract address whose credentials will carry the signature.
     pub smart_account: ScAddress,
+    /// SHA-256 network ID the `signature_payload` commits to.
+    pub network_id: [u8; 32],
     /// Soroban address-credential nonce obtained from simulation.
     pub nonce: i64,
     /// Signature expiration ledger obtained from simulation.
@@ -139,6 +148,81 @@ pub struct PartialSorobanAuthorizationEntry {
     pub auth_digest: [u8; 32],
     /// Context-rule IDs bound into `auth_digest`.
     pub context_rule_ids: Vec<ContextRuleId>,
+}
+
+impl PartialSorobanAuthorizationEntry {
+    /// Checks that the entry may be signed: its network is not mainnet, and
+    /// its `signature_payload` and `auth_digest` are the values its own facts
+    /// produce.
+    ///
+    /// Recomputes `signature_payload` from `network_id`, `nonce`,
+    /// `signature_expiration_ledger` and `root_invocation`, and `auth_digest`
+    /// from that payload and `context_rule_ids`, so `network_id` cannot
+    /// misstate the network the signature commits to. `smart_account` is
+    /// part of neither digest and is not checked.
+    ///
+    /// # Errors
+    ///
+    /// - [`SaError::MainnetWriteForbidden`]: `network_id` is the mainnet
+    ///   network ID.
+    /// - [`SaError::AuthEntryBindingMismatch`] with `field`
+    ///   `"signature_payload"` or `"auth_digest"`: the stored digest differs
+    ///   from the recomputed one.
+    /// - [`SaError::AuthEntryConstructionFailed`] at stage
+    ///   `"signature_payload"` or `"context_rule_ids"`: the recomputation
+    ///   could not encode its XDR input.
+    pub fn validate(&self) -> Result<(), SaError> {
+        if self.network_id == network_id_of(MAINNET_PASSPHRASE) {
+            return Err(SaError::MainnetWriteForbidden);
+        }
+        let (signature_payload, auth_digest) = derive_digests(
+            self.network_id,
+            self.nonce,
+            self.signature_expiration_ledger,
+            &self.root_invocation,
+            &self.context_rule_ids,
+        )?;
+        if signature_payload != self.signature_payload {
+            return Err(SaError::AuthEntryBindingMismatch {
+                field: "signature_payload",
+            });
+        }
+        if auth_digest != self.auth_digest {
+            return Err(SaError::AuthEntryBindingMismatch {
+                field: "auth_digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// SHA-256 of a network passphrase: the network ID a Soroban authorization
+/// preimage commits to.
+pub(crate) fn network_id_of(network_passphrase: &str) -> [u8; 32] {
+    Sha256::digest(network_passphrase.as_bytes()).into()
+}
+
+/// Refuses a passphrase that names mainnet, or whose network ID differs from
+/// the network ID `partial` commits to, and validates `partial`.
+///
+/// The boundary for every signing function that takes a partial together
+/// with a passphrase: the passphrase drives the delegated G-key entries, the
+/// partial drives the smart-account entry, and both must name one non-mainnet
+/// network.
+fn check_partial_against_passphrase(
+    partial: &PartialSorobanAuthorizationEntry,
+    network_passphrase: &str,
+) -> Result<(), SaError> {
+    if network_passphrase == MAINNET_PASSPHRASE {
+        return Err(SaError::MainnetWriteForbidden);
+    }
+    partial.validate()?;
+    if network_id_of(network_passphrase) != partial.network_id {
+        return Err(SaError::AuthEntryBindingMismatch {
+            field: "network_id",
+        });
+    }
+    Ok(())
 }
 
 /// Builds pre-signature state for a smart-account-targeted invocation.
@@ -254,28 +338,52 @@ pub async fn build_authorization_entry_with_sub_invocations(
         args,
         sub_invocations,
     )?;
-    let signature_payload = compute_signature_payload(
+    let (signature_payload, auth_digest) = derive_digests(
         simulation.network_id,
         simulation.nonce,
         simulation.signature_expiration_ledger,
-        root_invocation.clone(),
+        &root_invocation,
+        &rule_ids,
     )?;
-    let rule_ids_xdr =
-        encode_context_rule_ids(&rule_ids).map_err(|e| SaError::AuthEntryConstructionFailed {
-            stage: "context_rule_ids",
-            redacted_reason: format!("context_rule_ids XDR encode failed before signing: {e}"),
-        })?;
-    let auth_digest = compute_auth_digest(&signature_payload, &rule_ids_xdr);
 
     Ok(PartialSorobanAuthorizationEntry {
         smart_account: target_contract,
+        network_id: simulation.network_id,
         nonce: simulation.nonce,
         signature_expiration_ledger: simulation.signature_expiration_ledger,
         root_invocation,
         signature_payload,
-        auth_digest: *auth_digest.as_bytes(),
+        auth_digest,
         context_rule_ids: rule_ids,
     })
+}
+
+/// Derives the Soroban authorization `signature_payload` and the
+/// smart-account `auth_digest` from the facts they commit to.
+///
+/// The one derivation shared by the builder and by
+/// [`PartialSorobanAuthorizationEntry::validate`], so a partial validates
+/// exactly when its digests are the ones the builder would produce.
+fn derive_digests(
+    network_id: [u8; 32],
+    nonce: i64,
+    signature_expiration_ledger: u32,
+    root_invocation: &SorobanAuthorizedInvocation,
+    rule_ids: &[ContextRuleId],
+) -> Result<([u8; 32], [u8; 32]), SaError> {
+    let signature_payload = compute_signature_payload(
+        network_id,
+        nonce,
+        signature_expiration_ledger,
+        root_invocation.clone(),
+    )?;
+    let rule_ids_xdr =
+        encode_context_rule_ids(rule_ids).map_err(|e| SaError::AuthEntryConstructionFailed {
+            stage: "context_rule_ids",
+            redacted_reason: format!("context_rule_ids XDR encode failed before signing: {e}"),
+        })?;
+    let auth_digest = compute_auth_digest(&signature_payload, &rule_ids_xdr);
+    Ok((signature_payload, *auth_digest.as_bytes()))
 }
 
 fn root_contract_invocation(
@@ -343,17 +451,20 @@ fn compute_signature_payload(
 /// `context_rule_ids` and verifies the signature; a sponsor-rewritten
 /// `context_rule_ids` produces a different digest and the verification fails.
 ///
-/// The function calls [`Signer::public_key`] once to derive the user's
-/// Stellar address, then [`Signer::sign_auth_digest`] once to produce the
-/// 64-byte ed25519 signature, then assembles the on-chain canonical
-/// `AuthPayload` ScVal and wraps it
-/// in [`SorobanCredentials::Address`].
+/// The function first validates `partial` with
+/// [`PartialSorobanAuthorizationEntry::validate`], then calls
+/// [`Signer::public_key`] once to derive the user's Stellar address, then
+/// [`Signer::sign_auth_digest`] once to produce the 64-byte ed25519
+/// signature, then assembles the on-chain canonical `AuthPayload` ScVal and
+/// wraps it in [`SorobanCredentials::Address`].
 ///
-/// # Single call site
+/// # Call sites
 ///
-/// This is the single call site of [`Signer::sign_auth_digest`] across the
-/// workspace. Any additional caller is architecturally invalid — smart-account
-/// code paths must not invoke the `sign_tx_payload` primitive.
+/// One of the three call sites of [`Signer::sign_auth_digest`] in the
+/// workspace, beside [`complete_authorization_entry_multi_signer`] and the
+/// crate-internal mixed-signer collector; each validates its partial before
+/// any signer key access. Smart-account code paths must not invoke the
+/// `sign_tx_payload` primitive.
 ///
 /// # AuthPayload shape (OZ canonical)
 ///
@@ -374,6 +485,10 @@ fn compute_signature_payload(
 ///
 /// # Errors
 ///
+/// - [`SaError::MainnetWriteForbidden`] and
+///   [`SaError::AuthEntryBindingMismatch`]: `partial` fails
+///   [`PartialSorobanAuthorizationEntry::validate`]; no signer method was
+///   called.
 /// - [`SaError::AuthEntryConstructionFailed`] with `stage = "auth_payload"` —
 ///   signer `public_key()` fetch or `sign_auth_digest()` failure, or any of
 ///   the bounded ScVal/ScMap/VecM/BytesM conversions used to build the
@@ -386,6 +501,8 @@ pub async fn complete_authorization_entry(
     partial: PartialSorobanAuthorizationEntry,
     signer: &(dyn Signer + Send + Sync),
 ) -> Result<SorobanAuthorizationEntry, SaError> {
+    partial.validate()?;
+
     let pubkey = signer
         .public_key()
         .await
@@ -667,6 +784,11 @@ fn build_multi_signer_auth_payload_scval(
 ///
 /// # Errors
 ///
+/// Returns [`SaError::MainnetWriteForbidden`] or
+/// [`SaError::AuthEntryBindingMismatch`] when `partial` fails
+/// [`PartialSorobanAuthorizationEntry::validate`], before any signer method
+/// is called.
+///
 /// Returns [`SaError::AuthEntryConstructionFailed`] with `stage = "auth_payload"` on:
 /// - `signers` is empty.
 /// - Any signer's `public_key()` fetch fails.
@@ -677,6 +799,8 @@ pub async fn complete_authorization_entry_multi_signer(
     partial: PartialSorobanAuthorizationEntry,
     signers: &[&(dyn Signer + Send + Sync)],
 ) -> Result<SorobanAuthorizationEntry, SaError> {
+    partial.validate()?;
+
     if signers.is_empty() {
         return Err(SaError::AuthEntryConstructionFailed {
             stage: "auth_payload",
@@ -811,17 +935,35 @@ pub(crate) struct MixedSigner<'a> {
 /// The returned vector is `[smart_account_entry, delegated_g_key_entry*]`; its
 /// length is `1 + (number of Delegated signers)`.
 ///
+/// # Mainnet and network binding
+///
+/// This is the boundary for [`sign_with_ed25519_rule`] and for the
+/// External-Ed25519 arm of `submit_signed_invoke`. Before any signer key
+/// access it refuses a mainnet `network_passphrase`, validates `partial`
+/// with [`PartialSorobanAuthorizationEntry::validate`], and refuses a
+/// `network_passphrase` whose network ID differs from `partial.network_id`,
+/// so the smart-account entry and the delegated G-key entries are signed for
+/// one network.
+///
 /// # Errors
 ///
-/// Returns [`SaError::AuthEntryConstructionFailed`] with `stage = "auth_payload"`
-/// when `signers` is empty, when any signer's `public_key()` / `sign_auth_digest()`
-/// fails, or on any XDR encoding failure.
+/// - [`SaError::MainnetWriteForbidden`]: `network_passphrase` is the mainnet
+///   passphrase, or `partial.network_id` is the mainnet network ID.
+/// - [`SaError::AuthEntryBindingMismatch`]: `partial` fails validation
+///   (`field` `"signature_payload"` or `"auth_digest"`), or
+///   `network_passphrase` names another network than `partial.network_id`
+///   (`field` `"network_id"`).
+/// - [`SaError::AuthEntryConstructionFailed`] with `stage = "auth_payload"`
+///   when `signers` is empty, when any signer's `public_key()` /
+///   `sign_auth_digest()` fails, or on any XDR encoding failure.
 pub(crate) async fn collect_mixed_signer_entries(
     partial: PartialSorobanAuthorizationEntry,
     signers: &[MixedSigner<'_>],
     signature_expiration_ledger: u32,
     network_passphrase: &str,
 ) -> Result<Vec<SorobanAuthorizationEntry>, SaError> {
+    check_partial_against_passphrase(&partial, network_passphrase)?;
+
     if signers.is_empty() {
         return Err(SaError::AuthEntryConstructionFailed {
             stage: "auth_payload",
@@ -925,8 +1067,20 @@ pub(crate) async fn collect_mixed_signer_entries(
 /// — which produces a raw ed25519 signature over exactly those 32 bytes — is the
 /// correct primitive.
 ///
+/// # Mainnet
+///
+/// The mixed-signer collector is this function's mainnet and network-binding
+/// boundary: it refuses a mainnet passphrase, a mainnet
+/// `simulation.network_id` and a passphrase naming another network than the
+/// simulation before any signer key access. Building the partial touches no
+/// key, so this function carries no check of its own.
+///
 /// # Errors
 ///
+/// - [`SaError::MainnetWriteForbidden`]: `network_passphrase` or
+///   `simulation.network_id` names mainnet.
+/// - [`SaError::AuthEntryBindingMismatch`]: `network_passphrase` names
+///   another network than `simulation.network_id`.
 /// - [`SaError::RuleIdMismatch`] — `rule_ids` empty or misaligned with the
 ///   simulation auth-context list.
 /// - [`SaError::SimulationDivergence`] — the simulation context diverges from
@@ -1006,8 +1160,18 @@ pub async fn sign_with_ed25519_rule(
 ///    nonce, giving collision-resistance under same-millisecond retries rather
 ///    than a millisecond-timestamp source.
 ///
+/// # Mainnet
+///
+/// Refuses a mainnet `network_passphrase` before any signer key access. The
+/// `auth_digest` is opaque here: the network it was computed for is the
+/// caller's declaration, so every caller validates the partial the digest
+/// comes from, with [`PartialSorobanAuthorizationEntry::validate`] and
+/// against `network_passphrase`, before calling this function.
+///
 /// # Errors
 ///
+/// - [`SaError::MainnetWriteForbidden`] if `network_passphrase` is the
+///   mainnet passphrase.
 /// - [`SaError::AuthEntryConstructionFailed`] (`stage = "auth_payload"`)
 ///   if XDR encoding, ScVal construction, or `Signer` operations fail.
 pub(crate) async fn build_and_sign_delegated_g_key_entry(
@@ -1022,6 +1186,10 @@ pub(crate) async fn build_and_sign_delegated_g_key_entry(
         ScBytes, SorobanAddressCredentials, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
         SorobanCredentials, Uint256, WriteXdr,
     };
+
+    if network_passphrase == MAINNET_PASSPHRASE {
+        return Err(SaError::MainnetWriteForbidden);
+    }
 
     let auth_payload_err = |reason: String| SaError::AuthEntryConstructionFailed {
         stage: "auth_payload",
@@ -1088,7 +1256,7 @@ pub(crate) async fn build_and_sign_delegated_g_key_entry(
     };
 
     // Compute the Soroban auth-entry signature_payload.
-    let network_id: [u8; 32] = Sha256::digest(network_passphrase.as_bytes()).into();
+    let network_id = network_id_of(network_passphrase);
     let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
         network_id: Hash(network_id),
         nonce,
@@ -1372,7 +1540,13 @@ pub mod test_helpers {
     use sha2::{Digest as _, Sha256};
     use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 
-    use super::AuthorizationSimulation;
+    use stellar_xdr::{ScAddress, ScSymbol, VecM};
+
+    use super::{
+        AuthorizationSimulation, PartialSorobanAuthorizationEntry, derive_digests, network_id_of,
+        root_contract_invocation,
+    };
+    use crate::SaError;
     use crate::signing::divergence::{
         AuthContextFingerprint, EnvelopeContext, FeeEnvelopeContext, NetworkContext,
         SequenceContext, SimulationContext,
@@ -1451,6 +1625,58 @@ pub mod test_helpers {
             fee_envelope: simulation.context.fee_envelope.clone(),
         }
     }
+
+    /// Returns a [`PartialSorobanAuthorizationEntry`] for `smart_account`
+    /// whose digests are derived for the network of `network_passphrase` and
+    /// for `rule_ids`, so it passes
+    /// [`PartialSorobanAuthorizationEntry::validate`] unless the passphrase
+    /// names mainnet.
+    ///
+    /// The root invocation is a no-argument `execute` call on
+    /// `smart_account`; the nonce and expiration are the stable values of
+    /// [`baseline_authorization_simulation`] (42 / 9999).
+    ///
+    /// # Errors
+    ///
+    /// [`SaError::AuthEntryConstructionFailed`] if the digest inputs cannot
+    /// be XDR-encoded, which bounded fixture inputs never trigger.
+    pub fn partial_authorization_entry(
+        smart_account: ScAddress,
+        network_passphrase: &str,
+        rule_ids: Vec<ContextRuleId>,
+    ) -> Result<PartialSorobanAuthorizationEntry, SaError> {
+        let network_id = network_id_of(network_passphrase);
+        let function_name =
+            ScSymbol::try_from("execute").map_err(|e| SaError::AuthEntryConstructionFailed {
+                stage: "auth_contexts_args",
+                redacted_reason: format!("fixture function symbol encode failed: {e:?}"),
+            })?;
+        let root_invocation = root_contract_invocation(
+            smart_account.clone(),
+            function_name,
+            Vec::new(),
+            VecM::default(),
+        )?;
+        let nonce = 42;
+        let signature_expiration_ledger = 9999;
+        let (signature_payload, auth_digest) = derive_digests(
+            network_id,
+            nonce,
+            signature_expiration_ledger,
+            &root_invocation,
+            &rule_ids,
+        )?;
+        Ok(PartialSorobanAuthorizationEntry {
+            smart_account,
+            network_id,
+            nonce,
+            signature_expiration_ledger,
+            root_invocation,
+            signature_payload,
+            auth_digest,
+            context_rule_ids: rule_ids,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1466,6 +1692,11 @@ mod tests {
     use crate::signing::divergence::{
         AuthContextFingerprint, FeeEnvelopeContext, NetworkContext, SequenceContext,
     };
+    use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+    use stellar_agent_network::signing::test_doubles::CountingSigner;
+
+    /// A non-mainnet network other than testnet.
+    const FUTURENET_PASSPHRASE: &str = "Test SDF Future Network ; October 2022";
 
     fn contract_address(byte: u8) -> ScAddress {
         ScAddress::Contract(stellar_xdr::ContractId(Hash([byte; 32])))
@@ -1502,7 +1733,7 @@ mod tests {
         };
         let simulation = AuthorizationSimulation {
             context,
-            network_id: [9; 32],
+            network_id: network_id_of(TESTNET_PASSPHRASE),
             nonce: 123,
             signature_expiration_ledger: 456,
         };
@@ -2743,5 +2974,363 @@ mod tests {
             redacted_reason,
             "pin_plan exceeded collective pre-submit budget of 4s"
         );
+    }
+
+    // ── Mainnet refusal and network binding before any key access ───────────
+
+    /// A validated partial for the smart account `contract_address(7)` over
+    /// rule 42, derived for the network of `network_passphrase`.
+    fn partial_on(network_passphrase: &str) -> PartialSorobanAuthorizationEntry {
+        test_helpers::partial_authorization_entry(
+            contract_address(7),
+            network_passphrase,
+            vec![ContextRuleId::new(42)],
+        )
+        .unwrap()
+    }
+
+    /// A testnet partial whose `auth_digest` differs from the recomputed one.
+    fn tampered_testnet_partial() -> PartialSorobanAuthorizationEntry {
+        let mut partial = partial_on(TESTNET_PASSPHRASE);
+        partial.auth_digest[0] ^= 0x01;
+        partial
+    }
+
+    fn external_signer(signer: &CountingSigner) -> [MixedSigner<'_>; 1] {
+        [MixedSigner {
+            signer,
+            kind: MixedSignerKind::ExternalEd25519 {
+                verifier: contract_address(0xC1),
+            },
+        }]
+    }
+
+    #[test]
+    fn validate_accepts_a_testnet_partial_from_the_builder_derivation() {
+        partial_on(TESTNET_PASSPHRASE).validate().unwrap();
+    }
+
+    #[test]
+    fn validate_refuses_a_mainnet_network_id() {
+        let partial = partial_on(MAINNET_PASSPHRASE);
+
+        assert!(matches!(
+            partial.validate(),
+            Err(SaError::MainnetWriteForbidden)
+        ));
+    }
+
+    #[test]
+    fn validate_refuses_a_changed_signature_payload() {
+        let mut partial = partial_on(TESTNET_PASSPHRASE);
+        partial.signature_payload[31] ^= 0x01;
+
+        assert!(matches!(
+            partial.validate(),
+            Err(SaError::AuthEntryBindingMismatch {
+                field: "signature_payload"
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_refuses_a_changed_auth_digest() {
+        assert!(matches!(
+            tampered_testnet_partial().validate(),
+            Err(SaError::AuthEntryBindingMismatch {
+                field: "auth_digest"
+            })
+        ));
+    }
+
+    /// The network ID cannot be restated without the digests: a testnet
+    /// partial relabelled as futurenet no longer validates.
+    #[test]
+    fn validate_refuses_a_network_id_the_digests_were_not_computed_for() {
+        let mut partial = partial_on(TESTNET_PASSPHRASE);
+        partial.network_id = network_id_of(FUTURENET_PASSPHRASE);
+
+        assert!(matches!(
+            partial.validate(),
+            Err(SaError::AuthEntryBindingMismatch {
+                field: "signature_payload"
+            })
+        ));
+    }
+
+    /// The context-rule IDs are bound into `auth_digest`: a rewritten rule
+    /// list no longer validates.
+    #[test]
+    fn validate_refuses_changed_context_rule_ids() {
+        let mut partial = partial_on(TESTNET_PASSPHRASE);
+        partial.context_rule_ids = vec![ContextRuleId::new(43)];
+
+        assert!(matches!(
+            partial.validate(),
+            Err(SaError::AuthEntryBindingMismatch {
+                field: "auth_digest"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_authorization_entry_signs_a_testnet_partial() {
+        let signer = CountingSigner::new([0x41; 32]);
+
+        complete_authorization_entry(partial_on(TESTNET_PASSPHRASE), &signer)
+            .await
+            .unwrap();
+
+        assert_eq!(signer.public_key_calls(), 1);
+        assert_eq!(signer.sign_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn complete_authorization_entry_refuses_a_mainnet_partial_before_any_key_access() {
+        let signer = CountingSigner::new([0x41; 32]);
+
+        let err = complete_authorization_entry(partial_on(MAINNET_PASSPHRASE), &signer)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, SaError::MainnetWriteForbidden), "{err:?}");
+        assert_eq!(err.wire_code(), "network.mainnet_write_forbidden");
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    async fn complete_authorization_entry_refuses_a_tampered_digest_before_any_key_access() {
+        let signer = CountingSigner::new([0x41; 32]);
+
+        let err = complete_authorization_entry(tampered_testnet_partial(), &signer)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                SaError::AuthEntryBindingMismatch {
+                    field: "auth_digest"
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.wire_code(), "sa.auth_entry_binding_mismatch");
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    async fn complete_authorization_entry_multi_signer_signs_a_testnet_partial() {
+        let a = CountingSigner::new([0x42; 32]);
+        let b = CountingSigner::new([0x43; 32]);
+
+        complete_authorization_entry_multi_signer(partial_on(TESTNET_PASSPHRASE), &[&a, &b])
+            .await
+            .unwrap();
+
+        assert_eq!(a.key_accesses() + b.key_accesses(), 4);
+    }
+
+    #[tokio::test]
+    async fn complete_authorization_entry_multi_signer_refuses_a_mainnet_partial_before_any_key_access()
+     {
+        let a = CountingSigner::new([0x42; 32]);
+        let b = CountingSigner::new([0x43; 32]);
+
+        let err =
+            complete_authorization_entry_multi_signer(partial_on(MAINNET_PASSPHRASE), &[&a, &b])
+                .await
+                .unwrap_err();
+
+        assert!(matches!(err, SaError::MainnetWriteForbidden), "{err:?}");
+        assert_eq!(a.key_accesses() + b.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    async fn complete_authorization_entry_multi_signer_refuses_a_tampered_digest_before_any_key_access()
+     {
+        let a = CountingSigner::new([0x42; 32]);
+        let b = CountingSigner::new([0x43; 32]);
+
+        let err = complete_authorization_entry_multi_signer(tampered_testnet_partial(), &[&a, &b])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                SaError::AuthEntryBindingMismatch {
+                    field: "auth_digest"
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(a.key_accesses() + b.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    async fn collect_mixed_signer_entries_signs_a_testnet_partial_with_the_testnet_passphrase() {
+        let signer = CountingSigner::new([0x44; 32]);
+
+        let entries = collect_mixed_signer_entries(
+            partial_on(TESTNET_PASSPHRASE),
+            &external_signer(&signer),
+            9999,
+            TESTNET_PASSPHRASE,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(signer.key_accesses(), 2);
+    }
+
+    #[tokio::test]
+    async fn collect_mixed_signer_entries_refuses_the_mainnet_passphrase_before_any_key_access() {
+        let signer = CountingSigner::new([0x44; 32]);
+
+        let err = collect_mixed_signer_entries(
+            partial_on(TESTNET_PASSPHRASE),
+            &external_signer(&signer),
+            9999,
+            MAINNET_PASSPHRASE,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, SaError::MainnetWriteForbidden), "{err:?}");
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    async fn collect_mixed_signer_entries_refuses_a_mainnet_partial_before_any_key_access() {
+        let signer = CountingSigner::new([0x44; 32]);
+
+        let err = collect_mixed_signer_entries(
+            partial_on(MAINNET_PASSPHRASE),
+            &external_signer(&signer),
+            9999,
+            TESTNET_PASSPHRASE,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, SaError::MainnetWriteForbidden), "{err:?}");
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    async fn collect_mixed_signer_entries_refuses_a_tampered_digest_before_any_key_access() {
+        let signer = CountingSigner::new([0x44; 32]);
+
+        let err = collect_mixed_signer_entries(
+            tampered_testnet_partial(),
+            &external_signer(&signer),
+            9999,
+            TESTNET_PASSPHRASE,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                SaError::AuthEntryBindingMismatch {
+                    field: "auth_digest"
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    async fn collect_mixed_signer_entries_refuses_a_passphrase_of_another_network_before_any_key_access()
+     {
+        let signer = CountingSigner::new([0x44; 32]);
+
+        let err = collect_mixed_signer_entries(
+            partial_on(TESTNET_PASSPHRASE),
+            &external_signer(&signer),
+            9999,
+            FUTURENET_PASSPHRASE,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                SaError::AuthEntryBindingMismatch {
+                    field: "network_id"
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.wire_code(), "sa.auth_entry_binding_mismatch");
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    /// The rule signer reaches the collector's mainnet refusal before any key
+    /// access; the function has no check of its own.
+    #[tokio::test]
+    async fn sign_with_ed25519_rule_refuses_the_mainnet_passphrase_before_any_key_access() {
+        let (simulation, envelope) = contexts();
+        let signer = CountingSigner::new([0x45; 32]);
+
+        let err = sign_with_ed25519_rule(
+            contract_address(7),
+            symbol("transfer"),
+            vec![],
+            vec![ContextRuleId::new(42)],
+            &simulation,
+            &envelope,
+            &signer,
+            contract_address(0xC1),
+            MAINNET_PASSPHRASE,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, SaError::MainnetWriteForbidden), "{err:?}");
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    async fn build_and_sign_delegated_g_key_entry_signs_on_testnet() {
+        let signer = CountingSigner::new([0x46; 32]);
+        let partial = partial_on(TESTNET_PASSPHRASE);
+
+        build_and_sign_delegated_g_key_entry(
+            &partial.smart_account,
+            &partial.auth_digest,
+            9999,
+            &signer,
+            TESTNET_PASSPHRASE,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(signer.key_accesses(), 2);
+    }
+
+    #[tokio::test]
+    async fn build_and_sign_delegated_g_key_entry_refuses_the_mainnet_passphrase_before_any_key_access()
+     {
+        let signer = CountingSigner::new([0x46; 32]);
+        let partial = partial_on(TESTNET_PASSPHRASE);
+
+        let err = build_and_sign_delegated_g_key_entry(
+            &partial.smart_account,
+            &partial.auth_digest,
+            9999,
+            &signer,
+            MAINNET_PASSPHRASE,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, SaError::MainnetWriteForbidden), "{err:?}");
+        assert_eq!(signer.key_accesses(), 0);
     }
 }

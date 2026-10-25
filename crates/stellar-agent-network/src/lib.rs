@@ -133,8 +133,8 @@ pub use submission_record::{
     WalletSubmissionRecorder,
 };
 pub use submit::{
-    SubmissionResult, SubmissionSignerKind, envelope_hash_hex, redact_tx_hash,
-    refuse_mainnet_write, submit_transaction_and_wait,
+    MainnetSubmitGrant, SubmissionResult, SubmissionSignerKind, envelope_hash_hex, redact_tx_hash,
+    refuse_mainnet_write, submit_authorized_transaction_and_wait, submit_transaction_and_wait,
 };
 pub use transaction_record::TransactionRecord;
 pub use wasm_hash::{

@@ -149,6 +149,7 @@ stellar-governance = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+stellar-agent-network = { workspace = true, features = ["test-helpers"] }
 static_assertions = { workspace = true }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["verifier-registry", "wiremock-helpers", "test-helpers"] }
 stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }

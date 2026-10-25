@@ -37,9 +37,10 @@ use thiserror::Error;
 use crate::SaError;
 use crate::managers::auth_entry::{
     AuthorizationSimulation, PartialSorobanAuthorizationEntry, build_authorization_entry,
-    complete_authorization_entry_multi_signer,
+    complete_authorization_entry_multi_signer, network_id_of,
 };
 use crate::managers::rules::build_and_sign_delegated_g_key_entry;
+use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -304,6 +305,22 @@ pub enum QuorumError {
     /// Wire code: `sa.quorum.empty_authorization_info`.
     #[error("AuthorizationInfo has no groups (fail-closed)")]
     EmptyAuthorizationInfo,
+
+    /// Quorum signing was refused before any signer key access: the
+    /// passphrase names mainnet, or the passphrase and the simulation name
+    /// different networks.
+    ///
+    /// A mismatch shares the mainnet code because the delegated G-key entries
+    /// are signed for the passphrase and the smart-account entry for the
+    /// simulation's network ID: with the two apart, the declared network does
+    /// not establish which network a signature commits to.
+    ///
+    /// Wire code: `sa.quorum.mainnet_write_forbidden`.
+    #[error(
+        "quorum signing refused: the network is mainnet, or the passphrase and the simulation \
+         name different networks"
+    )]
+    MainnetWriteForbidden,
 }
 
 impl QuorumError {
@@ -340,6 +357,7 @@ impl QuorumError {
             }
             Self::SignatureProductionFailed { .. } => "sa.quorum.signature_production_failed",
             Self::EmptyAuthorizationInfo => "sa.quorum.empty_authorization_info",
+            Self::MainnetWriteForbidden => "sa.quorum.mainnet_write_forbidden",
         }
     }
 }
@@ -401,8 +419,21 @@ impl QuorumError {
 /// When `authz.combinator == Combinator::Or`, only the entries from the first
 /// satisfied group are returned.
 ///
+/// # Mainnet and network binding
+///
+/// Before resolving any signer's public key, the function refuses a mainnet
+/// `network_passphrase`, and a `network_passphrase` whose network ID differs
+/// from `simulation.network_id`. Together the two refuse a mainnet
+/// `simulation.network_id` too: with the networks equal it is the mainnet
+/// passphrase's, and with them apart the second check fires. The shared
+/// partial is validated again by the multi-signer completer before any
+/// signature.
+///
 /// # Errors
 ///
+/// - [`QuorumError::MainnetWriteForbidden`]: `network_passphrase` or
+///   `simulation.network_id` names mainnet, or the two name different
+///   networks; no signer method was called.
 /// - [`QuorumError::EmptyAuthorizationInfo`] — `authz.groups` is empty.
 /// - [`QuorumError::InsufficientSignersInGroup`] — a group does not have
 ///   enough qualifying signers (AND path: first such group; OR path: reported
@@ -437,6 +468,13 @@ pub async fn collect_quorum_signatures(
     network_passphrase: &str,
     signature_expiration_ledger: u32,
 ) -> Result<Vec<SorobanAuthorizationEntry>, QuorumError> {
+    if network_passphrase == MAINNET_PASSPHRASE {
+        return Err(QuorumError::MainnetWriteForbidden);
+    }
+    if network_id_of(network_passphrase) != simulation.network_id {
+        return Err(QuorumError::MainnetWriteForbidden);
+    }
+
     if authz.groups.is_empty() {
         return Err(QuorumError::EmptyAuthorizationInfo);
     }
@@ -872,6 +910,10 @@ mod tests {
             QuorumError::SignatureProductionFailed { detail: "x".into() }.wire_code(),
             "sa.quorum.signature_production_failed"
         );
+        assert_eq!(
+            QuorumError::MainnetWriteForbidden.wire_code(),
+            "sa.quorum.mainnet_write_forbidden"
+        );
     }
 
     // ── AuthorizationInfo construction ────────────────────────────────────────
@@ -1012,7 +1054,7 @@ mod tests {
                     resource_fee: 1000,
                 },
             },
-            network_id: [9u8; 32],
+            network_id: network_id_of("Test SDF Network ; September 2015"),
             nonce: 42,
             signature_expiration_ledger: 100,
         };
@@ -1089,7 +1131,7 @@ mod tests {
                     resource_fee: 1000,
                 },
             },
-            network_id: [9u8; 32],
+            network_id: network_id_of("Test SDF Network ; September 2015"),
             nonce: 42,
             signature_expiration_ledger: 100,
         };
@@ -1170,7 +1212,7 @@ mod tests {
                     resource_fee: 1000,
                 },
             },
-            network_id: [9u8; 32],
+            network_id: network_id_of("Test SDF Network ; September 2015"),
             nonce: 42,
             signature_expiration_ledger: 100,
         };
@@ -1249,7 +1291,7 @@ mod tests {
                     resource_fee: 1000,
                 },
             },
-            network_id: [9u8; 32],
+            network_id: network_id_of("Test SDF Network ; September 2015"),
             nonce: 42,
             signature_expiration_ledger: 100,
         };
@@ -1286,5 +1328,117 @@ mod tests {
         }
         // Any other error (auth-entry construction fails without live RPC) is acceptable
         // in this offline unit test.
+    }
+
+    // ── Mainnet refusal and network binding before any key access ───────────
+
+    /// A non-mainnet network other than testnet.
+    const FUTURENET_PASSPHRASE: &str = "Test SDF Future Network ; October 2022";
+
+    /// Runs a 1-of-1 quorum over one counting signer, declaring
+    /// `network_passphrase` with a simulation of the network of
+    /// `simulation_passphrase`. Returns the result and the signer's key
+    /// accesses. The quorum takes no RPC client, so it makes no request.
+    async fn quorum_over(
+        network_passphrase: &str,
+        simulation_passphrase: &str,
+    ) -> (Result<Vec<SorobanAuthorizationEntry>, QuorumError>, usize) {
+        use crate::managers::auth_entry::test_helpers::{
+            baseline_authorization_simulation, matching_envelope_context,
+        };
+        use stellar_agent_network::signing::test_doubles::CountingSigner;
+        use stellar_xdr::{ContractId, Hash};
+
+        let seed = [0x21u8; 32];
+        let member = stellar_agent_network::SoftwareSigningKey::new_from_bytes(seed)
+            .public_key()
+            .await
+            .unwrap()
+            .0;
+        let authz = AuthorizationInfo::new(
+            vec![SignerGroup::new("ops".into(), vec![member], 1).unwrap()],
+            Combinator::And,
+        );
+        let signer = CountingSigner::new(seed);
+        let rule_id = ContextRuleId::new(1);
+        let simulation = baseline_authorization_simulation(
+            simulation_passphrase,
+            "stellar:fixture",
+            vec![rule_id],
+        );
+        let envelope = matching_envelope_context(&simulation);
+
+        let result = collect_quorum_signatures(
+            &authz,
+            &[&signer],
+            ScAddress::Contract(ContractId(Hash([0x31; 32]))),
+            ScSymbol::try_from("execute").unwrap(),
+            vec![],
+            vec![rule_id],
+            &simulation,
+            &envelope,
+            network_passphrase,
+            9999,
+        )
+        .await;
+        (result, signer.key_accesses())
+    }
+
+    #[tokio::test]
+    async fn collect_quorum_signatures_signs_a_testnet_quorum() {
+        let (result, key_accesses) = quorum_over(
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap().len(),
+            2,
+            "the smart-account entry and one G-key entry"
+        );
+        assert!(key_accesses > 0);
+    }
+
+    #[tokio::test]
+    async fn collect_quorum_signatures_refuses_the_mainnet_passphrase_before_any_key_access() {
+        let (result, key_accesses) = quorum_over(MAINNET_PASSPHRASE, MAINNET_PASSPHRASE).await;
+
+        assert!(
+            matches!(result, Err(QuorumError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert_eq!(key_accesses, 0);
+    }
+
+    #[tokio::test]
+    async fn collect_quorum_signatures_refuses_a_mainnet_simulation_before_any_key_access() {
+        let (result, key_accesses) = quorum_over(
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            MAINNET_PASSPHRASE,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(QuorumError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert_eq!(key_accesses, 0);
+    }
+
+    #[tokio::test]
+    async fn collect_quorum_signatures_refuses_a_passphrase_of_another_network_before_any_key_access()
+     {
+        let (result, key_accesses) = quorum_over(
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+            FUTURENET_PASSPHRASE,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(QuorumError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert_eq!(key_accesses, 0);
     }
 }

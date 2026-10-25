@@ -105,6 +105,7 @@ use stellar_agent_smart_account::deployment::{
 };
 use stellar_agent_smart_account::ed25519_verifier::ED25519_VERIFIER_WASM;
 use stellar_agent_smart_account::error::SaError;
+use stellar_agent_smart_account::managers::auth_entry::test_helpers::partial_authorization_entry;
 use stellar_agent_smart_account::managers::credentials::{CredentialsError, CredentialsManager};
 use stellar_agent_smart_account::managers::rules::{
     ContextRuleDefinition, ContextRulePolicy, ContextRuleSignerInput, PinStatus, RuleContext,
@@ -1037,12 +1038,16 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
         "localhost",
         None,
     );
+    let entry = partial_authorization_entry(
+        parse_c_strkey_to_smart_account(&smart_account).expect("smart account strkey parses"),
+        TESTNET_PASSPHRASE,
+        vec![ContextRuleId::new(rule_id)],
+    )
+    .expect("auth entry builds");
     let outcome = credentials
         .sign_with_passkey_rule(
             "cap85-no-such-credential",
-            &smart_account,
-            &[0u8; 32],
-            vec![rule_id],
+            &entry,
             Arc::clone(&signers_manager),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19907),
             Duration::from_millis(500),

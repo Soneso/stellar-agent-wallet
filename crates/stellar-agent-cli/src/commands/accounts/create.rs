@@ -1273,8 +1273,8 @@ mod tests {
 
     use super::*;
     use crate::common::signer_ceremony::test_fixtures::{
-        EnrolledPin, assert_enrolled_outcome, enrolled_mainnet_profile, enrolled_test_g,
-        enrolled_test_secret,
+        EnrolledPin, assert_enrolled_mainnet_signing_outcome, enrolled_mainnet_profile,
+        enrolled_test_g, enrolled_test_secret,
     };
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
 
@@ -2420,7 +2420,7 @@ mod tests {
         unsafe {
             std::env::remove_var(var);
         }
-        assert_enrolled_outcome(pin, result);
+        assert_enrolled_mainnet_signing_outcome(pin, result);
     }
 
     #[tokio::test]

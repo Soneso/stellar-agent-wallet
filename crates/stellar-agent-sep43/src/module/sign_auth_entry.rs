@@ -18,7 +18,9 @@
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::signing::Signer;
 
-use crate::{address::validate_strkey, error::Sep43Error, signing::sign_soroban_auth_entry};
+use crate::address::validate_strkey;
+use crate::error::Sep43Error;
+use crate::signing::{refuse_mainnet, sign_soroban_auth_entry};
 
 /// Dispatches the SEP-43 `signAuthEntry` method.
 ///
@@ -28,6 +30,8 @@ use crate::{address::validate_strkey, error::Sep43Error, signing::sign_soroban_a
 ///
 /// # Argument validation
 ///
+/// - A mainnet profile is refused at entry, before the signer is asked for
+///   its key → [`Sep43Error::MainnetSigningForbidden`].
 /// - If `network_passphrase` is `Some`, it must equal
 ///   `profile.network_passphrase`; mismatch → [`Sep43Error::InvalidNetworkPassphrase`].
 /// - If `address` is `Some`, it must be a valid strkey AND must equal the
@@ -35,6 +39,8 @@ use crate::{address::validate_strkey, error::Sep43Error, signing::sign_soroban_a
 ///
 /// # Errors
 ///
+/// - [`Sep43Error::MainnetSigningForbidden`]: the profile's network is
+///   mainnet.
 /// - [`Sep43Error::InvalidNetworkPassphrase`]: passphrase mismatch, or the
 ///   preimage's `network_id` does not match the active network.
 /// - [`Sep43Error::InvalidAddress`]: provided `address` is not a valid strkey
@@ -58,6 +64,8 @@ pub async fn dispatch(
     network_passphrase: Option<&str>,
     address: Option<&str>,
 ) -> Result<serde_json::Value, Sep43Error> {
+    refuse_mainnet(&profile.network_passphrase)?;
+
     // Validate the optional address argument shape first (no signer I/O).
     if let Some(addr) = address {
         validate_strkey(addr)?;
@@ -351,5 +359,55 @@ mod tests {
             "address-mismatch guard must return InvalidAddress, got: {err:?}"
         );
         assert_eq!(err.sep43_code(), -3);
+    }
+
+    /// A mainnet profile is refused before the signer is asked for its key.
+    #[tokio::test]
+    async fn dispatch_refuses_a_mainnet_profile_before_any_key_access() {
+        let profile = Profile::builder_mainnet(
+            "https://rpc.example",
+            "svc",
+            "acct",
+            "nonce-svc",
+            "nonce-acct",
+        )
+        .build();
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([1u8; 32]);
+        let err = dispatch(
+            &profile,
+            &signer,
+            &minimal_soroban_auth_preimage_xdr(
+                stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, Sep43Error::MainnetSigningForbidden { .. }),
+            "got: {err:?}"
+        );
+        assert_eq!(signer.public_key_calls(), 0);
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    /// The same call on testnet reads the signer's key, so the refusal above
+    /// is the network's.
+    #[tokio::test]
+    async fn dispatch_reads_the_key_on_testnet() {
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([1u8; 32]);
+        let result = dispatch(
+            &testnet_profile(),
+            &signer,
+            &minimal_soroban_auth_preimage_xdr(TESTNET),
+            None,
+            None,
+        )
+        .await
+        .expect("a valid testnet request signs");
+        assert!(result["signedAuthEntry"].is_string());
+        assert_eq!(signer.public_key_calls(), 1);
+        assert_eq!(signer.sign_calls(), 1);
     }
 }

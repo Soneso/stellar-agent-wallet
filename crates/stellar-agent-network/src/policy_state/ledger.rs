@@ -1345,18 +1345,20 @@ impl PersistedWindowStore {
     /// Consumes every listed authorization in one transaction, all or
     /// nothing.
     ///
-    /// Under one lock, on the store's clock, after sweeping expired
-    /// authorizations: each record must exist, be open, and be inside its
-    /// lifetime; the supplied profile's name and chain must be the record's;
-    /// every expectation must equal the record; the policy pin,
-    /// read under the same lock, must still equal the record's policy; the
-    /// binding must be the one the domain is consumed by and match its
-    /// facts. A transaction binding whose envelope the window already holds
-    /// refuses as a duplicate. Then each consumption is applied: transaction
-    /// holds become the submission's pending records, Soroban holds become
-    /// retained authorized spend, and every record is marked used with its
-    /// binding. One generation commit covers the batch; a second consumption
-    /// of a record, in the same batch or later, refuses.
+    /// Under one lock, the store sweeps expired authorizations on its clock.
+    /// The duplicate check runs first. A transaction envelope held by a reservation
+    /// or named by an earlier consumption refuses with a distinct cause, so the
+    /// caller can preserve a reserved submission's row or close a settled resend.
+    ///
+    /// Each record must exist, be open, and be inside its lifetime. The supplied
+    /// profile's name and chain must be the record's. Every expectation must equal
+    /// the record. The policy pin, read under the same lock, must still equal the
+    /// record's policy. The binding must match the domain's consumption and facts.
+    ///
+    /// Then each consumption is applied: transaction holds become pending records,
+    /// Soroban holds become retained authorized spend, and every record is marked
+    /// used with its binding. One generation commit covers the batch. A second
+    /// consumption of a record, in the same batch or later, refuses.
     ///
     /// # Errors
     ///
@@ -1364,6 +1366,8 @@ impl PersistedWindowStore {
     ///   precondition; the store file is not written.
     /// - [`WindowStoreError::DuplicateReservation`] for an envelope the window
     ///   already holds.
+    /// - [`WindowStoreError::DuplicateConsumption`] for an envelope an earlier
+    ///   authorization consumed.
     /// - Every integrity, keyring, lock, and I/O error of the store.
     pub fn consume_authorizations(
         &self,
@@ -1380,8 +1384,24 @@ impl PersistedWindowStore {
         sweep_expired(&mut wire, now);
         let scope = PinScope::for_profile(self.path(), profile);
         let mut receipts = Vec::with_capacity(batch.len());
-        let mut checked_envelopes = Vec::new();
         for (id, expect, binding) in batch {
+            // Establish ownership before any authorization refusal can close
+            // a submission's pending audit row, even for a grant without holds.
+            if let ConsumptionBinding::Transaction(submission) = binding {
+                let envelope = stellar_agent_core::hex::encode(&submission.envelope_hash);
+                if file_holds_id(&original, &envelope) {
+                    return Err(WindowStoreError::DuplicateReservation);
+                }
+                if original.authorizations.iter().any(|auth| {
+                    matches!(
+                        &auth.consumption,
+                        Some(ConsumptionBinding::Transaction(consumed))
+                            if consumed.envelope_hash == submission.envelope_hash
+                    )
+                }) {
+                    return Err(WindowStoreError::DuplicateConsumption);
+                }
+            }
             let auth = wire
                 .authorizations
                 .iter()
@@ -1394,16 +1414,6 @@ impl PersistedWindowStore {
             pin::compare(&lock, &scope, auth.policy_sequence, &auth.policy_digest)
                 .map_err(pin_refusal)?;
             check_consumption(&wire, auth, binding)?;
-            if let ConsumptionBinding::Transaction(submission) = binding {
-                let has_holds = wire.holds.iter().any(|hold| hold.authorization_id == *id);
-                let envelope = stellar_agent_core::hex::encode(&submission.envelope_hash);
-                if has_holds && !checked_envelopes.contains(&envelope) {
-                    if file_holds_id(&original, &envelope) {
-                        return Err(WindowStoreError::DuplicateReservation);
-                    }
-                    checked_envelopes.push(envelope);
-                }
-            }
             let domain = auth.domain;
             apply_consumption(&mut wire, *id, binding, now);
             receipts.push(ConsumeReceipt {
@@ -1790,6 +1800,7 @@ mod tests {
         }
     }
 
+    /// Keeps envelope and transaction identities distinct in the fixtures.
     fn submission(
         tx_hash: [u8; 32],
         source: &str,
@@ -1798,7 +1809,7 @@ mod tests {
     ) -> ConsumptionBinding {
         ConsumptionBinding::Transaction(SubmissionBinding {
             fee_bump,
-            envelope_hash: [0xee; 32],
+            envelope_hash: tx_hash.map(|byte| byte ^ 0x5a),
             tx_hash,
             source: source.to_owned(),
             sequence,
@@ -2202,7 +2213,7 @@ mod tests {
         for (record, amount) in records.iter().zip([100, 20]) {
             assert_eq!(record.amount, amount);
             assert_eq!(record.status, RecordStatus::Pending);
-            assert_eq!(record.id, "ee".repeat(32));
+            assert_eq!(record.id, "db".repeat(32));
             assert_eq!(record.tx_hash, stellar_agent_core::hex::encode(&[0x81; 32]));
             assert_eq!(record.source, SOURCE);
             assert_eq!(record.sequence, 101);
@@ -2218,7 +2229,7 @@ mod tests {
         assert_eq!(used.consumption, Some(consumption_of(&request.binding)));
         let pending = l.store.pending_reservations(&l.profile).unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, "ee".repeat(32));
+        assert_eq!(pending[0].id, "db".repeat(32));
 
         // The consumed debit outlives the authorization's lifetime.
         l.clock.set(minted.expires_at_ms + 1);
@@ -2829,8 +2840,8 @@ mod tests {
         assert_eq!(
             converted,
             vec![
-                ("fee".to_owned(), 2, "ee".repeat(32)),
-                ("native".to_owned(), 100, "ee".repeat(32))
+                ("fee".to_owned(), 2, "7b".repeat(32)),
+                ("native".to_owned(), 100, "7b".repeat(32))
             ],
             "each owned debit converts once to the one submission"
         );
@@ -2964,7 +2975,7 @@ mod tests {
                 &l.profile,
                 &[hold(1)],
                 &SubmissionHold {
-                    id: "ee".repeat(32),
+                    id: "db".repeat(32),
                     tx_hash: "b".repeat(64),
                     source: SOURCE.to_owned(),
                     sequence: 9,
@@ -2983,6 +2994,54 @@ mod tests {
             Err(WindowStoreError::DuplicateReservation)
         ));
         assert_eq!(l.bytes(), before);
+    }
+
+    /// A consumed binding preserves ownership even when it reserved no window
+    /// entries. The duplicate check runs before authorization expectations.
+    #[test]
+    #[serial]
+    fn a_consumed_envelope_without_holds_is_a_duplicate() {
+        let l = Ledger::new();
+        let first = l.request(tx(1), vec![]);
+        let used = l.mint(&first).unwrap();
+        let binding = consumption_of(&first.binding);
+        l.consume(&first, &used, &binding).unwrap();
+        assert!(l.store.pending_reservations(&l.profile).unwrap().is_empty());
+        let mut second = l.request(tx(1), vec![]);
+        second.approval_nonce = "fresh-approval".to_owned();
+        let open = l.mint(&second).unwrap();
+        let before = l.bytes();
+        let ConsumptionBinding::Transaction(mut different_tx_hash) = binding.clone() else {
+            panic!("the fixture is a transaction");
+        };
+        assert_ne!(different_tx_hash.envelope_hash, different_tx_hash.tx_hash);
+        different_tx_hash.tx_hash = [0xff; 32];
+        for expect in [
+            l.expect(&second, &open),
+            ConsumeExpect {
+                entries_digest: [0xff; 32],
+                ..l.expect(&second, &open)
+            },
+        ] {
+            for duplicate in [
+                binding.clone(),
+                ConsumptionBinding::Transaction(different_tx_hash.clone()),
+            ] {
+                assert!(matches!(
+                    l.store
+                        .consume_authorization(&l.profile, open.id, &expect, &duplicate),
+                    Err(WindowStoreError::DuplicateConsumption)
+                ));
+                assert_eq!(l.bytes(), before, "a duplicate writes nothing");
+                assert_eq!(l.record(used.id).state, AuthorizationState::Used);
+                assert_eq!(l.record(open.id).state, AuthorizationState::Open);
+            }
+        }
+        let fresh = l.request(tx(2), vec![]);
+        let minted = l.mint(&fresh).unwrap();
+        let fresh_binding = consumption_of(&fresh.binding);
+        l.consume(&fresh, &minted, &fresh_binding).unwrap();
+        assert_eq!(l.record(minted.id).state, AuthorizationState::Used);
     }
 
     // ── contention, invalidation, pruning, versions ─────────────────────

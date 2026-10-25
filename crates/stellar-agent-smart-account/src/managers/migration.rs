@@ -558,8 +558,9 @@ impl MigrationPlan {
     /// - [`SaError::SubmissionUnresolved`]: a step was sent and its outcome
     ///   is unknown.
     /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase or
-    ///   primary endpoint is mainnet, or the endpoint reports mainnet; no
-    ///   transaction is sent.
+    ///   primary endpoint is mainnet, refused before the signer's public key
+    ///   is read and before any request, with zero attempted steps; or
+    ///   the endpoint reports mainnet, and no transaction is sent.
     /// - [`SaError::AuthEntryConstructionFailed`]: the signer public-key
     ///   fetch failed, the rule lock was not acquired within its budget, or
     ///   a step's auth entry could not be built.
@@ -574,6 +575,17 @@ impl MigrationPlan {
         signers_manager: &SignersManager,
         request_id: &str,
     ) -> MigrationSubmitResult {
+        if let Err(error) = signers_manager.refuse_mainnet_write() {
+            return MigrationSubmitResult {
+                successful_steps: vec![],
+                failed_step_index: Some(0),
+                failed_step_error: Some(error),
+                failed_step_remove_tx_hash: None,
+                pending_add: None,
+                total_steps_attempted: 0,
+            };
+        }
+
         let smart_account_strkey = match scaddress_to_strkey(&self.smart_account) {
             Ok(s) => s,
             Err(e) => {
@@ -2617,5 +2629,87 @@ mod tests {
             plan.warnings.is_empty(),
             "2-tx plan must not trigger inter-tx failure warning"
         );
+    }
+
+    // ── Mainnet refusal before the signer and the endpoint ──────────────────
+
+    /// Submits a plan with no steps through a signers manager declared for
+    /// `network_passphrase` whose endpoints are a mock that answers nothing.
+    /// Returns the result, the signer's key accesses and the requests sent.
+    async fn submit_empty_plan_on(
+        network_passphrase: &str,
+    ) -> (MigrationSubmitResult, usize, usize) {
+        use crate::managers::signers::SignersManagerConfig;
+        use stellar_agent_core::audit_log::writer::AuditWriter;
+
+        let server = wiremock::MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log_path = dir.path().join("audit.jsonl");
+        let manager = SignersManager::new(SignersManagerConfig::new(
+            server.uri(),
+            server.uri(),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                AuditWriter::open(audit_log_path.clone(), None).unwrap(),
+            )),
+            audit_log_path,
+            network_passphrase.to_owned(),
+            "test".to_owned(),
+            std::time::Duration::from_secs(1),
+            "stellar:fixture".to_owned(),
+        ))
+        .unwrap();
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x73; 32]);
+        let plan = MigrationPlan {
+            smart_account: ScAddress::Contract(ContractId(Hash([0x81u8; 32]))),
+            from_hash: [0x01; 32],
+            to_hash: [0x02; 32],
+            to_verifier_addr: ScAddress::Contract(ContractId(Hash([0x83u8; 32]))),
+            affected_rules: vec![],
+            destination_audit_status: VerifierAuditStatus::Unaudited,
+            request_id: "req-migrate".to_owned(),
+            warnings: vec![],
+            rules_skipped_count: 0,
+            audit_log_missing: vec![],
+        };
+
+        let result = plan.submit(&signer, &manager, "req-migrate").await;
+        let requests = server.received_requests().await.unwrap().len();
+        (result, signer.key_accesses(), requests)
+    }
+
+    #[tokio::test]
+    async fn submit_on_testnet_reads_the_signer_key_and_completes_an_empty_plan() {
+        let (result, key_accesses, requests) =
+            submit_empty_plan_on(stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE).await;
+
+        assert!(
+            result.failed_step_error.is_none(),
+            "{:?}",
+            result.failed_step_error
+        );
+        assert_eq!(result.total_steps_attempted, 0);
+        assert_eq!(key_accesses, 1, "the source public key is read once");
+        assert_eq!(requests, 0, "a plan with no steps sends nothing");
+    }
+
+    #[tokio::test]
+    async fn submit_refuses_a_mainnet_manager_before_any_key_access_or_request() {
+        let (result, key_accesses, requests) =
+            submit_empty_plan_on(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE).await;
+
+        assert!(
+            matches!(
+                result.failed_step_error,
+                Some(SaError::MainnetWriteForbidden)
+            ),
+            "{:?}",
+            result.failed_step_error
+        );
+        assert_eq!(result.failed_step_index, Some(0));
+        assert_eq!(result.total_steps_attempted, 0);
+        assert!(result.successful_steps.is_empty());
+        assert!(result.pending_add.is_none());
+        assert_eq!(key_accesses, 0);
+        assert_eq!(requests, 0);
     }
 }

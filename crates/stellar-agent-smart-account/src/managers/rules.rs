@@ -72,7 +72,7 @@ use crate::managers::verifiers::{PinnedKind, pin_referenced_contracts, scaddress
 use crate::signers::THRESHOLD_POLICY_WASM_HASHES;
 use crate::signing::divergence::AuthContextFingerprint;
 use crate::simple_threshold_policy::parse_simple_threshold_install_param;
-use crate::submit::ExpectedReturn;
+use crate::submit::{ExpectedReturn, refuse_mainnet_sa};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Manager configuration
@@ -738,6 +738,9 @@ impl ContextRuleManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
     /// - [`SaError::SignersManagerNotConfigured`]: no signers manager is
     ///   configured.
     /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
@@ -791,6 +794,8 @@ impl ContextRuleManager {
         accept_mutable_verifier: bool,
         accept_unknown_verifier: bool,
     ) -> Result<InstallRuleOutput, SaError> {
+        refuse_mainnet_sa(&self.network_passphrase, &self.primary_rpc_url)?;
+
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
@@ -1625,6 +1630,9 @@ impl ContextRuleManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
     /// - [`SaError::SignersManagerNotConfigured`]: no signers manager is
     ///   configured; the refusal names `rule_id`.
     /// - [`SaError::PolicyWasmNotInAllowlist`] / [`SaError::PolicyMutable`] /
@@ -1682,6 +1690,8 @@ impl ContextRuleManager {
         accept_mutable_verifier: bool,
         accept_unknown_verifier: bool,
     ) -> Result<u32, SaError> {
+        refuse_mainnet_sa(&self.network_passphrase, &self.primary_rpc_url)?;
+
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
         let policy_address_strkey = scaddress_to_strkey(&policy_address)?;
@@ -2003,6 +2013,9 @@ impl ContextRuleManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::MainnetWriteForbidden`]: the manager's passphrase names
+    ///   mainnet or its primary endpoint is a mainnet-pattern URL; refused
+    ///   before any signer key access and any request.
     /// - [`SaError::SignersManagerNotConfigured`]: no signers manager is
     ///   configured; the refusal names `rule_id`.
     /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
@@ -2049,6 +2062,8 @@ impl ContextRuleManager {
         mut audit_writer: Option<&mut AuditWriter>,
         request_id: String,
     ) -> Result<(), SaError> {
+        refuse_mainnet_sa(&self.network_passphrase, &self.primary_rpc_url)?;
+
         let smart_account_strkey = scaddress_to_strkey(&smart_account)?;
         let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
 
@@ -5322,6 +5337,8 @@ pub(crate) fn sa_error_to_invocation_result(
         // MainnetWriteForbidden: refused before signing or before the send;
         // nothing reached the network as a transaction.
         SaError::MainnetWriteForbidden => SaInvocationResult::PreSubmissionRefused,
+        // AuthEntryBindingMismatch: refused before any signer key access.
+        SaError::AuthEntryBindingMismatch { .. } => SaInvocationResult::PreSubmissionRefused,
         // MulticallSha256Drift: fires at registry-lookup time, before any I/O.
         SaError::MulticallSha256Drift { .. } => SaInvocationResult::PreSubmissionRefused,
         // MulticallRegistryEntryNotFound: fires at registry-lookup time, before any I/O.
@@ -5628,6 +5645,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::managers::signers::tests::testnet_target;
     use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
     use stellar_xdr::{AccountId, ContractId, PublicKey, Uint256};
 
@@ -6652,6 +6670,18 @@ mod tests {
 
         assert!(matches!(
             sa_error_to_invocation_result(&SaError::MainnetWriteForbidden),
+            SaInvocationResult::PreSubmissionRefused
+        ));
+    }
+
+    #[test]
+    fn sa_error_to_invocation_result_auth_entry_binding_mismatch_is_pre_submission() {
+        use stellar_agent_core::audit_log::schema::SaInvocationResult;
+
+        assert!(matches!(
+            sa_error_to_invocation_result(&SaError::AuthEntryBindingMismatch {
+                field: "network_id"
+            }),
             SaInvocationResult::PreSubmissionRefused
         ));
     }
@@ -9937,5 +9967,289 @@ mod tests {
         );
         assert!(debug.contains("https://primary.example"));
         assert!(debug.contains("https://secondary.example"));
+    }
+
+    // ── Mainnet refusal before the signer and the endpoint ──────────────────
+
+    /// A rule manager and its signers manager, both declared for mainnet,
+    /// whose endpoints are the mock `server`, with the audit log in `dir`.
+    fn mainnet_rule_manager(
+        server: &wiremock::MockServer,
+        dir: &tempfile::TempDir,
+    ) -> ContextRuleManager {
+        use crate::managers::signers::SignersManagerConfig;
+        use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+
+        let audit_log_path = dir.path().join("audit.jsonl");
+        let audit_writer = Arc::new(Mutex::new(
+            AuditWriter::open(audit_log_path.clone(), None).unwrap(),
+        ));
+        let signers_manager = Arc::new(
+            SignersManager::new(SignersManagerConfig::new(
+                server.uri(),
+                server.uri(),
+                Arc::clone(&audit_writer),
+                audit_log_path,
+                MAINNET_PASSPHRASE.to_owned(),
+                "test".to_owned(),
+                Duration::from_secs(1),
+                "stellar:pubnet".to_owned(),
+            ))
+            .unwrap(),
+        );
+        crate::managers::signers::tests::write_entry_guard_baselines(
+            &signers_manager,
+            &mainnet_target(),
+        );
+        ContextRuleManager::new(
+            ContextRuleManagerConfig::new(
+                server.uri(),
+                MAINNET_PASSPHRASE.to_owned(),
+                Duration::from_secs(1),
+                "stellar:pubnet".to_owned(),
+            )
+            .with_signers_manager(signers_manager)
+            .with_audit_writer(audit_writer),
+        )
+        .unwrap()
+    }
+
+    fn mainnet_target() -> ScAddress {
+        ScAddress::Contract(ContractId(Hash([0x81; 32])))
+    }
+
+    /// Asserts the canonical mainnet refusal with no signer method called
+    /// and no request sent.
+    async fn assert_refused_before_key_and_request(
+        result: Result<(), SaError>,
+        signer: &stellar_agent_network::signing::test_doubles::CountingSigner,
+        server: &wiremock::MockServer,
+    ) {
+        assert!(
+            matches!(result, Err(SaError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert_eq!(signer.key_accesses(), 0, "no signer method is called");
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no request is sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_rule_refuses_mainnet_before_any_key_access_or_request() {
+        let server = wiremock::MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = mainnet_rule_manager(&server, &dir);
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x71; 32]);
+
+        let result = manager
+            .install_rule(
+                mainnet_target(),
+                definition_with(
+                    vec![ContextRuleSignerInput::Delegated {
+                        address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
+                            Uint256([0x72; 32]),
+                        ))),
+                    }],
+                    vec![],
+                ),
+                vec![ContextRuleId::new(0)],
+                &signer,
+                None,
+                "req-install".to_owned(),
+                false,
+                false,
+            )
+            .await
+            .map(drop);
+
+        assert_refused_before_key_and_request(result, &signer, &server).await;
+    }
+
+    #[tokio::test]
+    async fn add_policy_refuses_mainnet_before_any_key_access_or_request() {
+        let server = wiremock::MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = mainnet_rule_manager(&server, &dir);
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x71; 32]);
+
+        let result = manager
+            .add_policy(
+                mainnet_target(),
+                1,
+                ScAddress::Contract(ContractId(Hash([0x82; 32]))),
+                ScVal::Void,
+                vec![ContextRuleId::new(0)],
+                &signer,
+                None,
+                "req-add-policy".to_owned(),
+                false,
+                false,
+            )
+            .await
+            .map(drop);
+
+        assert_refused_before_key_and_request(result, &signer, &server).await;
+    }
+
+    #[tokio::test]
+    async fn remove_policy_refuses_mainnet_before_any_key_access_or_request() {
+        let server = wiremock::MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = mainnet_rule_manager(&server, &dir);
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x71; 32]);
+
+        let result = manager
+            .remove_policy(
+                mainnet_target(),
+                1,
+                1,
+                vec![ContextRuleId::new(0)],
+                &signer,
+                None,
+                "req-remove-policy".to_owned(),
+            )
+            .await;
+
+        assert_refused_before_key_and_request(result, &signer, &server).await;
+    }
+
+    /// A testnet rule manager sharing its writer and baselines with its signers.
+    fn testnet_rule_manager(
+        server: &wiremock::MockServer,
+        dir: &tempfile::TempDir,
+    ) -> ContextRuleManager {
+        let audit_path = dir.path().join("audit.jsonl");
+        let writer = Arc::new(Mutex::new(
+            AuditWriter::open(audit_path.clone(), None).unwrap(),
+        ));
+        let signers = crate::test_helpers::signers_manager_for_tests(
+            &server.uri(),
+            &server.uri(),
+            Arc::clone(&writer),
+            audit_path,
+            Duration::from_secs(1),
+        );
+        crate::managers::signers::tests::write_entry_guard_baselines(&signers, &testnet_target());
+        crate::test_helpers::rule_manager_for_tests(
+            &server.uri(),
+            None,
+            signers,
+            writer,
+            Duration::from_secs(1),
+        )
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    async fn install_rule_reaches_rpc_on_testnet() {
+        let server = stellar_agent_test_support::KeyedLedgerEntriesResponder::new()
+            .serve()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = testnet_rule_manager(&server, &dir);
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x71; 32]);
+
+        let result = manager
+            .install_rule(
+                testnet_target(),
+                definition_with(
+                    vec![ContextRuleSignerInput::Delegated {
+                        address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
+                            Uint256([0x72; 32]),
+                        ))),
+                    }],
+                    vec![],
+                ),
+                vec![ContextRuleId::new(0)],
+                &signer,
+                None,
+                "req-install".to_owned(),
+                false,
+                false,
+            )
+            .await
+            .map(drop);
+
+        assert!(
+            !matches!(result, Err(SaError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert!(signer.key_accesses() > 0);
+        assert!(
+            !server.received_requests().await.unwrap().is_empty(),
+            "the call reaches its first RPC: {result:?}"
+        );
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    async fn add_policy_reaches_rpc_on_testnet() {
+        let server = stellar_agent_test_support::KeyedLedgerEntriesResponder::new()
+            .serve()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = testnet_rule_manager(&server, &dir);
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x71; 32]);
+
+        let result = manager
+            .add_policy(
+                testnet_target(),
+                1,
+                ScAddress::Contract(ContractId(Hash([0x82; 32]))),
+                ScVal::Void,
+                vec![ContextRuleId::new(0)],
+                &signer,
+                None,
+                "req-add-policy".to_owned(),
+                false,
+                false,
+            )
+            .await
+            .map(drop);
+
+        assert!(
+            !matches!(result, Err(SaError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert!(signer.key_accesses() > 0);
+        assert!(
+            !server.received_requests().await.unwrap().is_empty(),
+            "the call reaches its first RPC: {result:?}"
+        );
+    }
+
+    /// The testnet write passes its guard and reaches the first RPC.
+    #[tokio::test]
+    async fn remove_policy_reaches_rpc_on_testnet() {
+        let server = stellar_agent_test_support::KeyedLedgerEntriesResponder::new()
+            .serve()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = testnet_rule_manager(&server, &dir);
+        let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new([0x71; 32]);
+
+        let result = manager
+            .remove_policy(
+                testnet_target(),
+                1,
+                1,
+                vec![ContextRuleId::new(0)],
+                &signer,
+                None,
+                "req-remove-policy".to_owned(),
+            )
+            .await;
+
+        assert!(
+            !matches!(result, Err(SaError::MainnetWriteForbidden)),
+            "{result:?}"
+        );
+        assert!(signer.key_accesses() > 0);
+        assert!(
+            !server.received_requests().await.unwrap().is_empty(),
+            "the call reaches its first RPC: {result:?}"
+        );
     }
 }

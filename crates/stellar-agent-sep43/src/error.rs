@@ -28,7 +28,7 @@ use serde_json::json;
 /// - **Code -2 (external service error):** `HorizonError`, `RpcError`
 /// - **Code -3 (client-invalid request):** `InvalidXdr`, `InvalidAddress`,
 ///   `InvalidNetworkPassphrase`, `MissingAddress`, `MalformedAuthEntry`,
-///   `InvalidMessage`, `MainnetSigningForbidden`
+///   `InvalidMessage`, `MainnetSigningForbidden`, `MainnetAuthorizationRefused`
 /// - **Code -4 (user rejected):** `UserRejected`
 ///
 /// # Wire format
@@ -266,6 +266,20 @@ pub enum Sep43Error {
         detail: String,
     },
 
+    /// A mainnet signing request does not match the authorization it was
+    /// presented under.
+    ///
+    /// Returned by the authorized signing sibling when a check of the
+    /// authorization fails, the request is not for mainnet, or the signer's
+    /// signature does not verify. The message names no precondition; the
+    /// signing path logs it. The wire code is `sep43.mainnet_authorization_refused`.
+    /// The message contains `network.mainnet_authorization_refused`, the canonical
+    /// code shared with the network signing and submit gates.
+    ///
+    /// Maps to SEP-43 error code `-3`.
+    #[error("mainnet signing authorization refused (network.mainnet_authorization_refused)")]
+    MainnetAuthorizationRefused,
+
     // ── Code -4: user rejected ────────────────────────────────────────────────
     /// The user explicitly rejected the signing request.
     ///
@@ -350,6 +364,7 @@ impl Sep43Error {
             Self::MalformedAuthEntry { .. } => "sep43.malformed_auth_entry",
             Self::InvalidMessage { .. } => "sep43.invalid_message",
             Self::MainnetSigningForbidden { .. } => "sep43.mainnet_signing_forbidden",
+            Self::MainnetAuthorizationRefused => "sep43.mainnet_authorization_refused",
             Self::UserRejected { .. } => "sep43.user_rejected",
             _ => "sep43.unknown_error",
         }
@@ -400,7 +415,8 @@ impl Sep43Error {
             | Self::MissingAddress
             | Self::MalformedAuthEntry { .. }
             | Self::InvalidMessage { .. }
-            | Self::MainnetSigningForbidden { .. } => -3,
+            | Self::MainnetSigningForbidden { .. }
+            | Self::MainnetAuthorizationRefused => -3,
             // Code -4: user rejected
             Self::UserRejected { .. } => -4,
             // Forward-compat: new variants default to -1 (internal error)
@@ -596,6 +612,23 @@ mod tests {
     }
 
     #[test]
+    fn wire_code_mainnet_authorization_refused() {
+        assert_eq!(
+            Sep43Error::MainnetAuthorizationRefused.wire_code(),
+            "sep43.mainnet_authorization_refused"
+        );
+    }
+
+    /// The authorization refusal names the network code and no precondition.
+    #[test]
+    fn mainnet_authorization_refused_display_is_fixed() {
+        assert_eq!(
+            Sep43Error::MainnetAuthorizationRefused.to_string(),
+            "mainnet signing authorization refused (network.mainnet_authorization_refused)"
+        );
+    }
+
+    #[test]
     fn wire_code_user_rejected() {
         assert_eq!(
             Sep43Error::UserRejected {
@@ -667,6 +700,7 @@ mod tests {
             Sep43Error::MainnetSigningForbidden {
                 detail: String::new(),
             },
+            Sep43Error::MainnetAuthorizationRefused,
         ];
         for err in cases {
             assert_eq!(err.sep43_code(), -3, "expected -3 for {:?}", err);
@@ -810,6 +844,10 @@ mod tests {
             Sep43Error::InvalidMessage {
                 detail: String::new(),
             },
+            Sep43Error::MainnetSigningForbidden {
+                detail: String::new(),
+            },
+            Sep43Error::MainnetAuthorizationRefused,
             Sep43Error::UserRejected {
                 reason: String::new(),
             },

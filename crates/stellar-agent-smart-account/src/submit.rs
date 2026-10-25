@@ -2757,7 +2757,9 @@ mod tests {
         };
         let simulation = AuthorizationSimulation {
             context,
-            network_id: [9; 32],
+            network_id: crate::managers::auth_entry::network_id_of(
+                "Test SDF Network ; September 2015",
+            ),
             nonce: 123,
             signature_expiration_ledger: 456,
         };
