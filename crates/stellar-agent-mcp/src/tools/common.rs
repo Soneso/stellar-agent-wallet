@@ -2133,7 +2133,17 @@ pub(crate) async fn verify_attestation_gate(
     let attestation_key_bytes = load_attestation_key(&server.profile)?;
     let attestation_key = zeroize::Zeroizing::new(attestation_key_bytes);
 
-    // 8. Verify HMAC (constant-time).
+    // 8. Verify HMAC (constant-time) under the layout the record names; a
+    // version this build does not read verifies nothing.
+    let Some(scope) = entry.attestation_scope() else {
+        tracing::debug!(
+            nonce = %approval_nonce_str,
+            tool = tool_name,
+            version = entry.attestation_version,
+            "unsupported attestation version"
+        );
+        return Err(approval_required_indistinguishable(&profile_name));
+    };
     if !verify_attestation(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new(
@@ -2143,6 +2153,7 @@ pub(crate) async fn verify_attestation_gate(
         approval_nonce_str,
         &presented_sha256,
         &entry.process_uid,
+        &scope,
         &attestation_bytes,
     ) {
         tracing::debug!(
@@ -3706,6 +3717,7 @@ mod tests {
                 &approval_nonce,
                 &stellar_agent_core::approval::envelope_sha256(envelope_xdr.as_bytes()),
                 &entry.process_uid,
+                &entry.attested_lifetime(),
             );
             let wrong_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(wrong_blob);
             capture.clear();
@@ -4091,6 +4103,7 @@ mod tests {
             &entry.approval_nonce,
             &envelope_sha256(b"AAAA"),
             &entry.process_uid,
+            &entry.attested_lifetime(),
         );
         let mut store = PendingApprovalStore::open(
             dir.join(format!("{}.toml", server.profile_name_for_approval())),

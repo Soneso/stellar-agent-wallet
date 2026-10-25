@@ -1,10 +1,12 @@
 //! Independent oracle witnesses for classic transaction decisions and for
 //! Soroban simulations.
 
+mod bound;
 mod classic;
 mod digest;
 pub mod inputs;
 mod soroban;
+pub use bound::{BoundSorobanInputs, obtain_classic_witness_bound, obtain_soroban_witness_bound};
 pub use inputs::*;
 
 use crate::{
@@ -37,19 +39,81 @@ const WITNESS_READ_ATTEMPTS: u32 = 3;
 const WITNESS_RETRY_BACKOFF: Duration = Duration::from_secs(7);
 
 /// Evidence of a completed comparison against an identified oracle.
+///
+/// Only this module's producers build one, and its fields are private:
+///
+/// ```compile_fail,E0451
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn forge(p: CrossCheckWitness) -> CrossCheckWitness { CrossCheckWitness { ..p } }
+/// ```
+///
+/// No test constructor exists:
+///
+/// ```compile_fail,E0599
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn main() { let _ = CrossCheckWitness::for_tests("https://oracle.example.invalid", 1, [0;32],
+/// vec![]); }
+/// ```
+///
+/// The import and the getters resolve:
+///
+/// ```
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn inspect(p: &CrossCheckWitness) -> (Option<[u8; 32]>, u32) { (p.subject(), p.oracle_ledger())
+/// }
+/// let _ = inspect;
+/// ```
+///
+/// The witness implements none of `Serialize`, `Deserialize`, or `Default`:
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn need<T: serde::Serialize>() {}
+/// need::<CrossCheckWitness>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn need<T: serde::de::DeserializeOwned>() {}
+/// need::<CrossCheckWitness>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn need<T: Default>() {}
+/// need::<CrossCheckWitness>();
+/// ```
+/// The `subject` field cannot be projected outside this crate.
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn inspect(p: &CrossCheckWitness) { let _ = &p.subject; }
+/// ```
+///
+/// ```
+/// use stellar_agent_network::cross_check::CrossCheckWitness;
+/// fn need(_: Option<CrossCheckWitness>) {}
+/// need(None);
+/// ```
+///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossCheckWitness {
     authority: String,
     oracle_ledger: u32,
     inputs_digest: [u8; 32],
     kinds: Vec<WitnessEntry>,
+    /// The transaction the comparison is bound to: the network transaction
+    /// hash of a classic envelope, or the Soroban intent digest of a payment.
+    /// `None` from the producers that take no envelope.
+    subject: Option<[u8; 32]>,
 }
 
 impl CrossCheckWitness {
-    /// Creates synthetic evidence for tests without making an oracle request.
-    #[cfg(feature = "test-helpers")]
+    /// Creates synthetic evidence for this crate's tests without an oracle
+    /// request.
+    #[cfg(test)]
     #[must_use]
-    pub fn for_tests(
+    pub(crate) fn for_crate_tests(
         authority: &str,
         oracle_ledger: u32,
         inputs_digest: [u8; 32],
@@ -63,7 +127,44 @@ impl CrossCheckWitness {
             oracle_ledger,
             inputs_digest,
             kinds,
+            subject: None,
         }
+    }
+
+    /// Attaches a checked envelope subject to a test witness.
+    #[cfg(all(test, feature = "mainnet-write"))]
+    pub(crate) fn bound_for_crate_tests(mut self, subject: [u8; 32]) -> Self {
+        self.subject = Some(subject);
+        self
+    }
+
+    /// The transaction the comparison is bound to, when its producer took
+    /// one: the network transaction hash of a classic envelope, or the
+    /// Soroban intent digest of a payment.
+    #[must_use]
+    pub fn subject(&self) -> Option<[u8; 32]> {
+        self.subject
+    }
+
+    /// The fact digest under `stellar-agent-authz-fact:witness:v1`.
+    ///
+    /// Fields, in order: `lp(authority)`, `u32be(oracle_ledger)`, the 32-byte
+    /// inputs digest, `u32be(count)` and the one-byte tag of each entry kind
+    /// in ascending order, and the optional 32-byte subject.
+    #[must_use]
+    pub fn fact_digest(&self) -> [u8; 32] {
+        use stellar_agent_core::mainnet::fact::{FACT_LABEL_WITNESS, FactDigest};
+        let mut digest = FactDigest::new(FACT_LABEL_WITNESS);
+        digest
+            .bytes(self.authority.as_bytes())
+            .u32(self.oracle_ledger)
+            .fixed(&self.inputs_digest)
+            .u32(u32::try_from(self.kinds.len()).unwrap_or(u32::MAX));
+        for kind in &self.kinds {
+            digest.tag(*kind as u8);
+        }
+        digest.opt_fixed32(self.subject.as_ref());
+        digest.finish()
     }
 
     /// Oracle endpoint authority.
@@ -339,10 +440,40 @@ pub(crate) async fn obtain_classic_witness_with_timing(
     tool: &'static str,
     timing: WitnessTiming,
 ) -> Result<CrossCheckOutcome, WalletError> {
+    classic_witness(
+        profile,
+        context,
+        value,
+        &inputs,
+        &ThresholdSet::from_profile(profile),
+        None,
+        tool,
+        timing,
+    )
+    .await
+}
+
+/// Applies the requirement rule under `thresholds` and, when a comparison is
+/// required, compares the observations with the oracle; a passed witness
+/// carries `subject`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shared body of the bound and the unbound classic producers"
+)]
+async fn classic_witness(
+    profile: &Profile,
+    context: &NetworkContext,
+    value: CrossCheckValue<'_>,
+    inputs: &ClassicInputs,
+    thresholds: &ThresholdSet<'_>,
+    subject: Option<[u8; 32]>,
+    tool: &'static str,
+    timing: WitnessTiming,
+) -> Result<CrossCheckOutcome, WalletError> {
     match cross_check_requirement(
         context.chain_id,
         value,
-        &ThresholdSet::from_profile(profile),
+        thresholds,
         profile.oracle_provider_url.is_some(),
         inputs.memo_check(),
     )? {
@@ -371,6 +502,7 @@ pub(crate) async fn obtain_classic_witness_with_timing(
         oracle_ledger: ledger,
         inputs_digest,
         kinds,
+        subject,
     }))
 }
 
@@ -602,6 +734,17 @@ impl SorobanCrossCheck {
         inputs: SorobanWitnessInputs<'_>,
         timing: WitnessTiming,
     ) -> Result<CrossCheckOutcome, WalletError> {
+        self.witness_with_subject(inputs, timing, None).await
+    }
+
+    /// The oracle comparison of [`Self::witness_with_timing`]; a passed
+    /// witness carries `subject`.
+    async fn witness_with_subject(
+        &self,
+        inputs: SorobanWitnessInputs<'_>,
+        timing: WitnessTiming,
+        subject: Option<[u8; 32]>,
+    ) -> Result<CrossCheckOutcome, WalletError> {
         let (oracle, context, tool) = match self {
             Self::NotRequired => return Ok(CrossCheckOutcome::NotRequired),
             Self::Skipped(reason) => return Ok(CrossCheckOutcome::Skipped(*reason)),
@@ -628,6 +771,7 @@ impl SorobanCrossCheck {
                 inputs.primary.latest_ledger,
             )?,
             kinds: vec![WitnessEntry::SorobanSimulation],
+            subject,
         }))
     }
 }
@@ -698,6 +842,7 @@ mod tests {
             oracle_ledger: 4_242,
             inputs_digest: [0; 32],
             kinds: vec![WitnessEntry::SourceAccount],
+            subject: None,
         });
         let cases = [
             (
@@ -888,5 +1033,20 @@ mod tests {
             error,
             WalletError::Network(NetworkError::MainnetWriteForbidden)
         ));
+    }
+
+    #[test]
+    fn the_fact_digest_covers_a_bound_subject() {
+        let witness = CrossCheckWitness {
+            authority: "oracle.example".to_owned(),
+            oracle_ledger: 42,
+            inputs_digest: [3; 32],
+            kinds: vec![],
+            subject: Some([4; 32]),
+        };
+        assert_eq!(
+            stellar_agent_core::hex::encode(&witness.fact_digest()),
+            "0d0e52291f1d9645c008ed98f82e0febad912a6306d0b820e1b36cc27e967f18"
+        );
     }
 }

@@ -3,9 +3,9 @@
 //!
 //! [`StellarRpcClient::endpoint_identity`](crate::StellarRpcClient::endpoint_identity)
 //! asks the endpoint `getNetwork` and returns an [`EndpointIdentity`] only
-//! after the network checks and [`check_protocol_version`] pass. Outside the
-//! `test-helpers` feature, no other code in this crate builds one. Holding a
-//! value then means those checks pass against the endpoint it names.
+//! after the network checks and [`check_protocol_version`] pass. No other code
+//! builds one. Holding a value then means those checks passed against the
+//! endpoint it names, through the client whose identity it carries.
 
 use std::ops::RangeInclusive;
 
@@ -23,18 +23,73 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: RangeInclusive<u32> = 29..=29;
 /// What an RPC endpoint reports about itself, after the wallet checks it.
 ///
 /// The endpoint's passphrase matches the one the caller expects, and its
-/// protocol version passes [`check_protocol_version`]. Outside the `test-helpers`
-/// feature, the type has no public constructor. Its private fields prevent
-/// struct-literal construction outside this crate:
+/// protocol version passes [`check_protocol_version`]. The type has no public
+/// constructor, and two independent barriers keep it from being forged
+/// outside this crate: it is `#[non_exhaustive]`, and its fields are private.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0639
 /// use stellar_agent_network::EndpointIdentity;
+/// fn forge(p: EndpointIdentity) -> EndpointIdentity { EndpointIdentity { ..p } }
+/// ```
 ///
-/// let forged = EndpointIdentity {
-///     chain_id: None,
-///     protocol_version: 29,
-///     authority: String::from("https://rpc.example.com:443"),
-/// };
+/// Each field is private on its own:
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::EndpointIdentity;
+/// fn inspect(p: &EndpointIdentity) { let _ = &p.authority; }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::EndpointIdentity;
+/// fn inspect(p: &EndpointIdentity) { let _ = &p.chain_id; }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::EndpointIdentity;
+/// fn inspect(p: &EndpointIdentity) { let _ = &p.protocol_version; }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::EndpointIdentity;
+/// fn inspect(p: &EndpointIdentity) { let _ = &p.client_id; }
+/// ```
+///
+/// No test constructor exists:
+///
+/// ```compile_fail,E0599
+/// use stellar_agent_network::EndpointIdentity;
+/// fn main() { let _ = EndpointIdentity::for_tests(None, 29, "https://rpc.example.invalid"); }
+/// ```
+///
+/// The import and the getters resolve, so the snippets above fail on the
+/// barrier they name and not on the path:
+///
+/// ```
+/// use stellar_agent_network::EndpointIdentity;
+/// fn inspect(p: &EndpointIdentity) -> (u64, &str, u32) {
+///     (p.client_id(), p.authority(), p.protocol_version())
+/// }
+/// let _ = inspect;
+/// ```
+///
+/// The identity implements none of `Serialize`, `Deserialize`, or `Default`:
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::EndpointIdentity;
+/// fn need<T: serde::Serialize>() {}
+/// need::<EndpointIdentity>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::EndpointIdentity;
+/// fn need<T: serde::de::DeserializeOwned>() {}
+/// need::<EndpointIdentity>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::EndpointIdentity;
+/// fn need<T: Default>() {}
+/// need::<EndpointIdentity>();
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,36 +97,51 @@ pub struct EndpointIdentity {
     chain_id: Option<Caip2>,
     protocol_version: u32,
     authority: String,
+    client_id: u64,
 }
 
 impl EndpointIdentity {
-    /// Builds the identity of an endpoint whose answer passed every check.
+    /// Builds the identity of an endpoint whose answer passed every check,
+    /// through the client whose identity is `client_id`.
     pub(crate) fn checked(
         chain_id: Option<Caip2>,
         protocol_version: u32,
         authority: String,
+        client_id: u64,
     ) -> Self {
         Self {
             chain_id,
             protocol_version,
             authority,
+            client_id,
         }
     }
 
-    /// Builds an identity for a test in another crate.
-    ///
-    /// Only available under the `test-helpers` feature. Production code
-    /// receives an identity from
-    /// [`StellarRpcClient::endpoint_identity`](crate::StellarRpcClient::endpoint_identity)
-    /// alone.
-    #[cfg(feature = "test-helpers")]
+    /// The identity of the client the checks ran through, as
+    /// [`StellarRpcClient::id`](crate::StellarRpcClient::id) reports it.
     #[must_use]
-    pub fn for_tests(
-        chain_id: Option<Caip2>,
-        protocol_version: u32,
-        authority: impl Into<String>,
-    ) -> Self {
-        Self::checked(chain_id, protocol_version, authority.into())
+    pub fn client_id(&self) -> u64 {
+        self.client_id
+    }
+
+    /// The fact digest under `stellar-agent-authz-fact:endpoint:v1`.
+    ///
+    /// Fields, in order: the optional chain as its CAIP-2 text
+    /// (`lp(chain)`), `u32be(protocol_version)`, `lp(authority)`, and
+    /// `u64be(client_id)`.
+    #[must_use]
+    pub fn fact_digest(&self) -> [u8; 32] {
+        use stellar_agent_core::mainnet::fact::{FACT_LABEL_ENDPOINT, FactDigest};
+        let mut digest = FactDigest::new(FACT_LABEL_ENDPOINT);
+        digest.present(self.chain_id.is_some());
+        if let Some(chain) = self.chain_id {
+            digest.bytes(chain.caip2_str().as_bytes());
+        }
+        digest
+            .u32(self.protocol_version)
+            .bytes(self.authority.as_bytes())
+            .u64(self.client_id);
+        digest.finish()
     }
 
     /// The chain the endpoint's passphrase names: `Some` for testnet and
@@ -158,6 +228,32 @@ mod tests {
     use stellar_agent_test_support::WarningCapture;
 
     use super::*;
+
+    /// The fact digest follows the documented layout, against a vector
+    /// computed independently, and names the client.
+    #[test]
+    fn the_fact_digest_follows_the_layout() {
+        let identity = EndpointIdentity::checked(
+            Some(Caip2::Mainnet),
+            29,
+            "https://rpc.example.org".to_owned(),
+            7,
+        );
+        assert_eq!(identity.client_id(), 7);
+        assert_eq!(
+            stellar_agent_core::hex::encode(&identity.fact_digest()),
+            "9c9639a9968b49f4bf0d97c1c067370cdb4a445f2d654d6e2fb879f6a468c196"
+        );
+        let other_client = EndpointIdentity::checked(
+            Some(Caip2::Mainnet),
+            29,
+            "https://rpc.example.org".to_owned(),
+            8,
+        );
+        assert_ne!(other_client.fact_digest(), identity.fact_digest());
+        let no_chain = EndpointIdentity::checked(None, 29, "https://rpc.example.org".to_owned(), 7);
+        assert_ne!(no_chain.fact_digest(), identity.fact_digest());
+    }
 
     fn with_warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<BTreeMap<String, String>>) {
         let (warnings, _guard) = WarningCapture::capture(None);

@@ -66,6 +66,15 @@ use crate::{approval::ApprovalError, profile::schema::Profile};
 /// `profile.policy.engine = PolicyEngineKind::V1`.
 pub mod v1;
 
+/// The policy pin: the sequence, digest, and owner of the signed policy a
+/// mainnet profile last verified, read and written under the window-state
+/// store's lock.
+pub mod pin;
+
+/// The exclusive lock over one profile's policy window-state store, shared by
+/// the store, its authorization ledger, and the policy pin.
+pub mod state_lock;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // BuildRegistryError
 // ─────────────────────────────────────────────────────────────────────────────

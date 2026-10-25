@@ -289,8 +289,7 @@ impl WalletServer {
         &self,
         window: &PersistedWindowStore,
         tx_hash: &str,
-    ) -> Result<Option<stellar_agent_network::policy_state::WindowReservation>, CallToolResult>
-    {
+    ) -> Result<Option<stellar_agent_network::policy_state::SubmissionHold>, CallToolResult> {
         match window.pending_reservations(&self.profile) {
             Ok(open) => Ok(open.into_iter().find(|r| r.tx_hash == tx_hash)),
             Err(e) => Err(business_error_result(

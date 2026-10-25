@@ -118,6 +118,26 @@ fn the_shared_get_network_fixture_reports_a_supported_version() {
 
 // ── Outcomes ────────────────────────────────────────────────────────────────
 
+/// Each client carries its own identity into the facts it establishes, so two
+/// clients against one endpoint never yield the same identity.
+#[tokio::test]
+async fn the_identity_names_the_client_it_was_established_through() {
+    let server = serve_get_network(network(TESTNET_PASSPHRASE, 29)).await;
+    let first = StellarRpcClient::new(&server.uri()).unwrap();
+    let second = StellarRpcClient::new(&server.uri()).unwrap();
+    assert_ne!(first.id(), second.id());
+    for client in [&first, &second] {
+        let found = client
+            .endpoint_identity(
+                TESTNET_PASSPHRASE,
+                tokio::time::Instant::now() + GENEROUS_DEADLINE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.client_id(), client.id());
+    }
+}
+
 /// A testnet endpoint at a supported version yields its chain, its version,
 /// and an authority stripped of the userinfo, path, and query the endpoint
 /// URL carries.

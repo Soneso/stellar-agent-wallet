@@ -266,6 +266,7 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
     )
     .expect("new_payment_pending");
     let approval_nonce = entry.approval_nonce.clone();
+    let attested = entry.clone();
     {
         let store_path = approval_dir.path().join(format!("{g_strkey}.toml"));
         let mut store = PendingApprovalStore::open(store_path).expect("open store");
@@ -285,6 +286,7 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
         &approval_nonce,
         &sha,
         &uid,
+        &attested.attested_lifetime(),
     );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
 

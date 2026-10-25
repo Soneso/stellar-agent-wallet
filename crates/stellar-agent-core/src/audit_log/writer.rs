@@ -228,6 +228,8 @@ pub struct AuditWriter {
     /// In `Debug` output this is truncated to first-8 + last-8 characters of
     /// the hex portion to avoid full-hash exposure in debug traces.
     last_hash: String,
+    /// The chain hash the active segment's first entry links to.
+    segment_start_hash: [u8; 32],
     /// Whether the active file is empty (determines chain root signing).
     is_new_file: bool,
     /// Optional 32-byte HMAC key for chain-root signing (Zeroizing on drop).
@@ -259,6 +261,10 @@ pub struct AuditWriter {
     /// and after their pre-action row, so they never proceed while an anchor
     /// write is outstanding.
     pending_tip_anchor: Option<TipAnchor>,
+    /// Whether the writer was opened with an anchor store in the checked mode,
+    /// the only shape whose tip facts [`AuditWriter::verified_tip_facts`]
+    /// reports. A writer opened for repair, or with no anchor store, never is.
+    checked_open: bool,
     /// Keyring-held tip anchor for the active PATH, when the opener supplied
     /// one.
     ///
@@ -487,6 +493,24 @@ impl std::fmt::Debug for AuditWriter {
     }
 }
 
+/// What [`AuditWriter::verified_tip_facts`] established about a checked,
+/// anchored writer after verification and draining.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedTipFacts {
+    /// The chain hash the active file's first entry links to.
+    pub segment_start_hash: [u8; 32],
+    /// Entries in the active file after the drain. A rotation resets it.
+    pub entry_count: u64,
+    /// The active file's tip: the hash of its last entry, or, for an empty
+    /// file, the hash its first entry chains from.
+    pub tip_hash: [u8; 32],
+    /// [`super::tip_anchor::log_path_sha256`] of the active log path.
+    pub log_path_sha256: [u8; 32],
+    /// Whether the durable anchor names exactly this tip and no anchor write
+    /// is still owed.
+    pub anchor_covers_tip: bool,
+}
+
 impl AuditWriter {
     /// Opens the audit log file at `path` and acquires an exclusive advisory
     /// lock via [`std::fs::File::try_lock`].
@@ -701,6 +725,7 @@ impl AuditWriter {
         // "First-entry-per-file rule"), so a zero-block seed would read every
         // post-rotation active file as a broken chain.
         let seed = initial_chain_seed(&path)?;
+        let segment_start_hash = decode_hash(&seed).map_err(WriterError::Hash)?;
         let scan = if is_new_file {
             ChainScan::empty(seed)
         } else {
@@ -714,6 +739,7 @@ impl AuditWriter {
             drains,
             file,
             last_hash: scan.last_hash,
+            segment_start_hash,
             is_new_file,
             hmac_key,
             entry_count: scan.entry_count,
@@ -721,6 +747,7 @@ impl AuditWriter {
             pending_tip_anchor: None,
             log_diverged: None,
             owed_row_anchored: false,
+            checked_open: tip_anchor.is_some() && anchor_mode == TipAnchorOpenMode::Check,
             tip_anchor,
             #[cfg(test)]
             fail_after_entry_before_sidecar: false,
@@ -1199,6 +1226,70 @@ impl AuditWriter {
         let outcome = self.reconcile_tip_anchor()?;
         let anchored_count = self.entry_count;
         self.drain_then_record_adoption(outcome, anchored_count)
+    }
+
+    /// The anchor store attached to this writer.
+    #[must_use]
+    pub fn tip_anchor_store(&self) -> Option<&Arc<dyn TipAnchorStore>> {
+        self.tip_anchor.as_ref()
+    }
+
+    /// Verifies the log against its anchor, drains the outbox, and reports the
+    /// facts of the final tip.
+    ///
+    /// Requires a writer opened with an anchor store in the checked mode.
+    /// Runs [`AuditWriter::verify_tip_anchor`] (reconciliation, which first
+    /// repairs an owed anchor write, then the drain), re-writes an anchor the
+    /// drain's appends left owed, and only then compares the durable anchor
+    /// with the tip. The facts report a lag only when the anchor still does
+    /// not name the tip after that re-write. `entry_count` is taken after the
+    /// drain. A verified empty log with no anchor written yet is covered at
+    /// count zero, and so is an empty file a rotation created whose anchor
+    /// names the archive's handoff.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::TipAnchorUnavailable`] for a writer opened without an
+    ///   anchor store or for repair.
+    /// - Every error of [`AuditWriter::verify_tip_anchor`], including an
+    ///   anchor that cannot be read or an owed write that cannot be repaired.
+    /// - [`WriterError::TipAnchorStore`] when the anchor cannot be read back.
+    /// - [`WriterError::Hash`] when the tip hash does not decode.
+    pub fn verified_tip_facts(&mut self) -> Result<VerifiedTipFacts, WriterError> {
+        if !self.checked_open {
+            return Err(WriterError::TipAnchorUnavailable);
+        }
+        self.verify_tip_anchor()?;
+        // A drained row whose anchor write failed is owed; one more write is
+        // attempted before the lag is reported. Its failure is the lag itself.
+        if self.retry_tip_anchor_if_behind().is_err() {
+            tracing::debug!(
+                log = %basename_lossy_path(&self.path),
+                "audit tip anchor still behind after the drain"
+            );
+        }
+        let store = self
+            .tip_anchor
+            .clone()
+            .ok_or(WriterError::TipAnchorUnavailable)?;
+        let stored = store.load_anchor().map_err(WriterError::TipAnchorStore)?;
+        let anchor_covers_tip = !self.anchor_behind()
+            && match stored {
+                None => self.entry_count == 0,
+                Some(anchor) => {
+                    anchor.tip_hash == self.last_hash
+                        && (self.entry_count == 0
+                            || (anchor.entry_count == self.entry_count
+                                && anchor.end_offset == self.end_offset))
+                }
+            };
+        Ok(VerifiedTipFacts {
+            segment_start_hash: self.segment_start_hash,
+            entry_count: self.entry_count,
+            tip_hash: decode_hash(&self.last_hash).map_err(WriterError::Hash)?,
+            log_path_sha256: super::tip_anchor::log_path_sha256(&self.path),
+            anchor_covers_tip,
+        })
     }
 
     /// Moves the anchor to the active file's current tip and records the
@@ -2096,6 +2187,10 @@ impl AuditWriter {
         rotated_name: &str,
         handoff_hash: String,
     ) -> Result<(), WriterError> {
+        // The new segment starts at the handoff hash. It is decoded before any
+        // rename or state change, so a decode error leaves the writer whole.
+        let segment_start_hash = decode_hash(&handoff_hash).map_err(WriterError::Hash)?;
+
         // Rename the current log file to the rotated name.
         fs::rename(&self.path, rotated_path)?;
 
@@ -2133,6 +2228,7 @@ impl AuditWriter {
 
         // Atomic swap: the old handle is dropped here.
         self.file = new_file;
+        self.segment_start_hash = segment_start_hash;
         self.last_hash = handoff_hash;
         self.is_new_file = true;
         self.entry_count = 0;
@@ -3795,6 +3891,16 @@ impl EvictedWriter {
 static REGISTRY: OnceLock<Mutex<HashMap<String, RegistryEntry>>> = OnceLock::new();
 
 impl AuditWriterRegistry {
+    /// Removes one registry entry so tests can observe ownership by a proof alone.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn remove_for_test(profile_name: &str) {
+        if let Some(registry) = REGISTRY.get()
+            && let Ok(mut registry) = registry.lock()
+        {
+            registry.remove(profile_name);
+        }
+    }
+
     /// Returns the shared `Arc<Mutex<AuditWriter>>` for `profile_name`,
     /// opening it the first time it is requested.
     ///
@@ -7981,6 +8087,250 @@ mod tests {
             fs::metadata(&path).unwrap().len(),
             padded.len() as u64,
             "the file at the path is untouched by the refusal"
+        );
+    }
+
+    // ── verified tip facts ──────────────────────────────────────────────
+
+    fn tip_hash_bytes(anchor: &TipAnchor) -> [u8; 32] {
+        decode_hash(&anchor.tip_hash).unwrap()
+    }
+
+    #[test]
+    fn the_facts_of_a_current_anchor_name_the_tip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = keyed_anchor_writer(&path, &store);
+        writer.write_entry(make_entry("")).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        let facts = writer.verified_tip_facts().unwrap();
+        let tip = tip_of(&path);
+        assert_eq!(
+            facts,
+            VerifiedTipFacts {
+                segment_start_hash: decode_hash(ZERO_BLOCK_HASH).unwrap(),
+                entry_count: 2,
+                tip_hash: tip_hash_bytes(&tip),
+                log_path_sha256: super::super::tip_anchor::log_path_sha256(&path),
+                anchor_covers_tip: true,
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_genesis_is_covered_at_count_zero() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = keyed_anchor_writer(&path, &store);
+        let facts = writer.verified_tip_facts().unwrap();
+        assert_eq!(facts.entry_count, 0);
+        assert!(facts.anchor_covers_tip);
+        assert_eq!(facts.tip_hash, decode_hash(&writer.last_hash).unwrap());
+    }
+
+    #[test]
+    fn an_empty_rotation_file_is_covered_by_its_handoff() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        writer.force_rotate_for_test().unwrap();
+        let handoff = tip_of(&newest_archive(&path));
+        let facts = writer.verified_tip_facts().unwrap();
+        assert_eq!(facts.entry_count, 0, "a rotation resets the count");
+        assert!(facts.anchor_covers_tip);
+        assert_eq!(facts.tip_hash, tip_hash_bytes(&handoff));
+    }
+
+    #[test]
+    fn an_owed_anchor_write_is_repaired_before_the_facts() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = keyed_anchor_writer(&path, &store);
+        store.fail_next_writes(2);
+        writer.write_entry(make_entry("")).unwrap();
+        assert!(writer.anchor_behind());
+        let facts = writer.verified_tip_facts().unwrap();
+        assert!(facts.anchor_covers_tip);
+        assert_eq!(facts.entry_count, 1);
+        assert_eq!(store.peek(), Some(tip_of(&path)));
+    }
+
+    #[test]
+    fn a_persistent_anchor_write_failure_refuses_the_facts() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = keyed_anchor_writer(&path, &store);
+        writer.write_entry(make_entry("")).unwrap();
+        store.fail_next_writes(usize::MAX);
+        writer.write_entry(make_entry("")).unwrap();
+        assert!(matches!(
+            writer.verified_tip_facts(),
+            Err(WriterError::TipAnchorStore(_))
+        ));
+        store.fail_next_writes(0);
+        let facts = writer.verified_tip_facts().unwrap();
+        assert!(facts.anchor_covers_tip);
+        assert_eq!(facts.entry_count, 2);
+    }
+
+    #[test]
+    fn a_drained_row_whose_anchor_write_failed_is_retried_before_the_facts() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = keyed_anchor_writer(&path, &store);
+        writer.write_entry(make_entry("")).unwrap();
+        super::super::outbox::AuditOutbox::for_log(&path)
+            .append(&AuditEntry::new_approval_attested(
+                "PaymentSimulated",
+                "stellar_pay_commit",
+                None,
+                "ABCDEFGHIJKLMNOPQRSTUV",
+                "cli",
+                "queued",
+            ))
+            .unwrap();
+        // The drained append and its immediate retry both fail; the write the
+        // facts owe the anchor succeeds.
+        store.fail_next_writes(2);
+        let facts = writer.verified_tip_facts().unwrap();
+        assert!(facts.anchor_covers_tip);
+        assert_eq!(facts.entry_count, 2);
+        assert_eq!(store.peek(), Some(tip_of(&path)));
+    }
+
+    #[test]
+    fn a_drain_whose_anchor_stays_behind_is_reported_as_a_lag() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = keyed_anchor_writer(&path, &store);
+        writer.write_entry(make_entry("")).unwrap();
+        super::super::outbox::AuditOutbox::for_log(&path)
+            .append(&AuditEntry::new_approval_attested(
+                "PaymentSimulated",
+                "stellar_pay_commit",
+                None,
+                "ABCDEFGHIJKLMNOPQRSTUV",
+                "cli",
+                "queued",
+            ))
+            .unwrap();
+        store.fail_next_writes(usize::MAX);
+        let facts = writer.verified_tip_facts().unwrap();
+        assert!(
+            !facts.anchor_covers_tip,
+            "the durable anchor names the first entry"
+        );
+        assert_eq!(facts.entry_count, 2);
+        store.fail_next_writes(0);
+        assert!(writer.verified_tip_facts().unwrap().anchor_covers_tip);
+    }
+
+    #[test]
+    fn an_unreadable_anchor_refuses_the_facts() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = keyed_anchor_writer(&path, &store);
+        writer.write_entry(make_entry("")).unwrap();
+        store.set_failing(true);
+        assert!(writer.verified_tip_facts().is_err());
+        store.set_failing(false);
+        assert!(writer.verified_tip_facts().unwrap().anchor_covers_tip);
+    }
+
+    #[test]
+    fn the_count_is_taken_after_the_outbox_drains() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = keyed_anchor_writer(&path, &store);
+        writer.write_entry(make_entry("")).unwrap();
+        let outbox = super::super::outbox::AuditOutbox::for_log(&path);
+        for request_id in ["queued-1", "queued-2"] {
+            outbox
+                .append(&AuditEntry::new_approval_attested(
+                    "PaymentSimulated",
+                    "stellar_pay_commit",
+                    None,
+                    "ABCDEFGHIJKLMNOPQRSTUV",
+                    "cli",
+                    request_id,
+                ))
+                .unwrap();
+        }
+        let facts = writer.verified_tip_facts().unwrap();
+        assert_eq!(facts.entry_count, 3);
+        assert!(facts.anchor_covers_tip);
+        assert_eq!(facts.tip_hash, tip_hash_bytes(&tip_of(&path)));
+        assert_eq!(fs::metadata(outbox.path()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_writer_without_a_checked_anchor_has_no_facts() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let mut unanchored = open_no_key(path.clone());
+        assert!(matches!(
+            unanchored.verified_tip_facts(),
+            Err(WriterError::TipAnchorUnavailable)
+        ));
+        drop(unanchored);
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut repair = AuditWriter::open_for_reanchor(
+            path,
+            None,
+            Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+        )
+        .unwrap();
+        assert!(matches!(
+            repair.verified_tip_facts(),
+            Err(WriterError::TipAnchorUnavailable)
+        ));
+    }
+
+    #[test]
+    fn the_writer_carries_its_anchor_store() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let writer = keyed_anchor_writer(&path, &store);
+        let anchor = Arc::clone(&store) as Arc<dyn TipAnchorStore>;
+        assert!(Arc::ptr_eq(writer.tip_anchor_store().unwrap(), &anchor));
+    }
+
+    #[test]
+    fn rotation_changes_the_verified_segment_and_reopen_preserves_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = keyed_anchor_writer(&path, &store);
+        let genesis = writer.verified_tip_facts().unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        let before = writer.verified_tip_facts().unwrap();
+        assert_eq!(genesis.segment_start_hash, before.segment_start_hash);
+        writer.force_rotate_for_test().unwrap();
+        let rotated = writer.verified_tip_facts().unwrap();
+        assert_ne!(rotated.segment_start_hash, before.segment_start_hash);
+        assert_eq!(rotated.segment_start_hash, rotated.tip_hash);
+        assert_eq!(rotated.entry_count, 0);
+        writer.write_entry(make_entry("")).unwrap();
+        assert_eq!(
+            writer.verified_tip_facts().unwrap().segment_start_hash,
+            rotated.segment_start_hash
+        );
+        drop(writer);
+        let mut reopened = keyed_anchor_writer(&path, &store);
+        assert_eq!(
+            reopened.verified_tip_facts().unwrap().segment_start_hash,
+            rotated.segment_start_hash
         );
     }
 }

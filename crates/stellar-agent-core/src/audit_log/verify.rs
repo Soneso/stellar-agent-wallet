@@ -983,6 +983,7 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
             | EventKind::MppReceiptObserved { .. }
             | EventKind::MppSettlementReconciled { .. }
             | EventKind::KeyringKeyWritten { .. }
+            | EventKind::SignerIdentityEnrolled { .. }
             | EventKind::MppStateAdopted { .. }
             | EventKind::MppStateReset { .. }
             | EventKind::PolicyWindowStateReset { .. }
@@ -1608,6 +1609,7 @@ mod tests {
             EventKind::MppReceiptObserved { .. } => "mpp_receipt_observed",
             EventKind::MppSettlementReconciled { .. } => "mpp_settlement_reconciled",
             EventKind::KeyringKeyWritten { .. } => "keyring_key_written",
+            EventKind::SignerIdentityEnrolled { .. } => "signer_identity_enrolled",
             EventKind::PolicyWindowStateReset { .. } => "policy_window_state_reset",
             EventKind::MppStateAdopted { .. } => "mpp_state_adopted",
             EventKind::MppStateReset { .. } => "mpp_state_reset",
@@ -2144,6 +2146,12 @@ mod tests {
                 keyring_entry: "default".to_owned(),
                 public_address: None,
             },
+            EventKind::SignerIdentityEnrolled {
+                keyring_service: "stellar-agent-signer-default".to_owned(),
+                keyring_entry: "enrolled-identity".to_owned(),
+                public_address: RedactedStrkey::from_already_redacted("GABCD...VWXYZ"),
+                role: "agent".to_owned(),
+            },
             EventKind::ChannelPoolInitialised {
                 funder_redacted: "GABCD...12345".to_owned(),
                 channel_count: 4,
@@ -2430,6 +2438,7 @@ mod tests {
                 "mpp_receipt_observed",
                 "mpp_settlement_reconciled",
                 "keyring_key_written",
+                "signer_identity_enrolled",
                 "channel_pool_initialised",
                 "channel_acquired",
                 "channel_released",

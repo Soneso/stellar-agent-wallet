@@ -546,6 +546,7 @@ pub fn attest_and_persist(
                 &entry.approval_nonce,
                 &digest,
                 &entry.process_uid,
+                &entry.attested_lifetime(),
             );
             emit_attested_audit(
                 &mut audit,
@@ -582,6 +583,7 @@ pub fn attest_and_persist(
                 &entry.approval_nonce,
                 proposal_sha256,
                 &entry.process_uid,
+                &entry.attested_lifetime(),
             );
             let proposal_sha256_hex = proposal_sha256
                 .iter()
@@ -616,6 +618,7 @@ pub fn attest_and_persist(
                 &entry.approval_nonce,
                 prepared_artifact_hash,
                 &entry.process_uid,
+                &entry.attested_lifetime(),
             );
             emit_attested_audit(
                 &mut audit,
@@ -752,6 +755,7 @@ fn attest_envelope_and_persist(
         &entry.approval_nonce,
         &presented_sha256,
         &entry.process_uid,
+        &entry.attested_lifetime(),
     );
     emit_attested_audit(
         audit,
@@ -1279,17 +1283,23 @@ mod tests {
 
     fn assert_cross_bindings_refused(
         key: &[u8; 32],
-        nonce: &str,
+        entry: &PendingApproval,
         digest: &[u8; 32],
-        uid: &str,
         blob: &[u8; 32],
     ) {
+        let scope = entry.attestation_scope().unwrap();
         for binding in [
             crate::approval::AttestationBinding::new("b", "stellar:testnet"),
             crate::approval::AttestationBinding::new("a", "stellar:mainnet"),
         ] {
             assert!(!crate::approval::verify_attestation(
-                key, &binding, nonce, digest, uid, blob
+                key,
+                &binding,
+                &entry.approval_nonce,
+                digest,
+                &entry.process_uid,
+                &scope,
+                blob
             ));
         }
     }
@@ -1347,6 +1357,7 @@ mod tests {
             &nonce,
             &sha256_bytes,
             &process_uid,
+            &final_entry.attested_lifetime(),
         );
         let persisted_bytes: [u8; 32] = URL_SAFE_NO_PAD
             .decode(blob_b64)
@@ -1354,13 +1365,7 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(persisted_bytes, expected);
-        assert_cross_bindings_refused(
-            &raw_key,
-            &nonce,
-            &sha256_bytes,
-            &process_uid,
-            &persisted_bytes,
-        );
+        assert_cross_bindings_refused(&raw_key, final_entry, &sha256_bytes, &persisted_bytes);
     }
 
     #[test]
@@ -1571,6 +1576,7 @@ mod tests {
             &nonce,
             &proposal_sha256,
             &process_uid,
+            &final_entry.attested_lifetime(),
         );
         let persisted_bytes: [u8; 32] = URL_SAFE_NO_PAD
             .decode(blob_b64)
@@ -1578,13 +1584,7 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(persisted_bytes, expected);
-        assert_cross_bindings_refused(
-            &raw_key,
-            &nonce,
-            &proposal_sha256,
-            &process_uid,
-            &persisted_bytes,
-        );
+        assert_cross_bindings_refused(&raw_key, final_entry, &proposal_sha256, &persisted_bytes);
     }
 
     #[test]
@@ -2201,6 +2201,7 @@ mod tests {
                 &entry.approval_nonce,
                 &expected_digest,
                 &entry.process_uid,
+                &entry.attestation_scope().unwrap(),
                 &bytes
             ));
             let log = std::fs::read_to_string(dir.path().join("audit/audit.jsonl")).unwrap();

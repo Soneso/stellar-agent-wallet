@@ -2680,6 +2680,16 @@ mod tests {
         server.set_approval_dir_for_test(dir.path().to_path_buf());
         let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, DEFAULT_TTL_MS);
         let smart_account = parse_c_strkey_to_smart_account(TEST_SMART_ACCOUNT).unwrap();
+        let stored = {
+            let approvals_dir = server.resolve_approval_dir().unwrap();
+            let store_path =
+                approvals_dir.join(format!("{}.toml", server.profile_name_for_approval()));
+            PendingApprovalStore::open(store_path)
+                .unwrap()
+                .get(&nonce)
+                .unwrap()
+                .clone()
+        };
         let blob = compute_attestation(
             &attestation_key,
             &stellar_agent_core::approval::AttestationBinding::new(
@@ -2689,6 +2699,7 @@ mod tests {
             &nonce,
             &matching_digest_for(&smart_account),
             &process_uid_for_attestation().unwrap(),
+            &stored.attested_lifetime(),
         );
         {
             let approvals_dir = server.resolve_approval_dir().unwrap();

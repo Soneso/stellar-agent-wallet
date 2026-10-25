@@ -13,6 +13,7 @@ use super::loader::{guard_name_for_load, list_profiles_in_dir};
 use super::schema::{
     KeyringEntryRef, Profile, ProviderRole, WALLET_KEY_REFERENCE_FIELDS,
     default_audit_log_path_for, default_profile_dir, generation_account, keyring_entry_alias,
+    mainnet_enablement_entry_ref, policy_pin_entry_ref, signer_identity_entry_ref,
 };
 
 /// A bounded, path-redacted keyring coordinate carried by a finding.
@@ -214,6 +215,7 @@ const ROLES: [(ProviderRole, &str); 3] = [
 
 // Positions in `WALLET_KEY_REFERENCE_FIELDS`, which orders the first eight
 // enumeration entries; a test pins each name.
+const SIGNER_FIELD: usize = 0;
 const AUDIT_FIELD: usize = 2;
 const OWNER_FIELD: usize = 3;
 const POOL_FIELD: usize = 6;
@@ -223,6 +225,9 @@ const WINDOW_FIELD: usize = 7;
 const POOL_DEFAULT: &str = "pool_master_key_id (default)";
 const OWNER_CANONICAL: &str = "policy_owner_key_id (canonical)";
 const WINDOW_GENERATION: &str = "policy_window_state_key_id (generation)";
+const WINDOW_POLICY_PIN: &str = "policy_window_state_key_id (policy pin)";
+const WINDOW_ENABLEMENT: &str = "policy_window_state_key_id (mainnet enablement)";
+const SIGNER_IDENTITY: &str = "mcp_signer_default (enrolled identity)";
 const TIP_ANCHOR: &str = "audit_log_hash_chain_key_id (tip anchor)";
 const REANCHOR_COUNTER: &str = "audit_log_hash_chain_key_id (reanchor counter)";
 const AUDIT_BINDING: &str = "audit binding (derived)";
@@ -311,13 +316,17 @@ fn effective_coordinates(
         entries.extend(document.credentials.iter().cloned());
     }
     let window = &entries[WINDOW_FIELD].1;
-    entries.push((
-        WINDOW_GENERATION,
-        KeyringEntryRef {
-            service: window.service.clone(),
-            account: generation_account(&window.account),
-        },
-    ));
+    let window_generation = KeyringEntryRef {
+        service: window.service.clone(),
+        account: generation_account(&window.account),
+    };
+    let window_pin = policy_pin_entry_ref(window);
+    let window_enablement = mainnet_enablement_entry_ref(window);
+    let signer_identity = signer_identity_entry_ref(&entries[SIGNER_FIELD].1);
+    entries.push((WINDOW_GENERATION, window_generation));
+    entries.push((WINDOW_POLICY_PIN, window_pin));
+    entries.push((WINDOW_ENABLEMENT, window_enablement));
+    entries.push((SIGNER_IDENTITY, signer_identity));
     let path = merged
         .map(|p| &p.audit_log_path)
         .or_else(|| document.and_then(|d| d.audit_log_path.as_ref()))
@@ -830,6 +839,20 @@ mod tests {
                 reanchor_count_account(&audit.account, &a.audit_log_path),
             ),
             AUDIT_BINDING => KeyringEntryRef::default_audit_binding("alice"),
+            WINDOW_POLICY_PIN => KeyringEntryRef::new(
+                &a.policy_window_state_key_id.service,
+                format!("{}-policy-pin", a.policy_window_state_key_id.account),
+            ),
+            WINDOW_ENABLEMENT => KeyringEntryRef::new(
+                &a.policy_window_state_key_id.service,
+                format!(
+                    "{}-mainnet-enablement",
+                    a.policy_window_state_key_id.account
+                ),
+            ),
+            SIGNER_IDENTITY => {
+                KeyringEntryRef::new(&a.mcp_signer_default.service, "enrolled-identity")
+            }
             MPP_STATE => mpp,
             MPP_GENERATION => KeyringEntryRef::new(&mpp.service, generation_account(&mpp.account)),
             other => panic!("no derived fixture for {other}"),
@@ -896,6 +919,17 @@ mod tests {
         derived_collision(MPP_GENERATION);
     }
 
+    /// The policy pin, the mainnet enablement nonce, and the signer identity
+    /// record are enumerated, so a sibling naming one is found from both
+    /// sides.
+    #[test]
+    #[serial_test::serial]
+    fn mainnet_coordinates_are_reserved() {
+        derived_collision(WINDOW_POLICY_PIN);
+        derived_collision(WINDOW_ENABLEMENT);
+        derived_collision(SIGNER_IDENTITY);
+    }
+
     #[test]
     #[serial_test::serial]
     fn owner_entry_named_by_a_sibling_is_one_finding() {
@@ -953,6 +987,7 @@ mod tests {
     #[test]
     fn named_field_indices_match_the_reference_fields() {
         for (index, field) in [
+            (SIGNER_FIELD, "mcp_signer_default"),
             (AUDIT_FIELD, "audit_log_hash_chain_key_id"),
             (OWNER_FIELD, "policy_owner_key_id"),
             (POOL_FIELD, "pool_master_key_id"),

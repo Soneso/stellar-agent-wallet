@@ -3106,6 +3106,28 @@ pub enum EventKind {
         public_address: Option<RedactedStrkey>,
     },
 
+    /// `profile enroll-signer` recorded the enrolled signer's identity record
+    /// beside its seed.
+    ///
+    /// Emitted after the identity record write succeeds, on enrollment and on
+    /// `--repair-identity`. Records the coordinate of the identity record, the
+    /// redacted public address it names, and its role, never the seed or any
+    /// key material.
+    ///
+    /// # Schema additivity
+    ///
+    /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
+    SignerIdentityEnrolled {
+        /// Keyring service the identity record was written under.
+        keyring_service: String,
+        /// Keyring entry the identity record was written under.
+        keyring_entry: String,
+        /// Redacted first-5-last-5 strkey of the enrolled public key.
+        public_address: RedactedStrkey,
+        /// The enrolled role, `agent`.
+        role: String,
+    },
+
     /// `profile reset-window-state` records the accrual before mutating the
     /// store, while holding the audit writer and the window lock.
     PolicyWindowStateReset {
@@ -3189,7 +3211,7 @@ pub enum EventKind {
 /// the test stays green, leaving the new variant unpinned by any tag assertion.
 /// Closing that would need the count derived from the enum itself, which needs a
 /// derive macro this workspace does not carry.
-pub const EVENT_KIND_VARIANT_COUNT: usize = 70;
+pub const EVENT_KIND_VARIANT_COUNT: usize = 71;
 
 /// Why an [`EventKind::AuditTipAnchored`] row was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5771,6 +5793,30 @@ mod tests {
             result.is_err(),
             "missing-field deserialisation must fail for KeyringKeyWritten"
         );
+    }
+
+    /// The identity row has its own wire discriminant, carries the redacted
+    /// address and role, and no key material field exists to carry a seed.
+    #[test]
+    fn event_kind_signer_identity_enrolled_round_trip() {
+        let ev = EventKind::SignerIdentityEnrolled {
+            keyring_service: "stellar-agent-signer-default".to_owned(),
+            keyring_entry: "enrolled-identity".to_owned(),
+            public_address: RedactedStrkey::from_already_redacted("GAAAA...ZZZZZ"),
+            role: "agent".to_owned(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert_eq!(
+            s,
+            "{\"kind\":\"signer_identity_enrolled\",\"keyring_service\":\
+             \"stellar-agent-signer-default\",\"keyring_entry\":\"enrolled-identity\",\
+             \"public_address\":\"GAAAA...ZZZZZ\",\"role\":\"agent\"}"
+        );
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back);
+        let missing: Result<EventKind, _> =
+            serde_json::from_str(r#"{"kind":"signer_identity_enrolled"}"#);
+        assert!(missing.is_err());
     }
 
     #[test]

@@ -2387,6 +2387,83 @@ pub fn generation_account(account: &str) -> String {
     format!("{account}-generation")
 }
 
+/// The keyring account suffix of the policy pin beside the window-state key.
+const POLICY_PIN_SUFFIX: &str = "-policy-pin";
+
+/// The keyring account suffix of the mainnet enablement nonce beside the
+/// window-state key.
+const MAINNET_ENABLEMENT_SUFFIX: &str = "-mainnet-enablement";
+
+/// The keyring account that holds the enrolled signer's identity record,
+/// under the signer's own service.
+pub const SIGNER_IDENTITY_ACCOUNT: &str = "enrolled-identity";
+
+/// The keyring coordinate of the policy pin: the window-state key's service
+/// and its account suffixed `-policy-pin`.
+///
+/// Derived from the coordinate itself, so an operator-overridden window-state
+/// coordinate keeps its pin beside it.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::profile::schema::{KeyringEntryRef, policy_pin_entry_ref};
+///
+/// let window = KeyringEntryRef::default_policy_window_state_key("alice");
+/// let pin = policy_pin_entry_ref(&window);
+/// assert_eq!(pin.service, "stellar-agent-policy-window-alice");
+/// assert_eq!(pin.account, "default-policy-pin");
+/// ```
+#[must_use]
+pub fn policy_pin_entry_ref(window_key: &KeyringEntryRef) -> KeyringEntryRef {
+    KeyringEntryRef::new(
+        window_key.service.clone(),
+        format!("{}{POLICY_PIN_SUFFIX}", window_key.account),
+    )
+}
+
+/// The keyring coordinate of the mainnet enablement nonce: the window-state
+/// key's service and its account suffixed `-mainnet-enablement`.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::profile::schema::{KeyringEntryRef, mainnet_enablement_entry_ref};
+///
+/// let window = KeyringEntryRef::default_policy_window_state_key("alice");
+/// let nonce = mainnet_enablement_entry_ref(&window);
+/// assert_eq!(nonce.service, "stellar-agent-policy-window-alice");
+/// assert_eq!(nonce.account, "default-mainnet-enablement");
+/// ```
+#[must_use]
+pub fn mainnet_enablement_entry_ref(window_key: &KeyringEntryRef) -> KeyringEntryRef {
+    KeyringEntryRef::new(
+        window_key.service.clone(),
+        format!("{}{MAINNET_ENABLEMENT_SUFFIX}", window_key.account),
+    )
+}
+
+/// The keyring coordinate of the enrolled signer's identity record: the
+/// signer's service and the account [`SIGNER_IDENTITY_ACCOUNT`].
+///
+/// The record holds the enrolled public key and role, never the seed; the
+/// seed stays at the signer coordinate itself.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::profile::schema::{KeyringEntryRef, signer_identity_entry_ref};
+///
+/// let signer = KeyringEntryRef::default_signer("alice");
+/// let identity = signer_identity_entry_ref(&signer);
+/// assert_eq!(identity.service, "stellar-agent-signer-alice");
+/// assert_eq!(identity.account, "enrolled-identity");
+/// ```
+#[must_use]
+pub fn signer_identity_entry_ref(signer: &KeyringEntryRef) -> KeyringEntryRef {
+    KeyringEntryRef::new(signer.service.clone(), SIGNER_IDENTITY_ACCOUNT)
+}
+
 /// Whether a credential reference names a keyring entry another wallet key
 /// uses or that lies in a wallet key namespace.
 ///

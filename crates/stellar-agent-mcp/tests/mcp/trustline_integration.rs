@@ -1132,6 +1132,7 @@ fn seed_witness_opt_in(profile: &Profile, dir: &std::path::Path, case: Trustline
         &nonce,
         &digest,
         &entry.process_uid,
+        &entry.attested_lifetime(),
     );
     store
         .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())

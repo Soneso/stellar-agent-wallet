@@ -194,6 +194,15 @@ pub struct TransactionStatusView {
 pub struct StellarRpcClient {
     pub(crate) inner: Client,
     pub(crate) url: RpcEndpoint,
+    id: u64,
+}
+
+/// The next client identity; every construction takes one, so two clients
+/// of one process never share an identity.
+static NEXT_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_client_id() -> u64 {
+    NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl StellarRpcClient {
@@ -223,6 +232,7 @@ impl StellarRpcClient {
         Ok(Self {
             inner,
             url: endpoint,
+            id: next_client_id(),
         })
     }
 
@@ -315,7 +325,18 @@ impl StellarRpcClient {
         Ok(Self {
             inner,
             url: endpoint,
+            id: next_client_id(),
         })
+    }
+
+    /// The client's process-unique identity, assigned at construction.
+    ///
+    /// The [`EndpointIdentity`] this client produces carries it, so a fact
+    /// established through one client is never taken for one established
+    /// through another, even against the same endpoint.
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Returns the configured RPC endpoint URL of this client.
@@ -653,6 +674,7 @@ impl StellarRpcClient {
             chain_id,
             network.protocol_version,
             self.redacted_url(),
+            self.id,
         ))
     }
 

@@ -307,6 +307,7 @@ async fn approve_payment_mints_verifiable_attestation() {
         } => envelope_sha256_hex.clone(),
         _ => unreachable!(),
     };
+    let attested = entry.clone();
     let nonce = h.insert(entry);
     let csrf = h.csrf_for(&nonce);
 
@@ -332,6 +333,7 @@ async fn approve_payment_mints_verifiable_attestation() {
         &nonce,
         &sha,
         &process_uid,
+        &attested.attested_lifetime(),
     );
     let blob: [u8; 32] = URL_SAFE_NO_PAD
         .decode(blob_b64)
@@ -345,6 +347,7 @@ async fn approve_payment_mints_verifiable_attestation() {
         &nonce,
         &sha,
         &process_uid,
+        &attested.attestation_scope().unwrap(),
         &blob
     ));
 }
@@ -376,6 +379,7 @@ async fn serve_trustline_json_returns_attestation() {
         } => envelope_sha256_hex.clone(),
         _ => unreachable!(),
     };
+    let attested = entry.clone();
     let nonce = h.insert(entry);
     let csrf = h.csrf_for(&nonce);
 
@@ -401,6 +405,7 @@ async fn serve_trustline_json_returns_attestation() {
         &nonce,
         &sha,
         &process_uid,
+        &attested.attested_lifetime(),
     );
     let blob: [u8; 32] = URL_SAFE_NO_PAD
         .decode(blob_b64)
@@ -414,6 +419,7 @@ async fn serve_trustline_json_returns_attestation() {
         &nonce,
         &sha,
         &process_uid,
+        &attested.attestation_scope().unwrap(),
         &blob
     ));
     let req = Request::builder()

@@ -303,6 +303,15 @@ async fn t1_rule_create_commit_happy_path() {
         .try_into()
         .expect("proposal_sha256_hex must decode to exactly 32 bytes");
     let uid = process_uid_for_attestation().expect("process uid");
+    let stored = stellar_agent_core::approval::PendingApprovalStore::open(
+        stellar_agent_core::profile::schema::default_approval_dir()
+            .expect("approval dir")
+            .join(format!("{}.toml", server.profile_name_for_approval())),
+    )
+    .expect("open approval store")
+    .get(&approval_nonce)
+    .expect("the approval request is persisted")
+    .clone();
     let blob = compute_attestation(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new(
@@ -312,6 +321,7 @@ async fn t1_rule_create_commit_happy_path() {
         &approval_nonce,
         &proposal_sha256,
         &uid,
+        &stored.attested_lifetime(),
     );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
 

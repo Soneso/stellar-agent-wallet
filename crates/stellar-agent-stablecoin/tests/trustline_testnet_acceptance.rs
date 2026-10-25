@@ -534,6 +534,7 @@ async fn clawback_gate_opt_in_round_trip() {
     .expect("new_trustline_clawback_opt_in_pending must succeed");
 
     let approval_nonce = pending_entry.approval_nonce.clone();
+    let attested = pending_entry.clone();
 
     store
         .insert(pending_entry, 1)
@@ -569,6 +570,7 @@ async fn clawback_gate_opt_in_round_trip() {
         &approval_nonce,
         &digest,
         &uid,
+        &attested.attested_lifetime(),
     );
 
     store

@@ -1327,6 +1327,7 @@ mod tests {
             &nonce,
             &sha256_bytes,
             &process_uid,
+            &entry2.attested_lifetime(),
         );
 
         assert_eq!(

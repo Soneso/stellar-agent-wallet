@@ -77,7 +77,7 @@ use stellar_agent_core::profile::receipt::{
 };
 use stellar_agent_core::profile::schema::Profile;
 
-use crate::policy_state::{PersistedWindowStore, WindowReservation, WindowStoreError};
+use crate::policy_state::{PersistedWindowStore, SubmissionHold, WindowStoreError};
 use crate::sequence_floor::SequenceFloorHook;
 use crate::submit::redact_tx_hash;
 use stellar_agent_core::observability::redact::redact_strkey_first5_last5 as redact_account;
@@ -368,8 +368,8 @@ impl<'a> WalletSubmissionRecorder<'a> {
         self
     }
 
-    fn reservation(&self, intent: &SubmissionIntent) -> WindowReservation {
-        WindowReservation {
+    fn reservation(&self, intent: &SubmissionIntent) -> SubmissionHold {
+        SubmissionHold {
             id: intent.envelope_hash.clone(),
             tx_hash: intent.tx_hash.clone(),
             source: intent.source.clone(),
@@ -1037,7 +1037,6 @@ mod tests {
         assert_eq!(err.code(), "submission.record_unavailable");
     }
 
-    #[cfg(feature = "test-helpers")]
     #[tokio::test]
     #[serial_test::serial]
     async fn pending_and_submitted_rows_carry_the_witness() {
@@ -1048,7 +1047,7 @@ mod tests {
         let audit = Arc::new(Mutex::new(
             AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
         ));
-        let witness = crate::cross_check::CrossCheckWitness::for_tests(
+        let witness = crate::cross_check::CrossCheckWitness::for_crate_tests(
             "https://oracle.example",
             123,
             [9; 32],

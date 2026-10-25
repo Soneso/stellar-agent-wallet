@@ -842,6 +842,18 @@ async fn remote_approval_browser_drives_real_payment_commit() {
         .expect("attestation decodes as base64")
         .try_into()
         .expect("attestation is 32 bytes");
+    let stored = stellar_agent_core::approval::PendingApprovalStore::open(
+        approval_dir
+            .path()
+            .join(format!("{}.toml", server.profile_name_for_approval())),
+    )
+    .expect("open approval store")
+    .get(&approval_nonce)
+    .expect("the approved request is persisted")
+    .clone();
+    let scope = stored
+        .attestation_scope()
+        .expect("the approved request names a readable attestation layout");
     assert!(
         stellar_agent_core::approval::verify_attestation(
             &attestation_key,
@@ -852,6 +864,7 @@ async fn remote_approval_browser_drives_real_payment_commit() {
             &approval_nonce,
             &envelope_sha256,
             &uid,
+            &scope,
             &attestation_bytes,
         ),
         "the browser-surfaced attestation must verify against the attestation key"

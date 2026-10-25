@@ -288,7 +288,12 @@ impl TipAnchorStoreError {
 /// owns the writer and the check semantics, and never links a keyring backend of
 /// its own. Every method is called with the writer's sidecar lock already held,
 /// so implementations need no locking beyond what the backend provides.
-pub trait TipAnchorStore: std::fmt::Debug + Send + Sync {
+///
+/// `Any` is a supertrait so a holder of the trait object can establish which
+/// concrete store it is: the mainnet audit readiness accepts only the
+/// keyring-backed store at the profile's own coordinate, and an injected store
+/// of any other type never passes that check.
+pub trait TipAnchorStore: std::any::Any + std::fmt::Debug + Send + Sync {
     /// Reads the anchor. `Ok(None)` means no anchor has ever been written for
     /// this path — the adoption path.
     ///
