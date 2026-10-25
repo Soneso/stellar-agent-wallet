@@ -106,9 +106,23 @@
 //! serialise as decimal strings (the `wire_stroops::i128` / audit
 //! `i128_decimal_str` convention), never a bare JSON number, so no value is
 //! silently truncated by a JSON-number-as-f64 reader. The body also carries a
-//! `generation: u64` field; see "Anti-rollback" below. Version 3 includes the
-//! operator marker and optional prepared settlement. Versions 1 and 2 remain readable; absent status means
-//! confirmed spend and an absent operator marker means automatic selection.
+//! `generation: u64` field; see "Anti-rollback" below.
+//!
+//! The version is chosen from each snapshot's content. Version 3 is the
+//! compact form: the buckets with the operator marker and an optional
+//! prepared settlement. Version 4 adds the mainnet authorization ledger of
+//! [`ledger`]: the authorization records and the holds of the open ones, both
+//! omitted when empty. A snapshot is written as version 4 whenever its
+//! authorization history is non-empty, settled records included, and as
+//! version 3 once pruning has emptied that history. A version 4 file with an
+//! empty history is read; no writer produces one.
+//!
+//! Versions 1 to 4 are read for the current snapshot, and versions 3 and 4 for
+//! a prepared successor, in every pairing. A snapshot below version 4 that
+//! carries authorization history, or history that breaks a ledger invariant,
+//! refuses the read. A legacy current snapshot keeps its version in the
+//! prepared container. In versions 1 and 2, absent status means confirmed
+//! spend and an absent operator marker means automatic selection.
 //!
 //! # Integrity
 //!
@@ -151,7 +165,10 @@
 //! [`lock::WindowStoreLock`] — an OFD-advisory exclusive flock at
 //! `<store-file>.lock`, mirroring [`crate::counterparty::lock::CacheLock`] —
 //! serialises every read-modify-write against the file (record, reset,
-//! resign). [`load_into`](PersistedWindowStore::load_into) does not take the
+//! resign, and every authorization transition). It lives in
+//! [`stellar_agent_core::policy::state_lock`] and is re-exported here, so the
+//! policy pin of [`stellar_agent_core::policy::pin`] is read, written, and
+//! compared under the same guard. [`load_into`](PersistedWindowStore::load_into) does not take the
 //! lock: the file is only ever replaced via atomic rename (temp file +
 //! `sync_data` + rename + parent-directory fsync, mirroring
 //! [`stellar_agent_core::audit_log`]'s rotation `write_sidecar_atomic`
@@ -162,13 +179,21 @@
 //! Entries older than the largest supported criterion window (`1w` =
 //! 604,800 s) are pruned on every write once confirmed. Pending records are retained.
 
+pub mod ledger;
 pub mod lock;
 pub mod store;
 
+use lock::StateLockError;
+
+pub use ledger::{
+    ConsumeExpect, ConsumeReceipt, ConsumptionBinding, DomainBinding, FeeBumpFacts,
+    MAX_OPEN_AUTHORIZATIONS, MintRequest, MintedRecord, OpenAuthorization, SubmissionBinding,
+    WindowReservation,
+};
 pub use store::{
     MintOutcome, POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET,
-    RECONCILE_MIN_AGE_MS, ReconcileFailure, ReconcileReport, ResetError, ResetOutcome,
-    SettledSubmission, WindowReservation,
+    RECONCILE_MIN_AGE_MS, ReconcileFailure, ReconcileReport, ResetError, ResetOutcome, ResetRecord,
+    SettledSubmission, StateDefect, SubmissionHold,
 };
 
 /// Records a confirmed call's contribution into `engine`'s window state and
@@ -275,6 +300,17 @@ pub enum WindowStoreError {
         detail: String,
     },
 
+    /// The authenticated file was written by a newer build.
+    #[error(
+        "policy window-state version {version} exceeds {max}; written by a newer build; use that build"
+    )]
+    UnsupportedVersion {
+        /// The authenticated file's version.
+        version: u32,
+        /// The highest version this build reads.
+        max: u32,
+    },
+
     /// The store file's HMAC tag does not match the recomputed value —
     /// tampering, corruption, or a stale key.
     #[error("policy window-state store HMAC mismatch — possible tampering or rotation")]
@@ -284,6 +320,12 @@ pub enum WindowStoreError {
     /// generation counter, or one of the two is present without the other —
     /// a deleted-and-recreated file, a restored older snapshot, or a deleted
     /// generation counter. See the module docs' "Anti-rollback" section.
+    ///
+    /// For a mainnet profile in a build with mainnet writes, this condition,
+    /// like every other unverifiable state, refuses as
+    /// `MainnetStateUnverifiable` naming its defect instead; the reset is the
+    /// remedy there too, and refuses while a verifiable store still holds an
+    /// open mainnet authorization.
     #[error(
         "policy window-state store generation mismatch — possible deletion or rollback; \
          run `profile reset-window-state` to recover"
@@ -331,4 +373,52 @@ pub enum WindowStoreError {
     /// can count that spend. Nothing is written.
     #[error("the spending window already holds a reservation for these signed bytes")]
     DuplicateReservation,
+
+    /// A mainnet authorization transition refused: a precondition of the mint,
+    /// the consumption, or the invalidation does not hold. The store file is not written.
+    #[error("the mainnet authorization ledger refused: {precondition}")]
+    AuthorizationRefused {
+        /// The broken precondition.
+        precondition: crate::mainnet::MainnetPrecondition,
+    },
+
+    /// The store of a mainnet profile cannot be verified, so neither its
+    /// spend history nor its authorizations are known.
+    ///
+    /// Produced in place of the generic integrity errors for a mainnet
+    /// profile in a build with mainnet writes. The reset is the remedy.
+    #[cfg(feature = "mainnet-write")]
+    #[error(
+        "policy.window_state_unverifiable: the policy window-state of this mainnet profile \
+         cannot be verified ({defect}); run `stellar-agent profile reset-window-state <name> \
+         --reason <reason>` to reset it"
+    )]
+    MainnetStateUnverifiable {
+        /// The defect found.
+        defect: StateDefect,
+    },
+
+    /// The reset of a mainnet profile's verifiable store refused because a
+    /// mainnet authorization is still open. Nothing changed.
+    #[cfg(feature = "mainnet-write")]
+    #[error(
+        "the policy window-state holds {open} open mainnet authorization(s); the reset refuses \
+         until each is used or expires"
+    )]
+    OpenAuthorizations {
+        /// The number of effective open authorizations.
+        open: usize,
+    },
+}
+
+impl From<StateLockError> for WindowStoreError {
+    fn from(error: StateLockError) -> Self {
+        match error {
+            StateLockError::WriterLocked => Self::WriterLocked,
+            StateLockError::Io { kind } => Self::Io { kind },
+            _ => Self::Io {
+                kind: std::io::ErrorKind::Other,
+            },
+        }
+    }
 }

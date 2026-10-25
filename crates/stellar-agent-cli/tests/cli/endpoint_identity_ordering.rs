@@ -350,7 +350,7 @@ fn v1_profile_with_due_reservation(home: &Path, name: &str, rpc_url: &str, sourc
     };
     use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile};
     use stellar_agent_headless_keyring::{crypto::ProtectionMode, store::HeadlessStore};
-    use stellar_agent_network::policy_state::{PersistedWindowStore, WindowReservation};
+    use stellar_agent_network::policy_state::{PersistedWindowStore, SubmissionHold};
 
     let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home);
     let profile = Profile::builder_testnet_named(
@@ -387,7 +387,7 @@ fn v1_profile_with_due_reservation(home: &Path, name: &str, rpc_url: &str, sourc
                     max_stroops: 1_000_000_000,
                 },
             )],
-            &WindowReservation {
+            &SubmissionHold {
                 id: "7".repeat(64),
                 tx_hash: "7".repeat(64),
                 source: source.to_owned(),

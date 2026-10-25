@@ -847,6 +847,7 @@ async fn valid_attestation_passes_gate() {
     )
     .expect("new_payment_pending");
     let approval_nonce_id = entry.approval_nonce.clone();
+    let attested = entry.clone();
     {
         let store_path = temp.path().join("acct.toml");
         let mut store = PendingApprovalStore::open(store_path).expect("open store");
@@ -865,6 +866,7 @@ async fn valid_attestation_passes_gate() {
         &approval_nonce_id,
         &sha,
         &uid,
+        &attested.attested_lifetime(),
     );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
 
@@ -966,6 +968,7 @@ async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
     )
     .expect("new_payment_pending");
     let approval_nonce_id = entry.approval_nonce.clone();
+    let attested = entry.clone();
     {
         let mut store =
             PendingApprovalStore::open(temp.path().join("acct.toml")).expect("open store");
@@ -978,6 +981,7 @@ async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
         &approval_nonce_id,
         &stellar_agent_core::approval::envelope_sha256(envelope_xdr.as_bytes()),
         &uid,
+        &attested.attested_lifetime(),
     );
 
     let logs = CaptureWriter::new();

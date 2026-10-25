@@ -4237,7 +4237,7 @@ impl CompetingReservationResponder {
         use stellar_agent_core::policy::v1::criteria::state_store::{
             StateKey, WindowEntry, WindowLimit,
         };
-        use stellar_agent_network::policy_state::{PersistedWindowStore, WindowReservation};
+        use stellar_agent_network::policy_state::{PersistedWindowStore, SubmissionHold};
 
         let now = stellar_agent_core::timefmt::now_unix_ms().expect("clock");
         let entry = WindowEntry::new(
@@ -4254,7 +4254,7 @@ impl CompetingReservationResponder {
             .record_pending(
                 &self.profile,
                 &[entry],
-                &WindowReservation {
+                &SubmissionHold {
                     id: "9".repeat(64),
                     tx_hash: "9".repeat(64),
                     source: DEST_G.to_owned(),

@@ -1265,6 +1265,9 @@ struct PendingApprovalOnDisk {
     process_uid: String,
     created_at_unix_ms: u64,
     expires_at_unix_ms: u64,
+    // An absent version decodes as version 2.
+    #[serde(default = "legacy_attestation_version")]
+    attestation_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 
@@ -1335,6 +1338,11 @@ struct PendingApprovalOnDisk {
     passkey_assertion: Option<AssertionInput>,
     #[serde(default)]
     registration_input: Option<RegistrationInput>,
+}
+
+/// The layout of an attestation stored before records named theirs.
+fn legacy_attestation_version() -> u32 {
+    super::attestation::ATTESTATION_VERSION_V2
 }
 
 /// Optional `summary_to` deserialiser — applies the G-strkey validator when
@@ -1511,6 +1519,14 @@ pub struct PendingApproval {
     /// Set by `record_passkey_assertion` — SignWithPasskey only.
     /// Once set, this field cannot be overwritten.
     pub passkey_assertion: Option<AssertionInput>,
+
+    /// The layout `attestation_blob_b64` is computed under.
+    ///
+    /// [`super::attestation::ATTESTATION_VERSION`] for every record this build
+    /// creates and for every attestation it records, which covers the record's
+    /// kind and lifetime. A record written without the field reads as
+    /// [`super::attestation::ATTESTATION_VERSION_V2`].
+    pub attestation_version: u32,
 }
 
 impl std::fmt::Debug for PendingApproval {
@@ -1547,6 +1563,7 @@ impl std::fmt::Debug for PendingApproval {
             .field("kind", &self.kind)
             .field("attestation_blob_b64", &attest_display)
             .field("passkey_assertion", &passkey_display)
+            .field("attestation_version", &self.attestation_version)
             .finish()
     }
 }
@@ -1981,6 +1998,7 @@ impl Serialize for PendingApproval {
             process_uid: self.process_uid.clone(),
             created_at_unix_ms: self.created_at_unix_ms,
             expires_at_unix_ms: self.expires_at_unix_ms,
+            attestation_version: self.attestation_version,
             reason: self.reason.clone(),
             envelope_xdr_b64: envelope_xdr_b64.map(ToOwned::to_owned),
             envelope_sha256_hex: envelope_sha256_hex.map(ToOwned::to_owned),
@@ -2772,6 +2790,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
             kind,
             attestation_blob_b64: raw.attestation_blob_b64,
             passkey_assertion: raw.passkey_assertion,
+            attestation_version: raw.attestation_version,
         })
     }
 }
@@ -2785,6 +2804,27 @@ impl PendingApproval {
             .saturating_add(u64::from(request.ttl_seconds) * 1_000);
         self.reason = request.reason.clone();
         self
+    }
+
+    /// The kind and lifetime a version 3 attestation of this record covers:
+    /// its kind name, creation time, and expiry, as stored.
+    #[must_use]
+    pub fn attested_lifetime(&self) -> super::attestation::AttestedLifetime<'_> {
+        super::attestation::AttestedLifetime::new(
+            self.kind.kind_name(),
+            self.created_at_unix_ms,
+            self.expires_at_unix_ms,
+        )
+    }
+
+    /// The layout this record's attestation is verified under, or `None` for
+    /// a version this build does not read, which verifies nothing.
+    #[must_use]
+    pub fn attestation_scope(&self) -> Option<super::attestation::AttestationScope<'_>> {
+        super::attestation::AttestationScope::from_version(
+            self.attestation_version,
+            self.attested_lifetime(),
+        )
     }
 
     /// Returns the request bound to this persisted approval.
@@ -2899,6 +2939,7 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
+            attestation_version: super::attestation::ATTESTATION_VERSION,
         })
     }
 
@@ -3042,6 +3083,7 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
+            attestation_version: super::attestation::ATTESTATION_VERSION,
         })
     }
 
@@ -3159,6 +3201,7 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
+            attestation_version: super::attestation::ATTESTATION_VERSION,
         })
     }
 
@@ -3261,6 +3304,7 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
+            attestation_version: super::attestation::ATTESTATION_VERSION,
         })
     }
 
@@ -3334,6 +3378,7 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
+            attestation_version: super::attestation::ATTESTATION_VERSION,
         })
     }
 
@@ -3385,6 +3430,7 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
+            attestation_version: super::attestation::ATTESTATION_VERSION,
         })
     }
 
@@ -3469,6 +3515,7 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
+            attestation_version: super::attestation::ATTESTATION_VERSION,
         })
     }
 
@@ -3546,6 +3593,7 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
+            attestation_version: super::attestation::ATTESTATION_VERSION,
         })
     }
 
@@ -3685,6 +3733,7 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
+            attestation_version: super::attestation::ATTESTATION_VERSION,
         })
     }
 
@@ -4613,12 +4662,16 @@ impl PendingApprovalStore {
         let Ok(blob) = <[u8; 32]>::try_from(bytes) else {
             return false;
         };
+        let Some(scope) = entry.attestation_scope() else {
+            return false;
+        };
         verify_attestation(
             key,
             binding,
             &entry.approval_nonce,
             prepared_artifact_hash,
             &entry.process_uid,
+            &scope,
             &blob,
         )
     }
@@ -4725,6 +4778,8 @@ impl PendingApprovalStore {
         }
 
         entry.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode(attestation_blob));
+        // The blob a recording caller computed is the producer's layout.
+        entry.attestation_version = super::attestation::ATTESTATION_VERSION;
         self.persist()
     }
 
@@ -4898,6 +4953,7 @@ impl PendingApprovalStore {
             kind: ApprovalKind::Rejected { original_kind_name },
             attestation_blob_b64: None,
             passkey_assertion: None,
+            attestation_version: super::attestation::ATTESTATION_VERSION,
         };
 
         self.persist()?;
@@ -4963,6 +5019,7 @@ impl PendingApprovalStore {
             },
             attestation_blob_b64: existing.attestation_blob_b64.clone(),
             passkey_assertion: None,
+            attestation_version: existing.attestation_version,
         };
 
         self.persist()?;
@@ -5061,8 +5118,9 @@ impl PendingApprovalStore {
     ///
     /// 1. Decodes the stored `attestation_blob_b64` from URL-safe base64 no-pad.
     /// 2. Recomputes `compute_trustline_clawback_opt_in_digest(network, code, issuer)`.
-    /// 3. Calls `verify_attestation(key, binding, nonce, &digest, process_uid, &blob)`
-    ///    (constant-time HMAC-SHA256 comparison).
+    /// 3. Calls `verify_attestation(key, binding, nonce, &digest, process_uid,
+    ///    &scope, &blob)` under the layout the entry stores (constant-time
+    ///    HMAC-SHA256 comparison).
     ///
     /// A missing blob, a blob with a wrong length, or a blob that does not match
     /// the HMAC all return `false` — the gate stays closed.  Callers that cannot
@@ -5143,12 +5201,16 @@ impl PendingApprovalStore {
                 Err(_) => return false,
             };
             // HMAC-SHA256 verify (constant-time).  A forged or wrong-key blob fails here.
+            let Some(scope) = e.attestation_scope() else {
+                return false;
+            };
             verify_attestation(
                 key,
                 binding,
                 &e.approval_nonce,
                 &digest,
                 &e.process_uid,
+                &scope,
                 &blob_arr,
             )
         })
@@ -5262,6 +5324,8 @@ impl PendingApprovalStore {
         }
 
         entry.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode(attestation_blob));
+        // The blob a recording caller computed is the producer's layout.
+        entry.attestation_version = super::attestation::ATTESTATION_VERSION;
         self.persist()
     }
 
@@ -5321,6 +5385,8 @@ impl PendingApprovalStore {
         }
 
         entry.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode(attestation_blob));
+        // The blob a recording caller computed is the producer's layout.
+        entry.attestation_version = super::attestation::ATTESTATION_VERSION;
         self.persist()
     }
 
@@ -5372,12 +5438,16 @@ impl PendingApprovalStore {
             return Err(RuleProposalGateError::Refused);
         }
 
+        let scope = entry
+            .attestation_scope()
+            .ok_or(RuleProposalGateError::Refused)?;
         if !super::attestation::verify_attestation(
             attestation_key,
             binding,
             approval_nonce,
             proposal_sha256,
             &entry.process_uid,
+            &scope,
             attestation_blob,
         ) {
             return Err(RuleProposalGateError::Refused);
@@ -7872,6 +7942,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
             &nonce,
             &digest,
             &process_uid,
+            &store.get(&nonce).unwrap().attested_lifetime(),
         );
         store
             .record_trustline_clawback_opt_in_attestation(&nonce, real_blob)
@@ -7948,6 +8019,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
             &forged_nonce,
             &digest,
             &forged_uid,
+            &forged_entry.attested_lifetime(),
         );
         forged_store.insert(forged_entry, TEST_NOW_MS).unwrap();
         forged_store
@@ -9248,7 +9320,14 @@ csrf_token = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
                 "USDC",
                 TESTNET_USDC_ISSUER,
             );
-            let blob = compute_attestation(&key, &binding, &opt_in_nonce, &digest, "1000");
+            let blob = compute_attestation(
+                &key,
+                &binding,
+                &opt_in_nonce,
+                &digest,
+                "1000",
+                &opt_in.attested_lifetime(),
+            );
             store.insert(opt_in, TEST_NOW_MS).unwrap();
             store.insert(other, TEST_NOW_MS).unwrap();
             store
@@ -9899,6 +9978,7 @@ is_proposer = true
             &nonce,
             &digest,
             &process_uid,
+            &store.get(&nonce).unwrap().attested_lifetime(),
         );
         store
             .record_rule_proposal_attestation(&nonce, blob)
@@ -9957,6 +10037,7 @@ is_proposer = true
             &nonce,
             &stored_digest,
             &process_uid,
+            &store.get(&nonce).unwrap().attested_lifetime(),
         );
         store
             .record_rule_proposal_attestation(&nonce, blob)
@@ -9998,6 +10079,7 @@ is_proposer = true
             &nonce,
             &digest,
             &process_uid,
+            &store.get(&nonce).unwrap().attested_lifetime(),
         );
         store
             .record_rule_proposal_attestation(&nonce, blob)
@@ -10158,6 +10240,7 @@ is_proposer = true
             &nonce,
             &artifact,
             &process_uid,
+            &store.get(&nonce).unwrap().attested_lifetime(),
         );
         store.record_attestation(&nonce, blob).unwrap();
         drop(store);
@@ -10461,6 +10544,7 @@ is_proposer = true
             &nonce,
             &digest,
             &process_uid,
+            &store.get(&nonce).unwrap().attested_lifetime(),
         );
         store
             .record_rule_proposal_attestation(&nonce, blob)
@@ -10503,6 +10587,7 @@ is_proposer = true
             &nonce,
             &digest,
             &process_uid,
+            &store.get(&nonce).unwrap().attestation_scope().unwrap(),
             &blob
         ));
         assert!(
@@ -10540,6 +10625,7 @@ is_proposer = true
             &nonce,
             &artifact,
             &process_uid,
+            &reopened.get(&nonce).unwrap().attestation_scope().unwrap(),
             &blob
         ));
         assert!(!reopened.verify_mpp_charge_attestation(
@@ -10580,6 +10666,7 @@ is_proposer = true
             &nonce,
             &artifact,
             &process_uid,
+            &reopened.get(&nonce).unwrap().attestation_scope().unwrap(),
             &blob
         ));
         assert!(!reopened.verify_mpp_charge_attestation(

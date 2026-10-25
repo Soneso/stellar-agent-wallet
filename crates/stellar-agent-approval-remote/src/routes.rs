@@ -1338,6 +1338,7 @@ mod tests {
                 &nonce,
                 &envelope_sha256,
                 &entry.process_uid,
+                &entry.attested_lifetime(),
             );
             let actual: [u8; 32] = URL_SAFE_NO_PAD
                 .decode(attestation_b64)

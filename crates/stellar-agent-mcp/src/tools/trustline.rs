@@ -1592,6 +1592,7 @@ mod tests {
             &nonce,
             &digest,
             &entry.process_uid,
+            &entry.attested_lifetime(),
         );
         store.insert(entry, now)?;
         store.record_trustline_clawback_opt_in_attestation(&nonce, blob)?;

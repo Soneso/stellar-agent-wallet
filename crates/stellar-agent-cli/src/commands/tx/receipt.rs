@@ -622,7 +622,7 @@ fn open_reservation(
     window: &PersistedWindowStore,
     profile: &stellar_agent_core::profile::schema::Profile,
     envelope_hash: &str,
-) -> Result<Option<stellar_agent_network::policy_state::WindowReservation>, i32> {
+) -> Result<Option<stellar_agent_network::policy_state::SubmissionHold>, i32> {
     match window.pending_reservations(profile) {
         Ok(open) => Ok(open.into_iter().find(|r| r.id == envelope_hash)),
         Err(e) => {
@@ -737,7 +737,7 @@ fn settled_by_reconciliation(answer: &str, tx_hash: &str) -> Envelope<()> {
 /// record needs the acknowledgement.
 fn acknowledgement_required(
     existing: Option<&SubmissionReceipt>,
-    held: Option<&stellar_agent_network::policy_state::WindowReservation>,
+    held: Option<&stellar_agent_network::policy_state::SubmissionHold>,
     tx_hash: &str,
     now_ms: u64,
 ) -> Envelope<()> {

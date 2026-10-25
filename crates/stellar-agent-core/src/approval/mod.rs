@@ -50,8 +50,12 @@
 //!   the wallet-controlled summary, reads y/n from tty, calls
 //!   [`PendingApprovalStore::record_attestation`] on approval.
 //! - **MCP `_commit` verifier**: calls [`verify_attestation`] with the
-//!   caller-supplied `attestation_blob`, then collapses any error to
-//!   `policy.approval_required`.
+//!   caller-supplied `attestation_blob` under the layout the record stores,
+//!   then collapses any error to `policy.approval_required`.
+//! - **Mainnet proof**: [`witness::verify_approval`](crate::approval::witness::verify_approval)
+//! loads the record and the
+//!   key itself and accepts only a version 3 attestation, which covers the
+//!   record's kind and lifetime.
 //! - **Bridge POST handler**: calls
 //!   [`PendingApprovalStore::record_passkey_assertion`] after verifying the
 //!   WebAuthn assertion from the browser ceremony.
@@ -66,9 +70,11 @@ pub mod registration_input;
 pub mod retry;
 pub mod rule_proposal;
 pub mod store;
+pub mod subject;
 pub mod toolset_grant;
 pub mod user_id;
 pub mod view;
+pub mod witness;
 
 pub use assertion_input::AssertionInput;
 pub use attest::{
@@ -77,6 +83,7 @@ pub use attest::{
 };
 pub use attestation::AttestationBinding;
 pub use attestation::{
+    ATTESTATION_VERSION, ATTESTATION_VERSION_V2, AttestationScope, AttestedLifetime,
     RULE_PROPOSAL_DOMAIN_TAG, TOOLSET_GATE_DOMAIN_TAG, TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG,
     compute_attestation, compute_rule_proposal_digest, compute_toolset_gate_digest,
     compute_trustline_clawback_opt_in_digest, envelope_sha256, verify_attestation,

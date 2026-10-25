@@ -19,6 +19,7 @@ The loader still applies the overlay classes on that read.
 | `profile.network_flag_mismatch` | `--network` differs from the loaded chain. Remove the flag or select a profile on that chain. |
 | `auth.enrolled_signer_unpinned` | Mainnet enrollment is a placeholder or malformed. Correct a malformed `mcp_signer_default.account`, then run `stellar-agent profile enroll-signer --profile <name>`. |
 | `auth.enrolled_signer_mismatch` | The derived key differs from the enrolled identity. Use the enrolled seed, Ledger account, or keyring entry. |
+| `auth.enrolled_identity_unusable` | The signer identity record beside the seed is missing or unreadable, names another key or role, or the stored profile's signer differs from the loaded one. Run `stellar-agent profile enroll-signer --profile <name> --repair-identity`. |
 | `profile.mainnet_requires_explicit_profile` | A mainnet profile was selected by the environment or the default source. Supply `--profile <name>`. |
 
 Unset the `STELLAR_AGENT_*` variable the refusal names. On every chain that covers `STELLAR_AGENT_CHAIN_ID`, `STELLAR_AGENT_AUDIT_LOG_PATH`, every `*_KEY_ID` variable, and every other key outside the overlay classes. On mainnet it also covers `STELLAR_AGENT_RPC_URL`, `STELLAR_AGENT_SECONDARY_RPC_URL`, `STELLAR_AGENT_ORACLE_PROVIDER_URL`, `STELLAR_AGENT_MCP_SIGNER_DEFAULT`, and the other testnet-only keys. Remove refused keys from programmatic overlays too, and set needed values in the profile file. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
@@ -27,7 +28,7 @@ Unset the `STELLAR_AGENT_*` variable the refusal names. On every chain that cove
 
 The `profile` group creates, lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) binding a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no secrets; it only names keyring entries.
 
-The eight key-writing commands (`enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and the five key-rotation subcommands) each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `reset-window-state` writes the same row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
+The eight key-writing commands (`enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and the five key-rotation subcommands) each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `enroll-signer` also writes a `signer_identity_enrolled` row, with the record's keyring coordinate, the redacted public address, and the role, after it writes the signer identity record; `enroll-signer --repair-identity` writes that row alone. `reset-window-state` writes the `keyring_key_written` row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
 
 `profile list` lists all profile names and takes no profile selector. Every other `profile` subcommand accepts `--profile <NAME>`. For `init`, `enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, `reset-window-state`, and `reset-mpp-state`, supply exactly one positional `<NAME>` or `--profile <NAME>`. These commands require an explicit selection. `reset-mpp-state` requires `--acknowledge`; the other profile verbs have no confirmation flag.
 
@@ -160,15 +161,28 @@ enrollment, without network access. It reads the seed from a named environment
 variable through the shared mlock-protected ceremony and stores it verbatim.
 The seed is never printed, logged, or returned.
 
-- `--secret-env <VAR>` (required) — name of the environment variable holding the signer's `S...` strkey. The flag takes the variable name, never the secret.
+- `--secret-env <VAR>` (required unless `--repair-identity`): name of the environment variable holding the signer's `S...` strkey. The flag takes the variable name, never the secret.
 - `--profile <NAME>`: profile whose `mcp_signer_default` entry is written (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
 - `--expected-address <G_STRKEY>` — refuse unless the seed derives to this address.
 - `--force` — replace an already-enrolled entry (refused without it when one exists).
+- `--repair-identity`: write only the signer identity record of an existing enrollment; see below. Excludes `--secret-env` and `--force`.
 
 The coordinate's `account` field is the signer identity: `signer_from_keyring` verifies the loaded seed derives to it, so `account` must equal the seed's public address. Enrollment classifies the field from its raw on-disk value (environment overlays never influence what gets persisted) and resolves three cases. A profile fresh from `profile init`, or a v1-migrated profile, can hold the literal placeholder `"default"`. Enrollment pins the derived address into `account`, patching only that key in the profile TOML before writing the keyring entry. Once `account` holds a G-strkey, enrollment refuses on a mismatch and prints the address to set `account` to. The profile TOML is left untouched. Any other value (a typo'd or truncated pin) is refused with `enroll_signer.account_malformed` rather than replaced. Every refusal, including an unset secret variable, leaves the file unmodified. A keyring write that fails after the pin leaves the pinned address; a re-run retries the write. On success the data object reports the derived `public_address`, the `keyring_service`/`keyring_account` written, `replaced` (with `previous_address` when an entry was replaced), and `account_populated` (`true` when the placeholder was just pinned):
 
 ```json
-{"ok":true,"data":{"profile":"default","enrolled":true,"public_address":"G...","keyring_service":"stellar-agent-signer-default","keyring_account":"G...","replaced":false,"account_populated":true},"request_id":"..."}
+{"ok":true,"data":{"profile":"default","enrolled":true,"public_address":"G...","keyring_service":"stellar-agent-signer-default","keyring_account":"G...","replaced":false,"account_populated":true,"identity_keyring_account":"enrolled-identity"},"request_id":"..."}
+```
+
+After the seed, enrollment writes the signer identity record `{"v":1,"public_key":"G...","role":"agent"}` at the same keyring service, account `enrolled-identity`. Mainnet authorization reads the enrolled key from this record, never from the seed. Success is reported only after the record is written. When that write fails, the seed and the pin stay as written and the command exits `1` with `profile.enroll_signer_identity_incomplete`, naming the repair below. A `--force` replacement removes the old record before it writes the seed. If the removal succeeds and the seed write fails, the command exits `1` with the same code and leaves the seed coordinate unchanged. A previous seed kept there can be repaired with the repair below when it derives to the pinned address, or replaced by a re-run with `--force`. With no previous seed, a plain re-run enrolls. When the removal finds no record, a failed seed write reports its keyring error code.
+
+`--repair-identity` writes the record for an existing enrollment. It loads the stored seed, requires it to derive to the pinned `mcp_signer_default.account`, and writes only the record; the seed and the profile file are never written. A record that already names the pinned key is left as it is, and the command reports `written: false`. A stored record that names another key, another role, or contains malformed data refuses with `enroll_signer.identity_conflict` and is left as it is; remove that entry, then run the repair again. A keyring read failure retains its keyring error code.
+
+```bash
+stellar-agent profile enroll-signer --profile default --repair-identity
+```
+
+```json
+{"ok":true,"data":{"profile":"default","public_address":"G...","keyring_service":"stellar-agent-signer-default","keyring_account":"enrolled-identity","written":true},"request_id":"..."}
 ```
 
 Exits `1` on refusal:
@@ -178,7 +192,11 @@ Exits `1` on refusal:
 - `enroll_signer.account_malformed`: the stored account is neither the placeholder nor a valid G-strkey.
 - `enroll_signer.expected_address_mismatch`: `--expected-address` does not match.
 - `enroll_signer.entry_exists`: an entry exists without `--force`.
-- A keyring error: the platform keyring is unavailable.
+- `profile.enroll_signer_identity_incomplete`: the run ended without an identity record. Either the seed was enrolled and the record write failed, or a `--force` replacement removed the record and the seed write failed.
+- `enroll_signer.repair_unpinned`: `--repair-identity` on a profile that pins no signer address.
+- `enroll_signer.identity_conflict`: `--repair-identity` found a different identity record.
+- `auth.signer_key_mismatch`: `--repair-identity` found a seed that does not derive to the pinned address.
+- A keyring error: the platform keyring is unavailable, or `--repair-identity` found no stored seed.
 
 ### `profile enroll-rpc-credential`
 
@@ -363,10 +381,14 @@ window, plus generations before and after. Pending records count regardless of
 age. At most eight buckets appear, with bounded identifiers and a truncation flag;
 the entry count covers all live records. Missing or unverifiable stores report
 no totals. A store is unverifiable when its file fails its HMAC, does not parse,
-uses an unsupported format version, or holds an authentic older generation.
+breaks the supported format's invariants, or holds an authentic older generation.
 It is also unverifiable without a usable key: an absent key, a key that is not
 valid base64, or a key that is not 32 bytes. The reset replaces such a key after
 the row. A store file that exists but cannot be read refuses before the row.
+An authenticated newer format version refuses on every chain with
+`profile.reset_window_state_newer_version` and changes nothing; use the build
+that wrote it. The reset releases expired authorizations in memory before it
+writes the row.
 
 A running MCP server holds the audit writer. Reset then refuses with
 `audit.chain_key_unavailable` and the message sub-code `audit.writer_locked`.

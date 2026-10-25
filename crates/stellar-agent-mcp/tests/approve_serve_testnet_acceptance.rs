@@ -449,6 +449,18 @@ async fn t1_serve_approve_then_commit_on_testnet() {
         .expect("attestation decodes as base64")
         .try_into()
         .expect("attestation is 32 bytes");
+    let stored = stellar_agent_core::approval::PendingApprovalStore::open(
+        approval_dir
+            .path()
+            .join(format!("{}.toml", server.profile_name_for_approval())),
+    )
+    .expect("open approval store")
+    .get(&approval_nonce)
+    .expect("the approved request is persisted")
+    .clone();
+    let scope = stored
+        .attestation_scope()
+        .expect("the approved request names a readable attestation layout");
     assert!(
         stellar_agent_core::approval::verify_attestation(
             &attestation_key,
@@ -459,6 +471,7 @@ async fn t1_serve_approve_then_commit_on_testnet() {
             &approval_nonce,
             &sha,
             &uid,
+            &scope,
             &attestation_bytes,
         ),
         "the HTTP-surfaced attestation must verify against the attestation key"

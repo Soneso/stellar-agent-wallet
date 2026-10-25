@@ -30,6 +30,22 @@
 //! The row records intent and the generation pair. Completion requires loading
 //! the empty store at the recorded generation after the mutation.
 //!
+//! # Newer formats
+//!
+//! On every chain, a store whose authenticated format version is newer than
+//! this build reads refuses the reset with
+//! `profile.reset_window_state_newer_version` and changes nothing; the build
+//! that wrote it reads it.
+//!
+//! # Mainnet profiles
+//!
+//! In a build with mainnet writes, the store of a mainnet profile refuses to
+//! load when it cannot be verified (`policy.window_state_unverifiable`). This
+//! command resets such a store, and the audit row's `reason` names the defect
+//! it recovers from beside the operator's reason. A verifiable store that
+//! still holds an open mainnet authorization refuses the reset with
+//! `profile.reset_window_state_open_authorizations` and changes nothing.
+//!
 //! # Output (JSON envelope)
 //!
 //! On success:
@@ -62,10 +78,12 @@ use stellar_agent_core::audit_log::KeyPurpose;
 use stellar_agent_core::audit_log::schema::WipedAccrualRecord;
 use stellar_agent_core::audit_log::{AuditEntry, AuditWriter, WriterError, audit_writer_refusal};
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{InternalError, WalletError};
+use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_network::keyring::init_platform_keyring_store;
-use stellar_agent_network::policy_state::{PersistedWindowStore, ResetError};
+use stellar_agent_network::policy_state::{
+    PersistedWindowStore, ResetError, StateDefect, WindowStoreError,
+};
 use uuid::Uuid;
 
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
@@ -194,14 +212,14 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
     };
     let store = PersistedWindowStore::for_profile(name);
     let request_id = Uuid::new_v4().to_string();
-    let result = store.reset(&profile, now_ms, |accrual| {
+    let result = store.reset(&profile, now_ms, |record| {
         record_window_reset(
             &mut writer,
             name,
-            &args.reason,
+            &recorded_reason(&args.reason, record.defect),
             &request_id,
             profile.chain_id.caip2_str(),
-            accrual,
+            record.accrual,
         )
     });
     let minted = match &result {
@@ -225,11 +243,7 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
         Err(error) => {
             let error = match error {
                 ResetError::Recorder(error) => error,
-                ResetError::Store { error, .. } => {
-                    WalletError::Internal(InternalError::UnexpectedState {
-                        detail: format!("policy_window_state.reset_failed: {error}"),
-                    })
-                }
+                ResetError::Store { error, .. } => store_refusal(name, error),
             };
             render::render_json(&Envelope::err(&error));
             return 1;
@@ -243,6 +257,48 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
         wiped: outcome.accrual,
     }));
     0
+}
+
+/// The reason the audit row records: the operator's reason and, when the reset
+/// recovers an unverifiable mainnet store, the defect found.
+fn recorded_reason(reason: &str, defect: Option<StateDefect>) -> String {
+    match defect {
+        Some(defect) => format!("{reason} (unverifiable state: {defect})"),
+        None => reason.to_owned(),
+    }
+}
+
+/// Maps a store failure of the reset to its agent-facing error.
+///
+/// A store written by a newer build and the mainnet refusals carry their own
+/// validation codes; every other store failure is a wallet defect.
+fn store_refusal(name: &str, error: WindowStoreError) -> WalletError {
+    match error {
+        WindowStoreError::UnsupportedVersion { version, max } => {
+            WalletError::Validation(ValidationError::ResetWindowStateNewerVersion {
+                profile: name.to_owned(),
+                version,
+                max,
+            })
+        }
+        #[cfg(feature = "mainnet-write")]
+        WindowStoreError::MainnetStateUnverifiable { defect } => {
+            WalletError::Validation(ValidationError::WindowStateUnverifiable {
+                profile: name.to_owned(),
+                defect: defect.label(),
+            })
+        }
+        #[cfg(feature = "mainnet-write")]
+        WindowStoreError::OpenAuthorizations { open } => {
+            WalletError::Validation(ValidationError::ResetWindowStateOpenAuthorizations {
+                profile: name.to_owned(),
+                open,
+            })
+        }
+        error => WalletError::Internal(InternalError::UnexpectedState {
+            detail: format!("policy_window_state.reset_failed: {error}"),
+        }),
+    }
 }
 
 /// Records the attempted reset before the store or generation changes.
@@ -409,14 +465,14 @@ mod tests {
         )
         .unwrap();
         anchor.set_failing(true);
-        let result = store.reset(&profile, 100_000, |accrual| {
+        let result = store.reset(&profile, 100_000, |record| {
             record_window_reset(
                 &mut writer,
                 "reset-anchor",
                 "repair",
                 "reset-request",
                 "stellar:testnet",
-                accrual,
+                record.accrual,
             )
         });
         let Err(ResetError::Recorder(error)) = result else {
@@ -430,18 +486,84 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&rows).lines().count(), 1);
         assert!(
             store
-                .reset(&profile, 100_000, |accrual| record_window_reset(
+                .reset(&profile, 100_000, |record| record_window_reset(
                     &mut writer,
                     "reset-anchor",
                     "repair",
                     "reset-request",
                     "stellar:testnet",
-                    accrual,
+                    record.accrual,
                 ))
                 .is_err()
         );
         assert_eq!(std::fs::read(&profile.audit_log_path).unwrap(), rows);
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(generation.get_password().unwrap(), counter);
+    }
+
+    #[test]
+    fn the_recorded_reason_names_the_defect_it_recovers_from() {
+        assert_eq!(recorded_reason("repair", None), "repair");
+        assert_eq!(
+            recorded_reason("repair", Some(StateDefect::HmacInvalid)),
+            "repair (unverifiable state: hmac_invalid)"
+        );
+        assert_eq!(
+            recorded_reason("repair", Some(StateDefect::MissingFileWithGeneration)),
+            "repair (unverifiable state: missing_file_with_generation)"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_store_failure_is_a_wallet_defect() {
+        let error = store_refusal("acme", WindowStoreError::HmacMismatch);
+        assert_eq!(error.code(), "internal.unexpected_state");
+        assert!(
+            error
+                .to_string()
+                .contains("policy_window_state.reset_failed")
+        );
+    }
+
+    #[test]
+    fn a_store_from_a_newer_build_is_a_validation_refusal() {
+        let error = store_refusal(
+            "acme",
+            WindowStoreError::UnsupportedVersion { version: 5, max: 4 },
+        );
+        assert_eq!(error.code(), "profile.reset_window_state_newer_version");
+        assert_eq!(
+            error.category(),
+            stellar_agent_core::error::ErrorCategory::Validation
+        );
+        let text = error.to_string();
+        assert!(text.contains("profile 'acme'"), "{text}");
+        assert!(text.contains("format version 5"), "{text}");
+        assert!(text.contains("version 4 this build reads"), "{text}");
+        assert!(text.contains("Use the build that wrote it"), "{text}");
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    fn the_mainnet_store_refusals_keep_their_codes() {
+        let unverifiable = store_refusal(
+            "acme",
+            WindowStoreError::MainnetStateUnverifiable {
+                defect: StateDefect::GenerationMismatch,
+            },
+        );
+        assert_eq!(unverifiable.code(), "policy.window_state_unverifiable");
+        let text = unverifiable.to_string();
+        assert!(text.contains("generation_mismatch"), "{text}");
+        assert!(
+            text.contains("stellar-agent profile reset-window-state acme --reason <reason>"),
+            "{text}"
+        );
+        let open = store_refusal("acme", WindowStoreError::OpenAuthorizations { open: 2 });
+        assert_eq!(
+            open.code(),
+            "profile.reset_window_state_open_authorizations"
+        );
+        assert!(open.to_string().contains('2'), "{open}");
     }
 }

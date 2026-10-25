@@ -367,6 +367,7 @@ async fn assert_approved_submission_audit(
         let pending = store.snapshot(now_unix_ms().unwrap());
         assert_eq!(pending.len(), 1);
         let nonce = pending[0].approval_nonce.clone();
+        let stored = store.get(&nonce).unwrap().clone();
         let blob = compute_attestation(
             key,
             &stellar_agent_core::approval::AttestationBinding::new(
@@ -376,6 +377,7 @@ async fn assert_approved_submission_audit(
             &nonce,
             &envelope_sha256(data["envelope_xdr"].as_str().unwrap().as_bytes()),
             &process_uid_for_attestation().unwrap(),
+            &stored.attested_lifetime(),
         );
         store.record_attestation(&nonce, blob).unwrap();
         (nonce, URL_SAFE_NO_PAD.encode(blob))
@@ -1577,12 +1579,18 @@ async fn rule_create_pending_proposal_with_grant_reaches_signer_load() {
         .join(format!("{TEST_PROFILE_NAME}.toml"));
     let (approval_nonce, digest) =
         insert_rule_proposal(&store_path, TESTNET_PASSPHRASE, "stellar:testnet");
+    let stored = PendingApprovalStore::open(store_path.clone())
+        .expect("open approval store")
+        .get(&approval_nonce)
+        .expect("stored proposal")
+        .clone();
     let blob = compute_attestation(
         &key,
         &AttestationBinding::new(&server.profile_name_for_approval(), "stellar:testnet"),
         &approval_nonce,
         &digest,
         &process_uid_for_attestation().expect("process uid"),
+        &stored.attested_lifetime(),
     );
     PendingApprovalStore::open(store_path.clone())
         .expect("open approval store")

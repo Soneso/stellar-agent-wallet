@@ -854,7 +854,7 @@ fn seed_window(
         StateKey, WindowEntry, WindowLimit,
     };
     use stellar_agent_headless_keyring::{crypto::ProtectionMode, store::HeadlessStore};
-    use stellar_agent_network::policy_state::{PersistedWindowStore, WindowReservation};
+    use stellar_agent_network::policy_state::{PersistedWindowStore, SubmissionHold};
     keyring_core::set_default_store(Arc::new(HeadlessStore::new(
         home.join("headless-keyring/store.keyring"),
         ProtectionMode::EnvKey(Arc::new(zeroize::Zeroizing::new(std::array::from_fn(
@@ -869,7 +869,7 @@ fn seed_window(
     .unwrap();
     let window = PersistedWindowStore::at_path(home.join(format!("policy/{PROFILE}.window")));
     let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
-    let res = WindowReservation {
+    let res = SubmissionHold {
         id: id.to_owned(),
         tx_hash: TX_HASH.to_owned(),
         source: SOURCE.to_owned(),

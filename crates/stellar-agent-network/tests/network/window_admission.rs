@@ -24,9 +24,7 @@ use stellar_agent_core::policy::v1::criteria::state_store::{
     CLOCK_SKEW_TOLERANCE_MS, PolicyStateStore, StateKey, StateStoreError, WindowEntry, WindowLimit,
 };
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
-use stellar_agent_network::policy_state::{
-    PersistedWindowStore, WindowReservation, WindowStoreError,
-};
+use stellar_agent_network::policy_state::{PersistedWindowStore, SubmissionHold, WindowStoreError};
 use stellar_agent_test_support::keyring_mock;
 use tempfile::TempDir;
 
@@ -88,8 +86,8 @@ fn count_entry(profile_name: &str, ts_ms: u64, max_calls: u32) -> WindowEntry {
     )
 }
 
-fn reservation(id: &str, sequence: i64, now: u64) -> WindowReservation {
-    WindowReservation {
+fn reservation(id: &str, sequence: i64, now: u64) -> SubmissionHold {
+    SubmissionHold {
         id: id.to_owned(),
         tx_hash: id.to_owned(),
         source: "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned(),

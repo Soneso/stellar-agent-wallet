@@ -2698,6 +2698,42 @@ impl AuditEntry {
         }
     }
 
+    /// Constructs a `SignerIdentityEnrolled` audit entry.
+    ///
+    /// Emitted after `profile enroll-signer` writes the enrolled signer's
+    /// identity record. Like the key-writing rows it is not policy-gated, so
+    /// `policy_decision` is `Allow`, and it carries no `chain_id`.
+    #[must_use]
+    pub fn new_signer_identity_enrolled(
+        tool: impl Into<String>,
+        keyring_service: impl Into<String>,
+        keyring_entry: impl Into<String>,
+        public_address: RedactedStrkey,
+        role: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.into(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::SignerIdentityEnrolled {
+                keyring_service: keyring_service.into(),
+                keyring_entry: keyring_entry.into(),
+                public_address,
+                role: role.into(),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
     /// Records `profile reset-window-state` before the store mutation.
     ///
     /// The caller holds the audit writer and window lock while capturing and

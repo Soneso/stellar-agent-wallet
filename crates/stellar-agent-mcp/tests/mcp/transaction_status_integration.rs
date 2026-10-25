@@ -24,7 +24,7 @@ use stellar_agent_core::policy::v1::criteria::state_store::{StateKey, WindowEntr
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore, ReleaseEvidence};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::server::{StellarPayArgs, StellarTransactionStatusArgs, WalletServer};
-use stellar_agent_network::policy_state::{PersistedWindowStore, WindowReservation};
+use stellar_agent_network::policy_state::{PersistedWindowStore, SubmissionHold};
 use stellar_agent_test_support::keyring_mock;
 use stellar_agent_test_support::xdr_fixtures::{
     account_entry_xdr_with_seq, account_ledger_key_xdr,
@@ -175,7 +175,7 @@ fn seed_reservation(profile: &Profile, profile_name: &str, sequence: i64) -> Per
                     max_stroops: 1_000_000_000_000,
                 },
             )],
-            &WindowReservation {
+            &SubmissionHold {
                 id: ENVELOPE_HASH.to_owned(),
                 tx_hash: TX_HASH.to_owned(),
                 source: SOURCE.to_owned(),

@@ -237,12 +237,21 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
         .unwrap()
         .try_into()
         .unwrap();
+    let attested = PendingApprovalStore::open(home.join("approvals").join(format!("{name}.toml")))
+        .expect("read attested approval")
+        .get(&nonce)
+        .expect("the attested request is persisted")
+        .clone();
+    let scope = attested
+        .attestation_scope()
+        .expect("the attested request names a readable attestation layout");
     assert!(verify_attestation(
         &key,
         &AttestationBinding::new(name, profile.chain_id.caip2_str()),
         &nonce,
         &envelope_sha256(envelope.as_bytes()),
         &uid,
+        &scope,
         &blob
     ));
     assert_eq!(json["data"]["audit"], "written", "{stdout}");

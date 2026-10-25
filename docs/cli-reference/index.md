@@ -123,6 +123,7 @@ On a mainnet profile, `pay`, `claim`, account creation, account deployment, and 
 The same structural refusal covers the signer verbs that sign, rule writes, policy writes, `execute`, migration submit, timelock writes, and `multicall`.
 It also covers `vault deposit`, `vault withdraw`, `trade`, `trustline`, and `pool init`, before signer access and any RPC call.
 It reports `network.mainnet_write_forbidden`; Friendbot funding reports `network.friendbot_mainnet_forbidden`, and `mpp` reports `mpp.network_forbidden`.
+A build with mainnet writes reports `network.mainnet_authorization_refused` instead when it refuses the mainnet authorization for one action: a fact the action's authority binds does not hold, and nothing was signed or sent. `network.mainnet_write_forbidden` means the build or the verb has no mainnet write path at all.
 Read-only inspection remains available. `tx` signs nothing, and `pool init` is the only `pool` command that signs.
 `smart-account rules verify-pins`, `signers list`, and `signers refresh` load no signer and accept a mainnet profile. They keep their local audit writes, so a persisted profile needs `profile rotate-audit-key` first.
 `--network` is checked against the profile before a structural refusal, so `--network mainnet` on the zero-config testnet profile reports `profile.network_flag_mismatch`.

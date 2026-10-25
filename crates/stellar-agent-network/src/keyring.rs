@@ -1287,6 +1287,259 @@ pub async fn enrolled_keyring_signer(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Enrolled signer identity
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The role an [`EnrolledSigner`] is produced for.
+///
+/// Both roles name the profile's enrolled agent key: the fee payer of a fee
+/// bump is that key too. A SEP-10 session's ephemeral key is not enrolled and
+/// has no role here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrolledRole {
+    /// The agent signer of the profile's actions.
+    Agent,
+    /// The fee payer of a fee bump.
+    FeePayer,
+}
+
+impl EnrolledRole {
+    /// The role's one-byte tag in the signer fact digest.
+    #[must_use]
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::Agent => 1,
+            Self::FeePayer => 2,
+        }
+    }
+}
+
+/// Proof that a profile enrolled a signer key, read from the stored profile
+/// and the identity record beside the seed, never from the seed.
+///
+/// Only [`enrolled_signer`] produces one, and its fields are private:
+///
+/// ```compile_fail,E0451
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn forge(p: EnrolledSigner) -> EnrolledSigner { EnrolledSigner { ..p } }
+/// ```
+///
+/// The import alone resolves:
+///
+/// ```
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn need(_: Option<EnrolledSigner>) {}
+/// need(None);
+/// ```
+///
+/// It implements none of `Serialize`, `Deserialize`, or `Default`:
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn need<T: serde::Serialize>() {}
+/// need::<EnrolledSigner>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn need<T: serde::de::DeserializeOwned>() {}
+/// need::<EnrolledSigner>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn need<T: Default>() {}
+/// need::<EnrolledSigner>();
+/// ```
+/// The `public_key` field cannot be projected outside this crate.
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn inspect(p: &EnrolledSigner) { let _ = &p.public_key; }
+/// ```
+///
+/// ```
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn need(_: Option<EnrolledSigner>) {}
+/// need(None);
+/// ```
+///
+/// The `role` field cannot be projected outside this crate.
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn inspect(p: &EnrolledSigner) { let _ = &p.role; }
+/// ```
+///
+/// ```
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn need(_: Option<EnrolledSigner>) {}
+/// need(None);
+/// ```
+///
+/// The `seed_entry` field cannot be projected outside this crate.
+///
+/// ```compile_fail,E0616
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn inspect(p: &EnrolledSigner) { let _ = &p.seed_entry; }
+/// ```
+///
+/// ```
+/// use stellar_agent_network::keyring::EnrolledSigner;
+/// fn need(_: Option<EnrolledSigner>) {}
+/// need(None);
+/// ```
+///
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrolledSigner {
+    public_key: [u8; 32],
+    role: EnrolledRole,
+    seed_entry: KeyringEntryRef,
+}
+
+impl EnrolledSigner {
+    /// The enrolled public key.
+    #[must_use]
+    pub fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
+
+    /// The role the signer was produced for.
+    #[must_use]
+    pub fn role(&self) -> EnrolledRole {
+        self.role
+    }
+
+    /// The keyring coordinate of the enrolled seed, as the stored profile
+    /// names it. A coordinate only: the producer never reads the seed, and
+    /// [`lazy_signer_from_keyring`] loads it at the signing call.
+    #[must_use]
+    pub fn seed_entry(&self) -> &KeyringEntryRef {
+        &self.seed_entry
+    }
+
+    /// The fact digest under `stellar-agent-authz-fact:signer:v1`.
+    ///
+    /// Fields, in order: the 32-byte public key, the role's one-byte tag,
+    /// `lp(seed service)`, and `lp(seed account)`.
+    #[must_use]
+    pub fn fact_digest(&self) -> [u8; 32] {
+        use stellar_agent_core::mainnet::fact::{FACT_LABEL_SIGNER, FactDigest};
+        let mut digest = FactDigest::new(FACT_LABEL_SIGNER);
+        digest
+            .fixed(&self.public_key)
+            .tag(self.role.tag())
+            .bytes(self.seed_entry.service.as_bytes())
+            .bytes(self.seed_entry.account.as_bytes());
+        digest.finish()
+    }
+}
+
+fn identity_unusable(profile: &str, reason: &'static str) -> WalletError {
+    WalletError::Auth(AuthError::EnrolledIdentityUnusable {
+        profile: profile.to_owned(),
+        reason,
+    })
+}
+
+/// Produces the enrolled signer of profile `name` for `role`, requiring its
+/// key to be `expected_key`.
+///
+/// Reads the `[mcp_signer_default]` reference from the stored profile in
+/// `profiles_dir`, with no overlay, and requires it to equal the reference
+/// of `merged_profile` exactly. Its account must be a G-strkey pin. Then
+/// reads the identity record at the signer's service, account
+/// `enrolled-identity`, and requires it to be a version 1 agent record whose
+/// public key is the pin's and `expected_key`. The seed coordinate is
+/// returned, never read. For [`EnrolledRole::FeePayer`], `expected_key` is the
+/// fee source a fee bump names, so the fee payer is the enrolled agent key.
+///
+/// No refusal falls back to the seed or repairs anything.
+///
+/// # Errors
+///
+/// - `validation.profile_not_found` or `validation.config_invalid` when the
+///   stored profile cannot be read.
+/// - `auth.enrolled_signer_unpinned` for a placeholder or malformed pin.
+/// - `auth.enrolled_identity_unusable` naming the rule the identity breaks:
+///   `disk_disagreement`, `missing`, `malformed`, `unsupported_version`,
+///   `malformed_key`, `unsupported_role`, `pin_mismatch`,
+///   `public_key_mismatch`, or `fee_source_mismatch`.
+/// - The classified keyring error when the record cannot be read.
+pub fn enrolled_signer(
+    name: &str,
+    profiles_dir: &Path,
+    merged_profile: &Profile,
+    role: EnrolledRole,
+    expected_key: &[u8; 32],
+) -> Result<EnrolledSigner, WalletError> {
+    use stellar_agent_core::profile::loader::{ProfileLoadError, read_signer_ref_on_disk};
+    use stellar_agent_core::profile::schema::signer_identity_entry_ref;
+    use stellar_agent_core::profile::signer_identity::{
+        SignerIdentityRecord, SignerIdentityRecordError,
+    };
+
+    let stored = read_signer_ref_on_disk(name, profiles_dir).map_err(|error| match error {
+        ProfileLoadError::NotFound { name, .. } => {
+            WalletError::Validation(ValidationError::ProfileNotFound { name })
+        }
+        other => WalletError::Validation(ValidationError::ConfigInvalid {
+            component: "profile",
+            reason: stellar_agent_core::observability::redact_path_in_message(&format!(
+                "the stored signer reference of profile '{name}' cannot be read: {other}"
+            )),
+        }),
+    })?;
+    if stored != merged_profile.mcp_signer_default {
+        return Err(identity_unusable(name, "disk_disagreement"));
+    }
+    if stored.is_signer_placeholder() {
+        return Err(AuthError::EnrolledSignerUnpinned {
+            profile: name.to_owned(),
+            reason: "placeholder",
+        }
+        .into());
+    }
+    let pin = stellar_strkey::ed25519::PublicKey::from_string(&stored.account).map_err(|_| {
+        WalletError::Auth(AuthError::EnrolledSignerUnpinned {
+            profile: name.to_owned(),
+            reason: "malformed",
+        })
+    })?;
+    let identity_ref = signer_identity_entry_ref(&stored);
+    let raw =
+        read_keyring_string(&identity_ref)?.ok_or_else(|| identity_unusable(name, "missing"))?;
+    let record = SignerIdentityRecord::parse(&raw).map_err(|error| {
+        identity_unusable(
+            name,
+            match error {
+                SignerIdentityRecordError::UnsupportedVersion(_) => "unsupported_version",
+                SignerIdentityRecordError::MalformedKey => "malformed_key",
+                SignerIdentityRecordError::UnsupportedRole => "unsupported_role",
+                _ => "malformed",
+            },
+        )
+    })?;
+    if record.public_key() != pin.0 {
+        return Err(identity_unusable(name, "pin_mismatch"));
+    }
+    if record.public_key() != *expected_key {
+        return Err(identity_unusable(
+            name,
+            match role {
+                EnrolledRole::Agent => "public_key_mismatch",
+                EnrolledRole::FeePayer => "fee_source_mismatch",
+            },
+        ));
+    }
+    Ok(EnrolledSigner {
+        public_key: record.public_key(),
+        role,
+        seed_entry: stored,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2652,5 +2905,238 @@ mod tests {
             )),
             "{findings:?}"
         );
+    }
+
+    // ── enrolled signer identity ────────────────────────────────────────
+
+    mod enrolled {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use stellar_agent_core::profile::loader::save_to_dir;
+        use stellar_agent_core::profile::schema::signer_identity_entry_ref;
+        use stellar_agent_core::profile::signer_identity::SignerIdentityRecord;
+        use stellar_agent_test_support::keyring_mock::{self, ReadHook};
+        use tempfile::TempDir;
+
+        use super::super::*;
+
+        const SERVICE: &str = "stellar-agent-signer-enrolled";
+        const PUBLIC_KEY: [u8; 32] = [0x21; 32];
+
+        fn pin() -> String {
+            stellar_strkey::ed25519::PublicKey(PUBLIC_KEY)
+                .to_string()
+                .to_string()
+        }
+
+        fn profile_with(account: &str) -> Profile {
+            Profile::builder_mainnet_named(
+                "enrolled",
+                "https://rpc.example",
+                SERVICE,
+                account,
+                "n-svc",
+                "n-acct",
+            )
+            .build()
+        }
+
+        static SEED_READS: AtomicUsize = AtomicUsize::new(0);
+
+        /// A stored mainnet profile pinned to `account`, a mock keyring that
+        /// counts reads of the seed coordinate, and the identity record
+        /// `record` when given.
+        fn stored(account: &str, record: Option<&str>) -> (TempDir, Profile) {
+            SEED_READS.store(0, Ordering::SeqCst);
+            keyring_mock::install_with_read_hooks(vec![ReadHook::new(
+                SERVICE,
+                account,
+                std::sync::Arc::new(|| {
+                    SEED_READS.fetch_add(1, Ordering::SeqCst);
+                }),
+            )])
+            .unwrap();
+            let dir = TempDir::new().unwrap();
+            let profile = profile_with(account);
+            save_to_dir("enrolled", &profile, dir.path()).unwrap();
+            if let Some(record) = record {
+                write_keyring_string(
+                    &signer_identity_entry_ref(&profile.mcp_signer_default),
+                    record,
+                )
+                .unwrap();
+            }
+            (dir, profile)
+        }
+
+        fn produce(
+            dir: &TempDir,
+            profile: &Profile,
+            role: EnrolledRole,
+            expected: [u8; 32],
+        ) -> Result<EnrolledSigner, WalletError> {
+            enrolled_signer("enrolled", dir.path(), profile, role, &expected)
+        }
+
+        fn unusable(result: Result<EnrolledSigner, WalletError>) -> &'static str {
+            match result {
+                Err(WalletError::Auth(AuthError::EnrolledIdentityUnusable { reason, .. })) => {
+                    reason
+                }
+                other => panic!("expected an unusable identity, got {other:?}"),
+            }
+        }
+
+        fn agent_record() -> String {
+            SignerIdentityRecord::agent(PUBLIC_KEY).render()
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn the_enrolled_signer_comes_from_the_record_never_the_seed() {
+            let (dir, profile) = stored(&pin(), Some(&agent_record()));
+            for role in [EnrolledRole::Agent, EnrolledRole::FeePayer] {
+                let signer = produce(&dir, &profile, role, PUBLIC_KEY).unwrap();
+                assert_eq!(signer.public_key(), PUBLIC_KEY);
+                assert_eq!(signer.role(), role);
+                assert_eq!(signer.seed_entry(), &profile.mcp_signer_default);
+            }
+            assert_eq!(
+                SEED_READS.load(Ordering::SeqCst),
+                0,
+                "the seed is never read"
+            );
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn each_broken_identity_refuses_beside_its_accepted_twin() {
+            let other = stellar_strkey::ed25519::PublicKey([0x22; 32])
+                .to_string()
+                .to_string();
+            let records = [
+                ("missing", None),
+                ("malformed", Some("not json".to_owned())),
+                (
+                    "unsupported_version",
+                    Some(format!(
+                        "{{\"v\":2,\"public_key\":\"{}\",\"role\":\"agent\"}}",
+                        pin()
+                    )),
+                ),
+                (
+                    "malformed_key",
+                    Some("{\"v\":1,\"public_key\":\"GABC\",\"role\":\"agent\"}".to_owned()),
+                ),
+                (
+                    "unsupported_role",
+                    Some(format!(
+                        "{{\"v\":1,\"public_key\":\"{}\",\"role\":\"fee_payer\"}}",
+                        pin()
+                    )),
+                ),
+                (
+                    "pin_mismatch",
+                    Some(SignerIdentityRecord::agent([0x22; 32]).render()),
+                ),
+            ];
+            for (reason, record) in records {
+                let (dir, profile) = stored(&pin(), record.as_deref());
+                assert_eq!(
+                    unusable(produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY)),
+                    reason
+                );
+                write_keyring_string(
+                    &signer_identity_entry_ref(&profile.mcp_signer_default),
+                    &agent_record(),
+                )
+                .unwrap();
+                produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY).unwrap();
+                assert_eq!(SEED_READS.load(Ordering::SeqCst), 0, "{reason}");
+            }
+
+            let (dir, profile) = stored(&pin(), Some(&agent_record()));
+            assert_eq!(
+                unusable(produce(&dir, &profile, EnrolledRole::Agent, [0x22; 32])),
+                "public_key_mismatch"
+            );
+            assert_eq!(
+                unusable(produce(&dir, &profile, EnrolledRole::FeePayer, [0x22; 32])),
+                "fee_source_mismatch"
+            );
+
+            let mut overlaid = profile.clone();
+            overlaid.mcp_signer_default = KeyringEntryRef::new(SERVICE, other.clone());
+            assert_eq!(
+                unusable(produce(&dir, &overlaid, EnrolledRole::Agent, PUBLIC_KEY)),
+                "disk_disagreement"
+            );
+            overlaid.mcp_signer_default = KeyringEntryRef::new("another-service", pin());
+            assert_eq!(
+                unusable(produce(&dir, &overlaid, EnrolledRole::Agent, PUBLIC_KEY)),
+                "disk_disagreement"
+            );
+            produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY).unwrap();
+            assert_eq!(SEED_READS.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn an_unpinned_or_unstored_profile_refuses() {
+            for (account, reason) in [("default", "placeholder"), ("not-a-g-strkey", "malformed")] {
+                let (dir, profile) = stored(account, Some(&agent_record()));
+                match produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY) {
+                    Err(WalletError::Auth(AuthError::EnrolledSignerUnpinned {
+                        reason: found,
+                        ..
+                    })) => assert_eq!(found, reason),
+                    other => panic!("{account}: {other:?}"),
+                }
+            }
+            let (dir, profile) = stored(&pin(), Some(&agent_record()));
+            let missing = enrolled_signer(
+                "absent",
+                dir.path(),
+                &profile,
+                EnrolledRole::Agent,
+                &PUBLIC_KEY,
+            )
+            .unwrap_err();
+            assert_eq!(missing.code(), "validation.profile_not_found");
+            std::fs::write(dir.path().join("enrolled.toml"), "not toml [").unwrap();
+            let unreadable = produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY).unwrap_err();
+            assert_eq!(unreadable.code(), "validation.config_invalid");
+            assert_eq!(SEED_READS.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_keyring_failure_on_the_record_refuses() {
+            keyring_mock::install().unwrap();
+            let dir = TempDir::new().unwrap();
+            let profile = profile_with(&pin());
+            save_to_dir("enrolled", &profile, dir.path()).unwrap();
+            let identity = signer_identity_entry_ref(&profile.mcp_signer_default);
+            keyring_mock::inject_error(
+                &identity.service,
+                &identity.account,
+                keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::other("locked"))),
+            )
+            .unwrap();
+            let error = produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY).unwrap_err();
+            assert!(matches!(error, WalletError::Auth(_)), "{error:?}");
+            assert_ne!(error.code(), "auth.enrolled_identity_unusable");
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn the_signer_fact_digest_is_frozen() {
+            let (dir, profile) = stored(&pin(), Some(&agent_record()));
+            let signer = produce(&dir, &profile, EnrolledRole::FeePayer, PUBLIC_KEY).unwrap();
+            assert_eq!(
+                stellar_agent_core::hex::encode(&signer.fact_digest()),
+                "327807a06a5d845937759fdf5b37e4cda3e5645414d24386163c4705836da4d9"
+            );
+        }
     }
 }

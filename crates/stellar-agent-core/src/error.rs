@@ -627,6 +627,18 @@ pub enum ApprovalFailure {
         /// Non-secret operator-facing diagnostic.
         detail: String,
     },
+    /// The presented attestation does not prove the approval record: it does
+    /// not verify, it covers a different subject, or its version does not
+    /// cover the approval's kind and lifetime.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.attestation_invalid"`.
+    #[error("{detail}")]
+    AttestationInvalid {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
 }
 
 impl ApprovalFailure {
@@ -656,6 +668,7 @@ impl ApprovalFailure {
             Self::WriterLocked { .. } => "approval.writer_locked",
             Self::StoreOpenFailed { .. } => "approval.store_open_failed",
             Self::GcFailed { .. } => "approval.gc_failed",
+            Self::AttestationInvalid { .. } => "approval.attestation_invalid",
         }
     }
 }
@@ -1550,6 +1563,70 @@ pub enum ValidationError {
         /// Operations in the transaction.
         op_count: u32,
     },
+
+    /// The persisted policy window-state of a mainnet profile cannot be
+    /// verified, so neither its spend history nor its authorizations are
+    /// known.
+    ///
+    /// The reset is the remedy: it records the defect in its audit row and
+    /// re-initialises the store.
+    ///
+    /// # Wire code
+    ///
+    /// `"policy.window_state_unverifiable"`.
+    #[cfg(feature = "mainnet-write")]
+    #[error(
+        "policy.window_state_unverifiable: the policy window-state of mainnet profile \
+         '{profile}' cannot be verified ({defect}); run `stellar-agent profile \
+         reset-window-state {profile} --reason <reason>` to reset it"
+    )]
+    WindowStateUnverifiable {
+        /// Selected profile name.
+        profile: String,
+        /// Stable label of the defect found.
+        defect: &'static str,
+    },
+
+    /// The window-state reset of a mainnet profile refused because a mainnet
+    /// authorization is still open.
+    ///
+    /// # Wire code
+    ///
+    /// `"profile.reset_window_state_open_authorizations"`.
+    #[cfg(feature = "mainnet-write")]
+    #[error(
+        "profile '{profile}' holds {open} open mainnet authorization(s); reset-window-state \
+         refuses until each is used or expires"
+    )]
+    ResetWindowStateOpenAuthorizations {
+        /// Selected profile name.
+        profile: String,
+        /// Number of effective open authorizations.
+        open: usize,
+    },
+
+    /// The window-state reset refused because the store's authenticated
+    /// format version is newer than any this build reads.
+    ///
+    /// A newer build wrote the file, and its contents cannot be judged here,
+    /// so the reset changes nothing; the build that wrote it reads the file.
+    ///
+    /// # Wire code
+    ///
+    /// `"profile.reset_window_state_newer_version"`.
+    #[error(
+        "the policy window-state of profile '{profile}' has format version {version}, newer \
+         than the version {max} this build reads; reset-window-state refuses it. Use the \
+         build that wrote it"
+    )]
+    ResetWindowStateNewerVersion {
+        /// Selected profile name.
+        profile: String,
+        /// The authenticated file's format version.
+        version: u32,
+        /// The highest format version this build reads.
+        max: u32,
+    },
 }
 
 /// Where a classic per-operation fee came from.
@@ -1685,6 +1762,13 @@ impl ValidationError {
             // the subsystem (fees.*) while the category stays Validation.
             Self::FeeAboveCap { .. } => "fees.percentile_exceeds_cap",
             Self::FeeTotalOverflow { .. } => "validation.fee_total_overflow",
+            Self::ResetWindowStateNewerVersion { .. } => "profile.reset_window_state_newer_version",
+            #[cfg(feature = "mainnet-write")]
+            Self::WindowStateUnverifiable { .. } => "policy.window_state_unverifiable",
+            #[cfg(feature = "mainnet-write")]
+            Self::ResetWindowStateOpenAuthorizations { .. } => {
+                "profile.reset_window_state_open_authorizations"
+            }
         }
     }
 }
@@ -1784,6 +1868,17 @@ pub enum NetworkError {
     /// policy engine or enrolled keys.
     #[error("mainnet writes are structurally refused in this alpha")]
     MainnetWriteForbidden,
+
+    /// A mainnet authorization did not match the action it was presented for,
+    /// or a fact it binds does not hold at the moment of use.
+    ///
+    /// The text names no precondition, proof fact, or endpoint detail: the
+    /// refusing check is logged for the operator, and the agent learns only
+    /// that the authorization was refused. Distinct from
+    /// [`NetworkError::MainnetWriteForbidden`], which a build without mainnet
+    /// writes reports before any authorization exists.
+    #[error("the mainnet authorization for this action was refused; nothing was signed or sent")]
+    MainnetAuthorizationRefused,
 
     /// The Horizon API returned an unexpected HTTP status code.
     ///
@@ -2089,6 +2184,20 @@ pub enum WitnessUnavailableReason {
         /// Redacted oracle authority.
         authority: String,
     },
+    /// The transaction the witness is bound to does not match the
+    /// observations it compares: its source, its sequence, its operation, its
+    /// memo, or a Soroban payment's authorization differs from what the action
+    /// read, or its economic value differs from the value the requirement rule
+    /// decides on.
+    #[error(
+        "cross-check refused: the transaction's {part} does not match the observations the \
+         witness compares; the wallet did not sign or send. Build the action again"
+    )]
+    EnvelopeMismatch {
+        /// `source`, `sequence`, `operation`, `memo`, `value`, `envelope`, or
+        /// `authorization`.
+        part: &'static str,
+    },
 }
 
 fn witness_delta(
@@ -2168,6 +2277,7 @@ impl NetworkError {
             Self::FriendbotMainnetForbidden => "network.friendbot_mainnet_forbidden",
             Self::AccountNotFound { .. } => "network.account_not_found",
             Self::MainnetWriteForbidden => "network.mainnet_write_forbidden",
+            Self::MainnetAuthorizationRefused => "network.mainnet_authorization_refused",
             Self::HorizonUnavailable { .. } => "network.horizon_unavailable",
             Self::RpcResponseMalformed { .. } => "network.rpc_response_malformed",
             Self::RpcDivergence { .. } => "network.rpc_divergence",
@@ -2305,6 +2415,28 @@ pub enum AuthError {
         reason: &'static str,
     },
 
+    /// The enrolled signer identity cannot serve as a mainnet signer: the
+    /// stored profile disagrees with the loaded one, or the identity record
+    /// is absent, unreadable, or names another key or role.
+    ///
+    /// `reason` is one of `disk_disagreement`, `missing`, `malformed`,
+    /// `unsupported_version`, `malformed_key`, `unsupported_role`,
+    /// `pin_mismatch`, `public_key_mismatch`, or `fee_source_mismatch`.
+    ///
+    /// # Wire code
+    ///
+    /// `"auth.enrolled_identity_unusable"`.
+    #[error(
+        "the enrolled signer identity of profile `{profile}` cannot be used ({reason}); run \
+         `stellar-agent profile enroll-signer --profile {profile} --repair-identity`"
+    )]
+    EnrolledIdentityUnusable {
+        /// The selected profile name.
+        profile: String,
+        /// Which rule the identity breaks.
+        reason: &'static str,
+    },
+
     /// The resolved signer differs from the mainnet profile's enrolled key.
     #[error("signer `{derived}` is not the enrolled signer `{enrolled}` of profile `{profile}`")]
     EnrolledSignerMismatch {
@@ -2365,6 +2497,7 @@ impl AuthError {
             Self::HardwareUserRefused => "auth.hardware_user_refused",
             Self::EnrolledSignerUnpinned { .. } => "auth.enrolled_signer_unpinned",
             Self::EnrolledSignerMismatch { .. } => "auth.enrolled_signer_mismatch",
+            Self::EnrolledIdentityUnusable { .. } => "auth.enrolled_identity_unusable",
             Self::SignerKeyMismatch { .. } => "auth.signer_key_mismatch",
             Self::SignerKindMismatch { .. } => "auth.signer_kind_mismatch",
         }
@@ -2527,6 +2660,21 @@ pub enum WalletStateError {
         /// no secret material.
         detail: String,
     },
+
+    /// The system clock cannot supply a Unix timestamp in milliseconds.
+    ///
+    /// Raised by the clock the mainnet authorization store, the signing
+    /// points, and the submit gate share. The wire code is the one every
+    /// command reports for a clock it cannot read.
+    ///
+    /// # Wire code
+    ///
+    /// `"wallet.clock_error"`.
+    #[error("system clock error: {detail}")]
+    ClockError {
+        /// Operator-safe diagnostic string. Carries no secret material.
+        detail: String,
+    },
 }
 
 impl WalletStateError {
@@ -2545,6 +2693,7 @@ impl WalletStateError {
             Self::PlatformAuthenticatorError { .. } => "wallet_state.platform_authenticator_error",
             Self::PasskeyCredentialNotFound => "wallet_state.passkey_credential_not_found",
             Self::UnlockFailed { .. } => "wallet_state.unlock_failed",
+            Self::ClockError { .. } => "wallet.clock_error",
         }
     }
 }
@@ -3414,6 +3563,14 @@ mod tests {
                 },
                 "validation.fee_total_overflow",
             ),
+            (
+                ValidationError::ResetWindowStateNewerVersion {
+                    profile: "default".to_owned(),
+                    version: 5,
+                    max: 4,
+                },
+                "profile.reset_window_state_newer_version",
+            ),
         ];
 
         for (variant, expected_code) in cases {
@@ -3641,6 +3798,29 @@ mod tests {
                         op_count: *op_count,
                     }
                 }
+                ValidationError::ResetWindowStateNewerVersion {
+                    profile,
+                    version,
+                    max,
+                } => ValidationError::ResetWindowStateNewerVersion {
+                    profile: profile.clone(),
+                    version: *version,
+                    max: *max,
+                },
+                #[cfg(feature = "mainnet-write")]
+                ValidationError::WindowStateUnverifiable { profile, defect } => {
+                    ValidationError::WindowStateUnverifiable {
+                        profile: profile.clone(),
+                        defect,
+                    }
+                }
+                #[cfg(feature = "mainnet-write")]
+                ValidationError::ResetWindowStateOpenAuthorizations { profile, open } => {
+                    ValidationError::ResetWindowStateOpenAuthorizations {
+                        profile: profile.clone(),
+                        open: *open,
+                    }
+                }
             });
             assert_eq!(
                 wallet_err.code(),
@@ -3743,6 +3923,7 @@ mod tests {
                 attempts: 3,
             },
             WitnessUnavailableReason::InvalidAnswer { authority },
+            WitnessUnavailableReason::EnvelopeMismatch { part: "sequence" },
         ]
         .into_iter()
         .map(|reason| NetworkError::WitnessUnavailable { reason })
@@ -3793,6 +3974,10 @@ mod tests {
             (
                 NetworkError::MainnetWriteForbidden,
                 "network.mainnet_write_forbidden",
+            ),
+            (
+                NetworkError::MainnetAuthorizationRefused,
+                "network.mainnet_authorization_refused",
             ),
             (
                 NetworkError::HorizonUnavailable { status: 503 },
@@ -3952,6 +4137,13 @@ mod tests {
                 },
                 "auth.enrolled_signer_mismatch",
             ),
+            (
+                AuthError::EnrolledIdentityUnusable {
+                    profile: "mainnet".into(),
+                    reason: "missing",
+                },
+                "auth.enrolled_identity_unusable",
+            ),
             (AuthError::KeyringLocked, "auth.keyring_locked"),
             (
                 AuthError::KeyringPlatformError {
@@ -4067,6 +4259,12 @@ mod tests {
                     detail: "invalid TTL 601s: TTL exceeds the maximum".to_owned(),
                 },
                 "wallet_state.unlock_failed",
+            ),
+            (
+                WalletStateError::ClockError {
+                    detail: "system clock is before UNIX_EPOCH".to_owned(),
+                },
+                "wallet.clock_error",
             ),
         ];
 
@@ -4499,6 +4697,7 @@ mod tests {
                 NetworkError::WitnessUnavailable {
                     reason: WitnessUnavailableReason::OracleNotConfigured
                         | WitnessUnavailableReason::NoThresholdForAsset { .. }
+                        | WitnessUnavailableReason::EnvelopeMismatch { .. }
                 } | NetworkError::WitnessDivergence { .. }
             );
             assert_eq!(
@@ -4904,6 +5103,12 @@ mod tests {
                 },
                 "approval.gc_failed",
             ),
+            (
+                ApprovalFailure::AttestationInvalid {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.attestation_invalid",
+            ),
         ];
         for (failure, code) in cases {
             let error = WalletError::Approval(failure);
@@ -5043,4 +5248,67 @@ mod tests {
     //
     // The key contract: adding a new variant is not a breaking change for
     // callers that use `_ => ...` fallbacks.
+
+    /// The two mainnet refusals keep distinct codes: a build without mainnet
+    /// writes refuses before any authorization exists, a refused
+    /// authorization reports its own code, and the latter's text names no
+    /// precondition, proof fact, or endpoint detail.
+    #[test]
+    fn mainnet_authorization_refusal_is_distinct_and_generic() {
+        let refused = WalletError::Network(NetworkError::MainnetAuthorizationRefused);
+        let forbidden = WalletError::Network(NetworkError::MainnetWriteForbidden);
+        assert_eq!(refused.code(), "network.mainnet_authorization_refused");
+        assert_eq!(forbidden.code(), "network.mainnet_write_forbidden");
+        assert_eq!(refused.category(), ErrorCategory::Network);
+        let text = refused.to_string();
+        assert_eq!(
+            text,
+            "the mainnet authorization for this action was refused; nothing was signed or sent"
+        );
+        for forbidden_word in [
+            "precondition",
+            "endpoint",
+            "policy",
+            "approval",
+            "audit",
+            "digest",
+            "http",
+            "rpc",
+            "ledger",
+            "nonce",
+        ] {
+            assert!(
+                !text.to_ascii_lowercase().contains(forbidden_word),
+                "{forbidden_word}: {text}"
+            );
+        }
+    }
+
+    /// The mainnet window-state refusals name their codes, the defect or the
+    /// open count, and the reset remedy.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    fn mainnet_window_state_refusals_carry_codes_and_remedy() {
+        let unverifiable = WalletError::Validation(ValidationError::WindowStateUnverifiable {
+            profile: "main".to_owned(),
+            defect: "hmac_invalid",
+        });
+        assert_eq!(unverifiable.code(), "policy.window_state_unverifiable");
+        assert_eq!(unverifiable.category(), ErrorCategory::Validation);
+        let text = unverifiable.to_string();
+        assert!(text.contains("hmac_invalid"), "{text}");
+        assert!(
+            text.contains("stellar-agent profile reset-window-state main --reason <reason>"),
+            "{text}"
+        );
+        let open = WalletError::Validation(ValidationError::ResetWindowStateOpenAuthorizations {
+            profile: "main".to_owned(),
+            open: 2,
+        });
+        assert_eq!(
+            open.code(),
+            "profile.reset_window_state_open_authorizations"
+        );
+        assert!(open.to_string().contains("2 open mainnet"), "{open}");
+    }
 }

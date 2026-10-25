@@ -301,6 +301,7 @@ async fn exercise_approval_consumption(fail_once: bool) {
         &approval_nonce,
         &envelope_sha256(envelope_xdr.as_bytes()),
         &process_uid,
+        &entry.attested_lifetime(),
     );
     let attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
     {
@@ -556,6 +557,7 @@ async fn a_refused_commit_leaves_its_approval_untouched() {
         &approval_nonce,
         &envelope_sha256(envelope_xdr.as_bytes()),
         &process_uid,
+        &entry.attested_lifetime(),
     );
     let attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
     {
@@ -713,6 +715,7 @@ async fn pay_commit_logs_a_queued_consent_row_before_the_signer_loads() {
         &approval_nonce,
         &envelope_sha256(envelope_xdr.as_bytes()),
         &process_uid,
+        &entry.attested_lifetime(),
     );
     let attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
 

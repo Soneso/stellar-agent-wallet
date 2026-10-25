@@ -303,9 +303,29 @@ pub fn install_with_write_error(
         inner,
         target: (service.to_owned(), account.to_owned()),
         error: Arc::new(std::sync::Mutex::new(Some(err))),
+        failing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     keyring_core::set_default_store(store);
     Ok(())
+}
+
+/// Installs a mock whose writes at one coordinate fail while the returned switch is set.
+///
+/// # Errors
+/// Returns the error from creating the mock store.
+pub fn install_with_write_failure_switch(
+    service: &str,
+    account: &str,
+) -> Result<Arc<std::sync::atomic::AtomicBool>, keyring_core::Error> {
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let store = WriteErrorStore {
+        inner: keyring_core::mock::Store::new()?,
+        target: (service.to_owned(), account.to_owned()),
+        error: Arc::new(std::sync::Mutex::new(None)),
+        failing: Arc::clone(&failing),
+    };
+    keyring_core::set_default_store(Arc::new(store));
+    Ok(failing)
 }
 
 /// The mock store of [`install_with_write_error`].
@@ -313,6 +333,7 @@ struct WriteErrorStore {
     inner: Arc<keyring_core::mock::Store>,
     target: (String, String),
     error: Arc<std::sync::Mutex<Option<keyring_core::Error>>>,
+    failing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl keyring_core::api::CredentialStoreApi for WriteErrorStore {
@@ -336,6 +357,7 @@ impl keyring_core::api::CredentialStoreApi for WriteErrorStore {
                 WriteErrorCred {
                     inner: entry,
                     error: Arc::clone(&self.error),
+                    failing: Arc::clone(&self.failing),
                 },
             )));
         }
@@ -351,10 +373,14 @@ impl keyring_core::api::CredentialStoreApi for WriteErrorStore {
 struct WriteErrorCred {
     inner: keyring_core::Entry,
     error: Arc<std::sync::Mutex<Option<keyring_core::Error>>>,
+    failing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl keyring_core::api::CredentialApi for WriteErrorCred {
     fn set_secret(&self, secret: &[u8]) -> keyring_core::Result<()> {
+        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(keyring_core::Error::NoEntry);
+        }
         let pending = match self.error.lock() {
             Ok(mut guard) => guard.take(),
             Err(poisoned) => poisoned.into_inner().take(),

@@ -15,7 +15,8 @@ use ed25519_dalek::SigningKey;
 use serde_json::Value;
 use stellar_agent_core::audit_log::AuditBinding;
 use stellar_agent_core::profile::owner_key::encode_owner_public_key;
-use stellar_agent_core::profile::schema::KeyringEntryRef;
+use stellar_agent_core::profile::schema::{KeyringEntryRef, signer_identity_entry_ref};
+use stellar_agent_core::profile::signer_identity::SignerIdentityRecord;
 use stellar_agent_network::keyring::KeyringAuditBindingStore;
 
 use crate::v1_ceremony::{IsolatedHome, Keypair, policy_document, policy_rule};
@@ -74,6 +75,14 @@ fn a_fresh_v1_profile_through_inits_order_passes_audit_verify() {
         }),
         "the first signer enrollment writes its audit row"
     );
+    assert!(
+        rows.iter().any(|row| {
+            row["kind"] == "signer_identity_enrolled"
+                && row["keyring_entry"] == "enrolled-identity"
+                && row["role"] == "agent"
+        }),
+        "the enrollment records its identity record"
+    );
     let log_path = profile.audit_log_path.display().to_string();
     let verified = home.run_ok(&["audit", "verify", "--profile", PROFILE, &log_path], &[]);
     assert_eq!(verified["ok"], true, "{verified}");
@@ -105,5 +114,17 @@ fn a_fresh_v1_profile_through_inits_order_passes_audit_verify() {
             .unwrap()
             == encode_owner_public_key(&owner_bytes),
         "enroll-owner-key stores the G-strkey"
+    );
+    let identity = signer_identity_entry_ref(&profile.mcp_signer_default);
+    let signer_bytes = SigningKey::from_bytes(&SIGNER_SEED)
+        .verifying_key()
+        .to_bytes();
+    assert_eq!(
+        keyring_core::Entry::new(&identity.service, &identity.account)
+            .unwrap()
+            .get_password()
+            .unwrap(),
+        SignerIdentityRecord::agent(signer_bytes).render(),
+        "enroll-signer stores the identity record beside the seed"
     );
 }

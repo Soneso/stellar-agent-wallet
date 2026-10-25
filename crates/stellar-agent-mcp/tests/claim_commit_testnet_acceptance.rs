@@ -401,6 +401,15 @@ async fn t1_claim_two_phase_happy_path() {
     // ── 2. Recompute the attestation blob exactly as `approve` would ───────────
     let uid = process_uid_for_attestation().expect("process uid");
     let sha = envelope_sha256(envelope_xdr.as_bytes());
+    let stored = stellar_agent_core::approval::PendingApprovalStore::open(
+        stellar_agent_core::profile::schema::default_approval_dir()
+            .expect("approval dir")
+            .join(format!("{}.toml", server.profile_name_for_approval())),
+    )
+    .expect("open approval store")
+    .get(&approval_nonce)
+    .expect("the approval request is persisted")
+    .clone();
     let blob = compute_attestation(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new(
@@ -410,6 +419,7 @@ async fn t1_claim_two_phase_happy_path() {
         &approval_nonce,
         &sha,
         &uid,
+        &stored.attested_lifetime(),
     );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
 

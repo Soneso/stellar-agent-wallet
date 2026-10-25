@@ -54,6 +54,7 @@ pub mod fees;
 pub mod friendbot;
 pub mod idempotent_submit;
 pub mod keyring;
+pub mod mainnet;
 pub mod memo;
 pub mod policy_state;
 pub mod policy_view;

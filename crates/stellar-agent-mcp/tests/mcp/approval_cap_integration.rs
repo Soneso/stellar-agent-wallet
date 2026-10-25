@@ -342,6 +342,11 @@ decision = "allow"
     }
 
     fn attest_nonce(&self, nonce: &str, envelope: &str) -> (String, String) {
+        let mut store = PendingApprovalStore::open(
+            self.approval_dir.path().join(format!("{}.toml", self.name)),
+        )
+        .unwrap();
+        let stored = store.get(nonce).unwrap().clone();
         let blob = compute_attestation(
             &ATTESTATION_KEY,
             &stellar_agent_core::approval::AttestationBinding::new(
@@ -351,11 +356,8 @@ decision = "allow"
             nonce,
             &envelope_sha256(envelope.as_bytes()),
             &process_uid_for_attestation().unwrap(),
+            &stored.attested_lifetime(),
         );
-        let mut store = PendingApprovalStore::open(
-            self.approval_dir.path().join(format!("{}.toml", self.name)),
-        )
-        .unwrap();
         store.record_attestation(nonce, blob).unwrap();
         (
             nonce.to_owned(),
@@ -1563,6 +1565,7 @@ async fn split_approval_round_trip(pair: ClassicPair) {
             &entry.approval_nonce,
             &envelope_sha256(data["envelope_xdr"].as_str().unwrap().as_bytes()),
             &process_uid_for_attestation().unwrap(),
+            &entry.attested_lifetime(),
         );
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
         entry.attestation_blob_b64 = Some(encoded.clone());
@@ -1796,7 +1799,7 @@ async fn split_trustline_approval_uses_decoded_issuer() {
 #[serial]
 async fn split_approval_reconciles_only_one_bounded_pass() {
     use stellar_agent_core::policy::v1::criteria::state_store::{WindowEntry, WindowLimit};
-    use stellar_agent_network::policy_state::{RECONCILE_MIN_AGE_MS, WindowReservation};
+    use stellar_agent_network::policy_state::{RECONCILE_MIN_AGE_MS, SubmissionHold};
     let h = Harness::with_rules(
         "split-reconcile",
         Outcome::Success,
@@ -1808,7 +1811,7 @@ async fn split_approval_reconciles_only_one_bounded_pass() {
     let receipts = ReceiptStore::open(&h.name).unwrap();
     for index in 0..6 {
         let id = format!("{index:064x}");
-        let reservation = WindowReservation {
+        let reservation = SubmissionHold {
             id: id.clone(),
             tx_hash: id.clone(),
             source: h.source.clone(),

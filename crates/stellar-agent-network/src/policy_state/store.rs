@@ -5,8 +5,7 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
 
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::Sha256;
@@ -25,7 +24,8 @@ use stellar_agent_core::profile::schema::{
 use subtle::ConstantTimeEq as _;
 
 use crate::policy_state::WindowStoreError;
-use crate::policy_state::lock::WindowStoreLock;
+use crate::policy_state::ledger::{self, WireAuthorization, WireAuthorizationHold};
+use crate::policy_state::lock::{WindowStoreLock, window_lock_path};
 use crate::transaction_record::TransactionRecord;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -42,7 +42,7 @@ const HMAC_CONTEXT_LABEL: &[u8] = b"stellar-agent-policy-window/v1/body\x00";
 /// milliseconds. Entries older than `now_ms - RETENTION_MS` are pruned on
 /// every write, so the store never grows unbounded even if a criterion's
 /// window shrinks or a rule is removed.
-const RETENTION_MS: u64 = 604_800 * 1_000;
+pub(super) const RETENTION_MS: u64 = 604_800 * 1_000;
 
 /// Bounds the chain-time observation independently of the transport timeout.
 const LEDGER_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -159,15 +159,33 @@ fn network_failure_reason(error: stellar_agent_core::error::NetworkError) -> Str
     }
 }
 
-/// Wire-format version this build writes.
-const WIRE_VERSION: u32 = 3;
+/// Wire-format version of a snapshot whose authorization history is empty.
+///
+/// Every snapshot this build writes without authorization history uses it,
+/// so a build that reads up to version 3 keeps reading the store until a
+/// mainnet authorization is minted.
+pub(super) const WIRE_VERSION_COMPACT: u32 = 3;
+
+/// Wire-format version of a snapshot that carries authorization history,
+/// settled records included, until pruning removes the last of it.
+pub(super) const WIRE_VERSION_LEDGER: u32 = 4;
 
 /// Highest wire-format version this build reads.
 ///
 /// A file written by a newer build carries records this one cannot account
 /// for, so it is refused rather than read with the fields it happens to
 /// recognise.
-const WIRE_VERSION_MAX: u32 = 3;
+const WIRE_VERSION_MAX: u32 = WIRE_VERSION_LEDGER;
+
+/// The version a snapshot is written under, chosen from its content: version
+/// 4 when it carries authorization history, version 3 otherwise.
+pub(super) fn select_wire_version(wire: &WireFile) -> u32 {
+    if wire.authorizations.is_empty() {
+        WIRE_VERSION_COMPACT
+    } else {
+        WIRE_VERSION_LEDGER
+    }
+}
 
 /// How many reservations one reconciliation pass settles.
 ///
@@ -197,7 +215,7 @@ pub const RECONCILE_MIN_AGE_MS: u64 = 300_000;
 /// otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum RecordStatus {
+pub(super) enum RecordStatus {
     /// The transaction reached a ledger. Version 1 records default to
     /// confirmed spend so their window accounting remains defined.
     #[default]
@@ -212,41 +230,41 @@ enum RecordStatus {
 /// The identity fields carry defaults so a v1 record deserialises as a
 /// confirmed record with no reservation to reconcile.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct WireRecord {
-    ts_ms: u64,
+pub(super) struct WireRecord {
+    pub(super) ts_ms: u64,
     #[serde(with = "i128_decimal_str")]
-    amount: i128,
+    pub(super) amount: i128,
     /// Reservation identity: the envelope hash of the submission that wrote
     /// this record. Every record one submission writes shares it, so one
     /// reconciliation settles them together. Empty on a confirmed record
     /// written by a path that takes no reservation.
     #[serde(default)]
-    id: String,
+    pub(super) id: String,
     #[serde(default)]
-    status: RecordStatus,
+    pub(super) status: RecordStatus,
     /// Transaction hash to reconcile the reservation against.
     #[serde(default)]
-    tx_hash: String,
+    pub(super) tx_hash: String,
     /// The account whose sequence the transaction consumes.
     #[serde(default)]
-    source: String,
+    pub(super) source: String,
     /// The sequence number the transaction consumes.
     #[serde(default)]
-    sequence: i64,
+    pub(super) sequence: i64,
     /// `TimeBounds.maxTime` in absolute unix seconds; `0` means no time bound.
     #[serde(default)]
-    max_time: u64,
+    pub(super) max_time: u64,
     /// When the reservation was taken, in unix milliseconds.
     #[serde(default)]
-    pending_since_ms: u64,
+    pub(super) pending_since_ms: u64,
     /// The endpoint's latest ledger when the reservation was taken, compared
     /// against the endpoint's retention floor to tell "the endpoint never saw
     /// it" apart from "the endpoint no longer remembers it".
     #[serde(default)]
-    submission_ledger: u32,
+    pub(super) submission_ledger: u32,
     /// An orphan beyond retention requires an operator decision.
     #[serde(default)]
-    operator_required: bool,
+    pub(super) operator_required: bool,
 }
 
 impl WireRecord {
@@ -254,7 +272,7 @@ impl WireRecord {
     ///
     /// Used with struct-update syntax so a confirmed record names only its
     /// timestamp and amount at the call site.
-    fn confirmed_defaults() -> Self {
+    pub(super) fn confirmed_defaults() -> Self {
         Self {
             ts_ms: 0,
             amount: 0,
@@ -271,12 +289,12 @@ impl WireRecord {
     }
 }
 
-/// The identity of a submission that holds a window reservation.
+/// The identity of a submission whose pending records hold window headroom.
 ///
 /// Every record one submission writes carries this identity, so a
 /// reconciliation pass settles them together from one round trip.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WindowReservation {
+pub struct SubmissionHold {
     /// The submission's envelope hash, 64 lowercase hex characters.
     pub id: String,
     /// The transaction hash to reconcile against, 64 lowercase hex characters.
@@ -381,11 +399,11 @@ pub struct SettledSubmission {
 /// One `StateKey` bucket (everything but the profile name, which is implied
 /// by the file's identity) and its accumulated records.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct WireBucket {
-    scope_specificity: u8,
-    bucket: String,
-    window_secs: u64,
-    records: Vec<WireRecord>,
+pub(super) struct WireBucket {
+    pub(super) scope_specificity: u8,
+    pub(super) bucket: String,
+    pub(super) window_secs: u64,
+    pub(super) records: Vec<WireRecord>,
 }
 
 /// The canonical JSON body. `version` is the wire-format version, distinct
@@ -393,15 +411,26 @@ struct WireBucket {
 /// store's own wire shape changes. `generation` is the anti-rollback counter
 /// — see the module docs' "Anti-rollback" section; it MUST equal the
 /// keyring-held generation counter for the file to be accepted.
+///
+/// Version 4 adds the mainnet authorization ledger: `authorizations`, the
+/// record history, and `holds`, the window entries open authorizations own.
+/// Both are omitted while empty, so a snapshot without authorization history
+/// serializes exactly as version 3 does.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-struct WireFile {
-    version: u32,
-    generation: u64,
-    entries: Vec<WireBucket>,
+pub(super) struct WireFile {
+    pub(super) version: u32,
+    pub(super) generation: u64,
+    pub(super) entries: Vec<WireBucket>,
+    /// Mainnet authorization records, open and settled, until pruned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) authorizations: Vec<WireAuthorization>,
+    /// The holds of open authorizations, keyed by `(authorization, ordinal)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) holds: Vec<WireAuthorizationHold>,
     /// Prepared next generation, authenticated with the current snapshot.
     /// The keyring counter selects exactly one side of the atomic commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    prepared: Option<Box<WireFile>>,
+    pub(super) prepared: Option<Box<WireFile>>,
 }
 
 /// Decimal-string `i128` serde adapter, mirroring
@@ -409,14 +438,14 @@ struct WireFile {
 /// this crate cannot import those (private to their defining modules), and an
 /// `i128` on the wire as a bare JSON number risks float round-tripping through
 /// a permissive deserializer, so amounts are always decimal strings here too.
-mod i128_decimal_str {
+pub(super) mod i128_decimal_str {
     use serde::{Deserialize as _, Deserializer, Serializer};
 
-    pub(super) fn serialize<S: Serializer>(v: &i128, s: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(v: &i128, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&v.to_string())
     }
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<i128, D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<i128, D::Error> {
         let s = String::deserialize(d)?;
         s.parse::<i128>()
             .map_err(|e| serde::de::Error::custom(format!("invalid i128 decimal string: {e}")))
@@ -448,6 +477,60 @@ pub struct ResetOutcome {
     pub accrual: WipedAccrualRecord,
 }
 
+/// A defect that leaves a mainnet profile's window-state store unverifiable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StateDefect {
+    /// The file is missing while the keyring holds a committed generation.
+    MissingFileWithGeneration,
+    /// The file exists and its HMAC key does not.
+    MissingKey,
+    /// The file exists and its HMAC key is not 32 bytes of base64.
+    BadKey,
+    /// The file is truncated, is not the store's JSON, carries an invalid
+    /// version, or breaks a ledger invariant.
+    Malformed,
+    /// The file's HMAC tag does not verify under its key.
+    HmacInvalid,
+    /// The file's generation, or its body, does not match the keyring's
+    /// committed generation.
+    GenerationMismatch,
+}
+
+impl StateDefect {
+    /// The defect's stable snake-case label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::MissingFileWithGeneration => "missing_file_with_generation",
+            Self::MissingKey => "missing_key",
+            Self::BadKey => "bad_key",
+            Self::Malformed => "malformed",
+            Self::HmacInvalid => "hmac_invalid",
+            Self::GenerationMismatch => "generation_mismatch",
+        }
+    }
+}
+
+impl std::fmt::Display for StateDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// What the reset's recorder receives: the accrual it records and, for a
+/// mainnet profile in a build with mainnet writes, the defect that left the
+/// store unverifiable.
+#[derive(Debug, Clone, Copy)]
+pub struct ResetRecord<'a> {
+    /// The live accrual of the store being replaced.
+    pub accrual: &'a WipedAccrualRecord,
+    /// The defect the reset recovers from; `None` for verifiable state, a
+    /// genuine first run, a testnet profile, or a build without mainnet
+    /// writes.
+    pub defect: Option<StateDefect>,
+}
+
 /// Failure of the recorded reset ceremony.
 #[derive(Debug, thiserror::Error)]
 pub enum ResetError<E> {
@@ -471,7 +554,88 @@ pub struct PersistedWindowStore {
     path: PathBuf,
 }
 
-type ResetSnapshot = (Option<zeroize::Zeroizing<[u8; 32]>>, WipedAccrualRecord);
+/// What the reset established before its recorder runs.
+struct ResetSnapshot {
+    key: Option<zeroize::Zeroizing<[u8; 32]>>,
+    accrual: WipedAccrualRecord,
+    defect: Option<StateDefect>,
+}
+
+/// Whether the mainnet rules apply to `profile`: a mainnet profile in a build
+/// with mainnet writes.
+fn mainnet_rules(profile: &Profile) -> bool {
+    cfg!(feature = "mainnet-write") && profile.chain_id.is_mainnet()
+}
+
+/// The defect a loading error names, when it names one.
+fn defect_of(error: &WindowStoreError, file_missing: bool) -> Option<StateDefect> {
+    match error {
+        WindowStoreError::GenerationMismatch if file_missing => {
+            Some(StateDefect::MissingFileWithGeneration)
+        }
+        WindowStoreError::GenerationMismatch => Some(StateDefect::GenerationMismatch),
+        WindowStoreError::HmacMismatch => Some(StateDefect::HmacInvalid),
+        WindowStoreError::Invalid { .. } => Some(StateDefect::Malformed),
+        _ => None,
+    }
+}
+
+/// The defect a key load failure names, when it names one: an absent key or
+/// a stored value that is not 32 bytes of base64.
+fn key_defect_of(error: &stellar_agent_core::error::WalletError) -> Option<StateDefect> {
+    use stellar_agent_core::error::{AuthError, InternalError, WalletError};
+    match error {
+        WalletError::Auth(AuthError::KeyringNotFound { .. }) => Some(StateDefect::MissingKey),
+        WalletError::Internal(InternalError::UnexpectedState { detail })
+            if detail.starts_with("audit.key_length_error:")
+                || detail.starts_with("audit.key_decode_failed:") =>
+        {
+            Some(StateDefect::BadKey)
+        }
+        _ => None,
+    }
+}
+
+/// Replaces a loading error of a mainnet profile with the unverifiable
+/// refusal naming its defect; every other error, and every error under the
+/// testnet and build-without-mainnet-writes rules, passes unchanged.
+fn mainnet_loading_error(
+    #[cfg_attr(
+        not(feature = "mainnet-write"),
+        expect(unused_variables, reason = "only the mainnet rules read the profile")
+    )]
+    profile: &Profile,
+    error: WindowStoreError,
+    #[cfg_attr(
+        not(feature = "mainnet-write"),
+        expect(unused_variables, reason = "only the mainnet rules name the defect")
+    )]
+    defect: Option<StateDefect>,
+) -> WindowStoreError {
+    #[cfg(feature = "mainnet-write")]
+    if mainnet_rules(profile)
+        && let Some(defect) = defect
+    {
+        return WindowStoreError::MainnetStateUnverifiable { defect };
+    }
+    error
+}
+
+/// The keyring error a key load failure becomes, or the unverifiable refusal
+/// for a mainnet profile whose key is absent or unusable while its file
+/// exists.
+fn key_load_error(
+    profile: &Profile,
+    error: &stellar_agent_core::error::WalletError,
+) -> WindowStoreError {
+    mainnet_loading_error(
+        profile,
+        WindowStoreError::Keyring {
+            detail: format!("{error}"),
+        },
+        key_defect_of(error),
+    )
+}
 
 impl PersistedWindowStore {
     /// Constructs a store handle for the OS-conventional path for
@@ -503,14 +667,12 @@ impl PersistedWindowStore {
     }
 
     fn lock_path(&self) -> PathBuf {
-        let mut p = self.path.clone();
-        let name = p
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("policy.window")
-            .to_owned();
-        p.set_file_name(format!("{name}.lock"));
-        p
+        window_lock_path(&self.path)
+    }
+
+    /// The store file's path.
+    pub(super) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Loads every persisted entry into `dest`, verifying the HMAC tag AND
@@ -566,22 +728,31 @@ impl PersistedWindowStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return match load_generation(&gen_entry)? {
                     None => Ok(()), // genuine first run — no key, no file, no history.
-                    Some(_) => Err(WindowStoreError::GenerationMismatch), // deletion detected.
+                    // Deletion detected.
+                    Some(_) => Err(mainnet_loading_error(
+                        profile,
+                        WindowStoreError::GenerationMismatch,
+                        Some(StateDefect::MissingFileWithGeneration),
+                    )),
                 };
             }
             Err(e) => return Err(WindowStoreError::Io { kind: e.kind() }),
         };
 
         let key =
-            crate::keyring::load_hmac_key_32(entry_ref).map_err(|e| WindowStoreError::Keyring {
-                detail: format!("{e}"),
-            })?;
+            crate::keyring::load_hmac_key_32(entry_ref).map_err(|e| key_load_error(profile, &e))?;
         refuse_owner_public_key(
             key.as_ref(),
             &OwnerKeyContext::for_profile(profile_name, profile),
         )?;
-        let wire = self.verify_with_key(&key, &bytes)?;
-        let wire = select_generation(wire, load_counter(&gen_entry)?)?;
+        let counter = load_counter(&gen_entry)?;
+        let wire = self
+            .verify_with_key(&key, &bytes)
+            .and_then(|wire| select_generation(wire, counter))
+            .map_err(|e| {
+                let defect = defect_of(&e, false);
+                mainnet_loading_error(profile, e, defect)
+            })?;
 
         for entry in wire.entries {
             let key = StateKey::new(
@@ -659,7 +830,11 @@ impl PersistedWindowStore {
         let (key, mint_outcome) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
 
-        let mut wire = self.read_verified(&key, &gen_entry)?;
+        let mut wire = self.read_verified(profile, &key, &gen_entry)?;
+        let now_ms = now_ms()?;
+        // Expired authorizations release their holds before the window is
+        // counted; the holds that remain count against it.
+        ledger::sweep_expired(&mut wire, now_ms);
         if require_admission {
             admit(&wire, new_entries)?;
         }
@@ -673,9 +848,8 @@ impl PersistedWindowStore {
             });
         }
 
-        let now_ms = now_ms()?;
         prune_stale(&mut wire, now_ms);
-        wire.version = WIRE_VERSION;
+        wire.version = select_wire_version(&wire);
 
         wire.generation = next_generation(&gen_entry)?;
         write_generation(&gen_entry, &wire)?;
@@ -725,18 +899,22 @@ impl PersistedWindowStore {
         &self,
         profile: &Profile,
         new_entries: &[WindowEntry],
-        reservation: &WindowReservation,
+        reservation: &SubmissionHold,
     ) -> Result<MintOutcome, WindowStoreError> {
         self.ensure_parent_dir()?;
         let _lock = WindowStoreLock::acquire(&self.lock_path())?;
 
         let (key, mint_outcome) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
-        let mut wire = self.read_verified(&key, &gen_entry)?;
+        let mut wire = self.read_verified(profile, &key, &gen_entry)?;
+        let now_ms = now_ms()?;
 
         if file_holds_id(&wire, &reservation.id) {
             return Err(WindowStoreError::DuplicateReservation);
         }
+        // Expired authorizations release their holds before the window is
+        // counted; the holds that remain count against it.
+        ledger::sweep_expired(&mut wire, now_ms);
         admit(&wire, new_entries)?;
 
         for entry in new_entries {
@@ -756,8 +934,8 @@ impl PersistedWindowStore {
             });
         }
 
-        prune_stale(&mut wire, now_ms()?);
-        wire.version = WIRE_VERSION;
+        prune_stale(&mut wire, now_ms);
+        wire.version = select_wire_version(&wire);
         wire.generation = next_generation(&gen_entry)?;
         write_generation(&gen_entry, &wire)?;
         self.write_atomic(&key, &wire)?;
@@ -890,7 +1068,7 @@ impl PersistedWindowStore {
     pub fn pending_reservations(
         &self,
         profile: &Profile,
-    ) -> Result<Vec<WindowReservation>, WindowStoreError> {
+    ) -> Result<Vec<SubmissionHold>, WindowStoreError> {
         let wire = match self.read_for_inspection(profile)? {
             Some(wire) => wire,
             None => return Ok(Vec::new()),
@@ -981,7 +1159,7 @@ impl PersistedWindowStore {
                 None => HashMap::new(),
             };
 
-        let due: Vec<WindowReservation> = collect_pending(&wire)
+        let due: Vec<SubmissionHold> = collect_pending(&wire)
             .into_iter()
             .filter(|r| now_ms.saturating_sub(r.pending_since_ms) >= RECONCILE_MIN_AGE_MS)
             .filter(|r| !r.operator_required && !outcome_already_unknown(&known, &r.id))
@@ -1058,6 +1236,14 @@ impl PersistedWindowStore {
     /// The recorder runs before minting a key or writing either durable state.
     /// An unverifiable file carries no totals; read and keyring errors refuse.
     ///
+    /// For a mainnet profile in a build with mainnet writes, two rules apply.
+    /// Verifiable state that still holds an effective open authorization
+    /// refuses before the recorder, with nothing changed. Unverifiable state
+    /// resets, and the recorder receives the defect it recovers from, so its
+    /// audit row names it. Expired authorizations are released in memory only:
+    /// nothing persists before the recorder succeeds. A missing file with no
+    /// committed generation is a genuine first run and carries no defect.
+    ///
     /// # Errors
     ///
     /// Returns a store failure or the recorder's refusal. A store failure reports
@@ -1066,19 +1252,25 @@ impl PersistedWindowStore {
         &self,
         profile: &Profile,
         now_ms: u64,
-        record: impl FnOnce(&WipedAccrualRecord) -> Result<(), E>,
+        record: impl FnOnce(&ResetRecord<'_>) -> Result<(), E>,
     ) -> Result<ResetOutcome, ResetError<E>> {
         let before_mint = |error| ResetError::Store {
             error,
             minted: false,
         };
         self.ensure_parent_dir().map_err(before_mint)?;
-        let _lock = WindowStoreLock::acquire(&self.lock_path()).map_err(before_mint)?;
-        let (key, accrual) = self.reset_snapshot(profile, now_ms).map_err(before_mint)?;
-        record(&accrual).map_err(ResetError::Recorder)?;
+        let _lock =
+            WindowStoreLock::acquire(&self.lock_path()).map_err(|e| before_mint(e.into()))?;
+        let snapshot = self.reset_snapshot(profile, now_ms).map_err(before_mint)?;
+        record(&ResetRecord {
+            accrual: &snapshot.accrual,
+            defect: snapshot.defect,
+        })
+        .map_err(ResetError::Recorder)?;
+        let accrual = snapshot.accrual;
         let mut minted = false;
         let mutation = (|| {
-            let key = match key {
+            let key = match snapshot.key {
                 Some(key) => key,
                 None => {
                     let entry = &profile.policy_window_state_key_id;
@@ -1095,10 +1287,9 @@ impl PersistedWindowStore {
                 }
             };
             let empty = WireFile {
-                version: WIRE_VERSION,
+                version: WIRE_VERSION_COMPACT,
                 generation: accrual.generation_after,
-                entries: Vec::new(),
-                prepared: None,
+                ..WireFile::default()
             };
             write_generation(&generation_entry_ref(profile), &empty)?;
             self.write_atomic(&key, &empty)
@@ -1117,8 +1308,8 @@ impl PersistedWindowStore {
         profile: &Profile,
         now_ms: u64,
     ) -> Result<ResetSnapshot, WindowStoreError> {
-        use stellar_agent_core::error::{AuthError, InternalError, WalletError};
         refuse_owner_coordinate(profile)?;
+        let mut key_defect = None;
         let key = match crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id) {
             Ok(key) => {
                 refuse_owner_public_key(
@@ -1127,13 +1318,11 @@ impl PersistedWindowStore {
                 )?;
                 Some(key)
             }
-            Err(WalletError::Auth(AuthError::KeyringNotFound { .. })) => None,
-            // A stored value that is not base64 or not 32 bytes is no usable
-            // key: the file is unverifiable and the key is replaced after the row.
-            Err(WalletError::Internal(InternalError::UnexpectedState { detail }))
-                if detail.starts_with("audit.key_length_error:")
-                    || detail.starts_with("audit.key_decode_failed:") =>
-            {
+            // An absent key, or a stored value that is not base64 or not 32
+            // bytes, is no usable key: the file is unverifiable and the key is
+            // replaced after the row.
+            Err(e) if key_defect_of(&e).is_some() => {
+                key_defect = key_defect_of(&e);
                 None
             }
             Err(e) => {
@@ -1153,30 +1342,77 @@ impl PersistedWindowStore {
             generation_before,
             generation_after,
         };
+        let mainnet = mainnet_rules(profile);
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((key, accrual)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A committed generation without its file is a deletion; no
+                // committed generation is a genuine first run.
+                let defect = (mainnet && generation_before.is_some())
+                    .then_some(StateDefect::MissingFileWithGeneration);
+                return Ok(ResetSnapshot {
+                    key,
+                    accrual,
+                    defect,
+                });
+            }
             Err(e) => return Err(WindowStoreError::Io { kind: e.kind() }),
         };
         accrual.previous = PreviousState::Unverifiable;
+        let mut defect = key_defect;
         if let Some(key) = &key {
             match self
                 .verify_with_key(key, &bytes)
                 .and_then(|wire| select_generation(wire, counter))
             {
-                Ok(wire) => {
+                Ok(mut wire) => {
                     accrual.previous = PreviousState::Verified;
+                    // Authorization lifetimes are measured on the store's own
+                    // clock, as every ledger transition measures them.
+                    let clock = crate::policy_state::store::now_ms()?;
+                    #[cfg(feature = "mainnet-write")]
+                    if mainnet {
+                        let open = ledger::effective_open_count(&wire, clock);
+                        if open > 0 {
+                            return Err(WindowStoreError::OpenAuthorizations { open });
+                        }
+                    }
+                    ledger::sweep_expired(&mut wire, clock);
+                    // The holds of authorizations still open count as the
+                    // pending spend they hold.
+                    for hold in std::mem::take(&mut wire.holds) {
+                        let key = StateKey::new(
+                            "",
+                            hold.scope_specificity,
+                            &hold.bucket,
+                            hold.window_secs,
+                        );
+                        find_or_insert_bucket(&mut wire.entries, &key)
+                            .records
+                            .push(WireRecord {
+                                ts_ms: hold.ts_ms,
+                                amount: hold.amount,
+                                status: RecordStatus::Pending,
+                                ..WireRecord::confirmed_defaults()
+                            });
+                    }
                     snapshot_accrual(&wire, now_ms, &mut accrual);
                 }
                 Err(
-                    WindowStoreError::HmacMismatch
+                    e @ (WindowStoreError::HmacMismatch
                     | WindowStoreError::Invalid { .. }
-                    | WindowStoreError::GenerationMismatch,
-                ) => {}
+                    | WindowStoreError::GenerationMismatch),
+                ) => {
+                    defect = defect_of(&e, false);
+                }
                 Err(e) => return Err(e),
             }
         }
-        Ok((key, accrual))
+        Ok(ResetSnapshot {
+            key,
+            accrual,
+            defect: if mainnet { defect } else { None },
+        })
     }
 
     /// Verifies the store file's HMAC tag under `key` WITHOUT checking the
@@ -1271,7 +1507,7 @@ impl PersistedWindowStore {
 
         let (key, _mint) = self.load_or_mint_key(profile)?;
         let gen_entry = generation_entry_ref(profile);
-        let mut wire = self.read_verified(&key, &gen_entry)?;
+        let mut wire = self.read_verified(profile, &key, &gen_entry)?;
         let original = wire.clone();
 
         if !mutate(&mut wire) {
@@ -1279,14 +1515,13 @@ impl PersistedWindowStore {
         }
 
         prune_stale(&mut wire, now_ms()?);
-        wire.version = WIRE_VERSION;
         self.commit_generation(&key, &gen_entry, original, wire)
     }
 
     /// Persists both sides before advancing the keyring commit point. A crash
     /// at any write leaves a snapshot matching the counter, while replay of an
     /// older file cannot supply a matching committed generation.
-    fn commit_generation(
+    pub(super) fn commit_generation(
         &self,
         key: &[u8; 32],
         gen_entry: &KeyringEntryRef,
@@ -1301,13 +1536,17 @@ impl PersistedWindowStore {
                     detail: "policy window-state generation counter overflow".to_owned(),
                 })?;
         next.prepared = None;
+        // The successor's version follows from its own content, before its
+        // commitment is hashed. The current snapshot keeps the version it was
+        // committed under, so its committed digest stays the same with the
+        // successor beside it.
+        next.version = select_wire_version(&next);
         if original.generation == 0 {
             // Initialisation has no prior debit to retain. A missing trusted
             // counter on an existing file must remain a deletion error.
             write_generation(gen_entry, &next)?;
             return self.write_atomic(key, &next);
         }
-        original.version = WIRE_VERSION;
         original.prepared = Some(Box::new(next.clone()));
         self.write_atomic(key, &original)?;
         write_generation(gen_entry, &next)?;
@@ -1329,7 +1568,7 @@ impl PersistedWindowStore {
         profile: &Profile,
         client: &crate::client::StellarRpcClient,
         receipts: Option<&ReceiptStore>,
-        reservation: &WindowReservation,
+        reservation: &SubmissionHold,
         pass: &mut ReconcilePass,
     ) -> Result<Settlement, WindowStoreError> {
         // A reservation whose receipt already records release evidence is
@@ -1399,7 +1638,7 @@ impl PersistedWindowStore {
         &self,
         profile: &Profile,
         receipts: Option<&ReceiptStore>,
-        reservation: &WindowReservation,
+        reservation: &SubmissionHold,
         record: &TransactionRecord,
     ) -> Result<Settlement, WindowStoreError> {
         match record.status() {
@@ -1449,7 +1688,7 @@ impl PersistedWindowStore {
         profile: &Profile,
         client: &crate::client::StellarRpcClient,
         receipts: Option<&ReceiptStore>,
-        reservation: &WindowReservation,
+        reservation: &SubmissionHold,
         pass: &mut ReconcilePass,
     ) -> Result<Settlement, WindowStoreError> {
         // The retention boundary first: an endpoint that no longer holds the
@@ -1564,7 +1803,7 @@ impl PersistedWindowStore {
         profile: &Profile,
         client: &crate::client::StellarRpcClient,
         receipts: Option<&ReceiptStore>,
-        reservation: &WindowReservation,
+        reservation: &SubmissionHold,
         pass: &mut ReconcilePass,
         evidence: ReleaseEvidence,
     ) -> Result<Settlement, WindowStoreError> {
@@ -1608,7 +1847,7 @@ impl PersistedWindowStore {
         &self,
         profile: &Profile,
         receipts: Option<&ReceiptStore>,
-        reservation: &WindowReservation,
+        reservation: &SubmissionHold,
         evidence: ReleaseEvidence,
     ) -> Result<Settlement, WindowStoreError> {
         let evidence = match release_receipt(receipts, reservation, evidence) {
@@ -1626,7 +1865,10 @@ impl PersistedWindowStore {
     /// Reads and fully verifies the file for inspection, taking no lock.
     ///
     /// `Ok(None)` means there is nothing recorded yet for this profile.
-    fn read_for_inspection(&self, profile: &Profile) -> Result<Option<WireFile>, WindowStoreError> {
+    pub(super) fn read_for_inspection(
+        &self,
+        profile: &Profile,
+    ) -> Result<Option<WireFile>, WindowStoreError> {
         refuse_owner_coordinate(profile)?;
         let gen_entry = generation_entry_ref(profile);
         let bytes = match fs::read(&self.path) {
@@ -1634,30 +1876,36 @@ impl PersistedWindowStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return match load_generation(&gen_entry)? {
                     None => Ok(None),
-                    Some(_) => Err(WindowStoreError::GenerationMismatch),
+                    Some(_) => Err(mainnet_loading_error(
+                        profile,
+                        WindowStoreError::GenerationMismatch,
+                        Some(StateDefect::MissingFileWithGeneration),
+                    )),
                 };
             }
             Err(e) => return Err(WindowStoreError::Io { kind: e.kind() }),
         };
-        let key =
-            crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).map_err(|e| {
-                WindowStoreError::Keyring {
-                    detail: format!("{e}"),
-                }
-            })?;
+        let key = crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id)
+            .map_err(|e| key_load_error(profile, &e))?;
         refuse_owner_public_key(key.as_ref(), &OwnerKeyContext::for_loaded_profile(profile))?;
-        let wire = self.verify_with_key(&key, &bytes)?;
-        select_generation(wire, load_counter(&gen_entry)?).map(Some)
+        let counter = load_counter(&gen_entry)?;
+        self.verify_with_key(&key, &bytes)
+            .and_then(|wire| select_generation(wire, counter))
+            .map(Some)
+            .map_err(|e| {
+                let defect = defect_of(&e, false);
+                mainnet_loading_error(profile, e, defect)
+            })
     }
 
-    fn ensure_parent_dir(&self) -> Result<(), WindowStoreError> {
+    pub(super) fn ensure_parent_dir(&self) -> Result<(), WindowStoreError> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|e| WindowStoreError::Io { kind: e.kind() })?;
         }
         Ok(())
     }
 
-    fn load_or_mint_key(
+    pub(super) fn load_or_mint_key(
         &self,
         profile: &Profile,
     ) -> Result<(zeroize::Zeroizing<[u8; 32]>, MintOutcome), WindowStoreError> {
@@ -1665,7 +1913,26 @@ impl PersistedWindowStore {
         // An owner-namespace coordinate refuses here, so it never reaches the
         // mint arm below.
         refuse_owner_coordinate(profile)?;
-        match crate::keyring::load_hmac_key_32(entry_ref) {
+        let loaded = crate::keyring::load_hmac_key_32(entry_ref);
+        // Under the mainnet rules a key is minted only for a store with no
+        // committed history: a file without its key, and a committed
+        // generation without its file, are defects a write must not paper
+        // over with a fresh key.
+        if mainnet_rules(profile)
+            && let Err(error) = &loaded
+        {
+            if self.path.exists() {
+                return Err(key_load_error(profile, error));
+            }
+            if load_generation(&generation_entry_ref(profile))?.is_some() {
+                return Err(mainnet_loading_error(
+                    profile,
+                    WindowStoreError::GenerationMismatch,
+                    Some(StateDefect::MissingFileWithGeneration),
+                ));
+            }
+        }
+        match loaded {
             Ok(key) => {
                 refuse_owner_public_key(
                     key.as_ref(),
@@ -1715,25 +1982,33 @@ impl PersistedWindowStore {
     /// value and reports [`WindowStoreError::GenerationMismatch`] rather than
     /// silently accepting stale data — the caller retries and the very next
     /// read is consistent).
-    fn read_verified(
+    pub(super) fn read_verified(
         &self,
+        profile: &Profile,
         key: &[u8; 32],
         gen_entry: &KeyringEntryRef,
     ) -> Result<WireFile, WindowStoreError> {
         match fs::read(&self.path) {
             Ok(bytes) => {
-                let wire = self.verify_with_key(key, &bytes)?;
-                select_generation(wire, load_counter(gen_entry)?)
+                let counter = load_counter(gen_entry)?;
+                self.verify_with_key(key, &bytes)
+                    .and_then(|wire| select_generation(wire, counter))
+                    .map_err(|e| {
+                        let defect = defect_of(&e, false);
+                        mainnet_loading_error(profile, e, defect)
+                    })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => match load_generation(gen_entry)?
             {
                 None => Ok(WireFile {
-                    version: WIRE_VERSION,
-                    generation: 0,
-                    entries: Vec::new(),
-                    prepared: None,
+                    version: WIRE_VERSION_COMPACT,
+                    ..WireFile::default()
                 }),
-                Some(_) => Err(WindowStoreError::GenerationMismatch),
+                Some(_) => Err(mainnet_loading_error(
+                    profile,
+                    WindowStoreError::GenerationMismatch,
+                    Some(StateDefect::MissingFileWithGeneration),
+                )),
             },
             Err(e) => Err(WindowStoreError::Io { kind: e.kind() }),
         }
@@ -1750,17 +2025,27 @@ impl PersistedWindowStore {
         if !bool::from(stored_tag.ct_eq(&recomputed)) {
             return Err(WindowStoreError::HmacMismatch);
         }
+        #[derive(serde::Deserialize)]
+        struct Version {
+            version: u32,
+        }
+        let version: Version =
+            serde_json::from_slice(body).map_err(|error| WindowStoreError::Invalid {
+                detail: format!("store body has no readable version: {error}"),
+            })?;
+        if version.version > WIRE_VERSION_MAX {
+            return Err(WindowStoreError::UnsupportedVersion {
+                version: version.version,
+                max: WIRE_VERSION_MAX,
+            });
+        }
         let wire: WireFile =
             serde_json::from_slice(body).map_err(|e| WindowStoreError::Invalid {
                 detail: format!("store body is not valid JSON: {e}"),
             })?;
-        if wire.version > WIRE_VERSION_MAX {
-            return Err(WindowStoreError::Invalid {
-                detail: format!(
-                    "store file wire version {} is newer than this build reads (max {WIRE_VERSION_MAX})",
-                    wire.version
-                ),
-            });
+        check_snapshot(&wire)?;
+        if let Some(prepared) = &wire.prepared {
+            check_snapshot(prepared)?;
         }
         Ok(wire)
     }
@@ -1835,7 +2120,7 @@ impl PersistedWindowStore {
 /// `-generation`. Derived from the coordinate ITSELF (not re-derived from the
 /// profile name) so an operator-overridden HMAC-key coordinate still gets a
 /// correctly-associated generation entry.
-fn generation_entry_ref(profile: &Profile) -> KeyringEntryRef {
+pub(super) fn generation_entry_ref(profile: &Profile) -> KeyringEntryRef {
     let base = &profile.policy_window_state_key_id;
     KeyringEntryRef::new(base.service.clone(), generation_account(&base.account))
 }
@@ -1997,23 +2282,45 @@ fn compute_tag(key: &[u8], body: &[u8]) -> Result<[u8; HMAC_TAG_LEN], WindowStor
     Ok(out)
 }
 
-fn now_ms() -> Result<u64, WindowStoreError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .map_err(|e| WindowStoreError::Invalid {
-            detail: format!("system clock is before UNIX epoch: {e}"),
-        })
+/// The store's clock: the mainnet clock every authorization transition reads,
+/// which also dates pruning and the window's own writes.
+pub(super) fn now_ms() -> Result<u64, WindowStoreError> {
+    crate::mainnet::clock::now_ms().map_err(|e| WindowStoreError::Invalid {
+        detail: format!("the store clock cannot be read: {e}"),
+    })
 }
 
-/// Drops records that have aged out of the retention window.
+/// Checks one snapshot's version and its authorization history.
+///
+/// Versions 1 to 4 are read; a snapshot below version 4 carries no
+/// authorization history, and a version 4 snapshot may carry none.
+fn check_snapshot(wire: &WireFile) -> Result<(), WindowStoreError> {
+    if wire.version > WIRE_VERSION_MAX {
+        return Err(WindowStoreError::UnsupportedVersion {
+            version: wire.version,
+            max: WIRE_VERSION_MAX,
+        });
+    }
+    if wire.version == 0 {
+        return Err(WindowStoreError::Invalid {
+            detail: format!(
+                "store file wire version 0 is not a version this build reads (max \
+                 {WIRE_VERSION_MAX})"
+            ),
+        });
+    }
+    ledger::validate(wire)
+}
+
+/// Drops records and settled authorization history that have aged out of the
+/// retention window.
 ///
 /// A pending reservation is kept whatever its age. It holds the operator's cap
 /// for a submission whose outcome is still unknown, and dropping it would stop
 /// that spend counting and take the record out of reconciliation's reach while
 /// its receipt still reports pending. A reservation that old is resolved by
 /// `tx status` or by `tx receipt clear`, not by the clock.
-fn prune_stale(wire: &mut WireFile, now_ms: u64) {
+pub(super) fn prune_stale(wire: &mut WireFile, now_ms: u64) {
     let cutoff = now_ms.saturating_sub(RETENTION_MS);
     for bucket in &mut wire.entries {
         bucket
@@ -2021,6 +2328,10 @@ fn prune_stale(wire: &mut WireFile, now_ms: u64) {
             .retain(|r| r.ts_ms >= cutoff || r.status == RecordStatus::Pending);
     }
     wire.entries.retain(|b| !b.records.is_empty());
+    // Settled authorization history ages out on the same retention; an open
+    // authorization stays whatever its age, until a transaction's sweep
+    // settles it.
+    ledger::prune_history(wire, cutoff);
 }
 
 /// Whether the receipt for `envelope_hash` already records an outcome the
@@ -2073,12 +2384,12 @@ enum Settlement {
 ///
 /// Only a receipt still awaiting an answer is settled this way: one the chain
 /// has already answered for needs no round trip.
-fn reservation_from_receipt(receipts: &ReceiptStore, id: &str) -> Option<WindowReservation> {
+fn reservation_from_receipt(receipts: &ReceiptStore, id: &str) -> Option<SubmissionHold> {
     let receipt = receipts.get(id).ok().flatten()?;
     if receipt.status.is_terminal() || receipt.tx_hash.is_empty() {
         return None;
     }
-    Some(WindowReservation {
+    Some(SubmissionHold {
         id: receipt.envelope_hash,
         tx_hash: receipt.tx_hash,
         source: receipt.source,
@@ -2100,7 +2411,7 @@ fn reservation_from_receipt(receipts: &ReceiptStore, id: &str) -> Option<WindowR
 /// settled. A failed write leaves the reservation standing for the next pass.
 fn finalize_receipt(
     receipts: Option<&ReceiptStore>,
-    reservation: &WindowReservation,
+    reservation: &SubmissionHold,
     status: ReceiptStatus,
     ledger: Option<u32>,
 ) -> Result<(), ReceiptStoreError> {
@@ -2119,7 +2430,7 @@ fn finalize_receipt(
 /// The reservation is released only after this write succeeds.
 fn release_receipt(
     receipts: Option<&ReceiptStore>,
-    reservation: &WindowReservation,
+    reservation: &SubmissionHold,
     evidence: ReleaseEvidence,
 ) -> Result<ReleaseEvidence, ReceiptStoreError> {
     if let Some(store) = receipts
@@ -2148,7 +2459,7 @@ fn release_receipt(
 /// must be durable before the window settles.
 fn persist_receipt(
     receipts: Option<&ReceiptStore>,
-    reservation: &WindowReservation,
+    reservation: &SubmissionHold,
     restore: bool,
     write: impl FnOnce(&ReceiptStore) -> Result<(), ReceiptStoreError>,
 ) -> Result<(), ReceiptStoreError> {
@@ -2193,7 +2504,7 @@ fn persist_receipt(
 /// pending row already records.
 fn record_settlement(
     report: &mut ReconcileReport,
-    reservation: &WindowReservation,
+    reservation: &SubmissionHold,
     settlement: Settlement,
 ) {
     let settled = |status, release_code, ledger| SettledSubmission {
@@ -2241,9 +2552,11 @@ fn select_generation(
     mut wire: WireFile,
     counter: Option<GenerationState>,
 ) -> Result<WireFile, WindowStoreError> {
+    // The current snapshot may carry any version this build reads, a legacy
+    // one included; a successor is always written by a build that writes
+    // version 3 or 4.
     if let Some(next) = &wire.prepared
-        && (wire.version != WIRE_VERSION
-            || next.version != WIRE_VERSION
+        && (!(WIRE_VERSION_COMPACT..=WIRE_VERSION_LEDGER).contains(&next.version)
             || next.prepared.is_some()
             || wire.generation.checked_add(1) != Some(next.generation))
     {
@@ -2270,7 +2583,7 @@ fn select_generation(
 
 /// Whether any record in `wire`, pending or confirmed, carries the non-empty
 /// reservation `id`.
-fn file_holds_id(wire: &WireFile, id: &str) -> bool {
+pub(super) fn file_holds_id(wire: &WireFile, id: &str) -> bool {
     !id.is_empty()
         && wire
             .entries
@@ -2278,10 +2591,10 @@ fn file_holds_id(wire: &WireFile, id: &str) -> bool {
             .any(|bucket| bucket.records.iter().any(|record| record.id == id))
 }
 
-/// Collects one [`WindowReservation`] per distinct pending reservation id,
+/// Collects one [`SubmissionHold`] per distinct pending reservation id,
 /// oldest first by the time the reservation was taken.
-fn collect_pending(wire: &WireFile) -> Vec<WindowReservation> {
-    let mut seen: Vec<WindowReservation> = Vec::new();
+fn collect_pending(wire: &WireFile) -> Vec<SubmissionHold> {
+    let mut seen: Vec<SubmissionHold> = Vec::new();
     for bucket in &wire.entries {
         for record in &bucket.records {
             if record.status != RecordStatus::Pending || record.id.is_empty() {
@@ -2290,7 +2603,7 @@ fn collect_pending(wire: &WireFile) -> Vec<WindowReservation> {
             if seen.iter().any(|r| r.id == record.id) {
                 continue;
             }
-            seen.push(WindowReservation {
+            seen.push(SubmissionHold {
                 id: record.id.clone(),
                 tx_hash: record.tx_hash.clone(),
                 source: record.source.clone(),
@@ -2318,7 +2631,9 @@ fn collect_pending(wire: &WireFile) -> Vec<WindowReservation> {
 /// submission whose outcome is still open. Only host-dated pending records
 /// are subject to [`CLOCK_SKEW_TOLERANCE_MS`]. Confirmed records, whether
 /// dated by a ledger close time or by the host at authorization, count even
-/// when they are ahead of the host clock.
+/// when they are ahead of the host clock. Every hold of an open mainnet
+/// authorization counts too, whatever its age, until the authorization is
+/// consumed, invalidated, or swept as expired.
 fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128, u32), DenyReason> {
     let future_limit = now_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
     let mut sum: i128 = 0;
@@ -2344,6 +2659,15 @@ fn window_in_file(wire: &WireFile, key: &StateKey, now_ms: u64) -> Result<(i128,
                 continue;
             }
             sum = sum.saturating_add(record.amount);
+            count = count.saturating_add(1);
+        }
+    }
+    for hold in &wire.holds {
+        if hold.scope_specificity == key.scope_specificity()
+            && hold.bucket == key.bucket()
+            && hold.window_secs == key.window_secs()
+        {
+            sum = sum.saturating_add(hold.amount);
             count = count.saturating_add(1);
         }
     }
@@ -2418,7 +2742,7 @@ fn snapshot_accrual(wire: &WireFile, now_ms: u64, accrual: &mut WipedAccrualReco
 /// The batch is one submission's reservation, so entries that share a key are
 /// accumulated against each other: a batch whose own entries jointly exceed a
 /// bucket is refused, at the first entry that tips it.
-fn admit(wire: &WireFile, entries: &[WindowEntry]) -> Result<(), WindowStoreError> {
+pub(super) fn admit(wire: &WireFile, entries: &[WindowEntry]) -> Result<(), WindowStoreError> {
     let mut batch: HashMap<&StateKey, (i128, u32)> = HashMap::new();
     for entry in entries {
         let (file_sum, file_count) = window_in_file(wire, entry.key(), entry.timestamp_ms())
@@ -2440,7 +2764,7 @@ fn admit(wire: &WireFile, entries: &[WindowEntry]) -> Result<(), WindowStoreErro
     Ok(())
 }
 
-fn find_or_insert_bucket<'a>(
+pub(super) fn find_or_insert_bucket<'a>(
     entries: &'a mut Vec<WireBucket>,
     key: &StateKey,
 ) -> &'a mut WireBucket {
@@ -2707,7 +3031,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let lock_path = dir.path().join("held.window.lock");
         let _held = WindowStoreLock::acquire(&lock_path).unwrap();
-        let result = WindowStoreLock::acquire(&lock_path);
+        let result = WindowStoreLock::acquire(&lock_path).map_err(WindowStoreError::from);
         assert!(matches!(result, Err(WindowStoreError::WriterLocked)));
     }
 
@@ -3076,13 +3400,8 @@ mod tests {
 
     // ── reservations ────────────────────────────────────────────────────
 
-    fn reservation(
-        id: &str,
-        source: &str,
-        sequence: i64,
-        pending_since_ms: u64,
-    ) -> WindowReservation {
-        WindowReservation {
+    fn reservation(id: &str, source: &str, sequence: i64, pending_since_ms: u64) -> SubmissionHold {
+        SubmissionHold {
             id: id.to_owned(),
             tx_hash: "ab".repeat(32),
             source: source.to_owned(),
@@ -3717,14 +4036,14 @@ mod tests {
         store
             .record_and_persist(&profile, &[entry(k, now, 1)])
             .unwrap();
-        rewrite_body_version(&store, &profile, 4);
+        rewrite_body_version(&store, &profile, WIRE_VERSION_MAX + 1);
 
         let dest = PolicyStateStore::new();
         let err = store
             .load_into("v3-read", &profile, &dest)
             .expect_err("a newer wire version must be refused");
         assert!(
-            matches!(err, WindowStoreError::Invalid { ref detail } if detail.contains("newer")),
+            matches!(err, WindowStoreError::UnsupportedVersion { version, max } if version == max + 1),
             "the refusal must name the version condition; got {err:?}"
         );
     }
@@ -3957,7 +4276,7 @@ mod tests {
 
     fn reset_wire() -> WireFile {
         WireFile {
-            version: WIRE_VERSION,
+            version: WIRE_VERSION_COMPACT,
             generation: 1,
             prepared: None,
             entries: vec![WireBucket {
@@ -3970,6 +4289,7 @@ mod tests {
                     ..WireRecord::confirmed_defaults()
                 }],
             }],
+            ..WireFile::default()
         }
     }
 
@@ -4206,23 +4526,15 @@ mod tests {
 
     #[test]
     #[serial]
-    fn reset_malformed_and_unsupported_files_are_unverifiable() {
+    fn reset_malformed_files_are_unverifiable() {
         let f = ResetFixture::new();
         f.seal(&reset_wire());
         let key = crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
-        for body in [
-            b"invalid JSON".to_vec(),
-            serde_json::to_vec(&WireFile {
-                version: WIRE_VERSION_MAX + 1,
-                ..reset_wire()
-            })
-            .unwrap(),
-        ] {
-            f.store
-                .write_atomic_raw(&compute_tag(key.as_ref(), &body).unwrap(), &body)
-                .unwrap();
-            assert_eq!(f.reset().accrual.previous, PreviousState::Unverifiable);
-        }
+        let body = b"invalid JSON";
+        f.store
+            .write_atomic_raw(&compute_tag(key.as_ref(), body).unwrap(), body)
+            .unwrap();
+        assert_eq!(f.reset().accrual.previous, PreviousState::Unverifiable);
     }
 
     #[test]
@@ -4234,7 +4546,7 @@ mod tests {
             .store
             .reset(&f.profile, 100_000, |row| {
                 assert!(get_raw(&f.profile.policy_window_state_key_id).is_none());
-                assert_eq!(row.previous, PreviousState::Unverifiable);
+                assert_eq!(row.accrual.previous, PreviousState::Unverifiable);
                 Ok::<_, ()>(())
             })
             .unwrap();
@@ -4254,7 +4566,7 @@ mod tests {
                     get_raw(&f.profile.policy_window_state_key_id).as_deref(),
                     Some("AA")
                 );
-                assert_eq!(row.previous, PreviousState::Unverifiable);
+                assert_eq!(row.accrual.previous, PreviousState::Unverifiable);
                 Ok::<_, ()>(())
             })
             .unwrap();
@@ -4275,9 +4587,9 @@ mod tests {
                     get_raw(&f.profile.policy_window_state_key_id).as_deref(),
                     Some("not*base64")
                 );
-                assert_eq!(row.previous, PreviousState::Unverifiable);
-                assert!(row.buckets.is_empty());
-                assert_eq!(row.generation_before, Some(1));
+                assert_eq!(row.accrual.previous, PreviousState::Unverifiable);
+                assert!(row.accrual.buckets.is_empty());
+                assert_eq!(row.accrual.generation_before, Some(1));
                 Ok::<_, ()>(())
             })
             .unwrap();
@@ -4452,7 +4764,7 @@ mod tests {
                 assert_eq!(get_raw(&f.profile.policy_window_state_key_id), key);
                 assert_eq!(get_raw(&generation_entry_ref(&f.profile)), counter);
                 assert_eq!(
-                    row.generation_before,
+                    row.accrual.generation_before,
                     load_generation(&generation_entry_ref(&f.profile)).unwrap()
                 );
                 Err("recorder refused")
@@ -4715,5 +5027,654 @@ mod tests {
         );
         assert_eq!(receipts.get(&res.id).unwrap().unwrap(), checkpoint);
         assert!(store.pending_reservations(&profile).unwrap().is_empty());
+    }
+
+    // ── wire versions ───────────────────────────────────────────────────
+
+    /// The HMAC key the version 3 fixtures are signed under.
+    const FIXTURE_KEY: [u8; 32] = [0x11; 32];
+
+    /// A compact version 3 file: a current snapshot at generation 7 with a
+    /// confirmed record at the largest amount, a pending reservation marked
+    /// operator-required, and a rate-limit bucket. The tag was computed
+    /// independently of this code.
+    const V3_CURRENT_TAG: &str = "8645b5289a347ee41607c7cf139e9be8d3f174d4e5783db4ce4e6ab298f54ad4";
+    const V3_CURRENT_BODY: &str = r#"{"version":3,"generation":7,"entries":[{"scope_specificity":1,"bucket":"native","window_secs":86400,"records":[{"ts_ms":1700000000000,"amount":"170141183460469231731687303715884105727","id":"","status":"confirmed","tx_hash":"","source":"","sequence":0,"max_time":0,"pending_since_ms":0,"submission_ledger":0,"operator_required":false},{"ts_ms":1700000001000,"amount":"25","id":"abababababababababababababababababababababababababababababababab","status":"pending","tx_hash":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","source":"GAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSABGM","sequence":42,"max_time":1700000300,"pending_since_ms":1700000001000,"submission_ledger":512,"operator_required":true}]},{"scope_specificity":3,"bucket":"rate_limit","window_secs":60,"records":[{"ts_ms":1700000002000,"amount":"1","id":"","status":"confirmed","tx_hash":"","source":"","sequence":0,"max_time":0,"pending_since_ms":0,"submission_ledger":0,"operator_required":false}]}]}"#;
+
+    /// The same snapshot with a prepared successor at generation 8 that
+    /// released the pending reservation.
+    const V3_PREPARED_TAG: &str =
+        "9692cca26f07f67d3f61be6ccf8981b40bbd6d4d471c3e0bce1582dfa65d7642";
+    const V3_PREPARED_BODY: &str = r#"{"version":3,"generation":7,"entries":[{"scope_specificity":1,"bucket":"native","window_secs":86400,"records":[{"ts_ms":1700000000000,"amount":"170141183460469231731687303715884105727","id":"","status":"confirmed","tx_hash":"","source":"","sequence":0,"max_time":0,"pending_since_ms":0,"submission_ledger":0,"operator_required":false},{"ts_ms":1700000001000,"amount":"25","id":"abababababababababababababababababababababababababababababababab","status":"pending","tx_hash":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","source":"GAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSABGM","sequence":42,"max_time":1700000300,"pending_since_ms":1700000001000,"submission_ledger":512,"operator_required":true}]},{"scope_specificity":3,"bucket":"rate_limit","window_secs":60,"records":[{"ts_ms":1700000002000,"amount":"1","id":"","status":"confirmed","tx_hash":"","source":"","sequence":0,"max_time":0,"pending_since_ms":0,"submission_ledger":0,"operator_required":false}]}],"prepared":{"version":3,"generation":8,"entries":[{"scope_specificity":1,"bucket":"native","window_secs":86400,"records":[{"ts_ms":1700000000000,"amount":"170141183460469231731687303715884105727","id":"","status":"confirmed","tx_hash":"","source":"","sequence":0,"max_time":0,"pending_since_ms":0,"submission_ledger":0,"operator_required":false}]},{"scope_specificity":3,"bucket":"rate_limit","window_secs":60,"records":[{"ts_ms":1700000002000,"amount":"1","id":"","status":"confirmed","tx_hash":"","source":"","sequence":0,"max_time":0,"pending_since_ms":0,"submission_ledger":0,"operator_required":false}]}]}}"#;
+
+    fn fixture_bytes(tag: &str, body: &str) -> Vec<u8> {
+        let mut bytes = stellar_agent_core::hex::decode_hex32(tag).unwrap().to_vec();
+        bytes.extend_from_slice(body.as_bytes());
+        bytes
+    }
+
+    /// The compact version 3 files read, select version 3, and serialise back
+    /// to the same bytes, the current and the prepared container alike.
+    #[test]
+    fn a_compact_version_3_file_round_trips_byte_for_byte() {
+        let dir = TempDir::new().unwrap();
+        let store = PersistedWindowStore::at_path(dir.path().join("fixture.window"));
+        for (tag, body) in [
+            (V3_CURRENT_TAG, V3_CURRENT_BODY),
+            (V3_PREPARED_TAG, V3_PREPARED_BODY),
+        ] {
+            let bytes = fixture_bytes(tag, body);
+            let wire = store.verify_with_key(&FIXTURE_KEY, &bytes).unwrap();
+            assert_eq!((wire.version, wire.generation), (3, 7));
+            assert_eq!(select_wire_version(&wire), WIRE_VERSION_COMPACT);
+            if let Some(prepared) = &wire.prepared {
+                assert_eq!((prepared.version, prepared.generation), (3, 8));
+                assert_eq!(select_wire_version(prepared), WIRE_VERSION_COMPACT);
+            }
+            store.write_atomic(&FIXTURE_KEY, &wire).unwrap();
+            assert_eq!(fs::read(&store.path).unwrap(), bytes);
+        }
+        let current = store
+            .verify_with_key(
+                &FIXTURE_KEY,
+                &fixture_bytes(V3_CURRENT_TAG, V3_CURRENT_BODY),
+            )
+            .unwrap();
+        let mut container = store
+            .verify_with_key(
+                &FIXTURE_KEY,
+                &fixture_bytes(V3_PREPARED_TAG, V3_PREPARED_BODY),
+            )
+            .unwrap();
+        container.prepared = None;
+        assert_eq!(
+            body_digest(&current).unwrap(),
+            body_digest(&container).unwrap(),
+            "a prepared successor leaves the current commitment unchanged"
+        );
+    }
+
+    /// A version 4 file whose history is empty is read; the writer selects
+    /// version 3 for it.
+    #[test]
+    #[serial]
+    fn a_version_4_file_with_an_empty_history_is_read() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = test_profile(dir.path(), "v4-empty");
+        let store = PersistedWindowStore::at_path(dir.path().join("v4-empty.window"));
+        let k = key("v4-empty", "native", 86_400);
+        let now = now_ms().unwrap();
+        store
+            .record_and_persist(&profile, &[entry(k.clone(), now, 3)])
+            .unwrap();
+        rewrite_body_version(&store, &profile, 4);
+        let memory = PolicyStateStore::new();
+        store.load_into("v4-empty", &profile, &memory).unwrap();
+        assert_eq!(memory.query_window(&k, now).unwrap(), (3, 1));
+        store
+            .record_and_persist(&profile, &[entry(k, now, 1)])
+            .unwrap();
+        assert_eq!(
+            store
+                .read_for_inspection(&profile)
+                .unwrap()
+                .unwrap()
+                .version,
+            3
+        );
+    }
+
+    /// A settled authorization record, so a snapshot carries history.
+    fn settled_authorization(n: u8) -> ledger::WireAuthorization {
+        let binding = ledger::DomainBinding::Soroban {
+            intent_digest: [n; 32],
+        };
+        ledger::WireAuthorization {
+            id: crate::mainnet::AuthorizationId::from_bytes([n; 32]),
+            profile: "versions".to_owned(),
+            chain: stellar_agent_core::profile::caip2::Caip2::Mainnet,
+            domain: crate::mainnet::AuthorizationDomain::Soroban,
+            consumer: crate::mainnet::MainnetConsumer::X402Create,
+            content_digest: binding.content_digest(),
+            binding,
+            state: ledger::AuthorizationState::Expired,
+            minted_ms: 1,
+            expires_ms: 2,
+            settled_ms: Some(now_ms().unwrap()),
+            policy_sequence: 1,
+            policy_digest: [1; 32],
+            approval_nonce: format!("versions-{n}"),
+            approval_expires_ms: 2,
+            bindings_digest: [2; 32],
+            entries_digest: [3; 32],
+            reservation: None,
+            parent: None,
+            consumption: None,
+            invalidation: None,
+        }
+    }
+
+    /// Every supported pair of a current and a prepared snapshot version is
+    /// read on both sides of the commit point: before the counter commits the
+    /// successor, the current snapshot wins; after, the successor does, also
+    /// when its compaction never happened. A commitment naming another body
+    /// refuses, and the next write selects its version from its content.
+    #[test]
+    #[serial]
+    fn every_prepared_version_pair_survives_both_sides_of_the_commit_point() {
+        for (current_version, prepared_version) in [
+            (1, 3),
+            (2, 3),
+            (1, 4),
+            (2, 4),
+            (3, 3),
+            (3, 4),
+            (4, 4),
+            (4, 3),
+        ] {
+            let pair = format!("{current_version}->{prepared_version}");
+            keyring_mock::install().unwrap();
+            let dir = TempDir::new().unwrap();
+            let profile = test_profile(dir.path(), "versions");
+            let store = PersistedWindowStore::at_path(dir.path().join("versions.window"));
+            let k = key("versions", "native", 86_400);
+            let now = now_ms().unwrap();
+            store
+                .record_and_persist(&profile, &[entry(k.clone(), now, 10)])
+                .unwrap();
+            let hmac_key =
+                crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+            let gen_entry = generation_entry_ref(&profile);
+            match current_version {
+                1 | 2 => rewrite_body_version(&store, &profile, current_version),
+                _ => {
+                    let mut wire = store.read_for_inspection(&profile).unwrap().unwrap();
+                    wire.version = current_version;
+                    if current_version == 4 {
+                        wire.authorizations.push(settled_authorization(1));
+                    }
+                    store.write_atomic(&hmac_key, &wire).unwrap();
+                    write_generation(&gen_entry, &wire).unwrap();
+                }
+            }
+            let current = store.read_for_inspection(&profile).unwrap().unwrap();
+            assert_eq!(current.version, current_version, "{pair}");
+
+            let mut next = current.clone();
+            next.generation += 1;
+            next.version = prepared_version;
+            next.entries[0].records.push(WireRecord {
+                ts_ms: now,
+                amount: 5,
+                ..WireRecord::confirmed_defaults()
+            });
+            if prepared_version == 4 {
+                next.authorizations.push(settled_authorization(2));
+            } else {
+                next.authorizations.clear();
+            }
+            let mut container = current.clone();
+            container.prepared = Some(Box::new(next.clone()));
+            store.write_atomic(&hmac_key, &container).unwrap();
+
+            let before_commit = store.read_for_inspection(&profile).unwrap().unwrap();
+            assert_eq!(
+                (before_commit.version, before_commit.generation),
+                (current_version, current.generation),
+                "{pair}: the current snapshot wins before the commit"
+            );
+            let memory = PolicyStateStore::new();
+            store.load_into("versions", &profile, &memory).unwrap();
+            assert_eq!(memory.query_window(&k, now).unwrap(), (10, 1), "{pair}");
+
+            let mut other = next.clone();
+            other.entries[0].records[0].amount = 11;
+            write_generation(&gen_entry, &other).unwrap();
+            assert!(
+                matches!(
+                    store.read_for_inspection(&profile),
+                    Err(WindowStoreError::GenerationMismatch)
+                ),
+                "{pair}: a commitment of another body refuses"
+            );
+
+            write_generation(&gen_entry, &next).unwrap();
+            let after_commit = store.read_for_inspection(&profile).unwrap().unwrap();
+            assert_eq!(
+                (after_commit.version, after_commit.generation),
+                (prepared_version, next.generation),
+                "{pair}: the successor wins after the commit"
+            );
+            assert_eq!(after_commit.authorizations, next.authorizations, "{pair}");
+            let memory = PolicyStateStore::new();
+            store.load_into("versions", &profile, &memory).unwrap();
+            assert_eq!(memory.query_window(&k, now).unwrap(), (15, 2), "{pair}");
+
+            store
+                .record_and_persist(&profile, &[entry(k.clone(), now, 1)])
+                .unwrap();
+            let written = store.read_for_inspection(&profile).unwrap().unwrap();
+            assert_eq!(
+                written.version,
+                if prepared_version == 4 { 4 } else { 3 },
+                "{pair}: the next write selects its version from its content"
+            );
+        }
+    }
+
+    /// A successor above the versions this build writes, or a nested
+    /// candidate, refuses selection.
+    #[test]
+    fn a_successor_outside_the_written_versions_refuses_selection() {
+        let current = WireFile {
+            version: 3,
+            generation: 4,
+            ..WireFile::default()
+        };
+        let counter = || {
+            Some(GenerationState {
+                generation: 4,
+                body_sha256: None,
+            })
+        };
+        for version in [1, 2, 5] {
+            let mut container = current.clone();
+            container.prepared = Some(Box::new(WireFile {
+                version,
+                generation: 5,
+                ..WireFile::default()
+            }));
+            assert!(
+                matches!(
+                    select_generation(container, counter()),
+                    Err(WindowStoreError::GenerationMismatch)
+                ),
+                "prepared version {version}"
+            );
+        }
+        let mut nested = current.clone();
+        nested.prepared = Some(Box::new(WireFile {
+            version: 4,
+            generation: 5,
+            prepared: Some(Box::new(WireFile {
+                version: 3,
+                generation: 6,
+                ..WireFile::default()
+            })),
+            ..WireFile::default()
+        }));
+        assert!(matches!(
+            select_generation(nested, counter()),
+            Err(WindowStoreError::GenerationMismatch)
+        ));
+        let mut accepted = current;
+        accepted.prepared = Some(Box::new(WireFile {
+            version: 4,
+            generation: 5,
+            ..WireFile::default()
+        }));
+        assert_eq!(
+            select_generation(accepted, counter()).unwrap().generation,
+            4
+        );
+    }
+
+    // ── mainnet rules ───────────────────────────────────────────────────
+
+    fn mainnet_test_profile(dir: &Path, name: &str) -> Profile {
+        let mut p = Profile::builder_mainnet_named(
+            name,
+            "https://rpc.example",
+            "stellar-agent-signer-rules",
+            "acct",
+            "n-svc",
+            "n-acct",
+        )
+        .build();
+        p.policy_window_state_key_id =
+            stellar_agent_core::profile::schema::KeyringEntryRef::default_policy_window_state_key(
+                name,
+            );
+        p.audit_log_path = dir.join("audit.jsonl");
+        p
+    }
+
+    /// Leaves the committed store of `profile` in the state `defect` names.
+    fn break_store(store: &PersistedWindowStore, profile: &Profile, defect: StateDefect) {
+        let window_key = &profile.policy_window_state_key_id;
+        match defect {
+            StateDefect::MissingFileWithGeneration => fs::remove_file(&store.path).unwrap(),
+            StateDefect::MissingKey => {
+                keyring_core::Entry::new(&window_key.service, &window_key.account)
+                    .unwrap()
+                    .delete_credential()
+                    .unwrap();
+            }
+            StateDefect::BadKey => put_raw(window_key, "AA"),
+            StateDefect::Malformed => {
+                let key = crate::keyring::load_hmac_key_32(window_key).unwrap();
+                let body = b"{\"version\":3,\"generation\":1,\"entries\":7}";
+                let tag = compute_tag(key.as_slice(), body).unwrap();
+                store.write_atomic_raw(&tag, body).unwrap();
+            }
+            StateDefect::HmacInvalid => {
+                let mut bytes = fs::read(&store.path).unwrap();
+                let last = bytes.len() - 2;
+                bytes[last] ^= 0x01;
+                fs::write(&store.path, bytes).unwrap();
+            }
+            StateDefect::GenerationMismatch => {
+                let gen_entry = generation_entry_ref(profile);
+                keyring_core::Entry::new(&gen_entry.service, &gen_entry.account)
+                    .unwrap()
+                    .set_password("9")
+                    .unwrap();
+            }
+        }
+    }
+
+    const DEFECTS: [StateDefect; 6] = [
+        StateDefect::MissingFileWithGeneration,
+        StateDefect::MissingKey,
+        StateDefect::BadKey,
+        StateDefect::Malformed,
+        StateDefect::HmacInvalid,
+        StateDefect::GenerationMismatch,
+    ];
+
+    /// A committed store of `profile` in the state `defect` names.
+    fn broken(
+        name: &str,
+        mainnet: bool,
+        defect: StateDefect,
+    ) -> (TempDir, Profile, PersistedWindowStore) {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = if mainnet {
+            mainnet_test_profile(dir.path(), name)
+        } else {
+            test_profile(dir.path(), name)
+        };
+        let store = PersistedWindowStore::at_path(dir.path().join(format!("{name}.window")));
+        store
+            .record_and_persist(
+                &profile,
+                &[entry(key(name, "native", 86_400), now_ms().unwrap(), 2)],
+            )
+            .unwrap();
+        break_store(&store, &profile, defect);
+        (dir, profile, store)
+    }
+
+    /// Under the mainnet rules every unverifiable state refuses with the
+    /// defect it names, on every read and every write; no write replaces a
+    /// missing key or a missing file.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial]
+    fn each_unverifiable_mainnet_state_refuses_naming_its_defect() {
+        for defect in DEFECTS {
+            let (_dir, profile, store) = broken("rules", true, defect);
+            let unverifiable = |result: Result<(), WindowStoreError>, what: &str| {
+                assert!(
+                    matches!(
+                        &result,
+                        Err(WindowStoreError::MainnetStateUnverifiable { defect: found })
+                            if *found == defect
+                    ),
+                    "{what} under {defect}: {result:?}"
+                );
+            };
+            unverifiable(
+                store.load_into("rules", &profile, &PolicyStateStore::new()),
+                "load_into",
+            );
+            unverifiable(
+                store.pending_reservations(&profile).map(|_| ()),
+                "pending_reservations",
+            );
+            let key_before = get_raw(&profile.policy_window_state_key_id);
+            unverifiable(
+                store
+                    .record_and_persist(
+                        &profile,
+                        &[entry(key("rules", "native", 86_400), now_ms().unwrap(), 1)],
+                    )
+                    .map(|_| ()),
+                "record_and_persist",
+            );
+            assert_eq!(
+                get_raw(&profile.policy_window_state_key_id),
+                key_before,
+                "{defect}: a refused write mints no key"
+            );
+            if defect == StateDefect::MissingFileWithGeneration {
+                assert!(!store.path.exists(), "a refused write creates no file");
+            }
+        }
+    }
+
+    /// Without the mainnet rules the same states keep their generic errors.
+    #[test]
+    #[serial]
+    fn without_the_mainnet_rules_the_generic_errors_stand() {
+        let networks: &[bool] = if cfg!(feature = "mainnet-write") {
+            &[false]
+        } else {
+            &[false, true]
+        };
+        for &mainnet in networks {
+            for defect in DEFECTS {
+                let (_dir, profile, store) = broken("generic", mainnet, defect);
+                let result = store.load_into("generic", &profile, &PolicyStateStore::new());
+                let generic = match defect {
+                    StateDefect::MissingFileWithGeneration | StateDefect::GenerationMismatch => {
+                        matches!(result, Err(WindowStoreError::GenerationMismatch))
+                    }
+                    StateDefect::MissingKey | StateDefect::BadKey => {
+                        matches!(result, Err(WindowStoreError::Keyring { .. }))
+                    }
+                    StateDefect::Malformed => {
+                        matches!(result, Err(WindowStoreError::Invalid { .. }))
+                    }
+                    StateDefect::HmacInvalid => {
+                        matches!(result, Err(WindowStoreError::HmacMismatch))
+                    }
+                };
+                assert!(generic, "mainnet={mainnet} {defect}: {result:?}");
+            }
+        }
+    }
+
+    /// A mainnet store with no file and no committed generation is a genuine
+    /// first run under every rule set.
+    #[test]
+    #[serial]
+    fn a_genuine_mainnet_first_run_reads_empty_and_writes() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = mainnet_test_profile(dir.path(), "first");
+        let store = PersistedWindowStore::at_path(dir.path().join("first.window"));
+        store
+            .load_into("first", &profile, &PolicyStateStore::new())
+            .unwrap();
+        assert!(store.pending_reservations(&profile).unwrap().is_empty());
+        let outcome = store
+            .record_and_persist(
+                &profile,
+                &[entry(key("first", "native", 86_400), now_ms().unwrap(), 1)],
+            )
+            .unwrap();
+        assert!(outcome.newly_minted);
+    }
+
+    /// The reset of an unverifiable mainnet store hands the recorder the
+    /// defect, before anything changes, and then recovers; under the other
+    /// rules the recorder sees no defect.
+    #[test]
+    #[serial]
+    fn an_unverifiable_reset_passes_its_defect_to_the_recorder() {
+        for mainnet in [true, false] {
+            for defect in DEFECTS {
+                let (_dir, profile, store) = broken("unverifiable", mainnet, defect);
+                let before = fs::read(&store.path).ok();
+                let mut seen = None;
+                store
+                    .reset(&profile, now_ms().unwrap(), |record| {
+                        assert_eq!(fs::read(&store.path).ok(), before);
+                        seen = Some(record.defect);
+                        Ok::<_, ()>(())
+                    })
+                    .unwrap();
+                let expected = (mainnet && cfg!(feature = "mainnet-write")).then_some(defect);
+                assert_eq!(seen, Some(expected), "mainnet={mainnet} {defect}");
+                store
+                    .load_into("unverifiable", &profile, &PolicyStateStore::new())
+                    .unwrap();
+            }
+        }
+    }
+
+    /// A verifiable mainnet store with an effective open authorization
+    /// refuses the reset with nothing changed; once it expires, the reset
+    /// proceeds. Without the mainnet rules the open record does not block.
+    #[test]
+    #[serial]
+    fn a_reset_refuses_while_a_mainnet_authorization_is_open() {
+        for mainnet in [true, false] {
+            keyring_mock::install().unwrap();
+            let dir = TempDir::new().unwrap();
+            let profile = if mainnet {
+                mainnet_test_profile(dir.path(), "open-reset")
+            } else {
+                test_profile(dir.path(), "open-reset")
+            };
+            let store = PersistedWindowStore::at_path(dir.path().join("open-reset.window"));
+            let now = now_ms().unwrap();
+            store
+                .record_and_persist(
+                    &profile,
+                    &[entry(key("open-reset", "native", 86_400), now, 1)],
+                )
+                .unwrap();
+            let hmac_key =
+                crate::keyring::load_hmac_key_32(&profile.policy_window_state_key_id).unwrap();
+            let gen_entry = generation_entry_ref(&profile);
+            let mut wire = store.read_for_inspection(&profile).unwrap().unwrap();
+            let mut open = settled_authorization(1);
+            open.state = ledger::AuthorizationState::Open;
+            open.settled_ms = None;
+            open.minted_ms = now;
+            open.expires_ms = now + 60_000;
+            wire.authorizations.push(open);
+            wire.version = 4;
+            store.write_atomic(&hmac_key, &wire).unwrap();
+            write_generation(&gen_entry, &wire).unwrap();
+            let bytes = fs::read(&store.path).unwrap();
+            let counter = get_raw(&gen_entry);
+
+            let _clock = crate::mainnet::clock::set_now_ms_for_test(now);
+            let result = store.reset(&profile, now, |_| Ok::<_, ()>(()));
+            if mainnet && cfg!(feature = "mainnet-write") {
+                #[cfg(feature = "mainnet-write")]
+                assert!(matches!(
+                    result,
+                    Err(ResetError::Store {
+                        error: WindowStoreError::OpenAuthorizations { open: 1 },
+                        minted: false,
+                    })
+                ));
+                assert_eq!(fs::read(&store.path).unwrap(), bytes);
+                assert_eq!(get_raw(&gen_entry), counter);
+                _clock.set(now + 60_000);
+                store
+                    .reset(&profile, now + 60_000, |_| Ok::<_, ()>(()))
+                    .unwrap();
+            } else {
+                result.unwrap();
+            }
+            assert!(
+                store
+                    .read_for_inspection(&profile)
+                    .unwrap()
+                    .unwrap()
+                    .authorizations
+                    .is_empty()
+            );
+        }
+    }
+
+    /// An authenticated file of a newer version is refused, never reset, on
+    /// every chain.
+    #[test]
+    #[serial]
+    fn newer_files_with_unknown_fields_cannot_be_reset() {
+        use stellar_agent_core::profile::caip2::Caip2;
+        for chain in [Caip2::Testnet, Caip2::Mainnet] {
+            let mut f = ResetFixture::new();
+            f.profile.chain_id = chain;
+            f.seal(&reset_wire());
+            let key =
+                crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
+            let body = br#"{"version":5,"future_authorities":[{"open":true}],"prepared":"future representation"}"#;
+            f.store
+                .write_atomic_raw(&compute_tag(key.as_ref(), body).unwrap(), body)
+                .unwrap();
+            let before = fs::read(f.store.path()).unwrap();
+            assert!(
+                matches!(
+                    f.store.verify_with_key(&key, &before),
+                    Err(WindowStoreError::UnsupportedVersion { version: 5, max: 4 })
+                ),
+                "{chain:?}"
+            );
+            assert_eq!(
+                defect_of(
+                    &WindowStoreError::UnsupportedVersion { version: 5, max: 4 },
+                    false
+                ),
+                None
+            );
+            let called = std::cell::Cell::new(false);
+            let result = f.store.reset(&f.profile, 100_000, |_| -> Result<(), ()> {
+                called.set(true);
+                Ok(())
+            });
+            assert!(
+                matches!(
+                    result,
+                    Err(ResetError::Store {
+                        error: WindowStoreError::UnsupportedVersion { version: 5, max: 4 },
+                        minted: false,
+                    })
+                ),
+                "{chain:?}: {result:?}"
+            );
+            assert!(!called.get(), "{chain:?}");
+            assert_eq!(fs::read(f.store.path()).unwrap(), before, "{chain:?}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_supported_version_with_broken_invariants_is_malformed() {
+        let f = ResetFixture::new();
+        f.seal(&reset_wire());
+        let key = crate::keyring::load_hmac_key_32(&f.profile.policy_window_state_key_id).unwrap();
+        let mut invalid = reset_wire();
+        invalid.version = 4;
+        let mut auth = settled_authorization(1);
+        auth.settled_ms = None;
+        invalid.authorizations.push(auth);
+        let body = serde_json::to_vec(&invalid).unwrap();
+        f.store
+            .write_atomic_raw(&compute_tag(key.as_ref(), &body).unwrap(), &body)
+            .unwrap();
+        let error = f
+            .store
+            .verify_with_key(&key, &fs::read(f.store.path()).unwrap())
+            .unwrap_err();
+        assert_eq!(defect_of(&error, false), Some(StateDefect::Malformed));
     }
 }

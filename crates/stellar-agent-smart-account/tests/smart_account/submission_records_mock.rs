@@ -26,7 +26,7 @@ use stellar_agent_core::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMat
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::SoftwareSigningKey;
-use stellar_agent_network::policy_state::{PersistedWindowStore, WindowReservation};
+use stellar_agent_network::policy_state::{PersistedWindowStore, SubmissionHold};
 use stellar_agent_network::submission_record::WalletSubmissionRecorder;
 use stellar_agent_smart_account::SaError;
 use stellar_agent_smart_account::multicall::{
@@ -502,7 +502,7 @@ async fn a_reservation_refused_at_pre_send_surfaces_as_the_gate_denial() {
             .record_pending(
                 &profile,
                 &[entry],
-                &WindowReservation {
+                &SubmissionHold {
                     id: "c".repeat(64),
                     tx_hash: "d".repeat(64),
                     source: "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned(),

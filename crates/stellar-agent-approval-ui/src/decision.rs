@@ -780,6 +780,7 @@ mod tests {
             } => envelope_sha256_hex.clone(),
             _ => unreachable!(),
         };
+        let attested = entry.clone();
         let nonce = insert(&fx.ctx, entry);
 
         let outcome = apply_decision(
@@ -802,6 +803,7 @@ mod tests {
             &nonce,
             &sha,
             &process_uid,
+            &attested.attested_lifetime(),
         );
         let blob: [u8; 32] = URL_SAFE_NO_PAD
             .decode(&attestation)
@@ -815,6 +817,7 @@ mod tests {
             &nonce,
             &sha,
             &process_uid,
+            &attested.attestation_scope().unwrap(),
             &blob
         ));
     }
@@ -876,6 +879,7 @@ mod tests {
             } => envelope_sha256_hex.clone(),
             _ => unreachable!(),
         };
+        let attested = entry.clone();
         let nonce = insert(&fx.ctx, entry);
 
         let outcome = apply_decision(
@@ -898,6 +902,7 @@ mod tests {
             &nonce,
             &sha,
             &process_uid,
+            &attested.attested_lifetime(),
         );
         let blob: [u8; 32] = URL_SAFE_NO_PAD
             .decode(&attestation)
@@ -911,6 +916,7 @@ mod tests {
             &nonce,
             &sha,
             &process_uid,
+            &attested.attestation_scope().unwrap(),
             &blob
         ));
     }

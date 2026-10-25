@@ -127,6 +127,10 @@ pub mod rpc_budget;
 /// fatal startup error rather than a silent first-registration-wins drop.
 pub mod policy;
 
+/// Mainnet proof types core owns: the verified signed policy, the verified
+/// enablement record, and the shared fact-digest layout.
+pub mod mainnet;
+
 /// Per-profile wallet configuration.
 ///
 /// Provides the figment-backed [`profile::loader`], the [`profile::schema::Profile`]

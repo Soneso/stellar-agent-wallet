@@ -54,8 +54,17 @@ use serde::{Deserialize, Serialize};
 
 use super::error::ApprovalError;
 use crate::approval::attestation::{
+    ATTESTATION_VERSION, ATTESTATION_VERSION_V2, AttestationScope, AttestedLifetime,
     compute_attestation, compute_toolset_gate_digest, verify_toolset_gate_attestation,
 };
+
+/// The kind name a grant's version 3 attestation binds.
+pub const TOOLSET_GRANT_KIND: &str = "ToolsetGrant";
+
+/// The layout of a grant attestation stored before grants named theirs.
+fn legacy_attestation_version() -> u32 {
+    ATTESTATION_VERSION_V2
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TTL constant
@@ -117,6 +126,14 @@ pub struct ToolsetGrant {
 
     /// Platform-stable user identity at grant time (used to rebind HMAC).
     pub process_uid_at_grant: String,
+
+    /// The layout `attestation_blob_b64` is computed under.
+    ///
+    /// Version 3 also binds the grant's kind name ([`TOOLSET_GRANT_KIND`]),
+    /// its grant time, and its expiry, so a hand-edited lifetime fails
+    /// verification. A grant written without the field reads as version 2.
+    #[serde(default = "legacy_attestation_version")]
+    pub attestation_version: u32,
 }
 
 impl ToolsetGrant {
@@ -185,6 +202,11 @@ impl ToolsetGrant {
         let Ok(blob_arr): Result<[u8; 32], _> = blob_bytes.try_into() else {
             return false;
         };
+        let Some(scope) =
+            AttestationScope::from_version(self.attestation_version, self.attested_lifetime())
+        else {
+            return false;
+        };
         verify_toolset_gate_attestation(
             key,
             binding,
@@ -196,7 +218,18 @@ impl ToolsetGrant {
             self.amount_min_stroops,
             self.amount_max_stroops,
             &self.process_uid_at_grant,
+            &scope,
             &blob_arr,
+        )
+    }
+
+    /// The kind and lifetime a version 3 attestation of this grant covers.
+    #[must_use]
+    pub fn attested_lifetime(&self) -> AttestedLifetime<'static> {
+        AttestedLifetime::new(
+            TOOLSET_GRANT_KIND,
+            self.granted_at_unix_ms,
+            self.expires_at_unix_ms,
         )
     }
 }
@@ -465,9 +498,15 @@ pub fn build_attested_grant(
         amount_max_stroops,
     );
 
-    // Compute the HMAC attestation blob.
-    let attestation_blob =
-        compute_attestation(attestation_key, binding, &grant_id, &digest, &process_uid);
+    // Compute the HMAC attestation blob over the grant's kind and lifetime.
+    let attestation_blob = compute_attestation(
+        attestation_key,
+        binding,
+        &grant_id,
+        &digest,
+        &process_uid,
+        &AttestedLifetime::new(TOOLSET_GRANT_KIND, now_unix_ms, expires_at_unix_ms),
+    );
     let attestation_blob_b64 = URL_SAFE_NO_PAD.encode(attestation_blob);
 
     Ok(ToolsetGrant {
@@ -482,6 +521,7 @@ pub fn build_attested_grant(
         expires_at_unix_ms,
         attestation_blob_b64: Some(attestation_blob_b64),
         process_uid_at_grant: process_uid,
+        attestation_version: ATTESTATION_VERSION,
     })
 }
 
@@ -998,11 +1038,67 @@ mod tests {
             &grant.grant_id,
             &expected_digest,
             "1234",
+            &AttestationScope::V3(AttestedLifetime::new(
+                TOOLSET_GRANT_KIND,
+                NOW_MS,
+                NOW_MS + 86_400_000,
+            )),
             &blob_bytes,
         );
         assert!(
             ok,
             "independently-computed digest must match stored attestation"
         );
+    }
+
+    /// A grant attests at version 3; a stretched expiry fails, and a grant
+    /// stored at version 2 without the field still verifies under its own
+    /// layout.
+    #[test]
+    fn grant_attestation_binds_its_lifetime_and_reads_version_2() {
+        let key = [0x42u8; 32];
+        let binding = crate::approval::AttestationBinding::new("default", "stellar:testnet");
+        let grant = make_grant("my-toolset", "sign-payment", 0, 10, 86_400_000, &key);
+        assert_eq!(grant.attestation_version, ATTESTATION_VERSION);
+        assert!(grant.verify_attestation(&key, &binding));
+        let mut stretched = grant.clone();
+        stretched.expires_at_unix_ms += 1;
+        assert!(!stretched.verify_attestation(&key, &binding));
+
+        let mut legacy = grant.clone();
+        let digest =
+            compute_toolset_gate_digest("my-toolset", "sign-payment", DEST_G, "XLM", 0, 10);
+        let v2_blob = {
+            use hmac::{Hmac, KeyInit as _, Mac as _};
+            let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).unwrap();
+            mac.update(b"stellar-agent-approval-attestation:v2");
+            for field in [
+                b"default".as_slice(),
+                b"stellar:testnet",
+                legacy.grant_id.as_bytes(),
+            ] {
+                mac.update(&u32::try_from(field.len()).unwrap().to_be_bytes());
+                mac.update(field);
+            }
+            mac.update(&digest);
+            mac.update(&4_u32.to_be_bytes());
+            mac.update(b"1000");
+            let blob: [u8; 32] = mac.finalize().into_bytes().into();
+            blob
+        };
+        legacy.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode(v2_blob));
+        legacy.attestation_version = ATTESTATION_VERSION_V2;
+        assert!(legacy.verify_attestation(&key, &binding));
+        let mut text = toml::to_string(&legacy).unwrap();
+        text = text
+            .lines()
+            .filter(|line| !line.starts_with("attestation_version"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reread: ToolsetGrant = toml::from_str(&text).unwrap();
+        assert_eq!(reread.attestation_version, ATTESTATION_VERSION_V2);
+        assert!(reread.verify_attestation(&key, &binding));
+        legacy.attestation_version = ATTESTATION_VERSION;
+        assert!(!legacy.verify_attestation(&key, &binding));
     }
 }

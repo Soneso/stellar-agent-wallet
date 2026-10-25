@@ -163,5 +163,5 @@ pub use verify::{
 };
 pub use writer::{
     AuditWriter, AuditWriterRegistry, ReanchorAcknowledgement, ReanchorReport, StoredTipAnchor,
-    WriterError, audit_log_unusable_detail, audit_writer_refusal,
+    VerifiedTipFacts, WriterError, audit_log_unusable_detail, audit_writer_refusal,
 };

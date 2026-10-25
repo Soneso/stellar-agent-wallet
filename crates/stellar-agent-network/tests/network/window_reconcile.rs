@@ -37,8 +37,7 @@ use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore, ReleaseE
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
 use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::policy_state::{
-    PersistedWindowStore, RECONCILE_BUDGET, RECONCILE_MIN_AGE_MS, SettledSubmission,
-    WindowReservation,
+    PersistedWindowStore, RECONCILE_BUDGET, RECONCILE_MIN_AGE_MS, SettledSubmission, SubmissionHold,
 };
 use stellar_agent_test_support::keyring_mock;
 use stellar_agent_test_support::signed_envelope::{
@@ -99,8 +98,8 @@ fn entry(profile_name: &str, ts_ms: u64, amount: i128) -> WindowEntry {
     WindowEntry::new(state_key(profile_name), ts_ms, amount, window_limit())
 }
 
-fn reservation(id: &str, source: &str, sequence: i64, pending_since_ms: u64) -> WindowReservation {
-    WindowReservation {
+fn reservation(id: &str, source: &str, sequence: i64, pending_since_ms: u64) -> SubmissionHold {
+    SubmissionHold {
         id: id.to_owned(),
         tx_hash: id.to_owned(),
         source: source.to_owned(),
@@ -252,7 +251,7 @@ fn fixture(name: &str) -> Fixture {
 }
 
 impl Fixture {
-    fn take_reservation(&self, now: u64, reservation: &WindowReservation, amount: i128) {
+    fn take_reservation(&self, now: u64, reservation: &SubmissionHold, amount: i128) {
         self.window
             .record_pending(
                 &self.profile,
