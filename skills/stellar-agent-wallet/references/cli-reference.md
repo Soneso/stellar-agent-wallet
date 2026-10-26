@@ -493,9 +493,9 @@ The channel pool is a set of channel accounts derived from a single pool master 
 
 | Verb | Purpose | Extra flags |
 |---|---|---|
-| `init` | Fund `N` channels via one CAP-33 sponsored-reserve sandwich; signing. The master seed and a public `[pool_initialization]` checkpoint are persisted before the transaction is sent; `--resume` completes a pending initialization with the same keys. Refuses if a master exists (message `pool.already_initialised:`, fail-closed on ambiguous probe) unless `--force` (which orphans prior channels); `--force` refuses while initialization is pending. | `--size <N>` (required unless `--resume`, `1..=19`); `--force`; `--resume` |
+| `init` | Fund `N` channels via one CAP-33 sponsored-reserve sandwich; signing. The master seed and a public `[pool_initialization]` checkpoint are persisted before the transaction is sent; `--resume` completes a pending initialization with the same keys. Refuses if a master exists (message `pool.already_initialised:`, fail-closed on ambiguous probe) unless `--force` (which orphans prior channels); `--force` refuses while initialization is pending. | `--size <N>` (required unless `--resume`, `1..=19`); `--force`; `--resume`; `--timeout-seconds` (default `120`) |
 | `list` | List channels (BIP-44 index, public G-strkey, live sequence). Read-only; requires an initialised pool (else `internal.unexpected_state` with `pool.not_initialised:`). | — |
-| `status` | Report `initialised`, `pool_size`, `free`, `in_flight`. Read-only, no network (reads persisted `PoolConfig`). `in_flight:0` is not "safe to flood" — it reflects a stateless process. | — |
+| `status` | Report `initialised`, `pool_size`, `free`, `in_flight`. Read-only, no network (reads persisted `PoolConfig`). While initialization is pending, reports `resume_with`, and `clear_with` for an ambiguous receipt. `in_flight:0` is not "safe to flood"; it reflects a stateless process. | (none) |
 
 Pool refusals surface as `error.code` `internal.unexpected_state` with the specific reason (e.g. `pool.size_out_of_range:`, `pool.already_initialised:`) in `error.message`.
 
