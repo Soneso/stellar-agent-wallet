@@ -2,7 +2,7 @@
 
 DeFindex vault adapter for the stellar-agent-wallet.
 
-This crate implements the `stellar-agent-defi` `DefiAdapter` trait for the DeFindex vault protocol. It provides typed deposit and withdraw preview and submit with no raw-vector or opaque-calldata signing; `min_out` is required, and its absence is a structural pre-sign refusal. It discloses the four vault roles (Manager, EmergencyManager, RebalanceManager, VaultFeeReceiver), detects self-managed versus delegated vaults, and detects Blend-strategy vaults by WASM hash. An ordered trust gate refuses when a vault is upgradable, with an opt-in override that emits a distinct audit event.
+This crate implements the `stellar-agent-defi` `DefiAdapter` trait for the DeFindex vault protocol. It provides typed deposit and withdraw preview and submit with no raw-vector or opaque-calldata signing; `min_out` is required, and its absence is a structural pre-sign refusal. It discloses the four vault roles (Manager, EmergencyManager, RebalanceManager, VaultFeeReceiver), detects self-managed versus delegated vaults, and detects Blend-strategy vaults by WASM hash. An ordered trust gate refuses an upgradable vault, with an opt-in override that emits a distinct audit event. A self-managed vault, whose depositor controls every fund-affecting role, is exempt.
 
 Flash-loan, zapper, and rebalance operations are out of scope.
 

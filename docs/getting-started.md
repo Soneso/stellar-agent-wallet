@@ -39,6 +39,11 @@ reads secret keys from a named environment variable, not from the command line.
 - `cargo install` and a build from source need a stable Rust toolchain with
   edition 2024 support. The repository pins the channel in
   `rust-toolchain.toml` (`channel = "stable"`).
+- A source build also compiles OpenSSL from vendored source, which needs a C
+  compiler and Perl. On Windows this is a native Perl such as Strawberry Perl.
+  The MSYS Perl that Git for Windows installs lacks required modules.
+- On Linux, a source build also needs `libudev-dev` and `pkg-config` for the
+  hardware-wallet USB transport.
 - Some commands need only a classic keyring key, and others require a deployed
   smart-account contract. See
   [the two account models](concepts.md#two-account-models) for the split and a
@@ -186,10 +191,12 @@ stellar-agent --help
 
 A profile is a per-environment TOML config (schema version 2) that binds a CAIP-2
 chain id, an RPC endpoint, keyring entry references, thresholds, and the active
-policy engine. A profile holds no secrets; it only names keyring entries. The
+policy engine. A profile names keyring entries instead of holding keys. The
 signer seed, nonce key, and all HMAC keys live in the platform keyring (macOS
-Keychain, Linux Secret Service, Windows Credential Manager). The profile TOML is
-safe to back up.
+Keychain, Linux Secret Service, Windows Credential Manager). An endpoint URL can
+embed a credential in its path or query on any network. Mainnet refuses only a
+username or password in the URL. The profile TOML is safe to back up only when no
+endpoint URL embeds a credential.
 
 **Windows: Credential Manager requires an interactive logon session.** A
 non-interactive process, such as a Windows service, an SSH session, or a scheduled

@@ -6,7 +6,7 @@ This document explains how the Stellar Agent Wallet lets an autonomous agent tra
 
 An AI agent calls wallet tools on its own initiative. The model does not assume the agent is correct or honest. Instead, the wallet places fixed controls between every tool call and any network or signing action:
 
-- A **policy engine** evaluates each call to allow, deny, or require approval, before any RPC call or signature.
+- A **policy engine** evaluates each gated call to allow, deny, or require approval, before any signature. Reads the decision needs, such as the source account, can run first.
 - Out-of-band **operator approval** is required for the cases the policy engine flags, and the approval is cryptographically bound to the exact transaction that will be signed.
 - A **hash-chained audit log** records transaction submissions, signed
   authorizations, approvals, and explicit key-management and lifecycle events.
@@ -45,18 +45,20 @@ A handful of commands need neither model directly. `profile`, `credentials`, `ap
 
 | Command group | Account model | What you need first |
 |---|---|---|
-| `pay`, `balances`, `trustline`, `claim`, `pool`, `friendbot`, `fees` | Classic | A funded classic keyring key (`friendbot` funds one on testnet). |
-| `accounts create` | Classic | A keyring key to hold the new account's secret. |
+| `pay`, `trustline`, `claim`, `pool` | Classic | A funded classic keyring key (`friendbot` funds one on testnet). |
+| `balances`, `fees` | Classic | No key; both read public network state. |
+| `friendbot` | Classic | The G-address to fund on testnet or Futurenet; no key. |
+| `accounts create` | Classic | A new G-address, or `--generate`, which returns the new secret in the output. Friendbot mode needs no key. Sponsored mode signs with the sponsor key from `--secret-env` or `--sign-with-ledger`. |
 | `accounts deploy-c` | Classic (bridge) | A funded classic deployer key; the command's output is the smart-account contract address. |
-| `smart-account` (alias `sa`) | Smart-account | For `rules`, `signers`, `list-rules`, `migrate-verifier`, `timelock`, `multicall`: a deployed OZ smart-account contract address (from `accounts deploy-c`), plus at least one signer or context rule installed for write verbs. `list-verifiers`, `register-multicall`, `unregister-multicall`, and `deploy-webauthn-verifier` need no deployed contract. |
+| `smart-account` (alias `sa`) | Smart-account | For `rules`, `signers`, `list-rules`, `migrate-verifier`, `timelock`, `multicall`: a deployed OZ smart-account contract address (from `accounts deploy-c`), plus at least one signer or context rule installed for write verbs. `list-verifiers`, `register-multicall`, `unregister-multicall`, `deploy-webauthn-verifier`, `deploy-ed25519-verifier`, `deploy-spending-limit-policy`, and `deploy-policy` need no deployed contract. |
 | `trade`, `vault` (writes) | Smart-account | A smart-account contract address with a context rule authorizing the operation. |
 | `profile`, `credentials`, `approve`, `audit`, `toolsets`, `counterparty` | Neither | An initialized profile; these operate at the profile/operator layer. |
 
 ## Key custody and the unlock window
 
-Secrets are never stored in configuration. A profile is a per-environment TOML file (schema version 2) that binds a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no secret material; each `*_key_id` field is a Keyring entry reference (a `service` + `account` pair) that names a platform-keyring secret. The signer seed, the nonce key, and every HMAC key live in the platform keyring (macOS Keychain, Linux Secret Service, Windows Credential Manager). The profile TOML is therefore safe to back up. The profile's `Debug` output additionally redacts `rpc_url`, `secondary_rpc_url` and `oracle_provider_url`, since those may embed RPC credentials.
+Keys are never stored in configuration. A profile is a per-environment TOML file (schema version 2) that binds a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no key material; each `*_key_id` field is a Keyring entry reference (a `service` + `account` pair) that names a platform-keyring secret. The signer seed, the nonce key, and every HMAC key live in the platform keyring (macOS Keychain, Linux Secret Service, Windows Credential Manager). An endpoint URL can embed a credential in its path or query on any network. Mainnet refuses only a username or password in the URL. The profile TOML is safe to back up only when no endpoint URL embeds a credential. The profile's `Debug` output additionally redacts `rpc_url`, `secondary_rpc_url` and `oracle_provider_url`, since those may embed RPC credentials.
 
-When a tool needs to sign, the 32-byte signing seed is loaded into a short Unlock window:
+When a CLI command signs with a seed read from a `--*-secret-env` variable, the 32-byte signing seed is loaded into a short Unlock window. Keyring signers, the Ledger, and the MCP server never enter it; a keyring signer loads its key for each signature into a zeroize-on-drop buffer without a memory lock. The window works as follows:
 
 - The seed is moved into a zeroize-on-drop buffer, and its backing page is pinned in physical RAM via `mlock` (Linux/macOS) or `VirtualLock` (Windows). Pinning the page keeps the seed out of swap.
 - The window is TTL-bounded. The default is 30 seconds; the configured value (profile `[wallet] unlock_ttl_seconds`) must be in the range 1 to 600 seconds, and a value of 0 or above 600 is refused when the window is constructed rather than clamped. A background timer fires at the TTL and marks the wallet disposed.
@@ -72,7 +74,7 @@ unlock_ttl_seconds = 30     # default; must be in the range 1–600
 
 ## The policy engine
 
-Every tool or command invocation is evaluated by the active Policy engine before it does anything. The engine returns one of three decisions:
+The active Policy engine evaluates each gated tool or command before it signs anything. Reads the decision needs, such as the source account state, can run first. Read-only CLI commands such as `balances` evaluate no policy. The engine returns one of three decisions:
 
 - **Allow**: the call proceeds.
 - **Deny**: the call is refused, carrying a typed reason.
@@ -252,7 +254,7 @@ Files rotate at a size bound with a fixed number of rotated files retained.
 
 Each entry carries a timestamp, the tool name, the chain id, the **argument key names** (`arg_keys`), the envelope hash, and the nonce id. It also carries the policy decision (`allow` / `deny:<reason>` / `require_approval`), an optional decision reason, a request id, the event kind, and the previous entry's hash. The event kind enumerates tool invocations alongside smart-account lifecycle events (rule changes, signer-set and threshold changes, passkey registration and assertion, multicall, timelock, channel-pool, rotation handoff, and others). Additional kinds record `value_action_submitted` on every confirmed value-moving submit (carrying the gate-sized value legs) and `keyring_key_written` for the key-writing profile commands. `x402_payment_authorized` is written before a signed x402 authorization leaves the wallet in the RPC re-simulation. `x402_authorization_withheld` is written when that payment then fails, paired with the authorized row by its request id. Approval rows (`approval_attested`, `approval_rejected`, and their remote twins) are written before the decision takes effect.
 
-Argument **values are never logged**: only their key names. Strkeys appearing in a decision reason are redacted to first-five-last-five and transaction hashes to first-eight-last-eight; the envelope hash is left intact because it is a SHA-256 digest carrying no user data.
+Raw argument **values are never logged**: `arg_keys` holds only their key names. Typed event fields such as the value legs of `value_action_submitted` retain each leg's amount, asset, and redacted destination. Strkeys appearing in a decision reason are redacted to first-five-last-five and transaction hashes to first-eight-last-eight; the envelope hash is left intact because it is a SHA-256 digest carrying no user data.
 
 ### Tamper evidence
 
@@ -319,7 +321,7 @@ states. See [Agent payments with MPP](agent-payments.md).
 
 | Term | Meaning |
 |------|---------|
-| Profile | Per-environment TOML config (schema version 2) binding a CAIP-2 chain, RPC endpoint, keyring entry references, thresholds, and the active policy engine. Holds no secrets. |
+| Profile | Per-environment TOML config (schema version 2) binding a CAIP-2 chain, RPC endpoint, keyring entry references, thresholds, and the active policy engine. Holds no keys; an endpoint URL can still embed a credential. |
 | CAIP-2 chain id | `stellar:testnet` or `stellar:mainnet`; drives passphrase resolution and the mainnet-write gate. |
 | Keyring entry reference | A `service` + `account` pair naming a platform-keyring secret; never the secret itself. |
 | Unlock window | The short, TTL-bounded period during which the signing seed is resident in pinned, zeroize-on-drop memory. See [Key custody and the unlock window](#key-custody-and-the-unlock-window). |
@@ -327,7 +329,7 @@ states. See [Agent payments with MPP](agent-payments.md).
 | Criterion | One typed check inside a V1 policy rule (per-tx cap, per-period cap, rate limit, counterparty allowlist, minimum-reserve, session-active, and others). |
 | Approval spine | The storage and cryptographic substrate recording out-of-band operator approvals: a per-profile pending-approval store plus an HMAC attestation minted at approve time. |
 | Attestation | An HMAC-SHA256 tag, keyed by the profile attestation key, over a length-prefixed input binding the profile name, chain id, approval nonce, envelope SHA-256, and process uid. Proves the keyring holder ran `approve`. Constant-time verified. |
-| Audit log | A per-profile append-only hash-chained JSONL record of transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events; argument values are never logged. Verified with `audit verify`. |
+| Audit log | A per-profile append-only hash-chained JSONL record of transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events; raw argument values are never logged, while typed value legs keep amounts and assets. Verified with `audit verify`. |
 | Context rule | An on-chain OpenZeppelin smart-account authorization rule, identified by a `u32` rule id; governs which signers may authorize which actions. |
 | Auth digest | `sha256(signature_payload || context_rule_ids_xdr)`; the value a smart-account signer signs, binding the rule ids to close a downgrade attack. |
 | External Ed25519 signer | A context-rule signer authenticated by a raw ed25519 key through a deployed verifier contract. The recommended signer shape for an autonomous agent's own key: see [Agent delegation](agent-delegation.md). |

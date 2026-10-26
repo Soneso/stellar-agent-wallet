@@ -137,7 +137,7 @@ Argument groups (enforced by the parser):
 
 The deployer account must be funded; it pays the deployment fee.
 
-A genesis signer that is not Delegated cannot itself authorize any further rule mutation (`smart-account rules`, `smart-account signers`) on the account: `add_signer` / `batch_add_signers` / rule installs authorize only via a Delegated signer's key. Deployments using `--signer-webauthn` / `--signer-ed25519` / `--signer-external` should follow up promptly with `smart-account signers add` to attach a Delegated co-signer capable of administering the account, once a policy is attached to the target rule (see [`smart-account rules add-policy`](smart-account.md#smart-account-rules-add-policy) and [`smart-account signers add`](smart-account.md#smart-account-signers-add)).
+A genesis signer that is not Delegated cannot itself authorize any further rule mutation (`smart-account rules`, `smart-account signers`) through this CLI: the CLI signs those writes with a Delegated G-key. A deployment using `--signer-webauthn`, `--signer-ed25519`, or `--signer-external` therefore cannot gain a Delegated administrator through [`smart-account signers add`](smart-account.md#smart-account-signers-add) or [`smart-account rules add-policy`](smart-account.md#smart-account-rules-add-policy). Deploy with `--initial-signer` when the account needs CLI administration.
 
 Example: deploy with a random salt, signing from an env-var secret. Run this line on its own, paste the deployer seed when prompted, and press Enter:
 
@@ -471,7 +471,7 @@ Fee-statistics group. Subcommand: `stats`.
 
 Fetches Stellar RPC fee statistics, the helper behind classic fee selection.
 
-- **Signing.** Read-only; no signing or key access.
+- **Signing.** Read-only; no signing key access. With `--profile`, the client loads the profile's RPC provider credential from the keyring when one is configured.
 - **Network.** With `--profile`, load the profile and apply the shared endpoint rules. Without it, use `--rpc-url`, else the testnet endpoint. A given URL must pass the allowlist.
 
 | Flag | Meaning | Required | Default |

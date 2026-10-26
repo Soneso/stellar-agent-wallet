@@ -12,10 +12,10 @@ Write and signing paths are testnet-only in this alpha. Every signing tool struc
 
 ## Result envelope and conventions
 
-- MCP result envelope: `{ ok, data | error, request_id }`. On success `ok` is true and the payload is in `data`; on failure `error` carries a stable wire code.
+- MCP result envelope: `{ ok, data | error, request_id }`. On success `ok` is true and the payload is in `data`; on failure `error` carries a stable wire code. `stellar_toolset_list` and four DeFi tools return a bare success payload. Every tool on this page uses the envelope for business errors; invalid arguments and a `chain_id` mismatch use the JSON-RPC error channel.
 - `chain_id` is the CAIP-2 chain id (`"stellar:testnet"` or `"stellar:mainnet"`) and is **required** by most tools. SEP-43 `get_address`/`get_network` accept it as optional and fall back to the active profile's chain; the WalletConnect host passes `{}`. (Note: x402 uses the distinct wire-network string `stellar:pubnet` for mainnet in its `network` field; that is not a `chain_id` value.)
-- Asset format: `"native"`/`"XLM"`, or `"CODE:GISSUER"`. Amounts are decimal strings with a unit, e.g. `"10 XLM"`, never JSON numbers.
-- A `chain_id` that does not match the active profile is rejected by the dispatch gate as a JSON-RPC-level error before any work runs.
+- Asset format: `"native"`/`"XLM"`, or `"CODE:GISSUER"`. Amounts are strings, never JSON numbers, encoded per protocol. Classic payment amounts carry a unit, e.g. `"10 XLM"`. An x402 requirement `amount` is an atomic-unit integer string. The SEP-24 `deposit_hint` is a unitless decimal string such as `"100.50"`.
+- A `chain_id` that does not match the active profile is rejected by the dispatch gate as a JSON-RPC-level error before any signing. The x402 payment tools decode and validate `payment_required` first, so an `x402.*` requirement error comes before a chain mismatch.
 - Signing tools are single-shot: if the policy engine returns `RequireApproval`, the tool is fail-closed with wire code `policy.approval_required_unsupported` (message mentions "single-shot") and **no signature is produced**. Two-phase approval is not supported on the single-shot signing tools (the SEP-43 sign verbs and SEP-53 `sign_message`).
 
 ## SEP support matrix
@@ -23,11 +23,11 @@ Write and signing paths are testnet-only in this alpha. Every signing tool struc
 | SEP | Spec version | Capability | Tool(s) | Read-only |
 |---|---|---|---|---|
 | SEP-7 | 0007 | Parse `web+stellar:` URI into a preview; optional fresh-`stellar.toml` origin-signature verify | `stellar_sep7_parse_uri` | yes |
-| SEP-10 | 3.4.1 | Client Web Auth (fetch, 13-point validate, submit) → JWT; ephemeral-key flow | used by anchor + x402 flows | n/a |
+| SEP-10 | 3.4.1 | Client Web Auth (fetch, 13-point validate, submit) → JWT; ephemeral-key flow | used by the x402 identity gate | n/a |
 | SEP-6 | 0006 | Discovery only, `GET /info` capability set | `stellar_sep6_deposit_info` | yes |
 | SEP-24 | 0024 | Interactive deposit/withdraw URL via `POST .../interactive`; returned for browser hand-off | `stellar_sep24_interactive_url` | no (uses JWT) |
 | SEP-43 | 1.2.1 | Wallet signing: address/network/sign tx/sign auth entry/sign message/sign+submit | six tools (below) | mixed |
-| SEP-45 | 0.1.1 | Client Web Auth for contract (C-) accounts (steps 1–12); ephemeral + persistent-signer | used by anchor flows | n/a |
+| SEP-45 | 0.1.1 | Client Web Auth for contract (C-) accounts (steps 1–12); ephemeral + persistent-signer | library only; no MCP tool | n/a |
 | SEP-47 | 0047 | Discover SEPs a contract claims via `contractmetav0` `sep` meta | `stellar_sep47_discover` | yes |
 | SEP-48 | 0048 | Typed-argument preview of an `InvokeHostFunction` (display only) | `stellar_sep48_preview_invocation` | yes |
 | SEP-53 | 0053 | Sign and verify prefixed off-chain messages | `stellar_sep53_sign_message`, `stellar_sep53_verify_message` | mixed |
@@ -50,7 +50,7 @@ Does NOT: sign a URI; auto-POST to a `callback`; auto-submit. Origin-domain veri
 
 ## SEP-10: Stellar Web Authentication
 
-Client-side Web Auth: fetch the challenge transaction, run the 13-point challenge validation, submit the signed challenge to obtain a JWT session. A per-request ephemeral ed25519 key flow is provided. There is no standalone SEP-10 MCP tool; it is consumed internally by the anchor (SEP-24) and the x402 identity gate.
+Client-side Web Auth: fetch the challenge transaction, run the 13-point challenge validation, submit the signed challenge to obtain a JWT session. A per-request ephemeral ed25519 key flow is provided. There is no standalone SEP-10 MCP tool; it is consumed internally by the x402 identity gate. The anchor tools take a caller-supplied JWT.
 
 Does NOT: verify the server-issued JWT signature (the JWT is trusted via TLS). Challenge validation is fail-closed on every check. Ephemeral keys are generated fresh per call from the OS RNG and zeroized on drop.
 
@@ -90,7 +90,7 @@ Both tools do NOT transmit any SEP-9 KYC field. The arg structs have none by des
 
 ## SEP-43: Wallet Protocol (signing)
 
-Agent-side `ModuleInterface` dispatch. Results use the standard `{ ok, data | error, request_id }` envelope like every other tool; the SEP-43 raw protocol payload (`{ address }`, `{ signedTxXdr, signerAddress }`, etc.) is carried inside `data` on success.
+Agent-side `ModuleInterface` dispatch. Results use the standard `{ ok, data | error, request_id }` envelope; the SEP-43 raw protocol payload (`{ address }`, `{ signedTxXdr, signerAddress }`, etc.) is carried inside `data` on success.
 
 | Tool | Method | Read-only | Submits | Returns |
 |---|---|---|---|---|
@@ -124,7 +124,7 @@ SEP-43 opens no HTTP/HTTPS connections of its own (interop is stdio via MCP); `s
 
 ## SEP-45: Web Authentication for Contract Accounts
 
-Client-side Web Auth for contract (C-) accounts: fetch the challenge, validate the authorization entries, submit the signed challenge to obtain a JWT. Both an ephemeral-key flow and a persistent-signer flow exist. Consumed internally by anchor flows; no standalone tool.
+Client-side Web Auth for contract (C-) accounts: fetch the challenge, validate the authorization entries, submit the signed challenge to obtain a JWT. Both an ephemeral-key flow and a persistent-signer flow exist. It is a library with no MCP tool; the anchor tools take a caller-supplied JWT.
 
 Steps 1 through 12 of the 13-point validation are enforced; step 13 (footprint `read_write` keys) is deferred because it requires simulation results unavailable at challenge-fetch time. Fail-closed on any step. The JWT signature is not verified (trusted via TLS). HTTPS-only at the transport layer. Does not access the keyring or wallet seed (pure decode and validate); the ephemeral path suits only contracts that accept the ephemeral public key or need no client signature.
 

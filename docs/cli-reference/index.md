@@ -32,7 +32,7 @@ The top-level command accepts `-h`/`--help` and `-V`/`--version`. Network select
 
 ### Profile
 
-`--profile <NAME>` selects the [profile](../concepts.md) — the per-environment TOML config that binds a CAIP-2 chain, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. A profile holds no secrets; it only names keyring entries.
+`--profile <NAME>` selects the [profile](../concepts.md). A profile is the per-environment TOML config that binds a CAIP-2 chain, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. A profile names keyring entries instead of holding keys. An endpoint URL can still embed a credential.
 
 The effective profile name is resolved in this order:
 
@@ -210,7 +210,7 @@ Before dispatching any command, the CLI runs a local-only startup advisory: it s
 | `tx` | Reconcile a submitted transaction with `status`, or clear its submission record with `receipt clear`. | [stellar-ops](stellar-ops.md) |
 | `balances` | Read native XLM and trustline balances for an account (read-only). | [stellar-ops](stellar-ops.md) |
 | `trustline` | Create or remove a classic trustline (`ChangeTrust`) behind the ordered trust gate. | [stellar-ops](stellar-ops.md) |
-| `friendbot` | Fund a testnet or futurenet account via the Friendbot endpoint (read-only; mainnet refused). | [stellar-ops](stellar-ops.md) |
+| `friendbot` | Fund a testnet or futurenet account via the Friendbot endpoint (unsigned faucet funding; mainnet refused). | [stellar-ops](stellar-ops.md) |
 | `fees` | Fetch Stellar RPC fee statistics for classic fee selection (read-only). | [stellar-ops](stellar-ops.md) |
 | `counterparty` | Manage the cached `stellar.toml` bindings that back the counterparty allowlist policy. | [profile-and-governance](profile-and-governance.md) |
 | `vault` | Deposit into or withdraw from a DeFindex vault via the smart-account (signing). | [defi-and-pool](defi-and-pool.md) |

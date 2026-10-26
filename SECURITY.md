@@ -35,7 +35,7 @@ Please include:
 - Any proof-of-concept input, log excerpt, or transaction envelope — with secrets redacted.
 
 Do not include real secret seeds, private keys, or keyring secrets in a report. The
-wallet never logs argument values or secret material, and reports should follow the same
+wallet never logs secret material or raw argument values, and reports should follow the same
 discipline; a redacted strkey or a SHA-256 digest is enough to identify an affected
 account or envelope.
 
@@ -86,33 +86,41 @@ For the full design see [docs/concepts.md](docs/concepts.md) and
 properties:
 
 - Keyring custody. The signing seed, the nonce key, and the HMAC keys live in the
-  platform keyring. A profile is a per-environment TOML config that holds no secrets; it
-  only names keyring entries by a service-plus-account keyring entry reference. Profile
-  TOML is safe to back up.
-- Unlock window with zeroize and mlock. To sign, the 32-byte signing seed is loaded into
-  an unlock window: a short, TTL-bounded period (default 30s, hard cap 600s) during which
-  the seed is resident in pinned, zeroize-on-drop memory (`mlock`). On every drop path —
-  normal return, error propagation, or panic — the seed is zeroized and the lock
-  released.
-- Policy engine plus operator approval. Each tool or command is evaluated to Allow, Deny,
-  or RequireApproval. The Noop engine allows everything on testnet, allows read-only on
+  platform keyring. A profile is a per-environment TOML config that names keyring entries
+  by a service-plus-account keyring entry reference instead of holding keys. An endpoint
+  URL can embed a credential in its path or query on any network. Mainnet refuses only
+  a username or password in the URL. Profile TOML is safe to back up only when no
+  endpoint URL embeds a credential.
+- Unlock window with zeroize and mlock. When a CLI command signs with a seed read from a
+  `--*-secret-env` variable, the 32-byte seed is loaded into an unlock window. The window
+  is a short, TTL-bounded period (default 30s, hard cap 600s) during which the seed is
+  resident in pinned, zeroize-on-drop memory (`mlock`). On every drop path (normal
+  return, error propagation, or panic) the seed is zeroized and the lock released.
+  Keyring signers, the Ledger, and the MCP server never enter the window. A keyring
+  signer loads its key for each signature into a zeroize-on-drop buffer without a
+  memory lock.
+- Policy engine plus operator approval. The MCP dispatch gate and the CLI value-moving
+  verbs evaluate each action to Allow, Deny, or RequireApproval. Read-only CLI commands
+  such as `balances` evaluate no policy. The Noop engine allows everything on testnet, allows read-only on
   mainnet, and refuses mainnet destructive actions (`policy.engine_required`); the V1
   engine evaluates signature-verified typed criteria with first-match default-deny. When
   approval is required, the action is recorded in a per-profile pending-approval store and
   released only when the operator runs `approve`, which mints an HMAC-SHA256 attestation
   proving the keyring holder approved it. The attestation is constant-time verified and
   binds the approval nonce, the envelope SHA-256, and the OS process uid.
-- Tamper-evident audit log. Every tool invocation and lifecycle event is appended to a
-  per-profile hash-chained JSONL audit log. Argument values are never logged — only key
-  names. The chain is verified end-to-end with `audit verify`. The value-moving signing and
-  submitting verbs are `pay`, `claim`, `accounts create`, `trustline`, `trade`, `lend`,
+- Tamper-evident audit log. Approvals, submission lifecycle events, and explicit
+  authorization, key-management, and lifecycle events are appended to a per-profile
+  hash-chained JSONL audit log. A balance read writes no row.
+  The raw argument map is recorded as key names only. Typed value events retain each
+  leg's amount, asset, and redacted destination. The chain is verified end-to-end with `audit verify`. The value-moving signing and
+  submitting verbs are `pay`, `claim`, `accounts create`, `trustline`, `trade`,
   `vault`, the x402 payment tools, and the MPP charge commit. Each proves its audit writer
   is acquirable BEFORE the signing key is touched or a transaction is submitted. It refuses
   with `audit.chain_key_unavailable` rather than signing unaudited when the profile's
-  audit chain-root key was never minted. This pre-flight fails closed for a persisted profile;
-  the zero-config synthesized profile `pay`/`claim`/`accounts create` fall back to when no
-  `<name>.toml` file exists stays fail-open for this specific check, matching its
-  documented no-profile-required posture. The SEP-43 sign-only pair (`signTransaction`,
+  audit chain-root key was never minted. This pre-flight fails closed for a persisted profile.
+  `pay`, `claim`, and `accounts create` fall back to the zero-config synthesized profile
+  when no profile was named and no `default.toml` file exists. That profile stays
+  fail-open for this check, matching its documented no-profile-required posture. The SEP-43 sign-only pair (`signTransaction`,
   `signAuthEntry`) runs the same pre-flight and records an
   `opaque_payload_signed` audit row when the signature is produced. The x402 tools
   write `x402_payment_authorized` before the signed authorization leaves the wallet in

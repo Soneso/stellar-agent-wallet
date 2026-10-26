@@ -145,7 +145,8 @@ for the trust model before enabling it.
 
 ### How a profile selects the signer and keys
 
-The wallet holds no secrets in its config. A [profile](./profiles.md) is a
+The wallet holds no keys in its config, though an endpoint URL can embed a
+credential. A [profile](./profiles.md) is a
 per-environment TOML file (schema version 2) that binds a CAIP-2 chain id, an
 RPC endpoint, keyring entry references, thresholds, and the active policy
 engine. Each keyring entry reference is a service-plus-account pair naming a
@@ -164,9 +165,13 @@ The loaded profile therefore determines:
 - which policy engine evaluates each tool call.
 
 The synthesized testnet fallback profile carries placeholder keyring
-coordinates. Read-only tools and the simulate step of the two-phase signing
-verbs work under it. Signer keyring access fails until a profile names a
-populated signer entry. Most tools report `auth.keyring_not_found`.
+coordinates. Read-only tools work under it. The simulate steps of
+`stellar_pay`, `stellar_create_account`, `stellar_trustline`, and
+`stellar_claim` mint their nonce from the profile's nonce-key entry. They
+report `nonce.mint_failed` until that entry holds a key. `stellar_rule_create`
+mints no envelope nonce: it stores the proposal, and its commit requires that
+proposal's `approval_nonce`. Signer keyring
+access fails until a profile names a populated signer entry. Most tools report `auth.keyring_not_found`.
 The SEP-43 sign tools report `sep43.wallet_unlock_failed`.
 `stellar_sep53_sign_message` reports `sep53.keyring_load_failed`, and
 `stellar_mpp_charge_commit` reports `mpp.signing_failed`.
@@ -227,8 +232,13 @@ The server exposes three MCP resources. None contains a secret.
 
 ## How gating applies to every tool call
 
-Every tool call is dispatched through the same gate before the tool's own logic
-runs. The gate looks up the tool's registry descriptor and calls
+Every tool call except three MPP tools and `stellar_dex_quote` passes through
+the same gate before the tool signs or submits. Reads the decision needs, such as the source account,
+can run first. `stellar_mpp_record_receipt`,
+`stellar_mpp_reconcile_transaction`, and `stellar_mpp_authorization_status`
+check the profile and read the MPP store without a policy verdict.
+`stellar_dex_quote` passes no gate and never compares its `chain_id` with the profile. It picks the Soroswap router from `chain_id` and reads through the profile's RPC endpoint. The gate
+looks up the tool's registry descriptor and calls
 `policy_engine.evaluate(...)`. The verdict is one of:
 
 - `Allow`: the tool proceeds.
@@ -311,7 +321,8 @@ read-only allow, mainnet destructive refused) and V1 (signature-verified typed
 criteria, first-match default-deny).
 
 A tool that requires `chain_id` refuses any other chain with `invalid_params`
-before policy evaluation. Policy rules match on the profile's chain for
+before policy evaluation. `stellar_dex_quote` is the exception: it uses the
+supplied `chain_id` to select the router. Policy rules match on the profile's chain for
 evaluation and accounting, including gated tools without a `chain_id` argument.
 
 How a `RequireApproval` verdict is satisfied depends on the tool shape:
@@ -327,9 +338,11 @@ How a `RequireApproval` verdict is satisfied depends on the tool shape:
   state and can still deny an approved request. An exhausted cap returns
   `policy.deny.per_period_cap_exceeded`. The loaded policy document stays fixed
   for the server's lifetime. The wire error on any approval-path failure is the
-  uniform `policy.approval_required`, except an explicit operator rejection
-  recorded via the approval inbox, which commits report as
-  `policy.approval_rejected` so the agent stops retrying.
+  uniform `policy.approval_required`, with two exceptions. An explicit operator
+  rejection recorded via the approval inbox is reported as
+  `policy.approval_rejected`, so the agent stops retrying. An approval already
+  spent on a submission is reported as `policy.approval_consumed`; reconcile
+  that transaction instead of retrying.
 - One-shot signing verbs sign in a single call. If the policy returns
   `RequireApproval` for one of these tools, the call is refused fail-closed with
   `policy.approval_required_unsupported`; the wallet never signs without a
@@ -366,9 +379,9 @@ How a `RequireApproval` verdict is satisfied depends on the tool shape:
   `stellar_rule_create_commit` refuses again at commit time as defense in
   depth.
 
-Argument values are never written to the [audit log](./concepts.md); only key
-names and lifecycle metadata are recorded. Verify the chain with
-`stellar-agent audit verify`.
+Raw argument values are never written to the [audit log](./concepts.md); only
+key names and lifecycle metadata are recorded. Typed value events retain each leg's amount, asset, and redacted destination. Verify the chain with
+`stellar-agent audit verify <LOG_PATH> --profile <NAME>`.
 
 ### Audit pre-flight (fail-closed)
 
@@ -440,11 +453,15 @@ profile refuses after the acknowledgement until it restarts.
 The server registers 43 tools. For each tool below: the exact registered name,
 its purpose, and whether it is read-only, signs without submitting, or signs and
 submits. Every tool except `stellar_x402_parse_receipt`, `stellar_toolset_list`,
-and `stellar_toolset_invoke` requires a `chain_id` argument carrying the CAIP-2
-chain id, which must match the profile. For `stellar_sep43_get_address` and
+`stellar_toolset_invoke`, and the five `stellar_mpp_*` tools requires a
+`chain_id` argument carrying the CAIP-2 chain id, which must match the profile.
+The MPP tools reject a `chain_id` field as unknown and act on the server
+profile's chain. `stellar_toolset_invoke` accepts an optional `chain_id` and
+forwards it to the routed tool. For `stellar_sep43_get_address` and
 `stellar_sep43_get_network` the `chain_id` is optional and defaults to the
 profile chain when omitted, but is still validated against the profile when
-supplied.
+supplied. `stellar_dex_quote` requires a `chain_id` but never matches it
+against the profile; it selects the router from it.
 
 The four classic MCP commits obtain a witness after their policy and fee checks
 and before the audit pre-flight, nonce consumption, and signer load.
@@ -526,8 +543,13 @@ and [CLI reference: smart-account](./cli-reference/smart-account.md#smart-accoun
 an operator-run verb that submits one `CallContract` invocation signed by an
 agent's External-Ed25519 rule key. There is deliberately no MCP equivalent.
 
-Every signing-capable MCP tool in this catalog is a TYPED verb whose rendered
-preview is what the operator consents to. `stellar_pay_commit` renders a
+Every value-moving MCP tool in this catalog is a TYPED verb whose rendered
+preview is what the operator consents to. The three SEP-43 transaction and
+auth-entry signing tools are the exception: they sign caller-supplied material
+as `opaque_sign`. A value criterion, such as a per-transaction or per-period
+cap, refuses them with `policy.deny.unsizable_value_effect`. A matching rule
+that sets `allow_opaque_signing = true` exempts them from that refusal. A
+matching rule without criteria returns its own decision. `stellar_pay_commit` renders a
 payment, `stellar_rule_create_commit` renders a full rule definition, and so
 on. An arbitrary-invocation `execute` tool on the agent surface would have no
 such preview: it would sign whatever contract, function, and `ScVal` arguments
@@ -685,7 +707,7 @@ configured RPC sees signed authorization during mandatory re-simulation. See
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_toolset_list` | Enumerate installed toolsets and their invocable actions. | Read-only. No `chain_id`. |
-| `stellar_toolset_invoke` | Invoke a named action of an installed toolset, routed to a registered tool through capability enforcement. | Dispatcher. The toolset signs nothing directly; the routed tool's own policy gate still applies. No `chain_id`. |
+| `stellar_toolset_invoke` | Invoke a named action of an installed toolset, routed to a registered tool through capability enforcement. | Dispatcher. The toolset signs nothing directly; the routed tool's own policy gate still applies. Optional `chain_id`, forwarded to the routed tool. |
 
 The toolsets dispatcher enforces a toolset's declared capabilities and never reaches
 a signing tool directly regardless of those declarations. The routed tool runs
@@ -696,13 +718,23 @@ fire as described in [Toolsets](./toolsets.md).
 
 Tool results are returned as MCP tool-call content; read-only tools return JSON
 shaped like their CLI counterparts. The server runs until the MCP client closes
-the connection. Startup failures (no supported keyring backend, an unloadable
-profile, or a duplicate tool registration) cause the process to exit non-zero
-before serving any request.
+the connection. An unloadable profile or a duplicate tool registration makes
+the process exit non-zero before serving any request. A missing keyring backend
+alone is not fatal: the server starts, and signing tools fail closed at call
+time. A profile that selects the V1 engine still fails to start without one,
+because building the engine reads the owner key.
 
 Business errors return `{ "ok": false, "error": { "code", "message" }, "request_id" }`
 with `is_error` set; consumers branch on `error.code`. Every tool, including
-the SEP-43 family, uses this same envelope. See
+the SEP-43 family, uses this same envelope for business errors. Success results
+use `{ "ok": true, "data", "request_id" }` with five exceptions.
+`stellar_toolset_list` returns a bare JSON array. `stellar_dex_trade`,
+`stellar_dex_quote`, `stellar_defindex_vault_deposit`, and
+`stellar_defindex_vault_withdraw` return a bare object carrying a `status`
+field. Some refusals use the JSON-RPC error channel instead of the envelope: invalid
+arguments, a `chain_id` mismatch, and the toolset capability refusals.
+`toolset.first_invoke_approval_required` is a JSON-RPC error too, and its error
+data carries the `approval_nonce`. See
 [The result envelope](agents.md#the-result-envelope).
 
 Three codes carry an additional `details` object on the error:
