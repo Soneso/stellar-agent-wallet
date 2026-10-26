@@ -760,17 +760,42 @@ pub fn load_from_dir(
     profile_dir: &Path,
     multicall_hook: Option<&dyn MulticallRegistryHook>,
 ) -> Result<Profile, ProfileLoadError> {
+    load_from_path(
+        name,
+        &stored_profile_path(name, profile_dir)?,
+        multicall_hook,
+    )
+}
+
+/// The path of the named profile's file in `profile_dir`, after the name
+/// guard, refusing a file that does not exist.
+fn stored_profile_path(name: &str, profile_dir: &Path) -> Result<PathBuf, ProfileLoadError> {
     guard_name_for_load(name)?;
     let path = profile_dir.join(format!("{name}.toml"));
-
     if !path.exists() {
         return Err(ProfileLoadError::NotFound {
             name: name.to_owned(),
             path,
         });
     }
+    Ok(path)
+}
 
-    load_from_path(name, &path, multicall_hook)
+/// Loads and validates the stored profile without environment overlays.
+///
+/// # Errors
+/// Returns [`ProfileLoadError`] for a missing or invalid profile.
+pub fn load_from_dir_without_overlays(
+    name: &str,
+    profile_dir: &Path,
+    multicall_hook: Option<&dyn MulticallRegistryHook>,
+) -> Result<Profile, ProfileLoadError> {
+    load_from_path_with_overlays(
+        name,
+        &stored_profile_path(name, profile_dir)?,
+        figment::Figment::new(),
+        multicall_hook,
+    )
 }
 
 /// Loads a profile from an explicit file path.
@@ -7891,5 +7916,30 @@ account = "a"
                 Some(providers)
             );
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_without_overlays_ignores_env() {
+        if std::env::var_os("OVERLAY_LOADER_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "profile::loader::tests::load_without_overlays_ignores_env",
+                ])
+                .env("OVERLAY_LOADER_CHILD", "1")
+                .env("STELLAR_AGENT_RPC_URL", "https://overlay.example.invalid")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{stdout}");
+            assert!(stdout.contains("test result: ok. 1 passed;"), "{stdout}");
+            return;
+        }
+        let (dir, name) = write_profile(minimal_toml());
+        let stored = load_from_dir_without_overlays(&name, dir.path(), None).unwrap();
+        let merged = load_from_dir(&name, dir.path(), None).unwrap();
+        assert_eq!(merged.rpc_url, "https://overlay.example.invalid");
+        assert_ne!(stored.rpc_url, merged.rpc_url);
     }
 }

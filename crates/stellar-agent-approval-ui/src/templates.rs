@@ -618,7 +618,12 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             seq_num,
         } => {
             let mut rows = String::new();
-            rows.push_str(&row("Asset", asset));
+            rows.push_str(&row(
+                "Asset",
+                asset
+                    .as_deref()
+                    .unwrap_or("not known to the wallet before the claim"),
+            ));
             rows.push_str(&row(
                 "Source",
                 envelope_source
@@ -632,7 +637,10 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             rows.push_str(&row("Simulated seq num", &seq_num.to_string()));
             format!(
                 "{}{}{}",
-                amount_headline(*amount_stroops, asset),
+                match (amount_stroops, asset) {
+                    (Some(amount), Some(asset)) => amount_headline(*amount, asset),
+                    _ => row("Amount", "not known to the wallet before the claim"),
+                },
                 address_block("Balance id", balance_id_strkey),
                 facts(&rows)
             )
@@ -2272,5 +2280,26 @@ mod tests {
         view.expired = true;
         let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
         assert!(!html.contains(">Approve trustline</button>"));
+    }
+    #[test]
+    fn claim_summary_renders_unknown_value() {
+        let dir = TempDir::new().unwrap();
+        let mut view = claim_view(&dir);
+        let ApprovalSummaryView::Claim {
+            asset,
+            amount_stroops,
+            ..
+        } = &mut view.summary
+        else {
+            panic!("claim expected")
+        };
+        *asset = None;
+        *amount_stroops = None;
+        let html = render_summary_html(&view);
+        assert_eq!(
+            html.matches("not known to the wallet before the claim")
+                .count(),
+            2
+        );
     }
 }

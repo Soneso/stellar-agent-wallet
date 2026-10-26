@@ -127,6 +127,62 @@ use super::rule_proposal::{ContextRuleProposalSnapshot, validate_context_rule_pr
 /// Default approval TTL: 24 hours in milliseconds.
 pub const DEFAULT_TTL_MS: u64 = 86_400_000;
 
+/// The payee, the amount and the token contract of an x402 transfer.
+pub(crate) struct X402TransferTerms {
+    /// The `to` address.
+    pub(crate) payee: String,
+    /// The transferred amount in the token's base units.
+    pub(crate) amount: i128,
+    /// The token contract address.
+    pub(crate) asset: String,
+}
+
+/// The terms of `root` when its root call is `transfer(from, to, amount)`
+/// with address `from` and `to` arguments and an `i128` amount, and `None`
+/// otherwise.
+///
+/// Only the root call's function name and arguments are checked. The
+/// sub-invocations of `root` are not inspected.
+pub(crate) fn x402_transfer_terms(
+    root: &stellar_xdr::SorobanAuthorizedInvocation,
+) -> Option<X402TransferTerms> {
+    use stellar_xdr::{ScVal, SorobanAuthorizedFunction};
+    let SorobanAuthorizedFunction::ContractFn(function) = &root.function else {
+        return None;
+    };
+    if function.function_name.0.as_slice() != b"transfer" {
+        return None;
+    }
+    let [
+        ScVal::Address(_),
+        ScVal::Address(payee),
+        ScVal::I128(amount),
+    ] = function.args.as_slice()
+    else {
+        return None;
+    };
+    Some(X402TransferTerms {
+        payee: payee.to_string(),
+        amount: (i128::from(amount.hi) << 64) | i128::from(amount.lo),
+        asset: function.contract_address.to_string(),
+    })
+}
+
+/// Lifetime of an interactive mainnet confirmation, in seconds.
+pub const MAINNET_CONFIRMATION_TTL_SECONDS: u64 = 600;
+
+/// Returns the approval lifetime permitted by the evaluated decision.
+#[must_use]
+pub fn governing_ttl_ms(evaluation: &crate::policy::Evaluation) -> u64 {
+    match &evaluation.decision {
+        crate::policy::Decision::Allow => MAINNET_CONFIRMATION_TTL_SECONDS * 1000,
+        crate::policy::Decision::RequireApproval(requirement) => {
+            u64::from(requirement.ttl_seconds) * 1000
+        }
+        crate::policy::Decision::Deny(_) => 0,
+    }
+}
+
 /// Maximum lifetime for a sponsored MPP charge approval.
 pub const MPP_APPROVAL_MAX_TTL_MS: u64 = 5 * 60 * 1_000;
 
@@ -263,6 +319,22 @@ fn windows_sid_is_valid(s: &str) -> bool {
 #[derive(Clone, PartialEq)]
 #[non_exhaustive]
 pub enum ApprovalKind {
+    /// A Soroban payment intent awaiting operator consent.
+    X402Payment {
+        /// Digest of the invocation under its network identity.
+        intent_digest: [u8; 32],
+        /// Base64 XDR of the authorized invocation.
+        root_invocation_xdr: String,
+        /// Informational payee address.
+        payee: String,
+        /// Positive decimal token amount.
+        amount: String,
+        /// Token contract address.
+        asset: String,
+        /// Authenticated home domain, when required.
+        home_domain: Option<String>,
+    },
+
     /// A simulated payment transaction awaiting wallet-owner HMAC attestation.
     ///
     /// Serialised as flat fields on the `[[pending]]` entry (no sub-table).
@@ -506,10 +578,10 @@ pub enum ApprovalKind {
         ///
         /// Validated on deserialisation: same grammar as
         /// `PaymentSimulated::summary_asset`.
-        summary_asset: String,
+        summary_asset: Option<String>,
 
         /// Claim amount in stroops.
-        summary_amount_stroops: i64,
+        summary_amount_stroops: Option<i64>,
 
         /// Claiming (source) account G-strkey.
         ///
@@ -779,6 +851,7 @@ impl ApprovalKind {
     #[must_use]
     pub fn kind_name(&self) -> &'static str {
         match self {
+            Self::X402Payment { .. } => "X402Payment",
             Self::PaymentSimulated { .. } => "PaymentSimulated",
             Self::SignWithPasskey { .. } => "SignWithPasskey",
             Self::TrustlineClawbackOptIn { .. } => "TrustlineClawbackOptIn",
@@ -808,6 +881,7 @@ impl std::fmt::Debug for ApprovalKind {
     /// `PaymentSimulated` fields contain no raw secrets and are shown fully.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::X402Payment { .. } => f.debug_struct("X402Payment").finish_non_exhaustive(),
             Self::PaymentSimulated {
                 envelope_xdr_b64,
                 envelope_sha256_hex,
@@ -1210,11 +1284,25 @@ struct ClaimSimulatedWire {
     envelope_sha256_hex: String,
     summary_balance_id_hex72: String,
     summary_balance_id_strkey: String,
-    summary_asset: String,
-    summary_amount_stroops: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary_asset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary_amount_stroops: Option<i64>,
     summary_source: String,
     summary_simulated_fee_stroops: u32,
     summary_simulated_seq_num: i64,
+}
+
+/// Stored Soroban payment intent and its optional authenticated domain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct X402PaymentWire {
+    intent_digest: String,
+    root_invocation_xdr: String,
+    payee: String,
+    amount: String,
+    asset: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    home_domain: Option<String>,
 }
 
 /// Wire representation for `ApprovalKind::RuleProposalSimulated`.
@@ -1312,6 +1400,8 @@ struct PendingApprovalOnDisk {
     // ClaimSimulated sub-table — present iff all other kind fields are absent.
     #[serde(default)]
     claim_simulated: Option<ClaimSimulatedWire>,
+    #[serde(default)]
+    x402_payment: Option<X402PaymentWire>,
 
     // RuleProposalSimulated sub-table — present iff all other kind fields are absent.
     #[serde(default)]
@@ -1610,6 +1700,10 @@ impl Serialize for PendingApproval {
             // so it can be written to the top-level on-disk field.
             registration_input_for_disk,
         ) = match &self.kind {
+            ApprovalKind::X402Payment { .. } => (
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None,
+            ),
             ApprovalKind::PaymentSimulated {
                 envelope_xdr_b64,
                 envelope_sha256_hex,
@@ -1993,7 +2087,26 @@ impl Serialize for PendingApproval {
             ),
         };
 
+        let x402_payment = match &self.kind {
+            ApprovalKind::X402Payment {
+                intent_digest,
+                root_invocation_xdr,
+                payee,
+                amount,
+                asset,
+                home_domain,
+            } => Some(X402PaymentWire {
+                intent_digest: crate::hex::encode(intent_digest),
+                root_invocation_xdr: root_invocation_xdr.clone(),
+                payee: payee.clone(),
+                amount: amount.clone(),
+                asset: asset.clone(),
+                home_domain: home_domain.clone(),
+            }),
+            _ => None,
+        };
         let on_disk = PendingApprovalOnDisk {
+            x402_payment,
             approval_nonce: self.approval_nonce.clone(),
             process_uid: self.process_uid.clone(),
             created_at_unix_ms: self.created_at_unix_ms,
@@ -2104,6 +2217,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
             ),
             ("trustline_simulated", raw.trustline_simulated.is_some()),
             ("claim_simulated", raw.claim_simulated.is_some()),
+            ("x402_payment", raw.x402_payment.is_some()),
             (
                 "rule_proposal_simulated",
                 raw.rule_proposal_simulated.is_some(),
@@ -2453,6 +2567,74 @@ impl<'de> Deserialize<'de> for PendingApproval {
                 summary_simulated_fee_stroops: ts.simulated_fee_stroops,
                 summary_simulated_seq_num: ts.simulated_seq_num,
             }
+        } else if let Some(payment) = raw.x402_payment {
+            for (field, present) in [
+                ("envelope_xdr_b64", raw.envelope_xdr_b64.is_some()),
+                ("envelope_sha256_hex", raw.envelope_sha256_hex.is_some()),
+                ("summary_to", raw.summary_to.is_some()),
+                (
+                    "summary_amount_stroops",
+                    raw.summary_amount_stroops.is_some(),
+                ),
+                ("summary_asset", raw.summary_asset.is_some()),
+                ("summary_memo", raw.summary_memo.is_some()),
+                (
+                    "summary_simulated_fee_stroops",
+                    raw.summary_simulated_fee_stroops.is_some(),
+                ),
+                (
+                    "summary_simulated_seq_num",
+                    raw.summary_simulated_seq_num.is_some(),
+                ),
+                ("passkey_assertion", raw.passkey_assertion.is_some()),
+                ("registration_input", raw.registration_input.is_some()),
+                (
+                    "rule_proposal_simulated",
+                    raw.rule_proposal_simulated.is_some(),
+                ),
+                ("rejected", raw.rejected.is_some()),
+                ("consumed", raw.consumed.is_some()),
+            ] {
+                if present {
+                    return Err(serde::de::Error::custom(format!(
+                        "cross-kind field contamination: X402Payment entry must not carry \
+                         field `{field}`",
+                    )));
+                }
+            }
+
+            use stellar_xdr::ReadXdr as _;
+            let digest = crate::hex::decode_hex32(&payment.intent_digest)
+                .map_err(serde::de::Error::custom)?;
+            if payment.intent_digest != crate::hex::encode(&digest) {
+                return Err(serde::de::Error::custom(
+                    "intent digest must be lowercase hex",
+                ));
+            }
+            stellar_xdr::SorobanAuthorizedInvocation::from_xdr_base64(
+                &payment.root_invocation_xdr,
+                stellar_agent_xdr_limits::untrusted_decode_limits(
+                    payment.root_invocation_xdr.len(),
+                ),
+            )
+            .map_err(serde::de::Error::custom)?;
+            if !payment
+                .amount
+                .parse::<i128>()
+                .is_ok_and(|amount| amount > 0)
+            {
+                return Err(serde::de::Error::custom(
+                    "x402 amount must be a positive i128",
+                ));
+            }
+            ApprovalKind::X402Payment {
+                intent_digest: digest,
+                root_invocation_xdr: payment.root_invocation_xdr,
+                payee: payment.payee,
+                amount: payment.amount,
+                asset: payment.asset,
+                home_domain: payment.home_domain,
+            }
         } else if let Some(cs) = raw.claim_simulated {
             // Cross-kind contamination check: ClaimSimulated must not carry
             // PaymentSimulated flat fields, passkey-related fields, or any
@@ -2505,7 +2687,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
             validate_claim_simulated_invariants(
                 &cs.summary_balance_id_hex72,
                 &cs.summary_balance_id_strkey,
-                &cs.summary_asset,
+                cs.summary_asset.as_deref(),
                 cs.summary_amount_stroops,
                 &cs.summary_source,
             )
@@ -3475,10 +3657,76 @@ impl PendingApproval {
         process_uid: String,
         ttl_ms: u64,
     ) -> Result<Self, ApprovalError> {
+        Self::new_claim_pending_with_value(
+            envelope_xdr_b64,
+            envelope_xdr_bytes,
+            balance_id_hex72,
+            balance_id_strkey,
+            Some(asset),
+            Some(amount_stroops),
+            source,
+            simulated_fee_stroops,
+            simulated_seq_num,
+            process_uid,
+            ttl_ms,
+        )
+    }
+
+    /// Constructs a claim approval whose asset and amount are unknown before execution.
+    ///
+    /// # Errors
+    /// Returns an approval error for invalid identifiers or an unavailable clock.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the envelope and its decoded claim summary"
+    )]
+    pub fn new_claim_pending_unvalued(
+        envelope_xdr_b64: String,
+        envelope_xdr_bytes: &[u8],
+        balance_id_hex72: String,
+        balance_id_strkey: String,
+        source: String,
+        simulated_fee_stroops: u32,
+        simulated_seq_num: i64,
+        process_uid: String,
+        ttl_ms: u64,
+    ) -> Result<Self, ApprovalError> {
+        Self::new_claim_pending_with_value(
+            envelope_xdr_b64,
+            envelope_xdr_bytes,
+            balance_id_hex72,
+            balance_id_strkey,
+            None,
+            None,
+            source,
+            simulated_fee_stroops,
+            simulated_seq_num,
+            process_uid,
+            ttl_ms,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the envelope and its decoded claim summary"
+    )]
+    fn new_claim_pending_with_value(
+        envelope_xdr_b64: String,
+        envelope_xdr_bytes: &[u8],
+        balance_id_hex72: String,
+        balance_id_strkey: String,
+        asset: Option<String>,
+        amount_stroops: Option<i64>,
+        source: String,
+        simulated_fee_stroops: u32,
+        simulated_seq_num: i64,
+        process_uid: String,
+        ttl_ms: u64,
+    ) -> Result<Self, ApprovalError> {
         validate_claim_simulated_invariants(
             &balance_id_hex72,
             &balance_id_strkey,
-            &asset,
+            asset.as_deref(),
             amount_stroops,
             &source,
         )
@@ -3512,6 +3760,67 @@ impl PendingApproval {
                 summary_source: source,
                 summary_simulated_fee_stroops: simulated_fee_stroops,
                 summary_simulated_seq_num: simulated_seq_num,
+            },
+            attestation_blob_b64: None,
+            passkey_assertion: None,
+            attestation_version: super::attestation::ATTESTATION_VERSION,
+        })
+    }
+
+    /// Constructs a pending Soroban payment bound to its network and invocation.
+    ///
+    /// The payee, the amount and the token contract the record shows are
+    /// derived from `root`. Its root call must be `transfer(from, to, amount)`
+    /// with address `from` and `to` arguments and a positive amount. Only the
+    /// root call's function name and arguments are checked, and the
+    /// sub-invocations of `root` are not inspected.
+    ///
+    /// # Errors
+    /// Returns an approval error for an invocation that is not such a
+    /// transfer, a nonpositive amount, invalid XDR, or clock failure.
+    pub fn new_x402_pending(
+        network_id: &[u8; 32],
+        root: &stellar_xdr::SorobanAuthorizedInvocation,
+        home_domain: Option<String>,
+        process_uid: String,
+        ttl_ms: u64,
+    ) -> Result<Self, ApprovalError> {
+        use stellar_xdr::WriteXdr as _;
+        let terms = x402_transfer_terms(root).ok_or_else(|| ApprovalError::Invalid {
+            reason: "x402 invocation must be one transfer(from, to, amount) call".to_owned(),
+        })?;
+        if terms.amount <= 0 {
+            return Err(ApprovalError::Invalid {
+                reason: "x402 amount must be positive".to_owned(),
+            });
+        }
+        let intent_digest =
+            super::subject::soroban_intent_digest(network_id, root).map_err(|error| {
+                ApprovalError::Invalid {
+                    reason: error.to_string(),
+                }
+            })?;
+        let root_invocation_xdr =
+            root.to_xdr_base64(stellar_xdr::Limits::none())
+                .map_err(|error| ApprovalError::Invalid {
+                    reason: error.to_string(),
+                })?;
+        let mut raw = [0u8; 16];
+        OsRng.fill_bytes(&mut raw);
+        let created_at_unix_ms = approval_now_unix_ms()?;
+        Ok(Self {
+            approval_nonce: URL_SAFE_NO_PAD.encode(raw),
+            process_uid,
+            created_at_unix_ms,
+            expires_at_unix_ms: created_at_unix_ms.saturating_add(ttl_ms),
+            reason: None,
+            kind: ApprovalKind::X402Payment {
+                intent_digest,
+                root_invocation_xdr,
+                payee: terms.payee,
+                amount: terms.amount.to_string(),
+                asset: terms.asset,
+                home_domain,
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
@@ -4113,8 +4422,8 @@ fn validate_trustline_simulated_invariants(
 fn validate_claim_simulated_invariants(
     balance_id_hex72: &str,
     balance_id_strkey: &str,
-    asset: &str,
-    amount_stroops: i64,
+    asset: Option<&str>,
+    amount_stroops: Option<i64>,
     source: &str,
 ) -> Result<(), String> {
     // balance_id_hex72: exactly 72 ASCII hex characters.
@@ -4139,29 +4448,35 @@ fn validate_claim_simulated_invariants(
         );
     }
 
-    // asset: "XLM" or "<code>:<G-strkey>" — same grammar as summary_asset.
-    let asset_valid = asset == "XLM"
-        || asset.split_once(':').is_some_and(|(code, issuer)| {
-            !code.is_empty()
-                && code.len() <= 12
-                && code.chars().all(|c| c.is_ascii_alphanumeric())
-                && issuer.len() == 56
-                && issuer.starts_with('G')
-                && issuer[1..]
-                    .chars()
-                    .all(|c| matches!(c, 'A'..='Z' | '2'..='7'))
-        });
-    if !asset_valid {
-        return Err(format!(
-            "asset must be 'XLM' or '<code>:<G-strkey>', got: {asset:?}"
-        ));
-    }
+    match (asset, amount_stroops) {
+        (None, None) => {}
+        (Some(asset), Some(amount_stroops)) => {
+            // asset: "XLM" or "<code>:<G-strkey>", the grammar of summary_asset.
+            let asset_valid = asset == "XLM"
+                || asset.split_once(':').is_some_and(|(code, issuer)| {
+                    !code.is_empty()
+                        && code.len() <= 12
+                        && code.chars().all(|c| c.is_ascii_alphanumeric())
+                        && issuer.len() == 56
+                        && issuer.starts_with('G')
+                        && issuer[1..]
+                            .chars()
+                            .all(|c| matches!(c, 'A'..='Z' | '2'..='7'))
+                });
+            if !asset_valid {
+                return Err(format!(
+                    "asset must be 'XLM' or '<code>:<G-strkey>', got: {asset:?}"
+                ));
+            }
 
-    // amount_stroops: strictly positive.
-    if amount_stroops <= 0 {
-        return Err(format!(
-            "amount_stroops must be strictly positive, got {amount_stroops}"
-        ));
+            // amount_stroops: strictly positive.
+            if amount_stroops <= 0 {
+                return Err(format!(
+                    "amount_stroops must be strictly positive, got {amount_stroops}"
+                ));
+            }
+        }
+        _ => return Err("claim asset and amount must both be present or absent".to_owned()),
     }
 
     // source: valid Stellar G-strkey.
@@ -4766,9 +5081,11 @@ impl PendingApprovalStore {
                 | ApprovalKind::ClaimSimulated { .. }
                 | ApprovalKind::TrustlineSimulated { .. }
                 | ApprovalKind::MppChargeSimulated { .. }
+                | ApprovalKind::X402Payment { .. }
         ) {
             return Err(ApprovalError::WrongKind {
-                expected: "PaymentSimulated, ClaimSimulated, TrustlineSimulated, or MppChargeSimulated",
+                expected: "PaymentSimulated, ClaimSimulated, TrustlineSimulated, MppChargeSimulated, \
+                           or X402Payment",
                 actual: entry.kind.kind_name(),
             });
         }
@@ -6377,7 +6694,7 @@ expires_at_unix_ms = 9999999999999
             matches!(
                 err,
                 ApprovalError::WrongKind {
-                    expected: "PaymentSimulated, ClaimSimulated, TrustlineSimulated, or MppChargeSimulated",
+                    expected: "PaymentSimulated, ClaimSimulated, TrustlineSimulated, MppChargeSimulated, or X402Payment",
                     actual: "SignWithPasskey"
                 }
             ),
@@ -7553,8 +7870,8 @@ expires_at_unix_ms = 9999999999999
         };
         assert_eq!(summary_balance_id_hex72, &valid_balance_id_hex72());
         assert_eq!(summary_balance_id_strkey, VALID_BALANCE_ID_STRKEY);
-        assert_eq!(summary_asset, "XLM");
-        assert_eq!(summary_amount_stroops, 50_000_000);
+        assert_eq!(summary_asset.as_deref(), Some("XLM"));
+        assert_eq!(summary_amount_stroops, Some(50_000_000));
         assert_eq!(summary_source, VALID_SUMMARY_TO);
         assert_eq!(summary_simulated_fee_stroops, 200);
         assert_eq!(summary_simulated_seq_num, 777);
@@ -8534,7 +8851,7 @@ amount_max_stroops = 1000000
             matches!(
                 err,
                 ApprovalError::WrongKind {
-                    expected: "PaymentSimulated, ClaimSimulated, TrustlineSimulated, or MppChargeSimulated",
+                    expected: "PaymentSimulated, ClaimSimulated, TrustlineSimulated, MppChargeSimulated, or X402Payment",
                     actual: "TrustlineClawbackOptIn"
                 }
             ),
@@ -11050,5 +11367,295 @@ is_proposer = true
         assert!(debug.contains(&hex_encode(&super::super::envelope_sha256(
             b"trustline-xdr"
         ))));
+    }
+
+    #[test]
+    fn governing_ttl_follows_decision() {
+        use crate::policy::{ApprovalRequest, Decision, DenyReason, Evaluation};
+        for (decision, expected) in [
+            (Decision::Allow, 600_000),
+            (
+                Decision::RequireApproval(ApprovalRequest::new("approval".into(), 300)),
+                300_000,
+            ),
+            (Decision::Deny(DenyReason::AssetNotAllowlisted), 0),
+        ] {
+            assert_eq!(
+                governing_ttl_ms(&Evaluation {
+                    decision,
+                    value_effects: None
+                }),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn claim_unknown_value_round_trip() {
+        let entry = PendingApproval::new_claim_pending_unvalued(
+            "claim".into(),
+            b"claim",
+            valid_balance_id_hex72(),
+            VALID_BALANCE_ID_STRKEY.into(),
+            VALID_SUMMARY_TO.into(),
+            200,
+            777,
+            "1000".into(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let encoded = toml::to_string(&entry).unwrap();
+        assert!(!encoded.contains("summary_asset"));
+        assert!(!encoded.contains("summary_amount_stroops"));
+        let decoded: PendingApproval = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.kind, entry.kind);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pending.toml");
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        store
+            .insert(entry.clone(), entry.created_at_unix_ms)
+            .unwrap();
+        drop(store);
+        assert_eq!(
+            PendingApprovalStore::open(path)
+                .unwrap()
+                .get(&entry.approval_nonce)
+                .unwrap()
+                .kind,
+            entry.kind
+        );
+        for field in ["summary_asset = \"XLM\"", "summary_amount_stroops = 5"] {
+            let bad = encoded.replace("[claim_simulated]", &format!("[claim_simulated]\n{field}"));
+            assert!(toml::from_str::<PendingApproval>(&bad).is_err());
+        }
+        let known = make_claim_entry(DEFAULT_TTL_MS);
+        let known_bytes = toml::to_string(&known).unwrap();
+        assert!(known_bytes.contains("summary_asset = \"XLM\""));
+        assert!(known_bytes.contains("summary_amount_stroops = 50000000"));
+        assert_eq!(
+            &known_bytes[known_bytes.find("[claim_simulated]").unwrap()..],
+            r#"[claim_simulated]
+envelope_xdr_b64 = "b64xdr"
+envelope_sha256_hex = "bda67bc63ee56caf138ff361ac0fcf6ab71b8a90c52610652a1605f81041a17c"
+summary_balance_id_hex72 = "00000000abababababababababababababababababababababababababababababababab"
+summary_balance_id_strkey = "BAAKXK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5LVOV2XK6UVM"
+summary_asset = "XLM"
+summary_amount_stroops = 50000000
+summary_source = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+summary_simulated_fee_stroops = 200
+summary_simulated_seq_num = 777
+"#
+        );
+        assert_eq!(
+            toml::to_string(&toml::from_str::<PendingApproval>(&known_bytes).unwrap()).unwrap(),
+            known_bytes
+        );
+    }
+
+    fn x402_root(amount: i128) -> stellar_xdr::SorobanAuthorizedInvocation {
+        use stellar_xdr::{
+            AccountId, ContractId, Hash, InvokeContractArgs, PublicKey, ScAddress, ScVal,
+            SorobanAuthorizedFunction, SorobanAuthorizedInvocation, Uint256,
+        };
+        let account = |byte| {
+            ScVal::Address(ScAddress::Account(AccountId(
+                PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32])),
+            )))
+        };
+        SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([7; 32]))),
+                function_name: "transfer".try_into().unwrap(),
+                args: vec![account(4), account(5), ScVal::from(amount)]
+                    .try_into()
+                    .unwrap(),
+            }),
+            sub_invocations: vec![].try_into().unwrap(),
+        }
+    }
+
+    fn x402_entry(home_domain: Option<String>) -> PendingApproval {
+        PendingApproval::new_x402_pending(
+            &[1; 32],
+            &x402_root(12),
+            home_domain,
+            "1000".into(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn x402_pending_derives_terms_from_the_invocation() {
+        let entry = x402_entry(None);
+        let ApprovalKind::X402Payment {
+            payee,
+            amount,
+            asset,
+            ..
+        } = &entry.kind
+        else {
+            panic!("x402 kind required")
+        };
+        assert_eq!(
+            payee,
+            &stellar_strkey::ed25519::PublicKey([5; 32])
+                .to_string()
+                .to_string()
+        );
+        assert_eq!(amount, "12");
+        assert_eq!(
+            asset,
+            &stellar_strkey::Contract([7; 32]).to_string().to_string()
+        );
+        for amount in [0, -1] {
+            assert!(matches!(
+                PendingApproval::new_x402_pending(
+                    &[1; 32],
+                    &x402_root(amount),
+                    None,
+                    "1000".into(),
+                    DEFAULT_TTL_MS,
+                ),
+                Err(ApprovalError::Invalid { .. })
+            ));
+        }
+        let mut other = x402_root(12);
+        let stellar_xdr::SorobanAuthorizedFunction::ContractFn(function) = &mut other.function
+        else {
+            unreachable!()
+        };
+        function.function_name = "approve".try_into().unwrap();
+        assert!(matches!(
+            PendingApproval::new_x402_pending(
+                &[1; 32],
+                &other,
+                None,
+                "1000".into(),
+                DEFAULT_TTL_MS
+            ),
+            Err(ApprovalError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn x402_payer_must_be_an_address() {
+        use crate::approval::view::{ApprovalSummaryView, PendingApprovalView};
+        use stellar_xdr::WriteXdr as _;
+        let mut not_address = x402_root(12);
+        let stellar_xdr::SorobanAuthorizedFunction::ContractFn(function) =
+            &mut not_address.function
+        else {
+            unreachable!()
+        };
+        let mut args = function.args.to_vec();
+        args[0] = stellar_xdr::ScVal::U32(4);
+        function.args = args.try_into().unwrap();
+        assert!(matches!(
+            PendingApproval::new_x402_pending(
+                &[1; 32],
+                &not_address,
+                None,
+                "1000".into(),
+                DEFAULT_TTL_MS
+            ),
+            Err(ApprovalError::Invalid { .. })
+        ));
+
+        let mut entry = x402_entry(None);
+        let ApprovalKind::X402Payment {
+            root_invocation_xdr,
+            ..
+        } = &mut entry.kind
+        else {
+            unreachable!()
+        };
+        *root_invocation_xdr = not_address
+            .to_xdr_base64(stellar_xdr::Limits::none())
+            .unwrap();
+        let ApprovalSummaryView::X402Payment {
+            payee,
+            amount,
+            asset,
+            ..
+        } = PendingApprovalView::from_entry(&entry, TEST_NOW_MS).summary
+        else {
+            panic!("x402 view required")
+        };
+        assert_eq!((payee, amount, asset), (None, None, None));
+    }
+
+    #[test]
+    fn x402_reload_validates_digest_and_invocation() {
+        let bytes = toml::to_string(&x402_entry(None)).unwrap();
+        let valid: toml::Value = toml::from_str(&bytes).unwrap();
+        assert!(valid.clone().try_into::<PendingApproval>().is_ok());
+        let mut upper = valid.clone();
+        let digest = upper["x402_payment"]["intent_digest"]
+            .as_str()
+            .unwrap()
+            .to_ascii_uppercase();
+        upper["x402_payment"]["intent_digest"] = toml::Value::String(digest);
+        assert!(
+            upper
+                .try_into::<PendingApproval>()
+                .unwrap_err()
+                .to_string()
+                .contains("intent digest must be lowercase hex")
+        );
+        let mut undecodable = valid;
+        undecodable["x402_payment"]["root_invocation_xdr"] = toml::Value::String("AAAA".to_owned());
+        assert!(undecodable.try_into::<PendingApproval>().is_err());
+    }
+
+    #[test]
+    fn x402_pending_round_trip() {
+        for domain in [None, Some("merchant.example".into())] {
+            let entry = x402_entry(domain.clone());
+            let bytes = toml::to_string(&entry).unwrap();
+            assert!(bytes.contains("[x402_payment]"));
+            let mut golden = r#"[x402_payment]
+intent_digest = "475f55b4485773675cc0b84d4c31c6200b5a503f609d3ff390bbc37acdc8c133"
+root_invocation_xdr = "AAAAAAAAAAEHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwAAAAh0cmFuc2ZlcgAAAAMAAAASAAAAAAAAAAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAAABIAAAAAAAAAAAUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFAAAACgAAAAAAAAAAAAAAAAAAAAwAAAAA"
+payee = "GACQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKG7N"
+amount = "12"
+asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
+"#.to_owned();
+            if domain.is_some() {
+                golden.push_str("home_domain = \"merchant.example\"\n");
+            }
+            assert_eq!(&bytes[bytes.find("[x402_payment]").unwrap()..], golden);
+
+            assert_eq!(bytes.contains("home_domain ="), domain.is_some());
+            assert_eq!(entry.kind.kind_name(), "X402Payment");
+            let decoded: PendingApproval = toml::from_str(&bytes).unwrap();
+            assert_eq!(decoded.kind, entry.kind);
+            assert_eq!(toml::to_string(&decoded).unwrap(), bytes);
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("pending.toml");
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            store
+                .insert(entry.clone(), entry.created_at_unix_ms)
+                .unwrap();
+            drop(store);
+            assert_eq!(
+                PendingApprovalStore::open(path)
+                    .unwrap()
+                    .get(&entry.approval_nonce)
+                    .unwrap()
+                    .kind,
+                entry.kind
+            );
+            let claim = toml::to_string(&make_claim_entry(DEFAULT_TTL_MS)).unwrap();
+            let claim_table = &claim[claim.find("[claim_simulated]").unwrap()..];
+            assert!(toml::from_str::<PendingApproval>(&format!("{bytes}\n{claim_table}")).is_err());
+            assert!(
+                toml::from_str::<PendingApproval>(&format!("envelope_xdr_b64 = \"AA==\"\n{bytes}"))
+                    .is_err()
+            );
+            let mut bad: toml::Value = toml::from_str(&bytes).unwrap();
+            bad["x402_payment"]["amount"] = toml::Value::String("0".into());
+            assert!(bad.try_into::<PendingApproval>().is_err());
+        }
     }
 }

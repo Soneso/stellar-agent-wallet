@@ -111,6 +111,46 @@ pub fn approval_subject_x402_authenticated(
     hasher.finalize().into()
 }
 
+pub(crate) fn x402_kind_subject(intent_digest: &[u8; 32], home_domain: Option<&str>) -> [u8; 32] {
+    match home_domain {
+        Some(domain) => approval_subject_x402_authenticated(intent_digest, domain),
+        None => approval_subject_x402(intent_digest),
+    }
+}
+
+/// The subject of a stored x402 approval, after checking that its intent
+/// digest is the digest of its stored invocation on the network of
+/// `passphrase`.
+///
+/// # Errors
+///
+/// `approval.attestation_invalid` when the invocation does not decode or its
+/// digest differs from `intent_digest`.
+pub(crate) fn verified_x402_subject(
+    intent_digest: &[u8; 32],
+    root_invocation_xdr: &str,
+    home_domain: Option<&str>,
+    passphrase: &str,
+) -> Result<[u8; 32], WalletError> {
+    use crate::error::ApprovalFailure;
+    use stellar_xdr::ReadXdr as _;
+    let invalid = || {
+        WalletError::Approval(ApprovalFailure::AttestationInvalid {
+            detail: "the stored x402 invocation does not match its digest".to_owned(),
+        })
+    };
+    let root = SorobanAuthorizedInvocation::from_xdr_base64(
+        root_invocation_xdr,
+        stellar_agent_xdr_limits::untrusted_decode_limits(root_invocation_xdr.len()),
+    )
+    .map_err(|_| invalid())?;
+    let network_id = Sha256::digest(passphrase.as_bytes()).into();
+    if soroban_intent_digest(&network_id, &root)? != *intent_digest {
+        return Err(invalid());
+    }
+    Ok(x402_kind_subject(intent_digest, home_domain))
+}
+
 fn root_xdr(root: &SorobanAuthorizedInvocation) -> Result<Vec<u8>, WalletError> {
     root.to_xdr(Limits::none()).map_err(|e| {
         WalletError::Protocol(ProtocolError::XdrCodecFailed {

@@ -345,8 +345,21 @@ impl Criterion for PerPeriodCapCriterion {
     /// criterion's asset (e.g. the single-tx path of a multicall bundle, whose
     /// per-inner debits are recorded by `BundlePerPeriodCapCriterion` instead).
     fn record_confirmed(&self, ctx: &EvalContext<'_>) -> Result<Vec<WindowEntry>, PolicyError> {
+        let now_ms = system_time_to_ms()?;
+        let entry = self.size(ctx, now_ms)?;
+        if let Some(entry) = &entry {
+            ctx.state_store
+                .append(entry.key(), entry.timestamp_ms(), entry.amount())
+                .map_err(|error| PolicyError::CriterionEvaluationFailed {
+                    detail: format!("per_period_cap: record_confirmed state store error: {error}"),
+                })?;
+        }
+        Ok(entry.into_iter().collect())
+    }
+
+    fn size(&self, ctx: &EvalContext<'_>, now_ms: u64) -> Result<Option<WindowEntry>, PolicyError> {
         let crate::policy::v1::value::ValueClass::Value(effects) = &ctx.value else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let criterion_asset = asset_normalise(&self.asset);
         let mut sum: i128 = 0;
@@ -368,21 +381,15 @@ impl Criterion for PerPeriodCapCriterion {
             sum = sum.saturating_add(amount);
         }
         if !matched {
-            return Ok(Vec::new());
+            return Ok(None);
         }
-        let now_ms = system_time_to_ms()?;
         let state_key = StateKey::new(ctx.profile_name, 1, &criterion_asset, self.window.as_secs());
-        ctx.state_store
-            .append(&state_key, now_ms, sum)
-            .map_err(|e| PolicyError::CriterionEvaluationFailed {
-                detail: format!("per_period_cap: record_confirmed state store error: {e}"),
-            })?;
-        Ok(vec![WindowEntry::new(
+        Ok(Some(WindowEntry::new(
             state_key,
             now_ms,
             sum,
             self.window_limit(),
-        )])
+        )))
     }
 }
 

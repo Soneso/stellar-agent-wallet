@@ -1407,6 +1407,39 @@ impl PolicyEngineV1 {
         profile: &Profile,
         value: &value::ValueClass,
     ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
+        self.accounting_entries(tool, profile, value, |criterion, ctx| {
+            criterion.record_confirmed(ctx)
+        })
+    }
+
+    /// Sizes the first matching rule's holds without changing its state store.
+    ///
+    /// # Errors
+    /// Returns the criterion's sizing error.
+    pub fn size_window_entries(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &value::ValueClass,
+        now_ms: u64,
+    ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
+        self.accounting_entries(tool, profile, value, |criterion, ctx| {
+            criterion
+                .size(ctx, now_ms)
+                .map(|entry| entry.into_iter().collect())
+        })
+    }
+
+    fn accounting_entries(
+        &self,
+        tool: &ToolDescriptor,
+        profile: &Profile,
+        value: &value::ValueClass,
+        mut account: impl FnMut(
+            &dyn Criterion,
+            &EvalContext<'_>,
+        ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError>,
+    ) -> Result<Vec<criteria::state_store::WindowEntry>, PolicyError> {
         let rules = self.matching_rules(&self.profile_name, self.project_id.as_deref());
         for rule in rules {
             if !rule.matches_tool(tool) {
@@ -1429,7 +1462,7 @@ impl PolicyEngineV1 {
             };
             let mut recorded = Vec::new();
             for criterion in &rule.criteria {
-                recorded.extend(criterion.record_confirmed(&ctx)?);
+                recorded.extend(account(criterion.as_ref(), &ctx)?);
             }
             return Ok(recorded);
         }
@@ -2927,6 +2960,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn size_equals_record_confirmed() {
+        use criteria::{
+            per_period_cap::{PerPeriodCapCriterion, Window},
+            rate_limit::RateLimitCriterion,
+            state_store::{StateKey, WindowEntry, WindowLimit},
+        };
+        use value::{ActionKind, ValueClass, ValueLeg};
+        let value = ValueClass::single(ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(600),
+            asset: Some("native".into()),
+            destination: None,
+        });
+        let criteria: Vec<(Box<dyn Criterion>, WindowEntry)> = vec![
+            (
+                Box::new(PerPeriodCapCriterion::new(
+                    "native".into(),
+                    Window::parse("1d").unwrap(),
+                    1000,
+                )),
+                WindowEntry::new(
+                    StateKey::new("sizing", 1, "native", 86400),
+                    0,
+                    600,
+                    WindowLimit::Amount {
+                        asset: "native".into(),
+                        window: "1d".into(),
+                        max_stroops: 1000,
+                    },
+                ),
+            ),
+            (
+                Box::new(RateLimitCriterion::new(Window::parse("1m").unwrap(), 3)),
+                WindowEntry::new(
+                    StateKey::new("sizing", 1, "rate_limit", 60),
+                    0,
+                    1,
+                    WindowLimit::Count {
+                        window: "1m".into(),
+                        max_calls: 3,
+                    },
+                ),
+            ),
+        ];
+        for (criterion, golden) in criteria {
+            let engine = PolicyEngineV1::new(
+                allow_all_doc_with_criteria(vec![criterion]),
+                "sizing".into(),
+            );
+            let td = tool("stellar_pay", "stellar:testnet");
+            let profile = testnet_profile();
+            let recorded = engine.record_confirmed(&td, &profile, &value).unwrap();
+            assert_eq!(recorded.len(), 1);
+            let entry = &recorded[0];
+            assert_eq!(
+                engine
+                    .size_window_entries(&td, &profile, &value, entry.timestamp_ms())
+                    .unwrap(),
+                recorded
+            );
+            assert_eq!(
+                WindowEntry::new(
+                    entry.key().clone(),
+                    0,
+                    entry.amount(),
+                    entry.limit().clone()
+                ),
+                golden
+            );
+        }
+    }
+
     // ── PolicyEngineV1::record_confirmed / record_confirmed_bundle ──────────
 
     /// The success-then-deny round-trip: a `per_period_cap` rule allows a
@@ -3151,5 +3257,51 @@ mod tests {
             .record_confirmed(&td, &profile, &ValueClass::ReadOnly)
             .unwrap();
         assert!(recorded.is_empty());
+    }
+
+    #[test]
+    fn size_leaves_store_untouched() {
+        use criteria::{
+            per_period_cap::{PerPeriodCapCriterion, Window},
+            rate_limit::RateLimitCriterion,
+        };
+        use value::{ActionKind, ValueClass, ValueLeg};
+        let engine = PolicyEngineV1::new(
+            allow_all_doc_with_criteria(vec![
+                Box::new(PerPeriodCapCriterion::new(
+                    "native".into(),
+                    Window::parse("1d").unwrap(),
+                    1000,
+                )),
+                Box::new(RateLimitCriterion::new(Window::parse("1m").unwrap(), 3)),
+            ]),
+            "sizing".into(),
+        );
+        let value = ValueClass::single(ValueLeg {
+            kind: ActionKind::Payment,
+            amount: Some(600),
+            asset: Some("native".into()),
+            destination: None,
+        });
+        let entries = engine
+            .size_window_entries(
+                &tool("stellar_pay", "stellar:testnet"),
+                &testnet_profile(),
+                &value,
+                1_000_000,
+            )
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key().bucket(), "native");
+        assert_eq!(entries[1].key().bucket(), "rate_limit");
+        for entry in entries {
+            assert_eq!(
+                engine
+                    .state_store()
+                    .query_window(entry.key(), 1_000_000)
+                    .unwrap(),
+                (0, 0)
+            );
+        }
     }
 }

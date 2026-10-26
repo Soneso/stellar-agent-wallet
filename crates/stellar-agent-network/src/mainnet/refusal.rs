@@ -14,6 +14,83 @@ use stellar_agent_core::error::{NetworkError, WalletError};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum MainnetPrecondition {
+    /// The profile name was not selected by a flag.
+    NameSourceNotFlag,
+    /// The default profile cannot authorize mainnet writes.
+    DefaultProfile,
+    /// An endpoint override is forbidden.
+    EndpointFlagRefused,
+    /// The stored owner coordinate derives another profile name.
+    DerivedNameMismatch,
+    /// The merged chain or endpoint differs from disk.
+    DiskViewMismatch,
+    /// The authorization clock is unavailable.
+    ClockUnavailable,
+    /// The signed policy has no mainnet body.
+    PolicyNotMainnet,
+    /// The enablement names another policy sequence.
+    EnablementSequenceMismatch,
+    /// The endpoint identity cannot be established.
+    EndpointUnavailable,
+    /// The endpoint protocol is unsupported.
+    EndpointProtocolUnsupported,
+    /// The endpoint does not report mainnet.
+    EndpointNotMainnet,
+    /// The enabled endpoint host differs.
+    EnablementHostMismatch,
+    /// Fee bump resolution is forbidden.
+    FeeBumpRefused,
+    /// The envelope has an unsupported shape.
+    EnvelopeShape,
+    /// The envelope already carries signatures.
+    EnvelopePreSigned,
+    /// The envelope fee exceeds its effective cap.
+    FeeAboveCap,
+    /// The source account cannot be read.
+    AccountUnavailable,
+    /// Policy evaluation or sizing failed.
+    PolicyEvaluationFailed,
+    /// The signed and stored thresholds name no threshold for the asset.
+    WitnessThresholdMissing,
+    /// The profile has no oracle.
+    WitnessOracleMissing,
+    /// The required cross-check witness is absent.
+    WitnessRequired,
+    /// The witness shares the primary endpoint host.
+    WitnessSameHost,
+    /// The witness does not name the stored oracle host.
+    WitnessOracleUnbound,
+    /// The approval names another profile.
+    ApprovalProfileMismatch,
+    /// The approval names another chain.
+    ApprovalChainMismatch,
+    /// The approval names another subject.
+    ApprovalSubjectMismatch,
+    /// The approval has another kind.
+    ApprovalKindMismatch,
+    /// The approval has expired.
+    ApprovalExpired,
+    /// The approval lifetime exceeds the governing rule.
+    ApprovalTtlExceedsRule,
+    /// The audit lease names another profile.
+    AuditProfileMismatch,
+    /// The audit readiness proof is stale.
+    AuditStale,
+    /// The signer coordinate differs from the stored profile.
+    SignerCoordinateMismatch,
+    /// The authorization store is unavailable.
+    StoreUnavailable,
+    /// The intent has an unsupported invocation shape.
+    IntentShape,
+    /// The intent names another network.
+    IntentNetworkMismatch,
+    /// The intent payer differs from the signer.
+    IntentPayerMismatch,
+    /// The final envelope does not derive from the consumed intent.
+    DerivationMismatch,
+    /// The final envelope carries different authorization entries.
+    AuthEntriesMismatch,
+
     /// The profile differs.
     ProfileMismatch,
     /// A chain is not mainnet.
@@ -55,7 +132,7 @@ pub enum MainnetPrecondition {
     /// The audit log holds fewer anchored entries than the authorization
     /// recorded.
     AuditCount,
-    /// The time precedes the authorization's issue time.
+    /// The time precedes the authorization's issue time or the approval's creation time.
     NotYetValid,
     /// The authorization has expired.
     Expired,
@@ -135,6 +212,45 @@ impl MainnetPrecondition {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
+            Self::NameSourceNotFlag => "name_source_not_flag",
+            Self::DefaultProfile => "default_profile",
+            Self::EndpointFlagRefused => "endpoint_flag_refused",
+            Self::DerivedNameMismatch => "derived_name_mismatch",
+            Self::DiskViewMismatch => "disk_view_mismatch",
+            Self::ClockUnavailable => "clock_unavailable",
+            Self::PolicyNotMainnet => "policy_not_mainnet",
+            Self::EnablementSequenceMismatch => "enablement_sequence_mismatch",
+            Self::EndpointUnavailable => "endpoint_unavailable",
+            Self::EndpointProtocolUnsupported => "endpoint_protocol_unsupported",
+            Self::EndpointNotMainnet => "endpoint_not_mainnet",
+            Self::EnablementHostMismatch => "enablement_host_mismatch",
+            Self::FeeBumpRefused => "fee_bump_refused",
+            Self::EnvelopeShape => "envelope_shape",
+            Self::EnvelopePreSigned => "envelope_pre_signed",
+            Self::FeeAboveCap => "fee_above_cap",
+            Self::AccountUnavailable => "account_unavailable",
+            Self::PolicyEvaluationFailed => "policy_evaluation_failed",
+            Self::WitnessThresholdMissing => "witness_threshold_missing",
+            Self::WitnessOracleMissing => "witness_oracle_missing",
+            Self::WitnessRequired => "witness_required",
+            Self::WitnessSameHost => "witness_same_host",
+            Self::WitnessOracleUnbound => "witness_oracle_unbound",
+            Self::ApprovalProfileMismatch => "approval_profile_mismatch",
+            Self::ApprovalChainMismatch => "approval_chain_mismatch",
+            Self::ApprovalSubjectMismatch => "approval_subject_mismatch",
+            Self::ApprovalKindMismatch => "approval_kind_mismatch",
+            Self::ApprovalExpired => "approval_expired",
+            Self::ApprovalTtlExceedsRule => "approval_ttl_exceeds_rule",
+            Self::AuditProfileMismatch => "audit_profile_mismatch",
+            Self::AuditStale => "audit_stale",
+            Self::SignerCoordinateMismatch => "signer_coordinate_mismatch",
+            Self::StoreUnavailable => "store_unavailable",
+            Self::IntentShape => "intent_shape",
+            Self::IntentNetworkMismatch => "intent_network_mismatch",
+            Self::IntentPayerMismatch => "intent_payer_mismatch",
+            Self::DerivationMismatch => "derivation_mismatch",
+            Self::AuthEntriesMismatch => "auth_entries_mismatch",
+
             Self::ProfileMismatch => "profile_mismatch",
             Self::ChainNotMainnet => "chain_not_mainnet",
             Self::ChainMismatch => "chain_mismatch",
@@ -202,9 +318,12 @@ impl std::fmt::Display for MainnetPrecondition {
 }
 
 /// A mainnet authorization refusal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum MainnetAuthorizationError {
+    /// The policy denies evaluation or admission.
+    #[error("mainnet policy denied")]
+    PolicyDenied(Box<stellar_agent_core::policy::DenyReason>),
     /// This build has no mainnet writes.
     #[error("this build has no mainnet writes")]
     FeatureDisabled,
@@ -226,12 +345,14 @@ impl MainnetAuthorizationError {
 }
 
 impl From<MainnetAuthorizationError> for WalletError {
-    /// The agent-facing error: `network.mainnet_write_forbidden` for a build
-    /// without mainnet writes, `network.mainnet_authorization_refused` for
-    /// every refused precondition. The precondition does not cross into the
-    /// error: the caller logs it.
+    /// The agent-facing error: the policy's `policy.deny.*` code for a
+    /// denial, `network.mainnet_write_forbidden` for a build without mainnet
+    /// writes, and `network.mainnet_authorization_refused` for every refused
+    /// precondition. The precondition does not cross into the error: the
+    /// caller logs it.
     fn from(error: MainnetAuthorizationError) -> Self {
         match error {
+            MainnetAuthorizationError::PolicyDenied(reason) => WalletError::PolicyDenied { reason },
             MainnetAuthorizationError::FeatureDisabled => {
                 WalletError::Network(NetworkError::MainnetWriteForbidden)
             }
@@ -274,6 +395,9 @@ impl AuthorizedPathError {
 impl From<MainnetAuthorizationError> for AuthorizedPathError {
     fn from(error: MainnetAuthorizationError) -> Self {
         match error {
+            MainnetAuthorizationError::PolicyDenied(reason) => {
+                Self::Wallet(WalletError::PolicyDenied { reason })
+            }
             MainnetAuthorizationError::Refused(precondition) => Self::Refused(precondition),
             MainnetAuthorizationError::FeatureDisabled => {
                 Self::Wallet(WalletError::Network(NetworkError::MainnetWriteForbidden))
@@ -309,6 +433,44 @@ mod tests {
     fn every_precondition() -> Vec<MainnetPrecondition> {
         use MainnetPrecondition as P;
         let all = [
+            P::NameSourceNotFlag,
+            P::DefaultProfile,
+            P::EndpointFlagRefused,
+            P::DerivedNameMismatch,
+            P::DiskViewMismatch,
+            P::ClockUnavailable,
+            P::PolicyNotMainnet,
+            P::EnablementSequenceMismatch,
+            P::EndpointUnavailable,
+            P::EndpointProtocolUnsupported,
+            P::EndpointNotMainnet,
+            P::EnablementHostMismatch,
+            P::FeeBumpRefused,
+            P::EnvelopeShape,
+            P::EnvelopePreSigned,
+            P::FeeAboveCap,
+            P::AccountUnavailable,
+            P::PolicyEvaluationFailed,
+            P::WitnessThresholdMissing,
+            P::WitnessOracleMissing,
+            P::WitnessRequired,
+            P::WitnessSameHost,
+            P::WitnessOracleUnbound,
+            P::ApprovalProfileMismatch,
+            P::ApprovalChainMismatch,
+            P::ApprovalSubjectMismatch,
+            P::ApprovalKindMismatch,
+            P::ApprovalExpired,
+            P::ApprovalTtlExceedsRule,
+            P::AuditProfileMismatch,
+            P::AuditStale,
+            P::SignerCoordinateMismatch,
+            P::StoreUnavailable,
+            P::IntentShape,
+            P::IntentNetworkMismatch,
+            P::IntentPayerMismatch,
+            P::DerivationMismatch,
+            P::AuthEntriesMismatch,
             P::ProfileMismatch,
             P::ChainNotMainnet,
             P::ChainMismatch,
@@ -368,7 +530,45 @@ mod tests {
         ];
         for precondition in all {
             match precondition {
-                P::ProfileMismatch
+                P::NameSourceNotFlag
+                | P::DefaultProfile
+                | P::EndpointFlagRefused
+                | P::DerivedNameMismatch
+                | P::DiskViewMismatch
+                | P::ClockUnavailable
+                | P::PolicyNotMainnet
+                | P::EnablementSequenceMismatch
+                | P::EndpointUnavailable
+                | P::EndpointProtocolUnsupported
+                | P::EndpointNotMainnet
+                | P::EnablementHostMismatch
+                | P::FeeBumpRefused
+                | P::EnvelopeShape
+                | P::EnvelopePreSigned
+                | P::FeeAboveCap
+                | P::AccountUnavailable
+                | P::PolicyEvaluationFailed
+                | P::WitnessThresholdMissing
+                | P::WitnessOracleMissing
+                | P::WitnessRequired
+                | P::WitnessSameHost
+                | P::WitnessOracleUnbound
+                | P::ApprovalProfileMismatch
+                | P::ApprovalChainMismatch
+                | P::ApprovalSubjectMismatch
+                | P::ApprovalKindMismatch
+                | P::ApprovalExpired
+                | P::ApprovalTtlExceedsRule
+                | P::AuditProfileMismatch
+                | P::AuditStale
+                | P::SignerCoordinateMismatch
+                | P::StoreUnavailable
+                | P::IntentShape
+                | P::IntentNetworkMismatch
+                | P::IntentPayerMismatch
+                | P::DerivationMismatch
+                | P::AuthEntriesMismatch
+                | P::ProfileMismatch
                 | P::ChainNotMainnet
                 | P::ChainMismatch
                 | P::ConsumerMismatch
@@ -435,6 +635,103 @@ mod tests {
     #[test]
     fn every_refusal_maps_to_the_one_generic_code() {
         let all = every_precondition();
+        let expected = [
+            "name_source_not_flag",
+            "default_profile",
+            "endpoint_flag_refused",
+            "derived_name_mismatch",
+            "disk_view_mismatch",
+            "clock_unavailable",
+            "policy_not_mainnet",
+            "enablement_sequence_mismatch",
+            "endpoint_unavailable",
+            "endpoint_protocol_unsupported",
+            "endpoint_not_mainnet",
+            "enablement_host_mismatch",
+            "fee_bump_refused",
+            "envelope_shape",
+            "envelope_pre_signed",
+            "fee_above_cap",
+            "account_unavailable",
+            "policy_evaluation_failed",
+            "witness_threshold_missing",
+            "witness_oracle_missing",
+            "witness_required",
+            "witness_same_host",
+            "witness_oracle_unbound",
+            "approval_profile_mismatch",
+            "approval_chain_mismatch",
+            "approval_subject_mismatch",
+            "approval_kind_mismatch",
+            "approval_expired",
+            "approval_ttl_exceeds_rule",
+            "audit_profile_mismatch",
+            "audit_stale",
+            "signer_coordinate_mismatch",
+            "store_unavailable",
+            "intent_shape",
+            "intent_network_mismatch",
+            "intent_payer_mismatch",
+            "derivation_mismatch",
+            "auth_entries_mismatch",
+            "profile_mismatch",
+            "chain_not_mainnet",
+            "chain_mismatch",
+            "consumer_mismatch",
+            "signer_key_mismatch",
+            "signer_role_mismatch",
+            "endpoint_presence",
+            "endpoint_authority",
+            "endpoint_client",
+            "policy_sequence",
+            "policy_digest",
+            "enablement_mismatch",
+            "approval_nonce",
+            "approval_expiry",
+            "reservation_mismatch",
+            "witness_subject",
+            "audit_log_path",
+            "audit_provenance",
+            "audit_segment",
+            "audit_count",
+            "not_yet_valid",
+            "expired",
+            "lifetime_invalid",
+            "unsigned_envelope",
+            "tx_hash",
+            "source_account",
+            "sequence",
+            "intent_digest",
+            "intent_record_mismatch",
+            "final_envelope",
+            "root_invocation",
+            "inner_tx_hash",
+            "outer_tx_hash_absent",
+            "outer_tx_hash",
+            "fee_source",
+            "max_fee",
+            "message_home_domain",
+            "message_web_auth_domain",
+            "message_server_key",
+            "message_content",
+            "domain_mismatch",
+            "binding_mismatch",
+            "content_digest",
+            "entries_digest",
+            "bindings_digest",
+            "holds_mismatch",
+            "duplicate_open",
+            "too_many_open",
+            "approval_nonce_reused",
+            "policy_pin_absent",
+            "policy_pin_malformed",
+            "policy_pin_mismatch",
+            "unknown_authorization",
+            "not_open",
+            "audit_not_anchored",
+            "signature_invalid",
+        ];
+        assert_eq!(all.iter().map(|p| p.label()).collect::<Vec<_>>(), expected);
         let mut labels: Vec<_> = all.iter().map(|p| p.label()).collect();
         labels.sort_unstable();
         labels.dedup();
@@ -462,7 +759,7 @@ mod tests {
         for precondition in every_precondition() {
             let error = MainnetAuthorizationError::Refused(precondition);
             assert_eq!(
-                error.report("test").code(),
+                error.clone().report("test").code(),
                 WalletError::from(error).code(),
                 "{precondition}"
             );
@@ -484,5 +781,13 @@ mod tests {
                 MainnetPrecondition::TxHash
             ))
         );
+    }
+    #[test]
+    fn policy_denied_maps_to_policy_code() {
+        let reason = stellar_agent_core::policy::DenyReason::AssetNotAllowlisted;
+        let expected = reason.wire_code();
+        let error: WalletError = MainnetAuthorizationError::PolicyDenied(Box::new(reason)).into();
+        assert!(matches!(error, WalletError::PolicyDenied { .. }));
+        assert_eq!(error.code(), expected);
     }
 }

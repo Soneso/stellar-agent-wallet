@@ -195,6 +195,8 @@ pub struct StellarRpcClient {
     pub(crate) inner: Client,
     pub(crate) url: RpcEndpoint,
     id: u64,
+    #[cfg(test)]
+    identity_requests: std::sync::atomic::AtomicUsize,
 }
 
 /// The next client identity; every construction takes one, so two clients
@@ -233,6 +235,34 @@ impl StellarRpcClient {
             inner,
             url: endpoint,
             id: next_client_id(),
+            #[cfg(test)]
+            identity_requests: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// The URL the transport sends requests to, which a test transport
+    /// route sets apart from [`Self::url`].
+    #[cfg(test)]
+    pub(crate) fn transport_base_url(&self) -> &str {
+        self.inner.base_url()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_test_transport(
+        endpoint_url: &str,
+        transport_url: &str,
+    ) -> Result<Self, WalletError> {
+        #[cfg(feature = "test-hooks")]
+        CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+        let endpoint = RpcEndpoint::plain(endpoint_url);
+        let inner =
+            Client::new(transport_url).map_err(|error| construction_failure(&endpoint, &error))?;
+        Ok(Self {
+            inner,
+            url: endpoint,
+            id: next_client_id(),
+            #[cfg(test)]
+            identity_requests: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -326,6 +356,8 @@ impl StellarRpcClient {
             inner,
             url: endpoint,
             id: next_client_id(),
+            #[cfg(test)]
+            identity_requests: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -688,6 +720,23 @@ impl StellarRpcClient {
         self.checked_identity(&network)
     }
 
+    /// Checks that the endpoint reports mainnet and a supported protocol.
+    ///
+    /// # Errors
+    /// Returns the identity probe errors, or `network.mainnet_write_forbidden`
+    /// without a request when mainnet writes are disabled.
+    pub async fn check_mainnet_endpoint(&self, deadline: Instant) -> Result<(), WalletError> {
+        #[cfg(feature = "mainnet-write")]
+        {
+            self.mainnet_endpoint_identity(deadline).await.map(|_| ())
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            let _ = deadline;
+            Err(NetworkError::MainnetWriteForbidden.into())
+        }
+    }
+
     /// Issues the bounded, retried `getNetwork` request of the identity probes
     /// and maps a failure to the probe's refusal.
     async fn reported_network(
@@ -696,6 +745,9 @@ impl StellarRpcClient {
     ) -> Result<stellar_rpc_client::GetNetworkResponse, WalletError> {
         let policy = RetryPolicy::default();
         retry_with_backoff(&policy, deadline, is_retryable_identity_error, || async {
+            #[cfg(test)]
+            self.identity_requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.get_network().await
         })
         .await
@@ -1279,5 +1331,71 @@ mod tests {
             "{out}"
         );
         assert!(out.ends_with("\"..."), "{out}");
+    }
+    #[cfg(not(feature = "mainnet-write"))]
+    #[test]
+    fn check_mainnet_endpoint_refuses_feature_off_without_request() {
+        let client = StellarRpcClient::new("http://127.0.0.1:1").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            client
+                .check_mainnet_endpoint(Instant::now() + std::time::Duration::ZERO)
+                .await
+        });
+        assert_eq!(
+            client
+                .identity_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), "network.mainnet_write_forbidden");
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    async fn check_mainnet_endpoint_accepts_mainnet() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                stellar_agent_test_support::signed_envelope::get_network_result(
+                    stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+                ),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        StellarRpcClient::new(&server.uri())
+            .unwrap()
+            .check_mainnet_endpoint(Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    async fn check_mainnet_endpoint_refuses_testnet() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(stellar_agent_test_support::EchoIdResponder::new(
+                stellar_agent_test_support::signed_envelope::get_network_result(
+                    stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                ),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = StellarRpcClient::new(&server.uri())
+            .unwrap()
+            .check_mainnet_endpoint(Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "network.endpoint_network_mismatch");
     }
 }

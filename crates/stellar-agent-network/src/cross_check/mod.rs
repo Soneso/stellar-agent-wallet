@@ -322,6 +322,31 @@ impl OracleEndpoint {
             })?;
         Ok(Some(Self { client, authority }))
     }
+
+    /// Builds the oracle of `profile` as `context` builds its clients: a host
+    /// with a test transport route gets the routed client, and every other
+    /// oracle the client [`Self::from_profile`] builds.
+    ///
+    /// # Errors
+    /// The refusals of [`Self::from_profile`], and the routed client's
+    /// construction error.
+    pub(crate) fn from_context(
+        profile: &Profile,
+        context: &NetworkContext,
+    ) -> Result<Option<Self>, WalletError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(url) = &profile.oracle_provider_url
+            && let Some(client) = context.test_transport_routes().client(url.as_str())
+        {
+            return Ok(Some(Self {
+                client: client?,
+                authority: redact_url_authority(url.as_str()),
+            }));
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = context;
+        Self::from_profile(profile)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -489,10 +514,17 @@ async fn classic_witness(
     let keys = classic::keys(&observations);
     let client = &oracle.client;
     let keys = keys.as_slice();
-    let answer = read_with_retries(&oracle, context, timing, tool, move || {
-        client.witness_ledger_entries(keys)
-    })
-    .await?;
+    let answer = if subject.is_some() && context.chain_id.is_mainnet() {
+        read_with_mainnet_identity(&oracle, context, timing, tool, || {
+            client.witness_ledger_entries(keys)
+        })
+        .await?
+    } else {
+        read_with_retries(&oracle, context, timing, tool, || {
+            client.witness_ledger_entries(keys)
+        })
+        .await?
+    };
     let ledger = classic::compare_answer(&observations, keys, answer, &oracle.authority)?;
     let mut kinds: Vec<_> = observations.iter().map(|o| o.kind).collect();
     kinds.dedup();
@@ -520,14 +552,14 @@ fn warn_skipped(tool: &'static str, reason: CrossCheckSkip) {
 /// single-RPC verification.
 ///
 /// # Errors
-/// [`OracleEndpoint::from_profile`]'s refusal, or
+/// [`OracleEndpoint::from_context`]'s refusal, or
 /// `network.witness_unavailable` when the profile names no oracle.
 fn required_oracle(
     profile: &Profile,
     context: &NetworkContext,
     tool: &'static str,
 ) -> Result<OracleEndpoint, WalletError> {
-    let oracle = OracleEndpoint::from_profile(profile)?
+    let oracle = OracleEndpoint::from_context(profile, context)?
         .ok_or_else(|| unavailable(Reason::OracleNotConfigured))?;
     if same_provider_host(
         profile
@@ -570,6 +602,35 @@ async fn read_with_retries<T, F, Fut>(
     context: &NetworkContext,
     timing: WitnessTiming,
     tool: &'static str,
+    read: F,
+) -> Result<T, WalletError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, stellar_rpc_client::Error>>,
+{
+    read_with_identity(oracle, context, timing, tool, false, read).await
+}
+
+async fn read_with_mainnet_identity<T, F, Fut>(
+    oracle: &OracleEndpoint,
+    context: &NetworkContext,
+    timing: WitnessTiming,
+    tool: &'static str,
+    read: F,
+) -> Result<T, WalletError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, stellar_rpc_client::Error>>,
+{
+    read_with_identity(oracle, context, timing, tool, true, read).await
+}
+
+async fn read_with_identity<T, F, Fut>(
+    oracle: &OracleEndpoint,
+    context: &NetworkContext,
+    timing: WitnessTiming,
+    tool: &'static str,
+    mainnet: bool,
     mut read: F,
 ) -> Result<T, WalletError>
 where
@@ -577,11 +638,15 @@ where
     Fut: Future<Output = Result<T, stellar_rpc_client::Error>>,
 {
     let mut deadline = Instant::now() + timing.attempt_budget;
-    oracle
-        .client
-        .endpoint_identity(context.network_passphrase(), deadline)
-        .await
-        .map_err(|error| identity_error(error, &oracle.authority, context.chain_id))?;
+    let identity = if mainnet {
+        oracle.client.mainnet_endpoint_identity(deadline).await
+    } else {
+        oracle
+            .client
+            .endpoint_identity(context.network_passphrase(), deadline)
+            .await
+    };
+    identity.map_err(|error| identity_error(error, &oracle.authority, context.chain_id))?;
     let mut attempt = 1;
     loop {
         let response = timeout_at(deadline, read()).await.map_err(|_| {
@@ -757,10 +822,17 @@ impl SorobanCrossCheck {
         let primary = soroban::Primary::decode(&inputs)?;
         let client = &oracle.client;
         let envelope = inputs.envelope;
-        let answer = read_with_retries(oracle, context, timing, tool, move || {
-            client.witness_simulate(envelope)
-        })
-        .await?;
+        let answer = if subject.is_some() && context.chain_id.is_mainnet() {
+            read_with_mainnet_identity(oracle, context, timing, tool, move || {
+                client.witness_simulate(envelope)
+            })
+            .await?
+        } else {
+            read_with_retries(oracle, context, timing, tool, move || {
+                client.witness_simulate(envelope)
+            })
+            .await?
+        };
         soroban::compare(&primary, &inputs, &answer, &oracle.authority)?;
         Ok(CrossCheckOutcome::Passed(CrossCheckWitness {
             authority: oracle.authority.clone(),

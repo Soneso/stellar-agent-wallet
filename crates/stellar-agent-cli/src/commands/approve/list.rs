@@ -268,7 +268,14 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
             asset,
             amount_stroops,
             ..
-        } => format!("claim {amount_stroops} stroops {asset} ({balance_id_strkey})"),
+        } => match (amount_stroops, asset) {
+            (Some(amount), Some(asset)) => {
+                format!("claim {amount} stroops {asset} ({balance_id_strkey})")
+            }
+            _ => format!(
+                "claim {balance_id_strkey}: asset and amount not known to the wallet before the claim"
+            ),
+        },
         ApprovalSummaryView::SignWithPasskey {
             smart_account_redacted,
             rp_id,

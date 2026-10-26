@@ -21,7 +21,12 @@ use stellar_agent_core::error::{WalletError, WalletStateError};
 pub fn now_ms() -> Result<u64, WalletError> {
     #[cfg(any(test, feature = "test-hooks"))]
     if let Some(now) = *test_override::lock() {
-        return Ok(now);
+        return match now {
+            ClockOverride::At(now) => Ok(now),
+            ClockOverride::Fail => Err(WalletError::WalletState(WalletStateError::ClockError {
+                detail: "authorization clock unavailable".to_owned(),
+            })),
+        };
     }
     stellar_agent_core::timefmt::now_unix_ms().map_err(|error| {
         WalletError::WalletState(WalletStateError::ClockError {
@@ -31,12 +36,27 @@ pub fn now_ms() -> Result<u64, WalletError> {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
+#[derive(Clone, Copy)]
+enum ClockOverride {
+    At(u64),
+    Fail,
+}
+
+/// Makes the authorization clock fail until its guard drops.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub fn set_clock_error_for_test() -> TestClockGuard {
+    *test_override::lock() = Some(ClockOverride::Fail);
+    TestClockGuard(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
 mod test_override {
     use std::sync::{Mutex, MutexGuard, PoisonError};
 
-    static OVERRIDE: Mutex<Option<u64>> = Mutex::new(None);
+    static OVERRIDE: Mutex<Option<super::ClockOverride>> = Mutex::new(None);
 
-    pub(super) fn lock() -> MutexGuard<'static, Option<u64>> {
+    pub(super) fn lock() -> MutexGuard<'static, Option<super::ClockOverride>> {
         OVERRIDE.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -55,7 +75,7 @@ pub struct TestClockGuard(());
 impl TestClockGuard {
     /// Moves the overridden clock to `now_ms`.
     pub fn set(&self, now_ms: u64) {
-        *test_override::lock() = Some(now_ms);
+        *test_override::lock() = Some(ClockOverride::At(now_ms));
     }
 }
 
@@ -73,7 +93,7 @@ impl Drop for TestClockGuard {
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub fn set_now_ms_for_test(now_ms: u64) -> TestClockGuard {
-    *test_override::lock() = Some(now_ms);
+    *test_override::lock() = Some(ClockOverride::At(now_ms));
     TestClockGuard(())
 }
 

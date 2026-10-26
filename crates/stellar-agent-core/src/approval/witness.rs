@@ -77,6 +77,8 @@ use crate::profile::schema::Profile;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ApprovedKind {
+    /// An x402 Soroban payment intent.
+    X402Payment,
     /// A `PaymentSimulated` record: payments and account creation.
     Payment,
     /// A `ClaimSimulated` record.
@@ -93,6 +95,7 @@ impl ApprovedKind {
             Self::Payment => 1,
             Self::Claim => 2,
             Self::Trustline => 3,
+            Self::X402Payment => 4,
         }
     }
 }
@@ -343,26 +346,48 @@ pub fn verify_approval(
             detail: "no pending approval with that nonce".to_owned(),
         })
     })?;
-    let (kind, envelope_xdr_b64, envelope_sha256_hex) = match &record.kind {
+    let (kind, subject, stored_digest) = match &record.kind {
         ApprovalKind::PaymentSimulated {
             envelope_xdr_b64,
             envelope_sha256_hex,
             ..
-        } => (ApprovedKind::Payment, envelope_xdr_b64, envelope_sha256_hex),
+        } => (
+            ApprovedKind::Payment,
+            approval_subject_classic(envelope_xdr_b64),
+            decode_sha256_hex(envelope_sha256_hex)?,
+        ),
         ApprovalKind::ClaimSimulated {
             envelope_xdr_b64,
             envelope_sha256_hex,
             ..
-        } => (ApprovedKind::Claim, envelope_xdr_b64, envelope_sha256_hex),
+        } => (
+            ApprovedKind::Claim,
+            approval_subject_classic(envelope_xdr_b64),
+            decode_sha256_hex(envelope_sha256_hex)?,
+        ),
         ApprovalKind::TrustlineSimulated {
             envelope_xdr_b64,
             envelope_sha256_hex,
             ..
         } => (
             ApprovedKind::Trustline,
-            envelope_xdr_b64,
-            envelope_sha256_hex,
+            approval_subject_classic(envelope_xdr_b64),
+            decode_sha256_hex(envelope_sha256_hex)?,
         ),
+        ApprovalKind::X402Payment {
+            intent_digest,
+            root_invocation_xdr,
+            home_domain,
+            ..
+        } => {
+            let subject = super::subject::verified_x402_subject(
+                intent_digest,
+                root_invocation_xdr,
+                home_domain.as_deref(),
+                profile.chain_id.network_passphrase(),
+            )?;
+            (ApprovedKind::X402Payment, subject, subject)
+        }
         ApprovalKind::Rejected { .. } => {
             return Err(WalletError::Approval(ApprovalFailure::Rejected {
                 detail: "the operator rejected this approval".to_owned(),
@@ -390,8 +415,7 @@ pub fn verify_approval(
              approve the action again",
         ));
     }
-    let subject = approval_subject_classic(envelope_xdr_b64);
-    if decode_sha256_hex(envelope_sha256_hex)? != subject || subject != expected.subject {
+    if stored_digest != subject || subject != expected.subject {
         return Err(invalid("the approval approves another transaction"));
     }
     let key = load_attestation_key(

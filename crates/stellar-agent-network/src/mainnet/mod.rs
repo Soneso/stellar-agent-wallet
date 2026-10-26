@@ -25,7 +25,10 @@ pub mod consumed;
 pub mod digest;
 #[cfg(all(test, feature = "mainnet-write"))]
 pub(crate) mod fixtures;
+#[cfg(feature = "mainnet-write")]
+pub(crate) mod mint;
 pub(crate) mod refusal;
+pub mod resolve;
 pub mod soroban;
 pub(crate) mod types;
 

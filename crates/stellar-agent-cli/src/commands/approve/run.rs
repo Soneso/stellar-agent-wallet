@@ -58,7 +58,6 @@
 
 use std::io::{BufRead as _, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use clap::Args;
@@ -73,15 +72,13 @@ use stellar_agent_core::approval::{
     attest_and_persist, load_and_validate_entry, load_attestation_key, open_with_retry,
     process_uid_for_attestation, try_decode_spending_limit_params,
 };
-use stellar_agent_core::audit_log::writer::{AuditWriter, WriterError};
-use stellar_agent_core::audit_log::{AuditOutbox, drain_lock_is_held};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{ApprovalFailure, ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::timefmt;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
-use crate::commands::value_audit::{KeyedAcquireError, acquire_keyed_audit_writer};
+use crate::common::consent::{ConsentSink, acquire_consent_sink};
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::{render, resolve_profile_name};
 
@@ -311,66 +308,6 @@ enum ConsentRowOutcome {
     /// which appends it before any process loads a signing key for the
     /// approved action.
     Queued,
-}
-
-/// The sink `approve --id` writes its consent row through.
-enum ConsentSink {
-    /// This process holds the keyed writer.
-    Writer(Arc<Mutex<AuditWriter>>),
-    /// A draining writer in another process holds the log.
-    Outbox(AuditOutbox),
-}
-
-/// Returns `true` when an acquisition failure is contention for the writer's
-/// sidecar lock, the one failure `approve --id` retries and then resolves by
-/// probing the drain lock.
-///
-/// Classified by the typed error. Every other failure, `audit.outbox_busy`
-/// included, refuses the approval.
-fn is_sidecar_contention(error: &KeyedAcquireError) -> bool {
-    matches!(error, KeyedAcquireError::Writer(WriterError::FileLocked))
-}
-
-/// Acquires the sink for the consent row.
-///
-/// The keyed writer is acquired through the registry, which drains any queued
-/// rows at open. Sidecar contention is retried with the approval store's
-/// bounded retry, since a CLI command's startup advisory holds the lock
-/// briefly. Still locked, one `try_lock` on the drain lock, released at once,
-/// decides. Held means a draining writer owns the log, and the row is queued.
-/// Free means the holder does not drain, and the approval is refused with
-/// `audit.writer_locked`.
-///
-/// # Errors
-///
-/// The [`WalletError`] for any acquisition failure other than contention, and
-/// for contention with a holder that does not drain.
-fn acquire_consent_sink(profile: &Profile, profile_name: &str) -> Result<ConsentSink, WalletError> {
-    let mut attempt = 0_u32;
-    let contention = loop {
-        attempt += 1;
-        match acquire_keyed_audit_writer(
-            profile,
-            profile_name,
-            stellar_agent_core::audit_log::BindingCheck::Enforce,
-        ) {
-            Ok(writer) => return Ok(ConsentSink::Writer(writer)),
-            Err(error) if is_sidecar_contention(&error) => {
-                if attempt >= DEFAULT_RETRY_ATTEMPTS {
-                    break error;
-                }
-                std::thread::sleep(DEFAULT_RETRY_BACKOFF);
-            }
-            Err(error) => return Err(error.into_wallet_error(profile_name)),
-        }
-    };
-    match drain_lock_is_held(&profile.audit_log_path) {
-        Ok(true) => Ok(ConsentSink::Outbox(AuditOutbox::for_log(
-            &profile.audit_log_path,
-        ))),
-        Ok(false) => Err(contention.into_wallet_error(profile_name)),
-        Err(error) => Err(KeyedAcquireError::Writer(error).into_wallet_error(profile_name)),
-    }
 }
 
 /// Writes the consent row and persists the approval, in that order.
@@ -804,18 +741,17 @@ fn write_summary(
             summary_simulated_seq_num,
             ..
         } => {
-            // All fields are public claim data (balance ids, amounts, source
-            // account) rendered from VALIDATED STORED values — same posture as
-            // PaymentSimulated's summary_to.
-            let amount = if summary_asset == "XLM" {
-                format!(
-                    "{} XLM ({} stroops)",
-                    StellarAmount::from_stroops(*summary_amount_stroops).as_xlm_decimal_string(),
-                    summary_amount_stroops
-                )
-            } else {
-                format!("{summary_amount_stroops} stroops")
+            let amount = match (summary_asset.as_deref(), summary_amount_stroops) {
+                (Some("XLM"), Some(amount)) => format!(
+                    "{} XLM ({amount} stroops)",
+                    StellarAmount::from_stroops(*amount).as_xlm_decimal_string()
+                ),
+                (Some(_), Some(amount)) => format!("{amount} stroops"),
+                _ => "not known to the wallet before the claim".to_owned(),
             };
+            let summary_asset = summary_asset
+                .as_deref()
+                .unwrap_or("not known to the wallet before the claim");
             format!(
                 "  Kind:              ClaimSimulated\n  \
                  Balance ID:        {summary_balance_id_strkey}\n  \
@@ -841,6 +777,47 @@ fn write_summary(
                  {body}\n  \
                  Proposal digest:   {digest_hex}",
                 body = render_rule_proposal_definition(definition),
+            )
+        }
+        ApprovalKind::X402Payment {
+            root_invocation_xdr,
+            home_domain,
+            ..
+        } => {
+            use stellar_xdr::{
+                ReadXdr as _, ScVal, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+            };
+            let decoded = SorobanAuthorizedInvocation::from_xdr_base64(
+                root_invocation_xdr,
+                stellar_agent_xdr_limits::untrusted_decode_limits(root_invocation_xdr.len()),
+            );
+            let details = decoded
+                .ok()
+                .and_then(|root| {
+                    let SorobanAuthorizedFunction::ContractFn(function) = root.function else {
+                        return None;
+                    };
+                    if function.function_name.0.as_slice() != b"transfer" {
+                        return None;
+                    }
+                    let [
+                        ScVal::Address(_),
+                        ScVal::Address(payee),
+                        ScVal::I128(amount),
+                    ] = function.args.as_slice()
+                    else {
+                        return None;
+                    };
+                    let amount = (i128::from(amount.hi) << 64) | i128::from(amount.lo);
+                    Some(format!(
+                        "  Payee: {payee}\n  Amount: {amount}\n  Asset: {}",
+                        function.contract_address
+                    ))
+                })
+                .unwrap_or_else(|| "  Invocation cannot be decoded".to_owned());
+            format!(
+                "  Kind: X402Payment\n{details}\n  Home domain: {}",
+                crate::common::render::sanitize_for_table(home_domain.as_deref().unwrap_or("none"))
             )
         }
         other => {
@@ -991,6 +968,10 @@ mod tests {
         stellar_agent_core::approval::ApprovalContext::from_profile("render-test", &profile)
     }
     use super::*;
+    use crate::commands::value_audit::KeyedAcquireError;
+    use crate::common::consent::is_sidecar_contention;
+    use stellar_agent_core::audit_log::writer::{AuditWriter, WriterError};
+    use stellar_agent_core::audit_log::{AuditOutbox, drain_lock_is_held};
     use stellar_agent_core::profile::schema::default_approval_dir;
 
     // ── Helper: seed an attestation key into the mock keyring ────────────────
@@ -2246,5 +2227,92 @@ mod tests {
             assert!(!text.contains("To:"));
             assert!(!text.contains("Amount:"));
         }
+    }
+    #[test]
+    fn claim_summary_renders_unknown_value() {
+        let entry = PendingApproval::new_claim_pending_unvalued(
+            "b64xdr".into(),
+            b"b64xdr",
+            "00".repeat(36),
+            format!("B{}", "A".repeat(57)),
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            100,
+            1,
+            "1000".into(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        write_summary(&entry, &test_context(), &mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output)
+                .unwrap()
+                .matches("not known to the wallet before the claim")
+                .count(),
+            2
+        );
+    }
+    #[test]
+    fn approve_renders_x402_payee_and_amount() {
+        use stellar_xdr::{
+            AccountId, ContractId, Hash, InvokeContractArgs, PublicKey, ScAddress, ScVal,
+            SorobanAuthorizedFunction, SorobanAuthorizedInvocation, Uint256,
+        };
+        let root = SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([3; 32]))),
+                function_name: "transfer".try_into().unwrap(),
+                args: vec![
+                    ScVal::Address(ScAddress::Account(AccountId(
+                        PublicKey::PublicKeyTypeEd25519(Uint256([4; 32])),
+                    ))),
+                    ScVal::Address(ScAddress::Account(AccountId(
+                        PublicKey::PublicKeyTypeEd25519(Uint256([5; 32])),
+                    ))),
+                    ScVal::from(123i128),
+                ]
+                .try_into()
+                .unwrap(),
+            }),
+            sub_invocations: vec![].try_into().unwrap(),
+        };
+        let mut entry = PendingApproval::new_x402_pending(
+            &[0; 32],
+            &root,
+            Some("merchant.example.invalid\u{1b}[2J\u{7}".into()),
+            "1000".into(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let ApprovalKind::X402Payment {
+            payee,
+            amount,
+            asset,
+            ..
+        } = &mut entry.kind
+        else {
+            unreachable!()
+        };
+        "untrusted-payee".clone_into(payee);
+        "999".clone_into(amount);
+        "untrusted-asset".clone_into(asset);
+        let mut output = Vec::new();
+        write_summary(&entry, &test_context(), &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(
+            text.contains(
+                &stellar_strkey::ed25519::PublicKey([5; 32])
+                    .to_string()
+                    .to_string()
+            )
+        );
+        assert!(text.contains("123"));
+        assert!(text.contains("merchant.example.invalid"));
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.contains('\u{7}'));
+        assert!(!text.contains("untrusted-payee"));
+        assert!(!text.contains("999"));
+        assert!(text.contains(&stellar_strkey::Contract([3; 32]).to_string().to_string()));
+        assert!(!text.contains("untrusted-asset"));
     }
 }

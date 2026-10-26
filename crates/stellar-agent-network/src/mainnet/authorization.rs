@@ -628,6 +628,7 @@ enum Never {}
 /// A transaction signing: the header and its transaction facts.
 #[cfg(feature = "mainnet-write")]
 pub(crate) struct TxSignInner {
+    pub(crate) entries: Vec<stellar_agent_core::policy::v1::criteria::state_store::WindowEntry>,
     pub(crate) header: Header,
     pub(crate) binding: DomainBinding,
 }
@@ -635,6 +636,9 @@ pub(crate) struct TxSignInner {
 /// A Soroban intent signing: the header and its intent facts.
 #[cfg(feature = "mainnet-write")]
 pub(crate) struct SorobanIntentInner {
+    pub(crate) entries: Vec<stellar_agent_core::policy::v1::criteria::state_store::WindowEntry>,
+    pub(crate) facts: crate::mainnet::digest::BindingFacts,
+    pub(crate) authorization_ttl_ms: u64,
     pub(crate) header: Header,
     pub(crate) binding: DomainBinding,
 }
@@ -699,14 +703,14 @@ pub(crate) struct MessageSignInner {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Authority to sign one classic transaction on mainnet.
-pub struct MainnetTxSignAuthorization(TxSignInner);
+pub struct MainnetTxSignAuthorization(pub(crate) TxSignInner);
 
 /// Authority to sign one Soroban authorization for an x402 payment intent on
 /// mainnet.
-pub struct MainnetSorobanIntentAuthorization(SorobanIntentInner);
+pub struct MainnetSorobanIntentAuthorization(pub(crate) SorobanIntentInner);
 
 /// Authority to release one signed x402 payment payload on mainnet.
-pub struct MainnetSubmitAuthorization(SubmitInner);
+pub struct MainnetSubmitAuthorization(pub(crate) SubmitInner);
 
 /// Authority for one phase `R` of a fee bump on mainnet.
 pub struct MainnetFeeBumpAuthorization<R: FeeBumpRole>(FeeBumpInner<R>);
@@ -957,6 +961,19 @@ debug_impl!(
 );
 
 impl MainnetTxSignAuthorization {
+    pub(crate) fn entries(
+        &self,
+    ) -> &[stellar_agent_core::policy::v1::criteria::state_store::WindowEntry] {
+        #[cfg(feature = "mainnet-write")]
+        {
+            &self.0.entries
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            match self.0.never {}
+        }
+    }
+
     shared_methods!();
 
     /// An authorization over directly assembled facts, for this crate's tests
@@ -1016,6 +1033,23 @@ impl MainnetTxSignAuthorization {
 }
 
 impl MainnetSorobanIntentAuthorization {
+    #[cfg_attr(
+        not(feature = "mainnet-write"),
+        expect(dead_code, reason = "uninhabited without mainnet writes")
+    )]
+    pub(crate) fn entries(
+        &self,
+    ) -> &[stellar_agent_core::policy::v1::criteria::state_store::WindowEntry] {
+        #[cfg(feature = "mainnet-write")]
+        {
+            &self.0.entries
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            match self.0.never {}
+        }
+    }
+
     shared_methods!();
 
     /// An authorization over directly assembled facts, for this crate's tests
@@ -1300,6 +1334,7 @@ mod tests {
 
             fn tx(&self) -> MainnetTxSignAuthorization {
                 MainnetTxSignAuthorization(TxSignInner {
+                    entries: vec![],
                     header: self.header(AuthorizationDomain::Transaction, true),
                     binding: DomainBinding::Transaction {
                         unsigned_envelope_sha256: [0x11; 32],
@@ -1457,6 +1492,7 @@ mod tests {
             header.chain = Caip2::Testnet;
             header.expires_at_ms = 2_500;
             let a = MainnetTxSignAuthorization(TxSignInner {
+                entries: vec![],
                 header,
                 binding: DomainBinding::Transaction {
                     unsigned_envelope_sha256: [0x11; 32],
@@ -1496,6 +1532,18 @@ mod tests {
         fn the_soroban_and_submit_checks_compare_each_fact() {
             let f = Fixture::new();
             let intent = MainnetSorobanIntentAuthorization(SorobanIntentInner {
+                entries: vec![],
+                facts: crate::mainnet::digest::BindingFacts {
+                    endpoint: None,
+                    signer: [0; 32],
+                    policy: [0; 32],
+                    enablement: [0; 32],
+                    witness: None,
+                    reservation: None,
+                    approval: [0; 32],
+                    audit: [0; 32],
+                },
+                authorization_ttl_ms: 120_000,
                 header: f.header(AuthorizationDomain::Soroban, true),
                 binding: DomainBinding::Soroban {
                     intent_digest: [0x44; 32],

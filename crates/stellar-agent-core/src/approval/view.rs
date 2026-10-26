@@ -87,6 +87,22 @@ pub struct PendingApprovalView {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ApprovalSummaryView {
+    /// An x402 payment intent and its authenticated domain.
+    ///
+    /// The payee, the amount and the token contract are decoded from the
+    /// stored invocation, and all three are absent when that invocation is
+    /// not one `transfer(from, to, amount)` call.
+    X402Payment {
+        /// Payee address.
+        payee: Option<String>,
+        /// Decimal token amount.
+        amount: Option<String>,
+        /// Token contract address.
+        asset: Option<String>,
+        /// Authenticated home domain.
+        home_domain: Option<String>,
+    },
+
     /// [`ApprovalKind::PaymentSimulated`] summary fields.
     Payment {
         /// Effective source decoded from the envelope.
@@ -135,10 +151,10 @@ pub enum ApprovalSummaryView {
         /// `B...` strkey rendering of the balance id.
         balance_id_strkey: String,
         /// Asset identifier.
-        asset: String,
+        asset: Option<String>,
         /// Claim amount in stroops, decimal-string encoded.
-        #[serde(with = "crate::wire_stroops::i64")]
-        amount_stroops: i64,
+        #[serde(with = "crate::wire_stroops::i64_opt")]
+        amount_stroops: Option<i64>,
         /// Claiming (source) account G-strkey.
         source: String,
         /// Simulated transaction fee in stroops, decimal-string encoded.
@@ -285,7 +301,8 @@ impl PendingApprovalView {
     /// Builds a redacted view from a stored entry.
     pub(super) fn from_entry(entry: &PendingApproval, now_unix_ms: u64) -> Self {
         let attested = match &entry.kind {
-            ApprovalKind::PaymentSimulated { .. }
+            ApprovalKind::X402Payment { .. }
+            | ApprovalKind::PaymentSimulated { .. }
             | ApprovalKind::ClaimSimulated { .. }
             | ApprovalKind::TrustlineSimulated { .. }
             | ApprovalKind::TrustlineClawbackOptIn { .. }
@@ -301,6 +318,27 @@ impl PendingApprovalView {
         };
 
         let summary = match &entry.kind {
+            ApprovalKind::X402Payment {
+                root_invocation_xdr,
+                home_domain,
+                ..
+            } => {
+                use stellar_xdr::ReadXdr as _;
+                let terms = stellar_xdr::SorobanAuthorizedInvocation::from_xdr_base64(
+                    root_invocation_xdr,
+                    stellar_agent_xdr_limits::untrusted_decode_limits(root_invocation_xdr.len()),
+                )
+                .ok()
+                .as_ref()
+                .and_then(super::store::x402_transfer_terms);
+                ApprovalSummaryView::X402Payment {
+                    payee: terms.as_ref().map(|terms| terms.payee.clone()),
+                    amount: terms.as_ref().map(|terms| terms.amount.to_string()),
+                    asset: terms.map(|terms| terms.asset),
+                    home_domain: home_domain.clone(),
+                }
+            }
+
             ApprovalKind::PaymentSimulated {
                 envelope_xdr_b64,
                 summary_to,
@@ -874,8 +912,8 @@ mod tests {
         let claim = ApprovalSummaryView::Claim {
             envelope_source: Some("GENVELOPE".to_owned()),
             balance_id_strkey: "B".to_owned() + &"A".repeat(57),
-            asset: "XLM".to_owned(),
-            amount_stroops: 9_007_199_254_740_993_i64, // 2^53 + 1
+            asset: Some("XLM".to_owned()),
+            amount_stroops: Some(9_007_199_254_740_993_i64), // 2^53 + 1
             source: "GAAA".to_owned(),
             fee_stroops: 100,
             seq_num: 1,
@@ -1052,5 +1090,92 @@ mod tests {
             Some("GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA")
         );
         assert_ne!(source.as_ref(), Some(&holder));
+    }
+
+    #[test]
+    fn x402_view_renders_invocation_terms() {
+        use stellar_xdr::{
+            AccountId, ContractId, Hash, InvokeContractArgs, PublicKey, ScAddress, ScVal,
+            SorobanAuthorizedFunction, SorobanAuthorizedInvocation, Uint256, WriteXdr as _,
+        };
+        let account = |byte| {
+            ScVal::Address(ScAddress::Account(AccountId(
+                PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32])),
+            )))
+        };
+        let root = |function: &str| SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([7; 32]))),
+                function_name: function.try_into().unwrap(),
+                args: vec![account(4), account(5), ScVal::from(1_234_i128)]
+                    .try_into()
+                    .unwrap(),
+            }),
+            sub_invocations: vec![].try_into().unwrap(),
+        };
+        let mut entry = PendingApproval::new_x402_pending(
+            &[1; 32],
+            &root("transfer"),
+            Some("merchant.example.invalid".into()),
+            "1000".into(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let ApprovalKind::X402Payment {
+            payee,
+            amount,
+            asset,
+            ..
+        } = &mut entry.kind
+        else {
+            unreachable!()
+        };
+        "stored-payee".clone_into(payee);
+        "999".clone_into(amount);
+        "stored-asset".clone_into(asset);
+        let ApprovalSummaryView::X402Payment {
+            payee,
+            amount,
+            asset,
+            home_domain,
+        } = PendingApprovalView::from_entry(&entry, TEST_NOW_MS).summary
+        else {
+            panic!("x402")
+        };
+        assert_eq!(
+            payee,
+            Some(
+                stellar_strkey::ed25519::PublicKey([5; 32])
+                    .to_string()
+                    .to_string()
+            )
+        );
+        assert_eq!(amount.as_deref(), Some("1234"));
+        assert_eq!(
+            asset,
+            Some(stellar_strkey::Contract([7; 32]).to_string().to_string())
+        );
+        assert_eq!(home_domain.as_deref(), Some("merchant.example.invalid"));
+
+        let ApprovalKind::X402Payment {
+            root_invocation_xdr,
+            ..
+        } = &mut entry.kind
+        else {
+            unreachable!()
+        };
+        *root_invocation_xdr = root("approve")
+            .to_xdr_base64(stellar_xdr::Limits::none())
+            .unwrap();
+        let ApprovalSummaryView::X402Payment {
+            payee,
+            amount,
+            asset,
+            ..
+        } = PendingApprovalView::from_entry(&entry, TEST_NOW_MS).summary
+        else {
+            panic!("x402")
+        };
+        assert_eq!((payee, amount, asset), (None, None, None));
     }
 }

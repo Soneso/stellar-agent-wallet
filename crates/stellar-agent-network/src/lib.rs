@@ -92,7 +92,7 @@ pub use account::{
 };
 pub use builder::{Asset, ClassicOpBuilder};
 pub use client::{StellarRpcClient, TransactionStatusView};
-pub use context::NetworkContext;
+pub use context::{MainnetEndpointFlags, MainnetWriteContext, NetworkContext};
 pub use endpoint_identity::{
     EndpointIdentity, SUPPORTED_PROTOCOL_VERSIONS, check_protocol_version,
 };
