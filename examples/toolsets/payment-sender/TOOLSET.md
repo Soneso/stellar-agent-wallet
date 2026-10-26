@@ -13,7 +13,7 @@ A payment toolset. It declares two capabilities:
 
 - `propose-transaction`, which the wallet maps to `stellar_pay` — build an
   unsigned payment envelope. This is the ungated build step; it signs nothing.
-- `sign-payment`, the one signing-adjacent capability, which the wallet maps to
+- `sign-payment`, a signing-adjacent capability, which the wallet maps to
   the gated `stellar_pay_commit` — sign the built envelope and submit it.
 
 This toolset can move funds, but it cannot do so silently. Every payment it routes
@@ -30,8 +30,9 @@ lives only in the keyring.
 
 `stellar_pay_commit` (sign and submit) — arguments: the same
 `chain_id`/`source`/`destination`/`amount`/`asset`, plus the `nonce`,
-`expires_at_unix_ms`, and `envelope_xdr` returned by the build step. The
-destination, asset, and amount that the gate matches on are decoded from the
+`expires_at_unix_ms`, and `envelope_xdr` returned by the build step. Once the
+operator approves, a commit also carries `approval_nonce` and
+`approval_attestation`. The destination, asset, and amount that the gate matches on are decoded from the
 envelope itself, never from toolset-supplied text.
 
 ## Instructions
@@ -47,10 +48,14 @@ envelope itself, never from toolset-supplied text.
      `stellar-agent approve --id <nonce> --profile <name>` in a trusted context. Then re-invoke
      the commit; once a grant exists, the first-invoke re-prompt is suppressed.
    - The per-action approval still fires on every toolset-routed payment, even
-     after a first-invoke grant exists. Wait for the operator to approve before
-     treating the payment as sent.
+     after a first-invoke grant exists. A commit without approval fields refuses
+     with `policy.approval_required`. Once the operator approves, re-invoke the
+     commit with `approval_nonce` and the `approval_attestation` the operator
+     relays. Treat the payment as sent only when the commit returns its
+     transaction hash.
 3. Report the submitted transaction's hash and status from the commit result.
 
 Stop and tell the user if either step is refused. Do not retry a refused commit
 with altered amounts to get under a limit; the gate matches the authoritative
-envelope, and the audit log records every attempt.
+envelope, and the audit log records the operator's approval and the
+submission's lifecycle events.

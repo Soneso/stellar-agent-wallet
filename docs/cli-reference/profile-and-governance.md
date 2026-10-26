@@ -25,7 +25,7 @@ Unset the `STELLAR_AGENT_*` variable the refusal names. On every chain that cove
 
 ## `profile`
 
-The `profile` group creates, lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) binding a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. It holds no secrets; it only names keyring entries.
+The `profile` group creates, lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) binding a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. Wallet keys stay in the keyring, and the profile only names their entries. An endpoint URL can still embed a credential.
 
 The eight key-writing commands (`enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and the five key-rotation subcommands) each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `reset-window-state` writes the same row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
 
@@ -726,7 +726,7 @@ stellar-agent approve operator enroll \
 
 ## `audit`
 
-The `audit` group verifies the per-profile audit log, an append-only, hash-chained JSONL record of transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events, and repairs its tip anchor. MCP balance reads and payment simulations produce no automatic invocation row. Under V1, payment simulations can reconcile overdue reservations and write settlement audit rows. Argument values are never logged; only argument key names are recorded. The chain links each entry to the SHA-256 of the prior entry's canonical body, so any external modification breaks verification.
+The `audit` group verifies the per-profile audit log, an append-only, hash-chained JSONL record of transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events, and repairs its tip anchor. MCP balance reads and payment simulations produce no automatic invocation row. Under V1, payment simulations can reconcile overdue reservations and write settlement audit rows. Raw argument values are never logged; only argument key names are recorded. Typed value events retain each leg's amount, asset, and redacted destination. The chain links each entry to the SHA-256 of the prior entry's canonical body, so any external modification breaks verification.
 
 The chain and the per-file chain-root signatures verify a PREFIX of the log, so an older copy of the active file, or a truncated one, passes both. What pins the END of the chain is the tip anchor: the active file's entry count, last-entry hash, and byte offset, held in the platform keyring per log path. Every value-moving verb checks it before signing, and `audit verify --profile` checks it too.
 

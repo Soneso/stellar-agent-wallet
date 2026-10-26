@@ -6,9 +6,9 @@ behavioural thresholds, and the active policy engine. It is the single source of
 truth that the `stellar-agent` CLI, the `stellar-agent-mcp` server, and the
 policy engine all read.
 
-A profile holds **no secrets**. Every key it references lives in the platform
-keyring; the profile only names those entries. See
-[Secret discipline](#secret-discipline) below.
+A profile holds **no keys**. Every key it references lives in the platform
+keyring; the profile only names those entries. An endpoint URL can still
+embed a credential. See [Secret discipline](#secret-discipline) below.
 
 For the surrounding security model and terminology, see
 [concepts.md](concepts.md). For the CLI commands that create, inspect, migrate,
@@ -327,7 +327,7 @@ EURC asset and the USDC Stellar Asset Contract.
 
 ### Security-substrate key references
 
-These four `KeyringEntryRef` fields name the keyring entries holding the
+These five `KeyringEntryRef` fields name the keyring entries holding the
 security substrate's keys. A migrated profile populates them with
 default-derived names but mints no key material; the rotation commands mint the
 actual keys (see [Migration and key rotation](#migration-and-key-rotation)).
@@ -466,9 +466,20 @@ That request is not retried.
 The client removes the stored value and the form it sends from every error text it returns, before it shortens URLs to host and port.
 A key the endpoint re-encodes, truncates, or splits is not caught.
 
+### Channel-pool state
+
+`pool init` writes these three fields, patching only the pool keys. They hold
+public data; the pool master seed stays in the keyring.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `[pool_master_key_id]` | keyring ref | no | unset | Keyring entry holding the pool master seed. Channel keys derive from it at `m/44'/148'/<index>'`. |
+| `[pool_config]` | table | no | unset | The initialized pool: `pool_size` and one `channels` record per channel, each a BIP-44 index and public G-strkey. `pool list` and `pool status` read it. |
+| `[pool_initialization]` | table | no | unset | Recovery checkpoint for `pool init`: funder, network passphrase, channel records, seed readiness, attempt memo, submission hashes, and the completion ledger. `pool init --resume` continues from it. |
+
 ### `[wallet]` block
 
-These controls apply to every CLI seed read, including `pay`, `claim`, and `accounts create`. The zero-config testnet profile uses the `"warn"` posture and a 30-second TTL.
+These controls apply to every CLI seed read from a `--*-secret-env` variable, including `pay`, `claim`, and `accounts create`. Keyring signers, the Ledger, and the MCP server never enter the unlock window. The zero-config testnet profile uses the `"warn"` posture and a 30-second TTL.
 
 Controls the [unlock window](concepts.md). This is the short, TTL-bounded period
 during which the 32-byte signing seed is resident in pinned, zeroize-on-drop
@@ -526,7 +537,8 @@ misstate the transaction without touching a signing key.
 
 ## Secret discipline
 
-No profile field holds a secret. The signer seed, nonce key, and every HMAC and
+No profile field holds a key. An endpoint URL can still embed a
+credential, as the list below describes. The signer seed, nonce key, and every HMAC and
 ed25519 key live in the platform keyring (macOS Keychain, Linux Secret Service,
 Windows Credential Manager). Each `*_key_id` field, the signer reference, and the
 nonce reference are `KeyringEntryRef` values that only name a keyring entry.

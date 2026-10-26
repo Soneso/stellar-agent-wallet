@@ -62,7 +62,15 @@ describe an attempted reset that did not take effect.
 
 ## The result envelope
 
-Every tool returns one envelope shape:
+Every tool returns one envelope shape, with five success-path exceptions:
+`stellar_toolset_list` returns a bare JSON array, and `stellar_dex_trade`,
+`stellar_dex_quote`, `stellar_defindex_vault_deposit`, and
+`stellar_defindex_vault_withdraw` return a bare object carrying a `status`
+field. Their business errors use the envelope.
+Some refusals use the JSON-RPC error channel instead of the envelope: invalid
+arguments, a `chain_id` mismatch, and the toolset capability refusals.
+`toolset.first_invoke_approval_required` is a JSON-RPC error too, and its error
+data carries the `approval_nonce`.
 
 ```json
 { "ok": true,  "data": { ... }, "request_id": "..." }
@@ -80,10 +88,11 @@ is human-facing detail and may change.
 
 ## Self-custody and the platform keyring
 
-Secrets are never stored in configuration. A profile is a per-environment TOML
+Keys are never stored in configuration. A profile is a per-environment TOML
 file (schema version 2) that binds a CAIP-2 chain id, an RPC endpoint, keyring
-entry references, thresholds, and the active policy engine. It holds no secret
-material.
+entry references, thresholds, and the active policy engine. It holds no key
+material. An endpoint URL can embed a credential in its path or query on any
+network. Mainnet refuses only a username or password in the URL.
 
 - Each `*_key_id` field in a profile is a keyring entry reference: a
   `service` + `account` pair that names a platform-keyring secret. It is never the
@@ -91,8 +100,8 @@ material.
 - The signing seed, the nonce key, and every HMAC key (attestation, audit-chain)
   live in the platform keyring: macOS Keychain, Linux Secret Service, Windows
   Credential Manager.
-- Because the TOML names secrets but does not contain them, profile TOML is safe to
-  back up. The profile's `Debug` output additionally redacts `rpc_url`,
+- The TOML names keys but does not contain them, so profile TOML is safe to back
+  up when no endpoint URL embeds a credential. The profile's `Debug` output additionally redacts `rpc_url`,
   `secondary_rpc_url` and `oracle_provider_url`, since those may embed RPC credentials.
 - The core library compiles under `#![forbid(unsafe_code)]`. Secret material is
   never written to logs at any level.
@@ -103,16 +112,19 @@ assumes those secrets stay in the keyring.
 
 ## The unlock window: TTL-bounded, zeroize-on-drop, memory-locked
 
-When a tool needs to sign, the 32-byte signing seed is loaded into a short unlock
-window:
+When a CLI command signs with a seed read from a `--*-secret-env` variable, the
+32-byte signing seed is loaded into a short unlock window. Keyring signers, the
+Ledger, and the MCP server never enter it. A keyring signer loads its key for
+each signature into a zeroize-on-drop buffer without a memory lock. The unlock
+window works as follows:
 
 - The seed is moved into a zeroize-on-drop buffer, and its backing page is pinned
   in physical RAM via `mlock` (Linux/macOS) or `VirtualLock` (Windows). Pinning the
   page keeps the seed out of swap. The pin is eager: pages are populated and locked
   at lock time, so there is no pre-first-fault swap-disclosure window.
 - The window is TTL-bounded. The default is 30 seconds; `wallet.unlock_ttl_seconds`
-  is downward-only (a value above 30 is clamped to 30 with a warning) and the hard
-  cap is 600 seconds. `ttl_seconds == 0` or `> 600` is rejected.
+  honors any value from 1 through 600 seconds. `ttl_seconds == 0` or `> 600` is
+  rejected, never clamped.
 - A background timer fires at the TTL and marks the wallet disposed.
 - On every exit path, including normal return, error propagation (`?`), and
   panic-unwind, the seed is zeroized and the lock released.
@@ -134,7 +146,7 @@ On failure the wallet emits a structured warning carrying `profile`, `reason`, a
 ```toml
 [wallet]
 mlock_required = true       # default on Linux/macOS
-unlock_ttl_seconds = 30     # default; downward-only, hard cap 600
+unlock_ttl_seconds = 30     # default; 1 through 600 honored
 ```
 
 Operational implication for an agent: the window is short. Do not assume an unlock
@@ -368,13 +380,13 @@ whose file does not exist is refused outright (`profile.load_failed`), not
 replaced by that fallback, and a profile file whose owner-key coordinate names
 a DIFFERENT profile is refused with `profile.name_mismatch` rather than used to
 sign under a name it does not own. The SEP-43
-sign-only pair (`signTransaction`, `signAuthEntry`) is not yet covered by this
-pre-flight. See [Troubleshooting](troubleshooting.md#audit-key-code).
+sign-only pair (`signTransaction`, `signAuthEntry`) runs the same pre-flight
+before signing. See [Troubleshooting](troubleshooting.md#audit-key-code).
 
 Operators verify the chain end-to-end:
 
 ```text
-stellar-agent audit verify
+stellar-agent audit verify <LOG_PATH> --profile <NAME>
 ```
 
 Verification checks per-entry chaining, cross-file rotation handoff (defeating

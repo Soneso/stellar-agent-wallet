@@ -88,7 +88,7 @@ The key is the profile's `attestation_key_id` keyring entry, a 32-byte secret. T
 
 ### Process-uid binding and non-replay
 
-`process_uid` is the numeric OS uid of the approving process. Binding it into the HMAC gives cross-account-on-host non-replay: a blob minted by uid `1000` does not verify when presented by uid `2000`, because the recomputed tag differs. The attestation proves the keyring holder ran `approve`; it is not a proof that a human clicked "yes" in an agent UI.
+`process_uid` identifies the OS user of the approving process: the numeric uid on Unix, and the process token user's SID string on Windows. Binding it into the HMAC gives cross-account-on-host non-replay: a blob minted by uid `1000` does not verify when presented by uid `2000`, because the recomputed tag differs. The attestation proves the keyring holder ran `approve`; it is not a proof that a human clicked "yes" in an agent UI.
 
 ### Key rotation invalidates pending approvals
 
@@ -324,6 +324,7 @@ Each profile command that writes long-lived key material to the keyring records 
 | `profile rotate-attestation-key` | `attestation_hmac` | none |
 | `profile rotate-counterparty-key` | `counterparty_cache_hmac` | none |
 | `profile rotate-audit-key` | `audit_hash_chain_hmac` | none |
+| `profile rotate-policy-state-key` | `policy_window_state_hmac` | none |
 
 `rotate-audit-key` takes the audit writer's exclusive sidecar lock first and holds it throughout. No other process can append or rotate while the per-file sidecars are being rewritten. The MCP server acquires its audit writer when an operation needs it, such as a commit preflight before signing. MCP balance reads do not acquire it. Under V1, payment simulations can reconcile overdue reservations, acquire the writer, and write settlement audit rows. The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor. While the server holds the writer, rotation refuses with `audit.writer_locked`, even if the operation that acquired it later fails. The envelope carries that code in its detail, as the `approval.*` and `counterparty.*` lock codes do. Acquiring the writer also runs the tip-anchor check before the key is touched, so a rolled-back log is refused with the profile's key left alone. It then (1) persists the new key, (2) appends the `keyring_key_written` row, (3) reconciles the tip anchor and drains the audit outbox, and (4) re-signs every per-file chain-root sidecar with the new key. Re-signing last is what covers a row that happened to open a new file: its chain root is brought onto the new key by the same pass. A drained consent row that opens a new file is covered by the same pass. The re-sign pass reads the replacement key from the keyring after persistence.
 
@@ -401,7 +402,7 @@ bytes[0..16]  = random salt (OsRng)
 bytes[16..48] = HMAC-SHA256 tag (32 bytes)
 ```
 
-The salt does not feed either side of the HMAC. Its role is uniqueness (two calls with the same envelope in the same millisecond still produce different nonces) and serving as the HashMap key for the replay window.
+The salt does not feed either side of the HMAC. Its role is uniqueness (two calls with the same envelope in the same millisecond still produce different nonces) and, as part of the full 48-byte nonce (salt plus tag), keying the replay window's HashMap.
 
 ### HMAC input domain
 
@@ -695,7 +696,7 @@ Multicall bundles also carry a hard floor independent of policy: `evaluate_bundl
 - **Atomic write**: temp file + `sync_data` + rename + parent-directory fsync, the same discipline as the audit log's rotation `write_sidecar_atomic`.
 - **Retention**: confirmed entries older than the largest supported window (`1w` = 604,800s) are pruned on every write. A pending entry is kept until it settles, whatever its age.
 - **Failure posture**: an unreadable, tampered (HMAC mismatch), or unparseable store file is fail closed. `PolicyEngineV1`'s construction site hydrates the store BEFORE the engine is usable. A hydration failure refuses engine construction (`policy.engine_unavailable` / `BuildRegistryError::PolicyEngineError`) rather than silently starting with an empty store. Recovery: `stellar-agent profile reset-window-state <name> --reason <reason>`, which re-initialises the file to empty and audits the reset (`PolicyWindowStateReset`).
-- **Rotation**: `stellar-agent profile rotate-policy-state-key <name>` mints a fresh key and re-signs the store file's existing body under it. No old-key read is required. This is the same "recompute the tag over the unchanged body" shape as `rotate-audit-key`'s chain-root sidecar re-sign, so accumulated history survives rotation.
+- **Rotation**: `stellar-agent profile rotate-policy-state-key <name>` first verifies an existing store file's tag under the old key. It refuses the rotation, changing nothing, when the tag does not verify or the file exists without a minted old key. It then mints a fresh key and re-signs the store file's existing body under it. The re-sign itself needs no old key. This is the same "recompute the tag over the unchanged body" shape as `rotate-audit-key`'s chain-root sidecar re-sign, so accumulated history survives rotation.
 
 Stateful criteria derive window entries from the same `ValueEffects` used by evaluation and audit. Network submissions reserve those entries before sending and settle them from the ledger result. A reservation's id is the envelope hash, so the window refuses a second reservation for bytes it already holds, pending or confirmed: the recorder asks before it writes the pending row, which keeps a resend after a lost receipt from writing any row, and the reservation write refuses again under the file lock. Both map to `submission.tx_already_submitted`. The refusal exists only where the submission takes a reservation, so only under a policy with a stateful criterion. A release drops the pending records of a reservation and keeps its confirmed ones. A release on chain evidence (a consumed sequence, or an observed close time past a nonzero time bound, each confirmed by a fresh `NOT_FOUND`) records `release_code` on the receipt, restores a missing receipt first, and reports the submission as settled, so the caller writes a `value_action_failed` row under the evidence's code; a later status run writes it from the receipt when that append failed. MPP and x402 authorizers use `record_authorized_window_state`, which applies the reservation comparison under the file lock before signing or signed RPC re-simulation. Refusal records no entries, withholds the credential, and carries the governing policy denial to the caller. Admitted authorization spend consumes window headroom even if subsequent signing or delivery fails. The x402 tools validate the payment requirements in full before the dispatch gate, so invalid requirements consume no headroom. Admission precedes the endpoint identity check inside `create_payment`, so an identity refusal keeps the admitted spend. `record_confirmed_window_state` remains an unconditional post-confirmation recorder: spend already applied on-chain must be counted, and a persistence failure is logged.
 
@@ -819,9 +820,9 @@ Signing the digest rather than the raw `signature_payload` closes the rule-id do
 
 ## Redaction discipline
 
-Audit and policy wire output never carry argument values or secrets:
+Audit and policy wire output never carry secrets or raw argument maps:
 
-- The audit log records argument key names only (`arg_keys`); values are never logged at any level.
+- The audit log records raw argument key names only (`arg_keys`); raw argument values are never logged at any level. Typed value events retain each leg's amount, asset, and redacted destination.
 - Strkeys (`G` / `C` / `T` / `M` / `P`) in `decision_reason` are redacted to first-5-last-5 (for example `GABC...WXYZ`).
 - Transaction hashes are redacted to first-8-last-8.
 - The `envelope_hash` is recorded unredacted because it is a SHA-256 digest with no user data.

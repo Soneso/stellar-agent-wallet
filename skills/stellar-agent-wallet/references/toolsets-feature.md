@@ -14,8 +14,11 @@ are reading right now.
 The feature exists to enforce least privilege. A wallet toolset grants an
 agent a narrow, declared capability set; the wallet treats the toolset as data
 (a manifest plus a capability declaration), never executes toolset-supplied code,
-and never lets a toolset reach a signing, key, or policy tool through its declared
-capabilities. This FEATURE restricts what an agent may do. It is NOT a way to
+and never lets a toolset reach a signing, key, or policy tool through its ungated
+capabilities. The only signing tools a toolset reaches are `stellar_pay_commit`
+and `stellar_rule_create_commit`, through the gated `sign-payment` and
+`sign-rule-create` capabilities, each behind a first-invoke grant and a
+per-action approval. This FEATURE restricts what an agent may do. It is NOT a way to
 teach an agent.
 
 For the broader MCP tool surface used to invoke actions, see `./mcp-tools.md`
@@ -66,6 +69,7 @@ The capability manifest is the space-separated value of
 | `observe-event` | Observe a ledger event. No tool is wired to this capability yet, so it grants nothing. |
 | `sign-payment` | Sign and submit a classic payment. Signing-adjacent and gated; inert until the first-invoke gate converts it to a runtime grant. |
 | `read-rules` | Read the agent's own context rules (spending-limit budgets, expiry, signer/policy counts). Separately grantable from `read-balance`. |
+| `sign-rule-create` | Install an agent-proposed context rule on-chain. Signing-adjacent and gated; inert until the first-invoke gate converts it to a runtime grant. The per-proposal operator attestation fires regardless of the grant. |
 
 The bare token `sign-transaction` is always refused with a format error. There
 is no flat "sign" capability. Signing is never grantable as a plain manifest
@@ -84,7 +88,7 @@ trusted tool names:
 | Capability | Tools granted |
 |---|---|
 | `read-balance` | `stellar_balances` |
-| `propose-transaction` | `stellar_pay` (build unsigned only) |
+| `propose-transaction` | `stellar_pay`, `stellar_claim`, `stellar_rule_create` (build unsigned / simulate only) |
 | `suggest-destination` | `stellar_sep47_discover`, `stellar_sep48_preview_invocation`, `stellar_sep7_parse_uri` |
 | `observe-event` | (none) |
 | `read-rules` | `stellar_rules_list`, `stellar_rules_get` |
@@ -93,16 +97,18 @@ The ungated matrix contains no signing, key-derivation, or policy-mutation tool.
 A toolset that declares every capability still cannot resolve a signing tool
 through the ungated path, because no such tool exists in the matrix to resolve
 to. The build-vs-commit split is load-bearing: `propose-transaction` grants
-`stellar_pay` (which builds an unsigned envelope), never `stellar_pay_commit`
-(which signs and submits).
+`stellar_pay`, `stellar_claim`, and `stellar_rule_create` (which build an
+unsigned envelope or a simulated rule proposal), never `stellar_pay_commit`,
+`stellar_claim_commit`, or `stellar_rule_create_commit` (which sign and submit).
 
 ### Gated tier
 
-A separate table for the one signing-adjacent capability:
+A separate table for the two signing-adjacent capabilities:
 
 | Capability | Tool | Admission |
 |---|---|---|
 | `sign-payment` | `stellar_pay_commit` | First-invoke gate plus unconditional per-action approval only |
+| `sign-rule-create` | `stellar_rule_create_commit` | First-invoke gate plus unconditional per-proposal operator attestation only |
 
 ### Signing denylist
 
@@ -111,7 +117,7 @@ string, including `stellar_pay_commit`, the SEP-43 and SEP-53 signing tools, the
 `*_commit` tools, the x402 tools, and the toolset dispatcher's own tools
 `stellar_toolset_list` / `stellar_toolset_invoke` (the last two prevent a toolset from
 re-invoking the dispatcher to escalate). The denylist and the ungated matrix are
-disjoint by literal name, so the gated tool is unreachable from the ungated
+disjoint by literal name, so the gated tools are unreachable from the ungated
 resolver.
 
 ### The four-part check
@@ -283,27 +289,31 @@ the gated path). Read-only and non-destructive.
 }
 ```
 
-No signing, key, or policy tool is reachable through any capability, so an
+No signing, key, or policy tool is reachable through an ungated capability, so an
 `action` naming a signing tool returns `toolset.unknown_action` (the tool is not in
-the matrix to resolve). For a `sign-payment` toolset, `action:
+the matrix to resolve). The two gated tools are the exception. For a `sign-payment` toolset, `action:
 "stellar_pay_commit"` is routed through the gated resolver instead: `args` must
 carry the `envelope_xdr` produced by a prior `stellar_pay` simulate call, from
 which the destination, asset, and amount are decoded authoritatively. If the
 first-invoke gate fires, the call returns `toolset.first_invoke_approval_required`
 with the approval nonce; once a grant exists, the per-action payment approval is
-still forced on for the commit.
+still forced on for the commit. For a `sign-rule-create` toolset, `action:
+"stellar_rule_create_commit"` takes the same gated route, and the operator
+attestation over the proposal is always required.
 
-All wallet tool results use the envelope `{ok, data|error, request_id}`. Amounts
-are decimal strings with a unit such as `"10 XLM"`, never JSON numbers. Asset is
+Wallet tool results use the envelope `{ok, data|error, request_id}`, except that
+`stellar_toolset_list` returns a bare array. The capability refusals and
+`toolset.first_invoke_approval_required` are JSON-RPC errors, and the latter
+carries the `approval_nonce` in its error data. Amounts are decimal strings with a
+unit such as `"10 XLM"`, never JSON numbers; `stellar_pay` also accepts a raw
+stroop integer string as `amount_in_stroops`. Asset is
 `"native"`/`"XLM"` or `"CODE:GISSUER"`.
 
 ## CLI commands
 
 The subcommand group is `stellar-agent toolsets` (plural). All four subcommands are
 local and offline (no network calls, no chain signing) and print a JSON
-envelope. Each prints its success envelope on stdout. `install` and `uninstall`
-write the error envelope to stderr; `list` and `run` write the error envelope to
-stdout. Exit code is `0` on success, `1` on any error. The toolsets root defaults
+envelope. Each prints its success and error envelopes on stdout. Exit code is `0` on success, `1` on any error. The toolsets root defaults
 to the OS-conventional toolsets directory; `--toolsets-dir <PATH>` overrides it on
 every subcommand.
 
@@ -336,7 +346,7 @@ stellar-agent toolsets install balance-reporter@1.0.0 \
   --publisher GABC...WXYZ
 ```
 
-The success envelope reports `status`, `package`, `version`, and `attestation`
+The success envelope reports `package`, `version`, and `attestation`
 (`attested` / `overridden` / `not-required`).
 
 ### `toolsets list`
@@ -360,8 +370,8 @@ stellar-agent toolsets list
 
 Runs the four-part capability enforcement check for a toolset action and resolves
 the trusted registry tool it routes to. It does **not** execute the routed tool;
-on success it reports `status: "resolved"` with the `routed_to` tool name and a
-note that execution is not wired in the CLI. Use the MCP surface for execution.
+on success it reports `toolset`, `action`, the `routed_to` tool name, and a
+`note` that execution is not wired in the CLI. Use the MCP surface for execution.
 
 Positionals: `<TOOLSET-NAME>`: the installed package name (e.g.
 `balance-reporter`); `<ACTION>`: the exact registry tool name granted by the
@@ -401,7 +411,7 @@ stellar-agent toolsets uninstall balance-reporter
 | Code | Cause |
 |---|---|
 | `toolset.not_installed` | Named toolset has no pin record. |
-| `toolset.unknown_action` | Action does not resolve through the matrix (includes any signing tool named directly). |
+| `toolset.unknown_action` | Action does not resolve through the matrix (includes any signing tool named directly other than the two gated tools). |
 | `toolset.capability_not_declared` | Resolved tool's capability is not in the toolset's declared set. |
 | `toolset.tool_not_allowed` | Resolved tool is excluded by the toolset's `allowed_tools` narrowing. |
-| `toolset.first_invoke_approval_required` | Gated payment has no current matching grant; returns an approval nonce for `stellar-agent approve --id <nonce> --profile <name>`. |
+| `toolset.first_invoke_approval_required` | Gated payment or rule-create commit has no current matching grant; returns an approval nonce for `stellar-agent approve --id <nonce> --profile <name>`. |

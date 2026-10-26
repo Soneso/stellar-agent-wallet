@@ -51,6 +51,7 @@ Simulate step: builds a CreateAccount transaction envelope and mints a single-us
 - `source` (string, required): G-strkey of the funding account.
 - `destination` (string, required): G-strkey of the new account to create.
 - `starting_balance` (string, required): Amount with unit suffix, e.g. `"1 XLM"`.
+- `fee` (string, optional): Classic fee per operation: `<stroops>`, `auto`, or `auto:pNN`.
 
 **Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, simulation}`.
 
@@ -75,6 +76,8 @@ Commit step: verifies the nonce, re-builds the envelope for divergence check, si
 - `nonce` (string, required): Base64 nonce from the simulate step.
 - `expires_at_unix_ms` (number, required): Expiry from the simulate step.
 - `envelope_xdr` (string, required): Base64 envelope from the simulate step.
+- `approval_nonce` (string, optional): Approval nonce from the simulate step's `approval` block. Required, with `approval_attestation`, when the simulate step reported that approval is required.
+- `approval_attestation` (string, optional): URL-safe base64 attestation that `stellar-agent approve` writes after the operator confirms.
 
 **Returns:** `{tx_hash, ledger, cross_check}` on success.
 
@@ -90,12 +93,15 @@ without the cap returns `validation.mainnet_fee_cap_required`.
 
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
 `fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
-`network.witness_unavailable`, `policy.engine_required`, `policy.approval_consumed`,
+`network.witness_unavailable`, `policy.engine_required`, `policy.approval_required`,
+`policy.approval_rejected`, `policy.approval_consumed`,
 `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`,
 `network.rpc_credential_refused`, `auth.keyring_not_found`,
 `network.envelope_signed_for_mainnet`, `network.envelope_signature_unverifiable`,
 `network.envelope_unsigned`, `submission.tx_timeout`, `submission.tx_already_submitted`,
 `submission.hash_mismatch`, `submission.record_unavailable`.
+
+**Approval outcomes:** `policy.approval_required` means no valid approval was presented: retry the commit with `approval_nonce` and `approval_attestation` once the operator approves. `policy.approval_rejected` means the operator declined: stop retrying.
 
 `cross_check` reports `passed` with `provider` and `ledger`, `skipped` with a
 reason, or `not_required` with reason `below_threshold`.
@@ -110,12 +116,13 @@ Simulate step: builds a Payment transaction envelope for a native XLM or non-nat
 - `destination` (string, required): G-strkey of the recipient account.
 - `amount` (string, optional): Amount with unit suffix, e.g. `"10 XLM"`. Mutually exclusive with
   `amount_in_stroops`.
-- `amount_in_stroops` (number, optional): Raw positive stroop integer. Mutually exclusive with `amount`.
+- `amount_in_stroops` (string, optional): Raw positive stroop integer as a decimal string, e.g. `"10000000"`. Mutually exclusive with `amount`.
 - `asset` (string, required): `"native"` / `"XLM"` or `"CODE:G…ISSUER"`.
 - `memo_text` (string, optional): UTF-8 text memo (≤ 28 bytes). Mutually exclusive.
 - `memo_id` (number, optional): Integer memo (u64). Mutually exclusive.
 - `memo_hash_hex` (string, optional): 32-byte hash memo as 64 hex chars. Mutually exclusive.
 - `memo_return_hex` (string, optional): 32-byte return memo as 64 hex chars. Mutually exclusive.
+- `fee` (string, optional): Classic fee per operation: `<stroops>`, `auto`, or `auto:pNN`.
 
 **Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, simulation}`.
 
@@ -140,13 +147,15 @@ Commit step: verifies the nonce, re-builds the Payment envelope for divergence c
 - `destination` (string, required): G-strkey of the recipient account.
 - `amount` (string, optional): Amount with unit suffix (same as simulate). Mutually exclusive with
   `amount_in_stroops`.
-- `amount_in_stroops` (number, optional): Raw positive stroop integer (same as simulate). Mutually
-  exclusive with `amount`.
+- `amount_in_stroops` (string, optional): Raw positive stroop integer as a decimal string (same as
+  simulate). Mutually exclusive with `amount`.
 - `asset` (string, required): Asset descriptor (same as simulate).
 - `memo_text` / `memo_id` / `memo_hash_hex` / `memo_return_hex` (optional, same as simulate).
 - `nonce` (string, required): Base64 nonce from the simulate step.
 - `expires_at_unix_ms` (number, required): Expiry from the simulate step.
 - `envelope_xdr` (string, required): Base64 envelope from the simulate step.
+- `approval_nonce` (string, optional): Approval nonce from the simulate step's `approval` block. Required, with `approval_attestation`, when the simulate step reported that approval is required.
+- `approval_attestation` (string, optional): URL-safe base64 attestation that `stellar-agent approve` writes after the operator confirms.
 
 **Returns:** `{tx_hash, ledger, cross_check}` on success.
 
@@ -166,19 +175,44 @@ without the cap returns `validation.mainnet_fee_cap_required`.
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
 `fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
 `network.witness_unavailable`, `network.rpc_divergence`, `validation.memo_required`,
-`policy.engine_required`, `policy.approval_consumed`,
-`validation.memo_mutually_exclusive`, `network.endpoint_network_mismatch`,
+`policy.engine_required`, `policy.approval_required`, `policy.approval_rejected`,
+`policy.approval_consumed`, `validation.memo_mutually_exclusive`, `network.endpoint_network_mismatch`,
 `network.endpoint_identity_unavailable`, `network.rpc_credential_refused`,
 `auth.keyring_not_found`, `network.envelope_signed_for_mainnet`,
 `network.envelope_signature_unverifiable`, `network.envelope_unsigned`, `submission.tx_timeout`,
 `submission.tx_already_submitted`, `submission.hash_mismatch`, `submission.record_unavailable`.
 
+**Approval outcomes:** `policy.approval_required` means no valid approval was presented: retry the commit with `approval_nonce` and `approval_attestation` once the operator approves. `policy.approval_rejected` means the operator declined: stop retrying.
+
 `cross_check` reports `passed` with `provider` and `ledger`, `skipped` with a
 reason, or `not_required` with reason `below_threshold`.
+
+## stellar_claim
+
+Simulate step: fetches the claimable-balance entry, renders a typed preview, enforces the claim guards (claimant, predicate, trustline, fee affordability), builds a `ClaimClaimableBalance` envelope, and mints a single-use nonce. Pass `envelope_xdr`, `nonce`, and `expires_at_unix_ms` unmodified to `stellar_claim_commit`.
+
+**Arguments:**
+- `chain_id` (string, required): CAIP-2 chain identifier.
+- `balance_id` (string, required): Claimable-balance id: a `B...` strkey, the canonical 72-hex id, or the bare 64-hex hash.
+- `source_account` (string, optional): G-strkey of the claiming account. Defaults to the profile's default MCP signer account.
+
+**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, preview}`.
+
+**Annotations:** `readOnlyHint=false`, `destructiveHint=false`.
 
 ## stellar_claim_commit
 
 Commit step for `stellar_claim`: verifies the nonce, re-builds the `ClaimClaimableBalance` envelope for the divergence check, signs via the profile keyring, and submits. Testnet-only. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
+
+**Arguments:**
+- `chain_id` (string, required): CAIP-2 chain identifier.
+- `balance_id` (string, required): Claimable-balance id (same as simulate).
+- `source_account` (string, optional): G-strkey of the claiming account (same as simulate).
+- `nonce` (string, required): Base64 nonce from the simulate step.
+- `expires_at_unix_ms` (number, required): Expiry from the simulate step.
+- `envelope_xdr` (string, required): Base64 envelope from the simulate step.
+- `approval_nonce` (string, optional): Approval nonce from the simulate step's `approval` block. Required, with `approval_attestation`, when the simulate step reported that approval is required.
+- `approval_attestation` (string, optional): URL-safe base64 attestation that `stellar-agent approve` writes after the operator confirms.
 
 **Returns:** `{tx_hash, ledger, cross_check}` on success.
 
@@ -199,7 +233,8 @@ without the cap returns `validation.mainnet_fee_cap_required`.
 
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
 `fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
-`network.witness_unavailable`, `policy.engine_required`, `policy.approval_consumed`,
+`network.witness_unavailable`, `policy.engine_required`, `policy.approval_required`,
+`policy.approval_rejected`, `policy.approval_consumed`,
 `network.endpoint_network_mismatch`,
 `network.endpoint_identity_unavailable`, `network.rpc_credential_refused`,
 `auth.keyring_not_found`, `network.envelope_signed_for_mainnet`,
@@ -207,9 +242,35 @@ without the cap returns `validation.mainnet_fee_cap_required`.
 `submission.tx_timeout`, `submission.tx_already_submitted`, `submission.hash_mismatch`,
 `submission.record_unavailable`.
 
+**Approval outcomes:** `policy.approval_required` means no valid approval was presented: retry the commit with `approval_nonce` and `approval_attestation` once the operator approves. `policy.approval_rejected` means the operator declined: stop retrying.
+
+## stellar_trustline
+
+Simulate step: resolves the asset, fetches the issuer's live flags, runs the clawback gate, builds a `ChangeTrust` envelope, and mints a single-use nonce. USDT is refused unconditionally. Pass `envelope_xdr`, `nonce`, and `expires_at_unix_ms` unmodified to `stellar_trustline_commit`.
+
+**Arguments:**
+- `chain_id` (string, required): CAIP-2 chain identifier.
+- `from` (string, required): G-strkey of the account that holds the trustline.
+- `asset` (string, required): A bare code such as `"USDC"`, resolved through the pin table, or `"CODE:G…ISSUER"`. A SAC `C…` address returns a typed error.
+- `limit_stroops` (string, optional): Trustline limit in stroops as a decimal string. Absent sets the protocol default (`i64::MAX`); `"0"` removes the trustline.
+- `fee` (string, optional): Classic fee per operation: `<stroops>`, `auto`, or `auto:pNN`.
+
+**Returns:** `{envelope_xdr, nonce, expires_at_unix_ms, preview}`.
+
+**Annotations:** `readOnlyHint=false`, `destructiveHint=false`.
+
 ## stellar_trustline_commit
 
 Commit step for `stellar_trustline`: verifies the nonce, re-builds the `ChangeTrust` envelope for the divergence check, signs via the profile keyring, and submits. Testnet-only. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
+
+**Arguments:**
+- `chain_id` (string, required): CAIP-2 chain identifier (same as simulate).
+- `from` (string, required): G-strkey of the trustline account (same as simulate).
+- `nonce` (string, required): Base64 nonce from the simulate step.
+- `expires_at_unix_ms` (number, required): Expiry from the simulate step.
+- `envelope_xdr` (string, required): Base64 envelope from the simulate step. The commit derives the asset, issuer, and limit from it.
+- `approval_nonce` (string, optional): Approval nonce from the simulate step's `approval` block. Required, with `approval_attestation`, when the simulate step reported that approval is required.
+- `approval_attestation` (string, optional): URL-safe base64 attestation that `stellar-agent approve` writes after the operator confirms.
 
 **Returns:** `{tx_hash, ledger, cross_check}` on success.
 
@@ -236,7 +297,8 @@ without the cap returns `validation.mainnet_fee_cap_required`.
 
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
 `fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
-`network.witness_unavailable`, `policy.engine_required`, `policy.approval_consumed`,
+`network.witness_unavailable`, `policy.engine_required`, `policy.approval_required`,
+`policy.approval_rejected`, `policy.approval_consumed`,
 `network.endpoint_network_mismatch`,
 `network.endpoint_identity_unavailable`, `network.rpc_credential_refused`,
 `auth.keyring_not_found`, `network.envelope_signed_for_mainnet`,
@@ -245,6 +307,8 @@ without the cap returns `validation.mainnet_fee_cap_required`.
 `submission.record_unavailable`.
 Clawback re-check refusals use `trustline.gate_refused` or
 `trustline.clawback_opt_in_required`, as described above.
+
+**Approval outcomes:** `policy.approval_required` means no valid approval was presented: retry the commit with `approval_nonce` and `approval_attestation` once the operator approves. `policy.approval_rejected` means the operator declined: stop retrying.
 
 ## stellar_transaction_status
 
@@ -278,7 +342,7 @@ Three error codes describe a submission whose outcome the wallet cannot settle o
 `details` carries:
 
 - `tx_hash`: the transaction to reconcile, 64 lowercase hex characters, in full.
-- `envelope_hash`: the submission record's identity, which `stellar-agent tx receipt clear` takes. Present only where the reporting surface holds the signed bytes; the DeFi verbs do not. Recover it from `stellar_transaction_status`'s `record.envelope_hash` when it is absent.
+- `envelope_hash`: the submission record's identity, which `stellar-agent tx receipt clear` takes. Present where the reporting surface holds the signed bytes, the DeFi verbs included. Recover it from `stellar_transaction_status`'s `record.envelope_hash` when it is absent.
 - `timeout_seconds`: present on `submission.tx_timeout`.
 - `server_tx_hash`: present on `submission.hash_mismatch`.
 - `outcome`: always `"unknown"`.

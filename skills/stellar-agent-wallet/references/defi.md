@@ -14,14 +14,14 @@ stdio server.
   returns exit code `0` on success, `1` on any error. The envelope shape is
   `{ok, data|error, request_id}`: `ok: true` carries `data`; `ok: false`
   carries `error` (with `code` and `message`).
-- **Amounts:** at the agent surface, amounts are decimal strings with a unit,
-  e.g. `"10 XLM"` or `"500 USDC:GA..."`, never JSON numbers. The CLI DeFi
-  signing flags below take raw integer base units (`<i128>`); the agent-facing
-  unitful string is parsed to that base unit before signing.
+- **Amounts:** the CLI DeFi signing flags below take raw integer base units
+  (`<i128>`). The MCP DeFi tools take the same raw base units as decimal
+  integer strings, e.g. `"10000000"`, never JSON numbers and never with a unit.
 - **Assets:** `native` / `XLM`, or `CODE:GISSUER`, or a contract `C-strkey`.
 - **chain_id:** every MCP tool listed here requires a `chain_id` argument
   carrying the CAIP-2 chain id (e.g. `stellar:testnet`), which must match the
-  loaded profile.
+  loaded profile. `stellar_dex_quote` is the exception: it never matches its
+  `chain_id` against the profile and selects the router from it.
 - **Default network:** testnet (`stellar:testnet`). Friendbot funding is
   testnet-only.
 
@@ -38,12 +38,13 @@ Before signing, each one:
 2. Refuses a mainnet profile with `network.mainnet_write_forbidden`, before the
    keyring, the signer, and any RPC call.
 3. Pins the target contract by WASM hash (a two-RPC cross-check when
-   `--secondary-rpc-url` is supplied) so the named address actually runs the code
+   a secondary RPC is set by `--secondary-rpc-url` or the profile) so the named address actually runs the code
    the wallet expects.
 4. Evaluates the operator policy engine for the tool descriptor. A `Deny`
    refuses with `policy.deny.<code>`. A `RequireApproval` refuses with
-   `policy.approval_required` and directs you to the MCP server for two-phase
-   approval. The CLI has no interactive approval path for these verbs. A policy
+   `policy.approval_required`. Neither the CLI nor the MCP server has an
+   approval path for these verbs; the MCP tools refuse the same decision with
+   `policy.approval_required_unsupported`. A policy
    engine configured but unbuildable refuses with `policy.engine_unavailable`
    (fail closed).
 5. Loads the signing key from the OS keyring entry named by the profile, then
@@ -106,7 +107,7 @@ protection on that asset, opted into explicitly.
 | `--amounts-min <i128>...` | Minimum accepted amount per asset (same length as `--amounts-desired`); `0` disables slippage protection on that asset | Required | none |
 | `--invest` | Auto-invest immediately after deposit | Optional | `false` |
 | `--override-upgradable` | Proceed on an `upgradable:true` vault; emits a `vault.upgradable_override` audit event | Optional | `false` |
-| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check | Optional | none |
+| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check | Optional | profile `secondary_rpc_url`, else none |
 
 ```bash
 stellar-agent vault deposit \
@@ -131,7 +132,7 @@ pre-sign refusal.
 | `--shares <i128>` | Number of vault shares to redeem (raw on-chain value) | Required | none |
 | `--min-amounts-out <i128>...` | Minimum amount to receive per asset (one or more) | Required | none |
 | `--override-upgradable` | Proceed on an `upgradable:true` vault | Optional | `false` |
-| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check | Optional | none |
+| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check | Optional | profile `secondary_rpc_url`, else none |
 
 ```bash
 stellar-agent vault withdraw \
@@ -170,8 +171,8 @@ explicit address vector and is never auto-routed.
 | `--amount-in <i128>` | Exact input token amount in base units | Required | none |
 | `--amount-out-min <i128>` | Minimum output amount, as an absolute floor (not a percent) | Required | none |
 | `--path <ASSET>` | One swap-path element; repeat the flag to build the path. First element is the input token, last is the output token. Validated to have at least two elements before signing. Each value is a C-strkey, `native`, or `CODE:ISSUER` | Required | none |
-| `--deadline <UNIX_SECS>` | Swap deadline as a Unix timestamp in seconds; a missing, zero, or excessively-far deadline is refused | Optional | `now + 300s` |
-| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC router WASM-hash cross-check | Optional | none |
+| `--deadline <UNIX_SECS>` | Swap deadline as a Unix timestamp in seconds. An omitted deadline defaults to the current time plus 300 seconds; one at or before the current time, or over 3600 seconds ahead, is refused | Optional | `now + 300s` |
+| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC router WASM-hash cross-check | Optional | profile `secondary_rpc_url`, else none |
 
 ```bash
 stellar-agent trade \
@@ -307,7 +308,7 @@ stellar-agent pool status --profile default
 | Code | Raised by | Meaning |
 |---|---|---|
 | `policy.deny.<code>` | all signing verbs | Operator policy denied the operation |
-| `policy.approval_required` | all signing verbs | Needs two-phase approval via the MCP server |
+| `policy.approval_required` | all signing verbs | Policy requires approval; these verbs have no approval path on the CLI or MCP |
 | `policy.engine_unavailable` | all signing verbs | Policy engine configured but unbuildable (fail-closed) |
 | `oracle.staleness_exceeded` | none | Oracle price older than the staleness threshold |
 | `vault.upgradable_refused` | `vault` | Vault `upgradable:true`; not overridden |

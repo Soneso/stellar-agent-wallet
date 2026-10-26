@@ -12,8 +12,8 @@ Every command emits a JSON envelope on stdout by default and returns exit code `
 
 1. Loads the named profile (`--profile`, else `STELLAR_AGENT_PROFILE`, else `default`) and resolves the CAIP-2 chain id, RPC endpoint, and network passphrase from it.
 2. Refuses a mainnet profile with `network.mainnet_write_forbidden`, before the keyring, the signer, and any RPC call.
-3. Pins the target contract by WASM hash (a two-RPC cross-check when `--secondary-rpc-url` is supplied) so the address you name actually runs the code the wallet expects.
-4. Evaluates the operator policy engine for the corresponding tool descriptor. A `Deny` decision refuses with `policy.deny.<code>`. A `RequireApproval` decision refuses with `policy.approval_required` and a message directing you to the MCP server for two-phase approval. The CLI has no interactive approval path for these verbs. A policy engine that is configured but cannot be built refuses with `policy.engine_unavailable` (fail closed: the value-moving operation does not run permissively).
+3. Pins the target contract by WASM hash (a two-RPC cross-check when `--secondary-rpc-url` or the profile's `secondary_rpc_url` supplies a secondary) so the address you name actually runs the code the wallet expects.
+4. Evaluates the operator policy engine for the corresponding tool descriptor. A `Deny` decision refuses with `policy.deny.<code>`. A `RequireApproval` decision refuses with `policy.approval_required`. Neither the CLI nor the MCP server has an approval path for these verbs: the MCP tools refuse the same decision with `policy.approval_required_unsupported`. A policy engine that is configured but cannot be built refuses with `policy.engine_unavailable` (fail closed: the value-moving operation does not run permissively).
 5. Loads the signing key from the OS keyring entry named by the profile, then signs and submits through the venue adapter.
 
 These commands do not accept `--output`; they always emit JSON. Only the `pool` subcommands offer `--output`.
@@ -41,7 +41,7 @@ A self-managed vault, one where the depositor holds every fund-affecting role (M
 | `--amounts-min <i128>...` | Minimum accepted amount per asset (same length as `--amounts-desired`); `0` disables slippage protection on that asset | Required | none |
 | `--invest` | Auto-invest immediately after deposit | Optional | `false` |
 | `--override-upgradable` | Proceed on an `upgradable:true` vault; emits a `vault.upgradable_override` audit event | Optional | `false` |
-| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check | Optional | none |
+| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check | Optional | profile `secondary_rpc_url`, else none |
 
 Example:
 
@@ -68,7 +68,7 @@ Withdraw assets from a DeFindex vault by redeeming shares. Same venue, signing p
 | `--shares <i128>` | Number of vault shares to redeem (raw on-chain value) | Required | none |
 | `--min-amounts-out <i128>...` | Minimum amount to receive per asset (one or more values) | Required | none |
 | `--override-upgradable` | Proceed on an `upgradable:true` vault | Optional | `false` |
-| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check | Optional | none |
+| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC WASM-hash cross-check | Optional | profile `secondary_rpc_url`, else none |
 
 Example:
 
@@ -97,7 +97,7 @@ The router address and WASM hash are resolved per-network; a network with no pin
 | `--amount-out-min <i128>` | Minimum output amount, as an absolute floor (not a percent) | Required | none |
 | `--path <ASSET>` | One swap-path element; repeat the flag to build the path. First element is the input token, last is the output token. The path is validated to have at least two and at most five elements before signing. Each value is a C-strkey, `native`, or `CODE:ISSUER` | Required | none |
 | `--deadline <UNIX_SECS>` | Swap deadline as a Unix timestamp in seconds; refused when more than 3600 seconds (1 hour) in the future | Optional | `now + 300s` |
-| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC router WASM-hash cross-check | Optional | none |
+| `--secondary-rpc-url <URL>` | Second RPC endpoint for the two-RPC router WASM-hash cross-check | Optional | profile `secondary_rpc_url`, else none |
 
 Example:
 

@@ -248,7 +248,7 @@ Adds a policy contract to a rule (OZ `add_policy`). The per-rule policy cap (5) 
 `--kind <raw|spending-limit|simple-threshold|weighted-threshold>` (default `raw`) selects the install-parameter mode:
 
 - `--kind raw` (default): the caller supplies `--policy-address` and a hand-encoded `--install-param`. Works with any policy contract.
-- `--kind spending-limit`: the wallet resolves the deployed OZ spending-limit policy from the [`VerifierRegistry`](../agent-delegation.md) (or an explicit `--policy` override) and builds the typed `SpendingLimitAccountParams` install parameter internally. Refused client-side before any network call when `--limit <= 0` or `--period == 0` (mirroring the on-chain `InvalidLimitOrPeriod` constraint), and when the target rule's context type is not `call-contract` (mirroring `OnlyCallContractAllowed`): see [Agent delegation](../agent-delegation.md).
+- `--kind spending-limit`: the wallet resolves the deployed OZ spending-limit policy from the [`VerifierRegistry`](../agent-delegation.md) (or an explicit `--policy` override) and builds the typed `SpendingLimitAccountParams` install parameter internally. Refused client-side before any network call when `--limit <= 0` or `--period == 0` (mirroring the on-chain `InvalidLimitOrPeriod` constraint). Refused after the rule read, before simulation and submission, when the target rule's context type is not `call-contract` (mirroring `OnlyCallContractAllowed`): see [Agent delegation](../agent-delegation.md).
 - `--kind simple-threshold`: the wallet resolves the deployed OZ simple threshold-policy (signer-count based; use `smart-account deploy-policy --kind simple-threshold` first) and builds the `SimpleThresholdAccountParams { threshold }` install parameter from `--threshold`. Refused client-side when `--threshold == 0`.
 - `--kind weighted-threshold`: the wallet resolves the deployed OZ weighted-threshold policy (`smart-account deploy-policy --kind weighted-threshold`) and builds the `WeightedThresholdAccountParams { signer_weights, threshold }` install parameter from one or more `--weighted-signer-delegated` / `--weighted-signer-webauthn` flags plus `--threshold`. Refused client-side when the signer-weight set is empty, when `--threshold == 0`, or when `--threshold` exceeds the sum of the supplied weights.
 
@@ -257,7 +257,7 @@ Flags:
 - `--account <C_STRKEY>` (required).
 - `--rule-id <U32>` (required): rule to add the policy to.
 - `--policy-address <C_STRKEY>`: policy contract address. Required with `--kind raw`; rejected with the other kinds.
-- `--install-param <SCVAL_BASE64>`: a standard-base64 XDR `ScVal` install parameter (not base64url), passed to `add_policy` without further validation (raw passthrough). Required with `--kind raw`; rejected with the other kinds.
+- `--install-param <SCVAL_BASE64>`: a standard-base64 XDR `ScVal` install parameter (not base64url), passed to `add_policy` as given (raw passthrough). One exception: when the policy is recognized as the allowlisted simple-threshold policy, the parameter must be exactly `{ threshold: U32(t) }` with `t >= 1`, or the add refuses with `sa.simple_threshold_install_refused`. Required with `--kind raw`; rejected with the other kinds.
 - `--limit <STROOPS>`: spending limit in stroops (`--kind spending-limit`, required). The `i128` amount the rolling window admits before the policy panics `SpendingLimitExceeded`.
 - `--period <LEDGERS>`: rolling-window length in ledgers (`--kind spending-limit`, required).
 - `--policy <C_STRKEY>`: spending-limit policy contract override (`--kind spending-limit`). When omitted, resolves from the registry populated by `smart-account deploy-spending-limit-policy`; fails closed with a deploy-first hint if absent.
@@ -546,7 +546,7 @@ stellar-agent smart-account signers set-threshold \
 
 ### `smart-account signers set-weighted-threshold`
 
-Changes a rule's weighted-threshold policy's `threshold` (OZ `set_threshold` on the weighted-threshold policy contract). Signs and submits. Testnet only. The policy is identified by wasm-hash allowlist lookup (a SEPARATE allowlist from the simple threshold-policy's: the two kinds never cross-identify); zero or multiple matches refuse with the typed `WeightedThresholdNotInstalled` / `WeightedThresholdPolicyIdentificationFailed`. Refused client-side before any network call when the new threshold is `0` or exceeds the checked sum of current signer weights.
+Changes a rule's weighted-threshold policy's `threshold` (OZ `set_threshold` on the weighted-threshold policy contract). Signs and submits. Testnet only. The policy is identified by wasm-hash allowlist lookup (a SEPARATE allowlist from the simple threshold-policy's: the two kinds never cross-identify); zero or multiple matches refuse with the typed `WeightedThresholdNotInstalled` / `WeightedThresholdPolicyIdentificationFailed`. Refused after the policy, rule, and weight reads, before signing and submission, when the new threshold is `0` or exceeds the checked sum of current signer weights.
 
 Extra flags:
 
@@ -672,7 +672,7 @@ There is currently no MCP tool for this verb; see [MCP: why there is no agent-fa
 
 Submits an atomic multicall bundle (1 to 50 invocations) through the registered multicall router contract for the target network. Signs and submits. The router address is resolved from the local registry (`<canonical_data_root>/networks.toml`). On a mainnet profile the command refuses with `network.mainnet_write_forbidden` before any registry, writer, or signer access. A signer source is required.
 
-Each `--invocation` value has the form `<target>:<fn>:<json-args>`, where `<target>` is the C-strkey of the contract to invoke, `<fn>` is the function name, and `<json-args>` is a JSON array of XDR-encoded arguments.
+Each `--invocation` value has the form `<target>:<fn>:<json-args>`, where `<target>` is the C-strkey of the contract to invoke, `<fn>` is the function name, and `<json-args>` is a JSON array of scalar arguments. A JSON integer becomes an `i128`, a string becomes an `ScString`, and `null` becomes `Void`. Booleans, objects, and nested arrays are refused. A string is never decoded as an address or as XDR, so a function that takes an `Address` argument cannot be invoked this way.
 
 Flags:
 
@@ -701,7 +701,7 @@ Only an allow decision submits the bundle. The policy refusals are:
 stellar-agent smart-account multicall \
   --smart-account CABC...WXYZ \
   --rule-id 0 \
-  --invocation 'CTOK...WXYZ:transfer:["GABC...WXYZ","GWXY...WXYZ","1000000"]' \
+  --invocation 'CAPP...WXYZ:record:["invoice-42",1000000]' \
   --secondary-rpc-url https://rpc2.example \
   --signer-secret-env WALLET_SK
 ```
@@ -933,8 +933,9 @@ Without `--secondary-rpc-url`, the profile secondary applies. A configured mainn
 Schedules an operation (PROPOSER role). Signs and submits.
 The operation salt is derived non-deterministically and is returned in the JSON
 output as the `salt` field (64-char lowercase hex).
-Record it immediately: it is required by the matching `execute` and `cancel`
-calls and cannot be recomputed later.
+Record it immediately: the matching `execute` call requires it, and it cannot
+be recomputed later. `cancel` takes the operation ID from
+`operation_id_full_hex` instead.
 On success the envelope also carries `operation_id_full_hex`.
 
 Flags add:
