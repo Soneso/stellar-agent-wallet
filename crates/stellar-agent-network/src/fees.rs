@@ -377,6 +377,14 @@ pub fn check_classic_fee_cap(
     }
 }
 
+/// Returns the tighter stored and signed classic fee cap.
+#[must_use]
+pub fn effective_classic_fee_cap(profile: &Profile, signed: u32) -> u32 {
+    profile
+        .classic_max_fee_per_op_stroops
+        .map_or(signed, |cap| cap.min(signed))
+}
+
 /// Checks the tighter of the signed and profile classic fee caps.
 ///
 /// # Errors
@@ -388,11 +396,11 @@ pub fn check_classic_fee_cap_signed(
     signed: Option<u32>,
 ) -> Result<(), WalletError> {
     let cap = match (profile.classic_max_fee_per_op_stroops, signed) {
-        (Some(profile), Some(signed)) => {
-            if profile > signed {
+        (Some(profile_cap), Some(signed)) => {
+            if profile_cap > signed {
                 tracing::warn!("profile classic fee cap exceeds signed cap; using signed cap");
             }
-            Some(profile.min(signed))
+            Some(effective_classic_fee_cap(profile, signed))
         }
         (profile, signed) => profile.or(signed),
     };
@@ -597,5 +605,36 @@ mod tests {
             classic_fee_source(ClassicFeeChoice::ProfileDefault, FeeSource::ProfileDefault),
             FeeSource::ProfileDefault
         );
+    }
+    #[test]
+    fn effective_fee_cap_is_tighter_cap() {
+        let mut profile = Profile::builder_mainnet_named(
+            "fees",
+            "https://rpc.example.invalid",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .build();
+        for (configured, expected) in [(None, 500), (Some(900), 500), (Some(200), 200)] {
+            profile.classic_max_fee_per_op_stroops = configured;
+            assert_eq!(effective_classic_fee_cap(&profile, 500), expected);
+            assert!(
+                check_classic_fee_cap_signed(expected, FeeSource::Envelope, &profile, Some(500))
+                    .is_ok()
+            );
+            assert_eq!(
+                check_classic_fee_cap_signed(
+                    expected + 1,
+                    FeeSource::Envelope,
+                    &profile,
+                    Some(500)
+                )
+                .unwrap_err()
+                .code(),
+                "fees.percentile_exceeds_cap"
+            );
+        }
     }
 }

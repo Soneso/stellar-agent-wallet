@@ -200,11 +200,6 @@ impl Criterion for RateLimitCriterion {
     /// (this criterion's `evaluate` is not called at bundle level either — see
     /// its per-tool-call scoping).
     fn record_confirmed(&self, ctx: &EvalContext<'_>) -> Result<Vec<WindowEntry>, PolicyError> {
-        // Bundle path: per-inner counting is BundleRateLimitCriterion's job;
-        // this criterion counts single-tx calls only.
-        if ctx.bundle.is_some() {
-            return Ok(Vec::new());
-        }
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -213,18 +208,30 @@ impl Criterion for RateLimitCriterion {
                     "rate_limit: record_confirmed system clock is before UNIX epoch: {e}"
                 ),
             })?;
+        let entry = self.size(ctx, now_ms)?;
+        if let Some(entry) = &entry {
+            ctx.state_store
+                .append(entry.key(), entry.timestamp_ms(), entry.amount())
+                .map_err(|error| PolicyError::CriterionEvaluationFailed {
+                    detail: format!("rate_limit: record_confirmed state store error: {error}"),
+                })?;
+        }
+        Ok(entry.into_iter().collect())
+    }
+
+    fn size(&self, ctx: &EvalContext<'_>, now_ms: u64) -> Result<Option<WindowEntry>, PolicyError> {
+        // Bundle path: per-inner counting is BundleRateLimitCriterion's job;
+        // this criterion counts single-tx calls only.
+        if ctx.bundle.is_some() {
+            return Ok(None);
+        }
         let state_key = StateKey::new(ctx.profile_name, 1, "rate_limit", self.window.as_secs());
-        ctx.state_store.append(&state_key, now_ms, 1).map_err(|e| {
-            PolicyError::CriterionEvaluationFailed {
-                detail: format!("rate_limit: record_confirmed state store error: {e}"),
-            }
-        })?;
-        Ok(vec![WindowEntry::new(
+        Ok(Some(WindowEntry::new(
             state_key,
             now_ms,
             1,
             self.window_limit(),
-        )])
+        )))
     }
 }
 

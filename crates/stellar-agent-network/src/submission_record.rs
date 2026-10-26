@@ -377,6 +377,43 @@ impl<'a> WalletSubmissionRecorder<'a> {
         }
     }
 
+    /// Builds a recorder whose settlement entries are the authorization's minted holds.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the recorder binds the complete submission context"
+    )]
+    pub fn new_authorized(
+        profile: &'a Profile,
+        profile_name: impl Into<String>,
+        tool: &'static str,
+        chain_id: Option<String>,
+        policy_decision: PolicyDecision,
+        legs: Vec<ValueLegRecord>,
+        authorization: &crate::mainnet::authorization::MainnetTxSignAuthorization,
+        receipts: ReceiptStore,
+        window: PersistedWindowStore,
+        audit: Option<AuditWriterHandle>,
+        nonce_id: Option<String>,
+        request_id: impl Into<String>,
+        now_ms: u64,
+    ) -> Self {
+        Self::new(
+            profile,
+            profile_name,
+            tool,
+            chain_id,
+            policy_decision,
+            legs,
+            authorization.entries().to_vec(),
+            receipts,
+            window,
+            audit,
+            nonce_id,
+            request_id,
+            now_ms,
+        )
+    }
+
     /// States that the caller writes the value-action row for a confirmed
     /// submission itself.
     ///
@@ -1070,7 +1107,7 @@ impl WalletSubmissionRecorder<'_> {
             crate::mainnet::digest::content_digest(AuthorizationDomain::Transaction, &tx_hash);
         let expect = authorization.consume_expect(&RecomputedFacts {
             content_digest,
-            entries_digest: crate::mainnet::digest::entries_digest(&self.window_entries),
+            entries_digest: crate::mainnet::digest::entries_digest(authorization.entries()),
             audit,
         });
         let binding = ConsumptionBinding::Transaction(SubmissionBinding {
@@ -2444,51 +2481,171 @@ mod tests {
             );
         }
 
-        /// Runs a consumption whose recorder sizes `entries` against a grant
-        /// minted with a 100-stroop hold, and returns its precondition after
-        /// asserting the pending-row stage: the row is closed, the receipt
-        /// removed, and the record open.
-        async fn entries_refusal(
-            label: &str,
-            entries: impl FnOnce(
-                &LedgerFixture,
-            ) -> Vec<
-                stellar_agent_core::policy::v1::criteria::state_store::WindowEntry,
-            >,
-        ) -> MainnetPrecondition {
-            let fx = LedgerFixture::new(label, NOW);
+        #[tokio::test]
+        #[serial]
+        async fn authorized_branch_hashes_grant_entries() {
+            let fx = LedgerFixture::new("consume-grant-entries", NOW);
             let sub = submission();
-            let (id, authorization) = grant(&fx, &sub, &holds(&fx, 100), "approval-1");
-            let precondition = refused(
-                fx.recorder(entries(&fx), Some(Arc::clone(&fx.writer)))
-                    .consume_for_submission(&sub.intent, MainnetSubmitGrant::Tx(authorization)),
+            let (id, mut authorization) = grant(&fx, &sub, &holds(&fx, 100), "approval-1");
+            let recorder = WalletSubmissionRecorder::new_authorized(
+                &fx.profile,
+                fx.name.clone(),
+                "stellar_pay_commit",
+                Some("stellar:mainnet".into()),
+                PolicyDecision::Allow,
+                vec![],
+                &authorization,
+                fx.receipts.clone(),
+                fx.window.clone(),
+                Some(Arc::clone(&fx.writer)),
+                None,
+                "request",
+                NOW,
             );
-            assert!(fx.is_open(id), "the record stays open");
+            authorization.0.entries = holds(&fx, 101);
+            assert_eq!(
+                refused(
+                    recorder
+                        .consume_for_submission(&sub.intent, MainnetSubmitGrant::Tx(authorization))
+                ),
+                MainnetPrecondition::EntriesDigest
+            );
+            assert!(fx.is_open(id));
             assert_eq!(reservations(&fx), 0);
             assert!(receipt(&fx, &sub.intent).is_none());
-            assert_eq!(
-                fx.audit_kinds(),
-                ["value_action_pending", "value_action_failed"]
-            );
-            precondition
         }
 
         #[tokio::test]
         #[serial]
-        async fn a_recorder_without_the_minted_holds_is_refused() {
-            assert_eq!(
-                entries_refusal("consume-entries-empty", |_| vec![]).await,
-                MainnetPrecondition::EntriesDigest
-            );
+        async fn authorized_recorder_settles_minted_holds() {
+            for success in [true, false] {
+                let fx = LedgerFixture::new("authorized-settle", NOW);
+                let sub = submission();
+                let (_, authorization) = grant(&fx, &sub, &holds(&fx, 100), "approval-1");
+                let recorder = WalletSubmissionRecorder::new_authorized(
+                    &fx.profile,
+                    fx.name.clone(),
+                    "stellar_pay_commit",
+                    Some("stellar:mainnet".into()),
+                    PolicyDecision::Allow,
+                    vec![],
+                    &authorization,
+                    fx.receipts.clone(),
+                    fx.window.clone(),
+                    Some(Arc::clone(&fx.writer)),
+                    None,
+                    "request",
+                    NOW,
+                );
+                assert!(!recorder.window_entries.is_empty());
+                assert_eq!(recorder.window_entries, authorization.entries());
+                recorder
+                    .consume_for_submission(&sub.intent, MainnetSubmitGrant::Tx(authorization))
+                    .unwrap();
+                let outcome = if success {
+                    SubmissionOutcome::Success {
+                        ledger: 100,
+                        created_at: Some(i64::try_from(NOW / 1000).unwrap()),
+                    }
+                } else {
+                    SubmissionOutcome::Rejected {
+                        code: "transaction.failed".into(),
+                        error: "refused".into(),
+                    }
+                };
+                recorder.outcome(&sub.intent, &outcome).await;
+                assert_eq!(reservations(&fx), 0);
+                let bytes = std::fs::read(fx.dir.path().join("state.window")).unwrap();
+                let wire: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+                assert_eq!(
+                    wire["entries"].as_array().map_or(0, Vec::len),
+                    usize::from(success)
+                );
+            }
         }
 
         #[tokio::test]
         #[serial]
-        async fn a_recorder_with_a_changed_amount_is_refused() {
-            assert_eq!(
-                entries_refusal("consume-entries-amount", |fx| holds(fx, 101)).await,
-                MainnetPrecondition::EntriesDigest
-            );
+        async fn used_authorization_is_not_consumed_twice() {
+            for has_holds in [true, false] {
+                let fx = LedgerFixture::new("used-once", NOW);
+                let sub = submission();
+                let entries = if has_holds { holds(&fx, 100) } else { vec![] };
+                let (_, authorization) = grant(&fx, &sub, &entries, "approval-1");
+                let id = authorization.id();
+                let tx_hash = decode_intent_hash(&sub.intent.tx_hash).unwrap();
+                let expect = authorization.consume_expect(&RecomputedFacts {
+                    content_digest: crate::mainnet::digest::content_digest(
+                        AuthorizationDomain::Transaction,
+                        &tx_hash,
+                    ),
+                    entries_digest: crate::mainnet::digest::entries_digest(authorization.entries()),
+                    audit: covered_audit_facts(tip_facts(&fx.writer)).unwrap(),
+                });
+                let mut binding = SubmissionBinding {
+                    fee_bump: None,
+                    envelope_hash: decode_intent_hash(&sub.intent.envelope_hash).unwrap(),
+                    tx_hash,
+                    source: sub.intent.source.clone(),
+                    sequence: sub.intent.sequence,
+                    max_time: sub.intent.max_time,
+                    pending_since_ms: NOW,
+                    submission_ledger: sub.intent.submission_ledger,
+                };
+                let recorder = WalletSubmissionRecorder::new_authorized(
+                    &fx.profile,
+                    fx.name.clone(),
+                    "stellar_pay_commit",
+                    Some("stellar:mainnet".into()),
+                    PolicyDecision::Allow,
+                    vec![],
+                    &authorization,
+                    fx.receipts.clone(),
+                    fx.window.clone(),
+                    Some(Arc::clone(&fx.writer)),
+                    None,
+                    "request",
+                    NOW,
+                );
+                recorder
+                    .consume_for_submission(&sub.intent, MainnetSubmitGrant::Tx(authorization))
+                    .unwrap();
+                let before = std::fs::read(fx.dir.path().join("state.window")).unwrap();
+                let error = fx
+                    .window
+                    .consume_authorization(
+                        &fx.profile,
+                        id,
+                        &expect,
+                        &ConsumptionBinding::Transaction(binding.clone()),
+                    )
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        (&error, has_holds),
+                        (WindowStoreError::DuplicateReservation, true)
+                            | (WindowStoreError::DuplicateConsumption, false)
+                    ),
+                    "{error:?}"
+                );
+                binding.envelope_hash = [9; 32];
+                assert!(matches!(
+                    fx.window.consume_authorization(
+                        &fx.profile,
+                        id,
+                        &expect,
+                        &ConsumptionBinding::Transaction(binding)
+                    ),
+                    Err(WindowStoreError::AuthorizationRefused {
+                        precondition: MainnetPrecondition::NotOpen
+                    })
+                ));
+                assert_eq!(
+                    std::fs::read(fx.dir.path().join("state.window")).unwrap(),
+                    before
+                );
+                fx.assert_used_without_holds(id);
+            }
         }
 
         /// The audit facts of a writer over another log are refused.

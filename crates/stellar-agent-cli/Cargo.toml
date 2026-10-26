@@ -74,6 +74,7 @@ stellar-agent-approval-remote = { workspace = true }
 stellar-strkey = { workspace = true }
 # XDR envelope signing — TransactionEnvelope, SEP-23 payload (pay.rs).
 stellar-xdr = { workspace = true }
+stellar-agent-xdr-limits = { workspace = true }
 # SHA-256 of the SEP-23 signing payload (pay.rs).
 sha2 = { workspace = true }
 # Zeroizing<[u8; 32]> when constructing SoftwareSigningKey (pay.rs).

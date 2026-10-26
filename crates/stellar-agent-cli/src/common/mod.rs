@@ -29,11 +29,14 @@
 //! - [`validate_path_component_ascii_safe`] — validates that a string is safe
 //!   to use as a path component (no path traversal, no special characters).
 
+pub(crate) mod consent;
+pub(crate) mod mainnet_confirm;
 pub mod network;
 pub mod profile_access;
 pub mod render;
 pub mod served_pages;
 pub mod signer_ceremony;
+pub(crate) mod tty;
 
 /// Returns `true` when a graphical display is available for a browser launch.
 ///

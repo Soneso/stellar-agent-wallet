@@ -181,6 +181,18 @@ mod tests {
                     .unwrap();
             let authorization =
                 MainnetSorobanIntentAuthorization::for_crate_tests(SorobanIntentInner {
+                    entries: vec![],
+                    facts: super::super::digest::BindingFacts {
+                        endpoint: None,
+                        signer: [0; 32],
+                        policy: [0; 32],
+                        enablement: [0; 32],
+                        witness: None,
+                        reservation: None,
+                        approval: [0; 32],
+                        audit: [0; 32],
+                    },
+                    authorization_ttl_ms: TTL_MS,
                     header,
                     binding: DomainBinding::Soroban { intent_digest },
                 });

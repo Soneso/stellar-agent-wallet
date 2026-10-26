@@ -78,8 +78,8 @@ pub mod witness;
 
 pub use assertion_input::AssertionInput;
 pub use attest::{
-    ConsentAudit, Surface, ToolsetGrantRequest, attest_and_persist, decode_sha256_hex,
-    load_and_validate_entry, load_attestation_key,
+    ConsentAudit, Surface, ToolsetGrantRequest, attest_and_persist, attest_mainnet_confirmation,
+    decode_sha256_hex, load_and_validate_entry, load_attestation_key,
 };
 pub use attestation::AttestationBinding;
 pub use attestation::{
@@ -103,8 +103,9 @@ pub use rule_proposal::{
     RuleProposalSignerKind, try_decode_spending_limit_params,
 };
 pub use store::{
-    ApprovalKind, ConsumedOutcome, DEFAULT_TTL_MS, EXPECTED_NONCE_LEN, PendingApproval,
-    PendingApprovalStore, RuleProposalGateError, generate_csrf_token,
+    ApprovalKind, ConsumedOutcome, DEFAULT_TTL_MS, EXPECTED_NONCE_LEN,
+    MAINNET_CONFIRMATION_TTL_SECONDS, PendingApproval, PendingApprovalStore, RuleProposalGateError,
+    generate_csrf_token, governing_ttl_ms,
 };
 pub use toolset_grant::{
     TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrant, ToolsetGrantStore, build_attested_grant,

@@ -4671,6 +4671,7 @@ dependencies = [
  "stellar-agent-toolsets-install",
  "stellar-agent-toolsets-runtime",
  "stellar-agent-webauthn-bridge",
+ "stellar-agent-xdr-limits",
  "stellar-baselib",
  "stellar-strkey 0.0.18",
  "stellar-xdr 28.0.0",

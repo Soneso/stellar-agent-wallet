@@ -714,6 +714,16 @@ pub enum CapKind {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ValidationError {
+    /// Mainnet confirmation requires terminal input and diagnostics.
+    #[error("mainnet confirmation requires terminal stdin and stderr")]
+    ConfirmTtyRequired,
+    /// The typed profile name differs from the selected profile.
+    #[error("the typed profile name does not match")]
+    ConfirmProfileNameMismatch,
+    /// Confirmation input ended or could not be read.
+    #[error("mainnet confirmation input is unavailable")]
+    ConfirmInputUnavailable,
+
     /// The verified policy's installation bindings do not match the selected profile.
     #[error("profile.mainnet_enablement_invalid: {binding}")]
     MainnetEnablementInvalid {
@@ -1695,6 +1705,10 @@ impl ValidationError {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
+            Self::ConfirmTtyRequired => "confirm.tty_required",
+            Self::ConfirmProfileNameMismatch => "confirm.profile_name_mismatch",
+            Self::ConfirmInputUnavailable => "confirm.input_unavailable",
+
             Self::AmountUnitsRequired => "validation.amount_units_required",
             Self::AmountPrecisionExceeded { .. } => "validation.amount_precision_exceeded",
             Self::MemoRequired { .. } => "validation.memo_required",
@@ -3586,6 +3600,13 @@ mod tests {
 
         for (variant, expected_code) in cases {
             let wallet_err = WalletError::Validation(match variant {
+                ValidationError::ConfirmTtyRequired => ValidationError::ConfirmTtyRequired,
+                ValidationError::ConfirmProfileNameMismatch => {
+                    ValidationError::ConfirmProfileNameMismatch
+                }
+                ValidationError::ConfirmInputUnavailable => {
+                    ValidationError::ConfirmInputUnavailable
+                }
                 ValidationError::MainnetEnablementInvalid { binding } => {
                     ValidationError::MainnetEnablementInvalid { binding }
                 }

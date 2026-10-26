@@ -147,7 +147,11 @@ pub(crate) fn tx_authorization(
     header: Header,
     binding: DomainBinding,
 ) -> MainnetTxSignAuthorization {
-    MainnetTxSignAuthorization::for_crate_tests(TxSignInner { header, binding })
+    MainnetTxSignAuthorization::for_crate_tests(TxSignInner {
+        header,
+        binding,
+        entries: vec![],
+    })
 }
 
 /// An unsigned mainnet transaction envelope from the fixture's source.
@@ -317,7 +321,11 @@ impl LedgerFixture {
         header.issued_at_ms = minted.issued_at_ms;
         header.expires_at_ms = minted.expires_at_ms;
         header.bindings_digest = minted.bindings_digest;
-        tx_authorization(header, binding)
+        MainnetTxSignAuthorization::for_crate_tests(TxSignInner {
+            header,
+            binding,
+            entries: holds.to_vec(),
+        })
     }
 
     /// The wallet recorder of a `stellar_pay_commit` submission sizing
@@ -386,5 +394,344 @@ impl LedgerFixture {
                     .to_owned()
             })
             .collect()
+    }
+}
+
+/// Resolver inputs produced by the signed-policy, enrollment, approval, and audit verifiers.
+pub(crate) struct ResolverFixture {
+    pub(crate) dir: TempDir,
+    pub(crate) profile: Profile,
+    pub(crate) context: crate::MainnetWriteContext,
+    pub(crate) policy: stellar_agent_core::mainnet::verified_policy::VerifiedPolicy,
+    pub(crate) enablement: stellar_agent_core::mainnet::enablement::EnablementRecord,
+    pub(crate) signer: crate::keyring::EnrolledSigner,
+    pub(crate) window: PersistedWindowStore,
+    pub(crate) envelope: String,
+    pub(crate) source: SignedTestEnvelope,
+    pub(crate) now: u64,
+    pub(crate) clock: TestClockGuard,
+    pub(crate) anchor_failure: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ResolverFixture {
+    pub(crate) fn new() -> Self {
+        Self::configured(|_| {}, str::to_owned)
+    }
+
+    pub(crate) fn configured(
+        profile_edit: impl FnOnce(&mut Profile),
+        policy_edit: impl FnOnce(&str) -> String,
+    ) -> Self {
+        use stellar_agent_core::{
+            policy::v1::{
+                canonical, signature,
+                verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+            },
+            profile::{
+                loader,
+                schema::{KeyringEntryRef, signer_identity_entry_ref},
+                signer_identity::SignerIdentityRecord,
+            },
+        };
+        use stellar_xdr::{Memo, WriteXdr as _};
+        #[cfg(feature = "test-helpers")]
+        stellar_agent_core::audit_log::writer::AuditWriterRegistry::remove_for_test("operator");
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() - 300_000;
+        let clock = set_now_ms_for_test(now);
+        // The served source account is at sequence 1, so its next
+        // transaction carries sequence 2.
+        let source = SignedTestEnvelope::builder(SIGNER_SEED)
+            .network_passphrase(MAINNET_PASSPHRASE)
+            .amount_stroops(10)
+            .sequence(2)
+            .unsigned()
+            .build();
+        let mut decoded =
+            TransactionEnvelope::from_xdr_base64(source.envelope_xdr(), Limits::none()).unwrap();
+        let TransactionEnvelope::Tx(tx) = &mut decoded else {
+            unreachable!()
+        };
+        tx.tx.memo = Memo::Text(b"approved".to_vec().try_into().unwrap());
+        let envelope = decoded.to_xdr_base64(Limits::none()).unwrap();
+        let mut profile = Profile::builder_mainnet_named(
+            "operator",
+            "https://rpc.example.invalid",
+            "stellar-agent-signer-operator",
+            source.source(),
+            "stellar-agent-nonce-operator",
+            "default",
+        )
+        .build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        profile_edit(&mut profile);
+        let anchor = crate::keyring::KeyringTipAnchorStore::new(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        )
+        .anchor_entry_ref()
+        .clone();
+        let anchor_failure =
+            stellar_agent_test_support::keyring_mock::install_with_write_failure_switch(
+                &anchor.service,
+                &anchor.account,
+            )
+            .unwrap();
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let put = |entry: &KeyringEntryRef, text: &str| {
+            keyring_core::Entry::new(&entry.service, &entry.account)
+                .unwrap()
+                .set_password(text)
+                .unwrap();
+        };
+        put(
+            &profile.policy_owner_key_id,
+            &stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()).to_string(),
+        );
+        put(
+            &signer_identity_entry_ref(&profile.mcp_signer_default),
+            &SignerIdentityRecord::agent(public_key(SIGNER_SEED)).render(),
+        );
+        for key in [
+            &profile.policy_window_state_key_id,
+            &profile.audit_log_hash_chain_key_id,
+            &profile.attestation_key_id,
+        ] {
+            crate::keyring::rotate_keyring_secret_32(&key.service, &key.account).unwrap();
+        }
+        loader::save_to_dir("operator", &profile, &dir.path().join("profiles")).unwrap();
+        let nonce = "installation-nonce";
+        put(
+            &stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
+                &profile.policy_window_state_key_id,
+            ),
+            nonce,
+        );
+        let digest = stellar_agent_core::hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(
+            nonce.as_bytes(),
+        ));
+        let raw = include_str!("../../../stellar-agent-core/tests/fixtures/policy-v2.toml")
+            .replace(&"0".repeat(64), &digest)
+            .replace(
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                source.destination(),
+            )
+            .replace("decision = \"require_approval\"", "decision = \"allow\"")
+            .replace("ttl_secs = 3600", "")
+            .replace("reason = \"review\"", "");
+        let raw = policy_edit(&raw);
+        let canonical = canonical::canonical_bytes(&raw).unwrap();
+        let signature = signature::sign(&signature::digest(&canonical), &owner);
+        let policy_path = dir.path().join("policy.toml");
+        std::fs::write(
+            &policy_path,
+            format!(
+                "{raw}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()),
+                stellar_agent_core::hex::encode(&signature)
+            ),
+        )
+        .unwrap();
+        let window_path = dir.path().join("state.window");
+        let policy = load_verified_policy(
+            &PolicyLoad {
+                path: &policy_path,
+                profile: &profile,
+                profile_name: "operator",
+                owner_pubkey: &owner.verifying_key().to_bytes(),
+                owner_source: OwnerKeySource::Keyring,
+                window_path: &window_path,
+            },
+            stellar_agent_core::policy::v1::criteria::state_store::PolicyStateStore::new(),
+            PinMode::Advance,
+        )
+        .unwrap();
+        let enablement = stellar_agent_core::mainnet::enablement::verify_enablement(
+            &policy,
+            "operator",
+            stellar_agent_core::profile::name::ProfileNameSource::Flag,
+            &profile,
+            &dir.path().join("profiles"),
+            &|_| Ok(nonce.to_owned()),
+        )
+        .unwrap();
+        let signer = crate::keyring::enrolled_signer(
+            "operator",
+            &dir.path().join("profiles"),
+            &profile,
+            crate::keyring::EnrolledRole::Agent,
+            &public_key(SIGNER_SEED),
+        )
+        .unwrap();
+        let context = crate::NetworkContext::mainnet_write(
+            &profile,
+            &stellar_agent_core::profile::name::ResolvedProfileName::from_flag("operator"),
+            &dir.path().join("profiles"),
+            crate::MainnetEndpointFlags::default(),
+        )
+        .unwrap();
+        Self {
+            dir,
+            profile,
+            context,
+            policy,
+            enablement,
+            signer,
+            window: PersistedWindowStore::at_path(window_path),
+            envelope,
+            source,
+            now,
+            clock,
+            anchor_failure,
+        }
+    }
+
+    pub(crate) fn approval(
+        &self,
+        envelope: &str,
+        created: u64,
+        ttl: u64,
+    ) -> stellar_agent_core::approval::witness::ApprovalWitness {
+        use stellar_agent_core::approval::PendingApproval;
+        let args = stellar_agent_core::envelope_decode::decode_authoritative_args(
+            envelope,
+            "stellar_pay_commit",
+        )
+        .unwrap();
+        let mut entry = PendingApproval::new_payment_pending(
+            envelope.to_owned(),
+            envelope.as_bytes(),
+            args["destination"].as_str().unwrap().to_owned(),
+            args["amount_stroops"].as_str().unwrap().parse().unwrap(),
+            "XLM".to_owned(),
+            Some("approved".to_owned()),
+            100,
+            1,
+            "1000".into(),
+            ttl,
+        )
+        .unwrap();
+        entry.created_at_unix_ms = created;
+        entry.expires_at_unix_ms = created + ttl;
+        self.attested(
+            &entry,
+            &self.profile,
+            "operator",
+            stellar_agent_core::approval::witness::ApprovedKind::Payment,
+            stellar_agent_core::approval::subject::approval_subject_classic(envelope),
+            created,
+        )
+    }
+
+    pub(crate) fn attested(
+        &self,
+        entry: &stellar_agent_core::approval::PendingApproval,
+        profile: &Profile,
+        name: &str,
+        kind: stellar_agent_core::approval::witness::ApprovedKind,
+        subject: [u8; 32],
+        now: u64,
+    ) -> stellar_agent_core::approval::witness::ApprovalWitness {
+        use base64::Engine as _;
+        use stellar_agent_core::approval::{
+            AttestationBinding, ConsentAudit, PendingApprovalStore, Surface, attest_and_persist,
+            load_attestation_key,
+            witness::{ApprovalExpectation, verify_approval},
+        };
+        let path = self.dir.path().join(format!(
+            "{}-{}.toml",
+            entry.approval_nonce,
+            stellar_agent_core::hex::encode(&subject)
+        ));
+        let mut store = PendingApprovalStore::open(path).unwrap();
+        store.insert(entry.clone(), now).unwrap();
+        let audit = self.audit();
+        let key = load_attestation_key(
+            &profile.attestation_key_id,
+            &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(name, profile),
+        )
+        .unwrap();
+        attest_and_persist(
+            &mut store,
+            entry,
+            &key,
+            &AttestationBinding::new(name, profile.chain_id.caip2_str()),
+            Surface::Cli,
+            ConsentAudit::Writer(&mut audit.writer().lock().unwrap()),
+            None,
+            |_, _| Err("unexpected grant".to_owned()),
+        )
+        .unwrap();
+        let encoded = store
+            .get(&entry.approval_nonce)
+            .unwrap()
+            .attestation_blob_b64
+            .as_ref()
+            .unwrap();
+        let blob: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        verify_approval(
+            &store,
+            profile,
+            name,
+            &entry.approval_nonce,
+            &blob,
+            &ApprovalExpectation { kind, subject },
+            now,
+        )
+        .unwrap()
+    }
+
+    pub(crate) fn context_with_routes(
+        &self,
+        routes: &[(&str, &str)],
+    ) -> crate::MainnetWriteContext {
+        crate::NetworkContext::mainnet_write(
+            &self.profile,
+            &stellar_agent_core::profile::name::ResolvedProfileName::from_flag("operator"),
+            &self.dir.path().join("profiles"),
+            crate::MainnetEndpointFlags::default(),
+        )
+        .unwrap()
+        .with_test_transport_routes(routes)
+    }
+
+    pub(crate) fn wire(&self) -> serde_json::Value {
+        let path = self.dir.path().join("state.window");
+        if !path.exists() {
+            return serde_json::json!({});
+        }
+        let bytes = std::fs::read(path).unwrap();
+        serde_json::from_slice(&bytes[32..]).unwrap()
+    }
+
+    pub(crate) fn audit(&self) -> AuditReadiness {
+        super::audit_readiness::audit_readiness(&self.profile, "operator").unwrap()
+    }
+
+    pub(crate) async fn server(&self) -> wiremock::MockServer {
+        use stellar_agent_test_support::{EchoIdResponder, signed_envelope::get_network_result};
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "getNetwork"}),
+            ))
+            .respond_with(EchoIdResponder::new(get_network_result(MAINNET_PASSPHRASE)))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "getLedgerEntries"}),
+            ))
+            .respond_with(EchoIdResponder::new(self.source.ledger_entries_result()))
+            .mount(&server)
+            .await;
+        server
     }
 }

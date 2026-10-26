@@ -644,6 +644,10 @@ async fn action_challenge_post(
     };
     drop(store);
 
+    if matches!(entry.kind, ApprovalKind::X402Payment { .. }) {
+        return json_response(StatusCode::BAD_REQUEST, &json!({"error": "wrong_kind"}));
+    }
+
     let envelope_sha256 = entry_envelope_sha256(&entry);
     let rand32 = crate::challenge_store::random_32();
     let challenge = derive_action_challenge(&rand32, &envelope_sha256, &entry.approval_nonce);
@@ -2391,5 +2395,52 @@ mod tests {
             stellar_agent_core::approval::envelope_sha256(CHANGE_TRUST_ENVELOPE.as_bytes());
         assert_ne!(expected, [0; 32]);
         assert_eq!(entry_envelope_sha256(&entry), expected);
+    }
+    /// A `transfer` invocation of contract `[3; 32]` with no arguments.
+    const X402_ROOT_XDR: &str =
+        "AAAAAAAAAAEDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAAAh0cmFuc2ZlcgAAAAAAAAAA";
+
+    #[test]
+    #[serial]
+    fn remote_refuses_x402_challenge() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("x402-challenge");
+            let nonce = insert_payment_entry(&fx.state.ctx.store_path);
+            let mut store = PendingApprovalStore::open(fx.state.ctx.store_path.clone()).unwrap();
+            let mut entry = store.get(&nonce).unwrap().clone();
+            entry.kind = ApprovalKind::X402Payment {
+                intent_digest: [1; 32],
+                root_invocation_xdr: X402_ROOT_XDR.to_owned(),
+                payee: "payee".into(),
+                amount: "10".into(),
+                asset: "asset".into(),
+                home_domain: None,
+            };
+            store.remove(&nonce).unwrap();
+            store
+                .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
+                .unwrap();
+            drop(store);
+            let router = build_router();
+            let cookie = login(&router, &fx.state, &fx.authenticator).await;
+            let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
+            let response = router
+                .with_state(fx.state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/approval/{nonce}/challenge"))
+                        .header(header::COOKIE, cookie)
+                        .header(CSRF_HEADER_NAME, csrf)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(body_json(response).await["error"], "wrong_kind");
+            assert_entry_untouched(&fx.state.ctx.store_path, &nonce);
+        });
     }
 }

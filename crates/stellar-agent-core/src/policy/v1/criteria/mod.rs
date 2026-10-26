@@ -122,6 +122,18 @@ pub trait Criterion: Send + Sync + std::fmt::Debug {
     /// encounters an internal error (e.g. state-store I/O failure).
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError>;
 
+    /// Sizes one accounting entry without changing the state store.
+    ///
+    /// # Errors
+    /// Returns an evaluation error when the entry cannot be sized.
+    fn size(
+        &self,
+        _ctx: &EvalContext<'_>,
+        _now_ms: u64,
+    ) -> Result<Option<WindowEntry>, PolicyError> {
+        Ok(None)
+    }
+
     /// Whether this criterion fires at bundle-level (after all inner
     /// evaluations complete, with the full inners slice and populated overlay
     /// available) rather than once per inner.
@@ -504,5 +516,21 @@ mod tests {
         assert_send_sync::<Box<dyn Criterion>>();
         // Also verify the concrete type used by the engine.
         assert_send_sync::<PerTxCapCriterion>();
+    }
+    #[test]
+    fn criterion_size_defaults_to_none() {
+        let tool = ToolDescriptor::from_registration(&McpToolRegistration {
+            name: "stellar_pay",
+            destructive_hint: true,
+            read_only_hint: false,
+            chain_id_required: true,
+            value_kind: crate::policy::ToolValueKind::MovesValue,
+        });
+        let args = serde_json::Value::Null;
+        let profile = Profile::builder_testnet("criterion", "acct", "n", "acct").build();
+        let store = PolicyStateStore::new();
+        let ctx = single_tx_ctx(&tool, &args, &profile, &store);
+        let criterion = per_tx_cap::PerTxCapCriterion::new("native".into(), 100);
+        assert!(criterion.size(&ctx, 1).unwrap().is_none());
     }
 }

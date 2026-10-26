@@ -2633,7 +2633,8 @@ pub enum EventKind {
         envelope_sha256_hex: Option<String>,
         /// First 8 characters of the approval nonce.
         nonce_prefix: String,
-        /// Which origin attested the entry: `"cli"` or `"serve"`.
+        /// Which origin attested the entry: `"cli"`, `"serve"`,
+        /// `"serve-remote"`, or `"cli-mainnet-confirm"`.
         origin: String,
     },
 
