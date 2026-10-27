@@ -48,7 +48,7 @@ Crates form a directed acyclic graph from foundational substrate up to the two b
 
 ### Layer 2: protocol and SEP crates
 
-`stellar-agent-sep7`, `stellar-agent-sep10`, `stellar-agent-sep43`, `stellar-agent-sep45`, `stellar-agent-sep48`, `stellar-agent-sep53`, `stellar-agent-anchor`, `stellar-agent-x402`, `stellar-agent-x402-identity`, `stellar-agent-mpp`, and the toolsets triad `stellar-agent-toolsets` with `stellar-agent-toolsets-install` and `stellar-agent-toolsets-runtime`. Several lean SEP crates depend only on `xdr-limits` for untrusted-XDR bounds rather than on the heavier `core`. MPP is the exception to the former MCP-only protocol pattern: its shared library is adapted by both the CLI and MCP binaries.
+`stellar-agent-sep7`, `stellar-agent-sep10`, `stellar-agent-sep43`, `stellar-agent-sep45`, `stellar-agent-sep48`, `stellar-agent-sep53`, `stellar-agent-anchor`, `stellar-agent-x402`, `stellar-agent-x402-identity`, `stellar-agent-mpp`, and the toolsets triad `stellar-agent-toolsets` with `stellar-agent-toolsets-install` and `stellar-agent-toolsets-runtime`. `stellar-agent-sep5` has no workspace dependency; `stellar-agent-sep7` and `stellar-agent-sep48` depend on `xdr-limits` and `network`; the other SEP crates also depend on `core`. MPP is the exception to the MCP-only protocol pattern: its shared library is adapted by both the CLI and MCP binaries.
 
 ### Layer 3: DeFi substrate and adapters
 
@@ -89,7 +89,7 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 | `stellar-agent-headless-keyring` | Opt-in, file-backed `keyring-core` credential store for non-interactive deployments (services, SSH sessions, scheduled tasks) where the platform keyring is unreachable: XChaCha20-Poly1305 under an operator-supplied environment key, or DPAPI protection on Windows; sidecar-locked, fail-closed, never a silent fallback. |
 | `stellar-agent-pool` | SEP-5-derived channel-account pool with in-pool sequence management for concurrent submission without `tx_bad_seq`. |
 | `stellar-agent-sep7` | Inbound `web+stellar:` URI parse and anti-phishing origin-domain signature verification; never signs, submits, or auto-POSTs. |
-| `stellar-agent-sep10` | SEP-10 web-auth client: challenge parse and validation, JWT session, HTTP challenge fetch and submit, ephemeral-key flow. |
+| `stellar-agent-sep10` | SEP-10 web-auth client: challenge parse and validation, JWT session, HTTP challenge fetch and submit, ephemeral-key flow, and the authorized mainnet completion that takes a message-use receipt. |
 | `stellar-agent-sep43` | SEP-43 `ModuleInterface` dispatch substrate (`get_address`, `sign_transaction`, `sign_auth_entry`, `sign_message`, `get_network`). |
 | `stellar-agent-sep45` | SEP-45 contract-account web-auth: challenge validation, JWT session, ephemeral and persistent auth-entry signing. |
 | `stellar-agent-sep48` | SEP-48 contract-interface typed-arg preview and SEP-47 contract-interface discovery; non-authoritative display only. |
@@ -102,8 +102,8 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 | `stellar-agent-defindex` | DeFindex vault adapter: typed deposit and withdraw with mandatory `min_out`, role disclosure, upgradable-flag refusal gate; drives the `vault` verb. |
 | `stellar-agent-dex` | Soroswap router-direct swap adapter with absolute `amount_out_min`, pre-sign slippage re-verify, token canonicalisation, bounded deadline, venue allowlist and router pin; drives `trade`/`quote`. |
 | `stellar-agent-stablecoin` | Stablecoin substrate: USDC/EURC issuer pins, denomination resolver, USDT hard-refusal, clawback disclosure, typed trustline preview; backs the `trustline` verb. |
-| `stellar-agent-x402` | Payer-side x402 Exact-Stellar payment payload builder (validate, build, simulate, sign, re-simulate, finalize). |
-| `stellar-agent-x402-identity` | SEP-10 counterparty-identity pre-payment gate for x402, returning a JWT Bearer companion bound at the HTTP layer; never mutates the payment XDR. |
+| `stellar-agent-x402` | Payer-side x402 Exact-Stellar payment payload builder (validate, build, simulate, sign, re-simulate, finalize), and the authorized mainnet path that consumes the payment intent before signed re-simulation and returns the release authorization. |
+| `stellar-agent-x402-identity` | SEP-10 counterparty-identity pre-payment gate for x402, returning a JWT Bearer companion bound at the HTTP layer; never mutates the payment XDR. It also holds the authorized mainnet gate that binds the authentication to the approved payment and returns the receipt continuation. |
 | `stellar-agent-mpp` | Strict testnet sponsored MPP charge parsing, request binding, simulation, one-shot payer authorization, durable lifecycle, credential encoding, receipt observation, and ledger reconciliation; shared by CLI and MCP. |
 | `stellar-agent-mcp-macros` | Proc-macro crate exporting `#[mcp_tool_router]`, which scans `#[mcp_tool_item(...)]` markers and emits `inventory::submit!` tool-registry entries. |
 | `stellar-agent-mcp` | MCP stdio server library and binary: `WalletServer`, the bounded stdio transport, per-family tool modules, and the inventory-collected tool registry feeding the policy engine. |

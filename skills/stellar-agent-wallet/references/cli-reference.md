@@ -834,6 +834,8 @@ Read-only. Enumerates pending approvals from the profile's store: opens it, rend
 
 `data.expired_count` always reports the number of expired entries regardless of `--include-expired`, so the operator can tell whether `approve gc` is due even when expired entries are hidden.
 
+For a consumed x402 approval, the tombstone's `tx_hash` holds the final-envelope digest. It is not a chain transaction hash. The digest hashes the final envelope's base64 text. JSON reports it redacted in `summary.tx_hash_redacted`. Its table row reads `spent (X402Payment), final-envelope digest <redacted digest>, outcome <outcome>`.
+
 ```bash
 stellar-agent approve list --profile default --output table
 ```

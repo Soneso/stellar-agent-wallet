@@ -267,7 +267,9 @@ SEP-7 URI parsing, SEP-10/45 web auth, SEP-24/6 transfer hand-off, SEP-43 wallet
 signing (`get_address`, `get_network`, `sign_transaction`, `sign_auth_entry`,
 `sign_message`, `sign_and_submit_transaction`), SEP-47/48 contract discovery, and
 SEP-53 signed messages. The wallet also signs x402 v2 Exact Stellar agent
-payments and testnet sponsored MPP charges. MPP uses
+payments and testnet sponsored MPP charges. Both x402 payment tools support
+approved mainnet payments in a feature-enabled build. Authenticated payments
+bind their SEP-10 identity operation to the payment approval. MPP uses
 `stellar_mpp_charge_prepare` then one `stellar_mpp_charge_commit`; the trusted
 host sends the returned credential to the exact bound HTTP or MCP request. See
 `references/protocols.md`.
@@ -323,25 +325,29 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   witness for all four classic MCP commits and CLI `pay`, `claim`, sponsored
   `accounts create`, `trustline`, and sending `pool init` paths. The x402
   payment tools are covered by a second simulation on the oracle, which
-  simulates the same unsigned transfer before the payer signs.
+  simulates the same unsigned transfer before the payer signs. Mainnet x402
+  witnesses use the signed policy and profile thresholds. The oracle compares
+  the unsigned transfer before the payer signs.
   Opaque staged envelopes and the SEP-43 signing tools remain uncovered.
   `fees.percentile_exceeds_cap` and
   `validation.mainnet_fee_cap_required` report the classic fee cap.
   See references/troubleshooting.md.
 - These tools refuse `stellar:mainnet` at handler entry with
   `network.mainnet_write_forbidden`, before the policy gate. The refusal holds
-  in every build, except for the five tools named after the list:
+  in every build, except for the six tools named after the list:
   - the sign-only tools: the SEP-43 sign verbs, SEP-53 `sign_message`, and the
     two x402 payment tools;
   - `stellar_sep43_sign_and_submit_transaction` and the DeFi tools;
   - the commit tools, `stellar_rule_create_commit`, and the toolset signing
     actions.
 
-  `stellar_x402_create_payment` and the four classic commits depend on the
-  feature. With the feature off, they refuse at entry with the same code. A
+  Both x402 payment tools, `stellar_x402_create_payment` and
+  `stellar_x402_authenticated_payment`, and the four classic commits depend on
+  the feature. With the feature off, they refuse at entry with the same code. A
   feature-enabled build admits them after setup, as
   [classic MCP authorization](references/mcp-tools.md#classic-mainnet-authorization)
-  describes.
+  describes. With the feature enabled, both x402 tools use the approved two-call
+  flow.
 - Every MPP tool refuses `stellar:mainnet` at handler entry with
   `mpp.network_forbidden`. Branch on all three codes,
   `network.mainnet_write_forbidden`, `policy.engine_required`, and

@@ -237,6 +237,11 @@ The wallet signs x402 v2 Exact Stellar payments without submitting:
 identity gate against a `home_domain` first; `stellar_x402_parse_receipt` decodes
 the settlement receipt. See [protocols.md](protocols.md) for the flow.
 
+On an admitted mainnet server, call either payment tool without approval
+arguments to obtain pending approval. After CLI approval, repeat the same request
+with both approval arguments. For authenticated payments, keep the approved home
+domain unchanged.
+
 ## Sponsored MPP charges
 
 For an MPP Payment challenge, call `stellar_mpp_charge_prepare` with the exact

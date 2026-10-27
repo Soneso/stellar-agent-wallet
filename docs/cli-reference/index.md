@@ -158,6 +158,8 @@ Other signature-stage errors append `The signature was withheld and nothing was 
 Other post-signing errors retain their own outcome semantics. A signer can run
 before signature verification rejects its result. Submission refusal can follow
 signing. Classic MCP renders the core message without these stage replacements.
+[Mainnet refusal order](../getting-started.md#mainnet-refusal-order) lists what
+has been signed or sent when a mainnet check refuses.
 
 Read-only inspection remains available. `tx` signs nothing. Smart-account writes,
 DeFi, and pool submission remain excluded. `smart-account rules verify-pins`,

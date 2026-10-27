@@ -79,7 +79,7 @@ engine is first-match, default-deny over signed, typed criteria.
 | `policy.deny.unsizable_value_effect` | A value rule matched a tool whose value cannot be sized, including the raw signing tools. | Size the call through a supported verb, or ask the operator to set `allow_opaque_signing = true` on the matched rule if raw signing is intended. |
 | `trustline.clawback_opt_in_required` | Trusting a clawback-enabled issuer requires a recorded operator opt-in. | Ask the operator to run the printed `stellar-agent approve --id <nonce> --profile <name>` opt-in, then re-invoke. |
 | `policy.approval_required` | A two-phase signing verb reached its commit step without a valid operator approval, or the attestation was absent, invalid, or expired. This single code intentionally covers every approval-path failure mode (missing, expired, wrong-kind, hash mismatch, HMAC mismatch) so callers cannot probe which. | Ask the operator to run `stellar-agent approve --id <nonce> --profile <name>`, then re-submit the commit with the returned `approval_nonce` and `approval_attestation`. Use the approval nonce from simulation, which checks both tool names. If the request expires or no request exists, simulate again and review the new response. |
-| `policy.approval_required_unsupported` | The policy returned RequireApproval for a single-shot sign tool (no simulate/commit split: SEP-43 sign verbs, `stellar_sep43_sign_and_submit_transaction`, SEP-53 `sign_message`, x402 `create_payment` / `authenticated_payment`). The wallet refuses fail-closed rather than sign without approval. | Cannot proceed via the agent. Ask the operator to either adjust policy so this operation does not require approval, or perform it through a two-phase tool (`stellar_pay`, `stellar_create_account`, `stellar_trustline`, `stellar_claim`, `stellar_rule_create` and their `*_commit`). |
+| `policy.approval_required_unsupported` | The policy returned RequireApproval for a single-shot sign tool (no simulate/commit split: SEP-43 sign verbs, `stellar_sep43_sign_and_submit_transaction`, SEP-53 `sign_message`, and on testnet x402 `create_payment` / `authenticated_payment`). The wallet refuses fail-closed rather than sign without approval. | Cannot proceed via the agent. Ask the operator to either adjust policy so this operation does not require approval, or perform it through a two-phase tool (`stellar_pay`, `stellar_create_account`, `stellar_trustline`, `stellar_claim`, `stellar_rule_create` and their `*_commit`). On an admitted mainnet server, x402 payments use two calls. Call without approval arguments. After terminal CLI approval, repeat with both approval arguments. The operator approves with `stellar-agent approve --id <nonce> --profile <name>`. Only CLI approval attests x402 payments. |
 | `policy.engine_required` | The active engine cannot decide the call. Fires for the Noop engine on a destructive tool on `stellar:mainnet`, and for V1 engine errors such as a missing or unverifiable policy document. | Report the refusal to the operator. The profile needs a valid V1 policy and admitted context. Do not switch networks. |
 | `policy.unexpected_decision` | Forward-compatibility catch-all for an engine decision the gate does not recognize. Fail-closed. | Treat as a hard refusal. Report to the operator; do not retry. |
 
@@ -123,6 +123,96 @@ or unverifiable approvals use `policy.approval_required`, including expired
 tombstones. Pre-send recording failure after authorization consumption can
 leave no tombstone; reuse can then return authorization refusal.
 CLI `approval.*` errors retain their codes.
+
+The x402 payment tools report these mainnet refusals:
+
+- The SEP-10 and identity libraries refuse mainnet in their ordinary entries
+  with `sep10.mainnet_signing_forbidden` and `identity.mainnet_signing_forbidden`.
+  The authorized completion refuses with `sep10.mainnet_authorization_refused`
+  or `identity.mainnet_authorization_refused`. The MCP tool maps these signing
+  and authorization refusals to `network.mainnet_write_forbidden` and
+  `network.mainnet_authorization_refused`, respectively.
+- For the plain tool, authorization refusals use
+  `network.mainnet_authorization_refused`. Policy denials keep `policy.deny.*`.
+  Other payment errors keep their own codes.
+- For the authenticated tool, authorization refusals identify the withheld
+  payment payload. Policy, endpoint, and witness errors keep their codes. Other
+  payment-build failures use `x402.payment_build_failed`. Other identity
+  failures keep their `identity.*` codes, such as `identity.sep10_auth_failed`
+  after a failed challenge submission.
+- `the mainnet authorization for this SEP-10 authentication was refused; no signed challenge was submitted`
+  means the authenticated tool withheld the SEP-10 challenge.
+- `the mainnet authorization for this payment was refused; the payment payload was withheld`
+  means the authenticated tool withheld the payment payload. A withheld payment
+  payload does not establish that no signature exists. The configured RPC can
+  already have received the signed authorization during re-simulation.
+- Call 2 rechecks the startup binding and refuses a changed one with
+  `network.mainnet_write_forbidden`: `enablement or policy changed, restart the server`.
+  After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
+- After release authorization is consumed, the tool consumes the pending
+  approval. A failed or absent pending-record consume withholds the payload.
+  The `payment withheld at terminal approval` prefix marks a refusal after the
+  signed re-simulation. Report it to the operator; the payment authorization is
+  spent.
+- A live consumed approval returns `policy.approval_consumed`. Without its
+  pending-store tombstone, the authorization ledger refuses reuse. If a repeated
+  call 2 returns `network.mainnet_authorization_refused`, run call 1 again and
+  ask the operator for a new approval.
+- After a failed SEP-10 challenge submission, the Message record stays used and
+  the approval stays pending. A repeat of the same call 2 refuses with
+  `network.mainnet_authorization_refused`. Run call 1 again and ask the operator
+  for a fresh approval.
+- A challenge that names another client account refuses before the Message
+  record is minted. The approval stays unspent, and the same call 2 can be
+  repeated.
+- `identity.home_domain_invalid` means `home_domain` is not a lowercase LDH
+  name, for example `Anchor.Example.com`. Pass the lowercase domain. On mainnet,
+  call 1 refuses it before any approval is stored.
+
+### Mainnet refusal order
+
+A mainnet write passes four states in this order: nothing sent or signed,
+unsigned requests sent, signed locally, signed material sent. The states refer
+to the transaction or payment signature. Authenticated x402 also signs and
+submits a SEP-10 challenge with an ephemeral key inside the second state. Each
+row names the checks that can refuse in that state, grouped by class, and the
+codes they report. Inside a row, the order of the checks differs by command and
+tool.
+
+| State when a check refuses | Checks, by class | Codes |
+|---|---|---|
+| Nothing sent or signed | Entry: the compiled feature, an explicit nondefault mainnet profile with matching stored configuration, full mode and keyring access (CLI), envelope and address decoding (classic MCP). Policy: the V1 engine; classic MCP and x402 also check the verified policy and enablement here. URL: client construction and its credential (CLI, classic MCP, plain x402). x402: call 1 ends here. Plain x402 call 2 sends nothing before the payment build. Its checks up to there: requirements, `chain_id`, the approval pair, enrollment and address, local policy evaluation, forced approval, the attestation, audit readiness, the signing handle. Authenticated x402 call 2 runs the same checks through the attestation, plus the home domain, the audit pre-flight, and identity audit readiness. It leaves this state at the identity exchange. | `network.mainnet_write_forbidden`, profile and validation codes, keyring codes, `network.rpc_unreachable`, `network.rpc_credential_refused`, `simulation.divergence` (classic MCP), JSON-RPC invalid params, `x402.*` requirement codes, `identity.home_domain_invalid`, `policy.approval_required`, `policy.approval_rejected`, `policy.approval_consumed`, `policy.deny.*`, `policy.engine_required`, `policy.unexpected_decision`, `auth.enrolled_*`, `audit.*`, approval-store codes |
+| Unsigned requests sent: the endpoint identity probe, account and chain reads, the oracle simulation, the unsigned payment simulation (x402) | URL: endpoint identity, protocol version. Entry: the remaining input decoding (CLI, classic MCP). Policy: the verified policy and enablement (CLI), the rebuilt envelope (classic MCP), the policy evaluation, the fee cap and the operation conditions (CLI, classic MCP), the required witness, the health read (x402). Authorization: the attestation or the terminal confirmation, audit readiness, the nonce, signer enrollment, the resolver's sealed checks (CLI, classic MCP); the payment intent authorization (x402). Authenticated x402: the bound SEP-10 authentication runs in this state, and its signed challenge reaches the web-auth server before the payment checks. Payment audit readiness, the signing handle, the payment asset, and client construction follow it. | `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.unsupported_protocol_version`, `network.rpc_credential_refused`, `network.rpc_unreachable` (authenticated x402), read codes, keyring codes, `simulation.divergence`, `network.mainnet_write_forbidden` (CLI), `profile.mainnet_enablement_invalid`, `policy.engine_unavailable`, `trustline.policy_engine_unavailable`, `policy.deny.*`, `policy.engine_required`, `policy.unexpected_decision`, fee-cap codes, `trustline.*`, `network.witness_unavailable`, `confirm.*`, `policy.approval_required`, `policy.approval_rejected`, `policy.approval_consumed`, `audit.*`, `nonce.*`, `auth.enrolled_*`, `identity.*`, `x402.rpc_simulate_failed`, `x402.unexpected_auth_entries`, `x402.invalid_asset_address` (authenticated x402), `x402.payment_build_failed` (authenticated), `network.mainnet_authorization_refused` |
+| Signed locally, no signed material sent | Authorization: the signer and the signature check. Submission (CLI, classic MCP): the shared checks before the send: authorization, envelope shape, endpoint identity recheck, signature network binding, transaction hash, pre-send record, consumption proof. x402: the entry signature, the audit row, and the intent consumption before the re-simulation. | `network.mainnet_authorization_refused`, keyring and signer codes, `audit.*`, `protocol.xdr_codec_failed`, endpoint and protocol codes, `submission.record_unavailable`, `submission.tx_already_submitted`, `policy.deny.*`, `x402.transaction_build_failed`, `x402.payment_build_failed` (authenticated) |
+| Signed material sent | Submission (CLI, classic MCP): the send and the confirmation; reconcile an unknown outcome. x402: the signed re-simulation sends the signed authorization to the configured RPC. After it, the re-simulation answer checks, the release authorization, the payload encoding, the release consumption, and the pending-approval consumption withhold the payload. | `submission.*`, `x402.rpc_simulate_failed`, `x402.transaction_build_failed`, `x402.unexpected_auth_entries`, `x402.payment_build_failed` (authenticated), encoding codes, approval-store codes, `network.mainnet_authorization_refused` (payload withheld) |
+
+A code can appear in more than one row. For the plain x402 tool, the message
+prefix names the stage: `payment withheld before signed transmission`,
+`at intent transmit gate`, `after intent authorization`, `at payload encoding`,
+`at payload release`, or `at terminal approval`. A withheld payment payload
+does not mean the configured RPC saw no signed authorization. For authenticated
+x402, a refusal after the identity exchange does not mean the web-auth server
+saw nothing: the wallet can already have submitted the signed SEP-10 challenge.
+
+The boundary key maps what the plain x402 tool reports to the state of the
+call. The message prefix is in the error message. The `failure_stage` label is
+in the `x402_authorization_withheld` audit row.
+
+| Reported marker | Kind | State when the check refused |
+|---|---|---|
+| `payment withheld before signed transmission` | message prefix | Nothing sent or signed, unsigned requests sent, or signed locally |
+| `payment withheld at intent transmit gate` | message prefix | Signed locally, no signed material sent |
+| `payment withheld after intent authorization` | message prefix | Signed locally, no signed material sent, or signed material sent |
+| `payment withheld at payload encoding` | message prefix | Signed material sent |
+| `payment withheld at payload release` | message prefix | Signed material sent |
+| `payment withheld at terminal approval` | message prefix | Signed material sent |
+| `anchor_unavailable` | `failure_stage` | Signed locally, no signed material sent |
+| `resimulation` | `failure_stage` | Signed material sent |
+| `response_processing` | `failure_stage` | Signed locally, no signed material sent (a refused mainnet intent consumption), or signed material sent |
+| `encoding` | `failure_stage` | Signed material sent |
+| `payload_release` | `failure_stage` | Signed material sent |
+| `terminal_approval` | `failure_stage` | Signed material sent |
+
 
 ### Library and substrate refusals
 
@@ -219,9 +309,9 @@ own check comes after the nonce is consumed.
 | Code | Meaning | Agent action |
 |---|---|---|
 | `network.endpoint_network_mismatch` | The endpoint serves a different network than the one declared (an RPC URL and a `chain_id` / network passphrase that disagree). | Do not retry as-is. Report to the operator: the profile's `rpc_url` and its network do not name the same chain. |
-| `network.endpoint_identity_unavailable` | The endpoint's network identity could not be established within the submission timeout, or its `getNetwork` answer did not parse. A transport failure is retried with bounded backoff; an answer that does not parse is not retried. The probe never falls back to the declared network. | Nothing was sent. Treat the endpoint as unusable and surface it to the operator; do not switch to a different endpoint on your own. |
+| `network.endpoint_identity_unavailable` | The endpoint's network identity could not be established within the submission timeout, or its `getNetwork` answer did not parse. A transport failure is retried with bounded backoff; an answer that does not parse is not retried. The probe never falls back to the declared network. | No transaction or payment was sent. Treat the endpoint as unusable and surface it to the operator; do not switch to a different endpoint on your own. |
 | `network.rpc_credential_refused` | RPC credential invalid or rejected. | See below. |
-| `network.unsupported_protocol_version` | A mainnet endpoint runs a protocol version outside the range this release supports (protocol 29). The message names the version and the range. Ordinary submission refuses mainnet before this check. Authorized submission enforces it. On testnet and other networks the same version is a logged warning, not a refusal. | Nothing was sent. Report the version to the operator; do not switch to a different endpoint on your own. |
+| `network.unsupported_protocol_version` | A mainnet endpoint runs a protocol version outside the range this release supports (protocol 29). The message names the version and the range. Ordinary submission refuses mainnet before this check. Authorized submission enforces it. On testnet and other networks the same version is a logged warning, not a refusal. | No transaction or payment was sent. Report the version to the operator; do not switch to a different endpoint on your own. |
 | `network.envelope_signed_for_mainnet` | A signature fails under the endpoint network and verifies under mainnet. | Do not retry; the envelope cannot be relayed onto this chain. Re-run the simulate step for the intended network. |
 | `network.envelope_signature_unverifiable` | A signature verifies under neither the endpoint's network nor mainnet, or no eligible ed25519 signer accounts for it (hash-x and pre-auth-tx signers contribute no ed25519 key). | Do not retry the same envelope. Re-run the simulate step and sign with a key the source account lists as a signer. |
 | `network.envelope_unsigned` | The envelope carries no signature, or on a fee-bump the outer or the inner transaction carries none; typically a build-only envelope handed straight to a submit step. | Sign the envelope first, then submit. On a fee-bump, both the inner transaction and the fee source must sign. |
@@ -230,6 +320,10 @@ own check comes after the nonce is consumed.
 `network.rpc_credential_refused` means the credential is empty, exceeds 1024 bytes,
 holds a control character, or an endpoint answers a request with HTTP 401 or 403.
 A rejected request is not retried. No transaction was sent.
+
+For the x402 payment tools, a payment endpoint refusal occurs before the payer
+signs. For authenticated payment, the SEP-10 challenge can already have been
+signed and submitted.
 Report it to the operator, who reruns
 `stellar-agent profile enroll-rpc-credential --role <role> --force` and checks the
 placement against the provider's documentation.
@@ -262,7 +356,7 @@ around it. No recovery path sends a transaction again.
 | `submission.hash_mismatch` | The endpoint reported a transaction hash that does not describe the transaction that was sent. `details` carries both hashes. | Reconcile `details.tx_hash`. Report the mismatch to the operator: the endpoint is not describing what it was handed. |
 | `submission.record_unavailable` | The wallet could not durably record the submission, so nothing was sent. The condition is local: an unwritable receipt store, an unreadable spending-window file, an audit log that cannot be appended, or a pending audit row the audit log's tip anchor does not cover, whose message carries `audit.tip_anchor_unavailable`. | Not agent-recoverable. Report to the operator; the submission is safe to retry once it is fixed. |
 | `submission.tx_malformed` | The endpoint refused the transaction outright, reporting a validation error for the envelope (for example the fee was below the current floor). The wallet never sends those bytes again and releases the reservation. | A fresh simulate-and-commit is the next step; the sequence is free. |
-| `policy.approval_consumed` | The approval presented was already spent on a submission. | Check that transaction's status before asking for the action again. Do not re-present the same approval. |
+| `policy.approval_consumed` | The approval presented was already spent. A classic approval was spent on a submission. A consumed x402 approval cannot be replayed. Its stored digest identifies the final envelope, not a chain transaction. | Do not re-present the same approval. For a classic approval, check that transaction's status before asking for the action again. For an x402 payment, request a new payment intent with call 1 and a fresh approval. |
 
 What `stellar_transaction_status` reports, and what it means:
 
@@ -354,7 +448,8 @@ on a ledger entry the decision uses. The message names the entry and field.
 For the x402 payment tools the entry is the `soroban simulation`, and the field
 is one of `result`, `authorization count`, `credentials`, `address`, `signature`,
 `invocation`, `resource fee ceiling`, `ledger skew`, or `expiration`.
-Nothing is signed or sent. Re-simulate and retry; report persistent disagreements
+A witness refusal precedes the payer signature. Authenticated identity exchange
+can already be complete. Re-simulate and retry; report persistent disagreements
 to the operator. Envelope-decode and rebuild producers of this code remain.
 
 The x402 witness runs before the health read, which keeps the deadline of

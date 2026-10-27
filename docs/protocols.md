@@ -34,6 +34,14 @@ The scope table defines mainnet admission for each build configuration. Public S
   - Challenge validation is fail-closed on every check.
   - The server-issued JWT signature is not verified by the client; the JWT is trusted via TLS.
   - Ephemeral keys are generated fresh per call from the OS RNG and zeroized on drop.
+  - Ordinary ephemeral authentication refuses a mainnet passphrase before key generation. Mainnet challenge signing requires the authorized completion used by bound x402 identity authentication.
+  - `auth_with_ephemeral_key` refuses mainnet before generating an ephemeral key. The ordinary SEP-10 signing entry refuses a mainnet passphrase with `sep10.mainnet_signing_forbidden`.
+  - `sign_challenge_for_test` exists only with the `test-helpers` feature and signs with a caller-supplied key. It refuses mainnet before signing.
+  - `prepare_ephemeral_auth` generates the ephemeral key, fetches and validates the challenge, and seals its digest and validated network before authorization. It does not sign the challenge.
+  - `web_auth_domain_for_endpoint` derives the web-auth domain from the endpoint's host.
+  - In the authorized flow, the challenge must name the ephemeral account before message authorization and again before signing.
+  - `complete_ephemeral_auth_authorized` consumes the prepared challenge and checks it against the message-use receipt before signing and submitting it.
+  - `sep10.mainnet_authorization_refused` reports that the authorized SEP-10 completion refused before submitting a signed challenge.
 
 ### SEP-24 and SEP-6: anchor deposit/withdraw
 
@@ -102,7 +110,7 @@ The scope table defines mainnet admission for each build configuration. Public S
 ### x402 v2 Exact Stellar: payer side
 
 - **Spec:** x402 v2 wire format, Exact Stellar scheme; wire-compatible with the published `@x402/stellar` package.
-- **Capability:** Payer-side construction and signing of a `PAYMENT-SIGNATURE` payload through a validate, identify, build, simulate, cross-check, sign, re-simulate, finalize flow.
+- **Capability:** Payer-side construction and signing of a `PAYMENT-SIGNATURE` payload through a validate, identify, build, simulate, cross-check, sign, re-simulate, finalize flow. In a feature-enabled build, mainnet payments use an approved intent for signing and a separate authorization for payload release. Authenticated payments first consume a bound SEP-10 message authorization.
 - **Side:** Payer/client only.
 - **Refusals and constraints:**
   - Payer-only; no payee or facilitator logic.
@@ -113,10 +121,11 @@ The scope table defines mainnet admission for each build configuration. Public S
   - Before signing, the first simulation must return exactly one authorization entry. It carries legacy `Address` credentials for the payer, a zero expiration ledger, and no signature.
   - That entry's root invocation must equal the SAC `transfer` the wallet built, contract and every argument included, with no nested calls. Any other answer refuses before signing.
   - The signed re-simulation must return a decodable result whose authorization entries are empty or equal to the signed entry. Any other answer refuses, and no payment payload is returned.
-  - The requirements are validated before any request. The checks cover the scheme, the network and the profile passphrase, the mainnet refusal, and a C-strkey asset. They also cover a strict `areFeesSponsored: true`, a positive amount, a G-, C-, or M-strkey `payTo`, and a `maxTimeoutSeconds` of at least one.
+  - The requirements are validated before any request. Requirement validation checks the scheme, network, profile passphrase, asset, sponsorship, amount, recipient, and timeout. It requires a C-strkey asset, a strict `areFeesSponsored: true`, a positive amount, a G-, C-, or M-strkey `payTo`, and a `maxTimeoutSeconds` of at least one.
+  - The authorized path validates these fields without refusing the mainnet network itself. The ordinary entry `validate_requirements` refuses a mainnet passphrase or a mainnet-pattern endpoint before any request.
   - Header fields named in an error are escaped and cut at 200 characters. A header that does not decode reports the JSON error class and position, not its values.
-  - Every request of one payment goes to the primary client built from the operator's profile. Its first request is `getNetwork`: an endpoint serving another network, reporting mainnet, or not identified before the caller's deadline refuses with its `network.*` code before any simulation.
-  - The first simulation must hold exactly one result. When the amount reaches the asset's cross-check threshold and the profile names an oracle, the oracle simulates the same unsigned transfer before the payer signs. Its answer must hold the same authorization entries apart from the nonce and the expiration. Its `minResourceFee` lies between 1 and 10,000,000 stroops. Its ledger trails the primary's by at most two and lies before the expiration ledger. A disagreement refuses with `simulation.divergence`. The results carry `cross_check`, and the `x402_payment_authorized` audit row carries a passed witness when the payment required one.
+  - Every request of one payment goes to the primary client built from the operator's profile. Its first request is `getNetwork`. The authorized path checks that the configured endpoint serves mainnet before its first simulation. The ordinary path retains its endpoint network restrictions: an endpoint serving another network, reporting mainnet, or not identified before the caller's deadline refuses with its `network.*` code before any simulation.
+  - The first simulation must hold exactly one result. When the amount reaches the asset's cross-check threshold and the profile names an oracle, the oracle simulates the same unsigned transfer before the payer signs. Its answer must hold the same authorization entries apart from the nonce and the expiration. Its `minResourceFee` lies between 1 and 10,000,000 stroops. Its ledger trails the primary's by at most two and lies before the expiration ledger. A disagreement refuses with `simulation.divergence`. The results carry `cross_check`, and the `x402_payment_authorized` audit row carries a passed witness when the payment required one. In a feature-enabled build, mainnet witness thresholds combine the signed policy and profile. A required witness compares the oracle's unsigned simulation before the payer signs.
   - `maxTimeoutSeconds` is clamped to 300 seconds as input; the requirement names a maximum, so a shorter validity meets it. With the five-second ledger estimate, the clamped value gives a window of `ceil(min(t, 300) / 5)` ledgers, from 1 to 60. The window counts ledger advances, not a guaranteed wall-clock lifetime.
   - The expiration ledger is the unsigned simulation's latest ledger plus the window; an overflow refuses. A `getHealth` read on the same endpoint must report `healthy`.
   - The unsigned simulation's ledger is above zero and at most one ledger ahead of the health ledger. The re-simulation's ledger is at most one ledger behind the health ledger. The health and re-simulation ledgers lie before the expiration ledger.
@@ -139,6 +148,11 @@ The scope table defines mainnet admission for each build configuration. Public S
   - A refused challenge or token answer reports the HTTP method, the status, and the web-auth endpoint's host. The wallet does not read the answer body.
   - A stellar.toml syntax error reports its line and column.
   - The token must be a compact JWT of at most 8192 bytes, with base64url characters in every segment. Any other token refuses.
+  - On an admitted mainnet server, one approval binds the payment intent and home domain. Call 2 prepares and validates the SEP-10 challenge, consumes its message authorization, and completes authentication before building the payment.
+  - `resolve_and_verify_counterparty` and its transport seam, which exists only with the `test-helpers` feature, refuse mainnet before fetching `stellar.toml`. An ordinary x402 identity entry reports `identity.mainnet_signing_forbidden` before any request.
+  - `resolve_and_verify_counterparty_authorized` takes `MainnetIdentityInputs` and returns `MainnetCounterpartySession`. Its `into_parts` method transfers the session and receipt to the payment caller.
+  - `identity.mainnet_authorization_refused` reports that the bound identity authentication refused before submitting a signed challenge.
+  - Without `mainnet-write`, the context and receipt inputs needed by the authorized flow cannot be constructed.
 
 ## Machine Payments Protocol (MPP)
 
@@ -203,7 +217,7 @@ integration review of the rebuilt protocol.
 | Protocol | What is supported | Surface |
 |---|---|---|
 | SEP-7 | Parse inbound `web+stellar:` URI into a preview; optional fresh-`stellar.toml` origin-signature verify; never signs or submits | MCP |
-| SEP-10 | Client Web Auth (fetch, 13-point validate, submit) to obtain a JWT; ephemeral-key flow | (used by the x402 identity gate; anchor tools take a caller-supplied JWT) |
+| SEP-10 | Client Web Auth (fetch, 13-point validate, submit) with an ephemeral key; authorized mainnet completion for bound x402 identity authentication | (used by the x402 identity gate; anchor tools take a caller-supplied JWT) |
 | SEP-6 | Discovery only, `GET /info` capability set | MCP |
 | SEP-24 | Interactive deposit/withdraw URL via `POST .../interactive`; returned to operator, never followed | MCP |
 | SEP-43 | Agent `ModuleInterface`: `get_address`, `sign_transaction`, `sign_auth_entry`, `sign_message`, `get_network`, none of which submits; plus `stellar_sep43_sign_and_submit_transaction`, which signs and submits | MCP |
@@ -211,8 +225,8 @@ integration review of the rebuilt protocol.
 | SEP-47 | Discover SEPs a contract claims via `contractmetav0` | MCP |
 | SEP-48 | Typed-argument preview of `InvokeHostFunction` (display-only, does not gate signing) | MCP |
 | SEP-53 | Sign and verify prefixed off-chain messages | MCP |
-| x402 v2 Exact Stellar | Payer-side `PAYMENT-SIGNATURE` construction and signing (Stellar-only, `exact`-only) | MCP |
-| x402 identity gate | SEP-10 counterparty-identity gate returning a Bearer JWT companion (never in the XDR) | MCP |
+| x402 v2 Exact Stellar | Payer-side payment construction, authorized mainnet signing, and authorized payload release (Stellar-only, `exact`-only) | MCP |
+| x402 identity gate | Bound SEP-10 authentication for an approved x402 payment; returns a Bearer JWT companion outside the payment XDR | MCP |
 | MPP sponsored Stellar charge | Testnet G-account payer authorization; returns one HTTP/native-MCP credential, records a host receipt, and independently reconciles settlement | CLI, MCP |
 | Blend | removed (see above) | n/a |
 | Soroswap | `trade` (signing, CLI + MCP) and the read-only `stellar_dex_quote` (MCP only); absolute slippage floor, pre-sign re-verify, WASM-pinned | CLI, MCP |
