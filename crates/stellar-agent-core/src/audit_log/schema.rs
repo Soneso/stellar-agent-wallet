@@ -2960,10 +2960,13 @@ pub enum EventKind {
     /// An x402 payment whose `x402_payment_authorized` row was written did not
     /// return a payment signature to the caller.
     ///
-    /// Paired with that row by the outer `request_id`. At every stage but
-    /// `anchor_unavailable`, the signed authorization reached, or may have
-    /// reached, the configured RPC in the re-simulation. `failure_stage` is one
-    /// of a closed set:
+    /// Paired with that row by the outer `request_id`. The signed authorization
+    /// reached, or may have reached, the configured RPC in the re-simulation at
+    /// the `resimulation`, `encoding`, `payload_release`, and `terminal_approval`
+    /// stages, and at `response_processing` when the RPC answered. It never left
+    /// the wallet at `anchor_unavailable`, nor at `response_processing` when the
+    /// mainnet payment intent could not be consumed. `failure_stage` is one of a
+    /// closed set:
     ///
     /// - `anchor_unavailable`: the tip anchor could not be written after the
     ///   authorized row, so the signed authorization never left the wallet. The
@@ -2971,9 +2974,15 @@ pub enum EventKind {
     /// - `resimulation`: the signed re-simulation request failed in transport,
     ///   or the RPC answered it with an error or with no resource data.
     /// - `response_processing`: the RPC answered, and the payload could not be
-    ///   built from the answer.
+    ///   built from the answer; or, on mainnet, the payment intent could not be
+    ///   consumed after the transmit gate, before the signed re-simulation
+    ///   request was sent.
     /// - `encoding`: the payload was built, and it could not be encoded as the
     ///   `PAYMENT-SIGNATURE` header value.
+    /// - `payload_release`: the payload was built under a mainnet authorization,
+    ///   and the release consumption of its child authorization was refused.
+    /// - `terminal_approval`: the child authorization was consumed, and the
+    ///   mainnet pending approval could not be tombstoned.
     ///
     /// This variant intentionally has NO field named `request_id` or `tool`
     /// (the outer [`AuditEntry`](super::entry::AuditEntry) owns those). A binary

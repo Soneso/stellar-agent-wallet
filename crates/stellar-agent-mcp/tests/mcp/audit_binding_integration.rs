@@ -28,6 +28,8 @@ const RECIPIENT: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWH
 
 fn x402_args() -> X402CreatePaymentArgs {
     X402CreatePaymentArgs {
+        approval_nonce: None,
+        approval_attestation: None,
         chain_id: "stellar:testnet".into(),
         address: None,
         payment_required: serde_json::json!({

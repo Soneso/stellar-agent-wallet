@@ -86,35 +86,7 @@ pub(crate) fn build_recorder<'a>(
     record: CommitRecord<'a>,
     sequence_floor: Option<&'a dyn SequenceFloorHook>,
 ) -> Result<WalletSubmissionRecorder<'a>, WalletError> {
-    // Only a gate that required approval verified the presented nonce, so only
-    // that decision binds, spends and records it.
-    let approval = match record.policy_decision {
-        stellar_agent_core::audit_log::PolicyDecision::RequireApproval => {
-            match (record.approval_nonce, record.approval_dir) {
-                (Some(approval_nonce), Some(store_dir)) => Some(ApprovalTombstone {
-                    store_dir,
-                    profile_name: record.profile_name.clone(),
-                    approval_nonce,
-                }),
-                (None, _) => {
-                    return Err(WalletError::Submission(
-                        SubmissionError::RecordUnavailable {
-                            detail: "the approved submission presented no approval nonce"
-                                .to_owned(),
-                        },
-                    ));
-                }
-                (Some(_), None) => {
-                    return Err(WalletError::Submission(
-                        SubmissionError::RecordUnavailable {
-                            detail: "the approved submission has no approval store".to_owned(),
-                        },
-                    ));
-                }
-            }
-        }
-        _ => None,
-    };
+    let approval = approval_binding(&record)?;
 
     let descriptor = profile_bound_descriptor(record.registry, record.profile, record.tool)
         .ok_or_else(|| {
@@ -155,6 +127,323 @@ pub(crate) fn build_recorder<'a>(
     )
     .with_sequence_floor(sequence_floor)
     .with_approval(approval))
+}
+
+fn approval_binding(record: &CommitRecord<'_>) -> Result<Option<ApprovalTombstone>, WalletError> {
+    // Only a gate that required approval verified the presented nonce, so only
+    // that decision binds, spends and records it.
+    let approval = match record.policy_decision {
+        stellar_agent_core::audit_log::PolicyDecision::RequireApproval => {
+            match (record.approval_nonce.clone(), record.approval_dir.clone()) {
+                (Some(approval_nonce), Some(store_dir)) => Some(ApprovalTombstone {
+                    store_dir,
+                    profile_name: record.profile_name.clone(),
+                    approval_nonce,
+                }),
+                (None, _) => {
+                    return Err(WalletError::Submission(
+                        SubmissionError::RecordUnavailable {
+                            detail: "the approved submission presented no approval nonce"
+                                .to_owned(),
+                        },
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(WalletError::Submission(
+                        SubmissionError::RecordUnavailable {
+                            detail: "the approved submission has no approval store".to_owned(),
+                        },
+                    ));
+                }
+            }
+        }
+        _ => None,
+    };
+
+    Ok(approval)
+}
+
+/// Fallible local inputs prepared before an authorization is minted.
+pub(crate) struct PreparedRecorder<'a> {
+    record: CommitRecord<'a>,
+    approval: Option<ApprovalTombstone>,
+    receipts: ReceiptStore,
+    pub window: PersistedWindowStore,
+}
+
+pub(crate) fn prepare_authorized_recorder(
+    record: CommitRecord<'_>,
+    window: PersistedWindowStore,
+) -> Result<PreparedRecorder<'_>, WalletError> {
+    let approval = approval_binding(&record)?;
+    profile_bound_descriptor(record.registry, record.profile, record.tool).ok_or_else(|| {
+        WalletError::Submission(SubmissionError::RecordUnavailable {
+            detail: format!("the submission tool {} has no registry entry", record.tool),
+        })
+    })?;
+    let receipts = ReceiptStore::open(&record.profile_name).map_err(|error| {
+        WalletError::Submission(SubmissionError::RecordUnavailable {
+            detail: format!("the submission receipt store could not be opened: {error}"),
+        })
+    })?;
+    window
+        .load_into(
+            &record.profile_name,
+            record.profile,
+            &stellar_agent_core::policy::v1::PolicyStateStore::new(),
+        )
+        .map_err(|error| {
+            WalletError::Submission(SubmissionError::RecordUnavailable {
+                detail: format!("the submission window store could not be opened: {error}"),
+            })
+        })?;
+    Ok(PreparedRecorder {
+        record,
+        approval,
+        receipts,
+        window,
+    })
+}
+
+impl<'a> PreparedRecorder<'a> {
+    fn build(
+        self,
+        authorization: &stellar_agent_network::mainnet::authorization::MainnetTxSignAuthorization,
+        floor: Option<&'a dyn SequenceFloorHook>,
+    ) -> WalletSubmissionRecorder<'a> {
+        let record = self.record;
+        WalletSubmissionRecorder::new_authorized(
+            record.profile,
+            record.profile_name,
+            record.tool,
+            Some(record.chain_id),
+            record.policy_decision,
+            record.legs,
+            authorization,
+            self.receipts,
+            self.window,
+            Some(record.audit),
+            record.nonce_id,
+            uuid::Uuid::new_v4().to_string(),
+            record.now_ms,
+        )
+        .with_sequence_floor(floor)
+        .with_approval(self.approval)
+    }
+}
+
+/// Marks entry before delegating the durable consumption hook.
+struct MarkedRecorder<'a> {
+    inner: WalletSubmissionRecorder<'a>,
+    entered: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl stellar_agent_network::SubmissionRecorder for MarkedRecorder<'_> {
+    async fn pre_send(
+        &self,
+        intent: &stellar_agent_network::SubmissionIntent,
+    ) -> Result<(), WalletError> {
+        self.inner.pre_send(intent).await
+    }
+
+    async fn pre_send_authorized(
+        &self,
+        intent: &stellar_agent_network::SubmissionIntent,
+        grant: stellar_agent_network::submit::MainnetSubmitGrant,
+    ) -> Result<stellar_agent_network::mainnet::consumed::AuthorizationConsumed, WalletError> {
+        self.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.pre_send_authorized(intent, grant).await
+    }
+
+    async fn outcome(
+        &self,
+        intent: &stellar_agent_network::SubmissionIntent,
+        outcome: &stellar_agent_network::SubmissionOutcome,
+    ) {
+        self.inner.outcome(intent, outcome).await;
+    }
+}
+
+pub(crate) fn submit_failure_stage(
+    entered: bool,
+) -> stellar_agent_network::mainnet::resolve::InvalidationStage {
+    use stellar_agent_network::mainnet::resolve::InvalidationStage;
+    if entered {
+        InvalidationStage::PreSendRefused
+    } else {
+        InvalidationStage::SubmitGateRefused
+    }
+}
+
+pub(crate) fn sign_failure_stage(
+    error: &WalletError,
+) -> stellar_agent_network::mainnet::resolve::InvalidationStage {
+    use stellar_agent_network::mainnet::resolve::InvalidationStage;
+    if matches!(error, WalletError::Auth(_)) {
+        InvalidationStage::SignerUnavailable
+    } else {
+        InvalidationStage::SignRefused
+    }
+}
+
+pub(crate) fn cleanup_authorization(
+    store: &PersistedWindowStore,
+    context: &stellar_agent_network::MainnetWriteContext,
+    id: stellar_agent_network::mainnet::AuthorizationId,
+    stage: stellar_agent_network::mainnet::resolve::InvalidationStage,
+) {
+    if let Err(error) =
+        stellar_agent_network::mainnet::resolve::invalidate_unconsumed(store, context, id, stage)
+    {
+        let settled = matches!(
+            &error,
+            stellar_agent_network::mainnet::MainnetAuthorizationError::Refused(
+                stellar_agent_network::mainnet::MainnetPrecondition::NotOpen
+            )
+        );
+        tracing::warn!(
+            ?stage,
+            settled,
+            code = stellar_agent_core::WalletError::from(error).code(),
+            "authorization cleanup refused; primary failure retained"
+        );
+    }
+}
+
+/// Signs and submits the approved bytes under the same client and consumer.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call owns the signing and submission lifecycle"
+)]
+pub(crate) async fn sign_and_submit_classic(
+    server: &crate::server::WalletServer,
+    guard: Option<&crate::server::MainnetWriteGuard<'_>>,
+    approval: Option<&stellar_agent_core::approval::witness::ApprovalWitness>,
+    audit: Option<stellar_agent_network::mainnet::audit_readiness::AuditReadiness>,
+    consumer: stellar_agent_network::mainnet::MainnetConsumer,
+    client: &stellar_agent_network::StellarRpcClient,
+    envelope: &str,
+    source: &str,
+    record: CommitRecord<'_>,
+    witness: Option<&stellar_agent_network::cross_check::CrossCheckWitness>,
+    floor: Option<&dyn SequenceFloorHook>,
+) -> Result<stellar_agent_network::submit::SubmissionResult, CallToolResult> {
+    use stellar_agent_network::{
+        signing::envelope_signing::{attach_signature, attach_signature_authorized},
+        submit::{
+            MainnetSubmitGrant, SubmissionSignerKind, submit_authorized_transaction_and_wait,
+            submit_transaction_and_wait,
+        },
+    };
+    let render = |error: WalletError| submission_error_result(&error, envelope);
+    let timeout = super::common::submit_timeout(record.profile);
+    if let Some(guard) = guard {
+        let approval = approval.ok_or_else(|| {
+            super::common::approval_required_indistinguishable(&record.profile_name)
+        })?;
+        let audit = audit.ok_or_else(|| {
+            super::common::business_error_result(
+                "audit.chain_key_unavailable",
+                "audit readiness missing",
+            )
+        })?;
+        let signer = server.mainnet_enrolled_signer(guard).map_err(render)?;
+        let handle = stellar_agent_network::keyring::lazy_signer_from_keyring(
+            signer.seed_entry(),
+            &stellar_strkey::ed25519::PublicKey(signer.public_key()).to_string(),
+        )
+        .map_err(render)?;
+        let store = PersistedWindowStore::at_path(server.window_path.clone());
+        let prepared = prepare_authorized_recorder(
+            record,
+            PersistedWindowStore::at_path(server.window_path.clone()),
+        )
+        .map_err(render)?;
+        let authorization = stellar_agent_network::mainnet::resolve::resolve_tx_sign(
+            stellar_agent_network::mainnet::resolve::TxSignRequest {
+                context: guard.context,
+                consumer,
+                unsigned_envelope_xdr: envelope,
+                client,
+                probe_deadline: timeout,
+                witness,
+                signer: &signer,
+                policy: guard.policy,
+                enablement: guard.enablement,
+                approval,
+                audit,
+                store: &prepared.window,
+            },
+        )
+        .await
+        .map_err(|error| render(error.into()))?;
+        let id = authorization.id();
+        let signed = match attach_signature_authorized(
+            envelope,
+            &handle,
+            guard.context.network_passphrase(),
+            consumer,
+            &authorization,
+        )
+        .await
+        {
+            Ok(signed) => signed,
+            Err(error) => {
+                cleanup_authorization(&store, guard.context, id, sign_failure_stage(&error));
+                return Err(render(error));
+            }
+        };
+        let recorder = MarkedRecorder {
+            inner: prepared.build(&authorization, floor).with_witness(witness),
+            entered: std::sync::atomic::AtomicBool::new(false),
+        };
+        let result = submit_authorized_transaction_and_wait(
+            client,
+            &signed,
+            timeout,
+            guard.context.network_passphrase(),
+            Some(SubmissionSignerKind::Keyring),
+            &recorder,
+            consumer,
+            MainnetSubmitGrant::Tx(authorization),
+        )
+        .await;
+        if result.is_err() {
+            cleanup_authorization(
+                &store,
+                guard.context,
+                id,
+                submit_failure_stage(recorder.entered.load(std::sync::atomic::Ordering::SeqCst)),
+            );
+        }
+        result.map_err(|error| submission_error_result(&error, &signed))
+    } else {
+        let handle = stellar_agent_network::keyring::enrolled_keyring_signer(
+            &record.profile_name,
+            record.profile,
+            source,
+        )
+        .await
+        .map_err(render)?;
+        let signed = attach_signature(envelope, &handle, server.context.network_passphrase())
+            .await
+            .map_err(render)?;
+        let recorder = build_recorder(record, floor)
+            .map_err(render)?
+            .with_witness(witness);
+        submit_transaction_and_wait(
+            client,
+            &signed,
+            timeout,
+            server.context.network_passphrase(),
+            Some(SubmissionSignerKind::Keyring),
+            Some(&recorder),
+        )
+        .await
+        .map_err(|error| submission_error_result(&error, &signed))
+    }
 }
 
 /// Writes the value-action row that settles a reconciled submission.
@@ -822,6 +1111,77 @@ mod tests {
         assert!(error.message().contains("approval nonce"));
     }
 
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn mainnet_recorder_preparation_refuses_before_authorization() {
+        use crate::tools::common::tests::mainnet::Fixture;
+        for defect in [
+            "none",
+            "nonce",
+            "approval_dir",
+            "registry",
+            "receipts",
+            "window",
+        ] {
+            let f = Fixture::new(|raw| raw);
+            let profile = f.server.security_profile();
+            let readiness = stellar_agent_network::mainnet::audit_readiness::audit_readiness(
+                profile, "operator",
+            )
+            .unwrap();
+            if defect == "receipts" {
+                let directory =
+                    stellar_agent_core::profile::receipt::default_receipts_dir().unwrap();
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(directory.join("operator.json"), "invalid receipt state").unwrap();
+            }
+            if defect == "window" {
+                std::fs::create_dir_all(f.server.window_path.parent().unwrap()).unwrap();
+                std::fs::write(&f.server.window_path, "invalid window state").unwrap();
+            }
+            let result = prepare_authorized_recorder(
+                CommitRecord {
+                    profile,
+                    profile_name: "operator".to_owned(),
+                    tool: if defect == "registry" {
+                        "stellar_unregistered_commit"
+                    } else {
+                        "stellar_pay_commit"
+                    },
+                    policy_decision: stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+                    chain_id: "stellar:mainnet".to_owned(),
+                    legs: Vec::new(),
+                    engine: f.server.policy_engine.as_ref(),
+                    registry: &f.server.tool_registry,
+                    value_class: ValueClass::ReadOnly,
+                    audit: Arc::clone(readiness.writer()),
+                    nonce_id: None,
+                    approval_nonce: (defect != "nonce").then(|| "approval-binding".to_owned()),
+                    approval_dir: (defect != "approval_dir")
+                        .then(|| f.server.resolve_approval_dir().unwrap()),
+                    now_ms: stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                },
+                PersistedWindowStore::at_path(f.server.window_path.clone()),
+            );
+            if defect == "none" {
+                assert!(result.is_ok());
+            } else {
+                let error = match result {
+                    Ok(_) => panic!("accepted {defect}"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.code(), "submission.record_unavailable", "{defect}");
+            }
+            assert_eq!(f.seed_reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+            if defect != "window" && f.server.window_path.exists() {
+                let bytes = std::fs::read(&f.server.window_path).unwrap();
+                let state: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+                assert!(state["authorizations"].as_array().is_none_or(Vec::is_empty));
+            }
+        }
+    }
+
     /// Each receipt outcome selects the audit row and code it owes.
     #[test]
     fn settlement_rows_follow_receipt_status_and_evidence() {
@@ -945,5 +1305,23 @@ mod tests {
         assert_eq!(rows[1]["kind"], "value_action_submitted");
         assert_eq!(rows[1]["witness"], serde_json::to_value(&witness).unwrap());
         assert_eq!(rows[0]["witness"], rows[1]["witness"]);
+    }
+    #[test]
+    fn mainnet_classic_cleanup_tracks_signing_and_pre_send_entry() {
+        use stellar_agent_network::mainnet::resolve::InvalidationStage as S;
+        assert!(matches!(submit_failure_stage(false), S::SubmitGateRefused));
+        assert!(matches!(submit_failure_stage(true), S::PreSendRefused));
+        let unavailable =
+            WalletError::Auth(stellar_agent_core::error::AuthError::SignerKeyMismatch {
+                expected: "expected".to_owned(),
+                got: "missing".to_owned(),
+            });
+        assert!(matches!(
+            sign_failure_stage(&unavailable),
+            S::SignerUnavailable
+        ));
+        let refused =
+            WalletError::from(stellar_agent_core::error::NetworkError::MainnetAuthorizationRefused);
+        assert!(matches!(sign_failure_stage(&refused), S::SignRefused));
     }
 }

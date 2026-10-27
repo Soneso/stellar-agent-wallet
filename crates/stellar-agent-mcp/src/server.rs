@@ -55,7 +55,11 @@
 //!   G-strkey accounts.
 //! - `mcp-resource://profiles/<name>` - non-secret profile metadata.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use ed25519_dalek::PUBLIC_KEY_LENGTH;
 use rmcp::serde::Serialize;
@@ -503,7 +507,13 @@ fn build_policy_engine(
     profile: &Profile,
     policy_dir_override: Option<&Path>,
     selection: Option<(stellar_agent_core::profile::name::ProfileNameSource, &Path)>,
-) -> Result<Arc<dyn PolicyEngine>, BuildRegistryError> {
+) -> Result<
+    (
+        stellar_agent_network::policy_engine::BuiltPolicyEngine,
+        Option<PathBuf>,
+    ),
+    BuildRegistryError,
+> {
     use stellar_agent_core::policy::v1::verified::OwnerKeySource;
     use stellar_agent_network::policy_engine::{
         PolicyEngineBuildError, ProfileSelection, build_policy_engine as build_engine,
@@ -552,7 +562,8 @@ fn build_policy_engine(
             &name,
         );
     }
-    Ok(built.engine)
+    let policy_path = policy_dir.map(|dir| dir.join(format!("{name}.toml")));
+    Ok((built, policy_path))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -598,6 +609,15 @@ pub struct WalletServer {
     /// Network identity shared by all transaction tools.
     pub(crate) context: stellar_agent_network::NetworkContext,
     pub(crate) policy_engine: Arc<dyn PolicyEngine>,
+    pub(crate) mainnet_context: Option<Arc<stellar_agent_network::MainnetWriteContext>>,
+    pub(crate) verified_policy:
+        Option<Arc<stellar_agent_core::mainnet::verified_policy::VerifiedPolicy>>,
+    pub(crate) enablement: Option<Arc<stellar_agent_core::mainnet::enablement::EnablementRecord>>,
+    pub(crate) selection: Option<stellar_agent_core::profile::name::ResolvedProfileName>,
+    pub(crate) profiles_dir: Option<PathBuf>,
+    pub(crate) policy_path: Option<PathBuf>,
+    pub(crate) window_path: PathBuf,
+    pub(crate) owner_source: stellar_agent_core::policy::v1::verified::OwnerKeySource,
     /// Tool registry built from `#[mcp_tool_item]` attributes at startup.
     ///
     /// Maps tool name → [`ToolDescriptor`]; used by `tools/call` dispatch to
@@ -738,7 +758,14 @@ impl WalletServer {
         source: stellar_agent_core::profile::name::ProfileNameSource,
         profile_dir: &Path,
     ) -> Result<Self, BuildRegistryError> {
-        Self::new_with_selection_inner(profile, default_clock(), None, Some((source, profile_dir)))
+        Self::new_with_selection_inner(
+            profile,
+            default_clock(),
+            None,
+            Some((source, profile_dir)),
+            #[cfg(any(test, feature = "test-helpers"))]
+            &[],
+        )
     }
 
     /// Constructs a [`WalletServer`] with an injected [`Clock`].
@@ -763,7 +790,14 @@ impl WalletServer {
         clock: Arc<dyn Clock>,
         policy_dir_override: Option<&Path>,
     ) -> Result<Self, BuildRegistryError> {
-        Self::new_with_selection_inner(profile, clock, policy_dir_override, None)
+        Self::new_with_selection_inner(
+            profile,
+            clock,
+            policy_dir_override,
+            None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            &[],
+        )
     }
 
     fn new_with_selection_inner(
@@ -771,30 +805,73 @@ impl WalletServer {
         clock: Arc<dyn Clock>,
         policy_dir_override: Option<&Path>,
         selection: Option<(stellar_agent_core::profile::name::ProfileNameSource, &Path)>,
+        #[cfg(any(test, feature = "test-helpers"))] routes: &[(&str, &str)],
     ) -> Result<Self, BuildRegistryError> {
-        // NonceMint::from_profile is infallible in the current implementation
-        // (no reachability probe at construction time).  The `?` is for forward
-        // compatibility; the only currently-possible NonceError variants at
-        // construction time are none.
+        let resolved = selection
+            .map(|(source, _)| {
+                profile_name_from_key_ref(&profile).map(|name| {
+                    stellar_agent_core::profile::name::ResolvedProfileName { name, source }
+                })
+            })
+            .transpose()?;
+        let (built, policy_path) = build_policy_engine(&profile, policy_dir_override, selection)?;
+        let mainnet_context = if built.enablement.is_some() {
+            let (resolved, directory) = resolved
+                .as_ref()
+                .zip(selection.map(|(_, dir)| dir))
+                .ok_or_else(|| BuildRegistryError::PolicyEngineError {
+                    detail: "mainnet enablement requires explicit profile selection".to_owned(),
+                })?;
+            let context = stellar_agent_network::NetworkContext::mainnet_write(
+                &profile,
+                resolved,
+                directory,
+                stellar_agent_network::MainnetEndpointFlags::default(),
+            )
+            .map_err(|error| BuildRegistryError::PolicyEngineError {
+                detail: error.to_string(),
+            })?;
+            #[cfg(any(test, feature = "test-helpers"))]
+            let context = context.with_test_transport_routes(routes);
+            Some(Arc::new(context))
+        } else {
+            None
+        };
+        let context = mainnet_context.as_ref().map_or_else(
+            || stellar_agent_network::NetworkContext::from_profile(&profile),
+            |context| context.network_context(),
+        );
+        let security_profile = mainnet_context
+            .as_ref()
+            .map_or(&profile, |context| context.profile());
         let nonce_mint = NonceMint::from_profile(
-            &profile,
-            &stellar_agent_core::profile::name::profile_name_for_approval(&profile),
+            security_profile,
+            &stellar_agent_core::profile::name::profile_name_for_approval(security_profile),
         )
         .map_err(|e| BuildRegistryError::NonceMintInit {
             detail: e.to_string(),
         })?;
-
-        let policy_engine = build_policy_engine(&profile, policy_dir_override, selection)?;
+        let window_path = stellar_agent_core::profile::schema::default_policy_window_state_path_for(
+            &stellar_agent_core::profile::name::profile_name_for_approval(&profile),
+        );
 
         let tool_registry = Arc::new(build_tool_registry()?);
         let tool_catalogue = Arc::new(ToolCatalogueAdapter::new(Arc::clone(&tool_registry)));
-        let counterparty_resolver = build_counterparty_resolver(&profile);
+        let counterparty_resolver = build_counterparty_resolver(security_profile);
 
         Ok(Self {
-            context: stellar_agent_network::NetworkContext::from_profile(&profile),
+            context,
             profile: Arc::new(profile),
             audit_binding: BindingCheck::Enforce,
-            policy_engine,
+            policy_engine: built.engine,
+            mainnet_context,
+            verified_policy: built.verified.map(Arc::new),
+            enablement: built.enablement.map(Arc::new),
+            selection: resolved,
+            profiles_dir: selection.map(|(_, dir)| dir.to_path_buf()),
+            policy_path,
+            window_path,
+            owner_source: stellar_agent_core::policy::v1::verified::OwnerKeySource::Keyring,
             tool_registry,
             tool_catalogue,
             nonce_mint: Arc::new(nonce_mint),
@@ -1011,6 +1088,28 @@ impl WalletServer {
 
 #[cfg(any(test, feature = "test-helpers"))]
 impl WalletServer {
+    /// Constructs a selected server with host-bound test transports.
+    ///
+    /// Routes preserve the stored HTTPS endpoint identities and every proof check.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::new_with_selection`].
+    #[doc(hidden)]
+    pub fn new_with_selection_and_routes_for_test(
+        profile: Profile,
+        source: stellar_agent_core::profile::name::ProfileNameSource,
+        profile_dir: &Path,
+        routes: &[(&str, &str)],
+    ) -> Result<Self, BuildRegistryError> {
+        Self::new_with_selection_inner(
+            profile,
+            default_clock(),
+            None,
+            Some((source, profile_dir)),
+            routes,
+        )
+    }
+
     /// Replaces the active [`PolicyEngine`] for cross-track integration testing.
     ///
     /// The integration test in `tests/mcp/policy_v1_integration.rs` builds a
@@ -1022,6 +1121,9 @@ impl WalletServer {
     /// Gated on `test-helpers` feature or `#[cfg(test)]`.
     #[doc(hidden)]
     pub fn set_policy_engine_for_test(&mut self, engine: Arc<dyn PolicyEngine>) {
+        self.mainnet_context = None;
+        self.verified_policy = None;
+        self.enablement = None;
         self.policy_engine = engine;
     }
 
@@ -1359,6 +1461,176 @@ impl ServerHandler for WalletServer {
                 ]))
             }
             _ => Err(profile_resource_not_found(&request.uri)),
+        }
+    }
+}
+
+/// Startup proofs borrowed for one admitted mainnet action.
+pub(crate) struct MainnetWriteGuard<'a> {
+    pub context: &'a stellar_agent_network::MainnetWriteContext,
+    pub policy: &'a stellar_agent_core::mainnet::verified_policy::VerifiedPolicy,
+    pub enablement: &'a stellar_agent_core::mainnet::enablement::EnablementRecord,
+    pub profiles_dir: &'a Path,
+}
+
+impl WalletServer {
+    pub(crate) fn security_profile(&self) -> &Profile {
+        self.mainnet_context
+            .as_ref()
+            .map_or(&self.profile, |context| context.profile())
+    }
+
+    pub(crate) fn mainnet_write_admission(
+        &self,
+        surface: stellar_agent_network::mainnet::MainnetConsumer,
+    ) -> Result<MainnetWriteGuard<'_>, rmcp::model::CallToolResult> {
+        use crate::tools::common::business_error_result;
+        use stellar_agent_network::mainnet::MainnetConsumer;
+        let refuse = |detail| {
+            business_error_result(
+                "network.mainnet_write_forbidden",
+                format!("network.mainnet_write_forbidden: {detail}"),
+            )
+        };
+        if !matches!(
+            surface,
+            MainnetConsumer::McpPay
+                | MainnetConsumer::McpClaim
+                | MainnetConsumer::McpCreateAccount
+                | MainnetConsumer::McpTrustline
+                | MainnetConsumer::X402Create
+        ) {
+            return Err(refuse("this tool has no mainnet write authority"));
+        }
+        if self.profile.policy.engine != PolicyEngineKind::V1 {
+            return Err(refuse("mainnet writes require the V1 policy engine"));
+        }
+        let policy = self
+            .verified_policy
+            .as_deref()
+            .filter(|policy| policy.mainnet().is_some())
+            .ok_or_else(|| refuse("mainnet writes require a verified mainnet policy"))?;
+        let enablement = self
+            .enablement
+            .as_deref()
+            .ok_or_else(|| refuse("mainnet writes require verified enablement"))?;
+        let context = self
+            .mainnet_context
+            .as_deref()
+            .ok_or_else(|| refuse("mainnet writes require the enabled profile context"))?;
+        let profiles_dir = self
+            .profiles_dir
+            .as_deref()
+            .ok_or_else(|| refuse("mainnet writes require the selected profiles directory"))?;
+        Ok(MainnetWriteGuard {
+            context,
+            policy,
+            enablement,
+            profiles_dir,
+        })
+    }
+
+    pub(crate) fn verify_mainnet_freshness(
+        &self,
+        guard: &MainnetWriteGuard<'_>,
+    ) -> Result<(), rmcp::model::CallToolResult> {
+        use stellar_agent_core::mainnet::enablement::{read_enablement_nonce, verify_enablement};
+        use stellar_agent_core::policy::v1::{
+            PolicyStateStore,
+            verified::{PinMode, PolicyLoad, load_verified_policy},
+        };
+        let refuse = || {
+            crate::tools::common::business_error_result(
+                "network.mainnet_write_forbidden",
+                "enablement or policy changed, restart the server",
+            )
+        };
+        let selection = self.selection.as_ref().ok_or_else(refuse)?;
+        let path = self.policy_path.as_deref().ok_or_else(refuse)?;
+        // The same owner entry startup read: the selected profile's default
+        // owner coordinate.
+        let owner = fetch_owner_pubkey_from_keyring(&selection.name).map_err(|_| refuse())?;
+        let fresh = load_verified_policy(
+            &PolicyLoad {
+                path,
+                profile: guard.context.profile(),
+                profile_name: &selection.name,
+                owner_pubkey: &owner,
+                owner_source: self.owner_source,
+                window_path: &self.window_path,
+            },
+            PolicyStateStore::new(),
+            PinMode::CompareOnly,
+        )
+        .map_err(|_| refuse())?;
+        let enablement = verify_enablement(
+            &fresh,
+            &selection.name,
+            selection.source,
+            guard.context.profile(),
+            guard.profiles_dir,
+            &read_enablement_nonce,
+        )
+        .map_err(|_| refuse())?;
+        if fresh.fact_digest() != guard.policy.fact_digest()
+            || enablement.fact_digest() != guard.enablement.fact_digest()
+        {
+            return Err(refuse());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mainnet_enrolled_signer(
+        &self,
+        guard: &MainnetWriteGuard<'_>,
+    ) -> Result<stellar_agent_network::keyring::EnrolledSigner, stellar_agent_core::WalletError>
+    {
+        let pin = stellar_strkey::ed25519::PublicKey::from_string(
+            &guard.context.profile().mcp_signer_default.account,
+        )
+        .map_err(|_| stellar_agent_core::AuthError::EnrolledSignerUnpinned {
+            profile: guard.context.profile_name().to_owned(),
+            reason: "malformed",
+        })?;
+        stellar_agent_network::keyring::enrolled_signer(
+            guard.context.profile_name(),
+            guard.profiles_dir,
+            &self.profile,
+            stellar_agent_network::keyring::EnrolledRole::Agent,
+            &pin.0,
+        )
+    }
+
+    /// The primary RPC client a write tool reads and submits through.
+    ///
+    /// An admitted mainnet write uses the client of its mainnet context. Every
+    /// other route uses the profile's own client; on a mainnet profile without
+    /// admission, [`Self::probe_write_endpoint`] refuses that client with
+    /// `network.mainnet_write_forbidden` once the endpoint reports the mainnet
+    /// passphrase, before any read, so the refusal stays a tool result.
+    pub(crate) fn write_primary_client(
+        &self,
+    ) -> Result<stellar_agent_network::StellarRpcClient, stellar_agent_core::WalletError> {
+        match &self.mainnet_context {
+            Some(context) => context.primary_client(),
+            None => self.context.primary_client(),
+        }
+    }
+
+    pub(crate) async fn probe_write_endpoint(
+        &self,
+        client: &stellar_agent_network::StellarRpcClient,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), stellar_agent_core::WalletError> {
+        if self.mainnet_context.is_some() {
+            client.check_mainnet_endpoint(deadline).await
+        } else {
+            crate::tools::common::probe_endpoint_network(
+                client,
+                &self.context,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
         }
     }
 }
