@@ -52,7 +52,9 @@ use stellar_agent_core::{
     profile::schema::Profile,
 };
 use stellar_agent_mcp::server::{WalletServer, check_duplicate_registrations};
-use stellar_agent_test_support::source_order::{assert_called_between, production_half};
+use stellar_agent_test_support::source_order::{
+    assert_called_between, assert_calls_in_order, assert_not_called, production_half,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: iterate all registered McpToolRegistration records
@@ -1556,51 +1558,70 @@ fn value_kind_classification_matches_design() {
 // calls require_value_audit_writer
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `(tool_name, source_text)` for every MCP tool that signs or submits
-/// value-moving state and therefore MUST call `require_value_audit_writer`
-/// (the fail-closed audit pre-flight) before doing so.
+/// `(tool_name, source_text, acquisition)` for every MCP tool that signs or
+/// submits value-moving state and therefore MUST acquire the value-audit
+/// writer (the fail-closed audit pre-flight) before doing so.
 ///
-/// `include_str!` pulls each file in at compile time — a genuine scan of the
-/// shipped implementation, not a hand-copied duplicate. `vault.rs` appears
-/// twice (deposit and withdraw share one file); both checks are redundant
-/// against the same content, which is harmless.
-const MOVES_VALUE_COMMIT_HANDLER_SOURCES: &[(&str, &str)] = &[
-    ("stellar_pay_commit", include_str!("../../src/tools/pay.rs")),
+/// The acquisition is `require_value_audit_writer(` for a handler that
+/// acquires the writer itself, and `.write_audit()` for the four classic
+/// commit handlers, which acquire it through the server's `write_audit`:
+/// that routes a mainnet write through the anchored audit readiness and every
+/// other write through `require_value_audit_writer`, which
+/// `write_audit_routes_both_branches_through_the_keyed_preflight` pins.
+///
+/// `include_str!` pulls each file in at compile time, so the scan reads the
+/// shipped implementation. `vault.rs` appears twice (deposit and withdraw
+/// share one file); both checks read the same content.
+const MOVES_VALUE_COMMIT_HANDLER_SOURCES: &[(&str, &str, &str)] = &[
+    (
+        "stellar_pay_commit",
+        include_str!("../../src/tools/pay.rs"),
+        ".write_audit()",
+    ),
     (
         "stellar_create_account_commit",
         include_str!("../../src/tools/create_account.rs"),
+        ".write_audit()",
     ),
     (
         "stellar_claim_commit",
         include_str!("../../src/tools/claim.rs"),
+        ".write_audit()",
     ),
     (
         "stellar_trustline_commit",
         include_str!("../../src/tools/trustline.rs"),
+        ".write_audit()",
     ),
     (
         "stellar_dex_trade",
         include_str!("../../src/tools/dex_trade.rs"),
+        "require_value_audit_writer(",
     ),
     (
         "stellar_defindex_vault_deposit",
         include_str!("../../src/tools/vault.rs"),
+        "require_value_audit_writer(",
     ),
     (
         "stellar_defindex_vault_withdraw",
         include_str!("../../src/tools/vault.rs"),
+        "require_value_audit_writer(",
     ),
     (
         "stellar_x402_authenticated_payment",
         include_str!("../../src/tools/x402_authenticated_payment.rs"),
+        "require_value_audit_writer(",
     ),
     (
         "stellar_x402_create_payment",
         include_str!("../../src/tools/x402_create_payment.rs"),
+        "require_value_audit_writer(",
     ),
     (
         "stellar_mpp_charge_commit",
         include_str!("../../src/tools/mpp.rs"),
+        "require_value_audit_writer(",
     ),
 ];
 
@@ -1648,7 +1669,7 @@ fn every_moves_value_commit_handler_calls_require_value_audit_writer() {
 
     let covered: HashSet<&str> = MOVES_VALUE_COMMIT_HANDLER_SOURCES
         .iter()
-        .map(|(name, _)| *name)
+        .map(|(name, _, _)| *name)
         .collect();
     let exempt: HashSet<&str> = MOVES_VALUE_SIMULATE_PHASE_EXEMPT.iter().copied().collect();
 
@@ -1665,13 +1686,26 @@ fn every_moves_value_commit_handler_calls_require_value_audit_writer() {
         );
     }
 
-    for (tool_name, source) in MOVES_VALUE_COMMIT_HANDLER_SOURCES {
+    for (tool_name, source, acquisition) in MOVES_VALUE_COMMIT_HANDLER_SOURCES {
         assert!(
-            source.contains("require_value_audit_writer"),
-            "the source file implementing '{tool_name}' does not call \
-             require_value_audit_writer — the fail-closed audit pre-flight is missing"
+            production_half(source).contains(acquisition),
+            "the source file implementing '{tool_name}' does not call {acquisition}: the \
+             fail-closed audit pre-flight is missing"
         );
     }
+}
+
+/// The server's `write_audit`, which the four classic commit handlers call,
+/// acquires the anchored audit readiness on a mainnet write and the keyed
+/// `require_value_audit_writer` pre-flight on every other write.
+#[test]
+fn write_audit_routes_both_branches_through_the_keyed_preflight() {
+    assert_calls_in_order(
+        "common.rs",
+        include_str!("../../src/tools/common.rs"),
+        "pub(crate) fn write_audit(",
+        &["audit_readiness(", "require_value_audit_writer("],
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1766,6 +1800,14 @@ fn rule_create_audit_writer_routes_through_the_keyed_preflight() {
 /// Every MCP consumer of an approval acquires the keyed audit writer after it
 /// reads the approval and before it loads the signing key. The acquisition
 /// drains consent rows `stellar-agent approve` queued beside the server.
+///
+/// The four classic commit handlers read the approval, acquire the writer
+/// through `write_audit`, and then call the shared `sign_and_submit_classic`,
+/// which is the only place they load a signer. Inside the helper the mainnet
+/// branch refuses without the acquired audit readiness before it resolves the
+/// enrolled signer and builds the lazy seed handle, and the other branch loads
+/// the enrollment helper after it. The x402 create-payment mainnet path reads
+/// the approval, acquires the readiness, and only then builds the lazy handle.
 #[test]
 fn every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the_signer() {
     assert_called_between(
@@ -1811,8 +1853,40 @@ fn every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the
             source,
             function,
             "verify_attestation_gate(",
-            "require_value_audit_writer(",
-            "enrolled_keyring_signer(",
+            ".write_audit()",
+            "sign_and_submit_classic(",
+        );
+        assert_not_called(
+            file,
+            source,
+            function,
+            &[
+                "enrolled_keyring_signer(",
+                "lazy_signer_from_keyring(",
+                "mainnet_enrolled_signer(",
+            ],
         );
     }
+    assert_calls_in_order(
+        "submission_record.rs",
+        include_str!("../../src/tools/submission_record.rs"),
+        "pub(crate) async fn sign_and_submit_classic(",
+        &[
+            "audit.ok_or_else(",
+            "mainnet_enrolled_signer(",
+            "lazy_signer_from_keyring(",
+            "enrolled_keyring_signer(",
+        ],
+    );
+    assert_calls_in_order(
+        "x402_create_payment.rs",
+        include_str!("../../src/tools/x402_create_payment.rs"),
+        "async fn mainnet_x402_payment(",
+        &[
+            "verify_attestation_subject_gate(",
+            "audit_readiness(",
+            "lazy_signer_from_keyring(",
+            "create_payment_authorized(",
+        ],
+    );
 }

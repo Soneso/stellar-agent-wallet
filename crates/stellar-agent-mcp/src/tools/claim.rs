@@ -19,8 +19,8 @@ use crate::server::WalletServer;
 use crate::tools::common::{
     APPROVAL_TTL_MS, CLASSIC_SINGLE_OPERATION_COUNT, DEFAULT_NONCE_TTL_MS, DispatchOutcome,
     commit_envelope_and_verify_nonce, commit_path_error_result, ledger_err_result, nonce_id_prefix,
-    redacted_wallet_error_envelope, resolve_classic_fee_per_op_stroops, submit_timeout,
-    total_classic_fee_stroops, verify_attestation_gate,
+    redacted_wallet_error_envelope, resolve_classic_fee_per_op_stroops, total_classic_fee_stroops,
+    verify_attestation_gate,
 };
 use stellar_agent_claimable::entry::{fetch_claimable_balance_entry, fetch_trustline_state};
 use stellar_agent_claimable::error::ClaimError;
@@ -36,11 +36,8 @@ use stellar_agent_core::approval::{
 use stellar_agent_core::envelope_decode::decode_authoritative_args;
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::{
-    BASE_RESERVE_STROOPS, BalanceView, ClassicOpBuilder, check_classic_fee_cap, classic_fee_source,
-    keyring::enrolled_keyring_signer,
-    parse_classic_fee_choice, resolve_classic_fee_selection,
-    signing::envelope_signing::attach_signature,
-    submit::{SubmissionResult, SubmissionSignerKind, submit_transaction_and_wait},
+    BASE_RESERVE_STROOPS, BalanceView, ClassicOpBuilder, classic_fee_source,
+    parse_classic_fee_choice, resolve_classic_fee_selection, submit::SubmissionResult,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -92,7 +89,7 @@ pub struct StellarClaimArgs {
 /// Commit step of the simulate-then-commit pattern. The agent supplies the
 /// `(nonce, expires_at_unix_ms, envelope_xdr)` triple returned by
 /// `stellar_claim`, plus the original call arguments.
-#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Clone, serde::Deserialize, schemars::JsonSchema)]
 #[serde(crate = "rmcp::serde")]
 pub struct StellarClaimCommitArgs {
     /// CAIP-2 chain identifier: `stellar:testnet` or `stellar:mainnet`.
@@ -130,6 +127,26 @@ pub struct StellarClaimCommitArgs {
     /// approval.
     #[serde(default)]
     pub approval_attestation: Option<String>,
+}
+
+/// Prints every field but the attestation, which shows only whether it is
+/// set: the attestation is the operator's approval credential.
+impl std::fmt::Debug for StellarClaimCommitArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StellarClaimCommitArgs")
+            .field("chain_id", &self.chain_id)
+            .field("balance_id", &self.balance_id)
+            .field("source_account", &self.source_account)
+            .field("nonce", &self.nonce)
+            .field("expires_at_unix_ms", &self.expires_at_unix_ms)
+            .field("envelope_xdr", &self.envelope_xdr)
+            .field("approval_nonce", &self.approval_nonce)
+            .field(
+                "approval_attestation",
+                &crate::tools::common::AttestationPresence(&self.approval_attestation),
+            )
+            .finish()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -298,7 +315,7 @@ impl WalletServer {
         let source = args
             .source_account
             .clone()
-            .unwrap_or_else(|| self.profile.mcp_signer_default.account.clone());
+            .unwrap_or_else(|| self.security_profile().mcp_signer_default.account.clone());
 
         if let Err(err) = stellar_strkey::ed25519::PublicKey::from_string(&source) {
             return Err(rmcp::ErrorData::invalid_params(
@@ -319,7 +336,7 @@ impl WalletServer {
         };
 
         // ── RPC client ────────────────────────────────────────────────────────
-        let client = match self.context.primary_client() {
+        let client = match self.write_primary_client() {
             Ok(c) => c,
             Err(err) => return crate::tools::common::rpc_client_failure(&err),
         };
@@ -328,12 +345,13 @@ impl WalletServer {
         // on this client. The values read here feed the envelope the commit
         // signs and the policy gate, so an endpoint serving another network
         // answers none of them.
-        if let Err(e) = crate::tools::common::probe_endpoint_network(
-            &client,
-            &self.context,
-            crate::tools::common::submit_timeout(&self.profile),
-        )
-        .await
+        if let Err(e) = self
+            .probe_write_endpoint(
+                &client,
+                tokio::time::Instant::now()
+                    + crate::tools::common::submit_timeout(self.security_profile()),
+            )
+            .await
         {
             return Ok(crate::tools::common::endpoint_refusal_result(&e));
         }
@@ -425,7 +443,7 @@ impl WalletServer {
         })?;
         let fee_selection = match resolve_classic_fee_selection(
             &client,
-            resolve_classic_fee_per_op_stroops(&self.profile),
+            resolve_classic_fee_per_op_stroops(self.security_profile()),
             fee_choice,
         )
         .await
@@ -441,13 +459,12 @@ impl WalletServer {
                 ));
             }
         };
-        if let Err(err) = check_classic_fee_cap(
+        if let Err(err) = self.check_write_fee(
             fee_selection.per_op_stroops,
             classic_fee_source(
                 fee_choice,
                 stellar_agent_core::error::FeeSource::ProfileDefault,
             ),
-            &self.profile,
         ) {
             return Ok(ledger_err_result(&err));
         }
@@ -532,7 +549,7 @@ impl WalletServer {
 
         // ── Persist pending approval if policy requires it ────────────────────
         let asset_str = preview_asset_string(&preview);
-        let dispatch_outcome = self
+        let dispatch_outcome = match self
             .paired_commit_outcome(
                 dispatch_outcome,
                 &envelope_xdr,
@@ -541,7 +558,11 @@ impl WalletServer {
                 Some(&source_adapter),
                 None,
             )
-            .await;
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return error.into_result(),
+        };
 
         let approval_block =
             if let DispatchOutcome::RequireApproval(ref approval) = dispatch_outcome {
@@ -676,11 +697,20 @@ impl WalletServer {
         &self,
         args: StellarClaimCommitArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // Structural mainnet refusal, keyed on the server's profile context:
-        // before the policy gate, any key access, and any RPC request.
-        if self.context.chain_id.is_mainnet() {
-            return Ok(super::common::mainnet_write_forbidden_result());
-        }
+        let mainnet = if self.context.chain_id.is_mainnet() {
+            let guard = match self
+                .mainnet_write_admission(stellar_agent_network::mainnet::MainnetConsumer::McpClaim)
+            {
+                Ok(guard) => guard,
+                Err(result) => return Ok(result),
+            };
+            if let Err(result) = self.verify_mainnet_freshness(&guard) {
+                return Ok(result);
+            }
+            Some(guard)
+        } else {
+            None
+        };
 
         // ── Re-derive authoritative args from the HMAC-bound envelope_xdr ─────
         let mut authoritative_args =
@@ -729,7 +759,7 @@ impl WalletServer {
         }
 
         // ── RPC client ───────────────────────────────────────────────────────
-        let client = match self.context.primary_client() {
+        let client = match self.write_primary_client() {
             Ok(c) => c,
             Err(err) => return crate::tools::common::rpc_client_failure(&err),
         };
@@ -739,12 +769,13 @@ impl WalletServer {
         // rebuilt envelope that is signed, and the account views feed the
         // policy gate. A refusal here consumes no nonce, so the caller can
         // correct the endpoint and retry with the same approval.
-        if let Err(e) = crate::tools::common::probe_endpoint_network(
-            &client,
-            &self.context,
-            crate::tools::common::submit_timeout(&self.profile),
-        )
-        .await
+        if let Err(e) = self
+            .probe_write_endpoint(
+                &client,
+                tokio::time::Instant::now()
+                    + crate::tools::common::submit_timeout(self.security_profile()),
+            )
+            .await
         {
             return Ok(crate::tools::common::endpoint_refusal_result(&e));
         }
@@ -793,7 +824,12 @@ impl WalletServer {
         };
 
         // ── Attestation verification gate ────────────────────────────────────
-        if let Err(result) = verify_attestation_gate(
+        let dispatch_outcome =
+            match self.force_mainnet_confirmation("stellar_claim_commit", dispatch_outcome) {
+                Ok(outcome) => outcome,
+                Err(error) => return error.into_result(),
+            };
+        let approval_witness = match verify_attestation_gate(
             self,
             &dispatch_outcome,
             super::common::GatedApprovalKind::Claim,
@@ -804,8 +840,9 @@ impl WalletServer {
         )
         .await
         {
-            return Ok(result);
-        }
+            Ok(witness) => witness,
+            Err(result) => return Ok(result),
+        };
 
         // ── Decode nonce ─────────────────────────────────────────────────────
         let nonce = match stellar_agent_nonce::Nonce::from_base64(&args.nonce) {
@@ -910,10 +947,9 @@ impl WalletServer {
         }
 
         // ── Fee cap ──────────────────────────────────────────────────────────
-        if let Err(err) = check_classic_fee_cap(
+        if let Err(err) = self.check_write_fee(
             fee_per_op_stroops,
             stellar_agent_core::error::FeeSource::Envelope,
-            &self.profile,
         ) {
             return Ok(ledger_err_result(&err));
         }
@@ -923,23 +959,23 @@ impl WalletServer {
                 Ok(source) => source,
                 Err(err) => return Ok(ledger_err_result(&err)),
             };
-        let cross_check = match stellar_agent_network::cross_check::obtain_classic_witness(
-            &self.profile,
-            &self.context,
-            stellar_agent_core::cross_check::CrossCheckValue::Unvalued,
-            stellar_agent_network::cross_check::ClaimWitnessInputs {
-                source: source_observation,
-                trustline: None,
-                balance: Some(
-                    stellar_agent_network::cross_check::ClaimableBalanceObservation {
-                        balance_id: id.hash(),
-                        entry: Some(entry.clone()),
-                    },
-                ),
-            },
-            "stellar_claim_commit",
-        )
-        .await
+        let cross_check = match self
+            .classic_witness(
+                stellar_agent_core::cross_check::CrossCheckValue::Unvalued,
+                stellar_agent_network::cross_check::ClaimWitnessInputs {
+                    source: source_observation,
+                    trustline: None,
+                    balance: Some(
+                        stellar_agent_network::cross_check::ClaimableBalanceObservation {
+                            balance_id: id.hash(),
+                            entry: Some(entry.clone()),
+                        },
+                    ),
+                },
+                &args.envelope_xdr,
+                "stellar_claim_commit",
+            )
+            .await
         {
             Ok(outcome) => outcome,
             Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
@@ -952,9 +988,8 @@ impl WalletServer {
         // pre-send window reservation, which confirmation settles.
         let gate_value_effects: Option<stellar_agent_core::policy::v1::ValueEffects> =
             match &dispatch_outcome {
-                DispatchOutcome::Allow(Some(effects)) => Some(effects.clone()),
+                DispatchOutcome::Allow(allowed) => allowed.value_effects.clone(),
                 DispatchOutcome::RequireApproval(approval) => approval.value_effects.clone(),
-                _ => None,
             };
         let audit_legs: Vec<stellar_agent_core::audit_log::ValueLegRecord> = gate_value_effects
             .as_ref()
@@ -967,11 +1002,7 @@ impl WalletServer {
         // submitted — a refusal here burns no nonce/replay-window attestation.
         // Reused (not re-acquired) for the post-confirm `value_action_submitted`
         // row.
-        let audit_writer = match crate::tools::value_audit::require_value_audit_writer(
-            &self.profile,
-            &self.profile_name_for_approval(),
-            self.audit_binding,
-        ) {
+        let (audit_writer, audit_readiness) = match self.write_audit() {
             Ok(w) => w,
             Err(err) => {
                 let envelope = stellar_agent_core::envelope::Envelope::<()>::err(&err);
@@ -1005,64 +1036,24 @@ impl WalletServer {
             return e.into_result();
         }
 
-        // ── Load signer handle from keyring ──────────────────────────────────
-        let handle = match enrolled_keyring_signer(
-            &self.profile_name_for_approval(),
-            &self.profile,
-            &source,
-        )
-        .await
-        {
-            Ok(h) => h,
-            Err(err) => {
-                let envelope = stellar_agent_core::envelope::Envelope::<()>::err(&err);
-                let json = envelope
-                    .to_json_pretty()
-                    .unwrap_or_else(|_| String::from("{}"));
-                let mut result = CallToolResult::success(vec![Content::text(json)]);
-                result.is_error = Some(true);
-                return Ok(result);
-            }
-        };
-
-        // ── Sign envelope ────────────────────────────────────────────────────
-        let signed_xdr = match attach_signature(
-            &args.envelope_xdr,
-            &handle,
-            self.context.network_passphrase(),
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(err) => {
-                let envelope = stellar_agent_core::envelope::Envelope::<()>::err(&err);
-                let json = envelope
-                    .to_json_pretty()
-                    .unwrap_or_else(|_| String::from("{}"));
-                let mut result = CallToolResult::success(vec![Content::text(json)]);
-                result.is_error = Some(true);
-                return Ok(result);
-            }
-        };
-
         let nonce_id_prefix = nonce_id_prefix(&nonce);
-
-        // ── Record before submit ──────────────────────────────────────────────
-        //
-        // The recorder writes the receipt, the pending audit row and the
-        // spending-window reservation immediately before the bytes leave, and
-        // settles all three against what the network answers. The window
-        // entries it reserves come from the gate_value_effects the audit rows
-        // carry. The recorder binds the descriptor the gate evaluated against.
         let value_class = gate_value_effects
             .clone()
             .map(stellar_agent_core::policy::v1::ValueClass::Value)
             .unwrap_or(stellar_agent_core::policy::v1::ValueClass::ReadOnly);
         let floor_hook = crate::sequence_floor::hook(&self.sequence_floor);
-        let recorder = match crate::tools::submission_record::build_recorder(
+        match crate::tools::submission_record::sign_and_submit_classic(
+            self,
+            mainnet.as_ref(),
+            approval_witness.as_ref(),
+            audit_readiness,
+            stellar_agent_network::mainnet::MainnetConsumer::McpClaim,
+            &client,
+            &args.envelope_xdr,
+            &source,
             crate::tools::submission_record::CommitRecord {
                 policy_decision: dispatch_outcome.audit_decision(),
-                profile: &self.profile,
+                profile: self.security_profile(),
                 profile_name: self.profile_name_for_approval(),
                 tool: "stellar_claim_commit",
                 chain_id: args.chain_id.to_string(),
@@ -1076,25 +1067,8 @@ impl WalletServer {
                 approval_dir: self.resolve_approval_dir().ok(),
                 now_ms,
             },
+            cross_check.witness(),
             Some(&floor_hook),
-        ) {
-            Ok(r) => r.with_witness(cross_check.witness()),
-            Err(err) => {
-                return Ok(crate::tools::submission_record::submission_error_result(
-                    &err,
-                    &signed_xdr,
-                ));
-            }
-        };
-
-        // ── Submit ───────────────────────────────────────────────────────────
-        match submit_transaction_and_wait(
-            &client,
-            &signed_xdr,
-            submit_timeout(&self.profile),
-            self.context.network_passphrase(),
-            Some(SubmissionSignerKind::Keyring),
-            Some(&recorder),
         )
         .await
         {
@@ -1120,10 +1094,7 @@ impl WalletServer {
                     .unwrap_or_else(|_| String::from("{}"));
                 Ok(CallToolResult::success(vec![Content::text(json_out)]))
             }
-            Err(err) => Ok(crate::tools::submission_record::submission_error_result(
-                &err,
-                &signed_xdr,
-            )),
+            Err(result) => Ok(result),
         }
     }
 }
@@ -1189,5 +1160,34 @@ impl WalletServer {
         args: StellarClaimCommitArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.stellar_claim_commit(Parameters(args)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test-only")]
+
+    use super::*;
+
+    /// `Debug` shows whether the attestation is set and never its value; every
+    /// other field prints as usual.
+    #[test]
+    fn commit_args_debug_hides_the_attestation() {
+        let args: StellarClaimCommitArgs = serde_json::from_value(serde_json::json!({
+            "chain_id":"stellar:testnet", "balance_id":"ab", "source_account":"GSOURCE",
+            "nonce": "commit-nonce", "expires_at_unix_ms": 1, "envelope_xdr": "AAAA",
+            "approval_nonce": "approval-nonce", "approval_attestation": "SENTINEL-ATTESTATION"
+        }))
+        .unwrap();
+        let printed = format!("{args:?}");
+        assert!(!printed.contains("SENTINEL-ATTESTATION"), "{printed}");
+        assert!(
+            printed.contains("approval_attestation: Some(<set>)"),
+            "{printed}"
+        );
+        assert!(printed.contains("approval-nonce") && printed.contains("commit-nonce"));
+        let mut absent = args.clone();
+        absent.approval_attestation = None;
+        assert!(format!("{absent:?}").contains("approval_attestation: None"));
     }
 }

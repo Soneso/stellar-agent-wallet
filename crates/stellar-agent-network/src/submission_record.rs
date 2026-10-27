@@ -2564,6 +2564,75 @@ mod tests {
             }
         }
 
+        /// A definitive refusal of the send releases the converted window
+        /// records, leaves the authorization used, closes the pending row with
+        /// a failed row, and releases the receipt's hold on the approval.
+        #[tokio::test]
+        #[serial]
+        async fn a_definitive_rejection_releases_the_converted_rows() {
+            let fx = LedgerFixture::new("authorized-rejected", NOW);
+            let sub = submission();
+            let (id, authorization) = grant(&fx, &sub, &holds(&fx, 100), "approval-1");
+            let recorder = WalletSubmissionRecorder::new_authorized(
+                &fx.profile,
+                fx.name.clone(),
+                "stellar_pay_commit",
+                Some("stellar:mainnet".into()),
+                PolicyDecision::RequireApproval,
+                vec![],
+                &authorization,
+                fx.receipts.clone(),
+                fx.window.clone(),
+                Some(Arc::clone(&fx.writer)),
+                None,
+                "request",
+                NOW,
+            )
+            .with_approval(Some(ApprovalTombstone {
+                store_dir: fx.dir.path().join("approvals"),
+                profile_name: fx.name.clone(),
+                approval_nonce: "approval-nonce-1".into(),
+            }));
+            recorder
+                .consume_for_submission(&sub.intent, MainnetSubmitGrant::Tx(authorization))
+                .unwrap();
+            assert_eq!(reservations(&fx), 1);
+            assert!(
+                fx.receipts
+                    .find_by_approval_nonce("approval-nonce-1")
+                    .unwrap()
+                    .is_some()
+            );
+            recorder
+                .outcome(
+                    &sub.intent,
+                    &SubmissionOutcome::Rejected {
+                        code: "transaction.failed".into(),
+                        error: "refused".into(),
+                    },
+                )
+                .await;
+            assert_eq!(reservations(&fx), 0);
+            let bytes = std::fs::read(fx.dir.path().join("state.window")).unwrap();
+            let wire: serde_json::Value = serde_json::from_slice(&bytes[32..]).unwrap();
+            assert!(
+                wire["entries"].as_array().is_none_or(Vec::is_empty),
+                "the converted records are released: {wire}"
+            );
+            assert!(!fx.is_open(id), "the used authorization is not reopened");
+            assert!(
+                fx.receipts
+                    .find_by_approval_nonce("approval-nonce-1")
+                    .unwrap()
+                    .is_none(),
+                "the refused send releases the approval"
+            );
+            assert_eq!(
+                fx.audit_kinds(),
+                ["value_action_pending", "value_action_failed"]
+            );
+        }
+
         #[tokio::test]
         #[serial]
         async fn used_authorization_is_not_consumed_twice() {

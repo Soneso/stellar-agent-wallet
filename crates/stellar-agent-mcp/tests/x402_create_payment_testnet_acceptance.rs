@@ -493,6 +493,8 @@ async fn a6_create_payment_returns_signed_payload() {
     let (capture, _guard) = LedgerCapture::install();
     let result = server
         .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+            approval_nonce: None,
+            approval_attestation: None,
             payment_required: native_requirements(&recipient, NATIVE_AMOUNT_STROOPS),
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             address: None,
@@ -559,6 +561,8 @@ async fn a6_create_payment_with_witness_passes() {
     let (capture, _guard) = LedgerCapture::install();
     let result = server
         .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+            approval_nonce: None,
+            approval_attestation: None,
             payment_required: native_requirements(&recipient, WITNESS_AMOUNT_STROOPS),
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             address: None,
@@ -651,6 +655,8 @@ async fn a6_invalid_scheme_returns_error() {
 
     let result = server
         .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+            approval_nonce: None,
+            approval_attestation: None,
             payment_required: bad_requirements,
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             address: None,
@@ -689,6 +695,8 @@ async fn a6_chain_id_mismatch_returns_error_data() {
 
     let error = server
         .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+            approval_nonce: None,
+            approval_attestation: None,
             payment_required: requirements_json,
             chain_id: "stellar:pubnet".to_owned(), // mismatch: profile is testnet
             address: None,

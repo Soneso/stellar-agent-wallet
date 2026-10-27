@@ -23,6 +23,12 @@ use stellar_agent_sep43::Sep43Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum X402Error {
+    /// A typed resolver or consumption refusal, with operator-only proof details.
+    #[error("mainnet payment authorization refused")]
+    MainnetAuthorization(#[from] stellar_agent_network::mainnet::MainnetAuthorizationError),
+    /// An authorization refusal already logged by the SEP-43 signing boundary.
+    #[error("mainnet payment authorization refused")]
+    MainnetAuthorizationRefused,
     /// The payment-required object could not be decoded.
     ///
     /// Emitted when `decode_payment_required` receives malformed base64 or
@@ -81,7 +87,7 @@ pub enum X402Error {
     /// wallet, so no submit-layer mainnet gate stands between it and mainnet.
     /// [`crate::exact::create_payment`] raises this variant for a mainnet
     /// passphrase or a mainnet-pattern RPC URL, before any key access and any
-    /// request. The MCP payment tools also refuse a mainnet profile at entry.
+    /// request. MCP payment tools require verified authority for mainnet.
     /// The `detail` carries the canonical `network.mainnet_write_forbidden`
     /// wire code, so this refusal correlates with the CLI, submit-layer, and
     /// SEP-43 signing guards.
@@ -153,7 +159,6 @@ pub enum X402Error {
     #[error("auth-entry signing failed: {source}")]
     AuthEntrySignFailed {
         /// The underlying SEP-43 signing error.
-        #[from]
         source: Sep43Error,
     },
 
@@ -250,6 +255,16 @@ impl X402Error {
     #[must_use]
     pub fn wire_code(&self) -> &'static str {
         match self {
+            X402Error::MainnetAuthorization(error) => match error {
+                stellar_agent_network::mainnet::MainnetAuthorizationError::PolicyDenied(reason) => {
+                    reason.wire_code()
+                }
+                stellar_agent_network::mainnet::MainnetAuthorizationError::FeatureDisabled => {
+                    "network.mainnet_write_forbidden"
+                }
+                _ => "network.mainnet_authorization_refused",
+            },
+            X402Error::MainnetAuthorizationRefused => "network.mainnet_authorization_refused",
             X402Error::InvalidPaymentRequired { .. } => "x402.invalid_payment_required",
             X402Error::UnsupportedScheme { .. } => "x402.unsupported_scheme",
             X402Error::UnsupportedNetwork { .. } => "x402.unsupported_network",
@@ -268,6 +283,16 @@ impl X402Error {
             X402Error::KeyringLoadFailed { .. } => "x402.keyring_load_failed",
             X402Error::TransmitGateRefused { .. } => "x402.transmit_gate_refused",
             X402Error::EndpointIdentity(inner) | X402Error::CrossCheck(inner) => inner.code(),
+        }
+    }
+}
+
+impl From<Sep43Error> for X402Error {
+    fn from(source: Sep43Error) -> Self {
+        if matches!(source, Sep43Error::MainnetAuthorizationRefused) {
+            Self::MainnetAuthorizationRefused
+        } else {
+            Self::AuthEntrySignFailed { source }
         }
     }
 }
@@ -566,5 +591,29 @@ mod tests {
 
         let e = test_helpers::unsupported_network("evm:1");
         assert!(matches!(e, X402Error::UnsupportedNetwork { network } if network == "\"evm:1\""));
+    }
+    #[test]
+    fn mainnet_authorization_errors_preserve_codes_without_preconditions() {
+        use stellar_agent_network::mainnet::{
+            MainnetAuthorizationError as A, MainnetPrecondition as P,
+        };
+        for precondition in [P::ApprovalTtlExceedsRule, P::NotOpen, P::WitnessRequired] {
+            let error = X402Error::from(A::Refused(precondition));
+            assert_eq!(error.wire_code(), "network.mainnet_authorization_refused");
+            assert_eq!(error.to_string(), "mainnet payment authorization refused");
+            assert!(!error.to_string().contains(precondition.label()));
+        }
+        let error = X402Error::from(A::PolicyDenied(Box::new(
+            stellar_agent_core::policy::DenyReason::NoMatchingRule,
+        )));
+        assert_eq!(error.wire_code(), "policy.deny.no_matching_rule");
+        assert_eq!(
+            X402Error::from(A::FeatureDisabled).wire_code(),
+            "network.mainnet_write_forbidden"
+        );
+        let error = X402Error::from(Sep43Error::MainnetAuthorizationRefused);
+        assert!(matches!(error, X402Error::MainnetAuthorizationRefused));
+        assert_eq!(error.wire_code(), "network.mainnet_authorization_refused");
+        assert_eq!(error.to_string(), "mainnet payment authorization refused");
     }
 }

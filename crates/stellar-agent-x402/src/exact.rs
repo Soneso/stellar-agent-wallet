@@ -4,17 +4,17 @@
 //! # Flow
 //!
 //! ```text
-//! 1. Validate requirements (validate_requirements)
-//! 2. Endpoint identity: getNetwork on the caller's client, the first request
+//! 1. Validate requirements
+//! 2. Endpoint identity: getNetwork on the payment's client, the first request
 //! 3. Build SAC transfer InvokeHostFunction
 //! 4. simulateTransaction: restoration, fee bounds, transaction data, exactly
 //!    one result, and the payer authorization against the built transfer;
 //!    harvest the nonce and latest_ledger; compute signature_expiration_ledger
 //!    (window of 1 to 60 ledgers)
-//! 5. Cross-check witness: when the caller's prepared cross-check requires it,
-//!    the oracle simulates the same unsigned envelope and the answers are
-//!    compared; getHealth on the caller's client; ledger consistency
-//! 6. Set expiration on auth entry; sign via sep43 (single auth-signing call site)
+//! 5. Cross-check witness: when the payment's value requires it, the oracle
+//!    simulates the same unsigned envelope and the answers are compared;
+//!    getHealth on the payment's client; ledger consistency
+//! 6. Set expiration on the auth entry; sign through SEP-43
 //! 7. Transmit gate: the caller's `before_transmit` runs; an error stops here
 //! 8. Re-simulate with signed auth (mandatory footprint refresh): restoration,
 //!    fee bounds, transaction data, no authorization other than the signed
@@ -23,30 +23,47 @@
 //! 10. Wrap in PaymentPayload; return it with the cross-check outcome
 //! ```
 //!
-//! The flow matches the @x402/stellar reference implementation. Auth-entry
-//! signing goes through a single call site
-//! (`stellar_agent_sep43::sign_soroban_auth_entry`). The re-simulation in step 8
-//! is the first time the signed authorization leaves the wallet, to the
-//! configured RPC. The transmit gate in step 7 is the last point at which the
-//! caller can withhold it.
+//! The flow matches the @x402/stellar reference implementation. The
+//! re-simulation in step 8 is the first time the signed authorization leaves
+//! the wallet, to the configured RPC. The transmit gate in step 7 is the last
+//! point at which the caller can withhold it.
 //!
-//! Every request of the payment goes to the client the caller passes, and the
-//! endpoint identity check is its first request. The simulation answers come
-//! from that endpoint. Nothing is signed unless the first answer holds exactly
-//! one unsigned payer authorization for the transfer built in step 3, with no
-//! nested calls. The nonce, the `latest_ledger`, the resource data, and the fee
-//! come from that endpoint.
+//! Every request of the payment goes to one client, and the endpoint identity
+//! check is its first request. The simulation answers come from that endpoint.
+//! Nothing is signed unless the first answer holds exactly one unsigned payer
+//! authorization for the transfer built in step 3, with no nested calls. The
+//! nonce, the `latest_ledger`, the resource data, and the fee come from that
+//! endpoint.
 //!
-//! When the payment's value requires the cross-check witness, the caller's
-//! prepared [`SorobanCrossCheck`] holds an oracle client built from the
-//! operator's profile, and the crate builds none itself. The oracle simulates
-//! the same unsigned envelope before anything is signed. Its answer must hold
-//! the same authorization entries apart from the nonce and the expiration, a
-//! resource fee within the ceiling, and a ledger no more than two behind the
-//! primary's and before the signature expiration. That is independent evidence
-//! that the transfer simulates and that the ledger the expiration derives from
-//! is current. The oracle's answer is never signed and never replaces the
-//! primary's; the payload carries the primary's nonce and resource data.
+//! # Two authority paths
+//!
+//! [`create_payment`] signs a non-mainnet payment. The caller passes the
+//! payment's client and a prepared [`SorobanCrossCheck`], both built from the
+//! operator's profile, and the crate builds no client. Auth-entry signing goes
+//! through `stellar_agent_sep43::sign_soroban_auth_entry`.
+//!
+//! [`create_payment_authorized`] signs a mainnet payment under the resolver's
+//! authority. The payment's client and, when the value requires a witness, the
+//! primary and oracle clients of the bound witness all come from the mainnet
+//! write context, never from the caller. The resolver mints the payment intent
+//! before anything is signed, and the entry is signed through
+//! `stellar_agent_sep43::signing::sign_soroban_auth_entry_authorized` against
+//! that intent. After the transmit gate returns `Ok`, the intent is consumed
+//! before the signed re-simulation of step 8. The final envelope then mints a
+//! child authorization that the caller consumes before it releases the
+//! payload. A failure while an authorization is open invalidates it at the
+//! stage of the failure; a failure after the intent is consumed keeps its
+//! debit.
+//!
+//! When the payment's value requires the cross-check witness, the oracle
+//! simulates the same unsigned envelope before anything is signed. Its answer
+//! must hold the same authorization entries apart from the nonce and the
+//! expiration, a resource fee within the ceiling, and a ledger no more than
+//! two behind the primary's and before the signature expiration. That is
+//! independent evidence that the transfer simulates and that the ledger the
+//! expiration derives from is current. The oracle's answer is never signed and
+//! never replaces the primary's; the payload carries the primary's nonce and
+//! resource data.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -147,9 +164,7 @@ const PLACEHOLDER_SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AuthorizationToTransmit<'a> {
-    /// x402 wire network of the signed authorization. Always `stellar:testnet`:
-    /// [`validate_requirements`] refuses `stellar:pubnet` before anything is
-    /// signed.
+    /// x402 wire network of the signed authorization, bound to the active profile.
     pub network: &'a str,
     /// x402 scheme of the signed authorization; always `exact`.
     pub scheme: &'a str,
@@ -250,6 +265,25 @@ pub fn validate_requirements(
     profile_passphrase: &str,
     rpc_url: &str,
 ) -> Result<i128, X402Error> {
+    validate_requirements_inner(requirements, profile_passphrase, Some(rpc_url))
+}
+
+/// Validates a payment without accessing keys, storage, or a network endpoint.
+///
+/// # Errors
+/// Refuses scheme, network, asset, sponsorship, amount, recipient, or timeout errors.
+pub fn validate_requirements_for_payment(
+    requirements: &PaymentRequirements,
+    profile_passphrase: &str,
+) -> Result<i128, X402Error> {
+    validate_requirements_inner(requirements, profile_passphrase, None)
+}
+
+fn validate_requirements_inner(
+    requirements: &PaymentRequirements,
+    profile_passphrase: &str,
+    legacy_rpc: Option<&str>,
+) -> Result<i128, X402Error> {
     if requirements.scheme != "exact" {
         return Err(X402Error::UnsupportedScheme {
             scheme: quote_server_text(&requirements.scheme),
@@ -269,11 +303,13 @@ pub fn validate_requirements(
 
     // A mainnet passphrase or a mainnet-pattern endpoint never reaches the
     // signer or the endpoint.
-    refuse_mainnet_write(network_passphrase, rpc_url).map_err(|_| {
-        X402Error::MainnetSigningForbidden {
-            detail: MAINNET_SIGNING_REFUSAL_DETAIL.to_owned(),
-        }
-    })?;
+    if let Some(rpc_url) = legacy_rpc {
+        refuse_mainnet_write(network_passphrase, rpc_url).map_err(|_| {
+            X402Error::MainnetSigningForbidden {
+                detail: MAINNET_SIGNING_REFUSAL_DETAIL.to_owned(),
+            }
+        })?;
+    }
 
     validate_c_strkey(&requirements.asset)?;
 
@@ -314,6 +350,212 @@ pub fn validate_requirements(
     }
 
     Ok(amount)
+}
+
+/// Builds the single transfer root whose digest and approval bind the payment.
+///
+/// # Errors
+/// Refuses invalid payment requirements or payer address.
+pub fn payment_root(
+    requirements: &PaymentRequirements,
+    payer: &str,
+) -> Result<SorobanAuthorizedInvocation, X402Error> {
+    let passphrase = x402_network_to_passphrase(&requirements.network)?;
+    let amount = validate_requirements_for_payment(requirements, passphrase)?;
+    let invoke =
+        build_sac_transfer_invoke(&requirements.asset, payer, &requirements.pay_to, amount)?;
+    Ok(SorobanAuthorizedInvocation {
+        function: SorobanAuthorizedFunction::ContractFn(invoke),
+        sub_invocations: VecM::default(),
+    })
+}
+
+/// Computes the network-bound payment intent from requirements and the enrolled payer.
+///
+/// # Errors
+/// Refuses invalid requirements, payer, or root serialization.
+pub fn intent_digest(
+    requirements: &PaymentRequirements,
+    payer: &str,
+) -> Result<[u8; 32], X402Error> {
+    let root = payment_root(requirements, payer)?;
+    let network_id =
+        Sha256::digest(x402_network_to_passphrase(&requirements.network)?.as_bytes()).into();
+    stellar_agent_core::approval::subject::soroban_intent_digest(&network_id, &root).map_err(
+        |error| X402Error::TransactionBuildFailed {
+            detail: error.to_string(),
+        },
+    )
+}
+
+/// Borrowed authority and owned readiness for one mainnet payment.
+/// Construct this bundle through [`Self::new`]; readiness moves into the resolver.
+pub struct X402MainnetProofs<'a> {
+    context: &'a stellar_agent_network::MainnetWriteContext,
+    policy: &'a stellar_agent_core::mainnet::verified_policy::VerifiedPolicy,
+    enablement: &'a stellar_agent_core::mainnet::enablement::EnablementRecord,
+    approval: &'a stellar_agent_core::approval::witness::ApprovalWitness,
+    signer: &'a stellar_agent_network::keyring::EnrolledSigner,
+    keyring_handle: &'a stellar_agent_network::keyring::KeyringSignHandle,
+    audit: Option<stellar_agent_network::mainnet::audit_readiness::AuditReadiness>,
+    store: &'a stellar_agent_network::policy_state::PersistedWindowStore,
+}
+
+impl<'a> X402MainnetProofs<'a> {
+    /// Binds one-use readiness to the startup and action proofs.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each sealed proof has a separate producer"
+    )]
+    pub fn new(
+        context: &'a stellar_agent_network::MainnetWriteContext,
+        policy: &'a stellar_agent_core::mainnet::verified_policy::VerifiedPolicy,
+        enablement: &'a stellar_agent_core::mainnet::enablement::EnablementRecord,
+        approval: &'a stellar_agent_core::approval::witness::ApprovalWitness,
+        signer: &'a stellar_agent_network::keyring::EnrolledSigner,
+        keyring_handle: &'a stellar_agent_network::keyring::KeyringSignHandle,
+        audit: stellar_agent_network::mainnet::audit_readiness::AuditReadiness,
+        store: &'a stellar_agent_network::policy_state::PersistedWindowStore,
+    ) -> Self {
+        Self {
+            context,
+            policy,
+            enablement,
+            approval,
+            signer,
+            keyring_handle,
+            audit: Some(audit),
+            store,
+        }
+    }
+}
+
+/// A payment whose child authorization must be consumed before payload release.
+pub struct AuthorizedPayment {
+    /// The privately constructed payload and cross-check result.
+    pub payment: CreatedPayment,
+    /// One-use authority for releasing exactly this final envelope.
+    pub authorization: stellar_agent_network::mainnet::authorization::MainnetSubmitAuthorization,
+}
+
+/// Builds and signs a payment under real mainnet authority.
+///
+/// The context supplies the profile and all transports. The intent is consumed
+/// before signed simulation; the returned child remains open for payload release.
+///
+/// The endpoint check is the context's mainnet probe, which returns no
+/// endpoint identity, so the ledger trace of this path carries no protocol
+/// version.
+///
+/// # Errors
+/// Returns validation, endpoint, simulation, witness, signing, audit, or typed
+/// authorization refusals. A consumed intent retains its debit on later failure.
+pub async fn create_payment_authorized(
+    requirements: &PaymentRequirements,
+    consumer: stellar_agent_network::mainnet::MainnetConsumer,
+    mut proofs: X402MainnetProofs<'_>,
+    value: stellar_agent_core::cross_check::CrossCheckValue<'_>,
+    identity_deadline: Instant,
+    before_transmit: impl FnOnce(&AuthorizationToTransmit<'_>) -> Result<(), X402Error>,
+) -> Result<AuthorizedPayment, X402Error> {
+    validate_requirements_for_payment(requirements, proofs.context.network_passphrase())?;
+    let client = proofs
+        .context
+        .primary_client()
+        .map_err(X402Error::EndpointIdentity)?;
+    let handle = proofs.keyring_handle;
+    let passphrase = proofs.context.network_passphrase();
+    let (payment, authorization) = create_payment_inner(
+        requirements,
+        handle,
+        &client,
+        None,
+        passphrase,
+        identity_deadline,
+        before_transmit,
+        Some((&mut proofs, consumer, value)),
+    )
+    .await?;
+    let authorization = authorization.ok_or_else(|| X402Error::TransactionBuildFailed {
+        detail: "payment release authorization is missing".to_owned(),
+    })?;
+    Ok(AuthorizedPayment {
+        payment,
+        authorization,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum FailurePoint {
+    Signing { unavailable: bool },
+    BeforeTransmit,
+    IntentConsume,
+    IntentUsed,
+    ChildMinted,
+    Transferred,
+}
+
+/// The failure point of an authorized entry-sign refusal, classified as the
+/// classic signing path classifies its attach refusal.
+///
+/// The keyring handle reports every seed read failure (an absent or unreadable
+/// seed, or one that derives another key) as a `WalletError::Auth`, which the
+/// SEP-43 signer maps to [`stellar_agent_sep43::Sep43Error::UserRejected`]:
+/// that is the signer-unavailable class. Every other SEP-43 refusal, a
+/// `SignerUnavailable` from a wallet-state or other wallet error and an
+/// authorization refusal included, is a sign refusal.
+fn signing_failure_point(error: &stellar_agent_sep43::Sep43Error) -> FailurePoint {
+    FailurePoint::Signing {
+        unavailable: matches!(error, stellar_agent_sep43::Sep43Error::UserRejected { .. }),
+    }
+}
+
+fn invalidation_stage(
+    point: FailurePoint,
+) -> Option<stellar_agent_network::mainnet::resolve::InvalidationStage> {
+    use stellar_agent_network::mainnet::resolve::InvalidationStage;
+    Some(match point {
+        FailurePoint::Signing { unavailable: true } => InvalidationStage::SignerUnavailable,
+        FailurePoint::Signing { unavailable: false } => InvalidationStage::SignRefused,
+        FailurePoint::BeforeTransmit => InvalidationStage::IntentPreTransmitRefused,
+        FailurePoint::IntentConsume => InvalidationStage::IntentConsumeRefused,
+        FailurePoint::ChildMinted => InvalidationStage::PayloadReleaseRefused,
+        FailurePoint::IntentUsed | FailurePoint::Transferred => return None,
+    })
+}
+
+struct OpenAuthorization<'a> {
+    context: &'a stellar_agent_network::MainnetWriteContext,
+    store: &'a stellar_agent_network::policy_state::PersistedWindowStore,
+    id: Option<stellar_agent_network::mainnet::AuthorizationId>,
+    point: FailurePoint,
+}
+
+impl Drop for OpenAuthorization<'_> {
+    fn drop(&mut self) {
+        if let (Some(id), Some(stage)) = (self.id, invalidation_stage(self.point))
+            && let Err(error) = stellar_agent_network::mainnet::resolve::invalidate_unconsumed(
+                self.store,
+                self.context,
+                id,
+                stage,
+            )
+        {
+            let settled = matches!(
+                &error,
+                stellar_agent_network::mainnet::MainnetAuthorizationError::Refused(
+                    stellar_agent_network::mainnet::MainnetPrecondition::NotOpen
+                )
+            );
+            tracing::warn!(
+                ?stage,
+                settled,
+                code = stellar_agent_core::WalletError::from(error).code(),
+                "authorization cleanup refused; primary failure retained"
+            );
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -466,8 +708,52 @@ pub async fn create_payment(
     identity_deadline: Instant,
     before_transmit: impl FnOnce(&AuthorizationToTransmit<'_>) -> Result<(), X402Error>,
 ) -> Result<CreatedPayment, X402Error> {
+    validate_requirements(requirements, profile_passphrase, client.url())?;
+    create_payment_inner(
+        requirements,
+        signer,
+        client,
+        Some(cross_check),
+        profile_passphrase,
+        identity_deadline,
+        before_transmit,
+        None,
+    )
+    .await
+    .map(|(payment, _)| payment)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "ordered payment lifecycle shares simulation checks across both authority paths"
+)]
+async fn create_payment_inner(
+    requirements: &PaymentRequirements,
+    signer: &(dyn Signer + Send + Sync),
+    client: &StellarRpcClient,
+    cross_check: Option<&SorobanCrossCheck>,
+    profile_passphrase: &str,
+    identity_deadline: Instant,
+    before_transmit: impl FnOnce(&AuthorizationToTransmit<'_>) -> Result<(), X402Error>,
+    mut mainnet: Option<(
+        &mut X402MainnetProofs<'_>,
+        stellar_agent_network::mainnet::MainnetConsumer,
+        stellar_agent_core::cross_check::CrossCheckValue<'_>,
+    )>,
+) -> Result<
+    (
+        CreatedPayment,
+        Option<stellar_agent_network::mainnet::authorization::MainnetSubmitAuthorization>,
+    ),
+    X402Error,
+> {
+    use stellar_agent_network::mainnet::resolve::{
+        SorobanIntent, SorobanIntentRequest, SorobanSubmitRequest, consume_soroban_intent,
+        resolve_soroban_intent, resolve_soroban_submit,
+    };
     // ── Step 1: Validate ──────────────────────────────────────────────────────
-    let amount = validate_requirements(requirements, profile_passphrase, client.url())?;
+    let amount = validate_requirements_for_payment(requirements, profile_passphrase)?;
     // `validate_requirements` holds the requirement's passphrase equal to the
     // profile's, so this is the network the payment is built for.
     let network_passphrase = profile_passphrase;
@@ -475,10 +761,22 @@ pub async fn create_payment(
     // ── Step 2: Endpoint identity, the client's first request ────────────────
     // The endpoint answers every later request of this payment, so it must be
     // shown to serve the profile's network before it is asked anything else.
-    let identity = client
-        .endpoint_identity(network_passphrase, identity_deadline)
-        .await
-        .map_err(X402Error::EndpointIdentity)?;
+    // The mainnet probe returns no identity, so only the other path carries
+    // the protocol version into the ledger trace below.
+    let identity = if mainnet.is_some() {
+        client
+            .check_mainnet_endpoint(identity_deadline)
+            .await
+            .map_err(X402Error::EndpointIdentity)?;
+        None
+    } else {
+        Some(
+            client
+                .endpoint_identity(network_passphrase, identity_deadline)
+                .await
+                .map_err(X402Error::EndpointIdentity)?,
+        )
+    };
 
     // ── Step 3: Build SAC transfer InvokeHostFunction ─────────────────────────
     // SEP-41: transfer(from: Address, to: Address, amount: i128)
@@ -584,15 +882,44 @@ pub async fn create_payment(
     // ── Step 5: Cross-check witness and ledger consistency ────────────────────
     // The oracle simulates the envelope the primary simulated, before anything
     // is signed. A refusal returns here; the payer's key is never used.
-    let cross_check = cross_check
-        .witness(SorobanWitnessInputs {
-            envelope: &sim_envelope,
-            primary: &sim_response,
-            expiration_ledger: signature_expiration_ledger,
-            resource_fee_ceiling: u64::from(MAX_RESOURCE_FEE_STROOPS),
-        })
+    let inputs = SorobanWitnessInputs {
+        envelope: &sim_envelope,
+        primary: &sim_response,
+        expiration_ledger: signature_expiration_ledger,
+        resource_fee_ceiling: u64::from(MAX_RESOURCE_FEE_STROOPS),
+    };
+    let expected_root = payment_root(requirements, &payer_strkey)?;
+    let cross_check = if let Some((proofs, _, value)) = &mainnet {
+        let thresholds = stellar_agent_core::cross_check::ThresholdSet::from_profile_and_signed(
+            proofs.context.profile(),
+            proofs
+                .policy
+                .mainnet()
+                .and_then(|body| body.cross_check_thresholds.as_ref()),
+        );
+        stellar_agent_network::cross_check::obtain_soroban_witness_bound(
+            proofs.context.profile(),
+            &proofs.context.network_context(),
+            *value,
+            &thresholds,
+            &stellar_agent_network::cross_check::BoundSorobanInputs {
+                inputs: &inputs,
+                expected_root: &expected_root,
+                payer: &payer_strkey,
+            },
+            "stellar_x402_create_payment",
+        )
         .await
-        .map_err(X402Error::CrossCheck)?;
+        .map_err(X402Error::CrossCheck)?
+    } else {
+        cross_check
+            .ok_or_else(|| X402Error::TransactionBuildFailed {
+                detail: "cross-check configuration missing".to_owned(),
+            })?
+            .witness(inputs)
+            .await
+            .map_err(X402Error::CrossCheck)?
+    };
 
     // The health read runs on the same client under the identity deadline, so
     // the ledgers it compares come from the endpoint the identity check named.
@@ -632,7 +959,7 @@ pub async fn create_payment(
     // network and signs SHA-256 of this preimage.
     let network_id = Hash(Sha256::digest(network_passphrase.as_bytes()).into());
     let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
-        network_id,
+        network_id: network_id.clone(),
         nonce: payer_credentials.nonce,
         signature_expiration_ledger,
         invocation: root_invocation.clone(),
@@ -644,14 +971,72 @@ pub async fn create_payment(
                 detail: format!("auth preimage to_xdr_base64 failed: {e}"),
             })?;
 
-    let raw_signature_b64 = sign_soroban_auth_entry(
-        &preimage_xdr,
-        signer,
-        &payer_key,
-        network_passphrase,
-        None, // no override: the passphrase was validated above
-    )
-    .await?; // #[from] Sep43Error -> X402Error::AuthEntrySignFailed
+    let intent = SorobanIntent {
+        consumer: mainnet.as_ref().map_or(
+            stellar_agent_network::mainnet::MainnetConsumer::X402Create,
+            |(_, consumer, _)| *consumer,
+        ),
+        root_invocation: &root_invocation,
+        network_id: network_id.0,
+    };
+    let mut open_intent = None;
+    let authorization = if let Some((proofs, _, _)) = mainnet.as_mut() {
+        let audit = proofs
+            .audit
+            .take()
+            .ok_or_else(|| X402Error::TransactionBuildFailed {
+                detail: "audit readiness already used".to_owned(),
+            })?;
+        let authorization = resolve_soroban_intent(SorobanIntentRequest {
+            context: proofs.context,
+            intent: &intent,
+            client,
+            probe_deadline: identity_deadline.saturating_duration_since(Instant::now()),
+            witness: cross_check.witness(),
+            signer: proofs.signer,
+            policy: proofs.policy,
+            enablement: proofs.enablement,
+            approval: proofs.approval,
+            audit,
+            store: proofs.store,
+        })
+        .await?;
+        open_intent = Some(OpenAuthorization {
+            context: proofs.context,
+            store: proofs.store,
+            id: Some(authorization.id()),
+            point: FailurePoint::Signing { unavailable: false },
+        });
+        Some(authorization)
+    } else {
+        None
+    };
+    let signature = if let Some(authorization) = &authorization {
+        stellar_agent_sep43::signing::sign_soroban_auth_entry_authorized(
+            &preimage_xdr,
+            signer,
+            &payer_key,
+            network_passphrase,
+            None,
+            intent.consumer,
+            authorization,
+        )
+        .await
+    } else {
+        sign_soroban_auth_entry(&preimage_xdr, signer, &payer_key, network_passphrase, None).await
+    };
+    let raw_signature_b64 = match signature {
+        Ok(signature) => signature,
+        Err(error) => {
+            if let Some(open) = &mut open_intent {
+                open.point = signing_failure_point(&error);
+            }
+            return Err(error.into());
+        }
+    };
+    if let Some(open) = &mut open_intent {
+        open.point = FailurePoint::BeforeTransmit;
+    }
 
     let signature_bytes: [u8; 64] = BASE64_STANDARD
         .decode(&raw_signature_b64)
@@ -677,7 +1062,7 @@ pub async fn create_payment(
     payer_credentials.signature = g_key_sig_to_scval(&payer_pubkey_bytes, &signature_bytes)?;
     let signed_entries = vec![SorobanAuthorizationEntry {
         credentials: SorobanCredentials::Address(payer_credentials),
-        root_invocation,
+        root_invocation: root_invocation.clone(),
     }];
 
     // ── Step 7: Re-simulation envelope, then the transmit gate ───────────────
@@ -717,10 +1102,9 @@ pub async fn create_payment(
         })?;
 
     // The request below is the first one carrying the signed authorization.
-    // The gate runs immediately before it and after every step that can still
-    // fail without sending anything, so a gate that recorded the authorization
-    // and returned `Ok` is always followed by that request. A refusal returns
-    // here, and the signature never leaves the wallet.
+    // The gate records the authorization before any signed transmission.
+    // Mainnet also consumes the intent before the request. Either refusal keeps
+    // the signature local.
     before_transmit(&AuthorizationToTransmit {
         network: &requirements.network,
         scheme: &requirements.scheme,
@@ -731,6 +1115,24 @@ pub async fn create_payment(
         signature_expiration_ledger,
         cross_check: cross_check.witness(),
     })?;
+
+    let receipt = if let Some(authorization) = authorization {
+        let (proofs, _, _) = mainnet
+            .as_ref()
+            .ok_or_else(|| X402Error::TransactionBuildFailed {
+                detail: "mainnet context missing".to_owned(),
+            })?;
+        if let Some(open) = &mut open_intent {
+            open.point = FailurePoint::IntentConsume;
+        }
+        let receipt = consume_soroban_intent(proofs.context, authorization, &intent, proofs.store)?;
+        if let Some(open) = &mut open_intent {
+            open.point = FailurePoint::IntentUsed;
+        }
+        Some(receipt)
+    } else {
+        None
+    };
 
     // ── Step 8: Re-simulate with signed auth (MANDATORY) ─────────────────────
     // Without re-simulation, submit traps with:
@@ -766,21 +1168,23 @@ pub async fn create_payment(
         signature_expiration_ledger,
     )?;
     tracing::debug!(
-        protocol_version = identity.protocol_version(),
         simulation_ledger,
         health_ledger,
         resimulation_ledger,
         signature_expiration_ledger,
+        protocol_version = identity
+            .as_ref()
+            .map(stellar_agent_network::EndpointIdentity::protocol_version),
         "x402 payment ledgers checked"
     );
 
     // ── Step 9: Build final envelope and serialize ────────────────────────────
-    let auth_vecm_final: VecM<SorobanAuthorizationEntry> =
-        signed_entries
-            .try_into()
-            .map_err(|e| X402Error::TransactionBuildFailed {
-                detail: format!("final auth VecM construction failed: {e:?}"),
-            })?;
+    let auth_vecm_final: VecM<SorobanAuthorizationEntry> = signed_entries
+        .clone()
+        .try_into()
+        .map_err(|e| X402Error::TransactionBuildFailed {
+            detail: format!("final auth VecM construction failed: {e:?}"),
+        })?;
 
     let final_op = Operation {
         source_account: None,
@@ -817,19 +1221,51 @@ pub async fn create_payment(
                 detail: format!("envelope to_xdr_base64 failed: {e}"),
             })?;
 
+    let child = if let Some(receipt) = receipt {
+        let (proofs, _, _) = mainnet
+            .as_ref()
+            .ok_or_else(|| X402Error::TransactionBuildFailed {
+                detail: "mainnet context missing".to_owned(),
+            })?;
+        Some(resolve_soroban_submit(SorobanSubmitRequest {
+            context: proofs.context,
+            receipt,
+            final_envelope_xdr: &transaction_xdr,
+            signed_auth_entries: &signed_entries,
+            store: proofs.store,
+        })?)
+    } else {
+        None
+    };
+
+    let mut open_child = mainnet.as_ref().and_then(|(proofs, _, _)| {
+        child.as_ref().map(|child| OpenAuthorization {
+            context: proofs.context,
+            store: proofs.store,
+            id: Some(child.id()),
+            point: FailurePoint::ChildMinted,
+        })
+    });
     // ── Step 10: Wrap in PaymentPayload ───────────────────────────────────────
-    Ok(CreatedPayment {
-        payload: PaymentPayload {
-            x402_version: 2,
-            resource: None,
-            accepted: requirements.clone(),
-            payload: ExactStellarPayloadV2 {
-                transaction: transaction_xdr,
+    let result = (
+        CreatedPayment {
+            payload: PaymentPayload {
+                x402_version: 2,
+                resource: None,
+                accepted: requirements.clone(),
+                payload: ExactStellarPayloadV2 {
+                    transaction: transaction_xdr,
+                },
+                extensions: None,
             },
-            extensions: None,
+            cross_check,
         },
-        cross_check,
-    })
+        child,
+    );
+    if let Some(open) = &mut open_child {
+        open.point = FailurePoint::Transferred;
+    }
+    Ok(result)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1342,6 +1778,7 @@ mod tests {
     )]
 
     use super::*;
+    use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
     use stellar_xdr::{AccountId, PublicKey, SorobanAddressCredentialsWithDelegates, Uint256};
 
     // ── select_payer_auth_entry ───────────────────────────────────────────────
@@ -1636,5 +2073,98 @@ mod tests {
             }
         }
         assert!(saw_pubkey && saw_signature, "both fields present");
+    }
+    #[test]
+    fn mainnet_failure_points_select_only_open_intent_stages() {
+        use stellar_agent_network::mainnet::resolve::InvalidationStage as S;
+        assert!(matches!(
+            invalidation_stage(FailurePoint::Signing { unavailable: true }),
+            Some(S::SignerUnavailable)
+        ));
+        assert!(matches!(
+            invalidation_stage(FailurePoint::Signing { unavailable: false }),
+            Some(S::SignRefused)
+        ));
+        assert!(matches!(
+            invalidation_stage(FailurePoint::BeforeTransmit),
+            Some(S::IntentPreTransmitRefused)
+        ));
+        assert!(matches!(
+            invalidation_stage(FailurePoint::IntentConsume),
+            Some(S::IntentConsumeRefused)
+        ));
+        assert!(matches!(
+            invalidation_stage(FailurePoint::ChildMinted),
+            Some(S::PayloadReleaseRefused)
+        ));
+        assert!(invalidation_stage(FailurePoint::IntentUsed).is_none());
+        assert!(invalidation_stage(FailurePoint::Transferred).is_none());
+    }
+
+    #[test]
+    fn authorized_sign_refusals_classify_as_the_classic_path_does() {
+        use stellar_agent_network::mainnet::resolve::InvalidationStage as S;
+        use stellar_agent_sep43::Sep43Error as E;
+        let stage = |error: &E| invalidation_stage(signing_failure_point(error));
+        assert!(matches!(
+            stage(&E::UserRejected {
+                reason: "signing request rejected".to_owned()
+            }),
+            Some(S::SignerUnavailable)
+        ));
+        for error in [
+            E::SignerUnavailable {
+                detail: "wallet state error".to_owned(),
+            },
+            E::MainnetAuthorizationRefused,
+            E::InvalidXdr {
+                detail: "XDR codec operation failed".to_owned(),
+            },
+        ] {
+            assert!(matches!(stage(&error), Some(S::SignRefused)), "{error}");
+        }
+    }
+
+    #[test]
+    fn mainnet_intent_digest_binds_payment_fields_and_network() {
+        let payer = stellar_strkey::ed25519::PublicKey([1; 32])
+            .to_string()
+            .to_string();
+        let payee = stellar_strkey::ed25519::PublicKey([2; 32])
+            .to_string()
+            .to_string();
+        let requirements: PaymentRequirements = serde_json::from_value(serde_json::json!({
+            "scheme":"exact", "network":"stellar:pubnet", "asset":stellar_strkey::Contract([3;32]).to_string().as_str(),
+            "amount":"10", "payTo":payee, "maxTimeoutSeconds":60, "extra":{"areFeesSponsored":true}
+        })).unwrap();
+        assert_eq!(
+            validate_requirements_for_payment(&requirements, MAINNET_PASSPHRASE).unwrap(),
+            10
+        );
+        let digest = intent_digest(&requirements, &payer).unwrap();
+        assert_ne!(digest, intent_digest(&requirements, &payee).unwrap());
+        for field in ["payee", "amount", "asset", "network"] {
+            let mut changed = requirements.clone();
+            match field {
+                "payee" => changed.pay_to = payer.clone(),
+                "amount" => changed.amount = "11".to_owned(),
+                "asset" => {
+                    changed.asset = stellar_strkey::Contract([4; 32]).to_string().to_string()
+                }
+                "network" => changed.network = "stellar:testnet".to_owned(),
+                _ => unreachable!(),
+            }
+            assert_ne!(digest, intent_digest(&changed, &payer).unwrap(), "{field}");
+        }
+        assert_eq!(
+            validate_requirements(
+                &requirements,
+                MAINNET_PASSPHRASE,
+                "https://rpc.example.invalid"
+            )
+            .unwrap_err()
+            .wire_code(),
+            "network.mainnet_write_forbidden"
+        );
     }
 }

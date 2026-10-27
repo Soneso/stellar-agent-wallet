@@ -585,6 +585,8 @@ async fn call(fixture: &Fixture, tool: Tool) -> rmcp::model::CallToolResult {
         Tool::CreatePayment => fixture
             .server
             .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+                approval_nonce: None,
+                approval_attestation: None,
                 chain_id: "stellar:testnet".into(),
                 address: None,
                 payment_required: payment_required(),
@@ -813,6 +815,80 @@ async fn the_row_precedes_the_signed_resimulation(tool: Tool, profile_name: &str
     assert_eq!(authorized[0]["tool"], tool.name());
     assert_eq!(authorized[0]["network"], "stellar:testnet");
     assert_eq!(authorized[0]["scheme"], "exact");
+}
+
+/// The testnet payment's ledger trace carries the protocol version its
+/// endpoint identity check established.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn testnet_create_payment_traces_the_endpoint_protocol_version() {
+    use stellar_agent_core::observability::{FormatChoice, SubscriberConfig, subscriber_for_tests};
+    use tracing::instrument::WithSubscriber as _;
+    let fixture = fixture("x402-protocol-trace", [0xb4; 32], |_| {}).await;
+    let capture = stellar_agent_test_support::CaptureWriter::new();
+    let writer = capture.clone();
+    let subscriber = subscriber_for_tests(
+        SubscriberConfig::default()
+            .with_filter_override(Some(tracing_subscriber::EnvFilter::new("debug")))
+            .with_format_override(Some(FormatChoice::Pretty))
+            .with_writer_factory(Some(Box::new(move || Box::new(writer.clone())))),
+    )
+    .expect("the wallet subscriber builds");
+    let inert = stellar_agent_test_support::inert_dispatcher();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+    let result = call(&fixture, Tool::CreatePayment)
+        .with_subscriber(dispatch)
+        .await;
+    drop(inert);
+    assert_ne!(result.is_error, Some(true), "{}", result_json(&result));
+    let logs = capture.captured_str();
+    let trace = logs
+        .split("x402 payment ledgers checked")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the ledger trace is written: {logs}"));
+    let fields = trace.split("\n\n").next().unwrap_or(trace);
+    assert!(fields.contains("protocol_version"), "{fields}");
+}
+
+/// On testnet the create-payment tool ignores the approval arguments under an
+/// allowing policy: absent, either half alone, or both, the payment is signed
+/// and returned as without them.
+#[tokio::test]
+#[serial]
+async fn testnet_create_payment_ignores_supplied_approval_arguments() {
+    for (seed, nonce, attestation) in [
+        (0xb0, None, None),
+        (0xb1, Some("approval-nonce"), None),
+        (0xb2, None, Some("approval-attestation")),
+        (0xb3, Some("approval-nonce"), Some("approval-attestation")),
+    ] {
+        let fixture = fixture(&format!("x402-approval-args-{seed:x}"), [seed; 32], |_| {}).await;
+        let result = fixture
+            .server
+            .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+                approval_nonce: nonce.map(str::to_owned),
+                approval_attestation: attestation.map(str::to_owned),
+                chain_id: "stellar:testnet".into(),
+                address: None,
+                payment_required: payment_required(),
+            })
+            .await
+            .expect("no protocol error");
+        let envelope = result_json(&result);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "{nonce:?} {attestation:?}: {envelope}"
+        );
+        assert!(
+            envelope["data"]["paymentSignature"].is_string(),
+            "{nonce:?} {attestation:?}: {envelope}"
+        );
+        let (authorized, _) = x402_rows(&fixture.profile);
+        assert_eq!(authorized.len(), 1, "{nonce:?} {attestation:?}");
+        assert_eq!(authorized[0]["policy_decision"], "allow");
+    }
 }
 
 #[tokio::test]
@@ -1454,6 +1530,8 @@ async fn call_on_chain(
             fixture
                 .server
                 .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+                    approval_nonce: None,
+                    approval_attestation: None,
                     chain_id: chain_id.into(),
                     address: None,
                     payment_required: payment_required.to_owned(),
@@ -2045,6 +2123,8 @@ async fn x402_chain_arguments_preserve_refusal_order() {
     let invalid = payment_required_with(|r| r["scheme"] = "upto".into());
     let created = mainnet
         .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+            approval_nonce: None,
+            approval_attestation: None,
             chain_id: "stellar:pubnet".into(),
             address: None,
             payment_required: invalid.clone(),

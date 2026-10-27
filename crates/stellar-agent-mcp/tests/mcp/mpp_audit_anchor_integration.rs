@@ -718,6 +718,8 @@ async fn x402_accounting_cap_refusal_withholds_the_payment_signature() {
     )));
     let result = server
         .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+            approval_nonce: None,
+            approval_attestation: None,
             chain_id: "stellar:testnet".into(),
             address: None,
             payment_required: serde_json::json!({
@@ -1265,6 +1267,8 @@ async fn profile_chain_x402_accounting_persists_cap() {
         .server
         .set_policy_engine_for_test(std::sync::Arc::new(profile_chain_cap_engine(NAME)));
     let args = || X402CreatePaymentArgs {
+        approval_nonce: None,
+        approval_attestation: None,
         chain_id: "stellar:testnet".into(),
         address: None,
         payment_required: serde_json::json!({

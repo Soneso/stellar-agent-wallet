@@ -299,9 +299,10 @@ async fn stellar_pay_commit_require_approval_no_attestation_is_blocked() {
 // Test 4: stellar_create_account_commit with RequireApproval + absent attestation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The same setup for `stellar_create_account_commit`, whose nonce parse
-/// follows the policy gate directly and precedes its attestation gate: the
-/// un-parseable nonce refuses with `nonce.expired` before anything is signed.
+/// The same setup for `stellar_create_account_commit`, whose attestation gate
+/// follows the policy gate and precedes its nonce parse: the absent
+/// attestation refuses with `policy.approval_required` before the
+/// un-parseable nonce is read and before anything is signed.
 #[tokio::test]
 #[serial]
 async fn stellar_create_account_commit_require_approval_no_attestation_is_blocked() {
@@ -336,8 +337,8 @@ async fn stellar_create_account_commit_require_approval_no_attestation_is_blocke
         );
     let (code, _message, text) = crate::common::assert_business_envelope(&result);
     assert_eq!(
-        code, "nonce.expired",
-        "the nonce parse refuses after the policy gate: {text}"
+        code, "policy.approval_required",
+        "the attestation gate refuses before the nonce parse: {text}"
     );
 }
 

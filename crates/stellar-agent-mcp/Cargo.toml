@@ -162,6 +162,7 @@ zeroize = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
+toml_edit = { workspace = true }
 stellar-agent-toolsets-runtime = { path = "../stellar-agent-toolsets-runtime", features = ["test-helpers"] }
 # Path-only self-reference: enables this crate's own test features for its tests
 # and is stripped from the published manifest like every internal dev-dependency.
@@ -224,7 +225,7 @@ mainnet-write = ["stellar-agent-core/mainnet-write", "stellar-agent-network/main
 
 # Exposes call_stellar_* test helpers used by the integration tests and the
 # binary smoke-test harness. Must NOT be enabled in production builds.
-test-helpers = [
+test-helpers = ["stellar-agent-network/test-hooks",
     # Enable GatedInvokeParams override fields (approval_dir_override,
     # grant_store_path_override) used by the toolsets.rs test-helpers block.
     "stellar-agent-toolsets-runtime/test-helpers",
