@@ -1,5 +1,8 @@
 # Agent delegation
 
+See [Mainnet configurations and scope](getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 Hand an autonomous agent a scoped, budgeted, revocable slice of a smart
 account: one target contract, a spending cap, and its own key, instead of
 the account's full authority. The agent transacts with a key it holds

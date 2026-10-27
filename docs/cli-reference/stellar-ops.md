@@ -1,12 +1,41 @@
 # CLI reference: accounts and core Stellar operations
 
+See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This page documents the everyday Stellar operations exposed by the `stellar-agent` CLI: creating and funding accounts, deploying a smart-account contract, sending payments, reading balances, managing trustlines, funding via Friendbot, reading fee statistics, and managing the counterparty resolution cache.
 
 The binary is `stellar-agent`. It is also discoverable as a `stellar-cli` plugin, so when `stellar` is installed the same command runs as `stellar agent <command> ...`. The examples here use the direct form.
 
-Conventions shared by every command are defined once in the [CLI reference index](index.md). These are profile resolution, the `--output` format, the JSON envelope and exit codes, the signer-source group, and the mainnet-write refusal. This page references that index for the shared flags and documents only what is specific to each command.
+Conventions shared by every command are defined once in the [CLI reference index](index.md). These are profile resolution, the `--output` format, the JSON envelope and exit codes, the signer-source group, and mainnet write behavior. This page references that index for the shared flags and documents only what is specific to each command.
 
 For the concepts referenced below (profiles, the policy engine, the approval spine, the audit log), see [concepts](../concepts.md). For SEP-29 memo enforcement and the counterparty `stellar.toml` resolution, see [protocols](../protocols.md).
+
+## Mainnet actions
+
+Only full-mode `pay`, `claim`, sponsored `accounts create`, and `trustline`
+enter the authorized mainnet pipeline. Staged modes remain excluded.
+[Confirmation and setup](index.md#mainnet-write-behavior) apply to every action.
+Ledger and `--secret-env` signers require an enrolled identity. Enrollment takes
+`--secret-env` only, so a Ledger key cannot be enrolled for mainnet.
+
+The four full-mode verbs include numeric `total_fee_stroops`, equal to unsigned
+`tx.fee`, in policy arguments on both networks. Mainnet fees use the smaller
+signed/profile cap. The resolver independently reevaluates policy, fees, and
+witnesses against the bound action.
+
+CLI engine construction preserves `profile.mainnet_enablement_invalid`.
+Other build errors use `policy.engine_unavailable`, or
+`trustline.policy_engine_unavailable` for trustline. Evaluation failures use
+`policy.engine_required`; unknown decisions use `policy.unexpected_decision`.
+Policy denials retain `policy.deny.*`.
+
+Fee refusals include `fees.percentile_exceeds_cap`,
+`validation.fee_total_overflow`, and `validation.mainnet_fee_cap_required`.
+Resolver fee failures use `network.mainnet_authorization_refused`.
+Endpoint probes preserve `network.endpoint_network_mismatch`,
+`network.endpoint_identity_unavailable`, `network.unsupported_protocol_version`,
+and `network.rpc_credential_refused`.
 
 ## Shared flags
 
@@ -37,9 +66,14 @@ Creates a new Stellar account in one of two mutually exclusive modes: a sponsore
 
 - **Signing.** Sponsored mode signs the `CreateAccount` operation with the sponsor's key. Friendbot mode performs no signing and touches no key.
 - **Policy (sponsored mode only).** After `--starting-balance` and the new account's public key are resolved and before signing, the sponsored `CreateAccount` is evaluated against `--profile`'s policy engine. This is the same evaluation the `stellar_create_account` MCP tool runs. When no profile was named and no `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized. So sponsored mode works without an authored profile file until an operator opts into `policy.engine = "v1"`. A profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused (`profile.load_failed`). A profile file whose owner-key coordinate names a DIFFERENT profile is refused (`profile.name_mismatch`). Friendbot mode is not gated: it debits no wallet-held funds.
-- **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` is structurally refused before any RPC, HTTP, or key access. Sponsored mode returns `network.mainnet_write_forbidden`; Friendbot mode returns `network.friendbot_mainnet_forbidden`. Friendbot funding is testnet-only. In Friendbot mode, an account at or above the Friendbot starting balance (10,000 XLM on the SDF testnet) exits `1` with `network.friendbot_account_already_funded`. Friendbot pays the starting balance to an existing account below it.
+- **Network.** Sponsored creation admits configured mainnet writes in a feature-enabled build. Friendbot mode refuses mainnet with `network.friendbot_mainnet_forbidden`. Friendbot funding is testnet-only. In Friendbot mode, an account at or above the Friendbot starting balance (10,000 XLM on the SDF testnet) exits `1` with `network.friendbot_account_already_funded`. Friendbot pays the starting balance to an existing account below it.
 - **Account identity.** Provide the new account's G-strkey as the positional argument, or pass `--generate` to mint a fresh ed25519 keypair in-process. Exactly one is required.
 - **Secret-key discipline.** `--generate` returns the new S-strkey in the JSON envelope's `data.secret_key` field. It is never emitted in `--output table` and never logged. Capture it from the JSON output and store it securely. The command output holds the seed, so do not write it to a log or a shared terminal.
+
+Mainnet sponsored creation requires an existing destination G-strkey.
+In a feature-enabled build, `--generate` refuses with
+`accounts.create.generate_refused_on_mainnet`. With the feature off, context
+construction refuses earlier with `network.mainnet_write_forbidden`.
 
 Argument groups (enforced by the parser):
 
@@ -174,10 +208,15 @@ Sends a payment from a source account to a destination, enforcing SEP-29 memo-re
 
 - **Signing.** By default the command builds, signs, and submits atomically. Three staged flags split the pipeline: `--build-only` emits the unsigned envelope XDR and exits (no signing); `--sign-only <XDR>` signs a prebuilt envelope and emits signed XDR; `--submit-only <XDR>` submits a pre-signed envelope. The stage flags are mutually exclusive. `--submit-only` requires an envelope that is already signed: handing it the unsigned XDR that `--build-only` emitted is refused with `network.envelope_unsigned` before anything is sent.
 - **Policy.** After the envelope is built and before signing (in both the full pipeline and `--build-only`), the amount/asset/destination are evaluated against `--profile`'s policy engine. This is the same evaluation the `stellar_pay` MCP tool runs. When no profile was named and no `default.toml` exists, an in-memory `Noop`-engine testnet profile is synthesized. So the command works without an authored profile file until an operator opts into `policy.engine = "v1"`. A profile named through `--profile` or `STELLAR_AGENT_PROFILE` whose file does not exist is refused (`profile.load_failed`). A profile file whose owner-key coordinate names a DIFFERENT profile is refused (`profile.name_mismatch`). The staged `--sign-only` and `--submit-only` flows are gated too. Each decodes the supplied envelope through the same decoder the MCP `stellar_pay_commit` path uses. It evaluates the decoded amount/asset/destination before signing (`--sign-only`) or before broadcasting (`--submit-only`). For `--submit-only`, the envelope arrives pre-signed, but broadcasting still spends funds. An envelope the decoder cannot classify into a sized shape follows the opaque-signing posture: under a matched value rule it denies `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. The staged flows match policy rules under the `stellar_pay_commit` tool name (the same name the MCP commit phase matches). A ruleset that names only `stellar_pay` default-denies them, so author rules for both names, or `tool = "*"`, for uniform behavior. Under `policy.engine = "noop"` the staged flows are ungated, matching the rest of the command. Every stage that reads from the endpoint checks its identity first, on the client that later reads and sends. An `--rpc-url` pointing at a different network than `--network` is therefore refused before the policy gate and before the audit-key pre-flight. See [Endpoint identity before the first read](index.md#endpoint-identity-before-the-first-read).
-- **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` returns `network.mainnet_write_forbidden` before any RPC call, with a submit-layer URL rejection as defence in depth. Beyond those two zero-RPC refusals, the submit layer asks the endpoint which network it serves and binds the submission to that answer rather than to `--network`, refusing a mainnet endpoint, a mismatch, an unestablishable endpoint identity, and any signature that was not made for the network the endpoint reported. The same answer carries the endpoint's protocol version. This release supports protocol 29. Outside it, testnet and other networks log a warning; mainnet refuses with `network.unsupported_protocol_version`, which a mainnet endpoint never reaches while mainnet writes are refused. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
+- **Network.** Full mode admits configured mainnet writes in a feature-enabled
+  build. Staged modes refuse with `network.mainnet_write_forbidden`. Endpoint
+  identity and signature-network checks apply before sending. This release
+  supports protocol 29. Outside it, testnet and other networks log a warning;
+  mainnet refuses with `network.unsupported_protocol_version`. See
+  [Submit-layer network binding](index.md#submit-layer-network-binding).
 - **Submission record.** Before the transaction is sent, the command records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation under a policy with a stateful criterion, and a `value_action_pending` audit row. A submission that ends without a confirmed outcome exits 1 with `submission.tx_timeout` and keeps that record: the confirmation deadline passed, the endpoint reported an unexpected status, or a transport failure struck during or after the send. The transaction may still apply, and the message says to settle it by its transaction hash and not to resubmit. Resolve it with `stellar-agent tx status <HASH>`, never by rebuilding and re-sending: a second submission for the same source account and sequence is refused with `submission.tx_already_submitted` while the first stands, and so is a resend of the same signed bytes that the spending window already holds. `error.details` carries the full transaction hash and the envelope hash the operator verbs take. See [`stellar-agent tx`](#stellar-agent-tx).
 - **Fee cap.** After the policy gate, every stage checks the per-operation fee
-  against the profile's `classic_max_fee_per_op_stroops`. The full pipeline and
+  against the effective signed/profile `classic_max_fee_per_op_stroops`. The full pipeline and
   `--build-only` check the fee they selected: auto-selected with `--fee
   auto[:pNN]`, explicit with `--fee <STROOPS>`, otherwise the command's default
   of 100. `--sign-only` and `--submit-only` check the fee of the envelope they
@@ -304,27 +343,22 @@ The respective refusals are `claim.not_claimant`, `claim.predicate_not_satisfied
   a different network than `--network` is therefore refused before the policy
   gate and before the audit-key pre-flight. See
   [Endpoint identity before the first read](index.md#endpoint-identity-before-the-first-read).
-- **Network.** `--network` accepts `testnet` or `mainnet`; `mainnet` returns
-  `network.mainnet_write_forbidden` before any RPC call. Beyond that zero-RPC
-  refusal, the submit layer asks the endpoint which network it serves and binds
-  the submission to that answer rather than to `--network`, refusing a mainnet
-  endpoint, a mismatch, an unestablishable endpoint identity, and any signature
-  that was not made for the network the endpoint reported. The same answer
-  carries the endpoint's protocol version. This release supports protocol 29.
-  Outside it, testnet and other networks log a warning; mainnet refuses with
-  `network.unsupported_protocol_version`, which a mainnet endpoint never
-  reaches while mainnet writes are refused. See
-  [Submit-layer network binding](index.md#submit-layer-network-binding) for the
-  wire codes.
+- **Network.** Full mode admits configured mainnet writes in a feature-enabled
+  build. Staged modes refuse with `network.mainnet_write_forbidden`. Endpoint
+  identity and signature-network checks apply before sending. This release
+  supports protocol 29. Outside it, testnet and other networks log a warning;
+  mainnet refuses with `network.unsupported_protocol_version`. See
+  [Submit-layer network binding](index.md#submit-layer-network-binding).
 - **Timing.** The predicate is evaluated against the local clock; on-chain
   validation uses the apply-ledger close time, so a claim previewed near a
   time-bound boundary can still fail on submit.
 - **Fee cap.** After the policy gate, every stage checks the per-operation fee
-  against the profile's `classic_max_fee_per_op_stroops`, as `pay` does: the
-  selected fee in the full pipeline and `--build-only`, the decoded envelope
-  fee in `--sign-only` and `--submit-only`. A fee above the cap exits 1 with
-  `fees.percentile_exceeds_cap`; a mainnet profile without the cap refuses
-  with `validation.mainnet_fee_cap_required`.
+  against the effective signed/profile `classic_max_fee_per_op_stroops`.
+  It checks the selected fee in full mode and `--build-only`.
+  It checks the decoded envelope fee in `--sign-only` and `--submit-only`.
+  A fee above the cap exits 1 with `fees.percentile_exceeds_cap`.
+  A mainnet action without an effective cap refuses with
+  `validation.mainnet_fee_cap_required`.
 - **Cross-check witness.** The full pipeline, `--sign-only`, and
   `--submit-only` obtain a cross-check witness after the fee check and before
   the audit pre-flight, the signer, and the send. A claim credits the source,
@@ -403,7 +437,7 @@ Creates or removes a classic trustline (`ChangeTrust`) behind an ordered trust g
 
 - **Signing.** Signs via the profile's keyring signer; builds, signs, submits, and waits atomically. There is no staged pipeline.
 - **Timeout.** The profile's `submit_timeout_seconds`, 60 seconds when the field is unset, bounds two things, each with a budget of its own. The first is the endpoint identity check ahead of the issuer read. The second is the submission, from the submit layer's endpoint check to the last confirmation poll. There is no `--timeout-seconds` flag.
-- **Network.** Derived from the loaded profile (`rpc_url`, `network_passphrase`, `chain_id`). The profile file supplies the chain identity. There is no `--network` flag: the network comes from the profile configuration. The command goes through the same submit layer as every other verb, so it gets the same binding. A mainnet passphrase or a known mainnet RPC URL is refused with `network.mainnet_write_forbidden` and no RPC call. The endpoint is then asked which network it serves and that answer is authoritative. The envelope's signatures are verified against it. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
+- **Network.** Derived from the loaded profile (`rpc_url`, `network_passphrase`, `chain_id`). The profile file supplies the chain identity. There is no `--network` flag: the network comes from the profile configuration. The command goes through the same submit layer as every other verb, so it gets the same binding. The endpoint is asked which network it serves and that answer is authoritative. The envelope's signatures are verified against it. A feature-enabled build admits configured mainnet trustline actions through authorized signing and submission. With the feature off, a mainnet profile refuses with `network.mainnet_write_forbidden` before the keyring store, the signer, and any RPC request. See [Submit-layer network binding](index.md#submit-layer-network-binding) for the wire codes.
 - **USDT is hard-refused.** The denomination resolver rejects USDT outright; the command cannot create a USDT trustline.
 - **Limit.** `--limit-stroops 0` removes the trustline. When absent the Stellar default (`i64::MAX`, unlimited) applies.
 - **Asset grammar.** A bare code such as `USDC` resolves through the pin table; `CODE:ISSUER` names an explicit issuer; a 56-char `C...` SAC address is deferred and returns a typed error.

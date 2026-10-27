@@ -1,5 +1,8 @@
 # Agent payments with MPP
 
+See [Mainnet configurations and scope](getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 The wallet implements a narrow Machine Payments Protocol (MPP) payer flow for
 sponsored Stellar charges. This feature is testnet-only and credential-only:
 the wallet validates a challenge, prepares and signs the payer authorization,

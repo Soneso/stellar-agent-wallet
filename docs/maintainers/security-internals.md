@@ -1,8 +1,11 @@
 # Security internals
 
+See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This document describes the cryptographic primitives behind the Stellar Agent Wallet guardrail spine: the approval attestation, the hash-chained audit log, the wallet unlock window, the nonce scheme, the V1 policy evaluator, and the smart-account auth digest. It is written for a maintainer or security reviewer who needs the byte-level detail, not the operator-facing model. For the model itself see [Concepts](../concepts.md); for how the crates fit together see [Architecture](architecture.md).
 
-Both surfaces (the `stellar-agent` CLI and the `stellar-agent-mcp` server) share the attestation, audit hash-chain, nonce, policy-evaluator, and auth-digest primitives below. The wallet unlock window (mlock plus TTL) is the exception: it protects the CLI's `--secret-env` signing path, where the seed is loaded into pinned memory. The MCP server does not call `Wallet::unlock`; its signing goes through keyring signer handles, so the [Wallet unlock lifecycle](#wallet-unlock-lifecycle) section below applies to the CLI surface only. testnet (`stellar:testnet`) is the default. Every write or signing command structurally refuses mainnet (`stellar:mainnet`) with wire code `network.mainnet_write_forbidden`, except MPP, which refuses with `mpp.network_forbidden`. This covers `--network` commands and the profile-driven write commands before any RPC call or signing. At the submit layer it covers both a declared mainnet network passphrase and a known mainnet RPC URL, each at zero RPC cost. The submit layer additionally establishes the endpoint's own network identity and binds every signature on the envelope to it; see [Submit-layer network binding](#submit-layer-network-binding).
+The CLI and MCP server share attestation, audit, nonce, policy, and auth-digest primitives. The unlock window protects CLI `--secret-env` seeds. MCP signs through keyring handles without `Wallet::unlock`. Testnet is the default. Mainnet operation admission depends on build configuration and installation setup. Policy evaluation, sealed authorization, signing checks, and submit checks are independent boundaries. Ordinary signing and submission refuse mainnet. Authorized consumers bind each action to its endpoint, signer, policy, approval, audit state, and window reservation.
 
 ## Two sessions on one profile
 
@@ -22,7 +25,7 @@ The table distinguishes tested properties from operational claims that are not p
 | Counterparty cache | Per profile cache; default TTL is one hour on the host clock. Default duration: one hour (`DEFAULT_TTL`) in the four production callers; not pinned by a test. An entry whose fetch time lies more than five minutes in the future counts as expired. | Per refresh cache lock; `concurrent_refresh_second_gets_writer_locked` in network `counterparty_cache_integration.rs`. | Fetch time is authenticated: network `counterparty::cache::tests::hmac_v2_different_fetched_at_returns_mismatch`. The file time does not change it: `counterparty::cache::tests::touch_mtime_does_not_change_fetched_at`. Listing skips expired entries: `expired_cache_entry_is_skipped_by_list_cached`. Expiry at equality and the five-minute future-fetch tolerance: the `is_expired_*` unit tests and `future_fetch_tolerance_is_five_minutes`. Snapshot filtering: `snapshot_keeps_only_live_bindings`. | The disk cache persists; listing and snapshot construction enforce expiry on every read. Actual restart is not pinned. | The stale-return API has no production caller. Opt-in fallback on a transient failure until one TTL past expiry, the deadline included: `stale_if_error_returns_expired_hmac_verified_cache_entry` and `stale_fallback_permitted_at_grace_deadline`; caller absence is not pinned. Refusals: `stale_fallback_refused_one_nanosecond_past_grace_deadline`, `stale_if_error_refuses_entry_past_grace_bound`, `stale_if_error_refuses_permanent_fetch_failure`, `stale_read_refuses_an_entry_fetched_in_the_future`, and `stale_if_error_false_ignores_stale_cache_on_failure`. `stale_if_error_false_fail_closed_no_stale_return` pins that a failed fetch without a cached entry refuses. Expired fallback evidence cannot enter policy snapshots. |
 | Per-period admission | Classic reservations and x402 authorization usage share persisted window accounting. | Comparison and persistence under the window lock; not pinned. | Classic refusal: network `submission_record_integration::a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial`; x402 refusal before signing: MCP `x402_audit_gate_integration::window_admission_refusal_precedes_signing`. | State is persisted; actual restart is not pinned by these admission tests. | A second reset handle cannot enter during the recorder: network `policy_state::store::tests::reset_holds_window_lock_during_recorder`. |
 | x402 usage after a later failure | Admitted usage stays charged; this is the beta contract. | The admission lock ends before the later payment attempt. Lifetime: not pinned. | A later failure does not refund usage: MCP `x402_audit_gate_integration::post_admission_failure_keeps_spend`. | Actual restart after that failure: not pinned. | The admission-refusal test in the preceding row pins the before-signing boundary separately. |
-| Authorization per process with a durable single-use record | Future mechanism; absent from this release. | Not implemented. | Not pinned. | Not pinned. | No current authorization claim is made. |
+| Authorization per process with a durable single-use record | Per-profile authorization records and holds persist in the window store. `a_mint_records_the_authorization_its_holds_and_its_reservation` in network `policy_state::ledger`. | Mint, consume, and invalidation run under the state lock. Mint contention: `a_held_lock_refuses_a_mint`. Consume pin reread: `a_consume_rereads_the_pin_under_its_lock`. Invalidation under the lock: not pinned. | A second consume refuses without rewriting the file: `a_second_consume_refuses`. Approval nonces are single-use within retention: `an_approval_nonce_is_single_use_within_retention`. | Records are persisted. Actual process restart: not pinned. | Concurrent mints produce one open record: `concurrent_mints_of_one_content_yield_one_open_record`. Invalidation releases holds without reopening authority: `an_invalidation_releases_the_holds_and_never_reopens`. All named tests are in network `policy_state::ledger`. |
 
 The receipt store remains an unanchored map; a missing file reads as empty.
 It backs duplicate source-and-sequence refusal, duplicate-envelope refusal,
@@ -431,7 +434,7 @@ The HMAC key is the profile's `mcp_nonce_key_alias` keyring entry, stored as URL
 
 A Stellar signature commits to a network: the SEP-23 `TransactionSignaturePayload` the signer hashes carries `network_id = SHA-256(network_passphrase)`, so the same transaction signed for two networks produces two different signatures. Nothing in the wire format records which network a signature was made for; it can only be recovered by re-deriving the payload under a candidate network id and checking the signature against it. The check lives in `crates/stellar-agent-network/src/signing/verify_binding.rs`; the endpoint check it rests on is `StellarRpcClient::endpoint_identity`.
 
-### Order of operations at every submit entry point
+### Ordinary submission order
 
 1. A caller-declared mainnet network passphrase is refused with `network.mainnet_write_forbidden`. Zero RPC calls.
 2. An RPC URL matching a known mainnet host is refused the same way. Zero RPC calls.
@@ -442,6 +445,30 @@ A Stellar signature commits to a network: the SEP-23 `TransactionSignaturePayloa
 7. `sendTransaction`, then poll `getTransaction`.
 
 Steps 4 and 5 are two reads ahead of the send, so inside the submit layer every submission makes two round trips before the send.
+
+### Authorized signing and submission
+
+The four full-mode classic CLI verbs and four classic MCP commits resolve
+sealed authority before signing. Endpoint identity binds the originating client,
+network, and protocol. Transaction authority binds the envelope and signer.
+Signing checks authority before key access and verifies the returned signature.
+A verification refusal can therefore follow a signer call.
+
+The submit entry independently checks its grant, endpoint/client identity,
+transaction binding, and signatures. `SubmissionRecorder::pre_send_authorized`
+durably consumes authorization before `sendTransaction`. Refusal after signing
+withholds submission; it does not establish that no signature exists.
+
+Version 3 attestations authenticate approval kind, creation time, and expiry.
+Mainnet proof verification requires `attestation_version = 3`.
+`approval.attestation_invalid` covers missing version 3 coverage or a mismatched
+subject. MCP reports failed approval proofs as `policy.approval_required`.
+
+Direct CLI confirmation requires terminal stdin and stderr. The summary is
+rendered and flushed before reading the exact profile name. Terminal or name
+refusal occurs before pending insertion. Successful confirmation writes consent
+and persists its attestation before returning the witness. Its approval surface
+and audit origin are `cli-mainnet-confirm`.
 
 ### Endpoint identity before the first signed read
 
@@ -566,9 +593,13 @@ transaction's fee field refuses with `validation.fee_total_overflow` before the
 fresh checkpoint or signer load. The pool crate checks the same total before
 building the sandwich. A sending resume checks its fee before retiring an attempt.
 
-Mainnet writes stay refused structurally on every classic verb and commit, so
-the mainnet branches of the fee cap and of the witness are exercised by tests
-of the shared rules.
+The classic callers and resolver check the effective signed/profile cap.
+MCP preparation uses the same precedence. The smaller value applies, or the
+one available value; a higher profile value warns. The enabled-policy minimum
+requires its signed field. The resolver independently evaluates the bound action.
+Its fee-check failure becomes `network.mainnet_authorization_refused`.
+All four full-mode CLI verbs pass numeric `total_fee_stroops`, equal to unsigned
+`tx.fee`, to policy evaluation on both networks.
 
 ### Endpoint identity is authoritative
 
@@ -578,11 +609,11 @@ The outcomes, in the order the check reaches them:
 
 - endpoint answers HTTP 401 or 403: `network.rpc_credential_refused`, not retried, with the status and the endpoint's authority
 - identity not established within the submission timeout, or an answer that does not deserialize: `network.endpoint_identity_unavailable`
-- endpoint reports the mainnet passphrase: `network.mainnet_write_forbidden`, the one mainnet refusal that costs a round trip
+- ordinary submission sees the mainnet passphrase: `network.mainnet_write_forbidden`
 - endpoint reports a different network than the caller declared: `network.endpoint_network_mismatch`
 - protocol version outside the supported range on mainnet: `network.unsupported_protocol_version`
 
-The same answer carries the endpoint's protocol version, which the protocol rule checks against `SUPPORTED_PROTOCOL_VERSIONS`, protocol 29 in this release. A release adds a version to the range only after its testnet acceptance tests ran against that version. On testnet, and on any other network whose passphrase matches the declaration, a version outside the range passes with one logged warning that carries the version and the range. On mainnet the same version is refused. While mainnet writes are refused, an endpoint that reports mainnet is refused with `network.mainnet_write_forbidden` first, so the mainnet branch of the protocol rule does not fire.
+The same answer carries the endpoint's protocol version, which the protocol rule checks against `SUPPORTED_PROTOCOL_VERSIONS`, protocol 29 in this release. A release adds a version to the range only after its testnet acceptance tests ran against that version. On testnet, and on any other network whose passphrase matches the declaration, a version outside the range passes with one logged warning that carries the version and the range. On mainnet the same version is refused. Ordinary submission refuses mainnet before the protocol check. Authorized submission enforces the mainnet protocol range.
 
 The probe runs on the client instance that will carry `sendTransaction`, not on a fresh one, so the identity that was established is the identity of the connection the transaction goes out on.
 
@@ -638,14 +669,14 @@ The wallet has no automatic failover: the secondary and oracle endpoints verify 
 
 For a `Tx` envelope: the transaction's own source account and every distinct operation-level source account, because an operation-level source contributes its own authority and is signed for separately. For a `TxFeeBump` envelope: the fee source answers for the outer signatures and the inner transaction's sources for the inner ones. Muxed accounts resolve to the underlying G-account, which is where the signer set lives. The distinct set is fetched in a single `getLedgerEntries` call; an account absent from the ledger is `network.account_not_found`, refused before anything is sent.
 
-One class of operation source is absent from the ledger by construction: an account that an earlier operation of the same transaction creates. It exists when the operation applies but not when the envelope is submitted, and its signer set at that point is exactly its own master key, which is the account id. Such an account is therefore not requested from the ledger and its candidate key is derived locally. The CAP-33 sponsored-creation sandwich is built this way, with the new account signing the `EndSponsoringFutureReserves` operation that names it as source. Deriving the key locally is not an escape hatch: the signature still has to verify under the endpoint's network id, and a mainnet-bound signature by that same account is refused like any other.
+One class of operation source is absent from the ledger by construction: an account that an earlier operation of the same transaction creates. It exists when the operation applies but not when the envelope is submitted, and its signer set at that point is exactly its own master key, which is the account id. Such an account is therefore not requested from the ledger and its candidate key is derived locally. The CAP-33 sponsored-creation sandwich is built this way, with the new account signing the `EndSponsoringFutureReserves` operation that names it as source. The derived key's signature must verify under the endpoint's network id.
 
 ### Per-signature verdict
 
 Each `DecoratedSignature` carries a four-byte hint, the trailing four bytes of the signer's public key. The hint narrows the gathered signers to those whose key bytes `28..32` match it; the signature must then verify against one of those candidates under the payload rebuilt for the endpoint's network id.
 
 - verifies under the endpoint's network id: accepted
-- verifies under the mainnet network id: `network.envelope_signed_for_mainnet`, a mainnet authorisation, refused whatever endpoint it was relayed to
+- fails under the endpoint network but verifies under mainnet: `network.envelope_signed_for_mainnet`
 - verifies under neither: `network.envelope_signature_unverifiable`
 - a signature set carries no decorated signatures at all: `network.envelope_unsigned`, refused before the round trip. The sets are checked separately, so a fee-bump with a signed outer and an unsigned inner is refused here rather than on chain
 
@@ -653,7 +684,7 @@ Every signature must pass, and each signature set must have at least one. Hash-x
 
 ## Policy V1 evaluator
 
-`PolicyEngineV1` (`crates/stellar-agent-core/src/policy/v1/mod.rs`) is the signature-verified typed-criteria engine, active when `profile.policy.engine = V1` (the default for newly-minted profiles). The alternative, `NoopPolicyEngine` (`policy/mod.rs`), is selected by `engine = "noop"` and is the binding mainnet write gate: testnet allows all tools; mainnet read-only (`destructive_hint = false`) allows; mainnet destructive returns `Err(PolicyError::NotImplemented)`, surfaced as `policy.engine_required`.
+`PolicyEngineV1` (`crates/stellar-agent-core/src/policy/v1/mod.rs`) is the signature-verified typed-criteria engine, active when `profile.policy.engine = V1` (the default for newly-minted profiles). The alternative, `NoopPolicyEngine` (`policy/mod.rs`), is selected by `engine = "noop"`. It supplies one policy boundary alongside entry, signing, and submit checks. Testnet allows all tools. Mainnet read-only (`destructive_hint = false`) allows. Mainnet destructive returns `Err(PolicyError::NotImplemented)`, surfaced as `policy.engine_required`.
 
 ### First-match default-deny
 
@@ -709,8 +740,11 @@ keys refuse. The optional authorization TTL is 1 to 120 seconds.
 `ThresholdSet::from_profile_and_signed` and `check_classic_fee_cap_signed`
 combine a signed value with the profile's: the effective threshold and fee cap
 are the per-asset minimum, and a profile value above the signed one emits a
-warning. The transaction paths read the profile values through
-`ThresholdSet::from_profile` and `check_classic_fee_cap`.
+warning. Admitted classic callers use effective signed/profile values, and
+the resolver independently reevaluates them. See the normative
+[policy schema](../profiles.md#mainnet-policy-body),
+[minimum](../profiles.md#enabled-policy-minimum), and
+[fee and threshold rules](../profiles.md#thresholds-and-fees).
 
 The policy criteria have no memo requirement. `stellar_pay` and `pay` refuse a
 payment without a memo to an account whose `config.memo_required` data entry
@@ -737,6 +771,52 @@ payment; the policy cannot refuse its absence.
 - **Rotation**: `stellar-agent profile rotate-policy-state-key <name>` first verifies an existing store file's tag under the old key. It refuses the rotation, changing nothing, when the tag does not verify or the file exists without a minted old key. It then mints a fresh key and re-signs the store file's existing body under it. The re-sign itself needs no old key. This is the same "recompute the tag over the unchanged body" shape as `rotate-audit-key`'s chain-root sidecar re-sign, so accumulated history survives rotation.
 
 Stateful criteria derive window entries from the same `ValueEffects` used by evaluation and audit. Network submissions reserve those entries before sending and settle them from the ledger result. A reservation's id is the envelope hash, so the window refuses a second reservation for bytes it already holds, pending or confirmed: the recorder asks before it writes the pending row, which keeps a resend after a lost receipt from writing any row, and the reservation write refuses again under the file lock. Both map to `submission.tx_already_submitted`. The refusal exists only where the submission takes a reservation, so only under a policy with a stateful criterion. A release drops the pending records of a reservation and keeps its confirmed ones. A release on chain evidence (a consumed sequence, or an observed close time past a nonzero time bound, each confirmed by a fresh `NOT_FOUND`) records `release_code` on the receipt, restores a missing receipt first, and reports the submission as settled, so the caller writes a `value_action_failed` row under the evidence's code; a later status run writes it from the receipt when that append failed. MPP and x402 authorizers use `record_authorized_window_state`, which applies the reservation comparison under the file lock before signing or signed RPC re-simulation. Refusal records no entries, withholds the credential, and carries the governing policy denial to the caller. Admitted authorization spend consumes window headroom even if subsequent signing or delivery fails. The x402 tools validate the payment requirements in full before the dispatch gate, so invalid requirements consume no headroom. Admission precedes the endpoint identity check inside `create_payment`, so an identity refusal keeps the admitted spend. `record_confirmed_window_state` remains an unconditional post-confirmation recorder: spend already applied on-chain must be counted, and a persistence failure is logged.
+
+### Authorization records and recovery
+
+Minting allocates an authorization identity and reservation under the state lock.
+The proof binding includes that identity and reservation. A hold reduces
+available window headroom until consumption, invalidation, or expiry.
+Transaction consumption turns its holds into submission pending records.
+Authorization records and submission holds are distinct.
+
+Consumption rereads the policy pin under the lock and checks profile and chain.
+A second consume refuses without rewriting the store. Invalidation releases
+holds without reopening authority. An invalidation returning false can still
+commit an expiry sweep. Settled history remains for the retention window;
+open records are not pruned. An approval nonce remains single-use within retention.
+
+A live consumed or receipt-held approval reports `policy.approval_consumed`.
+Consumption followed by pre-send recording failure can leave no approval
+tombstone. Reuse can then report `network.mainnet_authorization_refused`.
+`submission.record_unavailable` retains its own meaning. Existing ownership of
+signed bytes refuses with `submission.tx_already_submitted`.
+Authorization operations share a mainnet clock. Clock failure reports
+`wallet.clock_error`. A witness bound to another envelope or intent fails
+with the `envelope_mismatch` reason.
+
+Reset refuses effective open authorizations with
+`profile.reset_window_state_open_authorizations`. Enabled-mainnet state that
+cannot be verified uses `policy.window_state_unverifiable`. Stop the MCP server,
+inspect the defect, and use `profile reset-window-state <NAME> --reason <REASON>`
+for recoverable state defects. A newer authenticated format refuses reset with
+`profile.reset_window_state_newer_version`; use a build that understands it.
+Reset audits the defect before replacement; expiry release remains in memory
+until that audit step succeeds.
+
+### Operator authorization logs
+
+Each reported authorization refusal emits one warn-level entry with `path`,
+`precondition`, and message `mainnet authorization refused`. `precondition`
+uses stable snake-case labels from `MainnetPrecondition`. The labels identify
+failed checks, not separate public wire codes. The public code remains
+`network.mainnet_authorization_refused`. Context entry refusal instead logs
+`mainnet write context refused`.
+
+`STELLAR_AGENT_LOG` takes precedence over `RUST_LOG`. The default level is
+`info`, and output goes to stderr. Report refusal to the operator without
+switching networks. A retry needs fresh preparation and approval. Unknown
+submission outcomes require reconciliation instead.
 
 ### Injected views fail closed when absent
 

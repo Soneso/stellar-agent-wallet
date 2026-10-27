@@ -1,5 +1,8 @@
 # CLI reference: DeFi and the channel pool
 
+See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This page documents the `stellar-agent` commands for DeFi venues (`vault` for DeFindex, `trade` for Soroswap) and the channel-account pool subcommands `pool init`, `pool list`, and `pool status`.
 
 The binary is `stellar-agent`. Under the `stellar-cli` external-binary plugin convention it is also reachable as `stellar agent ...`. See [the CLI reference index](index.md) for installation, the JSON envelope shape, and the global flags referenced below.

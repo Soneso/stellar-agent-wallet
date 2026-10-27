@@ -25,10 +25,10 @@ reads secret keys from a named environment variable, not from the command line.
 - `stellar:mainnet` is accepted for read-only commands. Select it with a
   mainnet profile (`--profile <NAME>`), or with `--rpc-url` for `balances`
   (which has no `--network` flag). `--network` asserts the profile's chain
-  and never selects one. On a mainnet profile, every command that signs a
-  ledger transaction refuses before any RPC call or signer access (see
-  [Mainnet is refused for writes](#mainnet-is-refused-for-writes)). `tx` signs
-  nothing, and `pool init` is the only `pool` command that signs.
+  and never selects one.
+  See [Mainnet configurations and scope](#mainnet-configurations-and-scope)
+  for signing and write admission. `tx` signs nothing.
+  `pool init` is the only `pool` command that signs.
 - CLI commands print a JSON envelope on stdout by default. Exit code is `0` on
   success and `1` on any error; the envelope's `error.code` carries the
   diagnostic.
@@ -465,6 +465,24 @@ with the enrolled owner's seed in `WALLET_OWNER_SK`.
 clearing that variable. The command adds the signature table; it refuses a
 missing file with `sign_policy.policy_file_unreadable`.
 
+### Set up mainnet writes
+
+Use a build whose version marker is `STELLAR_AGENT_BUILD_MAINNET_WRITE=on`.
+Create a dedicated mainnet profile with its HTTPS endpoint stored in the file.
+Initialize the audit, nonce, attestation, and policy-owner keys, then enroll the
+signer with `profile enroll-signer --secret-env`.
+
+Run `profile enable-mainnet --profile <NAME>` to bind this installation.
+Complete the [v2 policy body](profiles.md#mainnet-policy-body), including rules
+for each prepare and commit name. Run `profile sign-policy`, then
+`profile enable-mainnet --check`, and restart the MCP server.
+[The command reference](cli-reference/profile-and-governance.md#profile-enable-mainnet)
+owns ceremony flags and recovery.
+
+Engine `v1` evaluates the signed policy body. Policy-body version 2 carries
+mainnet bindings and a sequence. Profile-schema version 2 describes the
+configuration file. These versions are independent.
+
 ## Pass a secret seed
 
 Signing commands read a secret seed from the environment variable that
@@ -721,40 +739,59 @@ an AGPL-3.0 disclosure to stderr and declines with
 `validation.relayer_not_implemented`. See the [CLI reference](cli-reference/index.md)
 for the full flag set.
 
-### Mainnet is refused for writes
+## Mainnet configurations and scope
 
-Every write or signing command refuses a mainnet profile with wire code
-`network.mainnet_write_forbidden`. MPP refuses with `mpp.network_forbidden`.
-`pay` and the other guarded transaction and smart-account write commands refuse
-before any RPC call or signer access.
-[Mainnet-write refusal](cli-reference/index.md#mainnet-write-refusal) lists
-them.
+Released binaries have `mainnet-write` disabled. A build with the feature enabled
+admits only the operations listed below after operator setup and approval for
+each action. The version marker reports the build configuration.
 
-```bash
-stellar-agent pay GDEST...WXYZ "10 XLM" \
-  --source GABC...WXYZ --secret-env WALLET_SK --profile mainnet
-# exit code 1; error.code = network.mainnet_write_forbidden
-```
+With the feature off, no code path in the shipped binary can satisfy the
+mainnet-write guard, and the binary attests its feature state.
 
-`--network mainnet` on a testnet profile refuses with
-`profile.network_flag_mismatch`, because the flag asserts the profile's chain.
+The guarantee has one precondition: the claim holds only under the dependency
+set pinned and verified by the release.
 
-`trustline`, `trade`, `vault deposit`, `vault withdraw`, and `pool init`
-refuse a mainnet profile the same way, before any RPC call or signer access.
-`tx` signs nothing, and `pool init` is the only `pool` command that signs.
-`smart-account rules verify-pins`, `signers list`, and `signers refresh` load
-no signer and accept a mainnet profile. They keep their local audit writes, so
-a persisted profile needs `profile rotate-audit-key` first. The MCP signing,
-DeFi, and commit tools refuse a mainnet profile at entry.
+| Configuration | Behavior | Admitted operations | Exclusions | Preconditions and outcomes |
+|---|---|---|---|---|
+| `mainnet-write` off | Refuses mainnet signing and transaction writes. Reports `STELLAR_AGENT_BUILD_MAINNET_WRITE=off`. | None. | Every mainnet signing and transaction-write surface. | Setup cannot change the compiled feature state. Wallet guards report `network.mainnet_write_forbidden`. Excluded protocols retain their documented codes. |
+| `mainnet-write` on, classic CLI | Authorizes each supported action before signing and submission. Reports `STELLAR_AGENT_BUILD_MAINNET_WRITE=on`. | Full-mode `pay`, `claim`, sponsored `accounts create`, and `trustline`. | Build-only, sign-only, submit-only, Friendbot creation, `accounts create --generate`, relayer paths, and the excluded surfaces below. | Requires an explicit nondefault mainnet profile, matching stored configuration, enrolled identities, enablement, an owner-signed v2 policy, valid pin and audit state, required witness, and confirmation. |
+| `mainnet-write` on, classic MCP | Authorizes each supported commit before signing and submission. | `stellar_pay_commit`, `stellar_claim_commit`, `stellar_create_account_commit`, and `stellar_trustline_commit`. | Other generic signing tools, toolset signing actions, and the excluded surfaces below. | Requires the same installation and policy checks, plus approval bound to the action. Both prepare and commit policy names need matching rules. |
+| Classic failure classification | Reports the boundary that refused the action. | No admission follows from an error code. | A policy decision alone does not authorize signing. | Structural and context refusals use `network.mainnet_write_forbidden`. CLI engine construction preserves enablement errors and wraps other failures as `policy.engine_unavailable` or `trustline.policy_engine_unavailable`. Resolver setup gaps use `network.mainnet_authorization_refused`. Policy denials retain `policy.deny.*`. |
+| `mainnet-write` on, plain x402 | Admits the configured two-call payment flow with mandatory approval. | `stellar_x402_create_payment`. | Authenticated payments, generic SEP-10 signing, generic message signing, and unrelated Soroban operations. | Requires installation binding, signed policy, payment approval, required witness, authorized signing, and authorized payload release. The first call returns pending approval without a payment payload. The second supplies both approval arguments. |
+| Authenticated x402 | Refuses mainnet. | None. | `stellar_x402_authenticated_payment`. | Refuses a mainnet profile at entry with `network.mainnet_write_forbidden`. |
+| `mainnet-write` on, excluded operation | Refuses the operation on mainnet. | None. | Smart-account deployment and writes; rules, signers, policies, execute, multicall, migration-submit, and timelock writes; DeFi; pool submission; MPP; public SEP-43 signing; generic SEP-45/53 signing; fee bumps; idempotent mainnet submission. | Ceremony, policy, and approval do not admit these operations. MPP uses `mpp.network_forbidden`. Wallet and library interfaces retain their documented refusal codes. |
+| Either build, read or local operation | Applies the operation's profile, policy, audit, and protocol requirements. | No transaction-write admission follows from a read or local operation. | Read-only classification does not override a protocol refusal. | Mainnet selection and key-scope checks apply. Noop allows mainnet reads and refuses destructive actions with `policy.engine_required`. |
 
-The submit layer refuses mainnet too. A declared mainnet network passphrase and
-a known mainnet RPC URL are each refused with zero RPC calls. Beyond those two,
-the wallet asks the endpoint which network it serves and treats the answer as
-authoritative. It refuses when the answer is mainnet or disagrees with the
-declared network, and when the wallet cannot establish which network the
-endpoint serves. The wallet verifies every envelope signature against the
-endpoint's reported network. An envelope signed for one network cannot be
-submitted under another network's passphrase.
+On an admitted mainnet MCP server, the four classic prepare and commit pairs
+require approval even when the matching rule allows the action. The server
+loads the mainnet write context at startup when the selected profile has a
+verified enablement record. If enablement or policy fails startup checks, the
+server does not start.
+
+After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
+A changed startup binding refuses with `network.mainnet_write_forbidden` and
+`enablement or policy changed, restart the server`. Missing startup authority
+instead names the missing prerequisite.
+
+Report an authorization refusal to the operator. The operator reads the failed
+check in the `precondition` field of the warn-level log entry
+`mainnet authorization refused`. For missing enablement, run
+`profile enable-mainnet`, complete the policy, then run `profile sign-policy`.
+Then restart the MCP server. CLI entry checks can refuse missing engine,
+verified policy, or enablement before the resolver runs.
+
+Ledger and `--secret-env` signers must satisfy the enrolled-identity requirement.
+`profile enroll-signer` accepts `--secret-env` only and cannot enroll a Ledger
+key. Classic approvals support the CLI, approval-ui, and approval-remote
+attestation surfaces. CLI `approve` requires a terminal and refuses `--yes` on
+mainnet. Direct CLI confirmation requires the exact typed profile name.
+
+See [Mainnet write behavior](cli-reference/index.md#mainnet-write-behavior),
+[Mainnet policy body](profiles.md#mainnet-policy-body), and
+[the enablement ceremony](cli-reference/profile-and-governance.md#profile-enable-mainnet).
+Ordinary library signing and submission refuse mainnet. Authorized entry points
+independently verify sealed authority at signing and submission. Both paths
+bind signatures to the endpoint's network.
 
 ## Next steps
 

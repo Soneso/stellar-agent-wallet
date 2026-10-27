@@ -1,5 +1,8 @@
 # CLI reference
 
+See [Mainnet configurations and scope](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 `stellar-agent` is a self-custodial Stellar wallet for AI agents. It builds, signs, and submits transactions on testnet under a policy engine, an operator-approval spine, and a tamper-evident hash-chained audit log. This file documents the full command surface for an agent driving the CLI. For the MCP tool surface, see `./mcp-tools.md` (ships alongside this file).
 
 ## Mainnet profile selection
@@ -71,19 +74,72 @@ stellar-agent pay GDEST...WXYZ "10 XLM" --source GSRC...WXYZ --secret-env WALLET
 unset WALLET_SK
 ```
 
-### Mainnet-write refusal
+### Mainnet write behavior
 
-This is a testnet-first alpha. `mainnet` is accepted for read-only commands but every write or signing command structurally refuses `mainnet`, surfacing `network.mainnet_write_forbidden`. The `friendbot` command and `accounts create --fund-with-friendbot` use `network.friendbot_mainnet_forbidden`, and `mpp` uses `mpp.network_forbidden`. Commands that take `--network` refuse before any RPC call and before any signing key is touched. The profile-driven `vault deposit`, `vault withdraw`, `trade`, `trustline`, and `pool init` refuse a mainnet profile before signer access and any RPC call. At the submit layer, which every write goes through including the profile-driven ones, a declared mainnet passphrase and a known mainnet RPC URL are each refused with no RPC call at all.
+Released binaries have `mainnet-write` disabled. Enabled builds admit full-mode
+`pay`, `claim`, sponsored `accounts create`, and `trustline` after installation
+setup and confirmation for each action. Build-only, sign-only, submit-only,
+Friendbot creation, generated-account creation, and relayer paths remain excluded.
+
+Select an explicit nondefault mainnet profile with matching stored configuration.
+Enroll signer and owner identities, enable the installation, and sign a v2 policy.
+Valid pin and audit state, required witnesses, and per-action authorization remain
+necessary. [The policy guide](profiles-and-keys.md#mainnet-policy-body) lists the fields.
+
+Direct confirmation requires terminal stdin and stderr. The wallet renders and
+flushes the summary, then compares the typed profile name after removing only
+the line ending. A terminal refusal uses `confirm.tty_required`; a different
+name uses `confirm.profile_name_mismatch`. Input, output, or flush failure uses
+`confirm.input_unavailable`. CLI approval failures retain their `approval.*` codes.
+An Allow rule gives confirmation 600 seconds; RequireApproval supplies its lifetime.
+Authorization defaults to 120 seconds and cannot outlive approval.
+
+CLI `approve` uses a separate y/n prompt. In either build, mainnet `--yes`
+refuses before terminal checks or store access with `approve.yes_refused_on_mainnet`:
+`approve --yes is refused on a mainnet profile; run approve on a terminal and answer the prompt`.
+Classic UI and remote attestations retain their supported approval behavior.
+
+`network.mainnet_write_forbidden` means the build, operation, or selected context
+has no admitted path. Missing CLI engine, verified policy, or enablement is an
+entry refusal with the prerequisite named. Resolver refusal uses
+`network.mainnet_authorization_refused`. Its core message is
+`the mainnet write was refused before submission; nothing was sent`.
+
+CLI messages distinguish the withheld result:
+
+- Signature: `the mainnet write was refused; the signature was withheld and nothing was sent`.
+- Submission: `the mainnet write was refused; the submission was refused after signing and nothing was sent`.
+
+Other signature-stage errors append `The signature was withheld and nothing was sent.`
+Other post-signing errors retain their own outcome semantics. A signer can run
+before signature verification rejects its result. Submission refusal can follow
+signing. Classic MCP renders the core message without these stage replacements.
+
+Read-only inspection remains available. `tx` signs nothing. Smart-account writes,
+DeFi, and pool submission remain excluded. `smart-account rules verify-pins`,
+`signers list`, and `signers refresh` retain local audit writes without signing.
+A persisted profile therefore needs its audit key initialized.
+Friendbot reports `network.friendbot_mainnet_forbidden`; MPP reports
+`mpp.network_forbidden`. `--network mainnet` on a testnet profile reports
+`profile.network_flag_mismatch` before write admission.
+
+Ordinary library signing and submission refuse mainnet. Ordinary submission
+refuses the declared mainnet passphrase or known mainnet host before RPC.
+Authorized signing and submission independently check sealed authorization.
+
+All four full-mode verbs include numeric `total_fee_stroops`, equal to unsigned
+`tx.fee`, in policy arguments on both networks. Mainnet action checks use the
+effective signed/profile fee cap and thresholds; the resolver reevaluates them.
 
 ### Submit-layer network binding
 
-The submit layer does not take the declared network on trust. Before sending, it asks the endpoint which network it serves and which protocol it runs, on the client that sends. That answer is authoritative. `pay`, `claim`, sponsored `accounts create`, `trustline`, and `pool init` ask the same question earlier, on that same client, before the first read whose answer they sign or gate on. That read is the fee, the sequence, the claim entry, a policy view, or the reservation reconcile. An endpoint reporting mainnet is refused with `network.mainnet_write_forbidden`. One reporting a different network than declared is refused with `network.endpoint_network_mismatch`. One whose identity cannot be established within the timeout is refused with `network.endpoint_identity_unavailable`. One that answers the identity request with HTTP 401 or 403 is refused with `network.rpc_credential_refused`. The check is retried with bounded backoff inside the caller's timeout and never falls back to the declaration. An answer that does not parse, and a 401 or 403 answer, is not retried.
+The submit layer does not take the declared network on trust. Before sending, it asks the endpoint which network it serves and which protocol it runs, on the client that sends. That answer is authoritative. `pay`, `claim`, sponsored `accounts create`, `trustline`, and `pool init` ask the same question earlier, on that same client, before the first read whose answer they sign or gate on. That read is the fee, the sequence, the claim entry, a policy view, or the reservation reconcile. Ordinary submission refuses a mainnet endpoint with `network.mainnet_write_forbidden`. Authorized submission verifies its bound context. One reporting a different network than declared is refused with `network.endpoint_network_mismatch`. One whose identity cannot be established within the timeout is refused with `network.endpoint_identity_unavailable`. One that answers the identity request with HTTP 401 or 403 is refused with `network.rpc_credential_refused`. The check is retried with bounded backoff inside the caller's timeout and never falls back to the declaration. An answer that does not parse, and a 401 or 403 answer, is not retried.
 
 An endpoint refusal precedes every refusal that follows a read: a missing account or claim entry, a policy denial, the audit pre-flight, and the amount, asset, and fee checks. `pool init` runs its audit pre-flight before the check, and the full `pay` pipeline checks `--source` and `--fee` after the reconcile. A `claim` or `trustline` refused at the early check carries no preview. Each check gets a budget of its own: `--timeout-seconds` on `pay`, `claim`, `accounts create`, and `pool init`, and the profile's `submit_timeout_seconds` on `trustline`. `--build-only` checks before its reads. `--sign-only` checks before the account reads of an envelope it decodes and signs an envelope it cannot decode without any request.
 
-This release supports protocol version 29. On testnet and other networks, a version outside that range is logged as a warning and the submission continues. On mainnet the same version is refused with `network.unsupported_protocol_version`; while mainnet writes are refused, a mainnet endpoint is refused with `network.mainnet_write_forbidden` before this rule applies.
+This release supports protocol version 29. On testnet and other networks, a version outside that range is logged as a warning and the submission continues. On mainnet the same version is refused with `network.unsupported_protocol_version`. Ordinary submission refuses mainnet before this protocol rule.
 
-It then verifies every decorated signature on the envelope against the network id the endpoint reported, using the ed25519 signer sets of the transaction source and every operation source (an account absent from the ledger is `network.account_not_found`). A signature that verifies only under the mainnet network id is `network.envelope_signed_for_mainnet`, one that verifies under neither is `network.envelope_signature_unverifiable`, and an envelope with no signature, or a fee-bump whose outer or inner transaction has none, is `network.envelope_unsigned`. Every signature must pass and each signature set must have at least one, so an envelope signed for one network cannot be submitted under another network's passphrase.
+It verifies every decorated signature against the endpoint network id. Verification uses the ed25519 signer sets of the transaction source and each operation source. An account absent from the ledger reports `network.account_not_found`. A signature that fails under the endpoint network but verifies under mainnet uses `network.envelope_signed_for_mainnet`. Verification under neither uses `network.envelope_signature_unverifiable`. Missing signatures use `network.envelope_unsigned`, including either fee-bump signature set. Every signature must pass and each signature set must have at least one, so an envelope signed for one network cannot be submitted under another network's passphrase.
 
 ---
 
@@ -93,7 +149,7 @@ Account-management group. Subcommands: `create`, `deploy-c`.
 
 ### `accounts create [NEW_G_STRKEY] [flags]`
 
-Creates a new account in one of two mutually exclusive modes: sponsored `CreateAccount`, or Friendbot funding. Sponsored mode signs with the sponsor key; Friendbot mode signs nothing. `mainnet` parses but is structurally refused (sponsored: `network.mainnet_write_forbidden`; Friendbot: `network.friendbot_mainnet_forbidden`).
+Creates a new account in one of two mutually exclusive modes: sponsored `CreateAccount`, or Friendbot funding. Sponsored mode signs with the sponsor key; Friendbot mode signs nothing. Configured sponsored mainnet creation requires feature-enabled authorization. Friendbot refuses mainnet with `network.friendbot_mainnet_forbidden`. Mainnet requires an existing destination G-strkey. Feature-on `--generate` uses `accounts.create.generate_refused_on_mainnet`; feature-off context construction refuses earlier with `network.mainnet_write_forbidden`.
 
 Argument groups (parser-enforced): mode (exactly one) `--sponsor` xor `--fund-with-friendbot`; account (exactly one) positional `<NEW_G_STRKEY>` xor `--generate`; signer (sponsored) `--secret-env` xor `--sign-with-ledger`.
 
@@ -177,7 +233,7 @@ unset DEPLOYER_SK
 
 ## pay
 
-`pay <DESTINATION> <AMOUNT> [ASSET] [flags]` — sends a classic payment, enforcing SEP-29 memo-required before signing. By default builds, signs, and submits atomically. `mainnet` parses but is structurally refused for writes. `--use-oz-relayer` is not implemented and declines.
+`pay <DESTINATION> <AMOUNT> [ASSET] [flags]`: sends a classic payment, enforcing SEP-29 memo-required before signing. By default builds, signs, and submits atomically. Configured mainnet full mode requires feature-enabled authorization. Staged modes remain excluded. `--use-oz-relayer` is not implemented and declines.
 
 Staged pipeline (mutually exclusive): `--build-only` emits unsigned envelope XDR and exits; `--sign-only <XDR>` signs a prebuilt envelope and emits signed XDR; `--submit-only <XDR>` submits a pre-signed envelope.
 
@@ -203,11 +259,11 @@ Under `policy.engine = "v1"` `pay` evaluates operator policy before signing. The
 `--submit-only` runs the endpoint identity check before the policy gate and before the audit-key pre-flight, on the client that later reconciles, reads the gate's account views, and sends. An `--rpc-url` pointing at a different network than `--network` is therefore refused early. The check reads the endpoint's protocol version too and applies the same protocol rule as the submit layer, under its own `--timeout-seconds` deadline; the submission then starts a fresh one. It also requires an already-signed envelope: handing it the unsigned XDR that `--build-only` emitted is refused with `network.envelope_unsigned` before anything is sent. `claim --submit-only` behaves the same way.
 
 After the policy gate every `pay` stage checks the per-operation fee against the
-profile's `classic_max_fee_per_op_stroops`: the selected fee in the full
+effective signed/profile `classic_max_fee_per_op_stroops`: the selected fee in the full
 pipeline and `--build-only`, the decoded envelope fee in `--sign-only` and
 `--submit-only`. A fee above the cap exits 1 with `fees.percentile_exceeds_cap`,
-and the message names the fee's source and the remedy. A mainnet profile without
-the cap refuses with `validation.mainnet_fee_cap_required`.
+and the message names the fee's source and the remedy. A mainnet action without
+an effective cap refuses with `validation.mainnet_fee_cap_required`.
 
 The full pipeline, `--sign-only`, and `--submit-only` then obtain the
 cross-check witness before the audit pre-flight, the signer, and the send. The
@@ -323,7 +379,7 @@ stellar-agent trustline --from GABC...WXYZ --asset USDC --profile default
 
 ## claim
 
-`claim <BALANCE_ID> [flags]` — claims a Stellar `ClaimClaimableBalance` operation for a balance the agent already holds the id of. Enforces the claim guards (claimant membership, predicate satisfaction, non-native trustline state, native-XLM fee affordability) before signing. `mainnet` parses but is structurally refused for writes. Same three-stage pipeline as `pay`: `--build-only` emits unsigned envelope XDR and exits; `--sign-only <XDR>` signs a prebuilt envelope; `--submit-only <XDR>` submits a pre-signed envelope; the default runs all three atomically.
+`claim <BALANCE_ID> [flags]`: claims a Stellar `ClaimClaimableBalance` operation for a balance the agent already holds the id of. Enforces the claim guards (claimant membership, predicate satisfaction, non-native trustline state, native-XLM fee affordability) before signing. Configured mainnet full mode requires feature-enabled authorization. Staged modes remain excluded. Same three-stage pipeline as `pay`: `--build-only` emits unsigned envelope XDR and exits; `--sign-only <XDR>` signs a prebuilt envelope; `--submit-only <XDR>` submits a pre-signed envelope; the default runs all three atomically.
 
 | Flag / arg | Meaning | Default |
 |---|---|---|
@@ -334,7 +390,7 @@ stellar-agent trustline --from GABC...WXYZ --asset USDC --profile default
 | `--sign-with-ledger` / `--account-index <INDEX>` | Ledger signer / BIP index | `false` / `0` |
 | `--build-only` / `--sign-only <XDR>` / `--submit-only <XDR>` | Stage selection (at most one) | — |
 | `--profile <NAME>` | Profile whose policy engine, keys, and audit writer to use | `STELLAR_AGENT_PROFILE`, else `default` |
-| `--network <NETWORK>` | Optional assertion; must match the profile chain (a mainnet profile is structurally refused for writes) | profile chain |
+| `--network <NETWORK>` | Optional assertion; must match the profile chain (mainnet requires configured full mode) | profile chain |
 | `--timeout-seconds` / `--rpc-url` / `--output` | shared | as above |
 
 Under `policy.engine = "v1"` `claim` evaluates operator policy before signing. The staged `--sign-only` / `--submit-only` stages gate too: they decode the supplied envelope and match rules under the `stellar_claim_commit` tool name, and deny `policy.deny.unsizable_value_effect` on an envelope the decoder cannot size unless the matched rule sets `allow_opaque_signing = true`.
@@ -507,7 +563,19 @@ stellar-agent pool init --size 5 --profile default
 
 ## profile
 
-Creates, lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) holding no secrets. Every subcommand except `list` accepts a `--profile <NAME>` flag: `init`, `enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and `sign-policy` take only that flag (resolves `--profile` → `STELLAR_AGENT_PROFILE` → `default`), while `show`, `migrate`, the `rotate-*` subcommands, and `reset-window-state` accept it as an exactly-one-of alternative to their positional `<NAME>` (supply one; both or neither is a usage error), with no default. `reset-mpp-state` requires `--acknowledge`; no other subcommand has a confirmation flag. All operate on local state, with no network and no mainnet gate (`init`'s `--network mainnet` guard is a configuration-time refusal, not the mainnet-write gate). Uses the `{ok, data, request_id}` envelope.
+Creates, lists, shows, and migrates profiles, and manages their keyring references.
+A profile is a per-environment TOML config with schema version 2.
+Keyring references hold no keys, though endpoint URLs can embed credentials.
+These commands use the `{ok, data, request_id}` envelope.
+
+`init`, enrollment, and `sign-policy` accept `--profile <NAME>`.
+Selection resolves through `--profile`, `STELLAR_AGENT_PROFILE`, then `default`.
+Mainnet selection requires an explicit flag.
+`show`, `migrate`, rotation, and `reset-window-state` accept exactly one selector:
+a positional name or `--profile`, without a default.
+`list` takes none. `enable-mainnet` requires an explicit nondefault profile.
+`reset-mpp-state` requires `--acknowledge`; `enable-mainnet` offers `--check` and
+`--rotate`. These commands operate on local configuration and keyring state.
 
 | Verb | Form | Notes |
 |---|---|---|
@@ -549,6 +617,84 @@ then refuses with `validation.config_invalid`. The rule requires `http` or
 exits `1` with an internal error.
 
 `enroll-signer` reads the signer seed, and `enroll-owner-key` and `sign-policy` read the owner seed, from the environment of the shell that runs them. The operator supplies each seed as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows, only for those commands, and unsets it afterward. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment.
+
+### `profile enable-mainnet`
+
+```bash
+stellar-agent profile enable-mainnet --profile operator
+stellar-agent profile enable-mainnet --profile operator --check
+stellar-agent profile enable-mainnet --profile operator --rotate
+```
+
+Requires an explicit, nondefault mainnet profile, matching stored and merged
+chain and RPC URL, engine v1, an enrolled owner key and signer identity, and
+no key-scope findings. It records `mainnet_enablement_minted` through the
+strict audit writer, stores an installation nonce, then atomically rewrites
+the policy with the profile, normalized endpoint host, and nonce digest.
+A v1 body becomes v2. The operator supplies the fee cap, optional authorization
+TTL, and thresholds, then signs the policy as the output's `next` list directs.
+
+See [the policy schema and minimum](profiles-and-keys.md#mainnet-policy-body) for
+required signed fields and rules. After enablement, complete and sign the
+policy, run `--check`, and restart the MCP server.
+
+Binding failures name `mainnet_table`, `profile`, `source`, `default`, `on_disk`,
+`chain_id`, `on_disk_host`, `merged_host`, or `nonce_digest`. The signed policy
+field remains `endpoint_host`. Unreadable stored `chain_id` or `rpc_url`
+reports `profile chain and endpoint unreadable` with the path and cause.
+
+`--rotate` replaces the nonce and changes only the policy's nonce digest.
+The old nonce is gone; sign the updated policy before using its binding.
+On a policy without a `[mainnet]` table, `--rotate` binds in full, as the
+first run does. This recovers a run that stored the nonce but could not
+rewrite the policy. In a build without `mainnet-write`, the `next` list adds
+that writes require such a build.
+
+`--check` reports every check with the status `passed`, `failed`, or
+`not_evaluated` and a detail, and exits `1` when any check failed. The checks
+are the preconditions, `verified_policy`, `pin`, `enablement`, and every
+minimum restriction in either build. The restrictions are evaluated on the
+document the verified load read. Without a `[mainnet]` table the fee cap and
+every table restriction fail. When the policy does not verify, the
+restrictions and `enablement` are `not_evaluated`. The `enablement` check
+fails with `profile.mainnet_enablement_invalid` and the name of the binding
+that does not match, such as `on_disk_host` or `nonce_digest`. The `pin`
+check passes with the pinned sequence, or with `absent (first use)` when no
+pin or window-state lock file exists. It fails when the pin cannot be read or
+the comparison refuses, with `policy.sequence_rollback`,
+`policy.sequence_fork`, or the lock or pin error in its detail.
+`--check` creates and changes nothing: no window-state directory or lock
+file, and no policy, owner key, nonce, pin, or audit row.
+
+Exits `1` on refusal:
+
+- `profile.enable_mainnet_profile_flag_required`: supply `--profile`.
+- `profile.enable_mainnet_default_refused`: select a dedicated profile.
+- `profile.enable_mainnet_not_mainnet`: the selected chain is testnet.
+- `profile.enable_mainnet_precondition`: a named precondition or effect failed.
+- `profile.enable_mainnet_nonce_exists`: rerun with `--rotate` to replace the nonce.
+- Strict audit errors retain their own codes.
+
+### `profile sign-policy`
+
+Sign the policy with the enrolled owner identity:
+
+```bash
+stellar-agent profile sign-policy --profile operator --secret-env WALLET_OWNER_SK
+```
+
+V2 signing assigns `max(pin, body) + 1`, returning `sequence` and
+`previous_sequence`. Signing does not advance the pin; a verified load can.
+It creates no window-state directory or lock file. V1 warns about mainnet v2
+requirements and pin rollback. A refusal names the policy file and leaves it
+unwritten. Pin and lock errors retain their `policy.*` codes.
+
+`profile enroll-signer --repair-identity` repairs the seed-free identity record.
+It requires the stored public-key pin and verifies the existing seed against it.
+Incomplete identity uses `profile.enroll_signer_identity_incomplete`.
+Missing pin uses `enroll_signer.repair_unpinned`; conflicts use
+`enroll_signer.identity_conflict`. Enrollment and repair record
+`signer_identity_enrolled`.
 
 ### Key-rotation subcommands
 

@@ -1,5 +1,8 @@
 # Protocols (SEP and x402)
 
+See [Mainnet configurations and scope](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 The supported Stellar ecosystem protocols, the wallet surface for each, and the deliberate refusals that keep an autonomous agent safe. Every SEP/x402 capability listed here is exposed as an MCP tool on the `stellar-agent-mcp` stdio server. For the wider tool catalog see `./mcp-tools.md`; for keys, signers, and profiles see `./profiles-and-keys.md`.
 
 ## Three invariants
@@ -8,7 +11,11 @@ The supported Stellar ecosystem protocols, the wallet surface for each, and the 
 - **Fail-closed.** Validation refuses on any failed check rather than guessing. Unknown discriminants, ambiguous tokens, missing floors, and stale reads are refused before signing.
 - **Never auto-submit untrusted requests.** Inbound requests (a SEP-7 URI, a contract invocation) are parsed into a preview for the operator and policy engine. The wallet does not sign or submit on a dApp's behalf without the policy engine and approval flow.
 
-Write and signing paths are testnet-only in this alpha. Every signing tool structurally refuses `stellar:mainnet` with wire code `network.mainnet_write_forbidden`, except the MPP tools, which refuse with `mpp.network_forbidden`. Each refuses at handler entry, before the policy gate, any RPC call, and any signing. The network submit layer refuses mainnet again before any transaction is sent. Read-only tools accept mainnet.
+The scope table defines mainnet operation admission. Public SEP-43 signing,
+generic SEP-45/53 signing, and MPP remain excluded in every build.
+Wallet entry guards use `network.mainnet_write_forbidden`; library refusals
+retain their namespaced codes. Read-only classification grants no signing
+or transaction-write authority.
 
 ## Result envelope and conventions
 
@@ -27,7 +34,7 @@ Write and signing paths are testnet-only in this alpha. Every signing tool struc
 | SEP-6 | 0006 | Discovery only, `GET /info` capability set | `stellar_sep6_deposit_info` | yes |
 | SEP-24 | 0024 | Interactive deposit/withdraw URL via `POST .../interactive`; returned for browser hand-off | `stellar_sep24_interactive_url` | no (uses JWT) |
 | SEP-43 | 1.2.1 | Wallet signing: address/network/sign tx/sign auth entry/sign message/sign+submit | six tools (below) | mixed |
-| SEP-45 | 0.1.1 | Client Web Auth for contract (C-) accounts (steps 1–12); ephemeral + persistent-signer | library only; no MCP tool | n/a |
+| SEP-45 | 0.1.1 | Client Web Auth for contract (C-) accounts (steps 1 to 12); ephemeral + persistent-signer | no workspace consumer; refuses mainnet signing | n/a |
 | SEP-47 | 0047 | Discover SEPs a contract claims via `contractmetav0` `sep` meta | `stellar_sep47_discover` | yes |
 | SEP-48 | 0048 | Typed-argument preview of an `InvokeHostFunction` (display only) | `stellar_sep48_preview_invocation` | yes |
 | SEP-53 | 0053 | Sign and verify prefixed off-chain messages | `stellar_sep53_sign_message`, `stellar_sep53_verify_message` | mixed |
@@ -124,7 +131,7 @@ SEP-43 opens no HTTP/HTTPS connections of its own (interop is stdio via MCP); `s
 
 ## SEP-45: Web Authentication for Contract Accounts
 
-Client-side Web Auth for contract (C-) accounts: fetch the challenge, validate the authorization entries, submit the signed challenge to obtain a JWT. Both an ephemeral-key flow and a persistent-signer flow exist. It is a library with no MCP tool; the anchor tools take a caller-supplied JWT.
+Client-side Web Auth for contract (C-) accounts: fetch the challenge, validate the authorization entries, submit the signed challenge to obtain a JWT. Both an ephemeral-key flow and a persistent-signer flow exist. No workspace crate depends on it. It refuses mainnet signing in every build with `sep45.mainnet_signing_forbidden`. The anchor tools take a caller-supplied JWT.
 
 Steps 1 through 12 of the 13-point validation are enforced; step 13 (footprint `read_write` keys) is deferred because it requires simulation results unavailable at challenge-fetch time. Fail-closed on any step. The JWT signature is not verified (trusted via TLS). HTTPS-only at the transport layer. Does not access the keyring or wallet seed (pure decode and validate); the ephemeral path suits only contracts that accept the ephemeral public key or need no client signature.
 

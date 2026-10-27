@@ -1,5 +1,8 @@
 # CLI reference: smart-account
 
+See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 The chain and endpoints come from the resolved profile. Optional `--network` must equal the profile's chain.
 Optional RPC flags override testnet endpoints; a mainnet profile refuses either RPC flag, including equal values.
 Without a secondary flag, the profile's `secondary_rpc_url` applies. RPC flags refuse URLs containing credentials.

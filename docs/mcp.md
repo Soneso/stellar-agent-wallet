@@ -1,5 +1,25 @@
 # The MCP server
 
+See [Mainnet configurations and scope](getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions. Per tool on
+`stellar:mainnet`:
+
+- The sign-only tools are `stellar_sep43_sign_transaction`,
+  `stellar_sep43_sign_auth_entry`, `stellar_sep43_sign_message`,
+  `stellar_sep53_sign_message`, `stellar_x402_create_payment`, and
+  `stellar_x402_authenticated_payment`.
+- The tools that sign and submit are `stellar_sep43_sign_and_submit_transaction`
+  and the DeFi tools `stellar_defindex_vault_deposit`,
+  `stellar_defindex_vault_withdraw`, and `stellar_dex_trade`. The commit tools
+  `stellar_pay_commit`, `stellar_claim_commit`, `stellar_create_account_commit`,
+  `stellar_trustline_commit`, and `stellar_rule_create_commit` also sign and
+  submit.
+- Every tool named above and the signing actions of `stellar_toolset_invoke`
+  refuse at handler entry with `network.mainnet_write_forbidden` in every
+  build, except `stellar_x402_create_payment` and the four classic commits. A
+  feature-enabled build admits those five after setup. With the feature off,
+  they refuse at entry with the same code.
+
 `stellar-agent-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
 server that exposes the Stellar Agent Wallet to an MCP client. It speaks
 JSON-RPC over stdio and presents wallet capabilities as MCP tools, so an AI
@@ -7,11 +27,10 @@ assistant can read account state and submit Stellar transactions through the
 same policy engine, operator-approval spine, and tamper-evident audit log that
 back the `stellar-agent` CLI.
 
-A tool call is gated exactly as the equivalent CLI command is. The policy
-engine evaluates every call to `Allow`, `Deny`, or `RequireApproval`; signing
-verbs route through the approval spine; and the mainnet-write gate refuses every
-write on `stellar:mainnet`. See [Concepts](./concepts.md) for the shared
-guardrail model.
+Gated tools evaluate policy before signing. Mainnet writes also require a
+feature-enabled build, operator setup, and per-action authorization. The four
+classic commit tools use independent signing and submission checks. See
+[Concepts](./concepts.md) for the shared guardrail model.
 
 ## What it is
 
@@ -155,10 +174,11 @@ secret held in the platform keyring; it is never the secret itself.
 The loaded profile therefore determines:
 
 - which network the server operates on (`stellar:testnet` by default;
-  `stellar:mainnet` is accepted for read-only tools while every write is
-  structurally refused). The profile's declared network is what the server
-  asks for, not what it trusts: the network layer establishes the endpoint's
-  own identity before it sends and binds the submission to that. See
+  `stellar:mainnet` supports reads and the admitted operations described above
+  when their authorization requirements hold). The profile's declared network is
+  what the server asks for, not what it trusts: the network layer establishes
+  the endpoint's own identity before it sends and binds the submission to that.
+  See
   [How gating applies to every tool call](#how-gating-applies-to-every-tool-call)
   for the refusal layers and their wire codes;
 - which keyring entries the signing tools resolve their seed from;
@@ -248,25 +268,67 @@ looks up the tool's registry descriptor and calls
 - `Deny`: the call is refused with wire code `policy.deny.<reason>`.
 - `RequireApproval`: an out-of-band operator approval is required.
 
-Separately, the DeFi, sign-and-submit, commit, rule-commit, and sign-only tools
-and the toolset signing actions refuse a mainnet profile before this gate runs.
-Each answers a `network.mainnet_write_forbidden` business envelope before any
-RPC call or signing. The MPP tools refuse at entry with `mpp.network_forbidden`.
-On `stellar:mainnet` the Noop engine fails closed for the other destructive
-tools by returning the engine error `policy.engine_required` before producing a
-verdict. Below the policy layer, the network layer structurally refuses every
-mainnet write with `network.mainnet_write_forbidden` regardless of the
-configured engine or enrolled keys. No profile configuration unlocks mainnet
-writes in this alpha. A profile whose network passphrase is the mainnet passphrase, and
-one whose `rpc_url` names a known mainnet host, are each refused there with no
-RPC call at all.
+### Classic mainnet authorization
+
+A feature-enabled server admits `stellar_pay_commit`, `stellar_claim_commit`,
+`stellar_create_account_commit`, and `stellar_trustline_commit` after setup.
+Both prepare and commit policy names need matching rules. The four pairs require
+approval even under Allow. A pending approval uses the shorter lifetime from
+the prepare and commit evaluations. Allow contributes 600 seconds;
+RequireApproval supplies its configured lifetime. Authorization defaults to
+120 seconds and cannot outlive approval.
+
+Paired preparation refuses an undecodable envelope with `simulation.divergence`.
+A denied rule retains `policy.deny.*`; an unknown decision uses
+`policy.unexpected_decision`. None of these refusals persists an approval.
+Each commit forces confirmation before attestation validation.
+
+Feature-on startup loads the mainnet write context for a verified enabled
+profile. Failed enablement or policy checks abort startup. Admission refusals
+use `network.mainnet_write_forbidden` for unsupported tools or missing V1 engine,
+verified policy, enablement, enabled context, or profiles directory.
+
+After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
+Freshness compares current policy and enablement facts without advancing the pin.
+A changed binding reports `network.mainnet_write_forbidden` with
+`enablement or policy changed, restart the server`. Missing startup authority
+instead names the missing prerequisite.
+
+Missing, invalid, expired, or unverifiable approvals use
+`policy.approval_required`. A live rejection uses `policy.approval_rejected`. A
+live consumed approval or an approval held by a submission receipt uses
+`policy.approval_consumed`. Expired tombstones use `policy.approval_required`.
+Authorization consumption followed by pre-send recording failure can leave an
+unspent pending approval. Reusing it can produce
+`network.mainnet_authorization_refused` without a tombstone.
+
+Ordinary signing and submission refuse mainnet. Authorized entry points check
+sealed authority independently. Durable consumption precedes sending.
+Classic MCP authorization refusal renders
+`the mainnet write was refused before submission; nothing was sent`.
+Classic MCP uses this message at both signing and submission boundaries.
+A signer may run before its result is rejected. An envelope may already carry
+a signature.
+
+Report authorization refusal to the operator. Fresh preparation and fresh
+approval are required for a retry; do not switch networks. The operator reads
+`path` and `precondition` in the warn-level `mainnet authorization refused` log.
+A submission timeout has an unknown outcome and requires transaction
+reconciliation.
+
+DeFi, public SEP-43 signing, generic SEP-53 signing, rule writes, and toolset
+signing actions remain excluded on mainnet. Wallet entry guards use
+`network.mainnet_write_forbidden`; library entry points retain their namespaced
+codes. MPP refuses with `mpp.network_forbidden`. Noop permits mainnet reads and
+refuses destructive policy decisions with `policy.engine_required`.
 
 The network layer does not take the profile's declared network on trust either.
 Before sending, it asks the endpoint which network it serves and which protocol
 it runs (`getNetwork`), on the same client instance that sends. That answer is
-authoritative. An endpoint reporting mainnet is refused with
-`network.mainnet_write_forbidden`. One reporting a different network than the
-profile declares is refused with `network.endpoint_network_mismatch`. One whose
+authoritative. Ordinary submission refuses a mainnet endpoint with
+`network.mainnet_write_forbidden`. Authorized submission verifies the bound
+mainnet context. One reporting a different network than the profile declares
+is refused with `network.endpoint_network_mismatch`. One whose
 identity cannot be established within the submission timeout is refused with
 `network.endpoint_identity_unavailable`. One that answers the identity request
 with HTTP 401 or 403 is refused with `network.rpc_credential_refused`. The
@@ -276,14 +338,14 @@ and never falls back to the declaration; an answer that does not parse, and a
 [Retries, deadlines, and failover](maintainers/security-internals.md#retries-deadlines-and-failover)
 gives the numbers. This release supports protocol version 29. On testnet and
 other networks, a version outside that range is logged as a warning. On mainnet
-it is refused with `network.unsupported_protocol_version`, a refusal a mainnet
-endpoint never reaches while `network.mainnet_write_forbidden` refuses it first.
+authorized submission refuses with `network.unsupported_protocol_version`.
 The network layer then fetches the relevant accounts' ed25519 signer sets.
 It verifies every decorated signature on the envelope against the network id
 the endpoint reports. An account absent from the ledger is
-`network.account_not_found`. A signature that verifies only under the mainnet
-network id is `network.envelope_signed_for_mainnet`. One that verifies under
-neither network is `network.envelope_signature_unverifiable`. An envelope
+`network.account_not_found`. A signature that fails under the endpoint network
+but verifies under mainnet reports `network.envelope_signed_for_mainnet`. One
+that verifies under neither network is `network.envelope_signature_unverifiable`.
+An envelope
 carrying no signature is `network.envelope_unsigned`. For fee bumps, this code
 also applies when either the outer or inner transaction has no signature.
 
@@ -291,24 +353,28 @@ The classic prepare tools `stellar_pay`, `stellar_create_account`,
 `stellar_trustline`, and `stellar_claim` run the same check on their client
 before the first read on it. Their commit tools do the same on the client they
 submit with. The fee, the sequence, the claim entry, and the account views
-these tools read feed the envelope that is signed or the policy gate. A prepare
-refuses an endpoint that serves another network or reports mainnet with an
-error result carrying that code. A commit runs the check before any other
+these tools read feed the envelope that is signed or the policy gate. An
+admitted mainnet prepare probes the mainnet endpoint before action reads. A
+prepare refuses a mismatched or unavailable endpoint with its network code. A
+commit runs the check before any other
 request and before the single-use nonce is burned, so a refusal there does not
 consume the nonce. The submit layer's own check comes after the nonce is
 consumed. A commit reads the clock for the nonce's expiry after its check, so
 the check's time counts toward that expiry.
 
-The classic prepare tools check the per-operation fee they resolve against
-the profile's `classic_max_fee_per_op_stroops`. The commit tools
+The classic prepare tools check the per-operation fee against the effective
+signed/profile `classic_max_fee_per_op_stroops`. They use the smaller value,
+or the one available value. A higher profile value warns. The enabled-policy
+minimum separately requires the signed field. The resolver independently
+checks effective fees and thresholds when authorizing the action. The commit tools
 `stellar_pay_commit`, `stellar_create_account_commit`,
 `stellar_trustline_commit`, and `stellar_claim_commit` check the fee of the
 presented envelope the same way, before anything is signed or sent. A fee
 above the cap returns `fees.percentile_exceeds_cap`. The message names where
 the fee came from: an auto-selected fee and its percentile, an explicit
 `classic_base`, the profile's `classic_fee_per_op_stroops`, or the envelope.
-A mainnet profile without the cap returns
-`validation.mainnet_fee_cap_required`.
+A missing effective cap returns `validation.mainnet_fee_cap_required`.
+Resolver fee failures become `network.mainnet_authorization_refused`.
 
 An endpoint refusal precedes a missing account or claim entry, a policy
 denial, an approval refusal, a rebuild divergence, the audit pre-flight, and a
@@ -358,12 +424,10 @@ How a `RequireApproval` verdict is satisfied depends on the tool shape:
   A `requires_operator_approval` field reports the PROPOSE-time policy
   verdict, but this is informational only: `stellar_rule_create_commit`
   ALWAYS requires operator attestation, unconditionally, regardless of this
-  field's value or of the policy engine's verdict at commit time. This is a
-  deliberate divergence from the signing verbs above (where an `Allow`
-  verdict on the commit tool does let the call proceed without an
-  attestation): a payment `Allow` spends within an operator-configured
-  budget, but a rule-create `Allow` would let the agent grant itself
-  permanent, potentially account-wide authority, which this feature's
+  field's value or of the policy engine's verdict at commit time. On testnet,
+  an `Allow` verdict on a classic commit lets the call proceed without an
+  attestation. An `Allow` verdict on rule creation would let the agent grant
+  itself permanent, potentially account-wide authority, which this feature's
   contract forbids. The agent NEVER holds rule-write authority at any point
   in this flow. `stellar_rule_create` only simulates and resolves the
   definition (no signing, no submission).
@@ -373,10 +437,10 @@ How a `RequireApproval` verdict is satisfied depends on the tool shape:
   shared pay/claim attestation gate) and unconditionally recomputes the
   digest from the stored snapshot before installing. A mismatch is
   `simulation.divergence` regardless of the policy verdict. Every approval
-  surface (CLI `approve`, the loopback inbox, the remote inbox) renders the
-  FULL resolved rule: context, every signer, every policy, and the override
-  flags, so operator consent binds to exactly what gets installed, not to a
-  name or a hash. Both tools structurally refuse `chain_id=stellar:mainnet`
+  surface renders the full resolved rule: context, every signer, every policy,
+  and the override flags. This includes CLI `approve` and both approval inboxes.
+  Operator consent binds to the resolved rule that the wallet installs, not to
+  a name or a hash. Both tools structurally refuse `chain_id=stellar:mainnet`
   (`network.mainnet_write_forbidden`), matching every other smart-account
   write surface: `stellar_rule_create` refuses at propose time,
   `stellar_rule_create_commit` refuses again at commit time as defense in
@@ -597,7 +661,8 @@ is carried inside `data` on success. Business and validation failures carry a
 `sep43.*` wire code derived from the SEP-43 error taxonomy (e.g.
 `sep43.wallet_unlock_failed`, `sep43.invalid_network_passphrase`); the
 structural mainnet refusal shares the canonical `network.mainnet_write_forbidden`
-code used everywhere else in the wallet, rather than a SEP-43-specific code.
+code used by wallet entry guards. Library signing uses
+`sep43.mainnet_signing_forbidden` or `sep43.mainnet_authorization_refused`.
 A policy `RequireApproval` verdict (which every single-shot sign tool,
 including SEP-43, refuses fail-closed) carries
 `policy.approval_required_unsupported`.

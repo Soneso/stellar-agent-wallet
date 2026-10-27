@@ -1,5 +1,8 @@
 # Approvals and audit
 
+See [Mainnet configurations and scope](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 The guardrail loop that sits between an agent's tool call and any signing or
 network action: the policy engine, the operator-approval spine, attestations,
 and the hash-chained audit log. This file is self-contained; for the MCP tool
@@ -42,8 +45,8 @@ settlement audit rows.
 - `chain_id` is the CAIP-2 id, `stellar:testnet` (default) or `stellar:mainnet`.
 - The `profile`, `credentials`, `approve`, and `audit` groups operate only on
   local state (TOML files and platform-keyring entries). None submits a
-  transaction, so the network flags and the mainnet-write gate do not apply to
-  them.
+  transaction. Profile selection and enablement still enforce their
+  mainnet-specific prerequisites.
 
 ## The policy engine
 
@@ -55,22 +58,49 @@ Each gated invocation is evaluated before it signs. Three decisions:
 | Deny | The call is refused, carrying a typed reason with a stable wire code. |
 | RequireApproval | The call is held pending an out-of-band operator approval. |
 
-The engine that runs is selected per profile in `[policy]`. Two structural rules
-apply on every surface: the default network is `stellar:testnet`. Every write or
-signing command structurally refuses `stellar:mainnet`
-(`network.mainnet_write_forbidden`), except MPP, which refuses with
-`mpp.network_forbidden`. This covers `--network` commands and the profile-driven
-write commands before any RPC call or signature. At the submit layer it covers
-both a declared mainnet passphrase and a known mainnet RPC URL, each with no RPC
-call at all. Meanwhile `stellar:mainnet` stays accepted for read-only commands.
-The submit layer additionally asks the endpoint which network it serves and
-binds the submission to that answer rather than to the declared network,
-verifying every signature on the envelope against it; see
-references/troubleshooting.md for those wire codes.
+The engine in `[policy]` governs policy evaluation. Mainnet writes also need a
+feature-enabled build, installation setup, and sealed authorization. Signing
+and submission independently verify authority. The endpoint network binds every
+envelope signature. Reads retain their selection and key-scope checks.
+
+### Classic mainnet confirmation
+
+Version 3 attestations authenticate approval kind, creation time, and expiry.
+Mainnet proof verification requires `attestation_version = 3`.
+`approval.attestation_invalid` covers missing version 3 coverage or a mismatched
+subject. MCP reports failed approval proofs as `policy.approval_required`.
+
+Direct CLI confirmation requires terminal stdin and stderr. It renders and
+flushes the summary, then compares the typed profile name after stripping only
+the line ending. Terminal or name refusal precedes pending insertion.
+Successful confirmation writes consent and persists its attestation before
+returning the witness. Its audit origin is `cli-mainnet-confirm`.
+
+Allow supplies a 600-second confirmation lifetime. RequireApproval supplies its
+configured lifetime. Classic MCP approvals expire at the shorter prepare/commit
+lifetime, with Allow contributing 600 seconds. Both names need matching rules.
+All four classic pairs require approval even under Allow.
+
+Authorization defaults to 120 seconds, bounded by approval expiry.
+Minted authorization holds count against window headroom. Consumption,
+invalidation, or expiry releases or converts them. Consumption is single-use
+within retained history and checks the policy pin under the state lock.
+
+CLI `approve` uses a y/n prompt and requires a terminal on mainnet. It refuses
+`--yes` before terminal checks or store access in both builds with
+`approve.yes_refused_on_mainnet`. Classic UI and remote approvals retain their
+supported attestations. CLI `approval.*` errors retain their codes.
+
+Live consumed or receipt-held MCP approvals use `policy.approval_consumed`.
+Consumption followed by pre-send recording failure can leave no tombstone.
+Reusing that approval can produce `network.mainnet_authorization_refused`.
+After authorization refusal, obtain fresh preparation and approval. Unknown
+submission outcomes require reconciliation. Restart MCP after enablement or
+policy signing; a stale binding requires restart.
 
 ### Noop engine
 
-The binding gate used when no full engine is configured. Behavior is fixed:
+The policy boundary used when no full engine is configured. Behavior is fixed:
 
 | Profile | Tool | Result |
 |---|---|---|

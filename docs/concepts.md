@@ -1,5 +1,8 @@
 # Concepts: the security and governance model
 
+See [Mainnet configurations and scope](getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This document explains how the Stellar Agent Wallet lets an autonomous agent transact while keeping the agent inside guardrails it cannot bypass. It covers key custody, the policy engine, the operator-approval spine, the audit log, and smart-account authorization rules. It is conceptual; for command syntax see the [CLI reference](cli-reference/profile-and-governance.md), and for profile fields see [Profiles](profiles.md).
 
 ## The problem this model solves
@@ -22,7 +25,7 @@ An AI agent calls wallet tools on its own initiative. The model does not assume 
 
 A fifth control addresses a different risk: which tool definitions the agent may load. **Toolsets** package third-party or untrusted tool definitions behind capability isolation: a toolset installs only after publisher-signature and hash verification, and a structural boundary keeps it from reaching a signing tool it was not granted. Where the four controls above constrain each action, toolsets constrain the surface an agent can act through. See [Toolsets](toolsets.md).
 
-Two structural rules apply across all surfaces in this alpha. The default network is `stellar:testnet`: a command with no named profile and no `default.toml` runs on the zero-config testnet profile. Every write or signing command refuses `stellar:mainnet` with wire code `network.mainnet_write_forbidden`, except MPP, which refuses with `mpp.network_forbidden`. The transaction and smart-account write commands, `vault deposit`, `vault withdraw`, `trade`, `trustline`, and `pool init` refuse a mainnet profile before any RPC call or signer access. The MCP DeFi, sign-and-submit, commit, and rule-commit tools refuse it at entry, before the policy gate and any RPC request. At the submit layer, a declared mainnet network passphrase and a known mainnet RPC URL are each refused at zero RPC cost. Beyond those two, the submit layer asks the endpoint which network it serves and treats that answer as authoritative. Every signature on the envelope must verify under it, so an envelope signed for one network cannot be relayed onto another. `stellar:mainnet` remains accepted for read-only commands.
+The default network is `stellar:testnet`. A command with no named profile and no `default.toml` uses the zero-config testnet profile. Released binaries refuse mainnet writes. Feature-enabled builds admit only the operations in the scope table after setup and per-action approval. Policy evaluation, sealed authorization, signing checks, and submission checks are separate boundaries. The endpoint determines the network, and each envelope signature must verify under it. Read-only commands retain mainnet selection and key-scope requirements.
 
 ## Two account models
 
@@ -120,7 +123,7 @@ The Noop engine is the binding gate used when no full engine is configured. Its 
 A destructive tool on a mainnet profile cannot pass the Noop engine.
 `smart-account multicall` requires the V1 engine: on testnet it refuses a Noop
 profile with `policy.engine_required`, and on mainnet it refuses earlier with
-`network.mainnet_write_forbidden`. Newly minted profiles default to the V1 engine; profiles carried over from schema version 1 are set to Noop explicitly until the operator completes the key-rotation steps that stand up a V1 owner key. The engine choice governs the policy layer only: every mainnet write is additionally refused at the network layer (`network.mainnet_write_forbidden`) in this alpha, on Noop and V1 alike. MPP refuses mainnet with `mpp.network_forbidden` instead.
+`network.mainnet_write_forbidden`. Newly minted profiles default to the V1 engine; profiles carried over from schema version 1 are set to Noop explicitly until the operator completes the key-rotation steps that stand up a V1 owner key. The engine choice governs policy evaluation. Mainnet writes also need sealed authorization, checked independently by signing and submission. MPP refuses mainnet with `mpp.network_forbidden` instead.
 
 ### V1 engine
 

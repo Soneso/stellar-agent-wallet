@@ -1898,7 +1898,7 @@ pub enum NetworkError {
     /// that the authorization was refused. Distinct from
     /// [`NetworkError::MainnetWriteForbidden`], which a build without mainnet
     /// writes reports before any authorization exists.
-    #[error("the mainnet authorization for this action was refused; nothing was signed or sent")]
+    #[error("the mainnet write was refused before submission; nothing was sent")]
     MainnetAuthorizationRefused,
 
     /// The Horizon API returned an unexpected HTTP status code.
@@ -5298,7 +5298,7 @@ mod tests {
         let text = refused.to_string();
         assert_eq!(
             text,
-            "the mainnet authorization for this action was refused; nothing was signed or sent"
+            "the mainnet write was refused before submission; nothing was sent"
         );
         for forbidden_word in [
             "precondition",
