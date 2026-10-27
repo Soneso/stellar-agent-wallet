@@ -6,8 +6,11 @@
 //! between calls. It answers `getLedgerEntries` for the accounts and the
 //! extra ledger entries it was given, quotes fixed fee statistics, accepts
 //! every send with the hash of the transaction it was handed, and confirms
-//! every transaction. `getHealth` and `getLedgers` describe a ledger range
-//! that covers every submission the tests make.
+//! every transaction in a ledger that closed at the time of the request, so a
+//! confirmed spend counts in the current policy window. Every send it accepts
+//! advances the sequence number of the accounts it funds, as the network does
+//! for the source account. `getHealth` and `getLedgers` describe a ledger
+//! range that covers every submission the tests make.
 
 #![allow(
     clippy::unwrap_used,
@@ -38,20 +41,56 @@ const ACCOUNT_BALANCE_STROOPS: i64 = 100_000_000_000;
 /// with [`account_xdr`] at this sequence.
 pub(crate) const ACCOUNT_SEQUENCE: i64 = 100;
 
+/// Answers one request in place of the endpoint's own answer: called with
+/// the JSON-RPC method, how many earlier requests of that method the endpoint
+/// received, and the request body. `Some(result)` is the `result` member
+/// returned; `None` keeps the endpoint's answer.
+pub(crate) type Script = Arc<dyn Fn(&str, usize, &Value) -> Option<Value> + Send + Sync>;
+
 /// A mocked endpoint for the classic value verbs.
 #[derive(Clone)]
 pub(crate) struct ClassicRpc {
     network: Arc<Mutex<String>>,
+    /// The passphrase a sent transaction's hash is computed under.
+    send_passphrase: &'static str,
     /// `(ledger key XDR, entry XDR)` per answerable ledger entry.
     entries: Arc<Vec<(String, String)>>,
+    /// The accounts the endpoint funds.
+    accounts: Arc<Vec<String>>,
+    /// Per funded account, the sends from it the endpoint accepted with its
+    /// own answer; each advances the account's sequence number.
+    accepted_sends: Arc<Mutex<std::collections::HashMap<String, i64>>>,
+    /// The answers that replace the endpoint's own.
+    script: Option<Script>,
+    /// Requests received per method.
+    counts: Arc<Mutex<std::collections::HashMap<String, usize>>>,
 }
 
 impl ClassicRpc {
     /// An endpoint reporting testnet and answering for each of `accounts`,
     /// funded and signed by its own master key.
     pub(crate) fn testnet(accounts: &[&str]) -> Self {
+        Self::on_network(TESTNET_PASSPHRASE, accounts)
+    }
+
+    /// An endpoint reporting mainnet and answering for each of `accounts`,
+    /// funded and signed by its own master key.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn mainnet(accounts: &[&str]) -> Self {
+        Self::on_network(
+            stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+            accounts,
+        )
+    }
+
+    fn on_network(passphrase: &'static str, accounts: &[&str]) -> Self {
         Self {
-            network: Arc::new(Mutex::new(TESTNET_PASSPHRASE.to_owned())),
+            network: Arc::new(Mutex::new(passphrase.to_owned())),
+            send_passphrase: passphrase,
+            script: None,
+            counts: Arc::default(),
+            accounts: Arc::new(accounts.iter().map(|a| (*a).to_owned()).collect()),
+            accepted_sends: Arc::default(),
             entries: Arc::new(
                 accounts
                     .iter()
@@ -77,6 +116,16 @@ impl ClassicRpc {
         self
     }
 
+    /// Answers through `script` before the endpoint's own answers.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn with_script(
+        mut self,
+        script: impl Fn(&str, usize, &Value) -> Option<Value> + Send + Sync + 'static,
+    ) -> Self {
+        self.script = Some(Arc::new(script));
+        self
+    }
+
     /// Reports `passphrase` from every later `getNetwork`.
     pub(crate) fn report(&self, passphrase: &str) {
         *self.network.lock().unwrap() = passphrase.to_owned();
@@ -97,11 +146,30 @@ impl ClassicRpc {
             .as_array()
             .map(|keys| keys.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
+        let accepted = self.accepted_sends.lock().unwrap().clone();
         let entries: Vec<Value> = self
             .entries
             .iter()
             .filter(|(key, _)| requested.contains(&key.as_str()))
-            .map(|(key, entry)| json!({ "key": key, "xdr": entry, "lastModifiedLedgerSeq": 1000 }))
+            .map(|(key, entry)| {
+                let entry = self
+                    .accounts
+                    .iter()
+                    .find(|account| account_ledger_key_xdr(account) == *key)
+                    .and_then(|account| accepted.get(account).map(|sends| (account, *sends)))
+                    .map_or_else(
+                        || entry.clone(),
+                        |(account, sends)| {
+                            account_entry_xdr_with_seq(
+                                account,
+                                ACCOUNT_BALANCE_STROOPS,
+                                0,
+                                ACCOUNT_SEQUENCE + sends,
+                            )
+                        },
+                    );
+                json!({ "key": key, "xdr": entry, "lastModifiedLedgerSeq": 1000 })
+            })
             .collect();
         json!({ "entries": entries, "latestLedger": 1001 })
     }
@@ -116,23 +184,47 @@ impl Respond for ClassicRpc {
             "p80": "100", "p90": "100", "p95": "100", "p99": "100",
             "transactionCount": "10", "ledgerCount": 5
         });
-        let result = match body["method"].as_str().unwrap_or_default() {
+        let method_name = body["method"].as_str().unwrap_or_default();
+        let index = {
+            let mut counts = self.counts.lock().unwrap();
+            let count = counts.entry(method_name.to_owned()).or_insert(0);
+            let index = *count;
+            *count += 1;
+            index
+        };
+        if let Some(result) = self
+            .script
+            .as_ref()
+            .and_then(|script| script(method_name, index, &body))
+        {
+            return ResponseTemplate::new(200)
+                .set_body_json(json!({ "jsonrpc": "2.0", "id": body["id"], "result": result }));
+        }
+        let result = match method_name {
             "getNetwork" => get_network_result(&self.network.lock().unwrap()),
             "getLedgerEntries" => self.ledger_entries(&body),
             "getFeeStats" => json!({
                 "sorobanInclusionFee": fees, "inclusionFee": fees, "latestLedger": 1001
             }),
-            "sendTransaction" => json!({
-                "hash": send_transaction_hash_hex(&body, TESTNET_PASSPHRASE),
+            "sendTransaction" => {
+                *self
+                    .accepted_sends
+                    .lock()
+                    .unwrap()
+                    .entry(sent_source(&body))
+                    .or_insert(0) += 1;
+                json!({
+                "hash": send_transaction_hash_hex(&body, self.send_passphrase),
                 "status": "PENDING",
                 "latestLedger": 1001,
                 "latestLedgerCloseTime": "1700000000"
-            }),
+                })
+            }
             "getTransaction" => json!({
                 "status": "SUCCESS",
                 "txHash": body["params"]["hash"],
                 "ledger": 1005,
-                "createdAt": "1700000005",
+                "createdAt": ledger_close_now(),
                 "latestLedger": 1006,
                 "oldestLedger": 1
             }),
@@ -155,6 +247,41 @@ impl Respond for ClassicRpc {
         ResponseTemplate::new(200)
             .set_body_json(json!({ "jsonrpc": "2.0", "id": body["id"], "result": result }))
     }
+}
+
+/// The current Unix time in seconds as the decimal string `getTransaction`
+/// reports a ledger close time in.
+fn ledger_close_now() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string()
+}
+
+/// The G-strkey of the source account of the transaction a
+/// `sendTransaction` request carries.
+fn sent_source(body: &Value) -> String {
+    use stellar_xdr::{Limits, MuxedAccount, ReadXdr as _, TransactionEnvelope};
+    let envelope = TransactionEnvelope::from_xdr_base64(
+        body["params"]["transaction"].as_str().unwrap(),
+        Limits::none(),
+    )
+    .unwrap();
+    let source = match envelope {
+        TransactionEnvelope::Tx(v1) => v1.tx.source_account,
+        TransactionEnvelope::TxFeeBump(bump) => match bump.tx.inner_tx {
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.source_account,
+        },
+        TransactionEnvelope::TxV0(v0) => MuxedAccount::Ed25519(v0.tx.source_account_ed25519),
+    };
+    let key = match source {
+        MuxedAccount::Ed25519(key) => key.0,
+        MuxedAccount::MuxedEd25519(muxed) => muxed.ed25519.0,
+    };
+    stellar_strkey::ed25519::PublicKey(key)
+        .to_string()
+        .to_string()
 }
 
 /// The JSON-RPC methods `server` received, in order.
@@ -565,4 +692,80 @@ pub(crate) async fn signers_resolved_by<F: Future>(call: F) -> (F::Output, usize
 /// Whether `server` received a `sendTransaction`.
 pub(crate) async fn sent(server: &MockServer) -> bool {
     methods(server).await.iter().any(|m| m == "sendTransaction")
+}
+
+/// How a test names a mainnet profile without `--profile`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ImplicitSource {
+    /// `STELLAR_AGENT_PROFILE` names the profile.
+    Env,
+    /// Neither the flag nor the variable names a profile, so the name is
+    /// `default`.
+    Default,
+}
+
+/// The isolation of an implicit mainnet selection: a temporary home and a
+/// cleared `STELLAR_AGENT_PROFILE`, which the `Env` case sets to the
+/// profile's name. Callers are `#[serial]`.
+pub(crate) struct ImplicitSelection {
+    /// The name the resolver selects.
+    pub(crate) name: &'static str,
+    _profile_var: stellar_agent_test_support::ProfileEnvVarGuard,
+    _home: stellar_agent_test_support::StellarAgentHomeGuard,
+    _dir: tempfile::TempDir,
+}
+
+impl ImplicitSelection {
+    /// Sets up the selection of `source`.
+    #[allow(
+        unsafe_code,
+        reason = "test-only process environment mutation; serialised by #[serial]"
+    )]
+    pub(crate) fn new(source: ImplicitSource) -> Self {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let name = match source {
+            ImplicitSource::Env => {
+                // SAFETY: serialised by #[serial]; the guard restores the
+                // variable when it drops.
+                unsafe {
+                    std::env::set_var("STELLAR_AGENT_PROFILE", "implicit-mainnet");
+                }
+                "implicit-mainnet"
+            }
+            ImplicitSource::Default => "default",
+        };
+        Self {
+            name,
+            _profile_var: profile_var,
+            _home: home,
+            _dir: dir,
+        }
+    }
+
+    /// A loader answering every name with a mainnet profile of that name
+    /// whose endpoint is `rpc_url`.
+    pub(crate) fn loader(
+        rpc_url: &str,
+    ) -> impl Fn(&str) -> Result<Profile, ProfileLoadError> + use<> {
+        let rpc_url = rpc_url.to_owned();
+        move |name| {
+            Ok(
+                Profile::builder_mainnet_named(name, rpc_url.clone(), "s", "default", "n", "a")
+                    .build(),
+            )
+        }
+    }
+}
+
+/// A keyring initializer that succeeds and counts its calls in `calls`.
+pub(crate) fn counting_initializer(
+    calls: &std::rc::Rc<std::cell::Cell<usize>>,
+) -> impl Fn() -> Result<(), stellar_agent_core::error::WalletError> + use<> {
+    let calls = std::rc::Rc::clone(calls);
+    move || {
+        calls.set(calls.get() + 1);
+        Ok(())
+    }
 }

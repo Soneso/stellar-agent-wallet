@@ -53,16 +53,22 @@ use stellar_agent_core::policy::{
 // `stellar-agent-core`, beside `KeyringEntryRef::default_owner_key`, which is
 // the only writer of the coordinate. Both binaries import them, so the
 // construction and its inverse cannot drift apart.
+use stellar_agent_core::approval::store::governing_ttl_ms;
+use stellar_agent_core::mainnet::enablement::EnablementRecord;
+use stellar_agent_core::mainnet::verified_policy::{MainnetBody, VerifiedPolicy};
 use stellar_agent_core::policy::v1::verified::OwnerKeySource;
 use stellar_agent_core::profile::name::{
-    OWNER_KEY_SERVICE_PREFIX, derive_profile_name_from_owner_key,
+    OWNER_KEY_SERVICE_PREFIX, ProfileNameSource, derive_profile_name_from_owner_key,
 };
 use stellar_agent_core::profile::owner_key::{
     OwnerKeyForm, decode_owner_public_key, log_owner_entry_rewrite,
     rewrite_older_form_owner_entries_once, rewrite_owner_value_if_older,
 };
 use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile, default_policy_dir};
-use stellar_agent_network::policy_engine::{PolicyEngineBuildError, build_policy_engine};
+use stellar_agent_network::MainnetWriteContext;
+use stellar_agent_network::policy_engine::{
+    BuiltPolicyEngine, PolicyEngineBuildError, ProfileSelection, build_policy_engine,
+};
 
 /// Constructs the [`PolicyEngine`] for a value-moving CLI verb from the
 /// profile's `policy.engine` kind.
@@ -173,6 +179,61 @@ pub(crate) fn load_v1_policy_engine(
     profile: &stellar_agent_core::profile::schema::Profile,
     requested_profile_name: &str,
 ) -> Result<Arc<PolicyEngineV1>, String> {
+    let owner = resolve_owner_key(verb, profile)?;
+
+    // The CLI selects no profile for installation verification, so no profile
+    // directory is resolved. The owner-key source travels into the verified
+    // load, which refuses the test-only source for an enabled mainnet policy
+    // on the bytes it verifies.
+    let built = build_policy_engine(
+        profile,
+        None,
+        requested_profile_name,
+        Some(&owner.policy_dir),
+        owner.public_key,
+        owner.source,
+    )
+    .map_err(|error| build_error_message(error, verb, &owner.policy_path))?;
+    built
+        .verified
+        .map(|verified| verified.engine())
+        .ok_or_else(|| {
+            format!(
+                "policy.engine is 'v1' but no verified policy was built; {verb} refuses \
+                 (fail closed)"
+            )
+        })
+}
+
+/// The owner public key a V1 engine verifies its signed policy under, and
+/// where that policy lives.
+struct OwnerKeyPrelude {
+    /// The owner's 32-byte ed25519 public key.
+    public_key: [u8; 32],
+    /// Where the key was read from.
+    source: OwnerKeySource,
+    /// The OS policy state directory.
+    policy_dir: std::path::PathBuf,
+    /// The signed policy file of the profile's owner-key namespace.
+    policy_path: std::path::PathBuf,
+}
+
+/// Derives the owner-key namespace of `profile`, reads and decodes the owner
+/// public key, rewrites an older-form keyring value, and resolves the policy
+/// directory.
+///
+/// Every V1 loader runs this before it builds its engine, so the testnet and
+/// the mainnet loader verify the signed policy under the same key.
+///
+/// # Errors
+///
+/// Returns `Err(human-readable message)` naming `verb` when the owner-key
+/// service lacks its prefix, the key cannot be read or decoded, or the policy
+/// directory is unavailable.
+fn resolve_owner_key(
+    verb: &str,
+    profile: &stellar_agent_core::profile::schema::Profile,
+) -> Result<OwnerKeyPrelude, String> {
     use base64::Engine as _;
     use ed25519_dalek::PUBLIC_KEY_LENGTH;
 
@@ -195,7 +256,7 @@ pub(crate) fn load_v1_policy_engine(
     // test-only file source.
     let (raw_key, source) = owner_pubkey_raw(&profile_name, verb)?;
 
-    let owner_pubkey = match decode_owner_public_key(&raw_key) {
+    let public_key = match decode_owner_public_key(&raw_key) {
         Some((key, form)) => {
             // Only a keyring entry is rewritten, never the test-only
             // file source.
@@ -244,20 +305,21 @@ pub(crate) fn load_v1_policy_engine(
         }
     };
     let policy_path = policy_dir.join(format!("{profile_name}.toml"));
-
-    // The CLI selects no profile for installation verification, so no profile
-    // directory is resolved. The owner-key source travels into the verified
-    // load, which refuses the test-only source for an enabled mainnet policy
-    // on the bytes it verifies.
-    let built = build_policy_engine(
-        profile,
-        None,
-        requested_profile_name,
-        Some(&policy_dir),
-        owner_pubkey,
+    Ok(OwnerKeyPrelude {
+        public_key,
         source,
-    )
-    .map_err(|error| match error {
+        policy_dir,
+        policy_path,
+    })
+}
+
+/// The human-readable message for an engine build failure, naming `verb`.
+fn build_error_message(
+    error: PolicyEngineBuildError,
+    verb: &str,
+    policy_path: &std::path::Path,
+) -> String {
+    match error {
         PolicyEngineBuildError::Policy(e) => format!(
             "policy.engine is 'v1' but the policy file at {} failed to \
              load/verify ({e}); {verb} refuses (fail closed)",
@@ -273,16 +335,286 @@ pub(crate) fn load_v1_policy_engine(
             format!("unsupported policy engine kind {kind:?}; {verb} refuses (fail closed)")
         }
         other => format!("policy.engine is 'v1' but {other}; {verb} refuses (fail closed)"),
+    }
+}
+
+/// The engine, the verified signed policy and the installation's enablement
+/// a mainnet write is evaluated and authorized under.
+pub(crate) struct MainnetPolicy {
+    /// The evaluator the verified policy carries.
+    pub(crate) engine: Arc<dyn PolicyEngine>,
+    /// The verified signed policy, which has a `[mainnet]` table.
+    pub(crate) verified: VerifiedPolicy,
+    /// The verified policy's `[mainnet]` table.
+    pub(crate) body: MainnetBody,
+    /// The enablement bound to the verified policy and the explicit selection.
+    pub(crate) enablement: EnablementRecord,
+}
+
+/// Loads the verified V1 policy of the context's stored profile, with the
+/// installation's enablement bound to the operator's explicit selection.
+///
+/// The owner key, the policy directory and the window state are resolved as
+/// [`load_v1_policy_engine`] resolves them. The selection makes the builder
+/// verify the enablement against the stored profile in `profile_dir`.
+///
+/// # Errors
+///
+/// - `profile.mainnet_enablement_invalid` when the enablement does not verify.
+/// - `engine_code` with the build failure's message for every other build
+///   failure: `policy.engine_unavailable` for pay, claim and accounts create,
+///   `trustline.policy_engine_unavailable` for trustline.
+/// - `network.mainnet_write_forbidden` naming the next ceremony step when the
+///   verified policy has no `[mainnet]` table or no enablement was built.
+pub(crate) fn load_mainnet_policy_engine(
+    verb: &'static str,
+    engine_code: &'static str,
+    context: &MainnetWriteContext,
+    source: ProfileNameSource,
+    profile_dir: &std::path::Path,
+) -> Result<MainnetPolicy, Envelope<()>> {
+    let profile = context.profile();
+    let owner = resolve_owner_key(verb, profile)
+        .map_err(|msg| Envelope::<()>::err_raw(engine_code, msg))?;
+    let built = build_policy_engine(
+        profile,
+        Some(ProfileSelection {
+            name: context.profile_name(),
+            source,
+            profile_dir,
+        }),
+        context.profile_name(),
+        Some(&owner.policy_dir),
+        owner.public_key,
+        owner.source,
+    )
+    .map_err(|error| match error {
+        PolicyEngineBuildError::Enablement(e) => {
+            Envelope::<()>::err(&stellar_agent_core::error::WalletError::Validation(e))
+        }
+        other => Envelope::<()>::err_raw(
+            engine_code,
+            build_error_message(other, verb, &owner.policy_path),
+        ),
     })?;
-    built
-        .verified
-        .map(|verified| verified.engine())
-        .ok_or_else(|| {
+    mainnet_policy_from(built, verb)
+}
+
+/// Requires a built engine to carry a verified policy with a `[mainnet]`
+/// table and an enablement, and returns that table with the policy.
+///
+/// # Errors
+///
+/// `network.mainnet_write_forbidden` with the message naming the missing
+/// precondition and the ceremony step that supplies it.
+fn mainnet_policy_from(
+    built: BuiltPolicyEngine,
+    verb: &str,
+) -> Result<MainnetPolicy, Envelope<()>> {
+    let BuiltPolicyEngine {
+        engine,
+        verified,
+        enablement,
+    } = built;
+    let Some((verified, body)) = verified.and_then(|verified| {
+        let body = verified.mainnet()?.clone();
+        Some((verified, body))
+    }) else {
+        return Err(Envelope::<()>::err_raw(
+            MAINNET_WRITE_FORBIDDEN,
             format!(
-                "policy.engine is 'v1' but no verified policy was built; {verb} refuses \
-                 (fail closed)"
-            )
-        })
+                "{verb} on mainnet requires a signed policy with a [mainnet] table; run profile \
+                 enable-mainnet, complete the [mainnet] table, then run profile sign-policy"
+            ),
+        ));
+    };
+    let Some(enablement) = enablement else {
+        return Err(Envelope::<()>::err_raw(
+            MAINNET_WRITE_FORBIDDEN,
+            format!(
+                "{verb} on mainnet requires the profile's mainnet enablement; run profile \
+                 enable-mainnet, then profile sign-policy"
+            ),
+        ));
+    };
+    Ok(MainnetPolicy {
+        engine,
+        verified,
+        body,
+        enablement,
+    })
+}
+
+/// The wire code of a refused mainnet write.
+const MAINNET_WRITE_FORBIDDEN: &str = "network.mainnet_write_forbidden";
+
+/// Returns `args` with `"total_fee_stroops"` set to `fee` as a JSON number.
+///
+/// The full-mode argument maps carry the unsigned envelope's total fee, the
+/// value `minimum_reserve` adds to the debit. The decoder of a staged
+/// envelope writes the same key with the same type.
+#[must_use]
+pub(crate) fn with_total_fee(mut args: serde_json::Value, fee: u32) -> serde_json::Value {
+    if let Some(map) = args.as_object_mut() {
+        map.insert("total_fee_stroops".to_owned(), serde_json::Value::from(fee));
+    }
+    args
+}
+
+/// The total fee of an unsigned version 1 transaction envelope, `tx.fee`.
+///
+/// # Errors
+///
+/// `protocol.xdr_codec_failed` when `envelope_xdr` is not a version 1
+/// transaction envelope.
+pub(crate) fn envelope_total_fee(
+    envelope_xdr: &str,
+) -> Result<u32, stellar_agent_core::error::WalletError> {
+    use stellar_xdr::{ReadXdr as _, TransactionEnvelope};
+    let codec = |detail: String| {
+        stellar_agent_core::error::WalletError::Protocol(
+            stellar_agent_core::error::ProtocolError::XdrCodecFailed { detail },
+        )
+    };
+    match TransactionEnvelope::from_xdr_base64(
+        envelope_xdr,
+        stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr.len()),
+    )
+    .map_err(|e| codec(e.to_string()))?
+    {
+        TransactionEnvelope::Tx(tx) => Ok(tx.tx.fee),
+        _ => Err(codec(
+            "the built envelope is not a version 1 transaction envelope".to_owned(),
+        )),
+    }
+}
+
+/// The cap a mainnet summary shows: the tighter of the profile's classic fee
+/// cap and the signed one, the cap [`check_classic_fee_cap_signed`] enforces.
+///
+/// [`check_classic_fee_cap_signed`]: stellar_agent_network::fees::check_classic_fee_cap_signed
+pub(crate) use stellar_agent_network::fees::effective_classic_fee_cap;
+
+/// A mainnet policy verdict: the decisions a mainnet write proceeds under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MainnetVerdict {
+    /// The policy allows the write; the confirmation lives its default TTL.
+    Allow,
+    /// The policy requires approval; the confirmation lives `ttl_ms`.
+    RequireApproval {
+        /// The approval lifetime the evaluated rule permits, in milliseconds.
+        ttl_ms: u64,
+    },
+}
+
+impl MainnetVerdict {
+    /// The policy decision the submission's audit rows carry.
+    ///
+    /// The arms are those of the MCP server's dispatch outcome: an allow
+    /// records `Allow`, an approval requirement records `RequireApproval`.
+    #[must_use]
+    pub(crate) fn audit_decision(self) -> stellar_agent_core::audit_log::PolicyDecision {
+        match self {
+            Self::Allow => stellar_agent_core::audit_log::PolicyDecision::Allow,
+            Self::RequireApproval { .. } => {
+                stellar_agent_core::audit_log::PolicyDecision::RequireApproval
+            }
+        }
+    }
+}
+
+/// What a mainnet policy evaluation decided and sized.
+pub(crate) struct MainnetEvaluation {
+    /// The decision the write proceeds under.
+    pub(crate) verdict: MainnetVerdict,
+    /// The value effects the evaluation sized; the recorder's legs.
+    pub(crate) effects: Option<stellar_agent_core::policy::v1::ValueEffects>,
+}
+
+/// Evaluates operator policy for a mainnet write, with the inputs of
+/// [`evaluate_value_moving_policy`].
+///
+/// An allow and an approval requirement both proceed: the mainnet
+/// confirmation serves the requirement, under the TTL the evaluated rule
+/// permits. A deny is refused before any TTL is asked for.
+///
+/// # Errors
+///
+/// `policy.deny.{code}` on a deny, `policy.unexpected_decision` on a
+/// decision this build does not know, and `policy.engine_required` when the
+/// evaluator fails.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parameter set of evaluate_value_moving_policy, whose per-verb view contract \
+              the mainnet evaluation shares"
+)]
+pub(crate) fn evaluate_mainnet_policy(
+    policy_engine: &dyn PolicyEngine,
+    profile: &Profile,
+    tool_name: &'static str,
+    value_kind: ToolValueKind,
+    chain_id: &str,
+    policy_args: &serde_json::Value,
+    verb: &str,
+    account_view: Option<&dyn AccountReservesView>,
+    identity_view: Option<&dyn AccountIdentityView>,
+) -> Result<MainnetEvaluation, Envelope<()>> {
+    let tool_descriptor = value_descriptor(tool_name, value_kind, chain_id);
+    let evaluation = policy_engine
+        .evaluate_full(
+            &tool_descriptor,
+            policy_args,
+            profile,
+            account_view,
+            identity_view,
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| Envelope::<()>::err_raw("policy.engine_required", format!("{e}")))?;
+    let verdict = match &evaluation.decision {
+        Decision::Allow => MainnetVerdict::Allow,
+        Decision::Deny(reason) => {
+            return Err(Envelope::<()>::err_raw(
+                format!("policy.deny.{}", reason.code()),
+                format!("{verb} operation denied by operator policy"),
+            ));
+        }
+        Decision::RequireApproval(_) => MainnetVerdict::RequireApproval {
+            ttl_ms: governing_ttl_ms(&evaluation),
+        },
+        _ => return Err(unexpected_decision()),
+    };
+    Ok(MainnetEvaluation {
+        verdict,
+        effects: evaluation.value_effects,
+    })
+}
+
+/// The refusal of a policy decision this build does not know.
+fn unexpected_decision() -> Envelope<()> {
+    Envelope::<()>::err_raw(
+        "policy.unexpected_decision",
+        "unexpected policy decision; operation refused (fail-closed)",
+    )
+}
+
+/// The descriptor of a value-moving tool the CLI gates on `chain_id`.
+fn value_descriptor(
+    tool_name: &'static str,
+    value_kind: ToolValueKind,
+    chain_id: &str,
+) -> ToolDescriptor {
+    let reg = McpToolRegistration {
+        name: tool_name,
+        destructive_hint: true,
+        read_only_hint: false,
+        chain_id_required: true,
+        value_kind,
+    };
+    let mut tool_descriptor = ToolDescriptor::from_registration(&reg);
+    tool_descriptor.chain_id = chain_id.to_owned();
+    tool_descriptor
 }
 
 /// Resolves the operator's owner **PUBLIC** key, as stored, for
@@ -464,15 +796,7 @@ pub(crate) fn evaluate_value_moving_policy(
     account_view: Option<&dyn AccountReservesView>,
     identity_view: Option<&dyn AccountIdentityView>,
 ) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, Envelope<()>> {
-    let reg = McpToolRegistration {
-        name: tool_name,
-        destructive_hint: true,
-        read_only_hint: false,
-        chain_id_required: true,
-        value_kind,
-    };
-    let mut tool_descriptor = ToolDescriptor::from_registration(&reg);
-    tool_descriptor.chain_id = chain_id.to_owned();
+    let tool_descriptor = value_descriptor(tool_name, value_kind, chain_id);
 
     match policy_engine.evaluate_full(
         &tool_descriptor,
@@ -496,10 +820,7 @@ pub(crate) fn evaluate_value_moving_policy(
                     "{verb} operation requires approval; use the MCP server for two-phase approval"
                 ),
             )),
-            _ => Err(Envelope::<()>::err_raw(
-                "policy.unexpected_decision",
-                "unexpected policy decision — operation refused (fail-closed)".to_owned(),
-            )),
+            _ => Err(unexpected_decision()),
         },
         Err(e) => Err(Envelope::<()>::err_raw(
             "policy.engine_required",
@@ -575,10 +896,7 @@ pub(crate) fn evaluate_value_moving_policy_with_value(
                     "{verb} operation requires approval; use the MCP server for two-phase approval"
                 ),
             )),
-            _ => Err(Envelope::<()>::err_raw(
-                "policy.unexpected_decision",
-                "unexpected policy decision — operation refused (fail-closed)".to_owned(),
-            )),
+            _ => Err(unexpected_decision()),
         },
         Err(e) => Err(Envelope::<()>::err_raw(
             "policy.engine_required",
@@ -658,10 +976,7 @@ pub(crate) fn evaluate_opaque_signing_policy(
                     "{verb} operation requires approval; use the MCP server for two-phase approval"
                 ),
             )),
-            _ => Err(Envelope::<()>::err_raw(
-                "policy.unexpected_decision",
-                "unexpected policy decision — operation refused (fail-closed)".to_owned(),
-            )),
+            _ => Err(unexpected_decision()),
         },
         Err(e) => Err(Envelope::<()>::err_raw(
             "policy.engine_required",
@@ -2450,5 +2765,166 @@ decision = "allow"
                 );
             }
         }
+    }
+
+    /// A policy engine whose evaluator fails.
+    struct FailingEngine;
+
+    impl PolicyEngine for FailingEngine {
+        fn evaluate(
+            &self,
+            _tool: &ToolDescriptor,
+            _args: &serde_json::Value,
+            _profile: &Profile,
+            _account_view: Option<&dyn AccountReservesView>,
+            _identity_view: Option<&dyn AccountIdentityView>,
+            _counterparty_cache: Option<&dyn stellar_agent_core::policy::v1::CounterpartyCacheView>,
+            _sep10_sessions: Option<&dyn stellar_agent_core::policy::v1::Sep10SessionView>,
+            _sep45_sessions: Option<&dyn stellar_agent_core::policy::v1::Sep45SessionView>,
+        ) -> Result<Decision, stellar_agent_core::policy::PolicyError> {
+            Err(
+                stellar_agent_core::policy::PolicyError::CriterionEvaluationFailed {
+                    detail: "the evaluator failed".to_owned(),
+                },
+            )
+        }
+    }
+
+    /// An evaluator error refuses the mainnet write as an engine failure.
+    #[test]
+    fn an_evaluator_error_refuses_as_engine_required() {
+        let profile = make_profile(PolicyEngineKind::V1, "stellar-agent-owner-default");
+        let Err(envelope) = evaluate_mainnet_policy(
+            &FailingEngine,
+            &profile,
+            "stellar_pay",
+            ToolValueKind::MovesValue,
+            "stellar:mainnet",
+            &serde_json::json!({}),
+            "pay",
+            None,
+            None,
+        ) else {
+            panic!("an evaluator error must refuse");
+        };
+        assert_eq!(envelope.error.unwrap().code, "policy.engine_required");
+    }
+
+    /// The effective cap is the cap the signed check enforces: a fee equal
+    /// to it passes and one stroop more refuses, for a profile cap absent,
+    /// below, equal to and above the signed cap.
+    #[test]
+    fn the_effective_cap_is_the_enforced_cap() {
+        use stellar_agent_core::error::FeeSource;
+        use stellar_agent_network::fees::check_classic_fee_cap_signed;
+        let signed = 500;
+        for (profile_cap, expected) in [
+            (None, 500),
+            (Some(300), 300),
+            (Some(500), 500),
+            (Some(900), 500),
+        ] {
+            let mut profile = Profile::builder_mainnet_named(
+                "operator",
+                "https://rpc.example.invalid",
+                "s",
+                "a",
+                "n",
+                "b",
+            )
+            .build();
+            profile.classic_max_fee_per_op_stroops = profile_cap;
+            let cap = effective_classic_fee_cap(&profile, signed);
+            assert_eq!(cap, expected, "{profile_cap:?}");
+            check_classic_fee_cap_signed(cap, FeeSource::ProfileDefault, &profile, Some(signed))
+                .unwrap();
+            assert_eq!(
+                check_classic_fee_cap_signed(
+                    cap + 1,
+                    FeeSource::ProfileDefault,
+                    &profile,
+                    Some(signed)
+                )
+                .unwrap_err()
+                .code(),
+                "fees.percentile_exceeds_cap",
+                "{profile_cap:?}"
+            );
+        }
+    }
+
+    /// The CLI maps each verdict to the audit decision the MCP surface
+    /// records for the same outcome, and the MCP mapping has exactly the two
+    /// arms the CLI mirrors.
+    #[test]
+    fn the_audit_decision_mirrors_the_mcp_surface() {
+        let source = include_str!("../../../stellar-agent-mcp/src/tools/common.rs");
+        let start = source.find("fn audit_decision(").unwrap();
+        let open = start + source[start..].find('{').unwrap();
+        let mut depth = 0_usize;
+        let mut end = open;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body: String = source[open..=end].split_whitespace().collect();
+        assert_eq!(body.matches("=>").count(), 2, "{body}");
+        for (mcp_arm, verdict, decision) in [
+            (
+                "Self::Allow(_)=>stellar_agent_core::audit_log::PolicyDecision::Allow",
+                MainnetVerdict::Allow,
+                stellar_agent_core::audit_log::PolicyDecision::Allow,
+            ),
+            (
+                "Self::RequireApproval(_)=>{stellar_agent_core::audit_log::PolicyDecision::RequireApproval}",
+                MainnetVerdict::RequireApproval { ttl_ms: 300_000 },
+                stellar_agent_core::audit_log::PolicyDecision::RequireApproval,
+            ),
+        ] {
+            assert!(body.contains(mcp_arm), "{body}");
+            assert_eq!(verdict.audit_decision(), decision);
+        }
+    }
+
+    /// A verified policy with a `[mainnet]` table but no enablement refuses
+    /// with the message naming the enablement.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn a_mainnet_policy_without_its_enablement_refuses() {
+        let fixture =
+            crate::common::mainnet_write_fixture::Spec::new("mainnet-policy-no-enablement")
+                .build()
+                .await;
+        let profile = fixture.profile();
+        let owner = resolve_owner_key("pay", &profile).unwrap();
+        let built = stellar_agent_network::policy_engine::build_policy_engine(
+            &profile,
+            None,
+            fixture.name,
+            None,
+            owner.public_key,
+            owner.source,
+        )
+        .unwrap();
+        assert!(built.verified.as_ref().unwrap().mainnet().is_some());
+        assert!(built.enablement.is_none());
+        let envelope = mainnet_policy_from(built, "pay").err().unwrap();
+        let error = envelope.error.unwrap();
+        assert_eq!(error.code, "network.mainnet_write_forbidden");
+        assert_eq!(
+            error.message,
+            "pay on mainnet requires the profile's mainnet enablement; run profile \
+             enable-mainnet, then profile sign-policy"
+        );
     }
 }

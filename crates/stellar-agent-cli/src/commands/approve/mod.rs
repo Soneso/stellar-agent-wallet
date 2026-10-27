@@ -43,6 +43,7 @@
 //! This is the CLI user-tty half of the wallet-owned approval spine.
 
 mod common;
+pub(crate) use common::{approval_store_dir, approval_store_open_error};
 pub mod gc;
 pub mod list;
 pub mod operator;

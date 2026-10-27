@@ -1,5 +1,9 @@
 //! The approve binary binds attestations to the selected profile and network
 //! and reports approval refusals without persisting consent.
+//!
+//! On mainnet the operator approves at a terminal without `--yes`: the binary
+//! refuses `--yes` and refuses a missing terminal, in both cases before the
+//! approval store is opened, so the pending file stays byte-identical.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -20,6 +24,7 @@ use stellar_agent_core::{
         schema::{KeyringEntryRef, Profile},
     },
 };
+use stellar_agent_test_support::source_order::assert_called_between;
 use stellar_xdr::{
     Asset, Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
     SequenceNumber, Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope,
@@ -177,6 +182,8 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
         .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
         .unwrap();
     drop(approvals);
+    let pending_path = home.join("approvals").join(format!("{name}.toml"));
+    let pending_before = std::fs::read(&pending_path).unwrap();
     let requested_nonce = if matches!(case, ApprovalCase::UnknownNonce) {
         "AAAAAAAAAAAAAAAAAAAAAA"
     } else {
@@ -200,10 +207,14 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
         .expect("approve binary runs");
     let stderr = String::from_utf8(output.stderr).unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let expected_code = match case {
-        ApprovalCase::UnknownNonce => Some("approval.not_found"),
-        ApprovalCase::ClosedStdin => Some("approval.denied"),
-        ApprovalCase::Attest | ApprovalCase::Trustline => None,
+    let expected_code = match (mainnet, case) {
+        (true, ApprovalCase::Attest | ApprovalCase::Trustline | ApprovalCase::UnknownNonce) => {
+            Some("approve.yes_refused_on_mainnet")
+        }
+        (true, ApprovalCase::ClosedStdin) => Some("confirm.tty_required"),
+        (false, ApprovalCase::UnknownNonce) => Some("approval.not_found"),
+        (false, ApprovalCase::ClosedStdin) => Some("approval.denied"),
+        (false, ApprovalCase::Attest | ApprovalCase::Trustline) => None,
     };
     if let Some(expected_code) = expected_code {
         assert_eq!(
@@ -219,6 +230,13 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
         let pending = approvals.get(&nonce).expect("entry remains pending");
         assert!(pending.attestation_blob_b64.is_none());
         assert!(!profile.audit_log_path.exists());
+        if mainnet {
+            assert_eq!(
+                std::fs::read(&pending_path).unwrap(),
+                pending_before,
+                "the mainnet refusal leaves the pending file untouched"
+            );
+        }
         return;
     }
     assert!(output.status.success(), "stdout={stdout}; stderr={stderr}");
@@ -288,8 +306,28 @@ fn approve_binary_testnet_binding_and_summary() {
 
 #[test]
 #[serial]
-fn approve_binary_mainnet_binding_and_summary() {
+fn approve_binary_mainnet_refuses_yes() {
     approve_binary_case(true, ApprovalCase::Attest);
+}
+
+#[test]
+#[serial]
+fn approve_binary_mainnet_without_a_terminal_refuses() {
+    approve_binary_case(true, ApprovalCase::ClosedStdin);
+}
+
+/// The mainnet rule is applied after the profile is loaded and before the
+/// approval store is opened, so a refusal never touches the pending file.
+#[test]
+fn the_mainnet_approve_rule_runs_before_the_store_opens() {
+    assert_called_between(
+        "commands/approve/run.rs",
+        include_str!("../../src/commands/approve/run.rs"),
+        "pub async fn run(",
+        "load_profile_reconciled(",
+        "mainnet_approve_rule(",
+        "open_with_retry(",
+    );
 }
 
 #[test]

@@ -17,14 +17,20 @@
 //! mutually exclusive via a `clap` argument group. Passing more than one
 //! is a parse error before `run` is called.
 //!
-//! # Mainnet rejection
+//! # Mainnet
 //!
-//! `--network testnet` is the only accepted value. Mainnet is structurally
-//! rejected at two layers:
-//! - CLI: the `TargetNetwork::Mainnet` variant returns
-//!   `network.mainnet_write_forbidden` before any RPC call.
-//! - Submit layer: `submit_transaction_and_wait` rejects mainnet-looking URLs
-//!   as a defence-in-depth measure.
+//! On a mainnet profile only the full pipeline runs: `--build-only`,
+//! `--sign-only` and `--submit-only` refuse with
+//! `network.mainnet_write_forbidden` before the write context, the keyring
+//! and any request; the profile and the selection variable are read earlier.
+//! A build without the `mainnet-write` feature refuses every mainnet run with
+//! that code. With the feature, the run takes the stored profile of an
+//! explicit `--profile` selection, a verified signed policy with a
+//! `[mainnet]` table and its enablement, the enrolled signer, the independent
+//! witness the effective witness rule requires, and a confirmation on a
+//! terminal where the operator types the profile name. The seed is read and
+//! the Ledger opened only after the authorization is minted, and the submit
+//! layer checks the endpoint and passphrase again.
 //!
 //! # Endpoint identity
 //!
@@ -126,18 +132,20 @@ use std::time::Duration;
 use clap::{ArgGroup, Args};
 use stellar_agent_core::StellarAmount;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
-use stellar_agent_core::error::{AuthError, NetworkError, ValidationError, WalletError};
+use stellar_agent_core::error::{AuthError, FeeSource, NetworkError, ValidationError, WalletError};
 use stellar_agent_core::policy::PolicyEngine;
 use stellar_agent_core::policy::v1::{AccountIdentityView, AccountReservesView};
-use stellar_agent_network::NetworkContext;
+use stellar_agent_network::mainnet::MainnetConsumer;
+use stellar_agent_network::{MainnetEndpointFlags, NetworkContext};
 use stellar_xdr::Memo;
 
 use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile};
 use stellar_agent_network::builder::{Asset, ClassicOpBuilder};
 use stellar_agent_network::cross_check::{
     AccountObservation, CrossCheckOutcome, CrossCheckView, DestinationObservation, MemoObservation,
-    PayWitnessInputs, TrustlineObservation, obtain_classic_witness,
+    PayWitnessInputs, TrustlineObservation, obtain_classic_witness, obtain_classic_witness_bound,
 };
+use stellar_agent_network::fees::{check_classic_fee_cap_signed, classic_fee_source};
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::signing::source::signer_from_ledger;
@@ -149,11 +157,16 @@ use stellar_agent_network::{
 };
 
 use crate::commands::policy_engine::{
-    build_v1_policy_engine, evaluate_opaque_signing_policy, evaluate_value_moving_policy,
-    pay_policy_args,
+    build_v1_policy_engine, effective_classic_fee_cap, envelope_total_fee, evaluate_mainnet_policy,
+    evaluate_opaque_signing_policy, evaluate_value_moving_policy, load_mainnet_policy_engine,
+    pay_policy_args, with_total_fee,
+};
+use crate::common::mainnet_write::{
+    MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
+    require_v1_engine,
 };
 use crate::common::network::{
-    EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity,
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity, mainnet_mode_refusal,
     network_context_for_command,
 };
 use crate::common::profile_access::{
@@ -161,7 +174,8 @@ use crate::common::profile_access::{
 };
 use crate::common::render::{render_json, sanitize_for_table};
 use crate::common::signer_ceremony::{
-    SignerCeremonyOutcome, require_enrolled_signer, resolve_software_signer_from_env,
+    MainnetSignerChoice, SignerCeremonyOutcome, require_enrolled_signer,
+    resolve_software_signer_from_env,
 };
 use crate::common::{ResolvedProfileName, resolve_profile_name};
 
@@ -498,12 +512,16 @@ where
         "pay: profile resolved"
     );
 
-    // ── Mainnet structural rejection (first layer) ────────────────────────────
-    if context.chain_id.is_mainnet() {
-        let err = WalletError::Network(NetworkError::MainnetWriteForbidden);
-        let envelope = Envelope::<()>::err(&err);
-        print_error(&envelope, args.output);
+    // ── Mainnet: the staged modes are refused, full mode runs its own pipeline ─
+    // The mode check is pure, so a refused stage reads no file, keyring entry
+    // or environment variable.
+    let full_mode = !args.build_only && args.sign_only.is_none() && args.submit_only.is_none();
+    if let Some(err) = mainnet_mode_refusal(context.chain_id, full_mode) {
+        print_error(&Envelope::<()>::err(&err), args.output);
         return 1;
+    }
+    if context.chain_id.is_mainnet() {
+        return run_mainnet_pipeline(args, resolved, profile, init_keyring).await;
     }
 
     // ── OZ Relayer opt-in gate ────────────────────────────────────────────────
@@ -576,7 +594,8 @@ where
             let chain_id = context.chain_id.caip2_str();
             // Build-only: gate but do not submit, so the gate-sized effects are
             // not recorded (no confirmed on-chain action to attest).
-            if let Err(code) = evaluate_pay_policy(args, &built, chain_id, profile, &resolved.name)
+            if let Err(code) =
+                evaluate_pay_policy(args, &built, chain_id, profile, &resolved.name, None)
             {
                 return code;
             }
@@ -1331,7 +1350,21 @@ where
     // Runs while `built` is still owned so its fields can be moved out (not
     // cloned) once the gate allows.
     let chain_id = context.chain_id.caip2_str();
-    let pay_effects = match evaluate_pay_policy(args, &built, chain_id, profile, &resolved.name) {
+    let total_fee = match envelope_total_fee(&built.envelope_xdr) {
+        Ok(fee) => fee,
+        Err(e) => {
+            print_error(&Envelope::<()>::err(&e), args.output);
+            return 1;
+        }
+    };
+    let pay_effects = match evaluate_pay_policy(
+        args,
+        &built,
+        chain_id,
+        profile,
+        &resolved.name,
+        Some(total_fee),
+    ) {
         Ok(effects) => effects,
         Err(code) => return code,
     };
@@ -1655,7 +1688,42 @@ async fn witness_payment(
     observed: PaymentObservations<'_>,
     tool: &'static str,
 ) -> Result<CrossCheckOutcome, WalletError> {
-    let canonical = observed.asset.to_canonical()?;
+    let witness = payment_witness_inputs(client, observed).await?;
+    obtain_classic_witness(
+        profile,
+        context,
+        stellar_agent_core::cross_check::CrossCheckValue::Amount {
+            asset: &witness.asset,
+            base_units: witness.base_units,
+        },
+        witness.inputs,
+        tool,
+    )
+    .await
+}
+
+/// What a payment's witness is valued on and compares.
+struct PaymentWitness {
+    /// The send asset.
+    asset: stellar_agent_core::asset_id::CanonicalAsset,
+    /// The source debit in the send asset's base units.
+    base_units: i128,
+    /// The primary observations the oracle compares.
+    inputs: PayWitnessInputs,
+}
+
+/// Builds the witness inputs of a payment stage, reading the source's
+/// trustline of an issued send asset on the primary.
+///
+/// # Errors
+///
+/// Returns `validation.asset_invalid` for a send asset outside the canonical
+/// classic alphabet, and the primary trustline read's refusal.
+async fn payment_witness_inputs(
+    client: &StellarRpcClient,
+    observed: PaymentObservations<'_>,
+) -> Result<PaymentWitness, WalletError> {
+    let asset = observed.asset.to_canonical()?;
     let source = AccountObservation::from_view(observed.source_view)?;
     let trustline = TrustlineObservation::read_send_asset(
         client,
@@ -1663,14 +1731,10 @@ async fn witness_payment(
         observed.asset,
     )
     .await?;
-    obtain_classic_witness(
-        profile,
-        context,
-        stellar_agent_core::cross_check::CrossCheckValue::Amount {
-            asset: &canonical,
-            base_units: i128::from(observed.amount_stroops),
-        },
-        PayWitnessInputs {
+    Ok(PaymentWitness {
+        asset,
+        base_units: i128::from(observed.amount_stroops),
+        inputs: PayWitnessInputs {
             source,
             destination: DestinationObservation::from_view(
                 observed.destination,
@@ -1679,9 +1743,7 @@ async fn witness_payment(
             memo: observed.memo,
             trustline,
         },
-        tool,
-    )
-    .await
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1708,6 +1770,7 @@ fn evaluate_pay_policy(
     chain_id: &str,
     profile: &Profile,
     profile_name: &str,
+    total_fee: Option<u32>,
 ) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, i32> {
     let policy_engine =
         match build_v1_policy_engine("pay", &profile.policy.engine, profile, profile_name) {
@@ -1721,8 +1784,14 @@ fn evaluate_pay_policy(
             }
         };
     // Mirrors the `stellar_pay` MCP tool's dispatch args exactly: resolved
-    // stroops, the raw (unreformatted) asset string, and the destination.
+    // stroops, the raw (unreformatted) asset string, and the destination. The
+    // full pipeline adds the envelope's total fee, which `minimum_reserve`
+    // counts with the debit; `--build-only` passes none.
     let policy_args = pay_policy_args(built.amount_stroops, &built.asset_raw, &built.destination);
+    let policy_args = match total_fee {
+        Some(fee) => with_total_fee(policy_args, fee),
+        None => policy_args,
+    };
     // `account_view` reuses the source-account state `build_unsigned_envelope`
     // already fetched (feeds `minimum_reserve`); `identity_view` reuses the
     // destination-account state the same function fetched (`.ok()`-optional,
@@ -1970,6 +2039,236 @@ fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
         }
         // Json and all unknown formats: delegate to shared render_json.
         _ => render_json(envelope),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mainnet pipeline
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Runs the full pipeline on a mainnet profile.
+///
+/// The stored profile of the explicit selection replaces the merged one at
+/// the write context, and every later step reads it from the context. The
+/// steps up to the witness are this verb's: the relayer gate, the engine
+/// kind, the keyring, the checked client, the reconcile, the build, the
+/// verified policy with the built fee, the signed fee cap, the audit
+/// pre-flight and the bound witness. [`authorize_and_submit`] runs the rest.
+async fn run_mainnet_pipeline<InitKeyring>(
+    args: &PayArgs,
+    resolved: &ResolvedProfileName,
+    profile: &Profile,
+    init_keyring: InitKeyring,
+) -> i32
+where
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
+    let fail = |envelope: &Envelope<()>| {
+        print_error(envelope, args.output);
+        1
+    };
+    let context = match mainnet_context(
+        profile,
+        resolved,
+        MainnetEndpointFlags {
+            network: args.network.map(TargetNetwork::caip2),
+            rpc_url: args.rpc_url.is_some(),
+            secondary_rpc_url: false,
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let net_context = context.network_context();
+    let profile = context.profile();
+    let name = context.profile_name();
+    if let Err(e) = check_relayer_opt_in(args) {
+        return fail(&Envelope::<()>::err(&e));
+    }
+    if let Err(envelope) = require_v1_engine("pay", &context) {
+        return fail(&envelope);
+    }
+    if let Err(e) = init_keyring() {
+        return fail(&Envelope::<()>::err(&e));
+    }
+    let profiles_dir = match mainnet_profiles_dir() {
+        Ok(dir) => dir,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+
+    // One client serves every read, the resolver and the send.
+    let client = match context.primary_client() {
+        Ok(client) => client,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let timeout = Duration::from_secs(args.timeout_seconds);
+    if let Err(e) = check_endpoint_identity(&client, &net_context, timeout).await {
+        return fail(&Envelope::<()>::err(&e));
+    }
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(v) => v,
+        Err(e) => {
+            return fail(&Envelope::<()>::err_raw(
+                "wallet.clock_error",
+                e.to_string(),
+            ));
+        }
+    };
+    crate::commands::submission_record::reconcile_open_reservations(
+        profile,
+        name,
+        ProfileOrigin::Persisted,
+        &client,
+        now_ms,
+    )
+    .await;
+
+    let inputs = match build_inputs(args) {
+        Ok(inputs) => inputs,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let built = match build_unsigned_envelope(&client, &net_context, args, inputs).await {
+        Ok(built) => built,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+
+    let policy = match load_mainnet_policy_engine(
+        "pay",
+        "policy.engine_unavailable",
+        &context,
+        resolved.source,
+        &profiles_dir,
+    ) {
+        Ok(policy) => policy,
+        Err(envelope) => return fail(&envelope),
+    };
+    let total_fee = match envelope_total_fee(&built.envelope_xdr) {
+        Ok(fee) => fee,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let policy_args = with_total_fee(
+        pay_policy_args(built.amount_stroops, &built.asset_raw, &built.destination),
+        total_fee,
+    );
+    let source_adapter =
+        stellar_agent_network::policy_view::AccountViewAdapter::new(&built.source_account_view);
+    let dest_adapter = built
+        .dest_account_view
+        .as_ref()
+        .map(stellar_agent_network::policy_view::AccountViewAdapter::new);
+    let chain_id = context.chain().caip2_str();
+    let evaluation = match evaluate_mainnet_policy(
+        policy.engine.as_ref(),
+        profile,
+        "stellar_pay",
+        stellar_agent_core::policy::ToolValueKind::MovesValue,
+        chain_id,
+        &policy_args,
+        "pay",
+        Some(&source_adapter),
+        dest_adapter.as_ref().map(|a| a as &dyn AccountIdentityView),
+    ) {
+        Ok(evaluation) => evaluation,
+        Err(envelope) => return fail(&envelope),
+    };
+
+    let body = &policy.body;
+    if let Err(e) = check_classic_fee_cap_signed(
+        built.fee_selection.per_op_stroops,
+        classic_fee_source(built.fee_choice, FeeSource::CommandDefault),
+        profile,
+        Some(body.classic_max_fee_per_op_stroops),
+    ) {
+        return fail(&Envelope::<()>::err(&e));
+    }
+    let effective_cap = effective_classic_fee_cap(profile, body.classic_max_fee_per_op_stroops);
+    if let Err(e) = crate::commands::value_audit::require_value_audit_writer_for_origin(
+        profile,
+        name,
+        ProfileOrigin::Persisted,
+    ) {
+        return fail(&Envelope::<()>::err(&e));
+    }
+    let thresholds = stellar_agent_core::cross_check::ThresholdSet::from_profile_and_signed(
+        profile,
+        body.cross_check_thresholds.as_ref(),
+    );
+    let witness = match payment_witness_inputs(
+        &client,
+        PaymentObservations {
+            source_view: &built.source_account_view,
+            destination: &built.destination,
+            dest_view: built.dest_account_view.as_ref(),
+            memo: built.memo_observation,
+            asset: &built.asset,
+            amount_stroops: built.amount_stroops,
+        },
+    )
+    .await
+    {
+        Ok(witness) => witness,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    let cross_check = match obtain_classic_witness_bound(
+        profile,
+        &net_context,
+        stellar_agent_core::cross_check::CrossCheckValue::Amount {
+            asset: &witness.asset,
+            base_units: witness.base_units,
+        },
+        witness.inputs,
+        &built.envelope_xdr,
+        &thresholds,
+        "stellar_pay",
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+
+    let signer = match MainnetSignerChoice::from_flags(
+        args.sign_with_ledger,
+        args.account_index,
+        args.secret_env.as_deref(),
+        "pay-commit",
+    ) {
+        Ok(signer) => signer,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
+    };
+    match authorize_and_submit(MainnetWriteRequest {
+        context: &context,
+        profiles_dir: &profiles_dir,
+        verb: "pay",
+        tool: "stellar_pay",
+        consumer: MainnetConsumer::CliPay,
+        unsigned_xdr: &built.envelope_xdr,
+        client: &client,
+        probe_deadline: timeout,
+        submit_timeout: timeout,
+        source: inputs.source,
+        signer,
+        policy: &policy,
+        evaluation: &evaluation,
+        effective_cap,
+        witness: cross_check.witness(),
+    })
+    .await
+    {
+        Ok(submitted) => {
+            let result = PayResult {
+                envelope_xdr: submitted.signed_xdr,
+                tx_hash: Some(submitted.result.tx_hash.clone()),
+                ledger: Some(submitted.result.ledger),
+                stage: "build+sign+submit".to_owned(),
+                selected_fee_per_op_stroops: Some(built.fee_selection.per_op_stroops),
+                selected_fee_percentile: Some(built.fee_selection.selected_fee_percentile),
+                cross_check: Some(cross_check.view()),
+            };
+            print_success(&Envelope::ok(result), args.output);
+            0
+        }
+        Err(envelope) => fail(&envelope),
     }
 }
 
@@ -2342,12 +2641,18 @@ mod tests {
         );
     }
 
-    /// Mainnet is rejected at the `run` boundary: the keyring initializer is
-    /// never invoked and no request reaches the profile's endpoint.
+    /// A mainnet profile is refused before the keyring initializer runs and
+    /// before any request reaches an endpoint. Without `mainnet-write` the
+    /// write context refuses the build; with it, the injected loader's `http`
+    /// endpoint differs from the stored profile's `https` one, so the write
+    /// context refuses the merged view. Both refuse with
+    /// `network.mainnet_write_forbidden`.
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn mainnet_rejected_at_run_boundary() {
         crate::common::render::take_rendered_for_test();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let resolutions = crate::common::signer_ceremony::signer_resolutions_on_this_thread();
         let guard_rpc = wiremock::MockServer::start().await;
         let counter =
             stellar_agent_test_support::ConnectionCounter::start().expect("connection counter");
@@ -2386,10 +2691,15 @@ mod tests {
                         .build(),
                 )
             },
-            || panic!("mainnet must not initialize the keyring"),
+            crate::test_rpc::counting_initializer(&calls),
         )
         .await;
         assert_eq!(exit, 1, "mainnet must exit with code 1");
+        assert_eq!(calls.get(), 0, "the keyring is never initialized");
+        assert_eq!(
+            crate::common::signer_ceremony::signer_resolutions_on_this_thread(),
+            resolutions
+        );
         assert!(
             guard_rpc
                 .received_requests()
@@ -2410,11 +2720,14 @@ mod tests {
         );
     }
 
-    /// `--network mainnet` with no profile refuses before the keyring
-    /// initializer runs and before any request reaches `--rpc-url`.
+    /// `--network mainnet` against an absent profile, which synthesizes a
+    /// testnet profile, refuses as a network-flag mismatch before the keyring
+    /// initializer runs and before any request reaches `--rpc-url`. It is the
+    /// control for the flag check, which runs before any mainnet step.
     #[tokio::test]
     #[serial_test::serial]
     async fn mainnet_rejected_at_run_boundary_network_flag_without_profile_refuses() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
         let guard_rpc = wiremock::MockServer::start().await;
         let guard_home = tempfile::tempdir().expect("home");
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
@@ -2452,10 +2765,11 @@ mod tests {
                     },
                 )
             },
-            || panic!("network mismatch must not initialize the keyring"),
+            crate::test_rpc::counting_initializer(&calls),
         )
         .await;
         assert_eq!(exit, 1, "mainnet must exit with code 1");
+        assert_eq!(calls.get(), 0, "the keyring is never initialized");
         assert!(
             guard_rpc
                 .received_requests()
@@ -2463,6 +2777,153 @@ mod tests {
                 .expect("requests")
                 .is_empty()
         );
+    }
+
+    /// A staged mode on a mainnet profile refuses before the keyring and
+    /// before any request in a build without mainnet writes. `name` is the
+    /// fixture profile of a build with mainnet writes; this build refuses
+    /// every mainnet profile and uses the guard fixture's.
+    #[cfg(not(feature = "mainnet-write"))]
+    async fn assert_mode_refused(name: &'static str, stage: impl FnOnce(&mut PayArgs)) {
+        let _ = name;
+        crate::common::render::take_rendered_for_test();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let resolutions = crate::common::signer_ceremony::signer_resolutions_on_this_thread();
+        let guard_rpc = wiremock::MockServer::start().await;
+        let (_guard_dir, _guard_home, _guard_env) =
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(
+                "https://rpc.example.invalid",
+            );
+        let mut args = minimal_args();
+        args.profile = Some("guard-mainnet".to_owned());
+        args.network = None;
+        args.rpc_url = None;
+        args.source = Some(SOURCE_G.to_owned());
+        args.destination = DEST_G.to_owned();
+        args.secret_env = Some("PAY_MODE_REFUSAL_SK".to_owned());
+        stage(&mut args);
+        let exit = run_with_dependencies(
+            &args,
+            crate::test_rpc::ImplicitSelection::loader(&guard_rpc.uri()),
+            crate::test_rpc::counting_initializer(&calls),
+        )
+        .await;
+        assert_eq!(exit, 1);
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert_eq!(
+            rendered[0]["error"]["code"],
+            "network.mainnet_write_forbidden"
+        );
+        assert_eq!(calls.get(), 0, "the keyring is never initialized");
+        assert!(guard_rpc.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            crate::common::signer_ceremony::signer_resolutions_on_this_thread(),
+            resolutions
+        );
+    }
+
+    /// A staged mode on the fixture's mainnet profile, whose every proof is
+    /// valid and whose full-mode run would submit, refuses before the keyring
+    /// and before any request. `name` is the fixture's profile, unique in
+    /// the process because the audit writer registry is process-wide.
+    #[cfg(feature = "mainnet-write")]
+    async fn assert_mode_refused(name: &'static str, stage: impl FnOnce(&mut PayArgs)) {
+        let fixture = crate::common::mainnet_write_fixture::Spec::new(name)
+            .build()
+            .await;
+        let resolutions = crate::common::signer_ceremony::signer_resolutions_on_this_thread();
+        let mut args = mainnet_full::mainnet_args(&fixture);
+        stage(&mut args);
+        let run = mainnet_full::run(&fixture, &args).await;
+        assert_eq!(run.code, 1, "{}", run.envelope);
+        assert_eq!(
+            run.envelope["error"]["code"], "network.mainnet_write_forbidden",
+            "{}",
+            run.envelope
+        );
+        assert_eq!(
+            fixture.initializer_calls(),
+            0,
+            "the keyring is never initialized"
+        );
+        assert!(fixture.primary_methods().await.is_empty());
+        assert!(fixture.oracle_methods().await.is_empty());
+        assert_eq!(
+            crate::common::signer_ceremony::signer_resolutions_on_this_thread(),
+            resolutions
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn build_only_is_refused_on_mainnet() {
+        assert_mode_refused("mainnet-pay-build-only", |args| args.build_only = true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn sign_only_is_refused_on_mainnet() {
+        let envelope =
+            stellar_agent_test_support::signed_envelope::SignedTestEnvelope::builder([0x61; 32])
+                .unsigned()
+                .build();
+        assert_mode_refused("mainnet-pay-sign-only", |args| {
+            args.sign_only = Some(envelope.envelope_xdr().to_owned())
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn submit_only_is_refused_on_mainnet() {
+        let envelope =
+            stellar_agent_test_support::signed_envelope::SignedTestEnvelope::for_source([0x61; 32]);
+        assert_mode_refused("mainnet-pay-submit-only", |args| {
+            args.submit_only = Some(envelope.envelope_xdr().to_owned())
+        })
+        .await;
+    }
+
+    /// A mainnet profile selected without `--profile` refuses before the
+    /// keyring, in both builds.
+    async fn assert_implicit_selection_refused(source: crate::test_rpc::ImplicitSource) {
+        crate::common::render::take_rendered_for_test();
+        let selection = crate::test_rpc::ImplicitSelection::new(source);
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut args = minimal_args();
+        args.profile = None;
+        args.network = None;
+        args.rpc_url = None;
+        args.source = Some(SOURCE_G.to_owned());
+        args.destination = DEST_G.to_owned();
+        args.secret_env = Some("PAY_IMPLICIT_SK".to_owned());
+        let exit = run_with_dependencies(
+            &args,
+            crate::test_rpc::ImplicitSelection::loader("https://rpc.example.invalid"),
+            crate::test_rpc::counting_initializer(&calls),
+        )
+        .await;
+        assert_eq!(exit, 1);
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(
+            rendered[0]["error"]["code"], "profile.mainnet_requires_explicit_profile",
+            "{}: {rendered:?}",
+            selection.name
+        );
+        assert_eq!(calls.get(), 0, "the keyring is never initialized");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn a_mainnet_profile_named_by_the_variable_refuses() {
+        assert_implicit_selection_refused(crate::test_rpc::ImplicitSource::Env).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn a_mainnet_profile_saved_as_default_refuses() {
+        assert_implicit_selection_refused(crate::test_rpc::ImplicitSource::Default).await;
     }
 
     // Note: decode_32_hex_bytes and hex_nibble are now in
@@ -5031,5 +5492,1462 @@ mod tests {
                 .unwrap()
                 .contains("policy.sequence_rollback")
         );
+    }
+
+    /// The mainnet pipeline over the fixture's stored profile, ceremony and
+    /// routed endpoints.
+    #[cfg(feature = "mainnet-write")]
+    mod mainnet_full {
+        use super::*;
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        use serde_json::{Value, json};
+        use stellar_agent_core::error::{AuthError, WalletStateError};
+        use stellar_agent_core::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
+        use stellar_agent_network::mainnet::{MainnetAuthorizationError, MainnetPrecondition};
+        use stellar_agent_test_support::WarningCapture;
+        use stellar_agent_test_support::signed_envelope::{
+            get_network_result, send_transaction_hash_hex,
+        };
+        use stellar_agent_test_support::xdr_fixtures::{
+            account_entry_xdr_with_seq, account_ledger_key_xdr,
+        };
+
+        use crate::common::mainnet_write::{
+            bound_recorders_on_this_thread, invalidations_on_this_thread,
+        };
+        use crate::common::mainnet_write_fixture::{
+            AGENT_SEED, AGENT_VAR, DESTINATION, ISSUER, MainnetFixture, Spec,
+            install_ledger_double, minimum_reserve, open_authorizations_of, pay_rule,
+            pay_rule_capped,
+        };
+        use crate::common::signer_ceremony::{
+            env_signatures_on_this_thread, signer_resolutions_on_this_thread,
+        };
+        use crate::test_rpc::{ACCOUNT_SEQUENCE, ClassicRpc, last_rendered};
+
+        /// The native balance the mocked endpoints report for every account.
+        const BALANCE: i64 = 100_000_000_000;
+        /// The protocol reserve of an account without subentries.
+        const RESERVE: i64 = 10_000_000;
+        /// The amount of [`mainnet_args`]: 1 XLM.
+        const AMOUNT: i64 = 10_000_000;
+        /// How far a test's fixed mainnet clock runs ahead of the system
+        /// clock: the confirmation entry is created on the system clock, and
+        /// the resolver refuses an entry created after its own now.
+        const CLOCK_LEAD_MS: u64 = 5_000;
+
+        /// A 1 XLM payment from the agent to the allowlisted destination on
+        /// the fixture's profile, signed from [`AGENT_VAR`].
+        pub(super) fn mainnet_args(fixture: &MainnetFixture) -> PayArgs {
+            let mut args = minimal_args();
+            args.profile = Some(fixture.name.to_owned());
+            args.network = None;
+            args.rpc_url = None;
+            args.source = Some(fixture.agent.g.clone());
+            args.destination = DESTINATION.to_owned();
+            args.amount = "1 XLM".to_owned();
+            args.secret_env = Some(AGENT_VAR.to_owned());
+            args
+        }
+
+        /// [`mainnet_args`] with a memo, so no witness is in play below the
+        /// threshold.
+        fn memo_args(fixture: &MainnetFixture) -> PayArgs {
+            let mut args = mainnet_args(fixture);
+            args.memo_text = Some("invoice 7".to_owned());
+            args
+        }
+
+        /// One run of the verb: its exit code and the envelope it printed.
+        pub(super) struct Run {
+            pub(super) code: i32,
+            pub(super) envelope: Value,
+        }
+
+        impl Run {
+            fn code(&self) -> &str {
+                self.envelope["error"]["code"].as_str().unwrap_or("")
+            }
+            fn message(&self) -> &str {
+                self.envelope["error"]["message"].as_str().unwrap_or("")
+            }
+        }
+
+        pub(super) async fn run(fixture: &MainnetFixture, args: &PayArgs) -> Run {
+            crate::common::render::take_rendered_for_test();
+            let code = run_with_dependencies(args, fixture.loader(), fixture.initializer()).await;
+            Run {
+                code,
+                envelope: last_rendered(),
+            }
+        }
+
+        fn now() -> u64 {
+            stellar_agent_core::timefmt::now_unix_ms().unwrap()
+        }
+
+        /// The authorization clock, which a test may hold fixed.
+        fn mainnet_now() -> u64 {
+            stellar_agent_network::mainnet::clock::now_ms().unwrap()
+        }
+
+        /// Every authorization record of the window store, open or settled.
+        fn records(fixture: &MainnetFixture) -> Vec<Value> {
+            if !fixture.window_path().exists() {
+                return Vec::new();
+            }
+            fixture.window_body()["authorizations"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        /// Asserts a refusal with `code` that left no authorization record,
+        /// no pending entry and nothing sent.
+        async fn assert_refused_before_confirmation(
+            fixture: &MainnetFixture,
+            run: &Run,
+            code: &str,
+        ) {
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(run.code(), code, "{}", run.envelope);
+            assert!(records(fixture).is_empty(), "no authorization record");
+            assert!(
+                fixture.pending_entries().is_empty(),
+                "no confirmation entry"
+            );
+            assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+        }
+
+        /// Asserts a refusal with `code` after the confirmation and before
+        /// the mint: the withheld sentence, no record, the confirmation entry
+        /// pending and not tombstoned, nothing sent.
+        async fn assert_withheld_before_the_mint(fixture: &MainnetFixture, run: &Run, code: &str) {
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(run.code(), code, "{}", run.envelope);
+            assert!(records(fixture).is_empty(), "no authorization record");
+            let entries = fixture.pending_entries();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            assert_eq!(entries[0].kind_name, "PaymentSimulated");
+            assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+            assert!(invalidations_on_this_thread().is_empty());
+        }
+
+        /// Asserts the one invalidation of the run.
+        fn assert_invalidated(stage: &str, result: Result<(), MainnetAuthorizationError>) {
+            assert_eq!(invalidations_on_this_thread(), vec![(stage, result)]);
+        }
+
+        /// The `precondition` field of each warning whose message is the
+        /// refusal log line and whose `path` is `path`.
+        fn refusal_warnings(capture: &WarningCapture, path: &str) -> Vec<String> {
+            capture
+                .seen()
+                .into_iter()
+                .filter(|event| {
+                    event.get("message").map(String::as_str)
+                        == Some("mainnet authorization refused")
+                        && event.get("path").map(String::as_str) == Some(&format!("{path:?}"))
+                })
+                .map(|event| event.get("precondition").cloned().unwrap_or_default())
+                .collect()
+        }
+
+        /// Asserts that `envelope` carries no time bounds or other
+        /// preconditions.
+        fn assert_no_preconditions(envelope: &str) {
+            use stellar_xdr::{Limits, Preconditions, ReadXdr as _, TransactionEnvelope};
+            let TransactionEnvelope::Tx(v1) =
+                TransactionEnvelope::from_xdr_base64(envelope, Limits::none()).unwrap()
+            else {
+                panic!("not a v1 envelope");
+            };
+            assert_eq!(v1.tx.cond, Preconditions::None);
+        }
+
+        /// The agent account at `balance` as `getLedgerEntries` answers it.
+        fn agent_entries(balance: i64) -> Value {
+            let agent =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+            json!({
+                "entries": [{
+                    "key": account_ledger_key_xdr(&agent),
+                    "xdr": account_entry_xdr_with_seq(&agent, balance, 0, ACCOUNT_SEQUENCE),
+                    "lastModifiedLedgerSeq": 1000
+                }],
+                "latestLedger": 1001
+            })
+        }
+
+        fn accounts() -> ClassicRpc {
+            let agent =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+            ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER])
+        }
+
+        /// Accept: a payment with a memo below the threshold needs no
+        /// witness. It is sent once, signed by the enrolled key over the
+        /// mainnet payload, consumes its authorization, tombstones its
+        /// confirmation entry and never reaches the oracle.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn accept_with_a_memo_below_the_threshold() {
+            let fixture = Spec::new("mainnet-pay-accept-memo").build().await;
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1);
+            fixture.assert_signed_by_agent(&sent[0]);
+            assert_no_preconditions(&sent[0]);
+            let data = &run.envelope["data"];
+            assert_eq!(data["envelope_xdr"], sent[0]);
+            assert_eq!(data["stage"], "build+sign+submit");
+            assert_eq!(data["ledger"], 1005);
+            assert_eq!(data["tx_hash"].as_str().unwrap().len(), 64);
+            assert_eq!(data["selected_fee_per_op_stroops"], "100");
+            assert_eq!(data["cross_check"]["status"], "not_required");
+            assert!(fixture.open_authorizations(now()).is_empty());
+            assert!(invalidations_on_this_thread().is_empty());
+            let entries = fixture.pending_entries();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            assert_eq!(entries[0].kind_name, "Consumed");
+            assert!(fixture.oracle_methods().await.is_empty());
+            assert_eq!(fixture.initializer_calls(), 1);
+        }
+
+        /// Accept: a memo-less payment reaches the oracle through the route
+        /// map, and the witness passes.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn accept_without_a_memo_reaches_the_oracle() {
+            let fixture = Spec::new("mainnet-pay-accept-memoless").build().await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1);
+            fixture.assert_signed_by_agent(&sent[0]);
+            assert_eq!(run.envelope["data"]["cross_check"]["status"], "passed");
+            assert!(!fixture.oracle_methods().await.is_empty());
+            assert!(fixture.open_authorizations(now()).is_empty());
+            assert!(invalidations_on_this_thread().is_empty());
+            assert_eq!(fixture.pending_entries()[0].kind_name, "Consumed");
+        }
+
+        /// Engine kind: a Noop profile refuses at the engine check, naming the
+        /// engine, before the keyring and before any request.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_noop_engine_refuses_before_the_keyring() {
+            let fixture = Spec::new("mainnet-pay-noop").noop_engine().build().await;
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(run.code, 1);
+            assert_eq!(run.code(), "network.mainnet_write_forbidden");
+            assert!(run.message().contains("Noop"), "{}", run.message());
+            assert_eq!(fixture.initializer_calls(), 0);
+            assert!(fixture.primary_methods().await.is_empty());
+        }
+
+        /// Engine proofs: a signed policy without a `[mainnet]` table refuses
+        /// with the message naming the table and the ceremony step, before
+        /// any confirmation entry.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_policy_without_the_mainnet_table_refuses() {
+            let fixture = Spec::new("mainnet-pay-pre-enable")
+                .pre_enable()
+                .build()
+                .await;
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "network.mainnet_write_forbidden")
+                .await;
+            assert!(run.message().contains("[mainnet]"), "{}", run.message());
+            assert!(
+                run.message().contains("profile enable-mainnet"),
+                "{}",
+                run.message()
+            );
+        }
+
+        /// Engine proofs: without the enablement nonce entry the enablement
+        /// does not verify.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_removed_enablement_nonce_refuses() {
+            let fixture = Spec::new("mainnet-pay-nonce-removed").build().await;
+            let profile = fixture.profile();
+            let nonce = stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
+                &profile.policy_window_state_key_id,
+            );
+            fixture.delete_keyring_entry(&nonce);
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_refused_before_confirmation(
+                &fixture,
+                &run,
+                "profile.mainnet_enablement_invalid",
+            )
+            .await;
+        }
+
+        /// Engine proofs: a tampered policy signature fails the engine build.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_tampered_policy_signature_refuses() {
+            let fixture = Spec::new("mainnet-pay-tampered").build().await;
+            fixture.tamper_policy_signature();
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "policy.engine_unavailable").await;
+        }
+
+        /// Enrollment: a placeholder pin refuses before the confirmation.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_placeholder_pin_refuses_before_the_confirmation() {
+            let fixture = Spec::new("mainnet-pay-unpinned").build().await;
+            fixture.unpin_signer();
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "auth.enrolled_signer_unpinned")
+                .await;
+            fixture.assert_terminal_untouched();
+        }
+
+        /// Enrollment: a `--source` other than the enrolled key refuses with
+        /// the identity rule.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_source_other_than_the_enrolled_key_refuses() {
+            let fixture = Spec::new("mainnet-pay-other-source")
+                .primary(accounts().with_entry(
+                    account_ledger_key_xdr(DEST_G),
+                    account_entry_xdr_with_seq(DEST_G, BALANCE, 0, ACCOUNT_SEQUENCE),
+                ))
+                .build()
+                .await;
+            let mut args = memo_args(&fixture);
+            args.source = Some(DEST_G.to_owned());
+            args.destination = DESTINATION.to_owned();
+
+            let run = run(&fixture, &args).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "auth.enrolled_identity_unusable")
+                .await;
+            assert!(
+                run.message().contains("public_key_mismatch"),
+                "{}",
+                run.message()
+            );
+            fixture.assert_terminal_untouched();
+        }
+
+        /// Enrollment: the Ledger choice with an unenrolled key names the
+        /// enrollment limit.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_ledger_choice_with_an_unenrolled_key_names_the_limit() {
+            let fixture = Spec::new("mainnet-pay-ledger-unpinned").build().await;
+            fixture.unpin_signer();
+            let mut args = memo_args(&fixture);
+            args.secret_env = None;
+            args.sign_with_ledger = true;
+
+            let run = run(&fixture, &args).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "auth.enrolled_signer_unpinned")
+                .await;
+            assert!(
+                run.message()
+                    .contains("A Ledger key cannot be enrolled as the mainnet signer"),
+                "{}",
+                run.message()
+            );
+        }
+
+        /// Signer choice: no signer flag refuses before the confirmation.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn no_signer_flag_refuses_before_the_confirmation() {
+            let fixture = Spec::new("mainnet-pay-no-signer").build().await;
+            let mut args = memo_args(&fixture);
+            args.secret_env = None;
+
+            let run = run(&fixture, &args).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "validation.signer_source_required")
+                .await;
+        }
+
+        /// Asserts a confirmation refusal with `code`: no record, the
+        /// testnet signing helpers never ran, nothing sent.
+        async fn assert_confirmation_refused(fixture: &MainnetFixture, run: &Run, code: &str) {
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(run.code(), code, "{}", run.envelope);
+            assert!(records(fixture).is_empty(), "no authorization record");
+            assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+        }
+
+        /// Confirmation: without a terminal the confirmation refuses.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_confirmation_requires_a_terminal() {
+            let mut fixture = Spec::new("mainnet-pay-confirm-tty").build().await;
+            fixture.terminal(false, false);
+            let before = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_confirmation_refused(&fixture, &run, "confirm.tty_required").await;
+            assert_eq!(signer_resolutions_on_this_thread(), before);
+            assert!(fixture.prompts().is_empty());
+        }
+
+        /// Confirmation: a typed name other than the profile's refuses.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_confirmation_refuses_another_name() {
+            let mut fixture = Spec::new("mainnet-pay-confirm-name").build().await;
+            fixture.answer_with(|_| Ok(Some("another-profile".to_owned())));
+            let before = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_confirmation_refused(&fixture, &run, "confirm.profile_name_mismatch").await;
+            assert_eq!(signer_resolutions_on_this_thread(), before);
+        }
+
+        /// Confirmation: end of input refuses as unavailable input.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_confirmation_refuses_end_of_input() {
+            let mut fixture = Spec::new("mainnet-pay-confirm-eof").build().await;
+            fixture.answer_with(|_| Ok(None));
+            let before = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_confirmation_refused(&fixture, &run, "confirm.input_unavailable").await;
+            assert_eq!(signer_resolutions_on_this_thread(), before);
+        }
+
+        /// Confirmation: a read error refuses as unavailable input.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_confirmation_refuses_a_read_error() {
+            let mut fixture = Spec::new("mainnet-pay-confirm-read").build().await;
+            fixture.answer_with(|_| Err(std::io::Error::other("terminal gone")));
+            let before = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_confirmation_refused(&fixture, &run, "confirm.input_unavailable").await;
+            assert_eq!(signer_resolutions_on_this_thread(), before);
+        }
+
+        /// Confirmation: an unwritable approval directory refuses with the
+        /// store's code.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_confirmation_refuses_an_unwritable_approval_directory() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let fixture = Spec::new("mainnet-pay-confirm-store").build().await;
+            let dir = fixture
+                .approval_store_path()
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let before = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert!(run.code().starts_with("approval."), "{}", run.envelope);
+            assert!(records(&fixture).is_empty());
+            assert!(fixture.sent_envelopes().await.is_empty());
+            assert_eq!(signer_resolutions_on_this_thread(), before);
+        }
+
+        /// Confirmation origin: the consent row names the mainnet
+        /// confirmation and the pay tool.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_consent_row_names_the_confirmation_and_the_pay_tool() {
+            let fixture = Spec::new("mainnet-pay-origin").build().await;
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let rows = fixture.audit_rows("approval_attested");
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["origin"], "cli-mainnet-confirm");
+            assert_eq!(rows[0]["gated_tool"], "stellar_pay");
+        }
+
+        /// Pending store scope: the confirmation closes its store, so the
+        /// recorder tombstones the entry in the same run and nothing remains
+        /// owed.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_entry_is_tombstoned_in_the_same_run() {
+            let fixture = Spec::new("mainnet-pay-store-scope").build().await;
+            let (capture, _guard) = WarningCapture::capture(None);
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let entries = fixture.pending_entries();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].kind_name, "Consumed");
+            assert!(
+                !capture.seen().iter().any(|event| event
+                    .get("message")
+                    .is_some_and(|m| m.contains("approval consumption remains owed"))),
+                "{:?}",
+                capture.seen()
+            );
+        }
+
+        /// RequireApproval: the confirmation entry lives the rule's TTL and
+        /// the submission rows carry the decision.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn require_approval_confirms_with_the_rule_ttl() {
+            let fixture = Spec::new("mainnet-pay-require-approval")
+                .rules(vec![pay_rule("require_approval", "")])
+                .build()
+                .await;
+            let store_paths = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let observed = Rc::clone(&store_paths);
+            let mut fixture = fixture;
+            let name = fixture.name.to_owned();
+            let store = fixture.approval_store_path();
+            fixture.answer_with(move |_| {
+                observed.borrow_mut().push(store.clone());
+                Ok(Some(name.clone()))
+            });
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(
+                store_paths.borrow().len(),
+                1,
+                "the run reached the confirmation"
+            );
+            let entries = fixture.pending_entries();
+            assert_eq!(entries.len(), 1);
+            // `governing_ttl_ms` of an evaluation whose one matching rule
+            // requires approval is that rule's `ttl_secs`, 300 seconds.
+            assert_eq!(
+                entries[0].expires_at_unix_ms - entries[0].created_at_unix_ms,
+                300_000
+            );
+            for kind in ["value_action_pending", "value_action_submitted"] {
+                let rows = fixture.audit_rows(kind);
+                assert_eq!(rows.len(), 1, "{kind}: {rows:?}");
+                assert_eq!(rows[0]["policy_decision"], "require_approval", "{kind}");
+            }
+        }
+
+        /// Slow confirmation: the readiness proof is taken after the
+        /// confirmation, so a confirmation slower than its lifetime still
+        /// submits.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_slow_confirmation_keeps_the_readiness_fresh() {
+            let mut fixture = Spec::new("mainnet-pay-slow-confirm").build().await;
+            let clock = Rc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
+                now() + CLOCK_LEAD_MS,
+            ));
+            let advance = Rc::clone(&clock);
+            let name = fixture.name.to_owned();
+            fixture.answer_with(move |_| {
+                // The operator answers one second past the readiness lifetime
+                // of a proof made when the prompt appeared.
+                let prompted_at = stellar_agent_network::mainnet::clock::now_ms().unwrap();
+                advance.set(
+                    prompted_at
+                        + (stellar_agent_network::mainnet::resolve::MAINNET_AUDIT_READINESS_TTL_SECONDS
+                            + 1)
+                            * 1000,
+                );
+                Ok(Some(name.clone()))
+            });
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            drop(clock);
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(fixture.sent_envelopes().await.len(), 1);
+        }
+
+        /// Fee cap: the signed cap below the profile's governs.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_signed_fee_cap_below_the_profile_cap_governs() {
+            let fixture = Spec::new("mainnet-pay-fee-cap")
+                .profile_fee_cap(Some(1000))
+                .signed_fee_cap(200)
+                .build()
+                .await;
+            let mut args = memo_args(&fixture);
+            args.fee = Some("500".to_owned());
+
+            let run = run(&fixture, &args).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "fees.percentile_exceeds_cap").await;
+            assert!(run.message().contains("200"), "{}", run.message());
+        }
+
+        /// Initializer failure: its code, before any request.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_initializer_failure_refuses_before_any_request() {
+            let fixture = Spec::new("mainnet-pay-init-failure").build().await;
+            crate::common::render::take_rendered_for_test();
+            let code = run_with_dependencies(&memo_args(&fixture), fixture.loader(), || {
+                Err(WalletError::Auth(AuthError::KeyringConfigInvalid {
+                    detail: "fixture".to_owned(),
+                }))
+            })
+            .await;
+            let envelope = last_rendered();
+
+            assert_eq!(code, 1);
+            assert_eq!(envelope["error"]["code"], "auth.keyring_config_invalid");
+            assert!(fixture.primary_methods().await.is_empty());
+            assert!(fixture.pending_entries().is_empty());
+        }
+
+        /// Early probe: another passphrase at the first probe refuses before
+        /// the oracle and before the confirmation.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_early_probe_refuses_another_network() {
+            let fixture = Spec::new("mainnet-pay-early-probe")
+                .primary(accounts().with_script(|method, index, _| {
+                    (method == "getNetwork" && index == 0)
+                        .then(|| get_network_result(TESTNET_PASSPHRASE))
+                }))
+                .build()
+                .await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(
+                run.code(),
+                "network.endpoint_network_mismatch",
+                "{}",
+                run.envelope
+            );
+            assert!(fixture.oracle_methods().await.is_empty());
+            assert!(fixture.pending_entries().is_empty());
+            assert!(records(&fixture).is_empty());
+        }
+
+        /// After the confirmation, before the mint: a receipt directory the
+        /// recorder cannot open withholds the signature and leaves the entry
+        /// pending.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_unavailable_receipt_store_withholds_the_signature() {
+            let fixture = Spec::new("mainnet-pay-receipts").build().await;
+            let receipts = stellar_agent_core::profile::receipt::default_receipts_dir().unwrap();
+            if receipts.exists() {
+                std::fs::remove_dir_all(&receipts).unwrap();
+            }
+            std::fs::create_dir_all(receipts.parent().unwrap()).unwrap();
+            std::fs::write(&receipts, b"not a directory").unwrap();
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_withheld_before_the_mint(&fixture, &run, "submission.record_unavailable").await;
+            assert!(
+                run.message()
+                    .ends_with(" The signature was withheld and nothing was sent."),
+                "{}",
+                run.message()
+            );
+        }
+
+        /// After the confirmation, before the mint: the resolver's own probe
+        /// meeting another network refuses with the withheld text and one
+        /// warning, from the resolver.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_resolver_probe_refuses_another_network() {
+            let fixture = Spec::new("mainnet-pay-resolver-probe")
+                .primary(accounts().with_script(|method, index, _| {
+                    (method == "getNetwork" && index == 1)
+                        .then(|| get_network_result(TESTNET_PASSPHRASE))
+                }))
+                .build()
+                .await;
+            let (capture, _guard) = WarningCapture::capture(None);
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_withheld_before_the_mint(
+                &fixture,
+                &run,
+                "network.mainnet_authorization_refused",
+            )
+            .await;
+            assert_eq!(
+                run.message(),
+                "the mainnet write was refused; the signature was withheld and nothing was sent"
+            );
+            let all: Vec<_> = capture
+                .seen()
+                .into_iter()
+                .filter(|event| {
+                    event.get("message").map(String::as_str)
+                        == Some("mainnet authorization refused")
+                })
+                .collect();
+            assert_eq!(all.len(), 1, "{all:?}");
+            assert_eq!(
+                refusal_warnings(&capture, "resolve_tx_sign"),
+                vec!["\"endpoint_not_mainnet\"".to_owned()]
+            );
+        }
+
+        /// Resolver policy denial: the resolver's own source read crosses the
+        /// reserve, so it denies with the criterion's code and the withheld
+        /// sentence, leaving the entry pending and nothing minted.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_resolver_policy_denial_keeps_the_deny_code() {
+            let fixture = Spec::new("mainnet-pay-resolver-deny")
+                .rules(vec![pay_rule("allow", &minimum_reserve(0))])
+                .primary(accounts().with_script(|method, index, _| {
+                    (method == "getLedgerEntries" && index == 2)
+                        .then(|| agent_entries(RESERVE + AMOUNT))
+                }))
+                .build()
+                .await;
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert!(run.code().starts_with("policy.deny."), "{}", run.envelope);
+            assert!(
+                run.message()
+                    .ends_with(" The signature was withheld and nothing was sent."),
+                "{}",
+                run.message()
+            );
+            assert_eq!(fixture.pending_entries()[0].kind_name, "PaymentSimulated");
+            assert!(fixture.open_authorizations(now()).is_empty());
+            assert!(records(&fixture).is_empty());
+            assert!(invalidations_on_this_thread().is_empty());
+        }
+
+        /// Seed deferral: with the variable unset, the confirmation still
+        /// refuses first, so the seed is not read before it.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_unset_seed_variable_is_not_read_before_the_confirmation() {
+            let mut fixture = Spec::new("mainnet-pay-seed-order").build().await;
+            fixture.terminal(false, false);
+            let mut args = memo_args(&fixture);
+            args.secret_env = Some("STELLAR_AGENT_MAINNET_FIXTURE_UNSET_SK".to_owned());
+            let before = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code(), "confirm.tty_required", "{}", run.envelope);
+            assert_eq!(signer_resolutions_on_this_thread(), before);
+        }
+
+        /// Seed deferral: with the variable unset, the run reaches the
+        /// signing call, which refuses after the mint.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_unset_seed_variable_refuses_at_the_signing_call() {
+            let fixture = Spec::new("mainnet-pay-seed-unset").build().await;
+            let mut args = memo_args(&fixture);
+            args.secret_env = Some("STELLAR_AGENT_MAINNET_FIXTURE_UNSET_SK".to_owned());
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(
+                run.code(),
+                "validation.secret_env_not_set",
+                "{}",
+                run.envelope
+            );
+            assert!(
+                run.message()
+                    .ends_with(" The signature was withheld and nothing was sent.")
+            );
+            assert_invalidated("sign_refused", Ok(()));
+            assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// Runs a payment whose seed variable holds `secret`.
+        async fn run_with_seed(name: &'static str, secret: &str) -> (MainnetFixture, Run) {
+            let fixture = Spec::new(name).build().await;
+            let var = "STELLAR_AGENT_MAINNET_FIXTURE_OTHER_SK";
+            #[allow(
+                unsafe_code,
+                reason = "test-only env mutation; serialised by #[serial]"
+            )]
+            // SAFETY: the test is #[serial]; no other thread reads the
+            // environment while it changes.
+            unsafe {
+                std::env::set_var(var, secret);
+            }
+            let mut args = memo_args(&fixture);
+            args.secret_env = Some(var.to_owned());
+            let run = run(&fixture, &args).await;
+            #[allow(unsafe_code, reason = "test-only env cleanup")]
+            // SAFETY: same as above.
+            unsafe {
+                std::env::remove_var(var);
+            }
+            (fixture, run)
+        }
+
+        /// Env seed: a value that is not a secret seed refuses at the signing
+        /// call.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_invalid_seed_refuses_at_the_signing_call() {
+            let (fixture, run) = run_with_seed("mainnet-pay-seed-invalid", "not-a-seed").await;
+
+            assert_eq!(
+                run.code(),
+                "validation.secret_env_invalid",
+                "{}",
+                run.envelope
+            );
+            assert_invalidated("sign_refused", Ok(()));
+            assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// Env seed: a public key in place of the seed refuses at the signing
+        /// call.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_public_key_in_place_of_the_seed_refuses() {
+            let (fixture, run) = run_with_seed("mainnet-pay-seed-public", DESTINATION).await;
+
+            assert_eq!(
+                run.code(),
+                "validation.secret_env_invalid",
+                "{}",
+                run.envelope
+            );
+            assert_invalidated("sign_refused", Ok(()));
+            assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// Env seed: the seed of another key refuses before it signs.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_seed_of_another_key_refuses_before_it_signs() {
+            let other = stellar_strkey::ed25519::PrivateKey([0x5c; 32])
+                .as_unredacted()
+                .to_string()
+                .to_string();
+            let before = env_signatures_on_this_thread();
+            let (fixture, run) = run_with_seed("mainnet-pay-seed-other", &other).await;
+
+            assert_eq!(run.code(), "auth.signer_key_mismatch", "{}", run.envelope);
+            assert_eq!(env_signatures_on_this_thread(), before);
+            assert_invalidated("sign_refused", Ok(()));
+            assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// [`memo_args`] signing with the Ledger at index 0.
+        fn ledger_args(fixture: &MainnetFixture) -> PayArgs {
+            let mut args = memo_args(fixture);
+            args.secret_env = None;
+            args.sign_with_ledger = true;
+            args
+        }
+
+        /// Ledger order: the device is opened after the mint, and its calls
+        /// run constructor, public key, signature.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_ledger_is_opened_after_the_mint() {
+            let fixture = Spec::new("mainnet-pay-ledger-order").build().await;
+            let open = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let seen = Rc::clone(&open);
+            let name = fixture.name;
+            let (_ledger, calls) = install_ledger_double(
+                move || {
+                    seen.borrow_mut().push(open_authorizations_of(name, now()));
+                    Ok(())
+                },
+                || Ok(()),
+            );
+
+            let run = run(&fixture, &ledger_args(&fixture)).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let open = open.borrow();
+            assert_eq!(open.len(), 1);
+            assert_eq!(open[0].len(), 1, "{:?}", open[0]);
+            assert_eq!(open[0][0].consumer, MainnetConsumer::CliPay);
+            assert_eq!(
+                *calls.lock().unwrap(),
+                ["construct", "public_key", "sign_tx_payload"]
+            );
+        }
+
+        fn device_error() -> WalletError {
+            WalletError::WalletState(WalletStateError::HardwareNotFound)
+        }
+
+        /// Ledger refusals: a constructor failure means the signer was
+        /// unavailable.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_ledger_constructor_failure_is_signer_unavailable() {
+            let fixture = Spec::new("mainnet-pay-ledger-construct").build().await;
+            let (_ledger, _calls) = install_ledger_double(|| Err(device_error()), || Ok(()));
+
+            let run = run(&fixture, &ledger_args(&fixture)).await;
+
+            assert_eq!(run.code(), device_error().code(), "{}", run.envelope);
+            assert!(
+                run.message()
+                    .ends_with(" The signature was withheld and nothing was sent.")
+            );
+            assert_invalidated("signer_unavailable", Ok(()));
+        }
+
+        /// Ledger refusals: a refusal on the device means signing was
+        /// refused.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_ledger_user_refusal_is_sign_refused() {
+            let fixture = Spec::new("mainnet-pay-ledger-refused").build().await;
+            let (_ledger, _calls) = install_ledger_double(
+                || Ok(()),
+                || Err(WalletError::Auth(AuthError::HardwareUserRefused)),
+            );
+
+            let run = run(&fixture, &ledger_args(&fixture)).await;
+
+            assert_eq!(run.code(), "auth.hardware_user_refused", "{}", run.envelope);
+            assert_invalidated("sign_refused", Ok(()));
+            assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// Expiry at the attach: an authorization that expired before the
+        /// signature refuses before the device signs. The invalidation finds
+        /// the record already swept to expired, and the store releases its
+        /// holds.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_expired_authorization_refuses_at_the_attach() {
+            let fixture = Spec::new("mainnet-pay-expired-attach").build().await;
+            let clock = Rc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
+                now() + CLOCK_LEAD_MS,
+            ));
+            let advance = Rc::clone(&clock);
+            let minted = Rc::new(std::cell::Cell::new(0_u64));
+            let minted_at = Rc::clone(&minted);
+            let name = fixture.name;
+            let (_ledger, calls) = install_ledger_double(
+                move || {
+                    let open = open_authorizations_of(name, mainnet_now());
+                    minted_at.set(open[0].minted_at_ms);
+                    advance.set(open[0].expires_at_ms + 1);
+                    Ok(())
+                },
+                || Ok(()),
+            );
+
+            let run = run(&fixture, &ledger_args(&fixture)).await;
+
+            assert_eq!(
+                run.code(),
+                "network.mainnet_authorization_refused",
+                "{}",
+                run.envelope
+            );
+            assert_eq!(
+                run.message(),
+                "the mainnet write was refused; the signature was withheld and nothing was sent"
+            );
+            assert!(!calls.lock().unwrap().contains(&"sign_tx_payload"));
+            assert_invalidated(
+                "sign_refused",
+                Err(MainnetAuthorizationError::Refused(
+                    MainnetPrecondition::NotOpen,
+                )),
+            );
+            assert!(fixture.open_authorizations(minted.get()).is_empty());
+            let body = fixture.window_body();
+            let mut snapshots = vec![body.clone()];
+            if let Some(prepared) = body.get("prepared") {
+                snapshots.push(prepared.clone());
+            }
+            let mut listed = 0;
+            for snapshot in &snapshots {
+                for auth in snapshot["authorizations"].as_array().into_iter().flatten() {
+                    assert_eq!(auth["state"], "expired", "{auth}");
+                    listed += 1;
+                    let holds = snapshot["holds"].as_array().cloned().unwrap_or_default();
+                    assert!(
+                        !holds
+                            .iter()
+                            .any(|hold| hold["authorization_id"] == auth["id"]),
+                        "{snapshot}"
+                    );
+                }
+            }
+            assert!(listed >= 1, "{body}");
+            drop(clock);
+        }
+
+        /// Same-code submit stages: an expiry after the attach is the submit
+        /// gate's refusal.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_expiry_after_the_attach_is_the_submit_gate_refusal() {
+            let fixture = Spec::new("mainnet-pay-gate-expiry").build().await;
+            let clock = Arc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
+                now() + CLOCK_LEAD_MS,
+            ));
+            let advance = Arc::clone(&clock);
+            let name = fixture.name;
+            let (_ledger, _calls) = install_ledger_double(
+                || Ok(()),
+                move || {
+                    let expiry = open_authorizations_of(name, mainnet_now())[0].expires_at_ms;
+                    advance.set(expiry + 1);
+                    Ok(())
+                },
+            );
+
+            let run = run(&fixture, &ledger_args(&fixture)).await;
+
+            assert_eq!(
+                run.code(),
+                "network.mainnet_authorization_refused",
+                "{}",
+                run.envelope
+            );
+            assert_eq!(
+                run.message(),
+                "the mainnet write was refused; the submission was refused after signing and \
+                 nothing was sent"
+            );
+            assert_eq!(invalidations_on_this_thread().len(), 1);
+            assert_eq!(invalidations_on_this_thread()[0].0, "submit_gate_refused");
+            assert!(fixture.sent_envelopes().await.is_empty());
+            drop(clock);
+        }
+
+        /// Same-code submit stages: an expiry inside the pre-send hook is the
+        /// hook's refusal.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_expiry_inside_the_pre_send_hook_is_the_hooks_refusal() {
+            let clock = Arc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
+                now() + CLOCK_LEAD_MS,
+            ));
+            // The script lives on in the pooled mock server after the test,
+            // so it holds the clock weakly: the override ends with `clock`.
+            let advance = Arc::downgrade(&clock);
+            let fixture = Spec::new("mainnet-pay-hook-expiry")
+                .primary(accounts().with_script(move |method, index, _| {
+                    if method == "getNetwork"
+                        && index == 2
+                        && let Some(clock) = advance.upgrade()
+                    {
+                        clock.set(now() + 3_600_000);
+                    }
+                    None
+                }))
+                .build()
+                .await;
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(
+                run.code(),
+                "network.mainnet_authorization_refused",
+                "{}",
+                run.envelope
+            );
+            assert_eq!(
+                run.message(),
+                "the mainnet write was refused; the submission was refused after signing and \
+                 nothing was sent"
+            );
+            assert_eq!(invalidations_on_this_thread().len(), 1);
+            assert_eq!(invalidations_on_this_thread()[0].0, "pre_send_refused");
+            assert!(fixture.sent_envelopes().await.is_empty());
+            drop(clock);
+        }
+
+        /// Submit refusals: another network at the submit's own probe is the
+        /// submit gate's refusal, with its own code.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn another_network_at_the_submit_probe_is_the_gate_refusal() {
+            let fixture = Spec::new("mainnet-pay-submit-probe")
+                .primary(accounts().with_script(|method, index, _| {
+                    (method == "getNetwork" && index == 2)
+                        .then(|| get_network_result(TESTNET_PASSPHRASE))
+                }))
+                .build()
+                .await;
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(
+                run.code(),
+                "network.endpoint_network_mismatch",
+                "{}",
+                run.envelope
+            );
+            assert_eq!(invalidations_on_this_thread().len(), 1);
+            assert_eq!(invalidations_on_this_thread()[0].0, "submit_gate_refused");
+            assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// Submit refusals: a receipt already holding the source sequence is
+        /// the pre-send hook's refusal.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_claimed_receipt_is_the_pre_send_refusal() {
+            let fixture = Spec::new("mainnet-pay-claimed-receipt").build().await;
+            let receipts =
+                stellar_agent_core::profile::receipt::ReceiptStore::open(fixture.name).unwrap();
+            receipts
+                .try_begin(
+                    &"ab".repeat(32),
+                    &"cd".repeat(32),
+                    &fixture.agent.g,
+                    ACCOUNT_SEQUENCE + 1,
+                    0,
+                    1000,
+                )
+                .unwrap();
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(
+                run.code(),
+                "submission.tx_already_submitted",
+                "{}",
+                run.envelope
+            );
+            assert_eq!(invalidations_on_this_thread().len(), 1);
+            assert_eq!(invalidations_on_this_thread()[0].0, "pre_send_refused");
+            assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// Invalidation failure: a store the invalidation cannot write is
+        /// logged once by the helper, and the device's refusal is what the
+        /// operator sees.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_failed_invalidation_keeps_the_original_refusal() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let fixture = Spec::new("mainnet-pay-invalidation-failure").build().await;
+            let dir = fixture.window_path().parent().unwrap().to_path_buf();
+            let locked = dir.clone();
+            let (_ledger, _calls) = install_ledger_double(
+                move || {
+                    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+                        .unwrap();
+                    Err(device_error())
+                },
+                || Ok(()),
+            );
+            let (capture, _guard) = WarningCapture::capture(None);
+
+            let run = run(&fixture, &ledger_args(&fixture)).await;
+
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(run.code(), device_error().code(), "{}", run.envelope);
+            assert_invalidated(
+                "signer_unavailable",
+                Err(MainnetAuthorizationError::Refused(
+                    MainnetPrecondition::StoreUnavailable,
+                )),
+            );
+            assert_eq!(
+                refusal_warnings(&capture, "invalidate_unconsumed"),
+                vec!["\"store_unavailable\"".to_owned()]
+            );
+        }
+
+        /// The `sendTransaction` answer of a transaction the network refused
+        /// with a bad sequence.
+        fn refused_send(body: &Value) -> Value {
+            json!({
+                "status": "ERROR",
+                "hash": send_transaction_hash_hex(body, MAINNET_PASSPHRASE),
+                "latestLedger": 1001,
+                "latestLedgerCloseTime": "1700000000",
+                "errorResultXdr": "AAAAAAAAAGT////7AAAAAA=="
+            })
+        }
+
+        /// Consumed record: a send refused after the consume finds the record
+        /// used; the helper logs that once and the submit's code stays.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_refused_send_after_the_consume_keeps_the_submit_code() {
+            let fixture = Spec::new("mainnet-pay-consumed")
+                .primary(accounts().with_script(|method, _, body| {
+                    (method == "sendTransaction").then(|| refused_send(body))
+                }))
+                .build()
+                .await;
+            let (capture, _guard) = WarningCapture::capture(None);
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_ne!(run.code(), "network.mainnet_authorization_refused");
+            assert!(run.code().starts_with("submission."), "{}", run.envelope);
+            assert_invalidated(
+                "pre_send_refused",
+                Err(MainnetAuthorizationError::Refused(
+                    MainnetPrecondition::NotOpen,
+                )),
+            );
+            assert_eq!(
+                refusal_warnings(&capture, "invalidate_unconsumed"),
+                vec!["\"not_open\"".to_owned()]
+            );
+        }
+
+        /// Tombstone and holds: a refused send releases the payment's window
+        /// rows, so another payment under a cap admitting one succeeds.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_refused_send_releases_its_window_rows() {
+            let fixture = Spec::new("mainnet-pay-released")
+                .rules(vec![pay_rule_capped(AMOUNT, 100)])
+                .primary(accounts().with_script(|method, index, body| {
+                    (method == "sendTransaction" && index == 0).then(|| refused_send(body))
+                }))
+                .build()
+                .await;
+
+            let first = run(&fixture, &memo_args(&fixture)).await;
+            // Another payment, not a resend of the refused bytes, which the
+            // receipt gate keeps refusing.
+            let mut other = memo_args(&fixture);
+            other.memo_text = Some("invoice 8".to_owned());
+            let second = run(&fixture, &other).await;
+
+            assert_eq!(
+                first.code(),
+                "submission.tx_malformed",
+                "{}",
+                first.envelope
+            );
+            assert_eq!(second.code, 0, "{}", second.envelope);
+            assert_eq!(fixture.sent_envelopes().await.len(), 2);
+        }
+
+        /// Sizing: the native-pay rule's amount cap and rate limit each hold
+        /// one entry, and the bound recorder carries both.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_bound_recorder_carries_the_amount_and_call_entries() {
+            let fixture = Spec::new("mainnet-pay-sizing").build().await;
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let bound = bound_recorders_on_this_thread();
+            assert_eq!(bound.len(), 1);
+            assert!(bound[0].contains("window_entry_count: 2"), "{}", bound[0]);
+        }
+
+        /// Sizing: the amount cap counts each settled payment once, so the
+        /// third payment under a two-payment cap is denied.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_amount_cap_counts_each_payment_once() {
+            let fixture = Spec::new("mainnet-pay-amount-cap")
+                .rules(vec![pay_rule_capped(2 * AMOUNT, 100)])
+                .build()
+                .await;
+
+            let first = run(&fixture, &memo_args(&fixture)).await;
+            assert_eq!(first.code, 0, "{}", first.envelope);
+            assert_eq!(
+                fixture.pending_reservations(),
+                0,
+                "the first payment settled"
+            );
+            let second = run(&fixture, &memo_args(&fixture)).await;
+            assert_eq!(second.code, 0, "{}", second.envelope);
+            assert_eq!(
+                fixture.pending_reservations(),
+                0,
+                "the second payment settled"
+            );
+            let third = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(
+                third.code(),
+                "policy.deny.per_period_cap_exceeded",
+                "{}",
+                third.envelope
+            );
+        }
+
+        /// Sizing: the rate limit counts each settled payment once, so the
+        /// third payment under a two-call limit is denied.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_rate_limit_counts_each_payment_once() {
+            let fixture = Spec::new("mainnet-pay-rate-limit")
+                .rules(vec![pay_rule_capped(100 * AMOUNT, 2)])
+                .build()
+                .await;
+
+            let first = run(&fixture, &memo_args(&fixture)).await;
+            assert_eq!(first.code, 0, "{}", first.envelope);
+            assert_eq!(
+                fixture.pending_reservations(),
+                0,
+                "the first payment settled"
+            );
+            let second = run(&fixture, &memo_args(&fixture)).await;
+            assert_eq!(second.code, 0, "{}", second.envelope);
+            assert_eq!(
+                fixture.pending_reservations(),
+                0,
+                "the second payment settled"
+            );
+            let third = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(
+                third.code(),
+                "policy.deny.rate_limit_exceeded",
+                "{}",
+                third.envelope
+            );
+        }
+
+        /// The margin at which the 1 XLM debit alone passes the reserve and
+        /// the debit plus any fee crosses it.
+        const FEE_CROSSING_MARGIN: i64 = BALANCE - AMOUNT - RESERVE;
+
+        /// Fee in the policy arguments, mainnet: the fee alone crosses the
+        /// reserve, so the policy denies before the confirmation.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_fee_counts_toward_the_reserve_on_mainnet() {
+            let fixture = Spec::new("mainnet-pay-fee-reserve")
+                .rules(vec![pay_rule(
+                    "allow",
+                    &minimum_reserve(FEE_CROSSING_MARGIN),
+                )])
+                .build()
+                .await;
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_refused_before_confirmation(
+                &fixture,
+                &run,
+                "policy.deny.minimum_reserve_breached",
+            )
+            .await;
+        }
+
+        /// A testnet payment from the fixture's agent through its primary.
+        fn testnet_args(fixture: &MainnetFixture) -> PayArgs {
+            let mut args = memo_args(fixture);
+            args.network = None;
+            args
+        }
+
+        /// Fee in the policy arguments, testnet: the same rule denies the
+        /// full pipeline before it submits.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_fee_counts_toward_the_reserve_on_testnet() {
+            let fixture = Spec::new("testnet-pay-fee-reserve")
+                .testnet()
+                .primary(ClassicRpc::testnet(&[
+                    &stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED),
+                    DESTINATION,
+                ]))
+                .rules(vec![pay_rule(
+                    "allow",
+                    &minimum_reserve(FEE_CROSSING_MARGIN),
+                )])
+                .build()
+                .await;
+
+            let run = run(&fixture, &testnet_args(&fixture)).await;
+
+            assert_eq!(
+                run.code(),
+                "policy.deny.minimum_reserve_breached",
+                "{}",
+                run.envelope
+            );
+            assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// Build-only control: the build-only arguments carry no fee, so the
+        /// same rule admits the unsigned envelope.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn build_only_carries_no_fee_into_the_policy() {
+            let fixture = Spec::new("testnet-pay-build-only-reserve")
+                .testnet()
+                .primary(ClassicRpc::testnet(&[
+                    &stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED),
+                    DESTINATION,
+                ]))
+                .rules(vec![pay_rule(
+                    "allow",
+                    &minimum_reserve(FEE_CROSSING_MARGIN),
+                )])
+                .build()
+                .await;
+            let mut args = testnet_args(&fixture);
+            args.build_only = true;
+            args.secret_env = None;
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert!(
+                run.envelope["data"]["envelope_xdr"].is_string(),
+                "{}",
+                run.envelope
+            );
+        }
     }
 }

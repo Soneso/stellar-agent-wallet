@@ -6,14 +6,17 @@
 //! # Two-layer mainnet defence
 //!
 //! Structural refusals inspect the context's chain before signer access and
-//! any RPC request. They cover pay, claim, account creation and deployment,
-//! smart-account deployment, the signer writes, rules writes, execute,
-//! migration submit, timelock writes, and multicall. They also cover
-//! `vault deposit`, `vault withdraw`, `trade`, `trustline`, and `pool init`.
-//! Each answers `network.mainnet_write_forbidden` with exit code 1. The submit
-//! layer also checks the endpoint and passphrase. `rules verify-pins`,
-//! `signers list`, and `signers refresh` have no structural refusal: they load
-//! no signing key, sign nothing, and write nothing on chain.
+//! any RPC request. They cover account deployment, smart-account deployment,
+//! the signer writes, rules writes, execute, migration submit, timelock
+//! writes, and multicall. They also cover `vault deposit`, `vault withdraw`,
+//! `trade`, and `pool init`. Each answers `network.mainnet_write_forbidden`
+//! with exit code 1. `pay` and `claim` refuse their staged modes the same
+//! way. Their full mode, sponsored `accounts create` and `trustline` build
+//! the mainnet write context, which refuses with that code in a build without
+//! mainnet writes. The submit layer also checks the endpoint and passphrase.
+//! `rules verify-pins`, `signers list`, and `signers refresh` have no
+//! structural refusal: they load no signing key, sign nothing, and write
+//! nothing on chain.
 
 use std::fmt;
 use std::str::FromStr;
@@ -21,6 +24,7 @@ use std::str::FromStr;
 use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_core::profile::caip2::Caip2;
 pub(crate) use stellar_agent_core::profile::caip2::TESTNET_RPC_URL;
+use stellar_agent_network::StellarRpcClient;
 
 /// An optional assertion that the loaded profile uses the named network.
 /// Profile creation uses the value to select the new file's chain.
@@ -128,12 +132,27 @@ pub(crate) fn network_context_for_command(
 /// The structural mainnet-write refusal for `chain`: `Some` on mainnet, `None`
 /// otherwise.
 ///
-/// The timelock writes, `vault`, `trade`, `trustline`, and `pool init` call
+/// The timelock writes, `vault`, `trade`, and `pool init` call
 /// this once their network context is built. The call precedes their keyring
 /// initialiser or signer resolution, so a mainnet profile is refused before
 /// signer access and any RPC request.
 pub(crate) fn mainnet_write_refusal(chain: Caip2) -> Option<WalletError> {
     if chain.is_mainnet() {
+        Some(WalletError::Network(NetworkError::MainnetWriteForbidden))
+    } else {
+        None
+    }
+}
+
+/// The refusal of a staged mode on `chain`: `Some` on mainnet unless
+/// `full_mode`, `None` otherwise.
+///
+/// A mainnet write runs build, confirmation, signing and submission in one
+/// invocation, so `--build-only`, `--sign-only` and `--submit-only` are
+/// refused before the write context is built. The check reads no file, no
+/// keyring entry and no environment variable.
+pub(crate) fn mainnet_mode_refusal(chain: Caip2, full_mode: bool) -> Option<WalletError> {
+    if chain.is_mainnet() && !full_mode {
         Some(WalletError::Network(NetworkError::MainnetWriteForbidden))
     } else {
         None
@@ -150,20 +169,27 @@ pub(crate) fn mainnet_write_refusal(chain: Caip2) -> Option<WalletError> {
 /// layer checks the sending client again before the send. Each check gets its
 /// own budget, `timeout` from the moment it starts.
 ///
+/// On mainnet the check is the mainnet probe, which requires the mainnet
+/// passphrase and a supported protocol; on every other chain it is the
+/// endpoint identity of the context's passphrase.
+///
 /// # Errors
 ///
-/// Returns the refusal of
-/// [`StellarRpcClient::endpoint_identity`](stellar_agent_network::StellarRpcClient::endpoint_identity):
+/// Returns the refusal of [`StellarRpcClient::endpoint_identity`] or, on
+/// mainnet, of [`StellarRpcClient::check_mainnet_endpoint`]:
 /// `network.endpoint_network_mismatch`, `network.mainnet_write_forbidden`,
 /// `network.endpoint_identity_unavailable`,
 /// `network.unsupported_protocol_version`, or
 /// `network.rpc_credential_refused` when the endpoint answers HTTP 401 or 403.
 pub(crate) async fn check_endpoint_identity(
-    client: &stellar_agent_network::StellarRpcClient,
+    client: &StellarRpcClient,
     context: &stellar_agent_network::NetworkContext,
     timeout: std::time::Duration,
 ) -> Result<(), WalletError> {
     let deadline = tokio::time::Instant::now() + timeout;
+    if context.chain_id.is_mainnet() {
+        return client.check_mainnet_endpoint(deadline).await;
+    }
     client
         .endpoint_identity(context.network_passphrase(), deadline)
         .await?;

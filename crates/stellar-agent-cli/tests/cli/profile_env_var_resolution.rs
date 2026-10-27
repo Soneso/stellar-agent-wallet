@@ -820,6 +820,81 @@ fn trustline_mainnet_environment_refuses_before_endpoint_contact() {
     assert_no_contact(&endpoint);
 }
 
+/// The value verbs with a mainnet pipeline, each with arguments that pass
+/// the parser and reach the profile selection.
+const IMPLICIT_SELECTION_VERBS: &[(&str, &[&str])] = &[
+    ("pay", &["pay", SOURCE_G, "1 XLM", "--source", SOURCE_G]),
+    (
+        "claim",
+        &[
+            "claim",
+            "000000000000000000000000000000000000000000000000000000000000000000000000",
+            "--source",
+            SOURCE_G,
+        ],
+    ),
+    (
+        "accounts create",
+        &[
+            "accounts",
+            "create",
+            "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+            "--sponsor",
+            SOURCE_G,
+            "--starting-balance",
+            "1 XLM",
+        ],
+    ),
+];
+
+/// A mainnet profile selected by `STELLAR_AGENT_PROFILE` alone refuses on
+/// every value verb before any endpoint contact.
+#[test]
+fn value_verbs_refuse_a_mainnet_profile_named_by_the_environment() {
+    for (verb, argv) in IMPLICIT_SELECTION_VERBS {
+        let home = tempfile::tempdir().unwrap();
+        let endpoint = connection_counter();
+        write_mainnet_profile(home.path(), "mainnet", &endpoint.https_uri());
+        let run = run_cli(home.path(), Some("mainnet"), argv);
+        assert_eq!(run.code, 1, "`{verb}`: {} {}", run.stdout, run.stderr);
+        assert_eq!(
+            run.json()["error"]["code"],
+            "profile.mainnet_requires_explicit_profile",
+            "`{verb}`: {}",
+            run.stdout
+        );
+        assert_no_contact(&endpoint);
+    }
+}
+
+/// A mainnet profile saved as `default`, with neither `--profile` nor the
+/// variable, refuses on every value verb before any endpoint contact.
+#[test]
+fn value_verbs_refuse_a_mainnet_profile_saved_as_default() {
+    let mut verbs: Vec<(&str, Vec<&str>)> = IMPLICIT_SELECTION_VERBS
+        .iter()
+        .map(|(verb, argv)| (*verb, argv.to_vec()))
+        .collect();
+    verbs.push((
+        "trustline",
+        vec!["trustline", "--from", SOURCE_G, "--asset", "USDC"],
+    ));
+    for (verb, argv) in verbs {
+        let home = tempfile::tempdir().unwrap();
+        let endpoint = connection_counter();
+        write_mainnet_profile(home.path(), "default", &endpoint.https_uri());
+        let run = run_cli(home.path(), None, &argv);
+        assert_eq!(run.code, 1, "`{verb}`: {} {}", run.stdout, run.stderr);
+        assert_eq!(
+            run.json()["error"]["code"],
+            "profile.mainnet_requires_explicit_profile",
+            "`{verb}`: {}",
+            run.stdout
+        );
+        assert_no_contact(&endpoint);
+    }
+}
+
 /// A mainnet profile file without `rpc_url` refuses with the typed code on
 /// `trustline`, whose other load failures report
 /// `trustline.profile_load_failed`.
@@ -1616,6 +1691,11 @@ fn guarded_table_failures(
 /// Every guarded path refuses a persisted mainnet profile with its structural
 /// code, and no connection reaches the profile's endpoint. No seed variable
 /// is set, and every later stage on these paths reports a different code.
+///
+/// In a build with mainnet writes, `pay`, `claim`, `trustline` and sponsored
+/// `accounts create` run the mainnet pipeline, and the fixture's `noop`
+/// engine refuses there with the same code at the engine-kind check, which
+/// precedes the keyring and every endpoint read.
 #[test]
 fn every_guarded_path_refuses_a_mainnet_profile_before_endpoint_contact() {
     let endpoint = connection_counter();
