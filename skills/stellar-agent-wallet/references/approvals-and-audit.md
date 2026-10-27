@@ -419,9 +419,15 @@ confirmed value-moving submit (carrying the gate-sized value legs) and
 required one, before a signed x402 authorization leaves the wallet
 in the RPC re-simulation. When that payment then fails, it records
 `x402_authorization_withheld` with the same request id and a `failure_stage`
-of `anchor_unavailable`, `resimulation`, `response_processing`, or `encoding`.
-At `anchor_unavailable`, the signed authorization stays in the wallet and the
-admitted spend remains recorded. MPP adds
+of `anchor_unavailable`, `resimulation`, `response_processing`, `encoding`,
+`payload_release`, or `terminal_approval`. At `anchor_unavailable`, the signed
+authorization stays in the wallet. On testnet, the admitted spend remains
+recorded. Mainnet `x402_payment_authorized` rows record `RequireApproval`, the
+payment value leg, network, scheme, and any required witness. On mainnet, three
+consumption boundaries apply. The Message authorization of an authenticated
+payment is consumed before the SEP-10 signature. The payment intent is consumed
+before the signed simulation. The submit authorization is consumed before
+payload release. MPP adds
 `mpp_charge_authorized`, `mpp_authorization_withheld`, `mpp_receipt_observed`,
 and `mpp_settlement_reconciled`; these carry only hashes, redacted references,
 the exact policy-sized legs, and closed status labels, never a credential,
@@ -531,8 +537,38 @@ release of the reservation, a `value_action_failed` row under
 `submission.record_unavailable` that closes the pending row, and the removal of
 the receipt, each best-effort and logged. A resend that the reservation's
 duplicate check refuses after its row leaves that row open for the original
-submission's settlement. MPP's charge row keeps its existing flow. An x402
-refusal keeps the admitted spend.
+submission's settlement. MPP's charge row keeps its existing flow. On testnet,
+an x402 refusal keeps the admitted spend. On mainnet, a consumed payment intent
+retains its debit after a later failure. A refusal before consumption
+invalidates the open intent and releases its holds.
+
+`resolve_message_sign` checks the consumer, verified policy and enablement,
+intent network, approval binding and lifetime, and audit readiness before
+minting. The Message record binds the home domain, web-auth domain, server key,
+challenge digest, ephemeral key, policy, enablement, and approval. It reserves
+no value. `consume_message_sign` consumes the authorization and returns
+`MessageUseReceipt`. The receipt carries the bound facts and owns the audit
+lease. `X402MainnetProofs::with_authenticated` moves the receipt into the owned
+payment proofs. The authenticated payment continues its used Message record with
+one Soroban intent. The intent permits one payload-release child under the same
+approval.
+
+A minted Message record is open. Successful consumption makes it used. Refused
+consumption attempts invalidation. An already settled record stays settled. If
+cleanup fails, the record remains open until expiry. The cleanup warning retains
+the primary refusal. Each authorization refusal emits one warn-level
+`mainnet authorization refused` entry with `path` and `precondition`. The MCP
+identity mapper does not log that refusal again. A failed cleanup after a
+refused Message consumption emits `mainnet authorization cleanup failed`. It is
+separate from the primary refusal.
+
+On mainnet, after release authorization is consumed, the tool consumes the pending approval.
+A failed or absent pending-record consume withholds the payload. The
+`payment withheld at terminal approval` prefix marks a refusal after the signed
+re-simulation. The x402 tombstone's `tx_hash` contains the lowercase
+final-envelope digest. The digest hashes the final envelope's base64 text,
+rather than a chain transaction. `approve list` shows it as
+`spent (X402Payment), final-envelope digest <redacted digest>, outcome <outcome>`.
 
 For `audit.tip_anchor_unavailable`, restore keyring access and retry. A live
 writer repairs the anchor value it still owes; an honest same-generation tail

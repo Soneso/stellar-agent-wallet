@@ -248,8 +248,10 @@ The classic witness covers CLI `pay`, `claim`, sponsored `accounts create`,
 and `stellar_claim_commit`. The x402 payment tools `stellar_x402_create_payment`
 and `stellar_x402_authenticated_payment` are covered by a second simulation on
 the oracle: before the payer signs, the oracle simulates the same unsigned
-transfer, and the answers are compared. Opaque staged envelopes and the SEP-43
-signing tools remain uncovered.
+transfer, and the answers are compared. For admitted mainnet x402 payments,
+signed and profile thresholds determine the required witness. The oracle compares
+the unsigned transfer before the payer signs. Opaque staged envelopes and the
+SEP-43 signing tools remain uncovered.
 
 Signed and profile thresholds combine per asset using the smaller value.
 A higher profile threshold warns. Signed thresholds require positive i128
@@ -317,7 +319,8 @@ commits. Before signing, the oracle re-reads the ledger entries the decision use
 When a required witness has no oracle, mainnet refuses and testnet warns.
 For the x402 payment tools, the oracle simulates the same unsigned transfer the
 primary simulated, and the answers are compared before the payer signs.
-The x402 tools refuse a mainnet profile before the cross-check requirement rule runs.
+Both admitted mainnet x402 tools obtain the required witness before the payer signs.
+Missing required evidence refuses the payment.
 A mainnet profile requires `providers.oracle`, a host distinct from `rpc_url`,
 and a `[providers.primary]` record. Endpoint validation and URL redaction apply.
 `providers.oracle` can name a keyring credential for the endpoint.

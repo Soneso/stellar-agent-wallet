@@ -337,9 +337,17 @@ then fails. The configured RPC observes the signed x402 authorization.
 Approval and rejection rows are written before the decision takes effect.
 
 The `x402_authorization_withheld` stages are `anchor_unavailable`,
-`resimulation`, `response_processing`, and `encoding`. The transmit gate checks
-the anchor before and after its authorization row. At `anchor_unavailable`,
-the signature stays in the wallet and the previously admitted spend remains.
+`resimulation`, `response_processing`, `encoding`, `payload_release`, and
+`terminal_approval`. The transmit gate checks the anchor before and after its
+authorization row. At `anchor_unavailable`, the signature stays in the wallet.
+On testnet, the spend that policy admitted earlier in the call remains.
+
+The RPC receives the signed authorization during re-simulation. On an admitted
+mainnet server, payload release additionally requires consumed release
+authorization and pending approval. For an authenticated payment, the ephemeral
+key signs the SEP-10 challenge and the wallet submits it to the web-auth server
+before the payment build. On mainnet, that submission follows the consumption of
+its Message authorization.
 
 MPP credentials follow a stricter one-shot rule. Durable state is atomically
 claimed before policy accounting or signer access; value budget is recorded

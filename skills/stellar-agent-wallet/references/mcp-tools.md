@@ -16,9 +16,10 @@ for build configuration, admitted operations, and exclusions. Per tool on
   submit.
 - Every tool named above and the signing actions of `stellar_toolset_invoke`
   refuse at handler entry with `network.mainnet_write_forbidden` in every
-  build, except `stellar_x402_create_payment` and the four classic commits. A
-  feature-enabled build admits those five after setup. With the feature off,
-  they refuse at entry with the same code.
+  build, except both x402 payment tools and the four classic commits. A
+  feature-enabled build admits the four classic commits and both x402 payment
+  tools after setup. With the feature off, these tools refuse mainnet at entry
+  with the same code.
 
 The `stellar-agent-mcp` server exposes the Stellar Agent Wallet to an MCP client
 over JSON-RPC on stdio. It presents wallet capabilities as MCP tools so an AI
@@ -144,6 +145,9 @@ approval even under Allow. A pending approval uses the shorter lifetime from
 the prepare and commit evaluations. Allow contributes 600 seconds;
 RequireApproval supplies its configured lifetime. Authorization defaults to
 120 seconds and cannot outlive approval.
+
+Both x402 payment tools require approval under an Allow rule on an admitted
+mainnet server. [x402](#x402) describes their two calls.
 
 Paired preparation refuses an undecodable envelope with `simulation.divergence`.
 A denied rule retains `policy.deny.*`; an unknown decision uses
@@ -708,9 +712,9 @@ Arguments:
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
-| `stellar_x402_create_payment` | Construct and sign an x402 v2 Exact Stellar `PAYMENT-SIGNATURE` from a `PaymentRequirements` object; obtain the cross-check witness before signing; return the payment signature, its fields, and `cross_check`. | Signs the payment authorization entry; does not submit. |
+| `stellar_x402_create_payment` | Construct and sign an x402 v2 Exact Stellar `PAYMENT-SIGNATURE` from a `PaymentRequirements` object; obtain the cross-check witness before signing; return the payment signature, its fields, and `cross_check`. On an admitted mainnet server, call 1 returns approval instructions. Call 2 verifies approval and releases the authorized payment payload. | Signs the payment authorization entry; does not submit. |
 | `stellar_x402_parse_receipt` | Decode an x402 v2 `PAYMENT-RESPONSE` into a structured settlement receipt. | Read-only; no keyring, no network. No `chain_id`. |
-| `stellar_x402_authenticated_payment` | Run a SEP-10 identity gate against a `home_domain` (stellar.toml, SSRF bind, ephemeral challenge/response, JWT), then construct the `PAYMENT-SIGNATURE` with the cross-check witness. Any identity failure aborts before payment. | Signs the payment authorization entry; does not submit. |
+| `stellar_x402_authenticated_payment` | Run a SEP-10 identity gate against a `home_domain` (stellar.toml, SSRF bind, ephemeral challenge/response, JWT), then construct the `PAYMENT-SIGNATURE` with the cross-check witness. Any identity failure aborts before payment. On an admitted mainnet server, call 1 returns approval instructions. Call 2 verifies approval and releases the authorized payment payload. Call 2 signs and submits the bound SEP-10 challenge before payment construction. | Signs the payment authorization entry; does not submit. |
 
 Arguments:
 
@@ -718,12 +722,14 @@ Arguments:
   `PAYMENT-REQUIRED` header value OR raw JSON `PaymentRequirements`), required
   `chain_id` (`stellar:testnet` or `stellar:mainnet`, checked after the
   requirements); optional `address` (G-strkey signer; must match the enrolled
-  signer when supplied).
+  signer when supplied); optional `approval_nonce` and `approval_attestation`
+  (omit both for mainnet call 1, supply both for call 2).
 - `stellar_x402_parse_receipt`: `payment_response` only (base64 / JSON). No
   `chain_id`.
 - `stellar_x402_authenticated_payment`: required `payment_required`, required
   `chain_id` (as above), required `home_domain` (the SEP-10 counterparty
-  domain); optional `address`.
+  domain); optional `address`, `approval_nonce`, and `approval_attestation` (as
+  above).
 
 Both payment tools validate the requirements in full before the dispatch gate
 and consume no spending window on a refusal. They build one RPC client from
@@ -736,8 +742,78 @@ An identity refusal answers its `network.*` code through both tools.
 A witness refusal answers `simulation.divergence`, `network.witness_unavailable`,
 `network.rpc_credential_refused`, or the oracle credential read's keyring code
 (`auth.keyring_*`). The authenticated tool answers every other build failure
-with `x402.payment_build_failed`. Results carry `cross_check`. A
+with `x402.payment_build_failed`. Results carry `cross_check`. On testnet, a
 failure after admission keeps the admitted spend.
+
+### Mainnet x402 calls
+
+On an admitted mainnet server, each x402 payment takes two calls. Supplying only
+one approval argument returns `policy.approval_required`. Mainnet call 2
+requires the CLI-issued attestation alongside its approval nonce.
+
+Call 1 omits both approval arguments. It runs the entry and startup checks, the
+requirements, `chain_id`, the approval pair, and, for the authenticated tool,
+`home_domain` validation. It then loads the enrolled signer, checks `address`,
+computes the payment digest, and evaluates local policy. Local policy has no
+account-reserve view here. A matching `minimum_reserve` criterion fails closed
+with `policy.engine_required` before approval is stored. Forced approval turns
+Allow into a required approval, and the pending approval is stored. Call 1 reads
+enrollment and local policy state. It sends no payment RPC or SEP-10 request and
+performs no signing.
+
+Call 1 returns `data.approval` without a payment payload. Its fields are
+`approval_nonce`, `profile`, `chain_id`, `expires_at_unix_ms`, `reason`,
+`endpoint_host`, `signer`, `summary`, and `instructions`. `summary` contains
+`payTo`, `amount`, and `asset`. Approve x402 payments through
+`stellar-agent approve --id <nonce> --profile <name>` in a terminal.
+Approval-ui and remote approval do not attest this approval kind. For an x402
+payment, `stellar-agent approve` shows the payee, amount, and asset, and a
+`Home domain:` line that reads `none` for the plain tool. The
+authenticated approval subject binds the payment intent digest and home domain.
+Changing the home domain requires a matching approval.
+
+Call 2 repeats the request with both approval arguments. It rechecks startup
+freshness, then verifies the attestation and its bound subject. The
+authenticated tool then runs the identity exchange: it prepares and validates
+the SEP-10 challenge, consumes its message authorization, and signs and submits
+the challenge. The payment build follows: endpoint check, unsigned simulation,
+witness, health, intent mint, payer signature, audit row, intent consumption,
+and signed re-simulation. The tool encodes the payload, consumes the release
+authorization, and consumes the pending approval before it returns the payload.
+
+The plain tool's call 2 returns `data` with `paymentSignature`, `payer`,
+`asset`, `amount`, `payTo`, `network`, and `cross_check`. The authenticated tool
+returns the plain fields plus `authorization`, `home_domain`, and
+`payto_anchored`. `authorization` contains the Bearer JWT companion.
+
+For the plain tool, authorization refusals use
+`network.mainnet_authorization_refused`. Policy denials keep `policy.deny.*`.
+Other payment errors keep their own codes. For the authenticated tool,
+authorization refusals identify the withheld payment payload. Policy, endpoint,
+and witness errors keep their codes. Other payment-build failures use
+`x402.payment_build_failed`. The tool maps `identity.mainnet_signing_forbidden`
+and `identity.mainnet_authorization_refused` to
+`network.mainnet_write_forbidden` and `network.mainnet_authorization_refused`,
+respectively. Its two withholding messages are:
+
+```text
+the mainnet authorization for this SEP-10 authentication was refused; no signed challenge was submitted
+the mainnet authorization for this payment was refused; the payment payload was withheld
+```
+
+A withheld payment payload does not establish that no signature exists. The
+configured RPC can already have received the signed authorization during
+re-simulation. A consumed payment intent retains its debit after a later
+failure. An open intent can be invalidated before consumption.
+
+After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
+A changed startup binding returns `network.mainnet_write_forbidden`:
+`enablement or policy changed, restart the server`. A live consumed approval
+returns `policy.approval_consumed`. Without its pending-store tombstone, the
+authorization ledger refuses reuse.
+
+[Mainnet refusal order](troubleshooting.md#mainnet-refusal-order) lists what
+has been signed or sent when a mainnet check refuses.
 
 ## Machine Payments Protocol
 

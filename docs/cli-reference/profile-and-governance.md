@@ -720,6 +720,12 @@ Trustline table rows read
 JSON uses `summary.kind: "trustline"` with the full holder and issuer.
 Its `limit_stroops` is a decimal string, or `null` for unlimited.
 
+For a consumed x402 approval, the tombstone's `tx_hash` holds the final-envelope
+digest. It is not a chain transaction hash. The digest hashes the final
+envelope's base64 text. JSON reports it redacted in `summary.tx_hash_redacted`.
+Its table row reads
+`spent (X402Payment), final-envelope digest <redacted digest>, outcome <outcome>`.
+
 ### `approve serve`
 
 ```bash

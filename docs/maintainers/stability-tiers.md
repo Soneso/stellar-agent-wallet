@@ -56,17 +56,17 @@ Facts that apply to every crate:
 | `stellar-agent-smart-account` | 1 | C-account deploy, rules, signers, submit | excluded from beta for writes; read or local only |
 | `stellar-agent-cli` | 1 | the `stellar-agent` binary | supports admitted beta operations through the listed full-mode verbs |
 | `stellar-agent-mcp` | 1 | the `stellar-agent-mcp` binary | supports admitted beta operations through the listed tools |
-| `stellar-agent-x402` | 1 | x402 exact-payment scheme | pending capability |
+| `stellar-agent-x402` | 1 | x402 exact-payment scheme | supports admitted beta operations through authorized x402 payments |
 | `stellar-agent-mpp` | 1 | machine-payable-page charge lifecycle | excluded from beta |
-| `stellar-agent-x402-identity` | 2 | SEP-10 gate for authenticated x402 | pending capability |
+| `stellar-agent-x402-identity` | 2 | SEP-10 gate for authenticated x402 | supports admitted beta operations through authenticated x402 payments |
 | `stellar-agent-stablecoin` | 2 | issuer registry, trustline verb (payments support) | supports admitted beta operations through trustline actions; issuer queries are read-only |
 | `stellar-agent-pool` | 2 | channel-account pool | excluded from beta for submission; read or local only |
 | `stellar-agent-claimable` | 2 | claimable balances | supports admitted beta operations through claim actions |
 | `stellar-agent-anchor` | 2 | SEP-6 / SEP-24 anchor flows | read or local only; anchor flows grant no mainnet signing authority |
 | `stellar-agent-sep5` | 2 | key derivation vectors | read or local only; key derivation grants no mainnet signing authority |
 | `stellar-agent-sep7` | 2 | URI parsing | read or local only; URI parsing grants no mainnet signing authority |
-| `stellar-agent-sep10` | 2 | web authentication | pending capability |
-| `stellar-agent-sep43` | 2 | wallet-interface signing | excluded from beta for public signing tools |
+| `stellar-agent-sep10` | 2 | web authentication | supports admitted beta operations only through bound x402 identity authentication |
+| `stellar-agent-sep43` | 2 | wallet-interface signing | excluded from beta for public signing tools; its authorized primitive supports admitted x402 payments |
 | `stellar-agent-sep45` | 2 | contract-account authentication | excluded from beta |
 | `stellar-agent-sep48` | 2 | invocation preview | read or local only; invocation preview grants no signing authority |
 | `stellar-agent-sep53` | 2 | message signing | excluded from beta for message signing; verification is read-only |
@@ -82,7 +82,7 @@ Facts that apply to every crate:
 | `stellar-agent-toolsets-install` | 3 | toolset install and attestation | read or local only; installation admits no mainnet signing |
 | `stellar-agent-toolsets-runtime` | 3 | toolset invocation runtime | read or local only; signing actions refuse mainnet |
 | `stellar-agent-mcp-macros` | internal | proc-macros for the MCP registry | supports admitted beta operations through its MCP registry consumers |
-| `stellar-agent-soroban-auth` | internal | Soroban authorization preimages and signature payloads | n/a |
+| `stellar-agent-soroban-auth` | internal | Soroban authorization preimages and signature payloads | supports admitted beta operations through its authorized Soroban consumers |
 | `stellar-agent-test-support` | internal | test harness and fixtures | supports tests of admitted beta operations; grants no production authority |
 | `stellar-agent-windows-identity` | internal | Win32 SID / DPAPI wrappers | supports admitted beta operations through its Windows identity consumers |
 | `stellar-agent-xdr-limits` | internal | XDR decode bounds | supports admitted beta operations through its bounded XDR decoders |
@@ -91,8 +91,7 @@ Facts that apply to every crate:
 consumers listed in the scope table. Supporting infrastructure does not grant
 authority by itself. "Excluded from beta" means the capability does not admit
 that signing or write surface. "Read or local only" grants no transaction-write
-authority. These descriptions do not change maturity tiers. For cells marked
-"Pending capability", consult the scope table for current operation admission.
+authority. These descriptions do not change maturity tiers.
 
 ## Removed
 

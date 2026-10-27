@@ -57,8 +57,8 @@ Keep the following properties of the current alpha in mind when assessing impact
   The guarantee has one precondition: the claim holds only under the dependency
   set pinned and verified by the release.
   Feature-enabled builds admit only configured operations with per-action approval.
-  Policy evaluation alone grants no signing authority. Signing and submission
-  independently check sealed authorization. Ordinary library entry points refuse
+  Policy evaluation alone grants no signing authority. Signing, submission, and
+  x402 payload release independently check sealed authorization. Ordinary library entry points refuse
   mainnet. The endpoint's network binds each envelope signature.
   Read-only commands accept both `stellar:testnet` and `stellar:mainnet`.
   Every MPP tool refuses mainnet with `mpp.network_forbidden`.

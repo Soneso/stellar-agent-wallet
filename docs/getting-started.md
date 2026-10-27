@@ -757,13 +757,15 @@ set pinned and verified by the release.
 | `mainnet-write` on, classic CLI | Authorizes each supported action before signing and submission. Reports `STELLAR_AGENT_BUILD_MAINNET_WRITE=on`. | Full-mode `pay`, `claim`, sponsored `accounts create`, and `trustline`. | Build-only, sign-only, submit-only, Friendbot creation, `accounts create --generate`, relayer paths, and the excluded surfaces below. | Requires an explicit nondefault mainnet profile, matching stored configuration, enrolled identities, enablement, an owner-signed v2 policy, valid pin and audit state, required witness, and confirmation. |
 | `mainnet-write` on, classic MCP | Authorizes each supported commit before signing and submission. | `stellar_pay_commit`, `stellar_claim_commit`, `stellar_create_account_commit`, and `stellar_trustline_commit`. | Other generic signing tools, toolset signing actions, and the excluded surfaces below. | Requires the same installation and policy checks, plus approval bound to the action. Both prepare and commit policy names need matching rules. |
 | Classic failure classification | Reports the boundary that refused the action. | No admission follows from an error code. | A policy decision alone does not authorize signing. | Structural and context refusals use `network.mainnet_write_forbidden`. CLI engine construction preserves enablement errors and wraps other failures as `policy.engine_unavailable` or `trustline.policy_engine_unavailable`. Resolver setup gaps use `network.mainnet_authorization_refused`. Policy denials retain `policy.deny.*`. |
-| `mainnet-write` on, plain x402 | Admits the configured two-call payment flow with mandatory approval. | `stellar_x402_create_payment`. | Authenticated payments, generic SEP-10 signing, generic message signing, and unrelated Soroban operations. | Requires installation binding, signed policy, payment approval, required witness, authorized signing, and authorized payload release. The first call returns pending approval without a payment payload. The second supplies both approval arguments. |
-| Authenticated x402 | Refuses mainnet. | None. | `stellar_x402_authenticated_payment`. | Refuses a mainnet profile at entry with `network.mainnet_write_forbidden`. |
+| `mainnet-write` on, x402 | Releases an authorized payment payload through the supported flow. | `stellar_x402_create_payment`; `stellar_x402_authenticated_payment`, including its bound SEP-10 identity operation. | Generic SEP-10 signing, generic message signing, and unrelated Soroban operations. | Requires installation binding, signed policy, payment approval, required witness, authorized signing, and authorized payload release. Authenticated payments also bind the identity operation. |
 | `mainnet-write` on, excluded operation | Refuses the operation on mainnet. | None. | Smart-account deployment and writes; rules, signers, policies, execute, multicall, migration-submit, and timelock writes; DeFi; pool submission; MPP; public SEP-43 signing; generic SEP-45/53 signing; fee bumps; idempotent mainnet submission. | Ceremony, policy, and approval do not admit these operations. MPP uses `mpp.network_forbidden`. Wallet and library interfaces retain their documented refusal codes. |
 | Either build, read or local operation | Applies the operation's profile, policy, audit, and protocol requirements. | No transaction-write admission follows from a read or local operation. | Read-only classification does not override a protocol refusal. | Mainnet selection and key-scope checks apply. Noop allows mainnet reads and refuses destructive actions with `policy.engine_required`. |
 
 On an admitted mainnet MCP server, the four classic prepare and commit pairs
-require approval even when the matching rule allows the action. The server
+require approval even when the matching rule allows the action. Both x402
+payment tools also require approval under an Allow rule. On mainnet, their first
+call returns pending approval without a payment payload. Repeat the call with
+both approval arguments after CLI approval. The server
 loads the mainnet write context at startup when the selected profile has a
 verified enablement record. If enablement or policy fails startup checks, the
 server does not start.
@@ -792,6 +794,31 @@ See [Mainnet write behavior](cli-reference/index.md#mainnet-write-behavior),
 Ordinary library signing and submission refuse mainnet. Authorized entry points
 independently verify sealed authority at signing and submission. Both paths
 bind signatures to the endpoint's network.
+
+### Mainnet refusal order
+
+A mainnet write passes four states in this order: nothing sent or signed,
+unsigned requests sent, signed locally, signed material sent. The states refer
+to the transaction or payment signature. Authenticated x402 also signs and
+submits a SEP-10 challenge with an ephemeral key inside the second state. Each
+row names the checks that can refuse in that state, grouped by class, and the
+codes they report. Inside a row, the order of the checks differs by command and
+tool.
+
+| State when a check refuses | Checks, by class | Codes |
+|---|---|---|
+| Nothing sent or signed | Entry: the compiled feature, an explicit nondefault mainnet profile with matching stored configuration, full mode and keyring access (CLI), envelope and address decoding (classic MCP). Policy: the V1 engine; classic MCP and x402 also check the verified policy and enablement here. URL: client construction and its credential (CLI, classic MCP, plain x402). x402: call 1 ends here. Plain x402 call 2 sends nothing before the payment build. Its checks up to there: requirements, `chain_id`, the approval pair, enrollment and address, local policy evaluation, forced approval, the attestation, audit readiness, the signing handle. Authenticated x402 call 2 runs the same checks through the attestation, plus the home domain, the audit pre-flight, and identity audit readiness. It leaves this state at the identity exchange. | `network.mainnet_write_forbidden`, profile and validation codes, keyring codes, `network.rpc_unreachable`, `network.rpc_credential_refused`, `simulation.divergence` (classic MCP), JSON-RPC invalid params, `x402.*` requirement codes, `identity.home_domain_invalid`, `policy.approval_required`, `policy.approval_rejected`, `policy.approval_consumed`, `policy.deny.*`, `policy.engine_required`, `policy.unexpected_decision`, `auth.enrolled_*`, `audit.*`, approval-store codes |
+| Unsigned requests sent: the endpoint identity probe, account and chain reads, the oracle simulation, the unsigned payment simulation (x402) | URL: endpoint identity, protocol version. Entry: the remaining input decoding (CLI, classic MCP). Policy: the verified policy and enablement (CLI), the rebuilt envelope (classic MCP), the policy evaluation, the fee cap and the operation conditions (CLI, classic MCP), the required witness, the health read (x402). Authorization: the attestation or the terminal confirmation, audit readiness, the nonce, signer enrollment, the resolver's sealed checks (CLI, classic MCP); the payment intent authorization (x402). Authenticated x402: the bound SEP-10 authentication runs in this state, and its signed challenge reaches the web-auth server before the payment checks. Payment audit readiness, the signing handle, the payment asset, and client construction follow it. | `network.endpoint_network_mismatch`, `network.endpoint_identity_unavailable`, `network.unsupported_protocol_version`, `network.rpc_credential_refused`, `network.rpc_unreachable` (authenticated x402), read codes, keyring codes, `simulation.divergence`, `network.mainnet_write_forbidden` (CLI), `profile.mainnet_enablement_invalid`, `policy.engine_unavailable`, `trustline.policy_engine_unavailable`, `policy.deny.*`, `policy.engine_required`, `policy.unexpected_decision`, fee-cap codes, `trustline.*`, `network.witness_unavailable`, `confirm.*`, `policy.approval_required`, `policy.approval_rejected`, `policy.approval_consumed`, `audit.*`, `nonce.*`, `auth.enrolled_*`, `identity.*`, `x402.rpc_simulate_failed`, `x402.unexpected_auth_entries`, `x402.invalid_asset_address` (authenticated x402), `x402.payment_build_failed` (authenticated), `network.mainnet_authorization_refused` |
+| Signed locally, no signed material sent | Authorization: the signer and the signature check. Submission (CLI, classic MCP): the shared checks before the send: authorization, envelope shape, endpoint identity recheck, signature network binding, transaction hash, pre-send record, consumption proof. x402: the entry signature, the audit row, and the intent consumption before the re-simulation. | `network.mainnet_authorization_refused`, keyring and signer codes, `audit.*`, `protocol.xdr_codec_failed`, endpoint and protocol codes, `submission.record_unavailable`, `submission.tx_already_submitted`, `policy.deny.*`, `x402.transaction_build_failed`, `x402.payment_build_failed` (authenticated) |
+| Signed material sent | Submission (CLI, classic MCP): the send and the confirmation; reconcile an unknown outcome. x402: the signed re-simulation sends the signed authorization to the configured RPC. After it, the re-simulation answer checks, the release authorization, the payload encoding, the release consumption, and the pending-approval consumption withhold the payload. | `submission.*`, `x402.rpc_simulate_failed`, `x402.transaction_build_failed`, `x402.unexpected_auth_entries`, `x402.payment_build_failed` (authenticated), encoding codes, approval-store codes, `network.mainnet_authorization_refused` (payload withheld) |
+
+A code can appear in more than one row. For the plain x402 tool, the message
+prefix names the stage: `payment withheld before signed transmission`,
+`at intent transmit gate`, `after intent authorization`, `at payload encoding`,
+`at payload release`, or `at terminal approval`. A withheld payment payload
+does not mean the configured RPC saw no signed authorization. For authenticated
+x402, a refusal after the identity exchange does not mean the web-auth server
+saw nothing: the wallet can already have submitted the signed SEP-10 challenge.
 
 ## Next steps
 
