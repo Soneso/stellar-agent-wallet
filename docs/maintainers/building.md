@@ -1,5 +1,8 @@
 # Building and testing
 
+See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This guide is for maintainers and contributors building the `stellar-agent-wallet`
 workspace and running the gates that apply to each change. The workspace is a Cargo
 workspace of `stellar-agent-*` crates that produces two binaries: `stellar-agent`
@@ -70,7 +73,8 @@ rustup component add llvm-tools-preview
 
 ## Building
 
-The default-off `mainnet-write` Cargo feature changes build reporting only:
+The default-off `mainnet-write` Cargo feature controls authorization
+representation, enabled-policy checks, and build reporting.
 `stellar-agent` and `stellar-agent-mcp` report its state as
 `STELLAR_AGENT_BUILD_MAINNET_WRITE=off` or `=on` on the second line of
 `--version` and `-V` output.
@@ -652,8 +656,8 @@ crates, so a test build of `stellar-agent-smart-account` alone compiles none
 of them.
 
 These tests require network reachability to testnet RPC and Friendbot. Testnet is
-the default network; Friendbot funding is testnet-only. Write and signing commands
-structurally refuse mainnet in this alpha, so there is no mainnet acceptance tier.
+the default network; Friendbot funding is testnet-only. Live acceptance runs
+with `mainnet-write` off. These tests establish no live-mainnet acceptance.
 
 The MPP acceptance target also requires Node.js and pnpm for the pinned released
 `@stellar/mpp` server harness. Its package and lock files must contain the exact

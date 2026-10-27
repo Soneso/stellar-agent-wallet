@@ -41,10 +41,9 @@ the planned work per release.
 
 - testnet (`stellar:testnet`) is the default network: a command with no
   named profile and no `default.toml` runs on the zero-config testnet profile.
-- mainnet (`stellar:mainnet`) is read-only in this alpha. Every write or
-  signing command refuses a mainnet profile, and the submit layer refuses a
-  mainnet endpoint after asking it which network it serves.
-  [Mainnet is refused for writes](docs/getting-started.md#mainnet-is-refused-for-writes)
+- Released binaries have `mainnet-write` disabled. Feature-enabled builds admit
+  configured operations with approval for each action.
+  [Mainnet configurations and scope](docs/getting-started.md#mainnet-configurations-and-scope)
   lists the commands, the layers, and the wire codes.
 - Friendbot funding is testnet/futurenet only; mainnet is structurally refused.
 

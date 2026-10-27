@@ -1,5 +1,8 @@
 # Smart-account governance
 
+See [Mainnet configurations and scope](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 The `smart-account` CLI group (alias `sa`) governs an on-chain OpenZeppelin smart-account: its context rules, the signer sets and thresholds on each rule, the policy contracts attached to a rule, and the supporting infrastructure (verifier registry, multicall-router registry, upgrade timelock). Every command prints one JSON envelope on stdout and returns exit code `0` on success, `1` on any error.
 
 This file is self-contained. For the MCP tool surface and result-envelope shape see `./mcp-tools.md`. For the value-transfer / DeFi verbs see `./defi.md`.

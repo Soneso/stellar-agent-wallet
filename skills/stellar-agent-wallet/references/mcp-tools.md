@@ -1,5 +1,25 @@
 # MCP tools
 
+See [Mainnet configurations and scope](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions. Per tool on
+`stellar:mainnet`:
+
+- The sign-only tools are `stellar_sep43_sign_transaction`,
+  `stellar_sep43_sign_auth_entry`, `stellar_sep43_sign_message`,
+  `stellar_sep53_sign_message`, `stellar_x402_create_payment`, and
+  `stellar_x402_authenticated_payment`.
+- The tools that sign and submit are `stellar_sep43_sign_and_submit_transaction`
+  and the DeFi tools `stellar_defindex_vault_deposit`,
+  `stellar_defindex_vault_withdraw`, and `stellar_dex_trade`. The commit tools
+  `stellar_pay_commit`, `stellar_claim_commit`, `stellar_create_account_commit`,
+  `stellar_trustline_commit`, and `stellar_rule_create_commit` also sign and
+  submit.
+- Every tool named above and the signing actions of `stellar_toolset_invoke`
+  refuse at handler entry with `network.mainnet_write_forbidden` in every
+  build, except `stellar_x402_create_payment` and the four classic commits. A
+  feature-enabled build admits those five after setup. With the feature off,
+  they refuse at entry with the same code.
+
 The `stellar-agent-mcp` server exposes the Stellar Agent Wallet to an MCP client
 over JSON-RPC on stdio. It presents wallet capabilities as MCP tools so an AI
 assistant can read account state and submit Stellar transactions through the same
@@ -111,49 +131,69 @@ identity check and the account read, can run first.
 without a policy verdict. `stellar_dex_quote` passes no gate and never compares its `chain_id` with the profile. It picks the Soroswap router from `chain_id` and reads through the profile's RPC endpoint.
 The policy engine returns one verdict:
 
-- `Allow` — the tool proceeds.
-- `Deny` — refused with wire code `policy.deny.<reason>`.
-- `RequireApproval` — an out-of-band operator approval is required.
+- `Allow`: the tool proceeds.
+- `Deny`: refused with wire code `policy.deny.<reason>`.
+- `RequireApproval`: an out-of-band operator approval is required.
 
-These tools refuse `stellar:mainnet` structurally at handler entry with
-`network.mainnet_write_forbidden`, before any policy evaluation and regardless
-of engine:
+### Classic mainnet authorization
 
-- the six sign-only tools: `stellar_sep43_sign_transaction`,
-  `stellar_sep43_sign_auth_entry`, `stellar_sep43_sign_message`,
-  `stellar_sep53_sign_message`, `stellar_x402_create_payment`, and
-  `stellar_x402_authenticated_payment`;
-- `stellar_sep43_sign_and_submit_transaction`;
-- the DeFi tools `stellar_defindex_vault_deposit`,
-  `stellar_defindex_vault_withdraw`, and `stellar_dex_trade`;
-- the commit tools `stellar_pay_commit`, `stellar_claim_commit`,
-  `stellar_trustline_commit`, `stellar_create_account_commit`, and
-  `stellar_rule_create_commit`;
-- the signing actions of `stellar_toolset_invoke`, which queue no approval on
-  mainnet.
+A feature-enabled server admits `stellar_pay_commit`, `stellar_claim_commit`,
+`stellar_create_account_commit`, and `stellar_trustline_commit` after setup.
+Both prepare and commit policy names need matching rules. The four pairs require
+approval even under Allow. A pending approval uses the shorter lifetime from
+the prepare and commit evaluations. Allow contributes 600 seconds;
+RequireApproval supplies its configured lifetime. Authorization defaults to
+120 seconds and cannot outlive approval.
 
-The refusal crosses the wire as the standard business-error envelope on every
-one of these tools, including the SEP-43 family. The MPP tools refuse at handler
-entry with `mpp.network_forbidden`.
+Paired preparation refuses an undecodable envelope with `simulation.divergence`.
+A denied rule retains `policy.deny.*`; an unknown decision uses
+`policy.unexpected_decision`. None of these refusals persists an approval.
+Each commit forces confirmation before attestation validation.
 
-Separately, on `stellar:mainnet` the Noop engine fails closed for the other
-destructive tools, returning `policy.engine_required` before any RPC call or
-signing. The two engines are Noop (testnet allow-all; mainnet read-only allow,
-mainnet destructive refused) and V1 (signature-verified typed criteria,
-first-match default-deny).
+Feature-on startup loads the mainnet write context for a verified enabled
+profile. Failed enablement or policy checks abort startup. Admission refusals
+use `network.mainnet_write_forbidden` for unsupported tools or missing V1 engine,
+verified policy, enablement, enabled context, or profiles directory.
 
-Below both layers, the submit layer binds each submission to the network the RPC
-endpoint reports it serves rather than to the declared `chain_id`, and verifies
-every signature on the envelope against that network. The simulate tools
-`stellar_pay`, `stellar_create_account`, `stellar_trustline`, and `stellar_claim`
-and their commit tools ask the same question before their first read. A
-simulate refuses an endpoint serving another network, or reporting mainnet,
-with an `is_error` result carrying that code. A commit asks before the
-single-use nonce is burned, so a refusal at that check leaves the nonce
-usable. A refusal by the submit layer's own check comes after the nonce is
-consumed. A commit reads the clock for the nonce's expiry after its check. See
-[Troubleshooting](troubleshooting.md#network-binding-codes-submit-layer) for the
-wire codes.
+After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
+Freshness compares current policy and enablement facts without advancing the pin.
+A changed binding reports `network.mainnet_write_forbidden` with
+`enablement or policy changed, restart the server`. Missing startup authority
+instead names the missing prerequisite.
+
+Missing, invalid, expired, or unverifiable approvals use
+`policy.approval_required`. A live rejection uses `policy.approval_rejected`. A
+live consumed approval or an approval held by a submission receipt uses
+`policy.approval_consumed`. Expired tombstones use `policy.approval_required`.
+Authorization consumption followed by pre-send recording failure can leave an
+unspent pending approval. Reusing it can produce
+`network.mainnet_authorization_refused` without a tombstone.
+
+Ordinary signing and submission refuse mainnet. Authorized entry points check
+sealed authority independently. Durable consumption precedes sending.
+Classic MCP authorization refusal renders
+`the mainnet write was refused before submission; nothing was sent`.
+Classic MCP uses this message at both signing and submission boundaries.
+A signer may run before its result is rejected. An envelope may already carry
+a signature.
+
+Report authorization refusal to the operator. Fresh preparation and fresh
+approval are required for a retry; do not switch networks. The operator reads
+`path` and `precondition` in the warn-level `mainnet authorization refused` log.
+A submission timeout has an unknown outcome and requires transaction
+reconciliation.
+
+Public SEP-43 signing, generic SEP-53 signing, DeFi, rule writes, and toolset
+signing remain excluded. Wallet guards use `network.mainnet_write_forbidden`.
+MPP uses `mpp.network_forbidden`. Noop allows mainnet reads and refuses
+destructive policy decisions with `policy.engine_required`.
+
+The four classic preparations and commits probe endpoint identity before action
+reads. Commit checks before consuming the envelope nonce. Both use the smaller
+signed/profile fee cap, or the one available cap. A higher profile value warns.
+The enabled-policy minimum requires the signed field. The resolver independently
+evaluates effective fees and thresholds for the bound action.
+See [fee precedence](profiles-and-keys.md#thresholds-and-fees).
 
 How `RequireApproval` is satisfied depends on tool shape:
 
@@ -167,8 +207,9 @@ How `RequireApproval` is satisfied depends on tool shape:
   keyring, and submits. It re-evaluates its own tool name against current state
   and can still deny. An exhausted cap returns
   `policy.deny.per_period_cap_exceeded`. The loaded policy document stays fixed
-  for the server's lifetime. The wire error on any approval-path failure is the
-  uniform `policy.approval_required`.
+  for the server's lifetime. Missing, invalid, or expired approval uses
+  `policy.approval_required`. Live rejections use `policy.approval_rejected`;
+  live consumed or receipt-held approvals use `policy.approval_consumed`.
 - `stellar_mpp_charge_prepare` records a pending approval when policy requires
   approval for prepare or `stellar_mpp_charge_commit`. The request keeps its
   challenge-bounded lifetime.

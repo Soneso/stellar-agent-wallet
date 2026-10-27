@@ -1,6 +1,6 @@
 ---
 name: stellar-agent-wallet
-description: Operate the Stellar Agent Wallet, a self-custodial Stellar wallet built for AI agents, through its stellar-agent CLI and stellar-agent-mcp MCP server. Use when an agent needs to read Stellar account state, send XLM or asset payments, create accounts, manage trustlines, or claim claimable balances. Also use for OpenZeppelin smart-account governance, DeFi trading/deposits, and SEP, x402, and sponsored MPP charge flows. The wallet provides a local policy engine and an operator-approval gate. Its audit log records transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events. MCP balance reads and payment simulations produce no automatic invocation row. Under V1, payment simulations can reconcile overdue reservations and write settlement audit rows. Approval is satisfiable via the CLI, a local web inbox, or a TLS-protected remote-approval surface. Covers the two-phase build-then-commit signing pattern, the simulate-approve-commit handshake, chain_id and the JSON result envelope, and the mainnet write gate. Reach for it when the user mentions the stellar-agent wallet, an AI-agent wallet on Stellar, MCP-driven Stellar payments, or autonomous-agent key custody.
+description: Operate the Stellar Agent Wallet, a self-custodial Stellar wallet built for AI agents, through its stellar-agent CLI and stellar-agent-mcp MCP server. Use when an agent needs to read Stellar account state, send XLM or asset payments, create accounts, manage trustlines, or claim claimable balances. Also use for OpenZeppelin smart-account governance, DeFi trading/deposits, and SEP, x402, and sponsored MPP charge flows. The wallet provides a local policy engine and an operator-approval gate. Its audit log records transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events. MCP balance reads and payment simulations produce no automatic invocation row. Under V1, payment simulations can reconcile overdue reservations and write settlement audit rows. Approval is satisfiable via the CLI, a local web inbox, or a TLS-protected remote-approval surface. Covers the two-phase build-then-commit signing pattern, the simulate-approve-commit handshake, chain_id and the JSON result envelope, and configured mainnet authorization. Reach for it when the user mentions the stellar-agent wallet, an AI-agent wallet on Stellar, MCP-driven Stellar payments, or autonomous-agent key custody.
 license: Apache-2.0
 compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.12 public alpha; install from crates.io with a pinned version, for example cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.12 stellar-agent-mcp@0.1.0-alpha.12, or build from source). Targets Stellar testnet (default) and mainnet.
 metadata:
@@ -11,6 +11,9 @@ metadata:
 # Stellar Agent Wallet
 
 ## Overview
+
+See [Mainnet configurations and scope](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
 
 The Stellar Agent Wallet is a self-custodial Stellar wallet for AI agents. It has
 two surfaces over one shared core:
@@ -105,13 +108,12 @@ keyring and signing failures, submit failures, and the SEP-53, x402, and DeFi
 verbs alike; codes follow a `<family>.<reason>` convention (for example
 `x402.insufficient_funds`, `sep53.sign_failed`, `nonce.mint_failed`).
 
-The six `stellar_sep43_*` tools use this same standard envelope: the SEP-43
-raw protocol payload (`{ address }`, `{ signedTxXdr, signerAddress }`, and so
-on) is carried inside `data` on success, and failures surface as
-`{ ok: false, error: { code, message } }` with dotted `sep43.*` codes (for
-example `sep43.invalid_xdr`, `sep43.invalid_network_passphrase`); the
-structural mainnet-signing refusal carries the canonical
-`network.mainnet_write_forbidden` code shared with every signing surface. Do
+The six `stellar_sep43_*` tools use this same standard envelope.
+The SEP-43 raw protocol payload, such as `{ address }`, appears inside `data`
+on success. Failures use `{ ok: false, error: { code, message } }` with dotted
+`sep43.*` codes, including `sep43.invalid_xdr` and `sep43.invalid_network_passphrase`.
+Wallet entry guards report structural mainnet signing refusal with
+`network.mainnet_write_forbidden`. Do
 not expect the raw SEP-43 `{ code, message }` numeric-code object at the top
 level. See references/protocols.md for the per-tool payloads and the full
 wire-code table.
@@ -281,14 +283,17 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
 
 ## 9. Safety model
 
-- On `stellar:mainnet` read-only tools work. The DeFi, sign-and-submit, commit,
-  and rule-commit tools refuse a mainnet profile at handler entry with
-  `network.mainnet_write_forbidden`, before the policy gate and any RPC call. A
-  profile on the Noop engine refuses the other destructive tools on mainnet with
-  `policy.engine_required`. Below the policy layer, the network layer
-  structurally refuses every mainnet write with `network.mainnet_write_forbidden`
-  regardless of engine or keys. No configuration unlocks mainnet writes in this
-  alpha.
+- Released binaries have `mainnet-write` disabled. A feature-enabled build
+  admits the four classic full-mode CLI operations and classic MCP commits
+  after operator setup and approval for each action. See
+  [profiles and keys](references/profiles-and-keys.md#mainnet-policy-body) and
+  [classic MCP authorization](references/mcp-tools.md#classic-mainnet-authorization).
+  Mainnet reads retain selection, key-scope, and policy requirements.
+  Noop refuses destructive mainnet decisions with `policy.engine_required`.
+  Policy evaluation alone grants no signing authority. Signing and submission
+  independently check sealed authorization. Smart-account writes, DeFi, pool
+  submission, MPP, generic signing, and toolset signing remain excluded.
+
 - `profile.key_scope_conflict` refuses mainnet startup or CLI reconciliation
   for shared or invalid key scope; testnet logs a warning. Do not retry under
   another profile. Follow the named recovery in
@@ -308,9 +313,9 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   - `network.rpc_credential_refused`: the endpoint answered a
     request with HTTP 401 or 403, or the stored RPC credential is unusable.
   - `network.unsupported_protocol_version`: a mainnet endpoint reports a version
-    outside the supported range. While mainnet writes are refused, a mainnet
-    endpoint is refused before this check.
-  - `network.envelope_signed_for_mainnet`: a signature verifies only on mainnet.
+    outside the supported range. Authorized mainnet paths enforce this check.
+  - `network.envelope_signed_for_mainnet`: a signature fails under the endpoint
+    network but verifies under mainnet.
   - `network.envelope_signature_unverifiable`: a signature does not verify.
   - `network.envelope_unsigned`: a required signature set is empty.
 
@@ -323,17 +328,24 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   `fees.percentile_exceeds_cap` and
   `validation.mainnet_fee_cap_required` report the classic fee cap.
   See references/troubleshooting.md.
-- These tools refuse `stellar:mainnet` structurally at handler entry with
-  `network.mainnet_write_forbidden`, before the policy gate and regardless of
-  engine:
+- These tools refuse `stellar:mainnet` at handler entry with
+  `network.mainnet_write_forbidden`, before the policy gate. The refusal holds
+  in every build, except for the five tools named after the list:
   - the sign-only tools: the SEP-43 sign verbs, SEP-53 `sign_message`, and the
     two x402 payment tools;
   - `stellar_sep43_sign_and_submit_transaction` and the DeFi tools;
   - the commit tools, `stellar_rule_create_commit`, and the toolset signing
     actions.
+
+  `stellar_x402_create_payment` and the four classic commits depend on the
+  feature. With the feature off, they refuse at entry with the same code. A
+  feature-enabled build admits them after setup, as
+  [classic MCP authorization](references/mcp-tools.md#classic-mainnet-authorization)
+  describes.
 - Every MPP tool refuses `stellar:mainnet` at handler entry with
-  `mpp.network_forbidden`. Branch on all three codes when handling a mainnet
-  refusal.
+  `mpp.network_forbidden`. Branch on all three codes,
+  `network.mainnet_write_forbidden`, `policy.engine_required`, and
+  `mpp.network_forbidden`, when handling a mainnet refusal.
 - Raw argument values are never written to the audit log, only key names.
   Typed value events retain each leg's amount, asset, and redacted destination. The
   operator verifies the chain with
@@ -388,37 +400,22 @@ reconcile the transaction. Keep credential and receipt values out of logs.
 must approve and relay the `approval_attestation`. Retrying the commit unchanged
 will keep failing.
 
-**Mainnet writes are refused in this alpha.** Expect
-`network.mainnet_write_forbidden` at handler entry from the DeFi,
-sign-and-submit, commit, rule-commit, and sign-only tools, before the policy
-gate. The network layer refuses every mainnet write with the same code,
-regardless of engine or keys. No configuration unlocks mainnet writes. MPP tools
-refuse with `mpp.network_forbidden`. A profile on the Noop engine refuses the
-other destructive tools on mainnet with `policy.engine_required`. Branch on all
-three codes for mainnet refusals.
+**Mainnet actions require operator setup and approval.** The version marker
+reports compiled state. `network.mainnet_write_forbidden` identifies an excluded
+operation, a feature-off build, or a missing admitted context. Resolver gaps
+use `network.mainnet_authorization_refused`; policy denials retain `policy.deny.*`.
+Report authorization refusal to the operator. Do not switch networks. A retry
+needs fresh preparation and approval. Restart MCP after enablement or policy
+signing; stale startup bindings report the restart requirement.
 
-**The endpoint decides which network you are on, not `chain_id`.** The submit
-layer asks the RPC endpoint which network it serves and binds the submission to
-that answer. An endpoint serving a different network than the profile declares
-is `network.endpoint_network_mismatch`; an endpoint whose identity cannot be
-established in time is `network.endpoint_identity_unavailable`; one that
-answers the identity request with HTTP 401 or 403 is
-`network.rpc_credential_refused`. The same answer
-carries the endpoint's protocol version: this release supports protocol 29.
-Outside it, testnet logs a warning and continues; on mainnet the rule refuses
-with `network.unsupported_protocol_version`, which a mainnet endpoint never
-reaches while mainnet writes are refused. Signatures are
-then checked against the network the endpoint reported: an envelope signed for
-mainnet is `network.envelope_signed_for_mainnet`, one whose signatures verify
-under neither that network nor mainnet is
-`network.envelope_signature_unverifiable`, and an
-envelope with no signature, or a fee-bump whose outer or inner transaction
-has none, is `network.envelope_unsigned`. The four classic simulate tools and
-their commit tools check the endpoint before their first read, and a simulate
-against an endpoint reporting mainnet is refused with
-`network.mainnet_write_forbidden`. A commit checks before the single-use nonce
-is burned, so a refusal at that check leaves the nonce usable. A refusal by the
-submit layer's own check, after the nonce is consumed, does not.
+**The endpoint binds the network.** Prepare and commit probe the client before
+its first action read. Submission checks it again before send. A network
+mismatch uses `network.endpoint_network_mismatch`; unavailable identity uses
+`network.endpoint_identity_unavailable`. Credential refusals use
+`network.rpc_credential_refused`. Authorized mainnet operations require protocol 29.
+Signatures must verify under the endpoint network. See
+[network-binding codes](references/troubleshooting.md#network-binding-codes-submit-layer).
+A submission timeout requires reconciliation, not a new payment attempt.
 
 **Branch on `ok` and the error `code`, not the message.** The human message text
 is not a stable contract; the wire `code` is.

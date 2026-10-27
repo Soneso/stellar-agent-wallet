@@ -1,5 +1,8 @@
 # Releasing
 
+See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This page covers cutting a release tag, the checks the release and publish
 workflows run, the GitHub settings they rely on, and the crates.io publish
 dispatch.

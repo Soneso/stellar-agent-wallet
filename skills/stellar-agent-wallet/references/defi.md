@@ -1,5 +1,8 @@
 # DeFi and the channel pool
 
+See [Mainnet configurations and scope](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This reference covers the wallet's DeFi venues (Soroswap
 swaps (`trade`) and quotes (`quote`), and DeFindex vaults (`vault`)) and the
 SEP-5-derived channel-account pool (`pool`). It lists the CLI commands of the

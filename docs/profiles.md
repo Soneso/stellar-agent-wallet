@@ -1,5 +1,8 @@
 # Profile configuration reference
 
+See [Mainnet configurations and scope](getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 A **profile** is a per-environment TOML config file (schema `version = 2`) that
 binds a CAIP-2 chain, an RPC endpoint, a set of keyring entry references,
 behavioural thresholds, and the active policy engine. It is the single source of
@@ -218,6 +221,10 @@ on-disk document; the merged view is never written back, so a transient
 override cannot become persistent configuration and derived defaults are not
 materialised into the stored file.
 
+Enabled writes require an explicit nondefault mainnet profile whose stored
+chain and normalized endpoint host match its installation binding. A mainnet
+`default` profile can serve reads but cannot be enabled for writes.
+
 ## Schema version handling
 
 Every profile carries a top-level `version` field. The loader dispatches on it:
@@ -273,9 +280,19 @@ tools remain outside this coverage.
 The cap applies to the resolved auto-selected, explicit, profile, or command
 fee, or the decoded envelope fee. A fee equal to the cap passes. A fee above
 it refuses with `fees.percentile_exceeds_cap`, naming the fee's source.
-At these covered stages, a mainnet profile without the cap refuses with
-`validation.mainnet_fee_cap_required`. `profile init --network mainnet`
-writes `10000`. The cap refuses an excessive fee; it never lowers the bid.
+Mainnet action checks use the smaller signed/profile cap, or the one available
+value. A higher profile value warns. The enabled-policy minimum requires the
+signed cap even when a profile cap exists. MCP preparation uses this effective
+cap too. The resolver checks it independently when authorizing the action.
+A missing effective cap reports `validation.mainnet_fee_cap_required`.
+A total-fee overflow reports `validation.fee_total_overflow`. Resolver fee
+failures become `network.mainnet_authorization_refused`.
+`profile init --network mainnet` writes `10000`. The cap never lowers the bid.
+
+Full-mode CLI `pay`, `claim`, sponsored `accounts create`, and `trustline`
+include `total_fee_stroops` in policy arguments on both networks. It is a JSON
+number equal to the unsigned envelope's `tx.fee`.
+Mainnet excludes staged modes and pool submission.
 
 #### Witness thresholds
 
@@ -287,7 +304,8 @@ whenever an oracle is configured, including below threshold on testnet.
 Trustline changes, claims, and pool initialization are unvalued: they require a
 witness whenever an oracle is configured. Without an oracle, testnet reports
 `skipped`; the mainnet requirement rule refuses `network.witness_unavailable`.
-Mainnet writes remain structurally refused.
+Caller checks do not replace the resolver's bound witness checks.
+A resolver-detected witness gap reports `network.mainnet_authorization_refused`.
 
 The classic witness covers CLI `pay`, `claim`, sponsored `accounts create`,
 `trustline`, and every sending `pool init` path. It also covers MCP
@@ -297,6 +315,14 @@ and `stellar_x402_authenticated_payment` are covered by a second simulation on
 the oracle: before the payer signs, the oracle simulates the same unsigned
 transfer, and the answers are compared. Opaque staged envelopes and the SEP-43
 signing tools remain uncovered.
+
+On an enabled profile, signed and profile thresholds combine per asset using
+the smaller value. A higher profile threshold warns. One available value
+suffices; another asset's threshold never covers a missing one. A signed
+threshold is a positive TOML integer or a positive decimal string within the
+i128 range. Signed threshold keys are pinned asset identities. Classic assets
+and their SAC representations share network-specific identity. Duplicate
+equivalents and native-SAC aliases refuse.
 
 The legacy key `usd_threshold` also sets the native threshold. Setting both
 names across the file, environment, or CLI sources refuses as a duplicate field.
@@ -362,7 +388,6 @@ The x402 tools refuse a mainnet profile before the cross-check requirement rule 
 A mainnet profile requires `providers.oracle`, a host distinct from `rpc_url`,
 and a `[providers.primary]` record. Endpoint validation and URL redaction apply.
 `providers.oracle` can name a keyring credential for the endpoint.
-
 
 ### Provider attestations
 
@@ -573,8 +598,8 @@ A profile migrated from schema v1 stays on the `noop` engine until the operator
 completes key rotation and opts in to `v1`. Migration populates the four
 security-key reference names but mints no key material; the rotation commands
 below mint the actual keys. Note that the engine choice governs the policy
-layer only: every mainnet write is additionally refused at the network layer
-(`network.mainnet_write_forbidden`) in this alpha, on `noop` and `v1` alike.
+layer only. Admitted mainnet writes also require installation binding and
+sealed authorization at signing and submission.
 MPP refuses mainnet with `mpp.network_forbidden` instead.
 
 ### Migrate first
@@ -669,8 +694,8 @@ engine = "v1"
 
 Until this is done, a migrated profile continues to run under `noop`, which
 refuses mainnet destructive operations with `policy.engine_required`. Opting in
-to `v1` changes the policy layer only. Mainnet writes stay structurally
-refused at the network layer in this alpha. For the governance flow that V1
+to `v1` changes policy evaluation. Mainnet writes also need a feature-enabled
+build, enablement, a signed v2 body, and approval for each action. For the governance flow that V1
 enforces, see
 [cli-reference/profile-and-governance.md](cli-reference/profile-and-governance.md).
 
@@ -743,6 +768,164 @@ clearing that variable. The command adds the signature table. It refuses a
 missing file with `sign_policy.policy_file_unreadable`, a key outside the policy
 schema with `sign_policy.canonicalization_failed`, and a body the engine would
 refuse with `sign_policy.policy_body_invalid`.
+
+### Mainnet policy body
+
+Engine `v1`, policy-body version 2, and profile-schema version 2 are separate.
+The enabled-policy minimum applies to feature-on mainnet profiles with a
+signed v2 body containing `[mainnet]`. `profile enable-mainnet --check`
+evaluates the restrictions in either build.
+
+The profile file and policy file are separate documents. This policy example
+contains complete payment rules for CLI and MCP. Replace the destination with
+the intended account. The zero nonce digest and example endpoint are placeholders.
+Use the profile, endpoint host, and nonce digest written by
+[the enablement ceremony](cli-reference/profile-and-governance.md#profile-enable-mainnet).
+These installation bindings cannot be reused from another installation.
+
+```toml
+version = 2
+scope = "profile:operator"
+sequence = 1
+
+[mainnet]
+endpoint_host = "rpc.example.invalid"
+profile = "operator"
+installation_nonce_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+classic_max_fee_per_op_stroops = 500
+authorization_ttl_seconds = 60
+[mainnet.cross_check_thresholds]
+native = "10000000000"
+"USD:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" = "100"
+
+[[rules]]
+match = { tool = "stellar_pay", chain = "stellar:mainnet" }
+criteria = [
+    { kind = "asset_allowlist", assets = ["native"] },
+    { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"] },
+    { kind = "per_tx_cap", asset = "native", max_stroops = "10000000" },
+    { kind = "per_period_cap", window = "1d", asset = "native", max_stroops = "20000000" },
+    { kind = "rate_limit", window = "1d", max_calls = 10 },
+]
+decision = "require_approval"
+allow_opaque_signing = false
+ttl_secs = 600
+reason = "review"
+
+[[rules]]
+match = { tool = "stellar_pay_commit", chain = "stellar:mainnet" }
+criteria = [
+    { kind = "asset_allowlist", assets = ["native"] },
+    { kind = "counterparty_allowlist", kinds = ["G_ACCOUNT"], allowlist = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"] },
+    { kind = "per_tx_cap", asset = "native", max_stroops = "10000000" },
+    { kind = "per_period_cap", window = "1d", asset = "native", max_stroops = "20000000" },
+    { kind = "rate_limit", window = "1d", max_calls = 10 },
+]
+decision = "require_approval"
+allow_opaque_signing = false
+ttl_secs = 600
+reason = "review"
+```
+
+| Policy-body element | Meaning |
+|---|---|
+| `version`, `scope`, `sequence`, `[[rules]]` | `version = 2`, profile-specific scope, a positive sequence, and explicit rules. This policy is separate from the profile document. |
+| Sequence allocation | Signing assigns `max(pin, body) + 1`. Signing does not advance the pin. A verified load can advance it. |
+| Pin comparison | A pin refuses v1 or a lower sequence. Equal sequence with another digest or owner is a fork. |
+| `[mainnet].profile` | Dedicated profile name. |
+| `[mainnet].endpoint_host` | Ceremony-normalized endpoint host. This policy field remains named `endpoint_host`. |
+| `[mainnet].installation_nonce_sha256` | Installation nonce digest as 64 lowercase hexadecimal characters. |
+| `[mainnet].classic_max_fee_per_op_stroops` | Required signed `u32` classic per-operation cap. |
+| `[mainnet].authorization_ttl_seconds` | Optional lifetime from 1 through 120 seconds, distinct from approval lifetime. |
+| `[mainnet.cross_check_thresholds]` | Optional signed thresholds, each a positive TOML integer or a positive decimal string within the i128 range, such as `native = "10000000000"`. |
+| Signature coverage | V2 signs sequence and mainnet fields. Match and criterion keys are sorted canonically. |
+
+#### Enabled-policy minimum
+
+| Requirement | Restriction |
+|---|---|
+| `body_version` | Body v2 with sequence from 1 through `i64::MAX`. |
+| `mainnet_table` | A `[mainnet]` table exists. |
+| `rules_empty` | At least one rule exists. |
+| `scope` | Scope names this profile, optionally followed by project scope. Wildcard profile scope refuses. |
+| `chain` | Every rule names exactly `stellar:mainnet`. |
+| `tool` | Every rule names an admitted policy tool or an explicitly listed read/local tool. A rule does not itself admit a binary operation. |
+| `opaque` | `allow_opaque_signing` is absent or false. |
+| `rule_ttl` | Every RequireApproval rule supplies `ttl_secs` from 1 through 3600. |
+| `asset_allowlist` | Non-deny value-out and trustline rules contain exactly one nonempty pinned asset allowlist. Claim rules contain none. |
+| `destination` | Non-deny value-out rules require `G_ACCOUNT` or `C_ACCOUNT`. `KNOWN_ISSUER` may accompany them. No other kind may appear in that restriction. |
+| `home_domain` | Rules contain neither `HOME_DOMAIN` nor `home_domain_resolved`. |
+| `per_tx_cap` | Non-deny value-out rules cap every allowlisted asset per transaction. |
+| `per_period_cap` | Non-deny value-out rules cap every allowlisted asset per period. |
+| `rate_limit` | Non-deny value-out rules contain a rate limit. |
+| `fee_cap` | The signed mainnet table contains the classic per-operation cap. |
+| `thresholds` | Signed thresholds use pinned identities and positive i128 values. The native threshold meets the floor. |
+| `ttl` | Authorization TTL is absent or from 1 through 120 seconds. |
+
+The minimum has no memo criterion. SEP-29 still refuses a missing memo when
+the destination's `config.memo_required` entry is `1`. The operator supplies
+required deposit memos for destinations without that entry.
+
+#### Policy-tool names
+
+| CLI full-mode operation | CLI and MCP prepare name | MCP commit name |
+|---|---|---|
+| `pay` | `stellar_pay` | `stellar_pay_commit` |
+| Sponsored `accounts create` | `stellar_create_account` | `stellar_create_account_commit` |
+| `trustline` | `stellar_trustline` | `stellar_trustline_commit` |
+| `claim` | `stellar_claim` | `stellar_claim_commit` |
+
+Both MCP names need matching rules. Missing matches deny with
+`policy.deny.no_matching_rule`. A matching rule grants no admission to an
+excluded operation.
+
+Signing assigns `max(pin, body) + 1` without advancing the pin. A verified
+load can advance it. A pin refuses v1 or a lower sequence with
+`policy.sequence_rollback`. Equal sequence with another digest or owner
+refuses with `policy.sequence_fork`. The maximum sequence is `i64::MAX`;
+signing at that maximum refuses with `sign_policy.sequence_exhausted`.
+V2 signatures cover sequence and mainnet fields, with match and criterion keys
+sorted canonically. After signing or enablement, restart the MCP server.
+
+### Policy and setup diagnostics
+
+These are policy-library and setup codes. CLI engine construction preserves
+enablement errors but wraps other build failures as `policy.engine_unavailable`
+or `trustline.policy_engine_unavailable`.
+
+| Code | Meaning or remedy |
+|---|---|
+| `policy.engine_required` | Noop refuses destructive mainnet policy decisions. Surface entry checks can refuse earlier. |
+| `policy.engine_unavailable` | The policy engine cannot be built. Enabled mainnet refuses `test_owner_key` before pin advancement. |
+| `policy.mainnet_table_on_testnet` | The policy contains `[mainnet]` on a testnet profile. |
+| `policy.sequence_rollback` | The policy is older than the installation pin, or uses v1 after a pin exists. |
+| `policy.sequence_fork` | The pinned sequence has a different digest or owner. |
+| `policy.state_lock_busy` | The state lock remains held through the bounded acquisition attempts. |
+| `policy.state_lock_io` | The lock cannot be opened. The detail identifies the I/O failure. |
+| `policy.mainnet_minimum_unmet` | The enabled policy fails a named minimum requirement. |
+| `policy.pin_unusable` | The installation pin cannot be read or is malformed. |
+| `profile.mainnet_enablement_invalid` | The message names the failed binding: `mainnet_table`, `profile`, `source`, `default`, `on_disk`, `chain_id`, `on_disk_host`, `merged_host`, or `nonce_digest`. |
+| `profile.enable_mainnet_profile_flag_required` | Supply an explicit `--profile`. |
+| `profile.enable_mainnet_default_refused` | Select a dedicated profile whose name is not `default`. |
+| `profile.enable_mainnet_not_mainnet` | Select a mainnet profile. |
+| `profile.enable_mainnet_precondition` | A named ceremony prerequisite or effect failed. |
+| `profile.enable_mainnet_nonce_exists` | Use `--rotate` to replace the installation nonce. |
+| `sign_policy.sequence_exhausted` | The maximum of body and pinned sequence is `i64::MAX`. |
+| `profile.enroll_signer_identity_incomplete` | Follow the reported repair or enrollment remedy. |
+| `enroll_signer.repair_unpinned` | Identity repair requires the stored public-key pin. |
+| `enroll_signer.identity_conflict` | The stored identity conflicts with the enrolled signer. |
+| `auth.enrolled_identity_unusable` | The enrolled identity cannot establish the signer proof. Ledger enrollment is unavailable. |
+| `profile.reset_window_state_newer_version` | This build cannot reset an unsupported newer state format. |
+| `policy.window_state_unverifiable` | Enabled-mainnet state cannot be verified. Follow the operator recovery procedure. |
+| `profile.reset_window_state_open_authorizations` | Effective open authorizations prevent reset. |
+| `confirm.tty_required` | Direct mainnet confirmation requires terminal stdin and stderr. |
+| `confirm.profile_name_mismatch` | The entered line must equal the selected profile name. |
+| `confirm.input_unavailable` | Input, render, or flush failure prevents confirmation. |
+| `approve.yes_refused_on_mainnet` | On mainnet, `--yes` refuses before terminal or store checks in either build. CLI `approve` uses a y/n prompt. |
+| `accounts.create.generate_refused_on_mainnet` | Mainnet creation requires a destination public key. Generated-key creation is a testnet convenience. |
+
+Policy denials retain their `policy.deny.*` codes. The installed skill
+[lists the denial vocabulary](../skills/stellar-agent-wallet/references/troubleshooting.md#policy-denial-codes).
 
 ## Example profile
 

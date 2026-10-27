@@ -1,5 +1,8 @@
 # stellar-agent-mcp — tool documentation
 
+See [Mainnet configurations and scope](../../../docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 > **Note:** This document covers the core payment and account-management flows
 > only. The server exposes many additional tools (SEP-43, SEP-53, x402, toolsets,
 > DeFi, and others). For the full and authoritative list of tools and their
@@ -12,6 +15,63 @@ logs a warning and starts. Unreadable siblings warn on both chains and are
 skipped. `profile show` displays a conflicting document for diagnosis.
 Stop the MCP server before `profile reset-window-state`: it holds the profile's
 audit writer, and the reset refuses while that writer is held.
+
+## Classic mainnet authorization
+
+A feature-enabled server admits `stellar_pay_commit`, `stellar_claim_commit`,
+`stellar_create_account_commit`, and `stellar_trustline_commit` after setup.
+Both prepare and commit policy names need matching rules. The four pairs require
+approval even under Allow. A pending approval uses the shorter lifetime from
+the prepare and commit evaluations. Allow contributes 600 seconds;
+RequireApproval supplies its configured lifetime. Authorization defaults to
+120 seconds and cannot outlive approval.
+
+Paired preparation refuses an undecodable envelope with `simulation.divergence`.
+A denied rule retains `policy.deny.*`; an unknown decision uses
+`policy.unexpected_decision`. None of these refusals persists an approval.
+Each commit forces confirmation before attestation validation.
+
+Feature-on startup loads the mainnet write context for a verified enabled
+profile. Failed enablement or policy checks abort startup. Admission refusals
+use `network.mainnet_write_forbidden` for unsupported tools or missing V1 engine,
+verified policy, enablement, enabled context, or profiles directory.
+
+After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
+Freshness compares current policy and enablement facts without advancing the pin.
+A changed binding reports `network.mainnet_write_forbidden` with
+`enablement or policy changed, restart the server`. Missing startup authority
+instead names the missing prerequisite.
+
+Preparation and commit use the smaller signed/profile fee cap, or the one
+available value. A higher profile cap warns. The enabled-policy minimum
+requires the signed cap. The resolver independently reevaluates effective fees
+and thresholds. An admitted mainnet prepare probes endpoint identity before
+action reads, as does commit before consuming its nonce.
+
+Endpoint refusals preserve `network.endpoint_network_mismatch`,
+`network.endpoint_identity_unavailable`, `network.unsupported_protocol_version`,
+and `network.rpc_credential_refused`. `network.envelope_signed_for_mainnet`
+means a signature fails under the endpoint network but verifies under mainnet.
+
+Missing, invalid, expired, or unverifiable approvals use `policy.approval_required`.
+A live rejection uses `policy.approval_rejected`. A live consumed approval or an
+approval held by a submission receipt uses `policy.approval_consumed`.
+Expired tombstones use `policy.approval_required`. Authorization consumption
+followed by pre-send recording failure can leave an unspent pending approval.
+Reusing it can produce `network.mainnet_authorization_refused` without a tombstone.
+
+Ordinary signing and submission refuse mainnet. Authorized entry points check
+sealed authority independently. Durable consumption precedes sending.
+Classic MCP authorization refusal renders
+`the mainnet write was refused before submission; nothing was sent`.
+Classic MCP uses this message at both signing and submission boundaries.
+A signer may run before its result is rejected. An envelope may already carry
+a signature.
+
+Report authorization refusal to the operator. Fresh preparation and fresh
+approval are required for a retry; do not switch networks. The operator reads
+`path` and `precondition` in the warn-level `mainnet authorization refused` log.
+A submission timeout has an unknown outcome and requires transaction reconciliation.
 
 ## stellar_balances
 
@@ -32,7 +92,7 @@ Fetches the native XLM balance and trustlines for a Stellar account.
 Funds a testnet account via the Stellar Friendbot HTTP endpoint.
 
 **Arguments:**
-- `chain_id` (string, required): CAIP-2 chain identifier. Only `stellar:testnet` is accepted — mainnet profiles are rejected by the policy gate.
+- `chain_id` (string, required): CAIP-2 chain identifier. Only `stellar:testnet` is accepted. On mainnet the dispatch gate answers first: the Noop engine returns `policy.engine_required`, and a V1 engine denial returns its `policy.deny.*` code. A call the policy lets through without `friendbot_url` returns `invalid_params`, because mainnet has no default Friendbot URL. Only a call with an explicit, allow-listed `friendbot_url` reaches the inner guard, `network.friendbot_mainnet_forbidden`.
 - `account_id` (string, required): Stellar G-strkey to fund (ed25519 public key, 56 chars).
 - `friendbot_url` (string, optional): Override Friendbot endpoint URL. When supplied, must be in the production allow-list (friendbot.stellar.org or friendbot-futurenet.stellar.org over HTTPS). Defaults to `https://friendbot.stellar.org` for testnet.
 
@@ -57,16 +117,16 @@ Simulate step: builds a CreateAccount transaction envelope and mints a single-us
 
 **Annotations:** `readOnlyHint=false`, `destructiveHint=false`.
 
-**Fee cap:** The resolved per-operation fee is checked against the profile's
+**Fee cap:** The resolved per-operation fee is checked against the effective signed/profile
 `classic_max_fee_per_op_stroops`. A fee above the cap returns
 `fees.percentile_exceeds_cap`; the message names an auto-selected fee and its
 percentile, an explicit `classic_base`, or the profile's
-`classic_fee_per_op_stroops`. A mainnet profile without the cap returns
+`classic_fee_per_op_stroops`. A mainnet action without an effective cap returns
 `validation.mainnet_fee_cap_required`.
 
 ## stellar_create_account_commit
 
-Commit step: verifies the nonce, re-builds the envelope for divergence check, signs via the profile keyring, and submits the transaction. Testnet-only — mainnet profiles are rejected by the policy gate. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
+Commit step: verifies the nonce, re-builds the envelope for divergence check, signs via the profile keyring, and submits the transaction. Configured mainnet writes require a feature-enabled build and per-action authorization. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier.
@@ -86,10 +146,10 @@ Commit step: verifies the nonce, re-builds the envelope for divergence check, si
 **Submission record:** Before the transaction is sent, the wallet records it as submitted with an unknown outcome: a submission receipt, a spending-window reservation under a policy with a stateful criterion, and a `value_action_pending` audit row. The record is settled by what the network answers; a submission that ends without a confirmed outcome keeps it and returns `submission.tx_timeout`. On that code the outcome is unknown: pass `error.details.tx_hash` to `stellar_transaction_status`, and never resubmit. See "Unresolved submissions" below.
 
 **Fee cap:** Before signing, the presented envelope's per-operation fee is
-checked against the profile's `classic_max_fee_per_op_stroops`. A fee above the
+checked against the effective signed/profile `classic_max_fee_per_op_stroops`. A fee above the
 cap returns `fees.percentile_exceeds_cap` with a message naming the envelope's
-fee; prepare the transaction again with a fee within the cap. A mainnet profile
-without the cap returns `validation.mainnet_fee_cap_required`.
+fee; prepare the transaction again with a fee within the cap. A mainnet action
+without an effective cap returns `validation.mainnet_fee_cap_required`.
 
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
 `fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
@@ -130,16 +190,16 @@ Simulate step: builds a Payment transaction envelope for a native XLM or non-nat
 
 **SEP-29:** If the destination's `config.memo_required` data entry is set to `"1"` and no memo is provided, returns `validation.memo_required`.
 
-**Fee cap:** The resolved per-operation fee is checked against the profile's
+**Fee cap:** The resolved per-operation fee is checked against the effective signed/profile
 `classic_max_fee_per_op_stroops`. A fee above the cap returns
 `fees.percentile_exceeds_cap`; the message names an auto-selected fee and its
 percentile, an explicit `classic_base`, or the profile's
-`classic_fee_per_op_stroops`. A mainnet profile without the cap returns
+`classic_fee_per_op_stroops`. A mainnet action without an effective cap returns
 `validation.mainnet_fee_cap_required`.
 
 ## stellar_pay_commit
 
-Commit step: verifies the nonce, re-builds the Payment envelope for divergence check, signs via the profile keyring, and submits the transaction. Testnet-only — mainnet profiles are rejected by the policy gate. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
+Commit step: verifies the nonce, re-builds the Payment envelope for divergence check, signs via the profile keyring, and submits the transaction. Configured mainnet writes require a feature-enabled build and per-action authorization. Before the nonce is burned, the tool establishes which network the RPC endpoint actually serves and refuses a mismatch, so a wrongly-configured endpoint does not consume the nonce. The submit layer then verifies every signature on the envelope against the network the endpoint reported.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier.
@@ -167,10 +227,10 @@ Commit step: verifies the nonce, re-builds the Payment envelope for divergence c
 other failed destination read refuses with the read's own code.
 
 **Fee cap:** Before signing, the presented envelope's per-operation fee is
-checked against the profile's `classic_max_fee_per_op_stroops`. A fee above the
+checked against the effective signed/profile `classic_max_fee_per_op_stroops`. A fee above the
 cap returns `fees.percentile_exceeds_cap` with a message naming the envelope's
-fee; prepare the transaction again with a fee within the cap. A mainnet profile
-without the cap returns `validation.mainnet_fee_cap_required`.
+fee; prepare the transaction again with a fee within the cap. A mainnet action
+without an effective cap returns `validation.mainnet_fee_cap_required`.
 
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
 `fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
@@ -202,7 +262,7 @@ Simulate step: fetches the claimable-balance entry, renders a typed preview, enf
 
 ## stellar_claim_commit
 
-Commit step for `stellar_claim`: verifies the nonce, re-builds the `ClaimClaimableBalance` envelope for the divergence check, signs via the profile keyring, and submits. Testnet-only. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
+Commit step for `stellar_claim`: verifies the nonce, re-builds the `ClaimClaimableBalance` envelope for the divergence check, signs via the profile keyring, and submits. Configured mainnet writes require a feature-enabled build and per-action authorization. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier.
@@ -226,10 +286,10 @@ with a reason. A witness refusal keeps the nonce usable.
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
 **Fee cap:** Before signing, the presented envelope's per-operation fee is
-checked against the profile's `classic_max_fee_per_op_stroops`. A fee above the
+checked against the effective signed/profile `classic_max_fee_per_op_stroops`. A fee above the
 cap returns `fees.percentile_exceeds_cap` with a message naming the envelope's
-fee; prepare the transaction again with a fee within the cap. A mainnet profile
-without the cap returns `validation.mainnet_fee_cap_required`.
+fee; prepare the transaction again with a fee within the cap. A mainnet action
+without an effective cap returns `validation.mainnet_fee_cap_required`.
 
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
 `fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,
@@ -261,7 +321,7 @@ Simulate step: resolves the asset, fetches the issuer's live flags, runs the cla
 
 ## stellar_trustline_commit
 
-Commit step for `stellar_trustline`: verifies the nonce, re-builds the `ChangeTrust` envelope for the divergence check, signs via the profile keyring, and submits. Testnet-only. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
+Commit step for `stellar_trustline`: verifies the nonce, re-builds the `ChangeTrust` envelope for the divergence check, signs via the profile keyring, and submits. Configured mainnet writes require a feature-enabled build and per-action authorization. Carries the same pre-send endpoint-identity probe, signature-binding check and submission record as the other commit tools.
 
 **Arguments:**
 - `chain_id` (string, required): CAIP-2 chain identifier (same as simulate).
@@ -290,10 +350,10 @@ with a reason. A witness refusal keeps the nonce usable.
 **Annotations:** `readOnlyHint=false`, `destructiveHint=true`.
 
 **Fee cap:** Before signing, the presented envelope's per-operation fee is
-checked against the profile's `classic_max_fee_per_op_stroops`. A fee above the
+checked against the effective signed/profile `classic_max_fee_per_op_stroops`. A fee above the
 cap returns `fees.percentile_exceeds_cap` with a message naming the envelope's
-fee; prepare the transaction again with a fee within the cap. A mainnet profile
-without the cap returns `validation.mainnet_fee_cap_required`.
+fee; prepare the transaction again with a fee within the cap. A mainnet action
+without an effective cap returns `validation.mainnet_fee_cap_required`.
 
 **Error codes:** `nonce.expired`, `nonce.replayed`, `simulation.divergence`,
 `fees.percentile_exceeds_cap`, `validation.mainnet_fee_cap_required`,

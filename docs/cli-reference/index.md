@@ -1,8 +1,11 @@
 # CLI reference
 
+See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 `stellar-agent` is a self-custodial Stellar wallet for AI agents. It builds, signs, and submits transactions on testnet under a policy engine, an operator-approval spine, and a tamper-evident hash-chained audit log.
 
-This page covers the conventions shared by every command: how the profile and network are resolved, the signer-source flags, the JSON output envelope and exit codes, and the mainnet-write refusal. Each command group is documented on its own page, linked from the [command index](#command-index) below.
+This page covers the conventions shared by every command: how the profile and network are resolved, the signer-source flags, the JSON output envelope and exit codes, and [mainnet write behavior](#mainnet-write-behavior). Each command group is documented on its own page, linked from the [command index](#command-index) below.
 
 For the concepts referenced here (profiles, the policy engine, the approval spine, the audit log, context rules), see [concepts](../concepts.md). For which commands need only a classic keyring key versus a deployed smart-account contract, see [the two account models](../concepts.md#two-account-models).
 
@@ -115,20 +118,60 @@ else
 fi
 ```
 
-## Mainnet-write refusal
+## Mainnet write behavior
 
-The zero-config profile uses testnet. Friendbot funding is limited to testnet-class networks.
+Released binaries have `mainnet-write` disabled. Enabled builds admit full-mode
+`pay`, `claim`, sponsored `accounts create`, and `trustline` after installation
+setup and confirmation for each action. Build-only, sign-only, submit-only,
+Friendbot creation, generated-account creation, and relayer paths remain excluded.
 
-On a mainnet profile, `pay`, `claim`, account creation, account deployment, and smart-account deployment refuse before signer access.
-The same structural refusal covers the signer verbs that sign, rule writes, policy writes, `execute`, migration submit, timelock writes, and `multicall`.
-It also covers `vault deposit`, `vault withdraw`, `trade`, `trustline`, and `pool init`, before signer access and any RPC call.
-It reports `network.mainnet_write_forbidden`; Friendbot funding reports `network.friendbot_mainnet_forbidden`, and `mpp` reports `mpp.network_forbidden`.
-A build with mainnet writes reports `network.mainnet_authorization_refused` instead when it refuses the mainnet authorization for one action: a fact the action's authority binds does not hold, and nothing was signed or sent. `network.mainnet_write_forbidden` means the build or the verb has no mainnet write path at all.
-Read-only inspection remains available. `tx` signs nothing, and `pool init` is the only `pool` command that signs.
-`smart-account rules verify-pins`, `signers list`, and `signers refresh` load no signer and accept a mainnet profile. They keep their local audit writes, so a persisted profile needs `profile rotate-audit-key` first.
-`--network` is checked against the profile before a structural refusal, so `--network mainnet` on the zero-config testnet profile reports `profile.network_flag_mismatch`.
+Select an explicit nondefault mainnet profile with matching stored configuration.
+Enroll signer and owner identities, enable the installation, and sign a v2 policy.
+Valid pin and audit state, required witnesses, and per-action authorization remain
+necessary. [The policy guide](../profiles.md#mainnet-policy-body) lists the fields.
 
-The submit layer applies the same refusal in a fixed order. A declared mainnet network passphrase is refused first, then an `--rpc-url` matching a known mainnet host; both cost zero RPC calls. The envelope is then decoded locally, so a malformed or legacy V0 envelope is refused without a round trip.
+Direct confirmation requires terminal stdin and stderr. The wallet renders and
+flushes the summary, then compares the typed profile name after removing only
+the line ending. A terminal refusal uses `confirm.tty_required`; a different
+name uses `confirm.profile_name_mismatch`. Input, output, or flush failure uses
+`confirm.input_unavailable`. CLI approval failures retain their `approval.*` codes.
+An Allow rule gives confirmation 600 seconds; RequireApproval supplies its lifetime.
+Authorization defaults to 120 seconds and cannot outlive approval.
+
+CLI `approve` uses a separate y/n prompt. In either build, mainnet `--yes`
+refuses before terminal checks or store access with `approve.yes_refused_on_mainnet`:
+`approve --yes is refused on a mainnet profile; run approve on a terminal and answer the prompt`.
+Classic UI and remote attestations retain their supported approval behavior.
+
+`network.mainnet_write_forbidden` means the build, operation, or selected context
+has no admitted path. Missing CLI engine, verified policy, or enablement is an
+entry refusal with the prerequisite named. Resolver refusal uses
+`network.mainnet_authorization_refused`. Its core message is
+`the mainnet write was refused before submission; nothing was sent`.
+
+CLI messages distinguish the withheld result:
+
+- Signature: `the mainnet write was refused; the signature was withheld and nothing was sent`.
+- Submission: `the mainnet write was refused; the submission was refused after signing and nothing was sent`.
+
+Other signature-stage errors append `The signature was withheld and nothing was sent.`
+Other post-signing errors retain their own outcome semantics. A signer can run
+before signature verification rejects its result. Submission refusal can follow
+signing. Classic MCP renders the core message without these stage replacements.
+
+Read-only inspection remains available. `tx` signs nothing. Smart-account writes,
+DeFi, and pool submission remain excluded. `smart-account rules verify-pins`,
+`signers list`, and `signers refresh` retain local audit writes without signing.
+A persisted profile therefore needs its audit key initialized.
+Friendbot reports `network.friendbot_mainnet_forbidden`; MPP reports
+`mpp.network_forbidden`. `--network mainnet` on a testnet profile reports
+`profile.network_flag_mismatch` before write admission.
+
+Ordinary library signing and submission refuse mainnet. Ordinary submission
+refuses the declared mainnet passphrase or known mainnet host before RPC.
+Both submission paths then decode the envelope locally, so a malformed or
+legacy V0 envelope refuses with `protocol.xdr_codec_failed` without a round trip.
+Authorized signing and submission independently check sealed authorization.
 
 ## Endpoint identity before the first read
 
@@ -147,20 +190,20 @@ Each check gets a budget of its own: `--timeout-seconds` on `pay`, `claim`, `acc
 
 The submit layer does not take the declared network on trust. Before sending, it asks the endpoint which network it serves and which protocol it runs (`getNetwork`), on the same client instance that will send. It treats that answer, not the declaration, as authoritative:
 
-- the endpoint reports mainnet: `network.mainnet_write_forbidden`;
+- the ordinary submit path sees mainnet: `network.mainnet_write_forbidden`;
 - the endpoint reports a different network than the one declared: `network.endpoint_network_mismatch`;
 - the endpoint's identity cannot be established within the submission timeout: `network.endpoint_identity_unavailable`;
 - the endpoint answers the identity request with HTTP 401 or 403: `network.rpc_credential_refused`, which is not retried;
 - a mainnet endpoint runs a protocol version outside the supported range: `network.unsupported_protocol_version`.
 
-The probe is retried with bounded exponential backoff inside the caller's own timeout and is fail-closed: it never falls back to the declared network. An answer that does not parse, for example one without `protocolVersion`, is not retried and reports `network.endpoint_identity_unavailable`. The endpoint check is the one mainnet refusal that costs a round trip. [Retries, deadlines, and failover](../maintainers/security-internals.md#retries-deadlines-and-failover) gives the retry numbers and the deadlines.
+The probe is retried with bounded exponential backoff inside the caller's own timeout and is fail-closed: it never falls back to the declared network. An answer that does not parse, for example one without `protocolVersion`, is not retried and reports `network.endpoint_identity_unavailable`. The endpoint check uses an RPC round trip. Authorized paths verify mainnet identity against their bound context. [Retries, deadlines, and failover](../maintainers/security-internals.md#retries-deadlines-and-failover) gives the retry numbers and the deadlines.
 
-This release supports protocol version 29. A release adds a version only after its testnet acceptance tests ran against it. On testnet and on any other network that matches the declaration, a version outside the range is logged as a warning and the submission continues. On mainnet the same version is refused with `network.unsupported_protocol_version`. While mainnet writes are refused, an endpoint reporting mainnet is refused with `network.mainnet_write_forbidden` before this rule applies.
+This release supports protocol version 29. A release adds a version only after its testnet acceptance tests ran against it. On testnet and on any other network that matches the declaration, a version outside the range is logged as a warning and the submission continues. On mainnet the same version is refused with `network.unsupported_protocol_version`. Ordinary submission refuses a mainnet endpoint before this rule. Authorized submission enforces the mainnet protocol range.
 
 The layer then verifies the envelope's signatures against that network. It fetches the ed25519 signer sets of the transaction source account and of every distinct operation-level source account in one `getLedgerEntries` call (for a fee-bump, the fee source answers for the outer signatures and the inner transaction's sources for the inner ones); an account absent from the ledger is refused with `network.account_not_found` before anything is sent, unless the transaction itself creates it, in which case its own master key is the signer it will have at apply time and no ledger entry is needed. Every decorated signature must then verify: the SEP-23 signing payload is rebuilt under the network id the endpoint reported and checked against the gathered signers whose key hint matches.
 
 - verifies under the endpoint's network id: accepted;
-- verifies under the mainnet network id: `network.envelope_signed_for_mainnet`;
+- fails under the endpoint network but verifies under mainnet: `network.envelope_signed_for_mainnet`;
 - verifies under neither: `network.envelope_signature_unverifiable`;
 - the envelope carries no signature, or on a fee-bump the outer or the inner transaction carries none: `network.envelope_unsigned`.
 

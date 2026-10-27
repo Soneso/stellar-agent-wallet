@@ -1,5 +1,8 @@
 # Troubleshooting (wire and error codes)
 
+See [Mainnet configurations and scope](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 Reference for the stable wire and error codes the Stellar Agent Wallet returns,
 and the action an agent should take for each. The wallet places fixed controls
 between every tool call and any network or signing action: a policy engine, an
@@ -77,13 +80,128 @@ engine is first-match, default-deny over signed, typed criteria.
 | `trustline.clawback_opt_in_required` | Trusting a clawback-enabled issuer requires a recorded operator opt-in. | Ask the operator to run the printed `stellar-agent approve --id <nonce> --profile <name>` opt-in, then re-invoke. |
 | `policy.approval_required` | A two-phase signing verb reached its commit step without a valid operator approval, or the attestation was absent, invalid, or expired. This single code intentionally covers every approval-path failure mode (missing, expired, wrong-kind, hash mismatch, HMAC mismatch) so callers cannot probe which. | Ask the operator to run `stellar-agent approve --id <nonce> --profile <name>`, then re-submit the commit with the returned `approval_nonce` and `approval_attestation`. Use the approval nonce from simulation, which checks both tool names. If the request expires or no request exists, simulate again and review the new response. |
 | `policy.approval_required_unsupported` | The policy returned RequireApproval for a single-shot sign tool (no simulate/commit split: SEP-43 sign verbs, `stellar_sep43_sign_and_submit_transaction`, SEP-53 `sign_message`, x402 `create_payment` / `authenticated_payment`). The wallet refuses fail-closed rather than sign without approval. | Cannot proceed via the agent. Ask the operator to either adjust policy so this operation does not require approval, or perform it through a two-phase tool (`stellar_pay`, `stellar_create_account`, `stellar_trustline`, `stellar_claim`, `stellar_rule_create` and their `*_commit`). |
-| `policy.engine_required` | The active engine cannot decide the call. Fires for the Noop engine on a destructive tool on `stellar:mainnet`, and for V1 engine errors such as a missing or unverifiable policy document. | Do not retry on mainnet (writes are structurally refused in this alpha; use `stellar:testnet`). Otherwise the profile needs a valid V1 policy installed by the operator. |
+| `policy.engine_required` | The active engine cannot decide the call. Fires for the Noop engine on a destructive tool on `stellar:mainnet`, and for V1 engine errors such as a missing or unverifiable policy document. | Report the refusal to the operator. The profile needs a valid V1 policy and admitted context. Do not switch networks. |
 | `policy.unexpected_decision` | Forward-compatibility catch-all for an engine decision the gate does not recognize. Fail-closed. | Treat as a hard refusal. Report to the operator; do not retry. |
 
-Separately, every write or signing command refuses `stellar:mainnet` before any
-RPC call or signing with `network.mainnet_write_forbidden`, except MPP, which
-refuses with `mpp.network_forbidden`. Read-only commands accept mainnet. Action: run write and signing operations on `stellar:testnet` in
-this alpha.
+### Mainnet refusal recovery
+
+`network.mainnet_write_forbidden` identifies a feature-off build, excluded
+operation, or unavailable admitted context. CLI missing engine, verified policy,
+or enablement is an entry refusal with the prerequisite named.
+CLI engine construction preserves enablement errors and wraps other failures
+as `policy.engine_unavailable` or `trustline.policy_engine_unavailable`.
+Evaluation failure uses `policy.engine_required`; unknown decisions use
+`policy.unexpected_decision`. Policy denials retain `policy.deny.*`.
+
+After `network.mainnet_authorization_refused`, report the refusal to the operator.
+Do not switch networks. A retry requires fresh preparation and fresh approval.
+The operator reads the failed check in the `precondition` field of the warn-level
+log entry `mainnet authorization refused`. Its `path` identifies the consumer.
+The stable snake-case precondition labels are not additional wire codes.
+`STELLAR_AGENT_LOG` overrides `RUST_LOG`; the default is `info` on stderr.
+
+After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
+Stale policy or enablement reports `network.mainnet_write_forbidden` with
+`enablement or policy changed, restart the server`. Missing startup authority
+instead identifies its prerequisite.
+
+The core and classic MCP message is
+`the mainnet write was refused before submission; nothing was sent`.
+CLI messages distinguish these boundaries:
+
+- Signature: `the mainnet write was refused; the signature was withheld and nothing was sent`.
+- Submission: `the mainnet write was refused; the submission was refused after signing and nothing was sent`.
+
+Other signature-stage errors append `The signature was withheld and nothing was sent.`
+Other post-signing errors retain their outcome semantics. A signer can run
+before signature rejection. Submission refusal can follow signing.
+A submission timeout has an unknown outcome and requires reconciliation.
+
+Live rejected MCP approvals use `policy.approval_rejected`. Live consumed or
+receipt-held approvals use `policy.approval_consumed`. Missing, expired, invalid,
+or unverifiable approvals use `policy.approval_required`, including expired
+tombstones. Pre-send recording failure after authorization consumption can
+leave no tombstone; reuse can then return authorization refusal.
+CLI `approval.*` errors retain their codes.
+
+### Library and substrate refusals
+
+Wallet entry guards and library boundaries have distinct codes.
+Setup and policy cannot admit excluded signing surfaces.
+
+| Code or reason | Meaning |
+|---|---|
+| `network.witness_unavailable` | A required independent witness cannot be established. Resolver-detected witness gaps instead use `network.mainnet_authorization_refused`. |
+| `wallet.clock_error` | The authorization clock cannot provide a valid time. |
+| `envelope_mismatch` | The witness binds another envelope or intent. |
+| `sep43.mainnet_signing_forbidden` | An ordinary SEP-43 library signing path refuses mainnet. |
+| `sep43.mainnet_authorization_refused` | The authorized SEP-43 primitive refuses its bound authority. Public SEP-43 tools remain excluded. |
+| `sep45.mainnet_signing_forbidden` | SEP-45 refuses mainnet signing in either build. |
+| `feebump.mainnet_signing_forbidden` | The fee-bump signing path refuses mainnet. |
+| `sa.quorum.mainnet_write_forbidden` | Smart-account quorum writes refuse mainnet. |
+| `sa.credentials.mainnet_write_forbidden` | CLI smart-account credentials refuse mainnet writes. |
+
+### Policy and setup diagnostics
+
+These are policy-library and setup codes. CLI engine construction preserves
+enablement errors but wraps other build failures as `policy.engine_unavailable`
+or `trustline.policy_engine_unavailable`.
+
+| Code | Meaning or remedy |
+|---|---|
+| `policy.engine_required` | Noop refuses destructive mainnet policy decisions. Surface entry checks can refuse earlier. |
+| `policy.engine_unavailable` | The policy engine cannot be built. Enabled mainnet refuses `test_owner_key` before pin advancement. |
+| `policy.mainnet_table_on_testnet` | The policy contains `[mainnet]` on a testnet profile. |
+| `policy.sequence_rollback` | The policy is older than the installation pin, or uses v1 after a pin exists. |
+| `policy.sequence_fork` | The pinned sequence has a different digest or owner. |
+| `policy.state_lock_busy` | The state lock remains held through the bounded acquisition attempts. |
+| `policy.state_lock_io` | The lock cannot be opened. The detail identifies the I/O failure. |
+| `policy.mainnet_minimum_unmet` | The enabled policy fails a named minimum requirement. |
+| `policy.pin_unusable` | The installation pin cannot be read or is malformed. |
+| `profile.mainnet_enablement_invalid` | The message names the failed binding: `mainnet_table`, `profile`, `source`, `default`, `on_disk`, `chain_id`, `on_disk_host`, `merged_host`, or `nonce_digest`. |
+| `profile.enable_mainnet_profile_flag_required` | Supply an explicit `--profile`. |
+| `profile.enable_mainnet_default_refused` | Select a dedicated profile whose name is not `default`. |
+| `profile.enable_mainnet_not_mainnet` | Select a mainnet profile. |
+| `profile.enable_mainnet_precondition` | A named ceremony prerequisite or effect failed. |
+| `profile.enable_mainnet_nonce_exists` | Use `--rotate` to replace the installation nonce. |
+| `sign_policy.sequence_exhausted` | The maximum of body and pinned sequence is `i64::MAX`. |
+| `profile.enroll_signer_identity_incomplete` | Follow the reported repair or enrollment remedy. |
+| `enroll_signer.repair_unpinned` | Identity repair requires the stored public-key pin. |
+| `enroll_signer.identity_conflict` | The stored identity conflicts with the enrolled signer. |
+| `auth.enrolled_identity_unusable` | The enrolled identity cannot establish the signer proof. Ledger enrollment is unavailable. |
+| `profile.reset_window_state_newer_version` | This build cannot reset an unsupported newer state format. |
+| `policy.window_state_unverifiable` | Enabled-mainnet state cannot be verified. Follow the operator recovery procedure. |
+| `profile.reset_window_state_open_authorizations` | Effective open authorizations prevent reset. |
+| `confirm.tty_required` | Direct mainnet confirmation requires terminal stdin and stderr. |
+| `confirm.profile_name_mismatch` | The entered line must equal the selected profile name. |
+| `confirm.input_unavailable` | Input, render, or flush failure prevents confirmation. |
+| `approve.yes_refused_on_mainnet` | On mainnet, `--yes` refuses before terminal or store checks in either build. CLI `approve` uses a y/n prompt. |
+| `accounts.create.generate_refused_on_mainnet` | Mainnet creation requires a destination public key. Generated-key creation is a testnet convenience. |
+
+### Policy denial codes
+
+| Code | Meaning |
+|---|---|
+| `policy.deny.asset_not_allowlisted` | Asset outside the rule's allowlist. |
+| `policy.deny.per_tx_cap_exceeded` | Transaction cap exceeded. |
+| `policy.deny.per_period_cap_exceeded` | Period cap exceeded. |
+| `policy.deny.rate_limit_exceeded` | Rate limit exceeded. |
+| `policy.deny.counterparty_denied` | Counterparty restriction failed. |
+| `policy.deny.minimum_reserve_breached` | Minimum reserve breached. |
+| `policy.deny.owner_signature_stale` | Owner signature stale. |
+| `policy.deny.no_matching_rule` | No rule matches this policy-tool name and action. |
+| `policy.deny.counterparty_kind_unsupported` | Counterparty kind cannot be evaluated. |
+| `policy.deny.evaluation_error` | Policy evaluation failed. |
+| `policy.deny.unsizable_value_effect` | Value effect cannot be sized. |
+| `policy.deny.explicit_rule_deny` | Matching rule denies the action. |
+| `policy.deny.inner_invocation_count_cap_exceeded` | Invocation-count cap exceeded. |
+| `policy.deny.bundle_aggregate_cap_exceeded` | Bundle aggregate cap exceeded. |
+| `policy.deny.bundle_contains_generic_kind` | Bundle contains a generic invocation kind. |
+| `policy.deny.bundle_denied` | Bundle restriction failed. |
+| `policy.deny.quorum_not_satisfied` | Required quorum absent. |
+| `policy.deny.home_domain_not_resolved` | Required home domain unresolved. |
+| `policy.deny.sep10.session_missing` | Required SEP-10 session absent. |
+| `policy.deny.sep45.session_missing` | Required SEP-45 session absent. |
 
 ## Network-binding codes (submit layer)
 
@@ -103,8 +221,8 @@ own check comes after the nonce is consumed.
 | `network.endpoint_network_mismatch` | The endpoint serves a different network than the one declared (an RPC URL and a `chain_id` / network passphrase that disagree). | Do not retry as-is. Report to the operator: the profile's `rpc_url` and its network do not name the same chain. |
 | `network.endpoint_identity_unavailable` | The endpoint's network identity could not be established within the submission timeout, or its `getNetwork` answer did not parse. A transport failure is retried with bounded backoff; an answer that does not parse is not retried. The probe never falls back to the declared network. | Nothing was sent. Treat the endpoint as unusable and surface it to the operator; do not switch to a different endpoint on your own. |
 | `network.rpc_credential_refused` | RPC credential invalid or rejected. | See below. |
-| `network.unsupported_protocol_version` | A mainnet endpoint runs a protocol version outside the range this release supports (protocol 29). The message names the version and the range. While mainnet writes are refused, a mainnet endpoint is refused with `network.mainnet_write_forbidden` before this check. On testnet and other networks the same version is a logged warning, not a refusal. | Nothing was sent. Report the version to the operator; do not switch to a different endpoint on your own. |
-| `network.envelope_signed_for_mainnet` | A signature on the envelope was made for mainnet, not for the network the endpoint serves. | Do not retry; the envelope cannot be relayed onto this chain. Re-run the simulate step for the intended network. |
+| `network.unsupported_protocol_version` | A mainnet endpoint runs a protocol version outside the range this release supports (protocol 29). The message names the version and the range. Ordinary submission refuses mainnet before this check. Authorized submission enforces it. On testnet and other networks the same version is a logged warning, not a refusal. | Nothing was sent. Report the version to the operator; do not switch to a different endpoint on your own. |
+| `network.envelope_signed_for_mainnet` | A signature fails under the endpoint network and verifies under mainnet. | Do not retry; the envelope cannot be relayed onto this chain. Re-run the simulate step for the intended network. |
 | `network.envelope_signature_unverifiable` | A signature verifies under neither the endpoint's network nor mainnet, or no eligible ed25519 signer accounts for it (hash-x and pre-auth-tx signers contribute no ed25519 key). | Do not retry the same envelope. Re-run the simulate step and sign with a key the source account lists as a signer. |
 | `network.envelope_unsigned` | The envelope carries no signature, or on a fee-bump the outer or the inner transaction carries none; typically a build-only envelope handed straight to a submit step. | Sign the envelope first, then submit. On a fee-bump, both the inner transaction and the fee source must sign. |
 | `network.account_not_found` | A transaction-source or operation-source account on the envelope is absent from the ledger, so its signer set cannot be read. | Nothing was sent. Confirm the account exists and is funded on the target network. |
@@ -255,7 +373,7 @@ The operator corrects `oracle_provider_url`, `[providers.oracle]`, or
 | Code | Meaning | Agent action |
 |---|---|---|
 | `fees.percentile_exceeds_cap` | Fee exceeds cap. | Follow the remedy below. |
-| `validation.mainnet_fee_cap_required` | Mainnet cap missing. | Operator sets the cap. |
+| `validation.mainnet_fee_cap_required` | Mainnet cap missing. | Operator sets the signed cap. |
 | `validation.fee_total_overflow` | Pool fee overflows. | Lower the profile fee. |
 
 `fees.percentile_exceeds_cap` means the per-operation fee exceeds
@@ -269,10 +387,14 @@ fee, pass an explicit fee within the cap, or prepare again with a fee within
 the cap. Raising the cap or lowering `classic_fee_per_op_stroops` is an
 operator decision.
 
-`validation.mainnet_fee_cap_required` means a covered stage refused because a
-mainnet profile sets no `classic_max_fee_per_op_stroops`. Nothing was signed
-or sent. This is not agent-recoverable. The operator sets the cap in the
-profile file; `profile init --network mainnet` writes `10000`.
+`validation.mainnet_fee_cap_required` means an action has no effective classic
+fee cap. Nothing was sent. This is not agent-recoverable. The operator sets the
+signed cap, which the enabled-policy minimum requires. The effective cap is the
+smaller signed/profile value, or the one available value. MCP preparation checks
+the effective cap, and the resolver independently reevaluates it.
+A higher profile cap warns. Resolver fee failures become
+`network.mainnet_authorization_refused`. Over-cap fees retain
+`fees.percentile_exceeds_cap`; total overflow uses `validation.fee_total_overflow`.
 
 `validation.fee_total_overflow` means the `pool init` per-operation fee times
 the operation count exceeds the transaction fee limit. Nothing was built,

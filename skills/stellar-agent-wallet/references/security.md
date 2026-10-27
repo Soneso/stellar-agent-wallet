@@ -1,5 +1,8 @@
 # Security and safe operation
 
+See [Mainnet configurations and scope](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This wallet places fixed controls between every tool call an agent makes and any
 network or signing action. The agent is not assumed to be correct or honest: a
 policy engine evaluates calls and operator approval covers gated cases.
@@ -54,8 +57,8 @@ describe an attempted reset that did not take effect.
   required by most MCP tools. Where it is omittable (the SEP-43 read tools) it
   defaults to the active profile's chain; the wallet's default network is
   `stellar:testnet`.
-- Writes and signing are testnet-only in this alpha; a write/sign on
-  `stellar:mainnet` is structurally refused with `network.mainnet_write_forbidden`.
+- Mainnet writes require a feature-enabled build, installation setup, and
+  per-action approval. Excluded operations retain their refusal codes.
 - A single-use nonce is minted by the wallet at simulation time and must be passed
   back unchanged at commit time. Do not generate, cache across restarts, reuse, or
   mutate it.
@@ -153,68 +156,47 @@ Operational implication for an agent: the window is short. Do not assume an unlo
 persists between unrelated calls; each signing action stands up its own bounded
 window.
 
-## The mainnet write gate (read-only by default under Noop)
+## Mainnet authorization boundaries
 
-Two structural rules apply across all surfaces:
+Released binaries have `mainnet-write` disabled. With the feature off, no code
+path in the shipped binary can satisfy the mainnet-write guard, and the binary
+attests its feature state.
+The guarantee has one precondition: the claim holds only under the dependency
+set pinned and verified by the release.
 
-1. The default network is `stellar:testnet`.
-2. Every write or signing command structurally refuses `stellar:mainnet` before
-   any RPC call or signing, with wire code `network.mainnet_write_forbidden`,
-   except MPP, which refuses with `mpp.network_forbidden`. `stellar:mainnet`
-   stays accepted for read-only commands.
+Feature-enabled builds admit only configured operations. See the local
+[CLI](cli-reference.md#mainnet-write-behavior),
+[MCP](mcp-tools.md#classic-mainnet-authorization), and
+[policy](profiles-and-keys.md#mainnet-policy-body) references for setup.
+Policy evaluation alone grants no authority. Ordinary library signing and
+submission refuse mainnet. Authorized signing and submission independently check
+sealed authority, and durable consumption precedes sending.
+A signer can run before verification rejects its signature.
 
-The policy engine selected per profile in `[policy]` enforces the gate. When no
-full engine is configured, the Noop engine is the binding gate, with fixed
-behaviour:
+| Profile | Noop policy decision |
+|---|---|
+| Testnet | Allow. |
+| Mainnet read | Allow. |
+| Mainnet destructive action | Refuse with `policy.engine_required`. |
 
-| Profile | Tool | Result |
-|---------|------|--------|
-| testnet | any | Allow |
-| mainnet | read-only (`destructive_hint = false`) | Allow |
-| mainnet | destructive | refused with `policy.engine_required` |
+Smart-account multicall independently requires V1 even on testnet.
+Mainnet selection requires an explicit profile. Writes require a dedicated
+nondefault profile and matching stored chain, endpoint, and installation binding.
+Friendbot remains scoped to testnet and futurenet. MPP, smart-account writes,
+DeFi, pool submission, generic signing, and toolset signing remain excluded.
 
-A destructive tool on a mainnet profile cannot pass the Noop engine. Newly minted
-profiles default to the V1 engine (signature-verified typed criteria, first-match
-default-deny); profiles carried over from an older schema are set to Noop
-explicitly so the mainnet gate stays in place until the operator stands up a V1
-owner key.
+Prepare and commit probe the endpoint before action reads on their client.
+Submission checks the sending client again. The endpoint network binds every
+signature. `network.envelope_signed_for_mainnet` means verification fails under
+the endpoint network and succeeds under mainnet. Authorized mainnet paths also
+check the supported protocol version.
 
-There are no consent-gated mainnet write exceptions: every write surface refuses
-mainnet structurally. Friendbot funding is scoped to `testnet` and `futurenet`
-and refuses `mainnet` with `network.friendbot_mainnet_forbidden`.
-
-The gate does not rest on the declared network alone. The classic payment,
-sponsored account creation, trustline, claim, and pool paths ask the RPC
-endpoint which network it serves before the first read whose answer they sign
-or gate on. They ask on the client that sends, and the MCP simulate tools ask
-on their own client. Before it sends, the submit layer asks again on the
-sending client.
-Both treat the answer as authoritative. An endpoint reporting mainnet is
-refused with `network.mainnet_write_forbidden` even when the caller declared
-testnet. An endpoint reporting a different network than declared is refused
-with `network.endpoint_network_mismatch`. An endpoint whose identity cannot be
-established within the timeout is refused with
-`network.endpoint_identity_unavailable`. An endpoint that answers the identity
-request with HTTP 401 or 403 is refused with `network.rpc_credential_refused`,
-without a retry. The same answer carries the endpoint's
-protocol version. This release supports protocol 29: outside it, testnet and
-other networks log a warning, and a mainnet endpoint is refused with
-`network.unsupported_protocol_version`. While mainnet writes are refused, a
-mainnet endpoint is refused with `network.mainnet_write_forbidden` first. The
-submit layer then verifies every signature on the envelope against the network
-the endpoint reported. An envelope with a signature made for mainnet is refused
-with `network.envelope_signed_for_mainnet`. One with a signature that verifies
-under neither network is refused with `network.envelope_signature_unverifiable`.
-An envelope without a signature, or a fee-bump whose outer or inner transaction
-carries none, is refused with `network.envelope_unsigned`. An envelope signed
-for one network therefore cannot be relayed onto another.
-
-Agent rule: if you receive `network.mainnet_write_forbidden`,
-`policy.engine_required`, or any of the network-binding codes above, the action
-is structurally blocked on that chain and nothing was sent. Switching `chain_id`
-to mainnet to retry a write will not work and is not a valid path; neither will
-pointing at a different RPC endpoint to get past a binding refusal. Surface the
-block to the operator.
+After authorization refusal, report the failed action to the operator.
+Do not switch networks, nor point at a different RPC endpoint to get past a
+binding refusal. A retry requires fresh preparation and fresh approval.
+After enablement or policy signing, restart the MCP server. Stale startup
+bindings require restart; missing authority names its prerequisite.
+A submission timeout has an unknown outcome and requires reconciliation.
 
 ## Arguments are never logged: only key names
 
@@ -408,10 +390,9 @@ input with secrets redacted. Do not include real secret seeds, private keys, or
 keyring secrets; a redacted strkey or a SHA-256 digest is enough to identify an
 affected account or envelope.
 
-In scope and of high interest: an agent escaping or bypassing the guardrails (for
-example executing a signing action that should have been denied, forced to
-approval, or recorded), or reaching `stellar:mainnet` for a write or signing
-action despite the structural refusal (outside the consent-gated exceptions). Out
+Report an agent bypassing the guardrails, including signing that policy denies,
+needs approval for, or that the audit log records.
+Unauthorized mainnet signing, payload release, or submission is also in scope. Out
 of scope: defects in your own keyring backend, OS, RPC endpoint, or anchor; and
 any issue that requires already holding the wallet's keyring secrets, since custody
 of those secrets is the security boundary.

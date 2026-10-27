@@ -1,10 +1,13 @@
 # CLI reference: profiles, credentials, approvals, and audit
 
+See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This page documents four `stellar-agent` command groups: `profile`, `credentials`, `approve`, and `audit`. Together they configure a profile, manage its WebAuthn passkeys, and operate the operator-side governance loop: recording out-of-band approvals, verifying the tamper-evident audit log, and repairing its tip anchor.
 
-For the conventions shared by every command (profile and network resolution, the signer-source flags, the JSON output envelope, exit codes, and the mainnet-write refusal), see the [CLI reference index](index.md). For the underlying concepts (the policy engine, the approval spine, attestations, the audit log, and toolset gating), see [concepts](../concepts.md). For profile file structure, see [profiles](../profiles.md), and for toolset gating see [toolsets](../toolsets.md).
+For the conventions shared by every command (profile and network resolution, the signer-source flags, the JSON output envelope, exit codes, and mainnet write behavior), see the [CLI reference index](index.md). For the underlying concepts (the policy engine, the approval spine, attestations, the audit log, and toolset gating), see [concepts](../concepts.md). For profile file structure, see [profiles](../profiles.md), and for toolset gating see [toolsets](../toolsets.md).
 
-All four groups operate on local state — TOML files and platform-keyring entries. None of them submits a Stellar transaction, so the network flags and the mainnet-write gate do not apply here. Every command prints JSON on stdout and exits `0` on success or `1` on any error, using the standard `{ok, data, request_id}` envelope.
+All four groups operate on local TOML files and platform-keyring entries. None submits a Stellar transaction. Profile selection and enablement enforce their mainnet-specific prerequisites. Every command prints the standard `{ok, data, request_id}` JSON envelope on stdout. Exit `0` means success; exit `1` means an error.
 
 ## Profile selection and refused overlays
 
@@ -30,7 +33,7 @@ The `profile` group creates, lists, shows, and migrates profiles, and rotates th
 
 The eight key-writing commands (`enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and the five key-rotation subcommands) each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `enroll-signer` also writes a `signer_identity_enrolled` row, with the record's keyring coordinate, the redacted public address, and the role, after it writes the signer identity record; `enroll-signer --repair-identity` writes that row alone. `reset-window-state` writes the `keyring_key_written` row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
 
-`profile list` lists all profile names and takes no profile selector. Every other `profile` subcommand accepts `--profile <NAME>`. For `init`, `enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, `reset-window-state`, and `reset-mpp-state`, supply exactly one positional `<NAME>` or `--profile <NAME>`. These commands require an explicit selection. `reset-mpp-state` requires `--acknowledge`; the other profile verbs have no confirmation flag.
+`profile list` lists all profile names and takes no profile selector. Every other `profile` subcommand accepts `--profile <NAME>`. `enable-mainnet` requires an explicit nondefault mainnet profile. For `init`, `enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, `reset-window-state`, and `reset-mpp-state`, supply exactly one positional `<NAME>` or `--profile <NAME>`. These commands require an explicit selection. `reset-mpp-state` requires `--acknowledge`; the other profile verbs have no confirmation flag.
 
 The name itself becomes a path component and is validated before any path is built — charset, length, no leading `-`, and no Windows reserved device name. The rules and the recovery path for a file that already carries a refused name are in [Profile names](../profiles.md#profile-names).
 
@@ -198,6 +201,11 @@ Exits `1` on refusal:
 - `auth.signer_key_mismatch`: `--repair-identity` found a seed that does not derive to the pinned address.
 - A keyring error: the platform keyring is unavailable, or `--repair-identity` found no stored seed.
 
+Mainnet requires the signer identity to be enrolled, including when a command
+selects `--secret-env` or Ledger. `profile enroll-signer` accepts `--secret-env`
+only. A Ledger key cannot be enrolled as the mainnet signer.
+`auth.enrolled_identity_unusable` identifies an unusable enrolled proof.
+
 ### `profile enroll-rpc-credential`
 
 ```bash
@@ -330,6 +338,11 @@ Additional refusals:
 - `policy.state_lock_io`: the lock file cannot be opened; the detail gives the I/O kind.
 - `policy.pin_unusable`: the installation's policy pin cannot be read or is malformed.
 
+After signing an enabled mainnet policy, restart the MCP server. A stale
+startup binding refuses with `network.mainnet_write_forbidden` and
+`enablement or policy changed, restart the server`. Missing startup authority
+names its missing prerequisite instead.
+
 ### `profile enable-mainnet`
 
 ```bash
@@ -346,6 +359,15 @@ the policy with the profile, normalized endpoint host, and nonce digest.
 A v1 body becomes v2. The operator supplies the fee cap, optional authorization
 TTL, and thresholds, then signs the policy as the output's `next` list directs.
 
+See [the policy schema and minimum](../profiles.md#mainnet-policy-body) for
+required signed fields and rules. After enablement, complete and sign the
+policy, run `--check`, and restart the MCP server.
+
+Binding failures name `mainnet_table`, `profile`, `source`, `default`, `on_disk`,
+`chain_id`, `on_disk_host`, `merged_host`, or `nonce_digest`. The signed policy
+field remains `endpoint_host`. Unreadable stored `chain_id` or `rpc_url`
+reports `profile chain and endpoint unreadable` with the path and cause.
+
 `--rotate` replaces the nonce and changes only the policy's nonce digest.
 The old nonce is gone; sign the updated policy before using its binding.
 On a policy without a `[mainnet]` table, `--rotate` binds in full, as the
@@ -361,7 +383,7 @@ document the verified load read. Without a `[mainnet]` table the fee cap and
 every table restriction fail. When the policy does not verify, the
 restrictions and `enablement` are `not_evaluated`. The `enablement` check
 fails with `profile.mainnet_enablement_invalid` and the name of the binding
-that does not match, such as `endpoint_host` or `nonce_digest`. The `pin`
+that does not match, such as `on_disk_host` or `nonce_digest`. The `pin`
 check passes with the pinned sequence, or with `absent (first use)` when no
 pin or window-state lock file exists. It fails when the pin cannot be read or
 the comparison refuses, with `policy.sequence_rollback`,

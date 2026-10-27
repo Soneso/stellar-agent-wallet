@@ -87,8 +87,10 @@ Two guardrail features frame all of it:
 Nothing is asked of you on faith. The alpha is deliberately conservative:
 
 - **Testnet only.** Every write and signing command structurally refuses the
-  main Stellar network in this alpha. You experiment with test funds from
-  the free Friendbot faucet; nothing real is at stake while you learn.
+  main Stellar network in released builds. [Mainnet configurations and
+  scope](getting-started.md#mainnet-configurations-and-scope) describes the
+  other build configurations. You experiment with test funds from the free
+  Friendbot faucet; nothing real is at stake while you learn.
 - **Guardrails scale with you.** Running without a profile on testnet is
   permissive, so you can experiment with faucet funds. A profile you mint
   yourself defaults to the V1 policy engine, which is first-match,

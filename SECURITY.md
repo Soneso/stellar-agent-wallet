@@ -1,5 +1,8 @@
 # Security policy
 
+See [Mainnet configurations and scope](docs/getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This is the security policy for the Stellar Agent Wallet — a Stellar wallet for AI agents,
 shipping the `stellar-agent` CLI binary and the `stellar-agent-mcp` MCP stdio server.
 It covers which versions are supported, how to report a vulnerability, the scope of the
@@ -48,32 +51,29 @@ before any public disclosure.
 
 Keep the following properties of the current alpha in mind when assessing impact.
 
-- Writes and signing are testnet-only. Read-only commands accept both
-  `stellar:testnet` and `stellar:mainnet`, but every write and signing surface
-  structurally refuses `stellar:mainnet` with wire code `network.mainnet_write_forbidden`,
-  except MPP, which refuses with `mpp.network_forbidden`. There are no consent-gated
-  mainnet write exceptions. Commands that take `--network` refuse before any RPC call
-  or signing. The CLI write commands, including `vault deposit`, `vault withdraw`,
-  `trade`, `trustline`, and `pool init`, refuse a mainnet profile before signer access
-  and any RPC call. `smart-account rules verify-pins`, `smart-account signers list`, and
-  `smart-account signers refresh` keep their local audit writes but load no signer, sign
-  nothing, and write nothing on chain, so they accept a mainnet profile. The MCP DeFi,
-  sign-and-submit, commit, and rule-commit tools refuse it at entry, before the policy
-  gate and any RPC request. At the submit layer, which every write goes through
-  including the profile-driven flows, a declared mainnet network passphrase and a known
-  mainnet RPC URL are each refused at zero RPC cost. Beyond those two the endpoint is
-  asked which network it serves, that answer is authoritative over the declaration, and
-  every signature on the envelope must verify under that network's id.
-  Friendbot funding is scoped to
-  `testnet` and `futurenet` and structurally refuses `mainnet`
-  (`network.friendbot_mainnet_forbidden`).
+- Released binaries have `mainnet-write` disabled. With the feature off, no code
+  path in the shipped binary can satisfy the mainnet-write guard, and the binary
+  attests its feature state.
+  The guarantee has one precondition: the claim holds only under the dependency
+  set pinned and verified by the release.
+  Feature-enabled builds admit only configured operations with per-action approval.
+  Policy evaluation alone grants no signing authority. Signing and submission
+  independently check sealed authorization. Ordinary library entry points refuse
+  mainnet. The endpoint's network binds each envelope signature.
+  Read-only commands accept both `stellar:testnet` and `stellar:mainnet`.
+  Every MPP tool refuses mainnet with `mpp.network_forbidden`.
+  `smart-account rules verify-pins`, `signers list`, and `signers refresh` retain
+  local audit writes without signing or writing on chain. Friendbot funding is
+  scoped to testnet and futurenet and refuses mainnet with
+  `network.friendbot_mainnet_forbidden`.
+
 - The threat model centers on an autonomous agent transacting under wallet guardrails:
   a policy engine, an out-of-band operator-approval spine, and a tamper-evident audit
   log. Reports that demonstrate an agent escaping or bypassing these guardrails — for
   example, executing a signing action that should have been denied, forced to approval,
   or recorded — are in scope and of high interest.
-- A report that lets an autonomous agent reach `stellar:mainnet` for a write or signing
-  action, despite the structural refusal, is in scope.
+- Unauthorized mainnet signing, payload release, or submission is a reportable
+  violation.
 
 Out of scope: defects in your own keyring backend, operating system, RPC endpoint, or
 anchor; and issues that require already holding the wallet's keyring secrets (the seed,
@@ -103,7 +103,8 @@ properties:
   verbs evaluate each action to Allow, Deny, or RequireApproval. Read-only CLI commands
   such as `balances` evaluate no policy. The Noop engine allows everything on testnet, allows read-only on
   mainnet, and refuses mainnet destructive actions (`policy.engine_required`); the V1
-  engine evaluates signature-verified typed criteria with first-match default-deny. When
+  engine evaluates signature-verified typed criteria with first-match default-deny.
+  A verified policy alone does not confer mainnet authorization. When
   approval is required, the action is recorded in a per-profile pending-approval store and
   released only when the operator runs `approve`, which mints an HMAC-SHA256 attestation
   proving the keyring holder approved it. The attestation is constant-time verified and

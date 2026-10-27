@@ -1,5 +1,8 @@
 # Protocols and integrations
 
+See [Mainnet configurations and scope](getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This page lists the Stellar ecosystem protocols and venues the wallet speaks, what it does on each, and the deliberate refusals that keep an autonomous agent safe.
 
 Three principles shape every integration:
@@ -8,7 +11,7 @@ Three principles shape every integration:
 - **Fail-closed.** Validation refuses on any failed check rather than proceeding on a guess. Unknown discriminants, ambiguous tokens, missing slippage floors, and stale oracle reads are refused before signing.
 - **Never auto-submit untrusted requests.** Inbound requests (a SEP-7 URI, a contract invocation) are parsed into a preview for the operator and policy engine. The wallet does not sign or submit on a dApp's behalf without going through the policy engine and [approval spine](concepts.md#the-approval-spine).
 
-All write and signing paths are testnet-only in this alpha. Every signing command structurally refuses `stellar:mainnet` with wire code `network.mainnet_write_forbidden`, except MPP, which refuses with `mpp.network_forbidden`. The transaction and smart-account write commands, `vault deposit`, `vault withdraw`, `trade`, `trustline`, and `pool init` refuse a mainnet profile before any RPC call or signer access. The MCP signing tools refuse it at handler entry. At the submit layer it covers both a declared mainnet network passphrase and a known mainnet RPC URL, each at zero RPC cost. Beyond those two, the submit layer binds each submission to the network the endpoint reports it serves rather than to the declared one, and requires every signature on the envelope to verify under it. Read-only commands accept mainnet.
+The scope table defines mainnet admission for each build configuration. Public SEP-43 and generic SEP-45/53 signing remain excluded. Wallet entry guards use `network.mainnet_write_forbidden`; library refusals retain their namespaced codes. MPP refuses with `mpp.network_forbidden`. Ordinary signing and submission refuse mainnet. In every build, submission verifies each signature under the network the endpoint reports. Authorized submission also requires the bound endpoint, the bound signer's signature, and the bound transaction hash, and records the authorization as consumed before sending.
 
 ## SEP protocols
 
@@ -204,7 +207,7 @@ integration review of the rebuilt protocol.
 | SEP-6 | Discovery only, `GET /info` capability set | MCP |
 | SEP-24 | Interactive deposit/withdraw URL via `POST .../interactive`; returned to operator, never followed | MCP |
 | SEP-43 | Agent `ModuleInterface`: `get_address`, `sign_transaction`, `sign_auth_entry`, `sign_message`, `get_network`, none of which submits; plus `stellar_sep43_sign_and_submit_transaction`, which signs and submits | MCP |
-| SEP-45 | Client Web Auth for contract accounts (steps 1–12); ephemeral and persistent-signer flows | (library only; no MCP tool) |
+| SEP-45 | Client Web Auth for contract accounts (steps 1 to 12); ephemeral and persistent-signer flows | no workspace consumer; refuses mainnet signing |
 | SEP-47 | Discover SEPs a contract claims via `contractmetav0` | MCP |
 | SEP-48 | Typed-argument preview of `InvokeHostFunction` (display-only, does not gate signing) | MCP |
 | SEP-53 | Sign and verify prefixed off-chain messages | MCP |

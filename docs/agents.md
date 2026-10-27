@@ -1,5 +1,8 @@
 # Driving the wallet from an AI agent
 
+See [Mainnet configurations and scope](getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This guide is for an engineer wiring the Stellar Agent Wallet into an AI agent
 runtime. It covers how an agent connects, the call patterns that keep funds safe,
 and how operator approval fits in.
@@ -163,21 +166,37 @@ forged, or expired, so a caller learns nothing from the failure). Treat
 `policy.approval_required` as "ask the operator to approve, then retry the commit"
 and never as a transient error to retry blindly.
 
-## Mainnet is read-only in this alpha
+## Mainnet actions and refusal recovery
 
-On `stellar:mainnet`, read-only tools work; every write is refused. The DeFi,
-sign-and-submit, commit, rule-commit, and sign-only tools refuse a mainnet
-profile at handler entry with `network.mainnet_write_forbidden`, before the
-policy gate and any RPC call or signing. The MPP tools refuse at entry with
-`mpp.network_forbidden`. A profile on the Noop engine refuses the other
-destructive tools with `policy.engine_required`. Below these, the network layer
-structurally refuses every mainnet write with `network.mainnet_write_forbidden`,
-regardless of the configured policy engine or enrolled keys. No profile
-configuration unlocks mainnet writes in this alpha. A V1 engine with enrolled keys (see
-[profiles.md](profiles.md)) is the intended foundation for a future explicit
-mainnet opt-in, not a current unlock. Design the agent to treat every mainnet
-write refusal as structural: do not retry, and do not try configuration
-changes to get past it.
+Released binaries have `mainnet-write` disabled. A feature-enabled server admits
+`stellar_pay_commit`, `stellar_claim_commit`, `stellar_create_account_commit`,
+and `stellar_trustline_commit` after operator setup. Every action needs approval,
+even under an Allow rule. Both prepare and commit names need policy rules.
+
+The operator enrolls identities, runs `profile enable-mainnet`, completes the
+v2 policy, and runs `profile sign-policy`. Restart the MCP server afterward.
+A stale startup binding reports `network.mainnet_write_forbidden` with
+`enablement or policy changed, restart the server`. Missing startup authority
+instead names its missing prerequisite. Unsupported tools and contexts use the
+same wire code. The version marker reports compiled state, not setup completion.
+
+CLI engine construction preserves enablement errors and wraps other failures as
+`policy.engine_unavailable` or `trustline.policy_engine_unavailable`.
+Evaluation failure uses `policy.engine_required`; unknown decisions use
+`policy.unexpected_decision`. Policy denials retain `policy.deny.*`.
+
+After `network.mainnet_authorization_refused`, report the refusal to the operator.
+Do not switch networks. A retry requires fresh preparation and fresh approval.
+The operator reads the failed check in the `precondition` field of the warn-level
+log entry `mainnet authorization refused`.
+
+CLI refusal messages distinguish signature withholding from submission refusal
+after signing. The signature message is
+`the mainnet write was refused; the signature was withheld and nothing was sent`.
+A signer can run before its result is rejected. Classic MCP uses
+`the mainnet write was refused before submission; nothing was sent`.
+A submission timeout has an unknown outcome. Reconcile it with
+`stellar_transaction_status`; do not apply authorization-refusal retry guidance.
 
 ## Using installed toolsets
 

@@ -1,5 +1,8 @@
 # MPP internals
 
+See [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope)
+for build configuration, admitted operations, and exclusions.
+
 This page owns maintainer detail for the testnet sponsored Machine Payments
 Protocol charge path. User behavior and host duties are documented in
 [Agent payments with MPP](../agent-payments.md).
