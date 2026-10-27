@@ -63,6 +63,7 @@ use stellar_agent_x402_identity::{
 // ─────────────────────────────────────────────────────────────────────────────
 
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
 const SEP10_AUTH_PATH: &str = "/sep10/auth";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1303,5 +1304,67 @@ fn all_identity_error_variants_have_stable_wire_codes() {
             "wire_code must start with 'identity.': {code}"
         );
         let _ = err.to_string(); // Display must not panic.
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// The mainnet passphrase on the unauthorized entries
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// The test seam refuses the mainnet passphrase before it fetches the
+/// stellar.toml.
+#[tokio::test]
+async fn the_seam_refuses_mainnet_before_any_request() {
+    let mock_server = MockServer::start().await;
+    let server_key = gen_keypair();
+    let mock_host = server_host_port(&mock_server);
+    Mock::given(method("GET"))
+        .and(path("/.well-known/stellar.toml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/plain")
+                .set_body_string(build_stellar_toml(
+                    &pubkey_to_gstrkey(&server_key),
+                    &format!("https://{mock_host}{SEP10_AUTH_PATH}"),
+                )),
+        )
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let err = resolve_and_verify_counterparty_at(
+        &mock_host,
+        MAINNET_PASSPHRASE,
+        &mock_server.uri(),
+        &test_http_client(),
+        Some(&format!("http://{mock_host}{SEP10_AUTH_PATH}")),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.wire_code(), "identity.mainnet_signing_forbidden");
+    assert!(
+        matches!(
+            &err,
+            IdentityError::MainnetSigningForbidden { detail }
+                if detail == stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL
+        ),
+        "{err:?}"
+    );
+    mock_server.verify().await;
+}
+
+/// The production entry refuses the mainnet passphrase before it validates
+/// or fetches the home domain.
+#[tokio::test]
+async fn the_production_entry_refuses_mainnet_before_any_request() {
+    for home_domain in ["Not A Domain", "anchor.example.invalid"] {
+        let err = resolve_and_verify_counterparty(home_domain, MAINNET_PASSPHRASE)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.wire_code(),
+            "identity.mainnet_signing_forbidden",
+            "{home_domain}: {err:?}"
+        );
     }
 }

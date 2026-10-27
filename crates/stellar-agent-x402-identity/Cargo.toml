@@ -22,6 +22,10 @@ stellar-agent-sep10 = { workspace = true }
 # SIGNING_KEY resolution.  Provides fetch_stellar_toml, parse_minimal_sep1.
 stellar-agent-network = { workspace = true }
 
+# The mainnet passphrase, the mainnet signing refusal detail, and the verified
+# policy, enablement and approval proofs of the authorized gate.
+stellar-agent-core = { workspace = true }
+
 # Typed error derives.
 thiserror = { workspace = true }
 

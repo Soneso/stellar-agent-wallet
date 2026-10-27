@@ -88,3 +88,7 @@ pub(crate) mod rule_create;
 // The mainnet refusal at entry of the commit and sign-and-submit tools.
 #[cfg(test)]
 mod mainnet_entry_refusal_tests;
+
+// The authenticated x402 payment on an enabled mainnet profile.
+#[cfg(all(test, feature = "mainnet-write"))]
+mod x402_authenticated_mainnet_tests;

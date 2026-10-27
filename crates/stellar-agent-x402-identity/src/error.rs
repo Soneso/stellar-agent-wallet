@@ -136,6 +136,28 @@ pub enum IdentityError {
         /// or a fixed text, and the web-auth endpoint's host and port.
         reason: String,
     },
+
+    /// A mainnet passphrase reached an entry that never signs on mainnet, or
+    /// the authorized gate's authorization reported `FeatureDisabled`, which
+    /// maps to the signing refusal.
+    ///
+    /// The unauthorized entries refuse before any request.
+    #[error("x402-identity: mainnet signing forbidden: {detail}")]
+    MainnetSigningForbidden {
+        /// The mainnet signing refusal detail.
+        detail: String,
+    },
+
+    /// The mainnet authorization of the counterparty's SEP-10 authentication
+    /// was refused before the signed challenge was submitted.
+    ///
+    /// The refused precondition is logged where it was refused and is not
+    /// part of the error.
+    #[error(
+        "the mainnet authorization for this SEP-10 authentication was refused; \
+         no signed challenge was submitted"
+    )]
+    MainnetAuthorizationRefused,
 }
 
 impl IdentityError {
@@ -164,6 +186,8 @@ impl IdentityError {
             Self::SigningKeyMissing { .. } => "identity.signing_key_missing",
             Self::WebAuthEndpointHostMismatch { .. } => "identity.web_auth_endpoint_host_mismatch",
             Self::Sep10AuthFailed { .. } => "identity.sep10_auth_failed",
+            Self::MainnetSigningForbidden { .. } => "identity.mainnet_signing_forbidden",
+            Self::MainnetAuthorizationRefused => "identity.mainnet_authorization_refused",
         }
     }
 }
@@ -242,39 +266,73 @@ mod tests {
 
     #[test]
     fn wire_code_is_stable_and_non_empty_for_all_variants() {
-        let variants: &[IdentityError] = &[
-            IdentityError::HomeDomainInvalid {
-                detail: "contains uppercase".to_owned(),
-            },
-            IdentityError::HomeDomainUnresolvable {
-                authority: "example.com".to_owned(),
-            },
-            IdentityError::TomlFetchFailed {
-                authority: "example.com".to_owned(),
-                reason: "parse error".to_owned(),
-            },
-            IdentityError::WebAuthEndpointMissing {
-                home_domain: "example.com".to_owned(),
-            },
-            IdentityError::SigningKeyMissing {
-                home_domain: "example.com".to_owned(),
-            },
-            IdentityError::WebAuthEndpointHostMismatch {
-                endpoint_host: "evil.org".to_owned(),
-                home_domain: "example.com".to_owned(),
-            },
-            IdentityError::Sep10AuthFailed {
-                reason: "challenge expired".to_owned(),
-            },
+        let variants: [(IdentityError, &str); 9] = [
+            (
+                IdentityError::HomeDomainInvalid {
+                    detail: "contains uppercase".to_owned(),
+                },
+                "identity.home_domain_invalid",
+            ),
+            (
+                IdentityError::HomeDomainUnresolvable {
+                    authority: "example.com".to_owned(),
+                },
+                "identity.home_domain_unresolvable",
+            ),
+            (
+                IdentityError::TomlFetchFailed {
+                    authority: "example.com".to_owned(),
+                    reason: "parse error".to_owned(),
+                },
+                "identity.toml_fetch_failed",
+            ),
+            (
+                IdentityError::WebAuthEndpointMissing {
+                    home_domain: "example.com".to_owned(),
+                },
+                "identity.web_auth_endpoint_missing",
+            ),
+            (
+                IdentityError::SigningKeyMissing {
+                    home_domain: "example.com".to_owned(),
+                },
+                "identity.signing_key_missing",
+            ),
+            (
+                IdentityError::WebAuthEndpointHostMismatch {
+                    endpoint_host: "evil.org".to_owned(),
+                    home_domain: "example.com".to_owned(),
+                },
+                "identity.web_auth_endpoint_host_mismatch",
+            ),
+            (
+                IdentityError::Sep10AuthFailed {
+                    reason: "challenge expired".to_owned(),
+                },
+                "identity.sep10_auth_failed",
+            ),
+            (
+                IdentityError::MainnetSigningForbidden {
+                    detail: stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL.to_owned(),
+                },
+                "identity.mainnet_signing_forbidden",
+            ),
+            (
+                IdentityError::MainnetAuthorizationRefused,
+                "identity.mainnet_authorization_refused",
+            ),
         ];
-        for err in variants {
-            let code = err.wire_code();
-            assert!(!code.is_empty(), "wire_code must be non-empty: {err:?}");
-            assert!(
-                code.starts_with("identity."),
-                "wire_code must start with 'identity.': {code}"
-            );
+        for (err, code) in &variants {
+            assert_eq!(err.wire_code(), *code, "{err:?}");
         }
+    }
+
+    #[test]
+    fn the_mainnet_authorization_refusal_names_the_withheld_challenge() {
+        assert_eq!(
+            IdentityError::MainnetAuthorizationRefused.to_string(),
+            "the mainnet authorization for this SEP-10 authentication was refused; no signed challenge was submitted"
+        );
     }
 
     // ── Display non-leaky checks ──────────────────────────────────────────────

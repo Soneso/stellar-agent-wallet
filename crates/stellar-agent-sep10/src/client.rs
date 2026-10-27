@@ -64,6 +64,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
+use stellar_agent_core::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
 
 use crate::challenge::Challenge;
 use crate::error::Sep10Error;
@@ -316,17 +317,7 @@ impl Sep10Client {
         let expected_web_auth_domain: &str = match request.web_auth_domain {
             Some(d) => d,
             None => {
-                derived_domain = reqwest::Url::parse(web_auth_endpoint)
-                    .ok()
-                    .and_then(|u| u.host_str().map(str::to_owned))
-                    .ok_or_else(|| Sep10Error::InvalidWebAuthEndpoint {
-                        detail: format!(
-                            "cannot derive web_auth_domain: endpoint \
-                             {:?} has no parseable host; pass web_auth_domain \
-                             explicitly",
-                            web_auth_endpoint
-                        ),
-                    })?;
+                derived_domain = web_auth_domain_for_endpoint(web_auth_endpoint)?;
                 &derived_domain
             }
         };
@@ -473,14 +464,48 @@ impl std::fmt::Debug for Sep10Client {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Error-text helpers
+// Web auth domain
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The testnet network passphrase, a public protocol constant.
-const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+/// The web auth domain a challenge from `web_auth_endpoint` must name: the
+/// endpoint URL's host, without scheme, port or path.
+///
+/// [`Sep10Client::fetch_challenge`] applies this rule when the request names
+/// no web auth domain.
+///
+/// # Errors
+///
+/// [`Sep10Error::InvalidWebAuthEndpoint`] when `web_auth_endpoint` is not a
+/// URL or has no host.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_sep10::client::web_auth_domain_for_endpoint;
+///
+/// assert_eq!(
+///     web_auth_domain_for_endpoint("https://auth.example.com:8443/auth").unwrap(),
+///     "auth.example.com"
+/// );
+/// assert!(web_auth_domain_for_endpoint("not-a-url").is_err());
+/// ```
+pub fn web_auth_domain_for_endpoint(web_auth_endpoint: &str) -> Result<String, Sep10Error> {
+    reqwest::Url::parse(web_auth_endpoint)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .ok_or_else(|| Sep10Error::InvalidWebAuthEndpoint {
+            detail: format!(
+                "cannot derive web_auth_domain: endpoint \
+                 {:?} has no parseable host; pass web_auth_domain \
+                 explicitly",
+                web_auth_endpoint
+            ),
+        })
+}
 
-/// The mainnet network passphrase, a public protocol constant.
-const MAINNET_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
+// ─────────────────────────────────────────────────────────────────────────────
+// Error-text helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// The class of a network passphrase for an error or `Debug` text.
 ///
@@ -645,6 +670,27 @@ mod tests {
     }
 
     // ── web_auth_domain derivation ────────────────────────────────────────────
+
+    /// The web auth domain is the endpoint's host without its port; an
+    /// endpoint without a host refuses.
+    #[test]
+    fn web_auth_domain_is_the_endpoint_host() {
+        assert_eq!(
+            web_auth_domain_for_endpoint("http://127.0.0.1:41234/auth").unwrap(),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            web_auth_domain_for_endpoint("https://auth.example.com:8443/auth").unwrap(),
+            "auth.example.com"
+        );
+        for endpoint in ["not-a-url", "data:text/plain,challenge"] {
+            let err = web_auth_domain_for_endpoint(endpoint).unwrap_err();
+            assert!(
+                matches!(err, Sep10Error::InvalidWebAuthEndpoint { .. }),
+                "{endpoint}: {err:?}"
+            );
+        }
+    }
 
     /// When `web_auth_domain` is `None` and the endpoint URL cannot be parsed
     /// or has no host, `fetch_challenge` must return `InvalidWebAuthEndpoint`

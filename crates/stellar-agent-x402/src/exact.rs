@@ -390,6 +390,8 @@ pub fn intent_digest(
 
 /// Borrowed authority and owned readiness for one mainnet payment.
 /// Construct this bundle through [`Self::new`]; readiness moves into the resolver.
+/// An authenticated payment adds its message receipt through
+/// [`Self::with_authenticated`]; the receipt is dropped with the bundle.
 pub struct X402MainnetProofs<'a> {
     context: &'a stellar_agent_network::MainnetWriteContext,
     policy: &'a stellar_agent_core::mainnet::verified_policy::VerifiedPolicy,
@@ -399,6 +401,7 @@ pub struct X402MainnetProofs<'a> {
     keyring_handle: &'a stellar_agent_network::keyring::KeyringSignHandle,
     audit: Option<stellar_agent_network::mainnet::audit_readiness::AuditReadiness>,
     store: &'a stellar_agent_network::policy_state::PersistedWindowStore,
+    authenticated: Option<stellar_agent_network::mainnet::message::MessageUseReceipt>,
 }
 
 impl<'a> X402MainnetProofs<'a> {
@@ -427,7 +430,22 @@ impl<'a> X402MainnetProofs<'a> {
             keyring_handle,
             audit: Some(audit),
             store,
+            authenticated: None,
         }
+    }
+
+    /// Adds the receipt of the consumed message authorization that the
+    /// authenticated payment's intent continues.
+    ///
+    /// The intent resolver borrows it as the intent's parent, and it drops
+    /// when the payment call returns.
+    #[must_use]
+    pub fn with_authenticated(
+        mut self,
+        receipt: stellar_agent_network::mainnet::message::MessageUseReceipt,
+    ) -> Self {
+        self.authenticated = Some(receipt);
+        self
     }
 }
 
@@ -999,6 +1017,7 @@ async fn create_payment_inner(
             approval: proofs.approval,
             audit,
             store: proofs.store,
+            authenticated: proofs.authenticated.as_ref(),
         })
         .await?;
         open_intent = Some(OpenAuthorization {

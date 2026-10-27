@@ -66,6 +66,11 @@ OFF_FLOORS = {
 
 FLOORS = {"feature-off": OFF_FLOORS.copy(), "feature-on": OFF_FLOORS.copy()}
 
+# The authorized gate paths of stellar-agent-x402-identity compile feature-off
+# against uninhabited inputs and execute only in the feature-on configuration,
+# so the feature-off ratchet sits below the feature-on one.
+FLOORS["feature-off"]["stellar-agent-x402-identity"] = 75
+
 # A crate with no explicit entry must clear this floor. New crates that are
 # legitimately testnet-covered below this bar must add an explicit entry above.
 DEFAULT_FLOOR = 85

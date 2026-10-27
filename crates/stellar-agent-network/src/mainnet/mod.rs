@@ -11,6 +11,8 @@
 //!   consumed its authorization.
 //! - [`digest`]: the content, entries, and bindings digests, and the shared
 //!   subjects and labels by the names their consumers use.
+//! - [`message`]: the SEP-10 message facts, the message use receipt, and the
+//!   check of a challenge against the receipt before the ephemeral key signs.
 //! - [`soroban`]: the check of a Soroban authorization preimage against an
 //!   intent authorization.
 //!
@@ -25,6 +27,7 @@ pub mod consumed;
 pub mod digest;
 #[cfg(all(test, feature = "mainnet-write"))]
 pub(crate) mod fixtures;
+pub mod message;
 #[cfg(feature = "mainnet-write")]
 pub(crate) mod mint;
 pub(crate) mod refusal;

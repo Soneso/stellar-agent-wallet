@@ -48,7 +48,10 @@ pub mod error;
 pub mod gate;
 
 pub use error::IdentityError;
-pub use gate::{VerifiedCounterpartySession, resolve_and_verify_counterparty};
+pub use gate::{
+    MainnetCounterpartySession, MainnetIdentityInputs, VerifiedCounterpartySession,
+    resolve_and_verify_counterparty, resolve_and_verify_counterparty_authorized,
+};
 
 /// Test seam: drives the full gate against an explicit base URL.
 ///
@@ -60,3 +63,11 @@ pub use gate::{VerifiedCounterpartySession, resolve_and_verify_counterparty};
 /// See [`gate::resolve_and_verify_counterparty_at`] for full documentation.
 #[cfg(any(test, feature = "test-helpers"))]
 pub use gate::resolve_and_verify_counterparty_at;
+
+/// Test seam of the authorized mainnet gate: replaces the stellar.toml and
+/// SEP-10 transport only. Only available under `test-helpers` or
+/// `#[cfg(test)]`.
+///
+/// See [`gate::resolve_and_verify_counterparty_authorized_at`].
+#[cfg(any(test, feature = "test-helpers"))]
+pub use gate::resolve_and_verify_counterparty_authorized_at;

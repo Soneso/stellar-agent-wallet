@@ -655,12 +655,9 @@ impl WalletServer {
                 Ok(readiness) => readiness,
                 Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
             };
-        let handle = match stellar_agent_network::keyring::lazy_signer_from_keyring(
-            signer.seed_entry(),
-            &payer,
-        ) {
+        let handle = match x402_mainnet_signing_handle(&signer, &payer) {
             Ok(handle) => handle,
-            Err(error) => return Ok(crate::tools::common::endpoint_refusal_result(&error)),
+            Err(result) => return Ok(result),
         };
         let store = stellar_agent_network::policy_state::PersistedWindowStore::at_path(
             self.window_path.clone(),
@@ -769,7 +766,7 @@ impl WalletServer {
         Ok(response)
     }
 
-    fn x402_approval_store(
+    pub(super) fn x402_approval_store(
         &self,
     ) -> Result<stellar_agent_core::approval::PendingApprovalStore, stellar_agent_core::WalletError>
     {
@@ -789,20 +786,20 @@ impl WalletServer {
 }
 
 /// The approval-required view of a mainnet preparation call.
-struct ApprovalView<'a> {
-    entry: &'a stellar_agent_core::approval::PendingApproval,
-    profile: &'a str,
-    chain_id: &'a str,
-    endpoint_host: &'a str,
-    signer: &'a str,
-    requirements: &'a stellar_agent_x402::wire::PaymentRequirements,
+pub(super) struct ApprovalView<'a> {
+    pub(super) entry: &'a stellar_agent_core::approval::PendingApproval,
+    pub(super) profile: &'a str,
+    pub(super) chain_id: &'a str,
+    pub(super) endpoint_host: &'a str,
+    pub(super) signer: &'a str,
+    pub(super) requirements: &'a stellar_agent_x402::wire::PaymentRequirements,
 }
 
 /// The preparation call's result: the success envelope whose `data.approval`
 /// names the pending approval, as the classic preparation tools return it,
 /// plus the enabled endpoint host, the enrolled signer, and the approval
 /// instructions. It carries no payment payload.
-fn approval_response(view: &ApprovalView<'_>) -> CallToolResult {
+pub(super) fn approval_response(view: &ApprovalView<'_>) -> CallToolResult {
     let approval = json!({
         "approval_nonce": view.entry.approval_nonce,
         "profile": view.profile,
@@ -830,7 +827,7 @@ fn approval_response(view: &ApprovalView<'_>) -> CallToolResult {
 
 /// Where the release of a built mainnet payment failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReleaseFailure {
+pub(super) enum ReleaseFailure {
     /// The payload could not be encoded as the `PAYMENT-SIGNATURE` value.
     Encoding,
     /// The release consumption of the child authorization refused.
@@ -843,14 +840,14 @@ enum ReleaseFailure {
 /// What the handler does for a [`ReleaseFailure`]; it returns no payload in
 /// every case.
 #[derive(Debug)]
-struct ReleaseDecision {
+pub(super) struct ReleaseDecision {
     /// The invalidation stage of the child authorization, or `None` when the
     /// child is already consumed and both records stay used.
-    cleanup: Option<stellar_agent_network::mainnet::resolve::InvalidationStage>,
+    pub(super) cleanup: Option<stellar_agent_network::mainnet::resolve::InvalidationStage>,
     /// The failure whose stage the withheld audit row carries.
-    withheld: X402Failure<'static>,
+    pub(super) withheld: X402Failure<'static>,
     /// Where the payment was withheld, as the error message names it.
-    withheld_at: &'static str,
+    pub(super) withheld_at: &'static str,
 }
 
 /// Selects the cleanup, the withheld row, and the message for a release
@@ -860,7 +857,7 @@ struct ReleaseDecision {
 /// it at the payload release stage. After the child is consumed nothing is
 /// invalidated: the payment authorization is spent, and only the approval
 /// tombstone is missing.
-fn release_decision(failure: ReleaseFailure) -> ReleaseDecision {
+pub(super) fn release_decision(failure: ReleaseFailure) -> ReleaseDecision {
     use stellar_agent_network::mainnet::resolve::InvalidationStage;
     match failure {
         ReleaseFailure::Encoding => ReleaseDecision {
@@ -881,7 +878,7 @@ fn release_decision(failure: ReleaseFailure) -> ReleaseDecision {
     }
 }
 
-fn require_terminal_consumption(
+pub(super) fn require_terminal_consumption(
     result: Result<bool, stellar_agent_core::WalletError>,
 ) -> Result<(), stellar_agent_core::WalletError> {
     if result? {
@@ -891,9 +888,26 @@ fn require_terminal_consumption(
     }
 }
 
+/// The keyring handle that signs a mainnet x402 payment for `payer`.
+///
+/// The handle reads the seed only inside authorized signing, after every gate
+/// of the payment passed; the testnet paths keep the enrollment helper. Both
+/// mainnet x402 tools build their handle here, so the seed is read in one
+/// place for either payment.
+pub(super) fn x402_mainnet_signing_handle(
+    signer: &stellar_agent_network::keyring::EnrolledSigner,
+    payer: &str,
+) -> Result<stellar_agent_network::keyring::KeyringSignHandle, CallToolResult> {
+    stellar_agent_network::keyring::lazy_signer_from_keyring(signer.seed_entry(), payer)
+        .map_err(|error| crate::tools::common::endpoint_refusal_result(&error))
+}
+
 /// Renders a mainnet payment failure under its own code, with a message that
 /// starts with "payment withheld" followed by `withheld`, which says where.
-fn mainnet_x402_error(error: &stellar_agent_x402::X402Error, withheld: &str) -> CallToolResult {
+pub(super) fn mainnet_x402_error(
+    error: &stellar_agent_x402::X402Error,
+    withheld: &str,
+) -> CallToolResult {
     if let stellar_agent_x402::X402Error::MainnetAuthorization(
         stellar_agent_network::mainnet::MainnetAuthorizationError::PolicyDenied(reason),
     ) = error
@@ -1004,9 +1018,9 @@ pub(super) struct X402AuthorizationAudit<'a> {
     request_id: String,
     network: String,
     scheme: String,
-    gate_passed: bool,
+    pub(super) gate_passed: bool,
     decision: PolicyDecision,
-    refusal: Option<stellar_agent_core::error::WalletError>,
+    pub(super) refusal: Option<stellar_agent_core::error::WalletError>,
 }
 
 impl<'a> X402AuthorizationAudit<'a> {
@@ -1033,7 +1047,7 @@ impl<'a> X402AuthorizationAudit<'a> {
         }
     }
 
-    fn with_decision(mut self, decision: PolicyDecision) -> Self {
+    pub(super) fn with_decision(mut self, decision: PolicyDecision) -> Self {
         self.decision = decision;
         self
     }

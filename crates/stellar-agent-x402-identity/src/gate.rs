@@ -53,6 +53,16 @@
 //! valid LDH) BEFORE building the suffix pattern, providing defense-in-depth
 //! against degenerate domains (e.g. `""` → `"."` that matches any host).
 //!
+//! # Mainnet
+//!
+//! The entries above refuse the mainnet passphrase before any request. On
+//! mainnet, [`resolve_and_verify_counterparty_authorized`] runs the same
+//! resolution and bind, then signs the challenge only under a consumed
+//! message authorization: it prepares the ephemeral authentication, resolves
+//! and consumes the message authorization over the caller's proofs, and
+//! completes the authentication against the consumed authorization's
+//! receipt, which it returns with the session.
+//!
 //! # Abort-before-payment contract
 //!
 //! This function is the ONLY entry into the x402 identity gate.  Callers MUST
@@ -64,12 +74,28 @@
 use tracing::{debug, warn};
 use url::Url;
 
+use stellar_agent_core::approval::witness::ApprovalWitness;
+use stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL;
+use stellar_agent_core::mainnet::enablement::EnablementRecord;
+use stellar_agent_core::mainnet::verified_policy::VerifiedPolicy;
+use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+use stellar_agent_network::MainnetWriteContext;
 use stellar_agent_network::counterparty::{
     CounterpartyError, fetch::fetch_stellar_toml, parser::parse_minimal_sep1,
     validation::is_valid_ldh_home_domain,
 };
+use stellar_agent_network::mainnet::audit_readiness::AuditReadiness;
+use stellar_agent_network::mainnet::message::MessageUseReceipt;
+use stellar_agent_network::mainnet::resolve::{
+    MessageSignRequest, SorobanIntent, consume_message_sign, resolve_message_sign,
+};
+use stellar_agent_network::mainnet::{MainnetAuthorizationError, MainnetConsumer};
+use stellar_agent_network::policy_state::PersistedWindowStore;
 use stellar_agent_network::quote_server_text;
-use stellar_agent_sep10::ephemeral::auth_with_ephemeral_key;
+use stellar_agent_sep10::client::web_auth_domain_for_endpoint;
+use stellar_agent_sep10::ephemeral::{
+    auth_with_ephemeral_key, complete_ephemeral_auth_authorized, prepare_ephemeral_auth,
+};
 use stellar_agent_sep10::{Sep10Client, Sep10Error};
 
 use crate::error::{IdentityError, authority_hint};
@@ -237,6 +263,9 @@ fn redact_jwt_for_debug(jwt: &str) -> String {
 ///   rejected).
 /// - [`IdentityError::Sep10AuthFailed`] — the SEP-10 challenge/response cycle
 ///   failed (server signature mismatch, HTTP error, JWT parse failure, etc.).
+/// - [`IdentityError::MainnetSigningForbidden`]: `network_passphrase` is the
+///   mainnet passphrase; nothing is fetched. A mainnet counterparty is
+///   verified through [`resolve_and_verify_counterparty_authorized`].
 ///
 /// # Panics
 ///
@@ -303,6 +332,9 @@ pub async fn resolve_and_verify_counterparty(
 /// Same variants as [`resolve_and_verify_counterparty`], except:
 /// - `HomeDomainInvalid` is NOT returned (LDH check bypassed).
 ///
+/// The mainnet passphrase is refused with
+/// [`IdentityError::MainnetSigningForbidden`] before any request.
+///
 /// # Panics
 ///
 /// Never panics.
@@ -328,7 +360,80 @@ pub async fn resolve_and_verify_counterparty_at(
 // run_gate — shared implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Internal gate runner shared by the production entry point and the test seam.
+/// Internal gate runner of the entries that never sign on mainnet, shared by
+/// the production entry point and the test seam.
+///
+/// Refuses the mainnet passphrase before any request, resolves the web auth
+/// endpoint with [`resolve_web_auth`], and runs the SEP-10 ephemeral-key
+/// challenge/response with the endpoint's host as the web auth domain.
+async fn run_gate_with_override(
+    home_domain: &str,
+    network_passphrase: &str,
+    http: Option<&reqwest::Client>,
+    toml_base_url_override: Option<&str>,
+    web_auth_endpoint_override: Option<&str>,
+) -> Result<VerifiedCounterpartySession, IdentityError> {
+    if network_passphrase == MAINNET_PASSPHRASE {
+        return Err(mainnet_signing_forbidden());
+    }
+    let resolved = resolve_web_auth(
+        home_domain,
+        http,
+        toml_base_url_override,
+        web_auth_endpoint_override,
+    )
+    .await?;
+    let web_auth_endpoint = resolved.web_auth_endpoint;
+    let sep10_client = sep10_client(network_passphrase, toml_base_url_override)?;
+
+    debug!(
+        authority = %authority_hint(&web_auth_endpoint),
+        home_domain = %home_domain,
+        "x402-identity: starting SEP-10 ephemeral auth",
+    );
+
+    // The SEP-10 exchange runs the documented steps of auth_with_ephemeral_key.
+    let session = auth_with_ephemeral_key(
+        &sep10_client,
+        &web_auth_endpoint,
+        home_domain,
+        &resolved.signing_key,
+        None, // web_auth_domain: default to the endpoint host
+    )
+    .await
+    .map_err(|e| sep10_identity_error(&e, &web_auth_endpoint, home_domain))?;
+
+    debug!(
+        home_domain = %home_domain,
+        // The session JWT is never logged.
+        "x402-identity: SEP-10 auth succeeded; JWT obtained",
+    );
+
+    Ok(VerifiedCounterpartySession {
+        jwt: session.jwt.clone(),
+        sub: session.sub.clone(),
+        home_domain: home_domain.to_owned(),
+        // The verified domain's declared accounts, for the payTo anchoring
+        // checks; empty when the stellar.toml omits ACCOUNTS.
+        accounts: resolved.accounts,
+    })
+}
+
+/// The web auth endpoint, server signing key and declared accounts that the
+/// stellar.toml of a home domain names, after the same-domain bind.
+struct ResolvedWebAuth {
+    /// The endpoint the SEP-10 requests go to: the TOML's
+    /// `WEB_AUTH_ENDPOINT`, or the test seam's override after the bind.
+    web_auth_endpoint: String,
+    /// The TOML's `SIGNING_KEY`.
+    signing_key: String,
+    /// The TOML's `ACCOUNTS`.
+    accounts: Vec<String>,
+}
+
+/// Fetches and parses the stellar.toml of `home_domain`, reads
+/// `WEB_AUTH_ENDPOINT` and `SIGNING_KEY`, binds the endpoint to the home
+/// domain, and applies the test seam's endpoint override after the bind.
 ///
 /// When `toml_base_url_override` is `None` (production path), synthesises
 /// `https://{home_domain}/.well-known/stellar.toml` and validates the
@@ -342,13 +447,12 @@ pub async fn resolve_and_verify_counterparty_at(
 /// stellar.tomls to contain `https://` WEB_AUTH_ENDPOINT (passing parser
 /// validation) while actually directing Sep10 calls to a plain-HTTP server.
 /// Always `None` in production; `Some(...)` only in the test seam.
-async fn run_gate_with_override(
+async fn resolve_web_auth(
     home_domain: &str,
-    network_passphrase: &str,
     http: Option<&reqwest::Client>,
     toml_base_url_override: Option<&str>,
     web_auth_endpoint_override: Option<&str>,
-) -> Result<VerifiedCounterpartySession, IdentityError> {
+) -> Result<ResolvedWebAuth, IdentityError> {
     // ── Step 1: Fetch stellar.toml ────────────────────────────────────────────
     let (body, toml_authority) = if let Some(base) = toml_base_url_override {
         // Test-seam path: use the provided base URL, bypass LDH validation.
@@ -481,29 +585,36 @@ async fn run_gate_with_override(
         .map(str::to_owned)
         .unwrap_or(web_auth_endpoint);
 
-    // ── Step 5: SEP-10 ephemeral challenge/response ───────────────────────────
-    // auth_with_ephemeral_key:
-    //   1. Generates fresh SigningKey via OsRng (ZeroizeOnDrop on drop).
-    //   2. Derives ephemeral account G-key (not on-chain; unfunded).
-    //   3. fetch_challenge_verified: 13-point SEP-10 validation + server-key check.
-    //   4. Signs challenge with ephemeral key.
-    //   5. Submits → Sep10Session { jwt, sub, iss, exp, ... }.
-    //   6. ephemeral_key drops → ZeroizeOnDrop zeroes key bytes.
-    // The ephemeral key is not persisted, not funded, and not the payment signer.
-    //
-    // Test-seam path: when toml_base_url_override is Some(...) we are in test mode
-    // and may need to reach a plain-HTTP wiremock server.  Use new_for_unit_test
-    // which omits https_only(true).  This is safe because new_for_unit_test is
-    // only compiled under cfg(any(test, feature = "test-helpers")).
+    Ok(ResolvedWebAuth {
+        web_auth_endpoint,
+        signing_key,
+        accounts: sep1_accounts,
+    })
+}
+
+/// The SEP-10 client for `network_passphrase`.
+///
+/// Test-seam path: when `toml_base_url_override` is `Some(...)` we are in
+/// test mode and may need to reach a plain-HTTP wiremock server, so the
+/// client is `new_for_unit_test`, which omits `https_only(true)`. That
+/// constructor is only compiled under `cfg(any(test, feature =
+/// "test-helpers"))`.
+fn sep10_client(
+    network_passphrase: &str,
+    toml_base_url_override: Option<&str>,
+) -> Result<Sep10Client, IdentityError> {
+    // Production builds always use the HTTPS-only client.
     #[cfg(not(any(test, feature = "test-helpers")))]
-    let sep10_client = Sep10Client::new(network_passphrase).map_err(|e| {
+    let _ = toml_base_url_override;
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    let client = Sep10Client::new(network_passphrase).map_err(|e| {
         warn!("x402-identity: Sep10Client::new failed: {e}");
         IdentityError::Sep10AuthFailed {
             reason: quote_server_text(&e.to_string()),
         }
     })?;
     #[cfg(any(test, feature = "test-helpers"))]
-    let sep10_client = if toml_base_url_override.is_some() {
+    let client = if toml_base_url_override.is_some() {
         // Test-seam: plain-HTTP client for wiremock.
         Sep10Client::new_for_unit_test(network_passphrase).map_err(|e| {
             warn!("x402-identity[test]: Sep10Client::new_for_unit_test failed: {e}");
@@ -519,48 +630,293 @@ async fn run_gate_with_override(
             }
         })?
     };
+    Ok(client)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// resolve_and_verify_counterparty_authorized: the mainnet entry point
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The mainnet proofs the authorized gate spends on the message
+/// authorization of its SEP-10 challenge.
+///
+/// The approval is the operator's approval of the authenticated payment
+/// `intent` for the gate's home domain; one approval covers the message and
+/// the payment.
+pub struct MainnetIdentityInputs<'a> {
+    /// The mainnet write context; its passphrase is the SEP-10 network.
+    pub context: &'a MainnetWriteContext,
+    /// The authenticated payment intent the approval names.
+    pub intent: &'a SorobanIntent<'a>,
+    /// The verified mainnet policy.
+    pub policy: &'a VerifiedPolicy,
+    /// The verified enablement.
+    pub enablement: &'a EnablementRecord,
+    /// The verified approval of the authenticated payment.
+    pub approval: &'a ApprovalWitness,
+    /// The audit readiness, consumed by the message resolution.
+    pub audit: AuditReadiness,
+    /// The window store holding the authorization ledger.
+    pub store: &'a PersistedWindowStore,
+}
+
+impl std::fmt::Debug for MainnetIdentityInputs<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MainnetIdentityInputs")
+            .field("profile", &self.context.profile_name())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A counterparty session verified on mainnet, with the receipt of the
+/// consumed message authorization its challenge was signed under.
+///
+/// The receipt is the parent the authenticated payment's intent continues;
+/// [`Self::into_parts`] hands it on.
+pub struct MainnetCounterpartySession {
+    session: VerifiedCounterpartySession,
+    receipt: MessageUseReceipt,
+}
+
+impl MainnetCounterpartySession {
+    /// The verified session.
+    #[must_use]
+    pub fn session(&self) -> &VerifiedCounterpartySession {
+        &self.session
+    }
+
+    /// The verified session and the message receipt.
+    #[must_use]
+    pub fn into_parts(self) -> (VerifiedCounterpartySession, MessageUseReceipt) {
+        (self.session, self.receipt)
+    }
+}
+
+impl std::fmt::Debug for MainnetCounterpartySession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MainnetCounterpartySession")
+            .field("session", &self.session)
+            .field("receipt", &self.receipt)
+            .finish()
+    }
+}
+
+/// Runs the counterparty-identity gate on mainnet, signing the SEP-10
+/// challenge only under a consumed message authorization.
+///
+/// The steps run in this order:
+///
+/// 1. Fetch the stellar.toml of `home_domain` over the production fetch.
+/// 2. Parse it and read `WEB_AUTH_ENDPOINT` and `SIGNING_KEY`.
+/// 3. Bind the endpoint to the home domain.
+/// 4. Derive the web auth domain from the endpoint with
+///    [`web_auth_domain_for_endpoint`].
+/// 5. Build the SEP-10 client on the context's passphrase.
+/// 6. Prepare the ephemeral authentication with [`prepare_ephemeral_auth`],
+///    which requires the challenge's client account to be the ephemeral
+///    account before anything is authorized.
+/// 7. Resolve the message authorization of the prepared message facts for
+///    the authenticated payment with [`resolve_message_sign`].
+/// 8. Consume it with [`consume_message_sign`].
+/// 9. Sign and submit the challenge with
+///    [`complete_ephemeral_auth_authorized`] under the receipt.
+///
+/// The Message authorization is consumed before the SEP-10 signature.
+///
+/// A failure before step 7 leaves the authorization ledger untouched and the
+/// approval unspent. A refused resolution writes no record. A refused
+/// consume leaves the record invalidated, or `Used` when it was already
+/// used. If cleanup fails, the record remains open until expiry. A failure
+/// at step 9 leaves the record `Used`: the approval is spent and the
+/// operator approves again.
+///
+/// Without the `mainnet-write` feature of `stellar-agent-network` no
+/// [`MainnetWriteContext`] exists, so no [`MainnetIdentityInputs`] can be
+/// built and this function cannot be called. The entries that never sign on
+/// mainnet refuse a mainnet passphrase in every build.
+///
+/// # Errors
+///
+/// - Every [`IdentityError`] of [`resolve_and_verify_counterparty`] for the
+///   resolution, the bind and the SEP-10 exchange.
+/// - [`IdentityError::MainnetAuthorizationRefused`] when the challenge names
+///   another account, the message authorization is refused at its
+///   resolution or consume, or the completion refuses before its
+///   submission.
+/// - [`IdentityError::MainnetSigningForbidden`] when the authorization
+///   reports `FeatureDisabled`, which maps to the signing refusal.
+///
+/// # Panics
+///
+/// Never panics.
+pub async fn resolve_and_verify_counterparty_authorized(
+    home_domain: &str,
+    inputs: MainnetIdentityInputs<'_>,
+) -> Result<MainnetCounterpartySession, IdentityError> {
+    run_authorized_gate(home_domain, None, None, None, inputs).await
+}
+
+/// Test seam of [`resolve_and_verify_counterparty_authorized`]: the
+/// stellar.toml at `toml_base_url` over `http`, and the SEP-10 requests to
+/// `web_auth_override` after the bind, as
+/// [`resolve_and_verify_counterparty_at`] replaces them.
+///
+/// The seam replaces the transport only: the prepare step, the message
+/// resolution and consume, and the authorized signature run unchanged.
+///
+/// # Errors
+///
+/// Those of [`resolve_and_verify_counterparty_authorized`], except
+/// `HomeDomainInvalid` (the LDH check is bypassed).
+///
+/// # Panics
+///
+/// Never panics.
+#[cfg(any(test, feature = "test-helpers"))]
+pub async fn resolve_and_verify_counterparty_authorized_at(
+    home_domain: &str,
+    toml_base_url: &str,
+    http: &reqwest::Client,
+    web_auth_override: Option<&str>,
+    inputs: MainnetIdentityInputs<'_>,
+) -> Result<MainnetCounterpartySession, IdentityError> {
+    run_authorized_gate(
+        home_domain,
+        Some(http),
+        Some(toml_base_url),
+        web_auth_override,
+        inputs,
+    )
+    .await
+}
+
+/// The authorized gate shared by the mainnet entry point and its test seam.
+async fn run_authorized_gate(
+    home_domain: &str,
+    http: Option<&reqwest::Client>,
+    toml_base_url_override: Option<&str>,
+    web_auth_endpoint_override: Option<&str>,
+    inputs: MainnetIdentityInputs<'_>,
+) -> Result<MainnetCounterpartySession, IdentityError> {
+    let resolved = resolve_web_auth(
+        home_domain,
+        http,
+        toml_base_url_override,
+        web_auth_endpoint_override,
+    )
+    .await?;
+    let web_auth_endpoint = resolved.web_auth_endpoint;
+    let sep10_failure = |e: Sep10Error| sep10_identity_error(&e, &web_auth_endpoint, home_domain);
+    let web_auth_domain =
+        web_auth_domain_for_endpoint(&web_auth_endpoint).map_err(sep10_failure)?;
+    let client = sep10_client(inputs.context.network_passphrase(), toml_base_url_override)?;
 
     debug!(
         authority = %authority_hint(&web_auth_endpoint),
         home_domain = %home_domain,
-        "x402-identity: starting SEP-10 ephemeral auth",
+        "x402-identity: starting authorized SEP-10 ephemeral auth",
     );
 
-    let session = auth_with_ephemeral_key(
-        &sep10_client,
+    let prepared = prepare_ephemeral_auth(
+        &client,
         &web_auth_endpoint,
         home_domain,
-        &signing_key,
-        None, // web_auth_domain: default to the endpoint host
+        &resolved.signing_key,
+        &web_auth_domain,
     )
     .await
-    .map_err(|e| {
-        // The reason quotes the failure and names the endpoint by host and port.
-        warn!(
-            authority = %authority_hint(&web_auth_endpoint),
-            home_domain = %home_domain,
-            "x402-identity: SEP-10 auth failed",
-        );
-        IdentityError::Sep10AuthFailed {
-            reason: sep10_failure_reason(&e, &web_auth_endpoint),
-        }
-    })?;
+    .map_err(sep10_failure)?;
+    let message = prepared.message_facts();
+    let authorization = resolve_message_sign(MessageSignRequest {
+        context: inputs.context,
+        consumer: MainnetConsumer::X402Authenticated,
+        intent: inputs.intent,
+        message: &message,
+        policy: inputs.policy,
+        enablement: inputs.enablement,
+        approval: inputs.approval,
+        audit: inputs.audit,
+        store: inputs.store,
+    })
+    .map_err(|error| authorization_identity_error(&error))?;
+    let receipt = consume_message_sign(inputs.context, authorization, inputs.store)
+        .map_err(|error| authorization_identity_error(&error))?;
+    let session = complete_ephemeral_auth_authorized(
+        &client,
+        prepared,
+        MainnetConsumer::X402Authenticated,
+        &receipt,
+    )
+    .await
+    .map_err(sep10_failure)?;
 
     debug!(
         home_domain = %home_domain,
-        // NEVER log session.jwt here — JWT material must not appear in logs.
-        "x402-identity: SEP-10 auth succeeded; JWT obtained",
+        // The session JWT is never logged.
+        "x402-identity: authorized SEP-10 auth succeeded; JWT obtained",
     );
 
-    Ok(VerifiedCounterpartySession {
-        jwt: session.jwt.clone(),
-        sub: session.sub.clone(),
-        home_domain: home_domain.to_owned(),
-        // Carry the verified domain's declared accounts for downstream
-        // payTo-anchoring checks.
-        // Empty when stellar.toml omits ACCOUNTS — see field rustdoc.
-        accounts: sep1_accounts,
+    Ok(MainnetCounterpartySession {
+        session: VerifiedCounterpartySession {
+            jwt: session.jwt.clone(),
+            sub: session.sub.clone(),
+            home_domain: home_domain.to_owned(),
+            accounts: resolved.accounts,
+        },
+        receipt,
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mainnet error mapping
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The refusal of an entry that never signs on mainnet.
+fn mainnet_signing_forbidden() -> IdentityError {
+    IdentityError::MainnetSigningForbidden {
+        detail: MAINNET_SIGNING_REFUSAL_DETAIL.to_owned(),
+    }
+}
+
+/// The [`IdentityError`] of a failed SEP-10 step against `web_auth_endpoint`.
+///
+/// The two mainnet errors keep their meaning; every other error is a failed
+/// SEP-10 exchange, logged at warn and reported with
+/// [`sep10_failure_reason`].
+fn sep10_identity_error(
+    error: &Sep10Error,
+    web_auth_endpoint: &str,
+    home_domain: &str,
+) -> IdentityError {
+    match error {
+        Sep10Error::MainnetSigningForbidden { .. } => mainnet_signing_forbidden(),
+        Sep10Error::MainnetAuthorizationRefused => IdentityError::MainnetAuthorizationRefused,
+        other => {
+            // The reason quotes the failure and names the endpoint by host and port.
+            warn!(
+                authority = %authority_hint(web_auth_endpoint),
+                home_domain = %home_domain,
+                "x402-identity: SEP-10 auth failed",
+            );
+            IdentityError::Sep10AuthFailed {
+                reason: sep10_failure_reason(other, web_auth_endpoint),
+            }
+        }
+    }
+}
+
+/// The [`IdentityError`] of a refused message authorization.
+///
+/// `FeatureDisabled` maps to the signing refusal. A refused precondition,
+/// already logged where it was refused, is the generic refusal, which names
+/// none; a policy denial, which the message resolver never returns, is
+/// refused the same way.
+fn authorization_identity_error(error: &MainnetAuthorizationError) -> IdentityError {
+    match error {
+        MainnetAuthorizationError::FeatureDisabled => mainnet_signing_forbidden(),
+        // Refused, PolicyDenied, and any later variant fail closed.
+        _ => IdentityError::MainnetAuthorizationRefused,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1017,5 +1373,95 @@ mod tests {
             result.is_ok(),
             "auth.example.com must be accepted as a subdomain of example.com after FQDN guard; got: {result:?}"
         );
+    }
+
+    /// The two mainnet SEP-10 errors keep their meaning, and every other
+    /// SEP-10 error is a failed exchange.
+    #[test]
+    fn sep10_errors_map_to_the_identity_errors() {
+        let endpoint = "https://auth.example.com/auth";
+        let forbidden = sep10_identity_error(
+            &Sep10Error::MainnetSigningForbidden {
+                detail: MAINNET_SIGNING_REFUSAL_DETAIL.to_owned(),
+            },
+            endpoint,
+            "example.com",
+        );
+        assert!(
+            matches!(
+                &forbidden,
+                IdentityError::MainnetSigningForbidden { detail }
+                    if detail == MAINNET_SIGNING_REFUSAL_DETAIL
+            ),
+            "{forbidden:?}"
+        );
+        let refused = sep10_identity_error(
+            &Sep10Error::MainnetAuthorizationRefused,
+            endpoint,
+            "example.com",
+        );
+        assert!(
+            matches!(refused, IdentityError::MainnetAuthorizationRefused),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "the mainnet authorization for this SEP-10 authentication was refused; no signed challenge was submitted"
+        );
+        let failed =
+            sep10_identity_error(&Sep10Error::MissingServerSignature, endpoint, "example.com");
+        assert!(
+            matches!(
+                &failed,
+                IdentityError::Sep10AuthFailed { reason }
+                    if reason.ends_with("(authority: auth.example.com)")
+            ),
+            "{failed:?}"
+        );
+    }
+
+    /// `FeatureDisabled` maps to the signing refusal; a refused precondition
+    /// and a policy denial are the generic refusal, which names no
+    /// precondition.
+    #[test]
+    fn authorization_errors_map_to_the_identity_errors() {
+        use stellar_agent_network::mainnet::MainnetPrecondition;
+        let forbidden = authorization_identity_error(&MainnetAuthorizationError::FeatureDisabled);
+        assert!(
+            matches!(
+                &forbidden,
+                IdentityError::MainnetSigningForbidden { detail }
+                    if detail == MAINNET_SIGNING_REFUSAL_DETAIL
+            ),
+            "{forbidden:?}"
+        );
+        for (error, label) in [
+            (
+                MainnetAuthorizationError::Refused(MainnetPrecondition::MessageClientAccount),
+                "message_client_account",
+            ),
+            (
+                MainnetAuthorizationError::Refused(MainnetPrecondition::ApprovalNonceReused),
+                "approval_nonce_reused",
+            ),
+            (
+                MainnetAuthorizationError::PolicyDenied(Box::new(
+                    stellar_agent_core::policy::DenyReason::AssetNotAllowlisted,
+                )),
+                "asset_not_allowlisted",
+            ),
+        ] {
+            let mapped = authorization_identity_error(&error);
+            assert!(
+                matches!(mapped, IdentityError::MainnetAuthorizationRefused),
+                "{mapped:?}"
+            );
+            let text = mapped.to_string();
+            assert!(!text.contains(label), "{text}");
+            assert_eq!(
+                text,
+                "the mainnet authorization for this SEP-10 authentication was refused; no signed challenge was submitted"
+            );
+        }
     }
 }

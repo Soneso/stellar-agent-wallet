@@ -483,7 +483,10 @@ impl Header {
         require(chain == self.chain, P::ChainMismatch)
     }
 
-    fn check_consumer(&self, consumer: MainnetConsumer) -> Result<(), MainnetAuthorizationError> {
+    pub(crate) fn check_consumer(
+        &self,
+        consumer: MainnetConsumer,
+    ) -> Result<(), MainnetAuthorizationError> {
         require(consumer == self.consumer, P::ConsumerMismatch)?;
         require(
             self.domain != AuthorizationDomain::Soroban
@@ -569,7 +572,7 @@ impl Header {
         require(anchored_count >= self.audit.anchored_count(), P::AuditCount)
     }
 
-    fn check_not_expired(&self, now_ms: u64) -> Result<(), MainnetAuthorizationError> {
+    pub(crate) fn check_not_expired(&self, now_ms: u64) -> Result<(), MainnetAuthorizationError> {
         require(
             self.expires_at_ms <= self.approval.expires_at_ms,
             P::LifetimeInvalid,
@@ -1188,6 +1191,25 @@ impl<R: FeeBumpRole> MainnetFeeBumpAuthorization<R> {
 impl MainnetMessageSignAuthorization {
     shared_methods!();
 
+    /// The authorization over `inner`, assembled by the Message arm of the
+    /// crate's mint.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn from_inner(inner: MessageSignInner) -> Self {
+        Self(inner)
+    }
+
+    /// The header and the message facts the authorization binds.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn inner(&self) -> &MessageSignInner {
+        &self.0
+    }
+
+    /// The header and the message facts, moved out of the authorization.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn into_inner(self) -> MessageSignInner {
+        self.0
+    }
+
     gated_method! {
         /// Requires every component of `domain` and the content digest to be
         /// the bound ones, each on its own.
@@ -1196,17 +1218,52 @@ impl MainnetMessageSignAuthorization {
         ///
         /// [`MainnetAuthorizationError::Refused`] naming the mismatch.
         fn check_message(&self, domain: &MessageDomain, content_digest: &[u8; 32]) -> Result<(), MainnetAuthorizationError> {
-            match &self.0.binding {
-                DomainBinding::Message { domain: bound, content_digest: bound_content, .. } => {
-                    require(domain.home_domain == bound.home_domain, P::MessageHomeDomain)?;
-                    require(domain.web_auth_domain == bound.web_auth_domain, P::MessageWebAuthDomain)?;
-                    require(domain.server_key == bound.server_key, P::MessageServerKey)?;
-                    require(content_digest == bound_content, P::MessageContent)
-                }
-                _ => Err(MainnetAuthorizationError::Refused(P::BindingMismatch)),
-            }
+            check_message_binding(&self.0.binding, domain, content_digest)
         }
     }
+}
+
+/// Requires every component of `domain` and the content digest to be the ones
+/// `binding` holds, each on its own; a binding of another domain refuses.
+#[cfg(feature = "mainnet-write")]
+pub(crate) fn check_message_binding(
+    binding: &DomainBinding,
+    domain: &MessageDomain,
+    content_digest: &[u8; 32],
+) -> Result<(), MainnetAuthorizationError> {
+    match binding {
+        DomainBinding::Message {
+            domain: bound,
+            content_digest: bound_content,
+            ..
+        } => check_message_domain(bound, bound_content, domain, content_digest),
+        _ => Err(MainnetAuthorizationError::Refused(P::BindingMismatch)),
+    }
+}
+
+/// Requires every component of `domain` and `content_digest` to be the bound
+/// ones, each on its own: the home domain, the web authentication domain, the
+/// server key, then the content.
+///
+/// The one definition of the message comparisons, which the authorization's
+/// check and the SEP-10 challenge check share.
+#[cfg(feature = "mainnet-write")]
+pub(crate) fn check_message_domain(
+    bound: &MessageDomain,
+    bound_content: &[u8; 32],
+    domain: &MessageDomain,
+    content_digest: &[u8; 32],
+) -> Result<(), MainnetAuthorizationError> {
+    require(
+        domain.home_domain == bound.home_domain,
+        P::MessageHomeDomain,
+    )?;
+    require(
+        domain.web_auth_domain == bound.web_auth_domain,
+        P::MessageWebAuthDomain,
+    )?;
+    require(domain.server_key == bound.server_key, P::MessageServerKey)?;
+    require(content_digest == bound_content, P::MessageContent)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1970,7 +2027,13 @@ mod tests {
             let request = MintRequest {
                 chain: Caip2::Mainnet,
                 binding: binding.clone(),
-                consumer: MainnetConsumer::X402Create,
+                // A Message record is minted only for the authenticated x402
+                // payment.
+                consumer: if domain == AuthorizationDomain::Message {
+                    MainnetConsumer::X402Authenticated
+                } else {
+                    MainnetConsumer::X402Create
+                },
                 policy_sequence,
                 policy_digest,
                 approval_nonce: approval.nonce().to_owned(),

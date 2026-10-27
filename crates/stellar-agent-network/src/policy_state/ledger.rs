@@ -465,7 +465,7 @@ pub(super) fn validate(wire: &WireFile) -> Result<(), WindowStoreError> {
                 "an authorization holds a reservation other than its own".to_owned(),
             ));
         }
-        if auth.parent.is_some() != (auth.domain == AuthorizationDomain::X402Submit) {
+        if auth.parent.is_some() != requires_parent(auth.domain, auth.consumer) {
             return Err(invalid(
                 "an authorization's parent disagrees with its domain".to_owned(),
             ));
@@ -574,9 +574,30 @@ pub struct MintRequest {
     /// transaction, an inner fee bump, or a Soroban intent, and the fee
     /// entries of an outer fee bump. Empty for every other domain.
     pub holds: Vec<WindowEntry>,
-    /// The used authorization an x402 submission continues; absent for every
-    /// other domain.
+    /// The used authorization a continuation names: the used Soroban intent
+    /// of an x402 submission, and the used message record of an
+    /// authenticated x402 intent, which shares its approval. Absent for every
+    /// other record.
     pub parent: Option<AuthorizationId>,
+}
+
+/// Whether a record of `domain` minted for `consumer` continues a parent: an
+/// x402 submission always does, and so does the Soroban intent of an
+/// authenticated x402 payment.
+fn requires_parent(domain: AuthorizationDomain, consumer: MainnetConsumer) -> bool {
+    domain == AuthorizationDomain::X402Submit
+        || (domain == AuthorizationDomain::Soroban
+            && consumer == MainnetConsumer::X402Authenticated)
+}
+
+/// The domain of the parent a `child` record continues, or `None` for a
+/// domain without one.
+fn parent_domain(child: AuthorizationDomain) -> Option<AuthorizationDomain> {
+    match child {
+        AuthorizationDomain::X402Submit => Some(AuthorizationDomain::Soroban),
+        AuthorizationDomain::Soroban => Some(AuthorizationDomain::Message),
+        _ => None,
+    }
 }
 
 /// Proof that the store reserved window headroom for an authorization's
@@ -1158,11 +1179,16 @@ impl PersistedWindowStore {
             P::ConsumerMismatch,
         )?;
         check(
+            domain != AuthorizationDomain::Message
+                || request.consumer == MainnetConsumer::X402Authenticated,
+            P::ConsumerMismatch,
+        )?;
+        check(
             HoldKind::of(domain).is_some() || request.holds.is_empty(),
             P::HoldsMismatch,
         )?;
         check(
-            request.parent.is_some() == (domain == AuthorizationDomain::X402Submit),
+            request.parent.is_some() == requires_parent(domain, request.consumer),
             P::IntentRecordMismatch,
         )?;
         let now = now_ms()?;
@@ -1209,7 +1235,7 @@ impl PersistedWindowStore {
                 check(
                     parent.is_some_and(|parent| {
                         parent.state == AuthorizationState::Used
-                            && parent.domain == AuthorizationDomain::Soroban
+                            && Some(parent.domain) == parent_domain(domain)
                             && parent.profile
                                 == stellar_agent_core::profile::name::profile_name_for_approval(
                                     profile,
@@ -1617,13 +1643,12 @@ mod tests {
             self.nonces.set(n);
             MintRequest {
                 chain: Caip2::Mainnet,
-                consumer: if matches!(
-                    binding.domain(),
-                    AuthorizationDomain::Soroban | AuthorizationDomain::X402Submit
-                ) {
-                    MainnetConsumer::X402Create
-                } else {
-                    MainnetConsumer::CliPay
+                consumer: match binding.domain() {
+                    AuthorizationDomain::Soroban | AuthorizationDomain::X402Submit => {
+                        MainnetConsumer::X402Create
+                    }
+                    AuthorizationDomain::Message => MainnetConsumer::X402Authenticated,
+                    _ => MainnetConsumer::CliPay,
                 },
                 binding,
                 policy_sequence: 7,
@@ -3288,6 +3313,18 @@ mod tests {
             ("a parent outside an x402 submission", |w| {
                 w.authorizations[1].parent = Some(AuthorizationId::from_bytes([1; 32]));
             }),
+            ("an authenticated intent without a parent", |w| {
+                w.authorizations[1] = authenticated_intent_record(&w.authorizations[1], None);
+            }),
+            ("a message record with a parent", |w| {
+                let mut message_record = w.authorizations[1].clone();
+                message_record.binding = message(1);
+                message_record.domain = AuthorizationDomain::Message;
+                message_record.content_digest = message(1).content_digest();
+                message_record.consumer = MainnetConsumer::X402Authenticated;
+                message_record.parent = Some(AuthorizationId::from_bytes([1; 32]));
+                w.authorizations[1] = message_record;
+            }),
             ("a repeated hold", |w| {
                 let copy = w.holds[0].clone();
                 w.holds.push(copy);
@@ -3334,7 +3371,7 @@ mod tests {
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, minted.id);
         assert_eq!(open[0].domain, AuthorizationDomain::Message);
-        assert_eq!(open[0].consumer, MainnetConsumer::CliPay);
+        assert_eq!(open[0].consumer, MainnetConsumer::X402Authenticated);
         assert_eq!(
             (open[0].minted_at_ms, open[0].expires_at_ms),
             (T0, minted.expires_at_ms)
@@ -3474,8 +3511,250 @@ mod tests {
             );
             assert_eq!(l.store.path().exists().then(|| l.bytes()), before);
             request.consumer = consumer;
+            if consumer == MainnetConsumer::X402Authenticated {
+                // An authenticated intent continues its used message record.
+                assert_eq!(
+                    refusal(l.mint(&request)),
+                    MainnetPrecondition::IntentRecordMismatch
+                );
+                let (message_request, parent) = used_message(&l);
+                request.approval_nonce = message_request.approval_nonce;
+                request.parent = Some(parent.id);
+            }
             l.mint(&request).unwrap();
         }
+    }
+
+    /// A used message record whose approval an authenticated intent shares.
+    fn used_message(l: &Ledger) -> (MintRequest, MintedRecord) {
+        let request = l.request(message(0x40), vec![]);
+        let minted = l.mint(&request).unwrap();
+        l.consume(&request, &minted, &consumption_of(&request.binding))
+            .unwrap();
+        (request, minted)
+    }
+
+    /// An authenticated Soroban intent request continuing `parent`, the used
+    /// message record of `message_request`.
+    fn authenticated_child(
+        l: &Ledger,
+        message_request: &MintRequest,
+        parent: &MintedRecord,
+        n: u8,
+    ) -> MintRequest {
+        let mut child = l.request(soroban(n), vec![hold(40)]);
+        child.consumer = MainnetConsumer::X402Authenticated;
+        child.approval_nonce = message_request.approval_nonce.clone();
+        child.parent = Some(parent.id);
+        child
+    }
+
+    /// `record` as a settled authenticated Soroban intent naming `parent`.
+    fn authenticated_intent_record(
+        record: &WireAuthorization,
+        parent: Option<AuthorizationId>,
+    ) -> WireAuthorization {
+        let mut intent = record.clone();
+        intent.binding = soroban(1);
+        intent.domain = AuthorizationDomain::Soroban;
+        intent.content_digest = soroban(1).content_digest();
+        intent.consumer = MainnetConsumer::X402Authenticated;
+        intent.parent = parent;
+        intent
+    }
+
+    /// A snapshot with an authenticated intent that names its parent is
+    /// valid; the invariant breakage above is the parent's absence alone.
+    #[test]
+    fn an_authenticated_intent_with_its_parent_reads() {
+        let mut wire = WireFile {
+            version: 4,
+            authorizations: vec![sample(AuthorizationState::Expired, 2, Some(9))],
+            ..WireFile::default()
+        };
+        wire.authorizations[0] = authenticated_intent_record(
+            &wire.authorizations[0],
+            Some(AuthorizationId::from_bytes([1; 32])),
+        );
+        validate(&wire).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn a_message_record_is_minted_only_for_the_authenticated_consumer() {
+        let l = Ledger::new();
+        let mut request = l.request(message(1), vec![]);
+        request.consumer = MainnetConsumer::CliPay;
+        let before = l.store.path().exists().then(|| l.bytes());
+        assert_eq!(
+            refusal(l.mint(&request)),
+            MainnetPrecondition::ConsumerMismatch
+        );
+        assert_eq!(l.store.path().exists().then(|| l.bytes()), before);
+        request.consumer = MainnetConsumer::X402Authenticated;
+        l.mint(&request).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn an_authenticated_intent_continues_its_used_message_once() {
+        let l = Ledger::new();
+        let (message_request, parent) = used_message(&l);
+        let child = authenticated_child(&l, &message_request, &parent, 1);
+        let minted = l.mint(&child).unwrap();
+        assert_eq!(l.record(minted.id).parent, Some(parent.id));
+        assert_eq!(l.record(parent.id).state, AuthorizationState::Used);
+    }
+
+    #[test]
+    #[serial]
+    fn an_authenticated_continuation_breaking_a_requirement_refuses() {
+        use MainnetPrecondition as P;
+        let assert_unchanged_refusal = |l: &Ledger, request: &MintRequest, name: &str| {
+            let before = l.bytes();
+            assert_eq!(refusal(l.mint(request)), P::IntentRecordMismatch, "{name}");
+            assert_eq!(l.bytes(), before, "{name}");
+        };
+        // An authenticated intent always names a parent.
+        {
+            let l = Ledger::new();
+            let (message_request, parent) = used_message(&l);
+            let mut child = authenticated_child(&l, &message_request, &parent, 1);
+            child.parent = None;
+            assert_unchanged_refusal(&l, &child, "no parent");
+        }
+        // The parent is used.
+        {
+            let l = Ledger::new();
+            let message_request = l.request(message(0x40), vec![]);
+            let open = l.mint(&message_request).unwrap();
+            let child = authenticated_child(&l, &message_request, &open, 1);
+            assert_unchanged_refusal(&l, &child, "open parent");
+        }
+        // The fields are equal.
+        let mutations: [(&str, Mutation); 2] = [
+            ("nonce", |c| c.approval_nonce = "other".to_owned()),
+            ("approval expiry", |c| c.approval_expires_at_ms -= 1),
+        ];
+        for (name, mutate) in mutations {
+            let l = Ledger::new();
+            let (message_request, parent) = used_message(&l);
+            let mut child = authenticated_child(&l, &message_request, &parent, 1);
+            mutate(&mut child);
+            assert_unchanged_refusal(&l, &child, name);
+        }
+        // The profile is equal.
+        {
+            let l = Ledger::new();
+            let (message_request, parent) = used_message(&l);
+            let child = authenticated_child(&l, &message_request, &parent, 1);
+            let mut other = l.profile.clone();
+            other.attestation_key_id =
+                stellar_agent_core::profile::schema::KeyringEntryRef::default_attestation_key(
+                    "other",
+                );
+            other.policy_owner_key_id =
+                stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key("other");
+            assert_ne!(profile_name_for_approval(&other), l.name());
+            let before = l.bytes();
+            assert_eq!(
+                refusal(l.store.mint_authorization(&other, &child)),
+                P::IntentRecordMismatch
+            );
+            assert_eq!(l.bytes(), before);
+        }
+        // The policy is equal: the pin moves on and the child names it.
+        for (sequence, digest) in [(8, [7; 32]), (7, [8; 32])] {
+            let l = Ledger::new();
+            let (message_request, parent) = used_message(&l);
+            let mut child = authenticated_child(&l, &message_request, &parent, 1);
+            l.pin(sequence, digest);
+            child.policy_sequence = sequence;
+            child.policy_digest = digest;
+            assert_unchanged_refusal(&l, &child, "policy");
+        }
+        // A parent has one child, whatever the second child's content.
+        {
+            let l = Ledger::new();
+            let (message_request, parent) = used_message(&l);
+            l.mint(&authenticated_child(&l, &message_request, &parent, 1))
+                .unwrap();
+            let second = authenticated_child(&l, &message_request, &parent, 2);
+            assert_unchanged_refusal(&l, &second, "second child");
+        }
+        // The parent domain is the message domain: a used authenticated
+        // intent without a child is no parent of another intent.
+        {
+            let l = Ledger::new();
+            let (message_request, parent) = used_message(&l);
+            let intent = authenticated_child(&l, &message_request, &parent, 1);
+            let used = l.mint(&intent).unwrap();
+            l.consume(&intent, &used, &consumption_of(&intent.binding))
+                .unwrap();
+            let mut child = l.request(soroban(2), vec![hold(40)]);
+            child.consumer = MainnetConsumer::X402Authenticated;
+            child.approval_nonce = message_request.approval_nonce.clone();
+            child.parent = Some(used.id);
+            assert_unchanged_refusal(&l, &child, "intent parent of an intent");
+        }
+        // A submission continues an intent, never a message record.
+        {
+            let l = Ledger::new();
+            let (message_request, parent) = used_message(&l);
+            let mut child = l.request(x402(1), vec![]);
+            child.consumer = MainnetConsumer::X402Authenticated;
+            child.approval_nonce = message_request.approval_nonce.clone();
+            child.parent = Some(parent.id);
+            assert_unchanged_refusal(&l, &child, "message parent of a submission");
+        }
+        // A plain intent and a message record name no parent.
+        for binding in [soroban(1), message(1)] {
+            let l = Ledger::new();
+            let (message_request, parent) = used_message(&l);
+            let mut child = l.request(binding, vec![]);
+            child.approval_nonce = message_request.approval_nonce.clone();
+            child.parent = Some(parent.id);
+            assert_unchanged_refusal(&l, &child, "parent of a parentless record");
+        }
+    }
+
+    /// A message consume compares the recomputed content digest before the
+    /// consumption binding.
+    #[test]
+    #[serial]
+    fn a_message_consume_compares_the_content_before_the_binding() {
+        let l = Ledger::new();
+        let request = l.request(message(1), vec![]);
+        let minted = l.mint(&request).unwrap();
+        let expect = ConsumeExpect::new(
+            l.name(),
+            request.chain,
+            request.consumer,
+            request.binding.clone(),
+            request.policy_sequence,
+            request.policy_digest,
+            request.approval_nonce.clone(),
+            request.approval_expires_at_ms,
+            None,
+            minted.bindings_digest,
+            AUDIT,
+            &RecomputedFacts {
+                content_digest: message(2).content_digest(),
+                entries_digest: entries_digest(&[]),
+                audit: AUDIT,
+            },
+        );
+        let before = l.bytes();
+        assert_eq!(
+            refusal(l.store.consume_authorization(
+                &l.profile,
+                minted.id,
+                &expect,
+                &consumption_of(&message(2)),
+            )),
+            MainnetPrecondition::ContentDigest
+        );
+        assert_eq!(l.bytes(), before);
     }
 
     #[test]

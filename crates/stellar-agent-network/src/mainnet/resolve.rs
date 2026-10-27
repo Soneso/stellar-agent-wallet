@@ -9,8 +9,10 @@
 
 use super::audit_readiness::AuditReadiness;
 use super::authorization::{
-    MainnetSorobanIntentAuthorization, MainnetSubmitAuthorization, MainnetTxSignAuthorization,
+    MainnetMessageSignAuthorization, MainnetSorobanIntentAuthorization, MainnetSubmitAuthorization,
+    MainnetTxSignAuthorization,
 };
+use super::message::{MessageFacts, MessageUseReceipt};
 use super::{AuthorizationId, MainnetAuthorizationError, MainnetConsumer};
 use crate::{
     MainnetWriteContext, StellarRpcClient, cross_check::CrossCheckWitness, keyring::EnrolledSigner,
@@ -150,6 +152,39 @@ pub struct SorobanIntentRequest<'a> {
     pub audit: AuditReadiness,
     /// Durable holds and authorization store.
     pub store: &'a PersistedWindowStore,
+    /// The consumed SEP-10 message authorization an authenticated payment
+    /// continues: `Some` exactly for the
+    /// [`MainnetConsumer::X402Authenticated`] consumer, whose intent record
+    /// names the used message record as its parent. Borrowed, not consumed.
+    pub authenticated: Option<&'a MessageUseReceipt>,
+}
+
+/// Inputs for resolving one SEP-10 challenge signing for an authenticated
+/// x402 payment.
+///
+/// The request names no client, endpoint, witness, or enrolled signer: a
+/// message signing reaches no RPC endpoint, binds no endpoint, and its signer
+/// is the ephemeral key the message facts name. The context supplies the
+/// profile name and the stored profile.
+pub struct MessageSignRequest<'a> {
+    /// Validated stored profile.
+    pub context: &'a MainnetWriteContext,
+    /// The verb that will consume the authorization.
+    pub consumer: MainnetConsumer,
+    /// The payment intent the operator approved together with the message.
+    pub intent: &'a SorobanIntent<'a>,
+    /// The challenge facts the SEP-10 client proposes.
+    pub message: &'a MessageFacts,
+    /// Verified signed policy.
+    pub policy: &'a VerifiedPolicy,
+    /// Enablement bound to the signed policy.
+    pub enablement: &'a EnablementRecord,
+    /// Operator approval of the authenticated payment.
+    pub approval: &'a ApprovalWitness,
+    /// Anchored audit writer lease.
+    pub audit: AuditReadiness,
+    /// Durable authorization store.
+    pub store: &'a PersistedWindowStore,
 }
 
 /// Proof that an intent was consumed, retaining its audit lease and debit.
@@ -258,6 +293,72 @@ pub fn consume_soroban_intent(
     }
 }
 
+/// Resolves checked proofs into authority to sign one SEP-10 challenge for an
+/// authenticated x402 payment.
+///
+/// The checks run in this order: the clock; both consumers are
+/// [`MainnetConsumer::X402Authenticated`]; the policy has a mainnet body
+/// bound to the context's profile and the enablement; the intent is for the
+/// mainnet network id and its digest encodes; the approval is the profile's,
+/// for mainnet, of the x402 kind, for the authenticated subject over the
+/// intent digest and the message's home domain, created no later than now
+/// and not expired; the audit lease is the profile's and fresh. The mint then
+/// records a zero-value message record with no holds and no parent. The
+/// resolver evaluates no policy and makes no network request.
+///
+/// # Errors
+/// Returns a logged authorization refusal: the first failed check, or the
+/// store's refusal of the mint. A store failure refuses with
+/// `StoreUnavailable`.
+#[cfg_attr(
+    not(feature = "mainnet-write"),
+    expect(
+        clippy::needless_pass_by_value,
+        reason = "the request is consumed by the enabled API"
+    )
+)]
+pub fn resolve_message_sign(
+    req: MessageSignRequest<'_>,
+) -> Result<MainnetMessageSignAuthorization, MainnetAuthorizationError> {
+    #[cfg(feature = "mainnet-write")]
+    {
+        report("resolve_message_sign", enabled::message(req))
+    }
+    #[cfg(not(feature = "mainnet-write"))]
+    {
+        req.context.absurd()
+    }
+}
+
+/// Consumes a message authorization once and returns the receipt of its
+/// bound facts.
+///
+/// The consume proves durable single use: it rechecks the audit lease and
+/// moves the record to used with a message consumption binding. It compares
+/// no challenge; the signing point checks the challenge against the receipt.
+/// A refused consume invalidates the record with the reason
+/// `consume_refused`; a record already settled or unknown is left as it is,
+/// and a cleanup that fails is logged and never replaces the refusal.
+///
+/// # Errors
+/// Returns the logged refusal: a binding of another domain, changed audit
+/// provenance or an uncovered tip, and every refusal of the store's consume.
+pub fn consume_message_sign(
+    context: &MainnetWriteContext,
+    auth: MainnetMessageSignAuthorization,
+    store: &PersistedWindowStore,
+) -> Result<MessageUseReceipt, MainnetAuthorizationError> {
+    #[cfg(feature = "mainnet-write")]
+    {
+        enabled::consume_message(context, auth, store)
+    }
+    #[cfg(not(feature = "mainnet-write"))]
+    {
+        let _ = (auth, store);
+        context.absurd()
+    }
+}
+
 /// Derives a one-use final payload authorization from the consumed intent.
 ///
 /// # Errors
@@ -331,6 +432,8 @@ pub enum InvalidationStage {
     IntentConsumeRefused,
     /// Final payload release refused.
     PayloadReleaseRefused,
+    /// The consumption of a message authorization refused.
+    ConsumeRefused,
 }
 impl InvalidationStage {
     #[cfg(feature = "mainnet-write")]
@@ -343,6 +446,7 @@ impl InvalidationStage {
             Self::IntentPreTransmitRefused => "intent_pre_transmit_refused",
             Self::IntentConsumeRefused => "intent_consume_refused",
             Self::PayloadReleaseRefused => "payload_release_refused",
+            Self::ConsumeRefused => "consume_refused",
         }
     }
 }
@@ -361,18 +465,61 @@ pub fn invalidate_unconsumed(
     {
         report(
             "invalidate_unconsumed",
-            store
-                .invalidate_authorization(context.profile(), id, stage.reason())
-                .map_err(super::mint::store_error)
-                .and_then(|changed| {
-                    super::refusal::require(changed, super::MainnetPrecondition::NotOpen)
-                }),
+            invalidate(store, context, id, stage),
         )
     }
     #[cfg(not(feature = "mainnet-write"))]
     {
         let _ = (store, id, stage);
         context.absurd()
+    }
+}
+
+/// The invalidation [`invalidate_unconsumed`] reports: `NotOpen` for a
+/// settled record, the store's refusal otherwise. Logs nothing.
+#[cfg(feature = "mainnet-write")]
+fn invalidate(
+    store: &PersistedWindowStore,
+    context: &MainnetWriteContext,
+    id: AuthorizationId,
+    stage: InvalidationStage,
+) -> Result<(), MainnetAuthorizationError> {
+    store
+        .invalidate_authorization(context.profile(), id, stage.reason())
+        .map_err(super::mint::store_error)
+        .and_then(|changed| super::refusal::require(changed, super::MainnetPrecondition::NotOpen))
+}
+
+/// Invalidates the message record `id` after its consume refused.
+///
+/// A used, expired, or invalidated record (`NotOpen`) and an unknown record
+/// are left as they are, silently. Any other failure, such as an I/O,
+/// keyring, lock, or integrity failure of the store, is logged once at warn
+/// as a cleanup failure and leaves the record open until its lifetime ends;
+/// the caller returns its own refusal either way.
+#[cfg(feature = "mainnet-write")]
+pub(crate) fn invalidate_after_refused_consume(
+    store: &PersistedWindowStore,
+    context: &MainnetWriteContext,
+    id: AuthorizationId,
+) {
+    use super::MainnetPrecondition as P;
+    match invalidate(store, context, id, InvalidationStage::ConsumeRefused) {
+        Ok(()) | Err(MainnetAuthorizationError::Refused(P::NotOpen | P::UnknownAuthorization)) => {}
+        Err(error) => {
+            // An invalidation admits no holds, so its only failures are
+            // refusals; the store's own failures arrive as `StoreUnavailable`.
+            let precondition = match &error {
+                MainnetAuthorizationError::Refused(precondition) => precondition.label(),
+                _ => P::StoreUnavailable.label(),
+            };
+            tracing::warn!(
+                path = "consume_message_sign",
+                precondition,
+                id = ?id,
+                "mainnet authorization cleanup failed"
+            );
+        }
     }
 }
 
@@ -423,8 +570,8 @@ mod enabled {
         approval::{
             store::governing_ttl_ms,
             subject::{
-                approval_subject_classic, approval_subject_x402, root_invocation_digest,
-                soroban_intent_digest,
+                approval_subject_classic, approval_subject_x402,
+                approval_subject_x402_authenticated, root_invocation_digest, soroban_intent_digest,
             },
             witness::ApprovedKind,
         },
@@ -870,10 +1017,16 @@ mod enabled {
         let now = now()?;
         let deadline = tokio::time::Instant::now() + req.probe_deadline;
         let body = policy_body(req.context, req.policy, req.enablement)?;
-        require(
-            req.intent.consumer == MainnetConsumer::X402Create,
-            P::ConsumerMismatch,
-        )?;
+        // An authenticated payment continues its consumed message
+        // authorization; a plain payment has none.
+        let authenticated = match (req.intent.consumer, req.authenticated) {
+            (MainnetConsumer::X402Create, None) => None,
+            (MainnetConsumer::X402Authenticated, Some(receipt)) => Some(receipt),
+            (MainnetConsumer::X402Authenticated, None) => {
+                return Err(refused(P::IntentRecordMismatch));
+            }
+            _ => return Err(refused(P::ConsumerMismatch)),
+        };
         let endpoint = endpoint(req.context, req.client, deadline, req.enablement).await?;
         require(
             req.intent.network_id == network_id(req.context),
@@ -921,7 +1074,12 @@ mod enabled {
             asset: Some(asset),
             destination: Some(address_string(to)?),
         });
-        let descriptor = descriptor("stellar_x402_create_payment");
+        // The policy evaluates the rule of the tool the operator approved.
+        let descriptor = descriptor(if authenticated.is_some() {
+            "stellar_x402_authenticated_payment"
+        } else {
+            "stellar_x402_create_payment"
+        });
         let engine = req.policy.engine();
         let evaluation = engine
             .evaluate_with_value_full(
@@ -954,14 +1112,17 @@ mod enabled {
         final_checks(
             req.context,
             req.approval,
-            approval_subject_x402(&digest),
+            authenticated.map_or_else(
+                || approval_subject_x402(&digest),
+                |receipt| approval_subject_x402_authenticated(&digest, receipt.home_domain()),
+            ),
             ApprovedKind::X402Payment,
             &evaluation,
             &req.audit,
             req.signer,
             now,
         )?;
-        let request = request(
+        let mut request = request(
             req.context,
             DomainBinding::Soroban {
                 intent_digest: digest,
@@ -977,6 +1138,9 @@ mod enabled {
             &req.audit,
             entries,
         );
+        // The ledger checks, under its lock, that the parent is the used
+        // message record of the same approval.
+        request.parent = authenticated.map(MessageUseReceipt::id);
         let minted = req
             .store
             .mint_authorization(req.context.profile(), &request)
@@ -999,6 +1163,141 @@ mod enabled {
             facts: request.bindings,
             authorization_ttl_ms: request.authorization_ttl_ms,
         }))
+    }
+    pub(super) fn message(
+        req: MessageSignRequest<'_>,
+    ) -> Result<MainnetMessageSignAuthorization, MainnetAuthorizationError> {
+        let now = now()?;
+        require(
+            req.consumer == MainnetConsumer::X402Authenticated
+                && req.intent.consumer == MainnetConsumer::X402Authenticated,
+            P::ConsumerMismatch,
+        )?;
+        let body = policy_body(req.context, req.policy, req.enablement)?;
+        require(
+            req.intent.network_id == network_id(req.context),
+            P::IntentNetworkMismatch,
+        )?;
+        let digest = soroban_intent_digest(&req.intent.network_id, req.intent.root_invocation)
+            .map_err(|_| refused(P::IntentShape))?;
+        let approval = req.approval;
+        require(
+            approval.profile() == req.context.profile_name(),
+            P::ApprovalProfileMismatch,
+        )?;
+        require(approval.chain().is_mainnet(), P::ApprovalChainMismatch)?;
+        require(
+            approval.kind() == ApprovedKind::X402Payment,
+            P::ApprovalKindMismatch,
+        )?;
+        // The approval binds the SEP-10 counterparty: a challenge for another
+        // home domain cannot satisfy it.
+        require(
+            approval.subject()
+                == approval_subject_x402_authenticated(&digest, &req.message.domain.home_domain),
+            P::ApprovalSubjectMismatch,
+        )?;
+        require(approval.created_at_ms() <= now, P::NotYetValid)?;
+        require(now < approval.expires_at_ms(), P::ApprovalExpired)?;
+        require(
+            req.audit.profile() == req.context.profile_name(),
+            P::AuditProfileMismatch,
+        )?;
+        require(
+            now.saturating_sub(req.audit.verified_at_ms())
+                <= MAINNET_AUDIT_READINESS_TTL_SECONDS * 1000,
+            P::AuditStale,
+        )?;
+        let message = req.message;
+        let request = MintRequest {
+            chain: req.context.chain(),
+            binding: DomainBinding::Message {
+                domain: message.domain.clone(),
+                content_digest: message.content_digest,
+                ephemeral_public_key: message.ephemeral_public_key,
+            },
+            consumer: MainnetConsumer::X402Authenticated,
+            policy_sequence: req.policy.sequence(),
+            policy_digest: req.policy.digest(),
+            approval_nonce: approval.nonce().to_owned(),
+            approval_expires_at_ms: approval.expires_at_ms(),
+            authorization_ttl_ms: u64::from(
+                body.authorization_ttl_seconds
+                    .unwrap_or(MAINNET_AUTHORIZATION_TTL_SECONDS_DEFAULT),
+            ) * 1000,
+            bindings: BindingFacts {
+                endpoint: None,
+                signer: super::super::message::ephemeral_signer_fact(message.ephemeral_public_key),
+                policy: req.policy.fact_digest(),
+                enablement: req.enablement.fact_digest(),
+                witness: None,
+                reservation: None,
+                approval: approval.fact_digest(),
+                audit: req.audit.fact_digest(),
+            },
+            holds: vec![],
+            parent: None,
+        };
+        let minted = req
+            .store
+            .mint_authorization(req.context.profile(), &request)
+            .map_err(mint::store_error)?;
+        Ok(mint::message(
+            req.context,
+            request,
+            minted,
+            message.ephemeral_public_key,
+            req.enablement,
+            approval,
+            req.audit,
+        ))
+    }
+    pub(super) fn consume_message(
+        context: &MainnetWriteContext,
+        auth: MainnetMessageSignAuthorization,
+        store: &PersistedWindowStore,
+    ) -> Result<MessageUseReceipt, MainnetAuthorizationError> {
+        let id = auth.id();
+        let result = (|| {
+            let inner = auth.inner();
+            let DomainBinding::Message {
+                domain,
+                content_digest: content,
+                ephemeral_public_key,
+            } = &inner.binding
+            else {
+                return Err(refused(P::BindingMismatch));
+            };
+            let facts = RecomputedFacts {
+                content_digest: content_digest(AuthorizationDomain::Message, content),
+                entries_digest: entries_digest(&[]),
+                audit: inner.header.audit.fresh_facts()?,
+            };
+            store
+                .consume_authorization(
+                    context.profile(),
+                    id,
+                    &auth.consume_expect(&facts),
+                    &ConsumptionBinding::Message {
+                        domain: domain.clone(),
+                        content_digest: *content,
+                        ephemeral_public_key: *ephemeral_public_key,
+                    },
+                )
+                .map_err(mint::store_error)?;
+            Ok(MessageFacts {
+                domain: domain.clone(),
+                content_digest: *content,
+                ephemeral_public_key: *ephemeral_public_key,
+            })
+        })();
+        match report("consume_message_sign", result) {
+            Ok(facts) => Ok(MessageUseReceipt::new(auth.into_inner(), facts)),
+            Err(error) => {
+                super::invalidate_after_refused_consume(store, context, id);
+                Err(error)
+            }
+        }
     }
     pub(super) fn consume_intent(
         context: &MainnetWriteContext,
@@ -1689,6 +1988,7 @@ mod tests {
             approval,
             audit: f.audit(),
             store: &f.window,
+            authenticated: None,
         }
     }
     async fn resolved_intent(
@@ -1812,7 +2112,7 @@ mod tests {
     intent_case!(
         intent_authenticated_consumer_refuses,
         "authenticated",
-        ConsumerMismatch
+        IntentRecordMismatch
     );
     intent_case!(intent_classic_consumer_refuses, "classic", ConsumerMismatch);
     intent_case!(
@@ -2691,6 +2991,7 @@ mod tests {
                 InvalidationStage::PayloadReleaseRefused,
                 "payload_release_refused",
             ),
+            (InvalidationStage::ConsumeRefused, "consume_refused"),
         ] {
             let f = soroban_fixture();
             let root = root(&f);
@@ -3637,5 +3938,897 @@ mod tests {
             &f,
             &before,
         );
+    }
+
+    // ── The message domain ─────────────────────────────────────────────
+
+    use super::super::RecomputedFacts;
+    use super::super::digest::BindingFacts;
+    use super::super::fixtures::{
+        MESSAGE_HOME_DOMAIN, message_facts, x402_fixture, x402_intent, x402_policy, x402_root,
+    };
+    use crate::policy_state::ConsumptionBinding;
+
+    const EPHEMERAL: [u8; 32] = [0xe1; 32];
+
+    /// The message record of the fixture's ledger.
+    fn message_record(f: &ResolverFixture) -> serde_json::Value {
+        f.wire()["authorizations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["domain"] == "message")
+            .unwrap()
+            .clone()
+    }
+
+    /// The operator's attestation of the authenticated payment `root` for
+    /// `home_domain`, bound to `profile` under `name`.
+    fn bound_x402_approval(
+        f: &ResolverFixture,
+        root: &SorobanAuthorizedInvocation,
+        profile: &stellar_agent_core::profile::schema::Profile,
+        name: &str,
+    ) -> ApprovalWitness {
+        use stellar_agent_core::approval::subject::{
+            approval_subject_x402_authenticated, soroban_intent_digest,
+        };
+        let network_id = Sha256::digest(profile.chain_id.network_passphrase().as_bytes()).into();
+        let mut entry = stellar_agent_core::approval::PendingApproval::new_x402_pending(
+            &network_id,
+            root,
+            Some(MESSAGE_HOME_DOMAIN.to_owned()),
+            "1000".into(),
+            600_000,
+        )
+        .unwrap();
+        entry.created_at_unix_ms = f.now;
+        entry.expires_at_unix_ms = f.now + 600_000;
+        let subject = approval_subject_x402_authenticated(
+            &soroban_intent_digest(&network_id, root).unwrap(),
+            MESSAGE_HOME_DOMAIN,
+        );
+        f.attested(
+            &entry,
+            profile,
+            name,
+            ApprovedKind::X402Payment,
+            subject,
+            f.now,
+        )
+    }
+
+    /// The accepted record of each lifetime source: the policy's
+    /// `authorization_ttl_seconds`, the default, and an approval that
+    /// expires first.
+    #[test]
+    #[serial_test::serial]
+    fn message_resolver_mints_a_zero_value_record() {
+        use super::super::digest::bindings_digest;
+        for case in ["policy_ttl", "default_ttl", "approval_first"] {
+            let f = if case == "default_ttl" {
+                ResolverFixture::configured(
+                    |_| {},
+                    |raw| x402_policy(&raw.replace("authorization_ttl_seconds = 60\n", ""), |r| r),
+                )
+            } else {
+                x402_fixture()
+            };
+            let root = x402_root(&f);
+            let intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
+            let message = message_facts([1; 32], EPHEMERAL);
+            let approval = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
+            // The approval is attested against the wall clock, so the case
+            // where it expires before the record moves the resolver's clock
+            // to ten seconds before the approval's expiry.
+            let minted_at = if case == "approval_first" {
+                f.now + 590_000
+            } else {
+                f.now
+            };
+            f.clock.set(minted_at);
+            let auth =
+                resolve_message_sign(f.message_request(&intent, &message, &approval)).unwrap();
+            let wire = f.wire();
+            let records = wire["authorizations"].as_array().unwrap();
+            assert_eq!(records.len(), 1, "{case}");
+            let record = &records[0];
+            assert_eq!(record["domain"], "message", "{case}");
+            assert_eq!(record["consumer"], "x402_authenticated", "{case}");
+            assert_eq!(record["state"], "open", "{case}");
+            assert!(record.get("reservation").is_none(), "{case}");
+            assert!(record.get("parent").is_none(), "{case}");
+            assert!(wire["holds"].as_array().is_none_or(Vec::is_empty), "{case}");
+            assert_eq!(auth.signer_public_key(), EPHEMERAL, "{case}");
+            assert_eq!(auth.signer_role(), super::super::SignerRole::Sep10Ephemeral);
+            assert_eq!(auth.endpoint(), None, "{case}");
+            let header = &auth.inner().header;
+            assert_eq!(header.issued_at_ms, minted_at, "{case}");
+            let ttl = if case == "default_ttl" {
+                120_000
+            } else {
+                60_000
+            };
+            let expected = (header.issued_at_ms + ttl).min(approval.expires_at_ms());
+            assert_eq!(auth.expires_at_ms(), expected, "{case}");
+            assert_eq!(record["expires_ms"], expected, "{case}");
+            if case == "approval_first" {
+                assert_eq!(expected, approval.expires_at_ms());
+            } else {
+                assert_eq!(expected, f.now + ttl);
+            }
+            let facts = BindingFacts {
+                endpoint: None,
+                signer: super::super::message::ephemeral_signer_fact(EPHEMERAL),
+                policy: f.policy.fact_digest(),
+                enablement: f.enablement.fact_digest(),
+                witness: None,
+                reservation: None,
+                approval: approval.fact_digest(),
+                audit: header.audit.fact_digest(),
+            };
+            assert_eq!(header.bindings_digest, bindings_digest(&facts), "{case}");
+        }
+    }
+
+    fn message_refusal(case: &str, expected: P) {
+        let f = x402_fixture();
+        let root = x402_root(&f);
+        let mut intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
+        match case {
+            "intent_consumer" => intent.consumer = MainnetConsumer::X402Create,
+            "network" => {
+                intent.network_id = Sha256::digest(
+                    stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE.as_bytes(),
+                )
+                .into();
+            }
+            _ => {}
+        }
+        let message = message_facts([1; 32], EPHEMERAL);
+        let mut chain_profile = f.profile.clone();
+        chain_profile.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
+        let approval = match case {
+            "approval_profile" => bound_x402_approval(&f, &root, &f.profile, "other"),
+            "approval_chain" => bound_x402_approval(&f, &root, &chain_profile, "operator"),
+            "approval_kind" => f.approval(&f.envelope, f.now, 600_000),
+            "approval_other_domain" => f.x402_approval(&root, Some("other.example.com"), f.now),
+            "approval_plain" => f.x402_approval(&root, None, f.now),
+            _ => f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now),
+        };
+        let policy = match case {
+            "policy_body" => Some(alternate_policy(
+                &f,
+                |doc| {
+                    doc.remove("mainnet");
+                },
+                &f.profile,
+                "operator",
+            )),
+            "enablement_sequence" => Some(alternate_policy(
+                &f,
+                |doc| doc["sequence"] = toml_edit::value(8),
+                &f.profile,
+                "operator",
+            )),
+            _ => None,
+        };
+        let other_enablement = (case == "enablement_profile").then(|| {
+            let profile = f.profile.clone();
+            let policy = alternate_policy(
+                &f,
+                |doc| {
+                    doc["scope"] = toml_edit::value("profile:other");
+                    doc["mainnet"]["profile"] = toml_edit::value("other");
+                },
+                &profile,
+                "other",
+            );
+            let profiles = f.dir.path().join("alternate-profiles");
+            stellar_agent_core::profile::loader::save_to_dir("other", &profile, &profiles).unwrap();
+            stellar_agent_core::mainnet::enablement::verify_enablement(
+                &policy,
+                "other",
+                stellar_agent_core::profile::name::ProfileNameSource::Flag,
+                &profile,
+                &profiles,
+                &|_| Ok("installation-nonce".to_owned()),
+            )
+            .unwrap()
+        });
+        let mut req = f.message_request(&intent, &message, &approval);
+        match case {
+            "consumer" => req.consumer = MainnetConsumer::X402Create,
+            "audit_profile" => {
+                // The writer registry keeps one log path per profile name, so
+                // this case owns its name and starts without an entry.
+                const OTHER: &str = "other-message-audit";
+                stellar_agent_core::audit_log::writer::AuditWriterRegistry::remove_for_test(OTHER);
+                let mut profile = f.profile.clone();
+                profile.audit_log_path = f.dir.path().join("other-message-audit.jsonl");
+                req.audit =
+                    super::super::audit_readiness::audit_readiness(&profile, OTHER).unwrap();
+            }
+            "audit_stale" => {
+                f.clock
+                    .set(f.now - MAINNET_AUDIT_READINESS_TTL_SECONDS * 1000 - 1);
+                req.audit = f.audit();
+                f.clock.set(f.now);
+            }
+            "approval_expired" => {
+                // The readiness is acquired under the advanced clock, so the
+                // expired approval is the only invalid input.
+                f.clock.set(f.now + 600_000);
+                req.audit = f.audit();
+            }
+            _ => {}
+        }
+        if let Some(policy) = &policy {
+            req.policy = policy;
+        }
+        if let Some(enablement) = &other_enablement {
+            req.enablement = enablement;
+        }
+        let before = f.wire();
+        assert_refused(resolve_message_sign(req), expected, &f, &before);
+    }
+    macro_rules! message_case {
+        ($name:ident, $case:literal, $expected:ident) => {
+            #[test]
+            #[serial_test::serial]
+            fn $name() {
+                message_refusal($case, P::$expected);
+            }
+        };
+    }
+    message_case!(message_consumer_refuses, "consumer", ConsumerMismatch);
+    message_case!(
+        message_intent_consumer_refuses,
+        "intent_consumer",
+        ConsumerMismatch
+    );
+    message_case!(message_policy_body_refuses, "policy_body", PolicyNotMainnet);
+    message_case!(
+        message_enablement_profile_refuses,
+        "enablement_profile",
+        ProfileMismatch
+    );
+    message_case!(
+        message_enablement_sequence_refuses,
+        "enablement_sequence",
+        EnablementSequenceMismatch
+    );
+    message_case!(message_network_refuses, "network", IntentNetworkMismatch);
+    message_case!(
+        message_approval_profile_refuses,
+        "approval_profile",
+        ApprovalProfileMismatch
+    );
+    message_case!(
+        message_approval_chain_refuses,
+        "approval_chain",
+        ApprovalChainMismatch
+    );
+    message_case!(
+        message_approval_kind_refuses,
+        "approval_kind",
+        ApprovalKindMismatch
+    );
+    message_case!(
+        message_approval_other_domain_refuses,
+        "approval_other_domain",
+        ApprovalSubjectMismatch
+    );
+    message_case!(
+        message_approval_plain_subject_refuses,
+        "approval_plain",
+        ApprovalSubjectMismatch
+    );
+    message_case!(
+        message_approval_expired_refuses,
+        "approval_expired",
+        ApprovalExpired
+    );
+    message_case!(
+        message_audit_profile_refuses,
+        "audit_profile",
+        AuditProfileMismatch
+    );
+    message_case!(message_audit_stale_refuses, "audit_stale", AuditStale);
+
+    /// A request whose every input is invalid refuses at the consumer, the
+    /// first check. Repairing the inputs one at a time in the resolver's
+    /// order reports each later check in turn, down to the mint.
+    ///
+    /// The creation time and the expiry of one approval cannot both be
+    /// invalid under one clock: the approvals are created after the clock,
+    /// the creation repair moves the clock to the approval's expiry, and the
+    /// expiry repair moves it to the approval's creation.
+    #[test]
+    #[serial_test::serial]
+    fn message_resolver_refusals_follow_the_check_order() {
+        use stellar_agent_core::profile::caip2::{Caip2, TESTNET_PASSPHRASE};
+        const OTHER: &str = "other-message-audit";
+        let f = x402_fixture();
+        let root = x402_root(&f);
+        let message = message_facts([1; 32], EPHEMERAL);
+        let mainnet = x402_intent(&root, MainnetConsumer::X402Authenticated).network_id;
+        let testnet: [u8; 32] = Sha256::digest(TESTNET_PASSPHRASE.as_bytes()).into();
+        let without_mainnet = alternate_policy(
+            &f,
+            |doc| {
+                doc.remove("mainnet");
+            },
+            &f.profile,
+            "operator",
+        );
+        let mut testnet_profile = f.profile.clone();
+        testnet_profile.chain_id = Caip2::Testnet;
+        stellar_agent_core::audit_log::writer::AuditWriterRegistry::remove_for_test(OTHER);
+        let mut other_audit_profile = f.profile.clone();
+        other_audit_profile.audit_log_path = f.dir.path().join("other-message-audit.jsonl");
+        // An approval created now is created after the fixture's clock.
+        let created = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        assert!(created > f.now);
+        let other_profile =
+            f.approval_under(&f.envelope, created, 600_000, &testnet_profile, "other");
+        let other_chain =
+            f.approval_under(&f.envelope, created, 600_000, &testnet_profile, "operator");
+        let other_kind = f.approval(&f.envelope, created, 600_000);
+        let other_subject = f.x402_approval(&root, Some("other.example.com"), created);
+        let approval = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), created);
+        // A readiness verified one millisecond past its freshness before the
+        // fixture's clock, the clock then set to `now`.
+        let stale = |profile: &stellar_agent_core::profile::schema::Profile,
+                     name: &str,
+                     now: u64| {
+            f.clock
+                .set(f.now - MAINNET_AUDIT_READINESS_TTL_SECONDS * 1000 - 1);
+            let readiness = super::super::audit_readiness::audit_readiness(profile, name).unwrap();
+            f.clock.set(now);
+            readiness
+        };
+        let attempt = |consumer: MainnetConsumer,
+                       policy: &VerifiedPolicy,
+                       network_id: [u8; 32],
+                       approval: &ApprovalWitness,
+                       audit: AuditReadiness| {
+            let mut intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
+            intent.network_id = network_id;
+            let mut req = f.message_request(&intent, &message, approval);
+            req.consumer = consumer;
+            req.policy = policy;
+            req.audit = audit;
+            resolve_message_sign(req)
+        };
+        let before = f.wire();
+        let refused = |result, expected| assert_refused(result, expected, &f, &before);
+        let create = MainnetConsumer::X402Create;
+        let authenticated = MainnetConsumer::X402Authenticated;
+
+        let audit = stale(&other_audit_profile, OTHER, f.now);
+        refused(
+            attempt(create, &without_mainnet, testnet, &other_profile, audit),
+            P::ConsumerMismatch,
+        );
+        let audit = stale(&other_audit_profile, OTHER, f.now);
+        refused(
+            attempt(
+                authenticated,
+                &without_mainnet,
+                testnet,
+                &other_profile,
+                audit,
+            ),
+            P::PolicyNotMainnet,
+        );
+        let audit = stale(&other_audit_profile, OTHER, f.now);
+        refused(
+            attempt(authenticated, &f.policy, testnet, &other_profile, audit),
+            P::IntentNetworkMismatch,
+        );
+        for (witness, expected) in [
+            (&other_profile, P::ApprovalProfileMismatch),
+            (&other_chain, P::ApprovalChainMismatch),
+            (&other_kind, P::ApprovalKindMismatch),
+            (&other_subject, P::ApprovalSubjectMismatch),
+            (&approval, P::NotYetValid),
+        ] {
+            let audit = stale(&other_audit_profile, OTHER, f.now);
+            refused(
+                attempt(authenticated, &f.policy, mainnet, witness, audit),
+                expected,
+            );
+        }
+        let audit = stale(&other_audit_profile, OTHER, approval.expires_at_ms());
+        refused(
+            attempt(authenticated, &f.policy, mainnet, &approval, audit),
+            P::ApprovalExpired,
+        );
+        let audit = stale(&other_audit_profile, OTHER, approval.created_at_ms());
+        refused(
+            attempt(authenticated, &f.policy, mainnet, &approval, audit),
+            P::AuditProfileMismatch,
+        );
+        let audit = stale(&f.profile, "operator", approval.created_at_ms());
+        refused(
+            attempt(authenticated, &f.policy, mainnet, &approval, audit),
+            P::AuditStale,
+        );
+        attempt(authenticated, &f.policy, mainnet, &approval, f.audit()).unwrap();
+        assert_eq!(message_record(&f)["state"], "open");
+    }
+
+    /// An approval created after the resolver's clock refuses: the creation
+    /// time is checked against the clock before the expiry.
+    #[test]
+    #[serial_test::serial]
+    fn message_future_created_approval_refuses() {
+        use stellar_agent_core::approval::subject::{
+            approval_subject_x402_authenticated, soroban_intent_digest,
+        };
+        let f = x402_fixture();
+        let root = x402_root(&f);
+        let intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
+        let entry = stellar_agent_core::approval::PendingApproval::new_x402_pending(
+            &intent.network_id,
+            &root,
+            Some(MESSAGE_HOME_DOMAIN.to_owned()),
+            "1000".into(),
+            600_000,
+        )
+        .unwrap();
+        let created = entry.created_at_unix_ms;
+        let subject = approval_subject_x402_authenticated(
+            &soroban_intent_digest(&intent.network_id, &root).unwrap(),
+            MESSAGE_HOME_DOMAIN,
+        );
+        let approval = f.attested(
+            &entry,
+            &f.profile,
+            "operator",
+            ApprovedKind::X402Payment,
+            subject,
+            created,
+        );
+        f.clock.set(created - 8 * 24 * 60 * 60 * 1000);
+        let message = message_facts([1; 32], EPHEMERAL);
+        let req = f.message_request(&intent, &message, &approval);
+        let before = f.wire();
+        assert_refused(resolve_message_sign(req), P::NotYetValid, &f, &before);
+        assert!(
+            f.wire()["authorizations"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn message_clock_unavailable_refuses() {
+        let f = x402_fixture();
+        let root = x402_root(&f);
+        let intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
+        let message = message_facts([1; 32], EPHEMERAL);
+        let approval = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
+        let req = f.message_request(&intent, &message, &approval);
+        let before = f.wire();
+        let guard = super::super::clock::set_clock_error_for_test();
+        let result = resolve_message_sign(req);
+        drop(guard);
+        f.clock.set(f.now);
+        assert_refused(result, P::ClockUnavailable, &f, &before);
+    }
+
+    /// The store's mint rules hold for message records: the approval nonce
+    /// is single use, an open content cannot be minted twice, and the policy
+    /// pin must name the authorization's policy.
+    #[test]
+    #[serial_test::serial]
+    fn message_mint_keeps_the_store_rules() {
+        let f = x402_fixture();
+        let root = x402_root(&f);
+        let intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
+        let first = message_facts([1; 32], EPHEMERAL);
+        let other = message_facts([2; 32], EPHEMERAL);
+        let approval = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
+        resolve_message_sign(f.message_request(&intent, &first, &approval)).unwrap();
+        let before = f.wire();
+        assert_refused(
+            resolve_message_sign(f.message_request(&intent, &other, &approval)),
+            P::ApprovalNonceReused,
+            &f,
+            &before,
+        );
+        let fresh = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
+        assert_refused(
+            resolve_message_sign(f.message_request(&intent, &first, &fresh)),
+            P::DuplicateOpen,
+            &f,
+            &before,
+        );
+        let pin = stellar_agent_core::profile::schema::policy_pin_entry_ref(
+            &f.profile.policy_window_state_key_id,
+        );
+        let entry = keyring_core::Entry::new(&pin.service, &pin.account).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&entry.get_password().unwrap()).unwrap();
+        value["sequence"] = serde_json::json!(8);
+        entry.set_password(&value.to_string()).unwrap();
+        assert_refused(
+            resolve_message_sign(f.message_request(&intent, &other, &fresh)),
+            P::PolicyPinMismatch,
+            &f,
+            &before,
+        );
+    }
+
+    /// The consume returns the receipt of the record it settles, also after
+    /// an anchored append grew the log between the mint and the consume.
+    #[test]
+    #[serial_test::serial]
+    fn consume_message_sign_returns_the_receipt() {
+        for grown in [false, true] {
+            let f = x402_fixture();
+            let root = x402_root(&f);
+            let intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
+            let message = message_facts([1; 32], EPHEMERAL);
+            let approval = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
+            let auth =
+                resolve_message_sign(f.message_request(&intent, &message, &approval)).unwrap();
+            let id = auth.id();
+            if grown {
+                append_audit(&f);
+            }
+            let receipt = consume_message_sign(&f.context, auth, &f.window).unwrap();
+            assert_eq!(receipt.id(), id, "{grown}");
+            assert_eq!(receipt.home_domain(), MESSAGE_HOME_DOMAIN);
+            assert_eq!(receipt.content_digest(), message.content_digest);
+            assert_eq!(receipt.ephemeral_public_key(), message.ephemeral_public_key);
+            let record = message_record(&f);
+            assert_eq!(record["id"], serde_json::to_value(id).unwrap());
+            assert_eq!(record["state"], "used", "{grown}");
+            assert_eq!(
+                record["consumption"],
+                serde_json::to_value(ConsumptionBinding::Message {
+                    domain: message.domain.clone(),
+                    content_digest: message.content_digest,
+                    ephemeral_public_key: message.ephemeral_public_key,
+                })
+                .unwrap()
+            );
+            assert!(f.wire()["holds"].as_array().is_none_or(Vec::is_empty));
+        }
+    }
+
+    /// A consume that the audit refuses invalidates its record with the
+    /// reason `consume_refused`.
+    #[test]
+    #[serial_test::serial]
+    fn audit_refusal_at_the_message_consume_invalidates_the_record() {
+        use stellar_agent_core::audit_log::{AuditWriter, tip_anchor::InMemoryTipAnchorStore};
+        for (case, expected) in [
+            ("anchor_lag", P::AuditNotAnchored),
+            ("replaced_writer", P::AuditProvenance),
+        ] {
+            let f = x402_fixture();
+            let root = x402_root(&f);
+            let intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
+            let message = message_facts([1; 32], EPHEMERAL);
+            let approval = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
+            let auth =
+                resolve_message_sign(f.message_request(&intent, &message, &approval)).unwrap();
+            if case == "anchor_lag" {
+                f.anchor_failure
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                append_audit(&f);
+            } else {
+                let replacement = AuditWriter::open_with_tip_anchor(
+                    f.dir.path().join("injected.jsonl"),
+                    None,
+                    std::sync::Arc::new(InMemoryTipAnchorStore::new()),
+                )
+                .unwrap();
+                let original = std::mem::replace(
+                    &mut *auth.inner().header.audit.writer().lock().unwrap(),
+                    replacement,
+                );
+                drop(original);
+            }
+            let result = consume_message_sign(&f.context, auth, &f.window);
+            f.anchor_failure
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                matches!(result, Err(MainnetAuthorizationError::Refused(actual)) if actual == expected),
+                "{case}: {result:?}"
+            );
+            let record = message_record(&f);
+            assert_eq!(record["state"], "invalidated", "{case}");
+            assert_eq!(record["invalidation"], "consume_refused", "{case}");
+        }
+    }
+
+    /// The warnings the mainnet module logs while `f` runs.
+    fn mainnet_warnings<T>(
+        f: impl FnOnce() -> T,
+    ) -> (T, Vec<std::collections::BTreeMap<String, String>>) {
+        let (warnings, _guard) =
+            stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent_network"));
+        (f(), warnings.seen())
+    }
+
+    fn field<'a>(warning: &'a std::collections::BTreeMap<String, String>, name: &str) -> &'a str {
+        warning
+            .get(name)
+            .map_or("", |value| value.trim_matches('"'))
+    }
+
+    /// A record consumed already refuses its consume with `NotOpen`, stays
+    /// used, and needs no cleanup: the refusal is the one line logged.
+    #[test]
+    #[serial_test::serial]
+    fn consuming_a_used_message_record_refuses_without_cleanup() {
+        let f = x402_fixture();
+        let root = x402_root(&f);
+        let intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
+        let message = message_facts([1; 32], EPHEMERAL);
+        let approval = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
+        let auth = resolve_message_sign(f.message_request(&intent, &message, &approval)).unwrap();
+        let facts = RecomputedFacts {
+            content_digest: content_digest_of_message(&message),
+            entries_digest: super::super::digest::entries_digest(&[]),
+            audit: auth.inner().header.audit.fresh_facts().unwrap(),
+        };
+        f.window
+            .consume_authorization(
+                &f.profile,
+                auth.id(),
+                &auth.consume_expect(&facts),
+                &ConsumptionBinding::Message {
+                    domain: message.domain.clone(),
+                    content_digest: message.content_digest,
+                    ephemeral_public_key: message.ephemeral_public_key,
+                },
+            )
+            .unwrap();
+        let before = f.wire();
+        let (result, warnings) =
+            mainnet_warnings(|| consume_message_sign(&f.context, auth, &f.window));
+        assert!(
+            matches!(result, Err(MainnetAuthorizationError::Refused(P::NotOpen))),
+            "{result:?}"
+        );
+        assert_eq!(f.wire(), before);
+        assert_eq!(message_record(&f)["state"], "used");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(
+            field(&warnings[0], "message"),
+            "mainnet authorization refused"
+        );
+        assert_eq!(field(&warnings[0], "path"), "consume_message_sign");
+        assert_eq!(field(&warnings[0], "precondition"), "not_open");
+    }
+
+    fn content_digest_of_message(message: &super::super::message::MessageFacts) -> [u8; 32] {
+        super::super::digest::content_digest(
+            super::super::AuthorizationDomain::Message,
+            &message.content_digest,
+        )
+    }
+
+    /// The cleanup leaves a used record and an unknown identity as they
+    /// are, and logs nothing for either.
+    #[test]
+    #[serial_test::serial]
+    fn the_message_cleanup_ignores_settled_and_unknown_records() {
+        let f = x402_fixture();
+        let root = x402_root(&f);
+        let receipt = f.message_receipt(&root, &message_facts([1; 32], EPHEMERAL));
+        for id in [receipt.id(), AuthorizationId::from_bytes([0xcd; 32])] {
+            let before = f.wire();
+            let ((), warnings) = mainnet_warnings(|| {
+                invalidate_after_refused_consume(&f.window, &f.context, id);
+            });
+            assert_eq!(f.wire(), before, "{id:?}");
+            assert!(warnings.is_empty(), "{id:?}: {warnings:?}");
+        }
+        assert_eq!(message_record(&f)["state"], "used");
+    }
+
+    /// A refused consume whose cleanup fails returns the refusal, logs the
+    /// refusal and one cleanup failure, and leaves the record open.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_message_cleanup_keeps_the_primary_refusal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let f = x402_fixture();
+        let root = x402_root(&f);
+        let intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
+        let message = message_facts([1; 32], EPHEMERAL);
+        let approval = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
+        let auth = resolve_message_sign(f.message_request(&intent, &message, &approval)).unwrap();
+        f.anchor_failure
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        append_audit(&f);
+        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (result, warnings) =
+            mainnet_warnings(|| consume_message_sign(&f.context, auth, &f.window));
+        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        f.anchor_failure
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            matches!(
+                result,
+                Err(MainnetAuthorizationError::Refused(P::AuditNotAnchored))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(
+            field(&warnings[0], "message"),
+            "mainnet authorization refused"
+        );
+        assert_eq!(field(&warnings[0], "path"), "consume_message_sign");
+        assert_eq!(field(&warnings[0], "precondition"), "audit_not_anchored");
+        assert_eq!(
+            field(&warnings[1], "message"),
+            "mainnet authorization cleanup failed"
+        );
+        assert_eq!(field(&warnings[1], "path"), "consume_message_sign");
+        assert_eq!(field(&warnings[1], "precondition"), "store_unavailable");
+        assert_eq!(message_record(&f)["state"], "open");
+    }
+
+    // ── The authenticated intent ──────────────────────────────────────
+
+    /// A resolver fixture with the RPC double routed, and the parts of an
+    /// authenticated payment.
+    async fn authenticated_intent_case(
+        f: &ResolverFixture,
+        case: &str,
+    ) -> Result<MainnetSorobanIntentAuthorization, MainnetAuthorizationError> {
+        let root = x402_root(f);
+        let server = f.server().await;
+        let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+        let client = context.primary_client().unwrap();
+        let message = message_facts([1; 32], EPHEMERAL);
+        let approval = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
+        let receipt = match case {
+            "other_receipt_domain" => {
+                let mut other = message_facts([2; 32], EPHEMERAL);
+                other.domain.home_domain = "other.example.com".to_owned();
+                f.message_receipt(&root, &other)
+            }
+            _ => f.message_receipt_for(&root, &message, &approval),
+        };
+        let plain = f.x402_approval(&root, None, f.now);
+        let consumer = if matches!(case, "create_with_receipt" | "create_plain") {
+            MainnetConsumer::X402Create
+        } else {
+            MainnetConsumer::X402Authenticated
+        };
+        let intent = x402_intent(&root, consumer);
+        let mut req = SorobanIntentRequest {
+            context: &context,
+            intent: &intent,
+            client: &client,
+            probe_deadline: Duration::from_secs(1),
+            witness: None,
+            signer: &f.signer,
+            policy: &f.policy,
+            enablement: &f.enablement,
+            approval: &approval,
+            audit: f.audit(),
+            store: &f.window,
+            authenticated: Some(&receipt),
+        };
+        match case {
+            "no_receipt" => req.authenticated = None,
+            "plain_subject" => req.approval = &plain,
+            "create_plain" => {
+                req.authenticated = None;
+                req.approval = &plain;
+            }
+            _ => {}
+        }
+        let result = resolve_soroban_intent(req).await;
+        if let Ok(auth) = &result {
+            let wire = f.wire();
+            let record = wire["authorizations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| record["id"] == serde_json::to_value(auth.id()).unwrap())
+                .unwrap()
+                .clone();
+            let expected_parent = (consumer == MainnetConsumer::X402Authenticated)
+                .then(|| serde_json::to_value(receipt.id()).unwrap());
+            assert_eq!(record.get("parent").cloned(), expected_parent, "{case}");
+        }
+        result
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn authenticated_intent_names_its_message_parent() {
+        let f = x402_fixture();
+        let auth = authenticated_intent_case(&f, "accept").await.unwrap();
+        let wire = f.wire();
+        let record = &wire["authorizations"][1];
+        assert_eq!(record["id"], serde_json::to_value(auth.id()).unwrap());
+        assert_eq!(record["domain"], "soroban");
+        assert_eq!(record["consumer"], "x402_authenticated");
+        assert_eq!(record["state"], "open");
+        assert_eq!(record["parent"], wire["authorizations"][0]["id"]);
+        assert_eq!(wire["authorizations"][0]["domain"], "message");
+    }
+
+    async fn authenticated_intent_refusal(case: &str, expected: P) {
+        let f = x402_fixture();
+        let result = authenticated_intent_case(&f, case).await;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, MainnetAuthorizationError::Refused(actual) if actual == expected),
+            "{case}: expected {expected:?}, got {error:?}"
+        );
+        assert!(
+            f.wire()["authorizations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|record| record["domain"] == "message"),
+            "{case}: no intent record"
+        );
+    }
+    macro_rules! authenticated_intent_case {
+        ($name:ident, $case:literal, $expected:ident) => {
+            #[tokio::test]
+            #[serial_test::serial]
+            async fn $name() {
+                authenticated_intent_refusal($case, P::$expected).await;
+            }
+        };
+    }
+    authenticated_intent_case!(
+        authenticated_intent_without_receipt_refuses,
+        "no_receipt",
+        IntentRecordMismatch
+    );
+    authenticated_intent_case!(
+        create_intent_with_receipt_refuses,
+        "create_with_receipt",
+        ConsumerMismatch
+    );
+    authenticated_intent_case!(
+        authenticated_intent_plain_subject_refuses,
+        "plain_subject",
+        ApprovalSubjectMismatch
+    );
+    authenticated_intent_case!(
+        authenticated_intent_other_receipt_domain_refuses,
+        "other_receipt_domain",
+        ApprovalSubjectMismatch
+    );
+
+    /// The authenticated intent evaluates the authenticated tool's rule: it
+    /// denies while the create tool's rule allows the same payment.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn authenticated_intent_evaluates_the_authenticated_rule() {
+        let f = ResolverFixture::configured(
+            |_| {},
+            |raw| {
+                x402_policy(raw, |rule| {
+                    rule.replace("max_stroops = \"100\"", "max_stroops = \"5\"")
+                })
+            },
+        );
+        let result = authenticated_intent_case(&f, "accept").await;
+        assert!(
+            matches!(result, Err(MainnetAuthorizationError::PolicyDenied(_))),
+            "{result:?}"
+        );
+        authenticated_intent_case(&f, "create_plain").await.unwrap();
     }
 }
