@@ -21,6 +21,14 @@ Tool and command results use a uniform envelope:
 - `error.code` is the stable wire code. Branch on it.
 - `request_id` correlates the call with the audit log. Quote it when asking the
   operator to investigate.
+- Five MCP tools return a bare success payload: `stellar_toolset_list` returns a
+  JSON array, and `stellar_dex_trade`, `stellar_dex_quote`,
+  `stellar_defindex_vault_deposit`, and `stellar_defindex_vault_withdraw` return
+  an object carrying `status`. Their business errors use the envelope.
+- Some refusals use the JSON-RPC error channel instead of the envelope: invalid
+  arguments, a `chain_id` mismatch, and the toolset capability refusals.
+  `toolset.first_invoke_approval_required` is a JSON-RPC error too, and its error
+  data carries the `approval_nonce`.
 - By default every CLI command prints exactly one envelope on stdout and exits
   `0` on success, `1` on any error. An argument the parser refuses (an unknown flag,
   a missing required flag, a malformed value) returns `validation.usage_error`
@@ -29,26 +37,36 @@ Tool and command results use a uniform envelope:
 
 At the MCP boundary, account, strkey, and contract-id fields inside an error are
 redacted to first-five-last-five characters, and transaction hashes to
-first-eight-last-eight. The wallet never logs argument values, only argument key
-names.
+first-eight-last-eight. The wallet never logs raw argument values, only argument
+key names. Typed value events retain each leg's amount, asset, and redacted destination.
 
 ## Argument-format reminders (prevent most input errors)
 
 - `chain_id` is the CAIP-2 id, `stellar:testnet` (default) or `stellar:mainnet`.
-  Most MCP tools require it and it must match the active profile. (Exceptions:
-  `stellar_x402_parse_receipt`, `stellar_toolset_list`, `stellar_toolset_invoke`
-  take no `chain_id`; `stellar_sep43_get_address` and `stellar_sep43_get_network`
-  treat it as optional, defaulting to the profile chain, still validated when
-  supplied.)
-- Amounts are decimal strings with an explicit unit, e.g. `"10 XLM"`,
-  `"10.5 USDC"`. Never a JSON number; raw stroop strings are rejected.
+  Most MCP tools require it and it must match the active profile. The
+  exceptions follow.
+  - `stellar_x402_parse_receipt` and `stellar_toolset_list` take no `chain_id`.
+  - The five `stellar_mpp_*` tools reject it as an unknown field and act on the
+    profile chain.
+  - `stellar_toolset_invoke` accepts an optional `chain_id` and forwards it to
+    the routed tool.
+  - `stellar_sep43_get_address` and `stellar_sep43_get_network` treat it as
+    optional. They default to the profile chain and still validate a supplied
+    value.
+  - `stellar_dex_quote` requires it but never matches it against the profile;
+    it selects the router from it.
+- Classic `amount` fields are decimal strings with an explicit unit, e.g.
+  `"10 XLM"`, `"10.5 USDC"`. `stellar_pay` and `stellar_pay_commit` accept
+  `amount_in_stroops`, a raw stroop integer string, in place of `amount`. DeFi
+  quantity fields are raw base-unit integer strings. Never a JSON number.
 - Asset is `"native"` / `"XLM"` for the native asset, or `"CODE:GISSUER"` for an
   issued asset.
 
 ## Policy-engine codes
 
-The policy engine evaluates every call before any RPC or signing, returning
-Allow, Deny, or RequireApproval. The Noop engine allows everything on testnet,
+The policy engine evaluates every gated call before any signing, returning
+Allow, Deny, or RequireApproval. Reads the decision needs, such as the source
+account, can run first. The Noop engine allows everything on testnet,
 allows read-only on mainnet, and refuses destructive tools on mainnet. The V1
 engine is first-match, default-deny over signed, typed criteria.
 
@@ -171,9 +189,11 @@ through the MCP server. The CLI verb is not policy-gated.
 ## Nonce codes (two-phase signing verbs)
 
 A simulate step (`stellar_pay`, `stellar_create_account`, `stellar_trustline`,
-`stellar_claim`, `stellar_rule_create`) mints a single-use nonce bound to the
+`stellar_claim`) mints a single-use nonce bound to the
 exact envelope, tool, and chain. The
-commit step (`*_commit`) verifies it. Nonces are single-use and TTL-bounded, and
+commit step (`*_commit`) verifies it. `stellar_rule_create` mints no envelope
+nonce: it parks the resolved rule definition as a pending approval, and
+`stellar_rule_create_commit` requires that approval's `approval_nonce`. Nonces are single-use and TTL-bounded, and
 the replay window is wiped on process restart.
 
 | Code | Meaning | Agent action |
@@ -263,9 +283,11 @@ An existing checkpoint remains resumable, without consuming a retry attempt.
 ## Toolset codes
 
 `stellar_toolset_invoke` routes a toolset action to a registered tool through a
-four-part capability gate. Signing tools are never reachable through a toolset
-regardless of declared capabilities; the routed tool's own policy gate still
-applies.
+four-part capability gate. Two signing tools are reachable, only through gated
+capabilities: `stellar_pay_commit` (`sign-payment`) and
+`stellar_rule_create_commit` (`sign-rule-create`). Each needs a first-invoke
+grant plus its per-action approval. No other signing tool is reachable through
+a toolset. The routed tool's own policy gate still applies.
 
 | Code | Meaning | Agent action |
 |---|---|---|

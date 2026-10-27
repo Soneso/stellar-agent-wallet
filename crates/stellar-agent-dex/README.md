@@ -6,7 +6,7 @@ This crate implements the `stellar-agent-defi` `DefiAdapter` trait for the Soros
 
 Soroswap is the only wired venue; a route through an un-allowlisted venue is refused. The Soroswap aggregator (multi-venue distribution) path is not included.
 
-It is part of the stellar-agent-wallet workspace. Most users interact with it through the `trade` (signing) and `quote` (read-only) verbs dispatched by the `stellar-agent-cli` or `stellar-agent-mcp` binaries rather than directly.
+It is part of the stellar-agent-wallet workspace. Most users interact with it through the `stellar-agent-cli` `trade` verb and the `stellar-agent-mcp` tools `stellar_dex_trade` (signing) and `stellar_dex_quote` (read-only) rather than directly.
 
 ## Status
 

@@ -24,7 +24,7 @@ The top-level command accepts `-h`/`--help` and `-V`/`--version`. Network, profi
 
 ### Output envelope and exit codes
 
-Every command prints one JSON object on stdout. Exit code `0` means success; exit code `1` means any error. The standard envelope is:
+Every command prints one JSON object on stdout by default. A command that accepts `--output table` prints a table instead when that format is selected. Exit code `0` means success; exit code `1` means any error. The standard envelope is:
 
 ```json
 {"ok": true, "data": { ... }, "request_id": "..."}
@@ -45,7 +45,7 @@ These recur with the same meaning across groups:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--profile <NAME>` | Selects the per-environment TOML profile (binds CAIP-2 chain, RPC, keyring entry references, thresholds, policy engine). Holds no secrets. | resolves `--profile` → `STELLAR_AGENT_PROFILE` → `"default"` on every command that loads a profile (`fees stats` loads only with `--profile`; `accounts deploy-c` opens its writer only with that flag) |
+| `--profile <NAME>` | Selects the per-environment TOML profile (binds CAIP-2 chain, RPC, keyring entry references, thresholds, policy engine). Holds no keys; an endpoint URL can still embed a credential. | resolves `--profile` → `STELLAR_AGENT_PROFILE` → `"default"` on every command that loads a profile (`fees stats` loads only with `--profile`; `accounts deploy-c` opens its writer only with that flag) |
 | `--network <NETWORK>` | Optional assertion; must match the profile chain | profile chain |
 | `--rpc-url <URL>` | Testnet override; refused on mainnet; credentials refused; gets the keyring credential only when it equals the profile's `rpc_url` | profile endpoint |
 | `--secondary-rpc-url <URL>` | Testnet override; refused on mainnet; credentials refused; sends no keyring credential | profile secondary |
@@ -473,7 +473,7 @@ Flags for every verb: see [`smart-accounts.md`](smart-accounts.md).
 
 ## DeFi: vault, trade
 
-`vault deposit`, `vault withdraw`, and `trade` are signing commands. Before signing, each loads the profile and refuses a mainnet profile with `network.mainnet_write_forbidden` before signer access and any RPC call. It then pins the target contract by WASM hash (two-RPC cross-check when `--secondary-rpc-url` is set), evaluates the operator policy engine, and signs and submits. A `Deny` refuses `policy.deny.<code>`; a `RequireApproval` refuses `policy.approval_required` (use the MCP server for two-phase approval; the CLI has no interactive approval path for these verbs); an unbuildable engine refuses `policy.engine_unavailable` (fail closed). These commands do not accept `--output`; they always emit JSON. Per-network contract pins constrain them as well. DeFi amounts are raw integer base units (no decimal/unit string).
+`vault deposit`, `vault withdraw`, and `trade` are signing commands. Before signing, each loads the profile and refuses a mainnet profile with `network.mainnet_write_forbidden` before signer access and any RPC call. It then pins the target contract by WASM hash, evaluates the operator policy engine, and signs and submits. The pin uses a two-RPC cross-check when `--secondary-rpc-url` or the profile sets a secondary RPC. A `Deny` refuses `policy.deny.<code>`. A `RequireApproval` refuses `policy.approval_required`, because neither the CLI nor the MCP server has an approval path for these verbs. The MCP tools refuse the same decision with `policy.approval_required_unsupported`. An unbuildable engine refuses `policy.engine_unavailable` (fail closed). These commands do not accept `--output`; they always emit JSON. Per-network contract pins constrain them as well. DeFi amounts are raw integer base units (no decimal/unit string).
 
 Every venue's flags, trust gate, refusal codes, and examples live in [`defi.md`](defi.md). Per-verb index:
 
@@ -493,9 +493,9 @@ The channel pool is a set of channel accounts derived from a single pool master 
 
 | Verb | Purpose | Extra flags |
 |---|---|---|
-| `init` | Fund `N` channels via one CAP-33 sponsored-reserve sandwich; signing. Master seed written to keyring only after confirmation. Refuses if a master exists (message `pool.already_initialised:`, fail-closed on ambiguous probe) unless `--force` (which orphans prior channels). | `--size <N>` (required, `1..=19`); `--force` |
+| `init` | Fund `N` channels via one CAP-33 sponsored-reserve sandwich; signing. The master seed and a public `[pool_initialization]` checkpoint are persisted before the transaction is sent; `--resume` completes a pending initialization with the same keys. Refuses if a master exists (message `pool.already_initialised:`, fail-closed on ambiguous probe) unless `--force` (which orphans prior channels); `--force` refuses while initialization is pending. | `--size <N>` (required unless `--resume`, `1..=19`); `--force`; `--resume`; `--timeout-seconds` (default `120`) |
 | `list` | List channels (BIP-44 index, public G-strkey, live sequence). Read-only; requires an initialised pool (else `internal.unexpected_state` with `pool.not_initialised:`). | — |
-| `status` | Report `initialised`, `pool_size`, `free`, `in_flight`. Read-only, no network (reads persisted `PoolConfig`). `in_flight:0` is not "safe to flood" — it reflects a stateless process. | — |
+| `status` | Report `initialised`, `pool_size`, `free`, `in_flight`. Read-only, no network (reads persisted `PoolConfig`). While initialization is pending, reports `resume_with`, and `clear_with` for an ambiguous receipt. `in_flight:0` is not "safe to flood"; it reflects a stateless process. | (none) |
 
 Pool refusals surface as `error.code` `internal.unexpected_state` with the specific reason (e.g. `pool.size_out_of_range:`, `pool.already_initialised:`) in `error.message`.
 
@@ -559,7 +559,7 @@ The policy-file owner key is NOT rotated here — it is an ed25519 key enrolled 
 | Subcommand | Keyring entry | Effect |
 |---|---|---|
 | `rotate-attestation-key` | approval-spine attestation HMAC (`attestation_key_id`) | Invalidates all pending approvals; the simulate-and-approve round trip must be re-run. `key_kind:"hmac_32_bytes"`. |
-| `rotate-audit-key` | audit-log chain-root HMAC (`audit_log_hash_chain_key_id`) | Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify --profile <NAME>` stays green and the old key stops verifying. Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds the writer. A changed audit binding refuses with `audit.log_binding_changed` before the writer opens. |
+| `rotate-audit-key` | audit-log chain-root HMAC (`audit_log_hash_chain_key_id`) | Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify <LOG_PATH> --profile <NAME>` stays green and the old key stops verifying. Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds the writer. A changed audit binding refuses with `audit.log_binding_changed` before the writer opens. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | Invalidates outstanding nonces. Returns only `profile` + `rotated`. |
 | `rotate-counterparty-key` | `stellar.toml` cache-integrity HMAC (`counterparty_cache_key_id`) | Invalidates cached bindings. `counterparty refresh <domain>` rewrites one binding, and `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. Adds `key_kind:"hmac_32_bytes"` and `cache_invalidated:true`. |
 | `rotate-policy-state-key` | policy-window-state HMAC (`policy_window_state_key_id`) | Re-signs the persisted window-state store under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved, not invalidated. Refused if the store does not verify under the current key (use `reset-window-state` instead). Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. |
@@ -760,7 +760,7 @@ stellar-agent approve operator enroll --credential-id <B64URL> \
 
 ## audit
 
-Verifies the per-profile audit log, an append-only hash-chained JSONL record of transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events, and repairs its tip anchor. MCP balance reads and payment simulations produce no automatic invocation row. Under V1, payment simulations can reconcile overdue reservations and write settlement audit rows. Argument values are never logged; only argument key names. The chain links each entry to the SHA-256 of the prior entry's canonical body. Uses the `{ok, data, request_id}` envelope.
+Verifies the per-profile audit log, an append-only hash-chained JSONL record of transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events, and repairs its tip anchor. MCP balance reads and payment simulations produce no automatic invocation row. Under V1, payment simulations can reconcile overdue reservations and write settlement audit rows. Raw argument values are never logged; only argument key names. Typed value events retain each leg's amount, asset, and redacted destination. The chain links each entry to the SHA-256 of the prior entry's canonical body. Uses the `{ok, data, request_id}` envelope.
 
 The chain and the per-file chain-root signatures verify a PREFIX, so an older copy of the active log, or a truncated one, passes both. The tip anchor pins the END of the chain: the active file's entry count, last-entry hash, and byte offset, held in the platform keyring per log path.
 
@@ -822,7 +822,7 @@ stellar-agent audit reanchor --profile default --acknowledge-binding-change
 1. The agent surface evaluates an action against the policy engine; an action needing consent records a pending approval and returns its nonce instead of executing.
 2. The wallet owner runs `approve --id <NONCE> --profile <name>`, reads the wallet-controlled summary, and consents. The command writes an HMAC attestation (or toolset grant) bound to the profile name, chain id, nonce, envelope digest, and local user.
 3. The agent surface verifies the attestation and executes; the commit writes its transaction audit events to the hash-chained log.
-4. The operator periodically runs `audit verify --profile <NAME>` to confirm the chain, the chain-root HMAC sidecars, and the tip anchor are intact.
+4. The operator periodically runs `audit verify <LOG_PATH> --profile <NAME>` to confirm the chain, the chain-root HMAC sidecars, and the tip anchor are intact.
 
 ---
 

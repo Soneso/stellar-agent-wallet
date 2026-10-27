@@ -129,7 +129,7 @@ the SEP-43 and SEP-53 signing tools, the `*_commit` tools, the x402 tools, and
 the toolset dispatcher's own tools `stellar_toolset_list` /
 `stellar_toolset_invoke` (the last two prevent a toolset from
 re-invoking the dispatcher to escalate). The denylist and the ungated matrix are
-disjoint by literal name, so the gated tool is unreachable from the ungated
+disjoint by literal name, so the gated tools are unreachable from the ungated
 resolver.
 
 A toolset action passes only the **four-part check**:
@@ -178,7 +178,7 @@ merits, and signature verification is defence-in-depth layered before them.
 
 ### The attestation gate
 
-A toolset that declares a key-touching capability (currently `sign-payment`) requires
+A toolset that declares a key-touching capability (`sign-payment` or `sign-rule-create`) requires
 a `ToolsetAttestation` signed by an auditor key in a **separate** auditor trust set
 (`auditor-trust.txt`), distinct from the publisher trust set (`trust.txt`). The
 gate fires after the `name == package` identity cross-check and before the atomic
@@ -250,8 +250,7 @@ lives only in the keyring.
 
 The subcommand group is `stellar-agent toolsets` (plural). All four subcommands are
 local and offline (no network calls, no chain signing) and print a JSON envelope.
-Each prints its success envelope on stdout. `install` and `uninstall` write the
-error envelope to stderr; `list` and `run` write the error envelope to stdout.
+Each prints its success and error envelopes on stdout.
 Exit code is `0` on success, `1` on any error. The toolsets root defaults to the
 OS-conventional toolsets directory; `--toolsets-dir <PATH>` overrides it on every
 subcommand.
@@ -390,9 +389,9 @@ dispatch gate.
 }
 ```
 
-No signing, key, or policy tool is reachable through any capability, so an `action`
-naming a signing tool returns `toolset.unknown_action` (the tool is not in the matrix
-to resolve). For a `sign-payment` toolset, `action: "stellar_pay_commit"` is routed
+No signing, key, or policy tool is reachable through an ungated capability, so an
+`action` naming a signing tool returns `toolset.unknown_action` (the tool is not in
+the matrix to resolve). The two gated tools are the exception. For a `sign-payment` toolset, `action: "stellar_pay_commit"` is routed
 through the gated resolver instead: `args` must carry the `envelope_xdr` produced by
 a prior `stellar_pay` simulate call, from which the destination, asset, and amount
 are decoded authoritatively. If the first-invoke gate fires, the call returns

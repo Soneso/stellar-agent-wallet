@@ -2,7 +2,7 @@
 
 Signed-toolset format parsing and capability-manifest validation for the stellar-agent-wallet.
 
-This crate parses and validates a toolset directory's `TOOLSET.md` and the wallet capability manifest carried in its frontmatter metadata, producing either a validated, typed `Toolset` value or a typed refusal. It also provides the pre-canonicalisation argument-validation guard `validate_toolset_tool_args` (with its depth, node-count, and key-denylist constants), which both the MCP dispatcher and the CLI execution path call before deserializing typed arguments.
+This crate parses and validates a toolset directory's `TOOLSET.md` and the wallet capability manifest carried in its frontmatter metadata, producing either a validated, typed `Toolset` value or a typed refusal. It also provides the pre-canonicalisation argument-validation guard `validate_toolset_tool_args`, with its depth, node-count, and key-denylist constants. The MCP toolset dispatcher calls the guard before deserializing typed arguments. The MCP dispatch gate applies the same guard to every call it gates. The CLI `toolsets run` command resolves the routed tool without running it, so it does not call the guard.
 
 This crate is the format and parse/validate substrate only. It performs no install, no signing, no runtime enforcement, no MCP or CLI registration, and no network I/O; those concerns live in the install and runtime toolset crates.
 

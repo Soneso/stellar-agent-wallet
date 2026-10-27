@@ -40,7 +40,7 @@ Crates form a directed acyclic graph from foundational substrate up to the two b
 
 ### Layer 0: substrate
 
-`stellar-agent-core`, `stellar-agent-network` (depends on `core`), `stellar-agent-sep5`, `stellar-agent-xdr-limits`, `stellar-agent-soroban-auth`, and `stellar-agent-nonce`. These carry the typed errors, amounts, envelopes, RPC transport, key derivation, untrusted-XDR bounds, Soroban authorization preimages, and replay-nonce primitives that every higher layer builds on. `xdr-limits`, `soroban-auth`, `sep5`, and `nonce` are independent leaves; `network` depends on `core`.
+`stellar-agent-core`, `stellar-agent-network` (depends on `core`), `stellar-agent-sep5`, `stellar-agent-xdr-limits`, `stellar-agent-soroban-auth`, and `stellar-agent-nonce`. These carry the typed errors, amounts, envelopes, RPC transport, key derivation, untrusted-XDR bounds, Soroban authorization preimages, and replay-nonce primitives that every higher layer builds on. `xdr-limits`, `soroban-auth`, and `sep5` are independent leaves; `network` depends on `core`, and `nonce` depends on `core` and `network`.
 
 ### Layer 1: orchestration and platform
 
@@ -124,7 +124,7 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 
 The policy engine, approval spine, and audit log all live in `stellar-agent-core`. The relevant modules:
 
-- `policy`: the `PolicyEngine` trait, the typed `Decision` surface, the `NoopPolicyEngine`, and `policy::v1::PolicyEngineV1` (signature-verified typed `Criterion` rules, first-match default-deny). The server-side `build_tool_registry` lives here and fails closed: a duplicate registration name is a fatal startup error, not a silent first-wins drop.
+- `policy`: the `PolicyEngine` trait, the typed `Decision` surface, the `NoopPolicyEngine`, and `policy::v1::PolicyEngineV1` (signature-verified typed `Criterion` rules, first-match default-deny). The registry these policy types serve is built in the MCP crate: `build_tool_registry` in `stellar-agent-mcp`'s `tools/common.rs` fails closed: a duplicate registration name is a fatal startup error, not a silent first-wins drop.
 - `approval`: the per-profile `PendingApprovalStore` (TOML-backed, with an exclusive lifetime advisory lock that refuses a second opener), the HMAC-SHA256 attestation primitive, and the process-uid helper that binds an attestation to the OS user.
 - `audit_log`: the append-only hash-chained JSONL writer, the chain primitives, and `verify_log` for end-to-end chain verification.
 

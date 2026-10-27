@@ -97,10 +97,10 @@ guide, only `smart-account execute` reads it, from `AGENT_SK` (see
 
 ### 3. Create the scoped `CallContract` rule
 
-`rules create` needs at least one signer at creation time, so start with a
-bootstrap signer, typically your own operator key, then attach the
-agent's key in the next step. Run this line on its own, paste the operator
-seed when prompted, and press Enter:
+`rules create` installs the rule with the agent's key as its signer. The
+operator key signs the install under the default `--auth-rule-id 0`, the
+bootstrap rule from `accounts deploy-c`. Run this line on its own, paste the
+operator seed when prompted, and press Enter:
 
 ```bash
 printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
@@ -111,7 +111,8 @@ stellar-agent smart-account rules create \
   --account CABC...WXYZ \
   --name agent-ops \
   --context call-contract:CTOK...WXYZ \
-  --signer-delegated GOPS...WXYZ \
+  --signer-ed25519 <AGENT_HEX_PUBKEY_64> \
+  --accept-no-delegated-fallback \
   --signer-secret-env WALLET_SK
 unset WALLET_SK
 ```
@@ -120,34 +121,27 @@ unset WALLET_SK
 authorization for this rule only ever matches invocations of that one
 contract. Record the returned `rule_id`. Every following command needs it.
 
-### 4. Attach the agent's key to that rule
+`--verifier` is optional here. Omitted, it resolves the network's
+registered Ed25519 verifier from step 1, failing closed if none is
+registered. `--accept-no-delegated-fallback` acknowledges that the agent's
+External key is the rule's only signer.
 
-Run this line on its own, paste the operator seed when prompted, and press
-Enter:
+### 4. Keep administration on the bootstrap rule
+
+`signers add` and `signers remove` authorize a change with the rule being
+changed. A `CallContract` rule matches only calls to its own contract, so it
+cannot authorize changes to the smart account. Rule 0 keeps that authority.
+If the agent's key is lost or compromised, retire the scoped rule from rule 0.
+Read the operator seed as above, then run:
 
 ```bash
-printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
-```
-
-```bash
-stellar-agent smart-account signers add \
+stellar-agent smart-account rules delete \
   --account CABC...WXYZ \
   --rule-id <RULE_ID> \
-  --signer-ed25519 <AGENT_HEX_PUBKEY_64> \
+  --auth-rule-id 0 \
   --signer-secret-env WALLET_SK
 unset WALLET_SK
 ```
-
-`--verifier` is optional here. Omitted, it resolves the network's
-registered Ed25519 verifier from step 1, failing closed if none is
-registered.
-
-Whether to keep the bootstrap operator signer on the rule afterward is a choice. Leaving it in place gives you a recovery path if the agent's key is
-ever lost or compromised (you can still administer or retire the rule
-yourself). Removing it (`smart-account signers remove --signer-id <ID>`)
-makes the rule agent-only. There is no wrong answer. Pick based on how much
-you trust your own key-recovery process versus wanting a hard "agent only"
-boundary.
 
 ### 5. Attach the spending-limit policy
 
@@ -165,9 +159,14 @@ stellar-agent smart-account rules add-policy \
   --kind spending-limit \
   --limit 50000000 \
   --period 17280 \
+  --auth-rule-id 0 \
   --signer-secret-env WALLET_SK
 unset WALLET_SK
 ```
+
+`--auth-rule-id 0` authorizes the attachment with the bootstrap rule. The
+default is the rule being changed, which a `CallContract` rule cannot
+authorize.
 
 `--limit` is in stroops (`50000000` = 5 XLM); `--period` is a rolling window
 in ledgers (`17280` ≈ 24 hours at 5 s/ledger). The cumulative amount moved
@@ -176,8 +175,9 @@ transfer that would push it over is refused on-chain, not client-side:
 there is no way to bypass the cap by racing the check.
 
 The wallet refuses `--kind spending-limit` client-side, before any network
-call, if `--limit` is not positive or `--period` is zero, and if the target
-rule's context type is not `call-contract`. A spending limit is only
+call, if `--limit` is not positive or `--period` is zero. It refuses a target
+rule whose context type is not `call-contract` after reading the rule, before
+simulation and submission. A spending limit is only
 meaningful against a scoped contract, and the OpenZeppelin policy contract
 itself rejects both conditions the same way.
 
@@ -284,8 +284,9 @@ read the same state about its own rules through the read-only MCP tools
 granted by exposing these; both tools are `read_only_hint=true,
 destructive_hint=false`. `stellar_rules_get`'s `policies` field also reports
 each attached policy's best-effort classification (`threshold`,
-`spending-limit`, or `unknown`), degrading rather than failing when a policy
-cannot be identified.
+`spending-limit`, or `unknown`). A policy whose code hash is absent or
+unrecognized reports `unknown`. A failed rule read or hash fetch fails the
+request.
 
 The returned budget numbers are a point-in-time estimate, not a guarantee:
 they are exact only as of the `as_of_ledger` they were read at. Forward
@@ -301,10 +302,10 @@ once installed. Changing it requires removing and re-adding the policy,
 which does reset the history (see [CLI reference:
 smart-account](cli-reference/smart-account.md#smart-account-rules-set-spending-limit)).
 
-Revoking the delegation is the same lifecycle every other context rule
-uses: `smart-account rules delete`, `smart-account rules set-valid-until`
-to set an expiry, or `smart-account signers remove` to drop just the
-agent's key while leaving the rule (and any other signers on it) intact.
+Revoking the delegation uses `smart-account rules delete`, or
+`smart-account rules set-valid-until` to set an expiry, each with
+`--auth-rule-id 0`. `smart-account signers remove` authorizes with the rule
+being changed, so it cannot drop a signer from a `CallContract` rule.
 
 ## Weighted quorums for multiple agents
 
@@ -312,8 +313,9 @@ The simple threshold-policy above is signer-count based: any `N` of the
 configured signers authorize equally. When a rule delegates to several
 agents (or an operator plus several agents) whose keys should NOT carry
 equal authority, attach a weighted-threshold policy.
-For example, an agent alone can authorize small
-transfers but needs a co-signer for larger ones
+For example, an operator key can meet the threshold alone while two agent keys
+must sign together. The quorum is the same for every call, whatever the
+transfer amount
 ([`smart-account deploy-policy --kind weighted-threshold`](cli-reference/smart-account.md#smart-account-deploy-policy),
 [`rules add-policy --kind weighted-threshold`](cli-reference/smart-account.md#smart-account-rules-add-policy)).
 Each signer (Delegated or External) carries an independent weight.

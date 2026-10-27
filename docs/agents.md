@@ -56,17 +56,31 @@ the server exposes.
 Every tool requires a `chain_id` argument (the CAIP-2 chain id, e.g.
 `stellar:testnet`) that must match the active profile. `stellar_x402_parse_receipt`
 and `stellar_toolset_list` take none, and the two SEP-43 read tools make it
-optional. `stellar_toolset_invoke` accepts an optional `chain_id` that it forwards
+optional. The five `stellar_mpp_*` tools reject a `chain_id` field as unknown;
+they act on the chain of the profile the server was started with. `stellar_toolset_invoke` accepts an optional `chain_id` that it forwards
 to the routed tool, which may itself require it (a routed `stellar_balances` or
-`stellar_pay` does). A mismatch is refused before any network call.
+`stellar_pay` does). `stellar_dex_quote` requires a `chain_id` but never
+matches it against the profile; it selects the router from it. A mismatch is
+refused before signing. The classic simulate and commit tools read the
+endpoint and the accounts first.
 
 ## The result envelope
 
-Every tool returns the same JSON envelope:
+Every tool returns the same JSON envelope, with five success-path exceptions:
 
 ```json
 { "ok": true, "data": { }, "request_id": "..." }
 ```
+
+`stellar_toolset_list` returns a bare JSON array. `stellar_dex_trade`,
+`stellar_dex_quote`, `stellar_defindex_vault_deposit`, and
+`stellar_defindex_vault_withdraw` return a bare object carrying a `status`
+field on success. Their business errors use the envelope.
+
+Some refusals use the JSON-RPC error channel instead of the envelope: invalid
+arguments, a `chain_id` mismatch, and the toolset capability refusals.
+`toolset.first_invoke_approval_required` is a JSON-RPC error too, and its error
+data carries the `approval_nonce`.
 
 On failure, `ok` is `false` and `error` carries a stable wire `code` (such as
 `policy.deny.<reason>` or `policy.approval_required`) instead of `data`. Branch on
@@ -183,8 +197,8 @@ tools drive them:
 }
 ```
 
-No signing, key, or policy tool is reachable through any capability, so an
-`action` naming one returns `toolset.unknown_action`. Two signing-adjacent
+No signing, key, or policy tool is reachable through an ungated capability, so
+an `action` naming one returns `toolset.unknown_action`. Two signing-adjacent
 capabilities route through the gated path: `sign-payment` reaches
 `stellar_pay_commit`, and `sign-rule-create` reaches `stellar_rule_create_commit`
 (agent-proposed context rules). Each is guarded by a first-invoke gate. The
@@ -229,9 +243,11 @@ server transaction instead. The complete testnet-only workflow is in
   the gate matches the authoritative envelope. Audit rows come from explicit
   submission, signing, approval, key-management, and lifecycle events; early
   refusals do not automatically write a row.
-- The operator verifies the tamper-evident log with `stellar-agent audit verify`.
-  Argument values are never logged; only key names are. So passing data through the
-  wallet does not leak it into the audit trail.
+- The operator verifies the tamper-evident log with
+  `stellar-agent audit verify <LOG_PATH> --profile <NAME>`.
+  Raw argument values are never logged; only key names are. Typed event fields do
+  keep data: a value-moving row records each leg's amount, asset, and redacted
+  destination.
 - A commit/submit tool refuses `audit.chain_key_unavailable` if the profile's audit
   chain-root key was never minted (an `init`-minted profile, before the operator runs
   `rotate-audit-key`). This is an operator setup gap, not agent misuse: report the

@@ -6,8 +6,10 @@ thresholds, and the active policy engine. It is the single source of truth read
 by the `stellar-agent` CLI, the `stellar-agent-mcp` server, and the policy
 engine.
 
-A profile holds no secrets. Every key it references lives in the platform
-keyring; the profile only names those entries. See [Secret discipline](#secret-discipline).
+A profile holds no keys. Every key it references lives in the platform
+keyring; the profile only names those entries. An endpoint URL can embed a
+credential in its path or query on any network. Mainnet refuses only a username
+or password in the URL. See [Secret discipline](#secret-discipline).
 
 ## File location and selection
 
@@ -20,8 +22,12 @@ Profile files live one-per-name in the OS-conventional data directory:
 | Windows  | `%LOCALAPPDATA%\Soneso\stellar-agent\data\profiles\<name>.toml` |
 
 A profile is selected by name (the file stem): an explicit `--profile <NAME>`,
-then the `STELLAR_AGENT_PROFILE` environment variable, then `default`. Both the
-CLI and the MCP server resolve it that way, with no exceptions. When no name
+then the `STELLAR_AGENT_PROFILE` environment variable, then `default`. The MCP
+server and most CLI commands resolve it that way. `profile show`, `profile
+migrate`, the `profile rotate-*` commands, `profile reset-window-state`, and
+`profile reset-mpp-state` require an explicit positional `<NAME>` or
+`--profile <NAME>`. `fees stats` loads a profile only with `--profile`, and
+otherwise queries `--rpc-url` or the testnet RPC endpoint. When no name
 was given and no `default.toml` exists yet, both fall back to an in-memory
 testnet configuration — the MCP server so it can still serve read-only
 requests, the CLI so `pay`, `claim`, and `accounts create` work before any
@@ -157,7 +163,7 @@ Every profile carries a top-level `version` field. The loader dispatches on it:
 - `version = 2` — current schema; loads directly.
 - `version = 1` — not loaded directly. The loader fails fast and the file must
   first be migrated with `stellar-agent profile migrate <name>` (see
-  [Migration and key rotation](#migration-and-key-rotation)).
+  [Migrate first](#migrate-first)).
 - `version > 2` — refused. A profile written by a newer wallet is rejected so an
   older wallet never silently applies stale defaults.
 
@@ -260,10 +266,10 @@ EURC asset and the USDC Stellar Asset Contract.
 
 ### Security-substrate key references
 
-These four `KeyringEntryRef` fields name the keyring entries holding the security
+These five `KeyringEntryRef` fields name the keyring entries holding the security
 substrate's keys. A migrated profile populates them with default-derived names
 but mints no key material; the rotation commands mint the actual keys (see
-[Migration and key rotation](#migration-and-key-rotation)).
+[Rotate each key](#rotate-each-key)).
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -271,6 +277,7 @@ but mints no key material; the rotation commands mint the actual keys (see
 | `[policy_owner_key_id]` | keyring ref | yes | ed25519 key whose signature every V1 policy file must carry. |
 | `[attestation_key_id]` | keyring ref | yes | HMAC key minting approval attestations at `approve` time. |
 | `[counterparty_cache_key_id]` | keyring ref | yes | HMAC key protecting the local `stellar.toml` cache integrity. |
+| `[policy_window_state_key_id]` | keyring ref | no (name-derived default) | HMAC key authenticating the persisted policy-window-state store behind `per_period_cap`, `rate_limit`, `bundle_per_period_cap`, and `bundle_rate_limit`. When omitted, the loader derives `stellar-agent-policy-window-<profile>`. The key mints on the first store write. |
 
 ### Cross-check, MCP, and scan bounds
 
@@ -398,9 +405,44 @@ That request is not retried.
 The client removes the stored value and the form it sends from every error text it returns, before it shortens URLs to host and port.
 A key the endpoint re-encodes, truncates, or splits is not caught.
 
+### Channel-pool state
+
+`pool init` writes these three fields, patching only the pool keys. They hold
+public data; the pool master seed stays in the keyring.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `[pool_master_key_id]` | keyring ref | no | unset | Keyring entry holding the pool master seed. Channel keys derive from it at `m/44'/148'/<index>'`. |
+| `[pool_config]` | table | no | unset | The initialized pool: `pool_size` and one `channels` record per channel, each a BIP-44 index and public G-strkey. `pool list` and `pool status` read it. |
+| `[pool_initialization]` | table | no | unset | Recovery checkpoint for `pool init`. `pool init --resume` continues from it. |
+
+### `[remote_approval]` block
+
+Optional; absent by default, which keeps `approve serve` on loopback. The block
+is necessary but not sufficient for `approve serve --remote`, which also needs
+the `--confirm-remote-exposure` flag at start time.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `enabled` | bool | no | `false` | Must be `true`, together with `--confirm-remote-exposure`, for `--remote` to take effect. |
+| `bind` | string | yes (if block present) | none | Socket address to bind, validated before any TLS provisioning or bind attempt. |
+| `rp_id` | string | yes (if block present) | none | WebAuthn Relying Party ID, a DNS hostname; an IP literal is refused. |
+| `allowed_credentials` | array of strings | no | `[]` | Base64url WebAuthn credential IDs authorized to approve or reject. |
+
+### `[served_pages]` block
+
+Optional; absent by default, which serves the operator-facing pages with a plain
+title, no name, and no mark. It never changes what a page says about a
+transaction.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `display_name` | string | no | unset (no name) | Name shown in the page title and above each heading. At most 64 characters; HTML-escaped. |
+| `show_project_mark` | bool | no | `false` | Renders the project mark on the served pages. |
+
 ### `[wallet]` block
 
-These controls apply to every CLI seed read, including `pay`, `claim`, and `accounts create`. The zero-config testnet profile uses the `"warn"` posture and a 30-second TTL.
+These controls apply to every CLI seed read from a `--*-secret-env` variable, including `pay`, `claim`, and `accounts create`. Keyring signers, the Ledger, and the MCP server never enter the unlock window. The zero-config testnet profile uses the `"warn"` posture and a 30-second TTL.
 
 Controls the unlock window — the short, TTL-bounded period during which the
 32-byte signing seed is resident in pinned, zeroize-on-drop memory.
@@ -440,11 +482,13 @@ profile-driven values.
   required by most MCP tools.
 - The MCP result envelope is `{ok, data|error, request_id}`: `ok` is a boolean,
   `data` carries the result on success, `error` carries `{code, message}` on
-  failure, and `request_id` correlates the call with the audit log.
+  failure, and `request_id` correlates the call with the audit log. Five tools
+  return a bare success payload, and some refusals use the JSON-RPC error
+  channel; see [the result envelope](mcp-tools.md#the-result-envelope).
 
 ## Secret discipline
 
-No profile field holds a secret. The signer seed, nonce key, and every HMAC and
+No profile field holds a key, though an endpoint URL can embed a credential. The signer seed, nonce key, and every HMAC and
 ed25519 key live in the platform keyring (macOS Keychain, Linux Secret Service,
 Windows Credential Manager). Each `*_key_id` field, the signer reference, and the
 nonce reference are `KeyringEntryRef` values that only name a keyring entry.
@@ -542,9 +586,10 @@ in the older base64 form is rewritten as its G-strkey by the next V1 verb or
 | Command | Mints into | Notes |
 |---------|------------|-------|
 | `stellar-agent profile rotate-attestation-key <name>` | `attestation_key_id` | Fresh 32-byte HMAC key. All pending approvals are invalidated. |
-| `stellar-agent profile rotate-audit-key <name>` | `audit_log_hash_chain_key_id` | Fresh 32-byte HMAC key. Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify --profile <name>` stays green across the rotation and the old key stops verifying; the response carries `sidecars_resigned`. |
+| `stellar-agent profile rotate-audit-key <name>` | `audit_log_hash_chain_key_id` | Fresh 32-byte HMAC key. Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify <LOG_PATH> --profile <name>` stays green across the rotation and the old key stops verifying; the response carries `sidecars_resigned`. |
 | `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. Cached `stellar.toml` entries read as absent until a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. |
 | `stellar-agent profile rotate-nonce-key <name>` | `mcp_nonce_key_alias` | Fresh 32-byte HMAC key. Outstanding nonces minted with the old key are invalidated. |
+| `stellar-agent profile rotate-policy-state-key <name>` | `policy_window_state_key_id` | Fresh 32-byte HMAC key. The window-state store is verified under the old key and re-signed under the new one, so `per_period_cap` / `rate_limit` history is preserved. A store that does not verify refuses the rotation. |
 
 ### Enroll the MCP signer
 

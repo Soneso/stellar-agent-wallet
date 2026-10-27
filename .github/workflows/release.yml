@@ -118,7 +118,7 @@ jobs:
         env:
           TAG_VERSION: ${{ steps.version.outputs.version }}
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
 
@@ -129,7 +129,7 @@ jobs:
         # Dependency-graph gate specific to a release cut: cargo-deny runs on
         # every push to main too, but the dependency graph (and the RustSec
         # advisory database) can shift between the last CI run and the tag.
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-deny@0.19.9
       - run: cargo deny check
@@ -177,7 +177,7 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
 
@@ -196,7 +196,7 @@ jobs:
 
       # The environment guard of build.sh runs python3, 3.11 or later for
       # tomllib, so each leg installs it instead of relying on the image.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
 

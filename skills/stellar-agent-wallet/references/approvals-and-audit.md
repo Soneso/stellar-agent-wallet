@@ -7,8 +7,9 @@ surface that drives the simulate/commit handshake see `./mcp-tools.md`.
 
 ## The model in one paragraph
 
-Every tool/command invocation is evaluated by the active policy engine before
-any RPC call or signature. The engine returns Allow, Deny, or RequireApproval.
+Every gated tool/command invocation is evaluated by the active policy engine
+before any signature. Reads the decision needs, such as the source account, can
+run first. The engine returns Allow, Deny, or RequireApproval.
 A RequireApproval action does not execute on the agent's say-so: it is held in a
 per-profile pending-approval store. For pay, create-account, trustline, and
 claim, simulation records a pending approval when policy requires approval for
@@ -46,7 +47,7 @@ settlement audit rows.
 
 ## The policy engine
 
-Each invocation is evaluated before it does anything. Three decisions:
+Each gated invocation is evaluated before it signs. Three decisions:
 
 | Decision | Meaning |
 |---|---|
@@ -689,9 +690,10 @@ The policy-file owner key is not rotated here. It is enrolled with `profile enro
 | Subcommand | Key kind | Effect on outstanding material |
 |---|---|---|
 | `profile rotate-attestation-key <NAME>` | 32-byte HMAC | All pending approvals invalidated; re-run the simulate-and-approve round trip. |
-| `profile rotate-audit-key <NAME>` | 32-byte HMAC | Re-signs every existing per-file chain-root sidecar with the new key; `audit verify --profile <p>` stays green across the rotation and the old key stops verifying; the response carries `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds the writer. |
+| `profile rotate-audit-key <NAME>` | 32-byte HMAC | Re-signs every existing per-file chain-root sidecar with the new key; `audit verify <LOG_PATH> --profile <p>` stays green across the rotation and the old key stops verifying; the response carries `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds the writer. |
 | `profile rotate-nonce-key <NAME>` | 32-byte HMAC | All outstanding nonces minted with the old key are invalidated. |
 | `profile rotate-counterparty-key <NAME>` | 32-byte HMAC | Invalidates cached bindings. `counterparty refresh <domain>` rewrites one binding, and `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. |
+| `profile rotate-policy-state-key <NAME>` | 32-byte HMAC | Verifies the window-state store under the old key, then re-signs it under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved. A store that does not verify refuses the rotation; use `profile reset-window-state`. |
 
 ```bash
 stellar-agent profile rotate-attestation-key default

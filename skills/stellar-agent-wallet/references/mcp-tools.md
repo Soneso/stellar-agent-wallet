@@ -50,17 +50,27 @@ Omit the `args` entries to serve the `default` profile.
 
 ## The result envelope
 
-Every tool returns the same JSON envelope:
+Every tool returns the same JSON envelope, with five success-path exceptions:
 
 ```json
 { "ok": true, "data": { }, "request_id": "..." }
 ```
 
+`stellar_toolset_list` returns a bare JSON array. `stellar_dex_trade`,
+`stellar_dex_quote`, `stellar_defindex_vault_deposit`, and
+`stellar_defindex_vault_withdraw` return a bare object carrying a `status`
+field on success; their business errors use the envelope.
+
+Some refusals use the JSON-RPC error channel instead of the envelope: invalid
+arguments, a `chain_id` mismatch, and the toolset capability refusals.
+`toolset.first_invoke_approval_required` is a JSON-RPC error too, and its error
+data carries the `approval_nonce`.
+
 On failure, `ok` is `false` and `error` carries a stable wire `code` (such as
 `policy.deny.<reason>` or `policy.approval_required`) instead of `data`. Branch on
 `ok`; use `code` for control flow, not the human message. The `request_id`
-correlates the call with the audit log. Argument values are never written to the
-audit log; only key names and lifecycle metadata are recorded.
+correlates the call with the audit log. Raw argument values are never written to
+the audit log; only key names and lifecycle metadata are recorded. Typed value events retain each leg's amount, asset, and redacted destination.
 
 Three codes carry an `error.details` object as well: `submission.tx_timeout`,
 `submission.tx_already_submitted` and `submission.hash_mismatch`. Each reports a
@@ -93,8 +103,13 @@ claimable-balance record. It does not re-read the source trustline at commit.
 
 ## Gating model in brief
 
-Every call is dispatched through one gate before the tool's logic runs. The
-policy engine returns one verdict:
+Every call except three MPP tools and `stellar_dex_quote` passes through one
+gate before the tool signs or submits. Preparation and the reads the decision needs, such as the endpoint
+identity check and the account read, can run first.
+`stellar_mpp_record_receipt`, `stellar_mpp_reconcile_transaction`, and
+`stellar_mpp_authorization_status` check the profile and read the MPP store
+without a policy verdict. `stellar_dex_quote` passes no gate and never compares its `chain_id` with the profile. It picks the Soroswap router from `chain_id` and reads through the profile's RPC endpoint.
+The policy engine returns one verdict:
 
 - `Allow` — the tool proceeds.
 - `Deny` — refused with wire code `policy.deny.<reason>`.
@@ -185,12 +200,17 @@ and must match the loaded profile. The x402 requirement `network` spells mainnet
 `stellar:pubnet`; that spelling is not a valid `chain_id`.
 
 - Required by every tool EXCEPT: `stellar_x402_parse_receipt`,
-  `stellar_toolset_list`, `stellar_toolset_invoke`.
+  `stellar_toolset_list`, `stellar_toolset_invoke`, and the five
+  `stellar_mpp_*` tools.
+- The five MPP tools reject a `chain_id` field as unknown and act on the chain
+  of the server's profile.
 - `stellar_toolset_invoke` accepts an optional `chain_id` that it forwards to the
   routed tool, which may itself require it.
 - For `stellar_sep43_get_address` and `stellar_sep43_get_network`, `chain_id` is
   optional and defaults to the profile chain when omitted, but is still validated
   against the profile when supplied.
+- `stellar_dex_quote` requires a `chain_id` but never matches it against the
+  profile; it selects the router from it.
 
 A mismatch is refused before policy evaluation. On the classic simulate and
 commit tools, the endpoint check and the account reads come first, so an
@@ -310,9 +330,7 @@ optional `approval_nonce` / `approval_attestation` pair as `stellar_pay_commit`.
 | --- | --- | --- | --- |
 | `chain_id` | string | yes | Only `stellar:testnet` succeeds; mainnet returns `network.friendbot_mainnet_forbidden`. |
 | `account_id` | string | yes | G-strkey to fund. |
-
-(An optional Friendbot endpoint override is accepted; the default URL for the
-resolved chain is used when omitted.)
+| `friendbot_url` | string | no | Friendbot endpoint override. Must be on the allowlist (`friendbot.stellar.org`, `friendbot-futurenet.stellar.org`), else `invalid_params`. Omitted, the default URL for the resolved chain is used. |
 
 ## Trustline
 
@@ -393,7 +411,7 @@ byte-match the presented `envelope_xdr` returns `simulation.divergence`.
 | --- | --- | --- |
 | `stellar_fee_stats` | Fetch classic and Soroban inclusion-fee distributions for fee estimation. | Read-only. |
 
-Arguments: `chain_id` only.
+Arguments: `chain_id`, and an optional allowlisted `rpc_url` override.
 
 ## Smart-account rules
 

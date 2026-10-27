@@ -80,11 +80,21 @@ authoritative argument contract — prefer them over any example here.
 
 ### The result envelope
 
-Every tool returns the same JSON envelope:
+Every tool returns the same JSON envelope, with five success-path exceptions:
 
 ```json
 { "ok": true, "data": { }, "request_id": "..." }
 ```
+
+`stellar_toolset_list` returns a bare JSON array. `stellar_dex_trade`,
+`stellar_dex_quote`, `stellar_defindex_vault_deposit`, and
+`stellar_defindex_vault_withdraw` return a bare object carrying a `status`
+field on success; their business errors use the envelope.
+
+Some refusals use the JSON-RPC error channel instead of the envelope: invalid
+arguments, a `chain_id` mismatch, and the toolset capability refusals.
+`toolset.first_invoke_approval_required` is a JSON-RPC error too, and its error
+data carries the `approval_nonce`.
 
 On failure, `ok` is `false` and `error` carries a stable wire `code` (such as
 `policy.deny.<reason>`, `policy.approval_required`, or `policy.engine_required`)
@@ -112,7 +122,10 @@ Every tool requires a `chain_id` argument — the CAIP-2 chain id (`stellar:test
 or `stellar:mainnet`) — that must match the active profile. Exceptions:
 `stellar_x402_parse_receipt` and `stellar_toolset_list` take none; the two SEP-43
 read tools make it optional; `stellar_toolset_invoke` accepts an optional `chain_id`
-it forwards to the routed tool.
+it forwards to the routed tool. The five `stellar_mpp_*` tools reject a `chain_id`
+field as unknown and act on the chain of the server's profile.
+`stellar_dex_quote` requires a `chain_id` but never matches it against the
+profile; it selects the router from it and reads through the profile's RPC.
 
 ## 2. Reading account state
 
@@ -321,8 +334,10 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
 - Every MPP tool refuses `stellar:mainnet` at handler entry with
   `mpp.network_forbidden`. Branch on all three codes when handling a mainnet
   refusal.
-- Argument values are never written to the audit log — only key names. The
-  operator verifies the chain with `stellar-agent audit verify`.
+- Raw argument values are never written to the audit log, only key names.
+  Typed value events retain each leg's amount, asset, and redacted destination. The
+  operator verifies the chain with
+  `stellar-agent audit verify <LOG_PATH> --profile <NAME>`.
 
 See `references/security.md` and `references/approvals-and-audit.md`.
 

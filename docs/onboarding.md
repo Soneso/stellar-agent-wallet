@@ -22,8 +22,9 @@ The wallet answers that with a strict division of roles:
 
 - **The agent acts.** It reads balances, prepares payments, trades, and
   submits transactions, through a set of tools designed for machines.
-- **The wallet enforces.** Every single action passes a policy check you
-  configured: allowed, refused, or held for your approval. The agent cannot
+- **The wallet enforces.** Every transaction and signature the agent requests
+  passes a policy check you configured: allowed, refused, or held for your
+  approval. The agent cannot
   talk its way around a rule, because the rules never see the agent's words:
   only the transaction itself.
 - **You decide.** Actions held for approval land in your approval inbox. You
@@ -104,7 +105,8 @@ Nothing is asked of you on faith. The alpha is deliberately conservative:
 The wallet speaks the Model Context Protocol (MCP), which is how Claude Code
 and other AI coding agents discover tools. A first session looks like this:
 
-1. **Build the wallet** (a Rust toolchain is the only prerequisite):
+1. **Build the wallet** (a Rust toolchain plus the native build tools in
+   [Prerequisites](getting-started.md#prerequisites)):
 
    ```bash
    git clone --branch v0.1.0-alpha.12 https://github.com/Soneso/stellar-agent-wallet
