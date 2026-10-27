@@ -756,6 +756,14 @@ fn identifier_call(line: &str, needle: &str) -> bool {
     })
 }
 
+/// Every seed and Ledger resolver holds its signer to the enrolled identity.
+///
+/// The testnet-shaped resolvers call `require_enrolled_signer` after
+/// selecting the signer. The mainnet ceremony is held to the key the
+/// enrolled proof read before the confirmation: `ledger_signer` opens the
+/// Ledger against the enrolled source, and the deferred environment signer's
+/// `sign_tx_payload` compares the derived key with the enrolled one before it
+/// signs. Those two are the only resolvers without the call.
 #[test]
 fn every_seed_and_ledger_resolver_checks_enrollment() {
     use std::collections::BTreeSet;
@@ -798,11 +806,26 @@ fn every_seed_and_ledger_resolver_checks_enrollment() {
             }
         }
     }
+    let held_to_the_enrolled_proof = BTreeSet::from([
+        (
+            "common/signer_ceremony.rs".to_owned(),
+            "ledger_signer".to_owned(),
+        ),
+        (
+            "common/signer_ceremony.rs".to_owned(),
+            "sign_tx_payload".to_owned(),
+        ),
+    ]);
+    assert!(
+        checks.is_disjoint(&held_to_the_enrolled_proof),
+        "the mainnet ceremony compares with the enrolled proof, not with a second fetch"
+    );
+    let expected: BTreeSet<_> = checks.union(&held_to_the_enrolled_proof).cloned().collect();
     assert_eq!(
-        resolvers, checks,
+        resolvers, expected,
         "each seed and Ledger resolver must check enrollment once after selecting the signer"
     );
-    assert_eq!(resolvers.len(), 6, "exact resolver inventory");
+    assert_eq!(resolvers.len(), 8, "exact resolver inventory");
 }
 
 #[test]
@@ -857,6 +880,12 @@ const LAZY_KEYRING_SIGNER_SITES: &[(&str, usize, &str)] = &[
         1,
         "the MPP charge defers the seed read to its credential signature after the \
          approval check",
+    ),
+    (
+        "stellar-agent-cli/common/signer_ceremony.rs",
+        1,
+        "the mainnet keyring signer is built after the authorization is minted, so \
+         the seed is read only then",
     ),
     (
         "stellar-agent-mcp/tools/mpp.rs",

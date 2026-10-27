@@ -135,9 +135,10 @@ fn signing_verbs_acquire_the_writer_before_submit() {
 /// chain key), and the pre-flight still precedes the stage's signing step.
 ///
 /// EVERY pre-flight call site is checked: for each occurrence (staged files
-/// have several — sign-only, submit-only, full pipeline), a policy-eval CALL
-/// (definitions excluded) must appear between the previous pre-flight and
-/// this one, and a signing step must follow it before the next pre-flight.
+/// have several: sign-only, submit-only, full pipeline, mainnet pipeline), a
+/// policy-eval CALL (definitions excluded) must appear between the previous
+/// pre-flight and this one, and a signing step must follow it before the next
+/// pre-flight.
 #[test]
 fn value_verbs_evaluate_policy_before_the_audit_preflight() {
     fn call_indices(hay: &str, needles: &[&str]) -> Vec<usize> {
@@ -168,30 +169,46 @@ fn value_verbs_evaluate_policy_before_the_audit_preflight() {
     for (file, policy_calls, preflight_calls, sign_calls, witness_calls) in [
         (
             "commands/pay.rs",
-            &["evaluate_pay_policy(", "evaluate_staged_pay_policy("][..],
+            &[
+                "evaluate_pay_policy(",
+                "evaluate_staged_pay_policy(",
+                "evaluate_mainnet_policy(",
+            ][..],
             &["value_audit::require_value_audit_writer_for_origin("][..],
-            &["sign_envelope(", "submit_envelope("][..],
+            &[
+                "sign_envelope(",
+                "submit_envelope(",
+                "authorize_and_submit(",
+            ][..],
             &[][..],
         ),
         (
             "commands/claim.rs",
-            &["evaluate_claim_policy(", "evaluate_staged_claim_policy("][..],
+            &[
+                "evaluate_claim_policy(",
+                "evaluate_staged_claim_policy(",
+                "evaluate_mainnet_policy(",
+            ][..],
             &["value_audit::require_value_audit_writer_for_origin("][..],
-            &["sign_envelope(", "submit_envelope("][..],
+            &[
+                "sign_envelope(",
+                "submit_envelope(",
+                "authorize_and_submit(",
+            ][..],
             &[][..],
         ),
         (
             "commands/trustline.rs",
-            &["evaluate_value_moving_policy("][..],
+            &["evaluate_value_moving_policy(", "evaluate_mainnet_policy("][..],
             &["value_audit::require_value_audit_writer("][..],
-            &["enrolled_keyring_signer("][..],
+            &["enrolled_keyring_signer(", "authorize_and_submit("][..],
             &["obtain_classic_witness("][..],
         ),
         (
             "commands/accounts/create.rs",
-            &["evaluate_create_policy("][..],
+            &["evaluate_create_policy(", "evaluate_mainnet_policy("][..],
             &["value_audit::require_value_audit_writer_for_origin("][..],
-            &["sponsored_create("][..],
+            &["sponsored_create(", "authorize_and_submit("][..],
             &["obtain_classic_witness("][..],
         ),
     ] {

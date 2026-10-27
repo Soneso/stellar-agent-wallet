@@ -1,5 +1,4 @@
 //! Terminal requirements for interactive mainnet consent.
-#![cfg_attr(not(test), expect(dead_code, reason = "wired by the mainnet verbs"))]
 
 use std::io::IsTerminal as _;
 use stellar_agent_core::error::{ValidationError, WalletError};
@@ -7,6 +6,7 @@ use stellar_agent_core::error::{ValidationError, WalletError};
 pub(crate) fn require_tty_for_mainnet() -> Result<(), WalletError> {
     #[cfg(test)]
     if let Some((stdin, stderr)) = tests::TEST_TTY.get() {
+        tests::TEST_TTY_CHECKS.set(tests::TEST_TTY_CHECKS.get() + 1);
         return require_streams(stdin, stderr);
     }
     require_streams(
@@ -32,6 +32,10 @@ pub(crate) mod tests {
         /// [`require_tty_for_mainnet`] reports in place of the real streams.
         pub(crate) static TEST_TTY: std::cell::Cell<Option<(bool, bool)>> =
             const { std::cell::Cell::new(None) };
+        /// How often [`require_tty_for_mainnet`] answered from [`TEST_TTY`] on
+        /// this thread.
+        pub(crate) static TEST_TTY_CHECKS: std::cell::Cell<u64> =
+            const { std::cell::Cell::new(0) };
     }
 
     /// Restores the previous terminal state when dropped.
@@ -50,6 +54,29 @@ pub(crate) mod tests {
     #[cfg(feature = "mainnet-write")]
     pub(crate) fn test_tty(stdin: bool, stderr: bool) -> TestTty {
         TestTty(TEST_TTY.replace(Some((stdin, stderr))))
+    }
+
+    /// How often [`require_tty_for_mainnet`] answered from the reported
+    /// terminal state on this thread.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn tty_checks_on_this_thread() -> u64 {
+        TEST_TTY_CHECKS.get()
+    }
+
+    /// Every check under a reported terminal state is counted, whether it
+    /// passes or refuses.
+    #[test]
+    fn each_reported_check_is_counted() {
+        let previous = TEST_TTY.replace(Some((true, false)));
+        let before = TEST_TTY_CHECKS.get();
+        assert_eq!(
+            require_tty_for_mainnet().unwrap_err().code(),
+            "confirm.tty_required"
+        );
+        TEST_TTY.set(Some((true, true)));
+        require_tty_for_mainnet().unwrap();
+        assert_eq!(TEST_TTY_CHECKS.get() - before, 2);
+        TEST_TTY.set(previous);
     }
 
     #[test]

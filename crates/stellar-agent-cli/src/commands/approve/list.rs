@@ -314,6 +314,15 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
         ApprovalSummaryView::Rejected { original_kind_name } => {
             format!("rejected ({original_kind_name})")
         }
+        // An x402 payment tombstone holds the digest of the final envelope,
+        // never a chain hash, so its value is named for what it is.
+        ApprovalSummaryView::Consumed {
+            original_kind_name,
+            tx_hash_redacted,
+            outcome,
+        } if original_kind_name == "X402Payment" => format!(
+            "spent ({original_kind_name}), final-envelope digest {tx_hash_redacted}, outcome {outcome}"
+        ),
         ApprovalSummaryView::Consumed {
             original_kind_name,
             tx_hash_redacted,
@@ -354,6 +363,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
 
@@ -671,5 +681,85 @@ mod tests {
         let row = render_pending_row(view, now);
         assert!(row.contains("reason: Treasury review"), "{row}");
         assert!(row.contains("10m17s"), "{row}");
+    }
+
+    /// The tombstone view of `entry` after it is consumed with a 64-hex value
+    /// and a confirmed outcome.
+    fn consumed_view(entry: PendingApproval) -> (PendingApprovalView, String) {
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+        let now_ms = entry.created_at_unix_ms;
+        let nonce = entry.approval_nonce.clone();
+        store.insert(entry, now_ms).unwrap();
+        let value = "ab".repeat(32);
+        assert!(
+            store
+                .consume(
+                    &nonce,
+                    &value,
+                    stellar_agent_core::approval::ConsumedOutcome::Confirmed
+                )
+                .unwrap()
+        );
+        let view = store.snapshot(now_ms).pop().unwrap();
+        let ApprovalSummaryView::Consumed {
+            tx_hash_redacted, ..
+        } = &view.summary
+        else {
+            panic!("{:?}", view.summary);
+        };
+        let redacted = tx_hash_redacted.clone();
+        (view, redacted)
+    }
+
+    /// A consumed x402 payment approval names its value as the
+    /// final-envelope digest.
+    #[test]
+    fn a_consumed_x402_approval_names_the_final_envelope_digest() {
+        use stellar_xdr::{
+            AccountId, ContractId, Hash, InvokeContractArgs, PublicKey, ScAddress, ScVal,
+            SorobanAuthorizedFunction, SorobanAuthorizedInvocation, Uint256,
+        };
+        let root = SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([3; 32]))),
+                function_name: "transfer".try_into().unwrap(),
+                args: vec![
+                    ScVal::Address(ScAddress::Account(AccountId(
+                        PublicKey::PublicKeyTypeEd25519(Uint256([4; 32])),
+                    ))),
+                    ScVal::Address(ScAddress::Account(AccountId(
+                        PublicKey::PublicKeyTypeEd25519(Uint256([5; 32])),
+                    ))),
+                    ScVal::from(123i128),
+                ]
+                .try_into()
+                .unwrap(),
+            }),
+            sub_invocations: vec![].try_into().unwrap(),
+        };
+        let entry = PendingApproval::new_x402_pending(
+            &[7; 32],
+            &root,
+            Some("pay.example.org".to_owned()),
+            uid(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let (view, redacted) = consumed_view(entry);
+        assert_eq!(
+            render_summary_line(&view),
+            format!("spent (X402Payment), final-envelope digest {redacted}, outcome confirmed")
+        );
+    }
+
+    /// Every other consumed approval keeps the transaction wording.
+    #[test]
+    fn a_consumed_payment_approval_keeps_the_transaction_wording() {
+        let (view, redacted) = consumed_view(make_payment_entry(DEFAULT_TTL_MS));
+        assert_eq!(
+            render_summary_line(&view),
+            format!("spent (PaymentSimulated) on {redacted}, outcome confirmed")
+        );
     }
 }

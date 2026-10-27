@@ -32,13 +32,20 @@
 //! (`ledger.insufficient_balance`). Claiming credits the account, so the
 //! affordability check covers only the transaction fee, not the claimed amount.
 //!
-//! # Mainnet rejection
+//! # Mainnet
 //!
-//! `--network testnet` is the only accepted value. Mainnet is structurally
-//! rejected at two layers: the CLI `TargetNetwork::Mainnet` variant returns
-//! `network.mainnet_write_forbidden` before any RPC call, and
-//! `submit_transaction_and_wait` rejects mainnet-looking URLs as defence in
-//! depth.
+//! On a mainnet profile only the full pipeline runs: `--build-only`,
+//! `--sign-only` and `--submit-only` refuse with
+//! `network.mainnet_write_forbidden` before the write context, the keyring
+//! and any request; the profile and the selection variable are read earlier.
+//! A build without the `mainnet-write` feature refuses every mainnet run with
+//! that code. With the feature, the run takes the stored profile of an
+//! explicit `--profile` selection, a verified signed policy with a
+//! `[mainnet]` table and its enablement, the enrolled signer, the independent
+//! witness the effective witness rule requires, and a confirmation on a
+//! terminal where the operator types the profile name. The seed is read and
+//! the Ledger opened only after the authorization is minted, and the submit
+//! layer checks the endpoint and passphrase again.
 //!
 //! # Endpoint identity
 //!
@@ -122,9 +129,10 @@ use std::time::Duration;
 use clap::{ArgGroup, Args};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{
-    AuthError, InternalError, LedgerError, NetworkError, ValidationError, WalletError,
+    AuthError, FeeSource, InternalError, LedgerError, ValidationError, WalletError,
 };
-use stellar_agent_network::NetworkContext;
+use stellar_agent_network::mainnet::MainnetConsumer;
+use stellar_agent_network::{MainnetEndpointFlags, NetworkContext};
 
 use stellar_agent_claimable::entry::{fetch_claimable_balance_entry, fetch_trustline_state};
 use stellar_agent_claimable::error::ClaimError;
@@ -138,8 +146,9 @@ use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile};
 use stellar_agent_network::builder::ClassicOpBuilder;
 use stellar_agent_network::cross_check::{
     AccountObservation, ClaimWitnessInputs, ClaimableBalanceObservation, CrossCheckOutcome,
-    CrossCheckView, TrustlineObservation, obtain_classic_witness,
+    CrossCheckView, TrustlineObservation, obtain_classic_witness, obtain_classic_witness_bound,
 };
+use stellar_agent_network::fees::{check_classic_fee_cap_signed, classic_fee_source};
 use stellar_agent_network::signing::Signer;
 use stellar_agent_network::signing::envelope_signing::attach_signature;
 use stellar_agent_network::signing::source::signer_from_ledger;
@@ -151,11 +160,16 @@ use stellar_agent_network::{
 };
 
 use crate::commands::policy_engine::{
-    build_v1_policy_engine, claim_policy_args, evaluate_opaque_signing_policy,
-    evaluate_value_moving_policy,
+    build_v1_policy_engine, claim_policy_args, effective_classic_fee_cap, envelope_total_fee,
+    evaluate_mainnet_policy, evaluate_opaque_signing_policy, evaluate_value_moving_policy,
+    load_mainnet_policy_engine, with_total_fee,
+};
+use crate::common::mainnet_write::{
+    MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
+    require_v1_engine,
 };
 use crate::common::network::{
-    EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity,
+    EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity, mainnet_mode_refusal,
     network_context_for_command,
 };
 use crate::common::profile_access::{
@@ -165,7 +179,8 @@ use crate::common::render::{
     WithPreview, exit_code_after_output, sanitize_for_table, with_preview_detail, write_envelope,
 };
 use crate::common::signer_ceremony::{
-    SignerCeremonyOutcome, require_enrolled_signer, resolve_software_signer_from_env,
+    MainnetSignerChoice, SignerCeremonyOutcome, require_enrolled_signer,
+    resolve_software_signer_from_env,
 };
 use crate::common::{ResolvedProfileName, resolve_profile_name};
 
@@ -503,10 +518,15 @@ where
         "claim: profile resolved"
     );
 
-    // ── Mainnet structural rejection (first layer) ────────────────────────────
-    if context.chain_id.is_mainnet() {
-        let err = WalletError::Network(NetworkError::MainnetWriteForbidden);
+    // ── Mainnet: the staged modes are refused, full mode runs its own pipeline ─
+    // The mode check is pure, so a refused stage reads no file, keyring entry
+    // or environment variable.
+    let full_mode = !args.build_only && args.sign_only.is_none() && args.submit_only.is_none();
+    if let Some(err) = mainnet_mode_refusal(context.chain_id, full_mode) {
         return ClaimOutcome::failed(Envelope::<()>::err(&err));
+    }
+    if context.chain_id.is_mainnet() {
+        return run_mainnet_pipeline(args, resolved, profile, init_keyring).await;
     }
 
     // Every gated stage reads the owner key from the keyring through
@@ -576,7 +596,7 @@ where
     let chain_id = context.chain_id.caip2_str();
     // Build-only: gate but do not submit, so the gate-sized effects are
     // not recorded (no confirmed on-chain action to attest).
-    if let Err(envelope) = evaluate_claim_policy(&built, chain_id, profile, &resolved.name) {
+    if let Err(envelope) = evaluate_claim_policy(&built, chain_id, profile, &resolved.name, None) {
         return ClaimOutcome::failed_after_preview(built.preview, envelope);
     }
     if let Err(e) = check_built_fee_cap(
@@ -991,6 +1011,24 @@ async fn witness_built_claim(
     built: &BuiltClaimEnvelope,
     tool: &'static str,
 ) -> Result<CrossCheckOutcome, WalletError> {
+    obtain_classic_witness(
+        profile,
+        context,
+        stellar_agent_core::cross_check::CrossCheckValue::Unvalued,
+        claim_witness_inputs(built)?,
+        tool,
+    )
+    .await
+}
+
+/// The observations a built claim's witness compares: the source, the
+/// trustline of an issued balance, and the balance record.
+///
+/// # Errors
+///
+/// Returns `validation.asset_invalid` for a balance asset outside the
+/// canonical classic alphabet, and the observation build failure.
+fn claim_witness_inputs(built: &BuiltClaimEnvelope) -> Result<ClaimWitnessInputs, WalletError> {
     let source = AccountObservation::from_view(&built.account_view)?;
     let trustline = match (&built.preview.asset_code, &built.preview.asset_issuer) {
         (Some(code), Some(issuer)) => {
@@ -1007,21 +1045,14 @@ async fn witness_built_claim(
         }
         _ => None,
     };
-    obtain_classic_witness(
-        profile,
-        context,
-        stellar_agent_core::cross_check::CrossCheckValue::Unvalued,
-        ClaimWitnessInputs {
-            source,
-            trustline,
-            balance: Some(ClaimableBalanceObservation {
-                balance_id: built.id.hash(),
-                entry: Some(built.record.clone()),
-            }),
-        },
-        tool,
-    )
-    .await
+    Ok(ClaimWitnessInputs {
+        source,
+        trustline,
+        balance: Some(ClaimableBalanceObservation {
+            balance_id: built.id.hash(),
+            entry: Some(built.record.clone()),
+        }),
+    })
 }
 
 /// Checks a staged claim's fee against the cap and obtains the witness of
@@ -1166,10 +1197,15 @@ where
 
     // ── Operator policy evaluation (before signing) ───────────────────────────
     let chain_id = context.chain_id.caip2_str();
-    let claim_effects = match evaluate_claim_policy(&built, chain_id, profile, &resolved.name) {
-        Ok(effects) => effects,
-        Err(envelope) => return failed(envelope),
+    let total_fee = match envelope_total_fee(&built.envelope_xdr) {
+        Ok(fee) => fee,
+        Err(e) => return failed(Envelope::<()>::err(&e)),
     };
+    let claim_effects =
+        match evaluate_claim_policy(&built, chain_id, profile, &resolved.name, Some(total_fee)) {
+            Ok(effects) => effects,
+            Err(envelope) => return failed(envelope),
+        };
 
     // The fee is checked against the profile cap, then the oracle re-reads
     // the record, the source, and the trustline the decision used. Both
@@ -1484,6 +1520,7 @@ fn evaluate_claim_policy(
     chain_id: &str,
     profile: &Profile,
     profile_name: &str,
+    total_fee: Option<u32>,
 ) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, Envelope<()>> {
     let policy_engine =
         build_v1_policy_engine("claim", &profile.policy.engine, profile, profile_name)
@@ -1492,7 +1529,13 @@ fn evaluate_claim_policy(
     // Claim leg is always emitted); `balance_id` is carried for audit parity
     // with the MCP tool's dispatch args and for any future criterion that
     // reads it.
+    // The full pipeline adds the envelope's total fee, which `minimum_reserve`
+    // counts; `--build-only` passes none.
     let policy_args = claim_policy_args(&built.balance_id_hex72);
+    let policy_args = match total_fee {
+        Some(fee) => with_total_fee(policy_args, fee),
+        None => policy_args,
+    };
     // `account_view` reuses the source-account state `build_unsigned_envelope`
     // already fetched (feeds `minimum_reserve`) — mirroring the MCP
     // `stellar_claim` twin exactly. `identity_view` is `None`: `stellar_claim`
@@ -1739,6 +1782,200 @@ fn render_claim_table(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Mainnet pipeline
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Runs the full pipeline on a mainnet profile.
+///
+/// The stored profile of the explicit selection replaces the merged one at
+/// the write context, and every later step reads it from the context. The
+/// claim builds before its reconcile, as on testnet, with the context's
+/// primary client; the probe runs inside the build. The verified policy with
+/// the built fee, the signed fee cap, the audit pre-flight and the bound
+/// witness follow, and [`authorize_and_submit`] runs the rest.
+async fn run_mainnet_pipeline<InitKeyring>(
+    args: &ClaimArgs,
+    resolved: &ResolvedProfileName,
+    profile: &Profile,
+    init_keyring: InitKeyring,
+) -> ClaimOutcome
+where
+    InitKeyring: Fn() -> Result<(), WalletError>,
+{
+    let context = match mainnet_context(
+        profile,
+        resolved,
+        MainnetEndpointFlags {
+            network: args.network.map(TargetNetwork::caip2),
+            rpc_url: args.rpc_url.is_some(),
+            secondary_rpc_url: false,
+        },
+    ) {
+        Ok(context) => context,
+        Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
+    };
+    let net_context = context.network_context();
+    let profile = context.profile();
+    let name = context.profile_name();
+    if let Err(envelope) = require_v1_engine("claim", &context) {
+        return ClaimOutcome::failed(envelope);
+    }
+    if let Err(e) = init_keyring() {
+        return ClaimOutcome::failed(Envelope::<()>::err(&e));
+    }
+    let profiles_dir = match mainnet_profiles_dir() {
+        Ok(dir) => dir,
+        Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
+    };
+
+    let id = match claim_inputs(args) {
+        Ok(id) => id,
+        Err(error) => return ClaimOutcome::failed(claim_error_envelope(&error)),
+    };
+    // One client serves every read, the resolver and the send.
+    let client = match context.primary_client() {
+        Ok(client) => client,
+        Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
+    };
+    let built = match build_unsigned_envelope(&client, &net_context, args, id).await {
+        Ok(built) => built,
+        Err(failure) => return ClaimOutcome::from_build_failure(failure),
+    };
+    let preview = built.preview.clone();
+    let failed = |envelope: Envelope<()>| ClaimOutcome::failed_after_preview(preview, envelope);
+
+    let now_ms = match stellar_agent_core::timefmt::now_unix_ms() {
+        Ok(v) => v,
+        Err(e) => {
+            return failed(Envelope::<()>::err_raw("wallet.clock_error", e.to_string()));
+        }
+    };
+    crate::commands::submission_record::reconcile_open_reservations(
+        profile,
+        name,
+        ProfileOrigin::Persisted,
+        &client,
+        now_ms,
+    )
+    .await;
+
+    let policy = match load_mainnet_policy_engine(
+        "claim",
+        "policy.engine_unavailable",
+        &context,
+        resolved.source,
+        &profiles_dir,
+    ) {
+        Ok(policy) => policy,
+        Err(envelope) => return failed(envelope),
+    };
+    let total_fee = match envelope_total_fee(&built.envelope_xdr) {
+        Ok(fee) => fee,
+        Err(e) => return failed(Envelope::<()>::err(&e)),
+    };
+    let policy_args = with_total_fee(claim_policy_args(&built.balance_id_hex72), total_fee);
+    let source_adapter =
+        stellar_agent_network::policy_view::AccountViewAdapter::new(&built.account_view);
+    let evaluation = match evaluate_mainnet_policy(
+        policy.engine.as_ref(),
+        profile,
+        "stellar_claim",
+        stellar_agent_core::policy::ToolValueKind::MovesValue,
+        context.chain().caip2_str(),
+        &policy_args,
+        "claim",
+        Some(&source_adapter),
+        None,
+    ) {
+        Ok(evaluation) => evaluation,
+        Err(envelope) => return failed(envelope),
+    };
+
+    let body = &policy.body;
+    if let Err(e) = check_classic_fee_cap_signed(
+        built.fee_selection.per_op_stroops,
+        classic_fee_source(built.fee_choice, FeeSource::CommandDefault),
+        profile,
+        Some(body.classic_max_fee_per_op_stroops),
+    ) {
+        return failed(Envelope::<()>::err(&e));
+    }
+    let effective_cap = effective_classic_fee_cap(profile, body.classic_max_fee_per_op_stroops);
+    if let Err(e) = crate::commands::value_audit::require_value_audit_writer_for_origin(
+        profile,
+        name,
+        ProfileOrigin::Persisted,
+    ) {
+        return failed(Envelope::<()>::err(&e));
+    }
+    let thresholds = stellar_agent_core::cross_check::ThresholdSet::from_profile_and_signed(
+        profile,
+        body.cross_check_thresholds.as_ref(),
+    );
+    let inputs = match claim_witness_inputs(&built) {
+        Ok(inputs) => inputs,
+        Err(e) => return failed(Envelope::<()>::err(&e)),
+    };
+    let cross_check = match obtain_classic_witness_bound(
+        profile,
+        &net_context,
+        stellar_agent_core::cross_check::CrossCheckValue::Unvalued,
+        inputs,
+        &built.envelope_xdr,
+        &thresholds,
+        "stellar_claim",
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => return failed(Envelope::<()>::err(&e)),
+    };
+
+    let signer = match MainnetSignerChoice::from_flags(
+        args.sign_with_ledger,
+        args.account_index,
+        args.secret_env.as_deref(),
+        "claim-commit",
+    ) {
+        Ok(signer) => signer,
+        Err(e) => return failed(Envelope::<()>::err(&e)),
+    };
+    let timeout = Duration::from_secs(args.timeout_seconds);
+    match authorize_and_submit(MainnetWriteRequest {
+        context: &context,
+        profiles_dir: &profiles_dir,
+        verb: "claim",
+        tool: "stellar_claim",
+        consumer: MainnetConsumer::CliClaim,
+        unsigned_xdr: &built.envelope_xdr,
+        client: &client,
+        probe_deadline: timeout,
+        submit_timeout: timeout,
+        source: &args.source,
+        signer,
+        policy: &policy,
+        evaluation: &evaluation,
+        effective_cap,
+        witness: cross_check.witness(),
+    })
+    .await
+    {
+        Ok(submitted) => ClaimOutcome::succeeded(
+            Some(built.preview),
+            ClaimResult {
+                envelope_xdr: submitted.signed_xdr,
+                tx_hash: Some(submitted.result.tx_hash.clone()),
+                ledger: Some(submitted.result.ledger),
+                stage: "build+sign+submit".to_owned(),
+                balance_id_hex72: Some(built.balance_id_hex72),
+                cross_check: Some(cross_check.view()),
+            },
+        ),
+        Err(envelope) => failed(envelope),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1947,12 +2184,18 @@ mod tests {
 
     // ── Mainnet rejected at run boundary ──────────────────────────────────────
 
-    /// Mainnet is rejected at the `run` boundary: the keyring initializer is
-    /// never invoked and no request reaches the profile's endpoint.
+    /// A mainnet profile is refused before the keyring initializer runs and
+    /// before any request reaches an endpoint. Without `mainnet-write` the
+    /// write context refuses the build; with it, the injected loader's `http`
+    /// endpoint differs from the stored profile's `https` one, so the write
+    /// context refuses the merged view. Both refuse with
+    /// `network.mainnet_write_forbidden`.
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn mainnet_rejected_at_run_boundary() {
         let mut output = Vec::new();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let resolutions = crate::common::signer_ceremony::signer_resolutions_on_this_thread();
         let guard_rpc = wiremock::MockServer::start().await;
         let counter =
             stellar_agent_test_support::ConnectionCounter::start().expect("connection counter");
@@ -1972,11 +2215,16 @@ mod tests {
                         .build(),
                 )
             },
-            || panic!("mainnet must not initialize the keyring"),
+            crate::test_rpc::counting_initializer(&calls),
             &mut output,
         )
         .await;
         assert_eq!(exit, 1, "mainnet must exit with code 1");
+        assert_eq!(calls.get(), 0, "the keyring is never initialized");
+        assert_eq!(
+            crate::common::signer_ceremony::signer_resolutions_on_this_thread(),
+            resolutions
+        );
         assert!(
             guard_rpc
                 .received_requests()
@@ -1993,11 +2241,14 @@ mod tests {
         assert_eq!(rendered["error"]["code"], "network.mainnet_write_forbidden");
     }
 
-    /// `--network mainnet` with no profile refuses before the keyring
-    /// initializer runs and before any request reaches `--rpc-url`.
+    /// `--network mainnet` against an absent profile, which synthesizes a
+    /// testnet profile, refuses as a network-flag mismatch before the keyring
+    /// initializer runs and before any request reaches `--rpc-url`. It is the
+    /// control for the flag check, which runs before any mainnet step.
     #[tokio::test]
     #[serial_test::serial]
     async fn mainnet_rejected_at_run_boundary_network_flag_without_profile_refuses() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
         let guard_rpc = wiremock::MockServer::start().await;
         let guard_home = tempfile::tempdir().expect("home");
         let _guard_home = stellar_agent_test_support::StellarAgentHomeGuard::new(guard_home.path());
@@ -2015,11 +2266,12 @@ mod tests {
                     },
                 )
             },
-            || panic!("network mismatch must not initialize the keyring"),
+            crate::test_rpc::counting_initializer(&calls),
             &mut std::io::sink(),
         )
         .await;
         assert_eq!(exit, 1, "mainnet must exit with code 1");
+        assert_eq!(calls.get(), 0, "the keyring is never initialized");
         assert!(
             guard_rpc
                 .received_requests()
@@ -2027,6 +2279,153 @@ mod tests {
                 .expect("requests")
                 .is_empty()
         );
+    }
+
+    /// A staged mode on a mainnet profile refuses before the keyring and
+    /// before any request in a build without mainnet writes. `name` is the
+    /// fixture profile of a build with mainnet writes; this build refuses
+    /// every mainnet profile and uses the guard fixture's.
+    #[cfg(not(feature = "mainnet-write"))]
+    async fn assert_mode_refused(name: &'static str, stage: impl FnOnce(&mut ClaimArgs)) {
+        let _ = name;
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let resolutions = crate::common::signer_ceremony::signer_resolutions_on_this_thread();
+        let guard_rpc = wiremock::MockServer::start().await;
+        let (_guard_dir, _guard_home, _guard_env) =
+            crate::common::profile_access::test_fixtures::mainnet_guard_fixture(
+                "https://rpc.example.invalid",
+            );
+        let mut args = minimal_args();
+        args.profile = Some("guard-mainnet".to_owned());
+        args.network = None;
+        args.rpc_url = None;
+        args.secret_env = Some("CLAIM_MODE_REFUSAL_SK".to_owned());
+        stage(&mut args);
+        let mut output = Vec::new();
+        let exit = run_with_dependencies(
+            &args,
+            crate::test_rpc::ImplicitSelection::loader(&guard_rpc.uri()),
+            crate::test_rpc::counting_initializer(&calls),
+            &mut output,
+        )
+        .await;
+        assert_eq!(exit, 1);
+        let rendered = crate::common::render::single_json_document(&output);
+        assert_eq!(rendered["error"]["code"], "network.mainnet_write_forbidden");
+        assert_eq!(calls.get(), 0, "the keyring is never initialized");
+        assert!(guard_rpc.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            crate::common::signer_ceremony::signer_resolutions_on_this_thread(),
+            resolutions
+        );
+    }
+
+    /// A staged mode on the fixture's mainnet profile, whose every proof is
+    /// valid and whose full-mode run would submit, refuses before the keyring
+    /// and before any request. `name` is the fixture's profile, unique in
+    /// the process because the audit writer registry is process-wide.
+    #[cfg(feature = "mainnet-write")]
+    async fn assert_mode_refused(name: &'static str, stage: impl FnOnce(&mut ClaimArgs)) {
+        let fixture = crate::common::mainnet_write_fixture::Spec::new(name)
+            .build()
+            .await;
+        let resolutions = crate::common::signer_ceremony::signer_resolutions_on_this_thread();
+        let mut args = mainnet_full::mainnet_args(&fixture);
+        stage(&mut args);
+        let mut output = Vec::new();
+        let exit =
+            run_with_dependencies(&args, fixture.loader(), fixture.initializer(), &mut output)
+                .await;
+        let rendered = crate::common::render::single_json_document(&output);
+        assert_eq!(exit, 1, "{rendered}");
+        assert_eq!(
+            rendered["error"]["code"], "network.mainnet_write_forbidden",
+            "{rendered}"
+        );
+        assert_eq!(
+            fixture.initializer_calls(),
+            0,
+            "the keyring is never initialized"
+        );
+        assert!(fixture.primary_methods().await.is_empty());
+        assert!(fixture.oracle_methods().await.is_empty());
+        assert_eq!(
+            crate::common::signer_ceremony::signer_resolutions_on_this_thread(),
+            resolutions
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn build_only_is_refused_on_mainnet() {
+        assert_mode_refused("mainnet-claim-build-only", |args| args.build_only = true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn sign_only_is_refused_on_mainnet() {
+        let envelope =
+            stellar_agent_test_support::signed_envelope::SignedTestEnvelope::builder([0x61; 32])
+                .claim_claimable_balance([0xab; 32])
+                .unsigned()
+                .build();
+        assert_mode_refused("mainnet-claim-sign-only", |args| {
+            args.sign_only = Some(envelope.envelope_xdr().to_owned())
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn submit_only_is_refused_on_mainnet() {
+        let envelope =
+            stellar_agent_test_support::signed_envelope::SignedTestEnvelope::builder([0x61; 32])
+                .claim_claimable_balance([0xab; 32])
+                .build();
+        assert_mode_refused("mainnet-claim-submit-only", |args| {
+            args.submit_only = Some(envelope.envelope_xdr().to_owned())
+        })
+        .await;
+    }
+
+    /// A mainnet profile selected without `--profile` refuses before the
+    /// keyring, in both builds.
+    async fn assert_implicit_selection_refused(source: crate::test_rpc::ImplicitSource) {
+        let selection = crate::test_rpc::ImplicitSelection::new(source);
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut args = minimal_args();
+        args.profile = None;
+        args.network = None;
+        args.rpc_url = None;
+        args.secret_env = Some("CLAIM_IMPLICIT_SK".to_owned());
+        let mut output = Vec::new();
+        let exit = run_with_dependencies(
+            &args,
+            crate::test_rpc::ImplicitSelection::loader("https://rpc.example.invalid"),
+            crate::test_rpc::counting_initializer(&calls),
+            &mut output,
+        )
+        .await;
+        assert_eq!(exit, 1);
+        let rendered = crate::common::render::single_json_document(&output);
+        assert_eq!(
+            rendered["error"]["code"], "profile.mainnet_requires_explicit_profile",
+            "{}: {rendered}",
+            selection.name
+        );
+        assert_eq!(calls.get(), 0, "the keyring is never initialized");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn a_mainnet_profile_named_by_the_variable_refuses() {
+        assert_implicit_selection_refused(crate::test_rpc::ImplicitSource::Env).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn a_mainnet_profile_saved_as_default_refuses() {
+        assert_implicit_selection_refused(crate::test_rpc::ImplicitSource::Default).await;
     }
 
     // ── keyring store initialisation ordering (issue #41) ────────────────────
@@ -2576,6 +2975,13 @@ mod tests {
     /// native claimable balance with id `CLAIM_RPC_BALANCE_HEX64`, whose one
     /// claimant is `claimant`.
     fn claimable_entry_for(claimant: &str) -> (String, String) {
+        claimable_entry_with(claimant, 100_000_000)
+    }
+
+    /// Returns the ledger key and the entry XDR of an unconditional native
+    /// claimable balance of `amount` stroops with id
+    /// `CLAIM_RPC_BALANCE_HEX64`, whose one claimant is `claimant`.
+    fn claimable_entry_with(claimant: &str, amount: i64) -> (String, String) {
         use stellar_xdr::{
             ClaimPredicate, ClaimableBalanceEntry, ClaimableBalanceEntryExt, Claimant, ClaimantV0,
             LedgerEntryData, LedgerKey, LedgerKeyClaimableBalance,
@@ -2595,7 +3001,7 @@ mod tests {
             .try_into()
             .expect("claimants"),
             asset: stellar_xdr::Asset::Native,
-            amount: 100_000_000,
+            amount,
             ext: ClaimableBalanceEntryExt::V0,
         };
         let claim_xdr = LedgerEntryData::ClaimableBalance(entry)
@@ -3888,6 +4294,474 @@ mod tests {
 
             assert_refused(&run, "fees.percentile_exceeds_cap", &primary).await;
             assert!(methods(&oracle).await.is_empty());
+        }
+    }
+
+    /// The mainnet pipeline over the fixture's stored profile, ceremony and
+    /// routed endpoints.
+    #[cfg(feature = "mainnet-write")]
+    mod mainnet_full {
+        use super::*;
+        use std::rc::Rc;
+
+        use serde_json::Value;
+
+        use crate::common::mainnet_write::{
+            bound_recorders_on_this_thread, invalidations_on_this_thread,
+        };
+        use crate::common::mainnet_write_fixture::{
+            AGENT_SEED, AGENT_VAR, DESTINATION, ISSUER, MainnetFixture, Spec, claim_rule,
+            install_ledger_double, minimum_reserve, open_authorizations_of,
+        };
+        use crate::test_rpc::ClassicRpc;
+
+        /// The native balance the mocked endpoints report for every account.
+        const BALANCE: i64 = 100_000_000_000;
+        /// The protocol reserve of an account without subentries.
+        const RESERVE: i64 = 10_000_000;
+
+        fn agent() -> String {
+            stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED)
+        }
+
+        /// An endpoint on `passphrase` funding the agent and holding the
+        /// agent's claimable balance of `amount` stroops.
+        fn ledger(mainnet: bool, amount: i64) -> ClassicRpc {
+            let agent = agent();
+            let (key, entry) = claimable_entry_with(&agent, amount);
+            let rpc = if mainnet {
+                ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER])
+            } else {
+                ClassicRpc::testnet(&[&agent, DESTINATION, ISSUER])
+            };
+            rpc.with_entry(key, entry)
+        }
+
+        /// The fixture `name` whose endpoints hold the agent's 10 XLM
+        /// claimable balance.
+        fn spec(name: &'static str) -> Spec {
+            Spec::new(name)
+                .primary(ledger(true, 100_000_000))
+                .oracle(ledger(true, 100_000_000))
+        }
+
+        /// A claim of the agent's balance on the fixture's profile, signed
+        /// from [`AGENT_VAR`].
+        pub(super) fn mainnet_args(fixture: &MainnetFixture) -> ClaimArgs {
+            let mut args = minimal_args();
+            args.profile = Some(fixture.name.to_owned());
+            args.network = None;
+            args.rpc_url = None;
+            args.balance_id = CLAIM_RPC_BALANCE_HEX64.to_owned();
+            args.source = fixture.agent.g.clone();
+            args.secret_env = Some(AGENT_VAR.to_owned());
+            args
+        }
+
+        struct Run {
+            code: i32,
+            envelope: Value,
+        }
+
+        impl Run {
+            fn code(&self) -> &str {
+                self.envelope["error"]["code"].as_str().unwrap_or("")
+            }
+        }
+
+        async fn run(fixture: &MainnetFixture, args: &ClaimArgs) -> Run {
+            let mut out = Vec::new();
+            let code =
+                run_with_dependencies(args, fixture.loader(), fixture.initializer(), &mut out)
+                    .await;
+            Run {
+                code,
+                envelope: crate::common::render::single_json_document(&out),
+            }
+        }
+
+        fn now() -> u64 {
+            stellar_agent_core::timefmt::now_unix_ms().unwrap()
+        }
+
+        fn records(fixture: &MainnetFixture) -> Vec<Value> {
+            if !fixture.window_path().exists() {
+                return Vec::new();
+            }
+            fixture.window_body()["authorizations"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        async fn assert_refused_before_confirmation(
+            fixture: &MainnetFixture,
+            run: &Run,
+            code: &str,
+        ) {
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(run.code(), code, "{}", run.envelope);
+            assert!(records(fixture).is_empty(), "no authorization record");
+            assert!(
+                fixture.pending_entries().is_empty(),
+                "no confirmation entry"
+            );
+            assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+        }
+
+        /// Accept: the claim is witnessed through the routed oracle, sent
+        /// once with the enrolled key's signature, and settles its
+        /// authorization and its confirmation entry.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn accept() {
+            let fixture = spec("mainnet-claim-accept").build().await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1);
+            fixture.assert_signed_by_agent(&sent[0]);
+            {
+                use stellar_xdr::{Limits, Preconditions, ReadXdr as _, TransactionEnvelope};
+                let TransactionEnvelope::Tx(v1) =
+                    TransactionEnvelope::from_xdr_base64(&sent[0], Limits::none()).unwrap()
+                else {
+                    panic!("not a v1 envelope");
+                };
+                assert_eq!(v1.tx.cond, Preconditions::None);
+            }
+            assert_eq!(
+                run.envelope["data"]["envelope_xdr"], sent[0],
+                "{}",
+                run.envelope
+            );
+            assert_eq!(run.envelope["data"]["ledger"], 1005, "{}", run.envelope);
+            assert!(!fixture.oracle_methods().await.is_empty());
+            assert!(fixture.open_authorizations(now()).is_empty());
+            assert!(invalidations_on_this_thread().is_empty());
+            let entries = fixture.pending_entries();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].kind_name, "Consumed");
+        }
+
+        /// Engine kind: a Noop profile refuses at the engine check.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_noop_engine_refuses_before_the_keyring() {
+            let fixture = spec("mainnet-claim-noop").noop_engine().build().await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_eq!(
+                run.code(),
+                "network.mainnet_write_forbidden",
+                "{}",
+                run.envelope
+            );
+            assert!(
+                run.envelope["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Noop")
+            );
+            assert_eq!(fixture.initializer_calls(), 0);
+            assert!(fixture.primary_methods().await.is_empty());
+        }
+
+        /// Engine proofs: a signed policy without a `[mainnet]` table
+        /// refuses before the confirmation.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_policy_without_the_mainnet_table_refuses() {
+            let fixture = spec("mainnet-claim-pre-enable").pre_enable().build().await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "network.mainnet_write_forbidden")
+                .await;
+            let message = run.envelope["error"]["message"].as_str().unwrap();
+            assert!(message.contains("[mainnet]"), "{message}");
+            assert!(message.contains("profile enable-mainnet"), "{message}");
+        }
+
+        /// Enrollment: a placeholder pin refuses before the confirmation.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_placeholder_pin_refuses_before_the_confirmation() {
+            let fixture = spec("mainnet-claim-unpinned").build().await;
+            fixture.unpin_signer();
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "auth.enrolled_signer_unpinned")
+                .await;
+            fixture.assert_terminal_untouched();
+        }
+
+        /// Enrollment: a source other than the enrolled key refuses with the
+        /// identity rule.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_source_other_than_the_enrolled_key_refuses() {
+            let endpoint = || {
+                let (key, entry) = claimable_entry_with(DESTINATION, 100_000_000);
+                ClassicRpc::mainnet(&[&agent(), DESTINATION]).with_entry(key, entry)
+            };
+            let fixture = Spec::new("mainnet-claim-other-source")
+                .primary(endpoint())
+                .oracle(endpoint())
+                .build()
+                .await;
+            let mut args = mainnet_args(&fixture);
+            args.source = DESTINATION.to_owned();
+
+            let run = run(&fixture, &args).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "auth.enrolled_identity_unusable")
+                .await;
+            assert!(
+                run.envelope["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("public_key_mismatch")
+            );
+            fixture.assert_terminal_untouched();
+        }
+
+        /// Claim confirmation: the prompt shows the asset and the amount as
+        /// not known before the claim; the entry the confirmation writes
+        /// carries the decoded envelope and no value, and the authorization
+        /// is minted for the claim from it before the device opens.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_claim_confirmation_shows_the_value_as_unknown() {
+            let fixture = spec("mainnet-claim-confirmation").build().await;
+            let observed = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let seen = Rc::clone(&observed);
+            let name = fixture.name;
+            let store = fixture.approval_store_path();
+            let (_ledger, calls) = install_ledger_double(
+                move || {
+                    let pending = stellar_agent_core::approval::open_with_retry(
+                        &store,
+                        stellar_agent_core::approval::DEFAULT_RETRY_ATTEMPTS,
+                        stellar_agent_core::approval::DEFAULT_RETRY_BACKOFF,
+                    )
+                    .unwrap();
+                    let entries = pending.snapshot(now());
+                    drop(pending);
+                    seen.borrow_mut()
+                        .push((entries, open_authorizations_of(name, now())));
+                    Ok(())
+                },
+                || Ok(()),
+            );
+            let mut args = mainnet_args(&fixture);
+            args.secret_env = None;
+            args.sign_with_ledger = true;
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert_eq!(fixture.sent_envelopes().await.len(), 1);
+            let observed = observed.borrow();
+            assert_eq!(observed.len(), 1);
+            let (entries, open) = &observed[0];
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            assert_eq!(entries[0].kind_name, "ClaimSimulated");
+            let stellar_agent_core::approval::view::ApprovalSummaryView::Claim {
+                balance_id_strkey,
+                asset,
+                amount_stroops,
+                source,
+                fee_stroops,
+                ..
+            } = &entries[0].summary
+            else {
+                panic!("{:?}", entries[0].summary);
+            };
+            assert_eq!(*asset, None);
+            assert_eq!(*amount_stroops, None);
+            assert_eq!(*source, fixture.agent.g);
+            assert_eq!(*fee_stroops, 100);
+            assert_eq!(open.len(), 1, "{open:?}");
+            assert_eq!(open[0].consumer, MainnetConsumer::CliClaim);
+            let prompts = fixture.prompts();
+            assert_eq!(prompts.len(), 1);
+            let prompt = &prompts[0];
+            assert!(prompt.contains(balance_id_strkey.as_str()), "{prompt}");
+            assert!(prompt.contains(&fixture.agent.g), "{prompt}");
+            assert!(prompt.contains("Fee: 100 stroops"), "{prompt}");
+            assert_eq!(
+                prompt
+                    .matches("not known to the wallet before the claim")
+                    .count(),
+                2,
+                "{prompt}"
+            );
+            assert_eq!(
+                *calls.lock().unwrap(),
+                ["construct", "public_key", "sign_tx_payload"]
+            );
+            let after = fixture.pending_entries();
+            assert_eq!(after.len(), 1);
+            let stellar_agent_core::approval::view::ApprovalSummaryView::Consumed {
+                original_kind_name,
+                ..
+            } = &after[0].summary
+            else {
+                panic!("{:?}", after[0].summary);
+            };
+            assert_eq!(original_kind_name, "ClaimSimulated");
+        }
+
+        /// Pre-flight before the witness: without the audit chain key the
+        /// claim refuses before the oracle and before the confirmation.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_audit_preflight_runs_before_the_witness() {
+            let fixture = spec("mainnet-claim-audit-preflight").build().await;
+            fixture.delete_keyring_entry(&fixture.profile().audit_log_hash_chain_key_id);
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert!(run.code().starts_with("audit."), "{}", run.envelope);
+            assert!(fixture.oracle_methods().await.is_empty());
+            assert!(fixture.pending_entries().is_empty());
+        }
+
+        /// Witness divergence: an oracle reporting another balance refuses
+        /// with the bound producer's code before the confirmation.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_diverging_witness_refuses_before_the_confirmation() {
+            let fixture = Spec::new("mainnet-claim-divergence")
+                .primary(ledger(true, 100_000_000))
+                .oracle(ledger(true, 100_000_001))
+                .build()
+                .await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "simulation.divergence").await;
+        }
+
+        /// Ledger order: the device is opened after the mint.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_ledger_is_opened_after_the_mint() {
+            let fixture = spec("mainnet-claim-ledger-order").build().await;
+            let open = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let seen = Rc::clone(&open);
+            let name = fixture.name;
+            let (_ledger, calls) = install_ledger_double(
+                move || {
+                    seen.borrow_mut().push(open_authorizations_of(name, now()));
+                    Ok(())
+                },
+                || Ok(()),
+            );
+            let mut args = mainnet_args(&fixture);
+            args.secret_env = None;
+            args.sign_with_ledger = true;
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let open = open.borrow();
+            assert_eq!(open[0].len(), 1);
+            assert_eq!(open[0][0].consumer, MainnetConsumer::CliClaim);
+            assert_eq!(
+                *calls.lock().unwrap(),
+                ["construct", "public_key", "sign_tx_payload"]
+            );
+        }
+
+        /// Sizing: a claim rule whose one window criterion is a rate limit
+        /// sizes one entry.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_rate_limited_claim_sizes_one_entry() {
+            let fixture = spec("mainnet-claim-sizing").build().await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let bound = bound_recorders_on_this_thread();
+            assert_eq!(bound.len(), 1);
+            assert!(bound[0].contains("window_entry_count: 1"), "{}", bound[0]);
+        }
+
+        /// The margin at which the claim, which debits nothing, passes the
+        /// reserve alone and crosses it with any fee.
+        const FEE_CROSSING_MARGIN: i64 = BALANCE - RESERVE;
+
+        /// Fee in the policy arguments, mainnet.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_fee_counts_toward_the_reserve_on_mainnet() {
+            let fixture = spec("mainnet-claim-fee-reserve")
+                .rules(vec![claim_rule(&minimum_reserve(FEE_CROSSING_MARGIN))])
+                .build()
+                .await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_refused_before_confirmation(
+                &fixture,
+                &run,
+                "policy.deny.minimum_reserve_breached",
+            )
+            .await;
+        }
+
+        /// Fee in the policy arguments, testnet.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_fee_counts_toward_the_reserve_on_testnet() {
+            let fixture = Spec::new("testnet-claim-fee-reserve")
+                .testnet()
+                .primary(ledger(false, 100_000_000))
+                .rules(vec![claim_rule(&minimum_reserve(FEE_CROSSING_MARGIN))])
+                .build()
+                .await;
+
+            let run = run(&fixture, &mainnet_args(&fixture)).await;
+
+            assert_eq!(
+                run.code(),
+                "policy.deny.minimum_reserve_breached",
+                "{}",
+                run.envelope
+            );
+            assert!(fixture.sent_envelopes().await.is_empty());
+        }
+
+        /// Build-only control: the build-only arguments carry no fee.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn build_only_carries_no_fee_into_the_policy() {
+            let fixture = Spec::new("testnet-claim-build-only-reserve")
+                .testnet()
+                .primary(ledger(false, 100_000_000))
+                .rules(vec![claim_rule(&minimum_reserve(FEE_CROSSING_MARGIN))])
+                .build()
+                .await;
+            let mut args = mainnet_args(&fixture);
+            args.build_only = true;
+            args.secret_env = None;
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            assert!(
+                run.envelope["data"]["envelope_xdr"].is_string(),
+                "{}",
+                run.envelope
+            );
         }
     }
 }

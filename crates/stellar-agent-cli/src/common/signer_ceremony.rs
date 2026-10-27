@@ -37,18 +37,22 @@
 //! profile the signer must be the profile's enrolled identity. The enrollment
 //! ceremonies are exempt because they establish that identity.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::writer::AuditWriter;
-use stellar_agent_core::error::{ValidationError, WalletError, WalletStateError};
+use stellar_agent_core::error::{AuthError, ValidationError, WalletError, WalletStateError};
 use stellar_agent_core::profile::Profile;
 #[cfg(test)]
 use stellar_agent_core::wallet::{DEFAULT_TTL_SECONDS, MlockRequired};
 use stellar_agent_core::wallet::{MlockDegradation, Wallet};
+use stellar_agent_network::keyring::{EnrolledSigner, lazy_signer_from_keyring};
 use stellar_agent_network::signing::hardware::HardwareSigningKey;
 use stellar_agent_network::signing::wallet::signer_from_wallet;
-use stellar_agent_network::{Signer, SoftwareSigningKey};
+use stellar_agent_network::{
+    KeyringSignHandle, Signer, SoftwareSigningKey, WebAuthnAssertion, signer_from_ledger,
+};
 use stellar_agent_smart_account::deployment::DeployerKeypair;
 use zeroize::Zeroizing;
 
@@ -81,6 +85,46 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn signer_resolutions_on_this_thread() -> usize {
     SIGNER_RESOLUTIONS.with(std::cell::Cell::get)
+}
+
+/// Builds the Ledger signer in place of the device, for a test on this
+/// thread.
+#[cfg(test)]
+pub(crate) type LedgerSignerFactory =
+    std::rc::Rc<dyn Fn(u32, &str) -> Result<Box<dyn Signer + Send + Sync>, WalletError>>;
+
+#[cfg(test)]
+thread_local! {
+    /// The Ledger signer factory a test set on this thread.
+    static LEDGER_SIGNER_FACTORY: std::cell::RefCell<Option<LedgerSignerFactory>> =
+        const { std::cell::RefCell::new(None) };
+    /// Signatures the deferred env signer produced on this thread.
+    static ENV_SIGNATURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Restores the previous Ledger signer factory when dropped.
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) struct LedgerSignerFactoryGuard(Option<LedgerSignerFactory>);
+
+#[cfg(all(test, feature = "mainnet-write"))]
+impl Drop for LedgerSignerFactoryGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        LEDGER_SIGNER_FACTORY.with(|factory| *factory.borrow_mut() = previous);
+    }
+}
+
+/// Makes the mainnet Ledger signer on this thread come from `factory` until
+/// the guard drops.
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) fn set_ledger_signer_factory(factory: LedgerSignerFactory) -> LedgerSignerFactoryGuard {
+    LedgerSignerFactoryGuard(LEDGER_SIGNER_FACTORY.with(|slot| slot.replace(Some(factory))))
+}
+
+/// How many signatures [`DeferredEnvSigner`] produced on the calling thread.
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) fn env_signatures_on_this_thread() -> usize {
+    ENV_SIGNATURES.with(std::cell::Cell::get)
 }
 
 /// Derives a software signer using the loaded profile's wallet controls.
@@ -245,6 +289,287 @@ pub(crate) fn record_mlock_degradation(
         "wallet_mlock_failed",
         request_id,
     );
+}
+
+/// The signer a mainnet write signs with, resolved from the verb's flags
+/// without any I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MainnetSignerChoice {
+    /// The connected Ledger at `account_index`.
+    Ledger {
+        /// The BIP-44 account index.
+        account_index: u32,
+    },
+    /// The seed in the environment variable `var_name`, read at signing.
+    Env {
+        /// The environment variable holding the S-strkey.
+        var_name: String,
+        /// The wallet label the seed is unlocked under, the one the verb's
+        /// testnet signing passes.
+        label: &'static str,
+    },
+    /// The profile's enrolled agent seed in the keyring, read at signing.
+    Keyring,
+}
+
+impl MainnetSignerChoice {
+    /// The choice of a verb that takes `--sign-with-ledger` first and
+    /// `--secret-env` second, as its testnet signing does; an environment
+    /// seed is unlocked under `env_label`.
+    ///
+    /// # Errors
+    ///
+    /// `validation.signer_source_required` when neither flag is given.
+    pub(crate) fn from_flags(
+        sign_with_ledger: bool,
+        account_index: u32,
+        secret_env: Option<&str>,
+        env_label: &'static str,
+    ) -> Result<Self, WalletError> {
+        match (sign_with_ledger, secret_env) {
+            (true, _) => Ok(Self::Ledger { account_index }),
+            (false, Some(var_name)) => Ok(Self::Env {
+                var_name: var_name.to_owned(),
+                label: env_label,
+            }),
+            (false, None) => Err(ValidationError::SignerSourceRequired {
+                detail: "no signer flag specified; pass --secret-env <VAR> or --sign-with-ledger"
+                    .to_owned(),
+            }
+            .into()),
+        }
+    }
+
+    /// The signer kind the submission records.
+    #[must_use]
+    pub(crate) fn submission_kind(&self) -> stellar_agent_network::SubmissionSignerKind {
+        match self {
+            Self::Ledger { .. } => stellar_agent_network::SubmissionSignerKind::Hardware,
+            Self::Env { .. } => stellar_agent_network::SubmissionSignerKind::Software,
+            Self::Keyring => stellar_agent_network::SubmissionSignerKind::Keyring,
+        }
+    }
+}
+
+/// A mainnet signer, constructed after the authorization is minted.
+///
+/// `handle_failure` is set for the keyring choice only: it records whether
+/// the lazy keyring handle returned an error from a signing call, the one
+/// refusal of the authorized attach that means the signer was unavailable.
+pub(crate) struct MainnetSigner<'a> {
+    signer: Box<dyn Signer + Send + Sync + 'a>,
+    handle_failure: Option<Arc<AtomicBool>>,
+}
+
+impl<'a> MainnetSigner<'a> {
+    /// The signer the authorized attach signs with.
+    #[must_use]
+    pub(crate) fn signer(&self) -> &(dyn Signer + Send + Sync + 'a) {
+        self.signer.as_ref()
+    }
+
+    /// Whether the keyring handle returned an error; `false` for the Ledger
+    /// and the environment seed.
+    #[must_use]
+    pub(crate) fn handle_failed(&self) -> bool {
+        self.handle_failure
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+}
+
+/// Constructs the signer `choice` names for the enrolled agent `enrolled`.
+///
+/// Runs after the authorization is minted. The Ledger is opened here and its
+/// key compared with `source`. The environment seed and the keyring seed are
+/// not read here: each is read inside the signing call, after the authorized
+/// attach checked the authorization.
+///
+/// # Errors
+///
+/// The device errors and `auth.signer_key_mismatch` for the Ledger, and the
+/// refusal of [`lazy_signer_from_keyring`] for the keyring.
+pub(crate) async fn mainnet_signer<'a>(
+    choice: &MainnetSignerChoice,
+    profile: &'a Profile,
+    enrolled: &EnrolledSigner,
+    source: &str,
+) -> Result<MainnetSigner<'a>, WalletError> {
+    match choice {
+        MainnetSignerChoice::Ledger { account_index } => Ok(MainnetSigner {
+            signer: ledger_signer(*account_index, source).await?,
+            handle_failure: None,
+        }),
+        MainnetSignerChoice::Env { var_name, label } => Ok(MainnetSigner {
+            signer: Box::new(DeferredEnvSigner::new(
+                var_name.clone(),
+                label,
+                profile,
+                enrolled.public_key(),
+            )),
+            handle_failure: None,
+        }),
+        MainnetSignerChoice::Keyring => {
+            let handle = lazy_signer_from_keyring(enrolled.seed_entry(), source)?;
+            let failed = Arc::new(AtomicBool::new(false));
+            Ok(MainnetSigner {
+                signer: Box::new(KeyringHandleSigner {
+                    handle,
+                    failed: Arc::clone(&failed),
+                }),
+                handle_failure: Some(failed),
+            })
+        }
+    }
+}
+
+/// Opens the Ledger at `account_index` and requires its key to be `source`.
+async fn ledger_signer(
+    account_index: u32,
+    source: &str,
+) -> Result<Box<dyn Signer + Send + Sync>, WalletError> {
+    #[cfg(test)]
+    if let Some(factory) = LEDGER_SIGNER_FACTORY.with(|slot| slot.borrow().clone()) {
+        return factory(account_index, source);
+    }
+    Ok(Box::new(signer_from_ledger(account_index, source).await?))
+}
+
+/// A software signer whose seed is read from the environment inside the
+/// transaction signing call.
+///
+/// Its public key is the enrolled one, so the authorized attach compares the
+/// authorization's signer with the enrolled key before any seed is read. The
+/// signing call derives the key from the seed and refuses a seed of any
+/// other key before it signs.
+pub(crate) struct DeferredEnvSigner<'a> {
+    var_name: String,
+    label: &'static str,
+    profile: &'a Profile,
+    expected: [u8; 32],
+}
+
+impl<'a> DeferredEnvSigner<'a> {
+    /// A signer that reads `var_name` under the wallet `label` and the
+    /// `[wallet]` controls of `profile`, and signs only as `expected`.
+    #[must_use]
+    pub(crate) fn new(
+        var_name: String,
+        label: &'static str,
+        profile: &'a Profile,
+        expected: [u8; 32],
+    ) -> Self {
+        Self {
+            var_name,
+            label,
+            profile,
+            expected,
+        }
+    }
+
+    fn refused(requested_primitive: &'static str) -> WalletError {
+        WalletError::Auth(AuthError::SignerKindMismatch {
+            signer_kind: "env-seed",
+            requested_primitive,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Signer for DeferredEnvSigner<'_> {
+    async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        let SignerCeremonyOutcome {
+            signer,
+            mlock_degradation: _,
+        } = resolve_software_signer_from_env(&self.var_name, self.label, self.profile).await?;
+        let derived = signer.public_key().await?;
+        if derived.0 != self.expected {
+            return Err(AuthError::SignerKeyMismatch {
+                expected: stellar_strkey::ed25519::PublicKey(self.expected)
+                    .to_string()
+                    .to_string(),
+                got: derived.to_string().to_string(),
+            }
+            .into());
+        }
+        #[cfg(test)]
+        ENV_SIGNATURES.with(|count| count.set(count.get() + 1));
+        signer.sign_tx_payload(payload).await
+    }
+
+    async fn sign_auth_digest(&self, _digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        Err(Self::refused("sign_auth_digest"))
+    }
+
+    async fn sign_soroban_address_auth_payload(
+        &self,
+        _payload: &[u8; 32],
+    ) -> Result<[u8; 64], WalletError> {
+        Err(Self::refused("sign_soroban_address_auth_payload"))
+    }
+
+    async fn sign_webauthn_assertion(
+        &self,
+        _auth_digest: &[u8; 32],
+        _credential_id: &[u8],
+    ) -> Result<WebAuthnAssertion, WalletError> {
+        Err(Self::refused("sign_webauthn_assertion"))
+    }
+
+    async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
+        Ok(stellar_strkey::ed25519::PublicKey(self.expected))
+    }
+}
+
+/// The lazy keyring handle of the enrolled agent seed, recording whether a
+/// delegated call returned an error.
+///
+/// The handle loads the seed inside its first signing call, so an error it
+/// returns there means the seed was unavailable.
+pub(crate) struct KeyringHandleSigner {
+    handle: KeyringSignHandle,
+    failed: Arc<AtomicBool>,
+}
+
+impl KeyringHandleSigner {
+    fn observe<T>(&self, result: Result<T, WalletError>) -> Result<T, WalletError> {
+        if result.is_err() {
+            self.failed.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+}
+
+#[async_trait::async_trait]
+impl Signer for KeyringHandleSigner {
+    async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        self.observe(Signer::sign_tx_payload(&self.handle, payload).await)
+    }
+
+    async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        self.observe(Signer::sign_auth_digest(&self.handle, digest).await)
+    }
+
+    async fn sign_soroban_address_auth_payload(
+        &self,
+        payload: &[u8; 32],
+    ) -> Result<[u8; 64], WalletError> {
+        self.observe(Signer::sign_soroban_address_auth_payload(&self.handle, payload).await)
+    }
+
+    async fn sign_webauthn_assertion(
+        &self,
+        auth_digest: &[u8; 32],
+        credential_id: &[u8],
+    ) -> Result<WebAuthnAssertion, WalletError> {
+        self.observe(
+            Signer::sign_webauthn_assertion(&self.handle, auth_digest, credential_id).await,
+        )
+    }
+
+    async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
+        self.observe(Signer::public_key(&self.handle).await)
+    }
 }
 
 /// Enrolled-identity fixtures shared by the signing tests of the CLI verbs.

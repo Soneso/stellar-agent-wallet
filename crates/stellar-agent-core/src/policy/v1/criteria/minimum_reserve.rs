@@ -265,9 +265,8 @@ fn extract_amount_stroops(ctx: &EvalContext<'_>) -> Result<AmountOutcome, Policy
 
 /// Extracts the decoded envelope's total transaction fee in stroops.
 ///
-/// `decode_authoritative_args` writes this value as a JSON number. Policy
-/// arguments that a caller builds itself, such as the CLI full-pipeline maps
-/// and the MCP simulate maps, carry no fee, and the fee then counts as 0.
+/// `decode_authoritative_args` and the CLI full-mode argument maps write this
+/// value as a JSON number. Arguments without it count the fee as 0.
 fn extract_total_fee_stroops(ctx: &EvalContext<'_>) -> i64 {
     ctx.args
         .get("total_fee_stroops")

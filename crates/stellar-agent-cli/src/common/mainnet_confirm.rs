@@ -1,5 +1,4 @@
 //! Typed-profile consent for one decoded mainnet transaction.
-#![cfg_attr(not(test), expect(dead_code, reason = "wired by the mainnet verbs"))]
 
 use super::consent::{ConsentSink, acquire_consent_sink};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -260,27 +259,22 @@ fn read_name(input: &mut impl BufRead, expected: &str) -> Result<(), WalletError
     Ok(())
 }
 
-#[cfg_attr(
-    test,
-    expect(
-        dead_code,
-        reason = "tests drive the confirmation through confirm_with_io"
-    )
-)]
+/// Shows the operator the summary of the mainnet write on stderr, reads the
+/// profile name from stdin, and persists the attested confirmation.
+///
+/// # Errors
+///
+/// `confirm.tty_required` without a terminal on stdin and stderr,
+/// `confirm.input_unavailable` when the summary cannot be written or the
+/// name cannot be read, `confirm.profile_name_mismatch` for another name, and
+/// the summary's, the attestation's and the store's refusals.
 pub(crate) fn confirm_mainnet_write(
     summary: &MainnetWriteSummary,
     decision: ConfirmDecision,
     context: &MainnetWriteContext,
     pending: &mut PendingApprovalStore,
 ) -> Result<ApprovalWitness, WalletError> {
-    confirm_with_io(
-        summary,
-        decision,
-        context,
-        pending,
-        &mut std::io::stdin().lock(),
-        &mut std::io::stderr().lock(),
-    )
+    confirm_on_terminal(summary, decision, context, pending)
 }
 
 fn confirm_with_io(
@@ -379,6 +373,148 @@ fn persisted_attestation(
         .map_err(|_| attestation_invalid("the persisted attestation is not base64url"))?
         .try_into()
         .map_err(|_| attestation_invalid("the persisted attestation has the wrong length"))
+}
+
+/// Runs the confirmation on the process's stdin and stderr.
+#[cfg(not(test))]
+fn confirm_on_terminal(
+    summary: &MainnetWriteSummary,
+    decision: ConfirmDecision,
+    context: &MainnetWriteContext,
+    pending: &mut PendingApprovalStore,
+) -> Result<ApprovalWitness, WalletError> {
+    confirm_with_io(
+        summary,
+        decision,
+        context,
+        pending,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr().lock(),
+    )
+}
+
+/// The input a test answers the confirmation with: called with the rendered
+/// prompt while the input is pending, it returns the typed line, `None` for
+/// end of input, or a read error.
+#[cfg(test)]
+pub(crate) type ConfirmationInput = Box<dyn FnMut(&str) -> std::io::Result<Option<String>>>;
+
+#[cfg(test)]
+thread_local! {
+    /// The confirmation input a test set on this thread.
+    static CONFIRMATION_INPUT: std::cell::RefCell<Option<ConfirmationInput>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Clears the confirmation input of this thread when dropped.
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) struct ConfirmationInputGuard(());
+
+#[cfg(all(test, feature = "mainnet-write"))]
+impl Drop for ConfirmationInputGuard {
+    fn drop(&mut self) {
+        CONFIRMATION_INPUT.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+/// Answers every confirmation on this thread through `input` until the guard
+/// drops.
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) fn set_confirmation_input(input: ConfirmationInput) -> ConfirmationInputGuard {
+    CONFIRMATION_INPUT.with(|slot| *slot.borrow_mut() = Some(input));
+    ConfirmationInputGuard(())
+}
+
+/// Runs the confirmation through the test's input when one is set, and on
+/// stdin and stderr otherwise.
+///
+/// The prompt the confirmation writes is captured, and the input is asked for
+/// the line when the confirmation first reads, so the callback sees exactly
+/// what the operator would see before typing.
+#[cfg(test)]
+fn confirm_on_terminal(
+    summary: &MainnetWriteSummary,
+    decision: ConfirmDecision,
+    context: &MainnetWriteContext,
+    pending: &mut PendingApprovalStore,
+) -> Result<ApprovalWitness, WalletError> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct Prompt(Rc<RefCell<Vec<u8>>>);
+    impl Write for Prompt {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    struct Answer {
+        prompt: Rc<RefCell<Vec<u8>>>,
+        input: ConfirmationInput,
+        line: Option<std::io::Cursor<Vec<u8>>>,
+    }
+    impl std::io::Read for Answer {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let available = self.fill_buf()?;
+            let n = available.len().min(buf.len());
+            buf[..n].copy_from_slice(&available[..n]);
+            self.consume(n);
+            Ok(n)
+        }
+    }
+    impl BufRead for Answer {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if self.line.is_none() {
+                let prompt = String::from_utf8_lossy(&self.prompt.borrow()).into_owned();
+                let bytes = match (self.input)(&prompt)? {
+                    Some(line) => format!("{line}\n").into_bytes(),
+                    None => Vec::new(),
+                };
+                self.line = Some(std::io::Cursor::new(bytes));
+            }
+            self.line.as_mut().map_or(Ok(&[][..]), BufRead::fill_buf)
+        }
+        fn consume(&mut self, amount: usize) {
+            if let Some(line) = self.line.as_mut() {
+                line.consume(amount);
+            }
+        }
+    }
+
+    let Some(input) = CONFIRMATION_INPUT.with(|slot| slot.borrow_mut().take()) else {
+        return confirm_with_io(
+            summary,
+            decision,
+            context,
+            pending,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stderr().lock(),
+        );
+    };
+    let prompt = Rc::new(RefCell::new(Vec::new()));
+    let mut answer = Answer {
+        prompt: Rc::clone(&prompt),
+        input,
+        line: None,
+    };
+    let result = confirm_with_io(
+        summary,
+        decision,
+        context,
+        pending,
+        &mut answer,
+        &mut Prompt(prompt),
+    );
+    CONFIRMATION_INPUT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(answer.input);
+        }
+    });
+    result
 }
 
 #[cfg(test)]

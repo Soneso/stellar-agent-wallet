@@ -8,8 +8,10 @@
 //! gate and the mapping that turns the three unresolved-submission refusals
 //! into a response an operator or an agent can act on.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use stellar_agent_core::approval::witness::ApprovalWitness;
 use stellar_agent_core::audit_log::schema::ValueLegRecord;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::envelope::Envelope;
@@ -20,9 +22,16 @@ use stellar_agent_core::profile::receipt::{
     ReceiptStatus, ReceiptStore, ReleaseEvidence, SettledRow,
 };
 use stellar_agent_core::profile::schema::Profile;
-use stellar_agent_network::StellarRpcClient;
+use stellar_agent_network::cross_check::CrossCheckWitness;
+use stellar_agent_network::mainnet::audit_readiness::AuditReadiness;
+use stellar_agent_network::mainnet::authorization::MainnetTxSignAuthorization;
+use stellar_agent_network::mainnet::consumed::AuthorizationConsumed;
 use stellar_agent_network::policy_state::{PersistedWindowStore, RECONCILE_BUDGET};
-use stellar_agent_network::{WalletSubmissionRecorder, envelope_hash_hex};
+use stellar_agent_network::{
+    ApprovalTombstone, AuditWriterHandle, MainnetSubmitGrant, MainnetWriteContext,
+    StellarRpcClient, SubmissionIntent, SubmissionOutcome, SubmissionRecorder,
+    WalletSubmissionRecorder, envelope_hash_hex,
+};
 
 use crate::common::profile_access::ProfileOrigin;
 
@@ -123,6 +132,167 @@ pub(crate) fn build_recorder(
         uuid::Uuid::new_v4().to_string(),
         record.now_ms,
     ))
+}
+
+/// What a mainnet write's recorder records, prepared before the
+/// authorization is minted.
+///
+/// Everything that can fail is done here: the receipt store is open, the
+/// approval directory is resolved, and the clock is read. Binding to the
+/// minted authorization cannot fail, so no refusal falls between the mint and
+/// the signer.
+pub(crate) struct PreparedMainnetRecorder<'a> {
+    profile: &'a Profile,
+    profile_name: String,
+    tool: &'static str,
+    chain_id: String,
+    decision: stellar_agent_core::audit_log::PolicyDecision,
+    legs: Vec<ValueLegRecord>,
+    receipts: ReceiptStore,
+    window: PersistedWindowStore,
+    audit: AuditWriterHandle,
+    request_id: String,
+    now_ms: u64,
+    witness: Option<&'a CrossCheckWitness>,
+    tombstone: ApprovalTombstone,
+}
+
+/// Prepares the recorder of a mainnet write under `context`.
+///
+/// The legs are the evaluation's `effects`; the window entries come from the
+/// authorization at [`PreparedMainnetRecorder::bind_authorized`], never from
+/// a rebuilt engine. The audit writer is the one `readiness` verified. The
+/// confirmation entry `approval` names is tombstoned when the submission
+/// settles.
+///
+/// # Errors
+///
+/// `submission.record_unavailable` when the receipt store cannot be opened,
+/// the approval directory cannot be resolved, or the clock cannot be read.
+pub(crate) fn prepare_mainnet_recorder<'a>(
+    context: &'a MainnetWriteContext,
+    tool: &'static str,
+    decision: stellar_agent_core::audit_log::PolicyDecision,
+    effects: Option<&ValueEffects>,
+    readiness: &AuditReadiness,
+    witness: Option<&'a CrossCheckWitness>,
+    approval: &ApprovalWitness,
+) -> Result<PreparedMainnetRecorder<'a>, WalletError> {
+    let profile_name = context.profile_name().to_owned();
+    let receipts = ReceiptStore::open(&profile_name).map_err(|e| {
+        record_unavailable(format!(
+            "the submission receipt store could not be opened: {e}"
+        ))
+    })?;
+    let store_dir = crate::commands::approve::approval_store_dir().map_err(|e| {
+        record_unavailable(format!(
+            "the approval store directory could not be resolved: {e}"
+        ))
+    })?;
+    let now_ms = stellar_agent_network::mainnet::clock::now_ms()
+        .map_err(|e| record_unavailable(format!("the clock could not be read: {e}")))?;
+    let legs: Vec<ValueLegRecord> = effects
+        .map(|e| e.legs().iter().map(Into::into).collect())
+        .unwrap_or_default();
+    Ok(PreparedMainnetRecorder {
+        profile: context.profile(),
+        tombstone: ApprovalTombstone {
+            store_dir,
+            profile_name: profile_name.clone(),
+            approval_nonce: approval.nonce().to_owned(),
+        },
+        window: PersistedWindowStore::for_profile(&profile_name),
+        chain_id: context.chain().caip2_str().to_owned(),
+        profile_name,
+        tool,
+        decision,
+        legs,
+        receipts,
+        audit: Arc::clone(readiness.writer()),
+        request_id: uuid::Uuid::new_v4().to_string(),
+        now_ms,
+        witness,
+    })
+}
+
+impl<'a> PreparedMainnetRecorder<'a> {
+    /// Binds the prepared recorder to the minted `authorization`, whose
+    /// window entries it records, with the witness and the confirmation's
+    /// tombstone.
+    #[must_use]
+    pub(crate) fn bind_authorized(
+        self,
+        authorization: &MainnetTxSignAuthorization,
+    ) -> StageMarkedRecorder<'a> {
+        let recorder = WalletSubmissionRecorder::new_authorized(
+            self.profile,
+            self.profile_name,
+            self.tool,
+            Some(self.chain_id),
+            self.decision,
+            self.legs,
+            authorization,
+            self.receipts,
+            self.window,
+            Some(self.audit),
+            None,
+            self.request_id,
+            self.now_ms,
+        )
+        .with_witness(self.witness)
+        .with_approval(Some(self.tombstone));
+        StageMarkedRecorder {
+            inner: recorder,
+            pre_send_entered: AtomicBool::new(false),
+        }
+    }
+}
+
+/// The recorder of a mainnet write, marking whether the submit reached the
+/// authorized pre-send hook.
+///
+/// The mark separates the two refusals of the submit that share a code: a
+/// refusal of the submit gate before the hook, and a refusal inside it.
+pub(crate) struct StageMarkedRecorder<'a> {
+    inner: WalletSubmissionRecorder<'a>,
+    pre_send_entered: AtomicBool,
+}
+
+impl StageMarkedRecorder<'_> {
+    /// Whether [`SubmissionRecorder::pre_send_authorized`] was entered.
+    #[must_use]
+    pub(crate) fn pre_send_entered(&self) -> bool {
+        self.pre_send_entered.load(Ordering::SeqCst)
+    }
+}
+
+impl std::fmt::Debug for StageMarkedRecorder<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StageMarkedRecorder")
+            .field("inner", &self.inner)
+            .field("pre_send_entered", &self.pre_send_entered())
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl SubmissionRecorder for StageMarkedRecorder<'_> {
+    async fn pre_send(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
+        self.inner.pre_send(intent).await
+    }
+
+    async fn pre_send_authorized(
+        &self,
+        intent: &SubmissionIntent,
+        grant: MainnetSubmitGrant,
+    ) -> Result<AuthorizationConsumed, WalletError> {
+        self.pre_send_entered.store(true, Ordering::SeqCst);
+        self.inner.pre_send_authorized(intent, grant).await
+    }
+
+    async fn outcome(&self, intent: &SubmissionIntent, outcome: &SubmissionOutcome) {
+        self.inner.outcome(intent, outcome).await;
+    }
 }
 
 /// Reconstructs the [`ToolDescriptor`] the gate evaluated against.

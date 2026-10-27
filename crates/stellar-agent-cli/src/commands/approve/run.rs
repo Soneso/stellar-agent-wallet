@@ -190,6 +190,13 @@ pub async fn run(args: RunArgs) -> i32 {
         }
     };
 
+    // ── 3a. The mainnet rule: no --yes, and a terminal for the y/n prompt ───
+    // Before the store opens, so a refused approval leaves it untouched.
+    if let Err(envelope) = mainnet_approve_rule(&profile, args.yes) {
+        render::render_json(&envelope);
+        return 1;
+    }
+
     let context =
         stellar_agent_core::approval::ApprovalContext::from_profile(&profile_name, &profile);
 
@@ -385,6 +392,30 @@ fn approve_with_consent_row(
 // ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Refuses an approval of a pending entry on a mainnet profile that the
+/// operator cannot answer at a terminal.
+///
+/// `--yes` is refused first, then a missing terminal on stdin or stderr. A
+/// testnet profile passes without a terminal check, `--yes` included.
+///
+/// # Errors
+///
+/// `approve.yes_refused_on_mainnet` for `--yes` on a mainnet profile, and
+/// `confirm.tty_required` on a mainnet profile without a terminal.
+fn mainnet_approve_rule(profile: &Profile, yes: bool) -> Result<(), Envelope<()>> {
+    if !profile.chain_id.is_mainnet() {
+        return Ok(());
+    }
+    if yes {
+        return Err(Envelope::<()>::err_raw(
+            "approve.yes_refused_on_mainnet",
+            "approve --yes is refused on a mainnet profile; run approve on a terminal and \
+             answer the prompt",
+        ));
+    }
+    crate::common::tty::require_tty_for_mainnet().map_err(|e| Envelope::<()>::err(&e))
+}
 
 /// Builds the store path for `<profile>` as `<approval_dir>/<profile>.toml`.
 fn build_store_path(profile_name: &str) -> Result<PathBuf, WalletError> {
@@ -2314,5 +2345,71 @@ mod tests {
         assert!(!text.contains("999"));
         assert!(text.contains(&stellar_strkey::Contract([3; 32]).to_string().to_string()));
         assert!(!text.contains("untrusted-asset"));
+    }
+
+    /// The outcome of the mainnet rule for a mainnet profile when `mainnet`
+    /// is true and a testnet one otherwise, with `--yes` as given and stdin
+    /// and stderr reported as `terminal`.
+    fn approve_rule(mainnet: bool, yes: bool, terminal: (bool, bool)) -> Result<(), String> {
+        let profile = if mainnet {
+            Profile::builder_mainnet_named(
+                "operator",
+                "https://rpc.example.invalid",
+                "s",
+                "a",
+                "n",
+                "b",
+            )
+            .build()
+        } else {
+            Profile::builder_testnet_named("operator", "s", "a", "n", "b").build()
+        };
+        let previous = crate::common::tty::tests::TEST_TTY.replace(Some(terminal));
+        let outcome = mainnet_approve_rule(&profile, yes);
+        crate::common::tty::tests::TEST_TTY.set(previous);
+        outcome.map_err(|envelope| envelope.error.unwrap().code)
+    }
+
+    /// Mainnet with `--yes` refuses whatever the terminal.
+    #[test]
+    fn mainnet_refuses_yes_on_a_terminal() {
+        assert_eq!(
+            approve_rule(true, true, (true, true)),
+            Err("approve.yes_refused_on_mainnet".to_owned())
+        );
+    }
+
+    /// Mainnet without `--yes` requires stdin and stderr to be terminals.
+    #[test]
+    fn mainnet_without_yes_requires_a_terminal() {
+        for terminal in [(false, true), (true, false), (false, false)] {
+            assert_eq!(
+                approve_rule(true, false, terminal),
+                Err("confirm.tty_required".to_owned()),
+                "{terminal:?}"
+            );
+        }
+    }
+
+    /// Mainnet without `--yes` on a terminal proceeds to the prompt.
+    #[test]
+    fn mainnet_without_yes_on_a_terminal_proceeds() {
+        assert_eq!(approve_rule(true, false, (true, true)), Ok(()));
+    }
+
+    /// Testnet keeps `--yes` and checks no terminal.
+    #[test]
+    fn testnet_keeps_yes_without_a_terminal() {
+        assert_eq!(approve_rule(false, true, (false, false)), Ok(()));
+        assert_eq!(approve_rule(false, false, (false, false)), Ok(()));
+    }
+
+    /// Mainnet checks `--yes` before the terminal.
+    #[test]
+    fn mainnet_checks_yes_before_the_terminal() {
+        assert_eq!(
+            approve_rule(true, true, (false, false)),
+            Err("approve.yes_refused_on_mainnet".to_owned())
+        );
     }
 }

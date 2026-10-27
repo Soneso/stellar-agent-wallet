@@ -31,6 +31,9 @@
 
 pub(crate) mod consent;
 pub(crate) mod mainnet_confirm;
+pub(crate) mod mainnet_write;
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) mod mainnet_write_fixture;
 pub mod network;
 pub mod profile_access;
 pub mod render;
