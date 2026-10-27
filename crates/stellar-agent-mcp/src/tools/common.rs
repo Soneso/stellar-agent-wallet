@@ -1062,12 +1062,17 @@ pub(crate) fn mainnet_signing_forbidden_result() -> rmcp::model::CallToolResult 
 ///
 /// The x402 payment tools sign a payment authorization the MCP host
 /// broadcasts externally, so the submit-layer mainnet gate never fires.
-/// `stellar_x402_authenticated_payment` has no mainnet authority: on a mainnet
-/// profile it refuses structurally with this result, before any key access,
-/// so it never produces a mainnet payment signature.
-/// `stellar_x402_create_payment` is admitted on mainnet only through mainnet
-/// write admission and its two calls, the approval preparation and the
-/// approved payment; without admission it refuses with the admission's
+/// `stellar_x402_authenticated_payment` refuses with this result, before any
+/// key access, on a mainnet profile whose server holds no mainnet write
+/// context, in a build without mainnet writes, and when a test build stands
+/// a fixed session in for its identity gate. A server with the context
+/// admits it through mainnet write admission and its two calls, the
+/// approval preparation and the approved payment. The Message authorization
+/// is consumed before the SEP-10 signature. The payment intent is consumed
+/// before the signed simulation, and the submit authorization before the
+/// payload release.
+/// `stellar_x402_create_payment` is admitted on mainnet the same way;
+/// without admission it refuses with the admission's
 /// `network.mainnet_write_forbidden` result instead. Surfaced as an
 /// [`stellar_agent_x402::X402Error::MainnetSigningForbidden`] tool result
 /// (`is_error = true`) carrying the canonical `network.mainnet_write_forbidden`
@@ -1850,6 +1855,7 @@ fn requires_mainnet_confirmation(tool: &str) -> bool {
             | "stellar_trustline"
             | "stellar_trustline_commit"
             | "stellar_x402_create_payment"
+            | "stellar_x402_authenticated_payment"
     )
 }
 
@@ -5020,8 +5026,19 @@ pub(crate) mod tests {
                     .mainnet_write_admission(
                         stellar_agent_network::mainnet::MainnetConsumer::X402Authenticated
                     )
-                    .is_err()
+                    .is_ok()
             );
+            for consumer in [
+                stellar_agent_network::mainnet::MainnetConsumer::CliPay,
+                stellar_agent_network::mainnet::MainnetConsumer::CliClaim,
+                stellar_agent_network::mainnet::MainnetConsumer::CliCreateAccount,
+                stellar_agent_network::mainnet::MainnetConsumer::CliTrustline,
+            ] {
+                assert!(
+                    f.server.mainnet_write_admission(consumer).is_err(),
+                    "{consumer:?}"
+                );
+            }
         }
 
         #[test]
@@ -5155,6 +5172,7 @@ pub(crate) mod tests {
                 "stellar_trustline",
                 "stellar_trustline_commit",
                 "stellar_x402_create_payment",
+                "stellar_x402_authenticated_payment",
             ] {
                 let outcome = f
                     .server

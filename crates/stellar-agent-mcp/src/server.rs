@@ -704,6 +704,34 @@ pub struct WalletServer {
     /// Gated on `test-helpers` feature or `#[cfg(test)]`.
     #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) x402_identity_session_override: Option<(String, String, Vec<String>)>,
+
+    /// Test-only transport of the authorized SEP-10 counterparty gate of
+    /// `stellar_x402_authenticated_payment` on mainnet: the stellar.toml
+    /// base URL, the HTTP client, and the web auth endpoint the gate uses
+    /// after its same-domain bind.
+    ///
+    /// `None` in production, where the gate fetches the home domain's
+    /// stellar.toml over HTTPS. Set via
+    /// [`WalletServer::set_x402_identity_transport_for_test`].
+    ///
+    /// Gated on `test-helpers` feature or `#[cfg(test)]`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) x402_identity_transport_override: Option<X402IdentityTransport>,
+}
+
+/// The transport the authorized counterparty gate uses in a test build.
+///
+/// It holds transport configuration and no authority: the prepare step, the
+/// message authorization and the signature run unchanged under it.
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Clone)]
+pub(crate) struct X402IdentityTransport {
+    /// The base URL the stellar.toml is fetched from.
+    pub(crate) toml_base_url: String,
+    /// The client of the stellar.toml fetch.
+    pub(crate) http: reqwest::Client,
+    /// The web auth endpoint the SEP-10 requests go to after the bind.
+    pub(crate) web_auth_override: Option<String>,
 }
 
 impl WalletServer {
@@ -890,6 +918,8 @@ impl WalletServer {
             toolsets_root_override: None,
             #[cfg(any(test, feature = "test-helpers"))]
             x402_identity_session_override: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            x402_identity_transport_override: None,
         })
     }
 
@@ -1192,6 +1222,26 @@ impl WalletServer {
         accounts: Vec<String>,
     ) {
         self.x402_identity_session_override = Some((jwt, sub, accounts));
+    }
+
+    /// Points the authorized SEP-10 counterparty gate of
+    /// `stellar_x402_authenticated_payment` at a test transport: the
+    /// stellar.toml at `toml_base_url` over `http`, and the SEP-10 requests
+    /// to `web_auth_override` after the same-domain bind.
+    ///
+    /// Gated on `test-helpers` feature or `#[cfg(test)]`.
+    #[doc(hidden)]
+    pub fn set_x402_identity_transport_for_test(
+        &mut self,
+        toml_base_url: String,
+        http: reqwest::Client,
+        web_auth_override: Option<String>,
+    ) {
+        self.x402_identity_transport_override = Some(X402IdentityTransport {
+            toml_base_url,
+            http,
+            web_auth_override,
+        });
     }
 
     /// Overrides the toolsets root directory used by `stellar_toolset_invoke`.
@@ -1499,6 +1549,7 @@ impl WalletServer {
                 | MainnetConsumer::McpCreateAccount
                 | MainnetConsumer::McpTrustline
                 | MainnetConsumer::X402Create
+                | MainnetConsumer::X402Authenticated
         ) {
             return Err(refuse("this tool has no mainnet write authority"));
         }

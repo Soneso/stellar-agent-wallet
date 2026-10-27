@@ -205,6 +205,12 @@ pub enum MainnetPrecondition {
     AuditNotAnchored,
     /// A signature does not verify under the bound signer's key.
     SignatureInvalid,
+    /// A message receipt's bound content digest or ephemeral key differs
+    /// from the message about to be signed.
+    MessageUseMismatch,
+    /// A SEP-10 challenge's client account is not the ephemeral account
+    /// that signs it.
+    MessageClientAccount,
 }
 
 impl MainnetPrecondition {
@@ -307,6 +313,8 @@ impl MainnetPrecondition {
             Self::NotOpen => "not_open",
             Self::AuditNotAnchored => "audit_not_anchored",
             Self::SignatureInvalid => "signature_invalid",
+            Self::MessageUseMismatch => "message_use_mismatch",
+            Self::MessageClientAccount => "message_client_account",
         }
     }
 }
@@ -527,6 +535,8 @@ mod tests {
             P::NotOpen,
             P::AuditNotAnchored,
             P::SignatureInvalid,
+            P::MessageUseMismatch,
+            P::MessageClientAccount,
         ];
         for precondition in all {
             match precondition {
@@ -623,7 +633,9 @@ mod tests {
                 | P::UnknownAuthorization
                 | P::NotOpen
                 | P::AuditNotAnchored
-                | P::SignatureInvalid => {}
+                | P::SignatureInvalid
+                | P::MessageUseMismatch
+                | P::MessageClientAccount => {}
             }
         }
         all.to_vec()
@@ -730,6 +742,8 @@ mod tests {
             "not_open",
             "audit_not_anchored",
             "signature_invalid",
+            "message_use_mismatch",
+            "message_client_account",
         ];
         assert_eq!(all.iter().map(|p| p.label()).collect::<Vec<_>>(), expected);
         let mut labels: Vec<_> = all.iter().map(|p| p.label()).collect();

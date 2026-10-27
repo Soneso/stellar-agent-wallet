@@ -38,5 +38,6 @@ pub mod session;
 
 pub use challenge::Challenge;
 pub use client::{ChallengeRequest, Sep10Client};
+pub use ephemeral::PreparedEphemeralAuth;
 pub use error::Sep10Error;
 pub use session::Sep10Session;

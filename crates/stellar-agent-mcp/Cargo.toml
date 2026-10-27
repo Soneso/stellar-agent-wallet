@@ -172,6 +172,9 @@ stellar-agent-test-support = { path = "../stellar-agent-test-support", features 
 # which clients a prepare or commit call builds.
 stellar-agent-network = { path = "../stellar-agent-network", features = ["test-loopback", "test-hooks"] }
 stellar-agent-nonce = { path = "../stellar-agent-nonce", features = ["test-helpers"] }
+# The SEP-10 prepare step, the authorized completion and its signing hooks for
+# the authenticated x402 mainnet tests.
+stellar-agent-sep10 = { path = "../stellar-agent-sep10", features = ["test-helpers"] }
 tempfile                   = { workspace = true }
 tokio                      = { workspace = true, features = ["rt-multi-thread", "process", "io-util", "time", "sync", "test-util"] }
 regex-lite                 = { workspace = true }
@@ -229,6 +232,8 @@ test-helpers = ["stellar-agent-network/test-hooks",
     # Enable GatedInvokeParams override fields (approval_dir_override,
     # grant_store_path_override) used by the toolsets.rs test-helpers block.
     "stellar-agent-toolsets-runtime/test-helpers",
+    # The SEP-10 transport seam of the authorized counterparty gate.
+    "stellar-agent-x402-identity/test-helpers",
 ]
 # Gate end-to-end testnet acceptance tests that require a live Friendbot + RPC.
 # These tests are NOT run under default `cargo test`; invoke with:

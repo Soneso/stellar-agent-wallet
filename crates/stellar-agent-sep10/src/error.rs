@@ -26,6 +26,7 @@
 ///   `ReplayDetected`).
 /// - **Session integrity** (`SessionAccountMismatch`).
 /// - **Configuration** (`InvalidWebAuthEndpoint`).
+/// - **Mainnet** (`MainnetSigningForbidden`, `MainnetAuthorizationRefused`).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Sep10Error {
@@ -251,6 +252,29 @@ pub enum Sep10Error {
         /// Non-secret description of why the endpoint is invalid.
         detail: String,
     },
+
+    // ── Mainnet ──────────────────────────────────────────────────────────────
+    /// A mainnet challenge reached a path that never signs on mainnet.
+    ///
+    /// The unauthorized entries refuse a client on the mainnet passphrase
+    /// before they generate or use a key; only the authorized completion
+    /// signs a mainnet challenge.
+    #[error("mainnet signing forbidden: {detail}")]
+    MainnetSigningForbidden {
+        /// The mainnet signing refusal detail.
+        detail: String,
+    },
+
+    /// The mainnet authorization of this SEP-10 authentication was refused
+    /// before the signed challenge was submitted.
+    ///
+    /// The refused precondition is logged at the refusing path and is not
+    /// part of the error.
+    #[error(
+        "the mainnet authorization for this SEP-10 authentication was refused; \
+         no signed challenge was submitted"
+    )]
+    MainnetAuthorizationRefused,
 }
 
 impl Sep10Error {
@@ -325,6 +349,8 @@ impl Sep10Error {
             Self::ReplayDetected { .. } => "sep10.replay_detected",
             Self::SessionAccountMismatch { .. } => "sep10.session_account_mismatch",
             Self::InvalidWebAuthEndpoint { .. } => "sep10.invalid_web_auth_endpoint",
+            Self::MainnetSigningForbidden { .. } => "sep10.mainnet_signing_forbidden",
+            Self::MainnetAuthorizationRefused => "sep10.mainnet_authorization_refused",
             _ => "sep10.unknown_error",
         }
     }
@@ -584,6 +610,27 @@ mod tests {
             }
             .wire_code(),
             "sep10.invalid_web_auth_endpoint"
+        );
+    }
+
+    #[test]
+    fn mainnet_errors_keep_their_codes_and_texts() {
+        let forbidden = Sep10Error::MainnetSigningForbidden {
+            detail: stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL.to_owned(),
+        };
+        assert_eq!(forbidden.wire_code(), "sep10.mainnet_signing_forbidden");
+        assert_eq!(
+            forbidden.to_string(),
+            format!(
+                "mainnet signing forbidden: {}",
+                stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL
+            )
+        );
+        let refused = Sep10Error::MainnetAuthorizationRefused;
+        assert_eq!(refused.wire_code(), "sep10.mainnet_authorization_refused");
+        assert_eq!(
+            refused.to_string(),
+            "the mainnet authorization for this SEP-10 authentication was refused; no signed challenge was submitted"
         );
     }
 

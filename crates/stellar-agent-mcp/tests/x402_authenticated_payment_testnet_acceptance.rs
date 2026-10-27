@@ -521,6 +521,8 @@ async fn a6f_neg1_unreachable_domain_aborts_before_payment() {
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             home_domain: "unreachable.stellar.invalid".to_owned(),
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         })
         .await
         .expect("dispatch_gate must not raise ErrorData for a valid chain_id");
@@ -587,6 +589,8 @@ async fn a6f_neg2_invalid_home_domain_aborts_before_payment() {
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             home_domain: "UPPERCASE.COM".to_owned(), // uppercase LDH violation
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         })
         .await
         .expect("dispatch_gate must not raise ErrorData for a valid chain_id");
@@ -670,6 +674,8 @@ async fn a6f_positive_testanchor_sep10_authenticated_payment() {
             chain_id: TESTNET_CHAIN_ID.to_owned(),
             home_domain: TESTANCHOR_HOME_DOMAIN.to_owned(),
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
         })
         .await
         .expect("dispatch_gate must not raise ErrorData for a valid chain_id");

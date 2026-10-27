@@ -1806,8 +1806,10 @@ fn rule_create_audit_writer_routes_through_the_keyed_preflight() {
 /// which is the only place they load a signer. Inside the helper the mainnet
 /// branch refuses without the acquired audit readiness before it resolves the
 /// enrolled signer and builds the lazy seed handle, and the other branch loads
-/// the enrollment helper after it. The x402 create-payment mainnet path reads
-/// the approval, acquires the readiness, and only then builds the lazy handle.
+/// the enrollment helper after it. The two mainnet x402 paths read the
+/// approval, acquire the readiness, and only then build the lazy handle
+/// through the one shared helper; the authenticated path verifies the
+/// counterparty between the two. Neither path builds a handle of its own.
 #[test]
 fn every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the_signer() {
     assert_called_between(
@@ -1885,8 +1887,45 @@ fn every_approval_consumer_acquires_the_writer_between_the_approval_read_and_the
         &[
             "verify_attestation_subject_gate(",
             "audit_readiness(",
-            "lazy_signer_from_keyring(",
+            "x402_mainnet_signing_handle(",
             "create_payment_authorized(",
         ],
     );
+    assert_calls_in_order(
+        "x402_authenticated_payment.rs",
+        include_str!("../../src/tools/x402_authenticated_payment.rs"),
+        "async fn mainnet_authenticated_payment(",
+        &[
+            "verify_attestation_subject_gate(",
+            "audit_readiness(",
+            ".verify_x402_counterparty_authorized(",
+            "x402_mainnet_signing_handle(",
+            "create_payment_authorized(",
+        ],
+    );
+    assert_calls_in_order(
+        "x402_create_payment.rs",
+        include_str!("../../src/tools/x402_create_payment.rs"),
+        "pub(super) fn x402_mainnet_signing_handle(",
+        &["lazy_signer_from_keyring("],
+    );
+    for (file, source, function) in [
+        (
+            "x402_create_payment.rs",
+            include_str!("../../src/tools/x402_create_payment.rs"),
+            "async fn mainnet_x402_payment(",
+        ),
+        (
+            "x402_authenticated_payment.rs",
+            include_str!("../../src/tools/x402_authenticated_payment.rs"),
+            "async fn mainnet_authenticated_payment(",
+        ),
+    ] {
+        assert_not_called(
+            file,
+            source,
+            function,
+            &["lazy_signer_from_keyring(", "enrolled_keyring_signer("],
+        );
+    }
 }

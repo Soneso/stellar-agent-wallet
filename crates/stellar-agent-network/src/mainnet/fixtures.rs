@@ -593,6 +593,20 @@ impl ResolverFixture {
         created: u64,
         ttl: u64,
     ) -> stellar_agent_core::approval::witness::ApprovalWitness {
+        self.approval_under(envelope, created, ttl, &self.profile, "operator")
+    }
+
+    /// The classic payment approval of `envelope`, created at `created` and
+    /// expiring `ttl` later, attested and verified at `created` for `profile`
+    /// under `name`.
+    pub(crate) fn approval_under(
+        &self,
+        envelope: &str,
+        created: u64,
+        ttl: u64,
+        profile: &Profile,
+        name: &str,
+    ) -> stellar_agent_core::approval::witness::ApprovalWitness {
         use stellar_agent_core::approval::PendingApproval;
         let args = stellar_agent_core::envelope_decode::decode_authoritative_args(
             envelope,
@@ -616,8 +630,8 @@ impl ResolverFixture {
         entry.expires_at_unix_ms = created + ttl;
         self.attested(
             &entry,
-            &self.profile,
-            "operator",
+            profile,
+            name,
             stellar_agent_core::approval::witness::ApprovedKind::Payment,
             stellar_agent_core::approval::subject::approval_subject_classic(envelope),
             created,
@@ -733,5 +747,181 @@ impl ResolverFixture {
             .mount(&server)
             .await;
         server
+    }
+}
+
+/// The home domain the message fixtures approve and challenge.
+pub(crate) const MESSAGE_HOME_DOMAIN: &str = "anchor.example.com";
+
+/// The token contract the x402 fixtures pay in.
+pub(crate) fn x402_token() -> String {
+    stellar_strkey::Contract([3; 32]).to_string().to_string()
+}
+
+/// `raw` with its rule moved to the two x402 tools over the fixture's token:
+/// the create tool's rule as it is, and the authenticated tool's rule after
+/// `authenticated` edits it.
+pub(crate) fn x402_policy(raw: &str, authenticated: impl FnOnce(String) -> String) -> String {
+    let token = x402_token();
+    let raw = raw
+        .replace("\"native\"", &format!("\"{token}\""))
+        .replace("native =", &format!("\"{token}\" ="));
+    let start = raw.find("[[rules]]").unwrap();
+    let rule = &raw[start..];
+    format!(
+        "{}{}\n{}",
+        &raw[..start],
+        rule.replace("stellar_pay", "stellar_x402_create_payment"),
+        authenticated(rule.replace("stellar_pay", "stellar_x402_authenticated_payment"))
+    )
+}
+
+/// A resolver fixture whose policy evaluates both x402 tools.
+pub(crate) fn x402_fixture() -> ResolverFixture {
+    ResolverFixture::configured(|_| {}, |raw| x402_policy(raw, |rule| rule))
+}
+
+/// The payment root of the x402 fixtures: a transfer of 10 of the token from
+/// the fixture's signer to its destination, with no sub-invocations.
+pub(crate) fn x402_root(f: &ResolverFixture) -> stellar_xdr::SorobanAuthorizedInvocation {
+    use stellar_xdr::{
+        AccountId, ContractId, Hash, Int128Parts, InvokeContractArgs, PublicKey, ScAddress, ScVal,
+        SorobanAuthorizedFunction, SorobanAuthorizedInvocation, Uint256,
+    };
+    SorobanAuthorizedInvocation {
+        function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+            contract_address: ScAddress::Contract(ContractId(Hash([3; 32]))),
+            function_name: "transfer".try_into().unwrap(),
+            args: vec![
+                ScVal::Address(ScAddress::Account(AccountId(
+                    PublicKey::PublicKeyTypeEd25519(Uint256(f.signer.public_key())),
+                ))),
+                ScVal::Address(ScAddress::Account(AccountId(
+                    PublicKey::PublicKeyTypeEd25519(Uint256(
+                        stellar_strkey::ed25519::PublicKey::from_string(f.source.destination())
+                            .unwrap()
+                            .0,
+                    )),
+                ))),
+                ScVal::I128(Int128Parts { hi: 0, lo: 10 }),
+            ]
+            .try_into()
+            .unwrap(),
+        }),
+        sub_invocations: vec![].try_into().unwrap(),
+    }
+}
+
+/// The mainnet intent of `root` for `consumer`.
+pub(crate) fn x402_intent(
+    root: &stellar_xdr::SorobanAuthorizedInvocation,
+    consumer: MainnetConsumer,
+) -> super::resolve::SorobanIntent<'_> {
+    use sha2::Digest as _;
+    super::resolve::SorobanIntent {
+        consumer,
+        root_invocation: root,
+        network_id: sha2::Sha256::digest(MAINNET_PASSPHRASE.as_bytes()).into(),
+    }
+}
+
+/// Message facts for the fixture's home domain, its web authentication
+/// domain and server key, with `content` and `key`.
+pub(crate) fn message_facts(content: [u8; 32], key: [u8; 32]) -> super::message::MessageFacts {
+    super::message::MessageFacts {
+        domain: super::MessageDomain {
+            home_domain: MESSAGE_HOME_DOMAIN.to_owned(),
+            web_auth_domain: "auth.anchor.example.com".to_owned(),
+            server_key: [0x5e; 32],
+        },
+        content_digest: content,
+        ephemeral_public_key: key,
+    }
+}
+
+impl ResolverFixture {
+    /// The operator's approval of the x402 payment `root`, for the
+    /// authenticated subject over `home_domain` or the plain subject without
+    /// one, created at `created` and expiring 600 seconds later, attested and
+    /// verified at `created` through the real producers.
+    pub(crate) fn x402_approval(
+        &self,
+        root: &stellar_xdr::SorobanAuthorizedInvocation,
+        home_domain: Option<&str>,
+        created: u64,
+    ) -> stellar_agent_core::approval::witness::ApprovalWitness {
+        use stellar_agent_core::approval::subject::{
+            approval_subject_x402, approval_subject_x402_authenticated, soroban_intent_digest,
+        };
+        let intent = x402_intent(root, MainnetConsumer::X402Authenticated);
+        let mut entry = stellar_agent_core::approval::PendingApproval::new_x402_pending(
+            &intent.network_id,
+            root,
+            home_domain.map(str::to_owned),
+            "1000".into(),
+            600_000,
+        )
+        .unwrap();
+        entry.created_at_unix_ms = created;
+        entry.expires_at_unix_ms = created + 600_000;
+        let digest = soroban_intent_digest(&intent.network_id, root).unwrap();
+        self.attested(
+            &entry,
+            &self.profile,
+            "operator",
+            stellar_agent_core::approval::witness::ApprovedKind::X402Payment,
+            home_domain.map_or_else(
+                || approval_subject_x402(&digest),
+                |domain| approval_subject_x402_authenticated(&digest, domain),
+            ),
+            created,
+        )
+    }
+
+    /// The message signing request over this fixture's proofs.
+    pub(crate) fn message_request<'a>(
+        &'a self,
+        intent: &'a super::resolve::SorobanIntent<'a>,
+        message: &'a super::message::MessageFacts,
+        approval: &'a stellar_agent_core::approval::witness::ApprovalWitness,
+    ) -> super::resolve::MessageSignRequest<'a> {
+        super::resolve::MessageSignRequest {
+            context: &self.context,
+            consumer: MainnetConsumer::X402Authenticated,
+            intent,
+            message,
+            policy: &self.policy,
+            enablement: &self.enablement,
+            approval,
+            audit: self.audit(),
+            store: &self.window,
+        }
+    }
+
+    /// The receipt of a message authorization for `message`, resolved and
+    /// consumed over a fresh approval of the payment `root` for the
+    /// message's home domain.
+    pub(crate) fn message_receipt(
+        &self,
+        root: &stellar_xdr::SorobanAuthorizedInvocation,
+        message: &super::message::MessageFacts,
+    ) -> super::message::MessageUseReceipt {
+        let approval = self.x402_approval(root, Some(&message.domain.home_domain), self.now);
+        self.message_receipt_for(root, message, &approval)
+    }
+
+    /// The receipt of a message authorization for `message`, resolved under
+    /// `approval` and consumed.
+    pub(crate) fn message_receipt_for(
+        &self,
+        root: &stellar_xdr::SorobanAuthorizedInvocation,
+        message: &super::message::MessageFacts,
+        approval: &stellar_agent_core::approval::witness::ApprovalWitness,
+    ) -> super::message::MessageUseReceipt {
+        let intent = x402_intent(root, MainnetConsumer::X402Authenticated);
+        let authorization =
+            super::resolve::resolve_message_sign(self.message_request(&intent, message, approval))
+                .unwrap();
+        super::resolve::consume_message_sign(&self.context, authorization, &self.window).unwrap()
     }
 }

@@ -598,6 +598,8 @@ async fn call(fixture: &Fixture, tool: Tool) -> rmcp::model::CallToolResult {
             .call_stellar_x402_authenticated_payment(X402AuthenticatedPaymentArgs {
                 chain_id: "stellar:testnet".into(),
                 address: None,
+                approval_nonce: None,
+                approval_attestation: None,
                 home_domain: "merchant.example".into(),
                 payment_required: payment_required(),
             })
@@ -1544,6 +1546,8 @@ async fn call_on_chain(
                 .call_stellar_x402_authenticated_payment(X402AuthenticatedPaymentArgs {
                     chain_id: chain_id.into(),
                     address: None,
+                    approval_nonce: None,
+                    approval_attestation: None,
                     home_domain: "merchant.example".into(),
                     payment_required: payment_required.to_owned(),
                 })
@@ -2139,6 +2143,8 @@ async fn x402_chain_arguments_preserve_refusal_order() {
         .call_stellar_x402_authenticated_payment(X402AuthenticatedPaymentArgs {
             chain_id: "stellar:pubnet".into(),
             address: None,
+            approval_nonce: None,
+            approval_attestation: None,
             home_domain: "merchant.example".into(),
             payment_required: invalid,
         })
