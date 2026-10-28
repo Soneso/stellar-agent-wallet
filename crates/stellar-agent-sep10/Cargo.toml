@@ -36,6 +36,8 @@ serial_test = { workspace = true }
 wiremock = { workspace = true }
 
 [features]
+# Enables mainnet-write in core and network and compiles the authorized completion.
+mainnet-write = ["stellar-agent-core/mainnet-write", "stellar-agent-network/mainnet-write"]
 # Live network round-trip tests against the SDF testnet anchor. Implies the
 # test-helpers feature.
 testnet-integration = ["test-helpers"]

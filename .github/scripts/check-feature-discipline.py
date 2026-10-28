@@ -9,7 +9,7 @@ drift check cover them. Shell syntax the scanner does not model fails
 closed when its text runs cargo or cross.
 
 Rules:
-  D1  the four mainnet-write declarations hold, and no other feature, no
+  D1  the pinned mainnet-write declarations hold, and no other feature, no
       default and no normal dependency declaration reaches mainnet-write
   D2  no dev or build dependency declaration requests a feature that
       reaches mainnet-write
@@ -76,12 +76,17 @@ import tomllib
 FEATURE = 'mainnet-write'
 ALL_FEATURES = '--all-' + 'features'
 MARKER = 'STELLAR_AGENT_BUILD_' + 'MAINNET_WRITE='
-PACKAGES = tuple('stellar-agent-' + name for name in ('core', 'network', 'cli', 'mcp'))
+PACKAGES = tuple('stellar-agent-' + name for name in (
+    'core', 'network', 'cli', 'mcp', 'sep10', 'sep43', 'x402', 'x402-identity'))
 DECLARATIONS = {
     PACKAGES[0]: [],
     PACKAGES[1]: [PACKAGES[0] + '/' + FEATURE],
     PACKAGES[2]: [PACKAGES[0] + '/' + FEATURE, PACKAGES[1] + '/' + FEATURE],
-    PACKAGES[3]: [PACKAGES[0] + '/' + FEATURE, PACKAGES[1] + '/' + FEATURE],
+    PACKAGES[3]: [PACKAGES[index] + '/' + FEATURE for index in (0, 1, 5, 6, 7)],
+    PACKAGES[4]: [PACKAGES[0] + '/' + FEATURE, PACKAGES[1] + '/' + FEATURE],
+    PACKAGES[5]: [PACKAGES[0] + '/' + FEATURE, PACKAGES[1] + '/' + FEATURE],
+    PACKAGES[6]: [PACKAGES[index] + '/' + FEATURE for index in (0, 1, 5)],
+    PACKAGES[7]: [PACKAGES[index] + '/' + FEATURE for index in (0, 1, 4)],
 }
 REFUSED_VARS = ['RUST' + 'C', 'RUSTC_' + 'WRAPPER', 'RUSTC_WORKSPACE_' + 'WRAPPER',
                 'CARGO_BUILD_' + 'RUSTC*', 'RUST' + 'FLAGS', 'CARGO_ENCODED_' + 'RUSTFLAGS',
@@ -957,7 +962,7 @@ class Checker:
         return any(self.reaches(dependency['name'], feature, seen) for feature in features)
 
     def D1(self):
-        """The four declarations hold; nothing else reaches the feature."""
+        """The pinned declarations hold; nothing else reaches the feature."""
         for package, expected in DECLARATIONS.items():
             if self.packages.get(package, {}).get('features', {}).get(FEATURE) != expected:
                 self.fail('D1', f'{package}: declaration differs')

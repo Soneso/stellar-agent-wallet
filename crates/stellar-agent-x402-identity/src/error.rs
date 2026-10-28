@@ -137,9 +137,10 @@ pub enum IdentityError {
         reason: String,
     },
 
-    /// A mainnet passphrase reached an entry that never signs on mainnet, or
-    /// the authorized gate's authorization reported `FeatureDisabled`, which
-    /// maps to the signing refusal.
+    /// A mainnet passphrase reached an entry that never signs on mainnet, or,
+    /// in builds with the `mainnet-write` feature, the authorized gate's
+    /// authorization reported `FeatureDisabled`, which maps to the signing
+    /// refusal.
     ///
     /// The unauthorized entries refuse before any request.
     #[error("x402-identity: mainnet signing forbidden: {detail}")]

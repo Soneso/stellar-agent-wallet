@@ -42,10 +42,11 @@
 //! operator's profile, and the crate builds no client. Auth-entry signing goes
 //! through `stellar_agent_sep43::sign_soroban_auth_entry`.
 //!
-//! [`create_payment_authorized`] signs a mainnet payment under the resolver's
-//! authority. The payment's client and, when the value requires a witness, the
-//! primary and oracle clients of the bound witness all come from the mainnet
-//! write context, never from the caller. The resolver mints the payment intent
+//! `create_payment_authorized` signs a mainnet payment under the resolver's
+//! authority; it exists only in builds with the `mainnet-write` feature. The
+//! payment's client and, when the value requires a witness, the primary and
+//! oracle clients of the bound witness all come from the mainnet write
+//! context, never from the caller. The resolver mints the payment intent
 //! before anything is signed, and the entry is signed through
 //! `stellar_agent_sep43::signing::sign_soroban_auth_entry_authorized` against
 //! that intent. After the transmit gate returns `Ok`, the intent is consumed
@@ -392,6 +393,7 @@ pub fn intent_digest(
 /// Construct this bundle through [`Self::new`]; readiness moves into the resolver.
 /// An authenticated payment adds its message receipt through
 /// [`Self::with_authenticated`]; the receipt is dropped with the bundle.
+#[cfg(feature = "mainnet-write")]
 pub struct X402MainnetProofs<'a> {
     context: &'a stellar_agent_network::MainnetWriteContext,
     policy: &'a stellar_agent_core::mainnet::verified_policy::VerifiedPolicy,
@@ -404,6 +406,7 @@ pub struct X402MainnetProofs<'a> {
     authenticated: Option<stellar_agent_network::mainnet::message::MessageUseReceipt>,
 }
 
+#[cfg(feature = "mainnet-write")]
 impl<'a> X402MainnetProofs<'a> {
     /// Binds one-use readiness to the startup and action proofs.
     #[must_use]
@@ -450,6 +453,7 @@ impl<'a> X402MainnetProofs<'a> {
 }
 
 /// A payment whose child authorization must be consumed before payload release.
+#[cfg(feature = "mainnet-write")]
 pub struct AuthorizedPayment {
     /// The privately constructed payload and cross-check result.
     pub payment: CreatedPayment,
@@ -466,9 +470,12 @@ pub struct AuthorizedPayment {
 /// endpoint identity, so the ledger trace of this path carries no protocol
 /// version.
 ///
+/// Exists only in builds with the `mainnet-write` feature.
+///
 /// # Errors
 /// Returns validation, endpoint, simulation, witness, signing, audit, or typed
 /// authorization refusals. A consumed intent retains its debit on later failure.
+#[cfg(feature = "mainnet-write")]
 pub async fn create_payment_authorized(
     requirements: &PaymentRequirements,
     consumer: stellar_agent_network::mainnet::MainnetConsumer,
@@ -504,6 +511,7 @@ pub async fn create_payment_authorized(
     })
 }
 
+#[cfg(feature = "mainnet-write")]
 #[derive(Clone, Copy)]
 enum FailurePoint {
     Signing { unavailable: bool },
@@ -523,12 +531,14 @@ enum FailurePoint {
 /// that is the signer-unavailable class. Every other SEP-43 refusal, a
 /// `SignerUnavailable` from a wallet-state or other wallet error and an
 /// authorization refusal included, is a sign refusal.
+#[cfg(feature = "mainnet-write")]
 fn signing_failure_point(error: &stellar_agent_sep43::Sep43Error) -> FailurePoint {
     FailurePoint::Signing {
         unavailable: matches!(error, stellar_agent_sep43::Sep43Error::UserRejected { .. }),
     }
 }
 
+#[cfg(feature = "mainnet-write")]
 fn invalidation_stage(
     point: FailurePoint,
 ) -> Option<stellar_agent_network::mainnet::resolve::InvalidationStage> {
@@ -543,6 +553,7 @@ fn invalidation_stage(
     })
 }
 
+#[cfg(feature = "mainnet-write")]
 struct OpenAuthorization<'a> {
     context: &'a stellar_agent_network::MainnetWriteContext,
     store: &'a stellar_agent_network::policy_state::PersistedWindowStore,
@@ -550,6 +561,7 @@ struct OpenAuthorization<'a> {
     point: FailurePoint,
 }
 
+#[cfg(feature = "mainnet-write")]
 impl Drop for OpenAuthorization<'_> {
     fn drop(&mut self) {
         if let (Some(id), Some(stage)) = (self.id, invalidation_stage(self.point))
@@ -735,11 +747,24 @@ pub async fn create_payment(
         profile_passphrase,
         identity_deadline,
         before_transmit,
+        #[cfg(feature = "mainnet-write")]
         None,
     )
     .await
     .map(|(payment, _)| payment)
 }
+
+/// What the shared payment flow returns beside the payment: the child
+/// authorization of an authorized payment's final envelope, or `None` for a
+/// payment under a prepared cross-check.
+#[cfg(feature = "mainnet-write")]
+type ReleaseAuthorization =
+    Option<stellar_agent_network::mainnet::authorization::MainnetSubmitAuthorization>;
+
+/// What the shared payment flow returns beside the payment in a build
+/// without the authorized payment: nothing.
+#[cfg(not(feature = "mainnet-write"))]
+type ReleaseAuthorization = ();
 
 #[allow(
     clippy::too_many_arguments,
@@ -754,18 +779,13 @@ async fn create_payment_inner(
     profile_passphrase: &str,
     identity_deadline: Instant,
     before_transmit: impl FnOnce(&AuthorizationToTransmit<'_>) -> Result<(), X402Error>,
-    mut mainnet: Option<(
+    #[cfg(feature = "mainnet-write")] mut mainnet: Option<(
         &mut X402MainnetProofs<'_>,
         stellar_agent_network::mainnet::MainnetConsumer,
         stellar_agent_core::cross_check::CrossCheckValue<'_>,
     )>,
-) -> Result<
-    (
-        CreatedPayment,
-        Option<stellar_agent_network::mainnet::authorization::MainnetSubmitAuthorization>,
-    ),
-    X402Error,
-> {
+) -> Result<(CreatedPayment, ReleaseAuthorization), X402Error> {
+    #[cfg(feature = "mainnet-write")]
     use stellar_agent_network::mainnet::resolve::{
         SorobanIntent, SorobanIntentRequest, SorobanSubmitRequest, consume_soroban_intent,
         resolve_soroban_intent, resolve_soroban_submit,
@@ -781,6 +801,7 @@ async fn create_payment_inner(
     // shown to serve the profile's network before it is asked anything else.
     // The mainnet probe returns no identity, so only the other path carries
     // the protocol version into the ledger trace below.
+    #[cfg(feature = "mainnet-write")]
     let identity = if mainnet.is_some() {
         client
             .check_mainnet_endpoint(identity_deadline)
@@ -795,6 +816,13 @@ async fn create_payment_inner(
                 .map_err(X402Error::EndpointIdentity)?,
         )
     };
+    #[cfg(not(feature = "mainnet-write"))]
+    let identity = Some(
+        client
+            .endpoint_identity(network_passphrase, identity_deadline)
+            .await
+            .map_err(X402Error::EndpointIdentity)?,
+    );
 
     // ── Step 3: Build SAC transfer InvokeHostFunction ─────────────────────────
     // SEP-41: transfer(from: Address, to: Address, amount: i128)
@@ -906,7 +934,9 @@ async fn create_payment_inner(
         expiration_ledger: signature_expiration_ledger,
         resource_fee_ceiling: u64::from(MAX_RESOURCE_FEE_STROOPS),
     };
+    #[cfg(feature = "mainnet-write")]
     let expected_root = payment_root(requirements, &payer_strkey)?;
+    #[cfg(feature = "mainnet-write")]
     let cross_check = if let Some((proofs, _, value)) = &mainnet {
         let thresholds = stellar_agent_core::cross_check::ThresholdSet::from_profile_and_signed(
             proofs.context.profile(),
@@ -930,14 +960,10 @@ async fn create_payment_inner(
         .await
         .map_err(X402Error::CrossCheck)?
     } else {
-        cross_check
-            .ok_or_else(|| X402Error::TransactionBuildFailed {
-                detail: "cross-check configuration missing".to_owned(),
-            })?
-            .witness(inputs)
-            .await
-            .map_err(X402Error::CrossCheck)?
+        classic_witness(cross_check, inputs).await?
     };
+    #[cfg(not(feature = "mainnet-write"))]
+    let cross_check = classic_witness(cross_check, inputs).await?;
 
     // The health read runs on the same client under the identity deadline, so
     // the ledgers it compares come from the endpoint the identity check named.
@@ -989,6 +1015,7 @@ async fn create_payment_inner(
                 detail: format!("auth preimage to_xdr_base64 failed: {e}"),
             })?;
 
+    #[cfg(feature = "mainnet-write")]
     let intent = SorobanIntent {
         consumer: mainnet.as_ref().map_or(
             stellar_agent_network::mainnet::MainnetConsumer::X402Create,
@@ -997,7 +1024,9 @@ async fn create_payment_inner(
         root_invocation: &root_invocation,
         network_id: network_id.0,
     };
+    #[cfg(feature = "mainnet-write")]
     let mut open_intent = None;
+    #[cfg(feature = "mainnet-write")]
     let authorization = if let Some((proofs, _, _)) = mainnet.as_mut() {
         let audit = proofs
             .audit
@@ -1030,6 +1059,7 @@ async fn create_payment_inner(
     } else {
         None
     };
+    #[cfg(feature = "mainnet-write")]
     let signature = if let Some(authorization) = &authorization {
         stellar_agent_sep43::signing::sign_soroban_auth_entry_authorized(
             &preimage_xdr,
@@ -1044,15 +1074,20 @@ async fn create_payment_inner(
     } else {
         sign_soroban_auth_entry(&preimage_xdr, signer, &payer_key, network_passphrase, None).await
     };
+    #[cfg(not(feature = "mainnet-write"))]
+    let signature =
+        sign_soroban_auth_entry(&preimage_xdr, signer, &payer_key, network_passphrase, None).await;
     let raw_signature_b64 = match signature {
         Ok(signature) => signature,
         Err(error) => {
+            #[cfg(feature = "mainnet-write")]
             if let Some(open) = &mut open_intent {
                 open.point = signing_failure_point(&error);
             }
             return Err(error.into());
         }
     };
+    #[cfg(feature = "mainnet-write")]
     if let Some(open) = &mut open_intent {
         open.point = FailurePoint::BeforeTransmit;
     }
@@ -1135,6 +1170,7 @@ async fn create_payment_inner(
         cross_check: cross_check.witness(),
     })?;
 
+    #[cfg(feature = "mainnet-write")]
     let receipt = if let Some(authorization) = authorization {
         let (proofs, _, _) = mainnet
             .as_ref()
@@ -1240,6 +1276,7 @@ async fn create_payment_inner(
                 detail: format!("envelope to_xdr_base64 failed: {e}"),
             })?;
 
+    #[cfg(feature = "mainnet-write")]
     let child = if let Some(receipt) = receipt {
         let (proofs, _, _) = mainnet
             .as_ref()
@@ -1257,6 +1294,7 @@ async fn create_payment_inner(
         None
     };
 
+    #[cfg(feature = "mainnet-write")]
     let mut open_child = mainnet.as_ref().and_then(|(proofs, _, _)| {
         child.as_ref().map(|child| OpenAuthorization {
             context: proofs.context,
@@ -1279,12 +1317,31 @@ async fn create_payment_inner(
             },
             cross_check,
         },
+        #[cfg(feature = "mainnet-write")]
         child,
+        #[cfg(not(feature = "mainnet-write"))]
+        (),
     );
+    #[cfg(feature = "mainnet-write")]
     if let Some(open) = &mut open_child {
         open.point = FailurePoint::Transferred;
     }
     Ok(result)
+}
+
+/// The cross-check witness of a payment through the prepared cross-check its
+/// caller passed.
+async fn classic_witness(
+    cross_check: Option<&SorobanCrossCheck>,
+    inputs: SorobanWitnessInputs<'_>,
+) -> Result<CrossCheckOutcome, X402Error> {
+    cross_check
+        .ok_or_else(|| X402Error::TransactionBuildFailed {
+            detail: "cross-check configuration missing".to_owned(),
+        })?
+        .witness(inputs)
+        .await
+        .map_err(X402Error::CrossCheck)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2093,6 +2150,7 @@ mod tests {
         }
         assert!(saw_pubkey && saw_signature, "both fields present");
     }
+    #[cfg(feature = "mainnet-write")]
     #[test]
     fn mainnet_failure_points_select_only_open_intent_stages() {
         use stellar_agent_network::mainnet::resolve::InvalidationStage as S;
@@ -2120,6 +2178,7 @@ mod tests {
         assert!(invalidation_stage(FailurePoint::Transferred).is_none());
     }
 
+    #[cfg(feature = "mainnet-write")]
     #[test]
     fn authorized_sign_refusals_classify_as_the_classic_path_does() {
         use stellar_agent_network::mainnet::resolve::InvalidationStage as S;

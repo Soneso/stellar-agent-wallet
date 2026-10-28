@@ -40,7 +40,7 @@ The scope table defines mainnet admission for each build configuration. Public S
   - `prepare_ephemeral_auth` generates the ephemeral key, fetches and validates the challenge, and seals its digest and validated network before authorization. It does not sign the challenge.
   - `web_auth_domain_for_endpoint` derives the web-auth domain from the endpoint's host.
   - In the authorized flow, the challenge must name the ephemeral account before message authorization and again before signing.
-  - `complete_ephemeral_auth_authorized` consumes the prepared challenge and checks it against the message-use receipt before signing and submitting it.
+  - `complete_ephemeral_auth_authorized` consumes the prepared challenge and checks it against the message-use receipt before signing and submitting it. It exists only in builds with the `mainnet-write` feature.
   - `sep10.mainnet_authorization_refused` reports that the authorized SEP-10 completion refused before submitting a signed challenge.
 
 ### SEP-24 and SEP-6: anchor deposit/withdraw
@@ -152,7 +152,7 @@ The scope table defines mainnet admission for each build configuration. Public S
   - `resolve_and_verify_counterparty` and its transport seam, which exists only with the `test-helpers` feature, refuse mainnet before fetching `stellar.toml`. An ordinary x402 identity entry reports `identity.mainnet_signing_forbidden` before any request.
   - `resolve_and_verify_counterparty_authorized` takes `MainnetIdentityInputs` and returns `MainnetCounterpartySession`. Its `into_parts` method transfers the session and receipt to the payment caller.
   - `identity.mainnet_authorization_refused` reports that the bound identity authentication refused before submitting a signed challenge.
-  - Without `mainnet-write`, the context and receipt inputs needed by the authorized flow cannot be constructed.
+  - The authorized gate, `MainnetIdentityInputs`, and `MainnetCounterpartySession` exist only in builds with the `mainnet-write` feature.
 
 ## Machine Payments Protocol (MPP)
 

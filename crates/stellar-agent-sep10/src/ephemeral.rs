@@ -19,15 +19,16 @@
 //! A mainnet challenge is signed only in two steps.
 //! [`prepare_ephemeral_auth`] generates the key and fetches and validates the
 //! challenge into a sealed [`PreparedEphemeralAuth`], whose message facts the
-//! caller authorizes and consumes. [`complete_ephemeral_auth_authorized`] then
+//! caller authorizes and consumes. `complete_ephemeral_auth_authorized` then
 //! checks the challenge against the consumed authorization's receipt, signs
-//! once, verifies the signature and submits it.
+//! once, verifies the signature and submits it. The completion exists only in
+//! builds with the `mainnet-write` feature.
 //!
 //! # Memory discipline
 //!
 //! The ephemeral key lifetime is bounded to one authentication: the stack
 //! frame of [`auth_with_ephemeral_key`], or the [`PreparedEphemeralAuth`]
-//! value that [`complete_ephemeral_auth_authorized`] consumes. The key is
+//! value that `complete_ephemeral_auth_authorized` consumes. The key is
 //! throwaway one-shot and is zeroed automatically on drop via
 //! `ZeroizeOnDrop`. No mlock is required for a per-request throwaway key.
 
@@ -40,14 +41,17 @@ use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use stellar_agent_core::error::{MAINNET_SIGNING_REFUSAL_DETAIL, NetworkError, WalletError};
 use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
 use stellar_agent_network::mainnet::AuthorizationId;
+use stellar_agent_network::mainnet::MessageDomain;
+#[cfg(feature = "mainnet-write")]
 use stellar_agent_network::mainnet::message::{
-    ChallengeFacts, MessageFacts, MessageUseReceipt, check_challenge_against_receipt,
-    check_client_account,
+    ChallengeFacts, MessageUseReceipt, check_challenge_against_receipt,
 };
+use stellar_agent_network::mainnet::message::{MessageFacts, check_client_account};
+#[cfg(feature = "mainnet-write")]
 use stellar_agent_network::mainnet::{
-    MainnetAuthorizationError, MainnetConsumer, MainnetPrecondition, MessageDomain,
+    MainnetAuthorizationError, MainnetConsumer, MainnetPrecondition,
 };
 use stellar_xdr::{
     DecoratedSignature, Hash, Limits, ReadXdr, SignatureHint, Transaction, TransactionEnvelope,
@@ -134,7 +138,8 @@ fn network_id(network_passphrase: &str) -> [u8; 32] {
 ///
 /// A client on the mainnet passphrase is refused before a key is generated
 /// and before any request: a mainnet challenge is signed only through
-/// [`prepare_ephemeral_auth`] and [`complete_ephemeral_auth_authorized`].
+/// [`prepare_ephemeral_auth`] and `complete_ephemeral_auth_authorized`, which
+/// exists only in builds with the `mainnet-write` feature.
 ///
 /// # Steps
 ///
@@ -231,8 +236,9 @@ pub async fn auth_with_ephemeral_key(
 /// it, before any signature.
 ///
 /// Produced only by [`prepare_ephemeral_auth`] and consumed by
-/// [`complete_ephemeral_auth_authorized`], so one ephemeral key signs at most
-/// one challenge. It is neither `Clone` nor serializable. The network the
+/// `complete_ephemeral_auth_authorized`, which exists only in builds with the
+/// `mainnet-write` feature, so one ephemeral key signs at most one challenge.
+/// It is neither `Clone` nor serializable. In those builds the network the
 /// challenge was validated under is sealed inside: no getter exposes it and
 /// no caller can replace it, so the completion compares it with its own
 /// client's network.
@@ -251,6 +257,7 @@ pub struct PreparedEphemeralAuth {
     /// passphrase it was validated under.
     content_digest: [u8; 32],
     /// SHA-256 of the passphrase the challenge was validated under.
+    #[cfg(feature = "mainnet-write")]
     validated_network_id: [u8; 32],
 }
 
@@ -321,9 +328,10 @@ enum ClientAccount {
 /// was verified, so it is the validated network the prepared value seals.
 ///
 /// The prepare step signs nothing and refuses no network.
-/// [`complete_ephemeral_auth_authorized`] signs the prepared challenge once
-/// a mainnet authorization of [`PreparedEphemeralAuth::message_facts`] has
-/// been consumed. `web_auth_domain` is typically
+/// `complete_ephemeral_auth_authorized`, which exists only in builds with the
+/// `mainnet-write` feature, signs the prepared challenge once a mainnet
+/// authorization of [`PreparedEphemeralAuth::message_facts`] has been
+/// consumed. `web_auth_domain` is typically
 /// [`web_auth_domain_for_endpoint`] of the endpoint.
 ///
 /// # Errors
@@ -393,6 +401,7 @@ async fn prepare_body(
         web_auth_endpoint: web_auth_endpoint.to_owned(),
         home_domain: home_domain.to_owned(),
         content_digest,
+        #[cfg(feature = "mainnet-write")]
         validated_network_id: network_id(client.network_passphrase()),
     })
 }
@@ -444,8 +453,8 @@ async fn complete_ephemeral_auth(
 /// returns [`Sep10Error::MainnetAuthorizationRefused`], which names none.
 ///
 /// The Message authorization is consumed before the SEP-10 signature.
-/// Without the `mainnet-write` feature of `stellar-agent-network` no
-/// [`MessageUseReceipt`] exists, so this function cannot be called.
+///
+/// Exists only in builds with the `mainnet-write` feature.
 ///
 /// # Errors
 ///
@@ -459,6 +468,7 @@ async fn complete_ephemeral_auth(
 ///   twenty signatures.
 /// - The HTTP, JWT and [`Sep10Error::SessionAccountMismatch`] errors of the
 ///   submission.
+#[cfg(feature = "mainnet-write")]
 pub async fn complete_ephemeral_auth_authorized(
     client: &Sep10Client,
     prepared: PreparedEphemeralAuth,
@@ -512,6 +522,7 @@ pub async fn complete_ephemeral_auth_authorized(
 }
 
 /// Whether `signature` is a valid ed25519 signature of `payload` under `key`.
+#[cfg(feature = "mainnet-write")]
 fn signature_verifies(key: &[u8; 32], payload: &[u8; 32], signature: &[u8; 64]) -> bool {
     ed25519_dalek::VerifyingKey::from_bytes(key).is_ok_and(|key| {
         key.verify_strict(payload, &ed25519_dalek::Signature::from_bytes(signature))
@@ -565,7 +576,7 @@ async fn submit_and_check_session(
 // Signing observation hooks
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
 thread_local! {
     /// The receipt ids the authorized completion signed under on this
     /// thread, each recorded immediately before its signature.
@@ -581,7 +592,7 @@ thread_local! {
 ///
 /// Each id is recorded immediately before the signature, after every check
 /// of the challenge against its receipt passed.
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
 #[doc(hidden)]
 pub fn take_authorized_signings_for_test() -> Vec<AuthorizationId> {
     AUTHORIZED_SIGNINGS.with(std::cell::RefCell::take)
@@ -589,20 +600,20 @@ pub fn take_authorized_signings_for_test() -> Vec<AuthorizationId> {
 
 /// Makes the next authorized signature on this thread fail its verification,
 /// so the completion refuses after signing and before the submission.
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
 #[doc(hidden)]
 pub fn corrupt_next_signature_for_test() {
     CORRUPT_NEXT_SIGNATURE.with(|flag| flag.set(true));
 }
 
 /// Reads and clears the corruption flag.
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
 fn take_corruption_request() -> bool {
     CORRUPT_NEXT_SIGNATURE.with(|flag| flag.replace(false))
 }
 
 /// `signature` with bit 0 of byte 0 flipped when a corruption was requested.
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
 fn corrupt_if_requested(mut signature: [u8; 64]) -> [u8; 64] {
     if take_corruption_request() {
         signature[0] ^= 1;
@@ -1535,8 +1546,8 @@ mod tests {
     }
 
     /// The prepare step seals the payload hash of the served challenge under
-    /// the client's passphrase, the validated network, the domains and server
-    /// key, and the key of the requested account, without signing.
+    /// the client's passphrase, the domains and server key, and the key of
+    /// the requested account, without signing.
     #[tokio::test]
     async fn prepare_seals_the_challenge_under_the_client_network() {
         let mut digests = Vec::new();
@@ -1565,11 +1576,6 @@ mod tests {
                 independent_payload_hash(&envelope, passphrase),
                 "{passphrase}"
             );
-            {
-                use sha2::{Digest, Sha256};
-                let expected: [u8; 32] = Sha256::digest(passphrase.as_bytes()).into();
-                assert_eq!(prepared.validated_network_id, expected, "{passphrase}");
-            }
             assert_eq!(
                 prepared.ephemeral_public_key(),
                 stellar_strkey::ed25519::PublicKey::from_string(&account)
@@ -1589,6 +1595,30 @@ mod tests {
             double.server.verify().await;
         }
         assert_ne!(digests[0], digests[1]);
+    }
+
+    /// The prepare step seals the network the challenge was validated under:
+    /// the SHA-256 of the client's passphrase.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    async fn prepare_seals_the_validated_network() {
+        use sha2::{Digest, Sha256};
+        for passphrase in [MAINNET, TESTNET] {
+            let double = Sep10Double::start(passphrase, None, 1, 0).await;
+            let client = crate::client::Sep10Client::new_for_unit_test(passphrase).unwrap();
+            let prepared = super::prepare_ephemeral_auth(
+                &client,
+                &double.endpoint(),
+                PREPARE_HOME_DOMAIN,
+                &strkey(server_key().verifying_key().to_bytes()),
+                PREPARE_WEB_AUTH_DOMAIN,
+            )
+            .await
+            .unwrap();
+            let expected: [u8; 32] = Sha256::digest(passphrase.as_bytes()).into();
+            assert_eq!(prepared.validated_network_id, expected, "{passphrase}");
+            double.server.verify().await;
+        }
     }
 
     /// A challenge for another account refuses at the prepare step, before
@@ -1725,6 +1755,7 @@ mod tests {
 
     /// The verification helper accepts the signature of the payload under
     /// the key and refuses one flipped bit.
+    #[cfg(feature = "mainnet-write")]
     #[test]
     fn the_signature_verification_refuses_a_flipped_bit() {
         use ed25519_dalek::Signer as _;
@@ -1739,6 +1770,7 @@ mod tests {
 
     /// The corruption flag is consumed by the first read, and the signing
     /// observation starts empty.
+    #[cfg(feature = "mainnet-write")]
     #[test]
     fn the_test_hooks_hold_one_request_and_start_empty() {
         assert!(super::take_authorized_signings_for_test().is_empty());
@@ -1788,6 +1820,7 @@ mod tests {
 
     /// The content digest is the payload hash under the given passphrase,
     /// and the attached signature is a signature of it by the key.
+    #[cfg(feature = "mainnet-write")]
     #[test]
     fn the_signed_hash_is_the_content_digest() {
         use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope};

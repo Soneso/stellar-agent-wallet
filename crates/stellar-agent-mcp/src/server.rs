@@ -714,8 +714,9 @@ pub struct WalletServer {
     /// stellar.toml over HTTPS. Set via
     /// [`WalletServer::set_x402_identity_transport_for_test`].
     ///
-    /// Gated on `test-helpers` feature or `#[cfg(test)]`.
-    #[cfg(any(test, feature = "test-helpers"))]
+    /// Gated on the `mainnet-write` feature and on the `test-helpers` feature
+    /// or `#[cfg(test)]`.
+    #[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
     pub(crate) x402_identity_transport_override: Option<X402IdentityTransport>,
 }
 
@@ -723,7 +724,7 @@ pub struct WalletServer {
 ///
 /// It holds transport configuration and no authority: the prepare step, the
 /// message authorization and the signature run unchanged under it.
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
 #[derive(Clone)]
 pub(crate) struct X402IdentityTransport {
     /// The base URL the stellar.toml is fetched from.
@@ -918,7 +919,7 @@ impl WalletServer {
             toolsets_root_override: None,
             #[cfg(any(test, feature = "test-helpers"))]
             x402_identity_session_override: None,
-            #[cfg(any(test, feature = "test-helpers"))]
+            #[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
             x402_identity_transport_override: None,
         })
     }
@@ -1229,7 +1230,9 @@ impl WalletServer {
     /// stellar.toml at `toml_base_url` over `http`, and the SEP-10 requests
     /// to `web_auth_override` after the same-domain bind.
     ///
-    /// Gated on `test-helpers` feature or `#[cfg(test)]`.
+    /// Gated on the `mainnet-write` feature and on the `test-helpers` feature
+    /// or `#[cfg(test)]`.
+    #[cfg(feature = "mainnet-write")]
     #[doc(hidden)]
     pub fn set_x402_identity_transport_for_test(
         &mut self,

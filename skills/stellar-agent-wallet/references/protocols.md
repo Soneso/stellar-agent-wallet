@@ -68,10 +68,10 @@ Ordinary ephemeral authentication refuses a mainnet passphrase before key genera
 - `prepare_ephemeral_auth` generates the ephemeral key, fetches and validates the challenge, and seals its digest and validated network before authorization. It does not sign.
 - `web_auth_domain_for_endpoint` derives the web-auth domain from the endpoint's host.
 - In the authorized flow, the challenge must name the ephemeral account before message authorization and again before signing.
-- `complete_ephemeral_auth_authorized` consumes the prepared challenge and checks it against the message-use receipt before signing and submitting it. `sep10.mainnet_authorization_refused` reports that this completion refused before submitting a signed challenge.
+- `complete_ephemeral_auth_authorized` consumes the prepared challenge and checks it against the message-use receipt before signing and submitting it. It exists only in builds with the `mainnet-write` feature. `sep10.mainnet_authorization_refused` reports that this completion refused before submitting a signed challenge.
 - The identity gate's ordinary entries, `resolve_and_verify_counterparty` and its `test-helpers` transport seam, refuse mainnet before fetching `stellar.toml` with `identity.mainnet_signing_forbidden`.
 - `resolve_and_verify_counterparty_authorized` takes `MainnetIdentityInputs` and returns `MainnetCounterpartySession`. Its `into_parts` method transfers the session and receipt to the payment caller. `identity.mainnet_authorization_refused` reports that the bound identity authentication refused before submitting a signed challenge.
-- Without `mainnet-write`, the context and receipt inputs needed by the authorized flow cannot be constructed.
+- The authorized gate, `MainnetIdentityInputs`, and `MainnetCounterpartySession` exist only in builds with the `mainnet-write` feature.
 
 ## SEP-6 and SEP-24: anchor deposit/withdraw
 

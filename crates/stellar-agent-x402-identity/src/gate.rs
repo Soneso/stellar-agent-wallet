@@ -56,12 +56,13 @@
 //! # Mainnet
 //!
 //! The entries above refuse the mainnet passphrase before any request. On
-//! mainnet, [`resolve_and_verify_counterparty_authorized`] runs the same
+//! mainnet, `resolve_and_verify_counterparty_authorized` runs the same
 //! resolution and bind, then signs the challenge only under a consumed
 //! message authorization: it prepares the ephemeral authentication, resolves
 //! and consumes the message authorization over the caller's proofs, and
 //! completes the authentication against the consumed authorization's
-//! receipt, which it returns with the session.
+//! receipt, which it returns with the session. The authorized gate exists
+//! only in builds with the `mainnet-write` feature.
 //!
 //! # Abort-before-payment contract
 //!
@@ -74,28 +75,38 @@
 use tracing::{debug, warn};
 use url::Url;
 
+#[cfg(feature = "mainnet-write")]
 use stellar_agent_core::approval::witness::ApprovalWitness;
 use stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL;
+#[cfg(feature = "mainnet-write")]
 use stellar_agent_core::mainnet::enablement::EnablementRecord;
+#[cfg(feature = "mainnet-write")]
 use stellar_agent_core::mainnet::verified_policy::VerifiedPolicy;
 use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+#[cfg(feature = "mainnet-write")]
 use stellar_agent_network::MainnetWriteContext;
 use stellar_agent_network::counterparty::{
     CounterpartyError, fetch::fetch_stellar_toml, parser::parse_minimal_sep1,
     validation::is_valid_ldh_home_domain,
 };
+#[cfg(feature = "mainnet-write")]
 use stellar_agent_network::mainnet::audit_readiness::AuditReadiness;
+#[cfg(feature = "mainnet-write")]
 use stellar_agent_network::mainnet::message::MessageUseReceipt;
+#[cfg(feature = "mainnet-write")]
 use stellar_agent_network::mainnet::resolve::{
     MessageSignRequest, SorobanIntent, consume_message_sign, resolve_message_sign,
 };
+#[cfg(feature = "mainnet-write")]
 use stellar_agent_network::mainnet::{MainnetAuthorizationError, MainnetConsumer};
+#[cfg(feature = "mainnet-write")]
 use stellar_agent_network::policy_state::PersistedWindowStore;
 use stellar_agent_network::quote_server_text;
+#[cfg(feature = "mainnet-write")]
 use stellar_agent_sep10::client::web_auth_domain_for_endpoint;
-use stellar_agent_sep10::ephemeral::{
-    auth_with_ephemeral_key, complete_ephemeral_auth_authorized, prepare_ephemeral_auth,
-};
+use stellar_agent_sep10::ephemeral::auth_with_ephemeral_key;
+#[cfg(feature = "mainnet-write")]
+use stellar_agent_sep10::ephemeral::{complete_ephemeral_auth_authorized, prepare_ephemeral_auth};
 use stellar_agent_sep10::{Sep10Client, Sep10Error};
 
 use crate::error::{IdentityError, authority_hint};
@@ -265,7 +276,8 @@ fn redact_jwt_for_debug(jwt: &str) -> String {
 ///   failed (server signature mismatch, HTTP error, JWT parse failure, etc.).
 /// - [`IdentityError::MainnetSigningForbidden`]: `network_passphrase` is the
 ///   mainnet passphrase; nothing is fetched. A mainnet counterparty is
-///   verified through [`resolve_and_verify_counterparty_authorized`].
+///   verified through `resolve_and_verify_counterparty_authorized`, which
+///   exists only in builds with the `mainnet-write` feature.
 ///
 /// # Panics
 ///
@@ -643,6 +655,7 @@ fn sep10_client(
 /// The approval is the operator's approval of the authenticated payment
 /// `intent` for the gate's home domain; one approval covers the message and
 /// the payment.
+#[cfg(feature = "mainnet-write")]
 pub struct MainnetIdentityInputs<'a> {
     /// The mainnet write context; its passphrase is the SEP-10 network.
     pub context: &'a MainnetWriteContext,
@@ -660,6 +673,7 @@ pub struct MainnetIdentityInputs<'a> {
     pub store: &'a PersistedWindowStore,
 }
 
+#[cfg(feature = "mainnet-write")]
 impl std::fmt::Debug for MainnetIdentityInputs<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MainnetIdentityInputs")
@@ -673,11 +687,13 @@ impl std::fmt::Debug for MainnetIdentityInputs<'_> {
 ///
 /// The receipt is the parent the authenticated payment's intent continues;
 /// [`Self::into_parts`] hands it on.
+#[cfg(feature = "mainnet-write")]
 pub struct MainnetCounterpartySession {
     session: VerifiedCounterpartySession,
     receipt: MessageUseReceipt,
 }
 
+#[cfg(feature = "mainnet-write")]
 impl MainnetCounterpartySession {
     /// The verified session.
     #[must_use]
@@ -692,6 +708,7 @@ impl MainnetCounterpartySession {
     }
 }
 
+#[cfg(feature = "mainnet-write")]
 impl std::fmt::Debug for MainnetCounterpartySession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MainnetCounterpartySession")
@@ -730,10 +747,8 @@ impl std::fmt::Debug for MainnetCounterpartySession {
 /// at step 9 leaves the record `Used`: the approval is spent and the
 /// operator approves again.
 ///
-/// Without the `mainnet-write` feature of `stellar-agent-network` no
-/// [`MainnetWriteContext`] exists, so no [`MainnetIdentityInputs`] can be
-/// built and this function cannot be called. The entries that never sign on
-/// mainnet refuse a mainnet passphrase in every build.
+/// Exists only in builds with the `mainnet-write` feature. The entries that
+/// never sign on mainnet refuse a mainnet passphrase in every build.
 ///
 /// # Errors
 ///
@@ -749,6 +764,7 @@ impl std::fmt::Debug for MainnetCounterpartySession {
 /// # Panics
 ///
 /// Never panics.
+#[cfg(feature = "mainnet-write")]
 pub async fn resolve_and_verify_counterparty_authorized(
     home_domain: &str,
     inputs: MainnetIdentityInputs<'_>,
@@ -772,7 +788,7 @@ pub async fn resolve_and_verify_counterparty_authorized(
 /// # Panics
 ///
 /// Never panics.
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
 pub async fn resolve_and_verify_counterparty_authorized_at(
     home_domain: &str,
     toml_base_url: &str,
@@ -791,6 +807,7 @@ pub async fn resolve_and_verify_counterparty_authorized_at(
 }
 
 /// The authorized gate shared by the mainnet entry point and its test seam.
+#[cfg(feature = "mainnet-write")]
 async fn run_authorized_gate(
     home_domain: &str,
     http: Option<&reqwest::Client>,
@@ -911,6 +928,7 @@ fn sep10_identity_error(
 /// already logged where it was refused, is the generic refusal, which names
 /// none; a policy denial, which the message resolver never returns, is
 /// refused the same way.
+#[cfg(feature = "mainnet-write")]
 fn authorization_identity_error(error: &MainnetAuthorizationError) -> IdentityError {
     match error {
         MainnetAuthorizationError::FeatureDisabled => mainnet_signing_forbidden(),
@@ -1423,6 +1441,7 @@ mod tests {
     /// `FeatureDisabled` maps to the signing refusal; a refused precondition
     /// and a policy denial are the generic refusal, which names no
     /// precondition.
+    #[cfg(feature = "mainnet-write")]
     #[test]
     fn authorization_errors_map_to_the_identity_errors() {
         use stellar_agent_network::mainnet::MainnetPrecondition;

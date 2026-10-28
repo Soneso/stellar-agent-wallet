@@ -57,6 +57,12 @@ base64 = { workspace = true }
 reqwest = { workspace = true }
 
 [features]
+# Enables mainnet-write in core, network and sep10 and compiles the authorized gate.
+mainnet-write = [
+    "stellar-agent-core/mainnet-write",
+    "stellar-agent-network/mainnet-write",
+    "stellar-agent-sep10/mainnet-write",
+]
 # Exposes test-helper constructors for adversarial integration tests across crate
 # boundaries.  Never enable in production binaries. Propagates to the SEP-10
 # test-helper client constructor the gate test seam needs.

@@ -1696,6 +1696,7 @@ impl WalletServer {
     }
 
     /// Refreshes verified local state without reconciling through RPC.
+    #[cfg(feature = "mainnet-write")]
     pub(crate) async fn dispatch_preparation(
         &self,
         tool: &'static str,
@@ -2040,6 +2041,7 @@ pub(crate) enum GatedApprovalKind {
     /// Trustline changes.
     Trustline,
     /// Plain x402 payment intent.
+    #[cfg(feature = "mainnet-write")]
     X402,
 }
 
@@ -2053,6 +2055,7 @@ impl GatedApprovalKind {
             Self::Payment => ApprovedKind::Payment,
             Self::Claim => ApprovedKind::Claim,
             Self::Trustline => ApprovedKind::Trustline,
+            #[cfg(feature = "mainnet-write")]
             Self::X402 => ApprovedKind::X402Payment,
         };
         ApprovalExpectation { kind, subject }
@@ -4356,6 +4359,7 @@ pub(crate) mod tests {
         let holder = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned();
         let uid = process_uid_for_attestation().unwrap();
         match kind {
+            #[cfg(feature = "mainnet-write")]
             GatedApprovalKind::X402 => panic!("classic fixture requires a classic kind"),
             GatedApprovalKind::Payment => PendingApproval::new_payment_pending(
                 "AAAA".to_owned(),

@@ -29,6 +29,25 @@
 //! | [`session`] | [`Sep10Session`] JWT holder + claim accessors |
 //! | [`client`] | [`Sep10Client`] HTTP client |
 //! | [`ephemeral`] | per-request ephemeral-key signing flow |
+//!
+//! ## Feature `mainnet-write`
+//!
+//! `ephemeral::complete_ephemeral_auth_authorized`, the signature of a
+//! prepared mainnet challenge under a consumed message authorization, and its
+//! test hooks exist only in builds with the `mainnet-write` feature, which
+//! also enables it in `stellar-agent-core` and `stellar-agent-network`.
+#![cfg_attr(
+    not(feature = "mainnet-write"),
+    doc = "```compile_fail\nuse stellar_agent_sep10::ephemeral::complete_ephemeral_auth_authorized;\n```"
+)]
+#![cfg_attr(
+    not(feature = "mainnet-write"),
+    doc = "```compile_fail\nuse stellar_agent_sep10::ephemeral::take_authorized_signings_for_test;\n```"
+)]
+#![cfg_attr(
+    not(feature = "mainnet-write"),
+    doc = "```compile_fail\nuse stellar_agent_sep10::ephemeral::corrupt_next_signature_for_test;\n```"
+)]
 
 pub mod challenge;
 pub mod client;

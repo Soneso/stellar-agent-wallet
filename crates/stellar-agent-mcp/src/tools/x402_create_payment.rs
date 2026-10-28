@@ -269,7 +269,15 @@ impl WalletServer {
                 Ok(guard) => guard,
                 Err(result) => return Ok(result),
             };
+            #[cfg(feature = "mainnet-write")]
             return self.mainnet_x402_payment(args, guard).await;
+            // Without mainnet writes the server holds no write context, so no
+            // admission succeeds and the guard is never present here.
+            #[cfg(not(feature = "mainnet-write"))]
+            {
+                let _ = (args, guard);
+                return Ok(crate::tools::common::x402_mainnet_signing_forbidden_result());
+            }
         }
 
         // ── Decode and validate payment_required FIRST ────────────────────────
@@ -508,6 +516,7 @@ impl WalletServer {
     }
 }
 
+#[cfg(feature = "mainnet-write")]
 impl WalletServer {
     async fn mainnet_x402_payment(
         &self,
@@ -786,6 +795,7 @@ impl WalletServer {
 }
 
 /// The approval-required view of a mainnet preparation call.
+#[cfg(feature = "mainnet-write")]
 pub(super) struct ApprovalView<'a> {
     pub(super) entry: &'a stellar_agent_core::approval::PendingApproval,
     pub(super) profile: &'a str,
@@ -799,6 +809,7 @@ pub(super) struct ApprovalView<'a> {
 /// names the pending approval, as the classic preparation tools return it,
 /// plus the enabled endpoint host, the enrolled signer, and the approval
 /// instructions. It carries no payment payload.
+#[cfg(feature = "mainnet-write")]
 pub(super) fn approval_response(view: &ApprovalView<'_>) -> CallToolResult {
     let approval = json!({
         "approval_nonce": view.entry.approval_nonce,
@@ -826,6 +837,7 @@ pub(super) fn approval_response(view: &ApprovalView<'_>) -> CallToolResult {
 }
 
 /// Where the release of a built mainnet payment failed.
+#[cfg(feature = "mainnet-write")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReleaseFailure {
     /// The payload could not be encoded as the `PAYMENT-SIGNATURE` value.
@@ -839,6 +851,7 @@ pub(super) enum ReleaseFailure {
 
 /// What the handler does for a [`ReleaseFailure`]; it returns no payload in
 /// every case.
+#[cfg(feature = "mainnet-write")]
 #[derive(Debug)]
 pub(super) struct ReleaseDecision {
     /// The invalidation stage of the child authorization, or `None` when the
@@ -857,6 +870,7 @@ pub(super) struct ReleaseDecision {
 /// it at the payload release stage. After the child is consumed nothing is
 /// invalidated: the payment authorization is spent, and only the approval
 /// tombstone is missing.
+#[cfg(feature = "mainnet-write")]
 pub(super) fn release_decision(failure: ReleaseFailure) -> ReleaseDecision {
     use stellar_agent_network::mainnet::resolve::InvalidationStage;
     match failure {
@@ -878,6 +892,7 @@ pub(super) fn release_decision(failure: ReleaseFailure) -> ReleaseDecision {
     }
 }
 
+#[cfg(feature = "mainnet-write")]
 pub(super) fn require_terminal_consumption(
     result: Result<bool, stellar_agent_core::WalletError>,
 ) -> Result<(), stellar_agent_core::WalletError> {
@@ -894,6 +909,7 @@ pub(super) fn require_terminal_consumption(
 /// of the payment passed; the testnet paths keep the enrollment helper. Both
 /// mainnet x402 tools build their handle here, so the seed is read in one
 /// place for either payment.
+#[cfg(feature = "mainnet-write")]
 pub(super) fn x402_mainnet_signing_handle(
     signer: &stellar_agent_network::keyring::EnrolledSigner,
     payer: &str,
@@ -904,6 +920,7 @@ pub(super) fn x402_mainnet_signing_handle(
 
 /// Renders a mainnet payment failure under its own code, with a message that
 /// starts with "payment withheld" followed by `withheld`, which says where.
+#[cfg(feature = "mainnet-write")]
 pub(super) fn mainnet_x402_error(
     error: &stellar_agent_x402::X402Error,
     withheld: &str,
@@ -952,9 +969,11 @@ pub(super) enum X402Failure<'a> {
     /// header value.
     Encoding,
     /// The release consumption of the mainnet child authorization refused.
+    #[cfg(feature = "mainnet-write")]
     PayloadRelease,
     /// The mainnet pending approval could not be tombstoned after the child
     /// authorization was consumed.
+    #[cfg(feature = "mainnet-write")]
     TerminalApproval,
 }
 
@@ -975,9 +994,10 @@ pub(super) enum X402Failure<'a> {
 ///   never reached the RPC.
 /// - `encoding`: the built payload could not be encoded.
 /// - `payload_release`: the release consumption of the mainnet child
-///   authorization refused.
+///   authorization refused; only in builds with the `mainnet-write` feature.
 /// - `terminal_approval`: the mainnet pending approval could not be
-///   tombstoned after the child authorization was consumed.
+///   tombstoned after the child authorization was consumed; only in builds
+///   with the `mainnet-write` feature.
 pub(super) fn x402_withheld_stage(
     gate_passed: bool,
     failure: X402Failure<'_>,
@@ -991,7 +1011,9 @@ pub(super) fn x402_withheld_stage(
         }
         X402Failure::CreatePayment(_) => "response_processing",
         X402Failure::Encoding => "encoding",
+        #[cfg(feature = "mainnet-write")]
         X402Failure::PayloadRelease => "payload_release",
+        #[cfg(feature = "mainnet-write")]
         X402Failure::TerminalApproval => "terminal_approval",
     })
 }
@@ -1047,6 +1069,7 @@ impl<'a> X402AuthorizationAudit<'a> {
         }
     }
 
+    #[cfg(feature = "mainnet-write")]
     pub(super) fn with_decision(mut self, decision: PolicyDecision) -> Self {
         self.decision = decision;
         self
@@ -1406,6 +1429,7 @@ mod tests {
 
     // ── x402_withheld_stage: one test per arm ──────────────────────────────────
 
+    #[cfg(feature = "mainnet-write")]
     #[test]
     fn withheld_stage_is_none_before_the_gate_returned_ok() {
         use stellar_agent_x402::X402Error;
@@ -1435,6 +1459,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "mainnet-write")]
     #[test]
     fn withheld_stage_pins_every_failure_to_its_stage() {
         use stellar_agent_x402::X402Error;
@@ -1462,6 +1487,7 @@ mod tests {
     /// Before the child authorization is consumed the handler invalidates it
     /// at the payload release stage; after it is consumed nothing is
     /// invalidated. Every failure withholds the payload under its own stage.
+    #[cfg(feature = "mainnet-write")]
     #[test]
     fn mainnet_release_failures_select_cleanup_and_withheld_stage() {
         use stellar_agent_network::mainnet::resolve::InvalidationStage;
@@ -1535,6 +1561,7 @@ mod tests {
     /// the signed re-simulation request, is withheld at `response_processing`
     /// under its own code, with a message that names the withholding after
     /// intent authorization.
+    #[cfg(feature = "mainnet-write")]
     #[test]
     fn withheld_stage_names_a_refused_intent_consumption_response_processing() {
         use stellar_agent_network::mainnet::{MainnetAuthorizationError, MainnetPrecondition};
@@ -1859,6 +1886,7 @@ mod tests {
             "no payment signature may be produced on a policy denial; got: {text}"
         );
     }
+    #[cfg(feature = "mainnet-write")]
     #[test]
     fn mainnet_terminal_consumption_requires_a_present_record() {
         assert!(require_terminal_consumption(Ok(true)).is_ok());
@@ -2386,6 +2414,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mainnet-write")]
     #[test]
     fn mainnet_error_keeps_the_withholding_stage_and_redacts_policy_values() {
         let address = stellar_strkey::ed25519::PublicKey([9; 32])
