@@ -223,6 +223,14 @@ the default when this variable is unset. See [security-internals.md's headless
 keyring section](maintainers/security-internals.md#headless-keyring-store)
 for the trust model and protection-mode details before enabling it.
 
+The headless backends serve testnet. Mainnet needs the platform keyring:
+mainnet readiness and `profile enable-mainnet` refuse a process with
+`STELLAR_AGENT_KEYRING_BACKEND` set, with
+`network.mainnet_keyring_backend_unsupported`. The headless store keeps every
+entry, the audit log's tip anchor among them, in one file with no freshness
+witness, so an older copy of that file restored beside a truncated audit log
+agrees with it.
+
 ### Generate a headless keyring key
 
 Generate the key once and store it in your secret manager. Reuse it for every

@@ -10,9 +10,7 @@
 //! Every symmetric-key loader refuses a coordinate in the owner namespace
 //! before any keyring read ([`refuse_owner_key_coordinate`]) and a loaded key
 //! equal to the profile's own owner public key
-//! ([`refuse_owner_public_key`]). Under `headless-dpapi` an owner entry still
-//! in the older form can be moved to another coordinate until a V1 verb or
-//! `enroll-owner-key` rewrites it.
+//! ([`refuse_owner_public_key`]).
 
 use std::path::Path;
 

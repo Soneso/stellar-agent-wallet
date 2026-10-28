@@ -10,8 +10,9 @@
 //!   created them, so an attestation blob minted by one user cannot be
 //!   replayed by another user on the same machine.
 //! - [`dpapi_protect`] / [`dpapi_unprotect`] wrap DPAPI CurrentUser-scope
-//!   protect/unprotect, consumed by `stellar-agent-headless-keyring`'s
-//!   `dpapi` protection mode. Both calls require access to the current user's
+//!   protect/unprotect, and [`dpapi_protect_with_entropy`] /
+//!   [`dpapi_unprotect_with_entropy`] add DPAPI's optional entropy, consumed
+//!   by `stellar-agent-headless-keyring`'s `dpapi` protection mode. Both calls require access to the current user's
 //!   DPAPI master key and pass `CRYPTPROTECT_UI_FORBIDDEN` to prevent UI prompts.
 //!   Key-authenticated SSH sessions can lack master-key access; an interactive
 //!   desktop logon may help. The wallet's `headless-env` backend avoids this
@@ -118,7 +119,7 @@ pub enum DpapiError {
 /// Returns [`DpapiError`] if the underlying `CryptProtectData` call fails.
 #[cfg(target_os = "windows")]
 pub fn dpapi_protect(plaintext: &[u8]) -> Result<Vec<u8>, DpapiError> {
-    dpapi::protect(plaintext)
+    dpapi::protect(plaintext, None)
 }
 
 /// Decrypts `ciphertext` previously produced by [`dpapi_protect`].
@@ -131,7 +132,40 @@ pub fn dpapi_protect(plaintext: &[u8]) -> Result<Vec<u8>, DpapiError> {
 /// unprotect rather than silently returning altered plaintext).
 #[cfg(target_os = "windows")]
 pub fn dpapi_unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, DpapiError> {
-    dpapi::unprotect(ciphertext)
+    dpapi::unprotect(ciphertext, None)
+}
+
+/// Encrypts `plaintext` as [`dpapi_protect`] does, with `entropy` as DPAPI's
+/// optional entropy.
+///
+/// The blob opens only through [`dpapi_unprotect_with_entropy`] with the same
+/// `entropy`, so a caller that passes what a value is stored under binds the
+/// blob to that place.
+///
+/// # Errors
+///
+/// Returns [`DpapiError`] if the underlying `CryptProtectData` call fails, or
+/// [`DpapiError::InputTooLarge`] when either input exceeds DPAPI's length
+/// field.
+#[cfg(target_os = "windows")]
+pub fn dpapi_protect_with_entropy(plaintext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, DpapiError> {
+    dpapi::protect(plaintext, Some(entropy))
+}
+
+/// Decrypts `ciphertext` produced by [`dpapi_protect_with_entropy`] with the
+/// same `entropy`.
+///
+/// # Errors
+///
+/// Returns [`DpapiError`] if the underlying `CryptUnprotectData` call fails,
+/// which includes an `entropy` other than the one the blob was sealed with and
+/// a blob sealed with no entropy.
+#[cfg(target_os = "windows")]
+pub fn dpapi_unprotect_with_entropy(
+    ciphertext: &[u8],
+    entropy: &[u8],
+) -> Result<Vec<u8>, DpapiError> {
+    dpapi::unprotect(ciphertext, Some(entropy))
 }
 
 /// Non-Windows stub; see [`current_user_sid_string`]'s stub doc for the
@@ -152,6 +186,32 @@ pub fn dpapi_protect(_plaintext: &[u8]) -> Result<Vec<u8>, DpapiError> {
 /// Always returns [`DpapiError::UnsupportedPlatform`] on non-Windows targets.
 #[cfg(not(target_os = "windows"))]
 pub fn dpapi_unprotect(_ciphertext: &[u8]) -> Result<Vec<u8>, DpapiError> {
+    Err(DpapiError::UnsupportedPlatform)
+}
+
+/// Non-Windows stub; see [`dpapi_protect`]'s stub doc for the rationale.
+///
+/// # Errors
+///
+/// Always returns [`DpapiError::UnsupportedPlatform`] on non-Windows targets.
+#[cfg(not(target_os = "windows"))]
+pub fn dpapi_protect_with_entropy(
+    _plaintext: &[u8],
+    _entropy: &[u8],
+) -> Result<Vec<u8>, DpapiError> {
+    Err(DpapiError::UnsupportedPlatform)
+}
+
+/// Non-Windows stub; see [`dpapi_protect`]'s stub doc for the rationale.
+///
+/// # Errors
+///
+/// Always returns [`DpapiError::UnsupportedPlatform`] on non-Windows targets.
+#[cfg(not(target_os = "windows"))]
+pub fn dpapi_unprotect_with_entropy(
+    _ciphertext: &[u8],
+    _entropy: &[u8],
+) -> Result<Vec<u8>, DpapiError> {
     Err(DpapiError::UnsupportedPlatform)
 }
 
@@ -310,7 +370,7 @@ mod windows {
 #[allow(unsafe_code)]
 mod dpapi {
     use std::ffi::c_void;
-    use std::ptr::null_mut;
+    use std::ptr::{null, null_mut};
 
     use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
     use windows_sys::Win32::Security::Cryptography::{
@@ -360,8 +420,25 @@ mod dpapi {
         unsafe { std::slice::from_raw_parts(blob.pbData, blob.cbData as usize) }.to_vec()
     }
 
-    pub(super) fn protect(plaintext: &[u8]) -> Result<Vec<u8>, DpapiError> {
-        let mut input = CRYPT_INTEGER_BLOB {
+    /// Borrows `bytes` as a DPAPI input blob.
+    ///
+    /// DPAPI does not mutate an input blob despite the non-const pointer in
+    /// its type; casting away const matches the documented Win32 contract.
+    fn input_blob(bytes: &[u8]) -> Result<CRYPT_INTEGER_BLOB, DpapiError> {
+        Ok(CRYPT_INTEGER_BLOB {
+            cbData: u32::try_from(bytes.len()).map_err(|_| DpapiError::InputTooLarge)?,
+            pbData: bytes.as_ptr().cast_mut(),
+        })
+    }
+
+    /// The optional-entropy pointer DPAPI takes: null for no entropy.
+    fn entropy_ptr(entropy: Option<&CRYPT_INTEGER_BLOB>) -> *const CRYPT_INTEGER_BLOB {
+        entropy.map_or(null(), std::ptr::from_ref)
+    }
+
+    pub(super) fn protect(plaintext: &[u8], entropy: Option<&[u8]>) -> Result<Vec<u8>, DpapiError> {
+        let entropy = entropy.map(input_blob).transpose()?;
+        let input = CRYPT_INTEGER_BLOB {
             cbData: u32::try_from(plaintext.len()).map_err(|_| DpapiError::InputTooLarge)?,
             // CryptProtectData does not mutate the input blob despite the
             // non-const pointer in its signature; casting away const here
@@ -371,15 +448,16 @@ mod dpapi {
         let mut out = OutBlob::default();
 
         // SAFETY: `input` points to `plaintext` for `plaintext.len()` bytes,
-        // live for the duration of the call. `out.0` is a valid out-pointer;
-        // DPAPI allocates its `pbData` via LocalAlloc on success, freed by
-        // `OutBlob::drop`. No optional entropy, no prompt struct (forbidden by
-        // the flag below), no description string.
+        // live for the duration of the call. The entropy pointer is null or
+        // points to `entropy`, a blob over the caller's entropy slice; both
+        // outlive the call. `out.0` is a valid out-pointer; DPAPI allocates
+        // its `pbData` via LocalAlloc on success, freed by `OutBlob::drop`. No
+        // prompt struct (forbidden by the flag below), no description string.
         let ok = unsafe {
             CryptProtectData(
-                &mut input,
+                &input,
                 null_mut(),
-                null_mut(),
+                entropy_ptr(entropy.as_ref()),
                 null_mut(),
                 null_mut(),
                 CRYPTPROTECT_UI_FORBIDDEN,
@@ -404,20 +482,25 @@ mod dpapi {
         Ok(unsafe { blob_to_vec(&out.0) })
     }
 
-    pub(super) fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, DpapiError> {
-        let mut input = CRYPT_INTEGER_BLOB {
+    pub(super) fn unprotect(
+        ciphertext: &[u8],
+        entropy: Option<&[u8]>,
+    ) -> Result<Vec<u8>, DpapiError> {
+        let entropy = entropy.map(input_blob).transpose()?;
+        let input = CRYPT_INTEGER_BLOB {
             cbData: u32::try_from(ciphertext.len()).map_err(|_| DpapiError::InputTooLarge)?,
             pbData: ciphertext.as_ptr().cast_mut(),
         };
         let mut out = OutBlob::default();
 
-        // SAFETY: same discipline as `protect` above; `ppszDataDescr` is
-        // null (the description string is not used by this wrapper).
+        // SAFETY: same discipline as `protect` above, the entropy pointer
+        // included; `ppszDataDescr` is null (the description string is not
+        // used by this wrapper).
         let ok = unsafe {
             CryptUnprotectData(
-                &mut input,
+                &input,
                 null_mut(),
-                null_mut(),
+                entropy_ptr(entropy.as_ref()),
                 null_mut(),
                 null_mut(),
                 CRYPTPROTECT_UI_FORBIDDEN,
@@ -527,6 +610,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
+    fn dpapi_entropy_binds_the_blob_to_its_entropy() {
+        let plaintext = b"entropy-binding fixture";
+        let bound = dpapi_protect_with_entropy(plaintext, b"service\0account")
+            .expect("CryptProtectData must succeed");
+        assert_eq!(
+            dpapi_unprotect_with_entropy(&bound, b"service\0account")
+                .expect("the same entropy opens the blob"),
+            plaintext
+        );
+        assert!(
+            dpapi_unprotect_with_entropy(&bound, b"service\0other").is_err(),
+            "another entropy must not open the blob"
+        );
+        assert!(
+            dpapi_unprotect(&bound).is_err(),
+            "no entropy must not open a blob sealed with entropy"
+        );
+        let unbound = dpapi_protect(plaintext).expect("CryptProtectData must succeed");
+        assert!(
+            dpapi_unprotect_with_entropy(&unbound, b"service\0account").is_err(),
+            "entropy must not open a blob sealed without it"
+        );
+    }
+
+    #[test]
     #[cfg(not(target_os = "windows"))]
     fn dpapi_functions_are_windows_only() {
         assert!(matches!(
@@ -535,6 +644,14 @@ mod tests {
         ));
         assert!(matches!(
             dpapi_unprotect(b"x"),
+            Err(DpapiError::UnsupportedPlatform)
+        ));
+        assert!(matches!(
+            dpapi_protect_with_entropy(b"x", b"e"),
+            Err(DpapiError::UnsupportedPlatform)
+        ));
+        assert!(matches!(
+            dpapi_unprotect_with_entropy(b"x", b"e"),
             Err(DpapiError::UnsupportedPlatform)
         ));
     }

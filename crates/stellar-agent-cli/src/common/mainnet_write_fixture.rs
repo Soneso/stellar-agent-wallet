@@ -5,9 +5,11 @@
 //! primary and oracle records name two hosts of their own, carries the
 //! profile through the enrollment ceremony with the public `profile`
 //! runners, and routes the two hosts to two mocked endpoints through the
-//! test route map of [`crate::common::mainnet_write`]. The keyring is the
-//! headless store, so the runners' own initialization and the verbs'
-//! initializer reach the same entries. The terminal check passes and the
+//! test route map of [`crate::common::mainnet_write`]. The keyring is a fresh
+//! in-memory mock store that every keyring initialization keeps, so the
+//! runners' own initialization and the verbs' initializer reach the same
+//! entries. It is not a headless store, so the mainnet keyring-backend check
+//! passes as it does on the platform keyring. The terminal check passes and the
 //! confirmation answers the profile name unless a test says otherwise.
 //!
 //! Every test that builds a fixture is `#[serial]`: the data root, the
@@ -25,7 +27,6 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use base64::Engine as _;
 use clap::Parser as _;
 use serde_json::Value;
 use sha2::Digest as _;
@@ -252,39 +253,24 @@ impl Spec {
     }
 }
 
-/// Selects the headless keyring store with a fixed key until dropped, and
-/// reinstalls the in-memory mock store afterwards so no later test reaches a
-/// store inside a removed home.
-struct HeadlessKeyringEnv;
+/// Installs a fresh in-memory mock store and makes every keyring
+/// initialization keep it until dropped, then reinstalls a fresh mock store
+/// so no later test reaches this fixture's entries.
+struct MockKeyringScope;
 
-impl HeadlessKeyringEnv {
-    #[allow(
-        unsafe_code,
-        reason = "test-only process environment mutation; serialised by #[serial]"
-    )]
+impl MockKeyringScope {
     fn set() -> Self {
-        let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x37_u8; 32]);
-        // SAFETY: every fixture test is #[serial]; no other thread reads the
-        // environment while it changes.
-        unsafe {
-            std::env::set_var(
-                stellar_agent_headless_keyring::BACKEND_ENV_VAR,
-                "headless-env",
-            );
-            std::env::set_var(stellar_agent_headless_keyring::ENV_KEY_VAR, key);
-        }
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        stellar_agent_network::keyring::KEEP_REGISTERED_STORE
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         Self
     }
 }
 
-impl Drop for HeadlessKeyringEnv {
-    #[allow(unsafe_code, reason = "test-only env cleanup")]
+impl Drop for MockKeyringScope {
     fn drop(&mut self) {
-        // SAFETY: same as `set`.
-        unsafe {
-            std::env::remove_var(stellar_agent_headless_keyring::BACKEND_ENV_VAR);
-            std::env::remove_var(stellar_agent_headless_keyring::ENV_KEY_VAR);
-        }
+        stellar_agent_network::keyring::KEEP_REGISTERED_STORE
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
     }
 }
@@ -307,7 +293,7 @@ pub(crate) struct MainnetFixture {
     tty_checks_at_start: u64,
     _routes: TestRoutesGuard,
     _owner: EnvSigner,
-    _keyring: HeadlessKeyringEnv,
+    _keyring: MockKeyringScope,
     _profile_var: ProfileEnvVarGuard,
     _home: StellarAgentHomeGuard,
     _dir: tempfile::TempDir,
@@ -326,7 +312,7 @@ impl MainnetFixture {
         let home = tempfile::tempdir().unwrap();
         let home_guard = StellarAgentHomeGuard::new(home.path());
         let profile_var = ProfileEnvVarGuard::cleared();
-        let keyring = HeadlessKeyringEnv::set();
+        let keyring = MockKeyringScope::set();
         let agent = EnvSigner::new(AGENT_SEED, AGENT_VAR);
         let owner = EnvSigner::new(OWNER_SEED, OWNER_VAR);
         let name = spec.name;
@@ -434,7 +420,7 @@ impl MainnetFixture {
         primary: MockServer,
         oracle: MockServer,
         routes: TestRoutesGuard,
-        keyring: HeadlessKeyringEnv,
+        keyring: MockKeyringScope,
         profile_var: ProfileEnvVarGuard,
         home_guard: StellarAgentHomeGuard,
         home: tempfile::TempDir,

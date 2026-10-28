@@ -89,6 +89,10 @@ use crate::common::profile_access::ProfileOrigin;
 ///   replaced. The registry runs that check on every keyed acquisition,
 ///   because cached writers stay live for the process lifetime and the file
 ///   can be replaced while they are open.
+/// - [`ValidationError::AuditTipAnchorMissing`], code
+///   `audit.tip_anchor_missing`, when no anchor is stored for a log that
+///   shows it was anchored before: a recorded audit binding, a chain-root
+///   sidecar, or an `audit_tip_anchored` row.
 /// - [`ValidationError::AuditLogBindingChanged`], code
 ///   `audit.log_binding_changed`, when the profile names a log path or audit
 ///   key other than the binding recorded in the keyring. The profile is
@@ -973,9 +977,40 @@ mod tests {
         );
     }
 
-    /// A log with no anchor is adopted on first use with no operator action —
-    /// the upgrade path for every profile that predates the anchor — and the
-    /// adoption is recorded in the log itself.
+    /// Appends one value row to `profile`'s log through a writer that holds
+    /// no anchor store: keyed when `key` is given, unkeyed otherwise.
+    fn seed_unanchored_log(profile: &Profile, key: Option<zeroize::Zeroizing<[u8; 32]>>) {
+        let path = profile.audit_log_path.clone();
+        let mut writer = match key {
+            Some(key) => {
+                stellar_agent_core::audit_log::AuditWriter::open_keyed_unanchored_for_test(
+                    path, key,
+                )
+            }
+            None => stellar_agent_core::audit_log::AuditWriter::open(path, None),
+        }
+        .expect("open unanchored writer");
+        writer
+            .write_entry(AuditEntry::new_value_action_submitted(
+                "stellar_pay",
+                "stellar:testnet",
+                Vec::new(),
+                "abcd1234…wxyz5678",
+                1,
+                stellar_agent_core::audit_log::PolicyDecision::Allow,
+                None,
+                None,
+                None,
+                "req-pre-anchor",
+                None,
+            ))
+            .expect("append");
+    }
+
+    /// A log only unkeyed writers wrote is adopted on its first keyed use with
+    /// no operator action, and the adoption is recorded in the log itself.
+    /// Nothing shows such a log was anchored: no binding, no chain-root
+    /// sidecar, no `audit_tip_anchored` row.
     #[test]
     #[serial]
     fn require_value_audit_writer_adopts_an_existing_unanchored_log() {
@@ -983,34 +1018,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = keyed_profile("anchor-adopt", dir.path());
-
-        // A log written before the anchor existed: rows present, no anchor.
-        {
-            let key =
-                crate::commands::profile::audit_emit::load_audit_hmac_key(&profile, "test-profile")
-                    .expect("load key");
-            let mut writer =
-                stellar_agent_core::audit_log::AuditWriter::open_keyed_unanchored_for_test(
-                    profile.audit_log_path.clone(),
-                    key,
-                )
-                .expect("open unanchored writer");
-            writer
-                .write_entry(AuditEntry::new_value_action_submitted(
-                    "stellar_pay",
-                    "stellar:testnet",
-                    Vec::new(),
-                    "abcd1234…wxyz5678",
-                    1,
-                    stellar_agent_core::audit_log::PolicyDecision::Allow,
-                    None,
-                    None,
-                    None,
-                    "req-pre-anchor",
-                    None,
-                ))
-                .expect("append");
-        }
+        seed_unanchored_log(&profile, None);
 
         require_value_audit_writer(&profile, "anchor-adopt")
             .expect("adoption must need no operator action");
@@ -1024,6 +1032,36 @@ mod tests {
             .filter(|row| row["kind"] == "audit_tip_anchored" && row["reason"] == "adopted")
             .count();
         assert_eq!(adopted, 1, "adoption must leave exactly one row in the log");
+    }
+
+    /// A log a keyed writer signed carries a chain-root sidecar, which shows a
+    /// keyed writer ran there. With no anchor stored the pre-flight refuses
+    /// with `audit.tip_anchor_missing` and adopts nothing.
+    #[test]
+    #[serial]
+    fn require_value_audit_writer_refuses_a_signed_log_without_an_anchor() {
+        keyring_mock::install().expect("mock keyring store");
+
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = keyed_profile("anchor-signed-missing", dir.path());
+        let key =
+            crate::commands::profile::audit_emit::load_audit_hmac_key(&profile, "test-profile")
+                .expect("load key");
+        seed_unanchored_log(&profile, Some(key));
+        let before = std::fs::read(&profile.audit_log_path).expect("read log");
+
+        let err = require_value_audit_writer(&profile, "anchor-signed-missing")
+            .expect_err("a signed log without an anchor must refuse");
+        assert_eq!(err.code(), "audit.tip_anchor_missing", "{err}");
+        assert!(
+            err.to_string().contains("chain-root sidecar"),
+            "the refusal names its evidence: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&profile.audit_log_path).expect("read log"),
+            before,
+            "the refusal writes no row"
+        );
     }
 
     // ── Audit binding ────────────────────────────────────────────────────────
@@ -1155,6 +1193,40 @@ mod tests {
         )
         .expect_err("an unminted key refuses");
         assert_eq!(err.code(), "audit.chain_key_unavailable", "{err}");
+    }
+
+    /// An undecodable stored audit key refuses with
+    /// `audit.chain_key_unavailable`, and the message sends that case to
+    /// investigation and removal of the corrupt entry, since
+    /// `rotate-audit-key` refuses a key it cannot decode.
+    #[test]
+    #[serial]
+    fn an_undecodable_audit_key_names_investigation_before_minting() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let name = "undecodable-audit-key";
+        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let coord = &profile.audit_log_hash_chain_key_id;
+        keyring_core::Entry::new(&coord.service, &coord.account)
+            .expect("audit-key entry")
+            .set_password("not base64!")
+            .expect("store an undecodable key");
+        let Err(err) = require_value_audit_writer(&profile, name) else {
+            panic!("an undecodable audit key must refuse");
+        };
+        assert_eq!(err.code(), "audit.chain_key_unavailable", "{err}");
+        assert_eq!(
+            err.message(),
+            format!(
+                "profile '{name}' has no usable audit chain-root key; the command refuses to \
+                 proceed unaudited. A profile without one mints it with `stellar-agent profile \
+                 rotate-audit-key {name}`. A stored key that cannot be read or decoded is \
+                 refused by that command too: investigate, and if the stored key is corrupt, \
+                 remove its keyring entry with the platform keyring tool before minting a new \
+                 one"
+            )
+        );
     }
 
     /// The best-effort acquisition returns a binding refusal rather than
@@ -1329,6 +1401,7 @@ mod tests {
             anchored_path.clone(),
             None,
             Arc::new(InMemoryTipAnchorStore::new()) as Arc<dyn TipAnchorStore>,
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
         .unwrap();
         anchored.write_entry(row()).unwrap();

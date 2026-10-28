@@ -1373,6 +1373,7 @@ mod tests {
             path.clone(),
             None,
             Arc::new(MemAnchor::default()) as Arc<dyn TipAnchorStore>,
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
         .unwrap();
         writer

@@ -538,8 +538,9 @@ impl<'a> WalletSubmissionRecorder<'a> {
     /// Maps an audit-writer failure on the pending-row path to the refusal the
     /// caller reports.
     ///
-    /// A tip-anchor mismatch keeps its own code, because only `audit reanchor`
-    /// addresses it. Every other failure is `submission.record_unavailable`:
+    /// A tip-anchor mismatch and a missing anchor the log shows was written
+    /// keep their own codes, because only `audit reanchor` addresses them.
+    /// Every other failure is `submission.record_unavailable`:
     /// `context` names the step, and the writer error's text follows it with
     /// its `audit.*` sub-code where it has one, `audit.tip_anchor_unavailable`
     /// for an anchor that cannot be written.
@@ -549,6 +550,12 @@ impl<'a> WalletSubmissionRecorder<'a> {
                 WalletError::Validation(ValidationError::AuditTipAnchorMismatch {
                     profile: self.profile_name.clone(),
                     reason: reason.to_owned(),
+                })
+            }
+            WriterError::TipAnchorMissing { evidence, .. } => {
+                WalletError::Validation(ValidationError::AuditTipAnchorMissing {
+                    profile: self.profile_name.clone(),
+                    evidence: evidence.describe().to_owned(),
                 })
             }
             other => record_unavailable(format!("{context}: {other}")),

@@ -3,7 +3,9 @@
 //! Refusals use `profile.enable_mainnet_profile_flag_required`,
 //! `profile.enable_mainnet_default_refused`, `profile.enable_mainnet_not_mainnet`,
 //! `profile.enable_mainnet_precondition`, and `profile.enable_mainnet_nonce_exists`,
-//! and strict audit errors retain their own codes. `--check` reports every
+//! and strict audit errors retain their own codes. A process on a headless
+//! keyring backend is refused with `network.mainnet_keyring_backend_unsupported`
+//! in both modes, before any keyring entry is read. `--check` reports every
 //! check as `passed`, `failed`, or `not_evaluated` and writes nothing.
 
 use super::sign_policy::atomic_write_string;
@@ -212,6 +214,8 @@ fn execute(
     if !profile.chain_id.is_mainnet() {
         return Err(("profile.enable_mainnet_not_mainnet", "chain_id".into()));
     }
+    stellar_agent_network::mainnet::audit_readiness::refuse_headless_keyring_backend()
+        .map_err(|e| (e.code(), e.to_string()))?;
     let mut checks = Vec::new();
     let mut record = |item: &str, result: Result<(), String>| {
         checks.push(Check {
@@ -1181,6 +1185,35 @@ mod tests {
         assert_eq!(std::fs::read(fixture.path()).unwrap(), before);
         assert!(get(&coordinate).is_none());
     }
+    /// A process on the headless keyring store is refused with the backend
+    /// named, in both modes, and nothing is written.
+    #[test]
+    #[serial]
+    fn a_headless_keyring_backend_refuses_enable_mainnet() {
+        for check in [false, true] {
+            let mut fixture = Fixture::new();
+            fixture.args.check = check;
+            let listing = fixture.listing();
+            keyring_core::set_default_store(std::sync::Arc::new(
+                stellar_agent_headless_keyring::store::HeadlessStore::new(
+                    fixture.dir.path().join("headless").join("store.keyring"),
+                    stellar_agent_headless_keyring::crypto::ProtectionMode::EnvKey(
+                        std::sync::Arc::new(zeroize::Zeroizing::new([0x42; 32])),
+                    ),
+                ),
+            ));
+            let result = fixture.run();
+            keyring_mock::install().unwrap();
+            let (code, detail) = result.expect_err("a headless backend must refuse");
+            assert_eq!(
+                code, "network.mainnet_keyring_backend_unsupported",
+                "{detail}"
+            );
+            assert!(detail.contains("headless-env"), "{detail}");
+            assert_eq!(fixture.listing(), listing, "the refusal writes nothing");
+        }
+    }
+
     #[test]
     #[serial]
     fn ceremony_preconditions_refuse_before_effects() {

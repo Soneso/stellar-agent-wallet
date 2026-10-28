@@ -374,6 +374,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   check, such as an unknown key, gets no signing hint.
 - The V1 policy loader refuses a policy file without a `[signature]` table with
   a message that names `stellar-agent profile sign-policy` with the profile.
+- New wire code `audit.tip_anchor_missing`. A keyed audit writer refuses a log
+  whose tip anchor is absent while a recorded audit binding, a chain-root
+  sidecar, or an `audit_tip_anchored` row shows one was written, and writes
+  neither an anchor nor a row. `audit verify --profile` fails on the profile's
+  own log under the same conditions, with a message that says `anchor: missing`.
+  For an empty active file, only the sidecar counts as evidence. Profile
+  verification checks the chain and HMAC sidecars first unless the missing-anchor
+  rule applies after an unkeyed chain walk. After investigation,
+  `audit reanchor --acknowledge-rollback` accepts an intact prefix and writes its
+  `rollback_acknowledged` row. It refuses a broken chain. A log a keyed writer signed without an anchor
+  store carries a chain-root sidecar and needs that repair once. A log written
+  only by unkeyed writers adopts on its first key.
+- A keyed audit use records an absent audit binding only after the audit key
+  has loaded. `profile rotate-audit-key` minting a profile's first key records
+  it after its writer opens.
+- With a changed or unreadable audit binding, `audit reanchor` treats an absent
+  anchor whose log shows prior anchoring, through a chain-root sidecar or an
+  `audit_tip_anchored` row, as disagreeing, and needs both
+  `--acknowledge-binding-change` and `--acknowledge-rollback`. Under the writer
+  lock it reads those rows from the active file.
+- `profile rotate-audit-key` mints a key only where no audit key entry exists.
+  A stored key it cannot read or decode refuses before anything is written, and
+  the message gives the remedy: investigate, and if the key is corrupt, remove
+  its keyring entry with the platform keyring tool, rotate to mint a new key,
+  and run `audit reanchor --acknowledge-rollback` if the log's anchor is gone.
+  The `audit.chain_key_unavailable` message names minting for a missing key
+  only.
+- New wire code `network.mainnet_keyring_backend_unsupported`. Mainnet
+  readiness and `profile enable-mainnet`, in both modes, refuse a process whose
+  keyring backend is `headless-env` or `headless-dpapi` before any keyring entry
+  is read. Testnet use of the headless backends is unchanged.
+- `AuditWriter::open_with_tip_anchor` takes a fourth argument,
+  `BindingHistory`, which says whether the profile's audit binding was recorded
+  before the call. `WriterError` gains `TipAnchorMissing`; it is exhaustive, so
+  downstream exhaustive matches must add the arm. `VerifyError` and
+  `ValidationError` gain `TipAnchorMissing` and `AuditTipAnchorMissing`, and
+  `NetworkError` gains `MainnetKeyringBackendUnsupported`.
+  `AuditWriter::stored_anchor_disagrees` takes the `BindingHistory`, and an
+  absent anchor disagrees when `PriorAnchoring` finds evidence.
+  `stellar_agent_core::audit_log` exposes `BindingHistory`, `PriorAnchoring`,
+  and `check_missing_anchor`; `KeyedAuditAccess` gains `with_binding_history`
+  and `binding_history`. `stellar_agent_network::keyring::check_audit_binding`
+  returns the `BindingHistory`, and the module exposes `KeyringBackend` and
+  `active_keyring_backend`. `stellar_agent_network::mainnet::audit_readiness`
+  exposes `refuse_headless_keyring_backend`.
+  `stellar_agent_headless_keyring` exposes `registered_backend` and
+  `HeadlessStore::backend_label`. `stellar_agent_windows_identity` exposes
+  `dpapi_protect_with_entropy` and `dpapi_unprotect_with_entropy`.
 
 ### Removed
 
@@ -575,6 +623,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counts from the shared context-rule decoder. A rule with misaligned or
   malformed signer or policy lists fails with `sa.deployment_failed`, and a
   listing names the rule id. Thanks to @huong8373tt-beep.
+- A truncated audit log whose tip-anchor keyring entry was deleted is refused
+  rather than adopted as a fresh log. A recorded audit binding, a
+  chain-root sidecar, or an `audit_tip_anchored` row in the log outlives the
+  deleted anchor, and with any of them the writer and `audit verify --profile`
+  refuse with `audit.tip_anchor_missing`.
+- The headless keyring store has no freshness witness, so an older copy of its
+  file restored beside a truncated audit log agrees with it. Mainnet readiness
+  and `profile enable-mainnet` therefore refuse the headless backends with
+  `network.mainnet_keyring_backend_unsupported`.
+- `headless-dpapi` binds each entry to its keyring coordinate (service and
+  account) as DPAPI optional entropy, so an entry moved to another coordinate
+  fails to open. An entry sealed without entropy opens once through the call
+  without entropy and is rewritten bound to its coordinate under the store
+  lock; a failed rewrite fails the read. An entry that opens neither way fails
+  as before.
 
 ## [0.1.0-alpha.12] - 2026-10-15
 

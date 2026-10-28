@@ -159,7 +159,9 @@ DPAPI needs access to the current user's master key and can fail in
 key-authenticated SSH sessions. An interactive desktop logon may help.
 A protect failure reports `auth.keyring_platform_error`, naming DPAPI and its
 numeric error code when available. The `headless-env` backend avoids this DPAPI dependency
-and requires `STELLAR_AGENT_HEADLESS_KEYRING_KEY`. See
+and requires `STELLAR_AGENT_HEADLESS_KEYRING_KEY`. The headless backends serve testnet only: every mainnet write checks mainnet
+readiness, which refuses them with
+`network.mainnet_keyring_backend_unsupported`. See
 [security-internals.md's headless keyring section](maintainers/security-internals.md#headless-keyring-store)
 for the trust model before enabling it.
 
@@ -498,11 +500,13 @@ again, for identity and for the file still ending where the server left it, and
 a refused row is anchored so the refusal survives a restart. A log that simply moved FORWARD past its anchor
 is not a refusal. Unkeyed writers append without moving it, and the next
 acquisition absorbs the gap and re-anchors. A log with no anchor at all is
-adopted on first use with no operator action, which is what happens on the first
-run after upgrading a wallet whose audit log predates the anchor. An adoption
-writes its `audit_tip_anchored` row only for a non-empty file. Recovery from a
-mismatch is `stellar-agent audit reanchor --profile <name>
---acknowledge-rollback`. Stop this server first if it holds that profile's
+adopted on first use with no operator action when nothing shows it was anchored
+before, such as a log written only by unkeyed writers. A recorded audit
+binding, a chain-root sidecar, or an `audit_tip_anchored` row in the file shows
+it was, and the server then refuses with `audit.tip_anchor_missing`. An
+adoption writes its `audit_tip_anchored` row only for a non-empty file.
+Recovery from a mismatch or a missing anchor is `stellar-agent audit reanchor
+--profile <name> --acknowledge-rollback`. Stop this server first if it holds that profile's
 audit writer.
 
 Acquiring the writer also checks the profile's audit binding: the keyring

@@ -105,6 +105,11 @@ entry refusal with the prerequisite named. Resolver refusal uses
 `network.mainnet_authorization_refused`. Its core message is
 `the mainnet write was refused before submission; nothing was sent`.
 
+`network.mainnet_keyring_backend_unsupported` means the process uses a
+headless keyring backend (`STELLAR_AGENT_KEYRING_BACKEND` is set). Mainnet
+readiness and `profile enable-mainnet` refuse it before any keyring entry is
+read; mainnet needs the platform keyring. Testnet is unaffected.
+
 CLI messages distinguish the withheld result:
 
 - Signature: `the mainnet write was refused; the signature was withheld and nothing was sent`.
@@ -926,7 +931,9 @@ Read-only. Walks the log at `<LOG_PATH>`, following rotation manifests, and veri
 
 The tip anchor is checked only when `--profile` is supplied AND `<LOG_PATH>` is the log that profile configures, since the anchor names a path. Every other case reports `anchor.status` as `"not_checked"` with the reason and still verifies the chain in full. The check proves the anchored entry is still at the anchored offset, so a longer internally consistent log that does not contain it refuses rather than passing on length alone.
 
-On Unix, refuses to verify a log whose parent directory is owned by a different user. Exits `0` when the chain is intact, `1` on any integrity violation (broken chain, rotation gap, HMAC mismatch, missing sidecar, unparseable line, tip-anchor mismatch), path-contract failure, or I/O error.
+When no anchor is stored for the profile's own log, the log must show that it was never anchored. An audit binding recorded for the profile, a chain-root sidecar beside the active file, or an `audit_tip_anchored` row in it shows it was; the command then fails with `audit.tip_anchor_missing`, and the message says `anchor: missing` and names the evidence. A log with none of them reports `anchor.status` as `"not_checked"`.
+
+On Unix, refuses to verify a log whose parent directory is owned by a different user. Exits `0` when the chain is intact, `1` on any integrity violation (broken chain, rotation gap, HMAC mismatch, missing sidecar, unparseable line, tip-anchor mismatch, missing tip anchor), path-contract failure, or I/O error.
 
 `outbox_pending` counts the consent rows queued in the audit outbox beside the log (`<LOG_PATH>.outbox`) and not yet drained into it, read without taking the outbox lock. Queued rows sit outside the tip anchor until a draining writer appends them. A torn outbox adds an `outbox_torn_tail` warning and unparseable lines add `outbox_unparseable`. An unreadable outbox adds `outbox_unreadable` and omits `outbox_pending`, since no count is known. None of them changes the chain verdict.
 
@@ -940,7 +947,7 @@ stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --pr
 
 ### `audit reanchor --profile <NAME> --acknowledge-rollback`
 
-State-changing (writes the keyring anchor, appends one or two audit rows, then drains the audit outbox; no network). The only way out of an `audit.tip_anchor_mismatch` or `audit.log_binding_changed` refusal. Operator-only: an agent must never run it on its own initiative, because it accepts a log or a profile change that may have been tampered with.
+State-changing (writes the keyring anchor, appends one or two audit rows, then drains the audit outbox; no network). The only way out of an `audit.tip_anchor_mismatch`, `audit.tip_anchor_missing`, or `audit.log_binding_changed` refusal. Operator-only: an agent must never run it on its own initiative, because it accepts a log or a profile change that may have been tampered with.
 
 | Flag / arg | Meaning |
 |---|---|
@@ -951,8 +958,10 @@ State-changing (writes the keyring anchor, appends one or two audit rows, then d
 | Recorded binding | Current path's anchor | Flags required | Rows appended |
 |---|---|---|---|
 | Equal or absent | Any | `--acknowledge-rollback` | `rollback_acknowledged` |
-| Changed or unreadable | Absent, or agrees with the log | `--acknowledge-binding-change` | `binding_changed` |
-| Changed or unreadable | Disagrees with the log, or cannot be parsed | Both | `rollback_acknowledged`, then `binding_changed` |
+| Changed or unreadable | Agrees, or absent without prior anchoring evidence | `--acknowledge-binding-change` | `binding_changed` |
+| Changed or unreadable | Disagrees, cannot be parsed, or absent with prior anchoring evidence | Both | `rollback_acknowledged`, then `binding_changed` |
+
+The first row covers both anchor refusals: an anchor that disagrees with the log (`audit.tip_anchor_mismatch`), and an absent anchor on a log that shows it was anchored before (`audit.tip_anchor_missing`). In the binding-changed rows an absent anchor disagrees when a chain-root sidecar or an `audit_tip_anchored` row shows prior anchoring. Without evidence it agrees.
 
 A flag the matrix does not require is ignored. A missing flag changes nothing and exits `1` with `validation.acknowledgement_required`, naming the flag. With the required flags it replays the whole log, so a broken chain is refused rather than blessed. It writes the current tip, bumps the current path's re-anchor counter once, and appends the rows, each carrying that count. `binding_changed` names the old path's anchor, or none when the record was unreadable. The new binding is stored last. It takes the audit writer's exclusive lock. While an MCP server holds that profile's writer, repair refuses with `audit.writer_locked`. Stop that server before a rollback repair. A binding change needs no stop: a server running the edited profile refuses before it opens the new path, so it holds no lock there. A server still running the old profile refuses after the acknowledgement until it restarts.
 

@@ -10125,6 +10125,7 @@ pub(crate) mod tests {
             audit_log_path.clone(),
             None,
             Arc::new(InMemoryTipAnchorStore::new()) as Arc<dyn TipAnchorStore>,
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
         .expect("a draining writer opens");
         let manager = SignersManager::new(SignersManagerConfig::new(

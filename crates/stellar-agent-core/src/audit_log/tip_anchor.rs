@@ -42,12 +42,23 @@
 //!   not hash to `tip_hash`: the file was rolled back, truncated, or replaced.
 //!   Refuse.
 //!
-//! An absent anchor is adopted: the chain is verified and the current tip is
-//! written as the anchor. A file with entries also gets an
-//! `audit_tip_anchored` row recording the adoption; an empty file gets neither
-//! an anchor nor a row, and its first append writes the first anchor. This is
-//! what an audit log written before the anchor existed does on its first keyed
-//! use, with no operator action.
+//! An absent anchor is adopted when nothing shows the log was anchored before:
+//! the chain is verified and the current tip is written as the anchor. A file
+//! with entries also gets an `audit_tip_anchored` row recording the adoption;
+//! an empty file gets neither an anchor nor a row, and its first append writes
+//! the first anchor. This is what an audit log written only by unkeyed writers
+//! does on its first keyed use, with no operator action.
+//!
+//! An absent anchor is refused with `audit.tip_anchor_missing` when the log
+//! holds entries and [`PriorAnchoring`] finds evidence that it was anchored
+//! before: the profile's audit binding was recorded before this use, the
+//! active file carries a chain-root sidecar, or the active file holds an
+//! `audit_tip_anchored` row. Deleting the anchor and truncating the log would
+//! otherwise remove rows without a trace. An empty active file that carries a
+//! chain-root sidecar is refused the same way, because the sidecar signs a
+//! first entry the file no longer holds. The way out is
+//! `audit reanchor --acknowledge-rollback`, which records the repair in a
+//! permanent row.
 //!
 //! # Only a file with entries is ever anchored
 //!
@@ -93,6 +104,8 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
+
+use super::binding::BindingHistory;
 
 /// Number of hex characters of the path digest carried in the anchor's keyring
 /// account name.
@@ -345,6 +358,92 @@ pub trait TipAnchorStore: std::any::Any + std::fmt::Debug + Send + Sync {
     fn reanchor_count(&self) -> Result<Option<u64>, TipAnchorStoreError>;
 }
 
+// ── Prior anchoring ──────────────────────────────────────────────────────────
+
+/// Evidence that a log path was taken under anchor protection before, found
+/// while no anchor is stored for it.
+///
+/// The writer refuses to adopt such a log with `audit.tip_anchor_missing`, and
+/// `audit verify` fails on it with the same code. Each variant is a fact that
+/// outlives the deletion of the anchor itself: deleting the anchor and
+/// truncating the log leaves at least one of them in place unless the binding,
+/// the sidecar, and the rows are removed as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PriorAnchoring {
+    /// The profile's audit binding was recorded before the current keyed use.
+    BindingRecorded,
+    /// The active file carries a chain-root sidecar. Only a keyed writer writes
+    /// one, after the file's first entry. A regular file at the sidecar path
+    /// counts, and so does a path whose metadata cannot be read, since the
+    /// check cannot then rule a sidecar out; a directory or other non-file
+    /// there was not written by a writer and does not count.
+    ChainRootSidecar,
+    /// The active file holds an `audit_tip_anchored` row: an adoption, an
+    /// acknowledged rollback, or an acknowledged binding change.
+    AnchoringRow,
+}
+
+impl PriorAnchoring {
+    /// Finds the evidence that the log at `log_path` was anchored before.
+    ///
+    /// `entry_count` and `holds_anchoring_row` describe the active file as a
+    /// full replay found it. A file with entries is checked for all three
+    /// facts, in the order of the variants. A file with no entries is checked
+    /// for the sidecar alone: a binding recorded before a keyed use that found
+    /// an empty log is the ordinary state, and an empty file holds no row.
+    ///
+    /// `None` means nothing shows the log was ever anchored, which is the state
+    /// a log written only by unkeyed writers is in before its first keyed use.
+    #[must_use]
+    pub fn find(
+        binding: BindingHistory,
+        log_path: &Path,
+        entry_count: u64,
+        holds_anchoring_row: bool,
+    ) -> Option<Self> {
+        let sidecar = sidecar_present(&super::writer::hmac_sidecar_path(log_path));
+        if entry_count == 0 {
+            return sidecar.then_some(Self::ChainRootSidecar);
+        }
+        if binding == BindingHistory::Recorded {
+            Some(Self::BindingRecorded)
+        } else if sidecar {
+            Some(Self::ChainRootSidecar)
+        } else if holds_anchoring_row {
+            Some(Self::AnchoringRow)
+        } else {
+            None
+        }
+    }
+
+    /// The evidence in words, for operator-facing refusals. Names no path, no
+    /// coordinate, and no digest.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::BindingRecorded => "an audit binding is recorded for the profile",
+            Self::ChainRootSidecar => "the active log file carries a chain-root sidecar",
+            Self::AnchoringRow => "the active log file holds an audit_tip_anchored row",
+        }
+    }
+}
+
+impl std::fmt::Display for PriorAnchoring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.describe())
+    }
+}
+
+/// Whether a chain-root sidecar is present at `path`: a regular file, or a
+/// path whose metadata cannot be read for a reason other than its absence.
+fn sidecar_present(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(metadata) => metadata.is_file(),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 // ── Keyed access ─────────────────────────────────────────────────────────────
 
 /// The pair a KEYED audit-writer open needs: the chain-root HMAC key and the
@@ -362,6 +461,7 @@ pub trait TipAnchorStore: std::any::Any + std::fmt::Debug + Send + Sync {
 pub struct KeyedAuditAccess {
     hmac_key: Zeroizing<[u8; 32]>,
     tip_anchor: Arc<dyn TipAnchorStore>,
+    binding: BindingHistory,
 }
 
 impl std::fmt::Debug for KeyedAuditAccess {
@@ -369,18 +469,42 @@ impl std::fmt::Debug for KeyedAuditAccess {
         // The key never reaches Debug output.
         f.debug_struct("KeyedAuditAccess")
             .field("tip_anchor", &self.tip_anchor)
+            .field("binding", &self.binding)
             .finish_non_exhaustive()
     }
 }
 
 impl KeyedAuditAccess {
     /// Pairs a chain-root key with the anchor store for the log it will write.
+    ///
+    /// The binding history starts as [`BindingHistory::NotRecorded`]; the
+    /// surface that checked the profile's audit binding sets it with
+    /// [`KeyedAuditAccess::with_binding_history`].
     #[must_use]
     pub fn new(hmac_key: Zeroizing<[u8; 32]>, tip_anchor: Arc<dyn TipAnchorStore>) -> Self {
         Self {
             hmac_key,
             tip_anchor,
+            binding: BindingHistory::NotRecorded,
         }
+    }
+
+    /// Records whether the profile's audit binding was already recorded when
+    /// this access was built.
+    ///
+    /// A writer opened with [`BindingHistory::Recorded`] refuses to adopt a log
+    /// with entries whose anchor is absent; see [`PriorAnchoring`].
+    #[must_use]
+    pub fn with_binding_history(mut self, binding: BindingHistory) -> Self {
+        self.binding = binding;
+        self
+    }
+
+    /// Whether the profile's audit binding was recorded before this access was
+    /// built.
+    #[must_use]
+    pub fn binding_history(&self) -> BindingHistory {
+        self.binding
     }
 
     /// Borrows the anchor store, for callers that attach it to a writer they
@@ -826,5 +950,27 @@ mod tests {
 
         store.set_failing(true);
         assert!(store.load_anchor().is_err());
+    }
+
+    /// A regular file at the sidecar path is evidence of a keyed writer; a
+    /// directory there is not, and an absent path is not.
+    #[test]
+    fn only_a_regular_file_at_the_sidecar_path_is_a_chain_root_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        let sidecar = super::super::writer::hmac_sidecar_path(&log);
+        let find = || PriorAnchoring::find(BindingHistory::NotRecorded, &log, 1, false);
+
+        assert_eq!(find(), None, "no sidecar");
+        std::fs::create_dir(&sidecar).unwrap();
+        assert_eq!(find(), None, "a directory is not a sidecar");
+        std::fs::remove_dir(&sidecar).unwrap();
+        std::fs::write(&sidecar, b"sidecar").unwrap();
+        assert_eq!(find(), Some(PriorAnchoring::ChainRootSidecar));
+        assert_eq!(
+            PriorAnchoring::find(BindingHistory::NotRecorded, &log, 0, false),
+            Some(PriorAnchoring::ChainRootSidecar),
+            "an empty file with a sidecar was truncated"
+        );
     }
 }

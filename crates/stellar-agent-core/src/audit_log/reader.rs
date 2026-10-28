@@ -3004,6 +3004,7 @@ mod tests {
                 }
                 AuditLogIntegrityError::PartialRotation { .. } => "audit.partial_rotation",
                 AuditLogIntegrityError::TipAnchorMismatch { .. } => "audit.tip_anchor_mismatch",
+                AuditLogIntegrityError::TipAnchorMissing { .. } => "audit.tip_anchor_missing",
             }
         }
 
@@ -3055,6 +3056,11 @@ mod tests {
                 actual_count: 9,
                 actual_offset: 2600,
                 reason: "test",
+            },
+            AuditLogIntegrityError::TipAnchorMissing {
+                evidence: crate::audit_log::PriorAnchoring::BindingRecorded,
+                actual_count: 9,
+                actual_offset: 2600,
             },
         ];
 

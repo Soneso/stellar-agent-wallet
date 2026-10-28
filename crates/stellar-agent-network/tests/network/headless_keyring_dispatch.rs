@@ -89,6 +89,69 @@ fn init_platform_keyring_store_dispatches_to_headless_env_backend() {
     assert!(on_disk.contains("headless-env"));
 }
 
+/// The active backend follows `STELLAR_AGENT_KEYRING_BACKEND` when no headless
+/// store is registered, and mainnet readiness refuses every value but the
+/// platform keyring with `network.mainnet_keyring_backend_unsupported`.
+#[test]
+#[serial]
+fn the_requested_backend_is_the_active_backend_and_only_the_platform_serves_mainnet() {
+    use stellar_agent_network::keyring::{KeyringBackend, active_keyring_backend};
+    use stellar_agent_network::mainnet::audit_readiness::refuse_headless_keyring_backend;
+
+    stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+    assert_eq!(active_keyring_backend(), KeyringBackend::Platform);
+    refuse_headless_keyring_backend().expect("the platform keyring serves mainnet");
+
+    for (requested, expected) in [
+        ("headless-env", KeyringBackend::HeadlessEnv),
+        ("headless-dpapi", KeyringBackend::HeadlessDpapi),
+        ("not-a-real-backend", KeyringBackend::Unrecognized),
+    ] {
+        let _guard = EnvGuard::set(&[(stellar_agent_headless_keyring::BACKEND_ENV_VAR, requested)]);
+        assert_eq!(active_keyring_backend(), expected, "{requested}");
+        let err = refuse_headless_keyring_backend().unwrap_err();
+        assert_eq!(
+            err.code(),
+            "network.mainnet_keyring_backend_unsupported",
+            "{requested}"
+        );
+        assert!(err.message().contains(expected.label()), "{err}");
+    }
+    assert_eq!(active_keyring_backend(), KeyringBackend::Platform);
+}
+
+/// A registered headless store is the active backend even after
+/// `STELLAR_AGENT_KEYRING_BACKEND` is gone from the environment.
+#[test]
+#[serial]
+fn a_registered_headless_store_stays_the_active_backend() {
+    use stellar_agent_network::keyring::{KeyringBackend, active_keyring_backend};
+
+    let dir = tempfile::tempdir().expect("tmp dir");
+    let key = URL_SAFE_NO_PAD.encode([0x34u8; 32]);
+    {
+        let _guard = EnvGuard::set(&[
+            (
+                stellar_agent_headless_keyring::BACKEND_ENV_VAR,
+                "headless-env",
+            ),
+            (stellar_agent_headless_keyring::ENV_KEY_VAR, key.as_str()),
+            (
+                "STELLAR_AGENT_HOME",
+                dir.path().to_str().expect("utf8 path"),
+            ),
+        ]);
+        init_platform_keyring_store().expect("headless dispatch must succeed");
+    }
+    assert!(
+        stellar_agent_headless_keyring::requested_backend().is_none(),
+        "the guard removed the variable"
+    );
+    assert_eq!(active_keyring_backend(), KeyringBackend::HeadlessEnv);
+    stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+    assert_eq!(active_keyring_backend(), KeyringBackend::Platform);
+}
+
 /// An unrecognized `STELLAR_AGENT_KEYRING_BACKEND` value refuses as a
 /// configuration fault naming the variable. It never falls back to the
 /// platform keyring.

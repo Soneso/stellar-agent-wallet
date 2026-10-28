@@ -4527,6 +4527,7 @@ mod tests {
                     f.dir.path().join("injected.jsonl"),
                     None,
                     std::sync::Arc::new(InMemoryTipAnchorStore::new()),
+                    stellar_agent_core::audit_log::BindingHistory::NotRecorded,
                 )
                 .unwrap();
                 let original = std::mem::replace(

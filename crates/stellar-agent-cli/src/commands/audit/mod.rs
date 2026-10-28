@@ -22,7 +22,7 @@ use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 
 /// Maps an audit-writer failure onto the CLI envelope model.
 ///
-/// Two conditions are operator-actionable and get the codes the documentation
+/// Three conditions are operator-actionable and get the codes the documentation
 /// names for them, rather than being flattened into the caller's generic
 /// failure code:
 ///
@@ -37,6 +37,8 @@ use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 /// - A tip-anchor mismatch is `audit.tip_anchor_mismatch`, the same code the
 ///   value-verb pre-flight emits, so one refusal reads the same wherever it
 ///   comes from.
+/// - An absent anchor the log shows was written is `audit.tip_anchor_missing`,
+///   again the pre-flight's code. Both name `audit reanchor` as the remedy.
 ///
 /// Everything else carries `fallback_code`, the caller's own label for "this
 /// verb could not use the audit writer".
@@ -59,6 +61,12 @@ pub(crate) fn audit_writer_error(
             WalletError::Validation(ValidationError::AuditTipAnchorMismatch {
                 profile: profile_name.to_owned(),
                 reason: (*reason).to_owned(),
+            })
+        }
+        WriterError::TipAnchorMissing { evidence, .. } => {
+            WalletError::Validation(ValidationError::AuditTipAnchorMissing {
+                profile: profile_name.to_owned(),
+                evidence: evidence.describe().to_owned(),
             })
         }
         // Variants whose own Display already leads with an `audit.*` code carry
@@ -189,6 +197,26 @@ mod tests {
             "acme",
         );
         assert_eq!(err.code(), "audit.tip_anchor_mismatch");
+    }
+
+    #[test]
+    fn a_missing_tip_anchor_keeps_its_wire_code_and_names_the_evidence() {
+        let err = audit_writer_error(
+            &WriterError::TipAnchorMissing {
+                evidence: stellar_agent_core::audit_log::PriorAnchoring::ChainRootSidecar,
+                entry_count: 9,
+                actual_len: 2600,
+            },
+            "audit.writer_unavailable",
+            "acme",
+        );
+        assert_eq!(err.code(), "audit.tip_anchor_missing");
+        let message = err.to_string();
+        assert!(message.contains("chain-root sidecar"), "{message}");
+        assert!(
+            message.contains("audit reanchor --profile acme --acknowledge-rollback"),
+            "{message}"
+        );
     }
 
     #[test]

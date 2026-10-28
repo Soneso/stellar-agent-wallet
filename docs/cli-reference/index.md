@@ -149,6 +149,11 @@ entry refusal with the prerequisite named. Resolver refusal uses
 `network.mainnet_authorization_refused`. Its core message is
 `the mainnet write was refused before submission; nothing was sent`.
 
+`network.mainnet_keyring_backend_unsupported` means the process uses a
+headless keyring backend (`STELLAR_AGENT_KEYRING_BACKEND` is set). Mainnet
+readiness and `profile enable-mainnet` refuse it before any keyring entry is
+read; mainnet needs the platform keyring. Testnet is unaffected.
+
 CLI messages distinguish the withheld result:
 
 - Signature: `the mainnet write was refused; the signature was withheld and nothing was sent`.
@@ -239,7 +244,7 @@ binding still refuses with `audit.log_binding_changed` before signing or submiss
 See [Key-rotation subcommands](profile-and-governance.md#key-rotation-subcommands)
 and [Concepts: fail-closed on an unminted audit key](../concepts.md#fail-closed-on-an-unminted-audit-key).
 
-The same pre-flight proves the audit log still contains the chain tip its keyring-held anchor names, refusing with `audit.tip_anchor_mismatch` when the log was restored from an older copy, truncated, or substituted. A log that moved forward past its anchor is absorbed, not refused, and a log with no anchor is adopted on first use with no operator action. A profile whose `audit_log_path` or audit key differs from the binding recorded in the keyring refuses with `audit.log_binding_changed`. Recovery from either is [`audit reanchor`](profile-and-governance.md#audit-reanchor---profile-name---acknowledge-rollback).
+The same pre-flight proves the audit log still contains the chain tip its keyring-held anchor names, refusing with `audit.tip_anchor_mismatch` when the log was restored from an older copy, truncated, or substituted. A log that moved forward past its anchor is absorbed, not refused. A log with no anchor is adopted on first use with no operator action when nothing shows it was anchored before; a recorded audit binding, a chain-root sidecar, or an `audit_tip_anchored` row in the file shows it was, and the pre-flight refuses with `audit.tip_anchor_missing`. A profile whose `audit_log_path` or audit key differs from the binding recorded in the keyring refuses with `audit.log_binding_changed`. Recovery from any of them is [`audit reanchor`](profile-and-governance.md#audit-reanchor---profile-name---acknowledge-rollback).
 
 ## Startup advisory
 

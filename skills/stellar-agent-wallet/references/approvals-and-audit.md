@@ -461,12 +461,14 @@ outside the log file. Anyone who can restore the keyring's own storage together
 with the log can restore an older state. With a headless keyring backend these
 entries are kept in a file on the same host. Anyone who can write that file can
 restore older entries or delete one, which needs no key material. A deleted
-binding is recorded again from the profile file at the next keyed use. Under
-`headless-dpapi` an owner entry still in the older form can be moved to another
-coordinate until a V1 verb or `enroll-owner-key` rewrites it.
+binding is recorded again from the profile file at the next keyed use. A
+deleted anchor is refused while anything shows it was written (see the table
+below). Mainnet readiness refuses a headless backend with
+`network.mainnet_keyring_backend_unsupported`, because a restored copy of its
+file can make a truncated log and its anchor agree.
 
 Every value-moving verb checks the anchor before signing, on every acquisition of
-the audit writer. Seven outcomes:
+the audit writer. Eight outcomes:
 
 | Log versus anchor | Result |
 |---|---|
@@ -475,16 +477,17 @@ the audit writer. Seven outcomes:
 | Exactly the anchored tip | Proceeds |
 | Ahead of the anchor, anchored entry intact | Proceeds; the tail is absorbed and the anchor advances |
 | Behind the anchor, or the anchored entry is not at the anchored offset | Refuses `audit.tip_anchor_mismatch` |
-| No anchor, file has entries, chain verifies | Adopts the current tip and records `audit_tip_anchored { reason: adopted }` |
-| No anchor, file empty | Proceeds; no anchor and no row until the first append |
+| No anchor, and a recorded audit binding, a chain-root sidecar, or an `audit_tip_anchored` row in the file shows one was written | Refuses `audit.tip_anchor_missing`, naming the evidence |
+| No anchor, file has entries, chain verifies, none of that evidence | Adopts the current tip and records `audit_tip_anchored { reason: adopted }` |
+| No anchor, file empty, no chain-root sidecar | Proceeds; no anchor and no row until the first append |
 
 The ahead-of-anchor case is ordinary, not an exception. Writers opened without
 the audit key append without moving the anchor: the CLI startup advisory, and
 the zero-config and read-only smart-account paths of a profile whose audit key
 is not minted. Adoption needs
-no operator action and is what happens on the first run after upgrading a wallet
-whose audit log predates the anchor. An adoption writes its row only for a
-non-empty file.
+no operator action and is what happens on the first keyed use of a log that
+only unkeyed writers wrote. An adoption writes its row only for a non-empty
+file.
 
 The anchor names a PATH, not a profile, so a changed `audit_log_path` or audit
 key has an anchor coordinate of its own. The audit binding guards that change.
@@ -494,7 +497,7 @@ key has an anchor coordinate of its own. The audit binding guards that change.
 For each persisted profile the keyring records the SHA-256 of its lexically
 normalized `audit_log_path` and its audit-key coordinate, at service
 `stellar-agent-auditbinding-<profile>`, account `default`. The first keyed use
-records it from the profile file. Before the audit key loads, every keyed audit
+records it from the profile file, once the audit key has loaded. Before the audit key loads, every keyed audit
 writer compares the profile with the record:
 
 | Record | Persisted profile | Synthesized zero-config profile |
@@ -676,7 +679,7 @@ a different user (such a directory could be used to substitute files or
 sidecars). Exits `0` when the chain is intact, `1` on any integrity violation, a
 path-contract failure, or an I/O error. Verification failures use a closed set
 of wire codes, for example `audit.chain_broken`, `audit.rotation_gap`,
-`audit.hmac_mismatch`, `audit.tip_anchor_mismatch`, with line and file detail
+`audit.hmac_mismatch`, `audit.tip_anchor_mismatch`, `audit.tip_anchor_missing`, with line and file detail
 kept out of the code.
 
 `outbox_pending` counts the consent rows queued in the audit outbox beside the log (`<LOG_PATH>.outbox`) and not yet drained into it, read without taking the outbox lock. Queued rows sit outside the tip anchor until a draining writer appends them. A torn outbox adds an `outbox_torn_tail` warning and unparseable lines add `outbox_unparseable`. An unreadable outbox adds `outbox_unreadable` and omits `outbox_pending`, since no count is known. None of them changes the chain verdict.
@@ -692,7 +695,8 @@ stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --pr
 
 `stellar-agent audit reanchor --profile <NAME>` with `--acknowledge-rollback`,
 `--acknowledge-binding-change`, or both: the only way out of an
-`audit.tip_anchor_mismatch` or `audit.log_binding_changed` refusal.
+`audit.tip_anchor_mismatch`, `audit.tip_anchor_missing`, or
+`audit.log_binding_changed` refusal.
 Operator-only; an agent must never run it on its own initiative, because it
 accepts a log or a profile change that may have been tampered with.
 
@@ -705,8 +709,13 @@ accepts a log or a profile change that may have been tampered with.
 | Recorded binding | Current path's anchor | Flags required | Rows appended |
 |---|---|---|---|
 | Equal or absent | Any | `--acknowledge-rollback` | `rollback_acknowledged` |
-| Changed or unreadable | Absent, or agrees with the log | `--acknowledge-binding-change` | `binding_changed` |
-| Changed or unreadable | Disagrees with the log, or cannot be parsed | Both | `rollback_acknowledged`, then `binding_changed` |
+| Changed or unreadable | Agrees, or absent without prior anchoring evidence | `--acknowledge-binding-change` | `binding_changed` |
+| Changed or unreadable | Disagrees, cannot be parsed, or absent with prior anchoring evidence | Both | `rollback_acknowledged`, then `binding_changed` |
+
+The first row covers a disagreeing anchor and a missing one
+(`audit.tip_anchor_missing`). In the binding-changed rows an absent anchor
+disagrees when a chain-root sidecar or an `audit_tip_anchored` row shows prior
+anchoring. Without evidence it agrees.
 
 A flag the matrix does not require is ignored. A missing flag changes nothing
 and exits `1` with `validation.acknowledgement_required`, naming the flag. With

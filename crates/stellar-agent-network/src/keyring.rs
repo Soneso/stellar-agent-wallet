@@ -100,7 +100,7 @@ use keyring_core::Entry as KeyringEntry;
 use rand_core::{OsRng, RngCore};
 use stellar_agent_core::profile::owner_key;
 use stellar_agent_core::{
-    audit_log::binding::{AuditBinding, BindingCheck, RecordedBinding},
+    audit_log::binding::{AuditBinding, BindingCheck, BindingHistory, RecordedBinding},
     audit_log::tip_anchor::{
         KeyedAuditAccess, TipAnchor, TipAnchorStore, TipAnchorStoreError,
         reanchor_count_account_for_digest, tip_anchor_account_for_digest,
@@ -201,6 +201,12 @@ pub fn map_keyring_operation_error(
 /// init_platform_keyring_store().expect("platform keyring unavailable");
 /// ```
 pub fn init_platform_keyring_store() -> Result<(), WalletError> {
+    #[cfg(feature = "test-hooks")]
+    if KEEP_REGISTERED_STORE.load(std::sync::atomic::Ordering::SeqCst)
+        && keyring_core::get_default_store().is_some()
+    {
+        return Ok(());
+    }
     // A headless backend that cannot be set up is a configuration fault the
     // operator fixes in the environment, so it reports the configuration
     // code, with the variable or condition at fault, and no keyring entry.
@@ -238,6 +244,65 @@ pub fn init_platform_keyring_store() -> Result<(), WalletError> {
     Err(platform_store_init_failure(
         "unsupported-platform credential store initialization failed",
     ))
+}
+
+/// The keyring backend a process stores its entries in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyringBackend {
+    /// The platform keyring: the macOS Keychain, the Secret Service, or the
+    /// Windows Credential Manager.
+    Platform,
+    /// The headless file store sealed under the key in
+    /// `STELLAR_AGENT_HEADLESS_KEYRING_KEY`.
+    HeadlessEnv,
+    /// The headless file store sealed under Windows DPAPI.
+    HeadlessDpapi,
+    /// `STELLAR_AGENT_KEYRING_BACKEND` names no known backend, so
+    /// [`init_platform_keyring_store`] refuses to register a store.
+    Unrecognized,
+}
+
+impl KeyringBackend {
+    /// The backend's label: `platform`, `headless-env`, `headless-dpapi`, or
+    /// `unrecognized`.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Platform => "platform",
+            Self::HeadlessEnv => "headless-env",
+            Self::HeadlessDpapi => "headless-dpapi",
+            Self::Unrecognized => "unrecognized",
+        }
+    }
+
+    fn from_label(label: &str) -> Self {
+        match label {
+            "headless-env" => Self::HeadlessEnv,
+            "headless-dpapi" => Self::HeadlessDpapi,
+            _ => Self::Unrecognized,
+        }
+    }
+}
+
+/// The keyring backend this process uses.
+///
+/// A registered headless store answers first, then
+/// `STELLAR_AGENT_KEYRING_BACKEND`, the input [`init_platform_keyring_store`]
+/// selects the backend from. Either one naming a headless backend makes the
+/// answer headless, so a check made before the store is registered and one
+/// made after agree. With no headless store registered and the variable
+/// unset the answer is [`KeyringBackend::Platform`]; a set value naming no
+/// known backend is [`KeyringBackend::Unrecognized`].
+#[must_use]
+pub fn active_keyring_backend() -> KeyringBackend {
+    if let Some(label) = stellar_agent_headless_keyring::registered_backend() {
+        return KeyringBackend::from_label(label);
+    }
+    stellar_agent_headless_keyring::requested_backend()
+        .map_or(KeyringBackend::Platform, |requested| {
+            KeyringBackend::from_label(&requested)
+        })
 }
 
 /// Registers the platform keyring store, as [`init_platform_keyring_store`]
@@ -543,9 +608,16 @@ pub fn read_keyring_string(entry_ref: &KeyringEntryRef) -> Result<Option<String>
 /// `profile_name` is the selected, reconciled profile name; the binding
 /// coordinate derives from it alone. The key's coordinate is refused first
 /// when it sits in the owner key namespace, so no binding records an owner
-/// coordinate. [`check_audit_binding`] then runs under `binding` before the
-/// key loads, so a changed binding refuses without a key read. The loaded key
-/// is refused when it equals the profile's owner public key.
+/// coordinate. The recorded binding is then compared before the key loads, so
+/// a changed binding refuses without a key read. The loaded key is refused
+/// when it equals the profile's owner public key. Under
+/// [`BindingCheck::Enforce`] an absent binding is recorded only after the key
+/// has loaded and passed that check: a recorded binding says a keyed use
+/// reached the log, and a profile with no audit key has had none.
+///
+/// The returned access carries the binding's [`BindingHistory`] from before
+/// this call. A writer opened with it refuses to adopt a log whose anchor is
+/// missing when the binding was already recorded (`audit.tip_anchor_missing`).
 ///
 /// # Errors
 ///
@@ -565,18 +637,21 @@ pub fn keyed_audit_access(
     binding: BindingCheck,
 ) -> Result<KeyedAuditAccess, WalletError> {
     owner_key::refuse_owner_key_coordinate(&profile.audit_log_hash_chain_key_id, AUDIT_KEY_FIELD)?;
-    check_audit_binding(profile, profile_name, binding)?;
+    let classified = ClassifiedBinding::read(profile, profile_name)?;
     let hmac_key = load_hmac_key_32(&profile.audit_log_hash_chain_key_id)?;
     owner_key::refuse_owner_public_key(
         hmac_key.as_ref(),
         &owner_key::OwnerKeyContext::for_profile(profile_name, profile),
         AUDIT_KEY_FIELD,
     )?;
+    if binding == BindingCheck::Enforce {
+        classified.record_if_absent()?;
+    }
     let tip_anchor = KeyringTipAnchorStore::shared(
         &profile.audit_log_hash_chain_key_id,
         &profile.audit_log_path,
     );
-    Ok(KeyedAuditAccess::new(hmac_key, tip_anchor))
+    Ok(KeyedAuditAccess::new(hmac_key, tip_anchor).with_binding_history(classified.history))
 }
 
 /// The profile field an audit-key owner refusal names.
@@ -585,9 +660,10 @@ pub const AUDIT_KEY_FIELD: &str = "audit_log_hash_chain_key_id";
 /// Compares the profile's audit binding with the record at
 /// [`KeyringEntryRef::default_audit_binding`] for `profile_name`.
 ///
-/// - An equal record continues.
+/// - An equal record continues and returns [`BindingHistory::Recorded`].
 /// - An absent record is stored under [`BindingCheck::Enforce`] and left
-///   absent under [`BindingCheck::CheckOnly`].
+///   absent under [`BindingCheck::CheckOnly`]; either way the call returns
+///   [`BindingHistory::NotRecorded`], which describes the state before it.
 /// - A record that differs or does not parse refuses.
 ///
 /// # Errors
@@ -602,20 +678,60 @@ pub fn check_audit_binding(
     profile: &Profile,
     profile_name: &str,
     binding: BindingCheck,
-) -> Result<(), WalletError> {
-    let store = KeyringAuditBindingStore::for_profile(profile_name);
-    let expected = AuditBinding::for_profile(profile);
-    match store.classify(&expected)? {
-        RecordedBinding::Equal => Ok(()),
-        RecordedBinding::Absent => match binding {
-            BindingCheck::Enforce => store.store(&expected),
-            BindingCheck::CheckOnly => Ok(()),
-        },
-        RecordedBinding::Changed(_) | RecordedBinding::Unparseable => Err(WalletError::Validation(
-            ValidationError::AuditLogBindingChanged {
-                profile: profile_name.to_owned(),
-            },
-        )),
+) -> Result<BindingHistory, WalletError> {
+    let classified = ClassifiedBinding::read(profile, profile_name)?;
+    if binding == BindingCheck::Enforce {
+        classified.record_if_absent()?;
+    }
+    Ok(classified.history)
+}
+
+/// A profile's audit binding read and compared, not yet recorded.
+///
+/// Splits [`check_audit_binding`] so [`keyed_audit_access`] can refuse a
+/// changed binding before the key loads and record an absent one only after.
+struct ClassifiedBinding {
+    store: KeyringAuditBindingStore,
+    expected: AuditBinding,
+    history: BindingHistory,
+}
+
+impl ClassifiedBinding {
+    /// Reads the record for `profile_name` and compares it with `profile`'s
+    /// binding.
+    ///
+    /// # Errors
+    ///
+    /// [`ValidationError::AuditLogBindingChanged`] for a record that differs
+    /// or does not parse, and the keyring error when it cannot be read.
+    fn read(profile: &Profile, profile_name: &str) -> Result<Self, WalletError> {
+        let store = KeyringAuditBindingStore::for_profile(profile_name);
+        let expected = AuditBinding::for_profile(profile);
+        let recorded = store.classify(&expected)?;
+        if recorded.refuses() {
+            return Err(WalletError::Validation(
+                ValidationError::AuditLogBindingChanged {
+                    profile: profile_name.to_owned(),
+                },
+            ));
+        }
+        Ok(Self {
+            store,
+            expected,
+            history: recorded.history(),
+        })
+    }
+
+    /// Records the profile's binding when none was recorded.
+    ///
+    /// # Errors
+    ///
+    /// The keyring error when the write fails.
+    fn record_if_absent(&self) -> Result<(), WalletError> {
+        match self.history {
+            BindingHistory::NotRecorded => self.store.store(&self.expected),
+            BindingHistory::Recorded => Ok(()),
+        }
     }
 }
 
@@ -1698,6 +1814,22 @@ pub static PANIC_AFTER_LOAD: std::sync::atomic::AtomicBool =
 #[doc(hidden)]
 pub static DROP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Toggle that makes [`init_platform_keyring_store`] keep a store that is
+/// already registered instead of registering the platform store.
+///
+/// A test that drives several command runners in one process installs the
+/// in-memory mock store, arms this, and every runner's own initialization
+/// then reaches the same entries. The mock store is not a headless store, so
+/// [`active_keyring_backend`] reports [`KeyringBackend::Platform`] and the
+/// mainnet backend check runs as it does against the platform keyring.
+///
+/// Only compiled when the `test-hooks` Cargo feature is enabled.  Never include
+/// `test-hooks` in production or release builds.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub static KEEP_REGISTERED_STORE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2448,6 +2580,54 @@ mod tests {
         assert_binding_refusal(
             keyed_audit_access(&profile, "bind-enforce", BindingCheck::Enforce),
             "bind-enforce",
+        );
+    }
+
+    /// A profile with no audit key records no binding: the key load refuses
+    /// first. A binding recorded for a keyless profile would later read as a
+    /// keyed use of its log and refuse the log's first adoption.
+    #[test]
+    #[serial_test::serial]
+    fn a_keyless_profile_records_no_binding() {
+        keyring_mock::install().expect("mock keyring store");
+        let mut profile =
+            Profile::builder_testnet_named("bind-keyless", "s", "a", "n", "a").build();
+        profile.audit_log_path = std::path::PathBuf::from("/data/audit/keyless.jsonl");
+
+        let err = keyed_audit_access(&profile, "bind-keyless", BindingCheck::Enforce)
+            .expect_err("a profile with no audit key has no keyed access");
+        assert_ne!(err.code(), "audit.log_binding_changed", "{err}");
+        assert!(
+            recorded_binding("bind-keyless").is_none(),
+            "a failed key load records no binding"
+        );
+    }
+
+    /// The access carries the binding's state from before the call: the
+    /// first keyed use records the binding and reports it unrecorded, every
+    /// later one reports it recorded. `CheckOnly` reports without recording.
+    #[test]
+    #[serial_test::serial]
+    fn the_access_carries_the_binding_history_from_before_the_call() {
+        keyring_mock::install().expect("mock keyring store");
+        let profile = bound_profile("bind-history", "/data/audit/one.jsonl");
+
+        let check_only = keyed_audit_access(&profile, "bind-history", BindingCheck::CheckOnly)
+            .expect("an absent binding continues under CheckOnly");
+        assert_eq!(check_only.binding_history(), BindingHistory::NotRecorded);
+        let first = keyed_audit_access(&profile, "bind-history", BindingCheck::Enforce)
+            .expect("an absent binding is recorded");
+        assert_eq!(first.binding_history(), BindingHistory::NotRecorded);
+        assert!(recorded_binding("bind-history").is_some());
+        for check in [BindingCheck::Enforce, BindingCheck::CheckOnly] {
+            let later = keyed_audit_access(&profile, "bind-history", check)
+                .expect("an equal binding continues");
+            assert_eq!(later.binding_history(), BindingHistory::Recorded);
+        }
+        assert_eq!(
+            check_audit_binding(&profile, "bind-history", BindingCheck::CheckOnly)
+                .expect("an equal binding continues"),
+            BindingHistory::Recorded
         );
     }
 

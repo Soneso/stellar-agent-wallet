@@ -129,6 +129,21 @@ properties:
   rejection takes effect only after its audit row is durable, in the log or in the
   log's outbox. A queued row reaches the log before the consumer of the approval loads
   a signing key.
+- Code running as the same OS user. Such code can write the audit log and the wallet's
+  files. The wallet detects an edited or removed entry inside the log, a log rolled back
+  or truncated behind the tip anchor the keyring holds, a deleted anchor on a log that
+  shows it was anchored (`audit.tip_anchor_missing`), and a changed audit binding.
+  For an empty active file, only a surviving sidecar establishes prior anchoring.
+  These conditions refuse value-moving verbs. After investigation, `audit reanchor`
+  accepts an intact prefix and records the acknowledgement; it refuses a broken chain.
+  Profile verification checks the chain and HMAC sidecars before anchor agreement,
+  unless the missing-anchor rule applies after an unkeyed chain walk. The wallet does
+  not detect a well-formed entry appended at the tip. Raw
+  deletion or restore of platform keyring items outside the wallet, together with a
+  matching log, rests on the platform keyring's own access control. A headless keyring
+  backend keeps those items in a file that same-user code can restore, so mainnet
+  readiness and `profile enable-mainnet` refuse it
+  (`network.mainnet_keyring_backend_unsupported`).
 
 The core library compiles under `#![forbid(unsafe_code)]`. Logging redaction is enforced
 throughout: secret material is never written to logs, and account, strkey, and

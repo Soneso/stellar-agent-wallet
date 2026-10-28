@@ -190,7 +190,7 @@ Stable errors use the `mpp.*` namespace, including `mpp.challenge_invalid`,
 The verbs that record an audit row before they return (charge commit, record
 receipt, reconcile, prune) answer a problem with the audit LOG under its own
 `audit.*` code instead. They answer with `audit.chain_key_unavailable` when the profile's
-chain-root key is not acquirable. They answer with `audit.tip_anchor_mismatch` when the log no longer holds the chain tip its keyring-held anchor names. They answer with `audit.log_binding_changed` when the profile names a log path or audit key other than its recorded audit binding. Those name a different
+chain-root key is not acquirable. They answer with `audit.tip_anchor_mismatch` when the log no longer holds the chain tip its keyring-held anchor names, and with `audit.tip_anchor_missing` when the anchor is gone from a log that shows it was anchored. They answer with `audit.log_binding_changed` when the profile names a log path or audit key other than its recorded audit binding. Those name a different
 thing to fix from the MPP state file, and each has its own recovery in
 [Audit-log recovery](maintainers/audit-log-recovery.md).
 

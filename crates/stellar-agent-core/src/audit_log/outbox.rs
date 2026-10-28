@@ -603,6 +603,7 @@ mod tests {
             path.to_path_buf(),
             None,
             Arc::clone(store) as Arc<dyn TipAnchorStore>,
+            crate::audit_log::BindingHistory::NotRecorded,
         )
         .unwrap()
     }
@@ -962,6 +963,7 @@ mod tests {
             path.clone(),
             None,
             Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+            crate::audit_log::BindingHistory::NotRecorded,
         )
         .unwrap_err();
         assert!(matches!(err, WriterError::FileLocked), "{err:?}");

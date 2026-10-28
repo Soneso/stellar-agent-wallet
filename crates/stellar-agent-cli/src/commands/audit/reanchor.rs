@@ -35,12 +35,16 @@
 //! - Binding equal or absent: `--acknowledge-rollback` is required and
 //!   `--acknowledge-binding-change` is ignored. The verb re-anchors, bumps the
 //!   counter, appends `rollback_acknowledged`, and records an absent binding.
-//! - Binding changed or unreadable, anchor absent or agreeing:
+//!   This row covers a disagreeing anchor (`audit.tip_anchor_mismatch`) and a
+//!   missing one (`audit.tip_anchor_missing`): an absent anchor on a log that
+//!   shows it was anchored before, through a recorded binding, a chain-root
+//!   sidecar, or an `audit_tip_anchored` row.
+//! - Binding changed or unreadable, anchor agreeing or absent without evidence:
 //!   `--acknowledge-binding-change` is required and `--acknowledge-rollback` is
 //!   ignored. The verb appends one `binding_changed` row.
-//! - Binding changed or unreadable, anchor disagreeing: both flags are
-//!   required. The verb appends `rollback_acknowledged`, then
-//!   `binding_changed`.
+//! - Binding changed or unreadable, anchor disagreeing, which includes an
+//!   absent anchor whose log shows prior anchoring: both flags are required.
+//!   The verb appends `rollback_acknowledged`, then `binding_changed`.
 //!
 //! An anchor disagrees when the anchor-against-walk rule of `audit verify`
 //! refuses it, or when it cannot be parsed. A log that moved forward past its
@@ -48,6 +52,12 @@
 //! because opening creates the directory, the lock sidecar, and the log file.
 //! Disagreement is decided again under the writer's lock, and that decision is
 //! the one acted on.
+//!
+//! An absent anchor disagrees when a chain-root sidecar or an
+//! `audit_tip_anchored` row shows prior anchoring, and agrees otherwise. Both
+//! decisions apply this rule. The decision under the lock reads the rows from
+//! the writer's replay of the active file, the same facts the writer's own
+//! `audit.tip_anchor_missing` refusal reads.
 //!
 //! # What it does
 //!
@@ -87,8 +97,9 @@ use serde::Serialize;
 use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::{
     audit_log::{
-        AuditBinding, AuditWriter, ReanchorAcknowledgement, ReanchorReport, RecordedBinding,
-        StoredTipAnchor, TipAnchor, WriterError, stored_anchor_disagrees_with_walk, verify_log,
+        AuditBinding, AuditWriter, BindingHistory, PriorAnchoring, ReanchorAcknowledgement,
+        ReanchorReport, RecordedBinding, StoredTipAnchor, TipAnchor, WriterError,
+        stored_anchor_disagrees_with_walk, verify_log,
     },
     envelope::Envelope,
     error::{InternalError, ValidationError, WalletError},
@@ -287,25 +298,30 @@ fn reanchor_binding_change(
     expected: &AuditBinding,
     recorded: &RecordedBinding,
 ) -> Result<ReanchorData, WalletError> {
-    let refusal = |missing: &'static str| {
-        WalletError::Validation(ValidationError::AuditBindingChangeNotAcknowledged {
-            profile: args.profile.clone(),
-            missing,
-        })
-    };
-
-    let disagreeing = anchor_disagrees_before_open(profile)?;
+    let disagreeing = anchor_disagrees_with_log(profile, recorded.history())?;
     if let Some(missing) = missing_acknowledgements(args, disagreeing) {
-        return Err(refusal(missing));
+        return Err(binding_change_not_acknowledged(args, missing));
     }
 
     let mut writer = open_repair_writer(profile, &args.profile)?;
-    // Decided again under the lock; this decision is the one acted on.
+    reanchor_binding_change_locked(args, binding_store, expected, recorded, &mut writer)
+}
+
+/// Rechecks the acknowledgements and performs the repair under the writer lock.
+fn reanchor_binding_change_locked(
+    args: &ReanchorArgs,
+    binding_store: &KeyringAuditBindingStore,
+    expected: &AuditBinding,
+    recorded: &RecordedBinding,
+    writer: &mut AuditWriter,
+) -> Result<ReanchorData, WalletError> {
+    // Decided again under the lock from the writer's replay of the active
+    // file; this decision is the one acted on.
     let disagreeing = writer
-        .stored_anchor_disagrees()
+        .stored_anchor_disagrees(recorded.history())
         .map_err(|e| writer_error(&e, &args.profile))?;
     if let Some(missing) = missing_acknowledgements(args, disagreeing) {
-        return Err(refusal(missing));
+        return Err(binding_change_not_acknowledged(args, missing));
     }
 
     let previous_binding_anchor = match recorded {
@@ -339,6 +355,15 @@ fn reanchor_binding_change(
     ))
 }
 
+/// The refusal for a changed binding whose required flags are not all given;
+/// `missing` names the flags still needed.
+fn binding_change_not_acknowledged(args: &ReanchorArgs, missing: &'static str) -> WalletError {
+    WalletError::Validation(ValidationError::AuditBindingChangeNotAcknowledged {
+        profile: args.profile.clone(),
+        missing,
+    })
+}
+
 /// The acknowledgement flags a changed binding still needs, or `None` when
 /// every required flag is present.
 fn missing_acknowledgements(args: &ReanchorArgs, disagreeing: bool) -> Option<&'static str> {
@@ -355,9 +380,13 @@ fn missing_acknowledgements(args: &ReanchorArgs, disagreeing: bool) -> Option<&'
 /// without opening a writer.
 ///
 /// Reads the stored value and walks the log read-only. An absent anchor
-/// agrees; an unparseable one disagrees. A log that cannot be walked has no
+/// disagrees when evidence of prior anchoring survives. An unparseable anchor
+/// disagrees. A log that cannot be walked has no
 /// tip an anchor could agree with, so a present anchor disagrees with it.
-fn anchor_disagrees_before_open(profile: &Profile) -> Result<bool, WalletError> {
+fn anchor_disagrees_with_log(
+    profile: &Profile,
+    binding: BindingHistory,
+) -> Result<bool, WalletError> {
     let store = KeyringTipAnchorStore::new(
         &profile.audit_log_hash_chain_key_id,
         &profile.audit_log_path,
@@ -365,12 +394,17 @@ fn anchor_disagrees_before_open(profile: &Profile) -> Result<bool, WalletError> 
     let raw = stellar_agent_core::audit_log::TipAnchorStore::load_raw(&store)
         .map_err(|e| tip_anchor_unavailable(&e))?;
     let stored = StoredTipAnchor::from_raw(raw.as_deref());
-    if stored == StoredTipAnchor::Absent {
-        return Ok(false);
-    }
     let walked = verify_log(&profile.audit_log_path, None)
         .ok()
         .and_then(|ok| ok.active_tip);
+    if stored == StoredTipAnchor::Absent {
+        let (count, holds_row) = walked
+            .as_ref()
+            .map_or((0, false), |tip| (tip.entry_count, tip.holds_anchoring_row));
+        return Ok(
+            PriorAnchoring::find(binding, &profile.audit_log_path, count, holds_row).is_some(),
+        );
+    }
     Ok(
         stored_anchor_disagrees_with_walk(&profile.audit_log_path, &stored, walked.as_ref())
             .unwrap_or(true),
@@ -539,9 +573,13 @@ mod tests {
         let store = TestAnchorStore::shared(coord, &profile.audit_log_path);
         let key = load_audit_hmac_key(&profile, "test-profile").expect("load key");
         let snapshot = {
-            let mut writer =
-                AuditWriter::open_with_tip_anchor(profile.audit_log_path.clone(), Some(key), store)
-                    .expect("open anchored");
+            let mut writer = AuditWriter::open_with_tip_anchor(
+                profile.audit_log_path.clone(),
+                Some(key),
+                store,
+                stellar_agent_core::audit_log::BindingHistory::NotRecorded,
+            )
+            .expect("open anchored");
             writer.write_entry(sample_entry()).expect("append");
             writer.write_entry(sample_entry()).expect("append");
             let snapshot = std::fs::read(&profile.audit_log_path).expect("read log");
@@ -635,6 +673,7 @@ mod tests {
                 &profile.audit_log_hash_chain_key_id,
                 &profile.audit_log_path,
             ),
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
         .expect("the repaired log must open cleanly");
     }
@@ -676,9 +715,13 @@ mod tests {
             &profile.audit_log_hash_chain_key_id,
             &profile.audit_log_path,
         );
-        let mut writer =
-            AuditWriter::open_with_tip_anchor(profile.audit_log_path.clone(), Some(key), store)
-                .expect("open anchored");
+        let mut writer = AuditWriter::open_with_tip_anchor(
+            profile.audit_log_path.clone(),
+            Some(key),
+            store,
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
+        )
+        .expect("open anchored");
         for _ in 0..entries {
             writer.write_entry(sample_entry()).expect("append");
         }
@@ -813,6 +856,82 @@ mod tests {
         assert_eq!(rows[0]["reason"], "rollback_acknowledged");
     }
 
+    /// The anchor of a log that a keyed use reached is deleted and the log
+    /// truncated. Every keyed open refuses with `audit.tip_anchor_missing`;
+    /// `--acknowledge-rollback` is the way out, writes its row, and the next
+    /// keyed open succeeds.
+    #[test]
+    #[serial]
+    fn the_rollback_flag_clears_a_missing_anchor_and_writes_its_row() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let profile = anchored_profile("missing-anchor", dir.path(), 3);
+        record_binding("missing-anchor", &profile);
+        let anchor_ref = TestAnchorStore::new(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        )
+        .anchor_entry_ref()
+        .clone();
+        keyring_core::Entry::new(&anchor_ref.service, &anchor_ref.account)
+            .and_then(|entry| entry.delete_credential())
+            .expect("delete the anchor");
+        let content = std::fs::read_to_string(&profile.audit_log_path).expect("read log");
+        let kept: String = content.split_inclusive('\n').take(2).collect();
+        std::fs::write(&profile.audit_log_path, kept).expect("truncate the log");
+
+        let open_keyed = || {
+            let access = stellar_agent_network::keyring::keyed_audit_access(
+                &profile,
+                "missing-anchor",
+                BindingCheck::Enforce,
+            )
+            .expect("keyed access");
+            AuditWriter::open(profile.audit_log_path.clone(), Some(access))
+        };
+        let refusal = open_keyed().expect_err("a missing anchor refuses the keyed open");
+        assert!(
+            matches!(refusal, WriterError::TipAnchorMissing { .. }),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            crate::commands::audit::audit_writer_error(
+                &refusal,
+                "audit.writer_unavailable",
+                "missing-anchor"
+            )
+            .code(),
+            "audit.tip_anchor_missing"
+        );
+        assert!(
+            raw_anchor(&profile).is_none(),
+            "the refusal writes no anchor"
+        );
+
+        let err = run_reanchor(&args_with("missing-anchor", false, false), &profile)
+            .expect_err("the rollback flag is required");
+        assert!(
+            matches!(
+                err,
+                WalletError::Validation(ValidationError::AuditReanchorNotAcknowledged { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(
+            raw_anchor(&profile).is_none(),
+            "a refused repair writes nothing"
+        );
+
+        let data = run_reanchor(&args_with("missing-anchor", true, false), &profile)
+            .expect("the acknowledged repair succeeds");
+        assert_eq!(data.acknowledged, vec!["rollback"]);
+        let rows = tip_rows(&profile);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["reason"], "rollback_acknowledged");
+        assert_eq!(counter(&profile), Some(1));
+        drop(open_keyed().expect("the repaired log opens under the keyed path"));
+    }
+
     #[test]
     #[serial]
     fn an_absent_binding_is_recorded_after_a_rollback_repair() {
@@ -828,6 +947,177 @@ mod tests {
                 == Some(AuditBinding::for_profile(&profile).to_keyring_value()),
             "an absent binding is recorded after the repair"
         );
+    }
+
+    fn changed_binding_without_anchor(name: &str, dir: &std::path::Path) -> Profile {
+        let profile = anchored_profile(name, dir, 2);
+        let mut previous = profile.clone();
+        previous.audit_log_path = dir.join("previous.jsonl");
+        record_binding(name, &previous);
+        let store = TestAnchorStore::new(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        );
+        let anchor = store.anchor_entry_ref();
+        keyring_core::Entry::new(&anchor.service, &anchor.account)
+            .unwrap()
+            .delete_credential()
+            .unwrap();
+        assert!(
+            profile
+                .audit_log_path
+                .with_extension("jsonl.root_hmac")
+                .is_file()
+        );
+        assert!(tip_rows(&profile).is_empty());
+        profile
+    }
+
+    #[test]
+    #[serial]
+    fn a_changed_binding_with_missing_anchor_requires_rollback_before_and_under_lock() {
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let name = "bind-missing-refuse";
+        let profile = changed_binding_without_anchor(name, dir.path());
+        let args = args_with(name, false, true);
+        let before = snapshot(name, &profile, &profile);
+        let err = run_reanchor(&args, &profile).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WalletError::Validation(ValidationError::AuditBindingChangeNotAcknowledged {
+                    missing: "--acknowledge-rollback",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(snapshot(name, &profile, &profile), before);
+
+        // The locked decision refuses on its own.
+        let store = TestBindingStore::for_profile(name);
+        let expected = AuditBinding::for_profile(&profile);
+        let recorded = store.classify(&expected).unwrap();
+        let mut writer = open_repair_writer(&profile, name).unwrap();
+        let err = reanchor_binding_change_locked(&args, &store, &expected, &recorded, &mut writer)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WalletError::Validation(ValidationError::AuditBindingChangeNotAcknowledged {
+                    missing: "--acknowledge-rollback",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(snapshot(name, &profile, &profile), before);
+    }
+
+    #[test]
+    #[serial]
+    fn a_changed_binding_with_missing_anchor_and_both_flags_writes_both_rows() {
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let name = "bind-missing-both";
+        let profile = changed_binding_without_anchor(name, dir.path());
+        let data = run_reanchor(&args_with(name, true, true), &profile).unwrap();
+        assert_eq!(data.acknowledged, vec!["rollback", "binding_change"]);
+        let rows = tip_rows(&profile);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["reason"], "rollback_acknowledged");
+        assert_eq!(rows[1]["reason"], "binding_changed");
+        assert_eq!(counter(&profile), Some(1));
+        assert_eq!(
+            raw_binding(name),
+            Some(AuditBinding::for_profile(&profile).to_keyring_value())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_changed_binding_without_anchor_evidence_needs_only_the_binding_flag() {
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let name = "bind-no-evidence";
+        let mut profile = anchored_profile(name, dir.path(), 2);
+        record_binding(name, &profile);
+        profile.audit_log_path = dir.path().join("unkeyed.jsonl");
+        AuditWriter::open(profile.audit_log_path.clone(), None)
+            .unwrap()
+            .write_entry(sample_entry())
+            .unwrap();
+        let data = run_reanchor(&args_with(name, false, true), &profile).unwrap();
+        assert_eq!(data.acknowledged, vec!["binding_change"]);
+        let rows = tip_rows(&profile);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["reason"], "binding_changed");
+    }
+
+    /// An anchoring row in the active file shows prior anchoring when an
+    /// archive no longer verifies: the decision under the lock reads the
+    /// writer's replay of the active file, so the binding flag alone refuses
+    /// and nothing is written.
+    #[test]
+    #[serial]
+    fn an_anchoring_row_in_the_active_file_needs_rollback_despite_a_broken_archive() {
+        use stellar_agent_core::audit_log::TipAnchorReason;
+        use stellar_agent_core::audit_log::rotation::test_seam::set_rotation_threshold;
+        use stellar_agent_core::audit_log::test_helpers::break_newest_archive_link;
+
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let name = "bind-row-broken-archive";
+        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct")
+            .with_profile_name(name)
+            .build();
+        profile.audit_log_path = dir.path().join("rows.jsonl");
+        let mut previous = profile.clone();
+        previous.audit_log_path = dir.path().join("previous.jsonl");
+        record_binding(name, &previous);
+        {
+            let mut writer = AuditWriter::open(profile.audit_log_path.clone(), None).unwrap();
+            writer.write_entry(sample_entry()).unwrap();
+            writer.write_entry(sample_entry()).unwrap();
+            let size = std::fs::metadata(&profile.audit_log_path).unwrap().len();
+            let threshold = set_rotation_threshold(&profile.audit_log_path, size);
+            writer
+                .write_entry(AuditEntry::new_audit_tip_anchored(
+                    TipAnchorReason::RollbackAcknowledged,
+                    2,
+                    None,
+                    Some(1),
+                    uuid::Uuid::new_v4().to_string(),
+                ))
+                .unwrap();
+            drop(threshold);
+        }
+        break_newest_archive_link(&profile.audit_log_path);
+        assert!(verify_log(&profile.audit_log_path, None).is_err());
+        assert!(
+            !profile
+                .audit_log_path
+                .with_extension("jsonl.root_hmac")
+                .exists()
+        );
+        assert_eq!(tip_rows(&profile).len(), 1);
+        assert_eq!(raw_anchor(&profile), None);
+
+        let args = args_with(name, false, true);
+        let before = snapshot(name, &previous, &profile);
+        let err = run_reanchor(&args, &profile).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WalletError::Validation(ValidationError::AuditBindingChangeNotAcknowledged {
+                    missing: "--acknowledge-rollback",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(snapshot(name, &previous, &profile), before);
     }
 
     #[test]
@@ -1389,6 +1679,7 @@ mod tests {
                 &profile.audit_log_hash_chain_key_id,
                 &profile.audit_log_path,
             ),
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
         .expect("the repaired log opens cleanly");
     }

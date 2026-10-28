@@ -9,11 +9,18 @@
 //!   every platform; the intended target is Linux services and CI.
 //! - [`ProtectionMode::Dpapi`] (Windows only) — `CryptProtectData` /
 //!   `CryptUnprotectData`, CurrentUser scope, via
-//!   `stellar_agent_windows_identity::dpapi_protect` /
-//!   `dpapi_unprotect`. Processes running as the same Windows user can decrypt
-//!   when the session can access that user's DPAPI master key. Key-authenticated
-//!   SSH sessions can lack access; an interactive desktop logon may help.
-//!   `headless-env` has no DPAPI dependency and needs its configured key.
+//!   `stellar_agent_windows_identity::dpapi_protect_with_entropy` /
+//!   `dpapi_unprotect_with_entropy`. Processes running as the same Windows user
+//!   can decrypt when the session can access that user's DPAPI master key.
+//!   Key-authenticated SSH sessions can lack access; an interactive desktop
+//!   logon may help. `headless-env` has no DPAPI dependency and needs its
+//!   configured key.
+//!
+//! Both modes bind each value to its `service`/`account` coordinate: the
+//! XChaCha20-Poly1305 tag covers it as associated data, and DPAPI takes it as
+//! optional entropy. A value moved to another coordinate fails to open. A
+//! DPAPI value sealed with no entropy opens through the call without entropy
+//! and is reported unbound, so the store rewrites it bound.
 //!
 //! DPAPI protect failures carry only a typed numeric Windows code when
 //! available. The store maps seal errors to `PlatformFailure`, and the wallet
@@ -111,12 +118,26 @@ pub(crate) struct Sealed {
     pub ciphertext: Vec<u8>,
 }
 
-/// Seals `plaintext` under `mode`. `aad` (associated authenticated data —
-/// the `service`/`account` coordinate) is bound into the XChaCha20-Poly1305
-/// tag for [`ProtectionMode::EnvKey`] so a ciphertext cannot be silently
-/// relocated to a different entry; DPAPI has no AAD concept, so `aad` is
-/// unused for [`ProtectionMode::Dpapi`] (documented scope limitation — same
-/// trust boundary as Windows Credential Manager, which has none either).
+/// Whether an opened value is bound to the coordinate it was opened under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryBinding {
+    /// The value opened only under its own coordinate.
+    Bound,
+    /// A DPAPI value sealed with no entropy: it opens under any coordinate.
+    Unbound,
+}
+
+/// A value [`open`] recovered, and whether it is bound to its coordinate.
+pub(crate) struct Opened {
+    pub plaintext: Zeroizing<Vec<u8>>,
+    pub binding: EntryBinding,
+}
+
+/// Seals `plaintext` under `mode`, bound to `aad`, the `service`/`account`
+/// coordinate. [`ProtectionMode::EnvKey`] binds it into the
+/// XChaCha20-Poly1305 tag as associated data, and [`ProtectionMode::Dpapi`]
+/// passes it as DPAPI's optional entropy, so a ciphertext relocated to a
+/// different entry fails to open.
 pub(crate) fn seal(
     mode: &ProtectionMode,
     aad: &[u8],
@@ -144,22 +165,27 @@ pub(crate) fn seal(
                 ciphertext,
             })
         }
-        ProtectionMode::Dpapi => dpapi_seal(plaintext),
+        ProtectionMode::Dpapi => dpapi_seal(aad, plaintext),
     }
 }
 
 /// Opens a value sealed by [`seal`]. See [`seal`]'s docs for the `aad`
 /// binding.
 ///
+/// A DPAPI value that does not open under `aad` is tried once with no
+/// entropy, the form a value sealed with no coordinate binding has; one that
+/// opens that way is returned as [`EntryBinding::Unbound`].
+///
 /// # Errors
 ///
 /// Returns [`CryptoError::SealFailed`] for a corrupted/tampered ciphertext, a
-/// key mismatch, or a missing nonce on the `env-key` path.
+/// key mismatch, a value bound to another coordinate, or a missing nonce on
+/// the `env-key` path.
 pub(crate) fn open(
     mode: &ProtectionMode,
     aad: &[u8],
     sealed: &Sealed,
-) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+) -> Result<Opened, CryptoError> {
     match mode {
         ProtectionMode::EnvKey(key) => {
             let nonce_bytes = sealed.nonce.ok_or(CryptoError::SealFailed)?;
@@ -176,9 +202,12 @@ pub(crate) fn open(
                     },
                 )
                 .map_err(|_| CryptoError::SealFailed)?;
-            Ok(Zeroizing::new(plaintext))
+            Ok(Opened {
+                plaintext: Zeroizing::new(plaintext),
+                binding: EntryBinding::Bound,
+            })
         }
-        ProtectionMode::Dpapi => dpapi_open(&sealed.ciphertext),
+        ProtectionMode::Dpapi => dpapi_open(aad, &sealed.ciphertext),
     }
 }
 
@@ -211,13 +240,15 @@ pub fn with_dpapi_protect_result<T>(
 }
 
 #[cfg(target_os = "windows")]
-fn dpapi_seal(plaintext: &[u8]) -> Result<Sealed, CryptoError> {
+fn dpapi_seal(aad: &[u8], plaintext: &[u8]) -> Result<Sealed, CryptoError> {
     #[cfg(any(test, feature = "test-helpers"))]
     let result = PROTECT_RESULT
         .with(|slot| slot.borrow_mut().take())
-        .unwrap_or_else(|| stellar_agent_windows_identity::dpapi_protect(plaintext));
+        .unwrap_or_else(|| {
+            stellar_agent_windows_identity::dpapi_protect_with_entropy(plaintext, aad)
+        });
     #[cfg(not(any(test, feature = "test-helpers")))]
-    let result = stellar_agent_windows_identity::dpapi_protect(plaintext);
+    let result = stellar_agent_windows_identity::dpapi_protect_with_entropy(plaintext, aad);
     let ciphertext = result.map_err(|error| match error {
         stellar_agent_windows_identity::DpapiError::Win32 { code, .. } => {
             CryptoError::DpapiProtectFailed { code }
@@ -231,19 +262,30 @@ fn dpapi_seal(plaintext: &[u8]) -> Result<Sealed, CryptoError> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn dpapi_seal(_plaintext: &[u8]) -> Result<Sealed, CryptoError> {
+fn dpapi_seal(_aad: &[u8], _plaintext: &[u8]) -> Result<Sealed, CryptoError> {
     Err(CryptoError::DpapiUnsupportedPlatform)
 }
 
 #[cfg(target_os = "windows")]
-fn dpapi_open(ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+fn dpapi_open(aad: &[u8], ciphertext: &[u8]) -> Result<Opened, CryptoError> {
+    if let Ok(plaintext) =
+        stellar_agent_windows_identity::dpapi_unprotect_with_entropy(ciphertext, aad)
+    {
+        return Ok(Opened {
+            plaintext: Zeroizing::new(plaintext),
+            binding: EntryBinding::Bound,
+        });
+    }
     stellar_agent_windows_identity::dpapi_unprotect(ciphertext)
-        .map(Zeroizing::new)
+        .map(|plaintext| Opened {
+            plaintext: Zeroizing::new(plaintext),
+            binding: EntryBinding::Unbound,
+        })
         .map_err(|_| CryptoError::SealFailed)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn dpapi_open(_ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+fn dpapi_open(_aad: &[u8], _ciphertext: &[u8]) -> Result<Opened, CryptoError> {
     Err(CryptoError::DpapiUnsupportedPlatform)
 }
 
@@ -329,7 +371,7 @@ mod tests {
             }),
             || {
                 assert!(matches!(
-                    dpapi_seal(b"secret"),
+                    dpapi_seal(b"aad", b"secret"),
                     Err(CryptoError::DpapiProtectFailed { code: 2148073483 })
                 ));
             },
@@ -343,7 +385,7 @@ mod tests {
         ] {
             with_dpapi_protect_result(Err(error), || {
                 assert!(matches!(
-                    dpapi_seal(b"secret"),
+                    dpapi_seal(b"aad", b"secret"),
                     Err(CryptoError::DpapiProtectInternalFailure)
                 ));
             });
@@ -353,7 +395,9 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn dpapi_unprotect_failure_exposes_no_reason_or_code() {
-        let error = dpapi_open(b"invalid-dpapi-blob").unwrap_err();
+        let error = dpapi_open(b"aad", b"invalid-dpapi-blob")
+            .err()
+            .expect("an invalid blob must not open");
         assert!(matches!(error, CryptoError::SealFailed));
         assert_eq!(
             error.to_string(),
@@ -377,7 +421,8 @@ mod tests {
             "ciphertext must not equal plaintext"
         );
         let opened = open(&mode, aad, &sealed).expect("open");
-        assert_eq!(opened.as_slice(), plaintext);
+        assert_eq!(opened.plaintext.as_slice(), plaintext);
+        assert_eq!(opened.binding, EntryBinding::Bound);
     }
 
     #[test]
@@ -388,8 +433,8 @@ mod tests {
         let last = sealed.ciphertext.len() - 1;
         sealed.ciphertext[last] ^= 0xFF;
         assert!(matches!(
-            open(&mode, aad, &sealed),
-            Err(CryptoError::SealFailed)
+            open(&mode, aad, &sealed).err(),
+            Some(CryptoError::SealFailed)
         ));
     }
 
@@ -399,8 +444,8 @@ mod tests {
         let sealed = seal(&mode, b"svc\x00acct-a", b"payload").expect("seal");
         assert!(
             matches!(
-                open(&mode, b"svc\x00acct-b", &sealed),
-                Err(CryptoError::SealFailed)
+                open(&mode, b"svc\x00acct-b", &sealed).err(),
+                Some(CryptoError::SealFailed)
             ),
             "a ciphertext relocated to a different entry coordinate must fail to open"
         );
@@ -411,8 +456,8 @@ mod tests {
         let sealed = seal(&env_key_mode(), b"aad", b"payload").expect("seal");
         let other_mode = ProtectionMode::EnvKey(Arc::new(Zeroizing::new([0x99u8; 32])));
         assert!(matches!(
-            open(&other_mode, b"aad", &sealed),
-            Err(CryptoError::SealFailed)
+            open(&other_mode, b"aad", &sealed).err(),
+            Some(CryptoError::SealFailed)
         ));
     }
 
@@ -424,8 +469,8 @@ mod tests {
             ciphertext: vec![1, 2, 3],
         };
         assert!(matches!(
-            open(&mode, b"aad", &sealed),
-            Err(CryptoError::SealFailed)
+            open(&mode, b"aad", &sealed).err(),
+            Some(CryptoError::SealFailed)
         ));
     }
 
@@ -441,8 +486,8 @@ mod tests {
             ciphertext: vec![1, 2, 3],
         };
         assert!(matches!(
-            open(&ProtectionMode::Dpapi, b"aad", &sealed),
-            Err(CryptoError::DpapiUnsupportedPlatform)
+            open(&ProtectionMode::Dpapi, b"aad", &sealed).err(),
+            Some(CryptoError::DpapiUnsupportedPlatform)
         ));
     }
 
@@ -451,10 +496,39 @@ mod tests {
     fn dpapi_mode_round_trips() {
         let mode = ProtectionMode::Dpapi;
         let plaintext = b"headless keyring DPAPI mode round-trip";
-        let sealed = seal(&mode, b"unused-aad", plaintext).expect("seal");
+        let sealed = seal(&mode, b"svc\x00acct", plaintext).expect("seal");
         assert!(sealed.nonce.is_none());
-        let opened = open(&mode, b"unused-aad", &sealed).expect("open");
-        assert_eq!(opened.as_slice(), plaintext);
+        let opened = open(&mode, b"svc\x00acct", &sealed).expect("open");
+        assert_eq!(opened.plaintext.as_slice(), plaintext);
+        assert_eq!(opened.binding, EntryBinding::Bound);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn dpapi_open_rejects_a_value_relocated_to_another_coordinate() {
+        let mode = ProtectionMode::Dpapi;
+        let sealed = seal(&mode, b"svc\x00acct-a", b"payload").expect("seal");
+        assert!(
+            matches!(
+                open(&mode, b"svc\x00acct-b", &sealed).err(),
+                Some(CryptoError::SealFailed)
+            ),
+            "a DPAPI value relocated to a different coordinate must fail to open"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn dpapi_open_reports_a_value_sealed_without_entropy_as_unbound() {
+        let ciphertext =
+            stellar_agent_windows_identity::dpapi_protect(b"payload").expect("CryptProtectData");
+        let sealed = Sealed {
+            nonce: None,
+            ciphertext,
+        };
+        let opened = open(&ProtectionMode::Dpapi, b"svc\x00acct", &sealed).expect("open");
+        assert_eq!(opened.plaintext.as_slice(), b"payload");
+        assert_eq!(opened.binding, EntryBinding::Unbound);
     }
 
     #[test]
