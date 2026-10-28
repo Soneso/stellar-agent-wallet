@@ -1080,8 +1080,9 @@ bash .github/scripts/release/check-host.sh
 The checker reads metadata and Cargo trees with `--locked --offline`. Each
 error message names the rule that failed:
 
-- D1: the four `mainnet-write` declarations hold, and no other feature, no
-  `default`, and no normal dependency declaration reaches `mainnet-write`.
+- D1: the `mainnet-write` declarations the checker pins hold, and no other
+  feature, no `default`, and no normal dependency declaration reaches
+  `mainnet-write`.
 - D2: no dev or build dependency declaration requests a feature that reaches
   `mainnet-write`.
 - D3: every cargo and cross call of the workflows and of the scripts they name

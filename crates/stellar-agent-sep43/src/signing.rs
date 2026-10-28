@@ -32,8 +32,9 @@
 //! - [`sign_soroban_auth_entry`] invokes
 //!   `Signer::sign_soroban_address_auth_payload` over the SHA-256 of the
 //!   supplied preimage bytes: the auth-entry signing primitive. It refuses a
-//!   mainnet preimage; [`sign_soroban_auth_entry_authorized`] signs one under
-//!   a Soroban intent authorization.
+//!   mainnet preimage; `sign_soroban_auth_entry_authorized`, which exists only
+//!   in builds with the `mainnet-write` feature, signs one under a Soroban
+//!   intent authorization.
 //! - [`sign_message_bytes`] computes the SEP-53 message digest then invokes
 //!   `Signer::sign_tx_payload` (the payload domain is the SEP-53 message digest,
 //!   not a SEP-23 transaction, but the ed25519 primitive is identical).
@@ -48,8 +49,11 @@ use sha2::{Digest, Sha256};
 use stellar_agent_core::error::{MAINNET_SIGNING_REFUSAL_DETAIL, WalletError};
 use stellar_agent_core::observability::redact::redact_strkey_first5_last5;
 use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
+#[cfg(feature = "mainnet-write")]
 use stellar_agent_network::mainnet::authorization::MainnetSorobanIntentAuthorization;
+#[cfg(feature = "mainnet-write")]
 use stellar_agent_network::mainnet::soroban::check_preimage_against_authorization;
+#[cfg(feature = "mainnet-write")]
 use stellar_agent_network::mainnet::{
     MainnetAuthorizationError, MainnetConsumer, MainnetPrecondition, SignerRole,
 };
@@ -150,7 +154,7 @@ pub async fn sign_classic_transaction(
 /// 3. The preimage must be envelope type 9 or 10.
 /// 4. Its `network_id` must equal `SHA256(expected_network_passphrase)`.
 /// 5. The network must not be mainnet: a mainnet preimage is signed only by
-///    [`sign_soroban_auth_entry_authorized`].
+///    `sign_soroban_auth_entry_authorized`.
 /// 6. A type 10 preimage must be bound to `expected_signer`.
 ///
 /// `expected_signer` must be the public key of `signer`. Callers already hold
@@ -219,16 +223,15 @@ pub async fn sign_soroban_auth_entry(
 /// 6. The signature must verify under that key over `SHA256(preimage_bytes)`
 ///    before it is returned.
 ///
-/// Compiled in every build; without mainnet writes no authorization exists,
-/// so the function cannot be called.
+/// Exists only in builds with the `mainnet-write` feature.
 ///
 /// # Errors
 ///
 /// - [`Sep43Error::MainnetAuthorizationRefused`]: a check of the
 ///   authorization fails, the preimage is not for mainnet, or the signature
 ///   does not verify. The broken precondition is logged.
-/// - [`Sep43Error::MainnetSigningForbidden`]: this build has no mainnet
-///   writes.
+/// - [`Sep43Error::MainnetSigningForbidden`]: a check reports
+///   `network.mainnet_write_forbidden`.
 /// - [`Sep43Error::InvalidAddress`]: a type 10 preimage is bound to another
 ///   address than the authorization's signer.
 /// - The other errors of [`sign_soroban_auth_entry`] for the input and the
@@ -237,6 +240,7 @@ pub async fn sign_soroban_auth_entry(
 /// # Panics
 ///
 /// Never panics.
+#[cfg(feature = "mainnet-write")]
 pub async fn sign_soroban_auth_entry_authorized(
     preimage_xdr: &str,
     signer: &(dyn Signer + Send + Sync),
@@ -408,6 +412,7 @@ fn mainnet_signing_forbidden() -> Sep43Error {
 }
 
 /// Whether `signature` is a valid ed25519 signature by `key` over `payload`.
+#[cfg(feature = "mainnet-write")]
 fn signature_verifies(key: &[u8; 32], payload: &[u8; 32], signature: &[u8; 64]) -> bool {
     ed25519_dalek::VerifyingKey::from_bytes(key).is_ok_and(|key| {
         key.verify_strict(payload, &ed25519_dalek::Signature::from_bytes(signature))

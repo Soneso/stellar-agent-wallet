@@ -37,7 +37,26 @@
 //! - [`stellar_agent_sep43`] — auth-entry signing (single call site).
 //! - [`stellar_agent_network`] — Soroban RPC transport, account fetching.
 //! - [`stellar_agent_core`] — profile/CAIP-2 passphrase resolution.
-
+//!
+//! # Feature `mainnet-write`
+//!
+//! The authorized mainnet payment, `exact::create_payment_authorized` with its
+//! proofs `exact::X402MainnetProofs` and its result `exact::AuthorizedPayment`,
+//! exists only in builds with the `mainnet-write` feature, which also enables
+//! it in `stellar-agent-core`, `stellar-agent-network` and
+//! `stellar-agent-sep43`.
+#![cfg_attr(
+    not(feature = "mainnet-write"),
+    doc = "```compile_fail\nuse stellar_agent_x402::exact::X402MainnetProofs;\n```"
+)]
+#![cfg_attr(
+    not(feature = "mainnet-write"),
+    doc = "```compile_fail\nuse stellar_agent_x402::exact::AuthorizedPayment;\n```"
+)]
+#![cfg_attr(
+    not(feature = "mainnet-write"),
+    doc = "```compile_fail\nuse stellar_agent_x402::exact::create_payment_authorized;\n```"
+)]
 #![deny(missing_docs)]
 
 pub mod constants;

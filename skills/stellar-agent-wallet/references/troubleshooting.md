@@ -128,7 +128,8 @@ The x402 payment tools report these mainnet refusals:
 
 - The SEP-10 and identity libraries refuse mainnet in their ordinary entries
   with `sep10.mainnet_signing_forbidden` and `identity.mainnet_signing_forbidden`.
-  The authorized completion refuses with `sep10.mainnet_authorization_refused`
+  The authorized completion, which exists only in builds with the
+  `mainnet-write` feature, refuses with `sep10.mainnet_authorization_refused`
   or `identity.mainnet_authorization_refused`. The MCP tool maps these signing
   and authorization refusals to `network.mainnet_write_forbidden` and
   `network.mainnet_authorization_refused`, respectively.

@@ -11,6 +11,12 @@ keywords = ["stellar", "x402", "payments", "wallet", "soroban"]
 categories = ["cryptography::cryptocurrencies", "finance"]
 
 [features]
+# Enables mainnet-write in core, network and sep43 and compiles the authorized payment.
+mainnet-write = [
+    "stellar-agent-core/mainnet-write",
+    "stellar-agent-network/mainnet-write",
+    "stellar-agent-sep43/mainnet-write",
+]
 # Exposes constructors used by integration tests across crate boundaries.
 # Never enable in production binaries.
 test-helpers = []

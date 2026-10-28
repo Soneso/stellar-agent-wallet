@@ -298,6 +298,7 @@ const SEP10_REFUSAL_TEXT: &str = "the mainnet authorization for this SEP-10 auth
 
 /// The text of a refused mainnet authorization of the payment: an intent,
 /// submission or release refusal after the SEP-10 authentication.
+#[cfg(feature = "mainnet-write")]
 const PAYMENT_REFUSAL_TEXT: &str =
     "the mainnet authorization for this payment was refused; the payment payload was withheld";
 
@@ -439,19 +440,26 @@ impl WalletServer {
             if self.mainnet_context.is_none() {
                 return Ok(crate::tools::common::x402_mainnet_signing_forbidden_result());
             }
-            // A fixed test session would stand in for the authorized
-            // identity gate, so a server with the context refuses it.
-            #[cfg(any(test, feature = "test-helpers"))]
-            if self.x402_identity_session_override.is_some() {
-                return Ok(crate::tools::common::x402_mainnet_signing_forbidden_result());
+            // A build without the mainnet-write feature refuses a mainnet
+            // payment here.
+            #[cfg(feature = "mainnet-write")]
+            {
+                // A fixed test session would stand in for the authorized
+                // identity gate, so a server with the context refuses it.
+                #[cfg(any(test, feature = "test-helpers"))]
+                if self.x402_identity_session_override.is_some() {
+                    return Ok(crate::tools::common::x402_mainnet_signing_forbidden_result());
+                }
+                let guard = match self.mainnet_write_admission(
+                    stellar_agent_network::mainnet::MainnetConsumer::X402Authenticated,
+                ) {
+                    Ok(guard) => guard,
+                    Err(result) => return Ok(result),
+                };
+                return self.mainnet_authenticated_payment(args, guard).await;
             }
-            let guard = match self.mainnet_write_admission(
-                stellar_agent_network::mainnet::MainnetConsumer::X402Authenticated,
-            ) {
-                Ok(guard) => guard,
-                Err(result) => return Ok(result),
-            };
-            return self.mainnet_authenticated_payment(args, guard).await;
+            #[cfg(not(feature = "mainnet-write"))]
+            return Ok(crate::tools::common::x402_mainnet_signing_forbidden_result());
         }
 
         // ── Decode and validate payment_required FIRST ────────────────────────
@@ -823,6 +831,7 @@ impl WalletServer {
     }
 }
 
+#[cfg(feature = "mainnet-write")]
 impl WalletServer {
     /// The authenticated payment on a server holding the mainnet write
     /// context, in two calls.
@@ -1222,6 +1231,7 @@ impl WalletServer {
 /// `network.mainnet_write_forbidden`, an endpoint identity or cross-check
 /// refusal keeps its own code, and every other failure is
 /// `x402.payment_build_failed`.
+#[cfg(feature = "mainnet-write")]
 fn mainnet_payment_error(error: &stellar_agent_x402::X402Error, withheld: &str) -> CallToolResult {
     use stellar_agent_network::mainnet::MainnetAuthorizationError;
     use stellar_agent_x402::X402Error;
@@ -1773,8 +1783,9 @@ mod tests {
     }
 
     /// A refused authorization of the payment says that the payload was
-    /// withheld; a denial keeps its policy code, a build without mainnet
-    /// writes the write refusal, and every other error its own code.
+    /// withheld; a denial keeps its policy code, `FeatureDisabled` the write
+    /// refusal, and every other error its own code.
+    #[cfg(feature = "mainnet-write")]
     #[test]
     fn library_errors_map_to_the_payment_codes() {
         use stellar_agent_network::mainnet::{
@@ -1826,6 +1837,7 @@ mod tests {
     /// Each failure point of the payment after the identity gate selects the
     /// cleanup stage, the withheld row's stage and the message the tool
     /// passes on.
+    #[cfg(feature = "mainnet-write")]
     #[test]
     fn each_failure_point_selects_its_stage() {
         use crate::tools::x402_create_payment::{

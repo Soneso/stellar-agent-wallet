@@ -41,17 +41,41 @@
 //! - `stellar_agent_x402` — x402 Exact Stellar payment construction.
 //! - [`stellar_agent_sep10`] — SEP-10 challenge/response client + ephemeral flow.
 //! - [`stellar_agent_network`] — `stellar.toml` fetch + `MinimalSep1` parser.
-
+//!
+//! # Feature `mainnet-write`
+//!
+//! The authorized mainnet gate, `gate::resolve_and_verify_counterparty_authorized`
+//! with its inputs `gate::MainnetIdentityInputs`, its result
+//! `gate::MainnetCounterpartySession` and its test seam, exists only in builds
+//! with the `mainnet-write` feature, which also enables it in
+//! `stellar-agent-core`, `stellar-agent-network` and `stellar-agent-sep10`.
+#![cfg_attr(
+    not(feature = "mainnet-write"),
+    doc = "```compile_fail\nuse stellar_agent_x402_identity::gate::MainnetIdentityInputs;\n```"
+)]
+#![cfg_attr(
+    not(feature = "mainnet-write"),
+    doc = "```compile_fail\nuse stellar_agent_x402_identity::gate::MainnetCounterpartySession;\n```"
+)]
+#![cfg_attr(
+    not(feature = "mainnet-write"),
+    doc = "```compile_fail\nuse stellar_agent_x402_identity::gate::resolve_and_verify_counterparty_authorized;\n```"
+)]
+#![cfg_attr(
+    not(feature = "mainnet-write"),
+    doc = "```compile_fail\nuse stellar_agent_x402_identity::gate::resolve_and_verify_counterparty_authorized_at;\n```"
+)]
 #![deny(unsafe_code)]
 
 pub mod error;
 pub mod gate;
 
 pub use error::IdentityError;
+#[cfg(feature = "mainnet-write")]
 pub use gate::{
-    MainnetCounterpartySession, MainnetIdentityInputs, VerifiedCounterpartySession,
-    resolve_and_verify_counterparty, resolve_and_verify_counterparty_authorized,
+    MainnetCounterpartySession, MainnetIdentityInputs, resolve_and_verify_counterparty_authorized,
 };
+pub use gate::{VerifiedCounterpartySession, resolve_and_verify_counterparty};
 
 /// Test seam: drives the full gate against an explicit base URL.
 ///
@@ -65,9 +89,9 @@ pub use gate::{
 pub use gate::resolve_and_verify_counterparty_at;
 
 /// Test seam of the authorized mainnet gate: replaces the stellar.toml and
-/// SEP-10 transport only. Only available under `test-helpers` or
-/// `#[cfg(test)]`.
+/// SEP-10 transport only. Only available with `mainnet-write` and under
+/// `test-helpers` or `#[cfg(test)]`.
 ///
 /// See [`gate::resolve_and_verify_counterparty_authorized_at`].
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
 pub use gate::resolve_and_verify_counterparty_authorized_at;

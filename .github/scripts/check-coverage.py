@@ -44,7 +44,7 @@ OFF_FLOORS = {
     "stellar-agent-network": 85,
     "stellar-agent-nonce": 95,
     "stellar-agent-pool": 88,
-    "stellar-agent-sep10": 93,
+    "stellar-agent-sep10": 95,
     "stellar-agent-sep43": 95,
     "stellar-agent-sep45": 91,
     "stellar-agent-sep48": 93,
@@ -59,17 +59,12 @@ OFF_FLOORS = {
     "stellar-agent-toolsets-runtime": 91,
     "stellar-agent-webauthn-bridge": 89,
     "stellar-agent-windows-identity": 97,
-    "stellar-agent-x402": 67,
-    "stellar-agent-x402-identity": 83,
+    "stellar-agent-x402": 87,
+    "stellar-agent-x402-identity": 87,
     "stellar-agent-xdr-limits": 97,
 }
 
 FLOORS = {"feature-off": OFF_FLOORS.copy(), "feature-on": OFF_FLOORS.copy()}
-
-# The authorized gate paths of stellar-agent-x402-identity compile feature-off
-# against uninhabited inputs and execute only in the feature-on configuration,
-# so the feature-off ratchet sits below the feature-on one.
-FLOORS["feature-off"]["stellar-agent-x402-identity"] = 75
 
 # A crate with no explicit entry must clear this floor. New crates that are
 # legitimately testnet-covered below this bar must add an explicit entry above.

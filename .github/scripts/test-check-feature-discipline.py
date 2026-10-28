@@ -35,10 +35,37 @@ RULE_INPUTS = {'D5': (), 'D6': ('Cross.toml',), 'D7': (),
                'D8': ('docs/maintainers/building.md',), 'D9': (),
                'D10': ('docs/maintainers/building.md',), 'D11': (),
                'D12': ('crates',)}
-# Violating variants per rule; D7 has the workflow env map, an echo that
-# appends a lower-case refused name to the environment file and a
-# lower-case PowerShell assignment.
-VARIANTS = {'D7': 3}
+# Violating variants per rule. D1 has a core forward missing from network's
+# declaration, a sep10 forward missing from x402-identity's, an x402-identity
+# forward missing from mcp's, and an x402-identity test-helpers feature that
+# reaches the feature through sep10. D2 has a dev dependency that requests
+# core's feature and one that requests x402's. D3 has a crate outside the
+# workspace that enables core's feature in an off graph, and x402 off in an
+# on graph of cli and mcp whose declaration does not forward to it. D7 has
+# the workflow env map, an echo that appends a lower-case refused name to
+# the environment file and a lower-case PowerShell assignment.
+VARIANTS = {'D1': 4, 'D2': 2, 'D3': 2, 'D7': 3}
+# The normal dependencies of each synthetic workspace member, in the order
+# its mainnet-write declaration forwards to them; other declares no feature.
+FIXTURE_DEPENDENCIES = {
+    'core': [], 'network': ['core'], 'cli': ['core', 'network'],
+    'mcp': ['core', 'network', 'sep43', 'x402', 'x402-identity'],
+    'sep10': ['core', 'network'], 'sep43': ['core', 'network'],
+    'x402': ['core', 'network', 'sep43'], 'x402-identity': ['core', 'network', 'sep10'],
+    'other': [],
+}
+# The one error of each variant that targets a crate of the authorized
+# mainnet items: the variant holds exactly one defect.
+SINGLE_ERRORS = {
+    ('D1', 1): 'D1: stellar-agent-x402-identity: declaration differs',
+    ('D1', 2): 'D1: stellar-agent-mcp: declaration differs',
+    ('D1', 3): 'D1: stellar-agent-x402-identity/test-helpers reaches mainnet-write',
+    ('D2', 1): 'D2: stellar-agent-other: dev dependency enables mainnet-write',
+    ('D3', 1): 'positive control lacks feature',
+}
+# The on graph of D3's second variant: both binaries reach every declaring
+# crate, and neither selects x402 itself.
+SELECTED_ON = 'cargo test -p stellar-agent-cli -p stellar-agent-mcp --features mainnet-write'
 # Build-script output D4 accepts: literal directives, a cfg that is no
 # feature, and formatted directives with a literal key and literal
 # arguments.
@@ -73,7 +100,7 @@ def live_packages(m):
 
 
 def workspace(root, mutation=None):
-    names = ['core', 'network', 'cli', 'mcp', 'other']
+    names = list(FIXTURE_DEPENDENCIES)
     root.mkdir(parents=True)
     (root / 'Cargo.toml').write_text('[workspace]\nresolver="2"\nmembers=[' + ','.join(json.dumps(n) for n in names) + ']\n')
     for name in names:
@@ -82,7 +109,7 @@ def workspace(root, mutation=None):
         (path / 'src/lib.rs').write_text('pub fn sample() {}\n')
         if name in ('cli', 'mcp'):
             (path / 'src/main.rs').write_text('fn main() {}\n')
-        dependencies = [] if name in ('core', 'other') else ['core'] if name == 'network' else ['core', 'network']
+        dependencies = FIXTURE_DEPENDENCIES[name]
         edges = [f'stellar-agent-{dep}/mainnet-write' for dep in dependencies]
         features = '' if name == 'other' else 'mainnet-write=' + json.dumps(edges) + '\n'
         manifest = f'[package]\nname="stellar-agent-{name}"\nversion="0.0.0"\nedition="2024"\n[features]\ndefault=[]\n' + features
@@ -160,10 +187,21 @@ def rule_fixture(m, rule, directory, variant=0):
     if rule in ('D1', 'D2', 'D3', 'D4'):
         root = directory / rule
         def mutate(r):
-            if rule == 'D1':
+            if rule == 'D1' and variant == 0:
                 replace(r, 'network/Cargo.toml', 'mainnet-write=["stellar-agent-core/mainnet-write"]', 'mainnet-write=[]')
-            elif rule == 'D2':
+            elif rule == 'D1' and variant == 1:
+                replace(r, 'x402-identity/Cargo.toml', ', "stellar-agent-sep10/mainnet-write"', '')
+            elif rule == 'D1' and variant == 2:
+                replace(r, 'mcp/Cargo.toml', ', "stellar-agent-x402-identity/mainnet-write"', '')
+            elif rule == 'D1':
+                replace(r, 'x402-identity/Cargo.toml', 'default=[]\n',
+                        'default=[]\ntest-helpers=["stellar-agent-sep10/mainnet-write"]\n')
+            elif rule == 'D2' and variant == 0:
                 append(r, 'other/Cargo.toml', '[dev-dependencies]\nstellar-agent-core={path="../core",features=["mainnet-write"]}\n')
+            elif rule == 'D2':
+                append(r, 'other/Cargo.toml', '[dev-dependencies]\nstellar-agent-x402={path="../x402",features=["mainnet-write"]}\n')
+            elif rule == 'D3' and variant == 1:
+                replace(r, 'mcp/Cargo.toml', ', "stellar-agent-x402/mainnet-write"', '')
             elif rule == 'D3':
                 (r / 'external/src').mkdir(parents=True)
                 (r / 'external/src/lib.rs').write_text('pub fn sample() {}\n')
@@ -173,7 +211,12 @@ def rule_fixture(m, rule, directory, variant=0):
             elif rule == 'D4':
                 (r / 'other/build.rs').write_text('fn main() { println!("cargo:rustc-cfg=feature=\\"mainnet-write\\""); }\n')
         workspace(root, mutate)
-        c = graph_checker(m, root, 'cargo build --workspace') if rule == 'D3' else m.Checker(root)
+        if rule == 'D3' and variant == 1:
+            c = graph_checker(m, root, SELECTED_ON, 'on')
+        elif rule == 'D3':
+            c = graph_checker(m, root, 'cargo build --workspace')
+        else:
+            c = m.Checker(root)
     else:
         root = live_root(rule, directory / rule)
         c = bare_checker(m, root, packages=live_packages(m))
@@ -211,6 +254,9 @@ def regression(m, rule, directory, variant=0):
     errors = rule_fixture(m, rule, directory / f'{rule}-{variant}', variant)
     assert errors and all(e.startswith(rule + ':') for e in errors), \
         f'{rule}: violating fixture accepted: {errors}'
+    single = SINGLE_ERRORS.get((rule, variant))
+    assert single is None or (len(errors) == 1 and single in errors[0]), \
+        f'{rule} variant {variant}: expected one error with {single!r}: {errors}'
 
 
 def graph_cases(m, tmp, selected=None):
@@ -227,6 +273,7 @@ def graph_cases(m, tmp, selected=None):
         print(f'ok {name}')
     check('graph-baseline', None, 'cargo build --workspace', False)
     check('graph-positive', None, 'cargo test --workspace --features mainnet-write', False, 'on')
+    check('graph-positive-selected', None, SELECTED_ON, False, 'on')
     if not selected or selected == 'graph-positive-mutated':
         root = tmp / 'graph-positive-mutated'
         workspace(root)
@@ -299,7 +346,8 @@ def graph_cases(m, tmp, selected=None):
         print(f'ok {name}')
 
 
-GRAPHS = ('graph-baseline', 'graph-positive', 'graph-positive-mutated', 'graph-bin-workspace',
+GRAPHS = ('graph-baseline', 'graph-positive', 'graph-positive-selected', 'graph-positive-mutated',
+          'graph-bin-workspace',
           'graph-target-specific', 'graph-dev-build', 'graph-dev-test', 'graph-absent',
           'graph-missing-metadata', 'synthetic-baseline', 'D4-formatted', 'inventory-added',
           'inventory-vanished', 'inventory-duplicate', 'inventory-drift')
@@ -692,13 +740,14 @@ def case_topology(m, tmp, checker):
 
 @unit('d1-normal-dependency')
 def case_d1_normal_dependency(m, tmp, checker):
-    core, network, cli, mcp = m.PACKAGES
+    core = m.PACKAGES[0]
     def dep(name, features=()):
         return {'name': name, 'rename': None, 'features': list(features),
                 'uses_default_features': True, 'kind': None, 'target': None}
-    packages = {core: {'features': {m.FEATURE: [], 'default': []}, 'dependencies': []}}
-    for name, deps in ((network, [core]), (cli, [core, network]), (mcp, [core, network])):
-        packages[name] = {'features': {m.FEATURE: m.DECLARATIONS[name], 'default': []},
+    packages = {}
+    for name, declaration in m.DECLARATIONS.items():
+        deps = [forward.split('/', 1)[0] for forward in declaration]
+        packages[name] = {'features': {m.FEATURE: declaration, 'default': []},
                           'dependencies': [dep(d) for d in deps]}
     packages['other'] = {'features': {'default': []}, 'dependencies': [dep(core, [m.FEATURE])]}
     c = bare_checker(m, packages=packages)
