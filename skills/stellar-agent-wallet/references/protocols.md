@@ -53,6 +53,8 @@ Tool `stellar_sep7_parse_uri`:
 
 Preview fields: `operation` (`"tx"`/`"pay"`), parsed operation fields, `callback` (authority host for SSRF inspection), `origin_domain`, `origin_verified`, `signature_status` (`verified`/`failed`/`missing_required`/`absent`), `will_auto_submit` (always `false`), `will_auto_post_callback` (always `false`).
 
+A URI with any parameter after `signature`, a trailing `&` included, or with a percent-encoded `signature` name, refuses with `sep7.invalid_param_value`; the verified payload therefore covers every parameter the preview shows.
+
 Does NOT: sign a URI; auto-POST to a `callback`; auto-submit. Origin-domain verification always fetches a fresh `stellar.toml` (never cached). SEP-7 carries no nonce/timestamp, so replay protection is the host's responsibility. Parse and verify failures are business errors under the standard envelope with `sep7.*` wire codes (e.g. `sep7.malformed_uri`, `sep7.missing_required_param`, `sep7.invalid_param_value`, `sep7.msg_too_long` [`msg` max 300 chars], `sep7.too_many_chain_levels` [max 7], `sep7.toml_fetch_failed` [URL redacted], `sep7.signing_key_not_in_toml`, `sep7.signature_verification_failed`, `sep7.signature_missing_with_origin_domain`).
 
 ## SEP-10: Stellar Web Authentication

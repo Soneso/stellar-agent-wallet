@@ -576,6 +576,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loading and record a redacted `opaque_payload_signed` row after signing.
 - The signing documentation identifies wallet authorization checks and the
   keyring custody boundary. Public library signing primitives accept raw digests.
+- SEP-7 parsing refuses parameters after `signature`, including a trailing
+  empty pair, and percent-encoded signature parameter names with
+  `sep7.invalid_param_value`. Verification independently refuses trailing
+  parameters, so the verified payload covers every URI parameter the preview
+  shows.
 - An expired binding does not satisfy the `HOME_DOMAIN` kind of a
   `counterparty_allowlist` criterion or `home_domain_resolved`:
   `counterparty list` and the policy snapshot skip cache entries past their TTL.

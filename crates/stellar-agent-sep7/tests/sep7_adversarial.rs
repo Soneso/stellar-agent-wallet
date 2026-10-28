@@ -814,6 +814,36 @@ async fn c9_valid_signed_uri_verifies() {
     );
 }
 
+/// Appended payment fields refuse in both parsing and independent verification.
+#[cfg(feature = "test-helpers")]
+#[tokio::test]
+async fn c10_parameters_appended_after_a_valid_signature_are_refused() {
+    let sk = make_ephemeral_keypair();
+    let toml = toml_with_signing_key(&g_strkey(&sk));
+    let uri = "web+stellar:pay?\
+        destination=GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO\
+        &origin_domain=example.com";
+    let signed = sign_uri(uri, &sk);
+    let (_, sig_part) = signed.split_once("&signature=").unwrap();
+    let signature = urlencoding_decode(sig_part);
+    let appended = format!("{signed}&amount=5000&memo=ATTACKER&memo_type=MEMO_TEXT");
+
+    let err = parse_sep7_uri(&appended).unwrap_err();
+    assert!(
+        matches!(err, Sep7Error::InvalidParamValue { param: "signature", ref detail }
+            if detail == "signature must be the last parameter"),
+        "unexpected parse refusal: {err:?}"
+    );
+    let err = verify_with_injected_body(&appended, "example.com", Some(&signature), &toml)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Sep7Error::SignatureVerificationFailed { ref detail }
+            if detail == "signature must be the last parameter"),
+        "unexpected verification refusal: {err:?}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // (d) Replay
 // ─────────────────────────────────────────────────────────────────────────────
