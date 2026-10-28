@@ -168,9 +168,13 @@ Feature-enabled builds admit only configured operations. See the local
 [CLI](cli-reference.md#mainnet-write-behavior),
 [MCP](mcp-tools.md#classic-mainnet-authorization), and
 [policy](profiles-and-keys.md#mainnet-policy-body) references for setup.
-Policy evaluation alone grants no authority. Ordinary library signing and
-submission refuse mainnet. Authorized signing and submission independently check
-sealed authority, and durable consumption precedes sending.
+Policy evaluation alone grants no authority.
+The wallet's own signing paths sign mainnet payloads only under mainnet
+authorization. Library signing primitives do not enforce this requirement.
+Code running as the same OS user with access to a keyring entry can read its
+seed directly. The keyring entry is the custody boundary.
+Authorized signing and submission independently check sealed authority.
+Durable consumption precedes sending.
 A signer can run before verification rejects its signature.
 
 | Profile | Noop policy decision |

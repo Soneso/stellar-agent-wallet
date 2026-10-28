@@ -641,10 +641,14 @@ const fn default_unlock_ttl_seconds() -> u32 {
 /// engine = "v1"
 /// ```
 /// `Debug` redacts every URL-typed field: `rpc_url`, `secondary_rpc_url`,
-/// and `oracle_provider_url`. All other fields use their derived `Debug` output.
+/// and `oracle_provider_url`. Other persisted fields use their derived `Debug` output.
 #[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Profile {
+    /// Top-level fields supplied by the loader overlay; never persisted.
+    #[serde(skip)]
+    pub(crate) overlaid_fields: Vec<&'static str>,
+
     /// Schema version.  Must be `2`.
     ///
     /// Forward-compatibility: a wallet reading a profile with `version > 2`
@@ -1432,6 +1436,13 @@ pub(crate) const WALLET_KEY_REFERENCE_FIELDS: [&str; 8] = [
 ];
 
 impl Profile {
+    /// Whether a loader overlay (environment or programmatic) set this top-level
+    /// key; an alias is reported as written.
+    #[must_use]
+    pub fn is_overlaid(&self, field: &str) -> bool {
+        self.overlaid_fields.contains(&field)
+    }
+
     /// The endpoint URL of `role`: `rpc_url`, `secondary_rpc_url`, or
     /// `oracle_provider_url`, as the profile holds it. `None` when the role
     /// has no URL.
@@ -1465,8 +1476,9 @@ impl Profile {
     /// Returns the operator-facing view with URL credentials and paths removed.
     #[must_use]
     pub fn redacted(&self) -> RedactedProfile {
-        // Every field is listed; a URL-typed field is redacted, every other field is cloned.
+        // Persisted fields are cloned with URL redaction. Overlay provenance stays internal.
         let Self {
+            overlaid_fields: _,
             version,
             chain_id,
             rpc_url,
@@ -3069,6 +3081,7 @@ impl ProfileBuilder {
             .audit_log_path
             .unwrap_or_else(|| default_audit_log_path_for(&self.profile_name));
         Profile {
+            overlaid_fields: Vec::new(),
             version: self.version,
             chain_id: self.chain_id,
             rpc_url: self.rpc_url,
@@ -3574,6 +3587,7 @@ mod tests {
         // No `..`: a field added to `Profile` fails to compile here until its
         // author binds it as a wallet key reference or ignores it with `_`.
         let Profile {
+            overlaid_fields: _,
             version: _,
             chain_id: _,
             rpc_url: _,

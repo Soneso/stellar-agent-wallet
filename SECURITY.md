@@ -58,8 +58,12 @@ Keep the following properties of the current alpha in mind when assessing impact
   set pinned and verified by the release.
   Feature-enabled builds admit only configured operations with per-action approval.
   Policy evaluation alone grants no signing authority. Signing, submission, and
-  x402 payload release independently check sealed authorization. Ordinary library entry points refuse
-  mainnet. The endpoint's network binds each envelope signature.
+  x402 payload release independently check sealed authorization.
+  The wallet's own signing paths sign mainnet payloads only under mainnet
+  authorization. Library signing primitives do not enforce this requirement.
+  Code running as the same OS user with access to a keyring entry can read its
+  seed directly. The keyring entry is the custody boundary.
+  The endpoint's network binds each envelope signature.
   Read-only commands accept both `stellar:testnet` and `stellar:mainnet`.
   Every MPP tool refuses mainnet with `mpp.network_forbidden`.
   `smart-account rules verify-pins`, `signers list`, and `signers refresh` retain

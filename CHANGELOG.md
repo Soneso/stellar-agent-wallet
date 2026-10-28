@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `stellar_agent_core::profile::key_scope` exposes
+  `enforce_message_signing_scope` and `enforce_message_signing_scope_in_dir`,
+  which refuse an unsafe message-signing identity on every chain before key
+  access, and the finding kind `KeyScopeKind::MainnetSignerIdentity`
+  (`mainnet_signer_identity`). `Profile::is_overlaid` reports whether a loader
+  overlay set a top-level key.
 - `stellar_agent_core::audit_log::reader` exposes `try_value_action_settlement`
   and `try_submission_receipt_cleared_exists`, which return
   `AuditLogIntegrityError` when a visited file cannot be read or fails its
@@ -135,6 +141,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `KeyScopeKind` gains `MainnetSignerIdentity`. The enum is exhaustive, so
+  downstream exhaustive matches must add the arm.
 - The opt-in stale-if-error fallback returns expired entries only on transient
   fetch failures and only within one TTL past expiry, and never an entry whose
   fetch time lies more than five minutes in the future. It never writes them back.
@@ -490,6 +498,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- SEP-43 `signMessage` documentation describes the SEP-53 prefixed digest and
+  standard base64 signature. Both message tools produce the same signature bytes.
 - The `minimum_reserve` criterion counts the transaction fee of a decoded
   envelope in the MCP pay, create-account, trustline, and claim commits and
   in CLI `pay --sign-only`, `pay --submit-only`, and staged `claim`.
@@ -558,6 +568,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- SEP-43 and SEP-53 message tools refuse signer-scope conflicts on every chain,
+  including shared entries, collisions, out-of-scope references, and a mainnet
+  sibling's enrolled identity. Unreadable profiles or directory scans refuse.
+- Message signing refuses an overlaid `mcp_signer_default`. Other testnet tools
+  retain that overlay. Both message tools require an audit writer before key
+  loading and record a redacted `opaque_payload_signed` row after signing.
+- The signing documentation identifies wallet authorization checks and the
+  keyring custody boundary. Public library signing primitives accept raw digests.
 - An expired binding does not satisfy the `HOME_DOMAIN` kind of a
   `counterparty_allowlist` criterion or `home_domain_resolved`:
   `counterparty list` and the policy snapshot skip cache entries past their TTL.

@@ -117,9 +117,8 @@ pub trait Signer: Send + Sync {
     ///   indirect secondary use, not a raw duplicate.
     /// - **Secondary — SEP-43 `signMessage`:**
     ///   `stellar_agent_sep43::signing::sign_message_bytes` — the payload is
-    ///   `sha256(message_bytes)`. The ed25519 primitive is identical but the
-    ///   payload domain is "message hash", NOT a SEP-23 transaction-signing
-    ///   payload. The domain separation is documented in `sign_message_bytes`.
+    ///   `sha256("Stellar Signed Message:\n" || message_bytes)`, the SEP-53
+    ///   prefixed digest. Both message protocols sign the same digest.
     /// - **Secondary — SEP-53 `sign_message`:**
     ///   `stellar_agent_sep53::sign_message` — the payload is
     ///   `sha256("Stellar Signed Message:\n" || message_bytes)`, the SEP-53

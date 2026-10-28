@@ -107,7 +107,9 @@ pub struct Sep53SignMessageArgs {
 /// - `chain_id` does not match the profile.
 /// - `message` exceeds the maximum allowed size.
 /// - `message_encoding` is `"base64"` but `message` is not valid base64.
-/// - The keyring entry for the signer cannot be loaded.
+/// - The signer is overlaid, conflicts with local scope, or belongs to a mainnet sibling.
+/// - The profiles directory or a sibling cannot be read.
+/// - The audit writer or signer keyring entry cannot be loaded.
 ///
 /// # Examples
 ///
@@ -166,7 +168,8 @@ impl WalletServer {
         }
 
         // Decode the message bytes. A bad encoding is a business refusal on
-        // caller-supplied input, not a JSON-RPC protocol fault.
+        // caller-supplied input, not a JSON-RPC protocol fault; it reports its own
+        // code before the pre-signing checks.
         let encoding = args.message_encoding.as_deref().unwrap_or("utf8");
         let message_bytes: Vec<u8> = match encoding {
             "base64" => match base64::engine::general_purpose::STANDARD.decode(&args.message) {
@@ -185,6 +188,11 @@ impl WalletServer {
                     format!("unsupported message_encoding: {other:?}; use 'utf8' or 'base64'"),
                 ));
             }
+        };
+
+        let audit_writer = match self.message_signing_preflight() {
+            Ok(writer) => writer,
+            Err(refusal) => return Ok(refusal),
         };
 
         use std::sync::Arc;
@@ -267,6 +275,18 @@ impl WalletServer {
                     message_len = message_bytes.len(),
                     encoding = encoding,
                     "sep53 message signed"
+                );
+
+                // The signature exists; audit append failures warn and preserve the result.
+                crate::tools::value_audit::emit_value_audit_row_with_writer(
+                    &audit_writer,
+                    &self.profile_name_for_approval(),
+                    crate::tools::message_signing::message_signed_row(
+                        "stellar_sep53_sign_message",
+                        args.chain_id.as_str(),
+                        &message_bytes,
+                        &signer_public_key,
+                    ),
                 );
 
                 let envelope = stellar_agent_core::envelope::Envelope::ok(json!({
@@ -485,6 +505,11 @@ mod tests {
                     .to_string(),
             )
             .unwrap();
+        let audit = &profile.audit_log_hash_chain_key_id;
+        keyring_core::Entry::new(&audit.service, &audit.account)
+            .unwrap()
+            .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x41; 32]))
+            .unwrap();
         let mut server = crate::server::WalletServer::new(profile).unwrap();
         std::sync::Arc::make_mut(&mut server.profile).network_passphrase =
             stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE.to_owned();
@@ -500,5 +525,129 @@ mod tests {
         assert_eq!(code, "network.mainnet_write_forbidden");
         assert!(message.contains("network.mainnet_write_forbidden"));
         assert!(!text.contains("\"signature\""));
+    }
+
+    fn message_args() -> Sep53SignMessageArgs {
+        Sep53SignMessageArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            message: crate::tools::message_signing_tests::MESSAGE.to_owned(),
+            message_encoding: None,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn message_scope_scenario_a_refuses_before_key_access() {
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.mainnet_sibling(false);
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(message_args())
+            .await
+            .unwrap();
+        crate::tools::message_signing_tests::assert_refusal(&result, "profile.key_scope_conflict");
+        let (_, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert!(message.contains("mainnet"));
+        assert!(!text.contains("keyring"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn message_scope_scenario_b_refuses_signer_overlay() {
+        let mut fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.overlay_mainnet_signer();
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(message_args())
+            .await
+            .unwrap();
+        crate::tools::message_signing_tests::assert_refusal(
+            &result,
+            "profile.non_overlayable_field",
+        );
+        let (_, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert!(message.contains("message signing"));
+        assert!(!text.contains("keyring"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn message_scope_refuses_testnet_shared_signer_coordinate() {
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        let mut sibling = fixture.mainnet_sibling(true);
+        sibling.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
+        stellar_agent_core::profile::loader::save_to_dir(
+            "main",
+            &sibling,
+            &fixture.dir.path().join("profiles"),
+        )
+        .unwrap();
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(message_args())
+            .await
+            .unwrap();
+        crate::tools::message_signing_tests::assert_refusal(&result, "profile.key_scope_conflict");
+        let (_, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert!(message.contains("also named") || message.contains("also names"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn message_signing_records_one_redacted_row_and_verifies() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.seed_signer();
+        fixture.seed_audit();
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(message_args())
+            .await
+            .unwrap();
+        fixture.assert_signed_row(
+            &result,
+            "stellar_sep53_sign_message",
+            "signature",
+            "signer_public_key",
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn message_signing_unacquirable_audit_writer_refuses_before_signer_load() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.seed_audit();
+        fixture.profile.audit_log_path = fixture.dir.path().to_path_buf();
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(message_args())
+            .await
+            .unwrap();
+        crate::tools::message_signing_tests::assert_refusal(&result, "audit.chain_key_unavailable");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn malformed_message_reports_its_code_before_the_audit_preflight() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.seed_audit();
+        fixture.profile.audit_log_path = fixture.dir.path().to_path_buf();
+        let server = fixture.server();
+        for (encoding, code) in [
+            ("base64", "sep53.invalid_message_base64"),
+            ("hex", "sep53.invalid_encoding"),
+        ] {
+            let result = server
+                .call_stellar_sep53_sign_message(Sep53SignMessageArgs {
+                    message_encoding: Some(encoding.to_owned()),
+                    message: "not base64!".to_owned(),
+                    ..message_args()
+                })
+                .await
+                .unwrap();
+            crate::tools::message_signing_tests::assert_refusal(&result, code);
+        }
     }
 }

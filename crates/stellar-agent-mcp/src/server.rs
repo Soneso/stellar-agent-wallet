@@ -1292,9 +1292,10 @@ impl ServerHandler for WalletServer {
              base64 HashIdPreimage of a Soroban authorization entry, envelope \
              type 9 or 10, for the signing G-key, returns the raw signature as \
              signedAuthEntry + signerAddress, NOT destructive, does not submit); \
-             stellar_sep43_sign_message (SEP-43 signMessage: signs an arbitrary \
-             UTF-8 message via sha256(message) then ed25519, returns \
-             signedMessage (hex) + signerAddress, NOT destructive); \
+             stellar_sep43_sign_message (SEP-43 signMessage: signs the SEP-53 \
+             digest SHA-256('Stellar Signed Message:\\n' + message) with \
+             ed25519, returns signedMessage (base64) + signerAddress, NOT \
+             destructive); \
              stellar_sep43_sign_and_submit_transaction (SEP-43 signAndSubmit / \
              WC v2 stellar_signAndSubmitXDR: signs and submits a \
              TransactionEnvelope XDR, returns signedTxXdr + txHash + status, \

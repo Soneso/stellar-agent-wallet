@@ -71,6 +71,15 @@ entry before use. An unreadable sibling warns and is skipped on both chains.
 An unreadable selected document or profiles directory refuses on mainnet and
 warns on testnet. `profile show` still displays the document for diagnosis.
 
+Message signing refuses signer-scope conflicts on every chain with
+`profile.key_scope_conflict`. This includes the signer's enrolled identity entry
+and a signer account matching a mainnet sibling (`mainnet_signer_identity`).
+An unreadable sibling, selected document, or profiles directory also refuses
+message signing. Both message tools reject an `mcp_signer_default` overlay with
+`profile.non_overlayable_field`, even on testnet. Other testnet tools retain
+the overlay behavior. The comparison covers the selected data root; the keyring
+entry remains the custody boundary for keys accessible outside that root.
+
 The policy spend window does not travel with a copied file either. Rolling
 caps (`per_period_cap`, `rate_limit`, and their bundle forms) accumulate in a
 per-profile store keyed on the profile's `policy_window_state_key_id`. A copy

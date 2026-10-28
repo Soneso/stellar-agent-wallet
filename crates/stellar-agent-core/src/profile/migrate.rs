@@ -366,6 +366,7 @@ fn migrate_v1_to_v2(profile_name: &str, v1: PartialV1Profile) -> Result<Profile,
     let network_passphrase = chain_id.network_passphrase().to_owned();
 
     let profile = Profile {
+        overlaid_fields: Vec::new(),
         version: 2,
         chain_id,
         rpc_url,

@@ -117,7 +117,7 @@ Agent-side `ModuleInterface` dispatch. Results use the standard `{ ok, data | er
 | `stellar_sep43_get_network` | `getNetwork` | yes | no | `{ network, networkPassphrase }` |
 | `stellar_sep43_sign_transaction` | `signTransaction` | no | no | `{ signedTxXdr, signerAddress }` |
 | `stellar_sep43_sign_auth_entry` | `signAuthEntry` | no | no | `{ signedAuthEntry, signerAddress }` |
-| `stellar_sep43_sign_message` | `signMessage` | no | no | `{ signedMessage (hex), signerAddress }` |
+| `stellar_sep43_sign_message` | `signMessage` | no | no | `{ signedMessage (base64), signerAddress }` |
 | `stellar_sep43_sign_and_submit_transaction` | sign + submit | no | yes (destructive) | `{ signedTxXdr, txHash, status }` |
 
 Common signing args: `chain_id` (required), the payload field, optional `network_passphrase` (if provided must equal the profile passphrase exactly; mismatch → `sep43.invalid_network_passphrase`), optional `address` G-strkey (if provided must match the active signer; mismatch → `sep43.invalid_address`).
@@ -125,7 +125,7 @@ Common signing args: `chain_id` (required), the payload field, optional `network
 - `get_address` / `get_network`: `chain_id` is optional (chain-agnostic per spec); when omitted, the profile's chain is used. No keyring access.
 - `sign_transaction`: arg `transaction_xdr` (base64 `TransactionEnvelope`). Signs only; the optional SEP-43 `submit`/`submitUrl` opts are NOT implemented here.
 - `sign_auth_entry`: arg `auth_entry_xdr` (the base64 `HashIdPreimage` of the authorization entry, envelope type 9 `SorobanAuthorization` or type 10 `SorobanAuthorizationWithAddress`). Signs the SHA-256 of the received preimage with one ed25519 G-key and returns the raw signature; the requester assembles it into the entry. A type 10 preimage must be bound to the signing key's account; other addresses refuse with `sep43.invalid_address`; other preimage cases refuse with `sep43.malformed_auth_entry`. The preimage does not carry the credential arm, so the address binding is the check whichever credential type the entry uses. No multi-signer quorum.
-- `sign_message`: arg `message` (non-empty UTF-8). Computes `sha256(message_bytes)` with **no prefix** and signs; result `signedMessage` is hex. Optional `network_passphrase` is a caller-intent gate only: it is not mixed into the signed bytes (message signing is network-independent).
+- `sign_message`: arg `message` (non-empty UTF-8). Signs the SEP-53 digest `sha256("Stellar Signed Message:\n" || message_bytes)`; result `signedMessage` is standard base64. Optional `network_passphrase` is a caller-intent gate only: it is not mixed into the signed bytes (message signing is network-independent).
 - `sign_and_submit_transaction`: arg `transaction_xdr`. Signs, submits via Stellar RPC, and polls until ledger confirmation. `status` is `"success"` (confirmed; `txHash` is a hex64) or `"pending"` (the submission ended without a confirmed outcome: the polling deadline passed, the endpoint reported an unexpected status, or a transport failure struck during or after the send; `txHash` is the hex64 the wallet computed before the send, and the tx may still apply). For a pending transaction, settle it by passing `txHash` to `stellar_transaction_status`, and never resubmit. RPC endpoint/timeout errors strip the URL before surfacing.
 
 SEP-43 wire codes (`error.code` under the standard envelope, from `Sep43Error::wire_code()`):
@@ -138,6 +138,8 @@ SEP-43 wire codes (`error.code` under the standard envelope, from `Sep43Error::w
 | `sep43.user_rejected` | User rejected |
 
 The structural mainnet refusal (sign-only tools, before any key access) carries the canonical `network.mainnet_write_forbidden` code shared with every other signing surface, not a `sep43.*` code.
+
+`sign_message` refusals before key load (an overlaid or out-of-scope signer, an unavailable audit writer) carry `profile.*` and `audit.*` codes, not `sep43.*` codes.
 
 SEP-43 opens no HTTP/HTTPS connections of its own (interop is stdio via MCP); `sign_and_submit` is the only path that submits, via the profile-configured RPC.
 
@@ -184,7 +186,7 @@ Returns `{ signature (base64), signer_public_key (G...), message_encoding }`.
 
 Tool `stellar_sep53_verify_message` (read-only): args `chain_id` (required, dispatch-gate compat, verification is chain-agnostic), `message`, `message_encoding` (`"utf8"`/`"base64"`, must match signing), `signature` (standard base64, 64-byte ed25519), `public_key` (G-strkey). Returns `{ valid: true }` or an error envelope on failure.
 
-Distinct from SEP-43 `signMessage`: SEP-53 applies the 24-byte `"Stellar Signed Message:\n"` prefix, SEP-43 does not. The two signatures are incompatible and not interchangeable. SEP-53 is a pure off-chain scheme; it submits no transaction, does not base64-encode the message for you, and caps message length at 64 KiB (65,536 bytes).
+SEP-43 `signMessage` signs the same prefixed digest, so both tools return the same signature bytes for the same message and key. SEP-53 is a pure off-chain scheme; it submits no transaction, does not base64-encode the message for you, and caps message length at 64 KiB (65,536 bytes).
 
 ## x402 v2 Exact Stellar: agent payments
 
