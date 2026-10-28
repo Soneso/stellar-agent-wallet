@@ -219,11 +219,11 @@ in the `x402_authorization_withheld` audit row.
 Wallet entry guards and library boundaries have distinct codes.
 Setup and policy cannot admit excluded signing surfaces.
 
-| Code or reason | Meaning |
+| Code, reason, or message | Meaning |
 |---|---|
 | `network.witness_unavailable` | A required independent witness cannot be established. Resolver-detected witness gaps instead use `network.mainnet_authorization_refused`. |
 | `wallet.clock_error` | The authorization clock cannot provide a valid time. |
-| `envelope_mismatch` | The witness binds another envelope or intent. |
+| `network.witness_unavailable`: `cross-check refused: the transaction's {part} does not match the observations the witness compares` | The witness binds another envelope or intent. The message names `source`, `sequence`, `operation`, `memo`, `value`, `envelope`, or `authorization` as `{part}`. The wallet refuses signing and sending. Build the action again. |
 | `sep43.mainnet_signing_forbidden` | An ordinary SEP-43 library signing path refuses mainnet. |
 | `sep43.mainnet_authorization_refused` | The authorized SEP-43 primitive refuses its bound authority. Public SEP-43 tools remain excluded. |
 | `sep45.mainnet_signing_forbidden` | SEP-45 refuses mainnet signing in either build. |
@@ -460,6 +460,8 @@ as `x402.rpc_simulate_failed` in `stellar_x402_create_payment` and as
 `network.witness_unavailable` means the required oracle or asset threshold is
 missing, or the oracle cannot be constructed, identified, or read successfully.
 Its message gives a safe reason and at most the oracle authority.
+It also reports an envelope mismatch when the witness binds another envelope or
+intent. The operator then builds the action again.
 The operator corrects `oracle_provider_url`, `[providers.oracle]`, or
 `[cross_check_thresholds]`. Retry after a transient failure.
 

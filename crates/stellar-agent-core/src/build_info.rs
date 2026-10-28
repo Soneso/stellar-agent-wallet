@@ -1,9 +1,10 @@
-//! Compile-time feature state for wallet build reporting.
+//! Compile-time build reporting for the `mainnet-write` Cargo feature, which is
+//! disabled by default.
 //!
-//! The `mainnet-write` Cargo feature is disabled by default and changes build
-//! reporting only. Cargo unifies features per build, so a crate that enables
-//! `mainnet-write` on core turns the marker on for every crate linked against
-//! that core.
+//! The network, CLI, and MCP features of the same name forward to this one, and
+//! together they gate the authorized mainnet write paths. Cargo unifies features
+//! per build, so a crate that enables `mainnet-write` on core turns the marker on
+//! for every crate linked against that core.
 
 /// Version-output line for a build with the `mainnet-write` feature enabled.
 #[cfg(feature = "mainnet-write")]
