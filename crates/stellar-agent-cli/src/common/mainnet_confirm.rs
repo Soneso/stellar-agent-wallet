@@ -111,19 +111,26 @@ impl MainnetWriteSummary {
         };
         let policy_tool = tools.policy_tool;
         let value = derive_value_class(policy_tool, &args);
-        let memo = match &tx.tx.memo {
-            stellar_xdr::Memo::None => "none".to_owned(),
-            stellar_xdr::Memo::Text(text) => {
-                super::render::sanitize_for_table(&String::from_utf8_lossy(text.as_slice()))
+        let classic_kind = match tools.approved_kind {
+            ApprovedKind::Payment => {
+                stellar_agent_core::envelope_decode::ClassicTransactionKind::Payment
             }
-            stellar_xdr::Memo::Id(id) => format!("id {id}"),
-            stellar_xdr::Memo::Hash(hash) => {
-                format!("hash {}", stellar_agent_core::hex::encode(&hash.0))
+            ApprovedKind::Trustline => {
+                stellar_agent_core::envelope_decode::ClassicTransactionKind::Trustline
             }
-            stellar_xdr::Memo::Return(hash) => {
-                format!("return {}", stellar_agent_core::hex::encode(&hash.0))
+            ApprovedKind::Claim => {
+                stellar_agent_core::envelope_decode::ClassicTransactionKind::Claim
+            }
+            _ => {
+                return Err(wrong_kind(
+                    "mainnet confirmation requires a classic CLI consumer",
+                ));
             }
         };
+        let memo = stellar_agent_core::envelope_decode::classic_summary(envelope_xdr, classic_kind)
+            .map_err(envelope_error)?
+            .memo
+            .display();
         Ok(Self {
             envelope: envelope_xdr.to_owned(),
             consumer,
@@ -143,13 +150,14 @@ impl MainnetWriteSummary {
         context: &MainnetWriteContext,
         output: &mut impl Write,
     ) -> std::io::Result<()> {
+        let esc = super::render::escape_for_terminal;
         writeln!(
             output,
             "Profile: {}\nChain: {}\nEndpoint: {}\nSigner: {}",
-            context.profile_name(),
-            context.chain().caip2_str(),
-            context.authority(),
-            self.args["source"].as_str().unwrap_or("")
+            esc(context.profile_name()),
+            esc(context.chain().caip2_str()),
+            esc(context.authority()),
+            esc(self.args["source"].as_str().unwrap_or(""))
         )?;
         if let ValueClass::Value(effects) = &self.value {
             let unknown = if self.kind == ApprovedKind::Claim {
@@ -164,17 +172,21 @@ impl MainnetWriteSummary {
                     leg.kind,
                     leg.asset
                         .as_deref()
-                        .map_or_else(|| unknown.to_owned(), super::render::sanitize_for_table),
+                        .map_or_else(|| unknown.to_owned(), super::render::escape_for_terminal),
                     leg.amount
                         .map_or_else(|| unknown.to_owned(), |amount| amount.to_string()),
-                    leg.destination.as_deref().unwrap_or("")
+                    esc(leg.destination.as_deref().unwrap_or(""))
                 )?;
             }
         }
         if self.kind == ApprovedKind::Claim {
-            writeln!(output, "Balance ID: {}", self.string("balance_id_strkey"))?;
+            writeln!(
+                output,
+                "Balance ID: {}",
+                esc(&self.string("balance_id_strkey"))
+            )?;
         }
-        writeln!(output, "Memo: {}", self.memo)?;
+        writeln!(output, "Memo: {}", esc(&self.memo))?;
         writeln!(
             output,
             "Fee: {} stroops\nFee cap: {} stroops per operation\nType the profile name to confirm:",
@@ -579,7 +591,11 @@ mod tests {
             (Memo::None, "none".to_owned()),
             (
                 Memo::Text(b"order".to_vec().try_into().unwrap()),
-                "order".into(),
+                "text \"order\"".into(),
+            ),
+            (
+                Memo::Text("café\u{202e}".as_bytes().to_vec().try_into().unwrap()),
+                "text \"café\u{202e}\"".into(),
             ),
             (Memo::Id(7), "id 7".into()),
             (
@@ -610,11 +626,10 @@ mod tests {
             {
                 let mut output = Vec::new();
                 summary.render(&context, &mut output).unwrap();
-                assert!(
-                    String::from_utf8(output)
-                        .unwrap()
-                        .contains(&format!("Memo: {rendered}"))
-                );
+                assert!(String::from_utf8(output).unwrap().contains(&format!(
+                    "Memo: {}",
+                    crate::common::render::escape_for_terminal(&rendered)
+                )));
             }
             assert_eq!(summary.fee_cap, 500);
             let ValueClass::Value(value) = &summary.value else {
@@ -736,22 +751,22 @@ mod tests {
         }
     }
 
-    #[test]
+    /// A trustline envelope with `asset_code` and a text memo of `memo`
+    /// bytes, built from the confirmation fixture's envelope.
     #[cfg(feature = "mainnet-write")]
-    #[serial_test::serial]
-    fn summary_sanitizes_the_asset() {
+    fn trustline_envelope(envelope: &str, asset_code: [u8; 4], memo: &[u8]) -> String {
         use stellar_xdr::*;
-        let (_dir, context, envelope) = confirmation_fixture("confirm-asset");
         let TransactionEnvelope::Tx(mut tx) =
-            TransactionEnvelope::from_xdr_base64(&envelope, Limits::none()).unwrap()
+            TransactionEnvelope::from_xdr_base64(envelope, Limits::none()).unwrap()
         else {
             unreachable!()
         };
+        tx.tx.memo = Memo::Text(memo.to_vec().try_into().unwrap());
         tx.tx.operations = vec![Operation {
             source_account: None,
             body: OperationBody::ChangeTrust(ChangeTrustOp {
                 line: ChangeTrustAsset::CreditAlphanum4(AlphaNum4 {
-                    asset_code: AssetCode4([b'U', 0x1b, b'[', 0x07]),
+                    asset_code: AssetCode4(asset_code),
                     issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([7; 32]))),
                 }),
                 limit: 31,
@@ -759,16 +774,51 @@ mod tests {
         }]
         .try_into()
         .unwrap();
-        let encoded = TransactionEnvelope::Tx(tx)
+        TransactionEnvelope::Tx(tx)
             .to_xdr_base64(Limits::none())
-            .unwrap();
+            .unwrap()
+    }
+
+    /// An asset code holding control bytes cannot be shown faithfully, so the
+    /// confirmation refuses the envelope before it renders anything, and the
+    /// refusal carries none of the raw bytes.
+    #[test]
+    #[cfg(feature = "mainnet-write")]
+    #[serial_test::serial]
+    fn summary_refuses_an_asset_code_it_cannot_show() {
+        let (_dir, _context, envelope) = confirmation_fixture("confirm-asset");
+        let encoded = trustline_envelope(&envelope, [b'U', 0x1b, b'[', 0x07], b"order");
+        let Err(error) =
+            MainnetWriteSummary::from_envelope(&encoded, MainnetConsumer::CliTrustline, 500)
+        else {
+            panic!("an asset code with control bytes must be refused");
+        };
+        assert_eq!(error.code(), "protocol.xdr_codec_failed");
+        let message = error.message();
+        assert!(message.contains("asset code"), "{message}");
+        assert!(!message.contains('\u{1b}'), "{message:?}");
+        assert!(!message.contains('\u{7}'), "{message:?}");
+    }
+
+    /// A value that decodes is rendered with every control character as a
+    /// visible escape: the memo's cursor and bell bytes reach the terminal
+    /// only as `\u{1b}` and `\u{7}`.
+    #[test]
+    #[cfg(feature = "mainnet-write")]
+    #[serial_test::serial]
+    fn summary_escapes_control_characters_it_shows() {
+        let (_dir, context, envelope) = confirmation_fixture("confirm-memo-escape");
+        let encoded = trustline_envelope(&envelope, *b"USD\0", b"U\x1b[2K\x07");
         let summary =
             MainnetWriteSummary::from_envelope(&encoded, MainnetConsumer::CliTrustline, 500)
                 .unwrap();
         let mut output = Vec::new();
         summary.render(&context, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("Asset: U"), "{output}");
+        assert!(
+            output.contains("Memo: text \"U\\u{1b}[2K\\u{7}\""),
+            "{output}"
+        );
         assert!(!output.contains('\u{1b}'), "{output:?}");
         assert!(!output.contains('\u{7}'), "{output:?}");
     }

@@ -15,9 +15,11 @@
 //! Summary rows render challenge-bound entry data from `PendingApprovalView`.
 //! Header rows come from the serving profile and are not challenge-bound.
 //!
-//! Free-text fields that reach the HTML body directly (asset codes, memos,
-//! redacted addresses) are HTML-escaped via [`html_escape`]; the data-island
-//! JSON is escaped via [`json_data_island`].
+//! Every summary value that reaches the HTML body (asset codes, memos,
+//! addresses) passes through `stellar_agent_approval_ui::escape_value`:
+//! control and direction-override characters become visible escapes, then the
+//! text is HTML-escaped. The data-island JSON is escaped via
+//! [`json_data_island`].
 //!
 //! # Presentation
 //!
@@ -32,7 +34,7 @@ use stellar_agent_core::approval::{ApprovalSummaryView, PendingApprovalView};
 // the decision card, the kind pill, the button label, and the escaping, so the
 // two approval surfaces cannot present the same entry differently.
 use stellar_agent_approval_ui::{
-    DETAIL_STYLE, INBOX_STYLE, approve_button_label, html_escape, kind_pill,
+    DETAIL_STYLE, INBOX_STYLE, INCONSISTENT_NOTICE, approve_button_label, html_escape, kind_pill,
     render_rule_proposal_definition_html, render_summary_html,
 };
 use stellar_agent_loopback_http::brand::{BRAND_STYLE, PageIdentity, TRUST_LINE_SELF_HOSTED};
@@ -233,7 +235,9 @@ pub(crate) fn render_inbox_page(
     pending: &[PendingApprovalView],
     identity: &PageIdentity,
 ) -> String {
-    let data_island = json_data_island(&serde_json::json!({ "pending": pending }));
+    let data_island = json_data_island(
+        &serde_json::json!({ "pending": stellar_agent_approval_ui::pending_json_value(pending) }),
+    );
     let title = identity.page_title("Approvals");
     let topbar = identity.topbar_html("Approvals");
     let empty_mark = identity.empty_state_mark_html();
@@ -349,6 +353,8 @@ pub(crate) fn render_detail_page(
         r#"<div class="notice">This request was rejected. Nothing was signed.</div>"#
     } else if matches!(view.summary, ApprovalSummaryView::Consumed { .. }) {
         r#"<div class="notice">This approval was already spent on a submission. There is nothing left to decide; ask the wallet what became of that transaction.</div>"#
+    } else if matches!(view.summary, ApprovalSummaryView::Inconsistent { .. }) {
+        INCONSISTENT_NOTICE
     } else if view.expired {
         r#"<div class="notice warn">This request has expired. It can only be rejected now.</div>"#
     } else {
@@ -408,7 +414,9 @@ pub(crate) fn render_detail_page(
         || view.attested
         || matches!(
             view.summary,
-            ApprovalSummaryView::Rejected { .. } | ApprovalSummaryView::Consumed { .. }
+            ApprovalSummaryView::Rejected { .. }
+                | ApprovalSummaryView::Consumed { .. }
+                | ApprovalSummaryView::Inconsistent { .. }
         ) {
         format!(
             r#"<p class="expiry" id="expiry-line" data-created-ms="{created}" data-expires-ms="{expires}" data-expiry-form="absolute">
@@ -489,16 +497,15 @@ mod tests {
         clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
-    // ChangeTrust with transaction source [1; 32] and operation source [2; 32].
-    const CHANGE_TRUST_ENVELOPE: &str = concat!(
-        "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAA",
-        "AAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAGAAAAAVVT",
-        "REMAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAR//////////wAAAAAAAAAA",
-    );
+    const SOURCE_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+    const DEST_G: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+    const OTHER_G: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+    const USDC_ISSUER_G: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
     use super::*;
     use stellar_agent_core::approval::{
-        DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, process_uid_for_attestation,
+        ApprovalKind, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, fixtures,
+        process_uid_for_attestation,
     };
     use tempfile::TempDir;
 
@@ -535,19 +542,17 @@ mod tests {
     /// a `<script>` breakout attempt to exercise HTML escaping.
     fn payment_view(dir: &TempDir, attested: bool, snapshot_at: u64) -> PendingApprovalView {
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             2_500_000,
-            "XLM".to_owned(),
-            Some("<script>alert(1)</script>".to_owned()),
+            Some("<script>alert(1)</script>"),
             100,
             7,
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, NOW_MS).unwrap();
         if attested {
@@ -587,25 +592,23 @@ mod tests {
         assert_eq!(html_escape("a\u{00E9}\u{4E2D}b"), "a\u{00E9}\u{4E2D}b");
     }
 
-    /// The neutralisation reaches a real page: a memo carrying U+202E renders
-    /// as U+FFFD with no raw override byte anywhere in the response.
+    /// A memo carrying U+202E and U+202C reaches the page as visible escapes,
+    /// with no raw override character anywhere in the response.
     #[test]
     fn detail_page_neutralises_a_bidi_override_in_a_memo() {
         let dir = TempDir::new().unwrap();
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             1_000,
-            "XLM".to_owned(),
-            Some("pay \u{202E}MLX 000001\u{202C} now".to_owned()),
+            Some("pay \u{202E}MLX 000001\u{202C} now"),
             100,
             1,
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         store.insert(entry, NOW_MS).unwrap();
         let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
 
@@ -615,8 +618,8 @@ mod tests {
             "no raw right-to-left override may reach the page"
         );
         assert!(
-            html.contains('\u{FFFD}'),
-            "the override must render as the replacement character: {html}"
+            html.contains("pay \\u{202e}MLX 000001\\u{202c} now"),
+            "the override must render as a visible escape: {html}"
         );
     }
 
@@ -743,20 +746,15 @@ mod tests {
 
     fn claim_view(dir: &TempDir) -> PendingApprovalView {
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
-        let entry = PendingApproval::new_claim_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "a".repeat(72),
-            "B".to_owned() + &"A".repeat(57),
-            "XLM".to_owned(),
-            500,
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::claim_pending(
+            SOURCE_G,
+            [0x0a; 32],
+            Some(("XLM", 500)),
             100,
             1,
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         store.insert(entry, NOW_MS).unwrap();
         store.snapshot(NOW_MS).into_iter().next().unwrap()
     }
@@ -854,43 +852,43 @@ mod tests {
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
         let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
         let recipient = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-        let entry = PendingApproval::new_mpp_charge_pending(
-            [0x11; 32],
-            [0x22; 32],
-            "default".to_owned(),
-            "stellar:testnet".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            "http".to_owned(),
-            "merchant.example".to_owned(),
-            "/checkout".to_owned(),
-            "1000000".to_owned(),
-            recipient.to_owned(),
-            recipient.to_owned(),
-            now / 1_000 + 3_600,
-            1_100,
-            process_uid_for_attestation().unwrap(),
-            DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        let entry = stellar_agent_core::approval::fixtures::bind_mpp_entry(
+            PendingApproval::new_mpp_charge_pending(
+                [0x11; 32],
+                [0x22; 32],
+                "default".to_owned(),
+                "stellar:testnet".to_owned(),
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                "http".to_owned(),
+                "merchant.example".to_owned(),
+                "/checkout".to_owned(),
+                "1000000".to_owned(),
+                recipient.to_owned(),
+                recipient.to_owned(),
+                now / 1_000 + 3_600,
+                1_100,
+                process_uid_for_attestation().unwrap(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap(),
+        );
         store.insert(entry, now).unwrap();
         store.snapshot(now).into_iter().next().unwrap()
     }
 
     fn rejected_view(dir: &TempDir) -> PendingApprovalView {
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             1_000,
-            "XLM".to_owned(),
             None,
             100,
             1,
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, NOW_MS).unwrap();
         store.reject(&nonce, NOW_MS, DEFAULT_TTL_MS).unwrap();
@@ -933,19 +931,17 @@ mod tests {
     /// A spent approval, the tombstone a commit leaves behind.
     fn consumed_view(dir: &TempDir) -> PendingApprovalView {
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             1_000,
-            "XLM".to_owned(),
             None,
             100,
             1,
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, NOW_MS).unwrap();
         store
@@ -1168,7 +1164,7 @@ mod tests {
         // The fixture is 2_500_000 stroops of XLM.
         assert!(html.contains("0.2500000 XLM"), "{html}");
         assert!(html.contains("2500000 stroops"), "{html}");
-        let destination = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let destination = DEST_G;
         assert!(
             html.contains(&format!(r#"<div class="addr">{destination}</div>"#)),
             "the destination must render whole, in the address block: {html}"
@@ -1346,19 +1342,17 @@ mod tests {
     fn detail_page_payment_amount_survives_the_f64_precision_boundary() {
         let dir = TempDir::new().unwrap();
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            9_007_199_254_740_993, // 2^53 + 1
-            "XLM".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
+            9_007_199_254_740_993,
             None,
             100,
             7,
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         store.insert(entry, NOW_MS).unwrap();
         let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
 
@@ -1374,19 +1368,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
         let issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            &format!("USDC:{issuer}"),
             12_500_000,
-            format!("USDC:{issuer}"),
             None,
             100,
             7,
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         store.insert(entry, NOW_MS).unwrap();
         let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
 
@@ -1415,6 +1407,13 @@ mod tests {
             "a seven-decimal reading would state a value the charge does not carry: {html}"
         );
         assert!(html.contains(">Approve charge</button>"), "{html}");
+        assert!(
+            html.contains(&format!(
+                "Simulated fee (stroops, {})",
+                stellar_agent_approval_ui::SIMULATED_FEE_NOTE
+            )),
+            "{html}"
+        );
     }
 
     /// An expired entry says so in the warning treatment and offers only the
@@ -1474,46 +1473,40 @@ mod tests {
         assert!(html.contains("<dt>Signer</dt><dd>(not enrolled)</dd>"));
     }
 
+    /// A claim page shows the envelope's source and no stored summary field.
     #[test]
-    fn detail_page_renders_decoded_source_and_stored_claim_disagreement() {
+    fn detail_page_renders_the_decoded_claim_source() {
         let dir = TempDir::new().unwrap();
-        let mut view = claim_view(&dir);
-        if let ApprovalSummaryView::Claim {
-            envelope_source,
-            source,
-            ..
-        } = &mut view.summary
-        {
-            *envelope_source = Some("GENVELOPE".to_owned());
-            *source = "GSTORED".to_owned();
-        }
+        let view = claim_view(&dir);
         let html = render_detail_page(&view, &test_context(), "csrf", None, &neutral());
-        assert!(html.contains("<dt>Source</dt><dd>GENVELOPE</dd>"));
-        assert!(html.contains("<dt>Source (stored summary)</dt><dd>GSTORED</dd>"));
+        assert!(
+            html.contains(&format!("<dt>Source</dt><dd>{SOURCE_G}</dd>")),
+            "{html}"
+        );
+        assert!(!html.contains("stored summary"), "{html}");
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
         let html = render_detail_page(&view, &test_context(), "csrf", None, &neutral());
-        assert!(html.contains("<dt>Source</dt><dd>(undecodable envelope)</dd>"));
+        assert!(
+            html.contains(&format!("<dt>Source</dt><dd>{SOURCE_G}</dd>")),
+            "{html}"
+        );
     }
 
     fn trustline_view(dir: &TempDir) -> PendingApprovalView {
         let mut store = PendingApprovalStore::open(dir.path().join("trustline.toml")).unwrap();
-        let limit = Some(123456789);
         store
             .insert(
-                PendingApproval::new_trustline_pending(
-                    CHANGE_TRUST_ENVELOPE.to_owned(),
-                    CHANGE_TRUST_ENVELOPE.as_bytes(),
-                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                    "USDC".to_owned(),
-                    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
-                    limit,
+                fixtures::trustline_pending(
+                    SOURCE_G,
+                    "USDC",
+                    USDC_ISSUER_G,
+                    Some(123_456_789),
                     100,
                     42,
                     "1000".to_owned(),
                     DEFAULT_TTL_MS,
-                )
-                .unwrap(),
+                ),
                 NOW_MS,
             )
             .unwrap();
@@ -1538,12 +1531,11 @@ mod tests {
                 "TRUSTLINE",
                 ">Approve trustline</button>",
                 "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                &format!(r#"<div class="addr">{SOURCE_G}</div>"#),
                 shown,
-                "Source",
+                &format!("<dt>Source</dt><dd>{SOURCE_G}</dd>"),
                 "<dt>Simulated fee (stroops)</dt><dd>100</dd>",
                 "<dt>Simulated seq num</dt><dd>42</dd>",
-                "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA",
             ] {
                 assert!(html.contains(text), "missing {text}: {html}");
             }
@@ -1556,5 +1548,119 @@ mod tests {
         view.expired = true;
         let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
         assert!(!html.contains(">Approve trustline</button>"));
+    }
+
+    /// Stores `entry` and returns its snapshot view.
+    fn view_of(entry: PendingApproval) -> PendingApprovalView {
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+        store.insert(entry, NOW_MS).unwrap();
+        store.snapshot(NOW_MS).remove(0)
+    }
+
+    /// The remote detail page renders the envelope's amount and destination
+    /// when the stored summary fields name another payment.
+    #[test]
+    fn an_edited_entry_renders_the_envelope_amount() {
+        let mut entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
+            75_000_000_000,
+            None,
+            100,
+            3,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        );
+        let ApprovalKind::PaymentSimulated {
+            summary_to,
+            summary_amount_stroops,
+            ..
+        } = &mut entry.kind
+        else {
+            unreachable!()
+        };
+        OTHER_G.clone_into(summary_to);
+        *summary_amount_stroops = 10_000;
+        let view = view_of(entry);
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        assert!(html.contains("7500.0000000 XLM"), "{html}");
+        assert!(html.contains("75000000000 stroops"), "{html}");
+        assert!(
+            html.contains(&format!(r#"<div class="addr">{DEST_G}</div>"#)),
+            "{html}"
+        );
+        assert!(!html.contains(OTHER_G), "{html}");
+        assert!(!html.contains("10000 stroops"), "{html}");
+        let inbox = render_inbox_page(std::slice::from_ref(&view), &neutral());
+        assert!(
+            inbox.contains(r#""amount_stroops":"75000000000""#),
+            "{inbox}"
+        );
+        assert!(!inbox.contains(OTHER_G), "{inbox}");
+    }
+
+    /// An entry whose stored digest is not its envelope's offers no approve
+    /// action on the remote page.
+    #[test]
+    fn an_inconsistent_entry_offers_only_reject() {
+        let mut entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
+            1_000,
+            None,
+            100,
+            1,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        );
+        let ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64, ..
+        } = &mut entry.kind
+        else {
+            unreachable!()
+        };
+        *envelope_xdr_b64 = fixtures::payment_envelope(SOURCE_G, OTHER_G, "XLM", 9, None, 100, 1);
+        let view = view_of(entry);
+        assert!(!kind_is_approvable(&view.summary));
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        assert!(html.contains(INCONSISTENT_NOTICE), "{html}");
+        assert!(html.contains("INCONSISTENT"), "{html}");
+        assert!(!html.contains("approve-btn"), "{html}");
+        assert!(html.contains("reject-btn"), "{html}");
+        assert!(!html.contains(OTHER_G), "{html}");
+    }
+    fn assert_edited_mpp_inconsistent(edit_amount: bool) {
+        let mut entry = fixtures::mpp_pending();
+        if let ApprovalKind::MppChargeSimulated {
+            amount, recipient, ..
+        } = &mut entry.kind
+        {
+            if edit_amount {
+                *amount = "7".to_owned();
+            } else {
+                *recipient = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned();
+            }
+        }
+        let view = view_of(entry);
+        assert!(matches!(
+            view.summary,
+            ApprovalSummaryView::Inconsistent { .. }
+        ));
+        assert!(!kind_is_approvable(&view.summary));
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        assert!(html.contains(INCONSISTENT_NOTICE), "{html}");
+        let json = stellar_agent_approval_ui::pending_json_value(&[view]);
+        assert_eq!(json[0]["summary"]["kind"], "inconsistent");
+    }
+    #[test]
+    fn edited_mpp_amount_renders_inconsistent() {
+        assert_edited_mpp_inconsistent(true);
+    }
+    #[test]
+    fn edited_mpp_recipient_renders_inconsistent() {
+        assert_edited_mpp_inconsistent(false);
     }
 }

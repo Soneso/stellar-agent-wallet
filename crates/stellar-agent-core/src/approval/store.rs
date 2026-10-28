@@ -340,6 +340,12 @@ pub enum ApprovalKind {
     /// Serialised as flat fields on the `[[pending]]` entry (no sub-table).
     /// The HMAC attestation is stored in
     /// `PendingApproval::attestation_blob_b64`.
+    ///
+    /// The `summary_*` fields record what the producer built; the attestation
+    /// binds only `envelope_sha256_hex`. Approval surfaces render the envelope
+    /// through [`super::attest::classic_entry_summary`] and do not display
+    /// these fields. The same holds for `TrustlineSimulated` and
+    /// `ClaimSimulated`.
     PaymentSimulated {
         /// Base64-encoded simulated transaction envelope XDR.
         ///
@@ -712,6 +718,10 @@ pub enum ApprovalKind {
         /// SHA-256 fingerprint binding profile, network, request context, and
         /// exact challenge terms.
         authorization_fingerprint: [u8; 32],
+        /// The digests that let a surface check the displayed terms against
+        /// `authorization_fingerprint`. Absent from entries prepared without
+        /// binding digests; such entries are inconsistent.
+        authorization_context: Option<super::mpp::MppAuthorizationContext>,
         /// SHA-256 of the authoritative prepared transaction artifact.
         prepared_artifact_hash: [u8; 32],
         /// Wallet profile that owns the payer account.
@@ -1065,6 +1075,7 @@ impl std::fmt::Debug for ApprovalKind {
                 recipient,
                 challenge_expires_at_unix,
                 simulated_fee_stroops,
+                ..
             } => f
                 .debug_struct("MppChargeSimulated")
                 .field(
@@ -1326,6 +1337,8 @@ struct RuleProposalSimulatedWire {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MppChargeSimulatedWire {
     authorization_fingerprint: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorization_context: Option<super::mpp::MppAuthorizationContext>,
     prepared_artifact_hash: [u8; 32],
     profile: String,
     chain_id: String,
@@ -1986,6 +1999,7 @@ impl Serialize for PendingApproval {
             ),
             ApprovalKind::MppChargeSimulated {
                 authorization_fingerprint,
+                authorization_context,
                 prepared_artifact_hash,
                 profile,
                 chain_id,
@@ -2015,6 +2029,7 @@ impl Serialize for PendingApproval {
                 None::<RuleProposalSimulatedWire>,
                 Some(MppChargeSimulatedWire {
                     authorization_fingerprint: *authorization_fingerprint,
+                    authorization_context: *authorization_context,
                     prepared_artifact_hash: *prepared_artifact_hash,
                     profile: profile.clone(),
                     chain_id: chain_id.clone(),
@@ -2810,6 +2825,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
             validate_mpp_charge_simulated_invariants(&mpp).map_err(serde::de::Error::custom)?;
             ApprovalKind::MppChargeSimulated {
                 authorization_fingerprint: mpp.authorization_fingerprint,
+                authorization_context: mpp.authorization_context,
                 prepared_artifact_hash: mpp.prepared_artifact_hash,
                 profile: mpp.profile,
                 chain_id: mpp.chain_id,
@@ -3991,6 +4007,7 @@ impl PendingApproval {
     ) -> Result<Self, ApprovalError> {
         let wire = MppChargeSimulatedWire {
             authorization_fingerprint,
+            authorization_context: None,
             prepared_artifact_hash,
             profile: profile.clone(),
             chain_id: chain_id.clone(),
@@ -4027,6 +4044,7 @@ impl PendingApproval {
             reason: None,
             kind: ApprovalKind::MppChargeSimulated {
                 authorization_fingerprint,
+                authorization_context: None,
                 prepared_artifact_hash,
                 profile,
                 chain_id,
@@ -4947,7 +4965,8 @@ impl PendingApprovalStore {
         let Some(entry) = self.get(approval_nonce) else {
             return false;
         };
-        if entry.is_expired(now_unix_ms) {
+        if entry.is_expired(now_unix_ms) || super::mpp::verify_mpp_entry_terms(&entry.kind).is_err()
+        {
             return false;
         }
         let ApprovalKind::MppChargeSimulated {
@@ -4984,7 +5003,7 @@ impl PendingApprovalStore {
             key,
             binding,
             &entry.approval_nonce,
-            prepared_artifact_hash,
+            &super::mpp::approval_subject(authorization_fingerprint, prepared_artifact_hash),
             &entry.process_uid,
             &scope,
             &blob,
@@ -10529,24 +10548,33 @@ is_proposer = true
         let now = crate::timefmt::now_unix_ms().unwrap();
         let fingerprint = [0x11; 32];
         let artifact = [0x22; 32];
-        let entry = PendingApproval::new_mpp_charge_pending(
-            fingerprint,
-            artifact,
-            "mpp-profile".to_owned(),
-            "stellar:testnet".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            "mcp".to_owned(),
-            "merchant-server".to_owned(),
-            "tools/charge".to_owned(),
-            "1000000".to_owned(),
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            now / 1_000 + 3_600,
-            1_100,
-            "1000".to_owned(),
-            DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        let entry = crate::approval::fixtures::bind_mpp_entry(
+            PendingApproval::new_mpp_charge_pending(
+                fingerprint,
+                artifact,
+                "mpp-profile".to_owned(),
+                "stellar:testnet".to_owned(),
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                "mcp".to_owned(),
+                "merchant-server".to_owned(),
+                "tools/charge".to_owned(),
+                "1000000".to_owned(),
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                now / 1_000 + 3_600,
+                1_100,
+                "1000".to_owned(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap(),
+        );
+        let ApprovalKind::MppChargeSimulated {
+            authorization_fingerprint: fingerprint,
+            ..
+        } = entry.kind
+        else {
+            unreachable!()
+        };
         let nonce = entry.approval_nonce.clone();
         let process_uid = entry.process_uid.clone();
         store.insert(entry, now).unwrap();
@@ -10555,7 +10583,7 @@ is_proposer = true
             &key,
             &crate::approval::AttestationBinding::new("mpp-profile", "stellar:testnet"),
             &nonce,
-            &artifact,
+            &super::super::mpp::approval_subject(&fingerprint, &artifact),
             &process_uid,
             &store.get(&nonce).unwrap().attested_lifetime(),
         );
@@ -10940,7 +10968,7 @@ is_proposer = true
             &key,
             &binding,
             &nonce,
-            &artifact,
+            &super::super::mpp::approval_subject(&fingerprint, &artifact),
             &process_uid,
             &reopened.get(&nonce).unwrap().attestation_scope().unwrap(),
             &blob
@@ -10981,7 +11009,7 @@ is_proposer = true
             &key,
             &binding,
             &nonce,
-            &artifact,
+            &super::super::mpp::approval_subject(&fingerprint, &artifact),
             &process_uid,
             &reopened.get(&nonce).unwrap().attestation_scope().unwrap(),
             &blob
@@ -11160,24 +11188,26 @@ is_proposer = true
             DEFAULT_TTL_MS,
         )
         .unwrap();
-        let mpp = PendingApproval::new_mpp_charge_pending(
-            [1; 32],
-            [2; 32],
-            "default".to_owned(),
-            "stellar:testnet".to_owned(),
-            VALID_SUMMARY_TO.to_owned(),
-            "mcp".to_owned(),
-            "merchant".to_owned(),
-            "tools/charge".to_owned(),
-            "100".to_owned(),
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-            VALID_SUMMARY_TO.to_owned(),
-            approval_now_unix_ms().unwrap() / 1000 + 3600,
-            100,
-            "1000".to_owned(),
-            DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        let mpp = crate::approval::fixtures::bind_mpp_entry(
+            PendingApproval::new_mpp_charge_pending(
+                [1; 32],
+                [2; 32],
+                "default".to_owned(),
+                "stellar:testnet".to_owned(),
+                VALID_SUMMARY_TO.to_owned(),
+                "mcp".to_owned(),
+                "merchant".to_owned(),
+                "tools/charge".to_owned(),
+                "100".to_owned(),
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+                VALID_SUMMARY_TO.to_owned(),
+                approval_now_unix_ms().unwrap() / 1000 + 3600,
+                100,
+                "1000".to_owned(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap(),
+        );
         for (field, entry) in [
             ("sign_with_passkey", make_passkey_entry(DEFAULT_TTL_MS)),
             (
@@ -11657,5 +11687,76 @@ asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
             bad["x402_payment"]["amount"] = toml::Value::String("0".into());
             assert!(bad.try_into::<PendingApproval>().is_err());
         }
+    }
+    /// Terms edited after consent, with the original fingerprint and its
+    /// valid attestation left in place, are refused at commit by the term
+    /// check alone: the fingerprint, artifact and HMAC all still match.
+    #[test]
+    fn mpp_attestation_refuses_terms_edited_after_consent() {
+        for field in ["amount", "recipient"] {
+            let dir = TempDir::new().unwrap();
+            let mut fixture = attested_mpp_store(&dir);
+            let entry = fixture
+                .reopened
+                .entries
+                .iter_mut()
+                .find(|entry| entry.approval_nonce == fixture.nonce)
+                .unwrap();
+            let ApprovalKind::MppChargeSimulated {
+                amount, recipient, ..
+            } = &mut entry.kind
+            else {
+                unreachable!()
+            };
+            match field {
+                "amount" => "7".clone_into(amount),
+                _ => {
+                    "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".clone_into(recipient)
+                }
+            }
+            assert!(
+                !fixture.reopened.verify_mpp_charge_attestation(
+                    &fixture.key,
+                    &crate::approval::AttestationBinding::new("mpp-profile", "stellar:testnet"),
+                    &fixture.nonce,
+                    &fixture.fingerprint,
+                    &fixture.artifact,
+                    fixture.now
+                ),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn mpp_attestation_refuses_fingerprint_replacement_after_consent() {
+        let dir = TempDir::new().unwrap();
+        let mut fixture = attested_mpp_store(&dir);
+        let entry = fixture
+            .reopened
+            .entries
+            .iter_mut()
+            .find(|entry| entry.approval_nonce == fixture.nonce)
+            .unwrap();
+        if let ApprovalKind::MppChargeSimulated { amount, .. } = &mut entry.kind {
+            *amount = "7".to_owned();
+        }
+        *entry = super::super::fixtures::bind_mpp_entry(entry.clone());
+        let ApprovalKind::MppChargeSimulated {
+            authorization_fingerprint,
+            ..
+        } = &entry.kind
+        else {
+            unreachable!()
+        };
+        let changed = *authorization_fingerprint;
+        assert!(!fixture.reopened.verify_mpp_charge_attestation(
+            &fixture.key,
+            &crate::approval::AttestationBinding::new("mpp-profile", "stellar:testnet"),
+            &fixture.nonce,
+            &changed,
+            &fixture.artifact,
+            fixture.now
+        ));
     }
 }

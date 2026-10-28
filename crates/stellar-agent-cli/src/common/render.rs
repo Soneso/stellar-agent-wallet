@@ -7,7 +7,8 @@
 //!
 //! - `render_json_to` is the sole call site for `Envelope<T>::to_json_compact`.
 //!   `render_json` and every `print_success` / `print_error` fallback arm
-//!   delegate to it.
+//!   delegate to it, so every envelope it writes carries no raw character
+//!   [`escape_json_format_characters`] escapes.
 //! - `sanitize_for_table` is the sole call site for stripping terminal-escape
 //!   sequences from user-facing table output (N6).
 //! - A command that computes a typed preview before its later stages reports
@@ -99,8 +100,33 @@ pub(crate) fn render_json_to<T: serde::Serialize>(
     let json = envelope
         .to_json_compact()
         .map_err(|e| std::io::Error::other(format!("JSON serialization failed: {e}")))?;
-    writeln!(out, "{json}")?;
+    writeln!(out, "{}", escape_json_format_characters(&json))?;
     out.flush()
+}
+
+/// Rewrites every character of `json` that
+/// [`stellar_agent_core::observability::redact::is_untrusted_format_character`]
+/// names as a JSON `\uXXXX` escape, a surrogate pair above U+FFFF.
+///
+/// The result parses to the same value: the characters can occur only inside
+/// JSON strings, where the escape stands for the character itself. A terminal
+/// that prints the envelope therefore receives no character that moves the
+/// cursor, recolors, reorders or hides text, while every consumer that parses
+/// the JSON reads the original value.
+#[must_use]
+pub(crate) fn escape_json_format_characters(json: &str) -> String {
+    use std::fmt::Write as _;
+    let mut escaped = String::with_capacity(json.len());
+    for c in json.chars() {
+        if stellar_agent_core::observability::redact::is_untrusted_format_character(c) {
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                let _ = write!(escaped, "\\u{unit:04x}");
+            }
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped
 }
 
 /// Writes `envelope` to `out` and returns `exit_code`, or reports the output
@@ -225,6 +251,26 @@ pub fn sanitize_for_table(s: &str) -> String {
         .collect()
 }
 
+/// Renders untrusted text for a terminal with every control character shown
+/// as a visible escape.
+///
+/// Backslash, C0, DEL, C1, U+2028, U+2029 and every Unicode format character
+/// (category Cf) become escape sequences such as `\u{1b}` and `\u{202e}`;
+/// every other character, non-ASCII letters included, is kept. Nothing is removed,
+/// so the operator sees that a value held such a character. The rule is
+/// [`stellar_agent_core::observability::redact::escape_untrusted_text`], the
+/// one the approval inbox pages apply before HTML escaping.
+///
+/// # Examples
+///
+/// ```text
+/// // escape_for_terminal("a\x1b[1Ab") renders "a\\u{1b}[1Ab".
+/// ```
+#[must_use]
+pub fn escape_for_terminal(s: &str) -> String {
+    stellar_agent_core::observability::redact::escape_untrusted_text(s)
+}
+
 /// Parses `bytes` as exactly one JSON document and panics on anything else,
 /// trailing content included.
 ///
@@ -289,6 +335,25 @@ mod tests {
     #![allow(clippy::expect_used, reason = "test-only assertions")]
 
     use super::*;
+
+    /// A rule name holding bidirectional, zero-width, C1 and tag characters
+    /// reaches the terminal as JSON escapes and parses back to itself.
+    #[test]
+    fn render_json_to_escapes_format_characters_and_keeps_the_value() {
+        let name = "caf\u{e9}\u{202e}\u{200d}\u{85}\u{7f}\u{e0041}rule";
+        let mut out = Vec::new();
+        let written = render_json_to(&mut out, &Envelope::ok(serde_json::json!({ "name": name })));
+        assert!(written.is_ok(), "{written:?}");
+        let text = String::from_utf8(out.clone()).unwrap_or_default();
+        assert!(
+            text.contains(r#""name":"café\u202e\u200d\u0085\u007f\udb40\udc41rule""#),
+            "{text}"
+        );
+        for raw in ['\u{202e}', '\u{200d}', '\u{85}', '\u{7f}', '\u{e0041}'] {
+            assert!(!text.contains(raw), "{raw:?} {text}");
+        }
+        assert_eq!(single_json_document(&out)["data"]["name"], name);
+    }
 
     #[test]
     fn render_json_to_writes_one_compact_line() {
@@ -436,6 +501,15 @@ mod tests {
         let input = "abc\u{00E9}def"; // 'é'
         let out = sanitize_for_table(input);
         assert_eq!(out, "abcdef");
+    }
+
+    #[test]
+    fn escape_for_terminal_shows_controls_and_keeps_text() {
+        assert_eq!(
+            escape_for_terminal("x\u{1b}[1A\u{1b}[2K\u{9b}2J\u{202e}y"),
+            "x\\u{1b}[1A\\u{1b}[2K\\u{9b}2J\\u{202e}y"
+        );
+        assert_eq!(escape_for_terminal("caf\u{e9} 42"), "caf\u{e9} 42");
     }
 
     #[test]

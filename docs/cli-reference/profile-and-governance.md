@@ -628,7 +628,7 @@ Declining the prompt exits `1` with `error.code` `credentials.delete_canceled`; 
 
 `approve` is the operator-side half of the approval spine. When a signing-adjacent action requires an out-of-band approval, the agent surface (the MCP server) records a pending approval and returns an approval nonce. The wallet owner runs `approve --id <NONCE> --profile <name>` in a separate, trusted context to inspect a wallet-controlled summary and consent.
 
-The command renders stored request data alongside the serving profile context.
+The command renders the pending request alongside the serving profile context.
 The recorded process uid must match the approving local user.
 Consent records an HMAC attestation, or persists a toolset grant and consumes its pending request.
 The versioned HMAC binds the profile name, CAIP-2 chain id, approval nonce, digest, and process uid.
@@ -643,19 +643,40 @@ CLI approval prompt. The reason is display text and grants no authority.
 
 The CLI summary and both inbox detail pages show the profile name, CAIP-2 chain id, endpoint authority, and enrolled signer.
 An enrollment placeholder appears as `(not enrolled)`.
-Payment, claim, and trustline rows show the envelope's effective source; an operation source overrides the transaction source.
-An undecodable envelope appears as `(undecodable envelope)`.
-A claim whose stored summary source differs also shows `Source (stored summary)`.
-Trustline summaries show the full holder account, asset code, issuer, limit,
-simulated fee, and sequence number.
+
+Payment, claim, and trustline summaries are decoded from the transaction envelope the approval attests.
+Every destination, amount, asset, memo, limit, balance id, fee, and sequence number shown is the envelope's.
+The effective source is the operation source when the operation has one, otherwise the transaction source.
+A muxed destination shows as its `M...` address.
+A path payment shows the most the source pays and the least the destination receives.
+Memos show their signed type: `none`, `text "<escaped value>"`, `id <n>`, `hash <hex>`, or `return <hex>`.
+A claim names the balance by id only, so its asset and amount read `not part of the signed claim transaction`.
+Trustline summaries show the holder account, asset code, issuer, limit, fee, and sequence number.
 The CLI names the action `trustline change (ChangeTrust)`.
 The CLI limit reads `unlimited`, `0 stroops (removes the trustline)`, or the exact
 stroop count and decimal asset amount.
 Both inboxes label it `TRUSTLINE` and offer `Approve trustline`.
+An MPP charge summary shows the profile, network, payer, transport, authority, target, amount in the token's base units, token contract, recipient, challenge expiry, and fee.
+Before the summary is shown and before consent is recorded, the profile, payer, amount, token contract, recipient, and challenge expiry are checked against the entry's authorization fingerprint, and the network against the passphrase digest the fingerprint binds.
+A mismatch, or an entry that holds no binding digests, makes the entry inconsistent and prevents approval; an MPP entry without binding digests must be prepared again.
+The charge commit refuses with `approval.entry_inconsistent`, and commits nothing, when the transport, authority, or target the entry shows differs from the prepared request.
+The fee reads `not bound to this approval`.
+MPP consent binds both the fingerprint and the prepared artifact.
+
+Every value the summary shows is rendered with control characters visible: backslash, C0, DEL, C1, the line and paragraph separators, and every Unicode format character (category Cf) appear as escapes such as `\u{1b}` and `\u{202e}`.
+The JSON that `approve list` and the other approval commands print carries the same characters as JSON `\uXXXX` escapes, so it parses to the same values.
+Nothing is removed, so a value that holds such a character shows that it does.
+
+A payment, claim, or trustline request is inconsistent when its stored digest is not the SHA-256 of its stored envelope, or its envelope does not decode as that kind of transaction.
+An MPP charge request is inconsistent when the terms it shows do not match its authorization fingerprint.
+The CLI shows such a request as `INCONSISTENT` with the reason and refuses it before the prompt, `--yes` included, with `approval.entry_inconsistent`.
+Both inboxes label it `INCONSISTENT` and offer only Reject.
+Nothing is attested for it on any surface.
 
 The `approve`, `approve gc`, `approve list`, and `approve serve` commands return failures with `error.code` and a plain diagnostic message.
-These failures carry `approval.*` codes: `approval.not_found`, `approval.expired`, `approval.already_attested`, `approval.user_mismatch`, `approval.clock_error`, `approval.sha256_hex_error`, `approval.key_decode_failed`, `approval.key_length_error`, `approval.binding_mismatch`, `approval.grant_persist`, `approval.wrong_kind`, `approval.rejected`, `approval.consumed`, `approval.record_failed`, `approval.uid_unavailable`, `approval.denied`, `approval.store_dir_error`, `approval.permission_denied`, `approval.invalid_nonce_length`, `approval.writer_locked`, `approval.store_open_failed`, `approval.gc_failed`.
+These failures carry `approval.*` codes: `approval.not_found`, `approval.expired`, `approval.already_attested`, `approval.user_mismatch`, `approval.clock_error`, `approval.sha256_hex_error`, `approval.key_decode_failed`, `approval.key_length_error`, `approval.binding_mismatch`, `approval.grant_persist`, `approval.wrong_kind`, `approval.rejected`, `approval.consumed`, `approval.record_failed`, `approval.uid_unavailable`, `approval.denied`, `approval.store_dir_error`, `approval.permission_denied`, `approval.invalid_nonce_length`, `approval.writer_locked`, `approval.store_open_failed`, `approval.gc_failed`, `approval.entry_inconsistent`.
 `approval.gc_failed` reports a collection failure from `approve gc`.
+`approval.entry_inconsistent` reports a payment, claim, or trustline request whose stored digest is not the digest of its stored envelope, or whose envelope does not decode, and an MPP charge request whose shown terms do not match what it would authorize.
 Authentication, validation, and audit failures on approval paths carry their own codes.
 
 ### `approve --id <NONCE> --profile <name>`
@@ -666,7 +687,7 @@ State-changing (records an attestation or a grant in the on-disk pending-approva
 - `--profile <NAME>` — the profile whose attestation key and pending-approval store to use. Optional; resolves from `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
 - `--yes` — non-interactive auto-approve. Bypasses the stdin prompt; the wallet-controlled summary is still printed so there is a visible record. Intended for trusted automation and tests, not routine operator use.
 
-Interactively, the command prints the summary and prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. It exits `1` when the nonce is unknown, expired, already attested, created by a different local user, denied at the prompt, or on an I/O error.
+Interactively, the command prints the summary and prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. It exits `1` when the nonce is unknown, expired, already attested, created by a different local user, inconsistent, denied at the prompt, or on an I/O error.
 
 The `approval_attested` audit row is written before the approval is persisted. When an MCP server or `approve serve` inbox holds that profile's audit writer, the row is queued in the audit outbox. The running process appends it to the log before any process loads a signing key for the approved action. The envelope's `audit` field says which happened: `"written"` or `"queued"`. The command refuses, persists nothing, and exits `1` when the writer is held by a process that does not drain the outbox (`audit.writer_locked`). It does the same on any other audit failure. Examples are a missing audit key, a rolled-back log (`audit.tip_anchor_mismatch`), and a busy outbox (`audit.outbox_busy`).
 

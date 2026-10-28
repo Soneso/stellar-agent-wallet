@@ -346,6 +346,9 @@ pub fn verify_approval(
             detail: "no pending approval with that nonce".to_owned(),
         })
     })?;
+    if let Some(summary) = super::attest::classic_entry_summary(&record.kind) {
+        summary?;
+    }
     let (kind, subject, stored_digest) = match &record.kind {
         ApprovalKind::PaymentSimulated {
             envelope_xdr_b64,
@@ -475,7 +478,10 @@ mod tests {
     use tempfile::TempDir;
 
     const NAME: &str = "witness";
-    const ENVELOPE: &str = "AAAAAgAAAAA=";
+    static ENVELOPE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+        super::super::fixtures::payment_envelope(&source, &source, "XLM", 1000, None, 100, 7)
+    });
     const KEY: [u8; 32] = [0x5a; 32];
 
     struct Fixture {
@@ -513,7 +519,7 @@ mod tests {
         let profile = profile();
         put_key(&profile.attestation_key_id, &KEY);
         let entry = PendingApproval::new_payment_pending(
-            ENVELOPE.to_owned(),
+            ENVELOPE.to_string(),
             ENVELOPE.as_bytes(),
             stellar_strkey::ed25519::PublicKey([1; 32])
                 .to_string()
@@ -535,7 +541,7 @@ mod tests {
             &KEY,
             &binding(),
             &nonce,
-            &approval_subject_classic(ENVELOPE),
+            &approval_subject_classic(&ENVELOPE),
             "1000",
             &entry.attested_lifetime(),
         );
@@ -556,7 +562,7 @@ mod tests {
     fn expectation() -> ApprovalExpectation {
         ApprovalExpectation {
             kind: ApprovedKind::Payment,
-            subject: approval_subject_classic(ENVELOPE),
+            subject: approval_subject_classic(&ENVELOPE),
         }
     }
 
@@ -602,7 +608,7 @@ mod tests {
         assert_eq!(witness.chain(), Caip2::Mainnet);
         assert_eq!(witness.nonce(), f.nonce);
         assert_eq!(witness.kind(), ApprovedKind::Payment);
-        assert_eq!(witness.subject(), approval_subject_classic(ENVELOPE));
+        assert_eq!(witness.subject(), approval_subject_classic(&ENVELOPE));
         assert_eq!(witness.created_at_ms(), f.created);
         assert_eq!(witness.expires_at_ms(), f.expires);
 
@@ -612,7 +618,7 @@ mod tests {
             expected.extend(field);
         }
         expected.push(1);
-        expected.extend(approval_subject_classic(ENVELOPE));
+        expected.extend(approval_subject_classic(&ENVELOPE));
         expected.extend(f.created.to_be_bytes());
         expected.extend(f.expires.to_be_bytes());
         let independent: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&expected).into();
@@ -692,7 +698,7 @@ mod tests {
             &[0x11; 32],
             &binding(),
             &f.nonce,
-            &approval_subject_classic(ENVELOPE),
+            &approval_subject_classic(&ENVELOPE),
             "1000",
             &AttestedLifetime::new(
                 record.kind.kind_name(),
@@ -836,12 +842,12 @@ mod tests {
         let f = fixture();
         assert!(verify(&f, &f.blob, f.created).is_ok());
         let text = std::fs::read_to_string(&f.path).unwrap();
-        let good = crate::hex::encode(&approval_subject_classic(ENVELOPE));
+        let good = crate::hex::encode(&approval_subject_classic(&ENVELOPE));
         assert!(text.contains(&good));
         std::fs::write(&f.path, text.replace(&good, &"00".repeat(32))).unwrap();
         assert_eq!(
             verify(&f, &f.blob, f.created).unwrap_err().code(),
-            "approval.attestation_invalid"
+            "approval.entry_inconsistent"
         );
     }
 
@@ -858,12 +864,21 @@ mod tests {
         let balance = stellar_strkey::ClaimableBalance::V0([1; 32])
             .to_string()
             .to_string();
+        let claim_xdr = super::super::fixtures::claim_envelope(&address, [1; 32], 100, 7);
+        let trust_xdr = super::super::fixtures::change_trust_envelope(
+            &address,
+            "USD",
+            &address,
+            Some(100),
+            100,
+            7,
+        );
         let entries = [
             (
                 ApprovedKind::Claim,
                 PendingApproval::new_claim_pending(
-                    ENVELOPE.to_owned(),
-                    ENVELOPE.as_bytes(),
+                    claim_xdr.clone(),
+                    claim_xdr.as_bytes(),
                     format!("00000000{}", "01".repeat(32)),
                     balance,
                     "XLM".to_owned(),
@@ -879,8 +894,8 @@ mod tests {
             (
                 ApprovedKind::Trustline,
                 PendingApproval::new_trustline_pending(
-                    ENVELOPE.to_owned(),
-                    ENVELOPE.as_bytes(),
+                    trust_xdr.clone(),
+                    trust_xdr.as_bytes(),
                     address.clone(),
                     "USD".to_owned(),
                     address,
@@ -894,13 +909,18 @@ mod tests {
             ),
         ];
         for (kind, entry) in entries {
+            let subject = approval_subject_classic(if kind == ApprovedKind::Claim {
+                &claim_xdr
+            } else {
+                &trust_xdr
+            });
             let nonce = entry.approval_nonce.clone();
             let now = entry.created_at_unix_ms;
             let blob = compute_attestation(
                 &KEY,
                 &binding(),
                 &nonce,
-                &approval_subject_classic(ENVELOPE),
+                &subject,
                 "1000",
                 &entry.attested_lifetime(),
             );
@@ -914,14 +934,77 @@ mod tests {
                 NAME,
                 &nonce,
                 &blob,
-                &ApprovalExpectation {
-                    kind,
-                    subject: approval_subject_classic(ENVELOPE),
-                },
+                &ApprovalExpectation { kind, subject },
                 now,
             )
             .unwrap();
             assert_eq!(witness.kind(), kind);
         }
+    }
+    #[test]
+    #[serial_test::serial]
+    fn resolution_refuses_previously_attested_non_utf8_claim_memo() {
+        use stellar_xdr::{Limits, Memo, ReadXdr as _, TransactionEnvelope, WriteXdr as _};
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let profile = profile();
+        put_key(&profile.attestation_key_id, &KEY);
+        let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+        let xdr = super::super::fixtures::claim_envelope(&source, [9; 32], 100, 7);
+        let TransactionEnvelope::Tx(mut tx) =
+            TransactionEnvelope::from_xdr_base64(&xdr, Limits::none()).unwrap()
+        else {
+            unreachable!()
+        };
+        tx.tx.memo = Memo::Text(vec![0xff, 0xfe].try_into().unwrap());
+        let xdr = TransactionEnvelope::Tx(tx)
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        let (id, strkey) = super::super::fixtures::balance_ids([9; 32]);
+        let entry = PendingApproval::new_claim_pending(
+            xdr.clone(),
+            xdr.as_bytes(),
+            id,
+            strkey,
+            "XLM".to_owned(),
+            1,
+            source.to_string(),
+            100,
+            7,
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let subject = approval_subject_classic(&xdr);
+        let nonce = entry.approval_nonce.clone();
+        let now = entry.created_at_unix_ms;
+        let blob = compute_attestation(
+            &KEY,
+            &binding(),
+            &nonce,
+            &subject,
+            "1000",
+            &entry.attested_lifetime(),
+        );
+        let mut store = PendingApprovalStore::open(dir.path().join("claim.toml")).unwrap();
+        store.insert(entry, now).unwrap();
+        store.record_attestation_at(&nonce, blob, now).unwrap();
+        assert_eq!(
+            verify_approval(
+                &store,
+                &profile,
+                NAME,
+                &nonce,
+                &blob,
+                &ApprovalExpectation {
+                    kind: ApprovedKind::Claim,
+                    subject
+                },
+                now
+            )
+            .unwrap_err()
+            .code(),
+            "approval.entry_inconsistent"
+        );
     }
 }

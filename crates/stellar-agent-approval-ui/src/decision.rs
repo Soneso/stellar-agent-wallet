@@ -184,6 +184,10 @@ pub enum Outcome {
     /// The entry's kind is not one the attest path supports (for example a
     /// passkey kind, whose interactive flow lives in the WebAuthn bridge).
     WrongKind,
+    /// The entry's stored digest is not the digest of its stored envelope, or
+    /// that envelope does not decode, so no surface can show what an
+    /// attestation would approve. Nothing was attested and no row written.
+    Inconsistent,
 }
 
 /// Apply one operator [`Decision`] against the profile's approval store, on
@@ -416,6 +420,9 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
             if approval_code_is(&e, "approval.wrong_kind") {
                 return Outcome::WrongKind;
             }
+            if approval_code_is(&e, "approval.entry_inconsistent") {
+                return Outcome::Inconsistent;
+            }
             if approval_code_is(&e, "approval.not_found") {
                 return Outcome::NotFound;
             }
@@ -589,10 +596,13 @@ mod tests {
     use serial_test::serial;
     use stellar_agent_core::approval::attestation::{compute_attestation, verify_attestation};
     use stellar_agent_core::approval::{
-        DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, decode_sha256_hex,
+        DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, decode_sha256_hex, fixtures,
         process_uid_for_attestation,
     };
     use tempfile::TempDir;
+
+    const SOURCE_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+    const DEST_G: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
 
     struct Fixture {
         _dir: TempDir,
@@ -652,38 +662,34 @@ mod tests {
     }
 
     fn payment_entry(ttl_ms: u64) -> PendingApproval {
-        PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             2_500_000,
-            "XLM".to_owned(),
             None,
             100,
             1_234_567,
             uid(),
             ttl_ms,
         )
-        .unwrap()
     }
 
     /// A payment entry stamped with a `process_uid` that can never equal the
     /// test host's real uid, simulating an entry parked by a different OS
     /// user's agent process.
     fn foreign_payment_entry(ttl_ms: u64) -> PendingApproval {
-        PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             2_500_000,
-            "XLM".to_owned(),
             None,
             100,
             1_234_567,
             "99999999".to_owned(),
             ttl_ms,
         )
-        .unwrap()
     }
 
     #[test]
@@ -738,6 +744,12 @@ mod tests {
                 },
                 "approval.consumed",
             ),
+            (
+                ApprovalFailure::EntryInconsistent {
+                    detail: "plain diagnostic".to_owned(),
+                },
+                "approval.entry_inconsistent",
+            ),
         ];
         for (failure, code) in cases {
             let error = WalletError::Approval(failure);
@@ -757,6 +769,7 @@ mod tests {
             "approval.wrong_kind",
             "approval.rejected",
             "approval.consumed",
+            "approval.entry_inconsistent",
         ] {
             let unrelated =
                 WalletError::Internal(stellar_agent_core::InternalError::UnexpectedState {
@@ -764,6 +777,34 @@ mod tests {
                 });
             assert!(!approval_code_is(&unrelated, code));
         }
+    }
+
+    /// An entry whose stored digest is not its envelope's is refused as
+    /// inconsistent: nothing is attested and the entry stays pending.
+    #[test]
+    #[serial]
+    fn approve_inconsistent_entry_is_refused() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fx = fixture("inconsistent");
+        let mut entry = payment_entry(DEFAULT_TTL_MS);
+        let ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64, ..
+        } = &mut entry.kind
+        else {
+            unreachable!()
+        };
+        *envelope_xdr_b64 = fixtures::payment_envelope(SOURCE_G, SOURCE_G, "XLM", 9, None, 100, 1);
+        let nonce = insert(&fx.ctx, entry);
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Approve {
+                nonce: nonce.clone(),
+            },
+            &RequestIdentity::Local,
+        );
+        assert_eq!(outcome, Outcome::Inconsistent);
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        assert!(store.get(&nonce).unwrap().attestation_blob_b64.is_none());
     }
 
     #[test]
@@ -926,20 +967,15 @@ mod tests {
     fn approve_claim_mints_attestation() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fx = fixture("claim");
-        let entry = PendingApproval::new_claim_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "a".repeat(72),
-            "B".to_owned() + &"A".repeat(57),
-            "XLM".to_owned(),
-            500,
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::claim_pending(
+            SOURCE_G,
+            [0x0a; 32],
+            Some(("XLM", 500)),
             100,
             1,
             uid(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         let nonce = insert(&fx.ctx, entry);
         let outcome = apply_decision(
             &fx.ctx,

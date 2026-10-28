@@ -9,6 +9,9 @@
 
 use serde::Serialize;
 
+use crate::envelope_decode::{ClassicMemo, ClassicOperation, ClassicSummary};
+
+use super::attest::classic_entry_summary;
 use super::rule_proposal::ContextRuleProposalSnapshot;
 use super::store::{ApprovalKind, PendingApproval, redact_g_strkey, redact_tx_hash};
 
@@ -70,8 +73,8 @@ pub struct PendingApprovalView {
 /// every field here is either public on-chain data or already redacted.
 ///
 /// Serialises as a JSON object tagged with a `"kind"` discriminator
-/// (`"payment"`, `"trustline"`, `"claim"`, `"sign_with_passkey"`, `"register_passkey"`,
-/// `"toolset_first_invoke_gate"`, `"trustline_clawback_opt_in"`,
+/// (`"payment"`, `"trustline"`, `"claim"`, `"inconsistent"`, `"sign_with_passkey"`,
+/// `"register_passkey"`, `"toolset_first_invoke_gate"`, `"trustline_clawback_opt_in"`,
 /// `"rule_proposal"`, `"rejected"`), the same tagging convention as
 /// `stellar_agent_stablecoin::preview::GateDecisionView`.
 ///
@@ -103,32 +106,47 @@ pub enum ApprovalSummaryView {
         home_domain: Option<String>,
     },
 
-    /// [`ApprovalKind::PaymentSimulated`] summary fields.
+    /// [`ApprovalKind::PaymentSimulated`] summary, decoded from the envelope.
+    ///
+    /// Covers payments, path payments and account creation; for an account
+    /// creation `to` is the new account, `amount_stroops` its starting
+    /// balance and `asset` is `"XLM"`.
     Payment {
-        /// Effective source decoded from the envelope.
-        source: Option<String>,
-        /// Destination G-strkey.
+        /// Effective source G-strkey.
+        source: String,
+        /// Destination as the envelope names it: a G-strkey, or an M-strkey
+        /// for a muxed destination.
         to: String,
-        /// Amount in stroops, decimal-string encoded on the wire (see
-        /// [`stellar_agent_core::wire_stroops`](crate::wire_stroops)).
+        /// Amount the source pays in stroops, decimal-string encoded on the
+        /// wire (see [`stellar_agent_core::wire_stroops`](crate::wire_stroops)).
+        /// For a path payment, the most it pays.
         #[serde(with = "crate::wire_stroops::i64")]
         amount_stroops: i64,
-        /// Asset identifier (`"XLM"` or `"<code>:<issuer>"`).
+        /// Asset the source pays (`"XLM"` or `"<code>:<issuer>"`).
         asset: String,
-        /// Optional memo text.
-        memo: Option<String>,
-        /// Simulated transaction fee in stroops, decimal-string encoded.
+        /// For a path payment, the asset the destination receives.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dest_asset: Option<String>,
+        /// For a path payment, the amount the destination receives (at least
+        /// this much for a strict send), decimal-string encoded.
+        #[serde(
+            with = "crate::wire_stroops::i64_opt",
+            skip_serializing_if = "Option::is_none"
+        )]
+        dest_amount_stroops: Option<i64>,
+        /// The signed memo with its type preserved.
+        memo: ClassicMemo,
+        /// Transaction fee in stroops, decimal-string encoded.
         #[serde(with = "crate::wire_stroops::u32")]
         fee_stroops: u32,
-        /// Simulated sequence number.
+        /// Transaction sequence number.
         seq_num: i64,
     },
 
-    /// [`ApprovalKind::TrustlineSimulated`] summary fields.
+    /// [`ApprovalKind::TrustlineSimulated`] summary, decoded from the
+    /// envelope.
     Trustline {
-        /// Effective source decoded from the envelope.
-        source: Option<String>,
-        /// Full trustline holder G-strkey.
+        /// Trustline holder: the effective source G-strkey.
         holder: String,
         /// Asset code.
         asset_code: String,
@@ -137,31 +155,42 @@ pub enum ApprovalSummaryView {
         /// Exact limit in stroops; `None` means unlimited.
         #[serde(with = "crate::wire_stroops::i64_opt")]
         limit_stroops: Option<i64>,
-        /// Exact simulated fee in stroops.
+        /// Transaction fee in stroops.
         #[serde(with = "crate::wire_stroops::u32")]
         fee_stroops: u32,
-        /// Simulated sequence number.
+        /// Transaction sequence number.
         seq_num: i64,
+        /// The signed memo and its type.
+        memo: ClassicMemo,
     },
 
-    /// [`ApprovalKind::ClaimSimulated`] summary fields.
+    /// [`ApprovalKind::ClaimSimulated`] summary, decoded from the envelope.
+    ///
+    /// The envelope names the balance by id only; the balance's asset and
+    /// amount are ledger state the signed transaction does not carry.
     Claim {
-        /// Effective source decoded from the envelope.
-        envelope_source: Option<String>,
         /// `B...` strkey rendering of the balance id.
         balance_id_strkey: String,
-        /// Asset identifier.
-        asset: Option<String>,
-        /// Claim amount in stroops, decimal-string encoded.
-        #[serde(with = "crate::wire_stroops::i64_opt")]
-        amount_stroops: Option<i64>,
-        /// Claiming (source) account G-strkey.
+        /// Claiming account: the effective source G-strkey.
         source: String,
-        /// Simulated transaction fee in stroops, decimal-string encoded.
+        /// Transaction fee in stroops, decimal-string encoded.
         #[serde(with = "crate::wire_stroops::u32")]
         fee_stroops: u32,
-        /// Simulated sequence number.
+        /// Transaction sequence number.
         seq_num: i64,
+        /// The signed memo and its type.
+        memo: ClassicMemo,
+    },
+
+    /// A classic or MPP entry
+    /// whose stored digest is not the digest of its stored envelope, or whose
+    /// envelope does not decode, or whose MPP terms fail fingerprint verification.
+    /// It cannot be approved; it can be rejected.
+    Inconsistent {
+        /// `kind_name()` of the entry.
+        original_kind_name: String,
+        /// Why the entry cannot be shown or approved.
+        reason: String,
     },
 
     /// [`ApprovalKind::SignWithPasskey`] summary fields.
@@ -297,8 +326,105 @@ pub fn format_trustline_limit(limit_stroops: Option<i64>) -> String {
     }
 }
 
+/// The summary of a classic entry, decoded from its envelope, or
+/// [`ApprovalSummaryView::Inconsistent`] when the entry fails
+/// [`classic_entry_summary`].
+fn classic_summary_view(kind: &ApprovalKind) -> ApprovalSummaryView {
+    let inconsistent = |reason: String| ApprovalSummaryView::Inconsistent {
+        original_kind_name: kind.kind_name().to_owned(),
+        reason,
+    };
+    let summary = match classic_entry_summary(kind) {
+        Some(Ok(summary)) => summary,
+        Some(Err(error)) => return inconsistent(error.message()),
+        None => return inconsistent("the entry holds no classic transaction".to_owned()),
+    };
+    let ClassicSummary {
+        source,
+        fee_stroops,
+        seq_num,
+        memo,
+        operation,
+    } = summary;
+    // `classic_entry_summary` decodes each kind with the operations that kind
+    // accepts, so the operation determines the view.
+    match operation {
+        ClassicOperation::Payment {
+            destination,
+            asset,
+            amount_stroops,
+        } => ApprovalSummaryView::Payment {
+            source,
+            to: destination,
+            amount_stroops,
+            asset,
+            dest_asset: None,
+            dest_amount_stroops: None,
+            memo,
+            fee_stroops,
+            seq_num,
+        },
+        ClassicOperation::PathPayment {
+            destination,
+            send_asset,
+            send_amount_stroops,
+            dest_asset,
+            dest_amount_stroops,
+        } => ApprovalSummaryView::Payment {
+            source,
+            to: destination,
+            amount_stroops: send_amount_stroops,
+            asset: send_asset,
+            dest_asset: Some(dest_asset),
+            dest_amount_stroops: Some(dest_amount_stroops),
+            memo,
+            fee_stroops,
+            seq_num,
+        },
+        ClassicOperation::CreateAccount {
+            destination,
+            starting_balance_stroops,
+        } => ApprovalSummaryView::Payment {
+            source,
+            to: destination,
+            amount_stroops: starting_balance_stroops,
+            asset: "XLM".to_owned(),
+            dest_asset: None,
+            dest_amount_stroops: None,
+            memo,
+            fee_stroops,
+            seq_num,
+        },
+        ClassicOperation::ChangeTrust {
+            asset_code,
+            asset_issuer,
+            limit_stroops,
+        } => ApprovalSummaryView::Trustline {
+            holder: source,
+            asset_code,
+            asset_issuer,
+            limit_stroops,
+            fee_stroops,
+            seq_num,
+            memo,
+        },
+        ClassicOperation::ClaimClaimableBalance {
+            balance_id_strkey, ..
+        } => ApprovalSummaryView::Claim {
+            balance_id_strkey,
+            source,
+            fee_stroops,
+            seq_num,
+            memo,
+        },
+    }
+}
+
 impl PendingApprovalView {
     /// Builds a redacted view from a stored entry.
+    ///
+    /// A classic entry's summary is decoded from its envelope; its stored
+    /// `summary_*` fields are not read.
     pub(super) fn from_entry(entry: &PendingApproval, now_unix_ms: u64) -> Self {
         let attested = match &entry.kind {
             ApprovalKind::X402Payment { .. }
@@ -317,181 +443,141 @@ impl PendingApprovalView {
             | ApprovalKind::Consumed { .. } => false,
         };
 
-        let summary = match &entry.kind {
-            ApprovalKind::X402Payment {
-                root_invocation_xdr,
-                home_domain,
-                ..
-            } => {
-                use stellar_xdr::ReadXdr as _;
-                let terms = stellar_xdr::SorobanAuthorizedInvocation::from_xdr_base64(
-                    root_invocation_xdr,
-                    stellar_agent_xdr_limits::untrusted_decode_limits(root_invocation_xdr.len()),
-                )
-                .ok()
-                .as_ref()
-                .and_then(super::store::x402_transfer_terms);
-                ApprovalSummaryView::X402Payment {
-                    payee: terms.as_ref().map(|terms| terms.payee.clone()),
-                    amount: terms.as_ref().map(|terms| terms.amount.to_string()),
-                    asset: terms.map(|terms| terms.asset),
-                    home_domain: home_domain.clone(),
-                }
+        let summary = if let Err(error) = super::mpp::verify_mpp_entry_terms(&entry.kind) {
+            ApprovalSummaryView::Inconsistent {
+                original_kind_name: entry.kind.kind_name().to_owned(),
+                reason: error.message(),
             }
+        } else {
+            match &entry.kind {
+                ApprovalKind::X402Payment {
+                    root_invocation_xdr,
+                    home_domain,
+                    ..
+                } => {
+                    use stellar_xdr::ReadXdr as _;
+                    let terms = stellar_xdr::SorobanAuthorizedInvocation::from_xdr_base64(
+                        root_invocation_xdr,
+                        stellar_agent_xdr_limits::untrusted_decode_limits(
+                            root_invocation_xdr.len(),
+                        ),
+                    )
+                    .ok()
+                    .as_ref()
+                    .and_then(super::store::x402_transfer_terms);
+                    ApprovalSummaryView::X402Payment {
+                        payee: terms.as_ref().map(|terms| terms.payee.clone()),
+                        amount: terms.as_ref().map(|terms| terms.amount.to_string()),
+                        asset: terms.map(|terms| terms.asset),
+                        home_domain: home_domain.clone(),
+                    }
+                }
 
-            ApprovalKind::PaymentSimulated {
-                envelope_xdr_b64,
-                summary_to,
-                summary_amount_stroops,
-                summary_asset,
-                summary_memo,
-                summary_simulated_fee_stroops,
-                summary_simulated_seq_num,
-                ..
-            } => ApprovalSummaryView::Payment {
-                source: crate::envelope_decode::envelope_source_account(envelope_xdr_b64).ok(),
-                to: summary_to.clone(),
-                amount_stroops: *summary_amount_stroops,
-                asset: summary_asset.clone(),
-                memo: summary_memo.clone(),
-                fee_stroops: *summary_simulated_fee_stroops,
-                seq_num: *summary_simulated_seq_num,
-            },
-            ApprovalKind::TrustlineSimulated {
-                envelope_xdr_b64,
-                summary_holder,
-                summary_asset_code,
-                summary_asset_issuer,
-                summary_limit_stroops,
-                summary_simulated_fee_stroops,
-                summary_simulated_seq_num,
-                ..
-            } => ApprovalSummaryView::Trustline {
-                source: crate::envelope_decode::envelope_source_account(envelope_xdr_b64).ok(),
-                holder: summary_holder.clone(),
-                asset_code: summary_asset_code.clone(),
-                asset_issuer: summary_asset_issuer.clone(),
-                limit_stroops: *summary_limit_stroops,
-                fee_stroops: *summary_simulated_fee_stroops,
-                seq_num: *summary_simulated_seq_num,
-            },
-            ApprovalKind::ClaimSimulated {
-                envelope_xdr_b64,
-                summary_balance_id_strkey,
-                summary_asset,
-                summary_amount_stroops,
-                summary_source,
-                summary_simulated_fee_stroops,
-                summary_simulated_seq_num,
-                ..
-            } => ApprovalSummaryView::Claim {
-                envelope_source: crate::envelope_decode::envelope_source_account(envelope_xdr_b64)
-                    .ok(),
-                balance_id_strkey: summary_balance_id_strkey.clone(),
-                asset: summary_asset.clone(),
-                amount_stroops: *summary_amount_stroops,
-                source: summary_source.clone(),
-                fee_stroops: *summary_simulated_fee_stroops,
-                seq_num: *summary_simulated_seq_num,
-            },
-            ApprovalKind::SignWithPasskey {
-                smart_account_redacted,
-                rule_ids,
-                rp_id,
-                ..
-            } => ApprovalSummaryView::SignWithPasskey {
-                smart_account_redacted: smart_account_redacted.clone(),
-                rule_ids: rule_ids.clone(),
-                rp_id: rp_id.clone(),
-            },
-            ApprovalKind::RegisterPasskey {
-                smart_account_redacted,
-                rule_ids,
-                rp_id,
-                ..
-            } => ApprovalSummaryView::RegisterPasskey {
-                smart_account_redacted: smart_account_redacted.clone(),
-                rule_ids: rule_ids.clone(),
-                rp_id: rp_id.clone(),
-            },
-            ApprovalKind::ToolsetFirstInvokeGate {
-                toolset_name,
-                capability,
-                destination,
-                asset,
-                amount_min_stroops,
-                amount_max_stroops,
-            } => ApprovalSummaryView::ToolsetFirstInvokeGate {
-                toolset_name: toolset_name.clone(),
-                capability: capability.clone(),
-                destination_redacted: redact_g_strkey(destination),
-                asset: asset.clone(),
-                amount_min_stroops: *amount_min_stroops,
-                amount_max_stroops: *amount_max_stroops,
-            },
-            ApprovalKind::TrustlineClawbackOptIn {
-                network,
-                code,
-                issuer,
-            } => ApprovalSummaryView::TrustlineClawbackOptIn {
-                network: network.clone(),
-                code: code.clone(),
-                issuer_redacted: redact_g_strkey(issuer),
-            },
-            ApprovalKind::RuleProposalSimulated {
-                smart_account_redacted,
-                network_passphrase,
-                chain_id,
-                definition,
-                proposal_sha256,
-                summary_line,
-                ..
-            } => ApprovalSummaryView::RuleProposal {
-                smart_account_redacted: smart_account_redacted.clone(),
-                network_passphrase: network_passphrase.clone(),
-                chain_id: chain_id.clone(),
-                definition: definition.clone(),
-                proposal_sha256_hex: proposal_sha256.iter().map(|b| format!("{b:02x}")).collect(),
-                summary_line: summary_line.clone(),
-            },
-            ApprovalKind::MppChargeSimulated {
-                profile,
-                chain_id,
-                payer,
-                transport,
-                authority,
-                target,
-                amount,
-                currency,
-                recipient,
-                challenge_expires_at_unix,
-                simulated_fee_stroops,
-                ..
-            } => ApprovalSummaryView::MppCharge {
-                profile: profile.clone(),
-                chain_id: chain_id.clone(),
-                payer_redacted: redact_g_strkey(payer),
-                transport: transport.clone(),
-                authority: authority.clone(),
-                target: target.clone(),
-                amount: amount.clone(),
-                currency: currency.clone(),
-                recipient_redacted: redact_g_strkey(recipient),
-                challenge_expires_at_unix: *challenge_expires_at_unix,
-                simulated_fee_stroops: *simulated_fee_stroops,
-            },
-            ApprovalKind::Rejected { original_kind_name } => ApprovalSummaryView::Rejected {
-                original_kind_name: original_kind_name.clone(),
-            },
-            ApprovalKind::Consumed {
-                original_kind_name,
-                tx_hash,
-                outcome,
-            } => ApprovalSummaryView::Consumed {
-                original_kind_name: original_kind_name.clone(),
-                tx_hash_redacted: redact_tx_hash(tx_hash),
-                outcome: outcome.label().to_owned(),
-            },
+                ApprovalKind::PaymentSimulated { .. }
+                | ApprovalKind::TrustlineSimulated { .. }
+                | ApprovalKind::ClaimSimulated { .. } => classic_summary_view(&entry.kind),
+                ApprovalKind::SignWithPasskey {
+                    smart_account_redacted,
+                    rule_ids,
+                    rp_id,
+                    ..
+                } => ApprovalSummaryView::SignWithPasskey {
+                    smart_account_redacted: smart_account_redacted.clone(),
+                    rule_ids: rule_ids.clone(),
+                    rp_id: rp_id.clone(),
+                },
+                ApprovalKind::RegisterPasskey {
+                    smart_account_redacted,
+                    rule_ids,
+                    rp_id,
+                    ..
+                } => ApprovalSummaryView::RegisterPasskey {
+                    smart_account_redacted: smart_account_redacted.clone(),
+                    rule_ids: rule_ids.clone(),
+                    rp_id: rp_id.clone(),
+                },
+                ApprovalKind::ToolsetFirstInvokeGate {
+                    toolset_name,
+                    capability,
+                    destination,
+                    asset,
+                    amount_min_stroops,
+                    amount_max_stroops,
+                } => ApprovalSummaryView::ToolsetFirstInvokeGate {
+                    toolset_name: toolset_name.clone(),
+                    capability: capability.clone(),
+                    destination_redacted: redact_g_strkey(destination),
+                    asset: asset.clone(),
+                    amount_min_stroops: *amount_min_stroops,
+                    amount_max_stroops: *amount_max_stroops,
+                },
+                ApprovalKind::TrustlineClawbackOptIn {
+                    network,
+                    code,
+                    issuer,
+                } => ApprovalSummaryView::TrustlineClawbackOptIn {
+                    network: network.clone(),
+                    code: code.clone(),
+                    issuer_redacted: redact_g_strkey(issuer),
+                },
+                ApprovalKind::RuleProposalSimulated {
+                    smart_account_redacted,
+                    network_passphrase,
+                    chain_id,
+                    definition,
+                    proposal_sha256,
+                    summary_line,
+                    ..
+                } => ApprovalSummaryView::RuleProposal {
+                    smart_account_redacted: smart_account_redacted.clone(),
+                    network_passphrase: network_passphrase.clone(),
+                    chain_id: chain_id.clone(),
+                    definition: definition.clone(),
+                    proposal_sha256_hex: proposal_sha256
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect(),
+                    summary_line: summary_line.clone(),
+                },
+                ApprovalKind::MppChargeSimulated {
+                    profile,
+                    chain_id,
+                    payer,
+                    transport,
+                    authority,
+                    target,
+                    amount,
+                    currency,
+                    recipient,
+                    challenge_expires_at_unix,
+                    simulated_fee_stroops,
+                    ..
+                } => ApprovalSummaryView::MppCharge {
+                    profile: profile.clone(),
+                    chain_id: chain_id.clone(),
+                    payer_redacted: redact_g_strkey(payer),
+                    transport: transport.clone(),
+                    authority: authority.clone(),
+                    target: target.clone(),
+                    amount: amount.clone(),
+                    currency: currency.clone(),
+                    recipient_redacted: redact_g_strkey(recipient),
+                    challenge_expires_at_unix: *challenge_expires_at_unix,
+                    simulated_fee_stroops: *simulated_fee_stroops,
+                },
+                ApprovalKind::Rejected { original_kind_name } => ApprovalSummaryView::Rejected {
+                    original_kind_name: original_kind_name.clone(),
+                },
+                ApprovalKind::Consumed {
+                    original_kind_name,
+                    tx_hash,
+                    outcome,
+                } => ApprovalSummaryView::Consumed {
+                    original_kind_name: original_kind_name.clone(),
+                    tx_hash_redacted: redact_tx_hash(tx_hash),
+                    outcome: outcome.label().to_owned(),
+                },
+            }
         };
 
         Self {
@@ -523,6 +609,7 @@ mod tests {
         "REMAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAR//////////wAAAAAAAAAA",
     );
 
+    use super::super::fixtures;
     use super::super::store::{DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore};
     use super::super::user_id::process_uid_for_attestation;
     use super::*;
@@ -531,6 +618,13 @@ mod tests {
     const TEST_NOW_MS: u64 = 1_700_000_000_000;
     const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
     const TESTNET_USDC_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+    const SOURCE: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+    const DEST: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+    const OTHER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+    /// The operation source of `CHANGE_TRUST_ENVELOPE`: the key `[2; 32]`.
+    const OP_SOURCE: &str = "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA";
+    /// The issuer of `CHANGE_TRUST_ENVELOPE`: the key `[4; 32]`.
+    const ISSUER_04: &str = "GACAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAJJHP";
 
     fn uid() -> String {
         process_uid_for_attestation().expect("UID available on test host")
@@ -551,19 +645,17 @@ mod tests {
     fn snapshot_renders_payment_simulated() {
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE,
+            DEST,
+            "XLM",
             2_500_000,
-            "XLM".to_owned(),
-            Some("hello".to_owned()),
+            Some("hello"),
             100,
             1,
             uid(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
 
@@ -574,43 +666,37 @@ mod tests {
         assert_eq!(view.kind_name, "PaymentSimulated");
         assert!(!view.expired);
         assert!(!view.attested);
-        match &view.summary {
+        assert_eq!(
+            view.summary,
             ApprovalSummaryView::Payment {
-                to,
-                amount_stroops,
-                asset,
-                memo,
-                ..
-            } => {
-                assert_eq!(
-                    to,
-                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-                );
-                assert_eq!(*amount_stroops, 2_500_000);
-                assert_eq!(asset, "XLM");
-                assert_eq!(memo.as_deref(), Some("hello"));
+                source: SOURCE.to_owned(),
+                to: DEST.to_owned(),
+                amount_stroops: 2_500_000,
+                asset: "XLM".to_owned(),
+                dest_asset: None,
+                dest_amount_stroops: None,
+                memo: ClassicMemo::Text("hello".to_owned()),
+                fee_stroops: 100,
+                seq_num: 1,
             }
-            other => panic!("expected Payment summary, got {other:?}"),
-        }
+        );
     }
 
     #[test]
     fn snapshot_marks_payment_attested_after_record_attestation() {
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE,
+            DEST,
+            "XLM",
             1_000,
-            "XLM".to_owned(),
             None,
             100,
             1,
             uid(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
         store.record_attestation(&nonce, [0x11u8; 32]).unwrap();
@@ -626,28 +712,29 @@ mod tests {
     fn snapshot_renders_claim_simulated() {
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
-        let entry = PendingApproval::new_claim_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "a".repeat(72),
-            "B".to_owned() + &"A".repeat(57),
-            "XLM".to_owned(),
-            500,
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::claim_pending(
+            SOURCE,
+            [0x0a; 32],
+            Some(("XLM", 500)),
             100,
             1,
             uid(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         store.insert(entry, TEST_NOW_MS).unwrap();
 
         let views = store.snapshot(TEST_NOW_MS);
         assert_eq!(views[0].kind_name, "ClaimSimulated");
-        assert!(matches!(
+        assert_eq!(
             views[0].summary,
-            ApprovalSummaryView::Claim { .. }
-        ));
+            ApprovalSummaryView::Claim {
+                balance_id_strkey: fixtures::balance_ids([0x0a; 32]).1,
+                source: SOURCE.to_owned(),
+                fee_stroops: 100,
+                seq_num: 1,
+                memo: ClassicMemo::None,
+            }
+        );
     }
 
     #[test]
@@ -764,19 +851,17 @@ mod tests {
     fn snapshot_renders_rejected_tombstone_with_no_summary_data() {
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE,
+            DEST,
+            "XLM",
             1_000,
-            "XLM".to_owned(),
             None,
             100,
             1,
             uid(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
         store.reject(&nonce, TEST_NOW_MS, 60_000).unwrap();
@@ -848,19 +933,7 @@ mod tests {
     fn snapshot_flags_expired_entries() {
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            1_000,
-            "XLM".to_owned(),
-            None,
-            100,
-            1,
-            uid(),
-            1,
-        )
-        .unwrap();
+        let entry = fixtures::payment_pending(SOURCE, DEST, "XLM", 1_000, None, 100, 1, uid(), 1);
         let expiry = entry.expires_at_unix_ms;
         store.insert(entry, TEST_NOW_MS).unwrap();
 
@@ -880,16 +953,20 @@ mod tests {
     #[test]
     fn summary_view_serializes_with_snake_case_kind_tag() {
         let payment = ApprovalSummaryView::Payment {
-            source: Some("GSOURCE".to_owned()),
+            source: "GSOURCE".to_owned(),
             to: "GAAA".to_owned(),
             amount_stroops: 1,
             asset: "XLM".to_owned(),
-            memo: None,
+            dest_asset: None,
+            dest_amount_stroops: None,
+            memo: ClassicMemo::None,
             fee_stroops: 100,
             seq_num: 1,
         };
         let json = serde_json::to_value(&payment).unwrap();
         assert_eq!(json["kind"], "payment");
+        assert!(json.get("dest_asset").is_none());
+        assert!(json.get("dest_amount_stroops").is_none());
         assert_eq!(
             json["amount_stroops"], "1",
             "amount_stroops must serialize as a decimal string"
@@ -908,23 +985,30 @@ mod tests {
     }
 
     #[test]
-    fn claim_summary_view_encodes_stroop_fields_as_strings() {
-        let claim = ApprovalSummaryView::Claim {
-            envelope_source: Some("GENVELOPE".to_owned()),
-            balance_id_strkey: "B".to_owned() + &"A".repeat(57),
-            asset: Some("XLM".to_owned()),
-            amount_stroops: Some(9_007_199_254_740_993_i64), // 2^53 + 1
-            source: "GAAA".to_owned(),
+    fn path_payment_summary_view_encodes_stroop_fields_as_strings() {
+        let payment = ApprovalSummaryView::Payment {
+            source: "GSOURCE".to_owned(),
+            to: "GAAA".to_owned(),
+            amount_stroops: 9_007_199_254_740_993_i64, // 2^53 + 1
+            asset: "XLM".to_owned(),
+            dest_asset: Some("USDC:GISSUER".to_owned()),
+            dest_amount_stroops: Some(9_007_199_254_740_995_i64),
+            memo: ClassicMemo::None,
             fee_stroops: 100,
             seq_num: 1,
         };
-        let json = serde_json::to_value(&claim).unwrap();
-        assert_eq!(
-            json["amount_stroops"], "9007199254740993",
-            "amount_stroops must survive the f64 precision boundary as a string"
-        );
-        assert_eq!(json["fee_stroops"], "100");
-        assert_eq!(json["envelope_source"], "GENVELOPE");
+        let json = serde_json::to_value(&payment).unwrap();
+        assert_eq!(json["amount_stroops"], "9007199254740993");
+        assert_eq!(json["dest_amount_stroops"], "9007199254740995");
+        assert_eq!(json["dest_asset"], "USDC:GISSUER");
+
+        let inconsistent = ApprovalSummaryView::Inconsistent {
+            original_kind_name: "ClaimSimulated".to_owned(),
+            reason: "the stored digest is not the digest of the stored envelope".to_owned(),
+        };
+        let json = serde_json::to_value(&inconsistent).unwrap();
+        assert_eq!(json["kind"], "inconsistent");
+        assert_eq!(json["original_kind_name"], "ClaimSimulated");
     }
 
     #[test]
@@ -946,19 +1030,17 @@ mod tests {
     fn pending_approval_view_serializes_expected_top_level_fields() {
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE,
+            DEST,
+            "XLM",
             1_000,
-            "XLM".to_owned(),
             None,
             100,
             1,
             uid(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         store.insert(entry, TEST_NOW_MS).unwrap();
 
         let views = store.snapshot(TEST_NOW_MS);
@@ -968,22 +1050,7 @@ mod tests {
         assert_eq!(json["expired"], false);
         assert_eq!(json["attested"], false);
         assert_eq!(json["summary"]["kind"], "payment");
-        assert!(json["summary"].get("source").is_some());
-        let claim = PendingApproval::new_claim_pending(
-            "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAPAAAAAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAAAAAAAAAA=".to_owned(),
-            b"claim-envelope", "00".repeat(36), format!("B{}", "A".repeat(57)), "XLM".to_owned(), 1_000_000,
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(), 100, 1, uid(), DEFAULT_TTL_MS,
-        ).unwrap();
-        let claim_view = PendingApprovalView::from_entry(&claim, TEST_NOW_MS);
-        let claim_json = serde_json::to_value(claim_view).unwrap();
-        assert_eq!(
-            claim_json["summary"]["envelope_source"],
-            "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA"
-        );
-        assert_eq!(
-            claim_json["summary"]["source"],
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-        );
+        assert_eq!(json["summary"]["source"], SOURCE);
     }
 
     #[test]
@@ -993,24 +1060,26 @@ mod tests {
         let now = crate::timefmt::now_unix_ms().unwrap();
         let payer = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let recipient = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-        let entry = PendingApproval::new_mpp_charge_pending(
-            [0x11; 32],
-            [0x22; 32],
-            "default".to_owned(),
-            "stellar:testnet".to_owned(),
-            payer.to_owned(),
-            "http".to_owned(),
-            "merchant.example".to_owned(),
-            "/checkout".to_owned(),
-            "1000000".to_owned(),
-            recipient.to_owned(),
-            recipient.to_owned(),
-            now / 1_000 + 3_600,
-            1_100,
-            uid(),
-            DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        let entry = crate::approval::fixtures::bind_mpp_entry(
+            PendingApproval::new_mpp_charge_pending(
+                [0x11; 32],
+                [0x22; 32],
+                "default".to_owned(),
+                "stellar:testnet".to_owned(),
+                payer.to_owned(),
+                "http".to_owned(),
+                "merchant.example".to_owned(),
+                "/checkout".to_owned(),
+                "1000000".to_owned(),
+                recipient.to_owned(),
+                recipient.to_owned(),
+                now / 1_000 + 3_600,
+                1_100,
+                uid(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap(),
+        );
         assert!(entry.expires_at_unix_ms <= entry.created_at_unix_ms + 5 * 60 * 1_000);
         store.insert(entry, now).unwrap();
 
@@ -1039,12 +1108,12 @@ mod tests {
         PendingApproval::new_trustline_pending(
             CHANGE_TRUST_ENVELOPE.to_owned(),
             CHANGE_TRUST_ENVELOPE.as_bytes(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            OP_SOURCE.to_owned(),
             "USDC".to_owned(),
-            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+            ISSUER_04.to_owned(),
             limit,
             100,
-            42,
+            1,
             "1000".to_owned(),
             DEFAULT_TTL_MS,
         )
@@ -1053,22 +1122,25 @@ mod tests {
 
     #[test]
     fn snapshot_renders_trustline_simulated() {
-        for limit in [None, Some(0), Some(i64::MAX)] {
-            let mut entry = trustline_entry(limit);
+        for limit in [None, Some(0), Some(i64::MAX - 1)] {
+            let mut entry = fixtures::trustline_pending(
+                SOURCE,
+                "USDC",
+                TESTNET_USDC_ISSUER,
+                limit,
+                100,
+                42,
+                "1000".to_owned(),
+                DEFAULT_TTL_MS,
+            );
             entry.attestation_blob_b64 = Some("blob".to_owned());
             let view = PendingApprovalView::from_entry(&entry, TEST_NOW_MS);
             assert!(view.attested);
             assert_eq!(view.kind_name, "TrustlineSimulated");
             let json = serde_json::to_value(view).unwrap();
             assert_eq!(json["summary"]["kind"], "trustline");
-            assert_eq!(
-                json["summary"]["holder"],
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-            );
-            assert_eq!(
-                json["summary"]["asset_issuer"],
-                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
-            );
+            assert_eq!(json["summary"]["holder"], SOURCE);
+            assert_eq!(json["summary"]["asset_issuer"], TESTNET_USDC_ISSUER);
             assert_eq!(json["summary"]["asset_code"], "USDC");
             assert_eq!(
                 json["summary"]["limit_stroops"],
@@ -1079,17 +1151,453 @@ mod tests {
         }
     }
 
+    /// The holder is the operation source, which overrides the transaction
+    /// source, and the unlimited `i64::MAX` limit reads as `None`.
     #[test]
-    fn trustline_snapshot_decodes_source() {
+    fn trustline_snapshot_holder_is_the_operation_source() {
         let view = PendingApprovalView::from_entry(&trustline_entry(None), TEST_NOW_MS);
-        let ApprovalSummaryView::Trustline { source, holder, .. } = view.summary else {
-            panic!("trustline")
+        assert_eq!(
+            view.summary,
+            ApprovalSummaryView::Trustline {
+                holder: OP_SOURCE.to_owned(),
+                asset_code: "USDC".to_owned(),
+                asset_issuer: ISSUER_04.to_owned(),
+                limit_stroops: None,
+                fee_stroops: 100,
+                seq_num: 1,
+                memo: ClassicMemo::None,
+            }
+        );
+    }
+
+    /// Sets every stored `summary_*` field of a classic entry to name another
+    /// transaction than its envelope holds; the digest still names the
+    /// envelope.
+    fn edit_stored_summary(entry: &mut PendingApproval) {
+        match &mut entry.kind {
+            ApprovalKind::PaymentSimulated {
+                summary_to,
+                summary_amount_stroops,
+                summary_asset,
+                summary_memo,
+                summary_simulated_fee_stroops,
+                summary_simulated_seq_num,
+                ..
+            } => {
+                OTHER.clone_into(summary_to);
+                *summary_amount_stroops = 1;
+                "XLM".clone_into(summary_asset);
+                *summary_memo = Some("refund".to_owned());
+                *summary_simulated_fee_stroops = 1;
+                *summary_simulated_seq_num = 1;
+            }
+            ApprovalKind::TrustlineSimulated {
+                summary_holder,
+                summary_asset_code,
+                summary_asset_issuer,
+                summary_limit_stroops,
+                summary_simulated_fee_stroops,
+                summary_simulated_seq_num,
+                ..
+            } => {
+                OTHER.clone_into(summary_holder);
+                "EURT".clone_into(summary_asset_code);
+                OTHER.clone_into(summary_asset_issuer);
+                *summary_limit_stroops = Some(1);
+                *summary_simulated_fee_stroops = 1;
+                *summary_simulated_seq_num = 1;
+            }
+            ApprovalKind::ClaimSimulated {
+                summary_balance_id_hex72,
+                summary_balance_id_strkey,
+                summary_asset,
+                summary_amount_stroops,
+                summary_source,
+                summary_simulated_fee_stroops,
+                summary_simulated_seq_num,
+                ..
+            } => {
+                let (hex72, strkey) = fixtures::balance_ids([0x0b; 32]);
+                *summary_balance_id_hex72 = hex72;
+                *summary_balance_id_strkey = strkey;
+                *summary_asset = Some("XLM".to_owned());
+                *summary_amount_stroops = Some(1);
+                OTHER.clone_into(summary_source);
+                *summary_simulated_fee_stroops = 1;
+                *summary_simulated_seq_num = 1;
+            }
+            other => panic!("not a classic entry: {}", other.kind_name()),
+        }
+    }
+
+    /// Every payment, trustline and claim field of the view is the
+    /// envelope's, whatever the stored summary fields say.
+    #[test]
+    fn classic_summaries_come_from_the_envelope_not_the_stored_fields() {
+        let mut payment = fixtures::payment_pending(
+            SOURCE,
+            DEST,
+            &format!("USDC:{TESTNET_USDC_ISSUER}"),
+            987_654_321,
+            Some("invoice 7"),
+            300,
+            77,
+            uid(),
+            DEFAULT_TTL_MS,
+        );
+        edit_stored_summary(&mut payment);
+        assert_eq!(
+            PendingApprovalView::from_entry(&payment, TEST_NOW_MS).summary,
+            ApprovalSummaryView::Payment {
+                source: SOURCE.to_owned(),
+                to: DEST.to_owned(),
+                amount_stroops: 987_654_321,
+                asset: format!("USDC:{TESTNET_USDC_ISSUER}"),
+                dest_asset: None,
+                dest_amount_stroops: None,
+                memo: ClassicMemo::Text("invoice 7".to_owned()),
+                fee_stroops: 300,
+                seq_num: 77,
+            }
+        );
+
+        let mut trustline = fixtures::trustline_pending(
+            SOURCE,
+            "USDC",
+            TESTNET_USDC_ISSUER,
+            Some(5_000_000),
+            200,
+            78,
+            uid(),
+            DEFAULT_TTL_MS,
+        );
+        edit_stored_summary(&mut trustline);
+        assert_eq!(
+            PendingApprovalView::from_entry(&trustline, TEST_NOW_MS).summary,
+            ApprovalSummaryView::Trustline {
+                holder: SOURCE.to_owned(),
+                asset_code: "USDC".to_owned(),
+                asset_issuer: TESTNET_USDC_ISSUER.to_owned(),
+                limit_stroops: Some(5_000_000),
+                fee_stroops: 200,
+                seq_num: 78,
+                memo: ClassicMemo::None,
+            }
+        );
+
+        let mut claim = fixtures::claim_pending(
+            SOURCE,
+            [0x0a; 32],
+            Some(("XLM", 500)),
+            400,
+            79,
+            uid(),
+            DEFAULT_TTL_MS,
+        );
+        edit_stored_summary(&mut claim);
+        assert_eq!(
+            PendingApprovalView::from_entry(&claim, TEST_NOW_MS).summary,
+            ApprovalSummaryView::Claim {
+                balance_id_strkey: fixtures::balance_ids([0x0a; 32]).1,
+                source: SOURCE.to_owned(),
+                fee_stroops: 400,
+                seq_num: 79,
+                memo: ClassicMemo::None,
+            }
+        );
+    }
+
+    /// An unedited entry renders the values it was created with, for every
+    /// classic kind; the x402 view is pinned by
+    /// `x402_view_renders_invocation_terms`.
+    #[test]
+    fn unedited_classic_entries_render_their_stored_values() {
+        let payment = fixtures::payment_pending(
+            SOURCE,
+            DEST,
+            "XLM",
+            12_345,
+            Some("thanks"),
+            100,
+            5,
+            uid(),
+            DEFAULT_TTL_MS,
+        );
+        let ApprovalKind::PaymentSimulated {
+            summary_to,
+            summary_amount_stroops,
+            summary_asset,
+            summary_memo,
+            summary_simulated_fee_stroops,
+            summary_simulated_seq_num,
+            ..
+        } = &payment.kind
+        else {
+            unreachable!()
         };
         assert_eq!(
-            source.as_deref(),
-            Some("GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA")
+            PendingApprovalView::from_entry(&payment, TEST_NOW_MS).summary,
+            ApprovalSummaryView::Payment {
+                source: SOURCE.to_owned(),
+                to: summary_to.clone(),
+                amount_stroops: *summary_amount_stroops,
+                asset: summary_asset.clone(),
+                dest_asset: None,
+                dest_amount_stroops: None,
+                memo: summary_memo
+                    .clone()
+                    .map_or(ClassicMemo::None, ClassicMemo::Text),
+                fee_stroops: *summary_simulated_fee_stroops,
+                seq_num: *summary_simulated_seq_num,
+            }
         );
-        assert_ne!(source.as_ref(), Some(&holder));
+
+        let trustline = fixtures::trustline_pending(
+            SOURCE,
+            "USDC",
+            TESTNET_USDC_ISSUER,
+            None,
+            100,
+            6,
+            uid(),
+            DEFAULT_TTL_MS,
+        );
+        let ApprovalKind::TrustlineSimulated {
+            summary_holder,
+            summary_asset_code,
+            summary_asset_issuer,
+            summary_limit_stroops,
+            summary_simulated_fee_stroops,
+            summary_simulated_seq_num,
+            ..
+        } = &trustline.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            PendingApprovalView::from_entry(&trustline, TEST_NOW_MS).summary,
+            ApprovalSummaryView::Trustline {
+                holder: summary_holder.clone(),
+                asset_code: summary_asset_code.clone(),
+                asset_issuer: summary_asset_issuer.clone(),
+                limit_stroops: *summary_limit_stroops,
+                fee_stroops: *summary_simulated_fee_stroops,
+                seq_num: *summary_simulated_seq_num,
+                memo: ClassicMemo::None,
+            }
+        );
+
+        let claim =
+            fixtures::claim_pending(SOURCE, [0x0c; 32], None, 100, 7, uid(), DEFAULT_TTL_MS);
+        let ApprovalKind::ClaimSimulated {
+            summary_balance_id_strkey,
+            summary_source,
+            summary_simulated_fee_stroops,
+            summary_simulated_seq_num,
+            ..
+        } = &claim.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            PendingApprovalView::from_entry(&claim, TEST_NOW_MS).summary,
+            ApprovalSummaryView::Claim {
+                balance_id_strkey: summary_balance_id_strkey.clone(),
+                source: summary_source.clone(),
+                fee_stroops: *summary_simulated_fee_stroops,
+                seq_num: *summary_simulated_seq_num,
+                memo: ClassicMemo::None,
+            }
+        );
+    }
+
+    /// An envelope that is not the one the stored digest names, and an
+    /// envelope that does not decode, both render as inconsistent.
+    #[test]
+    fn inconsistent_classic_entries_render_as_inconsistent() {
+        let mut swapped =
+            fixtures::payment_pending(SOURCE, DEST, "XLM", 1_000, None, 100, 1, uid(), 60_000);
+        let other = fixtures::payment_envelope(SOURCE, OTHER, "XLM", 9_000, None, 100, 1);
+        let ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64, ..
+        } = &mut swapped.kind
+        else {
+            unreachable!()
+        };
+        *envelope_xdr_b64 = other;
+        let view = PendingApprovalView::from_entry(&swapped, TEST_NOW_MS);
+        let ApprovalSummaryView::Inconsistent {
+            original_kind_name,
+            reason,
+        } = &view.summary
+        else {
+            panic!("{:?}", view.summary)
+        };
+        assert_eq!(original_kind_name, "PaymentSimulated");
+        assert!(reason.contains("stored digest"), "{reason}");
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains(OTHER), "{json}");
+        assert!(!json.contains(DEST), "{json}");
+
+        let undecodable = PendingApproval::new_trustline_pending(
+            "AAAA".to_owned(),
+            b"AAAA",
+            SOURCE.to_owned(),
+            "USDC".to_owned(),
+            TESTNET_USDC_ISSUER.to_owned(),
+            None,
+            100,
+            1,
+            uid(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let ApprovalSummaryView::Inconsistent {
+            original_kind_name,
+            reason,
+        } = PendingApprovalView::from_entry(&undecodable, TEST_NOW_MS).summary
+        else {
+            panic!("undecodable envelope")
+        };
+        assert_eq!(original_kind_name, "TrustlineSimulated");
+        assert!(reason.contains("does not decode"), "{reason}");
+
+        // A claim entry whose envelope holds a payment.
+        let payment_envelope = fixtures::payment_envelope(SOURCE, DEST, "XLM", 1, None, 100, 1);
+        let (hex72, strkey) = fixtures::balance_ids([1; 32]);
+        let wrong_operation = PendingApproval::new_claim_pending_unvalued(
+            payment_envelope.clone(),
+            payment_envelope.as_bytes(),
+            hex72,
+            strkey,
+            SOURCE.to_owned(),
+            100,
+            1,
+            uid(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        assert!(matches!(
+            PendingApprovalView::from_entry(&wrong_operation, TEST_NOW_MS).summary,
+            ApprovalSummaryView::Inconsistent { .. }
+        ));
+    }
+
+    /// A path payment shows both legs, an account creation its starting
+    /// balance, and a muxed destination its M-strkey.
+    #[test]
+    fn payment_views_show_path_payments_account_creation_and_muxed_destinations() {
+        use stellar_xdr::{
+            CreateAccountOp, Memo, MuxedAccount, MuxedAccountMed25519, OperationBody,
+            PathPaymentStrictSendOp, Uint256,
+        };
+        let key = |g: &str| {
+            stellar_strkey::ed25519::PublicKey::from_string(g)
+                .unwrap()
+                .0
+        };
+        let pending = |envelope: String| {
+            PendingApproval::new_payment_pending(
+                envelope.clone(),
+                envelope.as_bytes(),
+                DEST.to_owned(),
+                1,
+                "XLM".to_owned(),
+                None,
+                100,
+                3,
+                uid(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap()
+        };
+
+        let path = fixtures::envelope(
+            SOURCE,
+            OperationBody::PathPaymentStrictSend(PathPaymentStrictSendOp {
+                send_asset: stellar_xdr::Asset::Native,
+                send_amount: 50_000_000,
+                destination: MuxedAccount::Ed25519(Uint256(key(DEST))),
+                dest_asset: stellar_xdr::Asset::Native,
+                dest_min: 49_000_000,
+                path: vec![].try_into().unwrap(),
+            }),
+            Memo::Id(42),
+            100,
+            3,
+        );
+        let ApprovalSummaryView::Payment {
+            amount_stroops,
+            dest_asset,
+            dest_amount_stroops,
+            memo,
+            ..
+        } = PendingApprovalView::from_entry(&pending(path), TEST_NOW_MS).summary
+        else {
+            panic!("path payment")
+        };
+        assert_eq!(amount_stroops, 50_000_000);
+        assert_eq!(dest_asset.as_deref(), Some("XLM"));
+        assert_eq!(dest_amount_stroops, Some(49_000_000));
+        assert_eq!(memo, ClassicMemo::Id(42));
+
+        let create = fixtures::envelope(
+            SOURCE,
+            OperationBody::CreateAccount(CreateAccountOp {
+                destination: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                    Uint256(key(OTHER)),
+                )),
+                starting_balance: 20_000_000,
+            }),
+            Memo::None,
+            100,
+            3,
+        );
+        let ApprovalSummaryView::Payment {
+            to,
+            amount_stroops,
+            asset,
+            memo,
+            ..
+        } = PendingApprovalView::from_entry(&pending(create), TEST_NOW_MS).summary
+        else {
+            panic!("account creation")
+        };
+        assert_eq!(
+            (to.as_str(), amount_stroops, asset.as_str()),
+            (OTHER, 20_000_000, "XLM")
+        );
+        assert_eq!(memo, ClassicMemo::None);
+
+        let muxed = fixtures::envelope(
+            SOURCE,
+            OperationBody::Payment(stellar_xdr::PaymentOp {
+                destination: MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+                    id: 7,
+                    ed25519: Uint256(key(DEST)),
+                }),
+                asset: stellar_xdr::Asset::Native,
+                amount: 1,
+            }),
+            Memo::None,
+            100,
+            3,
+        );
+        let ApprovalSummaryView::Payment { to, .. } =
+            PendingApprovalView::from_entry(&pending(muxed), TEST_NOW_MS).summary
+        else {
+            panic!("muxed payment")
+        };
+        assert!(to.starts_with('M'), "{to}");
+        assert_eq!(
+            to,
+            stellar_strkey::ed25519::MuxedAccount {
+                ed25519: key(DEST),
+                id: 7
+            }
+            .to_string()
+            .to_string()
+        );
     }
 
     #[test]
@@ -1177,5 +1685,69 @@ mod tests {
             panic!("x402")
         };
         assert_eq!((payee, amount, asset), (None, None, None));
+    }
+    #[test]
+    fn mpp_view_checks_every_fingerprinted_term_and_the_binding_digests() {
+        // Transport, authority and target enter the fingerprint only through
+        // the context digest; the MPP commit compares them with the prepared
+        // request context.
+        for field in [
+            "profile",
+            "chain",
+            "payer",
+            "amount",
+            "currency",
+            "recipient",
+            "expiry",
+            "context_digest",
+            "challenge_digest",
+            "passphrase_hash",
+            "missing_digests",
+        ] {
+            let mut entry = fixtures::mpp_pending();
+            if let ApprovalKind::MppChargeSimulated {
+                profile,
+                chain_id,
+                payer,
+                amount,
+                currency,
+                recipient,
+                challenge_expires_at_unix,
+                authorization_context,
+                ..
+            } = &mut entry.kind
+            {
+                match field {
+                    "profile" => profile.push('x'),
+                    "chain" => chain_id.push('x'),
+                    "payer" => payer.push('x'),
+                    "amount" => amount.push('0'),
+                    "currency" => currency.push('x'),
+                    "recipient" => recipient.push('x'),
+                    "expiry" => *challenge_expires_at_unix += 1,
+                    "context_digest" => {
+                        authorization_context.as_mut().unwrap().context_digest[0] ^= 1;
+                    }
+                    "challenge_digest" => {
+                        authorization_context.as_mut().unwrap().challenge_digest[0] ^= 1;
+                    }
+                    "passphrase_hash" => {
+                        authorization_context
+                            .as_mut()
+                            .unwrap()
+                            .network_passphrase_hash[0] ^= 1;
+                    }
+                    "missing_digests" => *authorization_context = None,
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                matches!(
+                    PendingApprovalView::from_entry(&entry, entry.created_at_unix_ms).summary,
+                    ApprovalSummaryView::Inconsistent { .. }
+                ),
+                "{field}"
+            );
+        }
     }
 }

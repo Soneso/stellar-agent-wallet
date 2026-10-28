@@ -267,7 +267,7 @@ Argument groups (enforced by the parser):
 | `[ASSET]` (positional) | `native`, `XLM`, or `CODE:ISSUER_GSTRKEY` | optional | `native` |
 | `--profile <NAME>` | Profile to evaluate operator policy against | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--source <G_STRKEY>` | Source account; required for signing | conditional | none |
-| `--memo-text <STRING>` | Memo text (UTF-8, up to 28 bytes) | one of the memo group | none |
+| `--memo-text <STRING>` | Memo text (UTF-8, up to 28 bytes; control characters, Unicode format characters, and line or paragraph separators are refused with `validation.memo_control_character`) | one of the memo group | none |
 | `--memo-id <U64>` | Memo ID (u64 decimal) | one of the memo group | none |
 | `--memo-hash <64_HEX>` | Memo hash (64 hex chars / 32 bytes) | one of the memo group | none |
 | `--memo-return <64_HEX>` | Memo return hash (64 hex chars / 32 bytes) | one of the memo group | none |

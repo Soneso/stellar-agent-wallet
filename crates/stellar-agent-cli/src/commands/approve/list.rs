@@ -23,9 +23,8 @@
 //!
 //! One row per entry: nonce, kind, a one-line wallet-controlled summary, and
 //! the time remaining until expiry. Every rendered field is passed through
-//! [`sanitize_for_table`] — summary fields such as a payment memo are
-//! agent-influenced free text and must not be trusted with raw terminal
-//! output.
+//! [`escape_for_terminal`]: summary values are decoded from an agent-built
+//! envelope and must not be trusted with raw terminal output.
 //!
 //! # `--include-expired`
 //!
@@ -52,7 +51,7 @@ use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::{ApprovalFailure, ValidationError, WalletError};
 use stellar_agent_core::timefmt;
 
-use crate::common::render::{render_json, sanitize_for_table};
+use crate::common::render::{escape_for_terminal, render_json};
 use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
 /// Arguments for `stellar-agent approve list`.
@@ -208,7 +207,7 @@ fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
         {
             #[allow(clippy::print_stdout, reason = "CLI binary intentional user output")]
             if let Some(err) = &envelope.error {
-                let safe_msg = sanitize_for_table(&err.message);
+                let safe_msg = escape_for_terminal(&err.message);
                 println!("Error: {} — {}", err.code, safe_msg);
             }
         }
@@ -222,14 +221,14 @@ fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
 /// so the displayed "expires in" duration is relative to the moment the
 /// snapshot was taken, not the entry's creation time.
 ///
-/// Every interpolated field passes through [`sanitize_for_table`] before
-/// being written — `summary_memo` and similar summary fields originate from
-/// simulate-time, potentially agent-influenced input and must not reach the
+/// Every interpolated field passes through [`escape_for_terminal`] before
+/// being written: the summary values are decoded from an agent-built
+/// envelope and the reason comes from the policy, so neither may reach the
 /// terminal unsanitised.
 fn render_pending_row(view: &PendingApprovalView, now_ms: u64) -> String {
-    let nonce = sanitize_for_table(&view.approval_nonce);
-    let kind = sanitize_for_table(view.kind_name);
-    let summary = sanitize_for_table(&render_summary_line(view));
+    let nonce = escape_for_terminal(&view.approval_nonce);
+    let kind = escape_for_terminal(view.kind_name);
+    let summary = escape_for_terminal(&render_summary_line(view));
     let expires_in = if view.expired {
         "expired".to_owned()
     } else {
@@ -238,7 +237,7 @@ fn render_pending_row(view: &PendingApprovalView, now_ms: u64) -> String {
     let reason = view
         .reason
         .as_deref()
-        .map(|reason| format!("  reason: {}", sanitize_for_table(reason)))
+        .map(|reason| format!("  reason: {}", escape_for_terminal(reason)))
         .unwrap_or_default();
     format!("{nonce}  {kind:<24}  {summary}{reason}  (expires in {expires_in})")
 }
@@ -250,32 +249,48 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
             to,
             amount_stroops,
             asset,
+            dest_asset: Some(dest_asset),
+            dest_amount_stroops: Some(dest_amount),
+            memo,
             ..
-        } => format!("pay {amount_stroops} stroops {asset} to {to}"),
+        } => format!(
+            "pay up to {amount_stroops} stroops {asset} to {to}, who receives at least \
+             {dest_amount} stroops {dest_asset}, memo {}",
+            memo.display()
+        ),
+        ApprovalSummaryView::Payment {
+            to,
+            amount_stroops,
+            asset,
+            memo,
+            ..
+        } => format!(
+            "pay {amount_stroops} stroops {asset} to {to}, memo {}",
+            memo.display()
+        ),
         ApprovalSummaryView::Trustline {
             holder,
             asset_code,
             asset_issuer,
             limit_stroops,
+            memo,
             ..
         } => {
             let issuer = stellar_agent_core::approval::store::redact_g_strkey(asset_issuer);
             let limit = format_trustline_limit(*limit_stroops);
-            format!("trustline {asset_code}:{issuer} limit {limit} for {holder}")
+            format!(
+                "trustline {asset_code}:{issuer} limit {limit} for {holder}, memo {}",
+                memo.display()
+            )
         }
         ApprovalSummaryView::Claim {
             balance_id_strkey,
-            asset,
-            amount_stroops,
+            memo,
             ..
-        } => match (amount_stroops, asset) {
-            (Some(amount), Some(asset)) => {
-                format!("claim {amount} stroops {asset} ({balance_id_strkey})")
-            }
-            _ => format!(
-                "claim {balance_id_strkey}: asset and amount not known to the wallet before the claim"
-            ),
-        },
+        } => format!("claim {balance_id_strkey}, memo {}", memo.display()),
+        ApprovalSummaryView::Inconsistent {
+            original_kind_name, ..
+        } => format!("inconsistent {original_kind_name}: cannot be approved"),
         ApprovalSummaryView::SignWithPasskey {
             smart_account_redacted,
             rp_id,
@@ -367,16 +382,14 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
-    // ChangeTrust with transaction source [1; 32] and operation source [2; 32].
-    const CHANGE_TRUST_ENVELOPE: &str = concat!(
-        "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAA",
-        "AAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAGAAAAAVVT",
-        "REMAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAR//////////wAAAAAAAAAA",
-    );
+    const SOURCE_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+    const DEST_G: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+    const USDC_ISSUER_G: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
     use serial_test::serial;
     use stellar_agent_core::approval::{
-        DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, process_uid_for_attestation,
+        DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, fixtures,
+        process_uid_for_attestation,
     };
     use stellar_agent_core::profile::schema::default_approval_dir;
     use stellar_agent_test_support::StellarAgentHomeGuard;
@@ -389,19 +402,17 @@ mod tests {
     }
 
     fn make_payment_entry(ttl_ms: u64) -> PendingApproval {
-        PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             1_000_000,
-            "XLM".to_owned(),
-            Some("hi".to_owned()),
+            Some("hi"),
             100,
             1,
             uid(),
             ttl_ms,
         )
-        .unwrap()
     }
 
     // ── format_expires_in ────────────────────────────────────────────────────
@@ -558,24 +569,38 @@ mod tests {
     fn render_pending_row_sanitizes_memo_escape_sequences() {
         let dir = TempDir::new().unwrap();
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+        let envelope = fixtures::payment_envelope(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
+            1_000,
+            Some("hello\x1b[31mworld"),
+            100,
+            1,
+        );
         let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            envelope.clone(),
+            envelope.as_bytes(),
+            DEST_G.to_owned(),
             1_000,
             "XLM".to_owned(),
-            Some("hello\x1b[31mworld".to_owned()),
+            None,
             100,
             1,
             uid(),
             DEFAULT_TTL_MS,
         )
-        .unwrap();
+        .unwrap()
+        .with_policy_request(
+            &stellar_agent_core::policy::ApprovalRequest::new(String::new(), 60)
+                .with_reason("review\x1b[2Kthis".to_owned()),
+        );
         store.insert(entry, 0).unwrap();
         let view = store.snapshot(0).into_iter().next().unwrap();
         // The row renderer must not embed the raw ESC byte anywhere.
         let row = render_pending_row(&view, 0);
-        assert!(!row.contains('\x1b'), "escape sequence must be sanitized");
+        assert!(!row.contains('\x1b'), "escape sequence must be escaped");
+        assert!(row.contains("review\\u{1b}[2Kthis"), "{row}");
     }
 
     #[test]
@@ -589,28 +614,23 @@ mod tests {
             let mut store = PendingApprovalStore::open(dir.path().join("trustline.toml")).unwrap();
             store
                 .insert(
-                    PendingApproval::new_trustline_pending(
-                        CHANGE_TRUST_ENVELOPE.to_owned(),
-                        CHANGE_TRUST_ENVELOPE.as_bytes(),
-                        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                        "USDC".to_owned(),
-                        "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+                    fixtures::trustline_pending(
+                        SOURCE_G,
+                        "USDC",
+                        USDC_ISSUER_G,
                         limit,
                         100,
                         42,
                         "1000".to_owned(),
                         DEFAULT_TTL_MS,
-                    )
-                    .unwrap(),
+                    ),
                     0,
                 )
                 .unwrap();
             let view = store.snapshot(0).remove(0);
             assert_eq!(
                 render_summary_line(&view),
-                format!(
-                    "trustline USDC:GBBD4...LFLA5 limit {shown} for GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-                )
+                format!("trustline USDC:GBBD4...LFLA5 limit {shown} for {SOURCE_G}, memo none")
             );
             let json = serde_json::to_value(&view).unwrap();
             assert_eq!(
@@ -624,7 +644,10 @@ mod tests {
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
         store.insert(make_payment_entry(DEFAULT_TTL_MS), 0).unwrap();
         let view = store.snapshot(0).into_iter().next().unwrap();
-        assert!(render_summary_line(&view).contains("pay"));
+        assert_eq!(
+            render_summary_line(&view),
+            format!("pay 1000000 stroops XLM to {DEST_G}, memo text \"hi\"")
+        );
 
         // Rejected tombstone
         let rejected_dir = TempDir::new().unwrap();
@@ -761,5 +784,50 @@ mod tests {
             render_summary_line(&view),
             format!("spent (PaymentSimulated) on {redacted}, outcome confirmed")
         );
+    }
+    #[test]
+    fn approve_list_preserves_unicode_and_escapes_bidi_rule_names() {
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("list.toml")).unwrap();
+        use stellar_agent_core::approval::{
+            ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
+        };
+        let entry = PendingApproval::new_rule_proposal_pending(
+            "CDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD".to_owned(),
+            "Test SDF Network ; September 2015".to_owned(),
+            "stellar:testnet".to_owned(),
+            ContextRuleProposalSnapshot::new(
+                RuleProposalContextType::Default,
+                "rule".to_owned(),
+                None,
+                vec![RuleProposalSigner::delegated(SOURCE_G.to_owned(), true)],
+                vec![],
+                vec![0],
+                false,
+                false,
+            ),
+            [0x11; 32],
+            "rule".to_owned(),
+            uid(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        store.insert(entry, 0).unwrap();
+        let mut view = store.snapshot(0).remove(0);
+        for (name, shown) in [("café", "café"), ("rule\u{202e}", "rule\\u{202e}")] {
+            if let ApprovalSummaryView::RuleProposal {
+                summary_line,
+                definition,
+                ..
+            } = &mut view.summary
+            {
+                *summary_line = name.to_owned();
+                definition.name = name.to_owned();
+            }
+            view.reason = Some(name.to_owned());
+            let row = render_pending_row(&view, 0);
+            assert!(row.contains(&format!("{shown} on")), "{row}");
+            assert!(!row.contains('\u{202e}'));
+        }
     }
 }

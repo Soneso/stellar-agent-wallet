@@ -221,10 +221,15 @@ Entry kinds: `PaymentSimulated`, `TrustlineSimulated`, `ClaimSimulated`, `SignWi
 ### What `approve` does
 
 `stellar-agent approve --id <nonce> --profile <name>` loads the store and renders a
-wallet-controlled summary of the pending action. The summary is produced by the
-command from the stored, validated entry fields, never from anything the agent
-supplied, so the agent cannot influence what the operator sees (it cannot inject
-terminal-rendering content into the summary). The operator confirms at the
+wallet-controlled summary of the pending action. For payments, trustlines and
+claims the summary is decoded from the stored transaction envelope, the bytes the
+attestation binds, and every value is rendered with control characters, line
+and paragraph separators and Unicode format characters (category Cf) shown as
+visible escapes, so the operator reads what is signed and memo text cannot
+rewrite the terminal. An entry whose envelope does not decode or does not match
+its stored digest, or an MPP charge whose shown terms do not match its
+authorization fingerprint, is shown as inconsistent and cannot be approved
+(`approval.entry_inconsistent`). The operator confirms at the
 terminal; the command then records the consent. Recording is one-shot: a nonce
 that is expired, of the wrong kind, or already attested is rejected. Approval is
 bound to the local user: the process uid recorded at create time is re-derived
@@ -235,7 +240,7 @@ Per kind:
 
 | Kind | What `approve` records |
 |---|---|
-| `PaymentSimulated` / `ClaimSimulated` / `TrustlineSimulated` | Computes the HMAC attestation over the envelope SHA-256 and persists it; returns `approval_attestation`. Each commit tool accepts its own approval kind. |
+| `PaymentSimulated` / `ClaimSimulated` / `TrustlineSimulated` | Refuses with `approval.entry_inconsistent`, before the consent row, unless the stored digest is the SHA-256 of the stored envelope and the envelope decodes. Then computes the HMAC attestation over that digest and persists it; returns `approval_attestation`. Each commit tool accepts its own approval kind. |
 | `TrustlineClawbackOptIn` | Computes a domain-separated HMAC over `(network, code, issuer)` and stores it; the trustline gate recomputes and verifies it. No `approval_attestation` returned. |
 | `ToolsetFirstInvokeGate` | Builds and persists a time-boxed toolset grant, then consumes (removes) the pending entry. Does not set an attestation blob on the entry. No `approval_attestation` returned. |
 | `RuleProposalSimulated` | Computes the HMAC attestation over `proposal_sha256` (the domain-separated digest of the FULL resolved rule definition), not an envelope hash; persists it and returns `approval_attestation`. A DEDICATED gate verifies it at commit. The envelope approval gate rejects this kind. |
@@ -250,11 +255,13 @@ validation is refused with `approval.already_attested`, `approval.rejected`, or
 
 The CLI summary and both inbox detail pages show the profile name, CAIP-2 chain id, endpoint authority, and enrolled signer.
 An enrollment placeholder appears as `(not enrolled)`.
-Payment, claim, and trustline rows show the envelope's effective source; an operation source overrides the transaction source.
-An undecodable envelope appears as `(undecodable envelope)`.
-A claim whose stored summary source differs also shows `Source (stored summary)`.
-Trustline summaries show the full holder account, asset code, issuer, limit,
-simulated fee, and sequence number.
+Payment, claim, and trustline summaries are decoded from the envelope the approval attests: every destination, amount, asset, memo, limit, balance id, fee, and sequence number shown is the envelope's.
+The effective source is the operation source when the operation has one, otherwise the transaction source.
+A claim names the balance by id only, so its asset and amount read `not part of the signed claim transaction`.
+Every value renders control characters as visible escapes such as `\u{1b}`.
+A request whose stored digest is not the digest of its stored envelope, or whose envelope does not decode, shows as `INCONSISTENT`, offers no approve action, and is refused with `approval.entry_inconsistent`.
+Trustline summaries show the holder account, asset code, issuer, limit,
+fee, and sequence number.
 The CLI names the action `trustline change (ChangeTrust)`.
 The CLI limit reads `unlimited`, `0 stroops (removes the trustline)`, or the exact
 stroop count and decimal asset amount.
@@ -434,9 +441,14 @@ the exact policy-sized legs, and closed status labels, never a credential,
 challenge, receipt, XDR, or signature.
 
 `MppChargeSimulated` is a dedicated short-lived approval kind. It binds the
-authorization fingerprint, prepared artifact hash, profile, testnet, payer,
-transport authority/target, amount, token, recipient, simulated fee, and
-challenge expiry. Local and remote views redact payer/recipient. Prepare records
+authorization fingerprint and prepared artifact hash. Every surface checks the
+profile, payer, amount, token, recipient, and challenge expiry against the
+fingerprint, and the network against its passphrase digest; the commit checks
+the transport, authority, and target against the prepared request
+(`approval.entry_inconsistent`). The simulated fee reads `not bound to this
+approval`. A mismatch, or an entry without binding digests, makes the entry
+inconsistent; prepare the charge again. Local and remote views
+redact payer/recipient. Prepare records
 the request when policy requires approval for prepare or charge commit. Commit
 re-evaluates its own tool name against current state and requires the matching
 attestation. An exhausted cap returns `policy.deny.per_period_cap_exceeded`.

@@ -38,9 +38,12 @@ use crate::keyring_errors::{KeyringOperation, map_keyring_operation_error};
 use crate::profile::schema::KeyringEntryRef;
 use crate::timefmt;
 
+use crate::envelope_decode::{ClassicSummary, ClassicTransactionKind, classic_summary};
+
 use super::attestation::{compute_attestation, compute_trustline_clawback_opt_in_digest};
 use super::error::ApprovalError;
 use super::store::{ApprovalKind, PendingApproval, PendingApprovalStore};
+use super::subject::approval_subject_classic;
 use super::user_id::ApproverIdentity;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -232,6 +235,78 @@ pub fn decode_sha256_hex(hex: &str) -> Result<[u8; 32], WalletError> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// classic_entry_summary
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Decodes the transaction a classic pending approval holds, after checking
+/// that its stored digest is the SHA-256 of its stored envelope.
+///
+/// Returns `None` for a kind that holds no classic envelope. For a
+/// `PaymentSimulated`, `TrustlineSimulated` or `ClaimSimulated` entry the
+/// attestation binds only the stored digest, so the envelope that digest
+/// names is the one transaction an approval surface may show and the
+/// attestation may approve. Every approval surface renders the returned
+/// [`ClassicSummary`] rather than the entry's stored `summary_*` fields, and
+/// [`attest_and_persist`] refuses an entry for which this returns an error.
+///
+/// # Errors
+///
+/// `approval.entry_inconsistent` when the stored digest is not the digest of
+/// the stored envelope, or the envelope does not decode as the entry's kind
+/// (see [`classic_summary`]).
+#[must_use]
+pub fn classic_entry_summary(kind: &ApprovalKind) -> Option<Result<ClassicSummary, WalletError>> {
+    let (envelope_xdr_b64, envelope_sha256_hex, classic_kind) = match kind {
+        ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64,
+            envelope_sha256_hex,
+            ..
+        } => (
+            envelope_xdr_b64,
+            envelope_sha256_hex,
+            ClassicTransactionKind::Payment,
+        ),
+        ApprovalKind::TrustlineSimulated {
+            envelope_xdr_b64,
+            envelope_sha256_hex,
+            ..
+        } => (
+            envelope_xdr_b64,
+            envelope_sha256_hex,
+            ClassicTransactionKind::Trustline,
+        ),
+        ApprovalKind::ClaimSimulated {
+            envelope_xdr_b64,
+            envelope_sha256_hex,
+            ..
+        } => (
+            envelope_xdr_b64,
+            envelope_sha256_hex,
+            ClassicTransactionKind::Claim,
+        ),
+        _ => return None,
+    };
+    let digest_matches = decode_sha256_hex(envelope_sha256_hex)
+        .is_ok_and(|stored| stored == approval_subject_classic(envelope_xdr_b64));
+    if !digest_matches {
+        return Some(Err(entry_inconsistent(
+            "the stored digest is not the digest of the stored envelope",
+        )));
+    }
+    Some(
+        classic_summary(envelope_xdr_b64, classic_kind).map_err(|error| {
+            entry_inconsistent(&format!("the stored envelope does not decode: {error}"))
+        }),
+    )
+}
+
+fn entry_inconsistent(reason: &str) -> WalletError {
+    WalletError::Approval(ApprovalFailure::EntryInconsistent {
+        detail: format!("this pending approval cannot be approved: {reason}"),
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // load_attestation_key
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -359,8 +434,10 @@ impl ConsentAudit<'_> {
 ///
 /// - Approval: a key-length mismatch (`approval.key_length_error`), a hash-decode
 ///   failure (`approval.sha256_hex_error`), a binding mismatch
-///   (`approval.binding_mismatch`), or an unattestable `entry.kind`
-///   (`approval.wrong_kind`).
+///   (`approval.binding_mismatch`), an unattestable `entry.kind`
+///   (`approval.wrong_kind`), or a classic entry whose stored digest is not
+///   the digest of its envelope or whose envelope does not decode
+///   (`approval.entry_inconsistent`).
 ///   `ApprovalKind::Rejected` and `ApprovalKind::Consumed` are tombstones and
 ///   can never be attested.
 /// - An entry that changed since validation: `approval.not_found`,
@@ -630,13 +707,15 @@ pub fn attest_and_persist(
         }
         ApprovalKind::MppChargeSimulated {
             prepared_artifact_hash,
+            authorization_fingerprint,
             ..
         } => {
+            super::mpp::verify_mpp_entry_terms(&entry.kind)?;
             let attestation_blob = compute_attestation(
                 key_arr,
                 binding,
                 &entry.approval_nonce,
-                prepared_artifact_hash,
+                &super::mpp::approval_subject(authorization_fingerprint, prepared_artifact_hash),
                 &entry.process_uid,
                 &entry.attested_lifetime(),
             );
@@ -845,6 +924,12 @@ pub fn record_error(e: &ApprovalError) -> WalletError {
 }
 
 /// Attests an envelope digest, writes its consent row, and persists the blob.
+///
+/// A classic entry is refused with `approval.entry_inconsistent`, before the
+/// row, unless its stored digest is the digest of its stored envelope and
+/// that envelope decodes (see [`classic_entry_summary`]); the digest an
+/// attestation binds is then always the digest of the transaction the
+/// approval surfaces showed.
 #[allow(
     clippy::too_many_arguments,
     reason = "shared envelope attestation uses the caller's binding and consent context"
@@ -862,6 +947,9 @@ fn attest_envelope_and_persist(
     kind_name: &str,
     gated_tool: &str,
 ) -> Result<Option<String>, WalletError> {
+    if let Some(consistency) = classic_entry_summary(&entry.kind) {
+        consistency?;
+    }
     let presented_sha256 = decode_sha256_hex(envelope_sha256_hex)?;
     let attestation_blob = compute_attestation(
         key,
@@ -959,6 +1047,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::approval::fixtures;
     use crate::approval::store::DEFAULT_TTL_MS;
     use crate::approval::user_id::process_uid_for_attestation;
     use stellar_agent_test_support::keyring_mock;
@@ -972,20 +1061,35 @@ mod tests {
         key
     }
 
+    const SOURCE: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+    const DEST: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+    const USDC_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
     fn make_entry(ttl_ms: u64) -> PendingApproval {
-        PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        fixtures::payment_pending(
+            SOURCE,
+            DEST,
+            "XLM",
             2_500_000,
-            "XLM".to_owned(),
             None,
             100,
             1_234_567,
             process_uid_for_attestation().expect("UID available on test host"),
             ttl_ms,
         )
-        .unwrap()
+    }
+
+    fn trustline_entry() -> PendingApproval {
+        fixtures::trustline_pending(
+            SOURCE,
+            "USDC",
+            USDC_ISSUER,
+            None,
+            100,
+            42,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )
     }
 
     /// Opens an unkeyed audit writer on a log inside `dir`.
@@ -1769,24 +1873,26 @@ mod tests {
             let mut audit_writer = test_audit_writer(&dir);
             let mut store = PendingApprovalStore::open(dir.path().join("a.toml")).unwrap();
             let now = timefmt::now_unix_ms().unwrap();
-            let mut entry = PendingApproval::new_mpp_charge_pending(
-                [0x11; 32],
-                [0x22; 32],
-                if mismatch_profile { "other" } else { "a" }.to_owned(),
-                "stellar:testnet".to_owned(),
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                "mcp".to_owned(),
-                "merchant".to_owned(),
-                "tools/charge".to_owned(),
-                "1000000".to_owned(),
-                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                now / 1_000 + 3_600,
-                1_100,
-                "1000".to_owned(),
-                DEFAULT_TTL_MS,
-            )
-            .unwrap();
+            let mut entry = crate::approval::fixtures::bind_mpp_entry(
+                PendingApproval::new_mpp_charge_pending(
+                    [0x11; 32],
+                    [0x22; 32],
+                    if mismatch_profile { "other" } else { "a" }.to_owned(),
+                    "stellar:testnet".to_owned(),
+                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                    "mcp".to_owned(),
+                    "merchant".to_owned(),
+                    "tools/charge".to_owned(),
+                    "1000000".to_owned(),
+                    "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                    now / 1_000 + 3_600,
+                    1_100,
+                    "1000".to_owned(),
+                    DEFAULT_TTL_MS,
+                )
+                .unwrap(),
+            );
             store.insert(entry.clone(), now).unwrap();
             if !mismatch_profile
                 && let ApprovalKind::MppChargeSimulated { chain_id, .. } = &mut entry.kind
@@ -1830,38 +1936,18 @@ mod tests {
         vec![
             ("PaymentSimulated", make_entry(DEFAULT_TTL_MS)),
             ("X402Payment", x402_entry(None)),
-            (
-                "TrustlineSimulated",
-                PendingApproval::new_trustline_pending(
-                    "trustline-envelope".to_owned(),
-                    b"trustline-envelope",
-                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                    "USDC".to_owned(),
-                    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
-                    None,
-                    100,
-                    42,
-                    process_uid_for_attestation().unwrap(),
-                    DEFAULT_TTL_MS,
-                )
-                .unwrap(),
-            ),
+            ("TrustlineSimulated", trustline_entry()),
             (
                 "ClaimSimulated",
-                PendingApproval::new_claim_pending(
-                    "b64xdr".to_owned(),
-                    b"fake-xdr",
-                    "a".repeat(72),
-                    "B".to_owned() + &"A".repeat(57),
-                    "XLM".to_owned(),
-                    500,
-                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                fixtures::claim_pending(
+                    SOURCE,
+                    [0x0a; 32],
+                    Some(("XLM", 500)),
                     100,
                     1,
                     uid.clone(),
                     DEFAULT_TTL_MS,
-                )
-                .unwrap(),
+                ),
             ),
             (
                 "ToolsetFirstInvokeGate",
@@ -1894,24 +1980,26 @@ mod tests {
             ),
             (
                 "MppChargeSimulated",
-                PendingApproval::new_mpp_charge_pending(
-                    [0x11; 32],
-                    [0x22; 32],
-                    BINDING_PROFILE.to_owned(),
-                    "stellar:testnet".to_owned(),
-                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                    "mcp".to_owned(),
-                    "merchant".to_owned(),
-                    "tools/charge".to_owned(),
-                    "1000000".to_owned(),
-                    "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                    now / 1_000 + 3_600,
-                    1_100,
-                    "1000".to_owned(),
-                    DEFAULT_TTL_MS,
-                )
-                .unwrap(),
+                crate::approval::fixtures::bind_mpp_entry(
+                    PendingApproval::new_mpp_charge_pending(
+                        [0x11; 32],
+                        [0x22; 32],
+                        BINDING_PROFILE.to_owned(),
+                        "stellar:testnet".to_owned(),
+                        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                        "mcp".to_owned(),
+                        "merchant".to_owned(),
+                        "tools/charge".to_owned(),
+                        "1000000".to_owned(),
+                        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+                        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                        now / 1_000 + 3_600,
+                        1_100,
+                        "1000".to_owned(),
+                        DEFAULT_TTL_MS,
+                    )
+                    .unwrap(),
+                ),
             ),
         ]
     }
@@ -2263,19 +2351,7 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("trustline.toml");
             let mut store = PendingApprovalStore::open(path.clone()).unwrap();
-            let entry = PendingApproval::new_trustline_pending(
-                "trustline-envelope".to_owned(),
-                b"trustline-envelope",
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                "USDC".to_owned(),
-                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
-                None,
-                100,
-                42,
-                process_uid_for_attestation().unwrap(),
-                DEFAULT_TTL_MS,
-            )
-            .unwrap();
+            let entry = trustline_entry();
             store
                 .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
                 .unwrap();
@@ -2309,7 +2385,13 @@ mod tests {
                 Some(&blob)
             );
             let bytes: [u8; 32] = URL_SAFE_NO_PAD.decode(&blob).unwrap().try_into().unwrap();
-            let expected_digest = crate::approval::envelope_sha256(b"trustline-envelope");
+            let ApprovalKind::TrustlineSimulated {
+                envelope_xdr_b64, ..
+            } = &entry.kind
+            else {
+                unreachable!()
+            };
+            let expected_digest = crate::approval::envelope_sha256(envelope_xdr_b64.as_bytes());
             assert!(crate::approval::verify_attestation(
                 &key,
                 &binding,
@@ -2782,5 +2864,256 @@ mod tests {
                 .is_none()
         );
         assert!(consent_rows(&dir).is_empty());
+    }
+
+    // ── The envelope the digest names ────────────────────────────────────────
+
+    fn classic_entries() -> Vec<(&'static str, PendingApproval)> {
+        vec![
+            ("PaymentSimulated", make_entry(DEFAULT_TTL_MS)),
+            ("TrustlineSimulated", trustline_entry()),
+            (
+                "ClaimSimulated",
+                fixtures::claim_pending(
+                    SOURCE,
+                    [0x0a; 32],
+                    None,
+                    100,
+                    1,
+                    process_uid_for_attestation().unwrap(),
+                    DEFAULT_TTL_MS,
+                ),
+            ),
+        ]
+    }
+
+    /// Replaces the stored envelope of a classic entry and keeps its stored
+    /// digest, so the digest no longer names the stored envelope.
+    fn swap_envelope(entry: &mut PendingApproval, envelope: &str) {
+        match &mut entry.kind {
+            ApprovalKind::PaymentSimulated {
+                envelope_xdr_b64, ..
+            }
+            | ApprovalKind::TrustlineSimulated {
+                envelope_xdr_b64, ..
+            }
+            | ApprovalKind::ClaimSimulated {
+                envelope_xdr_b64, ..
+            } => envelope.clone_into(envelope_xdr_b64),
+            other => panic!("not a classic entry: {}", other.kind_name()),
+        }
+    }
+
+    /// A classic entry whose stored digest is not the digest of its stored
+    /// envelope is refused before the consent row, and nothing is persisted:
+    /// the surface would show one transaction while the attestation approves
+    /// another.
+    #[test]
+    fn attestation_refuses_an_entry_whose_digest_is_not_its_envelopes() {
+        let other =
+            fixtures::payment_envelope(SOURCE, USDC_ISSUER, "XLM", 99_000_000, None, 100, 9);
+        for (kind, mut entry) in classic_entries() {
+            swap_envelope(&mut entry, &other);
+            let dir = TempDir::new().unwrap();
+            let store_path = dir.path().join("a.toml");
+            let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+            store
+                .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+                .unwrap();
+            let err = attest_validated_copy(&dir, &mut store, &entry);
+            assert_eq!(err.code(), "approval.entry_inconsistent", "{kind}: {err}");
+            assert!(
+                err.to_string()
+                    .contains("the stored digest is not the digest of the stored envelope"),
+                "{kind}: {err}"
+            );
+            drop(store);
+            assert!(still_pending(&store_path, &entry.approval_nonce), "{kind}");
+            assert!(consent_rows(&dir).is_empty(), "{kind}");
+        }
+    }
+
+    /// An envelope that does not decode as the entry's kind is refused even
+    /// when the stored digest is its digest, on the approve path and on the
+    /// mainnet confirmation path.
+    #[test]
+    fn attestation_refuses_an_entry_whose_envelope_does_not_decode() {
+        let uid = process_uid_for_attestation().unwrap();
+        let undecodable = PendingApproval::new_payment_pending(
+            "AAAA".to_owned(),
+            b"AAAA",
+            DEST.to_owned(),
+            1,
+            "XLM".to_owned(),
+            None,
+            100,
+            1,
+            uid.clone(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let trust = fixtures::change_trust_envelope(SOURCE, "USDC", USDC_ISSUER, None, 100, 1);
+        let wrong_operation = PendingApproval::new_payment_pending(
+            trust.clone(),
+            trust.as_bytes(),
+            DEST.to_owned(),
+            1,
+            "XLM".to_owned(),
+            None,
+            100,
+            1,
+            uid,
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        for entry in [undecodable, wrong_operation] {
+            let dir = TempDir::new().unwrap();
+            let mut store = PendingApprovalStore::open(dir.path().join("a.toml")).unwrap();
+            store
+                .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+                .unwrap();
+            let err = attest_validated_copy(&dir, &mut store, &entry);
+            assert_eq!(err.code(), "approval.entry_inconsistent", "{err}");
+            assert!(
+                err.to_string()
+                    .contains("the stored envelope does not decode"),
+                "{err}"
+            );
+            let err = attest_mainnet_confirmation(
+                &mut store,
+                &entry,
+                &[0x42; 32],
+                &binding(),
+                ConsentAudit::Writer(&mut test_audit_writer(&dir)),
+                "stellar_pay_commit",
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), "approval.entry_inconsistent", "{err}");
+            assert!(consent_rows(&dir).is_empty());
+            assert!(
+                store
+                    .get(&entry.approval_nonce)
+                    .unwrap()
+                    .attestation_blob_b64
+                    .is_none()
+            );
+        }
+    }
+
+    /// An unedited entry of each kind attests its stored digest exactly as
+    /// the attestation verifier expects.
+    #[test]
+    fn unedited_entries_attest_their_stored_subject() {
+        let mut entries = classic_entries();
+        entries.push(("X402Payment", x402_entry(None)));
+        for (kind, entry) in entries {
+            let subject = match &entry.kind {
+                ApprovalKind::X402Payment {
+                    intent_digest,
+                    root_invocation_xdr,
+                    home_domain,
+                    ..
+                } => crate::approval::subject::verified_x402_subject(
+                    intent_digest,
+                    root_invocation_xdr,
+                    home_domain.as_deref(),
+                    crate::profile::caip2::Caip2::Testnet.network_passphrase(),
+                )
+                .unwrap(),
+                ApprovalKind::PaymentSimulated {
+                    envelope_sha256_hex,
+                    ..
+                }
+                | ApprovalKind::TrustlineSimulated {
+                    envelope_sha256_hex,
+                    ..
+                }
+                | ApprovalKind::ClaimSimulated {
+                    envelope_sha256_hex,
+                    ..
+                } => decode_sha256_hex(envelope_sha256_hex).unwrap(),
+                other => panic!("{}", other.kind_name()),
+            };
+            let dir = TempDir::new().unwrap();
+            let mut store = PendingApprovalStore::open(dir.path().join("a.toml")).unwrap();
+            store
+                .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+                .unwrap();
+            let blob = attest_and_persist(
+                &mut store,
+                &entry,
+                &[0x42; 32],
+                &binding(),
+                Surface::Cli,
+                ConsentAudit::Writer(&mut test_audit_writer(&dir)),
+                None,
+                |_, _| panic!("no grant"),
+            )
+            .unwrap()
+            .unwrap();
+            let blob: [u8; 32] = URL_SAFE_NO_PAD.decode(&blob).unwrap().try_into().unwrap();
+            let stored = store.get(&entry.approval_nonce).unwrap();
+            assert_eq!(
+                blob,
+                compute_attestation(
+                    &[0x42; 32],
+                    &binding(),
+                    &entry.approval_nonce,
+                    &subject,
+                    &entry.process_uid,
+                    &stored.attested_lifetime(),
+                ),
+                "{kind}"
+            );
+            let rows = consent_rows(&dir);
+            assert_eq!(rows.len(), 1, "{kind}");
+            assert_eq!(rows[0]["approval_kind"], kind);
+        }
+    }
+    fn assert_edited_mpp_refused(edit_amount: bool) {
+        let dir = TempDir::new().unwrap();
+        let mut audit_writer = test_audit_writer(&dir);
+        let mut store = PendingApprovalStore::open(dir.path().join("a.toml")).unwrap();
+        let mut entry = super::super::fixtures::mpp_pending();
+        if let ApprovalKind::MppChargeSimulated {
+            amount, recipient, ..
+        } = &mut entry.kind
+        {
+            if edit_amount {
+                *amount = "7".to_owned();
+            } else {
+                *recipient = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned();
+            }
+        }
+        store
+            .insert(entry.clone(), entry.created_at_unix_ms)
+            .unwrap();
+        let error = attest_and_persist(
+            &mut store,
+            &entry,
+            &[0x42; 32],
+            &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
+            Surface::Cli,
+            ConsentAudit::Writer(&mut audit_writer),
+            None,
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "approval.entry_inconsistent");
+        assert!(
+            store
+                .get(&entry.approval_nonce)
+                .unwrap()
+                .attestation_blob_b64
+                .is_none()
+        );
+    }
+    #[test]
+    fn edited_mpp_amount_is_refused_at_attestation() {
+        assert_edited_mpp_refused(true);
+    }
+    #[test]
+    fn edited_mpp_recipient_is_refused_at_attestation() {
+        assert_edited_mpp_refused(false);
     }
 }

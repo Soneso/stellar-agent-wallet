@@ -639,6 +639,18 @@ pub enum ApprovalFailure {
         /// Non-secret operator-facing diagnostic.
         detail: String,
     },
+    /// The pending approval's envelope does not decode, or the stored digest
+    /// is not the digest of the stored envelope, so no surface can show what
+    /// an attestation would approve.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.entry_inconsistent"`.
+    #[error("{detail}")]
+    EntryInconsistent {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
 }
 
 impl ApprovalFailure {
@@ -669,6 +681,7 @@ impl ApprovalFailure {
             Self::StoreOpenFailed { .. } => "approval.store_open_failed",
             Self::GcFailed { .. } => "approval.gc_failed",
             Self::AttestationInvalid { .. } => "approval.attestation_invalid",
+            Self::EntryInconsistent { .. } => "approval.entry_inconsistent",
         }
     }
 }
@@ -776,6 +789,24 @@ pub enum ValidationError {
     /// `"validation.memo_mutually_exclusive"`.
     #[error("at most one memo variant may be provided; multiple memo fields were set")]
     MemoMutuallyExclusive,
+
+    /// A text memo holds a control character (C0, DEL or C1) or a
+    /// bidirectional override or isolate (U+202A to U+202E, U+2066 to U+2069).
+    ///
+    /// `code_point` names the first such character as `U+XXXX`; the memo
+    /// itself is not echoed.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.memo_control_character"`.
+    #[error(
+        "memo text holds the control character {code_point}; control and \
+         bidirectional-override characters are refused"
+    )]
+    MemoControlCharacter {
+        /// The first refused character, as `U+XXXX`.
+        code_point: String,
+    },
 
     /// A Stellar account address could not be parsed.
     ///
@@ -1750,6 +1781,7 @@ impl ValidationError {
             Self::MemoRequired { .. } => "validation.memo_required",
             Self::MemoInvalidType { .. } => "validation.memo_invalid_type",
             Self::MemoMutuallyExclusive => "validation.memo_mutually_exclusive",
+            Self::MemoControlCharacter { .. } => "validation.memo_control_character",
             Self::AddressInvalid { .. } => "validation.address_invalid",
             Self::AssetInvalid { .. } => "validation.asset_invalid",
             Self::ProfileNotFound { .. } => "validation.profile_not_found",
@@ -3417,6 +3449,12 @@ mod tests {
                 "validation.memo_mutually_exclusive",
             ),
             (
+                ValidationError::MemoControlCharacter {
+                    code_point: "U+001B".to_owned(),
+                },
+                "validation.memo_control_character",
+            ),
+            (
                 ValidationError::InvalidPluginName {
                     reason: "empty".to_owned(),
                 },
@@ -3715,6 +3753,11 @@ mod tests {
                     }
                 }
                 ValidationError::MemoMutuallyExclusive => ValidationError::MemoMutuallyExclusive,
+                ValidationError::MemoControlCharacter { code_point } => {
+                    ValidationError::MemoControlCharacter {
+                        code_point: code_point.clone(),
+                    }
+                }
                 ValidationError::InvalidPluginName { reason } => {
                     ValidationError::InvalidPluginName {
                         reason: reason.clone(),
@@ -5225,6 +5268,12 @@ mod tests {
                     detail: "operator diagnostic".to_owned(),
                 },
                 "approval.attestation_invalid",
+            ),
+            (
+                ApprovalFailure::EntryInconsistent {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.entry_inconsistent",
             ),
         ];
         for (failure, code) in cases {

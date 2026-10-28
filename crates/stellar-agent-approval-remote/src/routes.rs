@@ -214,8 +214,12 @@ fn entry_envelope_sha256(entry: &PendingApproval) -> [u8; 32] {
         } => *proposal_sha256,
         ApprovalKind::MppChargeSimulated {
             prepared_artifact_hash,
+            authorization_fingerprint,
             ..
-        } => *prepared_artifact_hash,
+        } => stellar_agent_core::approval::mpp::approval_subject(
+            authorization_fingerprint,
+            prepared_artifact_hash,
+        ),
         _ => [0u8; 32],
     }
 }
@@ -514,9 +518,10 @@ async fn pending_json(State(state): State<RemoteServeState>, headers: HeaderMap)
         return resp;
     }
     match take_snapshot(&state.ctx.store_path) {
-        SnapshotResult::Ok(pending) => {
-            json_response(StatusCode::OK, &json!({ "pending": pending }))
-        }
+        SnapshotResult::Ok(pending) => json_response(
+            StatusCode::OK,
+            &json!({ "pending": stellar_agent_approval_ui::pending_json_value(&pending) }),
+        ),
         SnapshotResult::Busy => store_busy(),
         SnapshotResult::Unavailable => store_unavailable(),
     }
@@ -812,6 +817,13 @@ fn outcome_to_response(outcome: stellar_agent_approval_ui::Outcome) -> Response 
         Outcome::UserMismatch => (StatusCode::OK, json!({"status": "user_mismatch"})),
         Outcome::NotFound => (StatusCode::OK, json!({"status": "not_found"})),
         Outcome::WrongKind => (StatusCode::OK, json!({"status": "wrong_kind"})),
+        Outcome::Inconsistent => (
+            StatusCode::OK,
+            json!({
+                "status": "inconsistent",
+                "message": stellar_agent_approval_ui::INCONSISTENT_MESSAGE,
+            }),
+        ),
         Outcome::Busy => (
             StatusCode::SERVICE_UNAVAILABLE,
             json!({"status": "busy", "retriable": true}),
@@ -957,12 +969,11 @@ mod tests {
 
     fn insert_payment_entry(store_path: &std::path::Path) -> String {
         let mut store = PendingApprovalStore::open(store_path.to_path_buf()).unwrap();
-        let entry = stellar_agent_core::approval::PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = stellar_agent_core::approval::fixtures::payment_pending(
+            "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+            "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+            "XLM",
             2_500_000,
-            "XLM".to_owned(),
             None,
             100,
             1_234_567,
@@ -973,8 +984,7 @@ mod tests {
             // for that variant.
             "424242".to_owned(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         let nonce = entry.approval_nonce.clone();
         store
             .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
@@ -1650,6 +1660,75 @@ mod tests {
         });
     }
 
+    /// Both remote inbox sinks, the `/inbox` data island and the
+    /// `/pending.json` poll, carry a memo's U+202E only as the visible escape.
+    #[test]
+    #[serial]
+    fn inbox_sinks_carry_a_bidi_memo_escaped() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("inbox-bidi");
+            // The envelope carries the memo; the stored summary memo, which
+            // no surface displays, is absent.
+            let envelope = stellar_agent_core::approval::fixtures::payment_envelope(
+                "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+                "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+                "XLM",
+                2_500_000,
+                Some("memo\u{202e}"),
+                100,
+                1_234_567,
+            );
+            let entry = PendingApproval::new_payment_pending(
+                envelope.clone(),
+                envelope.as_bytes(),
+                "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
+                2_500_000,
+                "XLM".to_owned(),
+                None,
+                100,
+                1_234_567,
+                "424242".to_owned(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap();
+            PendingApprovalStore::open(fx.state.ctx.store_path.clone())
+                .unwrap()
+                .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
+                .unwrap();
+            let router = build_router();
+            let cookie = login(&router, &fx.state, &fx.authenticator).await;
+            let get = |uri: &'static str| {
+                router.clone().with_state(fx.state.clone()).oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .header(header::COOKIE, &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+            };
+
+            let resp = get("/inbox").await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+            let html = std::str::from_utf8(&bytes).unwrap();
+            assert!(html.contains(r#""value":"memo\\u{202e}""#), "{html}");
+            assert!(!html.contains('\u{202e}'), "{html}");
+
+            let resp = get("/pending.json").await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            let body = std::str::from_utf8(&bytes).unwrap();
+            assert!(!body.contains('\u{202e}'), "{body}");
+            let json: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(
+                json["pending"][0]["summary"]["memo"]["value"],
+                r"memo\u{202e}"
+            );
+        });
+    }
+
     #[test]
     #[serial]
     fn wrong_rp_id_is_refused() {
@@ -2230,28 +2309,40 @@ mod tests {
             "RuleProposalSimulated must bind to proposal_sha256, not the zero placeholder"
         );
 
-        let mpp = stellar_agent_core::approval::PendingApproval::new_mpp_charge_pending(
-            [0x22; 32],
-            [0x33; 32],
-            "default".to_owned(),
-            "stellar:testnet".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            "http".to_owned(),
-            "merchant.example".to_owned(),
-            "/checkout".to_owned(),
-            "1000".to_owned(),
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            u64::MAX / 1_000,
-            1_000,
-            "424242".to_owned(),
-            DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        let mpp = stellar_agent_core::approval::fixtures::bind_mpp_entry(
+            PendingApproval::new_mpp_charge_pending(
+                [0x22; 32],
+                [0x33; 32],
+                "default".to_owned(),
+                "stellar:testnet".to_owned(),
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                "http".to_owned(),
+                "merchant.example".to_owned(),
+                "/checkout".to_owned(),
+                "1000".to_owned(),
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                u64::MAX / 1_000,
+                1_000,
+                "424242".to_owned(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap(),
+        );
+        let ApprovalKind::MppChargeSimulated {
+            authorization_fingerprint,
+            ..
+        } = &mpp.kind
+        else {
+            unreachable!()
+        };
         assert_eq!(
             entry_envelope_sha256(&mpp),
-            [0x33; 32],
-            "MppChargeSimulated must bind to its prepared artifact"
+            stellar_agent_core::approval::mpp::approval_subject(
+                authorization_fingerprint,
+                &[0x33; 32]
+            ),
+            "MPP consent binds its terms and prepared artifact"
         );
 
         // Kinds with no content digest of their own correctly fall back to

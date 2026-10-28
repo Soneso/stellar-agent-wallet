@@ -130,7 +130,9 @@ pub struct StellarPayArgs {
     /// - `"CODE:G…ISSUER"` for non-native assets.
     pub asset: String,
 
-    /// Optional UTF-8 text memo (at most 28 bytes).
+    /// Optional UTF-8 text memo (at most 28 bytes). A control character or a
+    /// bidirectional override or isolate is refused with
+    /// `validation.memo_control_character`.
     ///
     /// Mutually exclusive with `memo_id`, `memo_hash_hex`, `memo_return_hex`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

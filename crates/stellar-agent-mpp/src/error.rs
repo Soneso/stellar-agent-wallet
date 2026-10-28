@@ -27,6 +27,10 @@ pub enum MppErrorCode {
     ApprovalRequired,
     /// Approval was invalid or expired.
     ApprovalInvalid,
+    /// The pending approval displays a request context other than the one
+    /// the authorization commits. The code belongs to the approval taxonomy,
+    /// which every approval surface shares.
+    EntryInconsistent,
     /// No authorization matches the supplied identifier.
     AuthorizationNotFound,
     /// This authorization has already been consumed.
@@ -65,6 +69,7 @@ impl MppErrorCode {
             Self::NetworkForbidden => "mpp.network_forbidden",
             Self::ApprovalRequired => "mpp.approval_required",
             Self::ApprovalInvalid => "mpp.approval_invalid",
+            Self::EntryInconsistent => "approval.entry_inconsistent",
             Self::AuthorizationNotFound => "mpp.authorization_not_found",
             Self::AuthorizationReplayed => "mpp.authorization_replayed",
             Self::AuthorizationIndeterminate => "mpp.authorization_indeterminate",
@@ -132,7 +137,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_error_code_has_a_stable_mpp_wire_name() {
+    fn every_error_code_has_a_stable_wire_name() {
         let cases = [
             (MppErrorCode::InputTooLarge, "mpp.input_too_large"),
             (MppErrorCode::ChallengeInvalid, "mpp.challenge_invalid"),
@@ -145,6 +150,10 @@ mod tests {
             (MppErrorCode::NetworkForbidden, "mpp.network_forbidden"),
             (MppErrorCode::ApprovalRequired, "mpp.approval_required"),
             (MppErrorCode::ApprovalInvalid, "mpp.approval_invalid"),
+            (
+                MppErrorCode::EntryInconsistent,
+                "approval.entry_inconsistent",
+            ),
             (
                 MppErrorCode::AuthorizationNotFound,
                 "mpp.authorization_not_found",

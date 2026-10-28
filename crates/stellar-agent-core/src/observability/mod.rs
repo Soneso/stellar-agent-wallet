@@ -81,7 +81,8 @@
 
 pub mod redact;
 pub use redact::{
-    UNTRUSTED_DISPLAY_MAX_BYTES, redact_strkey_first5_last5, untrusted_display_bounded,
+    UNTRUSTED_DISPLAY_MAX_BYTES, escape_untrusted_text, is_untrusted_format_character,
+    redact_strkey_first5_last5, untrusted_display_bounded,
 };
 
 use std::fmt as std_fmt;

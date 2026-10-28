@@ -273,28 +273,30 @@ mod tests {
 
     use std::time::Duration as StdDuration;
     use stellar_agent_core::approval::{
-        DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, process_uid_for_attestation,
+        DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, fixtures,
+        process_uid_for_attestation,
     };
     use tempfile::TempDir;
+
+    const SOURCE_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+    const DEST_G: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
 
     fn uid() -> String {
         process_uid_for_attestation().expect("uid on test host")
     }
 
     fn payment_entry() -> PendingApproval {
-        PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             1_000,
-            "XLM".to_owned(),
             None,
             100,
             1,
             uid(),
             DEFAULT_TTL_MS,
         )
-        .unwrap()
     }
 
     fn insert_entry(path: &std::path::Path) -> String {

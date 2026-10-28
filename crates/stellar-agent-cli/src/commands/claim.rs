@@ -4577,8 +4577,6 @@ mod tests {
             assert_eq!(entries[0].kind_name, "ClaimSimulated");
             let stellar_agent_core::approval::view::ApprovalSummaryView::Claim {
                 balance_id_strkey,
-                asset,
-                amount_stroops,
                 source,
                 fee_stroops,
                 ..
@@ -4586,8 +4584,6 @@ mod tests {
             else {
                 panic!("{:?}", entries[0].summary);
             };
-            assert_eq!(*asset, None);
-            assert_eq!(*amount_stroops, None);
             assert_eq!(*source, fixture.agent.g);
             assert_eq!(*fee_stroops, 100);
             assert_eq!(open.len(), 1, "{open:?}");

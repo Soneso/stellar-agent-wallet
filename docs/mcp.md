@@ -576,6 +576,12 @@ claimable-balance record. It does not re-read the source trustline at commit.
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
 | `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it, by its receipt or, when the receipt is missing, by its reservation. The way out of `submission.tx_timeout`. Reports `record.release_code` for a release on chain evidence and `reservation` for a hold that remains. | Reads the chain and writes the wallet's record; moves no value and never sends. Not annotated read-only. |
 
+`stellar_pay` and `stellar_pay_commit` take at most one memo: `memo_text`, `memo_id`, `memo_hash_hex`, or `memo_return_hex`.
+`memo_text` is UTF-8 text of at most 28 bytes.
+On every network, a `memo_text` holding a control character (U+0000 to U+001F, U+007F to U+009F) or a Unicode format character (category Cf), line separator (U+2028), or paragraph separator (U+2029) is refused as invalid parameters whose message names `validation.memo_control_character` and the character, before any request is sent.
+The format characters include the zero-width non-joiner (U+200C) and joiner (U+200D), so a memo cannot carry them.
+Other non-ASCII text is accepted.
+
 A v1 rule set that names tools explicitly must include `stellar_transaction_status` to settle timed-out submissions through that server; the server logs `policy.transaction_status_unmatched` at startup when neither that tool nor `*` appears.
 
 ### Trustline

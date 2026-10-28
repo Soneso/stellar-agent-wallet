@@ -156,8 +156,14 @@ pub fn persist_prepared_authorization(
                 return Err(state_error());
             }
             let store = approval_store.take().ok_or_else(state_error)?;
-            let pending =
-                new_pending_approval(&existing, prepared, profile_name, process_uid, now_unix)?;
+            let pending = new_pending_approval(
+                &existing,
+                prepared,
+                profile_name,
+                network_passphrase,
+                process_uid,
+                now_unix,
+            )?;
             let approval_nonce = pending.approval_nonce.clone();
             let now_ms = u64::try_from(now_unix).unwrap_or(0).saturating_mul(1_000);
             store
@@ -177,8 +183,14 @@ pub fn persist_prepared_authorization(
         ApprovalDisposition::Allow => record.allow_commit(now_unix)?,
         ApprovalDisposition::RequireApproval => {
             let store = approval_store.take().ok_or_else(state_error)?;
-            let pending =
-                new_pending_approval(&record, prepared, profile_name, process_uid, now_unix)?;
+            let pending = new_pending_approval(
+                &record,
+                prepared,
+                profile_name,
+                network_passphrase,
+                process_uid,
+                now_unix,
+            )?;
             let approval_nonce = pending.approval_nonce.clone();
             let now_ms = u64::try_from(now_unix).unwrap_or(0).saturating_mul(1_000);
             store
@@ -192,24 +204,38 @@ pub fn persist_prepared_authorization(
     preview(&persisted)
 }
 
+/// Builds the pending approval of `record`, with the digests that let every
+/// approval surface check its displayed terms against the record's
+/// fingerprint.
+///
+/// The chain id is the network `network_passphrase` names; a passphrase of no
+/// known network is a state error. The entry is checked before it is returned,
+/// so a prepared charge never yields an inconsistent entry.
 fn new_pending_approval(
     record: &AuthorizationRecord,
     prepared: &PreparedSponsoredCharge,
     profile_name: &str,
+    network_passphrase: &str,
     process_uid: &str,
     now_unix: i64,
 ) -> Result<PendingApproval, MppError> {
+    use sha2::{Digest as _, Sha256};
+    use stellar_agent_core::approval::ApprovalKind;
+    use stellar_agent_core::approval::mpp::{MppAuthorizationContext, verify_mpp_entry_terms};
+    use stellar_agent_core::profile::caip2::Caip2;
+
+    let chain_id = Caip2::from_passphrase(network_passphrase).ok_or_else(state_error)?;
     let (transport, authority, target) = context_terms(prepared.selected().context());
     let challenge_expiry = u64::try_from(prepared.selected().effective_expires_at())
         .map_err(|_error| state_error())?;
     let now_ms = u64::try_from(now_unix)
         .map_err(|_error| state_error())?
         .saturating_mul(1_000);
-    PendingApproval::new_mpp_charge_pending_at(
+    let mut entry = PendingApproval::new_mpp_charge_pending_at(
         *record.fingerprint(),
         *prepared.artifact_hash(),
         profile_name.to_owned(),
-        crate::TESTNET_NETWORK.to_owned(),
+        chain_id.caip2_str().to_owned(),
         prepared.payer().to_owned(),
         transport,
         authority,
@@ -223,7 +249,53 @@ fn new_pending_approval(
         stellar_agent_core::approval::store::MPP_APPROVAL_MAX_TTL_MS,
         now_ms,
     )
-    .map_err(|_error| state_error())
+    .map_err(|_error| state_error())?;
+    if let ApprovalKind::MppChargeSimulated {
+        authorization_context,
+        ..
+    } = &mut entry.kind
+    {
+        *authorization_context = Some(MppAuthorizationContext {
+            context_digest: prepared.selected().context().digest()?,
+            network_passphrase_hash: Sha256::digest(network_passphrase.as_bytes()).into(),
+            challenge_digest: *prepared.selected().challenge_digest(),
+        });
+    }
+    verify_mpp_entry_terms(&entry.kind).map_err(|_error| state_error())?;
+    Ok(entry)
+}
+
+/// Refuses unless the pending approval `approval_nonce` displays the
+/// transport, authority and target of `prepared`'s request context.
+///
+/// The authorization fingerprint covers these three terms only through the
+/// request-context digest, so the commit compares them with the context of the
+/// authenticated MPP record before it accepts the operator's attestation. An
+/// absent entry or an entry of another kind is left to the attestation check,
+/// which refuses it.
+fn require_displayed_context(
+    approvals: &PendingApprovalStore,
+    approval_nonce: &str,
+    prepared: &PreparedSponsoredCharge,
+) -> Result<(), MppError> {
+    let Some(stellar_agent_core::approval::ApprovalKind::MppChargeSimulated {
+        transport,
+        authority,
+        target,
+        ..
+    }) = approvals.get(approval_nonce).map(|entry| &entry.kind)
+    else {
+        return Ok(());
+    };
+    let (prepared_transport, prepared_authority, prepared_target) =
+        context_terms(prepared.selected().context());
+    if *transport != prepared_transport
+        || *authority != prepared_authority
+        || *target != prepared_target
+    {
+        return Err(entry_inconsistent_error());
+    }
+    Ok(())
 }
 
 /// Loads a redacted durable status view. Expiry is derived from the caller's
@@ -319,6 +391,7 @@ where
         let approvals = approval_store.ok_or_else(approval_error)?;
         let key = approval_key.ok_or_else(approval_error)?;
         let prepared = record.prepared_charge()?;
+        require_displayed_context(approvals, nonce, &prepared)?;
         let now_ms = u64::try_from(now_unix).unwrap_or(0).saturating_mul(1_000);
         if !approvals.verify_mpp_charge_attestation(
             key,
@@ -527,6 +600,7 @@ pub fn verify_pending_approval(
     let approvals = approval_store.ok_or_else(approval_error)?;
     let key = approval_key.ok_or_else(approval_error)?;
     let prepared = record.prepared_charge()?;
+    require_displayed_context(approvals, nonce, &prepared)?;
     let now_ms = u64::try_from(now_unix).unwrap_or(0).saturating_mul(1_000);
     if !approvals.verify_mpp_charge_attestation(
         key,
@@ -592,6 +666,13 @@ fn approval_error() -> MppError {
     MppError::new(
         crate::MppErrorCode::ApprovalInvalid,
         "MPP approval is missing, invalid, or expired",
+    )
+}
+
+fn entry_inconsistent_error() -> MppError {
+    MppError::new(
+        crate::MppErrorCode::EntryInconsistent,
+        "the pending approval does not show the request this authorization commits",
     )
 }
 
@@ -733,6 +814,119 @@ mod tests {
                 .expect("pending verification must accept the attested binding");
                 assert_eq!(verified.status(), AuthorizationStatus::Ready);
             }
+        }
+    }
+
+    /// The fingerprint covers transport, authority and target only through
+    /// the request-context digest, so an entry edited in those fields still
+    /// verifies on display and attests. Both commit paths compare them with
+    /// the authenticated record's context and refuse before the record moves.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn commit_refuses_an_entry_that_shows_another_request_context() {
+        use stellar_agent_core::approval::{AttestationBinding, Surface, attest_and_persist};
+
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let binding = AttestationBinding::new("mpp-profile", "stellar:testnet");
+        let key = [0x42; 32];
+        let now = i64::try_from(stellar_agent_core::timefmt::now_unix_ms().expect("clock") / 1_000)
+            .expect("timestamp fits i64");
+        for (field, commit) in [
+            ("transport", true),
+            ("authority", true),
+            ("target", true),
+            ("authority", false),
+        ] {
+            let directory = TempDir::new().expect("tempdir");
+            let state = store(&directory);
+            let (prepared, signer, rpc) = prepared_fixture(now).await;
+            let approvals_path = directory.path().join("approvals.toml");
+            let mut approvals =
+                PendingApprovalStore::open(approvals_path.clone()).expect("approval store");
+            let preview = persist_prepared_authorization(
+                "mpp-profile",
+                TESTNET_PASSPHRASE,
+                &prepared,
+                ApprovalDisposition::RequireApproval,
+                "424242",
+                now,
+                &state,
+                Some(&mut approvals),
+            )
+            .expect("persist pending approval");
+            drop(approvals);
+            let nonce = preview.approval_id.expect("approval nonce");
+            let (transport, authority, target) = context_terms(prepared.selected().context());
+            let (shown, edited) = match field {
+                "transport" => (transport, "mcp".to_owned()),
+                "authority" => (authority, "https://other.example".to_owned()),
+                _ => (target, "https://merchant.example/other".to_owned()),
+            };
+            let text = std::fs::read_to_string(&approvals_path).expect("approval file");
+            let line = format!("{field} = \"{shown}\"");
+            assert_eq!(text.matches(&line).count(), 1, "{field}: {text}");
+            std::fs::write(
+                &approvals_path,
+                text.replace(&line, &format!("{field} = \"{edited}\"")),
+            )
+            .expect("edit approval file");
+
+            let mut approvals = PendingApprovalStore::open(approvals_path).expect("reopen");
+            let entry = approvals.get(&nonce).expect("pending entry").clone();
+            let mut audit_writer = stellar_agent_core::audit_log::AuditWriter::open(
+                directory.path().join("audit").join("audit.jsonl"),
+                None,
+            )
+            .expect("audit writer");
+            attest_and_persist(
+                &mut approvals,
+                &entry,
+                &key,
+                &binding,
+                Surface::Cli,
+                stellar_agent_core::approval::ConsentAudit::Writer(&mut audit_writer),
+                None,
+                |_, _| Err("MPP cannot persist a toolset grant".to_owned()),
+            )
+            .expect("the fingerprint does not cover the edited field");
+
+            let error = if commit {
+                commit_authorization(
+                    &state,
+                    Some(&approvals),
+                    Some(&key),
+                    &binding,
+                    &preview.authorization_id,
+                    now + 1,
+                    TESTNET_PASSPHRASE,
+                    &signer,
+                    &rpc,
+                    |_, _, _| Ok(()),
+                    |_| Ok(()),
+                    |_| {},
+                )
+                .await
+                .expect_err("commit must refuse the edited entry")
+            } else {
+                verify_pending_approval(
+                    &state,
+                    Some(&approvals),
+                    Some(&key),
+                    &binding,
+                    &preview.authorization_id,
+                    now + 1,
+                )
+                .expect_err("pending verification must refuse the edited entry")
+            };
+            assert_eq!(error.code(), "approval.entry_inconsistent", "{field}");
+            assert_eq!(
+                state
+                    .load(&preview.authorization_id)
+                    .expect("pending state")
+                    .status(),
+                AuthorizationStatus::ApprovalPending,
+                "{field}"
+            );
         }
     }
 

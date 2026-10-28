@@ -8,9 +8,12 @@
 //! same-origin `/static/app.js`, keeping the CSP at `script-src 'self'` with no
 //! `'unsafe-inline'`.
 //!
-//! Free-text fields that reach the HTML body directly (asset codes, memos,
-//! redacted addresses) are HTML-escaped via [`html_escape`]; the data-island
-//! JSON is escaped via [`json_data_island`].
+//! Every summary value that reaches the HTML body (asset codes, memos,
+//! addresses) passes through [`escape_value`]: control and direction-override
+//! characters become visible escapes, then the text is HTML-escaped via
+//! [`html_escape`]. The data-island JSON is escaped via [`json_data_island`].
+//! A payment, claim, or trustline summary is decoded from the entry's
+//! envelope by [`PendingApprovalView`].
 //!
 //! # Presentation
 //!
@@ -36,6 +39,7 @@ use stellar_agent_core::approval::{
     ApprovalSummaryView, ContextRuleProposalSnapshot, PendingApprovalView, RuleProposalContextType,
     RuleProposalSignerKind, try_decode_spending_limit_params,
 };
+use stellar_agent_core::observability::redact::escape_untrusted_text;
 use stellar_agent_loopback_http::brand::{BRAND_STYLE, PageIdentity, TRUST_LINE_LOOPBACK};
 
 // The single escaping definition every served page uses; re-exported so this
@@ -150,6 +154,24 @@ pub const DETAIL_STYLE: &str = r"
 // Shared page furniture
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Builds inbox JSON with every display string visibly escaped once.
+#[must_use]
+pub fn pending_json_value(pending: &[PendingApprovalView]) -> serde_json::Value {
+    fn escape(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => {
+                *text = stellar_agent_core::observability::escape_untrusted_text(text)
+            }
+            serde_json::Value::Array(values) => values.iter_mut().for_each(escape),
+            serde_json::Value::Object(fields) => fields.values_mut().for_each(escape),
+            _ => {}
+        }
+    }
+    let mut value = serde_json::json!(pending);
+    escape(&mut value);
+    value
+}
+
 /// Serialise `value` to JSON safe to embed inside a
 /// `<script type="application/json">` element.
 ///
@@ -197,7 +219,7 @@ pub(crate) fn render_inbox_page(
     identity: &PageIdentity,
 ) -> String {
     let data_island = json_data_island(&serde_json::json!({
-        "pending": pending,
+        "pending": pending_json_value(pending),
         "expired_count": expired_count,
         "include_expired": include_expired,
     }));
@@ -311,6 +333,8 @@ pub(crate) fn render_detail_page(
         r#"<div class="notice">This request was rejected. Nothing was signed.</div>"#
     } else if matches!(view.summary, ApprovalSummaryView::Consumed { .. }) {
         r#"<div class="notice">This approval was already spent on a submission. There is nothing left to decide; ask the wallet what became of that transaction.</div>"#
+    } else if matches!(view.summary, ApprovalSummaryView::Inconsistent { .. }) {
+        INCONSISTENT_NOTICE
     } else if view.expired {
         r#"<div class="notice warn">This request has expired. It can only be rejected now.</div>"#
     } else {
@@ -369,7 +393,9 @@ pub(crate) fn render_detail_page(
         || view.attested
         || matches!(
             view.summary,
-            ApprovalSummaryView::Rejected { .. } | ApprovalSummaryView::Consumed { .. }
+            ApprovalSummaryView::Rejected { .. }
+                | ApprovalSummaryView::Consumed { .. }
+                | ApprovalSummaryView::Inconsistent { .. }
         ) {
         format!(
             r#"<p class="expiry" id="expiry-line" data-created-ms="{created}" data-expires-ms="{expires}" data-expiry-form="absolute">
@@ -442,11 +468,37 @@ pub(crate) fn render_detail_page(
     )
 }
 
+/// Expands to the sentence every approval surface shows for an
+/// [`ApprovalSummaryView::Inconsistent`] entry, so the plain and the HTML
+/// constant share one literal.
+macro_rules! inconsistent_message {
+    () => {
+        "This request cannot be approved: what it shows does not match what it would authorize. Reject it."
+    };
+}
+
+/// The sentence the CLI, both detail pages and both decision routes show for
+/// an [`ApprovalSummaryView::Inconsistent`] entry, whatever its kind.
+pub const INCONSISTENT_MESSAGE: &str = inconsistent_message!();
+
+/// The notice on the detail page of an [`ApprovalSummaryView::Inconsistent`]
+/// entry, which offers no approve action on either approval surface.
+pub const INCONSISTENT_NOTICE: &str = concat!(
+    r#"<div class="notice warn">"#,
+    inconsistent_message!(),
+    "</div>"
+);
+
+/// The qualification shown beside an MPP charge's simulated fee, which
+/// neither the authorization fingerprint nor the commit binds.
+pub const SIMULATED_FEE_NOTE: &str = "not bound to this approval";
+
 /// The kind pill's label, and whether it takes the amber `.warn` variant.
 ///
 /// Passkey kinds take `.warn`: they are the two kinds this UI cannot approve
 /// (the ceremony happens in the browser bridge), so the pill has to read
-/// differently from the kinds that carry a decision here.
+/// differently from the kinds that carry a decision here. An inconsistent
+/// entry takes it too: it cannot be approved anywhere.
 ///
 /// Falls back to the entry's `kind_name` for a future
 /// [`ApprovalSummaryView`] variant, which is `#[non_exhaustive]`.
@@ -461,6 +513,7 @@ pub fn kind_pill(view: &PendingApprovalView) -> (String, bool) {
         | ApprovalSummaryView::RegisterPasskey { .. } => ("PASSKEY".to_owned(), true),
         ApprovalSummaryView::ToolsetFirstInvokeGate { .. } => ("TOOLSET GATE".to_owned(), false),
         ApprovalSummaryView::TrustlineClawbackOptIn { .. } => ("CLAWBACK OPT-IN".to_owned(), false),
+        ApprovalSummaryView::Inconsistent { .. } => ("INCONSISTENT".to_owned(), true),
         ApprovalSummaryView::Rejected { .. } => ("REJECTED".to_owned(), false),
         ApprovalSummaryView::Consumed { outcome, .. } => {
             (format!("SPENT ({})", outcome.to_uppercase()), false)
@@ -487,7 +540,7 @@ pub fn approve_button_label(summary: &ApprovalSummaryView) -> &'static str {
 }
 
 /// Renders the serving profile context above an approval summary.
-/// Every value is escaped as HTML text.
+/// Every value passes through [`escape_value`].
 #[must_use]
 pub fn render_context_header_html(
     context: &stellar_agent_core::approval::ApprovalContext,
@@ -508,7 +561,7 @@ pub fn render_context_header_html(
         html.push_str(&format!(
             "<dt>{}</dt><dd>{}</dd>\n",
             label,
-            html_escape(value)
+            escape_value(value)
         ));
     }
     html.push_str("</dl>\n");
@@ -516,15 +569,22 @@ pub fn render_context_header_html(
 }
 
 /// Renders the amount headline, the untruncated primary address, and the summary
-/// rows of an entry, every value HTML-escaped. The amount shows both denominations
-/// so the operator can match the stroop count against the CLI and the audit record.
-/// The nonce leads the grid because it is the handle the CLI prints.
+/// rows of an entry. The amount shows both denominations so the operator can
+/// match the stroop count against the CLI and the audit record. The nonce
+/// leads the grid because it is the handle the CLI prints.
+///
+/// Every value passes through [`escape_value`]: a control or
+/// direction-override character renders as a visible escape such as
+/// `\u{1b}` or `\u{202e}`, and the result is HTML-escaped. A payment, claim
+/// or trustline view is decoded from the entry's envelope by
+/// [`PendingApprovalView`]; an entry that fails that decode is an
+/// [`ApprovalSummaryView::Inconsistent`] view and renders its reason.
 pub fn render_summary_html(view: &PendingApprovalView) -> String {
     fn row(label: &str, value: &str) -> String {
         format!(
             "        <dt>{}</dt><dd>{}</dd>\n",
             html_escape(label),
-            html_escape(value)
+            escape_value(value)
         )
     }
 
@@ -537,7 +597,7 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
         format!(
             "      <div class=\"d-amount\">{} {} <small>{} stroops</small></div>\n",
             html_escape(&StellarAmount::from_stroops(amount_stroops).as_xlm_decimal_string()),
-            html_escape(asset_code(asset)),
+            escape_value(asset_code(asset)),
             amount_stroops
         )
     }
@@ -546,7 +606,7 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
         format!(
             "      <div class=\"addr-label\">{}</div>\n      <div class=\"addr\">{}</div>\n",
             html_escape(label),
-            html_escape(value)
+            escape_value(value)
         )
     }
 
@@ -563,17 +623,27 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             to,
             amount_stroops,
             asset,
+            dest_asset,
+            dest_amount_stroops,
             memo,
             fee_stroops,
             seq_num,
         } => {
             let mut rows = String::new();
             rows.push_str(&row("Asset", asset));
-            rows.push_str(&row(
-                "Source",
-                source.as_deref().unwrap_or("(undecodable envelope)"),
-            ));
-            rows.push_str(&row("Memo", memo.as_deref().unwrap_or("(none)")));
+            if let (Some(dest_asset), Some(dest_amount)) = (dest_asset, dest_amount_stroops) {
+                rows.push_str(&row(
+                    "Path payment",
+                    "the source pays at most the amount above",
+                ));
+                rows.push_str(&row("Destination receives asset", dest_asset));
+                rows.push_str(&row(
+                    "Destination receives at least (stroops)",
+                    &dest_amount.to_string(),
+                ));
+            }
+            rows.push_str(&row("Source", source));
+            rows.push_str(&row("Memo", &memo.display()));
             rows.push_str(&row("Simulated fee (stroops)", &fee_stroops.to_string()));
             rows.push_str(&row("Simulated seq num", &seq_num.to_string()));
             format!(
@@ -584,66 +654,55 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
             )
         }
         ApprovalSummaryView::Trustline {
-            source,
             holder,
             asset_code,
             asset_issuer,
             limit_stroops,
             fee_stroops,
             seq_num,
+            memo,
         } => {
             let asset = format!("{asset_code}:{asset_issuer}");
             let limit = format_trustline_limit(*limit_stroops);
             let mut rows = row("Limit", &limit);
-            rows.push_str(&row(
-                "Source",
-                source.as_deref().unwrap_or("(undecodable envelope)"),
-            ));
+            rows.push_str(&row("Source", holder));
+            rows.push_str(&row("Memo", &memo.display()));
             rows.push_str(&row("Simulated fee (stroops)", &fee_stroops.to_string()));
             rows.push_str(&row("Simulated seq num", &seq_num.to_string()));
             format!(
                 "      <div class=\"d-amount\">{}</div>\n{}{}",
-                html_escape(&asset),
+                escape_value(&asset),
                 address_block("Account", holder),
                 facts(&rows)
             )
         }
         ApprovalSummaryView::Claim {
-            envelope_source,
             balance_id_strkey,
-            asset,
-            amount_stroops,
             source,
             fee_stroops,
             seq_num,
+            memo,
         } => {
             let mut rows = String::new();
-            rows.push_str(&row(
-                "Asset",
-                asset
-                    .as_deref()
-                    .unwrap_or("not known to the wallet before the claim"),
-            ));
-            rows.push_str(&row(
-                "Source",
-                envelope_source
-                    .as_deref()
-                    .unwrap_or("(undecodable envelope)"),
-            ));
-            if envelope_source.as_ref() != Some(source) {
-                rows.push_str(&row("Source (stored summary)", source));
-            }
+            rows.push_str(&row("Asset", CLAIM_VALUE_NOTE));
+            rows.push_str(&row("Source", source));
+            rows.push_str(&row("Memo", &memo.display()));
             rows.push_str(&row("Simulated fee (stroops)", &fee_stroops.to_string()));
             rows.push_str(&row("Simulated seq num", &seq_num.to_string()));
             format!(
                 "{}{}{}",
-                match (amount_stroops, asset) {
-                    (Some(amount), Some(asset)) => amount_headline(*amount, asset),
-                    _ => row("Amount", "not known to the wallet before the claim"),
-                },
+                row("Amount", CLAIM_VALUE_NOTE),
                 address_block("Balance id", balance_id_strkey),
                 facts(&rows)
             )
+        }
+        ApprovalSummaryView::Inconsistent {
+            original_kind_name,
+            reason,
+        } => {
+            let mut rows = row("Kind", original_kind_name);
+            rows.push_str(&row("Reason", reason));
+            facts(&rows)
         }
         ApprovalSummaryView::SignWithPasskey {
             smart_account_redacted,
@@ -763,12 +822,12 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
                 &challenge_expires_at_unix.to_string(),
             ));
             rows.push_str(&row(
-                "Simulated fee (stroops)",
+                &format!("Simulated fee (stroops, {SIMULATED_FEE_NOTE})"),
                 &simulated_fee_stroops.to_string(),
             ));
             format!(
                 "      <div class=\"d-amount\">{} <small>base units of the token contract</small></div>\n{}{}",
-                html_escape(amount),
+                escape_value(amount),
                 address_block("Recipient", recipient_redacted),
                 facts(&rows)
             )
@@ -780,6 +839,19 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
         // a minimal placeholder rather than failing to build.
         _ => facts("        <dt>Summary</dt><dd>(unrecognised kind)</dd>\n"),
     }
+}
+
+/// What a claim summary shows for the balance's asset and amount: the claim
+/// transaction names the balance by id only.
+const CLAIM_VALUE_NOTE: &str = "not part of the signed claim transaction";
+
+/// Renders an untrusted value for HTML: every control and direction-override
+/// character becomes a visible escape through
+/// [`escape_untrusted_text`], the rule the CLI approval prompt applies, and
+/// the result is HTML-escaped.
+#[must_use]
+pub fn escape_value(value: &str) -> String {
+    html_escape(&escape_untrusted_text(value))
 }
 
 /// The displayable code of an asset identifier (`"XLM"` or `"<code>:<issuer>"`).
@@ -798,7 +870,7 @@ pub fn asset_code(asset: &str) -> &str {
 /// where recognized, else the raw base64 XDR params string), `auth_rule_ids`,
 /// and the two override warning lines when set.
 ///
-/// Every snapshot-derived string is passed through `html_escape`. No
+/// Every snapshot-derived string is passed through [`escape_value`]. No
 /// inline `<script>` or event-handler attribute is produced — this fn emits
 /// static markup only, consistent with the page's `script-src 'self'` CSP.
 ///
@@ -820,13 +892,13 @@ pub fn render_rule_proposal_definition_html(definition: &ContextRuleProposalSnap
         RuleProposalContextType::CallContract { contract } => {
             s.push_str(&format!(
                 "  <p>Context: CallContract {}</p>\n",
-                html_escape(contract)
+                escape_value(contract)
             ));
         }
         RuleProposalContextType::CreateContract { wasm_hash_hex } => {
             s.push_str(&format!(
                 "  <p>Context: CreateContract (wasm hash) {}</p>\n",
-                html_escape(wasm_hash_hex)
+                escape_value(wasm_hash_hex)
             ));
         }
         // RuleProposalContextType is #[non_exhaustive]; a future variant
@@ -834,14 +906,14 @@ pub fn render_rule_proposal_definition_html(definition: &ContextRuleProposalSnap
         other => {
             s.push_str(&format!(
                 "  <p>Context: (unrecognized: {})</p>\n",
-                html_escape(&format!("{other:?}"))
+                escape_value(&format!("{other:?}"))
             ));
         }
     }
 
     s.push_str(&format!(
         "  <p>Rule name: {}</p>\n",
-        html_escape(&definition.name)
+        escape_value(&definition.name)
     ));
     let expiry = match definition.valid_until {
         Some(ledger) => format!("expires at ledger {ledger}"),
@@ -882,8 +954,8 @@ pub fn render_rule_proposal_definition_html(definition: &ContextRuleProposalSnap
         s.push_str(&format!(
             "    <tr><td>{idx}</td><td>{}</td><td>{}</td><td>{}</td><td>{proposer_tag}</td></tr>\n",
             html_escape(kind_label),
-            html_escape(&address_cell),
-            html_escape(&pubkey_cell),
+            escape_value(&address_cell),
+            escape_value(&pubkey_cell),
         ));
     }
     s.push_str("  </table>\n");
@@ -915,8 +987,8 @@ pub fn render_rule_proposal_definition_html(definition: &ContextRuleProposalSnap
             };
             s.push_str(&format!(
                 "    <tr><td>{idx}</td><td>{}</td><td>{}</td></tr>\n",
-                html_escape(&policy.policy_address),
-                html_escape(&detail),
+                escape_value(&policy.policy_address),
+                escape_value(&detail),
             ));
         }
         s.push_str("  </table>\n");
@@ -951,16 +1023,15 @@ mod tests {
         clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
-    // ChangeTrust with transaction source [1; 32] and operation source [2; 32].
-    const CHANGE_TRUST_ENVELOPE: &str = concat!(
-        "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAA",
-        "AAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAGAAAAAVVT",
-        "REMAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAR//////////wAAAAAAAAAA",
-    );
+    const SOURCE_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+    const DEST_G: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+    const OTHER_G: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+    const USDC_ISSUER_G: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
     use super::*;
     use stellar_agent_core::approval::{
-        DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, process_uid_for_attestation,
+        ApprovalKind, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, fixtures,
+        process_uid_for_attestation,
     };
     use tempfile::TempDir;
 
@@ -998,19 +1069,17 @@ mod tests {
     /// `<script>` breakout attempt to exercise HTML escaping.
     fn payment_view(dir: &TempDir, attested: bool, snapshot_at: u64) -> PendingApprovalView {
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             2_500_000,
-            "XLM".to_owned(),
-            Some("<script>alert(1)</script>".to_owned()),
+            Some("<script>alert(1)</script>"),
             100,
             7,
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, NOW_MS).unwrap();
         if attested {
@@ -1050,25 +1119,23 @@ mod tests {
         assert_eq!(html_escape("a\u{00E9}\u{4E2D}b"), "a\u{00E9}\u{4E2D}b");
     }
 
-    /// The neutralisation reaches a real page: a memo carrying U+202E renders
-    /// as U+FFFD with no raw override byte anywhere in the response.
+    /// A memo carrying U+202E and U+202C reaches the page as visible escapes,
+    /// with no raw override character anywhere in the response.
     #[test]
     fn detail_page_neutralises_a_bidi_override_in_a_memo() {
         let dir = TempDir::new().unwrap();
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             1_000,
-            "XLM".to_owned(),
-            Some("pay \u{202E}MLX 000001\u{202C} now".to_owned()),
+            Some("pay \u{202E}MLX 000001\u{202C} now"),
             100,
             1,
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         store.insert(entry, NOW_MS).unwrap();
         let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
 
@@ -1078,8 +1145,8 @@ mod tests {
             "no raw right-to-left override may reach the page"
         );
         assert!(
-            html.contains('\u{FFFD}'),
-            "the override must render as the replacement character: {html}"
+            html.contains("pay \\u{202e}MLX 000001\\u{202c} now"),
+            "the override must render as a visible escape: {html}"
         );
     }
 
@@ -1141,20 +1208,15 @@ mod tests {
 
     fn claim_view(dir: &TempDir) -> PendingApprovalView {
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
-        let entry = PendingApproval::new_claim_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "a".repeat(72),
-            "B".to_owned() + &"A".repeat(57),
-            "XLM".to_owned(),
-            500,
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::claim_pending(
+            SOURCE_G,
+            [0x0a; 32],
+            Some(("XLM", 500)),
             100,
             1,
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         store.insert(entry, NOW_MS).unwrap();
         store.snapshot(NOW_MS).into_iter().next().unwrap()
     }
@@ -1297,43 +1359,43 @@ mod tests {
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
         let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
         let recipient = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-        let entry = PendingApproval::new_mpp_charge_pending(
-            [0x11; 32],
-            [0x22; 32],
-            "default".to_owned(),
-            "stellar:testnet".to_owned(),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            "http".to_owned(),
-            "merchant.example".to_owned(),
-            "/checkout".to_owned(),
-            "1000000".to_owned(),
-            recipient.to_owned(),
-            recipient.to_owned(),
-            now / 1_000 + 3_600,
-            1_100,
-            process_uid_for_attestation().unwrap(),
-            DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        let entry = stellar_agent_core::approval::fixtures::bind_mpp_entry(
+            PendingApproval::new_mpp_charge_pending(
+                [0x11; 32],
+                [0x22; 32],
+                "default".to_owned(),
+                "stellar:testnet".to_owned(),
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                "http".to_owned(),
+                "merchant.example".to_owned(),
+                "/checkout".to_owned(),
+                "1000000".to_owned(),
+                recipient.to_owned(),
+                recipient.to_owned(),
+                now / 1_000 + 3_600,
+                1_100,
+                process_uid_for_attestation().unwrap(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap(),
+        );
         store.insert(entry, now).unwrap();
         store.snapshot(now).into_iter().next().unwrap()
     }
 
     fn rejected_view(dir: &TempDir) -> PendingApprovalView {
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             1_000,
-            "XLM".to_owned(),
             None,
             100,
             1,
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, NOW_MS).unwrap();
         store.reject(&nonce, NOW_MS, DEFAULT_TTL_MS).unwrap();
@@ -1343,19 +1405,17 @@ mod tests {
     /// A spent approval, the tombstone a commit leaves behind.
     fn consumed_view(dir: &TempDir) -> PendingApprovalView {
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             1_000,
-            "XLM".to_owned(),
             None,
             100,
             1,
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, NOW_MS).unwrap();
         store
@@ -1864,7 +1924,7 @@ mod tests {
             html.contains("2500000 stroops"),
             "the stroop count must be rendered alongside it: {html}"
         );
-        let destination = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let destination = DEST_G;
         assert!(
             html.contains(&format!(r#"<div class="addr">{destination}</div>"#)),
             "the destination must render whole, in the address block: {html}"
@@ -1877,19 +1937,17 @@ mod tests {
     fn detail_page_payment_amount_survives_the_f64_precision_boundary() {
         let dir = TempDir::new().unwrap();
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             9_007_199_254_740_993, // 2^53 + 1
-            "XLM".to_owned(),
             None,
             100,
             7,
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         store.insert(entry, NOW_MS).unwrap();
         let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
 
@@ -1905,19 +1963,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
         let issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
-        let entry = PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            &format!("USDC:{issuer}"),
             12_500_000,
-            format!("USDC:{issuer}"),
             None,
             100,
             7,
             process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
-        )
-        .unwrap();
+        );
         store.insert(entry, NOW_MS).unwrap();
         let view = store.snapshot(NOW_MS).into_iter().next().unwrap();
 
@@ -2115,6 +2171,10 @@ mod tests {
             "a seven-decimal reading would state a value the charge does not carry: {html}"
         );
         assert!(html.contains(">Approve charge</button>"), "{html}");
+        assert!(
+            html.contains(&format!("Simulated fee (stroops, {SIMULATED_FEE_NOTE})")),
+            "{html}"
+        );
     }
 
     // ── Inbox page ───────────────────────────────────────────────────────
@@ -2198,46 +2258,40 @@ mod tests {
         assert!(html.contains("<dt>Signer</dt><dd>(not enrolled)</dd>"));
     }
 
+    /// A claim page shows the envelope's source and no stored summary field.
     #[test]
-    fn detail_page_renders_decoded_source_and_stored_claim_disagreement() {
+    fn detail_page_renders_the_decoded_claim_source() {
         let dir = TempDir::new().unwrap();
-        let mut view = claim_view(&dir);
-        if let ApprovalSummaryView::Claim {
-            envelope_source,
-            source,
-            ..
-        } = &mut view.summary
-        {
-            *envelope_source = Some("GENVELOPE".to_owned());
-            *source = "GSTORED".to_owned();
-        }
+        let view = claim_view(&dir);
         let html = render_detail_page(&view, &test_context(), "csrf", None, &neutral());
-        assert!(html.contains("<dt>Source</dt><dd>GENVELOPE</dd>"));
-        assert!(html.contains("<dt>Source (stored summary)</dt><dd>GSTORED</dd>"));
+        assert!(
+            html.contains(&format!("<dt>Source</dt><dd>{SOURCE_G}</dd>")),
+            "{html}"
+        );
+        assert!(!html.contains("stored summary"), "{html}");
         let dir = TempDir::new().unwrap();
         let view = payment_view(&dir, false, NOW_MS);
         let html = render_detail_page(&view, &test_context(), "csrf", None, &neutral());
-        assert!(html.contains("<dt>Source</dt><dd>(undecodable envelope)</dd>"));
+        assert!(
+            html.contains(&format!("<dt>Source</dt><dd>{SOURCE_G}</dd>")),
+            "{html}"
+        );
     }
 
     fn trustline_view(dir: &TempDir) -> PendingApprovalView {
         let mut store = PendingApprovalStore::open(dir.path().join("trustline.toml")).unwrap();
-        let limit = Some(123456789);
         store
             .insert(
-                PendingApproval::new_trustline_pending(
-                    CHANGE_TRUST_ENVELOPE.to_owned(),
-                    CHANGE_TRUST_ENVELOPE.as_bytes(),
-                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                    "USDC".to_owned(),
-                    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
-                    limit,
+                fixtures::trustline_pending(
+                    SOURCE_G,
+                    "USDC",
+                    USDC_ISSUER_G,
+                    Some(123_456_789),
                     100,
                     42,
                     "1000".to_owned(),
                     DEFAULT_TTL_MS,
-                )
-                .unwrap(),
+                ),
                 NOW_MS,
             )
             .unwrap();
@@ -2262,12 +2316,11 @@ mod tests {
                 "TRUSTLINE",
                 ">Approve trustline</button>",
                 "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                &format!(r#"<div class="addr">{SOURCE_G}</div>"#),
                 shown,
-                "Source",
+                &format!("<dt>Source</dt><dd>{SOURCE_G}</dd>"),
                 "<dt>Simulated fee (stroops)</dt><dd>100</dd>",
                 "<dt>Simulated seq num</dt><dd>42</dd>",
-                "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA",
             ] {
                 assert!(html.contains(text), "missing {text}: {html}");
             }
@@ -2282,24 +2335,219 @@ mod tests {
         assert!(!html.contains(">Approve trustline</button>"));
     }
     #[test]
-    fn claim_summary_renders_unknown_value() {
+    fn claim_summary_says_asset_and_amount_are_not_signed() {
         let dir = TempDir::new().unwrap();
-        let mut view = claim_view(&dir);
-        let ApprovalSummaryView::Claim {
-            asset,
-            amount_stroops,
-            ..
-        } = &mut view.summary
-        else {
-            panic!("claim expected")
-        };
-        *asset = None;
-        *amount_stroops = None;
-        let html = render_summary_html(&view);
+        let html = render_summary_html(&claim_view(&dir));
         assert_eq!(
-            html.matches("not known to the wallet before the claim")
+            html.matches("not part of the signed claim transaction")
                 .count(),
-            2
+            2,
+            "{html}"
         );
+        assert!(!html.contains("500 stroops"), "{html}");
+    }
+
+    /// Stores `entry` and returns its snapshot view.
+    fn view_of(entry: PendingApproval) -> PendingApprovalView {
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("default.toml")).unwrap();
+        store.insert(entry, NOW_MS).unwrap();
+        store.snapshot(NOW_MS).remove(0)
+    }
+
+    /// The inbox data island and the detail page carry the envelope's amount
+    /// and destination when the stored summary fields name another payment.
+    #[test]
+    fn an_edited_entry_renders_the_envelope_amount() {
+        let mut entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
+            75_000_000_000,
+            None,
+            100,
+            3,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        );
+        let ApprovalKind::PaymentSimulated {
+            summary_to,
+            summary_amount_stroops,
+            ..
+        } = &mut entry.kind
+        else {
+            unreachable!()
+        };
+        OTHER_G.clone_into(summary_to);
+        *summary_amount_stroops = 10_000;
+        let view = view_of(entry);
+
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        assert!(html.contains("7500.0000000 XLM"), "{html}");
+        assert!(html.contains("75000000000 stroops"), "{html}");
+        assert!(
+            html.contains(&format!(r#"<div class="addr">{DEST_G}</div>"#)),
+            "{html}"
+        );
+        assert!(!html.contains(OTHER_G), "{html}");
+        assert!(!html.contains("10000 stroops"), "{html}");
+
+        let inbox = render_inbox_page(std::slice::from_ref(&view), 0, false, &neutral());
+        assert!(
+            inbox.contains(r#""amount_stroops":"75000000000""#),
+            "{inbox}"
+        );
+        assert!(inbox.contains(DEST_G), "{inbox}");
+        assert!(!inbox.contains(OTHER_G), "{inbox}");
+    }
+
+    /// An entry whose stored digest is not its envelope's renders as
+    /// inconsistent with no approve action and neither transaction's terms.
+    #[test]
+    fn an_inconsistent_entry_offers_only_reject() {
+        let mut entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
+            1_000,
+            None,
+            100,
+            1,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        );
+        let ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64, ..
+        } = &mut entry.kind
+        else {
+            unreachable!()
+        };
+        *envelope_xdr_b64 = fixtures::payment_envelope(SOURCE_G, OTHER_G, "XLM", 9, None, 100, 1);
+        let view = view_of(entry);
+        assert!(!kind_is_approvable(&view.summary));
+        assert_eq!(kind_pill(&view), ("INCONSISTENT".to_owned(), true));
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        assert!(html.contains(INCONSISTENT_NOTICE), "{html}");
+        assert!(!html.contains("approve-btn"), "{html}");
+        assert!(html.contains("reject-btn"), "{html}");
+        assert!(html.contains(r#"data-expiry-form="absolute""#), "{html}");
+        assert!(!html.contains(OTHER_G), "{html}");
+        assert!(!html.contains(DEST_G), "{html}");
+    }
+
+    /// Every summary value renders control characters as visible escapes,
+    /// HTML-escaped, never raw.
+    #[test]
+    fn summary_values_render_control_characters_as_escapes() {
+        let memo = "\u{1b}[2K<b>\u{9b}\u{7}";
+        let envelope =
+            fixtures::payment_envelope(SOURCE_G, DEST_G, "XLM", 1_000, Some(memo), 100, 1);
+        let entry = PendingApproval::new_payment_pending(
+            envelope.clone(),
+            envelope.as_bytes(),
+            DEST_G.to_owned(),
+            1_000,
+            "XLM".to_owned(),
+            None,
+            100,
+            1,
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let html = render_summary_html(&view_of(entry));
+        assert!(
+            html.contains(r"<dt>Memo</dt><dd>text &quot;\u{1b}[2K&lt;b&gt;\u{9b}\u{7}&quot;</dd>"),
+            "{html}"
+        );
+        for raw in ['\u{1b}', '\u{9b}', '\u{7}'] {
+            assert!(!html.contains(raw), "{raw:?} {html}");
+        }
+        assert_eq!(escape_value("a\u{202e}b<"), r"a\u{202e}b&lt;");
+    }
+    fn assert_edited_mpp_inconsistent(edit_amount: bool) {
+        let mut entry = fixtures::mpp_pending();
+        if let ApprovalKind::MppChargeSimulated {
+            amount, recipient, ..
+        } = &mut entry.kind
+        {
+            if edit_amount {
+                *amount = "7".to_owned();
+            } else {
+                *recipient = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned();
+            }
+        }
+        let view = view_of(entry);
+        assert!(matches!(
+            view.summary,
+            ApprovalSummaryView::Inconsistent { .. }
+        ));
+        assert!(!kind_is_approvable(&view.summary));
+        let html = render_detail_page(&view, &test_context(), &"c".repeat(64), None, &neutral());
+        assert!(html.contains(INCONSISTENT_NOTICE), "{html}");
+        let json = pending_json_value(&[view]);
+        assert_eq!(json[0]["summary"]["kind"], "inconsistent");
+    }
+    #[test]
+    fn edited_mpp_amount_renders_inconsistent() {
+        assert_edited_mpp_inconsistent(true);
+    }
+    #[test]
+    fn edited_mpp_recipient_renders_inconsistent() {
+        assert_edited_mpp_inconsistent(false);
+    }
+
+    /// Inbox JSON for a rule proposal whose name and summary line hold U+202E
+    /// and a payment whose text memo holds it, checked in so the JavaScript
+    /// test renders exactly what Rust emits.
+    const INBOX_BIDI_FIXTURE: &str = include_str!("web/testdata/inbox_bidi.json");
+
+    /// The inbox JSON of a rule name, a summary line and a memo holding
+    /// U+202E carries each as the visible escape, and equals the checked-in
+    /// fixture the JavaScript test reads.
+    #[test]
+    fn inbox_json_bidi_fixture() {
+        let dir = TempDir::new().unwrap();
+        let mut rule = rule_proposal_view(&dir);
+        if let ApprovalSummaryView::RuleProposal {
+            definition,
+            summary_line,
+            ..
+        } = &mut rule.summary
+        {
+            definition.name = "caf\u{e9}\u{202e}rule".to_owned();
+            *summary_line = "caf\u{e9}\u{202e}rule".to_owned();
+        }
+        let payment = view_of(fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
+            1000,
+            Some("memo\u{202e}"),
+            100,
+            1,
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        ));
+        let mut views = [rule, payment];
+        for (index, view) in views.iter_mut().enumerate() {
+            view.approval_nonce = format!("fixture-nonce-{index}");
+            view.created_at_unix_ms = NOW_MS;
+            view.expires_at_unix_ms = NOW_MS + DEFAULT_TTL_MS;
+        }
+        let json = pending_json_value(&views);
+        let expected: serde_json::Value = serde_json::from_str(INBOX_BIDI_FIXTURE).unwrap();
+        assert!(
+            json == expected,
+            "{}",
+            serde_json::to_string_pretty(&json).unwrap()
+        );
+        assert_eq!(json[0]["summary"]["summary_line"], "caf\u{e9}\\u{202e}rule");
+        assert_eq!(
+            json[0]["summary"]["definition"]["name"],
+            "caf\u{e9}\\u{202e}rule"
+        );
+        assert_eq!(json[1]["summary"]["memo"]["value"], "memo\\u{202e}");
+        assert!(!json.to_string().contains('\u{202e}'));
     }
 }
