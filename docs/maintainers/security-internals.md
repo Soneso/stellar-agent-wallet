@@ -840,8 +840,15 @@ tombstone. Reuse can then report `network.mainnet_authorization_refused`.
 `submission.record_unavailable` retains its own meaning. Existing ownership of
 signed bytes refuses with `submission.tx_already_submitted`.
 Authorization operations share a mainnet clock. Clock failure reports
-`wallet.clock_error`. A witness bound to another envelope or intent fails
-with the `envelope_mismatch` reason.
+`wallet.clock_error`. A witness bound to another envelope or intent reports
+`network.witness_unavailable` with `WitnessUnavailableReason::EnvelopeMismatch { part }`.
+The message contains "cross-check refused: the transaction's {part} does not
+match the observations the witness compares".
+In `stellar_x402_create_payment` it follows a "payment withheld" prefix that
+names the withholding stage.
+The `{part}` is `source`, `sequence`, `operation`, `memo`, `value`, `envelope`,
+or `authorization`. The wallet refuses signing and sending.
+The message tells the operator to build the action again.
 
 Reset refuses effective open authorizations with
 `profile.reset_window_state_open_authorizations`. Enabled-mainnet state that

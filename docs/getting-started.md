@@ -745,6 +745,11 @@ Released binaries have `mainnet-write` disabled. A build with the feature enable
 admits only the operations listed below after operator setup and approval for
 each action. The version marker reports the build configuration.
 
+Mainnet writes move real funds. The wallet is alpha software and comes without
+warranty under the Apache-2.0 license. Use a feature-enabled build on mainnet at
+your own risk. Test each flow on testnet first, and start with small amounts and
+tight policy limits.
+
 With the feature off, no code path in the shipped binary can satisfy the
 mainnet-write guard, and the binary attests its feature state.
 

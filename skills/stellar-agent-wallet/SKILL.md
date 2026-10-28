@@ -295,6 +295,9 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
   Policy evaluation alone grants no signing authority. Signing and submission
   independently check sealed authorization. Smart-account writes, DeFi, pool
   submission, MPP, generic signing, and toolset signing remain excluded.
+  A feature-enabled build moves real funds on mainnet, and the operator uses it
+  at their own risk. Before the first mainnet write of a session, confirm that
+  the operator intends mainnet, and suggest a testnet run and a small amount.
 
 - `profile.key_scope_conflict` refuses mainnet startup or CLI reconciliation
   for shared or invalid key scope; testnet logs a warning. Do not retry under

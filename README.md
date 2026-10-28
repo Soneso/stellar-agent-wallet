@@ -45,6 +45,10 @@ the planned work per release.
   configured operations with approval for each action.
   [Mainnet configurations and scope](docs/getting-started.md#mainnet-configurations-and-scope)
   lists the commands, the layers, and the wire codes.
+- Mainnet writes move real funds. The wallet is alpha software and comes
+  without warranty under the Apache-2.0 license. Use a feature-enabled build
+  on mainnet at your own risk, and start with small amounts and tight policy
+  limits.
 - Friendbot funding is testnet/futurenet only; mainnet is structurally refused.
 
 Release archives are published on the
