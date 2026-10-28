@@ -594,7 +594,9 @@ and `STELLAR_AGENT_HEADLESS_KEYRING_KEY` in the process environment. The key mus
 encode 32 random bytes as URL-safe base64 without padding. See
 [Generate a headless keyring key](getting-started.md#generate-a-headless-keyring-key)
 for POSIX shell and PowerShell commands. Keep the key in your secret manager and
-reuse it for every process that opens the same store.
+reuse it for every process that opens the same store. The headless backends
+serve testnet only; mainnet needs the platform keyring and refuses them with
+`network.mainnet_keyring_backend_unsupported`.
 
 ## Migration and key rotation
 

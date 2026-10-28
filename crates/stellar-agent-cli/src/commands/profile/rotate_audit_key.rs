@@ -34,8 +34,15 @@
 //! The profile's audit binding is checked before the lock is taken. A binding
 //! that names another log path or audit key refuses with
 //! `audit.log_binding_changed`, and nothing is created or anchored at the path
-//! the profile names. An absent binding is recorded. The key rotates in place
-//! at the same keyring coordinate, so the binding is otherwise unchanged.
+//! the profile names. An absent binding is recorded once the writer has
+//! opened. The key rotates in place at the same keyring coordinate, so the
+//! binding is otherwise unchanged.
+//!
+//! A log with no tip anchor that shows it was anchored before refuses with
+//! `audit.tip_anchor_missing`. A recorded binding is such evidence only while
+//! the profile has a key: a profile minting its first key has had no keyed use
+//! of its log, so its first rotation adopts a log written only by unkeyed
+//! writers.
 //!
 //! See `docs/cli-reference/profile-and-governance.md#key-rotation-subcommands`
 //! for the writer lock and the prerequisites of a rotation.
@@ -64,10 +71,11 @@
 use clap::{ArgGroup, Args};
 use serde::Serialize;
 use stellar_agent_core::audit_log::{
-    AuditWriter, BindingCheck, KeyPurpose, SidecarResignError, resign_chain_root_sidecars,
+    AuditWriter, BindingCheck, BindingHistory, KeyPurpose, SidecarResignError,
+    resign_chain_root_sidecars,
 };
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{InternalError, WalletError};
+use stellar_agent_core::error::{AuthError, InternalError, WalletError};
 use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::profile::loader;
 use stellar_agent_core::profile::owner_key;
@@ -95,23 +103,78 @@ use super::key_ops::rotate_hmac_like_key;
 /// the sole audit-writer user in its own process, so there is nothing for a
 /// registry entry to share with.
 ///
-/// A profile with no chain-root key yet opens unkeyed: a first rotation on an
-/// `init`-minted profile has no key to read, and refusing here would make
-/// minting one impossible.
+/// A missing chain-root key (`NoEntry`) opens unkeyed and passes `NotRecorded`
+/// to the anchor check, allowing the first key to be minted. A recorded binding
+/// alone does not prove that a key existed. Every other key-read failure refuses
+/// through [`unusable_stored_key`] before any binding, key, or log write.
+/// `binding` is passed to the anchor check when the key loads.
 fn open_locked_audit_writer(
     profile: &Profile,
     profile_name: &str,
+    binding: BindingHistory,
 ) -> Result<AuditWriter, WalletError> {
-    let hmac_key = load_audit_hmac_key(profile, profile_name).ok();
+    let hmac_key = match load_audit_hmac_key(profile, profile_name) {
+        Ok(key) => Some(key),
+        // Only NoEntry maps to the bare service name; NoDefaultStore adds
+        // session guidance to its KeyringNotFound name.
+        Err(WalletError::Auth(AuthError::KeyringNotFound { name }))
+            if name == profile.audit_log_hash_chain_key_id.service =>
+        {
+            None
+        }
+        Err(error) => return Err(unusable_stored_key(error, profile_name)),
+    };
+    let binding = if hmac_key.is_some() {
+        binding
+    } else {
+        BindingHistory::NotRecorded
+    };
     let tip_anchor = KeyringTipAnchorStore::shared(
         &profile.audit_log_hash_chain_key_id,
         &profile.audit_log_path,
     );
-    AuditWriter::open_with_tip_anchor(profile.audit_log_path.clone(), hmac_key, tip_anchor).map_err(
-        |e| {
-            crate::commands::audit::audit_writer_error(&e, "audit.writer_unavailable", profile_name)
-        },
+    AuditWriter::open_with_tip_anchor(
+        profile.audit_log_path.clone(),
+        hmac_key,
+        tip_anchor,
+        binding,
     )
+    .map_err(|e| {
+        crate::commands::audit::audit_writer_error(&e, "audit.writer_unavailable", profile_name)
+    })
+}
+
+/// The refusal for a stored audit key this verb cannot read or decode.
+///
+/// Rotation never writes over a key it cannot read: the entry may hold the key
+/// the log's chain-root sidecars are signed under, and a read failure may be
+/// the keyring itself failing, which a new write would hide. The wire code
+/// stays the read failure's own. A keyring operation failure and an
+/// undecodable value gain the remedy in their message: investigate, and only
+/// for a corrupt key remove the entry, mint a new key, and re-anchor a log
+/// whose anchor is gone. The other refusals already name their own remedy: an
+/// unavailable credential store, a required interactive session, or a key
+/// refused as the owner key.
+fn unusable_stored_key(error: WalletError, profile_name: &str) -> WalletError {
+    let remedy = format!(
+        "investigate; if the stored audit key is corrupt, remove its keyring entry with the \
+         platform keyring tool, run `stellar-agent profile rotate-audit-key {profile_name}` to \
+         mint a new key, and run `stellar-agent audit reanchor --profile {profile_name} \
+         --acknowledge-rollback` if the log's anchor is gone"
+    );
+    match error {
+        WalletError::Internal(InternalError::UnexpectedState { detail }) => {
+            WalletError::Internal(InternalError::UnexpectedState {
+                detail: format!("{detail}; {remedy}"),
+            })
+        }
+        WalletError::Auth(AuthError::KeyringPlatformError { detail }) => {
+            WalletError::Auth(AuthError::KeyringPlatformError {
+                detail: format!("{detail}; {remedy}"),
+            })
+        }
+        other => other,
+    }
 }
 
 /// Arguments for `stellar-agent profile rotate-audit-key`.
@@ -276,9 +339,10 @@ where
     // directory, the lock sidecar, and the log file, and anchors the file it
     // finds. A binding that names another log or key refuses with
     // `audit.log_binding_changed` and nothing is created at the path the
-    // profile names. An absent binding is recorded. The key rotates in place
-    // at the same coordinate, so an equal binding stays as it is.
-    check_audit_binding(&profile, args.profile_name(), BindingCheck::Enforce)?;
+    // profile names. An absent binding is recorded once the writer has opened,
+    // so a refused open records none. The key rotates in place at the same
+    // coordinate, so an equal binding stays as it is.
+    let binding = check_audit_binding(&profile, args.profile_name(), BindingCheck::CheckOnly)?;
 
     // ── Step 0: take the audit writer's sidecar lock and hold it for the whole
     // rotation.  Re-signing walks the file chain and rewrites every `.root_hmac`
@@ -292,10 +356,12 @@ where
     // that was rolled back or truncated is refused here, leaving the profile's
     // key untouched and the operator free to investigate and run
     // `audit reanchor`.
-    let mut writer = open_locked_audit_writer(&profile, args.profile_name()).map_err(|e| {
-        tracing::warn!(error = %e, "rotate-audit-key: audit writer unavailable");
-        e
-    })?;
+    let mut writer =
+        open_locked_audit_writer(&profile, args.profile_name(), binding).map_err(|e| {
+            tracing::warn!(error = %e, "rotate-audit-key: audit writer unavailable");
+            e
+        })?;
+    check_audit_binding(&profile, args.profile_name(), BindingCheck::Enforce)?;
 
     // ── Step 1: persist the new chain-root key (destroys the old key).
     rotate_hmac_like_key(entry_ref, "rotate_audit_key")?;
@@ -439,7 +505,7 @@ mod tests {
     async fn rotate_audit_key_run_resign_keeps_verify_green_under_new_key_and_emits_row() {
         use std::io::BufRead as _;
 
-        use stellar_agent_core::audit_log::{AuditEntry, AuditWriter, PolicyDecision, verify_log};
+        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision, verify_log};
         use stellar_agent_test_support::keyring_mock;
 
         keyring_mock::install().expect("mock keyring store");
@@ -454,15 +520,14 @@ mod tests {
         profile.audit_log_path = dir.path().join("audit.jsonl");
         let entry_ref = profile.audit_log_hash_chain_key_id.clone();
 
-        // Seed the OLD chain-root key and write a pre-rotation chain under it.
+        // Seed the OLD chain-root key and write a pre-rotation chain under it,
+        // through the anchored writer the verb itself opens.
         rotate_hmac_like_key(&entry_ref, "test_seed").expect("seed old key");
         let old_key = load_audit_hmac_key(&profile, "test-profile").expect("load old key");
         {
-            let mut writer = AuditWriter::open_keyed_unanchored_for_test(
-                profile.audit_log_path.clone(),
-                old_key.clone(),
-            )
-            .expect("open under old key");
+            let mut writer =
+                open_locked_audit_writer(&profile, "rotate-run-e2e", BindingHistory::NotRecorded)
+                    .expect("open under old key");
             for ledger in 0..2u32 {
                 let entry = AuditEntry::new_value_action_submitted(
                     "stellar_pay",
@@ -593,7 +658,8 @@ mod tests {
         rotate_hmac_like_key(&entry_ref, "test_seed").expect("seed the old key");
         let old_key = load_audit_hmac_key(&profile, name).expect("load the old key");
         {
-            let mut writer = open_locked_audit_writer(&profile, name).expect("open the writer");
+            let mut writer = open_locked_audit_writer(&profile, name, BindingHistory::NotRecorded)
+                .expect("open the writer");
             writer
                 .write_entry(AuditEntry::new_value_action_submitted(
                     "stellar_pay",
@@ -679,7 +745,8 @@ mod tests {
         rotate_hmac_like_key(&entry_ref, "test_seed").expect("seed the old key");
         let old_key = load_audit_hmac_key(&profile, name).expect("load the old key");
         {
-            let mut writer = open_locked_audit_writer(&profile, name).expect("open the writer");
+            let mut writer = open_locked_audit_writer(&profile, name, BindingHistory::NotRecorded)
+                .expect("open the writer");
             writer
                 .write_entry(AuditEntry::new_value_action_submitted(
                     "stellar_pay",
@@ -784,8 +851,8 @@ mod tests {
         // Two anchored rows, with the file snapshotted between them, so the
         // snapshot is a log the anchor does not describe.
         let snapshot = {
-            let mut writer =
-                open_locked_audit_writer(&profile, name).expect("open the anchored writer");
+            let mut writer = open_locked_audit_writer(&profile, name, BindingHistory::NotRecorded)
+                .expect("open the anchored writer");
             writer.write_entry(row("req-anchor-1")).expect("append");
             let snapshot = std::fs::read(&profile.audit_log_path).expect("read the log");
             writer.write_entry(row("req-anchor-2")).expect("append");
@@ -827,6 +894,204 @@ mod tests {
         stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile(name)
             .load_raw()
             .expect("read binding")
+    }
+
+    /// Audit-key read failures other than NoEntry keep the mapped error's code,
+    /// add the corrupt-key remedy to a keyring operation failure, and leave the
+    /// binding, key, anchor, and log untouched.
+    #[tokio::test]
+    #[serial]
+    async fn rotate_audit_key_refuses_key_read_errors_and_writes_nothing() {
+        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision, TipAnchorStore};
+        use stellar_agent_network::keyring::{KeyringOperation, map_keyring_operation_error};
+        use stellar_agent_test_support::keyring_mock;
+
+        for injected in [
+            keyring_core::Error::NoStorageAccess(Box::new(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other(
+                "credential store locked",
+            ))),
+            keyring_core::Error::NoDefaultStore,
+            keyring_core::Error::BadEncoding(vec![0xff]),
+        ] {
+            keyring_mock::install().expect("mock keyring store");
+            let dir = tempfile::tempdir().expect("tmp dir");
+            let name = "rotate-key-read-error";
+            let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct")
+                .with_profile_name(name)
+                .build();
+            profile.audit_log_path = dir.path().join("audit.jsonl");
+            {
+                let mut writer = AuditWriter::open(profile.audit_log_path.clone(), None)
+                    .expect("unkeyed writer");
+                writer
+                    .write_entry(AuditEntry::new_value_action_submitted(
+                        "stellar_pay",
+                        "stellar:testnet",
+                        Vec::new(),
+                        "abcd1234…wxyz5678",
+                        7,
+                        PolicyDecision::Allow,
+                        None,
+                        None,
+                        None,
+                        "req-before-read-error",
+                        None,
+                    ))
+                    .expect("append");
+            }
+            let log_before = std::fs::read(&profile.audit_log_path).expect("read log");
+            assert!(binding_raw(name).is_none(), "no binding before rotation");
+            let entry_ref = &profile.audit_log_hash_chain_key_id;
+            let names_its_own_remedy = matches!(injected, keyring_core::Error::NoDefaultStore);
+            let expected =
+                map_keyring_operation_error(&injected, KeyringOperation::Read, &entry_ref.service);
+            keyring_mock::inject_error(&entry_ref.service, &entry_ref.account, injected)
+                .expect("inject audit-key read failure");
+            let args = RotateAuditKeyArgs {
+                name: Some(name.to_owned()),
+                profile: None,
+            };
+            let cloned_profile = profile.clone();
+            let error = match rotate(&args, move |_| Ok(cloned_profile.clone()), || Ok(())).await {
+                Err(RotateRefusal::Wallet(error)) => error,
+                Err(RotateRefusal::ProfileAccess(error)) => {
+                    panic!("unexpected profile refusal: {error}")
+                }
+                Ok(_) => panic!("an audit-key read failure must refuse rotation: {expected}"),
+            };
+            assert_eq!(error.code(), expected.code());
+            if names_its_own_remedy {
+                assert_eq!(error.message(), expected.message());
+            } else {
+                assert_eq!(
+                    error.message(),
+                    format!(
+                        "{}; investigate; if the stored audit key is corrupt, remove its \
+                         keyring entry with the platform keyring tool, run `stellar-agent \
+                         profile rotate-audit-key {name}` to mint a new key, and run \
+                         `stellar-agent audit reanchor --profile {name} --acknowledge-rollback` \
+                         if the log's anchor is gone",
+                        expected.message()
+                    )
+                );
+            }
+            assert!(binding_raw(name).is_none(), "no binding is recorded");
+            assert!(
+                matches!(
+                    keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+                        .expect("audit-key entry")
+                        .get_password(),
+                    Err(keyring_core::Error::NoEntry)
+                ),
+                "no audit key is minted"
+            );
+            assert_eq!(
+                std::fs::read(&profile.audit_log_path).expect("read log after refusal"),
+                log_before,
+                "the log is byte-identical"
+            );
+            assert_eq!(
+                KeyringTipAnchorStore::new(entry_ref, &profile.audit_log_path)
+                    .load_raw()
+                    .expect("read anchor"),
+                None,
+                "no anchor is recorded"
+            );
+        }
+    }
+
+    /// A stored audit key that is not base64 or not 32 bytes refuses with its
+    /// decode code and the corrupt-key remedy, and rotation writes nothing:
+    /// the stored value, the binding, the anchor, and the log stay as they
+    /// were, and no audit key replaces the undecodable one.
+    #[tokio::test]
+    #[serial]
+    async fn rotate_audit_key_refuses_an_undecodable_key_with_the_remedy_and_writes_nothing() {
+        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision, TipAnchorStore};
+        use stellar_agent_test_support::keyring_mock;
+
+        for (stored, sub_code) in [
+            ("not base64!", "audit.key_decode_failed"),
+            ("AAAA", "audit.key_length_error"),
+        ] {
+            keyring_mock::install().expect("mock keyring store");
+            let dir = tempfile::tempdir().expect("tmp dir");
+            let name = "rotate-key-undecodable";
+            let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct")
+                .with_profile_name(name)
+                .build();
+            profile.audit_log_path = dir.path().join("audit.jsonl");
+            AuditWriter::open(profile.audit_log_path.clone(), None)
+                .expect("unkeyed writer")
+                .write_entry(AuditEntry::new_value_action_submitted(
+                    "stellar_pay",
+                    "stellar:testnet",
+                    Vec::new(),
+                    "abcd1234…wxyz5678",
+                    7,
+                    PolicyDecision::Allow,
+                    None,
+                    None,
+                    None,
+                    "req-before-undecodable-key",
+                    None,
+                ))
+                .expect("append");
+            let log_before = std::fs::read(&profile.audit_log_path).expect("read log");
+            let entry_ref = &profile.audit_log_hash_chain_key_id;
+            let entry = keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+                .expect("audit-key entry");
+            entry
+                .set_password(stored)
+                .expect("store an undecodable key");
+
+            let args = RotateAuditKeyArgs {
+                name: Some(name.to_owned()),
+                profile: None,
+            };
+            let cloned_profile = profile.clone();
+            let error = match rotate(&args, move |_| Ok(cloned_profile.clone()), || Ok(())).await {
+                Err(RotateRefusal::Wallet(error)) => error,
+                Err(RotateRefusal::ProfileAccess(error)) => {
+                    panic!("unexpected profile refusal: {error}")
+                }
+                Ok(_) => panic!("an undecodable audit key must refuse rotation"),
+            };
+            assert_eq!(error.code(), "internal.unexpected_state");
+            let message = error.message();
+            assert!(message.contains(sub_code), "{message}");
+            assert!(
+                message.contains(&format!(
+                    "investigate; if the stored audit key is corrupt, remove its keyring entry \
+                     with the platform keyring tool, run `stellar-agent profile \
+                     rotate-audit-key {name}` to mint a new key, and run `stellar-agent audit \
+                     reanchor --profile {name} --acknowledge-rollback` if the log's anchor is \
+                     gone"
+                )),
+                "{message}"
+            );
+            assert_eq!(
+                entry.get_password().expect("the stored value survives"),
+                stored,
+                "no audit key replaces the undecodable one"
+            );
+            assert!(binding_raw(name).is_none(), "no binding is recorded");
+            assert_eq!(
+                std::fs::read(&profile.audit_log_path).expect("read log after refusal"),
+                log_before,
+                "the log is byte-identical"
+            );
+            assert_eq!(
+                KeyringTipAnchorStore::new(entry_ref, &profile.audit_log_path)
+                    .load_raw()
+                    .expect("read anchor"),
+                None,
+                "no anchor is recorded"
+            );
+        }
     }
 
     /// A changed binding refuses before the writer opens: nothing is created
@@ -989,5 +1254,84 @@ mod tests {
             "a rotation over an equal binding succeeds"
         );
         assert!(binding_raw(name) == Some(recorded), "byte-identical");
+    }
+
+    /// A profile minting its first key adopts a log written only by unkeyed
+    /// writers, even with its binding already recorded: a profile with no key
+    /// has had no keyed use of its log. The adopted log then opens under the
+    /// keyed path.
+    #[tokio::test]
+    #[serial]
+    async fn the_first_key_adopts_a_quickstart_log_under_a_recorded_binding() {
+        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
+        use stellar_agent_test_support::keyring_mock;
+
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let name = "rotate-quickstart";
+        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct")
+            .with_profile_name(name)
+            .build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        {
+            let mut writer =
+                AuditWriter::open(profile.audit_log_path.clone(), None).expect("unkeyed writer");
+            for request_id in ["req-quickstart-1", "req-quickstart-2"] {
+                writer
+                    .write_entry(AuditEntry::new_value_action_submitted(
+                        "stellar_pay",
+                        "stellar:testnet",
+                        Vec::new(),
+                        "abcd1234…wxyz5678",
+                        7,
+                        PolicyDecision::Allow,
+                        None,
+                        None,
+                        None,
+                        request_id,
+                        None,
+                    ))
+                    .expect("append");
+            }
+        }
+        stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile(name)
+            .store(&stellar_agent_core::audit_log::AuditBinding::for_profile(
+                &profile,
+            ))
+            .expect("record the binding");
+
+        let args = RotateAuditKeyArgs {
+            name: Some(name.to_owned()),
+            profile: None,
+        };
+        let cloned_profile = profile.clone();
+        match rotate(&args, move |_name| Ok(cloned_profile.clone()), || Ok(())).await {
+            Ok(_) => {}
+            Err(RotateRefusal::Wallet(error)) => {
+                panic!("the first key must adopt a quickstart log: {error}")
+            }
+            Err(RotateRefusal::ProfileAccess(error)) => panic!("profile access refused: {error}"),
+        }
+        let adopted = std::fs::read_to_string(&profile.audit_log_path)
+            .expect("read the log")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).expect("JSON row");
+                row["kind"] == "audit_tip_anchored" && row["reason"] == "adopted"
+            })
+            .count();
+        assert_eq!(adopted, 1, "the first key adopts the log once");
+
+        let access = stellar_agent_network::keyring::keyed_audit_access(
+            &profile,
+            name,
+            BindingCheck::Enforce,
+        )
+        .expect("keyed access");
+        drop(
+            AuditWriter::open(profile.audit_log_path.clone(), Some(access))
+                .expect("the adopted log opens under the keyed path"),
+        );
     }
 }

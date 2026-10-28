@@ -134,7 +134,9 @@ pub mod tip_anchor;
 pub mod verify;
 pub mod writer;
 
-pub use binding::{AuditBinding, AuditBindingParseError, BindingCheck, RecordedBinding};
+pub use binding::{
+    AuditBinding, AuditBindingParseError, BindingCheck, BindingHistory, RecordedBinding,
+};
 pub use entry::{AuditEntry, NewToolInvocation};
 pub use health::{AuditWriterHealth, AuditWriterHealthHandle};
 pub use outbox::{AuditOutbox, OutboxInspection, drain_lock_is_held, inspect_outbox};
@@ -153,13 +155,13 @@ pub use signer_set::{
     format_digest_first8_last8, signer_pubkey_canonical_body,
 };
 pub use tip_anchor::{
-    KeyedAuditAccess, TipAnchor, TipAnchorParseError, TipAnchorStore, TipAnchorStoreError,
-    log_path_sha256, reanchor_count_account, reanchor_count_account_for_digest, tip_anchor_account,
-    tip_anchor_account_for_digest,
+    KeyedAuditAccess, PriorAnchoring, TipAnchor, TipAnchorParseError, TipAnchorStore,
+    TipAnchorStoreError, log_path_sha256, reanchor_count_account,
+    reanchor_count_account_for_digest, tip_anchor_account, tip_anchor_account_for_digest,
 };
 pub use verify::{
     FileVerifyResult, PartialRotationState, VerifiedTip, VerifyError, VerifyOk, VerifyWarning,
-    check_anchor_against_walk, stored_anchor_disagrees_with_walk, verify_log,
+    check_anchor_against_walk, check_missing_anchor, stored_anchor_disagrees_with_walk, verify_log,
 };
 pub use writer::{
     AuditWriter, AuditWriterRegistry, ReanchorAcknowledgement, ReanchorReport, StoredTipAnchor,

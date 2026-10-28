@@ -2,8 +2,10 @@
 //! with the profile's keyring-held tip anchor, was verified and drained, and
 //! that the anchor covers its tip.
 //!
-//! [`audit_readiness`] is the only producer. It loads the profile's audit
-//! key and anchor store through [`crate::keyring::keyed_audit_access`],
+//! [`audit_readiness`] is the only producer. It refuses a process on a
+//! headless keyring backend through [`refuse_headless_keyring_backend`], then
+//! loads the profile's audit key and anchor store through
+//! [`crate::keyring::keyed_audit_access`],
 //! acquires the writer from the process registry under the profile's own
 //! name, and checks its keyring-backed anchor store and path under the same
 //! lock as its verified facts. Provenance belongs to the writer itself.
@@ -63,13 +65,13 @@ use stellar_agent_core::audit_log::writer::VerifiedTipFacts;
 use stellar_agent_core::audit_log::{
     AuditWriterRegistry, BindingCheck, TipAnchorStore, audit_writer_refusal,
 };
-use stellar_agent_core::error::{ValidationError, WalletError};
+use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
 use stellar_agent_core::mainnet::fact::{FACT_LABEL_AUDIT, FactDigest};
 use stellar_agent_core::profile::schema::Profile;
 
 use super::refusal::{MainnetAuthorizationError, MainnetPrecondition};
 use super::types::AuditFacts;
-use crate::keyring::KeyringTipAnchorStore;
+use crate::keyring::{KeyringBackend, KeyringTipAnchorStore, active_keyring_backend};
 use crate::submission_record::AuditWriterHandle;
 
 /// Proof that the profile's keyring-anchored audit writer was verified and
@@ -306,9 +308,36 @@ fn refuse_unless_covered(profile_name: &str, facts: &VerifiedTipFacts) -> Result
     }
 }
 
+/// Refuses a process whose keyring backend is not the platform keyring.
+///
+/// The tip anchor proves an audit log was not rolled back only while the
+/// anchor cannot be rolled back with it. A headless backend keeps every entry
+/// in one file on the same host with no generation or freshness witness, so
+/// restoring an older copy of that file together with a truncated log makes
+/// the two agree. Mainnet readiness and `profile enable-mainnet` call this;
+/// testnet paths do not.
+///
+/// # Errors
+///
+/// [`NetworkError::MainnetKeyringBackendUnsupported`] naming the backend, for
+/// any backend other than [`KeyringBackend::Platform`] as
+/// [`active_keyring_backend`] reports it.
+pub fn refuse_headless_keyring_backend() -> Result<(), WalletError> {
+    match active_keyring_backend() {
+        KeyringBackend::Platform => Ok(()),
+        backend => Err(WalletError::Network(
+            NetworkError::MainnetKeyringBackendUnsupported {
+                backend: backend.label(),
+            },
+        )),
+    }
+}
+
 /// Verifies `profile`'s keyed audit writer as `profile_name` and returns
 /// the proof.
 ///
+/// Refuses a headless keyring backend first, through
+/// [`refuse_headless_keyring_backend`], before any keyring entry is read.
 /// Checks the audit binding and loads the key and the keyring-backed anchor
 /// store, acquires the writer from the registry under `profile_name`,
 /// locks the writer, requires its anchor store to be the keyring-backed store
@@ -318,6 +347,8 @@ fn refuse_unless_covered(profile_name: &str, facts: &VerifiedTipFacts) -> Result
 ///
 /// # Errors
 ///
+/// - [`NetworkError::MainnetKeyringBackendUnsupported`] on a headless keyring
+///   backend.
 /// - The errors of [`crate::keyring::keyed_audit_access`].
 /// - The audit refusal of a writer that cannot be acquired or verified, as
 ///   [`audit_writer_refusal`] maps it.
@@ -331,6 +362,7 @@ pub fn audit_readiness(
     profile: &Profile,
     profile_name: &str,
 ) -> Result<AuditReadiness, WalletError> {
+    refuse_headless_keyring_backend()?;
     let access = crate::keyring::keyed_audit_access(profile, profile_name, BindingCheck::Enforce)?;
     let expected = KeyringTipAnchorStore::new(
         &profile.audit_log_hash_chain_key_id,
@@ -458,6 +490,47 @@ mod tests {
         assert_eq!(second.fact_digest(), independent);
     }
 
+    /// A process whose default keyring store is the headless file store is
+    /// refused with the backend named, before the binding is read or the
+    /// writer opens.
+    #[test]
+    #[serial]
+    fn a_headless_keyring_backend_refuses_mainnet_readiness() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "readiness-headless";
+        let profile = profile(dir.path(), name);
+        keyring_core::set_default_store(Arc::new(
+            stellar_agent_headless_keyring::store::HeadlessStore::new(
+                dir.path().join("store.keyring"),
+                stellar_agent_headless_keyring::crypto::ProtectionMode::EnvKey(Arc::new(
+                    zeroize::Zeroizing::new([0x41; 32]),
+                )),
+            ),
+        ));
+
+        let err = audit_readiness(&profile, name)
+            .expect_err("a headless backend must refuse mainnet readiness");
+        keyring_mock::install().unwrap();
+        assert_eq!(err.code(), "network.mainnet_keyring_backend_unsupported");
+        assert!(err.to_string().contains("headless-env"), "{err}");
+        assert!(
+            !profile.audit_log_path.exists(),
+            "the refusal comes before the writer opens"
+        );
+        assert!(
+            crate::keyring::read_keyring_string(
+                &stellar_agent_core::profile::schema::KeyringEntryRef::default_audit_binding(name)
+            )
+            .unwrap()
+            .is_none(),
+            "the refusal comes before the binding is recorded"
+        );
+        let key = &profile.audit_log_hash_chain_key_id;
+        crate::keyring::rotate_keyring_secret_32(&key.service, &key.account).unwrap();
+        audit_readiness(&profile, name).expect("the platform keyring is accepted");
+    }
+
     /// A writer this process first opened with an injected anchor store, at
     /// the profile's own path and with its own key, never yields the proof:
     /// the cache is primed before the authentic acquisition, which then gets
@@ -563,6 +636,7 @@ mod tests {
             dir.path().join("injected.jsonl"),
             None,
             Arc::new(InMemoryTipAnchorStore::new()),
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
         .unwrap();
         let original = std::mem::replace(&mut *proof.writer().lock().unwrap(), replacement);
@@ -588,6 +662,7 @@ mod tests {
             profile.audit_log_path.clone(),
             None,
             Arc::new(InMemoryTipAnchorStore::new()),
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
         .unwrap();
         let old = std::mem::replace(&mut *proof.writer().lock().unwrap(), replacement);
@@ -619,6 +694,7 @@ mod tests {
             dir.path().join("other.jsonl"),
             None,
             Arc::new(proof.expected.clone()),
+            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
         .unwrap();
         let old = std::mem::replace(&mut *proof.writer().lock().unwrap(), replacement);

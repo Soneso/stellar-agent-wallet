@@ -1255,9 +1255,12 @@ pub enum ValidationError {
     /// `stellar-agent profile init` mints the audit-log keyring-coordinate
     /// REFERENCE only — no key material — so an init-minted profile has no
     /// audit chain-root key until `stellar-agent profile rotate-audit-key`
-    /// mints one. This is the fail-closed pre-flight: the verb proves the
-    /// audit writer is acquirable BEFORE any signing key is touched or
-    /// transaction submitted, refusing here instead of proceeding unaudited.
+    /// mints one. A stored key that cannot be read or decoded is refused by
+    /// that verb too, so the message names minting for a missing key only and
+    /// sends every other cause to investigation. This is the fail-closed
+    /// pre-flight: the verb proves the audit writer is acquirable BEFORE any
+    /// signing key is touched or transaction submitted, refusing here instead
+    /// of proceeding unaudited.
     ///
     /// Distinct from [`ValidationError::AuditLogNotFound`]: that variant is
     /// `stellar-agent audit verify` finding no log file to verify (a read-path
@@ -1271,8 +1274,11 @@ pub enum ValidationError {
     ///
     /// `"audit.chain_key_unavailable"`.
     #[error(
-        "profile '{profile}' has no audit chain-root key available; the command refuses to \
-         proceed unaudited: run `stellar-agent profile rotate-audit-key {profile}` to mint one"
+        "profile '{profile}' has no usable audit chain-root key; the command refuses to proceed \
+         unaudited. A profile without one mints it with `stellar-agent profile rotate-audit-key \
+         {profile}`. A stored key that cannot be read or decoded is refused by that command \
+         too: investigate, and if the stored key is corrupt, remove its keyring entry with the \
+         platform keyring tool before minting a new one"
     )]
     AuditChainKeyUnavailable {
         /// The profile name whose audit chain-root key is unavailable.
@@ -1353,6 +1359,36 @@ pub enum ValidationError {
         /// rename need different things looked at, and the operator only ever
         /// sees the envelope. The wire code stays the same for both.
         reason: String,
+    },
+
+    /// A verb that writes audit rows refused because no tip anchor is stored
+    /// for the profile's audit log while the log shows one was.
+    ///
+    /// The evidence is a fact that outlives the anchor: an audit binding
+    /// recorded before this use, a chain-root sidecar on the active log file,
+    /// or an `audit_tip_anchored` row in it. Deleting the anchor and truncating
+    /// the log would otherwise be adopted as a fresh log, and the removed rows
+    /// would leave no trace. A log written only by unkeyed writers carries none
+    /// of these facts and is adopted on its first keyed use.
+    ///
+    /// Recovery requires establishing why the anchor is gone, then
+    /// `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`.
+    ///
+    /// # Wire code
+    ///
+    /// `"audit.tip_anchor_missing"`.
+    #[error(
+        "profile '{profile}' has an audit log with no tip anchor stored for it, although \
+         {evidence}; the command refuses to proceed against a log whose anchor was removed. \
+         Investigate, then run \
+         `stellar-agent audit reanchor --profile {profile} --acknowledge-rollback` to accept \
+         the current tip"
+    )]
+    AuditTipAnchorMissing {
+        /// The profile name whose audit log has no anchor.
+        profile: String,
+        /// What shows the log was anchored before, in the writer's own words.
+        evidence: String,
     },
 
     /// A verb that writes audit rows refused because the profile's audit log
@@ -1762,6 +1798,9 @@ impl ValidationError {
             // Audit taxonomy code on a validation-class variant: see
             // `AuditLogNotFound` above for the same rationale.
             Self::AuditTipAnchorMismatch { .. } => "audit.tip_anchor_mismatch",
+            // Audit taxonomy code on a validation-class variant: see
+            // `AuditLogNotFound` above for the same rationale.
+            Self::AuditTipAnchorMissing { .. } => "audit.tip_anchor_missing",
             // Same wire code as the two variants above by design — see this
             // variant's doc comment for why the code stays unified while the
             // remedy in the message differs.
@@ -1900,6 +1939,27 @@ pub enum NetworkError {
     /// writes reports before any authorization exists.
     #[error("the mainnet write was refused before submission; nothing was sent")]
     MainnetAuthorizationRefused,
+
+    /// The process uses a headless keyring backend, and mainnet needs a
+    /// platform keyring.
+    ///
+    /// A headless backend keeps every keyring entry, the audit tip anchor
+    /// among them, in one file on the same host with no generation or
+    /// freshness witness. Restoring an older copy of that file together with a
+    /// truncated audit log makes the two agree again, so the anchor cannot
+    /// prove the log was not rolled back. Mainnet readiness and
+    /// `profile enable-mainnet` refuse such a process. Testnet use of the
+    /// headless backends is unaffected.
+    #[error(
+        "mainnet needs a platform keyring; this process uses the {backend} keyring backend \
+         (STELLAR_AGENT_KEYRING_BACKEND), which serves testnet only. Unset \
+         STELLAR_AGENT_KEYRING_BACKEND and run with the platform keyring"
+    )]
+    MainnetKeyringBackendUnsupported {
+        /// The selected backend: `headless-env`, `headless-dpapi`, or
+        /// `unrecognized` for a value that names neither.
+        backend: &'static str,
+    },
 
     /// The Horizon API returned an unexpected HTTP status code.
     ///
@@ -2299,6 +2359,9 @@ impl NetworkError {
             Self::AccountNotFound { .. } => "network.account_not_found",
             Self::MainnetWriteForbidden => "network.mainnet_write_forbidden",
             Self::MainnetAuthorizationRefused => "network.mainnet_authorization_refused",
+            Self::MainnetKeyringBackendUnsupported { .. } => {
+                "network.mainnet_keyring_backend_unsupported"
+            }
             Self::HorizonUnavailable { .. } => "network.horizon_unavailable",
             Self::RpcResponseMalformed { .. } => "network.rpc_response_malformed",
             Self::RpcDivergence { .. } => "network.rpc_divergence",
@@ -3516,6 +3579,13 @@ mod tests {
                 "audit.tip_anchor_mismatch",
             ),
             (
+                ValidationError::AuditTipAnchorMissing {
+                    profile: "default".to_owned(),
+                    evidence: "an audit binding is recorded for the profile".to_owned(),
+                },
+                "audit.tip_anchor_missing",
+            ),
+            (
                 ValidationError::AuditLogUnusable {
                     profile: "default".to_owned(),
                     detail: "audit.writer_locked: the lock is held".to_owned(),
@@ -3777,6 +3847,12 @@ mod tests {
                         reason: reason.clone(),
                     }
                 }
+                ValidationError::AuditTipAnchorMissing { profile, evidence } => {
+                    ValidationError::AuditTipAnchorMissing {
+                        profile: profile.clone(),
+                        evidence: evidence.clone(),
+                    }
+                }
                 ValidationError::AuditLogUnusable { profile, detail } => {
                     ValidationError::AuditLogUnusable {
                         profile: profile.clone(),
@@ -4013,6 +4089,12 @@ mod tests {
             (
                 NetworkError::MainnetAuthorizationRefused,
                 "network.mainnet_authorization_refused",
+            ),
+            (
+                NetworkError::MainnetKeyringBackendUnsupported {
+                    backend: "headless-env",
+                },
+                "network.mainnet_keyring_backend_unsupported",
             ),
             (
                 NetworkError::HorizonUnavailable { status: 503 },

@@ -22,6 +22,13 @@
 //! nothing.  Every other case reports `anchor.status = "not_checked"` with the
 //! reason, and the hash chain is still fully verified.
 //!
+//! When the path is the profile's and no anchor is stored, the log must show it
+//! was never anchored. An audit binding recorded for the profile, a chain-root
+//! sidecar on the active file, or an `audit_tip_anchored` row in it shows it
+//! was, and the verify exits 1 with `audit.tip_anchor_missing`
+//! (`anchor: missing`). A log with none of these reports the anchor as
+//! `not_checked`.
+//!
 //! # Audit binding
 //!
 //! With `--profile <name>`, the profile's audit binding is read from the
@@ -49,11 +56,14 @@ use serde::{Deserialize, Serialize};
 use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::{
     audit_log::{
-        BindingCheck,
+        BindingCheck, BindingHistory,
         health::AuditWriterHealth,
         outbox::inspect_outbox,
         tip_anchor::{TipAnchor, TipAnchorStore as _, normalize_path_lexically},
-        verify::{FileVerifyResult, VerifyError, VerifyWarning, verify_log_with_health},
+        verify::{
+            FileVerifyResult, VerifyError, VerifyWarning, check_missing_anchor,
+            verify_log_with_health,
+        },
     },
     envelope::{Envelope, OutputFormat},
     error::{InternalError, WalletError},
@@ -258,11 +268,27 @@ impl From<WalletError> for VerifyFailure {
 /// whether the tip anchor was checked and why — is reachable without capturing
 /// stdout.
 fn verify_to_result(args: &VerifyArgs) -> Result<AuditVerifyResult, VerifyFailure> {
+    let inputs = resolve_profile_inputs(args.profile.as_deref(), &args.log_path)?;
+    verify_resolved(&args.log_path, inputs)
+}
+
+/// Walks the log at `log_path` against resolved inputs and builds the result
+/// payload.
+///
+/// An absent anchor for the profile's own log is checked here, after an
+/// unkeyed walk and before the keyed walk: the evidence includes what the
+/// unkeyed walk read from the active file, and a missing anchor takes
+/// precedence over a missing or invalid HMAC sidecar.
+fn verify_resolved(
+    log_path: &std::path::Path,
+    inputs: ResolvedVerifyInputs,
+) -> Result<AuditVerifyResult, VerifyFailure> {
     let ResolvedVerifyInputs {
         hmac_key,
         anchor,
         anchor_skip_reason,
-    } = resolve_profile_inputs(args.profile.as_deref(), &args.log_path)?;
+        missing_anchor_binding,
+    } = inputs;
 
     // Create a fresh health instance — in the CLI context the health latch is
     // never marked degraded (health is a session property of the MCP server).
@@ -270,17 +296,20 @@ fn verify_to_result(args: &VerifyArgs) -> Result<AuditVerifyResult, VerifyFailur
     // with any future MCP-tool caller that has access to a live handle.
     let health = AuditWriterHealth::new();
     let handle = health.handle();
-    let ok_with_health = verify_log_with_health(
-        &args.log_path,
-        hmac_key.as_deref(),
-        anchor.as_ref(),
-        &handle,
-    )
-    .map_err(|err| verify_failure(&err))?;
+    if let Some(binding) = missing_anchor_binding {
+        // Anchor evidence takes precedence over a missing or invalid HMAC sidecar.
+        let walked = verify_log_with_health(log_path, None, None, &handle)
+            .map_err(|err| verify_failure(&err))?;
+        check_missing_anchor(log_path, binding, walked.verify_ok.active_tip.as_ref())
+            .map_err(|err| verify_failure(&err))?;
+    }
+    let ok_with_health =
+        verify_log_with_health(log_path, hmac_key.as_deref(), anchor.as_ref(), &handle)
+            .map_err(|err| verify_failure(&err))?;
 
     let ok = ok_with_health.verify_ok;
     let mut warnings = ok.warnings;
-    let outbox_pending = inspect_outbox_into(&args.log_path, &mut warnings);
+    let outbox_pending = inspect_outbox_into(log_path, &mut warnings);
     Ok(AuditVerifyResult {
         entries_verified: ok.entries_verified,
         files_walked: ok.files_walked,
@@ -338,6 +367,10 @@ struct ResolvedVerifyInputs {
     anchor: Option<TipAnchor>,
     /// Why the anchor was not checked.  `None` means it was.
     anchor_skip_reason: Option<String>,
+    /// The profile's binding history, when the path is the profile's and no
+    /// anchor is stored for it: the walk must then show the log was never
+    /// anchored.
+    missing_anchor_binding: Option<BindingHistory>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -346,8 +379,9 @@ struct ResolvedVerifyInputs {
 ///
 /// The anchor names a PATH, so it is loaded only when `log_path` is the very
 /// file the profile configures; a path that differs is verified as a plain chain
-/// walk and the reason is reported. An absent anchor is likewise a reason, not a
-/// failure: a log whose first keyed use has not happened yet has none.
+/// walk and the reason is reported. An absent anchor is a reason, not a
+/// failure, for a log whose first keyed use has not happened yet; the walk
+/// refuses it for a log that shows it was anchored before.
 fn resolve_profile_inputs(
     profile_name: Option<&str>,
     log_path: &std::path::Path,
@@ -359,6 +393,7 @@ fn resolve_profile_inputs(
             anchor_skip_reason: Some(
                 "no --profile supplied; the tip anchor is held per profile".to_owned(),
             ),
+            missing_anchor_binding: None,
         });
     };
     let resolved = ResolvedProfileName::from_flag(profile_name);
@@ -375,13 +410,15 @@ fn resolve_profile_inputs(
 ///
 /// The profile's audit binding is read first and never written: a record that
 /// differs or does not parse refuses with `audit.log_binding_changed`, an
-/// absent or equal one proceeds, and a read error fails closed.
+/// absent or equal one proceeds, and a read error fails closed. Whether it was
+/// recorded is kept for an absent anchor, which the walk then checks against
+/// [`check_missing_anchor`].
 fn resolve_profile_inputs_with_profile(
     profile: &Profile,
     profile_name: &str,
     log_path: &std::path::Path,
 ) -> Result<ResolvedVerifyInputs, WalletError> {
-    check_audit_binding(profile, profile_name, BindingCheck::CheckOnly)?;
+    let binding = check_audit_binding(profile, profile_name, BindingCheck::CheckOnly)?;
     let hmac_key = Some(load_audit_hmac_key(profile, profile_name)?);
 
     if normalize_path_lexically(log_path) != normalize_path_lexically(&profile.audit_log_path) {
@@ -392,6 +429,7 @@ fn resolve_profile_inputs_with_profile(
                 "the supplied log path is not the audit log profile '{profile_name}' \
                  configures; the tip anchor names a path, not a profile"
             )),
+            missing_anchor_binding: None,
         });
     }
 
@@ -401,6 +439,7 @@ fn resolve_profile_inputs_with_profile(
             hmac_key,
             anchor: Some(anchor),
             anchor_skip_reason: None,
+            missing_anchor_binding: None,
         }),
         Ok(None) => Ok(ResolvedVerifyInputs {
             hmac_key,
@@ -410,6 +449,7 @@ fn resolve_profile_inputs_with_profile(
                  next value-moving verb"
                     .to_owned(),
             ),
+            missing_anchor_binding: Some(binding),
         }),
         Err(e) => Err(WalletError::Internal(InternalError::UnexpectedState {
             detail: format!("audit.tip_anchor_unavailable: {e}"),
@@ -977,6 +1017,14 @@ mod tests {
                 },
                 "audit.tip_anchor_mismatch",
             ),
+            (
+                VerifyError::TipAnchorMissing {
+                    evidence: stellar_agent_core::audit_log::PriorAnchoring::BindingRecorded,
+                    actual_count: 1,
+                    actual_offset: 10,
+                },
+                "audit.tip_anchor_missing",
+            ),
         ];
         for (err, expected_code) in cases {
             match verify_failure(&err) {
@@ -1173,6 +1221,133 @@ mod tests {
                 .expect("a skipped check must say why")
                 .contains("no tip anchor")
         );
+    }
+
+    /// Resolves `profile`'s inputs for its own log and walks it, as
+    /// `audit verify --profile` does.
+    fn verify_profile_log(
+        profile: &Profile,
+        name: &str,
+    ) -> Result<AuditVerifyResult, VerifyFailure> {
+        let inputs = resolve_profile_inputs_with_profile(profile, name, &profile.audit_log_path)?;
+        verify_resolved(&profile.audit_log_path, inputs)
+    }
+
+    /// Keeps the first `entries` lines of the log at `path`.
+    fn truncate_to_entries(path: &std::path::Path, entries: usize) {
+        let content = std::fs::read_to_string(path).unwrap();
+        let kept: String = content.split_inclusive('\n').take(entries).collect();
+        std::fs::write(path, kept).unwrap();
+    }
+
+    /// A profile whose audit key is minted and whose log holds `entries` rows
+    /// written under that key, so every file carries a verifying chain-root
+    /// sidecar, with no tip anchor stored.
+    fn keyed_unanchored_profile(name: &str, dir: &std::path::Path, entries: usize) -> Profile {
+        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = dir.join("audit.jsonl");
+        let coord = profile.audit_log_hash_chain_key_id.clone();
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&coord.service, &coord.account)
+            .expect("seed audit key");
+        let key = load_audit_hmac_key(&profile, name).expect("load audit key");
+        make_writer_and_entries(profile.audit_log_path.clone(), entries, Some(&key));
+        profile
+    }
+
+    /// The profile's binding is recorded, so a keyed use reached its log, and
+    /// the anchor that use left is gone while the log is truncated. Verify
+    /// exits with `audit.tip_anchor_missing` and says `anchor: missing`.
+    #[test]
+    #[serial]
+    fn verify_fails_with_anchor_missing_under_a_recorded_binding() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = TempDir::new().unwrap();
+        let profile = keyed_unanchored_profile("verify-missing", dir.path(), 3);
+        truncate_to_entries(&profile.audit_log_path, 2);
+        stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile("verify-missing")
+            .store(&stellar_agent_core::audit_log::AuditBinding::for_profile(
+                &profile,
+            ))
+            .expect("record the binding");
+
+        let Err(VerifyFailure::Raw { code, message }) =
+            verify_profile_log(&profile, "verify-missing")
+        else {
+            panic!("a missing anchor under a recorded binding must fail verify");
+        };
+        assert_eq!(code, "audit.tip_anchor_missing");
+        assert!(message.contains("anchor: missing"), "{message}");
+        assert!(message.contains("audit binding is recorded"), "{message}");
+        assert!(message.contains("2 entries"), "{message}");
+    }
+
+    #[test]
+    #[serial]
+    fn verify_reports_missing_anchor_before_missing_hmac_sidecar() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = TempDir::new().unwrap();
+        let name = "verify-binding-only";
+        let profile = keyed_unanchored_profile(name, dir.path(), 2);
+        stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile(name)
+            .store(&stellar_agent_core::audit_log::AuditBinding::for_profile(
+                &profile,
+            ))
+            .unwrap();
+        std::fs::remove_file(profile.audit_log_path.with_extension("jsonl.root_hmac")).unwrap();
+        let bytes = std::fs::read(&profile.audit_log_path).unwrap();
+        let Err(VerifyFailure::Raw { code, message }) = verify_profile_log(&profile, name) else {
+            panic!("a recorded binding alone must report the missing anchor");
+        };
+        assert_eq!(code, "audit.tip_anchor_missing");
+        assert!(message.contains("anchor: missing"), "{message}");
+        assert_eq!(std::fs::read(&profile.audit_log_path).unwrap(), bytes);
+    }
+
+    /// With no binding recorded, the chain-root sidecar alone shows a keyed
+    /// writer wrote the log, and a missing anchor fails verify the same way.
+    #[test]
+    #[serial]
+    fn verify_fails_with_anchor_missing_when_the_sidecar_shows_a_keyed_writer() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = TempDir::new().unwrap();
+        let profile = keyed_unanchored_profile("verify-sidecar", dir.path(), 2);
+
+        let Err(VerifyFailure::Raw { code, message }) =
+            verify_profile_log(&profile, "verify-sidecar")
+        else {
+            panic!("a missing anchor with a chain-root sidecar must fail verify");
+        };
+        assert_eq!(code, "audit.tip_anchor_missing");
+        assert!(message.contains("anchor: missing"), "{message}");
+        assert!(message.contains("chain-root sidecar"), "{message}");
+    }
+
+    /// Regression guard: an unanchored quickstart log, written only by
+    /// unkeyed writers and with no binding recorded, verifies as it does
+    /// without the missing-anchor check. Without `--profile` the chain walk
+    /// passes with the anchor not checked; with `--profile` the walk reports
+    /// the missing chain-root sidecar, never a missing anchor.
+    #[test]
+    #[serial]
+    fn an_unanchored_quickstart_log_verifies_as_without_the_anchor_check() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = TempDir::new().unwrap();
+        let profile = binding_profile("verify-quickstart", dir.path());
+
+        let plain = verify_resolved(
+            &profile.audit_log_path,
+            resolve_profile_inputs(None, &profile.audit_log_path).expect("no profile"),
+        )
+        .expect("the chain walk passes");
+        assert_eq!(plain.entries_verified, 1);
+        assert_eq!(plain.anchor.status, "not_checked");
+
+        let Err(VerifyFailure::Raw { code, .. }) =
+            verify_profile_log(&profile, "verify-quickstart")
+        else {
+            panic!("an unkeyed log has no chain-root sidecar to verify under the profile key");
+        };
+        assert_eq!(code, "audit.hmac_sidecar_missing");
     }
 
     /// A profile whose audit key is minted and whose log holds one entry.

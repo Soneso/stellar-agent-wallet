@@ -157,6 +157,21 @@ pub fn requested_backend() -> Option<String> {
     std::env::var(BACKEND_ENV_VAR).ok()
 }
 
+/// Returns the backend label of the process-default keyring store when it is a
+/// [`HeadlessStore`], or `None` for any other store or none.
+///
+/// The label is `"headless-env"` or `"headless-dpapi"`. This reads the store
+/// that is registered, not the environment, so it answers for a store that
+/// [`init_headless_store`] registered even after [`BACKEND_ENV_VAR`] changed.
+#[must_use]
+pub fn registered_backend() -> Option<&'static str> {
+    let store = keyring_core::get_default_store()?;
+    store
+        .as_any()
+        .downcast_ref::<HeadlessStore>()
+        .map(HeadlessStore::backend_label)
+}
+
 /// Registers the headless keyring store as the process default, per
 /// [`BACKEND_ENV_VAR`]'s value.
 ///

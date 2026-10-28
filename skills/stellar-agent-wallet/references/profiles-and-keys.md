@@ -555,6 +555,11 @@ with `auth.keyring_config_invalid` rather than switching stores. In `headless-en
 environment key is the custody boundary: whoever can read the process
 environment can decrypt the store, so scope it to the service user.
 
+The headless backends serve testnet only. Mainnet readiness and `profile
+enable-mainnet` refuse them with `network.mainnet_keyring_backend_unsupported`:
+the store keeps the audit log's tip anchor in one file with no freshness
+witness, so a restored older copy of it agrees with a truncated log.
+
 A profile migrated from schema v1 stays on the `noop` engine until the operator
 completes key rotation and opts in to `v1`. Migration populates the four
 security-key reference names but mints no key material; the rotation commands

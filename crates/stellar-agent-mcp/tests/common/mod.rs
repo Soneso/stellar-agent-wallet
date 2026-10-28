@@ -1,7 +1,7 @@
 pub mod policy_mock;
 pub mod v1_engine_mock;
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use rmcp::model::CallToolResult;
 use stellar_agent_test_support::signed_envelope::{TESTNET_PASSPHRASE, get_network_result};
@@ -68,18 +68,25 @@ impl EndpointNetwork {
 /// choice) breaks `AuditWriterRegistry`'s process-lifetime cache.
 const TEST_AUDIT_KEY_BYTES: [u8; 32] = [0x37_u8; 32];
 
-/// Per-process temp directory backing every `install_test_audit_key` call in
-/// a test binary — created once, reused by every test. As a `static`, this
-/// value is never dropped at process exit (Rust does not run destructors on
-/// statics), so the directory is NOT deleted by this binding; it is left for
-/// the OS temp-directory cleanup policy, same as any other leaked tempdir.
-static TEST_AUDIT_LOG_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+/// The audit log directories `install_test_audit_key` has handed out, each
+/// with the keyring store it was handed out under, the current one last.
+///
+/// One directory serves one keyring store: a test that installs a fresh mock
+/// store gets a fresh directory, and every later call under that store reuses
+/// it, also after the test deletes the audit key from it. Holding the store
+/// keeps its address from being reused by a later store. Earlier directories
+/// stay alive for the process, so a writer a finished test still references
+/// never loses its file. As a `static`, the list is never dropped, and the
+/// directories are left for the OS temp-directory cleanup policy.
+static TEST_AUDIT_LOG_DIRS: Mutex<Vec<(Arc<keyring_core::CredentialStore>, tempfile::TempDir)>> =
+    Mutex::new(Vec::new());
 
-/// Redirects `profile.audit_log_path` to a per-process temp directory and
-/// seeds a fixed 32-byte audit chain-root HMAC key at the profile's
-/// `audit_log_hash_chain_key_id` keyring coordinate, under the process-global
-/// mock keyring store (`stellar_agent_test_support::keyring_mock::install`
-/// must already be installed by the caller).
+/// Redirects `profile.audit_log_path` into the audit log directory of the
+/// current mock keyring and seeds a fixed 32-byte audit chain-root HMAC key at
+/// the profile's `audit_log_hash_chain_key_id` keyring coordinate, under the
+/// process-global mock keyring store
+/// (`stellar_agent_test_support::keyring_mock::install` must already be
+/// installed by the caller).
 ///
 /// Every full commit/submit round-trip test needs this: `require_value_audit_writer`
 /// refuses BEFORE the signer is loaded or the transaction is submitted unless
@@ -87,25 +94,24 @@ static TEST_AUDIT_LOG_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 /// `install_test_nonce_key`'s per-test seeding pattern for the nonce mint's
 /// HMAC key.
 ///
-/// # Why a FIXED path and a FIXED key, not a fresh tempdir/random key per test
+/// # One log per keyring, a fixed key
 ///
-/// `AuditWriterRegistry` is a process-global cache keyed by profile name
-/// (`stellar-agent-core::audit_log::writer`): the FIRST call for a given
-/// profile name in this test binary's process pins the `(log_path, hmac_key)`
-/// pair for every later call with that same profile name — a later call
-/// presenting a different path or key fails closed
-/// (`WriterError::PathMismatch` / `HmacKeyMismatch`), which this crate's
-/// `require_value_audit_writer` maps to the SAME `audit.chain_key_unavailable`
-/// refusal as a genuinely-missing key. Since every test built on
-/// `testnet_profile_with_rpc`-style helpers shares the same signer account
-/// (hence the same profile name), every test in one binary that reaches the
-/// audit pre-flight MUST present the identical path and key regardless of
-/// which test happens to run first under `#[serial]` — a per-test tempdir or
-/// random key reproduces the exact registry collision this function exists to
-/// avoid. Redirecting to a temp directory (rather than the real
-/// `canonical_data_root()` default, which `default_audit_log_path_for` does
-/// NOT gate behind `STELLAR_AGENT_HOME`) also keeps these tests from writing a
-/// real file under the developer's or CI runner's actual home directory.
+/// The keyring holds a log's tip anchor and audit binding beside its key, and
+/// the platform keyring keeps them for as long as the log exists. A log that
+/// outlives the keyring entries describing it is a log whose anchor was
+/// deleted, which every keyed writer refuses with `audit.tip_anchor_missing`.
+/// So under a keyring store this function has not seen (the caller installed
+/// a fresh one) the profile gets a fresh log directory, and the process-global
+/// `AuditWriterRegistry` entry for its profile name is dropped, since that
+/// cache pins `(log_path, hmac_key)` per profile name and a later call
+/// presenting a different path fails closed (`WriterError::PathMismatch`).
+/// Under the same keyring the directory, and so the path, stays the same for
+/// every call. The key is fixed so a cached writer never sees a different
+/// fingerprint (`WriterError::HmacKeyMismatch`). Redirecting to a temp
+/// directory (rather than the real `canonical_data_root()` default, which
+/// `default_audit_log_path_for` does NOT gate behind `STELLAR_AGENT_HOME`)
+/// also keeps these tests from writing a real file under the developer's or
+/// CI runner's actual home directory.
 #[allow(
     dead_code,
     reason = "shared across integration-test binaries; unused in some"
@@ -113,11 +119,24 @@ static TEST_AUDIT_LOG_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 pub fn install_test_audit_key(profile: &mut stellar_agent_core::profile::schema::Profile) {
     use base64::Engine as _;
 
-    let dir =
-        TEST_AUDIT_LOG_DIR.get_or_init(|| tempfile::tempdir().expect("tempdir for audit log"));
+    let store = keyring_core::get_default_store().expect("a mock keyring store is installed");
+    let mut dirs = TEST_AUDIT_LOG_DIRS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let same_store = dirs
+        .last()
+        .is_some_and(|(current, _)| Arc::ptr_eq(current, &store));
+    if !same_store {
+        stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test(
+            &stellar_agent_core::profile::name::profile_name_for_approval(profile),
+        );
+        dirs.push((store, tempfile::tempdir().expect("tempdir for audit log")));
+    }
+    let (_, dir) = dirs.last().expect("a current audit log directory");
     profile.audit_log_path = dir
         .path()
         .join(format!("{}.jsonl", profile.mcp_signer_default.account));
+    drop(dirs);
 
     let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(TEST_AUDIT_KEY_BYTES);
     let coord = &profile.audit_log_hash_chain_key_id;

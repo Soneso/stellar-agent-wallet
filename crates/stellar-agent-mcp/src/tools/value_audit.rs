@@ -68,7 +68,7 @@ use stellar_agent_network::keyring::keyed_audit_access;
 ///
 /// # Errors
 ///
-/// Returns [`WalletError::Validation`] wrapping one of five variants, each
+/// Returns [`WalletError::Validation`] wrapping one of six variants, each
 /// with its own operator-facing remedy:
 /// - [`ValidationError::AuditChainKeyUnavailable`] (`audit.chain_key_unavailable`)
 ///   when the profile's audit chain-root HMAC key cannot be loaded from the
@@ -79,6 +79,10 @@ use stellar_agent_network::keyring::keyed_audit_access;
 ///   log was rolled back, truncated, or replaced. The registry runs that check
 ///   on EVERY keyed acquisition, because it caches one writer per profile for
 ///   the process lifetime.
+/// - [`ValidationError::AuditTipAnchorMissing`] (`audit.tip_anchor_missing`)
+///   when no anchor is stored for a log that shows it was anchored before: a
+///   recorded audit binding, a chain-root sidecar, or an `audit_tip_anchored`
+///   row.
 /// - [`ValidationError::AuditLogUnusable`] (`audit.chain_key_unavailable`) when
 ///   the writer refused on a condition about the log. Its detail leads with the
 ///   `audit.*` sub-code: for example `audit.writer_locked`,

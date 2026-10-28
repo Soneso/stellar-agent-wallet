@@ -112,10 +112,13 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use super::{
-    chain::{ZERO_BLOCK_HASH, decode_hash, sign_chain_root, verify_chain_root},
+    binding::BindingHistory,
+    chain::{ZERO_BLOCK_HASH, decode_hash, sign_chain_root},
     entry::AuditEntry,
-    schema::TipAnchorReason,
-    tip_anchor::{KeyedAuditAccess, TipAnchor, TipAnchorStore, TipAnchorStoreError},
+    schema::{EventKind, TipAnchorReason},
+    tip_anchor::{
+        KeyedAuditAccess, PriorAnchoring, TipAnchor, TipAnchorStore, TipAnchorStoreError,
+    },
 };
 use crate::timefmt::current_iso8601_utc;
 
@@ -275,6 +278,13 @@ pub struct AuditWriter {
     /// their appends land ahead of the anchor and the next keyed acquisition
     /// absorbs them.
     tip_anchor: Option<Arc<dyn TipAnchorStore>>,
+    /// Whether the profile's audit binding was recorded before this writer was
+    /// opened, as the opener established it.
+    ///
+    /// One of the facts [`PriorAnchoring::find`] weighs when no anchor is
+    /// stored: a recorded binding means a keyed use reached this log before,
+    /// so its anchor should be there.
+    binding: BindingHistory,
     /// Test-only fault seam for the write-entry durability invariant.
     #[cfg(test)]
     fail_after_entry_before_sidecar: bool,
@@ -319,8 +329,10 @@ pub struct AuditWriter {
 /// How [`AuditWriter::open`] treats an attached tip-anchor store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TipAnchorOpenMode {
-    /// Run the check, adopting an absent anchor and absorbing appends made
-    /// ahead of it. A rolled-back or truncated file is refused.
+    /// Run the check, adopting an absent anchor that nothing shows was ever
+    /// written and absorbing appends made ahead of it. A rolled-back or
+    /// truncated file is refused, and so is an absent anchor that
+    /// [`PriorAnchoring`] shows was written before.
     Check,
     /// Skip the check so a refused file can be opened for repair. Only
     /// [`AuditWriter::open_for_reanchor`] uses this; the caller must follow it
@@ -558,14 +570,21 @@ impl AuditWriter {
     /// - Every error of [`AuditWriter::drain_outbox`], when `access` is
     ///   supplied.
     pub fn open(path: PathBuf, access: Option<KeyedAuditAccess>) -> Result<Self, WriterError> {
-        let (hmac_key, tip_anchor) = match access {
+        let (hmac_key, tip_anchor, binding) = match access {
             Some(access) => {
+                let binding = access.binding_history();
                 let (key, store) = access.into_parts();
-                (Some(key), Some(store))
+                (Some(key), Some(store), binding)
             }
-            None => (None, None),
+            None => (None, None, BindingHistory::NotRecorded),
         };
-        Self::open_inner(path, hmac_key, tip_anchor, TipAnchorOpenMode::Check)
+        Self::open_inner(
+            path,
+            hmac_key,
+            tip_anchor,
+            binding,
+            TipAnchorOpenMode::Check,
+        )
     }
 
     /// Opens a KEYED writer with no anchor store — the shape a production
@@ -584,7 +603,13 @@ impl AuditWriter {
         path: PathBuf,
         hmac_key: Zeroizing<[u8; 32]>,
     ) -> Result<Self, WriterError> {
-        Self::open_inner(path, Some(hmac_key), None, TipAnchorOpenMode::Check)
+        Self::open_inner(
+            path,
+            Some(hmac_key),
+            None,
+            BindingHistory::NotRecorded,
+            TipAnchorOpenMode::Check,
+        )
     }
 
     /// Opens the audit log as [`AuditWriter::open`] does and binds it to
@@ -601,8 +626,11 @@ impl AuditWriter {
     /// file already carried entries), a file that moved forward past the anchor
     /// with the anchored entry intact is absorbed and the anchor advanced, and a
     /// file that was rolled back, truncated, or replaced is refused with
-    /// [`WriterError::TipAnchorMismatch`]. From then on every
-    /// [`AuditWriter::write_entry`] advances the anchor.
+    /// [`WriterError::TipAnchorMismatch`]. An absent anchor that
+    /// [`PriorAnchoring`] shows was written before is refused with
+    /// [`WriterError::TipAnchorMissing`]; `binding` says whether the profile's
+    /// audit binding was recorded before this open, which is one such fact.
+    /// From then on every [`AuditWriter::write_entry`] advances the anchor.
     ///
     /// The writer takes `<log>.drain.lock` and drains the audit outbox after
     /// reconciliation. The adoption row is appended even when the drain
@@ -617,6 +645,8 @@ impl AuditWriter {
     /// Everything [`AuditWriter::open`] returns, plus:
     /// - [`WriterError::TipAnchorMismatch`] when the file no longer contains the
     ///   anchored tip.
+    /// - [`WriterError::TipAnchorMissing`] when no anchor is stored and the log
+    ///   shows it was anchored before.
     /// - [`WriterError::TipAnchorStore`] when the anchor cannot be read or
     ///   written.
     /// - Every error of [`AuditWriter::drain_outbox`].
@@ -624,8 +654,15 @@ impl AuditWriter {
         path: PathBuf,
         hmac_key: Option<Zeroizing<[u8; 32]>>,
         tip_anchor: Arc<dyn TipAnchorStore>,
+        binding: BindingHistory,
     ) -> Result<Self, WriterError> {
-        Self::open_inner(path, hmac_key, Some(tip_anchor), TipAnchorOpenMode::Check)
+        Self::open_inner(
+            path,
+            hmac_key,
+            Some(tip_anchor),
+            binding,
+            TipAnchorOpenMode::Check,
+        )
     }
 
     /// Opens the audit log for anchor repair, skipping the tip-anchor check so
@@ -643,13 +680,20 @@ impl AuditWriter {
         hmac_key: Option<Zeroizing<[u8; 32]>>,
         tip_anchor: Arc<dyn TipAnchorStore>,
     ) -> Result<Self, WriterError> {
-        Self::open_inner(path, hmac_key, Some(tip_anchor), TipAnchorOpenMode::Repair)
+        Self::open_inner(
+            path,
+            hmac_key,
+            Some(tip_anchor),
+            BindingHistory::NotRecorded,
+            TipAnchorOpenMode::Repair,
+        )
     }
 
     fn open_inner(
         path: PathBuf,
         hmac_key: Option<Zeroizing<[u8; 32]>>,
         tip_anchor: Option<Arc<dyn TipAnchorStore>>,
+        binding: BindingHistory,
         anchor_mode: TipAnchorOpenMode,
     ) -> Result<Self, WriterError> {
         // Enforce parent-component contract: a bare filename has no known
@@ -749,6 +793,7 @@ impl AuditWriter {
             owed_row_anchored: false,
             checked_open: tip_anchor.is_some() && anchor_mode == TipAnchorOpenMode::Check,
             tip_anchor,
+            binding,
             #[cfg(test)]
             fail_after_entry_before_sidecar: false,
             #[cfg(test)]
@@ -1423,9 +1468,14 @@ impl AuditWriter {
     /// Whether the stored anchor disagrees with the active file, decided under
     /// this writer's lock.
     ///
-    /// Applies [`super::verify::stored_anchor_disagrees_with_walk`] to the
-    /// stored value and a replay of the active file. It reads the store and the
-    /// file only: nothing is adopted, advanced, or written.
+    /// Both cases read a replay of the active file. An absent anchor disagrees
+    /// when [`PriorAnchoring::find`] finds evidence of prior anchoring for
+    /// `binding` and that replay's entry count and anchoring rows: the facts the
+    /// writer's own missing-anchor refusal reads, so a rotated archive that no
+    /// longer verifies cannot hide them. A present anchor is judged by
+    /// [`super::verify::stored_anchor_disagrees_with_walk`]. It reads the
+    /// store, the file, and the sidecar's metadata only: nothing is adopted,
+    /// advanced, or written.
     ///
     /// # Errors
     ///
@@ -1435,13 +1485,23 @@ impl AuditWriter {
     ///   [`WriterError::ChainBrokenAtOpen`] when the file cannot be replayed.
     /// - [`WriterError::IntegrityViolation`] when the anchored entry cannot be
     ///   read.
-    pub fn stored_anchor_disagrees(&self) -> Result<bool, WriterError> {
+    pub fn stored_anchor_disagrees(&self, binding: BindingHistory) -> Result<bool, WriterError> {
         let stored = self.stored_tip_anchor()?;
         let scan = self.replay_active_file()?;
+        if stored == StoredTipAnchor::Absent {
+            return Ok(PriorAnchoring::find(
+                binding,
+                &self.path,
+                scan.entry_count,
+                scan.holds_anchoring_row,
+            )
+            .is_some());
+        }
         let tip = super::verify::VerifiedTip {
             entry_count: scan.entry_count,
             tip_hash: scan.last_hash,
             end_offset: scan.end_offset,
+            holds_anchoring_row: scan.holds_anchoring_row,
         };
         Ok(super::verify::stored_anchor_disagrees_with_walk(
             &self.path,
@@ -1661,21 +1721,25 @@ impl AuditWriter {
         Ok(AnchorOutcome::RotationCompleted)
     }
 
-    /// Takes an unanchored file under anchor protection at its current tip.
+    /// Takes an unanchored file under anchor protection at its current tip,
+    /// unless the log shows it was anchored before.
     ///
     /// The whole file is replayed first, so a broken chain is refused rather
-    /// than adopted. When the writer is keyed AND the file carries a chain-root
-    /// sidecar, that sidecar must verify: a log whose root signature is wrong is
-    /// not a log worth anchoring. A keyed writer facing a file with NO sidecar
-    /// still adopts — that is a log written only by unkeyed writers, which is
-    /// exactly the state the zero-config quickstart leaves behind, and refusing
-    /// it would make minting an audit key a one-way door.
+    /// than adopted. A log that [`PriorAnchoring::find`] shows was anchored
+    /// before is refused with [`WriterError::TipAnchorMissing`]: its anchor was
+    /// deleted, and adopting the file as it stands would accept whatever was
+    /// removed from it alongside. A log with none of that evidence was written
+    /// only by unkeyed writers, which is the state the zero-config quickstart
+    /// leaves behind, and it is adopted; refusing it would make minting an
+    /// audit key a one-way door. A file with a chain-root sidecar never reaches
+    /// adoption, because the sidecar is itself such evidence.
     fn adopt_tip_anchor(
         &mut self,
         store: &dyn TipAnchorStore,
         len: u64,
     ) -> Result<AnchorOutcome, WriterError> {
         if len == 0 {
+            self.refuse_if_anchored_before(0, false, len)?;
             // Nothing to anchor. Leaving the store empty says exactly that, and
             // the first append writes the first real anchor.
             self.entry_count = 0;
@@ -1684,7 +1748,7 @@ impl AuditWriter {
         }
 
         let scan = self.replay_active_file()?;
-        self.verify_chain_root_for_adoption()?;
+        self.refuse_if_anchored_before(scan.entry_count, scan.holds_anchoring_row, len)?;
         let adopted = TipAnchor::new(scan.entry_count, scan.last_hash.clone(), scan.end_offset);
         self.adopt_scan_state(&scan);
         store
@@ -1697,27 +1761,25 @@ impl AuditWriter {
         })
     }
 
-    /// Verifies the active file's chain-root sidecar before adoption.
+    /// Refuses an absent anchor that the log shows was written before.
     ///
-    /// A missing sidecar is accepted; see [`AuditWriter::adopt_tip_anchor`].
-    fn verify_chain_root_for_adoption(&self) -> Result<(), WriterError> {
-        let Some(key) = self.hmac_key.as_ref() else {
-            return Ok(());
-        };
-        let sidecar = hmac_sidecar_path(&self.path);
-        if !sidecar.exists() {
-            return Ok(());
+    /// `entry_count` and `holds_anchoring_row` come from a full replay of the
+    /// active file; `len` is its length. See [`PriorAnchoring::find`] for the
+    /// evidence and its order.
+    fn refuse_if_anchored_before(
+        &self,
+        entry_count: u64,
+        holds_anchoring_row: bool,
+        len: u64,
+    ) -> Result<(), WriterError> {
+        match PriorAnchoring::find(self.binding, &self.path, entry_count, holds_anchoring_row) {
+            None => Ok(()),
+            Some(evidence) => Err(WriterError::TipAnchorMissing {
+                evidence,
+                entry_count,
+                actual_len: len,
+            }),
         }
-        let tag = fs::read_to_string(&sidecar)?;
-        let first = read_first_entry_of(&self.file)?;
-        let body = first
-            .canonical_json_body()
-            .map_err(WriterError::Serialise)?;
-        verify_chain_root(key.as_ref(), &body, tag.trim()).map_err(|_| {
-            WriterError::IntegrityViolation(super::verify::VerifyError::HmacMismatch {
-                file: basename_lossy_path(&self.path),
-            })
-        })
     }
 
     /// Returns `true` when the last entry ending at or before `end_offset` still
@@ -2827,6 +2889,9 @@ struct ChainScan {
     /// Byte offset just past the replayed range — the file length when the
     /// range ran to end of file.
     end_offset: u64,
+    /// Whether the replayed range holds an `audit_tip_anchored` row, which only
+    /// a writer with an anchor store appends.
+    holds_anchoring_row: bool,
 }
 
 impl ChainScan {
@@ -2836,6 +2901,7 @@ impl ChainScan {
             last_hash: seed,
             entry_count: 0,
             end_offset: 0,
+            holds_anchoring_row: false,
         }
     }
 }
@@ -2868,6 +2934,7 @@ fn read_and_verify_entry_chain(
     // after it that hold no entry (trailing blank lines) are not part of the
     // verified prefix.
     let mut end_offset = start_offset;
+    let mut holds_anchoring_row = false;
     let mut raw = Vec::new();
 
     loop {
@@ -2897,12 +2964,14 @@ fn read_and_verify_entry_chain(
         expected_previous_hash = hash.clone();
         last_hash = hash;
         end_offset = consumed;
+        holds_anchoring_row |= matches!(entry.event_kind, EventKind::AuditTipAnchored { .. });
     }
 
     Ok(ChainScan {
         last_hash,
         entry_count: entry_idx as u64,
         end_offset,
+        holds_anchoring_row,
     })
 }
 
@@ -3041,29 +3110,6 @@ pub(super) fn read_last_line_before(file: &File, end_offset: u64) -> io::Result<
             return Ok(Some(strip_line_terminator(&buf).to_vec()));
         }
         scan_end = chunk_start;
-    }
-}
-
-/// Reads and parses the first entry of the active file through the writer's own
-/// handle.
-fn read_first_entry_of(file: &File) -> Result<AuditEntry, WriterError> {
-    let mut cursor = file;
-    cursor.seek(SeekFrom::Start(0))?;
-    let mut reader = BufReader::new(cursor);
-    let mut raw = Vec::new();
-    loop {
-        raw.clear();
-        let read = reader.read_until(b'\n', &mut raw)?;
-        if read == 0 {
-            return Err(WriterError::Io(io::Error::other(
-                "audit log has no first entry to verify the chain root against",
-            )));
-        }
-        let line = strip_line_terminator(&raw);
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        return serde_json::from_slice(line).map_err(WriterError::Serialise);
     }
 }
 
@@ -3298,6 +3344,31 @@ pub enum WriterError {
         reason: &'static str,
     },
 
+    /// No anchor is stored for the log path, and the log shows one was.
+    ///
+    /// The evidence is a fact that outlives the anchor itself: an audit binding
+    /// recorded before this open, a chain-root sidecar on the active file, or
+    /// an `audit_tip_anchored` row in it. Deleting the anchor and truncating
+    /// the log would otherwise be adopted as a fresh log, and the removed rows
+    /// would leave no trace.
+    ///
+    /// Wire code: `audit.tip_anchor_missing`. Recovery:
+    /// `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`
+    /// after establishing why the anchor is gone. See
+    /// `docs/maintainers/audit-log-recovery.md`.
+    #[error(
+        "audit.tip_anchor_missing: no tip anchor is stored for this log path, although \
+         {evidence}; the file holds {entry_count} entries / {actual_len} bytes"
+    )]
+    TipAnchorMissing {
+        /// What shows the log was anchored before.
+        evidence: PriorAnchoring,
+        /// Number of entries in the active file.
+        entry_count: u64,
+        /// Current length of the log file.
+        actual_len: u64,
+    },
+
     /// The tip anchor could not be read from, or written to, its backing store.
     ///
     /// The anchor lives in the keyring. An unreadable anchor cannot be
@@ -3418,6 +3489,7 @@ pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
         ),
         WriterError::TipAnchorUnavailable => None,
         WriterError::TipAnchorMismatch { .. }
+        | WriterError::TipAnchorMissing { .. }
         | WriterError::PathMismatch { .. }
         | WriterError::HmacKeyMismatch { .. } => None,
     }
@@ -3430,8 +3502,10 @@ pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
 /// Three outcomes, because three different things are wrong and three
 /// different things fix them:
 ///
-/// - A tip-anchor mismatch is [`ValidationError::AuditTipAnchorMismatch`]: the
-///   log may have been rolled back, and only `audit reanchor` addresses that.
+/// - A tip-anchor mismatch is [`ValidationError::AuditTipAnchorMismatch`], and
+///   an absent anchor the log shows was written is
+///   [`ValidationError::AuditTipAnchorMissing`]: the log may have been rolled
+///   back or truncated, and only `audit reanchor` addresses that.
 /// - A condition about the log, as [`audit_log_unusable_detail`] names it, is
 ///   [`ValidationError::AuditLogUnusable`], led by its `audit.*` sub-code.
 /// - Everything left is a registry path or key registration conflict, which
@@ -3439,6 +3513,7 @@ pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
 ///
 /// [`WalletError`]: crate::error::WalletError
 /// [`ValidationError::AuditTipAnchorMismatch`]: crate::error::ValidationError::AuditTipAnchorMismatch
+/// [`ValidationError::AuditTipAnchorMissing`]: crate::error::ValidationError::AuditTipAnchorMissing
 /// [`ValidationError::AuditLogUnusable`]: crate::error::ValidationError::AuditLogUnusable
 /// [`ValidationError::AuditWriterOpenFailed`]: crate::error::ValidationError::AuditWriterOpenFailed
 #[must_use]
@@ -3449,6 +3524,12 @@ pub fn audit_writer_refusal(profile: &str, e: &WriterError) -> crate::error::Wal
         return WalletError::Validation(ValidationError::AuditTipAnchorMismatch {
             profile: profile.to_owned(),
             reason: (*reason).to_owned(),
+        });
+    }
+    if let WriterError::TipAnchorMissing { evidence, .. } = e {
+        return WalletError::Validation(ValidationError::AuditTipAnchorMissing {
+            profile: profile.to_owned(),
+            evidence: evidence.describe().to_owned(),
         });
     }
     if let Some(detail) = audit_log_unusable_detail(e) {
@@ -3995,11 +4076,12 @@ impl AuditWriterRegistry {
         log_path: &Path,
         access: KeyedAuditAccess,
     ) -> Result<Arc<Mutex<AuditWriter>>, WriterError> {
+        let binding = access.binding_history();
         let (handle, opened) = Self::get_or_open_inner(profile_name, log_path, Some(access))?;
         if opened {
             return Ok(handle);
         }
-        if let Err(e) = reconcile_cached_tip_anchor(&handle) {
+        if let Err(e) = reconcile_cached_tip_anchor(&handle, binding) {
             if let WriterError::TipAnchorMismatch {
                 expected_count,
                 expected_offset,
@@ -4183,12 +4265,19 @@ impl AuditWriterRegistry {
 /// same discipline [`AuditWriterRegistry::get_or_open_keyed`] applies to the
 /// registry mutex, and it is fail-closed for the same reason: a writer whose
 /// state cannot be read is a writer whose log cannot be proved current.
-fn reconcile_cached_tip_anchor(handle: &Arc<Mutex<AuditWriter>>) -> Result<(), WriterError> {
+fn reconcile_cached_tip_anchor(
+    handle: &Arc<Mutex<AuditWriter>>,
+    binding: BindingHistory,
+) -> Result<(), WriterError> {
     let mut writer = handle.lock().map_err(|_| {
         WriterError::Io(io::Error::other(
             "audit writer mutex poisoned; cannot reconcile the tip anchor",
         ))
     })?;
+    // Evidence learned by any acquisition survives later accesses that lack it.
+    if binding == BindingHistory::Recorded {
+        writer.binding = BindingHistory::Recorded;
+    }
     writer.verify_tip_anchor()
 }
 
@@ -5705,6 +5794,7 @@ mod tests {
             path.to_path_buf(),
             None,
             Arc::clone(store) as Arc<dyn TipAnchorStore>,
+            crate::audit_log::BindingHistory::NotRecorded,
         )
     }
 
@@ -6072,9 +6162,11 @@ mod tests {
         );
     }
 
-    /// The cache-hit twin: the anchor disappears from the keyring while a
-    /// draining writer is cached, so the next acquisition adopts the log. Its
-    /// drain refuses, and the adoption row is still appended, exactly once.
+    /// The cache-hit twin: while a keyed writer is cached, the anchor and the
+    /// chain-root sidecar both disappear, and the opener records no binding.
+    /// Nothing then shows the log was anchored, so the next acquisition adopts
+    /// it. Its drain refuses, and the adoption row is still appended, exactly
+    /// once.
     #[test]
     fn a_cache_hit_whose_drain_refuses_still_records_the_adoption() {
         let dir = TempDir::new().unwrap();
@@ -6088,6 +6180,7 @@ mod tests {
         let handle = AuditWriterRegistry::get_or_open_keyed(profile, &path, access()).unwrap();
         handle.lock().unwrap().write_entry(make_entry("")).unwrap();
         store.set(None);
+        fs::remove_file(hmac_sidecar_path(&path)).unwrap();
         let outbox = super::super::outbox::outbox_path(&path);
         fs::write(&outbox, b"not an audit entry\n").unwrap();
 
@@ -6326,43 +6419,315 @@ mod tests {
         );
     }
 
+    /// Keeps the first `entries` lines of the log at `path` and drops the rest,
+    /// as an attacker who removes the newest rows would.
+    fn truncate_to_entries(path: &Path, entries: usize) {
+        let content = fs::read_to_string(path).unwrap();
+        let kept: String = content.split_inclusive('\n').take(entries).collect();
+        fs::write(path, kept).unwrap();
+    }
+
+    /// Opens a keyed writer the way production does, through
+    /// [`KeyedAuditAccess`], with the binding history the opener established.
+    fn open_keyed_with_binding(
+        path: &Path,
+        store: &Arc<InMemoryTipAnchorStore>,
+        binding: BindingHistory,
+    ) -> Result<AuditWriter, WriterError> {
+        let access = KeyedAuditAccess::new(
+            Zeroizing::new([0x2c_u8; 32]),
+            Arc::clone(store) as Arc<dyn TipAnchorStore>,
+        )
+        .with_binding_history(binding);
+        AuditWriter::open(path.to_path_buf(), Some(access))
+    }
+
+    /// Asserts a refusal names `evidence` and that it left the store and the
+    /// file exactly as they were: no adoption row and no anchor.
+    fn assert_missing_anchor_refused(
+        result: Result<AuditWriter, WriterError>,
+        evidence: PriorAnchoring,
+        path: &Path,
+        store: &Arc<InMemoryTipAnchorStore>,
+        bytes_before: &[u8],
+    ) {
+        let err = result.expect_err("an absent anchor with evidence must be refused");
+        match &err {
+            WriterError::TipAnchorMissing {
+                evidence: found,
+                actual_len,
+                ..
+            } => {
+                assert_eq!(*found, evidence, "{err}");
+                assert_eq!(*actual_len, bytes_before.len() as u64, "{err}");
+            }
+            other => panic!("expected TipAnchorMissing, got {other:?}"),
+        }
+        assert!(
+            err.to_string().starts_with("audit.tip_anchor_missing: "),
+            "{err}"
+        );
+        assert!(store.peek().is_none(), "a refusal must not write an anchor");
+        assert_eq!(
+            fs::read(path).unwrap(),
+            bytes_before,
+            "a refusal must not append an adoption row"
+        );
+    }
+
+    /// The anchor is deleted and the log truncated, and the profile's audit
+    /// binding is recorded: a keyed use reached this log before, so the anchor
+    /// it left is gone. Nothing else points to it here (the rows were written
+    /// by an unkeyed anchored writer from an empty file, so there is neither a
+    /// sidecar nor an adoption row), and the binding alone refuses the open.
     #[test]
-    fn adoption_refuses_a_chain_root_signed_by_another_key() {
+    fn a_recorded_binding_refuses_to_adopt_a_truncated_log_whose_anchor_was_deleted() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.jsonl");
-        let one = Zeroizing::new([7u8; 32]);
-        let other = Zeroizing::new([9u8; 32]);
-
-        // A log whose chain root is signed under one key.
+        let store = Arc::new(InMemoryTipAnchorStore::new());
         {
-            let mut writer =
-                AuditWriter::open_keyed_unanchored_for_test(path.clone(), one).unwrap();
+            let mut writer = open_anchored(&path, &store).unwrap();
+            for _ in 0..3 {
+                writer.write_entry(make_entry("")).unwrap();
+            }
+        }
+        assert_eq!(store.peek().unwrap().entry_count, 3);
+        store.set(None);
+        truncate_to_entries(&path, 1);
+        assert!(!hmac_sidecar_path(&path).exists());
+        assert_eq!(count_tip_anchored_rows(&path, "adopted"), 0);
+        let bytes_before = fs::read(&path).unwrap();
+
+        assert_missing_anchor_refused(
+            open_keyed_with_binding(&path, &store, BindingHistory::Recorded),
+            PriorAnchoring::BindingRecorded,
+            &path,
+            &store,
+            &bytes_before,
+        );
+    }
+
+    /// Only the chain-root sidecar shows a keyed writer wrote this file: no
+    /// binding is recorded and the file holds no adoption row. The truncated
+    /// file is refused, and so is the file truncated to nothing.
+    #[test]
+    fn a_chain_root_sidecar_refuses_to_adopt_a_truncated_log_whose_anchor_was_deleted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        {
+            let mut writer = AuditWriter::open_keyed_unanchored_for_test(
+                path.clone(),
+                Zeroizing::new([0x2c_u8; 32]),
+            )
+            .unwrap();
+            for _ in 0..3 {
+                writer.write_entry(make_entry("")).unwrap();
+            }
+        }
+        assert!(hmac_sidecar_path(&path).exists());
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+
+        truncate_to_entries(&path, 1);
+        let bytes_before = fs::read(&path).unwrap();
+        assert_missing_anchor_refused(
+            open_keyed_with_binding(&path, &store, BindingHistory::NotRecorded),
+            PriorAnchoring::ChainRootSidecar,
+            &path,
+            &store,
+            &bytes_before,
+        );
+
+        truncate_to_entries(&path, 0);
+        assert_missing_anchor_refused(
+            open_keyed_with_binding(&path, &store, BindingHistory::NotRecorded),
+            PriorAnchoring::ChainRootSidecar,
+            &path,
+            &store,
+            &[],
+        );
+    }
+
+    /// Only an earlier adoption row shows the log was anchored: no binding is
+    /// recorded and an unkeyed writer left no sidecar. The anchor is deleted
+    /// and the rows after the adoption row are removed; the open is refused.
+    #[test]
+    fn an_earlier_adoption_row_refuses_to_adopt_a_truncated_log_whose_anchor_was_deleted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        open_no_key(path.clone())
+            .write_entry(make_entry(""))
+            .unwrap();
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        {
+            let mut writer = open_anchored(&path, &store).unwrap();
             writer.write_entry(make_entry("")).unwrap();
             writer.write_entry(make_entry("")).unwrap();
         }
+        assert_eq!(count_tip_anchored_rows(&path, "adopted"), 1);
+        store.set(None);
+        truncate_to_entries(&path, 2);
+        assert!(!hmac_sidecar_path(&path).exists());
+        assert_eq!(
+            count_tip_anchored_rows(&path, "adopted"),
+            1,
+            "the kept prefix ends on the adoption row"
+        );
+        let bytes_before = fs::read(&path).unwrap();
 
-        // Adoption under a different key must refuse: a log whose root signature
-        // does not verify is not a log worth taking under anchor protection.
+        assert_missing_anchor_refused(
+            open_keyed_with_binding(&path, &store, BindingHistory::NotRecorded),
+            PriorAnchoring::AnchoringRow,
+            &path,
+            &store,
+            &bytes_before,
+        );
+    }
+
+    fn assert_anchoring_row_alone_refuses_adoption(reason: TipAnchorReason) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        {
+            let mut writer = open_no_key(path.clone());
+            writer
+                .write_entry(AuditEntry::new_audit_tip_anchored(
+                    reason,
+                    0,
+                    None,
+                    Some(1),
+                    uuid::Uuid::new_v4().to_string(),
+                ))
+                .unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+        }
+        truncate_to_entries(&path, 1);
+        assert!(!hmac_sidecar_path(&path).exists());
         let store = Arc::new(InMemoryTipAnchorStore::new());
-        let err = AuditWriter::open_with_tip_anchor(
-            path.clone(),
-            Some(other.clone()),
-            Arc::clone(&store) as Arc<dyn TipAnchorStore>,
-        )
-        .unwrap_err();
+        let bytes = fs::read(&path).unwrap();
+        assert_missing_anchor_refused(
+            open_keyed_with_binding(&path, &store, BindingHistory::NotRecorded),
+            PriorAnchoring::AnchoringRow,
+            &path,
+            &store,
+            &bytes,
+        );
+    }
+
+    #[test]
+    fn a_rollback_acknowledged_row_alone_refuses_adoption() {
+        assert_anchoring_row_alone_refuses_adoption(TipAnchorReason::RollbackAcknowledged);
+    }
+
+    #[test]
+    fn a_binding_changed_row_alone_refuses_adoption() {
+        assert_anchoring_row_alone_refuses_adoption(TipAnchorReason::BindingChanged);
+    }
+
+    /// The cache-hit twin of the sidecar refusal: the anchor disappears from
+    /// the keyring while a keyed writer is cached. The next acquisition refuses
+    /// instead of adopting the log as it stands.
+    #[test]
+    fn a_cache_hit_refuses_a_deleted_anchor_the_sidecar_shows_was_written() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let key = Zeroizing::new([0x5b_u8; 32]);
+        let access =
+            || KeyedAuditAccess::new(key.clone(), Arc::clone(&store) as Arc<dyn TipAnchorStore>);
+        let profile = "cache-hit-anchor-deleted";
+
+        let handle = AuditWriterRegistry::get_or_open_keyed(profile, &path, access()).unwrap();
+        handle.lock().unwrap().write_entry(make_entry("")).unwrap();
+        drop(handle);
+        store.set(None);
+        let len_before = fs::metadata(&path).unwrap().len();
+
+        let err = AuditWriterRegistry::get_or_open_keyed(profile, &path, access()).unwrap_err();
         assert!(
             matches!(
                 err,
-                WriterError::IntegrityViolation(
-                    super::super::verify::VerifyError::HmacMismatch { .. }
-                )
+                WriterError::TipAnchorMissing {
+                    evidence: PriorAnchoring::ChainRootSidecar,
+                    ..
+                }
             ),
-            "adoption must refuse a chain root signed by another key: {err:?}"
+            "{err:?}"
         );
-        assert!(
-            store.peek().is_none(),
-            "a refused adoption must not write an anchor"
+        assert!(store.peek().is_none(), "a refusal must not write an anchor");
+        assert_eq!(fs::metadata(&path).unwrap().len(), len_before);
+    }
+
+    #[test]
+    fn a_cache_hit_preserves_incoming_recorded_binding_as_the_only_evidence() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let access = |binding| {
+            KeyedAuditAccess::new(
+                Zeroizing::new([0x5b_u8; 32]),
+                Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+            )
+            .with_binding_history(binding)
+        };
+        let profile = "cache-hit-new-binding-evidence";
+        let handle = AuditWriterRegistry::get_or_open_keyed(
+            profile,
+            &path,
+            access(BindingHistory::NotRecorded),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            handle.lock().unwrap().write_entry(make_entry("")).unwrap();
+        }
+        store.set(None);
+        fs::remove_file(hmac_sidecar_path(&path)).unwrap();
+        truncate_to_entries(&path, 1);
+        assert_eq!(count_tip_anchored_rows(&path, "adopted"), 0);
+        let bytes = fs::read(&path).unwrap();
+
+        for binding in [BindingHistory::Recorded, BindingHistory::NotRecorded] {
+            let err = AuditWriterRegistry::get_or_open_keyed(profile, &path, access(binding))
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    WriterError::TipAnchorMissing {
+                        evidence: PriorAnchoring::BindingRecorded,
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+            assert!(store.peek().is_none());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert!(!hmac_sidecar_path(&path).exists());
+        }
+    }
+
+    /// Regression guard: a log written only by unkeyed writers, with no
+    /// recorded binding, no sidecar and no adoption row, is the quickstart
+    /// state, and the first keyed open adopts it.
+    #[test]
+    fn a_quickstart_log_adopts_on_its_first_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        {
+            let mut writer = open_no_key(path.clone());
+            writer.write_entry(make_entry("")).unwrap();
+            writer.write_entry(make_entry("")).unwrap();
+        }
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        assert_eq!(
+            PriorAnchoring::find(BindingHistory::NotRecorded, &path, 2, false),
+            None,
+            "a quickstart log carries no evidence of an earlier anchor"
         );
+
+        drop(
+            open_keyed_with_binding(&path, &store, BindingHistory::NotRecorded)
+                .expect("a quickstart log adopts on its first key"),
+        );
+        assert_eq!(count_tip_anchored_rows(&path, "adopted"), 1);
+        assert_eq!(stored_value(&store), tip_of(&path).to_keyring_value());
     }
 
     #[test]
@@ -6383,6 +6748,7 @@ mod tests {
             path.clone(),
             Some(Zeroizing::new([3u8; 32])),
             Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+            crate::audit_log::BindingHistory::NotRecorded,
         )
         .expect("a sidecar-less log must still adopt");
         drop(writer);

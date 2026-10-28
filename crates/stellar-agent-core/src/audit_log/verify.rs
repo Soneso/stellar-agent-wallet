@@ -21,7 +21,8 @@
 //! `audit.rotation_gap`, `audit.hmac_mismatch`, `audit.hmac_sidecar_missing`,
 //! `audit.too_many_rotated_files`, `audit.non_regular_file_log_path`,
 //! `audit.parse_error`, `audit.path_contract`, `audit.io_error`,
-//! `audit.signer_set_canonical_body`, `audit.tip_anchor_mismatch`.  The line
+//! `audit.signer_set_canonical_body`, `audit.tip_anchor_mismatch`,
+//! `audit.tip_anchor_missing`.  The line
 //! number / file basename is in
 //! the envelope `detail` field, not the wire code itself, ensuring cardinality
 //! stays bounded.
@@ -41,10 +42,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::{
+    binding::BindingHistory,
     chain::{ZERO_BLOCK_HASH, compute_entry_hash, verify_chain_root},
     entry::AuditEntry,
     schema::EventKind,
-    tip_anchor::TipAnchor,
+    tip_anchor::{PriorAnchoring, TipAnchor},
     writer::{
         MAX_ROTATED_FILES, hmac_sidecar_path, is_rotated_sibling,
         wait_out_transient_rotation_window,
@@ -102,6 +104,8 @@ pub struct VerifiedTip {
     pub tip_hash: String,
     /// Byte offset just past the active file's last entry.
     pub end_offset: u64,
+    /// Whether the active file holds an `audit_tip_anchored` row.
+    pub holds_anchoring_row: bool,
 }
 
 /// Verification metadata for one walked audit-log file.
@@ -292,6 +296,7 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
             warnings: file_warnings,
             sidecar_verified,
             end_offset,
+            holds_anchoring_row,
         } = result;
 
         if is_last_file {
@@ -299,6 +304,7 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
                 entry_count: entries as u64,
                 tip_hash: last_hash.clone(),
                 end_offset,
+                holds_anchoring_row,
             });
         }
 
@@ -476,6 +482,38 @@ pub fn check_anchor_against_walk(
     Ok(())
 }
 
+/// Refuses a log with no stored anchor that shows it was anchored before.
+///
+/// The verifier's half of the writer's adoption rule, decided by the same
+/// [`PriorAnchoring::find`]: an audit binding recorded for the profile, a
+/// chain-root sidecar on the active file, or an `audit_tip_anchored` row in
+/// it, for a file with entries; the sidecar alone for an empty file. `binding`
+/// is what the caller read from the keyring without writing it. A log none of
+/// these facts describe was never anchored and passes, so a log written only by
+/// unkeyed writers verifies before its first keyed use.
+///
+/// Call this only when no anchor is stored for the path the walk verified.
+///
+/// # Errors
+///
+/// [`VerifyError::TipAnchorMissing`] naming the evidence.
+pub fn check_missing_anchor(
+    log_path: &Path,
+    binding: BindingHistory,
+    active_tip: Option<&VerifiedTip>,
+) -> Result<(), VerifyError> {
+    let (entry_count, holds_anchoring_row) =
+        active_tip.map_or((0, false), |tip| (tip.entry_count, tip.holds_anchoring_row));
+    match PriorAnchoring::find(binding, log_path, entry_count, holds_anchoring_row) {
+        None => Ok(()),
+        Some(evidence) => Err(VerifyError::TipAnchorMissing {
+            evidence,
+            actual_count: entry_count,
+            actual_offset: active_tip.map_or(0, |tip| tip.end_offset),
+        }),
+    }
+}
+
 /// Whether a stored anchor disagrees with the walked tip of the log at
 /// `log_path`.
 ///
@@ -567,6 +605,8 @@ pub struct VerifyOkWithHealth {
 
 struct SingleFileResult {
     entries: usize,
+    /// Whether this file holds an `audit_tip_anchored` row.
+    holds_anchoring_row: bool,
     /// Hash of the last entry in this file (used for cross-file chain bridging).
     last_hash: String,
     /// Byte offset just past the last entry in this file — the length of the
@@ -692,6 +732,7 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
 
     let mut entries = 0usize;
     let mut end_offset = 0u64;
+    let mut holds_anchoring_row = false;
     let mut is_first_entry = true;
     let mut last_handoff_next_file: Option<String> = None;
     let mut previous_timestamp = ctx.previous_timestamp.cloned();
@@ -808,6 +849,8 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
             }
             is_first_entry = false;
         }
+
+        holds_anchoring_row |= matches!(entry.event_kind, EventKind::AuditTipAnchored { .. });
 
         // Track rotation handoff entries for cross-file validation.
         // `EventKind` is `#[non_exhaustive]` but we are in the same crate, so
@@ -1046,6 +1089,7 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
 
     Ok(SingleFileResult {
         entries,
+        holds_anchoring_row,
         last_hash: prev_hash,
         end_offset,
         last_timestamp: previous_timestamp,
@@ -1481,6 +1525,33 @@ pub enum VerifyError {
         /// Stable diagnostic for which half of the check failed.
         reason: &'static str,
     },
+
+    /// No anchor is stored for the log path, and the log shows one was.
+    ///
+    /// The chain walk succeeded, and it verifies a prefix only. The evidence
+    /// is a fact that outlives the anchor: an audit binding recorded for the
+    /// profile, a chain-root sidecar on the active file, or an
+    /// `audit_tip_anchored` row in it. A log with its anchor deleted and its
+    /// tail truncated would otherwise verify as a log that was never anchored.
+    ///
+    /// Counts and offsets only: no digest appears in the message.
+    ///
+    /// Wire code: `audit.tip_anchor_missing`. Recovery:
+    /// `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`
+    /// after establishing why the anchor is gone. See
+    /// `docs/maintainers/audit-log-recovery.md`.
+    #[error(
+        "audit.tip_anchor_missing: anchor: missing; no tip anchor is stored for this log path, \
+         although {evidence}; file holds {actual_count} entries / {actual_offset} bytes"
+    )]
+    TipAnchorMissing {
+        /// What shows the log was anchored before.
+        evidence: PriorAnchoring,
+        /// Entry count the walk found in the active file.
+        actual_count: u64,
+        /// Byte offset the walk found for the active file's last entry.
+        actual_offset: u64,
+    },
 }
 
 impl VerifyError {
@@ -1503,6 +1574,7 @@ impl VerifyError {
             Self::SignerSetCanonicalBody(_) => "audit.signer_set_canonical_body",
             Self::PartialRotation { .. } => "audit.partial_rotation",
             Self::TipAnchorMismatch { .. } => "audit.tip_anchor_mismatch",
+            Self::TipAnchorMissing { .. } => "audit.tip_anchor_missing",
         }
     }
 }
@@ -2220,20 +2292,22 @@ mod tests {
         AuditEntry::new_tool_invocation(params)
     }
 
+    fn tool_entry() -> AuditEntry {
+        new_tool_invocation(
+            "stellar_pay_commit",
+            "stellar:testnet",
+            vec!["destination".to_owned()],
+            None,
+            None,
+            PolicyDecision::Allow,
+            None,
+            uuid::Uuid::new_v4().to_string(),
+        )
+    }
     fn write_entries(path: &Path, count: usize) {
         let mut writer = AuditWriter::open(path.to_path_buf(), None).unwrap();
         for _ in 0..count {
-            let entry = new_tool_invocation(
-                "stellar_pay_commit",
-                "stellar:testnet",
-                vec!["destination".to_owned()],
-                None,
-                None,
-                PolicyDecision::Allow,
-                None,
-                uuid::Uuid::new_v4().to_string(),
-            );
-            writer.write_entry(entry).unwrap();
+            writer.write_entry(tool_entry()).unwrap();
         }
     }
 
@@ -2599,6 +2673,146 @@ mod tests {
              refuse, got {err:?}"
         );
         assert_eq!(err.wire_code(), "audit.tip_anchor_mismatch");
+    }
+
+    /// Keeps the first `entries` lines of the log at `path`.
+    fn truncate_to_entries(path: &Path, entries: usize) {
+        let content = fs::read_to_string(path).unwrap();
+        let kept: String = content.split_inclusive('\n').take(entries).collect();
+        fs::write(path, kept).unwrap();
+    }
+
+    /// Walks the log and applies the missing-anchor check, as `audit verify`
+    /// does for a profile whose anchor is absent.
+    fn verify_without_anchor(path: &Path, binding: BindingHistory) -> Result<(), VerifyError> {
+        let ok = verify_log(path, None).expect("the truncated log still passes the chain walk");
+        check_missing_anchor(path, binding, ok.active_tip.as_ref())
+    }
+
+    fn assert_anchor_missing(err: &VerifyError, evidence: PriorAnchoring, count: u64) {
+        assert!(
+            matches!(
+                err,
+                VerifyError::TipAnchorMissing {
+                    evidence: found,
+                    actual_count,
+                    ..
+                } if *found == evidence && *actual_count == count
+            ),
+            "expected a missing anchor naming {evidence:?} at {count} entries, got {err:?}"
+        );
+        assert_eq!(err.wire_code(), "audit.tip_anchor_missing");
+        assert!(err.to_string().contains("anchor: missing"), "{err}");
+        assert!(
+            !err.to_string().contains("sha256:"),
+            "the refusal must not carry a digest: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_reports_anchor_missing_under_a_recorded_binding() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        write_entries(&path, 3);
+        truncate_to_entries(&path, 2);
+
+        let err = verify_without_anchor(&path, BindingHistory::Recorded).unwrap_err();
+        assert_anchor_missing(&err, PriorAnchoring::BindingRecorded, 2);
+    }
+
+    #[test]
+    fn verify_reports_anchor_missing_when_a_chain_root_sidecar_exists() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        {
+            let mut writer = AuditWriter::open_keyed_unanchored_for_test(
+                path.clone(),
+                Zeroizing::new([0x3d_u8; 32]),
+            )
+            .unwrap();
+            for _ in 0..3 {
+                writer.write_entry(tool_entry()).unwrap();
+            }
+        }
+        truncate_to_entries(&path, 1);
+
+        let err = verify_without_anchor(&path, BindingHistory::NotRecorded).unwrap_err();
+        assert_anchor_missing(&err, PriorAnchoring::ChainRootSidecar, 1);
+    }
+
+    #[test]
+    fn verify_reports_anchor_missing_when_the_log_holds_an_adoption_row() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        write_entries(&path, 1);
+        let store =
+            std::sync::Arc::new(crate::audit_log::tip_anchor::InMemoryTipAnchorStore::new());
+        {
+            let mut writer = AuditWriter::open_with_tip_anchor(
+                path.clone(),
+                None,
+                std::sync::Arc::clone(&store)
+                    as std::sync::Arc<dyn crate::audit_log::tip_anchor::TipAnchorStore>,
+                BindingHistory::NotRecorded,
+            )
+            .unwrap();
+            writer.write_entry(tool_entry()).unwrap();
+        }
+        // The kept prefix is the first entry and the adoption row after it.
+        truncate_to_entries(&path, 2);
+
+        let err = verify_without_anchor(&path, BindingHistory::NotRecorded).unwrap_err();
+        assert_anchor_missing(&err, PriorAnchoring::AnchoringRow, 2);
+    }
+
+    fn assert_anchoring_row_alone_reports_missing(
+        reason: crate::audit_log::schema::TipAnchorReason,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        {
+            let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+            writer
+                .write_entry(AuditEntry::new_audit_tip_anchored(
+                    reason,
+                    0,
+                    None,
+                    Some(1),
+                    uuid::Uuid::new_v4().to_string(),
+                ))
+                .unwrap();
+            writer.write_entry(tool_entry()).unwrap();
+        }
+        truncate_to_entries(&path, 1);
+        assert!(!crate::audit_log::writer::hmac_sidecar_path(&path).exists());
+        let err = verify_without_anchor(&path, BindingHistory::NotRecorded).unwrap_err();
+        assert_anchor_missing(&err, PriorAnchoring::AnchoringRow, 1);
+    }
+
+    #[test]
+    fn verify_reports_missing_anchor_from_a_rollback_acknowledged_row_alone() {
+        assert_anchoring_row_alone_reports_missing(
+            crate::audit_log::schema::TipAnchorReason::RollbackAcknowledged,
+        );
+    }
+
+    #[test]
+    fn verify_reports_missing_anchor_from_a_binding_changed_row_alone() {
+        assert_anchoring_row_alone_reports_missing(
+            crate::audit_log::schema::TipAnchorReason::BindingChanged,
+        );
+    }
+
+    /// Regression guard: a log written only by unkeyed writers, with no
+    /// recorded binding, verifies without an anchor.
+    #[test]
+    fn verify_passes_an_unanchored_quickstart_log() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        write_entries(&path, 3);
+
+        verify_without_anchor(&path, BindingHistory::NotRecorded)
+            .expect("a log that was never anchored verifies without an anchor");
     }
 
     /// Runs the walk with an anchor through the same entry point

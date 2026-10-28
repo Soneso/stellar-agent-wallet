@@ -28,9 +28,15 @@ use keyring_core::api::{Credential, CredentialApi, CredentialPersistence, Creden
 use keyring_core::{Entry, Error as KcError, Result as KcResult};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{self, CryptoError, ProtectionMode, Sealed};
+use crate::crypto::{self, CryptoError, EntryBinding, ProtectionMode, Sealed};
 
 const WIRE_VERSION: u32 = 1;
+
+#[cfg(all(test, windows))]
+thread_local! {
+    static BEFORE_REBIND: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static FAIL_REBIND_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Wire format
@@ -51,7 +57,7 @@ struct WireFile {
     entries: BTreeMap<String, WireEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct WireEntry {
     /// Base64 (URL-safe, no padding); absent (`None`) for DPAPI-sealed
     /// entries, present for env-key-sealed entries.
@@ -94,6 +100,13 @@ impl HeadlessStore {
     #[must_use]
     pub fn new(path: PathBuf, mode: ProtectionMode) -> Self {
         Self { path, mode }
+    }
+
+    /// The protection mode's backend label: `"headless-env"` or
+    /// `"headless-dpapi"`.
+    #[must_use]
+    pub fn backend_label(&self) -> &'static str {
+        self.mode.label()
     }
 }
 
@@ -160,6 +173,46 @@ struct HeadlessCredential {
     account: String,
 }
 
+impl HeadlessCredential {
+    /// Rewrites the unbound entry at `key`, which held `opened`, sealed bound
+    /// to its coordinate.
+    ///
+    /// Runs under the store lock and re-reads the file first: the entry is
+    /// rewritten only while it still holds the value that was opened, so a
+    /// concurrent write or delete is never overwritten.
+    fn rebind_entry(
+        &self,
+        key: &str,
+        opened: &WireEntry,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> KcResult<()> {
+        let _lock = acquire_store_lock(&self.path)?;
+        let mut file = read_wire_file(&self.path)?;
+        if file.entries.get(key) != Some(opened) {
+            return Ok(());
+        }
+        let sealed = crypto::seal(&self.mode, aad, plaintext)
+            .map_err(|error| KcError::PlatformFailure(Box::new(error)))?;
+        file.entries
+            .insert(key.to_owned(), wire_entry_from_sealed(&sealed));
+        #[cfg(all(test, windows))]
+        if FAIL_REBIND_WRITE.with(|fail| fail.replace(false)) {
+            return Err(KcError::PlatformFailure(Box::new(std::io::Error::other(
+                "injected rebind write failure",
+            ))));
+        }
+        write_wire_file(&self.path, &file)?;
+        tracing::info!(
+            target: "headless_keyring",
+            event = "headless_keyring.entry_rebound",
+            backend = self.mode.label(),
+            "headless keyring entry rewritten bound to its coordinate"
+        );
+        Ok(())
+    }
+}
+
 impl CredentialApi for HeadlessCredential {
     fn set_secret(&self, secret: &[u8]) -> KcResult<()> {
         let _lock = acquire_store_lock(&self.path)?;
@@ -182,6 +235,9 @@ impl CredentialApi for HeadlessCredential {
         Ok(())
     }
 
+    /// Reads and opens the entry. An entry sealed with no coordinate binding
+    /// is rewritten bound before its value is returned; a failed rewrite fails
+    /// the read.
     fn get_secret(&self) -> KcResult<Vec<u8>> {
         let file = read_wire_file(&self.path)?;
         let key = coord_key(&self.service, &self.account);
@@ -189,13 +245,16 @@ impl CredentialApi for HeadlessCredential {
             return Err(KcError::NoEntry);
         };
         let sealed = sealed_from_wire_entry(entry)?;
-        let plaintext = crypto::open(
-            &self.mode,
-            &aad_bytes(&self.service, &self.account),
-            &sealed,
-        )
-        .map_err(map_crypto_error)?;
-        Ok(plaintext.to_vec())
+        let aad = aad_bytes(&self.service, &self.account);
+        let opened = crypto::open(&self.mode, &aad, &sealed).map_err(map_crypto_error)?;
+        if opened.binding == EntryBinding::Unbound {
+            #[cfg(all(test, windows))]
+            if let Some(before) = BEFORE_REBIND.with(|hook| hook.borrow_mut().take()) {
+                before();
+            }
+            self.rebind_entry(&key, entry, &aad, &opened.plaintext)?;
+        }
+        Ok(opened.plaintext.to_vec())
     }
 
     fn delete_credential(&self) -> KcResult<()> {
@@ -444,6 +503,179 @@ mod tests {
                 Some(CryptoError::DpapiProtectInternalFailure)
             ));
         });
+    }
+
+    /// Reads the wire file at `path` back as JSON.
+    #[cfg(target_os = "windows")]
+    fn wire_file(path: &Path) -> WireFile {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    /// A DPAPI entry moved to another coordinate in the file fails to open
+    /// there; the entry still opens at its own coordinate.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn a_dpapi_entry_moved_to_another_coordinate_fails_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keyring.json");
+        let store = HeadlessStore::new(path.clone(), ProtectionMode::Dpapi);
+        store
+            .build("service", "account-a", None)
+            .unwrap()
+            .set_secret(b"secret-a")
+            .unwrap();
+
+        let mut file = wire_file(&path);
+        let moved = file.entries[&coord_key("service", "account-a")].clone();
+        file.entries
+            .insert(coord_key("service", "account-b"), moved);
+        write_wire_file(&path, &file).unwrap();
+
+        let error = store
+            .build("service", "account-b", None)
+            .unwrap()
+            .get_secret()
+            .unwrap_err();
+        assert!(
+            matches!(error, KcError::BadDataFormat(..)),
+            "a moved entry must fail to open: {error:?}"
+        );
+        assert_eq!(
+            store
+                .build("service", "account-a", None)
+                .unwrap()
+                .get_secret()
+                .unwrap(),
+            b"secret-a"
+        );
+    }
+
+    /// An entry sealed with no entropy opens once through the legacy call and
+    /// is rewritten bound: the stored blob changes, opens only with its
+    /// coordinate as entropy, and a second read leaves the file unchanged.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn a_legacy_dpapi_entry_opens_once_and_is_rewritten_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keyring.json");
+        let key = coord_key("service", "account");
+        let legacy = WireEntry {
+            nonce_b64: None,
+            ciphertext_b64: URL_SAFE_NO_PAD
+                .encode(stellar_agent_windows_identity::dpapi_protect(b"legacy-secret").unwrap()),
+        };
+        let mut file = WireFile {
+            version: WIRE_VERSION,
+            backend: "headless-dpapi".to_owned(),
+            entries: BTreeMap::new(),
+        };
+        file.entries.insert(key.clone(), legacy.clone());
+        write_wire_file(&path, &file).unwrap();
+
+        let store = HeadlessStore::new(path.clone(), ProtectionMode::Dpapi);
+        let entry = store.build("service", "account", None).unwrap();
+        assert_eq!(entry.get_secret().unwrap(), b"legacy-secret");
+
+        let rewritten = wire_file(&path).entries[&key].clone();
+        assert_ne!(rewritten, legacy, "the legacy entry is rewritten");
+        let blob = URL_SAFE_NO_PAD.decode(&rewritten.ciphertext_b64).unwrap();
+        assert_eq!(
+            stellar_agent_windows_identity::dpapi_unprotect_with_entropy(
+                &blob,
+                &aad_bytes("service", "account")
+            )
+            .unwrap(),
+            b"legacy-secret"
+        );
+        assert!(
+            stellar_agent_windows_identity::dpapi_unprotect(&blob).is_err(),
+            "the rewritten entry is bound to its coordinate"
+        );
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(entry.get_secret().unwrap(), b"legacy-secret");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "a bound entry is not rewritten"
+        );
+    }
+
+    #[cfg(windows)]
+    fn legacy_dpapi_store(path: &Path) -> HeadlessStore {
+        let legacy = WireEntry {
+            nonce_b64: None,
+            ciphertext_b64: URL_SAFE_NO_PAD
+                .encode(stellar_agent_windows_identity::dpapi_protect(b"legacy-secret").unwrap()),
+        };
+        let file = WireFile {
+            version: WIRE_VERSION,
+            backend: "headless-dpapi".to_owned(),
+            entries: BTreeMap::from([(coord_key("service", "account"), legacy)]),
+        };
+        write_wire_file(path, &file).unwrap();
+        HeadlessStore::new(path.to_owned(), ProtectionMode::Dpapi)
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_legacy_dpapi_rewrite_failure_fails_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keyring.json");
+        let store = legacy_dpapi_store(&path);
+        let before = fs::read(&path).unwrap();
+        FAIL_REBIND_WRITE.with(|fail| fail.set(true));
+        let error = store
+            .build("service", "account", None)
+            .unwrap()
+            .get_secret()
+            .unwrap_err();
+        let KcError::PlatformFailure(inner) = error else {
+            panic!("rewrite failure must fail the read");
+        };
+        assert_eq!(inner.to_string(), "injected rebind write failure");
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[cfg(windows)]
+    fn assert_concurrent_legacy_change_survives(delete: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keyring.json");
+        let store = legacy_dpapi_store(&path);
+        let concurrent = store.build("service", "account", None).unwrap();
+        let changed_bytes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let captured = changed_bytes.clone();
+        let changed_path = path.clone();
+        BEFORE_REBIND.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if delete {
+                    concurrent.delete_credential().unwrap();
+                } else {
+                    concurrent.set_secret(b"replacement-secret").unwrap();
+                }
+                *captured.borrow_mut() = fs::read(changed_path).unwrap();
+            }));
+        });
+        let entry = store.build("service", "account", None).unwrap();
+        assert_eq!(entry.get_secret().unwrap(), b"legacy-secret");
+        assert_eq!(fs::read(&path).unwrap(), *changed_bytes.borrow());
+        if delete {
+            assert!(matches!(entry.get_secret(), Err(KcError::NoEntry)));
+        } else {
+            assert_eq!(entry.get_secret().unwrap(), b"replacement-secret");
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_legacy_dpapi_entry_replaced_before_rewrite_is_not_overwritten() {
+        assert_concurrent_legacy_change_survives(false);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_legacy_dpapi_entry_deleted_before_rewrite_is_not_restored() {
+        assert_concurrent_legacy_change_survives(true);
     }
 
     #[test]
