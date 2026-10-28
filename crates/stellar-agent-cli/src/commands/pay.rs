@@ -592,10 +592,17 @@ where
     match built {
         Ok(built) => {
             let chain_id = context.chain_id.caip2_str();
+            let total_fee = match envelope_total_fee(&built.envelope_xdr) {
+                Ok(fee) => fee,
+                Err(e) => {
+                    print_error(&Envelope::<()>::err(&e), args.output);
+                    return 1;
+                }
+            };
             // Build-only: gate but do not submit, so the gate-sized effects are
             // not recorded (no confirmed on-chain action to attest).
             if let Err(code) =
-                evaluate_pay_policy(args, &built, chain_id, profile, &resolved.name, None)
+                evaluate_pay_policy(args, &built, chain_id, profile, &resolved.name, total_fee)
             {
                 return code;
             }
@@ -1357,17 +1364,11 @@ where
             return 1;
         }
     };
-    let pay_effects = match evaluate_pay_policy(
-        args,
-        &built,
-        chain_id,
-        profile,
-        &resolved.name,
-        Some(total_fee),
-    ) {
-        Ok(effects) => effects,
-        Err(code) => return code,
-    };
+    let pay_effects =
+        match evaluate_pay_policy(args, &built, chain_id, profile, &resolved.name, total_fee) {
+            Ok(effects) => effects,
+            Err(code) => return code,
+        };
 
     // The fee is checked against the profile cap, then the oracle re-reads
     // the entries the decision used. Both refuse before the audit pre-flight,
@@ -1754,9 +1755,8 @@ async fn payment_witness_inputs(
 /// engine path (and `stellar_pay` value descriptor contract) the
 /// `stellar_pay` MCP tool's dispatch gate uses.
 ///
-/// Returns `None` when the operation is allowed (the caller proceeds to
-/// signing); returns `Some(exit_code)` — with the refusal envelope already
-/// rendered — when the operation must be refused.
+/// Returns `Ok(effects)` when the policy allows the operation. On a refusal
+/// it renders the error envelope and returns `Err(exit_code)`.
 ///
 /// `profile` is the profile `run_with_dependencies` loaded at entry and passed
 /// to `run_build_only` / `run_full_pipeline`. This function does not
@@ -1770,7 +1770,7 @@ fn evaluate_pay_policy(
     chain_id: &str,
     profile: &Profile,
     profile_name: &str,
-    total_fee: Option<u32>,
+    total_fee: u32,
 ) -> Result<Option<stellar_agent_core::policy::v1::ValueEffects>, i32> {
     let policy_engine =
         match build_v1_policy_engine("pay", &profile.policy.engine, profile, profile_name) {
@@ -1783,15 +1783,15 @@ fn evaluate_pay_policy(
                 return Err(1);
             }
         };
-    // Mirrors the `stellar_pay` MCP tool's dispatch args exactly: resolved
-    // stroops, the raw (unreformatted) asset string, and the destination. The
-    // full pipeline adds the envelope's total fee, which `minimum_reserve`
-    // counts with the debit; `--build-only` passes none.
-    let policy_args = pay_policy_args(built.amount_stroops, &built.asset_raw, &built.destination);
-    let policy_args = match total_fee {
-        Some(fee) => with_total_fee(policy_args, fee),
-        None => policy_args,
-    };
+    // The `stellar_pay` value descriptor args (resolved stroops, the raw
+    // unreformatted asset string, and the destination) plus the built
+    // envelope's total fee, which `minimum_reserve` counts with the debit.
+    // Both `--build-only` and the full pipeline gate the envelope they built,
+    // so the reserve check sees what that envelope spends once signed.
+    let policy_args = with_total_fee(
+        pay_policy_args(built.amount_stroops, &built.asset_raw, &built.destination),
+        total_fee,
+    );
     // `account_view` reuses the source-account state `build_unsigned_envelope`
     // already fetched (feeds `minimum_reserve`); `identity_view` reuses the
     // destination-account state the same function fetched (`.ok()`-optional,
@@ -6919,21 +6919,20 @@ mod tests {
             assert!(fixture.sent_envelopes().await.is_empty());
         }
 
-        /// Build-only control: the build-only arguments carry no fee, so the
-        /// same rule admits the unsigned envelope.
-        #[tokio::test(flavor = "current_thread")]
-        #[serial_test::serial]
-        async fn build_only_carries_no_fee_into_the_policy() {
-            let fixture = Spec::new("testnet-pay-build-only-reserve")
+        /// The total fee of every envelope the mocked endpoints build: one
+        /// operation at the 100-stroop default fee.
+        const ENVELOPE_FEE: i64 = 100;
+
+        /// A testnet `--build-only` payment from the fixture's agent, under
+        /// a `minimum_reserve` rule with `margin_stroops`.
+        async fn build_only_under_margin(name: &'static str, margin_stroops: i64) -> Run {
+            let fixture = Spec::new(name)
                 .testnet()
                 .primary(ClassicRpc::testnet(&[
                     &stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED),
                     DESTINATION,
                 ]))
-                .rules(vec![pay_rule(
-                    "allow",
-                    &minimum_reserve(FEE_CROSSING_MARGIN),
-                )])
+                .rules(vec![pay_rule("allow", &minimum_reserve(margin_stroops))])
                 .build()
                 .await;
             let mut args = testnet_args(&fixture);
@@ -6941,13 +6940,73 @@ mod tests {
             args.secret_env = None;
 
             let run = run(&fixture, &args).await;
+            assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+            run
+        }
 
-            assert_eq!(run.code, 0, "{}", run.envelope);
-            assert!(
-                run.envelope["data"]["envelope_xdr"].is_string(),
+        /// Asserts a build-only `minimum_reserve` refusal that returned no
+        /// envelope.
+        fn assert_build_only_reserve_refusal(run: &Run) {
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(
+                run.code(),
+                "policy.deny.minimum_reserve_breached",
                 "{}",
                 run.envelope
             );
+            assert!(
+                run.envelope["data"].get("envelope_xdr").is_none(),
+                "{}",
+                run.envelope
+            );
+        }
+
+        /// Fee in the policy arguments, build-only: the envelope it returns
+        /// is signed later and spends its fee, so the same rule denies it.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn build_only_counts_the_fee_toward_the_reserve() {
+            let run =
+                build_only_under_margin("testnet-pay-build-only-reserve", FEE_CROSSING_MARGIN)
+                    .await;
+
+            assert_build_only_reserve_refusal(&run);
+        }
+
+        /// Build-only control: a margin lower by exactly the envelope fee
+        /// admits the envelope, so the refusal above comes from the fee.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn build_only_admits_the_margin_that_leaves_room_for_the_fee() {
+            let run = build_only_under_margin(
+                "testnet-pay-build-only-reserve-control",
+                FEE_CROSSING_MARGIN - ENVELOPE_FEE,
+            )
+            .await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let xdr = run.envelope["data"]["envelope_xdr"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{}", run.envelope));
+            assert_eq!(
+                i64::from(envelope_total_fee(xdr).unwrap()),
+                ENVELOPE_FEE,
+                "the returned envelope carries the fee the margin leaves room for"
+            );
+        }
+
+        /// Build-only boundary: a margin that leaves room for one stroop less
+        /// than the envelope fee denies the envelope.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn build_only_refuses_the_margin_one_stroop_short_of_the_fee() {
+            let run = build_only_under_margin(
+                "testnet-pay-build-only-reserve-deficit",
+                FEE_CROSSING_MARGIN - (ENVELOPE_FEE - 1),
+            )
+            .await;
+
+            assert_build_only_reserve_refusal(&run);
         }
     }
 }

@@ -618,7 +618,9 @@ one available value; a higher profile value warns. The enabled-policy minimum
 requires its signed field. The resolver independently evaluates the bound action.
 Its fee-check failure becomes `network.mainnet_authorization_refused`.
 All four full-mode CLI verbs pass numeric `total_fee_stroops`, equal to unsigned
-`tx.fee`, to policy evaluation on both networks.
+`tx.fee`, to policy evaluation on both networks. `pay --build-only` and
+`claim --build-only` pass it too, so `minimum_reserve` gates the fee of the
+envelope they return.
 
 ### Endpoint identity is authoritative
 

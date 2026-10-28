@@ -20,7 +20,9 @@ Ledger and `--secret-env` signers require an enrolled identity. Enrollment takes
 `--secret-env` only, so a Ledger key cannot be enrolled for mainnet.
 
 The four full-mode verbs include numeric `total_fee_stroops`, equal to unsigned
-`tx.fee`, in policy arguments on both networks. Mainnet fees use the smaller
+`tx.fee`, in policy arguments on both networks. `pay --build-only` and
+`claim --build-only` include it too, so `minimum_reserve` counts the fee of the
+envelope they return. Mainnet fees use the smaller
 signed/profile cap. The resolver independently reevaluates policy, fees, and
 witnesses against the bound action.
 

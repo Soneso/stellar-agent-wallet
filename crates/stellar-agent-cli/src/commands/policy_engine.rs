@@ -450,8 +450,9 @@ const MAINNET_WRITE_FORBIDDEN: &str = "network.mainnet_write_forbidden";
 
 /// Returns `args` with `"total_fee_stroops"` set to `fee` as a JSON number.
 ///
-/// The full-mode argument maps carry the unsigned envelope's total fee, the
-/// value `minimum_reserve` adds to the debit. The decoder of a staged
+/// The full-mode argument maps, and those of `pay --build-only` and
+/// `claim --build-only`, carry the unsigned envelope's total fee, the value
+/// `minimum_reserve` adds to the debit. The decoder of a staged
 /// envelope writes the same key with the same type.
 #[must_use]
 pub(crate) fn with_total_fee(mut args: serde_json::Value, fee: u32) -> serde_json::Value {

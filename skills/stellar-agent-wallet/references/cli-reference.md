@@ -128,7 +128,9 @@ refuses the declared mainnet passphrase or known mainnet host before RPC.
 Authorized signing and submission independently check sealed authorization.
 
 All four full-mode verbs include numeric `total_fee_stroops`, equal to unsigned
-`tx.fee`, in policy arguments on both networks. Mainnet action checks use the
+`tx.fee`, in policy arguments on both networks. `pay --build-only` and
+`claim --build-only` include it too, so `minimum_reserve` counts the fee of the
+envelope they return. Mainnet action checks use the
 effective signed/profile fee cap and thresholds; the resolver reevaluates them.
 
 ### Submit-layer network binding
