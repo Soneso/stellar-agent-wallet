@@ -173,8 +173,13 @@ Authorization consumption followed by pre-send recording failure can leave an
 unspent pending approval. Reusing it can produce
 `network.mainnet_authorization_refused` without a tombstone.
 
-Ordinary signing and submission refuse mainnet. Authorized entry points check
-sealed authority independently. Durable consumption precedes sending.
+The wallet's own signing paths sign mainnet payloads only under mainnet
+authorization. Library signing primitives do not enforce this requirement.
+Code running as the same OS user with access to a keyring entry can read its
+seed directly. The keyring entry is the custody boundary.
+Ordinary submission refuses the declared mainnet passphrase or known mainnet
+host before RPC. Authorized entry points check sealed authority independently.
+Durable consumption precedes sending.
 Classic MCP authorization refusal renders
 `the mainnet write was refused before submission; nothing was sent`.
 Classic MCP uses this message at both signing and submission boundaries.
@@ -630,7 +635,7 @@ decimal strings, not JSON numbers.
 | `stellar_sep43_get_network` | Return the active network name and passphrase. | Read-only. |
 | `stellar_sep43_sign_transaction` | Sign a `TransactionEnvelope` XDR; return `signedTxXdr` and `signerAddress`. | Signs; no submit. Audit pre-flight + `opaque_payload_signed` row. |
 | `stellar_sep43_sign_auth_entry` | Sign the base64 `HashIdPreimage` of a Soroban authorization entry (envelope type 9, or type 10 bound to the signing key's account); return the raw signature as `signedAuthEntry` and `signerAddress`. | Signs; no submit. Audit pre-flight + `opaque_payload_signed` row. |
-| `stellar_sep43_sign_message` | Sign an arbitrary UTF-8 message via `sha256(message)` then ed25519; return `signedMessage` (hex) and `signerAddress`. | Signs; no submit. |
+| `stellar_sep43_sign_message` | Sign an arbitrary UTF-8 message via `SHA-256("Stellar Signed Message:\n" + message)` then ed25519; return `signedMessage` (base64) and `signerAddress`. | Signs; does not submit. Refuses an overlaid or out-of-scope signer. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row. |
 | `stellar_sep43_sign_and_submit_transaction` | Sign a `TransactionEnvelope` XDR, submit, poll until confirmed; return `signedTxXdr`, `txHash`, `status`. | Signs and submits; policy gate. |
 
 Arguments:
@@ -653,13 +658,29 @@ The optional `network_passphrase` is validated as a caller-intent gate
 (fail-closed `InvalidNetworkPassphrase` on mismatch); it is not mixed into the
 signed bytes.
 
+Both `stellar_sep43_sign_message` and `stellar_sep53_sign_message` use these
+refusals before loading the signer:
+
+| Code | Meaning |
+| --- | --- |
+| `network.mainnet_write_forbidden` | The selected profile is mainnet. |
+| `profile.non_overlayable_field` | Message signing requires `mcp_signer_default` from the profile file. Unset `STELLAR_AGENT_MCP_SIGNER_DEFAULT`. |
+| `profile.key_scope_conflict` | The signer entry or its enrolled-identity entry is out of scope, shared with a sibling, or collides with another entry of this profile, or the signer account is the signer account of a mainnet profile in the same data root (`mainnet_signer_identity`). |
+| `profile.key_scope_conflict` | A sibling, selected document, or profiles directory cannot be read for the scope check. |
+| `audit.chain_key_unavailable` | The audit writer cannot be acquired before signing. The error identifies the recovery. |
+
+Message scope checks apply on every chain within the selected data root.
+Each successful signature writes one `opaque_payload_signed` audit row with
+the redacted SEP-53 digest and signer. The row contains neither the message nor
+the signature. A post-signature append failure warns and preserves the result.
+
 ## SEP-45, SEP-47, SEP-48, SEP-53
 
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_sep47_discover` | Read the `contractmetav0` `sep` meta entry of a contract and return the SEPs it claims. | Read-only. |
 | `stellar_sep48_preview_invocation` | Fetch the on-chain contract spec and render typed argument names and JSON values for an `InvokeHostFunction`, from a transaction XDR or a contract id plus function name. | Read-only. |
-| `stellar_sep53_sign_message` | Sign a prefixed message: `SHA-256('Stellar Signed Message:\n' + message)` then ed25519; return base64 signature and signer public key. Not compatible with SEP-43 `signMessage`. | Signs; no submit. |
+| `stellar_sep53_sign_message` | Sign a prefixed message: `SHA-256('Stellar Signed Message:\n' + message)` then ed25519; return base64 signature and signer public key. Uses the same digest and signature bytes as SEP-43 `signMessage`. | Signs; does not submit. Refuses an overlaid or out-of-scope signer. Requires the audit chain key (refuses `audit.chain_key_unavailable` before signing) and records an `opaque_payload_signed` audit row. |
 | `stellar_sep53_verify_message` | Verify a SEP-53 base64 signature against a G-strkey public key and message. | Read-only; no keyring. |
 
 Arguments:

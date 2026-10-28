@@ -804,9 +804,12 @@ mainnet. Direct CLI confirmation requires the exact typed profile name.
 See [Mainnet write behavior](cli-reference/index.md#mainnet-write-behavior),
 [Mainnet policy body](profiles.md#mainnet-policy-body), and
 [the enablement ceremony](cli-reference/profile-and-governance.md#profile-enable-mainnet).
-Ordinary library signing and submission refuse mainnet. Authorized entry points
-independently verify sealed authority at signing and submission. Both paths
-bind signatures to the endpoint's network.
+The wallet's own signing paths sign mainnet payloads only under mainnet
+authorization. Library signing primitives do not enforce this requirement.
+Code running as the same OS user with access to a keyring entry can read its
+seed directly. The keyring entry is the custody boundary.
+Authorized signing and submission independently verify sealed authority.
+Submission binds envelope signatures to the endpoint's network.
 
 ### Mainnet refusal order
 

@@ -11,7 +11,12 @@ Policy evaluation lives in `stellar-agent-core`. This crate resolves sealed
 authorization and independently checks it at signing and submission. All account
 and submission traffic goes through Stellar RPC.
 
-Ordinary signing and submission refuse mainnet. The authorized entry points
+The wallet's own signing paths sign mainnet payloads only under mainnet
+authorization. The signing primitives this crate exports (`Signer`,
+`KeyringSignHandle`) do not enforce this requirement. Code running as the same
+OS user with access to a keyring entry can read its seed directly. The keyring
+entry is the custody boundary. Ordinary submission refuses the declared mainnet
+passphrase or known mainnet host before RPC. The authorized entry points
 accept only a sealed authorization, which a build without `mainnet-write`
 cannot produce.
 

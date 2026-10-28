@@ -867,6 +867,15 @@ fn load_from_path_with_overlays(
         source: Box::new(e),
     })?;
     check_overlay_keys(&overlay_data, on_disk.chain_id)?;
+    let overlaid_fields = OVERLAY_CLASSES
+        .iter()
+        .filter_map(|&(field, _)| {
+            overlay_data
+                .values()
+                .any(|dict| dict.contains_key(field))
+                .then_some(field)
+        })
+        .collect();
     let partial: PartialProfile = Figment::new()
         .merge(Toml::file(path))
         .merge(&overlays)
@@ -967,6 +976,7 @@ fn load_from_path_with_overlays(
     // can replace `mcp_signer_default`.
     let file_key_refs = file_wallet_key_references(name, path)?;
     let mut profile = Profile {
+        overlaid_fields,
         version: partial.version,
         chain_id,
         rpc_url,
@@ -3154,6 +3164,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(profile.mcp_signer_default.account, "overlay-account");
+        assert!(profile.is_overlaid("mcp_signer_default"));
+        assert!(!profile.is_overlaid("rpc_url"));
+        let encoded = toml::to_string(&profile).unwrap();
+        assert!(!encoded.contains("overlaid_fields"));
+        let decoded: Profile = toml::from_str(&encoded).unwrap();
+        assert!(!decoded.is_overlaid("mcp_signer_default"));
     }
 
     #[test]
@@ -7941,5 +7957,45 @@ account = "a"
         let merged = load_from_dir(&name, dir.path(), None).unwrap();
         assert_eq!(merged.rpc_url, "https://overlay.example.invalid");
         assert_ne!(stored.rpc_url, merged.rpc_url);
+    }
+
+    #[test]
+    fn environment_signer_overlay_is_ephemeral() {
+        const CHILD: &str = "MESSAGE_OVERLAY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "profile::loader::tests::environment_signer_overlay_is_ephemeral",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(
+                    "STELLAR_AGENT_MCP_SIGNER_DEFAULT",
+                    r#"{account="overlay-account"}"#,
+                )
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{stdout}");
+            assert!(stdout.contains("test result: ok. 1 passed;"), "{stdout}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("message.toml"), minimal_toml()).unwrap();
+        let plain = load_from_dir_without_overlays("message", dir.path(), None).unwrap();
+        assert!(!plain.is_overlaid("mcp_signer_default"));
+        let loaded = load_from_dir("message", dir.path(), None).unwrap();
+        assert!(loaded.is_overlaid("mcp_signer_default"));
+        assert_eq!(loaded.mcp_signer_default.account, "overlay-account");
+        let encoded = toml::to_string(&loaded).unwrap();
+        assert!(!encoded.contains("overlaid_fields"));
+        let forged = format!(
+            "overlaid_fields = [\"mcp_signer_default\"]\n{}",
+            minimal_toml()
+        );
+        std::fs::write(dir.path().join("message.toml"), forged).unwrap();
+        let loaded = load_from_dir_without_overlays("message", dir.path(), None).unwrap();
+        assert!(!loaded.is_overlaid("mcp_signer_default"));
     }
 }

@@ -88,7 +88,12 @@ pub enum KeyScopeKind {
         /// Which file needs correction.
         recovery: SharedRecovery,
     },
-    /// A sibling cannot be compared and is skipped.
+    /// The signer is also enrolled in a mainnet sibling profile.
+    MainnetSignerIdentity {
+        /// Bounded sibling name.
+        sibling: String,
+    },
+    /// A sibling cannot be compared.
     SiblingUnreadable {
         /// Bounded sibling name; absent for a directory entry without one.
         sibling: Option<String>,
@@ -108,6 +113,7 @@ impl KeyScopeKind {
             Self::OwnerAccountOverride { .. } => "owner_account_override",
             Self::SelfCollision { .. } => "self_collision",
             Self::SharedWithSibling { .. } => "shared_with_sibling",
+            Self::MainnetSignerIdentity { .. } => "mainnet_signer_identity",
             Self::SiblingUnreadable { .. } => "sibling_unreadable",
             Self::SelectedDocumentUnreadable => "selected_document_unreadable",
             Self::ProfilesDirUnreadable => "profiles_dir_unreadable",
@@ -168,14 +174,16 @@ impl KeyScopeFinding {
                      file, this entry is the default for this profile's name"
                 ),
             },
+            KeyScopeKind::MainnetSignerIdentity { sibling } => format!(
+                "profile '{name}': message signing refuses the signer enrolled in mainnet \
+                 profile '{sibling}'; enroll a separate key for this profile"
+            ),
             KeyScopeKind::SiblingUnreadable { sibling } => {
                 let subject = sibling.as_ref().map_or_else(
                     || "a profile file".to_owned(),
                     |name| format!("profile '{name}'"),
                 );
-                format!(
-                    "{subject} could not be read for the keyring-entry comparison and is skipped"
-                )
+                format!("{subject} could not be read for the keyring-entry comparison")
             }
             KeyScopeKind::SelectedDocumentUnreadable => format!(
                 "profile '{name}': its profile file could not be read again for the \
@@ -202,6 +210,7 @@ pub(crate) fn render_part(s: &str) -> String {
 
 #[derive(Default)]
 struct ExplicitFields {
+    chain_id: Option<Caip2>,
     wallet: BTreeMap<String, KeyringEntryRef>,
     audit_log_path: Option<PathBuf>,
     credentials: Vec<(&'static str, KeyringEntryRef)>,
@@ -242,7 +251,14 @@ fn read_document(path: &Path) -> Result<Option<ExplicitFields>, ()> {
     };
     let text = std::str::from_utf8(&bytes).map_err(|_| ())?;
     let fields: toml::Table = toml::from_str(text).map_err(|_| ())?;
-    let mut document = ExplicitFields::default();
+    // A `chain_id` that does not parse leaves the document comparable: such a
+    // file is no working mainnet identity, and its coordinates still count.
+    let mut document = ExplicitFields {
+        chain_id: fields
+            .get("chain_id")
+            .and_then(|value| value.clone().try_into().ok()),
+        ..ExplicitFields::default()
+    };
     for field in WALLET_KEY_REFERENCE_FIELDS {
         if let Some(value) = fields.get(field) {
             let entry = value.clone().try_into().map_err(|_| ())?;
@@ -387,6 +403,15 @@ fn owns_entry(profile: &Profile, name: &str, field: &str, entry: &KeyringEntryRe
         })
 }
 
+/// Whether two G-strkeys name one ed25519 key, ignoring surrounding whitespace
+/// and letter case; an account that does not parse names no key.
+fn same_ed25519_account(a: &str, b: &str) -> bool {
+    let parse = |account: &str| {
+        stellar_strkey::ed25519::PublicKey::from_string(&account.trim().to_ascii_uppercase())
+    };
+    matches!((parse(a), parse(b)), (Ok(a), Ok(b)) if a == b)
+}
+
 fn finding(kind: KeyScopeKind) -> KeyScopeFinding {
     KeyScopeFinding { kind }
 }
@@ -397,6 +422,15 @@ pub fn key_scope_findings_in_dir(
     profile: &Profile,
     name: &str,
     dir: &Path,
+) -> Vec<KeyScopeFinding> {
+    scope_findings_in_dir(profile, name, dir, false)
+}
+
+fn scope_findings_in_dir(
+    profile: &Profile,
+    name: &str,
+    dir: &Path,
+    message_signing: bool,
 ) -> Vec<KeyScopeFinding> {
     let mut findings = Vec::new();
     if guard_name_for_load(name).is_err() {
@@ -482,6 +516,17 @@ pub fn key_scope_findings_in_dir(
                 continue;
             }
         };
+        if message_signing
+            && sibling_doc.chain_id == Some(Caip2::Mainnet)
+            && let Some(sibling_signer) = sibling_doc
+                .wallet
+                .get(WALLET_KEY_REFERENCE_FIELDS[SIGNER_FIELD])
+            && same_ed25519_account(&profile.mcp_signer_default.account, &sibling_signer.account)
+        {
+            findings.push(finding(KeyScopeKind::MainnetSignerIdentity {
+                sibling: render_part(&sibling),
+            }));
+        }
         let others = effective_coordinates(&sibling, Some(&sibling_doc), None);
         // One finding per coordinate and sibling: an explicit owner reference
         // equal to the canonical owner entry is one entry, listed twice.
@@ -521,8 +566,7 @@ pub fn key_scope_findings(profile: &Profile, name: &str) -> Vec<KeyScopeFinding>
     }
 }
 
-/// The refusal of a mainnet profile whose keyring references conflict with
-/// their host-local scope.
+/// A refusal caused by conflicting or unverifiable host-local key scope.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{detail}")]
 pub struct KeyScopeConflict {
@@ -559,19 +603,82 @@ pub fn enforce_key_scope(profile: &Profile, name: &str) -> Result<(), KeyScopeCo
     let mut refusal = None;
     for finding in findings {
         let detail = finding.message(name);
-        let refuses = profile.chain_id == Caip2::Mainnet
-            && !matches!(finding.kind, KeyScopeKind::SiblingUnreadable { .. });
+        let skipped = matches!(finding.kind, KeyScopeKind::SiblingUnreadable { .. });
+        let refuses = profile.chain_id == Caip2::Mainnet && !skipped;
         if refuses && refusal.is_none() {
             refusal = Some(KeyScopeConflict {
                 profile: name.to_owned(),
                 kind: finding.kind.as_str(),
                 detail,
             });
+        } else if skipped {
+            tracing::warn!(target: "profile.key_scope", "{detail} and is skipped");
         } else {
             tracing::warn!(target: "profile.key_scope", "{detail}");
         }
     }
     refusal.map_or(Ok(()), Err)
+}
+
+/// Refuses unsafe message-signing identities on every chain before key access.
+///
+/// The comparison covers sibling documents in the selected data root. Key loading
+/// verifies that the derived public key equals `mcp_signer_default.account`, so
+/// comparing those accounts identifies the key that message signing uses.
+///
+/// # Errors
+///
+/// Returns a signer-scope conflict, a mainnet sibling identity, or an unreadable
+/// profile or directory as [`ValidationError::ProfileKeyScopeConflict`].
+pub fn enforce_message_signing_scope(
+    profile: &Profile,
+    name: &str,
+) -> Result<(), KeyScopeConflict> {
+    let dir = default_profile_dir().map_err(|_| KeyScopeConflict {
+        profile: name.to_owned(),
+        kind: KeyScopeKind::ProfilesDirUnreadable.as_str(),
+        detail: finding(KeyScopeKind::ProfilesDirUnreadable).message(name),
+    })?;
+    enforce_message_signing_scope_in_dir(&dir, profile, name)
+}
+
+/// Checks message-signing scope against an explicit profiles directory.
+///
+/// See [`enforce_message_signing_scope`] for the key-loading identity guarantee.
+///
+/// # Errors
+///
+/// Returns a signer conflict or an unreadable profile or directory on every chain.
+pub fn enforce_message_signing_scope_in_dir(
+    profiles_dir: &Path,
+    profile: &Profile,
+    name: &str,
+) -> Result<(), KeyScopeConflict> {
+    let signer_field = |field: &str| {
+        field == WALLET_KEY_REFERENCE_FIELDS[SIGNER_FIELD] || field == SIGNER_IDENTITY
+    };
+    for finding in scope_findings_in_dir(profile, name, profiles_dir, true) {
+        let refuses = match &finding.kind {
+            KeyScopeKind::OutOfScope { field, .. }
+            | KeyScopeKind::SharedWithSibling { field, .. } => signer_field(field),
+            KeyScopeKind::SelfCollision {
+                field, other_field, ..
+            } => signer_field(field) || signer_field(other_field),
+            KeyScopeKind::MainnetSignerIdentity { .. }
+            | KeyScopeKind::SiblingUnreadable { .. }
+            | KeyScopeKind::SelectedDocumentUnreadable
+            | KeyScopeKind::ProfilesDirUnreadable => true,
+            KeyScopeKind::OwnerAccountOverride { .. } => false,
+        };
+        if refuses {
+            return Err(KeyScopeConflict {
+                profile: name.to_owned(),
+                kind: finding.kind.as_str(),
+                detail: finding.message(name),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1025,6 +1132,7 @@ mod tests {
                 },
             }]
         );
+        assert!(warn_output(&a, "alice").contains("could not be read"));
         assert!(warn_output(&a, "alice").contains("is skipped"));
         a.chain_id = Caip2::Testnet;
         assert!(warn_output(&a, "alice").contains("is skipped"));
@@ -1259,5 +1367,188 @@ mod tests {
                 assert!(!rendered.contains(&"x".repeat(128)), "{rendered}");
             }
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sibling_with_unparsed_chain_id_is_still_compared() {
+        let f = Fixture::new();
+        let mut a = profile("alice");
+        let mut b = profile("bob");
+        a.attestation_key_id = KeyringEntryRef::new("shared", "entry");
+        b.mcp_nonce_key_alias = a.attestation_key_id.clone();
+        f.save("alice", &a);
+        f.save("bob", &b);
+        let path = f.dir.join("bob.toml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mangled = text.replace(
+            "chain_id = \"stellar:mainnet\"",
+            "chain_id = \"stellar:pubnet\"",
+        );
+        assert_ne!(mangled, text);
+        std::fs::write(&path, mangled).unwrap();
+        shared(&f.findings("alice", &a), "attestation_key_id");
+        assert_eq!(
+            enforce_key_scope(&a, "alice").unwrap_err().kind,
+            "shared_with_sibling"
+        );
+    }
+
+    fn message_profile(name: &str) -> Profile {
+        let mut p = profile(name);
+        p.chain_id = Caip2::Testnet;
+        p.network_passphrase = Caip2::Testnet.network_passphrase().to_owned();
+        p.mcp_signer_default.account = stellar_strkey::ed25519::PublicKey([7; 32])
+            .to_string()
+            .to_string();
+        p
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn message_scope_refuses_mainnet_sibling_identity() {
+        let f = Fixture::new();
+        let selected = message_profile("message");
+        let mut sibling = profile("main");
+        for account in [
+            selected.mcp_signer_default.account.clone(),
+            format!(
+                " {} ",
+                selected.mcp_signer_default.account.to_ascii_lowercase()
+            ),
+        ] {
+            sibling.mcp_signer_default.account = account;
+            f.save("main", &sibling);
+            let error =
+                enforce_message_signing_scope_in_dir(&f.dir, &selected, "message").unwrap_err();
+            assert_eq!(error.kind, "mainnet_signer_identity");
+            assert_eq!(
+                ValidationError::from(error).code(),
+                "profile.key_scope_conflict"
+            );
+            assert!(
+                !f.findings("message", &selected)
+                    .iter()
+                    .any(|finding| matches!(
+                        finding.kind,
+                        KeyScopeKind::MainnetSignerIdentity { .. }
+                    ))
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn message_scope_refuses_shared_signer_and_identity() {
+        let f = Fixture::new();
+        let selected = message_profile("message");
+        let mut sibling = message_profile("sibling");
+        for entry in [
+            selected.mcp_signer_default.clone(),
+            signer_identity_entry_ref(&selected.mcp_signer_default),
+        ] {
+            sibling.attestation_key_id = entry;
+            f.save("sibling", &sibling);
+            let error =
+                enforce_message_signing_scope_in_dir(&f.dir, &selected, "message").unwrap_err();
+            assert_eq!(error.kind, "shared_with_sibling");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn message_scope_refuses_out_of_scope_signer() {
+        let f = Fixture::new();
+        let mut selected = message_profile("message");
+        f.save("message", &selected);
+        selected.mcp_signer_default.service = "external".to_owned();
+        assert_eq!(
+            enforce_message_signing_scope_in_dir(&f.dir, &selected, "message")
+                .unwrap_err()
+                .kind,
+            "out_of_scope"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn message_scope_refuses_self_collision() {
+        let f = Fixture::new();
+        let mut selected = message_profile("message");
+        for entry in [
+            selected.mcp_signer_default.clone(),
+            signer_identity_entry_ref(&selected.mcp_signer_default),
+        ] {
+            selected.attestation_key_id = entry;
+            assert_eq!(
+                enforce_message_signing_scope_in_dir(&f.dir, &selected, "message")
+                    .unwrap_err()
+                    .kind,
+                "self_collision"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn message_scope_refuses_unreadable_sibling() {
+        let f = Fixture::new();
+        let selected = message_profile("message");
+        std::fs::write(f.dir.join("sibling.toml"), "invalid = [").unwrap();
+        assert_eq!(
+            enforce_message_signing_scope_in_dir(&f.dir, &selected, "message")
+                .unwrap_err()
+                .kind,
+            "sibling_unreadable"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn message_scope_refuses_unreadable_directory_and_selected_document() {
+        let f = Fixture::new();
+        let selected = message_profile("message");
+        let file = f.home.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(
+            enforce_message_signing_scope_in_dir(&file, &selected, "message")
+                .unwrap_err()
+                .kind,
+            "profiles_dir_unreadable"
+        );
+        std::fs::write(f.dir.join("message.toml"), "invalid = [").unwrap();
+        assert_eq!(
+            enforce_message_signing_scope_in_dir(&f.dir, &selected, "message")
+                .unwrap_err()
+                .kind,
+            "selected_document_unreadable"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn message_scope_allows_own_key_and_unrelated_findings() {
+        let f = Fixture::new();
+        let mut selected = message_profile("message");
+        f.save("message", &selected);
+        enforce_message_signing_scope_in_dir(&f.dir, &selected, "message").unwrap();
+        let sibling = message_profile("sibling");
+        f.save("sibling", &sibling);
+        selected.attestation_key_id = sibling.attestation_key_id;
+        selected.mcp_nonce_key_alias = selected.attestation_key_id.clone();
+        selected.policy_owner_key_id.account = "other".into();
+        let findings = f.findings("message", &selected);
+        for kind in [
+            "out_of_scope",
+            "shared_with_sibling",
+            "self_collision",
+            "owner_account_override",
+        ] {
+            assert!(
+                findings.iter().any(|finding| finding.kind.as_str() == kind),
+                "missing {kind}: {findings:?}"
+            );
+        }
+        enforce_message_signing_scope_in_dir(&f.dir, &selected, "message").unwrap();
     }
 }

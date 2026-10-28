@@ -42,6 +42,7 @@ pub(crate) mod common;
 pub(crate) mod create_account;
 pub(crate) mod fee_stats;
 pub(crate) mod friendbot;
+pub(crate) mod message_signing;
 pub(crate) mod mpp;
 pub(crate) mod pay;
 pub(crate) mod sep43_get_address;
@@ -92,3 +93,6 @@ mod mainnet_entry_refusal_tests;
 // The authenticated x402 payment on an enabled mainnet profile.
 #[cfg(all(test, feature = "mainnet-write"))]
 mod x402_authenticated_mainnet_tests;
+
+#[cfg(test)]
+mod message_signing_tests;
