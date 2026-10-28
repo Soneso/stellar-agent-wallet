@@ -422,6 +422,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stellar_agent_headless_keyring` exposes `registered_backend` and
   `HeadlessStore::backend_label`. `stellar_agent_windows_identity` exposes
   `dpapi_protect_with_entropy` and `dpapi_unprotect_with_entropy`.
+- The `approve` summary, the approval inbox detail page, and the remote
+  approval detail page decode every payment, claim, and trustline field from
+  the transaction envelope the approval attests: destination, amount, asset,
+  memo, limit, balance id, fee, and sequence number. No surface displays the
+  stored summary fields, and `approve list` and the inbox JSON carry the same
+  decoded values. A muxed destination shows as its `M...` address, and a path
+  payment shows both legs. A claim summary carries no asset or amount, since
+  the claim transaction names the balance by id only; the claim view drops
+  its `asset`, `amount_stroops`, and `envelope_source` fields, the trustline
+  view drops `source`, and the payment and claim views carry `source` as a
+  string. `ApprovalSummaryView` gains `Inconsistent`, and the payment view
+  gains `dest_asset` and `dest_amount_stroops`. The `approve` prompt for an
+  MPP charge lists its terms.
+- Approval surfaces show a memo with its signed type: `none`,
+  `text "<value>"`, `id <n>`, `hash <hex>`, or `return <hex>`. The payment
+  view's `memo` is a `ClassicMemo`, serialized as `{"kind": ..., "value":
+  ...}` with an id as a decimal string and a hash as 32 bytes, and the
+  trustline and claim views gain the same `memo` field.
+  `ClassicMemo::display` returns that text as a `String`.
+- Every value the three approval surfaces show renders C0, DEL, C1, U+2028,
+  U+2029, and every Unicode format character (category Cf) as a visible
+  escape such as `\u{1b}` or `\u{202e}`, through
+  `stellar_agent_core::observability::redact::escape_untrusted_text`. The
+  inbox JSON, in the page and from `/pending.json` on both inboxes, carries
+  every string already escaped by the same rule. The JSON the CLI prints,
+  `approve list` included, writes these characters as JSON `\uXXXX` escapes
+  and parses to the same values. `untrusted_display_bounded`, which renders
+  audit-log tags, smart-account and wasm-hash values for logs and errors,
+  escapes the same set, so U+00AD, U+0600 to U+0605, and the other format
+  characters appear as escapes there as well. The set is public as
+  `stellar_agent_core::observability::redact::is_untrusted_format_character`.
+- A text memo holding a control character (U+0000 to U+001F, U+007F to
+  U+009F) or a Unicode format character (category Cf), line separator
+  (U+2028), or paragraph separator (U+2029) is refused with the new code
+  `validation.memo_control_character` on every network: by the `stellar_pay`
+  and `stellar_pay_commit` `memo_text` argument, by `pay --memo-text`, by
+  `stellar_agent_network::parse_memo_fields`, and by
+  `ClassicOpBuilder::memo`, which also refuses a text memo that is not UTF-8
+  with `validation.memo_invalid_type`. The format characters include the
+  zero-width non-joiner and joiner (U+200C, U+200D). `McpMemoTextArgumentError`
+  gains `ControlCharacter`.
+- An MPP charge approval can be `Inconsistent`. Every approval surface checks
+  the profile, payer, amount, token contract, recipient, and challenge expiry
+  an MPP entry shows against its authorization fingerprint, and its network
+  against the passphrase digest the fingerprint binds, through the new public
+  module `stellar_agent_core::approval::mpp`, which holds the one
+  fingerprint implementation; `stellar_agent_mpp::authorization_fingerprint`
+  calls it and returns the same bytes, so authorization ids and stored MPP
+  records keep their values. A pending MPP entry holds the digests that check
+  needs; one without them, such as an entry an earlier release prepared,
+  shows as inconsistent, and the charge must be prepared again. A charge
+  commit whose pending entry shows another transport, authority, or target
+  than the prepared request refuses with `approval.entry_inconsistent`
+  (`MppErrorCode::EntryInconsistent`).
 
 ### Removed
 
@@ -638,6 +692,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without entropy and is rewritten bound to its coordinate under the store
   lock; a failed rewrite fails the read. An entry that opens neither way fails
   as before.
+- A payment, claim, or trustline approval whose stored digest is not the
+  SHA-256 of its stored envelope, or whose envelope does not decode as its
+  kind, cannot be approved. Every approval surface shows it as inconsistent
+  and offers no approve action. Attestation refuses it with the new code
+  `approval.entry_inconsistent` before writing the consent row, and the
+  mainnet resolver refuses it with the same code before minting a witness,
+  also for a record attested by an earlier release.
+- An MPP charge approval shows only terms its authorization fingerprint or
+  the prepared request binds. An entry whose shown terms differ is shown as
+  inconsistent and refused at attestation and at commit, and the consent
+  attestation binds both the fingerprint and the prepared artifact.
+- Approval surfaces show the memo type, so a text memo cannot pose as an id
+  memo or as no memo, and render control and format characters as visible
+  escapes, so a memo or another shown value cannot move the cursor, recolor,
+  or reorder the lines the operator reads.
 
 ## [0.1.0-alpha.12] - 2026-10-15
 

@@ -38,6 +38,11 @@ use stellar_xdr::{Hash, Memo, StringM};
 ///
 /// - [`WalletError::Validation`] wrapping [`ValidationError::MemoMutuallyExclusive`]
 ///   if more than one memo variant is supplied.
+/// - [`WalletError::Validation`] wrapping [`ValidationError::MemoControlCharacter`]
+///   when `memo_text` holds C0, DEL, C1, U+2028, U+2029 or a Unicode format
+///   character (category Cf), see
+///   [`stellar_agent_core::observability::redact::is_untrusted_format_character`].
+///   Every network refuses it.
 /// - [`WalletError::Validation`] wrapping [`ValidationError::MemoInvalidType`]
 ///   when:
 ///   - `memo_text` exceeds 28 bytes.
@@ -90,6 +95,11 @@ pub fn parse_memo_fields(
             return Err(WalletError::Validation(ValidationError::MemoInvalidType {
                 memo_type: format!("TEXT (length {} exceeds 28-byte maximum)", bytes.len()),
             }));
+        }
+        if let Some(code_point) = stellar_agent_core::amount::first_memo_control_character(text) {
+            return Err(WalletError::Validation(
+                ValidationError::MemoControlCharacter { code_point },
+            ));
         }
         let string_m: StringM<28> = bytes.to_vec().try_into().map_err(|_| {
             WalletError::Validation(ValidationError::MemoInvalidType {
@@ -301,6 +311,44 @@ mod tests {
     }
 
     #[test]
+    fn memo_text_control_and_bidi_characters_refused() {
+        for (c, code_point) in [
+            ('\u{0}', "U+0000"),
+            ('\u{1b}', "U+001B"),
+            ('\r', "U+000D"),
+            ('\u{7f}', "U+007F"),
+            ('\u{85}', "U+0085"),
+            ('\u{9b}', "U+009B"),
+            ('\u{202A}', "U+202A"),
+            ('\u{202E}', "U+202E"),
+            ('\u{2066}', "U+2066"),
+            ('\u{2069}', "U+2069"),
+        ] {
+            let text = format!("ab{c}cd");
+            let err = parse_memo_fields(Some(&text), None, None, None)
+                .expect_err("control character refused");
+            assert_eq!(err.code(), "validation.memo_control_character", "{c:?}");
+            assert!(err.message().contains(code_point), "{}", err.message());
+        }
+    }
+
+    #[test]
+    fn memo_text_ordinary_non_ascii_accepted() {
+        for text in [
+            "Zahlung f\u{fc}r M\u{e4}rz",
+            "\u{4e2d}\u{6587}",
+            "\u{a0}~",
+            "\u{202F}\u{2065}",
+        ] {
+            let memo = parse_memo_fields(Some(text), None, None, None).unwrap();
+            assert!(
+                matches!(&memo, Memo::Text(bytes) if bytes.as_slice() == text.as_bytes()),
+                "{memo:?}"
+            );
+        }
+    }
+
+    #[test]
     fn memo_id() {
         let m = parse_memo_fields(None, Some(42), None, None).unwrap();
         assert!(matches!(m, Memo::Id(42)));
@@ -388,5 +436,32 @@ mod tests {
     fn decode_32_hex_too_long_fails() {
         let hex = "0".repeat(66);
         assert!(decode_32_hex_bytes(&hex, "HASH").is_err());
+    }
+    #[test]
+    fn memo_builder_refuses_every_control_range() {
+        for &(first, last) in stellar_agent_core::approval::fixtures::MEMO_CONTROL_RANGES {
+            for point in first..=last {
+                let c = char::from_u32(point).unwrap();
+                let text = format!("a{c}b");
+                let err = parse_memo_fields(Some(&text), None, None, None).unwrap_err();
+                assert_eq!(
+                    err.code(),
+                    "validation.memo_control_character",
+                    "U+{point:04X}"
+                );
+                let mut builder = crate::builder::ClassicOpBuilder::new(
+                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                    1,
+                    stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                    100,
+                );
+                let memo = stellar_xdr::Memo::Text(text.into_bytes().try_into().unwrap());
+                assert_eq!(
+                    builder.memo(&memo).err().unwrap().code(),
+                    "validation.memo_control_character",
+                    "U+{point:04X}"
+                );
+            }
+        }
     }
 }

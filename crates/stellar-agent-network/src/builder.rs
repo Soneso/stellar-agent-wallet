@@ -1013,17 +1013,18 @@ impl ClassicOpBuilder {
     /// # Errors
     ///
     /// - [`WalletError::Validation`] wrapping [`ValidationError::MemoInvalidType`]
-    ///   if a TEXT memo exceeds 28 bytes.
+    ///   if a TEXT memo exceeds 28 bytes or is not UTF-8.
+    /// - [`ValidationError::MemoControlCharacter`] if text contains a refused character.
     pub fn memo(&mut self, memo: &stellar_xdr::Memo) -> Result<&mut Self, WalletError> {
         use stellar_xdr::Memo as CurrMemo;
 
-        // Validate TEXT length.
-        if let CurrMemo::Text(ref t) = *memo
-            && t.len() > 28
-        {
-            return Err(WalletError::Validation(ValidationError::MemoInvalidType {
-                memo_type: format!("TEXT (length {} exceeds 28-byte maximum)", t.len()),
-            }));
+        if let CurrMemo::Text(text) = memo {
+            let text = std::str::from_utf8(text.as_slice()).map_err(|_| {
+                WalletError::Validation(ValidationError::MemoInvalidType {
+                    memo_type: "TEXT (invalid UTF-8)".to_owned(),
+                })
+            })?;
+            crate::memo::parse_memo_fields(Some(text), None, None, None)?;
         }
 
         self.memo = Some(memo.clone());

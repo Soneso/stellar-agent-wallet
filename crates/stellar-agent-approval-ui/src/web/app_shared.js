@@ -206,14 +206,17 @@ var stellarAgentApproval = (function () {
     register_passkey: "PASSKEY",
     toolset_first_invoke_gate: "TOOLSET GATE",
     trustline_clawback_opt_in: "CLAWBACK OPT-IN",
+    inconsistent: "INCONSISTENT",
     rejected: "REJECTED",
   };
 
   // The two passkey kinds take the amber pill: their ceremony runs in the
-  // browser bridge, so they are the kinds an inbox cannot approve.
-  function isPasskeyKind(view) {
+  // browser bridge, so they are the kinds an inbox cannot approve. An
+  // inconsistent entry takes it too: no surface can approve it.
+  function isWarnKind(view) {
     var kind = (view.summary || {}).kind;
-    return kind === "sign_with_passkey" || kind === "register_passkey";
+    return kind === "sign_with_passkey" || kind === "register_passkey" ||
+      kind === "inconsistent";
   }
 
   function kindLabel(view) {
@@ -224,7 +227,18 @@ var stellarAgentApproval = (function () {
     return String(view.kind_name || "approval").toUpperCase();
   }
 
-  // The row's headline: what this request is, in one line. Total over the ten
+  function memoText(memo) {
+    if (!memo || memo.kind === "none") return "none";
+    if (memo.kind === "text") return 'text "' + memo.value + '"';
+    if (memo.kind === "hash" || memo.kind === "return") {
+      return memo.kind + " " + memo.value.map(function (byte) {
+        return byte.toString(16).padStart(2, "0");
+      }).join("");
+    }
+    return memo.kind + " " + memo.value;
+  }
+
+  // The row's headline: what this request is, in one line. Total over the eleven
   // kinds, with a plain fallback for a kind this build does not know.
   function headlineText(view) {
     var s = view.summary || {};
@@ -232,8 +246,10 @@ var stellarAgentApproval = (function () {
       case "trustline":
         return "Trustline " + s.asset_code + ":" + s.asset_issuer;
       case "payment":
+        return (s.dest_asset ? "maximum sent " : "") +
+          (amountText(s.amount_stroops, s.asset) || kindLabel(view));
       case "claim":
-        return amountText(s.amount_stroops, s.asset) || kindLabel(view);
+        return "Claim balance " + s.balance_id_strkey;
       case "mpp_charge":
         // Base units of an arbitrary token contract, whose decimal scale the
         // wallet does not have here.
@@ -250,6 +266,8 @@ var stellarAgentApproval = (function () {
         return "Toolset capability request";
       case "trustline_clawback_opt_in":
         return "Clawback opt-in for " + s.code;
+      case "inconsistent":
+        return "Inconsistent " + s.original_kind_name;
       case "rejected":
         return "Rejected " + s.original_kind_name;
       default:
@@ -265,11 +283,15 @@ var stellarAgentApproval = (function () {
         var limit = s.limit_stroops == null ? "unlimited"
           : s.limit_stroops === "0" ? "0 stroops (remove)"
           : s.limit_stroops + " stroops";
-        return "limit " + limit + " for " + s.holder;
+        return "limit " + limit + " for " + s.holder + " · memo " + memoText(s.memo);
       case "payment":
-        return "to " + s.to;
+        return "to " + s.to + (s.dest_asset
+          ? " · destination receives at least " + amountText(s.dest_amount_stroops, s.dest_asset) : "") +
+          " · memo " + memoText(s.memo);
       case "claim":
-        return "balance " + s.balance_id_strkey;
+        return "source " + s.source + " · fee " + s.fee_stroops +
+          " stroops · sequence " + s.seq_num +
+          " · asset and amount: not part of the signed claim transaction · memo " + memoText(s.memo);
       case "mpp_charge":
         // authority and target are separate bound fields (an HTTPS authority
         // and a path, or an MCP server and an operation name); concatenating
@@ -284,6 +306,8 @@ var stellarAgentApproval = (function () {
         return s.toolset_name + " requests " + s.capability;
       case "trustline_clawback_opt_in":
         return s.code + " " + MIDDOT + " " + s.issuer_redacted;
+      case "inconsistent":
+        return "cannot be approved";
       case "rejected":
         return "no action required";
       default:
@@ -319,7 +343,7 @@ var stellarAgentApproval = (function () {
     row.href = "/approval/" + encodeURIComponent(view.approval_nonce);
 
     var kind = document.createElement("span");
-    kind.className = isPasskeyKind(view) ? "kind warn" : "kind";
+    kind.className = isWarnKind(view) ? "kind warn" : "kind";
     kind.textContent = kindLabel(view);
     row.appendChild(kind);
 

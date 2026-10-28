@@ -84,6 +84,9 @@ serial_test = { workspace = true }
 # In-memory mock keyring store for the attest-key tests.
 stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 
+# `approval::fixtures`: classic pending approvals over real envelopes.
+stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
+
 # Seed the attestation key into the mock keyring in decision tests.
 keyring-core = { workspace = true }
 

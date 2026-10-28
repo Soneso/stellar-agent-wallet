@@ -14,8 +14,11 @@
 //! # Security properties
 //!
 //! 1. **Wallet-controlled rendering** — the summary is produced by this
-//!    command from the stored [`PendingApproval`] fields, not forwarded from
-//!    agent output.  The agent cannot influence what the user sees.
+//!    command, not forwarded from agent output. A payment, claim, or trustline
+//!    summary is decoded from the envelope whose digest the attestation binds,
+//!    so the operator sees the transaction an approval signs; an entry whose
+//!    digest does not name its envelope is refused before the prompt. Every
+//!    untrusted value is rendered with control characters escaped.
 //!
 //! 2. **Cross-account-on-host non-replay** — `process_uid_for_attestation()`
 //!    is re-derived at CLI time and compared to `entry.process_uid` stored at
@@ -69,10 +72,11 @@ use stellar_agent_core::approval::{
     ApprovalKind, ApproverIdentity, ConsentAudit, ContextRuleProposalSnapshot,
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApproval, PendingApprovalStore,
     RuleProposalContextType, RuleProposalSignerKind, Surface, ToolsetGrantRequest,
-    attest_and_persist, load_and_validate_entry, load_attestation_key, open_with_retry,
-    process_uid_for_attestation, try_decode_spending_limit_params,
+    attest_and_persist, classic_entry_summary, load_and_validate_entry, load_attestation_key,
+    open_with_retry, process_uid_for_attestation, try_decode_spending_limit_params,
 };
 use stellar_agent_core::envelope::Envelope;
+use stellar_agent_core::envelope_decode::ClassicOperation;
 use stellar_agent_core::error::{ApprovalFailure, ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::timefmt;
@@ -423,12 +427,21 @@ fn build_store_path(profile_name: &str) -> Result<PathBuf, WalletError> {
     Ok(dir.join(format!("{profile_name}.toml")))
 }
 
+/// Renders the summary, then asks for consent.
+///
+/// A classic entry that fails [`classic_entry_summary`] is refused with
+/// `approval.entry_inconsistent` after its summary, before any prompt and
+/// whatever `auto_approve` says.
 fn prompt_approval(
     entry: &PendingApproval,
     context: &stellar_agent_core::approval::ApprovalContext,
     auto_approve: bool,
 ) -> Result<bool, WalletError> {
     render_summary(entry, context);
+    stellar_agent_core::approval::mpp::verify_mpp_entry_terms(&entry.kind)?;
+    if let Some(Err(error)) = classic_entry_summary(&entry.kind) {
+        return Err(error);
+    }
     if auto_approve {
         return Ok(true);
     }
@@ -446,6 +459,7 @@ fn prompt_approval(
 /// loopback/remote HTML templates render the same fields via their own
 /// markup, not this fn).
 fn render_rule_proposal_definition(definition: &ContextRuleProposalSnapshot) -> String {
+    use render::escape_for_terminal as esc;
     let mut lines = Vec::new();
 
     match &definition.context_type {
@@ -459,22 +473,29 @@ fn render_rule_proposal_definition(definition: &ContextRuleProposalSnapshot) -> 
             );
         }
         RuleProposalContextType::CallContract { contract } => {
-            lines.push(format!("  Context:           CallContract {contract}"));
+            lines.push(format!(
+                "  Context:           CallContract {}",
+                esc(contract)
+            ));
         }
         RuleProposalContextType::CreateContract { wasm_hash_hex } => {
             lines.push(format!(
-                "  Context:           CreateContract (wasm hash) {wasm_hash_hex}"
+                "  Context:           CreateContract (wasm hash) {}",
+                esc(wasm_hash_hex)
             ));
         }
         // RuleProposalContextType is #[non_exhaustive]; a future variant
         // renders with a minimal fallback rather than aborting the approval
         // flow — the operator still sees every other field.
         other => {
-            lines.push(format!("  Context:           (unrecognized: {other:?})"));
+            lines.push(format!(
+                "  Context:           (unrecognized: {})",
+                esc(&format!("{other:?}"))
+            ));
         }
     }
 
-    lines.push(format!("  Rule name:         {}", definition.name));
+    lines.push(format!("  Rule name:         {}", esc(&definition.name)));
     let expiry = match definition.valid_until {
         Some(ledger) => format!("expires at ledger {ledger}"),
         None => "permanent (no expiry)".to_owned(),
@@ -491,7 +512,7 @@ fn render_rule_proposal_definition(definition: &ContextRuleProposalSnapshot) -> 
         let detail = match signer.kind {
             RuleProposalSignerKind::Delegated => {
                 let address = signer.address.as_deref().unwrap_or("<missing address>");
-                format!("Delegated  {address}")
+                format!("Delegated  {}", esc(address))
             }
             RuleProposalSignerKind::External => {
                 let verifier = signer.verifier.as_deref().unwrap_or("<missing verifier>");
@@ -503,7 +524,7 @@ fn render_rule_proposal_definition(definition: &ContextRuleProposalSnapshot) -> 
                     .as_deref()
                     .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
                     .unwrap_or_else(|| "<none>".to_owned());
-                format!("External   verifier={verifier} pubkey={pubkey_hex}")
+                format!("External   verifier={} pubkey={pubkey_hex}", esc(verifier))
             }
         };
         lines.push(format!("    [{idx}] {detail}{proposer_tag}"));
@@ -537,11 +558,11 @@ fn render_rule_proposal_definition(definition: &ContextRuleProposalSnapshot) -> 
                 // operator is actually attesting to, not just its byte
                 // count. The base64 XDR string is size-bounded (OZ policy
                 // install params) so truncation is not a concern here.
-                None => format!("(raw XDR params) {}", policy.params_xdr_b64),
+                None => format!("(raw XDR params) {}", esc(&policy.params_xdr_b64)),
             };
             lines.push(format!(
                 "    [{idx}] {policy_address}  {detail}",
-                policy_address = policy.policy_address
+                policy_address = esc(&policy.policy_address)
             ));
         }
     }
@@ -576,143 +597,223 @@ fn render_rule_proposal_definition(definition: &ContextRuleProposalSnapshot) -> 
 /// single terminal JSON envelope; factored out so the block formatting is
 /// unit-testable against an in-memory sink.
 ///
-/// Every kind opens with the context's profile, network, endpoint, and signer rows.
-/// Payments, claims, and trustlines add the envelope's effective source.
-/// Claims show a stored summary source when it differs. Passkey signing entries show the redacted
-/// smart-account address and rule IDs.
+/// Every kind opens with the context's profile, network, endpoint, and signer
+/// rows. A payment, claim, or trustline entry is rendered from its envelope
+/// through [`classic_entry_summary`]: the effective source, every amount,
+/// asset, destination, memo, fee and sequence number are the envelope's, and
+/// the entry's stored `summary_*` fields are not read. An entry that fails
+/// that check renders as inconsistent and is never prompted for. Every value
+/// that does not come from this command passes through
+/// [`render::escape_for_terminal`], so a control or direction-override
+/// character shows as an escape instead of acting on the terminal.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per approval kind, each rendering every field it consents to"
+)]
 fn write_summary(
     entry: &PendingApproval,
     context: &stellar_agent_core::approval::ApprovalContext,
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
-    writeln!(out, "  Profile:           {}", context.profile_name)?;
-    writeln!(out, "  Network:           {}", context.chain_id)?;
-    writeln!(out, "  Endpoint:          {}", context.endpoint_host)?;
+    use render::escape_for_terminal as esc;
+
+    writeln!(out, "  Profile:           {}", esc(&context.profile_name))?;
+    writeln!(out, "  Network:           {}", esc(&context.chain_id))?;
+    writeln!(out, "  Endpoint:          {}", esc(&context.endpoint_host))?;
     writeln!(
         out,
         "  Signer:            {}",
-        context
+        esc(context
             .signer_account
             .as_deref()
-            .unwrap_or("(not enrolled)")
+            .unwrap_or("(not enrolled)"))
     )?;
-    match &entry.kind {
-        ApprovalKind::PaymentSimulated {
-            envelope_xdr_b64, ..
-        }
-        | ApprovalKind::TrustlineSimulated {
-            envelope_xdr_b64, ..
-        }
-        | ApprovalKind::ClaimSimulated {
-            envelope_xdr_b64, ..
-        } => {
-            let source =
-                stellar_agent_core::envelope_decode::envelope_source_account(envelope_xdr_b64).ok();
-            writeln!(
-                out,
-                "  Source:            {}",
-                source.as_deref().unwrap_or("(undecodable envelope)")
-            )?;
-            if let ApprovalKind::ClaimSimulated { summary_source, .. } = &entry.kind
-                && source.as_ref() != Some(summary_source)
-            {
-                writeln!(out, "  Source (stored summary): {summary_source}")?;
-            }
-        }
-        _ => {}
+    let classic = match stellar_agent_core::approval::mpp::verify_mpp_entry_terms(&entry.kind) {
+        Ok(()) => classic_entry_summary(&entry.kind),
+        Err(error) => Some(Err(error)),
+    };
+    if let Some(Ok(summary)) = &classic {
+        writeln!(out, "  Source:            {}", esc(&summary.source))?;
     }
     if let Some(reason) = &entry.reason {
-        writeln!(
-            out,
-            "Reason: {}",
-            crate::common::render::sanitize_for_table(reason)
-        )?;
+        writeln!(out, "Reason: {}", esc(reason))?;
     }
     let created = unix_ms_to_rfc3339(entry.created_at_unix_ms);
     let expires = unix_ms_to_rfc3339(entry.expires_at_unix_ms);
 
-    let body = match &entry.kind {
-        ApprovalKind::PaymentSimulated {
-            summary_to,
-            summary_amount_stroops,
-            summary_asset,
-            summary_memo,
-            summary_simulated_fee_stroops,
-            summary_simulated_seq_num,
-            ..
-        } => {
-            let memo = summary_memo
-                .as_deref()
-                .map(|m| format!("  Memo:              {m}"))
-                .unwrap_or_else(|| "  Memo:              (none)".to_owned());
-            let amount_xlm = if summary_asset == "XLM" {
-                format!(
-                    "{} XLM ({} stroops)",
-                    StellarAmount::from_stroops(*summary_amount_stroops).as_xlm_decimal_string(),
-                    summary_amount_stroops
-                )
-            } else {
-                format!("{} stroops", summary_amount_stroops)
-            };
-            format!(
-                "  To:                {to}\n  \
-                 Amount:            {amount}\n  \
-                 Asset:             {asset}\n\
-                 {memo}\n  \
-                 Simulated fee:     {fee} stroops\n  \
-                 Simulated seq num: {seq}",
-                to = summary_to,
-                amount = amount_xlm,
-                asset = summary_asset,
-                memo = memo,
-                fee = summary_simulated_fee_stroops,
-                seq = summary_simulated_seq_num,
-            )
-        }
-        ApprovalKind::TrustlineSimulated {
-            summary_holder,
-            summary_asset_code,
-            summary_asset_issuer,
-            summary_limit_stroops,
-            summary_simulated_fee_stroops,
-            summary_simulated_seq_num,
-            ..
-        } => {
-            let mut limit = format_trustline_limit(*summary_limit_stroops);
-            if let Some(n) = summary_limit_stroops.filter(|n| *n != 0) {
-                limit.push_str(&format!(
-                    " ({} {summary_asset_code})",
-                    StellarAmount::from_stroops(n).as_xlm_decimal_string()
-                ));
+    let body = match (&entry.kind, classic) {
+        (_, Some(Err(error))) => format!(
+            "  Kind:              {}\n  \
+             INCONSISTENT:      {}\n  \
+             {}",
+            entry.kind.kind_name(),
+            esc(&error.message()),
+            stellar_agent_approval_ui::INCONSISTENT_MESSAGE,
+        ),
+        (_, Some(Ok(summary))) => {
+            let fee = summary.fee_stroops;
+            let seq = summary.seq_num;
+            let memo = esc(&summary.memo.display());
+            match &summary.operation {
+                ClassicOperation::Payment {
+                    destination,
+                    asset,
+                    amount_stroops,
+                } => {
+                    let memo = esc(&summary.memo.display());
+                    format!(
+                        "  To:                {to}\n  \
+                         Amount:            {amount}\n  \
+                         Asset:             {asset}\n  \
+                         Memo:              {memo}\n  \
+                         Simulated fee:     {fee} stroops\n  \
+                         Simulated seq num: {seq}",
+                        to = esc(destination),
+                        amount = stroop_amount(*amount_stroops, asset),
+                        asset = esc(asset),
+                    )
+                }
+                ClassicOperation::PathPayment {
+                    destination,
+                    send_asset,
+                    send_amount_stroops,
+                    dest_asset,
+                    dest_amount_stroops,
+                } => {
+                    let memo = esc(&summary.memo.display());
+                    format!(
+                        "  Kind:              path payment\n  \
+                         To:                {to}\n  \
+                         Amount:            {amount} at most\n  \
+                         Asset:             {asset}\n  \
+                         Receives:          {receives} at least\n  \
+                         Receives asset:    {receives_asset}\n  \
+                         Memo:              {memo}\n  \
+                         Simulated fee:     {fee} stroops\n  \
+                         Simulated seq num: {seq}",
+                        to = esc(destination),
+                        amount = stroop_amount(*send_amount_stroops, send_asset),
+                        asset = esc(send_asset),
+                        receives = stroop_amount(*dest_amount_stroops, dest_asset),
+                        receives_asset = esc(dest_asset),
+                    )
+                }
+                ClassicOperation::CreateAccount {
+                    destination,
+                    starting_balance_stroops,
+                } => {
+                    let memo = esc(&summary.memo.display());
+                    format!(
+                        "  To:                {to}\n  \
+                         Amount:            {amount}\n  \
+                         Asset:             XLM\n  \
+                         Memo:              {memo}\n  \
+                         Simulated fee:     {fee} stroops\n  \
+                         Simulated seq num: {seq}",
+                        to = esc(destination),
+                        amount = stroop_amount(*starting_balance_stroops, "XLM"),
+                    )
+                }
+                ClassicOperation::ChangeTrust {
+                    asset_code,
+                    asset_issuer,
+                    limit_stroops,
+                } => {
+                    let mut limit = format_trustline_limit(*limit_stroops);
+                    if let Some(n) = limit_stroops.filter(|n| *n != 0) {
+                        limit.push_str(&format!(
+                            " ({} {})",
+                            StellarAmount::from_stroops(n).as_xlm_decimal_string(),
+                            esc(asset_code)
+                        ));
+                    }
+                    format!(
+                        "  Kind:              trustline change (ChangeTrust)\n  \
+                         Account:           {holder}\n  \
+                         Asset:             {code}:{issuer}\n  \
+                         Limit:             {limit}\n  \
+                         Memo:              {memo}\n  \
+                         Simulated fee:     {fee} stroops\n  \
+                         Simulated seq num: {seq}",
+                        holder = esc(&summary.source),
+                        code = esc(asset_code),
+                        issuer = esc(asset_issuer),
+                    )
+                }
+                ClassicOperation::ClaimClaimableBalance {
+                    balance_id_hex72,
+                    balance_id_strkey,
+                } => format!(
+                    "  Kind:              ClaimSimulated\n  \
+                     Balance ID:        {strkey}\n  \
+                     Balance ID (hex):  {hex}\n  \
+                     Asset:             {CLAIM_VALUE_NOTE}\n  \
+                     Amount:            {CLAIM_VALUE_NOTE}\n  \
+                     Memo:              {memo}\n  \
+                     Simulated fee:     {fee} stroops\n  \
+                     Simulated seq num: {seq}",
+                    strkey = esc(balance_id_strkey),
+                    hex = esc(balance_id_hex72),
+                ),
+                other => format!(
+                    "  Kind:              {}\n  \
+                     Terms:             this build cannot show this operation ({other:?})",
+                    entry.kind.kind_name()
+                ),
             }
-            format!(
-                "  Kind:              trustline change (ChangeTrust)\n  \
-                 Account:           {summary_holder}\n  \
-                 Asset:             {summary_asset_code}:{summary_asset_issuer}\n  \
-                 Limit:             {limit}\n  \
-                 Simulated fee:     {summary_simulated_fee_stroops} stroops\n  \
-                 Simulated seq num: {summary_simulated_seq_num}"
-            )
         }
-        ApprovalKind::SignWithPasskey {
-            smart_account_redacted,
-            rule_ids,
-            ..
-        } => {
+        (
+            ApprovalKind::SignWithPasskey {
+                smart_account_redacted,
+                rule_ids,
+                ..
+            },
+            None,
+        ) => {
             format!(
                 "  Kind:              SignWithPasskey\n  \
-                 Smart account:     {smart_account_redacted}\n  \
-                 Rule IDs:          {rule_ids:?}"
+                 Smart account:     {}\n  \
+                 Rule IDs:          {rule_ids:?}",
+                esc(smart_account_redacted)
             )
         }
-        ApprovalKind::ToolsetFirstInvokeGate {
-            toolset_name,
-            capability,
-            destination,
-            asset,
-            amount_min_stroops,
-            amount_max_stroops,
-        } => {
+        (
+            ApprovalKind::RegisterPasskey {
+                smart_account_redacted,
+                rule_ids,
+                ..
+            },
+            None,
+        ) => format!(
+            "  Kind:              RegisterPasskey\n  \
+             Smart account:     {}\n  \
+             Rule IDs:          {rule_ids:?}",
+            esc(smart_account_redacted)
+        ),
+        (ApprovalKind::Rejected { original_kind_name }, None) => format!(
+            "  Kind:              Rejected ({})",
+            esc(original_kind_name)
+        ),
+        (
+            ApprovalKind::Consumed {
+                original_kind_name, ..
+            },
+            None,
+        ) => format!(
+            "  Kind:              Consumed ({})",
+            esc(original_kind_name)
+        ),
+        (
+            ApprovalKind::ToolsetFirstInvokeGate {
+                toolset_name,
+                capability,
+                destination,
+                asset,
+                amount_min_stroops,
+                amount_max_stroops,
+            },
+            None,
+        ) => {
             // Redact destination to first-5-last-5.
             // Fields are rendered from VALIDATED STORED values — never from
             // agent-relayed content (wallet-owned rendering).
@@ -725,29 +826,29 @@ fn write_summary(
             } else {
                 "<redacted>".to_owned()
             };
-            let amount_max_xlm = if asset == "XLM" {
-                format!(
-                    "{} XLM ({amount_max_stroops} stroops)",
-                    StellarAmount::from_stroops(*amount_max_stroops).as_xlm_decimal_string(),
-                )
-            } else {
-                format!("{amount_max_stroops} stroops")
-            };
             format!(
                 "  Kind:              ToolsetFirstInvokeGate\n  \
-                 Toolset:           {toolset_name}\n  \
+                 Toolset:           {toolset}\n  \
                  Capability:        {capability}\n  \
-                 Destination:       {dest_redacted}\n  \
-                 Asset:             {asset}\n  \
-                 Amount max:        {amount_max_xlm}\n  \
-                 Amount min:        {amount_min_stroops} stroops"
+                 Destination:       {dest}\n  \
+                 Asset:             {asset_text}\n  \
+                 Amount max:        {amount_max}\n  \
+                 Amount min:        {amount_min_stroops} stroops",
+                toolset = esc(toolset_name),
+                capability = esc(capability),
+                dest = esc(&dest_redacted),
+                asset_text = esc(asset),
+                amount_max = stroop_amount(*amount_max_stroops, asset),
             )
         }
-        ApprovalKind::TrustlineClawbackOptIn {
-            network,
-            code,
-            issuer,
-        } => {
+        (
+            ApprovalKind::TrustlineClawbackOptIn {
+                network,
+                code,
+                issuer,
+            },
+            None,
+        ) => {
             // Redact issuer G-strkey to first-5-last-5.
             let issuer_redacted = if issuer.len() >= 10 {
                 format!("{}...{}", &issuer[..5], &issuer[issuer.len() - 5..])
@@ -756,65 +857,86 @@ fn write_summary(
             };
             format!(
                 "  Kind:              TrustlineClawbackOptIn\n  \
-                 Network:           {network}\n  \
-                 Asset code:        {code}\n  \
-                 Issuer:            {issuer_redacted}\n  \
+                 Network:           {}\n  \
+                 Asset code:        {}\n  \
+                 Issuer:            {}\n  \
                  WARNING: This issuer has AUTH_CLAWBACK_ENABLED set.\n    \
-                 The issuer may reclaim tokens from this trustline."
+                 The issuer may reclaim tokens from this trustline.",
+                esc(network),
+                esc(code),
+                esc(&issuer_redacted)
             )
         }
-        ApprovalKind::ClaimSimulated {
-            summary_balance_id_hex72,
-            summary_balance_id_strkey,
-            summary_asset,
-            summary_amount_stroops,
-            summary_simulated_fee_stroops,
-            summary_simulated_seq_num,
-            ..
-        } => {
-            let amount = match (summary_asset.as_deref(), summary_amount_stroops) {
-                (Some("XLM"), Some(amount)) => format!(
-                    "{} XLM ({amount} stroops)",
-                    StellarAmount::from_stroops(*amount).as_xlm_decimal_string()
-                ),
-                (Some(_), Some(amount)) => format!("{amount} stroops"),
-                _ => "not known to the wallet before the claim".to_owned(),
-            };
-            let summary_asset = summary_asset
-                .as_deref()
-                .unwrap_or("not known to the wallet before the claim");
-            format!(
-                "  Kind:              ClaimSimulated\n  \
-                 Balance ID:        {summary_balance_id_strkey}\n  \
-                 Balance ID (hex):  {summary_balance_id_hex72}\n  \
-                 Asset:             {summary_asset}\n  \
-                 Amount:            {amount}\n  \
-                 Simulated fee:     {summary_simulated_fee_stroops} stroops\n  \
-                 Simulated seq num: {summary_simulated_seq_num}"
-            )
-        }
-        ApprovalKind::RuleProposalSimulated {
-            smart_account_redacted,
-            chain_id,
-            definition,
-            proposal_sha256,
-            ..
-        } => {
+        (
+            ApprovalKind::RuleProposalSimulated {
+                smart_account_redacted,
+                chain_id,
+                definition,
+                proposal_sha256,
+                ..
+            },
+            None,
+        ) => {
             let digest_hex: String = proposal_sha256.iter().map(|b| format!("{b:02x}")).collect();
             format!(
                 "  Kind:              RuleProposalSimulated\n  \
-                 Smart account:     {smart_account_redacted}\n  \
-                 Chain ID:          {chain_id}\n\
+                 Smart account:     {}\n  \
+                 Chain ID:          {}\n\
                  {body}\n  \
                  Proposal digest:   {digest_hex}",
+                esc(smart_account_redacted),
+                esc(chain_id),
                 body = render_rule_proposal_definition(definition),
             )
         }
-        ApprovalKind::X402Payment {
-            root_invocation_xdr,
-            home_domain,
-            ..
-        } => {
+        (
+            ApprovalKind::MppChargeSimulated {
+                profile,
+                chain_id,
+                payer,
+                transport,
+                authority,
+                target,
+                amount,
+                currency,
+                recipient,
+                challenge_expires_at_unix,
+                simulated_fee_stroops,
+                ..
+            },
+            None,
+        ) => format!(
+            "  Kind:              MppChargeSimulated\n  \
+             Profile:           {}\n  \
+             Network:           {}\n  \
+             Payer:             {}\n  \
+             Transport:         {}\n  \
+             Authority:         {}\n  \
+             Target:            {}\n  \
+             Amount:            {} base units of the token contract\n  \
+             Token contract:    {}\n  \
+             Recipient:         {}\n  \
+             Challenge expires: {challenge_expires_at_unix} (Unix seconds)\n  \
+             Simulated fee:     {simulated_fee_stroops} stroops ({})",
+            esc(profile),
+            esc(chain_id),
+            esc(payer),
+            esc(transport),
+            esc(authority),
+            esc(target),
+            esc(amount),
+            esc(currency),
+            esc(recipient),
+            stellar_agent_approval_ui::SIMULATED_FEE_NOTE,
+        ),
+        (
+            ApprovalKind::X402Payment {
+                root_invocation_xdr,
+                home_domain,
+                ..
+            },
+            None,
+        ) => {
             use stellar_xdr::{
                 ReadXdr as _, ScVal, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
             };
@@ -848,15 +970,19 @@ fn write_summary(
                 .unwrap_or_else(|| "  Invocation cannot be decoded".to_owned());
             format!(
                 "  Kind: X402Payment\n{details}\n  Home domain: {}",
-                crate::common::render::sanitize_for_table(home_domain.as_deref().unwrap_or("none"))
+                esc(home_domain.as_deref().unwrap_or("none"))
             )
         }
-        other => {
-            // ApprovalKind is #[non_exhaustive]; future variants render with a
-            // minimal kind-name fallback rather than aborting. The CLI never
+        (other, _) => {
+            // ApprovalKind is #[non_exhaustive]; a future variant renders its
+            // kind name and says that its terms cannot be shown. The CLI never
             // attests an unknown kind (attest_and_persist's match also catches
             // unknown variants and returns wrong-kind).
-            format!("  Kind:              {}", other.kind_name())
+            format!(
+                "  Kind:              {}\n  \
+                 Terms:             this build cannot show the terms of this kind",
+                other.kind_name()
+            )
         }
     };
 
@@ -868,13 +994,30 @@ fn write_summary(
          {indent}Created at:        {created}\n\
          {indent}Expires at:        {expires}\n",
         indent = "  ",
-        nonce = entry.approval_nonce,
+        nonce = esc(&entry.approval_nonce),
         body = body,
         created = created,
         expires = expires,
     );
 
     write!(out, "{summary}")
+}
+
+/// What a claim summary shows for the balance's asset and amount: the claim
+/// transaction names the balance by id only.
+const CLAIM_VALUE_NOTE: &str = "not part of the signed claim transaction";
+
+/// An amount in stroops: `"<decimal> XLM (<n> stroops)"` for XLM, else
+/// `"<n> stroops"`.
+fn stroop_amount(amount_stroops: i64, asset: &str) -> String {
+    if asset == "XLM" {
+        format!(
+            "{} XLM ({amount_stroops} stroops)",
+            StellarAmount::from_stroops(amount_stroops).as_xlm_decimal_string()
+        )
+    } else {
+        format!("{amount_stroops} stroops")
+    }
 }
 
 /// Renders the wallet-controlled approval summary to stderr.
@@ -949,13 +1092,6 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
-    // ChangeTrust with transaction source [1; 32] and operation source [2; 32].
-    const CHANGE_TRUST_ENVELOPE: &str = concat!(
-        "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAA",
-        "AAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAGAAAAAVVT",
-        "REMAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAR//////////wAAAAAAAAAA",
-    );
-
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use clap::Parser;
@@ -963,7 +1099,7 @@ mod tests {
     use serial_test::serial;
     use stellar_agent_core::approval::{
         ApprovalError, ApprovalKind, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore,
-        attestation::compute_attestation, decode_sha256_hex, process_uid_for_attestation,
+        attestation::compute_attestation, decode_sha256_hex, fixtures, process_uid_for_attestation,
     };
     use stellar_agent_core::error::AuthError;
     use stellar_agent_core::profile::schema::KeyringEntryRef;
@@ -1024,20 +1160,23 @@ mod tests {
 
     // ── Helper: build a valid PendingApproval entry ──────────────────────────
 
+    const SOURCE_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+    const DEST_G: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+    const OTHER_G: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+    const USDC_ISSUER_G: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
     fn make_entry(ttl_ms: u64) -> PendingApproval {
-        PendingApproval::new_payment_pending(
-            "b64xdr".to_owned(),
-            b"fake-xdr-bytes",
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
             2_500_000,
-            "XLM".to_owned(),
             None,
             100,
             1_234_567,
             process_uid_for_attestation().expect("UID available on test host"),
             ttl_ms,
         )
-        .unwrap()
     }
 
     // ── Decode sha256 hex ────────────────────────────────────────────────────
@@ -1456,7 +1595,7 @@ mod tests {
             "  Network:           stellar:testnet",
             "  Endpoint:          https://",
             "  Signer:            (not enrolled)",
-            "  Source:            (undecodable envelope)",
+            "  Source:            GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
         ] {
             assert!(s.contains(row), "missing {row}: {s}");
         }
@@ -1830,21 +1969,48 @@ mod tests {
         );
     }
 
+    /// A claim shows the envelope's source and balance id; the stored summary
+    /// source and balance id are not shown.
     #[test]
-    fn write_summary_claim_shows_envelope_and_stored_sources() {
-        let entry = PendingApproval::new_claim_pending(
-            "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAPAAAAAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAAAAAAAAAA=".to_owned(), b"AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAAPAAAAAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAAAAAAAAAA=", "00".repeat(36), format!("B{}", "A".repeat(57)), "XLM".to_owned(), 1_000_000,
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(), 100, 1, "1000".to_owned(), DEFAULT_TTL_MS,
-        ).unwrap();
+    fn write_summary_claim_shows_the_envelope_source_only() {
+        let mut entry = fixtures::claim_pending(
+            SOURCE_G,
+            [0x0a; 32],
+            Some(("XLM", 1_000_000)),
+            100,
+            1,
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        );
+        let ApprovalKind::ClaimSimulated {
+            summary_source,
+            summary_balance_id_strkey,
+            ..
+        } = &mut entry.kind
+        else {
+            unreachable!()
+        };
+        OTHER_G.clone_into(summary_source);
+        *summary_balance_id_strkey = fixtures::balance_ids([0x0b; 32]).1;
         let mut sink = Vec::new();
         write_summary(&entry, &test_context(), &mut sink).unwrap();
         let text = String::from_utf8(sink).unwrap();
-        assert!(text.contains(
-            "  Source:            GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA"
-        ));
-        assert!(text.contains(
-            "  Source (stored summary): GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-        ));
+        assert!(
+            text.contains(&format!("  Source:            {SOURCE_G}")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "  Balance ID:        {}",
+                fixtures::balance_ids([0x0a; 32]).1
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(OTHER_G), "{text}");
+        assert!(
+            !text.contains(&fixtures::balance_ids([0x0b; 32]).1),
+            "{text}"
+        );
     }
 
     // ── The consent row: written, queued, or refused ─────────────────────────
@@ -2216,32 +2382,23 @@ mod tests {
             (Some(0), "0 stroops (removes the trustline)"),
             (Some(123456789), "123456789 stroops (12.3456789 USDC)"),
         ] {
-            let entry = PendingApproval::new_trustline_pending(
-                CHANGE_TRUST_ENVELOPE.to_owned(),
-                CHANGE_TRUST_ENVELOPE.as_bytes(),
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-                "USDC".to_owned(),
-                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_owned(),
+            let entry = fixtures::trustline_pending(
+                SOURCE_G,
+                "USDC",
+                USDC_ISSUER_G,
                 limit,
                 100,
                 42,
                 "1000".to_owned(),
                 DEFAULT_TTL_MS,
-            )
-            .unwrap();
+            );
             let mut sink = Vec::new();
             write_summary(&entry, &test_context(), &mut sink).unwrap();
             let text = String::from_utf8(sink).unwrap();
             for row in [
-                format!(
-                    "  Source:            {}",
-                    "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA"
-                ),
+                format!("  Source:            {SOURCE_G}"),
                 "  Kind:              trustline change (ChangeTrust)".to_owned(),
-                format!(
-                    "  Account:           {}",
-                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-                ),
+                format!("  Account:           {SOURCE_G}"),
                 format!(
                     "  Asset:             {}",
                     "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
@@ -2259,30 +2416,244 @@ mod tests {
             assert!(!text.contains("Amount:"));
         }
     }
+    /// The claim transaction names the balance by id only, so the summary
+    /// says that its asset and amount are not part of it, whatever the
+    /// stored summary holds.
     #[test]
-    fn claim_summary_renders_unknown_value() {
-        let entry = PendingApproval::new_claim_pending_unvalued(
-            "b64xdr".into(),
-            b"b64xdr",
-            "00".repeat(36),
-            format!("B{}", "A".repeat(57)),
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+    fn claim_summary_says_asset_and_amount_are_not_signed() {
+        for value in [None, Some(("XLM", 1_000_000))] {
+            let entry = fixtures::claim_pending(
+                SOURCE_G,
+                [0x0a; 32],
+                value,
+                100,
+                1,
+                "1000".into(),
+                DEFAULT_TTL_MS,
+            );
+            let mut output = Vec::new();
+            write_summary(&entry, &test_context(), &mut output).unwrap();
+            let text = String::from_utf8(output).unwrap();
+            assert_eq!(
+                text.matches("not part of the signed claim transaction")
+                    .count(),
+                2,
+                "{text}"
+            );
+            assert!(!text.contains("1000000"), "{text}");
+        }
+    }
+
+    /// Sets the stored summary of a payment entry to name another payment
+    /// than its envelope holds; the stored digest still names the envelope.
+    fn edit_stored_payment(entry: &mut PendingApproval) {
+        let ApprovalKind::PaymentSimulated {
+            summary_to,
+            summary_amount_stroops,
+            summary_asset,
+            summary_memo,
+            summary_simulated_fee_stroops,
+            summary_simulated_seq_num,
+            ..
+        } = &mut entry.kind
+        else {
+            unreachable!()
+        };
+        OTHER_G.clone_into(summary_to);
+        *summary_amount_stroops = 10_000;
+        "XLM".clone_into(summary_asset);
+        *summary_memo = Some("refund".to_owned());
+        *summary_simulated_fee_stroops = 7;
+        *summary_simulated_seq_num = 8;
+    }
+
+    /// The `approve` summary shows the envelope's destination, amount, asset
+    /// and memo when the stored summary fields name another payment.
+    #[test]
+    fn approve_summary_shows_the_envelope_payment_not_the_stored_summary() {
+        let mut entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            &format!("USDC:{USDC_ISSUER_G}"),
+            500_000_000,
+            Some("invoice 9"),
+            300,
+            61,
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        );
+        edit_stored_payment(&mut entry);
+        let mut sink = Vec::new();
+        write_summary(&entry, &test_context(), &mut sink).unwrap();
+        let text = String::from_utf8(sink).unwrap();
+        for row in [
+            format!("  To:                {DEST_G}"),
+            "  Amount:            500000000 stroops".to_owned(),
+            format!("  Asset:             USDC:{USDC_ISSUER_G}"),
+            "  Memo:              text \"invoice 9\"".to_owned(),
+            "  Simulated fee:     300 stroops".to_owned(),
+            "  Simulated seq num: 61".to_owned(),
+        ] {
+            assert!(
+                text.lines().any(|line| line == row),
+                "missing {row}: {text}"
+            );
+        }
+        assert!(!text.contains(OTHER_G), "{text}");
+        assert!(!text.contains("10000"), "{text}");
+        assert!(!text.contains("refund"), "{text}");
+    }
+
+    /// A memo holding cursor-up and erase-line sequences renders as escaped
+    /// text on its own line, and the only Amount line is the envelope's.
+    #[test]
+    fn approve_escapes_control_sequences_in_a_memo() {
+        let memo = "\u{1b}[1A\u{1b}[2KAmount: 0.1 XLM";
+        let envelope =
+            fixtures::payment_envelope(SOURCE_G, DEST_G, "XLM", 5_000_000_000, Some(memo), 100, 2);
+        let entry = PendingApproval::new_payment_pending(
+            envelope.clone(),
+            envelope.as_bytes(),
+            DEST_G.to_owned(),
+            1_000_000,
+            "XLM".to_owned(),
+            None,
             100,
-            1,
-            "1000".into(),
+            2,
+            "1000".to_owned(),
             DEFAULT_TTL_MS,
         )
         .unwrap();
-        let mut output = Vec::new();
-        write_summary(&entry, &test_context(), &mut output).unwrap();
+        let mut sink = Vec::new();
+        write_summary(&entry, &test_context(), &mut sink).unwrap();
+        let text = String::from_utf8(sink).unwrap();
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(
+            text.lines()
+                .any(|line| line
+                    == "  Memo:              text \"\\u{1b}[1A\\u{1b}[2KAmount: 0.1 XLM\""),
+            "{text}"
+        );
+        let amount_lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.trim_start().starts_with("Amount:"))
+            .collect();
         assert_eq!(
-            String::from_utf8(output)
-                .unwrap()
-                .matches("not known to the wallet before the claim")
-                .count(),
-            2
+            amount_lines,
+            ["  Amount:            500.0000000 XLM (5000000000 stroops)"],
+            "{text}"
         );
     }
+
+    /// An entry whose stored digest is not its envelope's renders as
+    /// inconsistent, shows neither transaction's terms, and is refused before
+    /// any prompt, `--yes` included.
+    #[test]
+    fn an_inconsistent_entry_renders_as_such_and_is_never_prompted() {
+        let mut entry = make_entry(DEFAULT_TTL_MS);
+        let other = fixtures::payment_envelope(SOURCE_G, OTHER_G, "XLM", 9, None, 100, 1);
+        let ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64, ..
+        } = &mut entry.kind
+        else {
+            unreachable!()
+        };
+        *envelope_xdr_b64 = other;
+        let mut sink = Vec::new();
+        write_summary(&entry, &test_context(), &mut sink).unwrap();
+        let text = String::from_utf8(sink).unwrap();
+        assert!(text.contains("  INCONSISTENT:      "), "{text}");
+        assert!(
+            text.contains(stellar_agent_approval_ui::INCONSISTENT_MESSAGE),
+            "{text}"
+        );
+        assert!(!text.contains(OTHER_G), "{text}");
+        assert!(!text.contains(DEST_G), "{text}");
+        assert!(!text.contains("  Source:"), "{text}");
+        let err = prompt_approval(&entry, &test_context(), true).unwrap_err();
+        assert_eq!(err.code(), "approval.entry_inconsistent");
+    }
+
+    /// An unedited payment renders its envelope terms.
+    #[test]
+    fn an_unedited_payment_renders_its_stored_values() {
+        let entry = fixtures::payment_pending(
+            SOURCE_G,
+            DEST_G,
+            "XLM",
+            25_000_000,
+            Some("rent"),
+            100,
+            9,
+            "1000".to_owned(),
+            DEFAULT_TTL_MS,
+        );
+        let mut sink = Vec::new();
+        write_summary(&entry, &test_context(), &mut sink).unwrap();
+        let text = String::from_utf8(sink).unwrap();
+        let expected = format!(
+            "  Approval nonce:    {}\n  \
+             To:                {DEST_G}\n  \
+             Amount:            2.5000000 XLM (25000000 stroops)\n  \
+             Asset:             XLM\n  \
+             Memo:              text \"rent\"\n  \
+             Simulated fee:     100 stroops\n  \
+             Simulated seq num: 9\n",
+            entry.approval_nonce
+        );
+        assert!(text.contains(&expected), "{text}");
+        assert!(prompt_approval(&entry, &test_context(), true).unwrap());
+    }
+
+    /// The MPP charge prompt names every charge term, escaped.
+    #[test]
+    fn mpp_charge_summary_renders_its_terms() {
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        let recipient = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let entry = stellar_agent_core::approval::fixtures::bind_mpp_entry(
+            PendingApproval::new_mpp_charge_pending(
+                [0x11; 32],
+                [0x22; 32],
+                "render-test".to_owned(),
+                "stellar:testnet".to_owned(),
+                SOURCE_G.to_owned(),
+                "http".to_owned(),
+                "merchant.example".to_owned(),
+                "/checkout".to_owned(),
+                "1000000".to_owned(),
+                recipient.to_owned(),
+                recipient.to_owned(),
+                now / 1_000 + 3_600,
+                1_100,
+                "1000".to_owned(),
+                DEFAULT_TTL_MS,
+            )
+            .unwrap(),
+        );
+        let mut sink = Vec::new();
+        write_summary(&entry, &test_context(), &mut sink).unwrap();
+        let text = String::from_utf8(sink).unwrap();
+        for row in [
+            "  Kind:              MppChargeSimulated".to_owned(),
+            format!("  Payer:             {SOURCE_G}"),
+            "  Transport:         http".to_owned(),
+            "  Authority:         merchant.example".to_owned(),
+            "  Target:            /checkout".to_owned(),
+            "  Amount:            1000000 base units of the token contract".to_owned(),
+            format!("  Token contract:    {recipient}"),
+            format!("  Recipient:         {recipient}"),
+            format!(
+                "  Simulated fee:     1100 stroops ({})",
+                stellar_agent_approval_ui::SIMULATED_FEE_NOTE
+            ),
+        ] {
+            assert!(
+                text.lines().any(|line| line == row),
+                "missing {row}: {text}"
+            );
+        }
+    }
+
     #[test]
     fn approve_renders_x402_payee_and_amount() {
         use stellar_xdr::{
@@ -2411,5 +2782,41 @@ mod tests {
             approve_rule(true, true, (false, false)),
             Err("approve.yes_refused_on_mainnet".to_owned())
         );
+    }
+    fn assert_edited_mpp_inconsistent(edit_amount: bool) {
+        let mut entry = fixtures::mpp_pending();
+        if let ApprovalKind::MppChargeSimulated {
+            amount, recipient, ..
+        } = &mut entry.kind
+        {
+            if edit_amount {
+                *amount = "7".to_owned();
+            } else {
+                *recipient = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned();
+            }
+        }
+        let mut output = Vec::new();
+        write_summary(&entry, &test_context(), &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("INCONSISTENT"), "{text}");
+        assert!(
+            text.contains(stellar_agent_approval_ui::INCONSISTENT_MESSAGE),
+            "{text}"
+        );
+        assert!(!text.contains("Token contract:"), "{text}");
+        assert_eq!(
+            prompt_approval(&entry, &test_context(), true)
+                .unwrap_err()
+                .code(),
+            "approval.entry_inconsistent"
+        );
+    }
+    #[test]
+    fn edited_mpp_amount_renders_inconsistent() {
+        assert_edited_mpp_inconsistent(true);
+    }
+    #[test]
+    fn edited_mpp_recipient_renders_inconsistent() {
+        assert_edited_mpp_inconsistent(false);
     }
 }

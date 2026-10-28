@@ -74,7 +74,8 @@ pub use stellar_agent_loopback_http::security_headers::SecurityHeadersLayer;
 // two copies. The browser-side half is served by both servers at
 // `/static/app-shared.js`; the server-side half renders the decision card.
 pub use templates::{
-    DETAIL_STYLE, INBOX_STYLE, approve_button_label, asset_code, html_escape, kind_pill,
+    DETAIL_STYLE, INBOX_STYLE, INCONSISTENT_MESSAGE, INCONSISTENT_NOTICE, SIMULATED_FEE_NOTE,
+    approve_button_label, asset_code, escape_value, html_escape, kind_pill, pending_json_value,
     render_context_header_html, render_rule_proposal_definition_html, render_summary_html,
 };
 pub use web::APP_SHARED_JS;

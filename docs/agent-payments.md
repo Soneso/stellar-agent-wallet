@@ -185,7 +185,10 @@ Stable errors use the `mpp.*` namespace, including `mpp.challenge_invalid`,
 `mpp.authorization_not_found`, `mpp.authorization_replayed`,
 `mpp.state_unavailable`, `mpp.simulation_failed`, `mpp.signing_failed`,
 `mpp.credential_too_large`, `mpp.receipt_invalid`, `mpp.receipt_conflict`, and
-`mpp.reconciliation_unavailable`.
+`mpp.reconciliation_unavailable`. A charge commit whose pending approval shows
+another transport, authority, or target than the prepared request refuses
+with `approval.entry_inconsistent`, the approval code every approval surface
+uses for such a request, and commits nothing.
 
 The verbs that record an audit row before they return (charge commit, record
 receipt, reconcile, prune) answer a problem with the audit LOG under its own

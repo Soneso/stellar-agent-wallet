@@ -51,7 +51,7 @@ use thiserror::Error;
 // Error type
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Errors returned by [`decode_authoritative_args`].
+/// Errors returned by [`decode_authoritative_args`] and [`classic_summary`].
 ///
 /// Each variant carries the minimum description needed to diagnose the failure
 /// without leaking raw XDR byte content.
@@ -65,6 +65,7 @@ use thiserror::Error;
 /// | `OperationKindMismatch` | Operation kind disagrees with the dispatched tool | Caller passed the wrong tool name, or the envelope changed between simulate and commit. |
 /// | `UnsupportedTool` | Tool name is not in the recognised decoder set | Caller bug or future tool not yet wired into this decoder. |
 /// | `IssuerEncodeFailed` | XDR-decoded issuer key fails strkey encoding | Should be unreachable for valid XDR; defensive guard for malformed-but-XDR-valid keys. |
+/// | `AssetCodeInvalid` | An asset code holds a byte outside ASCII letters and digits, or is empty | [`classic_summary`] refuses a code an approval surface cannot show faithfully. |
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum EnvelopeDecodeError {
@@ -142,6 +143,13 @@ pub enum EnvelopeDecodeError {
         /// Short description; no raw byte content.
         detail: String,
     },
+
+    /// An asset code is not 1 to 12 ASCII letters and digits followed only
+    /// by NUL padding.
+    ///
+    /// Returned by [`classic_summary`]; the code bytes are not echoed.
+    #[error("asset code is not 1 to 12 ASCII letters and digits")]
+    AssetCodeInvalid,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -898,6 +906,302 @@ fn decode_claim_args(
         "balance_id_hex72": balance_id_hex72,
         "balance_id_strkey": balance_id_strkey,
     }))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Classic transaction summary for approval surfaces
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The classic transaction kind a pending approval holds.
+///
+/// Each kind names the operations its envelope may carry, the same set the
+/// matching `*_commit` tool accepts in [`decode_authoritative_args`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClassicTransactionKind {
+    /// A payment approval: a `Payment`, a path payment, or a `CreateAccount`.
+    Payment,
+    /// A `ChangeTrust` approval.
+    Trustline,
+    /// A `ClaimClaimableBalance` approval.
+    Claim,
+}
+
+/// The memo of a classic transaction.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ClassicMemo {
+    /// The transaction carries no memo.
+    None,
+    /// A text memo, exactly as the envelope carries it.
+    Text(String),
+    /// An id memo.
+    Id(#[serde(with = "crate::wire_stroops::u64")] u64),
+    /// A hash memo.
+    Hash([u8; 32]),
+    /// A return memo.
+    Return([u8; 32]),
+}
+
+impl ClassicMemo {
+    /// Formats the memo with its signed type. The caller escapes this text
+    /// for its output surface.
+    #[must_use]
+    pub fn display(&self) -> String {
+        match self {
+            Self::None => "none".to_owned(),
+            Self::Text(text) => format!("text \"{text}\""),
+            Self::Id(id) => format!("id {id}"),
+            Self::Hash(hash) => format!("hash {}", crate::hex::encode(hash)),
+            Self::Return(hash) => format!("return {}", crate::hex::encode(hash)),
+        }
+    }
+}
+
+/// The operation of a classic transaction, with every value it moves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClassicOperation {
+    /// A `Payment`.
+    Payment {
+        /// The destination as the envelope names it: a G-strkey, or an
+        /// M-strkey for a muxed destination.
+        destination: String,
+        /// `"XLM"` or `"CODE:Gissuer"`.
+        asset: String,
+        /// The amount in stroops.
+        amount_stroops: i64,
+    },
+    /// A `PathPaymentStrictSend` or `PathPaymentStrictReceive`.
+    PathPayment {
+        /// The destination as the envelope names it.
+        destination: String,
+        /// The asset the source pays.
+        send_asset: String,
+        /// The most the source pays: `send_amount` for strict send,
+        /// `send_max` for strict receive.
+        send_amount_stroops: i64,
+        /// The asset the destination receives.
+        dest_asset: String,
+        /// What the destination receives: `dest_amount` for strict receive,
+        /// the floor `dest_min` for strict send.
+        dest_amount_stroops: i64,
+    },
+    /// A `CreateAccount`.
+    CreateAccount {
+        /// The account created.
+        destination: String,
+        /// The starting balance in stroops of XLM.
+        starting_balance_stroops: i64,
+    },
+    /// A `ChangeTrust` on a credit asset.
+    ChangeTrust {
+        /// The asset code.
+        asset_code: String,
+        /// The issuer G-strkey.
+        asset_issuer: String,
+        /// The limit in stroops; `None` is the unlimited limit `i64::MAX`.
+        limit_stroops: Option<i64>,
+    },
+    /// A `ClaimClaimableBalance`.
+    ClaimClaimableBalance {
+        /// The canonical 72-hex balance id.
+        balance_id_hex72: String,
+        /// The `B...` strkey of the balance id.
+        balance_id_strkey: String,
+    },
+}
+
+/// The details of a single-operation classic transaction an approval surface
+/// shows, every one decoded from the envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClassicSummary {
+    /// The effective source G-strkey: the operation source, else the
+    /// transaction source.
+    pub source: String,
+    /// The transaction fee in stroops.
+    pub fee_stroops: u32,
+    /// The transaction sequence number.
+    pub seq_num: i64,
+    /// The transaction memo.
+    pub memo: ClassicMemo,
+    /// The single operation.
+    pub operation: ClassicOperation,
+}
+
+/// Decodes the details an approval surface shows for a classic pending
+/// approval from its envelope.
+///
+/// The decode is the one [`decode_authoritative_args`] runs: the same
+/// bounded XDR read, the single-operation rule, the operation-source
+/// override, and the operation kinds the matching `*_commit` tool accepts.
+/// It refuses what an approval surface cannot show faithfully: a text memo
+/// that is not UTF-8, an asset code that is not 1 to 12 ASCII letters and
+/// digits padded with NUL bytes, and a trustline on a pool share or on XLM.
+///
+/// # Errors
+///
+/// Returns the [`EnvelopeDecodeError`] of a malformed envelope, a fee-bump
+/// or legacy envelope, an operation count other than one, an operation the
+/// kind does not accept, or one of the refusals above
+/// ([`EnvelopeDecodeError::XdrDecode`] for the memo,
+/// [`EnvelopeDecodeError::AssetCodeInvalid`] for an asset code,
+/// [`EnvelopeDecodeError::OperationKindMismatch`] for the trustline asset).
+pub fn classic_summary(
+    envelope_xdr_b64: &str,
+    kind: ClassicTransactionKind,
+) -> Result<ClassicSummary, EnvelopeDecodeError> {
+    use stellar_xdr::{ChangeTrustAsset, ClaimableBalanceId, OperationBody};
+
+    let (tx, op, source) = decode_single_operation(envelope_xdr_b64)?;
+    let memo = match &tx.memo {
+        stellar_xdr::Memo::None => ClassicMemo::None,
+        text @ stellar_xdr::Memo::Text(_) => {
+            ClassicMemo::Text(memo_to_optional_string(text)?.unwrap_or_default())
+        }
+        stellar_xdr::Memo::Id(id) => ClassicMemo::Id(*id),
+        stellar_xdr::Memo::Hash(hash) => ClassicMemo::Hash(hash.0),
+        stellar_xdr::Memo::Return(hash) => ClassicMemo::Return(hash.0),
+    };
+    let mismatch = |tool: &'static str, expected: &'static str, body: &OperationBody| {
+        EnvelopeDecodeError::OperationKindMismatch {
+            tool,
+            expected,
+            found: op_body_kind_name(body).to_owned(),
+        }
+    };
+
+    let operation = match (kind, &op.body) {
+        (ClassicTransactionKind::Payment, OperationBody::Payment(p)) => ClassicOperation::Payment {
+            destination: muxed_account_to_display_strkey(&p.destination),
+            asset: strict_asset_string(&p.asset)?,
+            amount_stroops: p.amount,
+        },
+        (ClassicTransactionKind::Payment, OperationBody::PathPaymentStrictReceive(pp)) => {
+            ClassicOperation::PathPayment {
+                destination: muxed_account_to_display_strkey(&pp.destination),
+                send_asset: strict_asset_string(&pp.send_asset)?,
+                send_amount_stroops: pp.send_max,
+                dest_asset: strict_asset_string(&pp.dest_asset)?,
+                dest_amount_stroops: pp.dest_amount,
+            }
+        }
+        (ClassicTransactionKind::Payment, OperationBody::PathPaymentStrictSend(pp)) => {
+            ClassicOperation::PathPayment {
+                destination: muxed_account_to_display_strkey(&pp.destination),
+                send_asset: strict_asset_string(&pp.send_asset)?,
+                send_amount_stroops: pp.send_amount,
+                dest_asset: strict_asset_string(&pp.dest_asset)?,
+                dest_amount_stroops: pp.dest_min,
+            }
+        }
+        (ClassicTransactionKind::Payment, OperationBody::CreateAccount(ca)) => {
+            ClassicOperation::CreateAccount {
+                destination: account_id_to_strkey(&ca.destination),
+                starting_balance_stroops: ca.starting_balance,
+            }
+        }
+        (ClassicTransactionKind::Payment, other) => {
+            return Err(mismatch(
+                "stellar_pay_commit",
+                "Payment, PathPaymentStrictReceive, PathPaymentStrictSend, or CreateAccount",
+                other,
+            ));
+        }
+        (ClassicTransactionKind::Trustline, OperationBody::ChangeTrust(ct)) => {
+            let (code_bytes, issuer): (&[u8], _) = match &ct.line {
+                ChangeTrustAsset::CreditAlphanum4(a) => (&a.asset_code.0, &a.issuer),
+                ChangeTrustAsset::CreditAlphanum12(a) => (&a.asset_code.0, &a.issuer),
+                ChangeTrustAsset::Native | ChangeTrustAsset::PoolShare(_) => {
+                    return Err(EnvelopeDecodeError::OperationKindMismatch {
+                        tool: "stellar_trustline_commit",
+                        expected: "ChangeTrust with credit asset",
+                        found: "ChangeTrust on a non-credit asset".to_owned(),
+                    });
+                }
+            };
+            ClassicOperation::ChangeTrust {
+                asset_code: strict_asset_code(code_bytes)?,
+                asset_issuer: account_id_to_strkey(issuer),
+                limit_stroops: (ct.limit != i64::MAX).then_some(ct.limit),
+            }
+        }
+        (ClassicTransactionKind::Trustline, other) => {
+            return Err(mismatch("stellar_trustline_commit", "ChangeTrust", other));
+        }
+        (ClassicTransactionKind::Claim, OperationBody::ClaimClaimableBalance(claim)) => {
+            let ClaimableBalanceId::ClaimableBalanceIdTypeV0(hash) = &claim.balance_id;
+            ClassicOperation::ClaimClaimableBalance {
+                balance_id_hex72: format!("00000000{}", crate::hex::encode(&hash.0)),
+                balance_id_strkey: format!("{}", stellar_strkey::ClaimableBalance::V0(hash.0)),
+            }
+        }
+        (ClassicTransactionKind::Claim, other) => {
+            return Err(mismatch(
+                "stellar_claim_commit",
+                "ClaimClaimableBalance",
+                other,
+            ));
+        }
+    };
+
+    Ok(ClassicSummary {
+        source,
+        fee_stroops: tx.fee,
+        seq_num: tx.seq_num.0,
+        memo,
+        operation,
+    })
+}
+
+/// Renders a `MuxedAccount` as the strkey it is: a G-strkey for a plain
+/// account, an M-strkey (account and mux id) for a muxed one.
+fn muxed_account_to_display_strkey(muxed: &stellar_xdr::MuxedAccount) -> String {
+    match muxed {
+        stellar_xdr::MuxedAccount::Ed25519(_) => muxed_account_to_strkey(muxed),
+        stellar_xdr::MuxedAccount::MuxedEd25519(med) => format!(
+            "{}",
+            stellar_strkey::ed25519::MuxedAccount {
+                ed25519: med.ed25519.0,
+                id: med.id,
+            }
+        ),
+    }
+}
+
+/// Renders an asset as `"XLM"` or `"CODE:Gissuer"`, refusing an asset code
+/// outside the protocol's alphabet.
+fn strict_asset_string(asset: &stellar_xdr::Asset) -> Result<String, EnvelopeDecodeError> {
+    match asset {
+        stellar_xdr::Asset::Native => Ok("XLM".to_owned()),
+        stellar_xdr::Asset::CreditAlphanum4(a) => Ok(format!(
+            "{}:{}",
+            strict_asset_code(&a.asset_code.0)?,
+            account_id_to_strkey(&a.issuer)
+        )),
+        stellar_xdr::Asset::CreditAlphanum12(a) => Ok(format!(
+            "{}:{}",
+            strict_asset_code(&a.asset_code.0)?,
+            account_id_to_strkey(&a.issuer)
+        )),
+    }
+}
+
+/// Returns the asset code of a fixed-width XDR code field: one or more ASCII
+/// letters and digits, followed only by NUL padding.
+fn strict_asset_code(bytes: &[u8]) -> Result<String, EnvelopeDecodeError> {
+    let len = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    let (code, padding) = bytes.split_at(len);
+    if code.is_empty()
+        || !code.iter().all(u8::is_ascii_alphanumeric)
+        || padding.iter().any(|b| *b != 0)
+    {
+        return Err(EnvelopeDecodeError::AssetCodeInvalid);
+    }
+    // ASCII alphanumeric bytes are UTF-8.
+    Ok(code.iter().map(|b| char::from(*b)).collect())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1871,5 +2175,211 @@ mod tests {
             matches!(err, EnvelopeDecodeError::OperationKindMismatch { .. }),
             "expected OperationKindMismatch, got: {err}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // classic_summary
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn usdc() -> Asset {
+        use stellar_xdr::{AlphaNum4, AssetCode4};
+        Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USDC"),
+            issuer: g_to_account_id(USDC_ISSUER_G),
+        })
+    }
+
+    /// The summary of a payment carries the values the policy decoder
+    /// evaluates for the same envelope, plus the memo, fee and sequence.
+    #[test]
+    fn classic_summary_payment_agrees_with_the_policy_decoder() {
+        let op = Operation {
+            source_account: Some(g_to_muxed(DEST_G)),
+            body: OperationBody::Payment(PaymentOp {
+                destination: g_to_muxed(USDC_ISSUER_G),
+                asset: usdc(),
+                amount: 123_456_789,
+            }),
+        };
+        let memo = Memo::Text(b"inv \x1b[2K".as_slice().try_into().unwrap());
+        let xdr_b64 = to_b64(&build_envelope(SOURCE_G, op, memo));
+
+        let summary = classic_summary(&xdr_b64, ClassicTransactionKind::Payment).unwrap();
+        let policy = decode_authoritative_args(&xdr_b64, "stellar_pay_commit").unwrap();
+        assert_eq!(summary.source, policy["source"]);
+        assert_eq!(summary.source, DEST_G);
+        assert_eq!(summary.fee_stroops, 100);
+        assert_eq!(summary.seq_num, 101);
+        assert_eq!(summary.memo, ClassicMemo::Text("inv \u{1b}[2K".to_owned()));
+        assert_eq!(summary.memo.display(), "text \"inv \u{1b}[2K\"");
+        let ClassicOperation::Payment {
+            destination,
+            asset,
+            amount_stroops,
+        } = &summary.operation
+        else {
+            panic!("{:?}", summary.operation)
+        };
+        assert_eq!(destination, &policy["destination"]);
+        assert_eq!(asset, &policy["asset"]);
+        assert_eq!(amount_stroops.to_string(), policy["amount_stroops"]);
+    }
+
+    #[test]
+    fn classic_summary_memo_kinds_name_themselves() {
+        let pay = |memo| {
+            let op = Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: g_to_muxed(DEST_G),
+                    asset: Asset::Native,
+                    amount: 1,
+                }),
+            };
+            classic_summary(
+                &to_b64(&build_envelope(SOURCE_G, op, memo)),
+                ClassicTransactionKind::Payment,
+            )
+            .unwrap()
+            .memo
+            .display()
+        };
+        assert_eq!(pay(Memo::None), "none");
+        assert_ne!(
+            pay(Memo::Text(b"id 7".to_vec().try_into().unwrap())),
+            pay(Memo::Id(7))
+        );
+        assert_ne!(
+            pay(Memo::Text(b"(none)".to_vec().try_into().unwrap())),
+            pay(Memo::None)
+        );
+        assert_eq!(pay(Memo::Id(7)), "id 7");
+        assert_eq!(
+            pay(Memo::Hash(stellar_xdr::Hash([0xab; 32]))),
+            format!("hash {}", "ab".repeat(32))
+        );
+        assert_eq!(
+            pay(Memo::Return(stellar_xdr::Hash([0x01; 32]))),
+            format!("return {}", "01".repeat(32))
+        );
+    }
+
+    /// A summary refuses what it cannot show faithfully: an asset code with a
+    /// byte outside ASCII letters and digits, a text memo that is not UTF-8,
+    /// and an operation of another kind.
+    #[test]
+    fn classic_summary_refuses_unshowable_envelopes() {
+        use stellar_xdr::{AlphaNum4, AssetCode4};
+        for code in [*b"US\x1bD", *b"\0USD", *b"U\0SD", [0; 4]] {
+            let op = Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: g_to_muxed(DEST_G),
+                    asset: Asset::CreditAlphanum4(AlphaNum4 {
+                        asset_code: AssetCode4(code),
+                        issuer: g_to_account_id(USDC_ISSUER_G),
+                    }),
+                    amount: 1,
+                }),
+            };
+            let xdr_b64 = to_b64(&build_envelope(SOURCE_G, op, Memo::None));
+            assert!(
+                matches!(
+                    classic_summary(&xdr_b64, ClassicTransactionKind::Payment),
+                    Err(EnvelopeDecodeError::AssetCodeInvalid)
+                ),
+                "{code:?}"
+            );
+        }
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: g_to_muxed(DEST_G),
+                asset: Asset::Native,
+                amount: 1,
+            }),
+        };
+        let memo = Memo::Text(vec![0xff, 0xfe].try_into().unwrap());
+        let xdr_b64 = to_b64(&build_envelope(SOURCE_G, op.clone(), memo));
+        assert!(matches!(
+            classic_summary(&xdr_b64, ClassicTransactionKind::Payment),
+            Err(EnvelopeDecodeError::XdrDecode { .. })
+        ));
+
+        let xdr_b64 = to_b64(&build_envelope(SOURCE_G, op, Memo::None));
+        for kind in [
+            ClassicTransactionKind::Trustline,
+            ClassicTransactionKind::Claim,
+        ] {
+            assert!(matches!(
+                classic_summary(&xdr_b64, kind),
+                Err(EnvelopeDecodeError::OperationKindMismatch { .. })
+            ));
+        }
+        assert!(classic_summary("AAAA", ClassicTransactionKind::Payment).is_err());
+    }
+
+    #[test]
+    fn classic_summary_change_trust_and_claim() {
+        use stellar_xdr::{
+            AlphaNum12, AssetCode12, ChangeTrustAsset, ChangeTrustOp, ClaimClaimableBalanceOp,
+            ClaimableBalanceId, Hash,
+        };
+        let mut code = [0u8; 12];
+        code[..6].copy_from_slice(b"LONGER");
+        let trust = |limit| Operation {
+            source_account: None,
+            body: OperationBody::ChangeTrust(ChangeTrustOp {
+                line: ChangeTrustAsset::CreditAlphanum12(AlphaNum12 {
+                    asset_code: AssetCode12(code),
+                    issuer: g_to_account_id(USDC_ISSUER_G),
+                }),
+                limit,
+            }),
+        };
+        let summary = classic_summary(
+            &to_b64(&build_envelope(SOURCE_G, trust(i64::MAX), Memo::None)),
+            ClassicTransactionKind::Trustline,
+        )
+        .unwrap();
+        assert_eq!(
+            summary.operation,
+            ClassicOperation::ChangeTrust {
+                asset_code: "LONGER".to_owned(),
+                asset_issuer: USDC_ISSUER_G.to_owned(),
+                limit_stroops: None,
+            }
+        );
+        let summary = classic_summary(
+            &to_b64(&build_envelope(SOURCE_G, trust(0), Memo::None)),
+            ClassicTransactionKind::Trustline,
+        )
+        .unwrap();
+        assert!(matches!(
+            summary.operation,
+            ClassicOperation::ChangeTrust {
+                limit_stroops: Some(0),
+                ..
+            }
+        ));
+
+        let claim = Operation {
+            source_account: None,
+            body: OperationBody::ClaimClaimableBalance(ClaimClaimableBalanceOp {
+                balance_id: ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([0x5a; 32])),
+            }),
+        };
+        let xdr_b64 = to_b64(&build_envelope(SOURCE_G, claim, Memo::None));
+        let summary = classic_summary(&xdr_b64, ClassicTransactionKind::Claim).unwrap();
+        let policy = decode_authoritative_args(&xdr_b64, "stellar_claim_commit").unwrap();
+        assert_eq!(
+            summary.operation,
+            ClassicOperation::ClaimClaimableBalance {
+                balance_id_hex72: policy["balance_id_hex72"].as_str().unwrap().to_owned(),
+                balance_id_strkey: policy["balance_id_strkey"].as_str().unwrap().to_owned(),
+            }
+        );
+        assert_eq!(summary.source, SOURCE_G);
     }
 }

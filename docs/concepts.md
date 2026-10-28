@@ -180,7 +180,7 @@ simulate and approve again to create a trustline approval.
 
 ### What `approve` does
 
-`stellar-agent approve --id <nonce> --profile <name>` loads the store and renders a wallet-controlled summary of the pending action. The destination G-strkey and asset are validated when the entry is deserialized, so a hostile entry cannot inject terminal-rendering content into that summary. The operator confirms at the terminal, and the command then computes and records the attestation. Recording is one-shot: a nonce that is expired, of the wrong kind, or already attested is rejected.
+`stellar-agent approve --id <nonce> --profile <name>` loads the store and renders a wallet-controlled summary of the pending action. A payment, claim, or trustline summary is decoded from the envelope whose digest the attestation binds, and an entry whose stored digest is not that envelope's digest is refused with `approval.entry_inconsistent`. Every value renders control characters as visible escapes, so a hostile entry cannot inject terminal-rendering content into that summary. The operator confirms at the terminal, and the command then computes and records the attestation. Recording is one-shot: a nonce that is expired, of the wrong kind, or already attested is rejected.
 
 ### The attestation
 

@@ -65,6 +65,9 @@ pub mod attest;
 pub mod attestation;
 mod context;
 pub mod error;
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod fixtures;
+pub mod mpp;
 pub mod operator_credentials;
 pub mod registration_input;
 pub mod retry;
@@ -79,7 +82,7 @@ pub mod witness;
 pub use assertion_input::AssertionInput;
 pub use attest::{
     ConsentAudit, Surface, ToolsetGrantRequest, attest_and_persist, attest_mainnet_confirmation,
-    decode_sha256_hex, load_and_validate_entry, load_attestation_key,
+    classic_entry_summary, decode_sha256_hex, load_and_validate_entry, load_attestation_key,
 };
 pub use attestation::AttestationBinding;
 pub use attestation::{

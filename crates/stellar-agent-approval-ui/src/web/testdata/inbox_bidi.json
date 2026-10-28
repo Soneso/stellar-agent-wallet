@@ -1,0 +1,140 @@
+[
+  {
+    "approval_nonce": "fixture-nonce-0",
+    "attested": false,
+    "created_at_unix_ms": 1700000000000,
+    "expired": false,
+    "expires_at_unix_ms": 1700086400000,
+    "kind_name": "RuleProposalSimulated",
+    "summary": {
+      "chain_id": "stellar:testnet",
+      "definition": {
+        "accept_mutable_verifier": true,
+        "accept_unknown_verifier": true,
+        "auth_rule_ids": [
+          0
+        ],
+        "context_type": {
+          "type": "default"
+        },
+        "name": "café\\u{202e}rule",
+        "policies": [
+          {
+            "params_xdr_b64": "AAAAEQAAAAEAAAACAAAADwAAAA5wZXJpb2RfbGVkZ2VycwAAAAAAAwAAQ4AAAAAPAAAADnNwZW5kaW5nX2xpbWl0AAAAAAAKAAAAAAAAAAAAAAAAAJiWgA",
+            "policy_address": "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+          }
+        ],
+        "signers": [
+          {
+            "address": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "is_proposer": true,
+            "kind": "delegated",
+            "pubkey_data": null,
+            "verifier": null
+          },
+          {
+            "address": null,
+            "is_proposer": false,
+            "kind": "external",
+            "pubkey_data": [
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171,
+              171
+            ],
+            "verifier": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+          }
+        ],
+        "snapshot_version": 1,
+        "valid_until": null
+      },
+      "kind": "rule_proposal",
+      "network_passphrase": "Test SDF Network ; September 2015",
+      "proposal_sha256_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "smart_account_redacted": "CDDDD...DDDDD",
+      "summary_line": "café\\u{202e}rule"
+    }
+  },
+  {
+    "approval_nonce": "fixture-nonce-1",
+    "attested": false,
+    "created_at_unix_ms": 1700000000000,
+    "expired": false,
+    "expires_at_unix_ms": 1700086400000,
+    "kind_name": "PaymentSimulated",
+    "summary": {
+      "amount_stroops": "1000",
+      "asset": "XLM",
+      "fee_stroops": "100",
+      "kind": "payment",
+      "memo": {
+        "kind": "text",
+        "value": "memo\\u{202e}"
+      },
+      "seq_num": 1,
+      "source": "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+      "to": "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL"
+    }
+  }
+]

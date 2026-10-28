@@ -12,6 +12,9 @@
     reason = "test-only; panics acceptable in unit tests"
 )]
 
+const SOURCE_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+const DEST_G: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
+
 // ChangeTrust with transaction source [1; 32] and operation source [2; 32].
 const CHANGE_TRUST_ENVELOPE: &str = concat!(
     "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAA",
@@ -35,7 +38,7 @@ use tower::ServiceExt as _;
 use stellar_agent_core::approval::attestation::{compute_attestation, verify_attestation};
 use stellar_agent_core::approval::{
     ApprovalKind, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, decode_sha256_hex,
-    process_uid_for_attestation,
+    fixtures, process_uid_for_attestation,
 };
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::profile::schema::KeyringEntryRef;
@@ -150,19 +153,17 @@ fn uid() -> String {
 }
 
 fn payment_entry(ttl_ms: u64) -> PendingApproval {
-    PendingApproval::new_payment_pending(
-        "b64xdr".to_owned(),
-        b"fake-xdr",
-        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+    fixtures::payment_pending(
+        SOURCE_G,
+        DEST_G,
+        "XLM",
         2_500_000,
-        "XLM".to_owned(),
         None,
         100,
         1_234_567,
         uid(),
         ttl_ms,
     )
-    .unwrap()
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -523,19 +524,17 @@ async fn approve_expired_entry_reports_expired() {
 async fn approve_foreign_process_uid_reports_user_mismatch() {
     let h = Harness::new("approve-mismatch");
     let cookie = h.bootstrap().await;
-    let entry = PendingApproval::new_payment_pending(
-        "b64xdr".to_owned(),
-        b"fake-xdr",
-        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+    let entry = fixtures::payment_pending(
+        SOURCE_G,
+        DEST_G,
+        "XLM",
         2_500_000,
-        "XLM".to_owned(),
         None,
         100,
         1_234_567,
         "99999999".to_owned(),
         DEFAULT_TTL_MS,
-    )
-    .unwrap();
+    );
     let nonce = h.insert(entry);
     let csrf = h.csrf_for(&nonce);
 
@@ -563,19 +562,17 @@ async fn approve_foreign_process_uid_reports_user_mismatch() {
 async fn reject_foreign_process_uid_reports_user_mismatch() {
     let h = Harness::new("reject-mismatch");
     let cookie = h.bootstrap().await;
-    let entry = PendingApproval::new_payment_pending(
-        "b64xdr".to_owned(),
-        b"fake-xdr",
-        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+    let entry = fixtures::payment_pending(
+        SOURCE_G,
+        DEST_G,
+        "XLM",
         2_500_000,
-        "XLM".to_owned(),
         None,
         100,
         1_234_567,
         "99999999".to_owned(),
         DEFAULT_TTL_MS,
-    )
-    .unwrap();
+    );
     let nonce = h.insert(entry);
     let csrf = h.csrf_for(&nonce);
 
@@ -845,6 +842,67 @@ async fn inbox_get_renders_for_authenticated_session() {
     let html = std::str::from_utf8(&bytes).unwrap();
     assert!(html.contains(r#"id="pending-data""#));
     assert!(html.contains("Pending approvals"));
+}
+
+/// Both inbox sinks, the `/inbox` data island and the `/pending.json`
+/// poll, carry a memo's U+202E only as the visible escape.
+#[tokio::test]
+#[serial]
+async fn inbox_sinks_carry_a_bidi_memo_escaped() {
+    let h = Harness::new("inbox-bidi");
+    let cookie = h.bootstrap().await;
+    // The envelope carries the memo; the stored summary memo, which no
+    // surface displays, is absent.
+    let envelope = fixtures::payment_envelope(
+        SOURCE_G,
+        DEST_G,
+        "XLM",
+        2_500_000,
+        Some("memo\u{202e}"),
+        100,
+        1_234_567,
+    );
+    h.insert(
+        PendingApproval::new_payment_pending(
+            envelope.clone(),
+            envelope.as_bytes(),
+            DEST_G.to_owned(),
+            2_500_000,
+            "XLM".to_owned(),
+            None,
+            100,
+            1_234_567,
+            uid(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap(),
+    );
+
+    let get = |uri: &'static str| {
+        Request::builder()
+            .uri(uri)
+            .header(header::HOST, HOST)
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let resp = h.router().oneshot(get("/inbox")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+    let html = std::str::from_utf8(&bytes).unwrap();
+    assert!(html.contains(r#""value":"memo\\u{202e}""#), "{html}");
+    assert!(!html.contains('\u{202e}'), "{html}");
+
+    let resp = h.router().oneshot(get("/pending.json")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body = std::str::from_utf8(&bytes).unwrap();
+    assert!(!body.contains('\u{202e}'), "{body}");
+    let json: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(
+        json["pending"][0]["summary"]["memo"]["value"],
+        r"memo\u{202e}"
+    );
 }
 
 #[tokio::test]
@@ -1264,19 +1322,17 @@ async fn approve_with_unseeded_keyring_returns_unavailable_status() {
         .unwrap()
         .to_owned();
 
-    let entry = PendingApproval::new_payment_pending(
-        "b64xdr".to_owned(),
-        b"fake-xdr",
-        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+    let entry = fixtures::payment_pending(
+        SOURCE_G,
+        DEST_G,
+        "XLM",
         1_000,
-        "XLM".to_owned(),
         None,
         100,
         1,
         uid(),
         DEFAULT_TTL_MS,
-    )
-    .unwrap();
+    );
     let nonce = entry.approval_nonce.clone();
     {
         let mut store = PendingApprovalStore::open(store_path).unwrap();
@@ -1401,13 +1457,22 @@ async fn authenticated_detail_renders_selected_context_and_envelope_source() {
     context.chain_id = "stellar:mainnet".to_owned();
     context.endpoint_host = "https://route-rpc.example".to_owned();
     context.signer_account = Some("GENROLLED".to_owned());
-    let mut entry = payment_entry(DEFAULT_TTL_MS);
-    if let stellar_agent_core::approval::ApprovalKind::PaymentSimulated {
-        envelope_xdr_b64, ..
-    } = &mut entry.kind
-    {
-        *envelope_xdr_b64 = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAABAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAD0JAAAAAAAAAAAA=".to_owned();
-    }
+    // A payment whose operation source ([2; 32]) overrides its transaction
+    // source ([1; 32]).
+    let envelope = "AAAAAgAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAEAAAAAAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAABAAAAAAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAAAAAAAAAAAAD0JAAAAAAAAAAAA=";
+    let entry = PendingApproval::new_payment_pending(
+        envelope.to_owned(),
+        envelope.as_bytes(),
+        DEST_G.to_owned(),
+        1_000_000,
+        "XLM".to_owned(),
+        None,
+        100,
+        1,
+        uid(),
+        DEFAULT_TTL_MS,
+    )
+    .unwrap();
     let nonce = h.insert(entry);
     let cookie = h.bootstrap().await;
     let response = h

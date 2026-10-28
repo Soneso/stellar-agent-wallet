@@ -2931,6 +2931,21 @@ mod tests {
     // The parse_memo tests below exercise the thin CLI wrapper.
 
     #[test]
+    fn parse_memo_refuses_every_control_range() {
+        for &(first, last) in stellar_agent_core::approval::fixtures::MEMO_CONTROL_RANGES {
+            for point in first..=last {
+                let mut args = minimal_args();
+                args.memo_text = Some(format!("a{}b", char::from_u32(point).unwrap()));
+                assert_eq!(
+                    parse_memo(&args).unwrap_err().code(),
+                    "validation.memo_control_character",
+                    "U+{point:04X}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn parse_memo_none() {
         let args = minimal_args();
         let memo = parse_memo(&args).unwrap();

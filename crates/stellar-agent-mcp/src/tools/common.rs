@@ -3856,7 +3856,16 @@ pub(crate) mod tests {
         let approvals_dir = tempfile::tempdir().unwrap();
         server.set_approval_dir_for_test(approvals_dir.path().to_path_buf());
 
-        let envelope_xdr = "AAAA";
+        let envelope = stellar_agent_core::approval::fixtures::payment_envelope(
+            "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+            "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+            "XLM",
+            1_000_000,
+            None,
+            100,
+            123,
+        );
+        let envelope_xdr = envelope.as_str();
         let store_path = approvals_dir
             .path()
             .join(format!("{}.toml", server.profile_name_for_approval()));
@@ -3973,7 +3982,16 @@ pub(crate) mod tests {
         let approvals_dir = tempfile::tempdir().unwrap();
         server.set_approval_dir_for_test(approvals_dir.path().to_path_buf());
 
-        let envelope_xdr = "AAAA";
+        let envelope = stellar_agent_core::approval::fixtures::payment_envelope(
+            "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL",
+            "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+            "XLM",
+            1_000_000,
+            None,
+            100,
+            123,
+        );
+        let envelope_xdr = envelope.as_str();
         let store_path = approvals_dir
             .path()
             .join(format!("{}.toml", server.profile_name_for_approval()));

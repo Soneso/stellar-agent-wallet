@@ -280,7 +280,7 @@ async fn pending_json(
         } => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/json")],
-            json!({ "pending": pending, "expired_count": expired_count }).to_string(),
+            json!({ "pending": crate::templates::pending_json_value(&pending), "expired_count": expired_count }).to_string(),
         )
             .into_response(),
         SnapshotResult::Busy => store_busy(),
@@ -460,6 +460,13 @@ fn outcome_to_response(outcome: Outcome) -> Response {
         ),
         Outcome::NotFound => (StatusCode::OK, json!({ "status": "not_found" })),
         Outcome::WrongKind => (StatusCode::OK, json!({ "status": "wrong_kind" })),
+        Outcome::Inconsistent => (
+            StatusCode::OK,
+            json!({
+                "status": "inconsistent",
+                "message": crate::templates::INCONSISTENT_MESSAGE,
+            }),
+        ),
         Outcome::Busy => (
             StatusCode::SERVICE_UNAVAILABLE,
             json!({ "status": "busy", "retriable": true }),

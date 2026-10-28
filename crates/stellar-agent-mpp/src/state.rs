@@ -410,6 +410,10 @@ impl fmt::Debug for AuthorizationRecord {
 /// Computes the versioned authorization fingerprint that binds profile,
 /// network, payer, transport context, exact challenge, terms, and expiry.
 ///
+/// The bytes are those of
+/// [`stellar_agent_core::approval::mpp::authorization_fingerprint`], which
+/// pending approvals are checked against.
+///
 /// # Errors
 ///
 /// Returns a redacted challenge error if context serialization fails.
@@ -419,26 +423,24 @@ pub fn authorization_fingerprint(
     payer: &str,
     selected: &SelectedChallenge,
 ) -> Result<[u8; 32], MppError> {
-    let mut hash = Sha256::new();
-    hash.update(b"stellar-agent-mpp-authorization:v1\0");
-    update(&mut hash, profile_name.as_bytes());
-    update(&mut hash, &Sha256::digest(network_passphrase.as_bytes()));
-    update(&mut hash, payer.as_bytes());
-    update(&mut hash, &selected.context().digest()?);
-    update(&mut hash, selected.challenge_digest());
-    update(&mut hash, b"stellar");
-    update(&mut hash, b"charge");
-    update(&mut hash, b"sponsored_pull");
-    update(&mut hash, selected.request().amount_decimal().as_bytes());
-    update(&mut hash, selected.request().currency().as_bytes());
-    update(&mut hash, selected.request().recipient().as_bytes());
-    update(&mut hash, &selected.effective_expires_at().to_be_bytes());
-    Ok(hash.finalize().into())
-}
-
-fn update(hash: &mut Sha256, value: &[u8]) {
-    hash.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
-    hash.update(value);
+    use stellar_agent_core::approval::mpp::{MppAuthorizationContext, MppChargeTerms};
+    Ok(
+        stellar_agent_core::approval::mpp::authorization_fingerprint(
+            &MppChargeTerms {
+                profile: profile_name,
+                payer,
+                amount: selected.request().amount_decimal(),
+                currency: selected.request().currency(),
+                recipient: selected.request().recipient(),
+                effective_expires_at_unix: selected.effective_expires_at(),
+            },
+            &MppAuthorizationContext {
+                context_digest: selected.context().digest()?,
+                network_passphrase_hash: Sha256::digest(network_passphrase.as_bytes()).into(),
+                challenge_digest: *selected.challenge_digest(),
+            },
+        ),
+    )
 }
 
 const fn state_error() -> MppError {
@@ -697,6 +699,24 @@ mod tests {
                 .expect_err("corrupt artifact")
                 .code(),
             "mpp.state_unavailable"
+        );
+    }
+
+    /// The fingerprint keys stored authorization records, so its bytes are
+    /// pinned: the same vector as the core known-answer test.
+    #[tokio::test]
+    async fn authorization_fingerprint_known_answer() {
+        let (prepared, _signer, _rpc) = prepared_fixture(1_700_000_000).await;
+        let fingerprint = authorization_fingerprint(
+            "default",
+            TESTNET_PASSPHRASE,
+            prepared.payer(),
+            prepared.selected(),
+        )
+        .expect("fingerprint");
+        assert_eq!(
+            hex::encode(fingerprint),
+            "79d368c1aeb6b1f89a1bf84a56bea75bb7ca6e138c252cafa18e24c013fd1768"
         );
     }
 

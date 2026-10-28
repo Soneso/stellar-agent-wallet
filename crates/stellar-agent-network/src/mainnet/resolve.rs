@@ -747,7 +747,7 @@ mod enabled {
         clippy::too_many_arguments,
         reason = "approval, audit and signer checks share one clock and context"
     )]
-    fn final_checks(
+    pub(super) fn final_checks(
         context: &MainnetWriteContext,
         approval: &ApprovalWitness,
         subject: [u8; 32],
@@ -2697,6 +2697,15 @@ mod tests {
             changed_envelope(&f, |tx| {
                 tx.tx.memo = stellar_xdr::Memo::Text(b"other".to_vec().try_into().unwrap())
             })
+        } else if case == "trustline_approval" {
+            stellar_agent_core::approval::fixtures::change_trust_envelope(
+                f.source.source(),
+                "USD",
+                f.source.destination(),
+                Some(10),
+                100,
+                1,
+            )
         } else {
             f.envelope.clone()
         };
@@ -2716,7 +2725,7 @@ mod tests {
         entry.created_at_unix_ms = f.now;
         entry.expires_at_unix_ms = f.now + 600_000;
         let mut kind = stellar_agent_core::approval::witness::ApprovedKind::Payment;
-        if case == "kind" {
+        if case == "trustline_approval" {
             entry = stellar_agent_core::approval::PendingApproval::new_trustline_pending(
                 envelope.clone(),
                 envelope.as_bytes(),
@@ -2734,18 +2743,13 @@ mod tests {
             entry.expires_at_unix_ms = f.now + 600_000;
             kind = stellar_agent_core::approval::witness::ApprovedKind::Trustline;
         }
-        let approval = f.attested(
-            &entry,
-            &profile,
-            if case == "profile" {
-                "other"
-            } else {
-                "operator"
-            },
-            kind,
-            stellar_agent_core::approval::subject::approval_subject_classic(&envelope),
-            f.now,
-        );
+        let name = if case == "profile" {
+            "other"
+        } else {
+            "operator"
+        };
+        let subject = stellar_agent_core::approval::subject::approval_subject_classic(&envelope);
+        let approval = f.attested(&entry, &profile, name, kind, subject, f.now);
         let signer = crate::keyring::enrolled_signer(
             "operator",
             &f.dir.path().join("profiles"),
@@ -2785,10 +2789,78 @@ mod tests {
     binding_case!(approval_profile_refuses, "profile", ApprovalProfileMismatch);
     binding_case!(approval_chain_refuses, "chain", ApprovalChainMismatch);
     binding_case!(approval_subject_refuses, "subject", ApprovalSubjectMismatch);
-    binding_case!(approval_kind_refuses, "kind", ApprovalKindMismatch);
+    binding_case!(
+        a_trustline_approval_does_not_authorize_a_payment,
+        "trustline_approval",
+        ApprovalSubjectMismatch
+    );
     binding_case!(audit_stale_refuses, "audit_age", AuditStale);
     binding_case!(audit_profile_refuses, "audit_profile", AuditProfileMismatch);
     binding_case!(signer_role_refuses, "signer_role", SignerRoleMismatch);
+
+    /// The kind check refuses a verified approval whose subject is the
+    /// request's subject when the consumer expects another kind. The same
+    /// call with the approval's own kind passes, so the kind is the only
+    /// difference.
+    #[test]
+    #[serial_test::serial]
+    fn approval_kind_refuses() {
+        use stellar_agent_core::approval::witness::ApprovedKind;
+        use stellar_agent_core::policy::{
+            Decision, McpToolRegistration, NoopPolicyEngine, PolicyEngine as _, ToolDescriptor,
+            ToolValueKind,
+        };
+        let f = ResolverFixture::new();
+        let read_only = ToolDescriptor::from_registration(&McpToolRegistration {
+            name: "stellar_balances",
+            destructive_hint: false,
+            read_only_hint: true,
+            chain_id_required: true,
+            value_kind: ToolValueKind::ReadOnly,
+        });
+        let evaluation = NoopPolicyEngine
+            .evaluate_full(
+                &read_only,
+                &serde_json::Value::Null,
+                &f.profile,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(evaluation.decision, Decision::Allow);
+        let approval = f.approval(
+            &f.envelope,
+            f.now,
+            stellar_agent_core::approval::store::governing_ttl_ms(&evaluation),
+        );
+        let subject = stellar_agent_core::approval::subject::approval_subject_classic(&f.envelope);
+        let audit = f.audit();
+        let check = |kind| {
+            enabled::final_checks(
+                &f.context,
+                &approval,
+                subject,
+                kind,
+                &evaluation,
+                &audit,
+                &f.signer,
+                f.now,
+            )
+        };
+        assert_eq!(approval.kind(), ApprovedKind::Payment);
+        check(ApprovedKind::Payment).unwrap();
+        let error = check(ApprovedKind::Trustline).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MainnetAuthorizationError::Refused(P::ApprovalKindMismatch)
+            ),
+            "expected ApprovalKindMismatch, got {error:?}"
+        );
+    }
 
     #[tokio::test]
     #[serial_test::serial]

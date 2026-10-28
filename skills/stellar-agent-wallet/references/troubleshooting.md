@@ -479,6 +479,12 @@ The operator corrects `oracle_provider_url`, `[providers.oracle]`, or
 | `validation.mainnet_fee_cap_required` | Mainnet cap missing. | Operator sets the signed cap. |
 | `validation.fee_total_overflow` | Pool fee overflows. | Lower the profile fee. |
 
+## Memo codes
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `validation.memo_control_character` | A text memo holds a control character (U+0000 to U+001F, U+007F to U+009F) or a Unicode format character (category Cf), line separator (U+2028), or paragraph separator (U+2029), on any network. The format characters include U+200C and U+200D. The message names the character, not the memo. | Send the memo without that character. |
+
 `fees.percentile_exceeds_cap` means the per-operation fee exceeds
 `classic_max_fee_per_op_stroops`. The message names the source: an auto-selected
 fee and percentile, an explicit fee, the profile's `classic_fee_per_op_stroops`,
@@ -597,6 +603,7 @@ These failures carry `approval.*` codes:
 | `approval.already_attested` | Consent is already recorded for this entry. | Use the recorded consent for the pending action. |
 | `approval.rejected` | The operator refused this approval. | Stop the requested action. |
 | `approval.consumed` | This approval has already been used. | Request a new simulation before seeking another approval. |
+| `approval.entry_inconsistent` | The pending payment, claim, or trustline request's stored digest is not the digest of its stored envelope, or its envelope does not decode; or the pending MPP charge shows terms that do not match what it would authorize, holds no binding digests, or at commit shows another transport, authority, or target than the prepared request. No surface approves it. | Stop. Report it: the approval store was changed outside the wallet. Request a fresh simulation for the intended action. |
 | `approval.clock_error`, `approval.sha256_hex_error`, `approval.key_decode_failed`, `approval.key_length_error`, `approval.binding_mismatch`, `approval.grant_persist`, `approval.wrong_kind`, `approval.record_failed`, `approval.uid_unavailable`, `approval.store_dir_error`, `approval.permission_denied`, `approval.invalid_nonce_length`, `approval.writer_locked`, `approval.store_open_failed`, `approval.gc_failed` | Approval validation, attestation, storage, or expired-entry collection refuses. | Report the code and diagnostic. Have the operator resolve the approval state, key, identity, clock, or store condition before requesting fresh consent. |
 
 ## Audit-key code
@@ -675,7 +682,9 @@ MPP codes are closed and redacted. Input/selection failures include
 `mpp.authorization_indeterminate`, `mpp.state_unavailable`,
 `mpp.simulation_failed`, `mpp.signing_failed`, and
 `mpp.credential_too_large`. Observation failures are `mpp.receipt_invalid`,
-`mpp.receipt_conflict`, and `mpp.reconciliation_unavailable`.
+`mpp.receipt_conflict`, and `mpp.reconciliation_unavailable`. A charge commit
+whose pending approval shows another transport, authority, or target than the
+prepared request refuses with `approval.entry_inconsistent` and commits nothing.
 
 `mpp.authorization_not_found` means no authorization matches the identifier
 you supplied, including on a profile that has never prepared a charge. It is a

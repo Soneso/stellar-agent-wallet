@@ -250,7 +250,7 @@ Staged pipeline (mutually exclusive): `--build-only` emits unsigned envelope XDR
 | `<AMOUNT>` (positional) | Amount with units, e.g. `"10 XLM"` | — |
 | `[ASSET]` (positional) | `native`, `XLM`, or `CODE:ISSUER` | `native` |
 | `--source <G_STRKEY>` | Source account; required for signing | — |
-| `--memo-text <STRING>` | Memo text (UTF-8, up to 28 bytes) | — |
+| `--memo-text <STRING>` | Memo text (UTF-8, up to 28 bytes; control characters, Unicode format characters, and line or paragraph separators are refused with `validation.memo_control_character`) | — |
 | `--memo-id <U64>` | Memo ID (u64 decimal) | — |
 | `--memo-hash <64_HEX>` / `--memo-return <64_HEX>` | Memo hash / return hash (32 bytes) | — |
 | `--secret-env <VAR>` | Env-var name holding source S-strkey | — |

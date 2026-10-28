@@ -17,6 +17,12 @@ The wallet host mints an attestation under the serving profile name and CAIP-2 c
 The shared HMAC also binds the pending nonce, digest, and process uid.
 The detail page shows the profile, network, endpoint authority, and enrolled signer above the request summary.
 Summary rows render challenge-bound entry data. Header rows come from the serving profile and are not challenge-bound.
+A payment, claim, or trustline summary is decoded from the transaction envelope whose digest the challenge and the attestation bind, so the page shows the transaction an approval signs.
+Every summary value renders control characters as visible escapes such as `\u{1b}` and `\u{202e}`.
+Memos retain their type: `none`, `text "<escaped value>"`, `id <n>`, `hash <hex>`, or `return <hex>`.
+MPP terms and the network are checked against the authorization fingerprint before display or attestation; the charge commit checks the transport, authority, and target against the prepared request.
+The simulated fee reads `not bound to this approval`.
+A request whose stored digest is not the digest of its stored envelope, whose envelope does not decode, or whose MPP terms do not match its fingerprint shows as `INCONSISTENT` and offers only Reject; an approve of it is refused with the status `inconsistent` and attests nothing.
 A commit cannot tell whether an attestation came from the local inbox or the remote listener.
 The audit log distinguishes remote `ApprovalAttestedRemote` / `ApprovalRejectedRemote` events from loopback `ApprovalAttested` / `ApprovalRejected` events.
 Each row is written before the decision takes effect; a decision whose row cannot be written is refused and the entry stays pending.
@@ -198,8 +204,10 @@ not recognized until you do.
    Windows Hello, or a security key), same as any other passkey sign-in.
 3. You land on the inbox: the pending approvals list, updating automatically.
 4. Click an entry to see the wallet-decoded summary of the parked action:
-   payment, claim, or trustline. A trustline names the full holder and issuer,
-   asset code, and limit.
+   payment, claim, or trustline, decoded from its transaction envelope. A
+   trustline names the full holder and issuer, asset code, and limit. A claim
+   names the balance by id; its asset and amount are not part of the signed
+   claim transaction.
 5. Click Approve or Reject. Each one prompts a FRESH passkey assertion.
    The browser calls out to your authenticator again, over a challenge bound
    to that exact entry, before the decision is applied. This is by design:

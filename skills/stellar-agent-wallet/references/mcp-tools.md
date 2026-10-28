@@ -307,7 +307,7 @@ their own `x402.*` code before the `chain_id` check.
 | `amount` | string | one of amount/stroops | Decimal + unit, e.g. `"10 XLM"`. |
 | `amount_in_stroops` | decimal string | one of amount/stroops | Raw stroops, no unit; mutually exclusive with `amount`; rejected if negative, malformed, or > i64::MAX. |
 | `asset` | string | yes | `"native"`/`"XLM"` or `"CODE:GISSUER"`. |
-| `memo_text` | string | no | UTF-8, at most 28 bytes; mutually exclusive with other memo fields. |
+| `memo_text` | string | no | UTF-8, at most 28 bytes; control characters, Unicode format characters, and line or paragraph separators are refused (`validation.memo_control_character`); mutually exclusive with other memo fields. |
 | `memo_id` | integer (u64) | no | Mutually exclusive with other memo fields. |
 | `memo_hash_hex` | string | no | 64 hex chars (32 bytes); mutually exclusive. |
 | `memo_return_hex` | string | no | 64 hex chars (32 bytes); mutually exclusive. |

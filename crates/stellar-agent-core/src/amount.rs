@@ -19,6 +19,7 @@
 use std::fmt;
 
 use crate::error::ValidationError;
+use crate::observability::redact::is_untrusted_format_character;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Protocol constants
@@ -533,6 +534,18 @@ impl schemars::JsonSchema for McpAmountArgument {
 /// Maximum byte length for Stellar `MEMO_TEXT`.
 pub const MCP_MEMO_TEXT_MAX_BYTES: usize = 28;
 
+/// The first character of `text` that memo input refuses, as `U+XXXX`.
+///
+/// Memo input refuses exactly the characters approval surfaces render as
+/// visible escapes, [`is_untrusted_format_character`], so no accepted memo
+/// needs an escape to be displayed.
+#[must_use]
+pub fn first_memo_control_character(text: &str) -> Option<String> {
+    text.chars()
+        .find(|c| is_untrusted_format_character(*c))
+        .map(|c| format!("U+{:04X}", u32::from(c)))
+}
+
 /// Error returned when constructing an [`McpMemoTextArgument`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum McpMemoTextArgumentError {
@@ -544,23 +557,41 @@ pub enum McpMemoTextArgumentError {
         /// Actual UTF-8 byte length.
         actual: usize,
     },
+    /// The text memo holds a character [`is_untrusted_format_character`] refuses.
+    ///
+    /// The message leads with the wire code
+    /// `validation.memo_control_character` and names the character as
+    /// `U+XXXX`; the memo is not echoed.
+    #[error(
+        "validation.memo_control_character: memo_text holds the control character \
+         {code_point}; control and Unicode format characters or line separators are refused"
+    )]
+    ControlCharacter {
+        /// The first refused character, as `U+XXXX`.
+        code_point: String,
+    },
 }
 
 /// A typed wrapper around Stellar `MEMO_TEXT` for MCP tool arguments.
 ///
 /// JSON strings are already valid UTF-8 at the serde boundary. This wrapper
-/// closes the remaining wire-boundary gap by rejecting strings whose UTF-8 byte
-/// length exceeds Stellar's 28-byte `MEMO_TEXT` limit.
+/// closes the remaining wire-boundary gaps: it rejects strings whose UTF-8 byte
+/// length exceeds Stellar's 28-byte `MEMO_TEXT` limit, and strings holding a
+/// control, Unicode format, line separator, or paragraph separator character (see
+/// [`is_untrusted_format_character`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpMemoTextArgument(String);
 
 impl McpMemoTextArgument {
-    /// Constructs a memo text argument after enforcing the 28-byte cap.
+    /// Constructs a memo text argument after enforcing the 28-byte cap and the
+    /// control-character refusal.
     ///
     /// # Errors
     ///
     /// Returns [`McpMemoTextArgumentError::TooLong`] when `value` exceeds
-    /// [`MCP_MEMO_TEXT_MAX_BYTES`] bytes.
+    /// [`MCP_MEMO_TEXT_MAX_BYTES`] bytes, and
+    /// [`McpMemoTextArgumentError::ControlCharacter`] when it holds a
+    /// character [`is_untrusted_format_character`] refuses.
     pub fn new(value: String) -> Result<Self, McpMemoTextArgumentError> {
         let actual = value.len();
         if actual > MCP_MEMO_TEXT_MAX_BYTES {
@@ -568,6 +599,9 @@ impl McpMemoTextArgument {
                 max: MCP_MEMO_TEXT_MAX_BYTES,
                 actual,
             });
+        }
+        if let Some(code_point) = first_memo_control_character(&value) {
+            return Err(McpMemoTextArgumentError::ControlCharacter { code_point });
         }
         Ok(Self(value))
     }
@@ -638,7 +672,9 @@ impl schemars::JsonSchema for McpMemoTextArgument {
     fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "string",
-            "description": "Stellar MEMO_TEXT value encoded as UTF-8, capped at 28 bytes.",
+            "description": "Stellar MEMO_TEXT value encoded as UTF-8, capped at 28 bytes. \
+                            Control characters (C0, DEL, C1), Unicode format characters (Cf), \
+                            and line or paragraph separators (U+2028, U+2029) are refused.",
             "maxLength": MCP_MEMO_TEXT_MAX_BYTES
         })
     }
@@ -2294,6 +2330,78 @@ mod tests {
         assert!(memo.as_str().len() <= MCP_MEMO_TEXT_MAX_BYTES);
     }
 
+    /// Every refused character class is refused by the constructor and by
+    /// serde, with the wire code and the code point, and the memo is not
+    /// echoed.
+    #[test]
+    fn mcp_memo_text_arg_refuses_control_and_bidi_characters() {
+        for (c, code_point) in [
+            ('\u{0}', "U+0000"),
+            ('\u{1b}', "U+001B"),
+            ('\n', "U+000A"),
+            ('\u{1f}', "U+001F"),
+            ('\u{7f}', "U+007F"),
+            ('\u{80}', "U+0080"),
+            ('\u{9b}', "U+009B"),
+            ('\u{9f}', "U+009F"),
+            ('\u{202A}', "U+202A"),
+            ('\u{202E}', "U+202E"),
+            ('\u{2066}', "U+2066"),
+            ('\u{2069}', "U+2069"),
+        ] {
+            let memo = format!("pay{c}secret");
+            let err =
+                McpMemoTextArgument::new(memo.clone()).expect_err("control character refused");
+            assert_eq!(
+                err,
+                McpMemoTextArgumentError::ControlCharacter {
+                    code_point: code_point.to_owned()
+                },
+                "{c:?}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.starts_with("validation.memo_control_character: "),
+                "{message}"
+            );
+            assert!(message.contains(code_point), "{message}");
+            assert!(!message.contains("secret"), "{message}");
+
+            let json = serde_json::to_string(&memo).expect("JSON string");
+            let serde_err = serde_json::from_str::<McpMemoTextArgument>(&json)
+                .expect_err("serde refuses a control character");
+            assert!(
+                serde_err
+                    .to_string()
+                    .contains("validation.memo_control_character"),
+                "{serde_err}"
+            );
+        }
+    }
+
+    /// Ordinary text is accepted, non-ASCII letters and the characters next to
+    /// the refused ranges included.
+    #[test]
+    fn mcp_memo_text_arg_accepts_ordinary_text() {
+        for text in [
+            "invoice 42",
+            "Zahlung f\u{fc}r M\u{e4}rz",
+            "\u{4e2d}\u{6587}\u{5907}\u{6ce8}",
+            "\u{a0}\u{a1}~ !",
+            "\u{202F}\u{2065}",
+        ] {
+            let memo = McpMemoTextArgument::new(text.to_owned()).expect("ordinary text accepted");
+            assert_eq!(memo.as_str(), text);
+        }
+        assert!(!is_untrusted_format_character(' '));
+        assert!(!is_untrusted_format_character('~'));
+        assert!(!is_untrusted_format_character('\u{a0}'));
+        assert!(is_untrusted_format_character('\u{2029}'));
+        assert!(!is_untrusted_format_character('\u{202F}'));
+        assert!(!is_untrusted_format_character('\u{2065}'));
+        assert!(is_untrusted_format_character('\u{206A}'));
+    }
+
     /// `JsonSchema` output carries the MEMO_TEXT byte cap.
     #[test]
     fn mcp_memo_text_arg_schema_has_max_length() {
@@ -2304,5 +2412,25 @@ mod tests {
             json.contains("\"maxLength\":28"),
             "schema must carry maxLength 28: {json}"
         );
+    }
+    #[test]
+    fn memo_control_ranges_include_every_interior_value() {
+        for &(first, last) in crate::approval::fixtures::MEMO_CONTROL_RANGES {
+            for point in first..=last {
+                let c = char::from_u32(point).unwrap();
+                assert!(is_untrusted_format_character(c), "U+{point:04X}");
+                let text = format!("a{c}b");
+                assert!(
+                    McpMemoTextArgument::new(text.clone()).is_err(),
+                    "U+{point:04X}"
+                );
+                let escaped = crate::observability::escape_untrusted_text(&text);
+                assert_eq!(
+                    escaped,
+                    format!("a{}b", c.escape_default()),
+                    "U+{point:04X}"
+                );
+            }
+        }
     }
 }

@@ -30,14 +30,48 @@ pub const UNTRUSTED_DISPLAY_MAX_BYTES: usize = 64;
 /// Marker appended by [`untrusted_display_bounded`] when it truncates.
 const TRUNCATION_MARKER: &str = "...";
 
+/// Whether `c` is a character untrusted text must never carry raw onto an
+/// approval surface, a terminal or a log line.
+///
+/// The set is C0, DEL and C1 (`char::is_control`), the line and paragraph
+/// separators U+2028 and U+2029, and every Unicode format character (general
+/// category Cf), among them the bidirectional overrides and isolates, the
+/// zero-width characters including U+200C and U+200D, the soft hyphen, the
+/// byte-order mark and the tag characters. These characters move the cursor,
+/// recolor, reorder or hide the text around them. [`escape_untrusted_text`]
+/// and [`untrusted_display_bounded`] render each as a visible escape, and memo
+/// input refuses them, so an accepted memo never needs one.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::observability::redact::is_untrusted_format_character;
+///
+/// assert!(is_untrusted_format_character('\u{1b}'));
+/// assert!(is_untrusted_format_character('\u{202E}'));
+/// assert!(is_untrusted_format_character('\u{200D}'));
+/// assert!(!is_untrusted_format_character('\u{e9}'));
+/// ```
+#[must_use]
+pub const fn is_untrusted_format_character(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
+        | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180E}'
+        | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
+        | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}'
+        | '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
+}
+
 /// Renders untrusted bytes (for example an owner-chosen ledger string) for a
 /// log line, error string, audit row or MCP envelope.
 ///
-/// The bytes are decoded lossily as UTF-8. Backslash, double quote, every
-/// Unicode control character and the invisible formatting characters that can
-/// reorder or hide terminal text (bidirectional overrides and isolates,
-/// zero-width characters, line and paragraph separators, the byte-order mark)
-/// are rendered as Rust escape sequences, so the output is a single printable
+/// The bytes are decoded lossily as UTF-8. Backslash, double quote and every
+/// character [`is_untrusted_format_character`] names (C0, DEL, C1, U+2028,
+/// U+2029 and every Unicode format character, category Cf) are rendered as
+/// Rust escape sequences, so the output is a single printable
 /// line whose escapes are unambiguous. The result is at most
 /// [`UNTRUSTED_DISPLAY_MAX_BYTES`] bytes; a longer rendering is cut at an
 /// escape-sequence and character boundary and ends in `...`.
@@ -61,7 +95,7 @@ pub fn untrusted_display_bounded(bytes: &[u8]) -> String {
     // truncation point is always one of these, so no escape is split.
     let mut boundaries: Vec<usize> = Vec::with_capacity(prefix_len);
     for c in decoded.chars() {
-        if c == '\\' || c == '"' || c.is_control() || is_invisible_format_char(c) {
+        if c == '\\' || c == '"' || is_untrusted_format_character(c) {
             rendered.extend(c.escape_default());
         } else {
             rendered.push(c);
@@ -84,19 +118,43 @@ pub fn untrusted_display_bounded(bytes: &[u8]) -> String {
     rendered
 }
 
-/// Returns `true` for Unicode formatting characters that are invisible in a
-/// terminal but change how the surrounding text is displayed.
-fn is_invisible_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061C}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-    )
+/// Renders untrusted text for an approval surface, in full.
+///
+/// Backslash and every character [`is_untrusted_format_character`] names
+/// (C0, DEL, C1, U+2028, U+2029 and every Unicode format character, category
+/// Cf) are rendered as Rust escape sequences such as `\u{1b}` and
+/// `\u{202e}`; every other character is kept.
+/// Nothing is removed, so a value that carried such a character shows that
+/// it did, and the escaped backslash keeps a literal `\u{1b}` in the input
+/// distinguishable from an escaped control character. The result holds no
+/// character a terminal or a browser interprets as a cursor movement, a
+/// color change or a direction change.
+///
+/// Every approval surface renders memo text, asset codes, addresses and the
+/// other summary fields through this one rule: the CLI writes the result to
+/// the terminal, and the HTML surfaces HTML-escape the result.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::observability::redact::escape_untrusted_text;
+///
+/// assert_eq!(escape_untrusted_text("invoice 42"), "invoice 42");
+/// assert_eq!(escape_untrusted_text("a\u{1b}[1Ab"), "a\\u{1b}[1Ab");
+/// assert_eq!(escape_untrusted_text("a\u{202E}b"), "a\\u{202e}b");
+/// assert_eq!(escape_untrusted_text("caf\u{e9}"), "caf\u{e9}");
+/// ```
+#[must_use]
+pub fn escape_untrusted_text(text: &str) -> String {
+    let mut rendered = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == '\\' || is_untrusted_format_character(c) {
+            rendered.extend(c.escape_default());
+        } else {
+            rendered.push(c);
+        }
+    }
+    rendered
 }
 
 #[cfg(test)]
@@ -161,6 +219,45 @@ mod tests {
         let out = untrusted_display_bounded(wide.as_bytes());
         assert!(out.len() <= UNTRUSTED_DISPLAY_MAX_BYTES);
         assert_eq!(out, format!("{}...", "\u{1F680}".repeat(15)));
+    }
+
+    #[test]
+    fn escape_untrusted_text_renders_every_control_class_visibly() {
+        assert_eq!(
+            escape_untrusted_text("a\u{1b}[1A\u{1b}[2Kb"),
+            "a\\u{1b}[1A\\u{1b}[2Kb"
+        );
+        assert_eq!(escape_untrusted_text("a\rb\nc\td"), "a\\rb\\nc\\td");
+        assert_eq!(escape_untrusted_text("\u{0}\u{7f}"), "\\u{0}\\u{7f}");
+        assert_eq!(escape_untrusted_text("\u{85}\u{9b}"), "\\u{85}\\u{9b}");
+        for (control, escaped) in [
+            ('\u{202A}', "\\u{202a}"),
+            ('\u{202E}', "\\u{202e}"),
+            ('\u{2066}', "\\u{2066}"),
+            ('\u{2069}', "\\u{2069}"),
+            ('\u{200B}', "\\u{200b}"),
+            ('\u{FEFF}', "\\u{feff}"),
+        ] {
+            assert_eq!(
+                escape_untrusted_text(&format!("x{control}y")),
+                format!("x{escaped}y"),
+                "{control:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_untrusted_text_keeps_printable_text_and_escapes_backslash() {
+        assert_eq!(
+            escape_untrusted_text("Zahlung f\u{fc}r M\u{e4}rz"),
+            "Zahlung f\u{fc}r M\u{e4}rz"
+        );
+        assert_eq!(
+            escape_untrusted_text("\u{4e2d}\u{6587} \"q\" <b>"),
+            "\u{4e2d}\u{6587} \"q\" <b>"
+        );
+        assert_eq!(escape_untrusted_text("a\\u{1b}b"), "a\\\\u{1b}b");
+        assert_eq!(escape_untrusted_text(""), "");
     }
 
     #[test]
