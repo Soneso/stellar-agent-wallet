@@ -12,12 +12,16 @@ mod audit_binding_cli;
 mod audit_path_discipline;
 #[path = "cli/audit_verify_codes.rs"]
 mod audit_verify_codes;
+#[path = "cli/classic_ledger.rs"]
+mod classic_ledger;
 #[path = "cli/consent_drain_source_order.rs"]
 mod consent_drain_source_order;
 #[path = "cli/cross_check_witness.rs"]
 mod cross_check_witness;
 #[path = "cli/endpoint_identity_ordering.rs"]
 mod endpoint_identity_ordering;
+#[path = "cli/fee_reserve_boundary.rs"]
+mod fee_reserve_boundary;
 #[path = "cli/fresh_v1_ceremony.rs"]
 mod fresh_v1_ceremony;
 #[path = "cli/keyring_classification_discipline.rs"]

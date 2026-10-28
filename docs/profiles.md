@@ -291,7 +291,8 @@ failures become `network.mainnet_authorization_refused`.
 
 Full-mode CLI `pay`, `claim`, sponsored `accounts create`, and `trustline`
 include `total_fee_stroops` in policy arguments on both networks. It is a JSON
-number equal to the unsigned envelope's `tx.fee`.
+number equal to the unsigned envelope's `tx.fee`. `pay --build-only` and
+`claim --build-only` include it too.
 Mainnet excludes staged modes and pool submission.
 
 #### Witness thresholds
