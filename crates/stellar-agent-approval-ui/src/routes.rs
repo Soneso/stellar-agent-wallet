@@ -6,21 +6,25 @@
 //! | `GET`  | `/inbox` | [`inbox_get`] | session cookie |
 //! | `GET`  | `/pending.json` | [`pending_json`] | session cookie |
 //! | `GET`  | `/approval/{nonce}` | [`approval_detail_get`] | session cookie |
-//! | `POST` | `/approval/{nonce}/approve` | [`approve_post`] | session + CSRF |
-//! | `POST` | `/approval/{nonce}/reject` | [`reject_post`] | session + CSRF |
+//! | `POST` | `/approval/{nonce}/approve` | [`approve_post`] | session + CSRF + proof |
+//! | `POST` | `/approval/{nonce}/reject` | [`reject_post`] | session + CSRF + proof |
+//! | `POST` | `/session/activity` | [`session_activity_post`] | session + CSRF + proof |
 //! | `GET`  | `/static/app-shared.js` | [`app_shared_js`] | session cookie |
 //! | `GET`  | `/static/app.js` | [`app_js`] | session cookie |
+//! | `GET`  | `/static/session-bootstrap.js` | [`session_bootstrap_js`] | none |
 //!
 //! The Host / Origin / security-header / body-limit / trace layers are applied
-//! at the router level in [`crate::start_serve`], not here. Session-cookie and
-//! CSRF checks happen at the top of each handler (the auth boundary), never
-//! inside [`apply_decision`].
+//! at the router level in [`crate::start_serve`], not here. Session-cookie,
+//! CSRF and session-proof checks happen at the top of each handler (the auth
+//! boundary), never inside [`apply_decision`]. The successful bootstrap
+//! response is the only response that carries the session proof; see
+//! [`crate::auth`] for the session model and its lifetime.
 
 use axum::{
     Router,
     extract::{Path, RawQuery, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::json;
@@ -32,12 +36,16 @@ use stellar_agent_core::approval::{
 use stellar_agent_core::timefmt;
 
 use crate::ServeState;
-use crate::auth::{
-    CSRF_HEADER_NAME, SESSION_COOKIE_NAME, SessionState, session_cookie_value, verify_csrf,
-};
+use crate::auth::{CSRF_HEADER_NAME, SessionState, require_session_proof, verify_csrf};
 use crate::decision::{Decision, Outcome, RequestIdentity, apply_decision};
-use crate::templates::{render_detail_page, render_inbox_page, render_not_found_page};
+use crate::templates::{
+    render_detail_page, render_inbox_page, render_not_found_page, render_session_bootstrap_page,
+};
 use crate::web;
+
+/// The fixed CSRF nonce `POST /session/activity` binds to; the inbox and
+/// detail pages carry its CSRF value next to the per-approval one.
+pub(crate) const SESSION_ACTIVITY_NONCE: &str = "session-activity";
 
 /// Build the router (without the outer middleware stack, which is applied by
 /// [`crate::start_serve`]).
@@ -49,8 +57,10 @@ pub(crate) fn build_router() -> Router<ServeState> {
         .route("/approval/{nonce}", get(approval_detail_get))
         .route("/approval/{nonce}/approve", post(approve_post))
         .route("/approval/{nonce}/reject", post(reject_post))
+        .route("/session/activity", post(session_activity_post))
         .route("/static/app-shared.js", get(app_shared_js))
         .route("/static/app.js", get(app_js))
+        .route("/static/session-bootstrap.js", get(session_bootstrap_js))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -108,25 +118,50 @@ fn store_unavailable() -> Response {
         .into_response()
 }
 
-/// Recovers the [`SessionState`] iff the request carries a valid session cookie.
+/// Recovers the [`SessionState`] iff the request carries the cookie of a live,
+/// unexpired session.
 ///
 /// Returns the session on success (with its per-run CSRF key), or a `404`
-/// response on absent / malformed / mismatched cookie.
+/// response on an absent / malformed / mismatched cookie or an expired
+/// session. Never records activity.
 #[allow(
     clippy::result_large_err,
     reason = "the Err variant is the ready-to-return axum Response for the auth-boundary rejection; boxing would only add an allocation on the reject path"
 )]
 fn require_session(state: &ServeState, headers: &HeaderMap) -> Result<SessionState, Response> {
-    let guard = match state.auth.lock() {
+    let mut guard = match state.auth.lock() {
         Ok(g) => g,
         Err(poison) => poison.into_inner(),
     };
-    let session = guard.session.as_ref().ok_or_else(not_found)?;
+    let now = guard.now();
+    guard.require_session(headers, now).ok_or_else(not_found)
+}
 
-    let cookie = session_cookie_value(headers).ok_or_else(not_found)?;
-    let submitted = crate::auth::OpaqueToken::from_hex(&cookie).ok_or_else(not_found)?;
-    if session.session_id.ct_eq(&submitted) {
-        Ok(session.clone())
+/// Authorizes a state-changing request: the session cookie, then the CSRF
+/// value for `csrf_nonce`, then the session proof, then records the activity.
+///
+/// Each failure returns its own response: `404` for the session, `403`
+/// `csrf_rejected`, `403` `session_proof_invalid`. A session that expired
+/// between the cookie check and the activity record answers `404` as well.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err variant is the ready-to-return axum Response for the auth-boundary rejection; boxing would only add an allocation on the reject path"
+)]
+fn authorize_mutation(
+    state: &ServeState,
+    headers: &HeaderMap,
+    csrf_nonce: &str,
+) -> Result<(), Response> {
+    let session = require_session(state, headers)?;
+    require_csrf(&session, headers, csrf_nonce)?;
+    require_session_proof(&session, headers)?;
+    let mut guard = match state.auth.lock() {
+        Ok(g) => g,
+        Err(poison) => poison.into_inner(),
+    };
+    let now = guard.now();
+    if guard.record_activity(&session.session_id, now) {
+        Ok(())
     } else {
         Err(not_found())
     }
@@ -200,33 +235,29 @@ fn take_snapshot(store_path: &std::path::Path, include_expired: bool) -> Snapsho
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `GET /bootstrap/{token}` — one-time exchange of the bootstrap token for a
-/// session cookie, then redirect to `/inbox`.
+/// session.
+///
+/// The success response sets the session cookie and returns the bootstrap
+/// page, which carries the session proof and navigates to `/inbox` once the
+/// proof is stored. This is the only response that ever carries the proof.
 async fn bootstrap_get(State(state): State<ServeState>, Path(token): Path<String>) -> Response {
     let mut guard = match state.auth.lock() {
         Ok(g) => g,
         Err(poison) => poison.into_inner(),
     };
-
-    let Some(submitted) = crate::auth::OpaqueToken::from_hex(&token) else {
+    let now = guard.now();
+    let Some(session) = guard.exchange_bootstrap(&token, now) else {
         return not_found();
     };
-    let matches = guard
-        .bootstrap
-        .as_ref()
-        .is_some_and(|stored| stored.ct_eq(&submitted));
-    if !matches {
-        return not_found();
-    }
-
-    // Consume the token immediately: any later request to this path 404s.
-    guard.bootstrap = None;
-    let session = SessionState::generate();
-    let cookie_value = session.session_id.to_hex();
-    guard.session = Some(session);
+    let cookie = guard.set_cookie_value(&session);
+    let purpose = guard.purpose();
     drop(guard);
 
-    let cookie = format!("{SESSION_COOKIE_NAME}={cookie_value}; HttpOnly; SameSite=Strict; Path=/");
-    let mut resp = Redirect::to("/inbox").into_response();
+    let mut resp = Html(render_session_bootstrap_page(
+        &session.session_proof.to_hex(),
+        purpose,
+    ))
+    .into_response();
     if let Ok(hv) = HeaderValue::from_str(&cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, hv);
     }
@@ -239,9 +270,11 @@ async fn inbox_get(
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
-    if let Err(resp) = require_session(&state, &headers) {
-        return resp;
-    }
+    let session = match require_session(&state, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let activity_csrf = crate::auth::compute_csrf(&session.csrf_key, SESSION_ACTIVITY_NONCE);
 
     let include_expired = include_expired_flag(raw_query.as_deref());
     match take_snapshot(&state.ctx.store_path, include_expired) {
@@ -252,14 +285,20 @@ async fn inbox_get(
             &pending,
             expired_count,
             include_expired,
+            &activity_csrf,
             &state.identity,
         ))
         .into_response(),
         // The shell still renders on a transient store failure; the client-side
         // poll of /pending.json recovers the rows once the lock clears.
-        SnapshotResult::Busy | SnapshotResult::Unavailable => {
-            Html(render_inbox_page(&[], 0, include_expired, &state.identity)).into_response()
-        }
+        SnapshotResult::Busy | SnapshotResult::Unavailable => Html(render_inbox_page(
+            &[],
+            0,
+            include_expired,
+            &activity_csrf,
+            &state.identity,
+        ))
+        .into_response(),
     }
 }
 
@@ -337,10 +376,12 @@ async fn approval_detail_get(
     drop(store);
 
     let csrf = crate::auth::compute_csrf(&session.csrf_key, &nonce);
+    let activity_csrf = crate::auth::compute_csrf(&session.csrf_key, SESSION_ACTIVITY_NONCE);
     Html(render_detail_page(
         &view,
         &state.ctx.context,
         &csrf,
+        &activity_csrf,
         attestation_blob.as_deref(),
         &state.identity,
     ))
@@ -353,11 +394,7 @@ async fn approve_post(
     headers: HeaderMap,
     Path(nonce): Path<String>,
 ) -> Response {
-    let session = match require_session(&state, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-    if let Err(resp) = require_csrf(&session, &headers, &nonce) {
+    if let Err(resp) = authorize_mutation(&state, &headers, &nonce) {
         return resp;
     }
     let outcome = apply_decision(
@@ -374,11 +411,7 @@ async fn reject_post(
     headers: HeaderMap,
     Path(nonce): Path<String>,
 ) -> Response {
-    let session = match require_session(&state, &headers) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-    if let Err(resp) = require_csrf(&session, &headers, &nonce) {
+    if let Err(resp) = authorize_mutation(&state, &headers, &nonce) {
         return resp;
     }
     let outcome = apply_decision(
@@ -387,6 +420,37 @@ async fn reject_post(
         &RequestIdentity::Local,
     );
     outcome_to_response(outcome)
+}
+
+/// `POST /session/activity`: records operator activity, extending the idle
+/// limit; never the absolute one.
+///
+/// Requires the cookie, the CSRF value for [`SESSION_ACTIVITY_NONCE`] and the
+/// session proof. Answers `204 No Content`. The browser sends it only on a
+/// trusted user interaction, throttled to once a minute; background polling
+/// never reaches it.
+async fn session_activity_post(State(state): State<ServeState>, headers: HeaderMap) -> Response {
+    match authorize_mutation(&state, &headers, SESSION_ACTIVITY_NONCE) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// `GET /static/session-bootstrap.js`: the bootstrap page's script.
+///
+/// Served without a session: the bootstrap page loads it in the same
+/// navigation that sets the cookie, and the bytes are fixed and carry no
+/// secret.
+async fn session_bootstrap_js() -> Response {
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        web::SESSION_BOOTSTRAP_JS,
+    )
+        .into_response()
 }
 
 /// `GET /static/app-shared.js` — the approval rendering both approval
@@ -531,6 +595,7 @@ mod tests {
             .header(header::ORIGIN, "http://127.0.0.1:8080")
             .header(header::COOKIE, cookie)
             .header("x-stellar-approval-csrf", h.csrf_for(&nonce))
+            .header("x-session-proof", h.proof())
             .body(Body::empty())
             .unwrap();
         let response = h.router().oneshot(request).await.unwrap();

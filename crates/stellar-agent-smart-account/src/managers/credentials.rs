@@ -227,10 +227,11 @@ impl std::fmt::Debug for RegistrationHandle {
 /// # Note on browser-launch failure
 ///
 /// Browser-launch failure is NOT surfaced through `AddPasskeyOutcome`. The
-/// CLI layer (`add_passkey.rs`) handles a failed `webbrowser::open` call by
-/// printing the URL to stderr and continuing the poll normally. The outcome
-/// of the polling loop is one of the variants above regardless of whether the
-/// browser was launched.
+/// CLI layer (`add_passkey.rs`) prints the URL to stderr as the manual
+/// handoff, opens the browser through a private redirect file, and continues
+/// the poll whether or not the launch succeeded. The outcome of the polling
+/// loop is one of the variants above regardless of whether the browser was
+/// launched.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum AddPasskeyOutcome {
@@ -1126,7 +1127,8 @@ impl CredentialsManager {
     /// 1. Opening the `PendingApprovalStore` exactly once.
     /// 2. Passing the same `Arc<Mutex<PendingApprovalStore>>` to both
     ///    `start_bridge_register_only` / `start_bridge_with_pubkey_lookup` and [`CredentialsManager::new`].
-    /// 3. Launching the browser to the returned `RegistrationHandle::url`.
+    /// 3. Handing the returned `RegistrationHandle::url` to the browser
+    ///    without placing it in a launcher process's arguments.
     /// 4. Calling [`CredentialsManager::poll_registration`] with the nonce.
     ///
     /// The `nominal_smart_account` parameter is an optional display-only

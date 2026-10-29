@@ -12,14 +12,28 @@
 //! - **Loopback-only bind.** The server refuses any non-loopback bind address
 //!   ([`ServeStartError::NonLoopbackBind`]); the queue and the approve/reject
 //!   actions must never be reachable off-host.
-//! - **One-time bootstrap → session cookie.** A 32-byte bootstrap token is
-//!   emitted once (`GET /bootstrap/<hex>`); the first successful exchange
-//!   consumes it and sets an `HttpOnly; SameSite=Strict` session cookie. Every
-//!   other route requires that cookie; absent / malformed / mismatched
-//!   collapses to `404` — no route reveals a session concept exists.
+//! - **One-time bootstrap → session cookie and session proof.** A 32-byte
+//!   bootstrap token is emitted once (`GET /bootstrap/<hex>`); the first
+//!   successful exchange consumes it, sets an `HttpOnly; SameSite=Strict`
+//!   session cookie with a per-listener random name and a `Max-Age` of the
+//!   absolute session limit, and returns a page that stores a separate
+//!   session proof in the tab's `sessionStorage`. Every other route requires
+//!   the cookie; absent / malformed / mismatched / expired collapses to
+//!   `404`.
+//! - **Cookies are host-scoped, the proof is origin-scoped.** A browser sends
+//!   the cookie to every port on `127.0.0.1`, so another local service can
+//!   receive it. `sessionStorage` belongs to the full origin, port included,
+//!   so that service cannot read the proof, and no cookie-authorized route
+//!   returns it. State-changing POSTs require the proof in `X-Session-Proof`;
+//!   a stolen cookie can still read what the cookie authorizes until the
+//!   session expires.
 //! - **Per-nonce CSRF.** State-changing POSTs carry
 //!   `hex(HMAC-SHA256(session_csrf_key, nonce))` in `X-Stellar-Approval-CSRF`,
 //!   recomputed and constant-time-compared server-side.
+//! - **Bounded session.** A session expires after 15 minutes without operator
+//!   activity or 8 hours after the bootstrap exchange, and is never revived;
+//!   restart the server for a new one. Background polling and cookie-only
+//!   requests do not count as activity.
 //! - **Layered defence stack.** Host allowlist, security headers + CSP
 //!   (`script-src 'self'`), Origin allowlist on state-changing methods, and a
 //!   16 KiB body cap — the same `stellar-agent-loopback-http` layers the
@@ -60,6 +74,8 @@ mod web;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod trace_capture;
 
 pub use decision::{
     Decision, DecisionContext, Outcome, REJECT_TOMBSTONE_TTL_MS, RequestIdentity, apply_decision,
@@ -80,7 +96,7 @@ pub use templates::{
 };
 pub use web::APP_SHARED_JS;
 
-use auth::{AuthState, OpaqueToken};
+use auth::{AuthState, OpaqueToken, SessionPurpose};
 
 /// Maximum request body size accepted by the server, in bytes (16 KiB).
 ///
@@ -260,7 +276,10 @@ pub async fn start_serve(config: ServeConfig) -> Result<ServeHandle, ServeStartE
 
     let bootstrap_token = OpaqueToken::generate();
     let bootstrap_token_hex = bootstrap_token.to_hex();
-    let auth = Arc::new(StdMutex::new(AuthState::new(bootstrap_token)));
+    let auth = Arc::new(StdMutex::new(AuthState::new(
+        bootstrap_token,
+        SessionPurpose::Inbox,
+    )));
 
     let store_path = config.context.store_path.clone();
     let state = ServeState {
@@ -318,12 +337,14 @@ pub async fn start_serve(config: ServeConfig) -> Result<ServeHandle, ServeStartE
 ///   → handler
 /// ```
 fn build_router(state: ServeState, local_addr: SocketAddr) -> Router {
+    // The span records the matched route template, never the request path:
+    // the bootstrap and approval paths carry a token or a nonce.
     let trace_layer = TraceLayer::new_for_http().make_span_with(
         |request: &axum::http::Request<axum::body::Body>| {
             tracing::info_span!(
                 "approval_inbox_request",
                 method = %request.method(),
-                path = request.uri().path(),
+                path = stellar_agent_loopback_http::request_trace::route_label(request),
             )
         },
     );

@@ -9,6 +9,13 @@
 //!   account SID. The SID binds approval attestations to the OS user that
 //!   created them, so an attestation blob minted by one user cannot be
 //!   replayed by another user on the same machine.
+//! - `create_owner_only_directory` creates a directory whose protected DACL
+//!   grants access to the current user only, inherited by everything created
+//!   inside it; `path_dacl_sddl` reads a path's DACL back as SDDL, and
+//!   `admits_only_current_user` checks that a path's DACL grants nothing to
+//!   anyone else. The CLI writes its private browser redirect file into such
+//!   a directory. All three are Windows-only and have no stub on other
+//!   targets.
 //! - [`dpapi_protect`] / [`dpapi_unprotect`] wrap DPAPI CurrentUser-scope
 //!   protect/unprotect, and [`dpapi_protect_with_entropy`] /
 //!   [`dpapi_unprotect_with_entropy`] add DPAPI's optional entropy, consumed
@@ -44,6 +51,12 @@ pub enum WindowsIdentityError {
     /// The returned SID string was not valid UTF-16.
     #[error("SID string was not valid UTF-16")]
     InvalidUtf16,
+    /// A returned security-descriptor string was not valid UTF-16.
+    #[error("security descriptor string was not valid UTF-16")]
+    SddlNotUtf16,
+    /// A path passed to a Win32 API contains a NUL character.
+    #[error("path contains a NUL character")]
+    PathContainsNul,
     /// Returned only by the non-Windows stub of [`current_user_sid_string`];
     /// unreachable when the crate is used as intended, behind a Windows cfg.
     #[error("Windows SID lookup is only available on Windows")]
@@ -75,6 +88,90 @@ pub fn current_user_sid_string() -> Result<String, WindowsIdentityError> {
 #[cfg(not(target_os = "windows"))]
 pub fn current_user_sid_string() -> Result<String, WindowsIdentityError> {
     Err(WindowsIdentityError::UnsupportedPlatform)
+}
+
+/// Creates `path` as a new directory whose DACL grants full access to the
+/// current process user only.
+///
+/// The DACL is protected, so nothing is inherited from the parent, and its
+/// single access-allowed ACE carries object and container inheritance, so
+/// every file and directory later created inside receives the same
+/// user-only ACE. The directory is created with that descriptor in one
+/// `CreateDirectoryW` call; there is no moment at which it exists with a
+/// broader DACL. An existing path, a symbolic link included, fails with
+/// `ERROR_ALREADY_EXISTS` and is never reused.
+///
+/// # Errors
+///
+/// Returns [`WindowsIdentityError`] if the SID lookup, the security-descriptor
+/// conversion, or the directory creation fails, or if `path` contains a NUL.
+#[cfg(target_os = "windows")]
+pub fn create_owner_only_directory(path: &std::path::Path) -> Result<(), WindowsIdentityError> {
+    windows::create_owner_only_directory(path)
+}
+
+/// Returns the DACL of `path` in SDDL form, for example
+/// `D:P(A;OICI;FA;;;S-1-5-21-...)`.
+///
+/// # Errors
+///
+/// Returns [`WindowsIdentityError`] if the security information cannot be
+/// read or converted, or if `path` contains a NUL.
+#[cfg(target_os = "windows")]
+pub fn path_dacl_sddl(path: &std::path::Path) -> Result<String, WindowsIdentityError> {
+    windows::path_dacl_sddl(path)
+}
+
+/// Returns `true` iff the DACL of `path` holds only access-allowed ACEs for
+/// the current process user, at least one of them, and, when
+/// `require_protected` is set, is protected from inheritance.
+///
+/// # Errors
+///
+/// Returns [`WindowsIdentityError`] if the SID lookup or the DACL read fails.
+#[cfg(target_os = "windows")]
+pub fn admits_only_current_user(
+    path: &std::path::Path,
+    require_protected: bool,
+) -> Result<bool, WindowsIdentityError> {
+    let sid = current_user_sid_string()?;
+    let sddl = path_dacl_sddl(path)?;
+    Ok(dacl_sddl_admits_only(&sddl, &sid, require_protected))
+}
+
+/// Decides [`admits_only_current_user`] on an SDDL DACL string.
+///
+/// The string has the form `D:<flags>(<ace>)(<ace>)...`; each ACE is
+/// `type;flags;rights;object;inherit-object;sid`. Every ACE must be an allow
+/// ACE (`A`) whose trustee is exactly `sid`, and there must be at least one.
+/// An empty DACL (`D:` with no ACE) grants nothing to anyone and is refused
+/// too, as is a NULL DACL (`D:NO_ACCESS_CONTROL`), which grants everything.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn dacl_sddl_admits_only(sddl: &str, sid: &str, require_protected: bool) -> bool {
+    let Some(body) = sddl.strip_prefix("D:") else {
+        return false;
+    };
+    let split = body.find('(').unwrap_or(body.len());
+    let (flags, mut aces) = body.split_at(split);
+    if flags.contains("NO_ACCESS_CONTROL") || (require_protected && !flags.contains('P')) {
+        return false;
+    }
+    let mut count = 0usize;
+    while !aces.is_empty() {
+        let Some(rest) = aces.strip_prefix('(') else {
+            return false;
+        };
+        let Some(end) = rest.find(')') else {
+            return false;
+        };
+        let fields: Vec<&str> = rest[..end].split(';').collect();
+        if fields.len() != 6 || fields[0] != "A" || fields[5] != sid {
+            return false;
+        }
+        count += 1;
+        aces = &rest[end + 1..];
+    }
+    count > 0
 }
 
 /// Errors returned by the DPAPI protect/unprotect wrappers.
@@ -221,14 +318,167 @@ pub fn dpapi_unprotect_with_entropy(
 #[allow(unsafe_code)]
 mod windows {
     use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::path::Path;
     use std::ptr::null_mut;
 
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, LocalFree};
-    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_SUCCESS, GetLastError, HANDLE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+        TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use super::WindowsIdentityError;
+
+    /// Owns a `LocalAlloc`-backed allocation returned by a Win32 API and
+    /// releases it with `LocalFree` exactly once, on drop.
+    struct LocalAllocation(*mut c_void);
+
+    impl Drop for LocalAllocation {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was allocated by the Win32 API that
+                // returned it, which documents `LocalFree` as its release;
+                // it is released exactly once, here.
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+    }
+
+    /// `path` as a NUL-terminated UTF-16 string.
+    fn wide_path(path: &Path) -> Result<Vec<u16>, WindowsIdentityError> {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(WindowsIdentityError::PathContainsNul);
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    pub(super) fn create_owner_only_directory(path: &Path) -> Result<(), WindowsIdentityError> {
+        let sid = current_user_sid_string()?;
+        // A protected DACL (`P`) with one ACE: allow (`A`) full file access
+        // (`FA`) to the current user, inherited by files (`OI`) and
+        // subdirectories (`CI`) created inside.
+        let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;{sid})")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: `sddl` is a NUL-terminated UTF-16 string live for the call;
+        // `descriptor` is a valid out-pointer and the size out-pointer may be
+        // null. On success the descriptor is a LocalAlloc allocation, owned
+        // below by `LocalAllocation`.
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                null_mut(),
+            )
+        };
+        if converted == 0 {
+            return Err(last_error(
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+            ));
+        }
+        if descriptor.is_null() {
+            return Err(WindowsIdentityError::NullPointer {
+                api: "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+            });
+        }
+        let descriptor = LocalAllocation(descriptor);
+
+        let wide = wide_path(path)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path and `attributes`
+        // points to the live self-relative descriptor; both outlive the call.
+        let created = unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) };
+        if created == 0 {
+            return Err(last_error("CreateDirectoryW"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn path_dacl_sddl(path: &Path) -> Result<String, WindowsIdentityError> {
+        let wide = wide_path(path)?;
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path live for the call.
+        // Only the descriptor out-pointer is requested; the owner, group,
+        // DACL and SACL out-pointers may be null. On success the descriptor
+        // is a LocalAlloc allocation, owned below by `LocalAllocation`.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(WindowsIdentityError::Win32 {
+                api: "GetNamedSecurityInfoW",
+                code: status,
+            });
+        }
+        if descriptor.is_null() {
+            return Err(WindowsIdentityError::NullPointer {
+                api: "GetNamedSecurityInfoW",
+            });
+        }
+        let descriptor = LocalAllocation(descriptor);
+
+        let mut sddl: *mut u16 = null_mut();
+        // SAFETY: `descriptor.0` is the live descriptor returned above and
+        // `sddl` is a valid out-pointer; the length out-pointer may be null.
+        // On success the string is a LocalAlloc allocation, owned below.
+        let converted = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor.0,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut sddl,
+                null_mut(),
+            )
+        };
+        if converted == 0 {
+            return Err(last_error(
+                "ConvertSecurityDescriptorToStringSecurityDescriptorW",
+            ));
+        }
+        if sddl.is_null() {
+            return Err(WindowsIdentityError::NullPointer {
+                api: "ConvertSecurityDescriptorToStringSecurityDescriptorW",
+            });
+        }
+        let allocation = LocalAllocation(sddl.cast::<c_void>());
+        // SAFETY: `sddl` is non-null (checked above) and points to the
+        // NUL-terminated UTF-16 string the conversion produced, live until
+        // `allocation` drops at the end of this function.
+        let decoded = unsafe { wide_null_terminated_to_string(sddl) }
+            .map_err(|_| WindowsIdentityError::SddlNotUtf16);
+        drop(allocation);
+        decoded
+    }
 
     struct TokenHandle(HANDLE);
 
@@ -581,6 +831,92 @@ mod tests {
             WindowsIdentityError::UnsupportedPlatform.to_string(),
             "Windows SID lookup is only available on Windows"
         );
+        assert_eq!(
+            WindowsIdentityError::SddlNotUtf16.to_string(),
+            "security descriptor string was not valid UTF-16"
+        );
+        assert_eq!(
+            WindowsIdentityError::PathContainsNul.to_string(),
+            "path contains a NUL character"
+        );
+    }
+
+    #[test]
+    fn dacl_sddl_admits_only_the_named_user() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        assert!(dacl_sddl_admits_only(
+            "D:P(A;OICI;FA;;;S-1-5-21-1-2-3-1001)",
+            sid,
+            true
+        ));
+        assert!(dacl_sddl_admits_only(
+            "D:AI(A;ID;FA;;;S-1-5-21-1-2-3-1001)",
+            sid,
+            false
+        ));
+        assert!(dacl_sddl_admits_only(
+            "D:PAI(A;OICI;FA;;;S-1-5-21-1-2-3-1001)(A;ID;0x1200a9;;;S-1-5-21-1-2-3-1001)",
+            sid,
+            true
+        ));
+        for refused in [
+            "D:AI(A;ID;FA;;;S-1-5-21-1-2-3-1001)",
+            "D:P(A;OICI;FA;;;S-1-5-21-1-2-3-1001)(A;OICI;FA;;;SY)",
+            "D:P(A;OICI;FA;;;S-1-5-21-1-2-3-1001)(A;OICI;FR;;;WD)",
+            "D:P(D;OICI;FA;;;S-1-5-21-1-2-3-1001)",
+            "D:P(A;OICI;FA;;;S-1-5-21-1-2-3-10010)",
+            "D:P",
+            "D:NO_ACCESS_CONTROL",
+            "D:P(A;OICI;FA;;;S-1-5-21-1-2-3-1001",
+            "O:S-1-5-21-1-2-3-1001D:P(A;OICI;FA;;;S-1-5-21-1-2-3-1001)",
+            "",
+        ] {
+            assert!(!dacl_sddl_admits_only(refused, sid, true), "{refused}");
+        }
+    }
+
+    /// The directory carries exactly one protected, inheritable ACE for the
+    /// current user, a file created inside inherits exactly that ACE, and an
+    /// existing path is refused.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn owner_only_directory_admits_only_the_current_user() {
+        let sid = current_user_sid_string().expect("Windows SID must be available");
+        let parent = std::env::temp_dir().join(format!(
+            "stellar-agent-owner-only-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir(&parent).expect("parent directory");
+        let dir = parent.join("private");
+
+        create_owner_only_directory(&dir).expect("CreateDirectoryW must succeed");
+        // SDDL `D:<flags>(ace)(ace)...`: split the control flags from the ACEs.
+        let split = |sddl: String| {
+            let body = sddl.strip_prefix("D:").expect("a DACL string").to_owned();
+            let at = body.find('(').unwrap_or(body.len());
+            (body[..at].to_owned(), body[at..].to_owned())
+        };
+        let (flags, aces) = split(path_dacl_sddl(&dir).expect("directory DACL"));
+        assert!(flags.contains('P'), "the DACL must be protected: {flags}");
+        assert_eq!(aces, format!("(A;OICI;FA;;;{sid})"));
+
+        let file = dir.join("redirect.html");
+        std::fs::write(&file, b"x").expect("file inside the directory");
+        let (_flags, aces) = split(path_dacl_sddl(&file).expect("file DACL"));
+        assert_eq!(aces, format!("(A;ID;FA;;;{sid})"));
+        assert!(admits_only_current_user(&dir, true).expect("directory DACL"));
+        assert!(admits_only_current_user(&file, false).expect("file DACL"));
+        assert!(!admits_only_current_user(&parent, true).expect("parent DACL"));
+
+        assert!(matches!(
+            create_owner_only_directory(&dir),
+            Err(WindowsIdentityError::Win32 {
+                api: "CreateDirectoryW",
+                ..
+            })
+        ));
+        std::fs::remove_dir_all(&parent).expect("cleanup");
     }
 
     #[test]

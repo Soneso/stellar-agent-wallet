@@ -16,7 +16,8 @@ name = "stellar_agent_loopback_http"
 [dependencies]
 # HTTP framework types (Request/Response/StatusCode/header) the middleware
 # operates on; no server or router surface is exposed from this crate.
-axum = { workspace = true }
+# `matched-path`: the route template `request_trace::route_label` records.
+axum = { workspace = true, features = ["matched-path"] }
 
 # Layer/Service traits the middleware implements.
 tower = { workspace = true }

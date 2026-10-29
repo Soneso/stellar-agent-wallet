@@ -81,6 +81,9 @@ operator-enroll-browser-acceptance = ["test-helpers"]
 
 [dev-dependencies]
 stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
+# The cross-port browser acceptance tests run a second loopback HTTP service
+# on a raw socket.
+tokio = { workspace = true, features = ["io-util", "net"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 serial_test = { workspace = true }
 keyring-core = { workspace = true }

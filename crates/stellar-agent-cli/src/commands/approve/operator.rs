@@ -19,9 +19,10 @@
 //!
 //! - `--interactive`: for a loopback or SSH-tunnelled listener. Starts a
 //!   one-shot local server (`stellar_agent_approval_ui::operator_enroll`),
-//!   prints (and optionally opens) its enrollment URL, and persists the
-//!   result automatically once the ceremony completes. Always produces a
-//!   `rp_id: "localhost"` credential.
+//!   prints its enrollment URL, opens it through a private redirect file
+//!   unless `--no-open` is passed (the launcher never receives the URL
+//!   itself), and persists the result automatically once the ceremony
+//!   completes. Always produces a `rp_id: "localhost"` credential.
 //! - `--credential-id` / `--public-key` / `--rp-id` / `--label` (all four
 //!   together): for a domain-configured remote listener. Imports the id and
 //!   public key produced by a WebAuthn ceremony run elsewhere — normally the
@@ -35,13 +36,14 @@
 //! operator-controlled authorization step.
 
 use std::collections::HashSet;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use clap::{ArgGroup, Args, Subcommand};
 
 use stellar_agent_approval_ui::operator_enroll::{
-    OperatorEnrollAwaitError, start_operator_enroll_server,
+    OperatorEnrollAwaitError, OperatorEnrollHandle, start_operator_enroll_server,
 };
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::approval::operator_credentials::{
@@ -54,11 +56,12 @@ use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::timefmt;
 use stellar_agent_loopback_http::brand::PageIdentity;
 
-use crate::common::display_available;
+use crate::common::private_open;
 use crate::common::profile_access::load_profile_reconciled;
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 use crate::common::served_pages::page_identity_for;
+use crate::common::{display_available, interrupted};
 
 /// Reminder attached to every successful enrollment, in both modes:
 /// enrollment writes to the credential store only — it never touches the
@@ -351,7 +354,7 @@ async fn run_enroll_interactive(resolved: ResolvedProfileName, args: EnrollArgs)
     };
 
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let mut handle = match start_operator_enroll_server(
+    let handle = match start_operator_enroll_server(
         store_path,
         profile_name,
         bind_addr,
@@ -373,41 +376,98 @@ async fn run_enroll_interactive(resolved: ResolvedProfileName, args: EnrollArgs)
     let url = handle.enroll_url();
     print_interactive_startup(&url);
 
-    if !args.no_open && display_available() {
-        let _ = webbrowser::open(&url);
-    }
+    let end = enroll_until_done(
+        handle,
+        &url,
+        !args.no_open && display_available(),
+        private_open::browser_opener,
+        Duration::from_secs(args.timeout_seconds),
+        tokio::signal::ctrl_c(),
+    )
+    .await;
+    report_ceremony_end(end, &store, &before_ids)
+}
 
-    let timeout = Duration::from_secs(args.timeout_seconds);
-    let completion_result = handle.await_completion(timeout).await;
+/// How the interactive ceremony's wait ended.
+#[derive(Debug)]
+enum CeremonyEnd {
+    /// The ceremony completed, timed out, or its server failed.
+    Finished(Result<(), OperatorEnrollAwaitError>),
+    /// The operator interrupted the wait (Ctrl-C).
+    Interrupted,
+}
+
+/// Runs the started enrollment server until the ceremony ends or
+/// `interrupt` resolves.
+///
+/// When `open_browser` is set, opens the enrollment URL through a private
+/// redirect file first; `opener` receives only the file's URL. The file stays
+/// while the ceremony runs. Every end, an interrupt included, then stops the
+/// server and removes the file and its directory. When the open fails, the
+/// URL printed at startup is the handoff.
+async fn enroll_until_done(
+    mut handle: OperatorEnrollHandle,
+    url: &str,
+    open_browser: bool,
+    opener: impl FnOnce(&str) -> io::Result<()>,
+    timeout: Duration,
+    interrupt: impl Future<Output = io::Result<()>>,
+) -> CeremonyEnd {
+    let browser_handoff = if open_browser {
+        private_open::open_or_point_to_handoff(url, opener, "the enrollment URL printed above")
+    } else {
+        None
+    };
+
+    let end = tokio::select! {
+        result = handle.await_completion(timeout) => CeremonyEnd::Finished(result),
+        () = interrupted(interrupt) => CeremonyEnd::Interrupted,
+    };
 
     if let Err(e) = handle.shutdown().await {
-        // Non-fatal: the ceremony has already completed, timed out, or
-        // errored — shutdown failing here does not change the outcome.
+        // Non-fatal: the ceremony has already completed, timed out, errored
+        // or been interrupted; shutdown failing here does not change the
+        // outcome.
         tracing::debug!(
             error = %e,
             "approve operator enroll --interactive: shutdown did not complete cleanly"
         );
     }
-
-    match completion_result {
-        Ok(()) => report_interactive_success(&store, &before_ids),
-        Err(OperatorEnrollAwaitError::Timeout) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: "approve.operator_enroll_interactive_timeout: no enrollment completed \
-                         within the timeout"
-                    .to_owned(),
-            });
-            render_json(&Envelope::<()>::err(&err));
-            1
-        }
-        Err(e) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("approve.operator_enroll_interactive_failed: {e}"),
-            });
-            render_json(&Envelope::<()>::err(&err));
-            1
-        }
+    if let Some(handoff) = browser_handoff
+        && let Err(e) = handoff.close()
+    {
+        tracing::debug!(
+            error.kind = ?e.kind(),
+            "approve operator enroll --interactive: redirect file cleanup failed"
+        );
     }
+    end
+}
+
+/// Renders the envelope for how the ceremony ended and returns the exit code:
+/// `0` for a persisted credential, `1` otherwise.
+fn report_ceremony_end(
+    end: CeremonyEnd,
+    store: &OperatorApprovalCredentialStore,
+    before_ids: &HashSet<String>,
+) -> i32 {
+    let detail = match end {
+        CeremonyEnd::Finished(Ok(())) => return report_interactive_success(store, before_ids),
+        CeremonyEnd::Finished(Err(OperatorEnrollAwaitError::Timeout)) => {
+            "approve.operator_enroll_interactive_timeout: no enrollment completed within the \
+             timeout"
+                .to_owned()
+        }
+        CeremonyEnd::Finished(Err(e)) => {
+            format!("approve.operator_enroll_interactive_failed: {e}")
+        }
+        CeremonyEnd::Interrupted => "approve.operator_enroll_interactive_interrupted: the \
+                                     ceremony was interrupted before an enrollment completed"
+            .to_owned(),
+    };
+    let err = WalletError::Internal(InternalError::UnexpectedState { detail });
+    render_json(&Envelope::<()>::err(&err));
+    1
 }
 
 /// Prints the interactive-ceremony startup guidance to stderr, keeping
@@ -545,6 +605,116 @@ mod tests {
             let error = result.expect_err("protected refusal was swallowed");
             assert_eq!(error.code(), expected);
         }
+    }
+
+    /// A started enrollment server on a temporary store, with its URL and
+    /// bootstrap token.
+    async fn start_test_enrollment(
+        dir: &tempfile::TempDir,
+    ) -> (OperatorEnrollHandle, String, String) {
+        let handle = start_operator_enroll_server(
+            dir.path().join("enroll-test.toml"),
+            "enroll-test".to_owned(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            None,
+            PageIdentity::neutral(),
+        )
+        .await
+        .unwrap();
+        let url = handle.enroll_url();
+        let token = handle.bootstrap_token_hex().to_owned();
+        (handle, url, token)
+    }
+
+    /// The enrollment phase hands the browser only the private redirect
+    /// file's URL and keeps the file while the ceremony waits. An interrupt
+    /// ends the wait; the server stops, the file and its directory are
+    /// removed, and the command exits `1`. A failed open makes one attempt
+    /// with the file URL and leaves nothing behind; `--no-open` opens nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn operator_enroll_uses_private_open() {
+        use crate::common::private_open::handoff_probe::HandoffProbe;
+        // Far beyond the test's bound: only the interrupt can end the wait.
+        let ceremony = Duration::from_secs(3600);
+        let bound = Duration::from_secs(30);
+        let dir = tempfile::tempdir().unwrap();
+        let store = OperatorApprovalCredentialStore::new(dir.path().join("enroll-test.toml"));
+
+        let (handle, url, token) = start_test_enrollment(&dir).await;
+        let addr = handle.local_addr();
+        let probe = HandoffProbe::default();
+        let end = tokio::time::timeout(
+            bound,
+            enroll_until_done(
+                handle,
+                &url,
+                true,
+                probe.opener(Ok(())),
+                ceremony,
+                probe.interrupt(),
+            ),
+        )
+        .await
+        .expect("the interrupt ends the enrollment wait");
+        assert!(matches!(end, CeremonyEnd::Interrupted), "{end:?}");
+        probe.assert_private_handoff(&url, &token);
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "the server stopped"
+        );
+        crate::common::render::take_rendered_for_test();
+        assert_eq!(report_ceremony_end(end, &store, &HashSet::new()), 1);
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert_eq!(rendered[0]["ok"], false, "{rendered:?}");
+        assert_eq!(
+            rendered[0]["error"]["code"], "internal.unexpected_state",
+            "{rendered:?}"
+        );
+        let message = rendered[0]["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(
+                "approve.operator_enroll_interactive_interrupted: the ceremony was \
+                 interrupted before an enrollment completed"
+            ),
+            "{rendered:?}"
+        );
+
+        let (handle, url, token) = start_test_enrollment(&dir).await;
+        let probe = HandoffProbe::default();
+        let end = tokio::time::timeout(
+            bound,
+            enroll_until_done(
+                handle,
+                &url,
+                true,
+                probe.opener(Err(io::Error::other("no browser"))),
+                ceremony,
+                probe.interrupt(),
+            ),
+        )
+        .await
+        .expect("the interrupt ends the enrollment wait");
+        assert!(matches!(end, CeremonyEnd::Interrupted), "{end:?}");
+        probe.assert_failed_open_left_nothing(&token);
+
+        let (handle, url, _token) = start_test_enrollment(&dir).await;
+        let probe = HandoffProbe::default();
+        let end = tokio::time::timeout(
+            bound,
+            enroll_until_done(
+                handle,
+                &url,
+                false,
+                probe.opener(Ok(())),
+                ceremony,
+                probe.interrupt(),
+            ),
+        )
+        .await
+        .expect("the interrupt ends the enrollment wait");
+        assert!(matches!(end, CeremonyEnd::Interrupted), "{end:?}");
+        assert!(probe.launched().is_empty());
     }
 
     #[derive(Debug, Parser)]

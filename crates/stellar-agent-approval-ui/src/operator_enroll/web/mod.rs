@@ -42,6 +42,21 @@ mod tests {
         assert!(body.contains("x-stellar-approval-csrf"));
     }
 
+    /// The ceremony reads the proof from the key the bootstrap page stores it
+    /// under and sends it in the header the server checks.
+    #[test]
+    fn operator_enroll_js_reads_the_enrollment_proof_key_and_sends_the_proof_header() {
+        let body = std::str::from_utf8(OPERATOR_ENROLL_JS).unwrap();
+        assert!(body.contains(&format!(
+            "\"{}\"",
+            crate::auth::SessionPurpose::OperatorEnroll.proof_storage_key()
+        )));
+        assert!(body.contains(&format!(
+            "\"{}\": proof",
+            crate::auth::SESSION_PROOF_HEADER_NAME
+        )));
+    }
+
     #[test]
     fn operator_enroll_js_extracts_sign_count_via_get_authenticator_data() {
         let body = std::str::from_utf8(OPERATOR_ENROLL_JS).unwrap();

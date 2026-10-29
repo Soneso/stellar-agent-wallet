@@ -730,7 +730,8 @@ fn add_passkey_refuses_before_the_bridge_starts() {
     for marker in [
         "bridge HTTP server started",
         "start_bridge_register_only",
-        "browser launch failed",
+        "if the browser does not show the registration page",
+        "could not open the browser",
     ] {
         assert!(
             !run.stderr.contains(marker),

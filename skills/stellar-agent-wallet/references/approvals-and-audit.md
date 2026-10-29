@@ -356,6 +356,12 @@ with it. Three surfaces exist for the operator side of that handshake:
 - **Loopback web inbox**: `stellar-agent approve serve` binds a local HTTP
   server and opens a browser to the pending-approval queue, so the operator
   clicks Approve/Reject per entry without running `approve --id <nonce> --profile <name>` per nonce.
+  The browser opens through a private redirect file, so the launcher never
+  receives the bootstrap URL. Approve and Reject require the session cookie,
+  an origin-scoped session proof, and a CSRF value. The inbox session expires
+  after 15 minutes without operator activity or 8 hours after bootstrap;
+  background polling does not extend it, and the operator restarts
+  `approve serve` for a new session.
 - **Remote approval**: `stellar-agent approve serve --remote
   --confirm-remote-exposure` binds a TLS-protected listener reachable from a
   device other than the wallet host, authenticated by a registered WebAuthn passkey. Use it when the agent runs on a headless machine. Every approve or

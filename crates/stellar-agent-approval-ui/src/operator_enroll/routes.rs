@@ -5,12 +5,15 @@
 //! | `GET`  | `/bootstrap/{token}` | [`bootstrap_get`] | one-time token |
 //! | `GET`  | `/enroll` | [`enroll_page_get`] | session cookie |
 //! | `GET`  | `/static/operator-enroll.js` | [`operator_enroll_js_get`] | session cookie |
-//! | `POST` | `/enroll/credential` | [`enroll_credential_post`] | session + CSRF |
+//! | `GET`  | `/static/session-bootstrap.js` | [`session_bootstrap_js_get`] | none |
+//! | `POST` | `/enroll/credential` | [`enroll_credential_post`] | session + CSRF + proof |
 //!
 //! The Host / Origin / security-header / body-limit / trace layers are
 //! applied at the router level by [`super::start_operator_enroll_server`],
-//! not here. Session-cookie and CSRF checks happen at the top of each
-//! handler (the auth boundary), mirroring `crate::routes`.
+//! not here. Session-cookie, CSRF and session-proof checks happen at the top
+//! of each handler (the auth boundary), mirroring `crate::routes`. The
+//! successful bootstrap response is the only response that carries the
+//! session proof.
 //!
 //! # Server-side attestation verification is intentionally omitted
 //!
@@ -42,7 +45,7 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use base64::Engine as _;
@@ -54,9 +57,9 @@ use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::approval::operator_credentials::OperatorApprovalCredential;
 
 use crate::auth::{
-    CSRF_HEADER_NAME, OpaqueToken, SESSION_COOKIE_NAME, SessionState, compute_csrf,
-    session_cookie_value, verify_csrf,
+    CSRF_HEADER_NAME, SessionState, compute_csrf, require_session_proof, verify_csrf,
 };
+use crate::templates::render_session_bootstrap_page;
 
 use super::OperatorEnrollState;
 use super::templates::render_enroll_page;
@@ -105,6 +108,10 @@ pub(super) fn build_router() -> Router<Arc<OperatorEnrollState>> {
         .route("/bootstrap/{token}", get(bootstrap_get))
         .route("/enroll", get(enroll_page_get))
         .route("/static/operator-enroll.js", get(operator_enroll_js_get))
+        .route(
+            "/static/session-bootstrap.js",
+            get(session_bootstrap_js_get),
+        )
         .route("/enroll/credential", post(enroll_credential_post))
 }
 
@@ -121,11 +128,12 @@ fn not_found() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
 
-/// Recovers the [`SessionState`] iff the request carries a valid session
-/// cookie.
+/// Recovers the [`SessionState`] iff the request carries the cookie of a
+/// live, unexpired session.
 ///
 /// Returns the session on success (with its per-run CSRF key), or a `404`
-/// response on absent / malformed / mismatched cookie.
+/// response on an absent / malformed / mismatched cookie or an expired
+/// session. Never records activity.
 #[allow(
     clippy::result_large_err,
     reason = "the Err variant is the ready-to-return axum Response for the auth-boundary rejection; boxing would only add an allocation on the reject path"
@@ -134,19 +142,12 @@ fn require_session(
     state: &OperatorEnrollState,
     headers: &HeaderMap,
 ) -> Result<SessionState, Response> {
-    let guard = match state.auth.lock() {
+    let mut guard = match state.auth.lock() {
         Ok(g) => g,
         Err(poison) => poison.into_inner(),
     };
-    let session = guard.session.as_ref().ok_or_else(not_found)?;
-
-    let cookie = session_cookie_value(headers).ok_or_else(not_found)?;
-    let submitted = OpaqueToken::from_hex(&cookie).ok_or_else(not_found)?;
-    if session.session_id.ct_eq(&submitted) {
-        Ok(session.clone())
-    } else {
-        Err(not_found())
-    }
+    let now = guard.now();
+    guard.require_session(headers, now).ok_or_else(not_found)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -154,7 +155,11 @@ fn require_session(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `GET /bootstrap/{token}` — one-time exchange of the bootstrap token for a
-/// session cookie, then redirect to `/enroll`.
+/// session.
+///
+/// The success response sets the session cookie and returns the bootstrap
+/// page, which carries the session proof and navigates to `/enroll` once the
+/// proof is stored. This is the only response that ever carries the proof.
 async fn bootstrap_get(
     State(state): State<Arc<OperatorEnrollState>>,
     Path(token): Path<String>,
@@ -163,31 +168,45 @@ async fn bootstrap_get(
         Ok(g) => g,
         Err(poison) => poison.into_inner(),
     };
-
-    let Some(submitted) = OpaqueToken::from_hex(&token) else {
+    let now = guard.now();
+    let Some(session) = guard.exchange_bootstrap(&token, now) else {
         return not_found();
     };
-    let matches = guard
-        .bootstrap
-        .as_ref()
-        .is_some_and(|stored| stored.ct_eq(&submitted));
-    if !matches {
-        return not_found();
-    }
-
-    // Consume the token immediately: any later request to this path 404s.
-    guard.bootstrap = None;
-    let session = SessionState::generate();
-    let cookie_value = session.session_id.to_hex();
-    guard.session = Some(session);
+    let cookie = guard.set_cookie_value(&session);
+    let purpose = guard.purpose();
     drop(guard);
 
-    let cookie = format!("{SESSION_COOKIE_NAME}={cookie_value}; HttpOnly; SameSite=Strict; Path=/");
-    let mut resp = Redirect::to("/enroll").into_response();
+    let mut resp = Html(render_session_bootstrap_page(
+        &session.session_proof.to_hex(),
+        purpose,
+    ))
+    .into_response();
     if let Ok(hv) = HeaderValue::from_str(&cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, hv);
     }
     resp
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /static/session-bootstrap.js
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `GET /static/session-bootstrap.js`: the bootstrap page's script, the same
+/// bytes the approval inbox serves.
+///
+/// Served without a session: the bootstrap page loads it in the same
+/// navigation that sets the cookie, and the bytes are fixed and carry no
+/// secret.
+async fn session_bootstrap_js_get() -> Response {
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        crate::web::SESSION_BOOTSTRAP_JS,
+    )
+        .into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -330,7 +349,11 @@ fn public_key_shape_is_valid(b64: &str) -> bool {
 /// beyond a bare `404`. The `X-Stellar-Approval-CSRF` header must then carry
 /// `hex(HMAC-SHA256(session_csrf_key, "operator-enroll"))`, the same value
 /// embedded in the `/enroll` page's data island, recomputed server-side and
-/// compared in constant time via [`crate::auth::verify_csrf`].
+/// compared in constant time via [`crate::auth::verify_csrf`]; a failure is
+/// `403` `csrf_invalid`. Last, the `X-Session-Proof` header must carry the
+/// session proof the bootstrap page stored; a failure is `403`
+/// `session_proof_invalid`. A request that passes all three records session
+/// activity before anything is validated or persisted.
 ///
 /// # Single-use enforcement
 ///
@@ -350,7 +373,7 @@ async fn enroll_credential_post(
     headers: HeaderMap,
     Json(payload): Json<EnrollCredentialRequest>,
 ) -> Response {
-    // ── Session, then CSRF ───────────────────────────────────────────────────
+    // ── Session, then CSRF, then proof ──────────────────────────────────────
     let session = match require_session(&state, &headers) {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -360,6 +383,19 @@ async fn enroll_credential_post(
     };
     if !verify_csrf(&session.csrf_key, ENROLL_NONCE, submitted_hex) {
         return csrf_invalid();
+    }
+    if let Err(resp) = require_session_proof(&session, &headers) {
+        return resp;
+    }
+    {
+        let mut auth = match state.auth.lock() {
+            Ok(g) => g,
+            Err(poison) => poison.into_inner(),
+        };
+        let now = auth.now();
+        if !auth.record_activity(&session.session_id, now) {
+            return not_found();
+        }
     }
 
     // ── Shape validation (before touching the store or the latch) ──────────

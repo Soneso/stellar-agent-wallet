@@ -7,8 +7,8 @@
 //! attestation: `stellar_pay` (under a `RequireApproval` policy) persists the
 //! pending entry exactly as production does, the approval-inbox server is
 //! started against the same store + attestation key, and a `reqwest` client
-//! drives the bootstrap → session-cookie → CSRF → approve/reject flow a
-//! browser would.
+//! drives the bootstrap → session cookie and session proof → CSRF →
+//! approve/reject flow a browser would.
 //!
 //! Gated behind the `testnet-acceptance` feature flag:
 //!
@@ -243,9 +243,10 @@ async fn start_serve_for_profile(
     (handle, base, rx)
 }
 
-/// A `reqwest::Client` that does not auto-follow redirects, so the bootstrap
-/// exchange's `303 See Other` + `Set-Cookie` can be observed directly, the
-/// same posture the in-crate router tests take against the assembled router.
+/// A `reqwest::Client` that does not auto-follow redirects, so every
+/// response, the bootstrap exchange's `Set-Cookie` included, is observed
+/// directly, the same posture the in-crate router tests take against the
+/// assembled router.
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -253,9 +254,16 @@ fn http_client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
-/// Performs the one-time bootstrap exchange and returns the `name=value`
-/// session-cookie header.
-async fn bootstrap_session(client: &reqwest::Client, bootstrap_url: &str) -> String {
+/// The session a bootstrap exchange establishes: the `name=value` cookie
+/// header and the session proof the bootstrap page hands its script.
+struct Session {
+    cookie: String,
+    proof: String,
+}
+
+/// Performs the one-time bootstrap exchange and returns the session cookie
+/// and the session proof.
+async fn bootstrap_session(client: &reqwest::Client, bootstrap_url: &str) -> Session {
     let resp = client
         .get(bootstrap_url)
         .send()
@@ -263,21 +271,28 @@ async fn bootstrap_session(client: &reqwest::Client, bootstrap_url: &str) -> Str
         .expect("bootstrap GET must succeed");
     assert_eq!(
         resp.status(),
-        reqwest::StatusCode::SEE_OTHER,
-        "bootstrap exchange must redirect to /inbox"
+        reqwest::StatusCode::OK,
+        "bootstrap exchange must return the session bootstrap page"
     );
-    let set_cookie = resp
+    let cookie = resp
         .headers()
         .get(reqwest::header::SET_COOKIE)
         .expect("bootstrap must set a session cookie")
         .to_str()
-        .expect("cookie header is ASCII");
-    set_cookie
+        .expect("cookie header is ASCII")
         .split(';')
         .next()
         .expect("cookie header carries a name=value pair")
         .trim()
-        .to_owned()
+        .to_owned();
+    let page = resp.text().await.expect("bootstrap body is text");
+    let island = extract_json_island(&page, "session-bootstrap-data");
+    assert_eq!(island["next"], "/inbox");
+    let proof = island["proof"]
+        .as_str()
+        .expect("the bootstrap page carries the session proof")
+        .to_owned();
+    Session { cookie, proof }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -360,8 +375,8 @@ async fn t1_serve_approve_then_commit_on_testnet() {
     let bootstrap_url = serve_handle.bootstrap_url();
     let client = http_client();
 
-    // ── 3. Bootstrap → session cookie ────────────────────────────────────────
-    let cookie = bootstrap_session(&client, &bootstrap_url).await;
+    // ── 3. Bootstrap → session cookie and session proof ─────────────────────
+    let Session { cookie, proof } = bootstrap_session(&client, &bootstrap_url).await;
 
     // Single-use: a second exchange of the same bootstrap token 404s.
     let replay = client
@@ -425,6 +440,7 @@ async fn t1_serve_approve_then_commit_on_testnet() {
         .header(reqwest::header::COOKIE, &cookie)
         .header(reqwest::header::ORIGIN, &origin)
         .header("X-Stellar-Approval-CSRF", &csrf)
+        .header("X-Session-Proof", &proof)
         .send()
         .await
         .expect("approve POST must succeed");
@@ -598,7 +614,7 @@ async fn t2_serve_reject_then_commit_refused() {
     let (serve_handle, base, _rx) = start_serve_for_profile(&server, &profile, &approval_dir).await;
     let bootstrap_url = serve_handle.bootstrap_url();
     let client = http_client();
-    let cookie = bootstrap_session(&client, &bootstrap_url).await;
+    let Session { cookie, proof } = bootstrap_session(&client, &bootstrap_url).await;
 
     let detail_resp = client
         .get(format!("{base}/approval/{approval_nonce}"))
@@ -618,6 +634,7 @@ async fn t2_serve_reject_then_commit_refused() {
         .header(reqwest::header::COOKIE, &cookie)
         .header(reqwest::header::ORIGIN, &base)
         .header("X-Stellar-Approval-CSRF", &csrf)
+        .header("X-Session-Proof", &proof)
         .send()
         .await
         .expect("reject POST must succeed");

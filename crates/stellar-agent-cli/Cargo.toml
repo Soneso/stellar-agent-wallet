@@ -96,7 +96,8 @@ uuid = { workspace = true }
 base64 = { workspace = true }
 # hex decode for --signer-key-data (smart-account signers --signer-external path).
 hex = { workspace = true }
-# Browser launch for the passkey-registration handoff (credentials/add_passkey.rs).
+# Browser launch for the loopback handoffs, through the private redirect file
+# of common/private_open.rs.
 webbrowser = { workspace = true }
 # WebAuthn bridge for the passkey-registration ceremony.
 stellar-agent-webauthn-bridge = { workspace = true }
@@ -111,6 +112,11 @@ tempfile = { workspace = true }
 # Hidden terminal input of an RPC provider credential
 # (profile/enroll_rpc_credential.rs).
 rpassword = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# The current-user-only directory that holds the private browser redirect file
+# (common/private_open.rs).
+stellar-agent-windows-identity = { workspace = true }
 
 [dev-dependencies]
 # WalletServer::call_stellar_pay for the CLI and MCP policy parity test.

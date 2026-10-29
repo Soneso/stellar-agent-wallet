@@ -44,8 +44,9 @@
 //!    under 4 KiB.
 //! 5. **`DefaultBodyLimit::max(16 KiB)`** — axum-level body cap applied via
 //!    the router layer (same constant as above).
-//! 6. **`TraceLayer`** — path-only structured logging; query strings and body
-//!    bytes are never emitted. Innermost wrapper so the recorded span reflects
+//! 6. **`TraceLayer`**: structured logging of the matched route template
+//!    (`/register/{nonce}`), never the request path, its query string or
+//!    body bytes. Innermost wrapper so the recorded span reflects
 //!    only the surface area that survives the prior layers' admission
 //!    decisions.
 //!
@@ -477,14 +478,15 @@ fn build_router(
     local_addr: SocketAddr,
     page_identity: PageIdentity,
 ) -> Router {
-    // TraceLayer: path-only logging (never full URI), so query strings and body
-    // bytes are never emitted.
+    // TraceLayer: records the matched route template, never the request path
+    // (which carries the registration or approval nonce), the query string or
+    // body bytes.
     let trace_layer = TraceLayer::new_for_http().make_span_with(
         |request: &axum::http::Request<axum::body::Body>| {
             tracing::info_span!(
                 "bridge_request",
                 method = %request.method(),
-                path = request.uri().path(),
+                path = stellar_agent_loopback_http::request_trace::route_label(request),
             )
         },
     );
@@ -704,5 +706,180 @@ mod tests {
             matches!(result, Ok(None)),
             "empty registry must return Ok(None), got: {result:?}"
         );
+    }
+
+    // ─── Request tracing ─────────────────────────────────────────────────────
+
+    /// Records every span and event field as one text line.
+    #[derive(Clone, Default)]
+    struct TraceLines {
+        lines: Arc<std::sync::Mutex<Vec<String>>>,
+        next_id: Arc<std::sync::Mutex<u64>>,
+    }
+
+    struct CollectFields<'a>(&'a mut String);
+
+    impl tracing::field::Visit for CollectFields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!(" {}={value:?}", field.name()));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push_str(&format!(" {}={value}", field.name()));
+        }
+    }
+
+    impl tracing::Subscriber for TraceLines {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let mut line = span.metadata().name().to_owned();
+            span.record(&mut CollectFields(&mut line));
+            self.lines.lock().unwrap().push(line);
+            let mut next = self.next_id.lock().unwrap();
+            *next += 1;
+            tracing::span::Id::from_u64(*next)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            let mut line = String::from("record");
+            values.record(&mut CollectFields(&mut line));
+            self.lines.lock().unwrap().push(line);
+        }
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = event.metadata().name().to_owned();
+            event.record(&mut CollectFields(&mut line));
+            self.lines.lock().unwrap().push(line);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// The registration page and its credential POST record their route
+    /// templates: the nonce in the request path never reaches the trace.
+    ///
+    /// The bridge runs on this test's single-threaded runtime, so its request
+    /// spans reach the capture installed as this thread's default.
+    #[tokio::test(flavor = "current_thread")]
+    async fn registration_trace_redacts_nonce() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use stellar_agent_core::approval::{generate_csrf_token, store::PendingApproval};
+
+        let (store, _dir) = test_store();
+        let csrf = generate_csrf_token();
+        let entry = PendingApproval::new_register_passkey_pending(
+            "CAAAA...BBBBB".to_owned(),
+            vec![1_u32],
+            csrf,
+            "localhost".to_owned(),
+            [0xcc_u8; 32],
+            "test-proc-uid".to_owned(),
+            300_000,
+        )
+        .unwrap();
+        let nonce = entry.approval_nonce.clone();
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        store.lock().await.insert(entry, now_ms).unwrap();
+
+        // Registered before the capture and held while it is installed, so
+        // callsite interest is computed from every registered dispatcher.
+        let inert = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let capture = TraceLines::default();
+        let default = tracing::subscriber::set_default(capture.clone());
+        tracing::callsite::rebuild_interest_cache();
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let handle = start_bridge_register_only(Arc::clone(&store), addr, PageIdentity::neutral())
+            .await
+            .unwrap();
+        let local = handle.local_addr();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let page = client
+            .get(format!("http://{local}/register/{nonce}"))
+            .header("Host", local.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status().as_u16(), 200);
+
+        let credential_id = URL_SAFE_NO_PAD.encode([0x42_u8; 16]);
+        let mut pubkey_sec1 = [0x01_u8; 65];
+        pubkey_sec1[0] = 0x04;
+        let payload = serde_json::json!({
+            "id": credential_id,
+            "rawId": credential_id,
+            "type": "public-key",
+            "response": {
+                "clientDataJSON": "ZHVtbXk",
+                "attestationObject": "ZHVtbXk",
+                "publicKeySec1B64": STANDARD.encode(pubkey_sec1),
+                "transports": ["internal"]
+            }
+        });
+        let posted = client
+            .post(format!("http://{local}/register/{nonce}/credential"))
+            .header("Host", local.to_string())
+            .header("Origin", format!("http://{local}"))
+            .header("X-Stellar-Approval-CSRF", hex::encode(csrf))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(posted.status().as_u16(), 200);
+
+        handle.shutdown().await.unwrap();
+        drop(default);
+        drop(inert);
+
+        let lines = capture.lines.lock().unwrap().clone();
+        let paths: Vec<&str> = lines
+            .iter()
+            .filter(|line| line.starts_with("bridge_request "))
+            .filter_map(|line| {
+                line.split(' ')
+                    .find_map(|field| field.strip_prefix("path="))
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            ["/register/{nonce}", "/register/{nonce}/credential"],
+            "{lines:?}"
+        );
+        for line in &lines {
+            assert!(!line.contains(&nonce), "nonce in trace: {line}");
+            assert!(
+                !line.contains(&format!("/register/{nonce}")),
+                "request path in trace: {line}"
+            );
+        }
     }
 }

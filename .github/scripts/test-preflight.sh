@@ -1126,12 +1126,12 @@ case_two_owners() {
   expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
 }
 
-# Core and headless-keyring depend on windows-identity only in their Windows
-# target tables.
+# Core, headless-keyring and the CLI depend on windows-identity only in their
+# Windows target tables.
 case_target_specific_edge() {
   start_case
   edit crates/stellar-agent-windows-identity/src/lib.rs
-  pin_packages "stellar-agent-windows-identity stellar-agent-core stellar-agent-headless-keyring" test-helpers \
+  pin_packages "stellar-agent-windows-identity stellar-agent-cli stellar-agent-core stellar-agent-headless-keyring" test-helpers \
     crates/stellar-agent-windows-identity/src/lib.rs
   expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}"
 }

@@ -32,11 +32,17 @@
 //! down by the caller once it completes (or the caller's timeout elapses). A
 //! 32-byte bootstrap token is minted at start and never embedded in a served
 //! page; the operator's browser exchanges it once, at `GET /bootstrap/<hex>`,
-//! for an `HttpOnly; SameSite=Strict` session cookie. Every other route
-//! requires that cookie — absent, malformed, or mismatched collapses to a
-//! bare `404` — so a local process that never opened the bootstrap URL itself
-//! cannot scrape a token from a served page and race the operator to
-//! `POST /enroll/credential`. `POST /enroll/credential` fires a single-use
+//! for an `HttpOnly; SameSite=Strict` session cookie and a session proof the
+//! bootstrap page keeps in the tab's `sessionStorage`. Every other route
+//! requires that cookie; an absent, malformed, mismatched, or expired cookie
+//! collapses to a bare `404`. A local process that never opened the bootstrap
+//! URL itself therefore cannot scrape a token from a served page and race the
+//! operator to `POST /enroll/credential`. The cookie is host-scoped, so a service on
+//! another `localhost` port can receive it; the proof is origin-scoped and
+//! never served again, and `POST /enroll/credential` refuses a request without
+//! it. The session uses the same lifetime limits as the approval inbox (see
+//! `crate::auth`); the ceremony timeout of the caller is normally the shorter
+//! limit. `POST /enroll/credential` fires a single-use
 //! completion signal (see [`OperatorEnrollHandle::await_completion`]) the
 //! first time it persists a credential; see `routes::enroll_credential_post`
 //! for how the single-use latch is enforced atomically against concurrent
@@ -74,7 +80,7 @@ use stellar_agent_core::approval::operator_credentials::OperatorApprovalCredenti
 
 use stellar_agent_loopback_http::brand::PageIdentity;
 
-use crate::auth::{AuthState, OpaqueToken};
+use crate::auth::{AuthState, OpaqueToken, SessionPurpose};
 use crate::{HostHeaderAllowlistLayer, OriginHeaderAllowlistLayer, SecurityHeadersLayer};
 
 mod error;
@@ -299,7 +305,7 @@ pub async fn start_operator_enroll_server(
     let (completion_tx, completion_rx) = oneshot::channel::<()>();
     let state = Arc::new(OperatorEnrollState {
         profile: profile.into(),
-        auth: StdMutex::new(AuthState::new(bootstrap)),
+        auth: StdMutex::new(AuthState::new(bootstrap, SessionPurpose::OperatorEnroll)),
         store: OperatorApprovalCredentialStore::new(store_path),
         label_prefill,
         identity: page_identity,
@@ -349,12 +355,14 @@ pub async fn start_operator_enroll_server(
 ///   → handler
 /// ```
 fn build_router(state: Arc<OperatorEnrollState>, local_addr: SocketAddr) -> Router {
+    // The span records the matched route template, never the request path:
+    // the bootstrap path carries the single-use token.
     let trace_layer = TraceLayer::new_for_http().make_span_with(
         |request: &axum::http::Request<axum::body::Body>| {
             tracing::info_span!(
                 "operator_enroll_request",
                 method = %request.method(),
-                path = request.uri().path(),
+                path = stellar_agent_loopback_http::request_trace::route_label(request),
             )
         },
     );

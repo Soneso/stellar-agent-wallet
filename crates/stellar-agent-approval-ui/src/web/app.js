@@ -13,7 +13,18 @@
 //
 // Detail: reads #approval-data (nonce + CSRF value), wires the Approve / Reject
 // buttons to POST /approval/<nonce>/{approve,reject} with the
-// X-Stellar-Approval-CSRF header, and renders the JSON response.
+// X-Stellar-Approval-CSRF header and the X-Session-Proof header, and renders
+// the JSON response.
+//
+// # Session proof and activity
+//
+// The bootstrap page stored the session proof in this tab's sessionStorage
+// (see /static/session-bootstrap.js). Every state-changing request carries it
+// in X-Session-Proof; the server refuses a request without it. The session
+// expires after a period without operator activity, and the background poll
+// does not count: only a trusted user interaction (a pointer press, a key
+// press, a wheel turn, a touch) sends POST /session/activity, at most once a
+// minute across this tab's page loads. Timers never send it.
 //
 // # DOM discipline
 //
@@ -25,6 +36,65 @@
   "use strict";
 
   var shared = stellarAgentApproval;
+
+  var PROOF_KEY = "stellar-agent-approval-session-proof";
+  var ACTIVITY_AT_KEY = "stellar-agent-approval-session-activity-at";
+  var ACTIVITY_INTERVAL_MS = 60000;
+  var ACTIVITY_EVENTS = ["pointerdown", "keydown", "wheel", "touchstart"];
+
+  function storageGet(key) {
+    try {
+      return window.sessionStorage.getItem(key);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function storageSet(key, value) {
+    try {
+      window.sessionStorage.setItem(key, value);
+    } catch (e) {
+      /* the throttle falls back to this page load */
+    }
+  }
+
+  function readProof() {
+    var proof = storageGet(PROOF_KEY);
+    return typeof proof === "string" && proof.length > 0 ? proof : null;
+  }
+
+  // Sends POST /session/activity for a trusted user interaction, at most once
+  // per ACTIVITY_INTERVAL_MS. The last send time lives in sessionStorage so
+  // navigating between pages does not reset the throttle. `keepalive` lets the
+  // request finish when the interaction is a click that leaves the page.
+  function watchActivity(activityCsrf) {
+    var proof = readProof();
+    if (!proof || typeof activityCsrf !== "string" || activityCsrf.length === 0) {
+      return;
+    }
+    var lastSent = Number(storageGet(ACTIVITY_AT_KEY)) || 0;
+    function onInteraction(event) {
+      if (!event || event.isTrusted !== true) {
+        return;
+      }
+      var now = Date.now();
+      if (now - lastSent < ACTIVITY_INTERVAL_MS) {
+        return;
+      }
+      lastSent = now;
+      storageSet(ACTIVITY_AT_KEY, String(now));
+      fetch("/session/activity", {
+        method: "POST",
+        keepalive: true,
+        headers: { "X-Stellar-Approval-CSRF": activityCsrf, "X-Session-Proof": proof },
+      }).catch(function () {
+        /* the next interaction after the interval retries */
+      });
+    }
+    for (var i = 0; i < ACTIVITY_EVENTS.length; i++) {
+      document.addEventListener(ACTIVITY_EVENTS[i], onInteraction, { capture: true, passive: true });
+    }
+  }
 
   function updateBadge(count) {
     var base = "Stellar Agent Wallet — Approvals";
@@ -72,13 +142,29 @@
   // elsewhere, a store that could not be written — and means nothing was
   // signed, so it renders in the refusal treatment rather than as a status
   // line the operator could read as success.
+  //
+  // A tab without the session proof cannot act: the decision would be refused,
+  // so nothing is sent and the refusal names the way back.
   function post(url, csrf, result) {
+    var proof = readProof();
+    if (!proof) {
+      result.className = "result refused";
+      result.textContent =
+        "Not recorded: this tab has no wallet session. Use the tab the " +
+        "command opened, or restart it for a new link.";
+      shared.setPageState("error");
+      return;
+    }
     result.className = "result";
     result.textContent = "Working…";
     shared.setPageState("busy");
     fetch(url, {
       method: "POST",
-      headers: { "X-Stellar-Approval-CSRF": csrf, Accept: "application/json" },
+      headers: {
+        "X-Stellar-Approval-CSRF": csrf,
+        "X-Session-Proof": proof,
+        Accept: "application/json",
+      },
     })
       .then(function (r) {
         return r
@@ -132,11 +218,13 @@
 
   var inboxIsland = shared.readIsland("pending-data");
   if (inboxIsland) {
+    watchActivity(inboxIsland.activity_csrf);
     startInbox(inboxIsland);
     return;
   }
   var detailIsland = shared.readIsland("approval-data");
   if (detailIsland) {
+    watchActivity(detailIsland.activity_csrf);
     startDetail(detailIsland);
   }
 })();

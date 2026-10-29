@@ -10,8 +10,17 @@
 //!
 //! On start the server mints a single-use bootstrap token and prints the
 //! `http://127.0.0.1:<port>/bootstrap/<token>` URL. Opening it exchanges the
-//! token for an `HttpOnly` session cookie and redirects to the inbox; every
-//! other route requires the cookie. The server runs until Ctrl-C.
+//! token for an `HttpOnly` session cookie and a session proof the page keeps
+//! in the tab, then shows the inbox; every other route requires the cookie,
+//! and approve and reject also require the proof. The session ends after 15
+//! minutes without operator activity or 8 hours after the exchange; restart
+//! the command for a new one. The server runs until Ctrl-C.
+//!
+//! Unless `--no-open` is passed, the browser is opened through a private
+//! redirect file (see `crate::common::private_open`): the launcher receives
+//! only the file's URL, never the bootstrap URL. The file stays until the
+//! server stops. If the browser cannot be opened, the printed URL is the
+//! handoff.
 //!
 //! # Security notes
 //!
@@ -28,16 +37,20 @@
 //! - `0` — clean shutdown after Ctrl-C.
 //! - `1` — failure to start (profile not found, keyring init, port in use).
 
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use clap::{Args, ValueEnum};
 
-use stellar_agent_approval_ui::{DecisionContext, ServeConfig, ServeStartError, start_serve};
+use stellar_agent_approval_ui::{
+    DecisionContext, ServeConfig, ServeHandle, ServeStartError, start_serve,
+};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, WalletError};
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
 use crate::commands::smart_account::common::open_audit_writer;
+use crate::common::private_open;
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
@@ -210,15 +223,6 @@ pub async fn run(args: ServeArgs) -> i32 {
 
     print_startup(&bootstrap_url, port, port_was_explicit);
 
-    // Open the browser only on a host with a display, and only when the URL is
-    // not being handed to another process for a headless/tunnelled session.
-    if !args.no_open
-        && crate::common::display_available()
-        && webbrowser::open(&bootstrap_url).is_err()
-    {
-        tracing::debug!("approve serve: browser open failed; use the printed URL");
-    }
-
     // CLI-side notice printer: reads the watcher's count-increase events.
     let bell = args.bell;
     let notice_task = tokio::spawn(async move {
@@ -227,16 +231,58 @@ pub async fn run(args: ServeArgs) -> i32 {
         }
     });
 
-    // Run until Ctrl-C.
-    if let Err(e) = tokio::signal::ctrl_c().await {
+    // Open the browser only on a host with a display, and only when the URL is
+    // not being handed to another process for a headless/tunnelled session.
+    let open_browser = !args.no_open && crate::common::display_available();
+    serve_until_shutdown(
+        handle,
+        &bootstrap_url,
+        open_browser,
+        private_open::browser_opener,
+        tokio::signal::ctrl_c(),
+    )
+    .await;
+
+    notice_task.abort();
+    0
+}
+
+/// Runs the started inbox server until `shutdown_signal` resolves (Ctrl-C).
+///
+/// When `open_browser` is set, opens the bootstrap URL through a private
+/// redirect file first; `opener` receives only the file's URL. The file stays
+/// while the server runs. After the signal the server stops and the file and
+/// its directory are removed. When the open fails, the URL printed at startup
+/// is the handoff.
+async fn serve_until_shutdown(
+    handle: ServeHandle,
+    bootstrap_url: &str,
+    open_browser: bool,
+    opener: impl FnOnce(&str) -> io::Result<()>,
+    shutdown_signal: impl Future<Output = io::Result<()>>,
+) {
+    let browser_handoff = if open_browser {
+        private_open::open_or_point_to_handoff(
+            bootstrap_url,
+            opener,
+            "the approval inbox URL printed above",
+        )
+    } else {
+        None
+    };
+
+    if let Err(e) = shutdown_signal.await {
         tracing::debug!(error = %e, "approve serve: ctrl-c wait failed; shutting down");
     }
 
-    notice_task.abort();
     if let Err(e) = handle.shutdown().await {
         tracing::debug!(error = %e, "approve serve: shutdown did not complete cleanly");
     }
-    0
+    if let Some(handoff) = browser_handoff
+        && let Err(e) = handoff.close()
+    {
+        tracing::debug!(error.kind = ?e.kind(), "approve serve: redirect file cleanup failed");
+    }
 }
 
 /// Runs `stellar-agent approve serve --remote`.
@@ -441,6 +487,92 @@ mod tests {
     struct Wrap {
         #[command(flatten)]
         args: ServeArgs,
+    }
+
+    /// A started inbox server on a temporary store, with its bootstrap URL
+    /// and token.
+    async fn start_test_inbox(dir: &tempfile::TempDir) -> (ServeHandle, String, String) {
+        use std::sync::{Arc, Mutex};
+
+        use stellar_agent_core::audit_log::writer::AuditWriter;
+        use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
+
+        let profile = Profile::builder_testnet("svc", "default", "nonce", "default").build();
+        let context = DecisionContext::new(
+            stellar_agent_core::approval::ApprovalContext::from_profile("serve-test", &profile),
+            dir.path().join("serve-test.toml"),
+            KeyringEntryRef::new("svc", "default"),
+            stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile_name("serve-test"),
+            Arc::new(Mutex::new(
+                AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap(),
+            )),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let config = ServeConfig::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            context,
+            tx,
+            false,
+        );
+        let handle = start_serve(config).await.unwrap();
+        let url = handle.bootstrap_url();
+        let token = handle.bootstrap_token_hex().to_owned();
+        (handle, url, token)
+    }
+
+    /// The serve phase hands the browser only the private redirect file's
+    /// URL, keeps the file while the server runs, and removes it once the
+    /// shutdown signal stops the server. A failed open makes one attempt with
+    /// the file URL and leaves nothing behind; `--no-open` opens nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_uses_private_open() {
+        use crate::common::private_open::handoff_probe::HandoffProbe;
+        let bound = std::time::Duration::from_secs(30);
+        let dir = tempfile::tempdir().unwrap();
+
+        let (handle, url, token) = start_test_inbox(&dir).await;
+        let addr = handle.local_addr();
+        let probe = HandoffProbe::default();
+        tokio::time::timeout(
+            bound,
+            serve_until_shutdown(handle, &url, true, probe.opener(Ok(())), probe.interrupt()),
+        )
+        .await
+        .expect("the shutdown signal ends the serve phase");
+        probe.assert_private_handoff(&url, &token);
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "the server stopped"
+        );
+
+        let (handle, url, token) = start_test_inbox(&dir).await;
+        let probe = HandoffProbe::default();
+        tokio::time::timeout(
+            bound,
+            serve_until_shutdown(
+                handle,
+                &url,
+                true,
+                probe.opener(Err(io::Error::other("no browser"))),
+                probe.interrupt(),
+            ),
+        )
+        .await
+        .expect("the shutdown signal ends the serve phase");
+        assert!(probe.waited());
+        probe.assert_failed_open_left_nothing(&token);
+
+        let (handle, url, _token) = start_test_inbox(&dir).await;
+        let probe = HandoffProbe::default();
+        tokio::time::timeout(
+            bound,
+            serve_until_shutdown(handle, &url, false, probe.opener(Ok(())), probe.interrupt()),
+        )
+        .await
+        .expect("the shutdown signal ends the serve phase");
+        assert!(probe.waited());
+        assert!(probe.launched().is_empty());
     }
 
     #[test]

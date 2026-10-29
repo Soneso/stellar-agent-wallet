@@ -44,7 +44,10 @@ use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::profile::schema::KeyringEntryRef;
 use stellar_agent_core::timefmt;
 
-use crate::auth::{AuthState, OpaqueToken, compute_csrf};
+use crate::auth::{
+    AuthState, OpaqueToken, SESSION_ABSOLUTE_TIMEOUT, SESSION_IDLE_TIMEOUT, SessionClock,
+    SessionPurpose, compute_csrf,
+};
 use crate::decision::DecisionContext;
 use crate::{PageIdentity, ServeConfig, ServeStartError, ServeState, build_router, start_serve};
 
@@ -56,8 +59,11 @@ pub(crate) struct Harness {
     _dir: TempDir,
     state: ServeState,
     pub(crate) store_path: std::path::PathBuf,
+    audit_path: std::path::PathBuf,
     bootstrap_hex: String,
     raw_key: [u8; 32],
+    clock: SessionClock,
+    proof: StdMutex<Option<String>>,
 }
 
 impl Harness {
@@ -75,7 +81,7 @@ impl Harness {
             .unwrap();
 
         let audit_writer = Arc::new(StdMutex::new(
-            AuditWriter::open(audit_path, None).expect("audit writer"),
+            AuditWriter::open(audit_path.clone(), None).expect("audit writer"),
         ));
         let ctx = DecisionContext::new(
             stellar_agent_core::approval::ApprovalContext::from_profile(
@@ -93,8 +99,13 @@ impl Harness {
         );
         let bootstrap = OpaqueToken::generate();
         let bootstrap_hex = bootstrap.to_hex();
+        let clock = SessionClock::manual();
         let state = ServeState {
-            auth: Arc::new(StdMutex::new(AuthState::new(bootstrap))),
+            auth: Arc::new(StdMutex::new(AuthState::with_clock(
+                bootstrap,
+                SessionPurpose::Inbox,
+                clock.clone(),
+            ))),
             ctx: Arc::new(ctx),
             identity: Arc::new(PageIdentity::neutral()),
         };
@@ -102,8 +113,11 @@ impl Harness {
             _dir: dir,
             state,
             store_path,
+            audit_path,
             bootstrap_hex,
             raw_key,
+            clock,
+            proof: StdMutex::new(None),
         }
     }
 
@@ -121,7 +135,9 @@ impl Harness {
         nonce
     }
 
-    /// Perform the bootstrap exchange and return the session cookie header value.
+    /// Perform the bootstrap exchange and return the session cookie header
+    /// value. The session proof the bootstrap page carries is kept for
+    /// [`Self::proof`].
     pub(crate) async fn bootstrap(&self) -> String {
         let req = Request::builder()
             .uri(format!("/bootstrap/{}", self.bootstrap_hex))
@@ -129,15 +145,23 @@ impl Harness {
             .body(Body::empty())
             .unwrap();
         let resp = self.router().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "bootstrap should 302");
-        let set_cookie = resp
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("bootstrap sets a session cookie")
-            .to_str()
-            .unwrap();
-        // Keep only the `name=value` part for the Cookie header.
-        set_cookie.split(';').next().unwrap().trim().to_owned()
+        let (cookie, proof) = read_bootstrap_response(resp).await;
+        *self.proof.lock().unwrap() = Some(proof);
+        cookie
+    }
+
+    /// The session proof the last bootstrap exchange delivered.
+    pub(crate) fn proof(&self) -> String {
+        self.proof
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("bootstrap delivered a proof")
+    }
+
+    /// The audit log bytes, or `None` while no event was written.
+    fn audit_bytes(&self) -> Option<Vec<u8>> {
+        std::fs::read(&self.audit_path).ok()
     }
 
     /// The session CSRF value for `nonce` under the live session key.
@@ -146,6 +170,36 @@ impl Harness {
         let session = guard.session.as_ref().expect("session established");
         compute_csrf(&session.csrf_key, nonce)
     }
+}
+
+/// Reads a successful bootstrap response: `200`, an HTML page, the session
+/// cookie, and the proof from the page's data island. Returns the cookie's
+/// `name=value` part and the proof.
+pub(crate) async fn read_bootstrap_response(resp: axum::response::Response) -> (String, String) {
+    assert_eq!(resp.status(), StatusCode::OK, "bootstrap returns its page");
+    let set_cookie = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("bootstrap sets a session cookie")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+    let island = json_island(&html, "session-bootstrap-data");
+    let proof = island["proof"].as_str().unwrap().to_owned();
+    assert_eq!(island["next"], "/inbox");
+    // Keep only the `name=value` part for the Cookie header.
+    let cookie = set_cookie.split(';').next().unwrap().trim().to_owned();
+    (cookie, proof)
+}
+
+/// Parses the JSON data island with element id `id` out of `html`.
+fn json_island(html: &str, id: &str) -> serde_json::Value {
+    let open = format!(r#"<script type="application/json" id="{id}">"#);
+    let start = html.find(&open).expect("data island present") + open.len();
+    let end = start + html[start..].find("</script>").unwrap();
+    serde_json::from_str(&html[start..end]).unwrap()
 }
 
 fn uid() -> String {
@@ -180,7 +234,7 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 async fn bootstrap_is_single_use() {
     let h = Harness::new("bootstrap-single");
     let cookie = h.bootstrap().await;
-    assert!(cookie.starts_with("stellar_agent_approval_session="));
+    assert!(cookie.starts_with("stellar_agent_approval_session_"));
 
     // Second attempt with the same token must 404.
     let req = Request::builder()
@@ -245,6 +299,7 @@ async fn post_without_origin_is_403() {
         .header(header::HOST, HOST)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -278,6 +333,7 @@ async fn post_with_missing_or_wrong_csrf_is_403_and_does_not_mutate() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", "00".repeat(32))
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -319,6 +375,7 @@ async fn approve_payment_mints_verifiable_attestation() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -391,6 +448,7 @@ async fn serve_trustline_json_returns_attestation() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -451,6 +509,7 @@ async fn reject_creates_tombstone() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -478,6 +537,7 @@ async fn second_approve_is_idempotent_already_resolved() {
             .header(header::ORIGIN, ORIGIN)
             .header(header::COOKIE, &cookie)
             .header("x-stellar-approval-csrf", &csrf)
+            .header("x-session-proof", h.proof())
             .body(Body::empty())
             .unwrap()
     };
@@ -509,6 +569,7 @@ async fn approve_expired_entry_reports_expired() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -545,6 +606,7 @@ async fn approve_foreign_process_uid_reports_user_mismatch() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -583,6 +645,7 @@ async fn reject_foreign_process_uid_reports_user_mismatch() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -666,6 +729,7 @@ async fn approve_when_store_locked_returns_503_busy() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -786,12 +850,18 @@ async fn start_serve_end_to_end_over_real_tcp_bind() {
         .expect("read the bootstrap response");
     let response_text = String::from_utf8_lossy(&response);
     assert!(
-        response_text.starts_with("HTTP/1.1 303"),
-        "bootstrap exchange over a real socket must redirect: {response_text}"
+        response_text.starts_with("HTTP/1.1 200"),
+        "bootstrap exchange over a real socket must return its page: {response_text}"
+    );
+    let lower = response_text.to_ascii_lowercase();
+    assert!(
+        lower.contains("set-cookie: stellar_agent_approval_session_")
+            && lower.contains("max-age=28800"),
+        "bootstrap exchange must set the bounded session cookie: {response_text}"
     );
     assert!(
-        response_text.to_ascii_lowercase().contains("set-cookie"),
-        "bootstrap exchange must set the session cookie: {response_text}"
+        response_text.contains(r#"id="session-bootstrap-data""#),
+        "bootstrap exchange must deliver the session proof page: {response_text}"
     );
 
     handle
@@ -990,14 +1060,12 @@ async fn detail_page_without_cookie_is_404() {
 #[serial]
 async fn protected_route_with_wrong_cookie_value_is_404() {
     let h = Harness::new("wrong-cookie-value");
-    let _cookie = h.bootstrap().await;
+    let cookie = h.bootstrap().await;
+    let (name, _) = cookie.split_once('=').unwrap();
     let req = Request::builder()
         .uri("/pending.json")
         .header(header::HOST, HOST)
-        .header(
-            header::COOKIE,
-            format!("stellar_agent_approval_session={}", "0".repeat(64)),
-        )
+        .header(header::COOKIE, format!("{name}={}", "0".repeat(64)))
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -1040,6 +1108,7 @@ async fn detail_page_reshows_attestation_after_approve() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let approve_resp = h.router().oneshot(approve_req).await.unwrap();
@@ -1206,6 +1275,7 @@ async fn approve_toolset_first_invoke_gate_via_router_returns_grant_active() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -1228,6 +1298,7 @@ async fn approve_unknown_nonce_via_router_returns_not_found_status() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -1261,6 +1332,7 @@ async fn approve_sign_with_passkey_via_router_returns_wrong_kind_status() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", h.proof())
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
@@ -1298,7 +1370,10 @@ async fn approve_with_unseeded_keyring_returns_unavailable_status() {
     let bootstrap = OpaqueToken::generate();
     let bootstrap_hex = bootstrap.to_hex();
     let state = ServeState {
-        auth: Arc::new(StdMutex::new(AuthState::new(bootstrap))),
+        auth: Arc::new(StdMutex::new(AuthState::new(
+            bootstrap,
+            SessionPurpose::Inbox,
+        ))),
         ctx: Arc::new(ctx),
         identity: Arc::new(PageIdentity::neutral()),
     };
@@ -1311,16 +1386,7 @@ async fn approve_with_unseeded_keyring_returns_unavailable_status() {
         .body(Body::empty())
         .unwrap();
     let bootstrap_resp = router.clone().oneshot(bootstrap_req).await.unwrap();
-    let cookie = bootstrap_resp
-        .headers()
-        .get(header::SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
+    let (cookie, proof) = read_bootstrap_response(bootstrap_resp).await;
 
     let entry = fixtures::payment_pending(
         SOURCE_G,
@@ -1353,6 +1419,7 @@ async fn approve_with_unseeded_keyring_returns_unavailable_status() {
         .header(header::ORIGIN, ORIGIN)
         .header(header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", csrf)
+        .header("x-session-proof", &proof)
         .body(Body::empty())
         .unwrap();
     let approve_resp = router.oneshot(approve_req).await.unwrap();
@@ -1413,7 +1480,8 @@ async fn bootstrap_survives_poisoned_auth_mutex() {
         .body(Body::empty())
         .unwrap();
     let resp = h.router().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let (cookie, _proof) = read_bootstrap_response(resp).await;
+    assert!(cookie.starts_with("stellar_agent_approval_session_"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1498,5 +1566,552 @@ async fn authenticated_detail_renders_selected_context_and_envelope_source() {
         "GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA",
     ] {
         assert!(html.contains(value), "missing {value}: {html}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Session proof, lifetime and cookie shape
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A `POST` to `path` carrying the given cookie, CSRF value and proof headers.
+fn mutation(path: &str, cookie: &str, csrf: Option<&str>, proof: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::HOST, HOST)
+        .header(header::ORIGIN, ORIGIN)
+        .header(header::COOKIE, cookie);
+    if let Some(csrf) = csrf {
+        builder = builder.header("x-stellar-approval-csrf", csrf);
+    }
+    if let Some(proof) = proof {
+        builder = builder.header("x-session-proof", proof);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+/// A cookie-only `GET` of `path`.
+fn cookie_get(path: &str, cookie: &str) -> Request<Body> {
+    Request::builder()
+        .uri(path)
+        .header(header::HOST, HOST)
+        .header(header::COOKIE, cookie)
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn body_text(resp: axum::response::Response) -> String {
+    let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// The session cookie and a valid CSRF value do not authorize approve or
+/// reject without the session proof: a missing, malformed, or wrong proof is
+/// refused with `session_proof_invalid`, and neither the store nor the audit
+/// log changes.
+#[tokio::test]
+#[serial]
+async fn cookie_and_csrf_without_proof_cannot_mutate() {
+    let h = Harness::new("proof-required");
+    let cookie = h.bootstrap().await;
+    let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let csrf = h.csrf_for(&nonce);
+    let store_before = std::fs::read(&h.store_path).unwrap();
+    let audit_before = h.audit_bytes();
+    let wrong = OpaqueToken::generate().to_hex();
+    let session_id = h
+        .state
+        .auth
+        .lock()
+        .unwrap()
+        .session
+        .as_ref()
+        .unwrap()
+        .session_id
+        .to_hex();
+
+    for action in ["approve", "reject"] {
+        for proof in [
+            None,
+            Some("not-a-proof"),
+            Some(wrong.as_str()),
+            Some(session_id.as_str()),
+        ] {
+            let resp = h
+                .router()
+                .oneshot(mutation(
+                    &format!("/approval/{nonce}/{action}"),
+                    &cookie,
+                    Some(&csrf),
+                    proof,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{action} {proof:?}");
+            assert_eq!(
+                body_json(resp).await,
+                serde_json::json!({"error": "session_proof_invalid"}),
+                "{action} {proof:?}"
+            );
+        }
+    }
+
+    assert_eq!(std::fs::read(&h.store_path).unwrap(), store_before);
+    assert_eq!(h.audit_bytes(), audit_before);
+    {
+        let store = PendingApprovalStore::open(h.store_path.clone()).unwrap();
+        let entry = store.get(&nonce).expect("entry still present");
+        assert!(matches!(entry.kind, ApprovalKind::PaymentSimulated { .. }));
+        assert!(entry.attestation_blob_b64.is_none());
+    }
+
+    // The same request with the proof is the operator's and goes through.
+    let resp = h
+        .router()
+        .oneshot(mutation(
+            &format!("/approval/{nonce}/approve"),
+            &cookie,
+            Some(&csrf),
+            Some(&h.proof()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["status"], "attested");
+}
+
+/// The proof leaves the server once, in the successful bootstrap response.
+/// No cookie-authorized page, script, JSON body, or header carries it, and a
+/// repeated bootstrap cannot mint or recover it.
+#[tokio::test]
+#[serial]
+async fn bootstrap_proof_is_one_shot_and_not_recoverable() {
+    let h = Harness::new("proof-one-shot");
+    let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let cookie = h.bootstrap().await;
+    let proof = h.proof();
+    assert_eq!(proof.len(), 64);
+
+    let paths = [
+        "/inbox".to_owned(),
+        "/inbox?include_expired=1".to_owned(),
+        "/pending.json".to_owned(),
+        format!("/approval/{nonce}"),
+        "/approval/AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        "/static/app.js".to_owned(),
+        "/static/app-shared.js".to_owned(),
+        "/static/session-bootstrap.js".to_owned(),
+    ];
+    for path in &paths {
+        let resp = h.router().oneshot(cookie_get(path, &cookie)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        for value in resp.headers().values() {
+            assert!(
+                !value.to_str().unwrap_or_default().contains(&proof),
+                "{path} header"
+            );
+        }
+        assert!(!body_text(resp).await.contains(&proof), "{path} body");
+    }
+
+    let resp = h
+        .router()
+        .oneshot(cookie_get(
+            &format!("/bootstrap/{}", h.bootstrap_hex),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(resp.headers().get(header::SET_COOKIE).is_none());
+    assert!(!body_text(resp).await.contains(&proof));
+
+    // The decision responses do not echo it either.
+    let resp = h
+        .router()
+        .oneshot(mutation(
+            &format!("/approval/{nonce}/reject"),
+            &cookie,
+            Some(&h.csrf_for(&nonce)),
+            Some(&proof),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!body_text(resp).await.contains(&proof));
+}
+
+/// The session cookie is bounded and per listener: `Max-Age` of the absolute
+/// limit, `HttpOnly`, `SameSite=Strict`, `Path=/`, and a name no other
+/// listener shares.
+#[tokio::test]
+#[serial]
+async fn bootstrap_sets_max_age_and_distinct_cookie_names() {
+    let a = Harness::new("cookie-a");
+    let b = Harness::new("cookie-b");
+    let mut names = Vec::new();
+    for h in [&a, &b] {
+        let req = Request::builder()
+            .uri(format!("/bootstrap/{}", h.bootstrap_hex))
+            .header(header::HOST, HOST)
+            .body(Body::empty())
+            .unwrap();
+        let resp = h.router().oneshot(req).await.unwrap();
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let attributes: Vec<&str> = set_cookie.split(';').map(str::trim).collect();
+        assert!(attributes.contains(&"HttpOnly"), "{set_cookie}");
+        assert!(attributes.contains(&"SameSite=Strict"), "{set_cookie}");
+        assert!(attributes.contains(&"Path=/"), "{set_cookie}");
+        assert!(
+            attributes
+                .contains(&format!("Max-Age={}", SESSION_ABSOLUTE_TIMEOUT.as_secs()).as_str()),
+            "{set_cookie}"
+        );
+        assert_eq!(SESSION_ABSOLUTE_TIMEOUT.as_secs(), 28_800);
+        let name = attributes[0].split_once('=').unwrap().0.to_owned();
+        assert!(
+            name.starts_with("stellar_agent_approval_session_"),
+            "{name}"
+        );
+        assert!(
+            name.len() > "stellar_agent_approval_session_".len(),
+            "{name}"
+        );
+        names.push(name);
+    }
+    assert_ne!(
+        names[0], names[1],
+        "two listeners must not share a cookie name"
+    );
+
+    // The cookie of one listener does not open the other.
+    let cookie_a = format!("{}={}", names[0], "0".repeat(64));
+    let resp = b
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie_a))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// The router holds a session one tick before the idle limit and refuses it
+/// exactly at the limit, on every route, for good.
+#[tokio::test]
+#[serial]
+async fn idle_expiry_boundary() {
+    let h = Harness::new("idle-boundary");
+    let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let cookie = h.bootstrap().await;
+    let csrf = h.csrf_for(&nonce);
+    let tick = std::time::Duration::from_secs(1);
+
+    h.clock.advance(SESSION_IDLE_TIMEOUT - tick);
+    let resp = h
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    h.clock.advance(tick);
+    let resp = h
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = h
+        .router()
+        .oneshot(mutation(
+            &format!("/approval/{nonce}/approve"),
+            &cookie,
+            Some(&csrf),
+            Some(&h.proof()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(h.state.auth.lock().unwrap().session.is_none());
+    let store = PendingApprovalStore::open(h.store_path.clone()).unwrap();
+    assert!(store.get(&nonce).unwrap().attestation_blob_b64.is_none());
+}
+
+/// Background polls, cookie-only page loads, and refused mutations never
+/// record activity: the session still expires at the idle limit counted from
+/// the bootstrap exchange.
+#[tokio::test]
+#[serial]
+async fn polling_and_cookie_only_requests_do_not_extend_idle() {
+    let h = Harness::new("idle-polling");
+    let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let cookie = h.bootstrap().await;
+    let csrf = h.csrf_for(&nonce);
+    let activity_csrf = h.csrf_for(crate::routes::SESSION_ACTIVITY_NONCE);
+    let poll = std::time::Duration::from_secs(2);
+
+    let mut elapsed = std::time::Duration::ZERO;
+    while elapsed + poll < SESSION_IDLE_TIMEOUT {
+        h.clock.advance(poll);
+        elapsed += poll;
+        let resp = h
+            .router()
+            .oneshot(cookie_get("/pending.json", &cookie))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "poll at {elapsed:?}");
+    }
+    for path in ["/inbox".to_owned(), format!("/approval/{nonce}")] {
+        let resp = h
+            .router()
+            .oneshot(cookie_get(&path, &cookie))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    }
+    let refused = [
+        mutation(
+            &format!("/approval/{nonce}/approve"),
+            &cookie,
+            Some(&csrf),
+            None,
+        ),
+        mutation("/session/activity", &cookie, Some(&activity_csrf), None),
+        mutation("/session/activity", &cookie, None, Some(&h.proof())),
+        mutation("/session/activity", &cookie, Some(&csrf), Some(&h.proof())),
+    ];
+    for req in refused {
+        let resp = h.router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    h.clock.advance(SESSION_IDLE_TIMEOUT - elapsed);
+    let resp = h
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `POST /session/activity` with the proof and its CSRF value answers `204`
+/// and moves the idle deadline; so does an authorized decision.
+#[tokio::test]
+#[serial]
+async fn activity_and_decisions_extend_idle() {
+    let h = Harness::new("idle-activity");
+    let first = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let cookie = h.bootstrap().await;
+    let activity_csrf = h.csrf_for(crate::routes::SESSION_ACTIVITY_NONCE);
+    let tick = std::time::Duration::from_secs(1);
+
+    h.clock.advance(SESSION_IDLE_TIMEOUT - tick);
+    let resp = h
+        .router()
+        .oneshot(mutation(
+            "/session/activity",
+            &cookie,
+            Some(&activity_csrf),
+            Some(&h.proof()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(body_text(resp).await.is_empty());
+
+    h.clock.advance(SESSION_IDLE_TIMEOUT - tick);
+    let resp = h
+        .router()
+        .oneshot(mutation(
+            &format!("/approval/{first}/reject"),
+            &cookie,
+            Some(&h.csrf_for(&first)),
+            Some(&h.proof()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["status"], "rejected");
+
+    h.clock.advance(SESSION_IDLE_TIMEOUT - tick);
+    let resp = h
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    h.clock.advance(tick);
+    let resp = h
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Activity every ten minutes keeps the session only until the absolute
+/// limit: one tick before it the session holds, at it the session is gone.
+#[tokio::test]
+#[serial]
+async fn absolute_expiry_boundary() {
+    let h = Harness::new("absolute-boundary");
+    let cookie = h.bootstrap().await;
+    let activity_csrf = h.csrf_for(crate::routes::SESSION_ACTIVITY_NONCE);
+    let step = std::time::Duration::from_secs(10 * 60);
+    let tick = std::time::Duration::from_secs(1);
+    let activity = |h: &Harness| {
+        mutation(
+            "/session/activity",
+            &cookie,
+            Some(&activity_csrf),
+            Some(&h.proof()),
+        )
+    };
+
+    let mut elapsed = std::time::Duration::ZERO;
+    while elapsed + step < SESSION_ABSOLUTE_TIMEOUT {
+        h.clock.advance(step);
+        elapsed += step;
+        let resp = h.router().oneshot(activity(&h)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "activity at {elapsed:?}"
+        );
+    }
+    h.clock.advance(SESSION_ABSOLUTE_TIMEOUT - elapsed - tick);
+    let resp = h.router().oneshot(activity(&h)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    h.clock.advance(tick);
+    let resp = h.router().oneshot(activity(&h)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = h
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// The bootstrap page's script is reachable before any session exists and
+/// serves the fixed bytes.
+#[tokio::test]
+#[serial]
+async fn session_bootstrap_js_is_served_without_a_session() {
+    let h = Harness::new("bootstrap-js");
+    let req = Request::builder()
+        .uri("/static/session-bootstrap.js")
+        .header(header::HOST, HOST)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/javascript; charset=utf-8"
+    );
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(bytes.as_ref(), crate::web::SESSION_BOOTSTRAP_JS);
+}
+
+/// The bootstrap page keeps the listener's CSP and cache posture.
+#[tokio::test]
+#[serial]
+async fn bootstrap_page_keeps_the_security_headers() {
+    let h = Harness::new("bootstrap-headers");
+    let req = Request::builder()
+        .uri(format!("/bootstrap/{}", h.bootstrap_hex))
+        .header(header::HOST, HOST)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router().oneshot(req).await.unwrap();
+    let headers = resp.headers();
+    let csp = headers
+        .get(header::CONTENT_SECURITY_POLICY)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let script_src: Vec<&str> = csp
+        .split(';')
+        .map(str::trim)
+        .filter(|directive| directive.starts_with("script-src"))
+        .collect();
+    assert_eq!(script_src, ["script-src 'self'"], "{csp}");
+    assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(headers.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+}
+
+/// Each request span records the matched route template: neither the
+/// bootstrap token, nor an approval nonce, nor the session proof an
+/// authorized mutation carries reaches the trace, and a request that matches
+/// no route records the fixed label.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn bootstrap_trace_redacts_token() {
+    let h = Harness::new("bootstrap-trace");
+    let nonce = h.insert(payment_entry(DEFAULT_TTL_MS));
+    let capture = crate::trace_capture::SpanCapture::install();
+
+    let cookie = h.bootstrap().await;
+    let proof = h.proof();
+    let replay = Request::builder()
+        .uri(format!("/bootstrap/{}", h.bootstrap_hex))
+        .header(header::HOST, HOST)
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router().oneshot(replay).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = h
+        .router()
+        .oneshot(cookie_get("/pending.json", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = h
+        .router()
+        .oneshot(cookie_get(&format!("/approval/{nonce}"), &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = h
+        .router()
+        .oneshot(cookie_get(&format!("/unknown/{nonce}"), &cookie))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = h
+        .router()
+        .oneshot(mutation(
+            "/session/activity",
+            &cookie,
+            Some(&h.csrf_for(crate::routes::SESSION_ACTIVITY_NONCE)),
+            Some(&proof),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    assert_eq!(
+        capture.span_paths("approval_inbox_request"),
+        [
+            "/bootstrap/{token}",
+            "/bootstrap/{token}",
+            "/pending.json",
+            "/approval/{nonce}",
+            stellar_agent_loopback_http::request_trace::UNMATCHED_ROUTE_LABEL,
+            "/session/activity",
+        ],
+        "{:?}",
+        capture.lines()
+    );
+    for line in capture.lines() {
+        assert!(!line.contains(&h.bootstrap_hex), "token in trace: {line}");
+        assert!(!line.contains(&nonce), "nonce in trace: {line}");
+        assert!(!line.contains(&proof), "proof in trace: {line}");
     }
 }
