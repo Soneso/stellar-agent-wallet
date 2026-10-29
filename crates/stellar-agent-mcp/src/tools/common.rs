@@ -4823,6 +4823,13 @@ pub(crate) mod tests {
                     "stellar-agent-nonce-operator",
                     "default",
                 )
+                .primary_provider(PrimaryProviderRecord::new("primary", "rpc.example.invalid"))
+                .oracle_provider_url(url::Url::parse("https://oracle.example.invalid").unwrap())
+                .oracle_provider(ProviderRecord::new(
+                    "oracle",
+                    "oracle.example.invalid",
+                    true,
+                ))
                 .build();
                 profile.audit_log_path = dir.path().join("audit.jsonl");
                 profile_edit(&mut profile);
@@ -5135,6 +5142,45 @@ pub(crate) mod tests {
                 )
                 .is_err()
             );
+            assert_eq!(f.seed_reads.load(Ordering::SeqCst), 0);
+        }
+
+        /// A stored mainnet profile whose oracle URL and record were removed
+        /// after enablement still starts, and its admission refuses every
+        /// mainnet write consumer with `profile.mainnet_oracle_required`
+        /// before any seed read.
+        #[test]
+        #[serial_test::serial(keyring)]
+        fn mainnet_oracle_required_admission_refuses_each_write_consumer() {
+            use stellar_agent_network::mainnet::MainnetConsumer;
+            let f = Fixture::with_profile(
+                |raw| raw,
+                |profile| {
+                    profile.oracle_provider_url = None;
+                    profile.providers.as_mut().unwrap().oracle = None;
+                },
+            );
+            assert!(f.server.mainnet_context.is_some());
+            for consumer in [
+                MainnetConsumer::McpPay,
+                MainnetConsumer::McpClaim,
+                MainnetConsumer::McpCreateAccount,
+                MainnetConsumer::McpTrustline,
+                MainnetConsumer::X402Create,
+                MainnetConsumer::X402Authenticated,
+            ] {
+                let refusal = match f.server.mainnet_write_admission(consumer) {
+                    Ok(_) => panic!("admitted {consumer:?} without an oracle"),
+                    Err(refusal) => refusal,
+                };
+                let (code, message, _) = assert_business_envelope(&refusal);
+                assert_eq!(code, "profile.mainnet_oracle_required", "{consumer:?}");
+                assert_eq!(
+                    message,
+                    stellar_agent_core::error::MainnetOracleGap::UrlMissing.text(),
+                    "{consumer:?}"
+                );
+            }
             assert_eq!(f.seed_reads.load(Ordering::SeqCst), 0);
         }
 

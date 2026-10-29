@@ -368,8 +368,17 @@ stellar-agent profile enable-mainnet --profile operator --rotate
 ```
 
 Requires an explicit, nondefault mainnet profile, matching stored and merged
-chain and RPC URL, engine v1, an enrolled owner key and signer identity, and
-no key-scope findings. A process on a headless keyring backend
+chain and RPC URL, engine v1, an enrolled owner key and signer identity, an
+oracle, and no key-scope findings. A profile without `oracle_provider_url` is
+refused with `profile.mainnet_oracle_required` before any keyring entry is
+read, and no nonce, pin, policy change, or audit row is written. A profile
+that sets `oracle_provider_url` without its `providers.oracle` record does not
+load, and the ceremony refuses it with `profile.enable_mainnet_precondition`
+and the loader's message.
+An enabled profile whose oracle is removed refuses every mainnet write, in the
+CLI and in the MCP server, with `profile.mainnet_oracle_required` before any
+signature, until the oracle is set again. The MCP server reads the profile at
+startup, so it applies an oracle change from its next start. A process on a headless keyring backend
 (`STELLAR_AGENT_KEYRING_BACKEND` set to `headless-env` or `headless-dpapi`)
 is refused in every mode with `network.mainnet_keyring_backend_unsupported`
 before any keyring entry is read: mainnet needs the platform keyring.
@@ -418,13 +427,13 @@ When only the policy-state lock file is missing and the pin entry exists,
 the refusal names the lock file instead: a command that builds the V1 policy
 engine, such as starting the MCP server, recreates it, and the nonce stays.
 
-`--check` reports every check with the status `passed`, `failed`,
-`not_evaluated`, or `advisory` and a detail, and exits `1` when any check
-failed. An advisory never fails the check. The checks are the preconditions,
-`verified_policy`, `pin`, `enablement`, every minimum restriction in either
-build, and `oracle_provider_url`. The last is `advisory` on a profile without
-an oracle. There, a submission the primary endpoint reports failed, refused,
-or unknown keeps its reservation until `tx receipt clear` releases it.
+`--check` reports every check with the status `passed`, `failed`, or
+`not_evaluated` and a detail, and exits `1` when any check failed. The checks
+are the preconditions, `verified_policy`, `pin`, `enablement`, every minimum
+restriction in either build, and `oracle_provider_url`. The last fails when
+the profile names no oracle, and its detail names what is missing. `--check`
+reads the prerequisite state, keyring entries included, and writes no nonce,
+pin, policy change, or audit row.
 The restrictions are evaluated on the
 document the verified load read. Without a `[mainnet]` table the fee cap and
 every table restriction fail. When the policy does not verify, the

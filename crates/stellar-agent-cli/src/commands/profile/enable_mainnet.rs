@@ -8,16 +8,19 @@
 //!
 //! Refusals use `profile.enable_mainnet_profile_flag_required`,
 //! `profile.enable_mainnet_default_refused`, `profile.enable_mainnet_not_mainnet`,
-//! `profile.enable_mainnet_precondition`, `profile.enable_mainnet_nonce_exists`,
-//! and `policy.pin_absent`. The pin step returns the `policy.*` code of its
-//! verified load, such as `policy.owner_signature_invalid`,
-//! `policy.sequence_rollback`, or `policy.state_lock_busy`, and strict audit
-//! errors retain their own codes. A process on a headless keyring backend is
-//! refused with `network.mainnet_keyring_backend_unsupported` in both modes,
-//! before any keyring entry is read. `--check` reports every check as
-//! `passed`, `failed`, `not_evaluated`, or `advisory` and writes nothing. An
-//! advisory names a setting the profile can run without, at a cost the detail
-//! states; it never fails the check.
+//! `profile.mainnet_oracle_required`, `profile.enable_mainnet_precondition`,
+//! `profile.enable_mainnet_nonce_exists`, and `policy.pin_absent`. The pin
+//! step returns the `policy.*` code of its verified load, such as
+//! `policy.owner_signature_invalid`, `policy.sequence_rollback`, or
+//! `policy.state_lock_busy`, and strict audit errors retain their own codes.
+//! A process on a headless keyring backend is refused with
+//! `network.mainnet_keyring_backend_unsupported` in both modes, before any
+//! keyring entry is read. A profile without a usable oracle is refused with
+//! `profile.mainnet_oracle_required` before any keyring entry is read.
+//! `--check` reports every check as `passed`, `failed`, or `not_evaluated`,
+//! reads the prerequisite state, keyring entries included, and writes no
+//! nonce, pin, policy change, or audit row; a missing oracle is a failed check
+//! there.
 
 use super::sign_policy::atomic_write_string;
 use crate::{
@@ -35,8 +38,11 @@ use stellar_agent_core::{
         schema::{EventKind, PolicyDecision},
     },
     envelope::Envelope,
-    mainnet::enablement::{
-        has_enablement_nonce, normalize_endpoint_host, read_enablement_nonce, verify_enablement,
+    mainnet::{
+        enablement::{
+            has_enablement_nonce, normalize_endpoint_host, read_enablement_nonce, verify_enablement,
+        },
+        oracle::require_mainnet_oracle,
     },
     policy::{
         PolicyError,
@@ -88,31 +94,21 @@ enum Status {
     Passed,
     Failed,
     NotEvaluated,
-    /// A setting the profile runs without, reported with its cost.
-    Advisory,
 }
 
-/// The oracle check: a mainnet profile without `oracle_provider_url` runs,
-/// but no second endpoint confirms a negative answer of the primary, so a
-/// submission the primary reports failed, refused, or unknown keeps its
-/// reservation until an operator clears it.
+/// The oracle check: a mainnet profile is enabled only with
+/// `oracle_provider_url` and its `providers.oracle` record, the oracle every
+/// mainnet write requires.
 fn oracle_check(profile: &Profile) -> Check {
-    match profile.oracle_provider_url {
-        Some(_) => Check {
-            item: "oracle_provider_url".into(),
-            status: Status::Passed,
-            detail: None,
+    let result = require_mainnet_oracle(profile);
+    Check {
+        item: "oracle_provider_url".into(),
+        status: if result.is_ok() {
+            Status::Passed
+        } else {
+            Status::Failed
         },
-        None => Check {
-            item: "oracle_provider_url".into(),
-            status: Status::Advisory,
-            detail: Some(
-                "no oracle is set: a submission the primary endpoint reports failed, refused, \
-                 or unknown keeps its spending-window reservation until `stellar-agent tx \
-                 receipt clear` releases it"
-                    .into(),
-            ),
-        },
+        detail: result.err().map(|error| error.to_string()),
     }
 }
 
@@ -255,6 +251,9 @@ pub(super) fn execute(
     }
     stellar_agent_network::mainnet::audit_readiness::refuse_headless_keyring_backend()
         .map_err(|e| (e.code(), e.to_string()))?;
+    if !args.check {
+        require_mainnet_oracle(profile).map_err(|e| (e.code(), e.to_string()))?;
+    }
     let mut checks = Vec::new();
     let mut record = |item: &str, result: Result<(), String>| {
         checks.push(Check {
@@ -693,6 +692,8 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use serial_test::serial;
     use std::cell::RefCell;
+    use std::sync::{Arc, Mutex};
+    use stellar_agent_core::error::MainnetOracleGap;
     use stellar_agent_core::{
         mainnet::verified_policy::VerifiedPolicy,
         policy::{
@@ -700,7 +701,10 @@ mod tests {
             state_lock::WindowStoreLock,
             v1::verified::{PinMode, load_verified_policy, read_pin_without_creating},
         },
-        profile::{schema::signer_identity_entry_ref, signer_identity::SignerIdentityRecord},
+        profile::{
+            schema::{PrimaryProviderRecord, ProviderRecord, signer_identity_entry_ref},
+            signer_identity::SignerIdentityRecord,
+        },
     };
     use stellar_agent_test_support::keyring_mock;
     const FULL: &str = include_str!("../../../../stellar-agent-core/tests/fixtures/policy-v2.toml");
@@ -715,11 +719,50 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             keyring_mock::install().unwrap();
-            let dir = tempfile::tempdir().unwrap();
+            Self::seeded(Self::profile())
+        }
+        /// A fixture whose keyring store records in `reads` the coordinate of
+        /// every secret read at a keyring entry the ceremony can reach: each
+        /// coordinate the profile names and each one derived from them.
+        fn recording(reads: &Arc<Mutex<Vec<String>>>) -> Self {
+            let profile = Self::profile();
+            let window = &profile.policy_window_state_key_id;
+            let mut coordinates = vec![
+                profile.mcp_signer_default.clone(),
+                profile.mcp_nonce_key_alias.clone(),
+                profile.audit_log_hash_chain_key_id.clone(),
+                profile.policy_owner_key_id.clone(),
+                profile.attestation_key_id.clone(),
+                profile.counterparty_cache_key_id.clone(),
+                window.clone(),
+                stellar_agent_core::profile::schema::policy_pin_entry_ref(window),
+                mainnet_enablement_entry_ref(window),
+                signer_identity_entry_ref(&profile.mcp_signer_default),
+                KeyringEntryRef::default_owner_key("operator"),
+                KeyringEntryRef::default_audit_binding("operator"),
+                KeyringEntryRef::default_mpp_state_key("operator"),
+            ];
+            coordinates.extend(profile.pool_master_key_id.clone());
+            let hooks = coordinates
+                .into_iter()
+                .map(|coordinate| {
+                    let reads = Arc::clone(reads);
+                    let label = format!("{}/{}", coordinate.service, coordinate.account);
+                    keyring_mock::ReadHook::new(
+                        &coordinate.service,
+                        &coordinate.account,
+                        Arc::new(move || reads.lock().unwrap().push(label.clone())),
+                    )
+                })
+                .collect();
+            keyring_mock::install_with_read_hooks(hooks).unwrap();
+            Self::seeded(profile)
+        }
+        fn profile() -> Profile {
             let signer = stellar_strkey::ed25519::PublicKey([2; 32])
                 .to_string()
                 .to_string();
-            let profile = Profile::builder_mainnet_named(
+            Profile::builder_mainnet_named(
                 "operator",
                 "https://rpc.example.invalid",
                 "stellar-agent-signer-operator",
@@ -727,7 +770,22 @@ mod tests {
                 "stellar-agent-nonce-operator",
                 "default",
             )
-            .build();
+            .primary_provider(PrimaryProviderRecord::new(
+                "Primary operator",
+                "rpc.example.invalid",
+            ))
+            .oracle_provider_url(url::Url::parse("https://oracle.example.invalid").unwrap())
+            .oracle_provider(ProviderRecord::new(
+                "Oracle operator",
+                "oracle.example.invalid",
+                true,
+            ))
+            .build()
+        }
+        /// Saves `profile` and seeds the keyring and the policy of an
+        /// installation ready for its first enablement.
+        fn seeded(profile: Profile) -> Self {
+            let dir = tempfile::tempdir().unwrap();
             loader::save_to_dir("operator", &profile, &dir.path().join("profiles")).unwrap();
             let owner = SigningKey::from_bytes(&[11; 32]);
             put(
@@ -1348,7 +1406,6 @@ mod tests {
                 ),
                 "mainnet_table" | "fee_cap" | "thresholds" | "ttl" => ("failed", missing_table),
                 "pin" => ("passed", Some("absent (first use)".to_owned())),
-                "oracle_provider_url" => ("advisory", oracle_check(&fixture.profile).detail),
                 "enablement" => (
                     "failed",
                     Some(
@@ -1437,11 +1494,30 @@ mod tests {
         );
         assert_eq!(exit_code(&refused), 1);
     }
-    /// A profile without an oracle passes the check with an advisory that
-    /// states what it costs; a profile with one passes the oracle check.
+    /// The two ways a profile lacks a usable oracle: no URL, and a URL
+    /// without its `providers.oracle` record.
+    fn without_oracle(profile: &Profile, gap: MainnetOracleGap) -> Profile {
+        let mut profile = profile.clone();
+        match gap {
+            MainnetOracleGap::UrlMissing => profile.oracle_provider_url = None,
+            MainnetOracleGap::RecordMissing => {
+                profile.providers.as_mut().unwrap().oracle = None;
+            }
+            _ => unreachable!(),
+        }
+        profile
+    }
+    const GAPS: [MainnetOracleGap; 2] = [
+        MainnetOracleGap::UrlMissing,
+        MainnetOracleGap::RecordMissing,
+    ];
+
+    /// On an enabled installation, `--check` passes the oracle check of a
+    /// complete oracle, and reports a missing URL or a missing record as a
+    /// failed check with its detail, exits 1, and writes nothing.
     #[test]
     #[serial]
-    fn check_advises_on_a_profile_without_an_oracle() {
+    fn mainnet_oracle_required_check_fails_without_an_oracle() {
         let mut fixture = Fixture::new();
         fixture.run().unwrap();
         fixture.signed_body(7);
@@ -1449,23 +1525,123 @@ mod tests {
 
         let output = fixture.run().unwrap();
         assert_eq!(output["valid"], true, "{output}");
-        assert_eq!(exit_code(&Ok(output.clone())), 0);
-        let (status, detail) = check_of(&output, "oracle_provider_url");
-        assert_eq!(status, "advisory");
-        let detail = detail.expect("the advisory states its cost");
-        assert!(
-            detail.contains("keeps its spending-window reservation"),
-            "{detail}"
-        );
-        assert!(detail.contains("tx receipt clear"), "{detail}");
-
-        fixture.profile.oracle_provider_url =
-            Some(url::Url::parse("https://oracle.example.invalid").unwrap());
-        let output = fixture.run().unwrap();
         assert_eq!(
             check_of(&output, "oracle_provider_url"),
             ("passed".to_owned(), None)
         );
+
+        let complete = fixture.profile.clone();
+        for gap in GAPS {
+            fixture.profile = without_oracle(&complete, gap);
+            let file = std::fs::read(fixture.path()).unwrap();
+            let nonce = get(&fixture.nonce_ref());
+            let pin = fixture.pin();
+            let audit = std::fs::read(fixture.dir.path().join("audit.jsonl")).unwrap();
+            let listing = fixture.listing();
+            let output = fixture.run();
+            assert_eq!(exit_code(&output), 1, "{gap:?}");
+            let output = output.unwrap();
+            assert_eq!(output["valid"], false, "{gap:?}: {output}");
+            assert_eq!(
+                check_of(&output, "oracle_provider_url"),
+                ("failed".to_owned(), Some(gap.text().to_owned())),
+                "{gap:?}"
+            );
+            let failed: Vec<_> = output["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|check| check["status"] == "failed")
+                .map(|check| check["item"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(failed, ["oracle_provider_url"], "{gap:?}: {output}");
+            assert_eq!(std::fs::read(fixture.path()).unwrap(), file, "{gap:?}");
+            assert_eq!(get(&fixture.nonce_ref()), nonce, "{gap:?}");
+            assert_eq!(fixture.pin(), pin, "{gap:?}");
+            assert_eq!(
+                std::fs::read(fixture.dir.path().join("audit.jsonl")).unwrap(),
+                audit,
+                "{gap:?}"
+            );
+            assert_eq!(fixture.listing(), listing, "{gap:?}");
+        }
+    }
+
+    /// The ceremony refuses a profile without a usable oracle with
+    /// `profile.mainnet_oracle_required`, for the first enablement and for a
+    /// rotation, before it reads any keyring entry, and writes no pin, nonce,
+    /// policy, audit row, or file. The recording store observes the reads of
+    /// the successful rotation that follows once the oracle is restored.
+    #[test]
+    #[serial]
+    fn mainnet_oracle_required_enablement_refuses_without_an_oracle() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let take = || std::mem::take(&mut *reads.lock().unwrap());
+        for gap in GAPS {
+            let mut fixture = Fixture::recording(&reads);
+            fixture.profile = without_oracle(&fixture.profile, gap);
+            let file = std::fs::read(fixture.path()).unwrap();
+            let listing = fixture.listing();
+            let mut audited = false;
+            take();
+            let refused = fixture
+                .run_with(
+                    |_| {
+                        audited = true;
+                        Ok(())
+                    },
+                    atomic_write_string,
+                )
+                .unwrap_err();
+            assert_eq!(take(), Vec::<String>::new(), "{gap:?}: keyring reads");
+            assert_eq!(
+                refused,
+                ("profile.mainnet_oracle_required", gap.text().to_owned()),
+                "{gap:?}"
+            );
+            assert!(!audited, "{gap:?}");
+            assert_eq!(get(&fixture.nonce_ref()), None, "{gap:?}");
+            assert_eq!(fixture.pin(), PinState::Absent, "{gap:?}");
+            assert_eq!(std::fs::read(fixture.path()).unwrap(), file, "{gap:?}");
+            assert_eq!(fixture.listing(), listing, "{gap:?}");
+        }
+
+        // A rotation of an enabled installation whose oracle was removed
+        // keeps its nonce, pin, and policy.
+        for gap in GAPS {
+            let mut fixture = Fixture::recording(&reads);
+            fixture.run().unwrap();
+            let complete = fixture.profile.clone();
+            fixture.profile = without_oracle(&complete, gap);
+            fixture.args.rotate = true;
+            let file = std::fs::read(fixture.path()).unwrap();
+            let nonce = get(&fixture.nonce_ref());
+            let pin = fixture.pin();
+            let audit = std::fs::read(fixture.dir.path().join("audit.jsonl")).unwrap();
+            let listing = fixture.listing();
+            take();
+            let refused = fixture.run().unwrap_err();
+            assert_eq!(take(), Vec::<String>::new(), "{gap:?}: keyring reads");
+            assert_eq!(refused.0, "profile.mainnet_oracle_required", "{gap:?}");
+            assert_eq!(std::fs::read(fixture.path()).unwrap(), file, "{gap:?}");
+            assert_eq!(get(&fixture.nonce_ref()), nonce, "{gap:?}");
+            assert_eq!(fixture.pin(), pin, "{gap:?}");
+            assert_eq!(
+                std::fs::read(fixture.dir.path().join("audit.jsonl")).unwrap(),
+                audit,
+                "{gap:?}"
+            );
+            assert_eq!(fixture.listing(), listing, "{gap:?}");
+            fixture.profile = complete;
+            take();
+            fixture.run().unwrap();
+            let owner = KeyringEntryRef::default_owner_key("operator");
+            assert!(
+                take().contains(&format!("{}/{}", owner.service, owner.account)),
+                "{gap:?}: the rotation reads the owner key"
+            );
+            assert_ne!(get(&fixture.nonce_ref()), nonce, "{gap:?}");
+        }
     }
     #[test]
     #[serial]

@@ -27,6 +27,7 @@ use stellar_agent_core::approval::{
 };
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
+use stellar_agent_core::mainnet::oracle::require_mainnet_oracle;
 use stellar_agent_core::profile::Profile;
 use stellar_agent_core::profile::name::ResolvedProfileName;
 use stellar_agent_network::cross_check::CrossCheckWitness;
@@ -89,20 +90,25 @@ pub(crate) fn mainnet_profiles_dir() -> Result<PathBuf, WalletError> {
 ///
 /// `profile` is the merged profile the verb loaded. The context holds the
 /// stored profile, read without overlays, and every later step takes its
-/// profile from the context.
+/// profile from the context. Every mainnet verb builds its context here
+/// first, so a stored profile without a usable oracle refuses before any
+/// endpoint read, keyring read, or signature.
 ///
 /// # Errors
 ///
 /// `network.mainnet_write_forbidden` in a build without mainnet writes and
-/// for every refused selection, and the loader's code when the stored profile
-/// cannot be read.
+/// for every refused selection, the loader's code when the stored profile
+/// cannot be read, and `profile.mainnet_oracle_required` when the stored
+/// profile names no usable oracle.
 pub(crate) fn mainnet_context(
     profile: &Profile,
     resolved: &ResolvedProfileName,
     flags: MainnetEndpointFlags,
 ) -> Result<MainnetWriteContext, WalletError> {
     let profiles_dir = mainnet_profiles_dir()?;
-    NetworkContext::mainnet_write(profile, resolved, &profiles_dir, flags).map(apply_test_routes)
+    let context = NetworkContext::mainnet_write(profile, resolved, &profiles_dir, flags)?;
+    require_mainnet_oracle(context.profile())?;
+    Ok(apply_test_routes(context))
 }
 
 /// Refuses an engine other than V1 on mainnet: only the V1 engine yields

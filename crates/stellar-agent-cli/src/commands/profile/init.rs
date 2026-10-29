@@ -439,10 +439,9 @@ fn next_steps(profile_name: &str, engine: PolicyEngineKind, network: TargetNetwo
             steps.push(
                 "Set `oracle_provider_url`, `[providers.oracle]`, and `[providers.primary]` in \
                  the profile file. Choose an independently administered endpoint on a different \
-                 host; a mainnet profile without `oracle_provider_url` cannot run the MCP payment \
-                 and account-creation commits that need a witness, and a submission its primary \
-                 endpoint reports failed, refused, or unknown keeps its spending-window \
-                 reservation until `stellar-agent tx receipt clear` releases it."
+                 host; `stellar-agent profile enable-mainnet` and every mainnet write refuse a \
+                 mainnet profile without `oracle_provider_url` with \
+                 `profile.mainnet_oracle_required`."
                     .to_owned(),
             );
         }
@@ -1027,16 +1026,9 @@ mod tests {
         assert!(steps[7].contains("different host"), "{}", steps[7]);
         assert!(
             steps[7].contains(
-                "a mainnet profile without `oracle_provider_url` cannot run the MCP payment \
-                 and account-creation commits that need a witness"
-            ),
-            "{}",
-            steps[7]
-        );
-        assert!(
-            steps[7].contains(
-                "keeps its spending-window reservation until `stellar-agent tx receipt clear` \
-                 releases it"
+                "`stellar-agent profile enable-mainnet` and every mainnet write refuse a \
+                 mainnet profile without `oracle_provider_url` with \
+                 `profile.mainnet_oracle_required`"
             ),
             "{}",
             steps[7]

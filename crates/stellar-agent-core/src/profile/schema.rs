@@ -809,7 +809,10 @@ pub struct Profile {
     /// Mainnet requires a matching `providers.oracle` record asserting independent
     /// administration and a host distinct from the primary, and a
     /// `[providers.primary]` record.
-    /// An absent URL skips these second-endpoint checks.
+    /// An absent URL skips these second-endpoint checks at load. Mainnet
+    /// enablement and every mainnet write refuse a profile without the URL
+    /// and its record; see
+    /// [`require_mainnet_oracle`](crate::mainnet::oracle::require_mainnet_oracle).
     /// A high-value rebuild mismatch reports `simulation.divergence`.
     ///
     /// The loader checks a configured value with [`check_endpoint_url`].

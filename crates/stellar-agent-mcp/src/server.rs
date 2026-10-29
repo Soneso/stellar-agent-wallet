@@ -1600,6 +1600,8 @@ impl WalletServer {
             .mainnet_context
             .as_deref()
             .ok_or_else(|| refuse("mainnet writes require the enabled profile context"))?;
+        stellar_agent_core::mainnet::oracle::require_mainnet_oracle(context.profile())
+            .map_err(|error| business_error_result(error.code(), error.to_string()))?;
         let profiles_dir = self
             .profiles_dir
             .as_deref()

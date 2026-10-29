@@ -5757,6 +5757,36 @@ mod tests {
             assert_eq!(fixture.pending_entries()[0].kind_name, "Consumed");
         }
 
+        /// An enabled profile whose oracle was removed after enablement
+        /// refuses a payment below the witness threshold at the write
+        /// context with `profile.mainnet_oracle_required`: no keyring
+        /// initialization, no endpoint read, no signer, nothing sent.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn mainnet_oracle_required_refuses_an_enabled_profile_without_its_oracle() {
+            let fixture = Spec::new("mainnet-pay-oracle-removed")
+                .without_oracle()
+                .build()
+                .await;
+            let resolutions = signer_resolutions_on_this_thread();
+            let signatures = env_signatures_on_this_thread();
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_refused_before_confirmation(&fixture, &run, "profile.mainnet_oracle_required")
+                .await;
+            assert_eq!(
+                run.message(),
+                stellar_agent_core::error::MainnetOracleGap::UrlMissing.text()
+            );
+            assert_eq!(fixture.initializer_calls(), 0);
+            assert!(fixture.primary_methods().await.is_empty());
+            assert!(fixture.oracle_methods().await.is_empty());
+            assert_eq!(signer_resolutions_on_this_thread(), resolutions);
+            assert_eq!(env_signatures_on_this_thread(), signatures);
+            fixture.assert_terminal_untouched();
+        }
+
         /// Engine kind: a Noop profile refuses at the engine check, naming the
         /// engine, before the keyring and before any request.
         #[tokio::test(flavor = "current_thread")]

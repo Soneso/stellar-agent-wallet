@@ -39,6 +39,8 @@ mod fee_stats_integration;
 mod friendbot_integration;
 #[path = "mcp/integration.rs"]
 mod integration;
+#[path = "mcp/mainnet_oracle_required_integration.rs"]
+mod mainnet_oracle_required_integration;
 #[path = "mcp/mpp_audit_anchor_integration.rs"]
 mod mpp_audit_anchor_integration;
 #[path = "mcp/pay_commit_args_redrive_integration.rs"]

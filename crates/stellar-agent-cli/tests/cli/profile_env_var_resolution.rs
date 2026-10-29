@@ -58,7 +58,9 @@ use std::process::Command;
 
 use serde_json::Value;
 use stellar_agent_core::profile::loader::save_new_to_dir;
-use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
+use stellar_agent_core::profile::schema::{
+    KeyringEntryRef, PrimaryProviderRecord, Profile, ProviderRecord,
+};
 use stellar_agent_test_support::ConnectionCounter;
 
 /// Profile named only by `STELLAR_AGENT_PROFILE` in every test below.
@@ -681,6 +683,29 @@ fn the_moved_verbs_let_the_profile_flag_beat_the_environment_variable() {
 /// records no request for a TLS attempt.
 fn write_mainnet_profile(home: &Path, name: &str, rpc_url: &str) {
     let profile = Profile::builder_mainnet_named(name, rpc_url, "s", "a", "n", "a")
+        .audit_log_path(home.join("audit").join(format!("{name}.jsonl")))
+        .with_noop_engine()
+        .build();
+    save_new_to_dir(name, &profile, &home.join("profiles")).unwrap();
+}
+
+/// [`write_mainnet_profile`] with a primary record and a complete oracle, so
+/// a mainnet write passes the oracle requirement and reaches the engine-kind
+/// check. The oracle endpoint is never contacted.
+fn write_mainnet_profile_with_oracle(home: &Path, name: &str, rpc_url: &str) {
+    let host = url::Url::parse(rpc_url)
+        .unwrap()
+        .host_str()
+        .unwrap()
+        .to_owned();
+    let profile = Profile::builder_mainnet_named(name, rpc_url, "s", "a", "n", "a")
+        .primary_provider(PrimaryProviderRecord::new("Primary operator", host))
+        .oracle_provider_url(url::Url::parse("https://oracle.example.invalid").unwrap())
+        .oracle_provider(ProviderRecord::new(
+            "Oracle operator",
+            "oracle.example.invalid",
+            true,
+        ))
         .audit_log_path(home.join("audit").join(format!("{name}.jsonl")))
         .with_noop_engine()
         .build();
@@ -1693,14 +1718,14 @@ fn guarded_table_failures(
 /// is set, and every later stage on these paths reports a different code.
 ///
 /// In a build with mainnet writes, `pay`, `claim`, `trustline` and sponsored
-/// `accounts create` run the mainnet pipeline, and the fixture's `noop`
-/// engine refuses there with the same code at the engine-kind check, which
-/// precedes the keyring and every endpoint read.
+/// `accounts create` run the mainnet pipeline. The fixture names an oracle,
+/// so its `noop` engine refuses there with the same code at the engine-kind
+/// check, which precedes the keyring and every endpoint read.
 #[test]
 fn every_guarded_path_refuses_a_mainnet_profile_before_endpoint_contact() {
     let endpoint = connection_counter();
     let home = tempfile::tempdir().unwrap();
-    write_mainnet_profile(home.path(), "mainnet", &endpoint.https_uri());
+    write_mainnet_profile_with_oracle(home.path(), "mainnet", &endpoint.https_uri());
     let failures = guarded_table_failures(
         home.path(),
         &endpoint,

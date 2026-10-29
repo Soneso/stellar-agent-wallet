@@ -244,6 +244,8 @@ whenever an oracle is configured, including below threshold on testnet.
 Trustline changes, claims, and pool initialization are unvalued: they require a
 witness whenever an oracle is configured. Without an oracle, testnet reports
 `skipped`; the mainnet requirement rule refuses `network.witness_unavailable`.
+A mainnet profile without an oracle refuses before that rule, with
+`profile.mainnet_oracle_required`.
 The resolver independently checks the bound action and its witnesses.
 
 The classic witness covers CLI `pay`, `claim`, sponsored `accounts create`,
@@ -309,7 +311,7 @@ but mints no key material; the rotation commands mint the actual keys (see
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `oracle_provider_url` | URL | no | unset | Oracle witness endpoint; see below. |
+| `oracle_provider_url` | URL | for mainnet enablement and mainnet writes | unset | Oracle witness endpoint, with its `providers.oracle` record. Mainnet reads run without it; see below. |
 | `mcp_disabled` | bool | no | `false` | When `true`, the `stellar-agent-mcp` server refuses to start with error `mcp.disabled_per_profile`. |
 | `audit_log_path` | string (path) | no | OS-conventional | Path to the per-profile audit log. |
 | `secondary_rpc_url` | string (URL) | no | unset | Secondary endpoint for cross-RPC checks. `smart-account multicall` requires an effective secondary from the profile or a testnet flag. Follows the endpoint rule in [Loader source order](#loader-source-order). Mainnet reads this field from the file only and requires `providers.secondary`, its independence assertion, a host distinct from the primary, and a `[providers.primary]` record. Debug output is redacted. `providers.secondary` can name a keyring credential; the smart-account and DeFi commands that read this endpoint send none. |
@@ -320,7 +322,19 @@ but mints no key material; the rotation commands mint the actual keys (see
 
 `oracle_provider_url` supplies the oracle for MCP payment and account-creation
 commits. Before signing, the oracle re-reads the ledger entries the decision used.
-When a required witness has no oracle, mainnet refuses and testnet warns.
+Mainnet enablement and mainnet writes require the oracle; mainnet reads run
+without it. A mainnet profile that sets `oracle_provider_url` without its
+`providers.oracle` record does not load: commands report the loader's
+`validation.provider_attestation_invalid`, and `profile enable-mainnet`
+reports `profile.enable_mainnet_precondition` with the loader's message. A
+mainnet profile that loads without `oracle_provider_url` is refused with
+`profile.mainnet_oracle_required`: `profile enable-mainnet` refuses before it
+reads a keyring entry and writes no enablement state, and every mainnet
+write, in the CLI and in the MCP server, refuses before any signature. An
+enabled profile whose oracle is removed refuses every mainnet write until the
+oracle is set again. The MCP server reads the profile at startup, so it
+applies an oracle change from its next start. On testnet the oracle is
+optional, and a required witness without one warns.
 For the x402 payment tools, the oracle simulates the same unsigned transfer the
 primary simulated, and the answers are compared before the payer signs.
 Both admitted mainnet x402 tools obtain the required witness before the payer signs.
