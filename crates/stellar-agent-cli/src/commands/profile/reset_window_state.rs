@@ -39,6 +39,13 @@
 //!
 //! # Mainnet profiles
 //!
+//! An enablement nonce requires `--owner-secret-env VAR` holding the pinned
+//! owner's seed in every build. The nonce and pin are read under the scoped
+//! store lock. With the flag, the seed must match the pin even without a nonce.
+//! Owner and pin refusals write no row and change no store, generation or key.
+//! The row records the owner's signature over the profile, chain, store digest,
+//! generation pair, reason bounded to 80 Unicode characters and request id.
+//!
 //! In a build with mainnet writes, the store of a mainnet profile refuses to
 //! load when it cannot be verified (`policy.window_state_unverifiable`). This
 //! command resets such a store, and the audit row's `reason` names the defect
@@ -47,6 +54,9 @@
 //! `profile.reset_window_state_open_authorizations` and changes nothing.
 //!
 //! # Output (JSON envelope)
+//!
+//! The success envelope reports the wiped accrual. The audit row also carries
+//! `owner_authorization` when `--owner-secret-env` supplies the pinned seed.
 //!
 //! On success:
 //!
@@ -69,20 +79,29 @@
 //! # Errors
 //!
 //! Returns exit code `1` when the profile cannot be loaded or the store
-//! reset fails.
+//! reset fails, an enabled profile lacks the owner seed, the seed is invalid,
+//! the pin is absent or unreadable, or the supplied seed does not match it.
 
+use super::owner_seed::{OwnerSeedError, with_owner_seed};
 use clap::{ArgGroup, Args};
 use serde::Serialize;
 use stellar_agent_core::audit_log::BindingCheck;
 use stellar_agent_core::audit_log::KeyPurpose;
-use stellar_agent_core::audit_log::schema::WipedAccrualRecord;
+use stellar_agent_core::audit_log::schema::{
+    WindowResetAuthorization, WipedAccrualRecord, bound_window_reset_reason,
+};
 use stellar_agent_core::audit_log::{AuditEntry, AuditWriter, WriterError, audit_writer_refusal};
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
+use stellar_agent_core::error::{InternalError, ValidationError, WalletError, WalletStateError};
+use stellar_agent_core::policy::PolicyError;
+use stellar_agent_core::policy::pin::PinState;
+use stellar_agent_core::policy::v1::signature::{WindowResetStatement, sign, window_reset_digest};
 use stellar_agent_core::profile::ResolvedProfileName;
+use stellar_agent_core::profile::owner_key::encode_owner_public_key;
+use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 use stellar_agent_network::policy_state::{
-    PersistedWindowStore, ResetError, StateDefect, WindowStoreError,
+    PersistedWindowStore, ResetError, ResetRecord, StateDefect, WindowStoreError,
 };
 use uuid::Uuid;
 
@@ -120,6 +139,11 @@ pub(crate) struct ResetWindowStateArgs {
     /// (e.g. `"corrupt-file recovery"`).
     #[arg(long)]
     pub(crate) reason: String,
+
+    /// Environment variable containing the pinned policy owner's S-strkey.
+    /// Supply the variable name, never the secret itself.
+    #[arg(long, value_name = "VAR")]
+    pub(crate) owner_secret_env: Option<String>,
 }
 
 impl ResetWindowStateArgs {
@@ -185,8 +209,45 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
         return 1;
     }
 
+    if let Some(var) = args.owner_secret_env.as_deref() {
+        return match with_owner_seed(
+            var,
+            "profile-reset-window-state",
+            profile.wallet.mlock_required,
+            profile.wallet.unlock_ttl_seconds,
+            async |key| Ok::<_, OwnerSeedError>(reset_with_owner(args, &profile, Some(key))),
+        )
+        .await
+        {
+            Ok(code) => code,
+            Err(error) => {
+                let error = match error {
+                    OwnerSeedError::NotSet { var } => {
+                        WalletError::Validation(ValidationError::SecretEnvNotSet { var })
+                    }
+                    OwnerSeedError::Invalid { var } => {
+                        WalletError::Validation(ValidationError::SecretEnvInvalid { var })
+                    }
+                    OwnerSeedError::Unlock(detail) => {
+                        WalletError::WalletState(WalletStateError::UnlockFailed { detail })
+                    }
+                };
+                render::render_json(&Envelope::err(&error));
+                1
+            }
+        };
+    }
+    reset_with_owner(args, &profile, None)
+}
+
+/// Acquires the writer and resets with the seed already unlocked, when supplied.
+fn reset_with_owner(
+    args: &ResetWindowStateArgs,
+    profile: &Profile,
+    key: Option<&ed25519_dalek::SigningKey>,
+) -> i32 {
     let name = args.profile_name();
-    let writer = match acquire_keyed_audit_writer(&profile, name, BindingCheck::Enforce) {
+    let writer = match acquire_keyed_audit_writer(profile, name, BindingCheck::Enforce) {
         Ok(writer) => writer,
         Err(error) => {
             render::render_json(&Envelope::err(&error.into_wallet_error(name)));
@@ -212,15 +273,20 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
     };
     let store = PersistedWindowStore::for_profile(name);
     let request_id = Uuid::new_v4().to_string();
-    let result = store.reset(&profile, now_ms, |record| {
+    let result = store.reset(profile, now_ms, |record| {
+        let reason = bound_window_reset_reason(&recorded_reason(&args.reason, record.defect));
+        let owner_authorization =
+            authorize_reset(record, key, profile, name, &reason, &request_id)?;
         record_window_reset(
             &mut writer,
             name,
-            &recorded_reason(&args.reason, record.defect),
+            &reason,
             &request_id,
             profile.chain_id.caip2_str(),
             record.accrual,
+            owner_authorization,
         )
+        .map_err(ResetRefusal::Wallet)
     });
     let minted = match &result {
         Ok(outcome) => outcome.mint.newly_minted,
@@ -243,9 +309,9 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
         Err(error) => {
             let error = match error {
                 ResetError::Recorder(error) => error,
-                ResetError::Store { error, .. } => store_refusal(name, error),
+                ResetError::Store { error, .. } => ResetRefusal::Wallet(store_refusal(name, error)),
             };
-            render::render_json(&Envelope::err(&error));
+            render::render_json(&Envelope::<()>::err_raw(error.code(), error.message()));
             return 1;
         }
     };
@@ -257,6 +323,96 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
         wiped: outcome.accrual,
     }));
     0
+}
+
+/// A typed refusal rendered by the reset ceremony.
+enum ResetRefusal {
+    Validation(ValidationError),
+    Policy(PolicyError),
+    PinAbsent { profile: String },
+    Wallet(WalletError),
+}
+
+impl ResetRefusal {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Validation(error) => error.code(),
+            Self::Policy(error) => error.wire_code(),
+            Self::PinAbsent { .. } => PolicyError::PinAbsent.wire_code(),
+            Self::Wallet(error) => error.code(),
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::Validation(error) => error.to_string(),
+            Self::Policy(error) => error.to_string(),
+            Self::PinAbsent { profile } => format!(
+                "no policy pin names an owner for profile '{profile}'; \
+                 run without --owner-secret-env"
+            ),
+            Self::Wallet(error) => error.to_string(),
+        }
+    }
+}
+
+/// Checks the live nonce and pin under the store lock and signs the reset.
+fn authorize_reset(
+    record: &ResetRecord<'_>,
+    key: Option<&ed25519_dalek::SigningKey>,
+    profile: &Profile,
+    name: &str,
+    reason: &str,
+    request_id: &str,
+) -> Result<Option<WindowResetAuthorization>, ResetRefusal> {
+    let enabled = stellar_agent_core::mainnet::enablement::has_enablement_nonce(profile)
+        .map_err(ResetRefusal::Validation)?;
+    if enabled && key.is_none() {
+        return Err(ResetRefusal::Validation(
+            ValidationError::ResetWindowStateOwnerRequired {
+                profile: name.to_owned(),
+            },
+        ));
+    }
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    let pin = record
+        .pin()
+        .map_err(|error| ResetRefusal::Policy(PolicyError::from(error)))?;
+    let PinState::Present(pin) = pin else {
+        return Err(ResetRefusal::PinAbsent {
+            profile: name.to_owned(),
+        });
+    };
+    let derived = key.verifying_key().to_bytes();
+    if derived != pin.owner() {
+        return Err(ResetRefusal::Validation(
+            ValidationError::ResetWindowStateOwnerMismatch {
+                profile: name.to_owned(),
+                derived: encode_owner_public_key(&derived),
+                pinned: encode_owner_public_key(&pin.owner()),
+            },
+        ));
+    }
+    let digest = window_reset_digest(&WindowResetStatement {
+        profile: name,
+        chain_id: profile.chain_id.caip2_str(),
+        store_sha256: record.store_sha256,
+        generation_before: record.accrual.generation_before,
+        generation_after: record.accrual.generation_after,
+        reason,
+        request_id,
+    });
+    Ok(Some(WindowResetAuthorization {
+        owner_redacted: stellar_agent_core::observability::RedactedStrkey::from_full(
+            &encode_owner_public_key(&derived),
+        ),
+        store_sha256: record
+            .store_sha256
+            .map(|hash| stellar_agent_core::hex::encode(&hash)),
+        signature: stellar_agent_core::hex::encode(&sign(&digest, key)),
+    }))
 }
 
 /// The reason the audit row records: the operator's reason and, when the reset
@@ -317,6 +473,7 @@ fn record_window_reset(
     request_id: &str,
     chain_id: &str,
     accrual: &WipedAccrualRecord,
+    owner_authorization: Option<WindowResetAuthorization>,
 ) -> Result<(), WalletError> {
     writer
         .require_anchor_current()
@@ -328,6 +485,7 @@ fn record_window_reset(
         request_id,
         chain_id,
         accrual.clone(),
+        owner_authorization,
     );
     append_value_audit_row_strict(writer, name, entry)?;
     writer
@@ -390,6 +548,22 @@ mod tests {
     }
 
     #[test]
+    fn the_owner_secret_env_flag_parses() {
+        let parsed = Wrap::try_parse_from([
+            "prog",
+            "acme",
+            "--reason",
+            "repair",
+            "--owner-secret-env",
+            "OWNER_SEED",
+        ])
+        .unwrap();
+        assert_eq!(parsed.args.owner_secret_env.as_deref(), Some("OWNER_SEED"));
+        let absent = Wrap::try_parse_from(["prog", "acme", "--reason", "repair"]).unwrap();
+        assert!(absent.args.owner_secret_env.is_none());
+    }
+
+    #[test]
     fn both_positional_and_flag_is_a_conflict() {
         let err =
             Wrap::try_parse_from(["prog", "acme", "--profile", "other", "--reason", "recovery"])
@@ -410,6 +584,7 @@ mod tests {
             name: Some("__nonexistent_reset_window_state__".to_owned()),
             profile: None,
             reason: "test".to_owned(),
+            owner_secret_env: None,
         };
         let code = run(&args).await;
         assert_eq!(code, 1);
@@ -473,6 +648,7 @@ mod tests {
                 "reset-request",
                 "stellar:testnet",
                 record.accrual,
+                None,
             )
         });
         let Err(ResetError::Recorder(error)) = result else {
@@ -493,12 +669,64 @@ mod tests {
                     "reset-request",
                     "stellar:testnet",
                     record.accrual,
+                    None,
                 ))
                 .is_err()
         );
         assert_eq!(std::fs::read(&profile.audit_log_path).unwrap(), rows);
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(generation.get_password().unwrap(), counter);
+    }
+
+    #[test]
+    #[serial]
+    fn the_enablement_nonce_is_read_under_the_store_lock() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use stellar_agent_core::policy::state_lock::{StateLockError, WindowStoreLock};
+        use stellar_agent_core::profile::schema::{
+            default_policy_window_state_path_for, mainnet_enablement_entry_ref,
+        };
+        use stellar_agent_test_support::keyring_mock::{ReadHook, install_with_read_hooks};
+
+        let dir = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let name = "reset-nonce-lock";
+        let profile = Profile::builder_testnet_named(name, "signer", "account", "nonce", "account")
+            .with_noop_engine()
+            .audit_log_path(dir.path().join("audit.jsonl"))
+            .build();
+        let path = default_policy_window_state_path_for(name);
+        let coordinate = profile.policy_window_state_key_id.clone();
+        let nonce = mainnet_enablement_entry_ref(&coordinate);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&reads);
+        install_with_read_hooks(vec![ReadHook::new(
+            &nonce.service,
+            &nonce.account,
+            Arc::new(move || {
+                assert!(matches!(
+                    WindowStoreLock::acquire_for(&path, &coordinate),
+                    Err(StateLockError::WriterLocked)
+                ));
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+        )])
+        .unwrap();
+        let audit_key = &profile.audit_log_hash_chain_key_id;
+        use base64::Engine as _;
+        keyring_core::Entry::new(&audit_key.service, &audit_key.account)
+            .unwrap()
+            .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x2c; 32]))
+            .unwrap();
+        let args = ResetWindowStateArgs {
+            name: Some(name.to_owned()),
+            profile: None,
+            reason: "repair".to_owned(),
+            owner_secret_env: None,
+        };
+        assert_eq!(reset_with_owner(&args, &profile, None), 0);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
     }
 
     #[test]

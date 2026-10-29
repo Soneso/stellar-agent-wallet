@@ -2749,8 +2749,9 @@ impl AuditEntry {
         request_id: impl Into<String>,
         chain_id: impl Into<String>,
         wiped: crate::audit_log::schema::WipedAccrualRecord,
+        owner_authorization: Option<crate::audit_log::schema::WindowResetAuthorization>,
     ) -> Self {
-        use crate::audit_log::schema::bound_recorded_str;
+        use crate::audit_log::schema::bound_window_reset_reason;
         let reason = reason.into();
         Self {
             ts: current_iso8601_utc(),
@@ -2766,8 +2767,9 @@ impl AuditEntry {
             request_id: request_id.into(),
             event_kind: EventKind::PolicyWindowStateReset {
                 profile: profile.into(),
-                reason: bound_recorded_str(&reason),
+                reason: bound_window_reset_reason(&reason),
                 wiped: Some(wiped),
+                owner_authorization,
             },
             previous_entry_hash: String::new(),
         }

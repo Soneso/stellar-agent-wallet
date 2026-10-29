@@ -79,21 +79,20 @@
 
 use std::path::PathBuf;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Args;
 use keyring_core::Entry as KeyringEntry;
 use serde::Serialize;
-use zeroize::Zeroizing;
 
+use super::owner_seed::{OwnerSeedError, with_owner_seed};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::WalletError;
 use stellar_agent_core::policy::v1::canonical::canonical_bytes;
 use stellar_agent_core::policy::v1::signature::{digest, sign};
 use stellar_agent_core::policy::v1::{validate_policy_keys, validate_unsigned_policy};
 use stellar_agent_core::profile::loader;
+use stellar_agent_core::profile::owner_key::{OwnerKeyDecodeError, owner_key_fingerprint};
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile, default_policy_dir};
-use stellar_agent_core::wallet::{MlockRequired, Wallet};
+use stellar_agent_core::wallet::MlockRequired;
 use stellar_agent_network::keyring::{KeyringOperation, map_keyring_operation_error};
 
 use crate::common::profile_access::{
@@ -235,11 +234,12 @@ where
     // ── Read the enrolled owner PUBLIC key (the engine's verification key) ────
     let enrolled_pubkey = match read_owner_pubkey(&owner_coord) {
         Ok(pk) => pk,
-        Err(msg) => {
-            render::render_json(&Envelope::<()>::err_raw(
-                "sign_policy.owner_key_unavailable",
-                msg,
-            ));
+        Err(error) => {
+            let code = match &error {
+                OwnerReadError::OlderForm => "sign_policy.owner_key_older_form",
+                OwnerReadError::Unavailable(_) => "sign_policy.owner_key_unavailable",
+            };
+            render::render_json(&Envelope::<()>::err_raw(code, error.message()));
             return 1;
         }
     };
@@ -339,16 +339,16 @@ where
             let derived_address = stellar_strkey::ed25519::PublicKey(derived)
                 .to_string()
                 .to_string();
-            let enrolled_address = stellar_strkey::ed25519::PublicKey(enrolled_pubkey)
-                .to_string()
-                .to_string();
+            let enrolled_fingerprint = owner_key_fingerprint(&enrolled_pubkey);
+            let derived_fingerprint = owner_key_fingerprint(&derived);
             render::render_json(&Envelope::<()>::err_raw(
                 "sign_policy.owner_key_mismatch",
                 format!(
-                    "the seed in '{}' derives to owner key {derived_address}, but the profile's \
-                     enrolled owner key is {enrolled_address}; a policy signed with this seed \
-                     would be rejected by the engine. Supply the enrolled owner's seed, or \
-                     re-enroll with `stellar-agent profile enroll-owner-key`. No file was written.",
+                    "the seed in '{}' derives to owner key {derived_address} (fingerprint {derived_fingerprint}), \
+                     but the profile's enrolled owner key has fingerprint {enrolled_fingerprint}; \
+                     a policy signed with this seed would be rejected by the engine. Supply the \
+                     enrolled owner's seed, or enroll the owner public key again with \
+                     `stellar-agent profile enroll-owner-key --force`. No file was written.",
                     args.secret_env
                 ),
             ));
@@ -358,9 +358,13 @@ where
             let derived_address = stellar_strkey::ed25519::PublicKey(derived)
                 .to_string()
                 .to_string();
-            let expected_address = stellar_strkey::ed25519::PublicKey(expected)
-                .to_string()
-                .to_string();
+            let expected_identity = if prepared.pinned_owner.is_some() {
+                stellar_strkey::ed25519::PublicKey(expected)
+                    .to_string()
+                    .to_string()
+            } else {
+                format!("fingerprint {}", owner_key_fingerprint(&expected))
+            };
             let source = if prepared.pinned_owner.is_some() {
                 "the owner the installation's policy pin names"
             } else {
@@ -370,7 +374,7 @@ where
                 "sign_policy.owner_key_mismatch",
                 format!(
                     "the seed in '{}' derives to owner key {derived_address}, but the previous \
-                     owner of this rotation is {expected_address}, {source}. Supply that \
+                     owner of this rotation is {expected_identity}, {source}. Supply that \
                      owner's seed. No file was written.",
                     args.previous_owner_secret_env
                         .as_deref()
@@ -625,10 +629,35 @@ fn engine_profile_name(profile: &Profile) -> Result<String, String> {
         })
 }
 
+/// A value-free failure to read the enrolled owner.
+#[derive(Debug)]
+enum OwnerReadError {
+    OlderForm,
+    Unavailable(String),
+}
+
+impl From<String> for OwnerReadError {
+    fn from(message: String) -> Self {
+        Self::Unavailable(message)
+    }
+}
+
+impl OwnerReadError {
+    fn message(self) -> String {
+        match self {
+            Self::OlderForm => "the owner key entry is in the older base64 form; \
+                enroll the owner public key again with \
+                `stellar-agent profile enroll-owner-key --force`"
+                .to_owned(),
+            Self::Unavailable(message) => message,
+        }
+    }
+}
+
 /// Reads the enrolled owner public key (32 bytes) from the keyring coordinate.
 ///
-/// Accepts the stored G-strkey and the older URL-safe base64 form.
-fn read_owner_pubkey(coord: &KeyringEntryRef) -> Result<[u8; 32], String> {
+/// Accepts only the stored G-strkey; the older form requires enrollment again.
+fn read_owner_pubkey(coord: &KeyringEntryRef) -> Result<[u8; 32], OwnerReadError> {
     let entry = KeyringEntry::new(&coord.service, &coord.account).map_err(|e| {
         let classified =
             map_keyring_operation_error(&e, KeyringOperation::Construct, &coord.service);
@@ -637,48 +666,40 @@ fn read_owner_pubkey(coord: &KeyringEntryRef) -> Result<[u8; 32], String> {
             coord.service, coord.account
         )
     })?;
-    let raw = entry.get_password().map_err(|e| match &e {
-        // Absence keeps the outward not-enrolled contract; any other cause is
-        // classified and surfaced, so a non-interactive Windows session is not
-        // misreported as a missing enrolment.
-        keyring_core::Error::NoEntry => format!(
-            "no owner key is enrolled at keyring service '{}' account '{}'; run \
-             `stellar-agent profile enroll-owner-key` first",
-            coord.service, coord.account
-        ),
-        other => {
-            let classified =
-                map_keyring_operation_error(other, KeyringOperation::Read, &coord.service);
-            format!(
-                "the owner key at keyring service '{}' account '{}' could not be read ({}): {}",
-                coord.service,
-                coord.account,
-                classified.code(),
-                classified.message()
-            )
+    let raw = entry
+        .get_password()
+        .map(zeroize::Zeroizing::new)
+        .map_err(|e| match &e {
+            // Absence keeps the outward not-enrolled contract; any other cause is
+            // classified and surfaced, so a non-interactive Windows session is not
+            // misreported as a missing enrolment.
+            keyring_core::Error::NoEntry => format!(
+                "no owner key is enrolled at keyring service '{}' account '{}'; run \
+                 `stellar-agent profile enroll-owner-key` first",
+                coord.service, coord.account
+            ),
+            other => {
+                let classified =
+                    map_keyring_operation_error(other, KeyringOperation::Read, &coord.service);
+                format!(
+                    "the owner key at keyring service '{}' account '{}' could not be read ({}): {}",
+                    coord.service,
+                    coord.account,
+                    classified.code(),
+                    classified.message()
+                )
+            }
+        })?;
+    stellar_agent_core::profile::owner_key::decode_owner_public_key(&raw).map_err(|error| {
+        match error {
+            OwnerKeyDecodeError::OlderForm => OwnerReadError::OlderForm,
+            _ => OwnerReadError::Unavailable(
+                "the enrolled owner key is neither a G-strkey nor the older form; \
+                 enroll the owner public key again with \
+                 `stellar-agent profile enroll-owner-key --force`"
+                    .to_owned(),
+            ),
         }
-    })?;
-    // The stored form is the G-strkey; the older form is URL-safe base64.
-    if let Some((key, _form)) =
-        stellar_agent_core::profile::owner_key::decode_owner_public_key(&raw)
-    {
-        return Ok(key);
-    }
-    let bytes = URL_SAFE_NO_PAD.decode(raw.trim()).map_err(|e| {
-        format!(
-            "the enrolled owner key at '{}:{}' is neither a G-strkey nor valid base64 ({e}); \
-             re-enroll with `stellar-agent profile enroll-owner-key`",
-            coord.service, coord.account
-        )
-    })?;
-    bytes.try_into().map_err(|v: Vec<u8>| {
-        format!(
-            "the enrolled owner key at '{}:{}' decoded to {} bytes (expected 32); re-enroll with \
-             `stellar-agent profile enroll-owner-key`",
-            coord.service,
-            coord.account,
-            v.len()
-        )
     })
 }
 
@@ -705,49 +726,18 @@ enum OwnerSignError {
     },
 }
 
-/// Reads the owner `S...` strkey from `var_name` into a zeroizing 32-byte seed.
-///
-/// The `Copy` residue `stellar_strkey` leaves in `PrivateKey.0` is explicitly
-/// zeroized (the type has no `Drop`/`Zeroize` impl of its own).
-fn seed_from_env(var_name: &str) -> Result<Zeroizing<[u8; 32]>, String> {
-    let s_strkey: Zeroizing<String> = Zeroizing::new(
-        std::env::var(var_name)
-            .map_err(|_| format!("environment variable '{var_name}' not set"))?,
-    );
-    let mut private_key = stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey)
-        .map_err(|_| format!("environment variable '{var_name}' contains an invalid S-strkey"))?;
-    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(private_key.0);
-    zeroize::Zeroize::zeroize(&mut private_key.0);
-    Ok(seed)
-}
-
-/// Runs an operation while the seed is held by the wallet's mlock ceremony.
-/// The wallet is disposed on every path; the dalek key zeroizes on drop.
-async fn with_owner_seed<T>(
-    var_name: &str,
-    mlock_required: MlockRequired,
-    ttl_seconds: u32,
-    operation: impl AsyncFnOnce(&ed25519_dalek::SigningKey) -> Result<T, OwnerSignError>,
-) -> Result<T, OwnerSignError> {
-    let seed = seed_from_env(var_name).map_err(OwnerSignError::Env)?;
-    let mut wallet = Wallet::unlock(
-        "profile-sign-policy".to_owned(),
-        seed,
-        ttl_seconds,
-        mlock_required,
-    )
-    .await
-    .map_err(|e| OwnerSignError::Unlock(e.to_string()))?;
-    let key = wallet
-        .seed()
-        .map(ed25519_dalek::SigningKey::from_bytes)
-        .map_err(|e| OwnerSignError::Unlock(e.to_string()));
-    let result = match key {
-        Ok(key) => operation(&key).await,
-        Err(error) => Err(error),
-    };
-    wallet.dispose();
-    result
+impl From<OwnerSeedError> for OwnerSignError {
+    fn from(error: OwnerSeedError) -> Self {
+        match error {
+            OwnerSeedError::NotSet { var } => {
+                Self::Env(format!("environment variable '{var}' not set"))
+            }
+            OwnerSeedError::Invalid { var } => Self::Env(format!(
+                "environment variable '{var}' contains an invalid S-strkey"
+            )),
+            OwnerSeedError::Unlock(message) => Self::Unlock(message),
+        }
+    }
 }
 
 /// The previous owner a rotation statement must name.
@@ -774,51 +764,58 @@ async fn sign_policy_with_owner_seeds(
     raw: &str,
     previous: Option<PreviousOwner<'_>>,
 ) -> Result<(String, [u8; 32], [u8; 64], [u8; 32]), OwnerSignError> {
-    with_owner_seed(var_name, mlock_required, ttl_seconds, async |key| {
-        let derived = key.verifying_key().to_bytes();
-        let mut raw = raw.to_owned();
-        match previous {
-            Some(previous) => {
-                let table = with_owner_seed(
-                    previous.var_name,
-                    mlock_required,
-                    ttl_seconds,
-                    async |previous_key| {
-                        let previous_owner = previous_key.verifying_key().to_bytes();
-                        if previous_owner != previous.expected {
-                            return Err(OwnerSignError::PreviousMismatch {
-                                derived: previous_owner,
-                                expected: previous.expected,
-                            });
-                        }
-                        stellar_agent_core::policy::v1::signature::build_owner_rotation(
-                            &raw,
-                            previous_key,
-                            &derived,
-                        )
-                        .map_err(OwnerSignError::Policy)
-                    },
-                )
-                .await?;
-                let mut doc = raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
-                    OwnerSignError::Policy(
-                        stellar_agent_core::policy::PolicyError::PolicyFileParseFailed {
-                            detail: e.to_string(),
+    with_owner_seed(
+        var_name,
+        "profile-sign-policy",
+        mlock_required,
+        ttl_seconds,
+        async |key| {
+            let derived = key.verifying_key().to_bytes();
+            let mut raw = raw.to_owned();
+            match previous {
+                Some(previous) => {
+                    let table = with_owner_seed(
+                        previous.var_name,
+                        "profile-sign-policy",
+                        mlock_required,
+                        ttl_seconds,
+                        async |previous_key| {
+                            let previous_owner = previous_key.verifying_key().to_bytes();
+                            if previous_owner != previous.expected {
+                                return Err(OwnerSignError::PreviousMismatch {
+                                    derived: previous_owner,
+                                    expected: previous.expected,
+                                });
+                            }
+                            stellar_agent_core::policy::v1::signature::build_owner_rotation(
+                                &raw,
+                                previous_key,
+                                &derived,
+                            )
+                            .map_err(OwnerSignError::Policy)
                         },
                     )
-                })?;
-                doc["owner_rotation"] = toml_edit::Item::Table(table);
-                raw = doc.to_string();
+                    .await?;
+                    let mut doc = raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
+                        OwnerSignError::Policy(
+                            stellar_agent_core::policy::PolicyError::PolicyFileParseFailed {
+                                detail: e.to_string(),
+                            },
+                        )
+                    })?;
+                    doc["owner_rotation"] = toml_edit::Item::Table(table);
+                    raw = doc.to_string();
+                }
+                None if derived != *enrolled_pubkey => {
+                    return Err(OwnerSignError::Mismatch { derived });
+                }
+                None => {}
             }
-            None if derived != *enrolled_pubkey => {
-                return Err(OwnerSignError::Mismatch { derived });
-            }
-            None => {}
-        }
-        let canonical = canonical_bytes(&raw).map_err(OwnerSignError::Policy)?;
-        let digest = digest(&canonical);
-        Ok((raw, derived, sign(&digest, key), digest))
-    })
+            let canonical = canonical_bytes(&raw).map_err(OwnerSignError::Policy)?;
+            let digest = digest(&canonical);
+            Ok((raw, derived, sign(&digest, key), digest))
+        },
+    )
     .await
 }
 
@@ -937,7 +934,9 @@ mod tests {
     fn enroll_owner_pubkey(name: &str, pk: &[u8; 32]) {
         let coord = KeyringEntryRef::default_owner_key(name);
         let entry = KeyringEntry::new(&coord.service, &coord.account).unwrap();
-        entry.set_password(&URL_SAFE_NO_PAD.encode(pk)).unwrap();
+        entry
+            .set_password(&stellar_agent_core::profile::owner_key::encode_owner_public_key(pk))
+            .unwrap();
     }
 
     struct EnvGuard {
@@ -989,7 +988,7 @@ mod tests {
     fn read_owner_pubkey_reports_not_enrolled_on_absence() {
         keyring_mock::install().expect("mock store");
         let coord = KeyringEntryRef::default_owner_key("sign-policy-owner-absent-test");
-        let err = read_owner_pubkey(&coord).unwrap_err();
+        let err = read_owner_pubkey(&coord).unwrap_err().message();
         assert!(
             err.contains("no owner key is enrolled"),
             "absence must keep the not-enrolled message, got: {err}"
@@ -1005,7 +1004,7 @@ mod tests {
         keyring_mock::install().expect("mock store");
         let coord = KeyringEntryRef::default_owner_key("sign-policy-owner-no-logon-test");
         keyring_mock::inject_no_logon_session(&coord.service, &coord.account).unwrap();
-        let err = read_owner_pubkey(&coord).unwrap_err();
+        let err = read_owner_pubkey(&coord).unwrap_err().message();
         assert!(
             err.contains("auth.keyring_interactive_session_required"),
             "a non-interactive session must surface the classified code, got: {err}"
@@ -1124,6 +1123,84 @@ mod tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(after, body, "no file must be written on owner-key mismatch");
         assert!(!after.contains("[signature]"));
+    }
+
+    async fn owner_refusal(stored: &str, previous: bool) -> serde_json::Value {
+        keyring_mock::install().unwrap();
+        let coord = KeyringEntryRef::default_owner_key(PROFILE_NAME);
+        KeyringEntry::new(&coord.service, &coord.account)
+            .unwrap()
+            .set_password(stored)
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let path = dir.path().join("policy.toml");
+        let body = policy_body(PROFILE_NAME);
+        std::fs::write(&path, &body).unwrap();
+        let (secret, _, _) = seed_material([0x55; 32]);
+        let var = unique_var("OWNER_HYGIENE");
+        let _guard = EnvGuard::set(var.clone(), &secret);
+        let mut arguments = args(&path, &var);
+        if previous {
+            arguments.previous_owner_secret_env = Some(var);
+        }
+        render::take_rendered_for_test();
+        let profile = profile_for(PROFILE_NAME);
+        assert_eq!(
+            run_with_dependencies(&arguments, |_| Ok(profile.clone()), || Ok(())).await,
+            1
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), body);
+        let mut output = render::take_rendered_for_test();
+        assert_eq!(output.len(), 1);
+        output.remove(0)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn an_older_form_owner_entry_refuses_sign_policy() {
+        use base64::Engine as _;
+        let bytes = [0x44; 32];
+        let older = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let output = owner_refusal(&older, false).await;
+        assert_eq!(output["error"]["code"], "sign_policy.owner_key_older_form");
+        let rendered = output.to_string();
+        for value in [
+            older,
+            stellar_agent_core::profile::owner_key::encode_owner_public_key(&bytes),
+            seed_material(bytes).0,
+        ] {
+            assert!(!rendered.contains(&value));
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_mismatch_error_names_fingerprints_and_no_enrolled_key() {
+        let bytes = [0x44; 32];
+        let stored = stellar_agent_core::profile::owner_key::encode_owner_public_key(&bytes);
+        let output = owner_refusal(&stored, false).await;
+        assert_eq!(output["error"]["code"], "sign_policy.owner_key_mismatch");
+        let rendered = output.to_string();
+        let (_, derived, address) = seed_material([0x55; 32]);
+        assert!(rendered.contains(&owner_key_fingerprint(&bytes)));
+        assert!(rendered.contains(&owner_key_fingerprint(&derived)));
+        assert!(rendered.contains(&address));
+        assert!(!rendered.contains(&stored));
+        assert!(!rendered.contains(&seed_material(bytes).0));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_previous_owner_mismatch_without_a_pin_names_a_fingerprint() {
+        let bytes = [0x44; 32];
+        let stored = stellar_agent_core::profile::owner_key::encode_owner_public_key(&bytes);
+        let output = owner_refusal(&stored, true).await;
+        assert_eq!(output["error"]["code"], "sign_policy.owner_key_mismatch");
+        let rendered = output.to_string();
+        assert!(rendered.contains(&owner_key_fingerprint(&bytes)));
+        assert!(!rendered.contains(&stored));
+        assert!(!rendered.contains(&seed_material(bytes).0));
     }
 
     /// Re-signing an already-signed file succeeds without a force flag,

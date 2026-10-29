@@ -8,9 +8,10 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use hmac::{Hmac, KeyInit as _, Mac as _};
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::schema::{PreviousState, WipedAccrualRecord, WipedBucket};
 use stellar_agent_core::policy::DenyReason;
+use stellar_agent_core::policy::pin::{self, PinError, PinScope, PinState};
 use stellar_agent_core::policy::v1::criteria::state_store::{
     CLOCK_SKEW_TOLERANCE_MS, PolicyStateStore, StateKey, StateStoreError, WindowEntry,
 };
@@ -750,9 +751,9 @@ impl std::fmt::Display for StateDefect {
     }
 }
 
-/// What the reset's recorder receives: the accrual it records and, for a
-/// mainnet profile in a build with mainnet writes, the defect that left the
-/// store unverifiable.
+/// The reset's live accrual, store digest and any mainnet state defect.
+/// The recorder can read the policy pin through [`Self::pin`] under the held
+/// store lock. Only the store constructs this record and its scoped guard.
 #[derive(Debug, Clone, Copy)]
 pub struct ResetRecord<'a> {
     /// The live accrual of the store being replaced.
@@ -761,6 +762,20 @@ pub struct ResetRecord<'a> {
     /// genuine first run, a testnet profile, or a build without mainnet
     /// writes.
     pub defect: Option<StateDefect>,
+    /// SHA-256 of the exact store bytes read, or `None` for a missing file.
+    pub store_sha256: Option<[u8; 32]>,
+    guard: &'a WindowStoreLock,
+    scope: PinScope<'a>,
+}
+
+impl ResetRecord<'_> {
+    /// Reads the policy pin under the reset's held store lock.
+    ///
+    /// # Errors
+    /// Refuses a guard mismatch or an unreadable or malformed pin.
+    pub fn pin(&self) -> Result<PinState, PinError> {
+        pin::read(self.guard, &self.scope)
+    }
 }
 
 /// Failure of the recorded reset ceremony.
@@ -788,6 +803,7 @@ pub struct PersistedWindowStore {
 
 /// What the reset established before its recorder runs.
 struct ResetSnapshot {
+    store_sha256: Option<[u8; 32]>,
     key: Option<zeroize::Zeroizing<[u8; 32]>>,
     accrual: WipedAccrualRecord,
     defect: Option<StateDefect>,
@@ -1582,12 +1598,18 @@ impl PersistedWindowStore {
             minted: false,
         };
         self.ensure_parent_dir().map_err(before_mint)?;
-        let _lock = WindowStoreLock::acquire_with_retry(&self.lock_path())
-            .map_err(|e| before_mint(e.into()))?;
+        let lock = WindowStoreLock::acquire_for_with_retry(
+            &self.path,
+            &profile.policy_window_state_key_id,
+        )
+        .map_err(|e| before_mint(e.into()))?;
         let snapshot = self.reset_snapshot(profile, now_ms).map_err(before_mint)?;
         record(&ResetRecord {
             accrual: &snapshot.accrual,
             defect: snapshot.defect,
+            store_sha256: snapshot.store_sha256,
+            guard: &lock,
+            scope: PinScope::for_profile(&self.path, profile),
         })
         .map_err(ResetError::Recorder)?;
         let accrual = snapshot.accrual;
@@ -1674,6 +1696,7 @@ impl PersistedWindowStore {
                 let defect = (mainnet && generation_before.is_some())
                     .then_some(StateDefect::MissingFileWithGeneration);
                 return Ok(ResetSnapshot {
+                    store_sha256: None,
                     key,
                     accrual,
                     defect,
@@ -1732,6 +1755,7 @@ impl PersistedWindowStore {
             }
         }
         Ok(ResetSnapshot {
+            store_sha256: Some(Sha256::digest(&bytes).into()),
             key,
             accrual,
             defect: if mainnet { defect } else { None },
@@ -4822,6 +4846,17 @@ mod tests {
         );
     }
 
+    fn largest_reset_authorization()
+    -> stellar_agent_core::audit_log::schema::WindowResetAuthorization {
+        stellar_agent_core::audit_log::schema::WindowResetAuthorization {
+            owner_redacted: stellar_agent_core::observability::RedactedStrkey::from_full(
+                &stellar_agent_core::profile::owner_key::encode_owner_public_key(&[0x51; 32]),
+            ),
+            store_sha256: Some("f".repeat(64)),
+            signature: "f".repeat(128),
+        }
+    }
+
     #[test]
     #[serial]
     fn reset_largest_row_fits_without_writer_truncation() {
@@ -4852,9 +4887,13 @@ mod tests {
             "00000000-0000-4000-8000-000000000000",
             "stellar:mainnet",
             row,
+            Some(largest_reset_authorization()),
         );
         assert_eq!(entry.chain_id.as_deref(), Some("stellar:mainnet"));
+        entry.previous_entry_hash = format!("sha256:{}", "f".repeat(64));
         // The writer runs this bound at append.
+        let size = serde_json::to_vec(&entry).unwrap().len();
+        assert!(size < MAX_ENTRY_BYTES, "row is {size} bytes");
         entry.truncate_arg_keys_if_needed().unwrap();
         assert!(!entry.truncated);
         let json = serde_json::to_vec(&entry).unwrap();
@@ -4892,10 +4931,13 @@ mod tests {
                 "00000000-0000-4000-8000-000000000000",
                 "stellar:mainnet",
                 row,
+                Some(largest_reset_authorization()),
             );
             assert_eq!(entry.chain_id.as_deref(), Some("stellar:mainnet"));
             entry.previous_entry_hash = format!("sha256:{}", "f".repeat(64));
             // The writer runs this bound at append.
+            let size = serde_json::to_vec(&entry).unwrap().len();
+            assert!(size < MAX_ENTRY_BYTES, "row is {size} bytes");
             entry.truncate_arg_keys_if_needed().unwrap();
             assert!(!entry.truncated);
             let json = serde_json::to_vec(&entry).unwrap();

@@ -202,6 +202,59 @@ pub fn owner_rotation_digest(
     Ok(digest(&message))
 }
 
+/// The reset fields authorized by the pinned policy owner.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowResetStatement<'a> {
+    /// The selected profile name.
+    pub profile: &'a str,
+    /// The profile's CAIP-2 chain identifier.
+    pub chain_id: &'a str,
+    /// SHA-256 of the store bytes read, or `None` when absent.
+    pub store_sha256: Option<[u8; 32]>,
+    /// The generation observed before reset, or `None` when absent.
+    pub generation_before: Option<u64>,
+    /// The empty store's new generation.
+    pub generation_after: u64,
+    /// The bounded reason recorded in the audit row.
+    pub reason: &'a str,
+    /// The audit row's request identifier.
+    pub request_id: &'a str,
+}
+
+/// Computes the domain-separated BLAKE3 digest for an owner-authorized reset.
+///
+/// Strings carry a u32 big-endian byte length. Optional fields carry a zero
+/// byte when absent, or a one byte followed by their value. Generations are
+/// u64 big-endian. Callers supply the bounded reason recorded in the row.
+#[must_use]
+pub fn window_reset_digest(statement: &WindowResetStatement<'_>) -> [u8; 32] {
+    fn string(message: &mut Vec<u8>, value: &str) {
+        message.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        message.extend_from_slice(value.as_bytes());
+    }
+    let mut message = b"stellar-agent-window-reset-v1".to_vec();
+    string(&mut message, statement.profile);
+    string(&mut message, statement.chain_id);
+    match statement.store_sha256 {
+        None => message.push(0),
+        Some(hash) => {
+            message.push(1);
+            message.extend_from_slice(&hash);
+        }
+    }
+    match statement.generation_before {
+        None => message.push(0),
+        Some(generation) => {
+            message.push(1);
+            message.extend_from_slice(&generation.to_be_bytes());
+        }
+    }
+    message.extend_from_slice(&statement.generation_after.to_be_bytes());
+    string(&mut message, statement.reason);
+    string(&mut message, statement.request_id);
+    digest(&message)
+}
+
 /// Builds an `[owner_rotation]` table signed by the previous owner.
 ///
 /// The new owner's policy signature must cover the returned table too.
@@ -358,6 +411,64 @@ mod tests {
     }
 
     const CANONICAL: &[u8] = b"version = 1\nscope = \"profile:default\"\n";
+
+    #[test]
+    fn window_reset_digest_binds_every_field() {
+        let statement = WindowResetStatement {
+            profile: "reset",
+            chain_id: "stellar:mainnet",
+            store_sha256: Some([0x11; 32]),
+            generation_before: Some(7),
+            generation_after: 8,
+            reason: "repair",
+            request_id: "request",
+        };
+        let expected = window_reset_digest(&statement);
+        for changed in [
+            WindowResetStatement {
+                profile: "other",
+                ..statement
+            },
+            WindowResetStatement {
+                chain_id: "stellar:testnet",
+                ..statement
+            },
+            WindowResetStatement {
+                store_sha256: None,
+                ..statement
+            },
+            WindowResetStatement {
+                store_sha256: Some([0x22; 32]),
+                ..statement
+            },
+            WindowResetStatement {
+                generation_before: None,
+                ..statement
+            },
+            WindowResetStatement {
+                generation_before: Some(6),
+                ..statement
+            },
+            WindowResetStatement {
+                generation_after: 9,
+                ..statement
+            },
+            WindowResetStatement {
+                reason: "recover",
+                ..statement
+            },
+            WindowResetStatement {
+                request_id: "another-request",
+                ..statement
+            },
+        ] {
+            assert_ne!(expected, window_reset_digest(&changed), "{changed:?}");
+        }
+        assert_eq!(
+            crate::hex::encode(&expected),
+            "51a71d3f135698b598e0d7da26cf428ed6aedefff9c88fb16e8ba8571387e220"
+        );
+    }
 
     // ── digest_deterministic ─────────────────────────────────────────────────
 

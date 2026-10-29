@@ -36,6 +36,7 @@ pub mod init;
 pub mod key_ops;
 pub mod list;
 pub mod migrate;
+pub(super) mod owner_seed;
 pub mod reset_mpp_state;
 pub mod reset_window_state;
 pub mod rotate_attestation_key;

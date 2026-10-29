@@ -979,7 +979,9 @@ Reset refuses effective open authorizations with
 `profile.reset_window_state_open_authorizations`. Enabled-mainnet state that
 cannot be verified uses `policy.window_state_unverifiable`. Stop the MCP server,
 inspect the defect, and use `profile reset-window-state <NAME> --reason <REASON>`
-for recoverable state defects. A newer authenticated format refuses reset with
+with `--owner-secret-env VAR` holding the pinned owner's seed on an enabled
+installation, in every build. The check reads the nonce and pin under the scoped
+store lock. A newer authenticated format refuses reset with
 `profile.reset_window_state_newer_version`; use a build that understands it.
 Reset audits the defect before replacement; expiry release remains in memory
 until that audit step succeeds.
@@ -1041,6 +1043,9 @@ The policy loader (`policy/v1/loader.rs`) is fail closed at parse time. An unkno
 `profile reset-window-state` writes its `policy_window_state_reset` audit row,
 with the wiped accrual, before it mints a key, advances the generation or
 replaces the store. A reset whose row cannot be written does not happen.
+With an owner seed, the row records the pinned owner's signature over the
+profile, chain, store SHA-256, generation pair, bounded reason and request id.
+Owner-required, owner-mismatch and pin refusals write no row and change no state.
 The [CLI reference](../cli-reference/profile-and-governance.md#reset-window-state-name---reason-reason)
 describes the row, the refusals, the failure windows and the recovery.
 

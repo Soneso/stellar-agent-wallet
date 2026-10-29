@@ -1718,6 +1718,28 @@ pub enum ValidationError {
         defect: &'static str,
     },
 
+    /// An enabled installation needs its pinned owner's seed for a reset.
+    #[error(
+        "profile '{profile}' has mainnet enabled; reset-window-state requires the pinned owner's seed in --owner-secret-env; nothing was changed"
+    )]
+    ResetWindowStateOwnerRequired {
+        /// Selected profile name.
+        profile: String,
+    },
+
+    /// The supplied seed does not derive to the pinned policy owner.
+    #[error(
+        "profile '{profile}' reset-window-state owner {derived} does not match pinned owner {pinned}; nothing was changed"
+    )]
+    ResetWindowStateOwnerMismatch {
+        /// Selected profile name.
+        profile: String,
+        /// The public key derived from the supplied seed.
+        derived: String,
+        /// The public key named by the verified policy pin.
+        pinned: String,
+    },
+
     /// The window-state reset of a mainnet profile refused because a mainnet
     /// authorization is still open.
     ///
@@ -1938,6 +1960,12 @@ impl ValidationError {
             // the subsystem (fees.*) while the category stays Validation.
             Self::FeeAboveCap { .. } => "fees.percentile_exceeds_cap",
             Self::FeeTotalOverflow { .. } => "validation.fee_total_overflow",
+            Self::ResetWindowStateOwnerRequired { .. } => {
+                "profile.reset_window_state_owner_required"
+            }
+            Self::ResetWindowStateOwnerMismatch { .. } => {
+                "profile.reset_window_state_owner_mismatch"
+            }
             Self::ResetWindowStateNewerVersion { .. } => "profile.reset_window_state_newer_version",
             #[cfg(feature = "mainnet-write")]
             Self::WindowStateUnverifiable { .. } => "policy.window_state_unverifiable",
@@ -3793,6 +3821,20 @@ mod tests {
                 "validation.fee_total_overflow",
             ),
             (
+                ValidationError::ResetWindowStateOwnerRequired {
+                    profile: "default".to_owned(),
+                },
+                "profile.reset_window_state_owner_required",
+            ),
+            (
+                ValidationError::ResetWindowStateOwnerMismatch {
+                    profile: "default".to_owned(),
+                    derived: "derived".to_owned(),
+                    pinned: "pinned".to_owned(),
+                },
+                "profile.reset_window_state_owner_mismatch",
+            ),
+            (
                 ValidationError::ResetWindowStateNewerVersion {
                     profile: "default".to_owned(),
                     version: 5,
@@ -4051,6 +4093,20 @@ mod tests {
                         op_count: *op_count,
                     }
                 }
+                ValidationError::ResetWindowStateOwnerRequired { profile } => {
+                    ValidationError::ResetWindowStateOwnerRequired {
+                        profile: profile.clone(),
+                    }
+                }
+                ValidationError::ResetWindowStateOwnerMismatch {
+                    profile,
+                    derived,
+                    pinned,
+                } => ValidationError::ResetWindowStateOwnerMismatch {
+                    profile: profile.clone(),
+                    derived: derived.clone(),
+                    pinned: pinned.clone(),
+                },
                 ValidationError::ResetWindowStateNewerVersion {
                     profile,
                     version,

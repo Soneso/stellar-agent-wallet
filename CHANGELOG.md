@@ -166,6 +166,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `decode_owner_public_key` returns `Result<[u8; 32], OwnerKeyDecodeError>`.
+  `OwnerKeyForm`, `OwnerEntryRewrite`, `rewrite_older_form_owner_entry`,
+  `rewrite_owner_value_if_older`, `log_owner_entry_rewrite`,
+  `rewrite_older_form_owner_entries_in_dir`, `rewrite_older_form_owner_entries_once`,
+  and `BuildRegistryError::OwnerKeyLengthMismatch` are removed.
+  `BuildRegistryError::OwnerKeyOlderForm` identifies refused base64 entries.
+  `owner_key_fingerprint` identifies stored bytes without rendering their value.
+- `ResetRecord` exposes the store SHA-256 and guarded pin reading, and its
+  private fields restrict construction to its crate.
+  `WindowResetStatement` and `window_reset_digest` define reset authorization.
+  `EventKind::PolicyWindowStateReset` adds optional `owner_authorization`, and
+  `AuditEntry::new_policy_window_state_reset` takes that authorization.
+  `bound_window_reset_reason` bounds the signed and recorded reason to 80 Unicode
+  characters; `WINDOW_RESET_REASON_MAX` names the bound.
+  `bound_recorded_str` exposes the general audit string bound.
 - MPP state adds a `default-generation-intent` keyring entry beside its committed
   counter; `intent_account` and `generation_intent_account` derive its account.
   `reset_for_profile` accepts the current time and returns `MppStateReset`.
@@ -718,6 +733,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Owner readers refuse entries in the older base64 form and keep them unchanged.
+  An installation that runs `profile rotate-owner-key` on v0.1.0-alpha.1 or
+  v0.1.0-alpha.2 holds that command's generated owner seed at the owner coordinate.
+  Builds from v0.1.0-alpha.10 store those bytes as a G-strkey.
+  Treat that seed as disclosed, generate a new owner key offline, enroll it with
+  `profile enroll-owner-key --force`, and sign the policy again.
+  A `sign_policy.owner_key_mismatch` with your own seed identifies this disclosed
+  seed case. `sign-policy` mismatch errors identify enrolled bytes by fingerprints.
+- A window-state reset on an installation with mainnet enabled requires the
+  pinned owner's seed in every build. Its audit row records the owner's
+  signature over the reset, including the store digest and generation pair.
 - Release and rehearsal builds restore and save no cache.
 - Release signing, provenance, and publication wait for the vendored Wasm
   rebuild of the tagged commit, and a tag run of the vendored Wasm workflow

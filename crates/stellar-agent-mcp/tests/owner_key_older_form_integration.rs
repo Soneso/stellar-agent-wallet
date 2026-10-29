@@ -1,8 +1,4 @@
-//! The first V1 engine build in a process rewrites the older-form owner entry
-//! of every other profile in the profile directory.
-//!
-//! The sweep runs once per process, so this file holds a single test and runs
-//! as its own test binary.
+//! Engine builds preserve sibling owner entries and refuse older base64.
 
 #![allow(
     clippy::unwrap_used,
@@ -33,39 +29,43 @@ fn owner(name: &str) -> Option<String> {
         .ok()
 }
 
-/// An engine build for profile A rewrites A's older-form owner entry and
-/// profile B's. A profile with no owner entry is skipped and the build goes
-/// on to its own policy check.
 #[test]
 #[serial_test::serial]
-fn an_engine_build_for_one_profile_rewrites_another_profiles_older_form_entry() {
+fn an_engine_build_leaves_another_profiles_older_form_entry() {
     let home = tempfile::tempdir().unwrap();
     let _home = StellarAgentHomeGuard::new(home.path());
     keyring_mock::install().unwrap();
     let profile_dir = default_profile_dir().unwrap();
     std::fs::create_dir_all(&profile_dir).unwrap();
-    for name in ["sweep-a", "sweep-b", "sweep-absent"] {
+    for name in ["owner-a", "owner-b", "owner-absent"] {
         std::fs::write(profile_dir.join(format!("{name}.toml")), "").unwrap();
     }
     let key_a = [0x71_u8; 32];
     let key_b = [0x72_u8; 32];
-    put_owner("sweep-a", &URL_SAFE_NO_PAD.encode(key_a));
-    put_owner("sweep-b", &URL_SAFE_NO_PAD.encode(key_b));
+    put_owner("owner-a", &encode_owner_public_key(&key_a));
+    put_owner("owner-b", &URL_SAFE_NO_PAD.encode(key_b));
 
-    let profile_a = Profile::builder_testnet_named("sweep-a", "s", "a", "n", "a").build();
+    let profile_a = Profile::builder_testnet_named("owner-a", "s", "a", "n", "a").build();
     // No signed policy exists, so the build itself refuses after the owner read.
     assert!(WalletServer::new(profile_a).is_err());
 
     assert!(
-        owner("sweep-a") == Some(encode_owner_public_key(&key_a)),
-        "the built profile's own entry is rewritten"
+        owner("owner-a") == Some(encode_owner_public_key(&key_a)),
+        "the built profile's entry is unchanged"
     );
     assert!(
-        owner("sweep-b") == Some(encode_owner_public_key(&key_b)),
-        "the first engine build rewrites another profile's older-form entry"
+        owner("owner-b") == Some(URL_SAFE_NO_PAD.encode(key_b)),
+        "the sibling entry stays byte-identical"
     );
     assert!(
-        owner("sweep-absent").is_none(),
-        "an absent entry is skipped"
+        owner("owner-absent").is_none(),
+        "an absent sibling entry stays absent"
     );
+    let profile_b = Profile::builder_testnet_named("owner-b", "s", "b", "n", "b").build();
+    let error = WalletServer::new(profile_b).err().unwrap();
+    assert!(matches!(
+        error,
+        stellar_agent_core::policy::BuildRegistryError::OwnerKeyOlderForm { .. }
+    ));
+    assert_eq!(owner("owner-b"), Some(URL_SAFE_NO_PAD.encode(key_b)));
 }
