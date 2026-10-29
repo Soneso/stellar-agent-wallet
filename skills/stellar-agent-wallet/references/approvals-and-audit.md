@@ -451,7 +451,9 @@ of `anchor_unavailable`, `resimulation`, `response_processing`, `encoding`,
 `payload_release`, or `terminal_approval`. At `anchor_unavailable`, the signed
 authorization stays in the wallet. On testnet, the admitted spend remains
 recorded. Mainnet `x402_payment_authorized` rows record `RequireApproval`, the
-payment value leg, network, scheme, and any required witness. On mainnet, three
+payment value leg, network, scheme, any required witness, and
+`signature_expiration_ledger`, the last ledger at which the signed
+authorization is valid. On mainnet, three
 consumption boundaries apply. The Message authorization of an authenticated
 payment is consumed before the SEP-10 signature. The payment intent is consumed
 before the signed simulation. The submit authorization is consumed before

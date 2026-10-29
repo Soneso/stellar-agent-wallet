@@ -69,6 +69,8 @@ fn divergence(field: WitnessField) -> WalletError {
 ///    several ledgers after the primary's simulation.
 /// 6. Its ledger lies before the signature expiration ledger.
 ///
+/// Checks 5 and 6 are [`compare_ledger`].
+///
 /// # Errors
 /// `simulation.divergence` naming the Soroban simulation and the field of the
 /// failed check; `network.witness_unavailable` with `InvalidAnswer` for an
@@ -115,11 +117,38 @@ pub(super) fn compare(
     if oracle.min_resource_fee == 0 || oracle.min_resource_fee > inputs.resource_fee_ceiling {
         return Err(divergence(F::ResourceFee));
     }
-    if oracle.latest_ledger.saturating_add(MAX_ORACLE_LAG_LEDGERS) < inputs.primary.latest_ledger {
-        return Err(divergence(F::LedgerSkew));
+    compare_ledger(
+        inputs.primary.latest_ledger,
+        oracle.latest_ledger,
+        inputs.expiration_ledger,
+    )
+}
+
+/// Compares the oracle's ledger with the primary's simulation ledger and the
+/// signature expiration ledger derived from it, and refuses at the first
+/// disagreement.
+///
+/// 1. `oracle_ledger` trails `primary_ledger` by at most two ledgers. An
+///    oracle ahead of the primary is bounded by check 2 alone: a retried
+///    answer arrives several ledgers after the primary's simulation.
+/// 2. `oracle_ledger` lies before `expiration_ledger`.
+///
+/// A primary that reports an inflated ledger fails check 1, so the signed
+/// window stays bounded by the oracle's view of the network.
+///
+/// # Errors
+/// `simulation.divergence` naming the Soroban simulation and
+/// [`WitnessField::LedgerSkew`] or [`WitnessField::Expiration`].
+pub(super) fn compare_ledger(
+    primary_ledger: u32,
+    oracle_ledger: u32,
+    expiration_ledger: u32,
+) -> Result<(), WalletError> {
+    if oracle_ledger.saturating_add(MAX_ORACLE_LAG_LEDGERS) < primary_ledger {
+        return Err(divergence(WitnessField::LedgerSkew));
     }
-    if oracle.latest_ledger >= inputs.expiration_ledger {
-        return Err(divergence(F::Expiration));
+    if oracle_ledger >= expiration_ledger {
+        return Err(divergence(WitnessField::Expiration));
     }
     Ok(())
 }
@@ -981,5 +1010,52 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    /// The `simulation.divergence` field of a refused ledger comparison.
+    fn ledger_divergence(result: Result<(), WalletError>) -> WitnessField {
+        match result {
+            Err(WalletError::Network(NetworkError::WitnessDivergence {
+                entry: WitnessEntry::SorobanSimulation,
+                field,
+                sequence_delta: None,
+            })) => field,
+            other => panic!("expected a Soroban simulation divergence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compare_ledger_accepts_an_oracle_two_ledgers_behind() {
+        compare_ledger(PRIMARY_LEDGER, PRIMARY_LEDGER - 2, EXPIRATION).unwrap();
+        compare_ledger(PRIMARY_LEDGER, PRIMARY_LEDGER, EXPIRATION).unwrap();
+    }
+
+    #[test]
+    fn compare_ledger_refuses_an_oracle_three_ledgers_behind() {
+        assert_eq!(
+            ledger_divergence(compare_ledger(
+                PRIMARY_LEDGER,
+                PRIMARY_LEDGER - 3,
+                EXPIRATION
+            )),
+            WitnessField::LedgerSkew
+        );
+    }
+
+    #[test]
+    fn compare_ledger_accepts_an_oracle_ahead_of_the_primary() {
+        compare_ledger(PRIMARY_LEDGER, PRIMARY_LEDGER + 5, EXPIRATION).unwrap();
+        compare_ledger(PRIMARY_LEDGER, EXPIRATION - 1, EXPIRATION).unwrap();
+    }
+
+    #[test]
+    fn compare_ledger_refuses_an_oracle_at_or_past_the_expiration() {
+        for oracle in [EXPIRATION, EXPIRATION + 1] {
+            assert_eq!(
+                ledger_divergence(compare_ledger(PRIMARY_LEDGER, oracle, EXPIRATION)),
+                WitnessField::Expiration,
+                "oracle at {oracle}"
+            );
+        }
     }
 }

@@ -33,6 +33,16 @@
 //! ones into the expectation the ledger compares at consumption; the bound
 //! facts never leave the type.
 //!
+//! # One signature per Soroban intent
+//!
+//! A [`MainnetSorobanIntentAuthorization`] binds the entry's nonce and
+//! signature expiration ledger beside the intent digest, and it signs one
+//! preimage: the authorized signing takes it by value and returns a
+//! [`MainnetSignedSorobanIntent`] in its place. The signed intent carries the
+//! same bound facts, exposes its identity, and has no signing method; the
+//! intent's consumption takes it. A second signature needs a second
+//! authorization.
+//!
 //! # Without mainnet writes
 //!
 //! In a build without the `mainnet-write` feature every inner type holds an
@@ -108,8 +118,8 @@
 //! use stellar_agent_network::mainnet::AuthorizationId;
 //! use stellar_agent_network::mainnet::authorization::{
 //!     FeeBumpRole, Inner, MainnetFeeBumpAuthorization, MainnetMessageSignAuthorization,
-//!     MainnetSorobanIntentAuthorization, MainnetSubmitAuthorization,
-//!     MainnetTxSignAuthorization, Outer, Submit,
+//!     MainnetSignedSorobanIntent, MainnetSorobanIntentAuthorization,
+//!     MainnetSubmitAuthorization, MainnetTxSignAuthorization, Outer, Submit,
 //! };
 //! fn ids(
 //!     a: &MainnetTxSignAuthorization,
@@ -119,8 +129,9 @@
 //!     e: &MainnetFeeBumpAuthorization<Outer>,
 //!     f: &MainnetFeeBumpAuthorization<Submit>,
 //!     g: &MainnetMessageSignAuthorization,
-//! ) -> [AuthorizationId; 7] {
-//!     [a.id(), b.id(), c.id(), d.id(), e.id(), f.id(), g.id()]
+//!     h: &MainnetSignedSorobanIntent,
+//! ) -> [AuthorizationId; 8] {
+//!     [a.id(), b.id(), c.id(), d.id(), e.id(), f.id(), g.id(), h.id()]
 //! }
 //! fn role<R: FeeBumpRole>() {}
 //! role::<Inner>();
@@ -636,7 +647,12 @@ pub(crate) struct TxSignInner {
     pub(crate) binding: DomainBinding,
 }
 
-/// A Soroban intent signing: the header and its intent facts.
+/// A Soroban intent signing: the header, its intent facts, and the entry
+/// fields the signed preimage must carry.
+///
+/// The nonce and the signature expiration ledger stay in memory: the ledger
+/// record binds the intent digest, and the signing check compares the
+/// preimage's entry fields with these.
 #[cfg(feature = "mainnet-write")]
 pub(crate) struct SorobanIntentInner {
     pub(crate) entries: Vec<stellar_agent_core::policy::v1::criteria::state_store::WindowEntry>,
@@ -644,6 +660,8 @@ pub(crate) struct SorobanIntentInner {
     pub(crate) authorization_ttl_ms: u64,
     pub(crate) header: Header,
     pub(crate) binding: DomainBinding,
+    pub(crate) nonce: i64,
+    pub(crate) signature_expiration_ledger: u32,
 }
 
 /// An x402 payload release: the header, its submission facts, and the used
@@ -710,7 +728,17 @@ pub struct MainnetTxSignAuthorization(pub(crate) TxSignInner);
 
 /// Authority to sign one Soroban authorization for an x402 payment intent on
 /// mainnet.
+///
+/// It covers one preimage: the bound invocation under the bound nonce and
+/// signature expiration ledger. The authorized signing takes it by value and
+/// returns a [`MainnetSignedSorobanIntent`], so one authorization signs once.
 pub struct MainnetSorobanIntentAuthorization(pub(crate) SorobanIntentInner);
+
+/// A Soroban intent authorization whose one signature was produced.
+///
+/// It carries the authorization's bound facts for the intent's consumption
+/// and has no signing method.
+pub struct MainnetSignedSorobanIntent(pub(crate) SorobanIntentInner);
 
 /// Authority to release one signed x402 payment payload on mainnet.
 pub struct MainnetSubmitAuthorization(pub(crate) SubmitInner);
@@ -952,6 +980,7 @@ debug_impl!(
     MainnetSorobanIntentAuthorization,
     "MainnetSorobanIntentAuthorization"
 );
+debug_impl!(MainnetSignedSorobanIntent, "MainnetSignedSorobanIntent");
 debug_impl!(MainnetSubmitAuthorization, "MainnetSubmitAuthorization");
 debug_impl!(
     MainnetFeeBumpAuthorization<R>,
@@ -1074,6 +1103,47 @@ impl MainnetSorobanIntentAuthorization {
                 _ => Err(MainnetAuthorizationError::Refused(P::BindingMismatch)),
             }
         }
+    }
+
+    gated_method! {
+        /// Requires `nonce` and `signature_expiration_ledger` to be the bound
+        /// entry's, each on its own.
+        ///
+        /// # Errors
+        ///
+        /// [`MainnetAuthorizationError::Refused`] naming the mismatch.
+        fn check_entry(&self, nonce: i64, signature_expiration_ledger: u32) -> Result<(), MainnetAuthorizationError> {
+            require(nonce == self.0.nonce, P::EntryNonce)?;
+            require(
+                signature_expiration_ledger == self.0.signature_expiration_ledger,
+                P::EntryExpiration,
+            )
+        }
+    }
+
+    /// The signed intent that takes this authorization's place once its one
+    /// signature is produced.
+    ///
+    /// The authorized signing calls it after the signature verifies. A caller
+    /// that calls it without signing holds a value that only the intent's
+    /// consumption accepts.
+    #[must_use]
+    pub fn into_signed(self) -> MainnetSignedSorobanIntent {
+        MainnetSignedSorobanIntent(self.0)
+    }
+}
+
+impl MainnetSignedSorobanIntent {
+    gated_method! {
+        /// The authorization's identity: its ledger record's.
+        #[must_use]
+        fn id(&self) -> AuthorizationId { self.0.header.id }
+    }
+
+    /// The bound facts, for the intent's consumption.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn into_inner(self) -> SorobanIntentInner {
+        self.0
     }
 }
 
@@ -1605,12 +1675,17 @@ mod tests {
                 binding: DomainBinding::Soroban {
                     intent_digest: [0x44; 32],
                 },
+                nonce: 7,
+                signature_expiration_ledger: 1_000,
             });
             intent.check_intent_digest(&[0x44; 32]).unwrap();
             assert_eq!(
                 refused(intent.check_intent_digest(&[0x45; 32])),
                 P::IntentDigest
             );
+            intent.check_entry(7, 1_000).unwrap();
+            assert_eq!(refused(intent.check_entry(8, 1_000)), P::EntryNonce);
+            assert_eq!(refused(intent.check_entry(7, 1_001)), P::EntryExpiration);
 
             let parent = AuthorizationId::from_bytes([0x55; 32]);
             let mut header = f.header(AuthorizationDomain::X402Submit, true);

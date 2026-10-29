@@ -695,6 +695,37 @@ where
     }
 }
 
+/// Reads the oracle's latest ledger on mainnet and bounds the primary's
+/// simulation ledger and the signature expiration with it, as checks 5 and 6
+/// of the Soroban comparison do.
+///
+/// The read runs under [`read_with_mainnet_identity`]: the oracle must answer
+/// the mainnet identity first, and the retry policy and refusals are the
+/// witness simulation's. No answer of the primary stands in for the oracle's.
+///
+/// # Errors
+/// `simulation.divergence` with `LedgerSkew` or `Expiration`;
+/// `network.witness_unavailable` and `network.rpc_credential_refused` as the
+/// witness read reports them; the identity check's mainnet refusal.
+async fn oracle_ledger_bound(
+    oracle: &OracleEndpoint,
+    context: &NetworkContext,
+    inputs: &SorobanWitnessInputs<'_>,
+    timing: WitnessTiming,
+    tool: &'static str,
+) -> Result<(), WalletError> {
+    let client = &oracle.client;
+    let answer = read_with_mainnet_identity(oracle, context, timing, tool, move || {
+        client.witness_latest_ledger()
+    })
+    .await?;
+    soroban::compare_ledger(
+        inputs.primary.latest_ledger,
+        answer.sequence,
+        inputs.expiration_ledger,
+    )
+}
+
 /// The witness requirement of one Soroban payment, prepared before the
 /// signer is read.
 ///

@@ -158,6 +158,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the rehearsal workflow that reads a secret or the workflow token,
   top-level keys and job IDs included. It also refuses a double quote
   outside a single-quoted string in such an expression.
+- `stellar_agent_soroban_auth::preimage_entry` returns the nonce and the
+  signature expiration ledger a Soroban authorization preimage commits to.
+- `stellar_agent_network::mainnet::authorization::MainnetSignedSorobanIntent`
+  is the Soroban intent authorization whose one signature was produced, and
+  `MainnetSorobanIntentAuthorization::into_signed` converts one into it.
 
 ### Changed
 
@@ -597,6 +602,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process, so a test that installs or reads the mock keyring store holds the
   same `serial_test` key as every other test in its binary that touches the
   store or the process environment (`STELLAR_AGENT_HOME`).
+- `AuditEntry::new_x402_payment_authorized` takes the signature expiration
+  ledger as its last parameter. The `x402_payment_authorized` row gains
+  `signature_expiration_ledger`, the last ledger at which the signed
+  authorization is valid. A row with it verifies with this release or later.
+  An older binary refuses once a checked root HMAC, later row or tip anchor
+  covers that row. It can read an uncovered tail with the field dropped; a row
+  it then appends makes this release refuse the extended log at that row. Rows
+  without the field retain their serialized form.
+- `sign_soroban_auth_entry_authorized` takes the
+  `MainnetSorobanIntentAuthorization` by value and returns the signature with
+  a `MainnetSignedSorobanIntent`; `consume_soroban_intent` takes the
+  `MainnetSignedSorobanIntent`. `SorobanIntentRequest` gains `nonce` and
+  `signature_expiration_ledger`, the entry fields the signed preimage must
+  carry. `MainnetPrecondition` gains `EntryNonce` (`entry_nonce`) and
+  `EntryExpiration` (`entry_expiration`), both reported as
+  `network.mainnet_authorization_refused`.
 
 ### Removed
 
@@ -937,6 +958,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ledger sequence refuses with `network.rpc_response_malformed` before the
   send, and a reservation recorded against ledger 0 never releases on
   `NOT_FOUND`.
+- A mainnet x402 payment below its cross-check threshold has the oracle answer
+  its mainnet identity and `getLatestLedger` before the payer signs. The
+  oracle's ledger must trail the primary's simulation ledger by at most two
+  ledgers and lie before the signature expiration ledger, or the payment
+  refuses with `simulation.divergence`, so a primary that reports an inflated
+  ledger cannot stretch the signed window. A mainnet profile without
+  `oracle_provider_url` refuses every x402 payment with
+  `network.witness_unavailable` before the payer signs.
+- Every mainnet x402 error reply after the transmit gate passes appends
+  `; the signed authorization may have reached the configured RPC and is valid
+  through ledger <L>`, the ledger the `x402_payment_authorized` row records.
+  The codes and the message prefixes are unchanged.
+- A mainnet Soroban intent authorization binds the authorization entry's nonce
+  and signature expiration ledger and signs one preimage. A preimage under
+  another nonce or another expiration ledger refuses before key access, and a
+  second signature needs a second authorization.
 
 ## [0.1.0-alpha.12] - 2026-10-15
 

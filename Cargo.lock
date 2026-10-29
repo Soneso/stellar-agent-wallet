@@ -4867,6 +4867,7 @@ dependencies = [
  "stellar-agent-sep53",
  "stellar-agent-sep7",
  "stellar-agent-smart-account",
+ "stellar-agent-soroban-auth",
  "stellar-agent-stablecoin",
  "stellar-agent-test-support",
  "stellar-agent-toolsets",

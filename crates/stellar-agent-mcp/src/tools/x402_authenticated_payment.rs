@@ -1126,7 +1126,11 @@ impl WalletServer {
                     "before signed transmission"
                 };
                 audit.record_withheld(X402Failure::CreatePayment(&error));
-                return Ok(mainnet_payment_error(&error, withheld));
+                return Ok(mainnet_payment_error(
+                    &error,
+                    withheld,
+                    audit.transmitted_ledger(),
+                ));
             }
         };
         let id = created.authorization.id();
@@ -1148,7 +1152,11 @@ impl WalletServer {
                 Ok(signature) => signature,
                 Err(error) => {
                     let withheld = withhold(ReleaseFailure::Encoding);
-                    return Ok(mainnet_x402_error(&error, withheld));
+                    return Ok(mainnet_x402_error(
+                        &error,
+                        withheld,
+                        audit.transmitted_ledger(),
+                    ));
                 }
             };
         let envelope = &created.payment.payload.payload.transaction;
@@ -1160,7 +1168,11 @@ impl WalletServer {
         ) {
             let withheld = withhold(ReleaseFailure::ReleaseConsume);
             let error = stellar_agent_x402::X402Error::MainnetAuthorization(error);
-            return Ok(mainnet_payment_error(&error, withheld));
+            return Ok(mainnet_payment_error(
+                &error,
+                withheld,
+                audit.transmitted_ledger(),
+            ));
         }
         let final_digest = stellar_agent_core::hex::encode(
             &stellar_agent_core::approval::subject::approval_subject_classic(envelope),
@@ -1176,15 +1188,11 @@ impl WalletServer {
         });
         if let Err(error) = require_terminal_consumption(terminal) {
             let withheld = withhold(ReleaseFailure::TerminalApproval);
-            let code = error.code();
-            let message = if code
-                == stellar_agent_core::error::NetworkError::MainnetAuthorizationRefused.code()
-            {
-                PAYMENT_REFUSAL_TEXT.to_owned()
-            } else {
-                format!("payment withheld {withheld}: {}", error.message())
-            };
-            return Ok(business_error_result(code, message));
+            return Ok(terminal_payment_error(
+                &error,
+                withheld,
+                audit.transmitted_ledger(),
+            ));
         }
         Ok(payment_response(
             &payment_signature,
@@ -1231,13 +1239,25 @@ impl WalletServer {
 /// `network.mainnet_write_forbidden`, an endpoint identity or cross-check
 /// refusal keeps its own code, and every other failure is
 /// `x402.payment_build_failed`.
+///
+/// `transmitted` is the signature expiration ledger of an authorization the
+/// transmit gate let through. The denial, refusal and build-failure texts
+/// then end with the sentence of
+/// [`crate::tools::x402_create_payment::transmitted_authorization`]. The
+/// `FeatureDisabled`, endpoint identity and cross-check refusals arise only
+/// before anything is signed and keep their texts.
 #[cfg(feature = "mainnet-write")]
-fn mainnet_payment_error(error: &stellar_agent_x402::X402Error, withheld: &str) -> CallToolResult {
+fn mainnet_payment_error(
+    error: &stellar_agent_x402::X402Error,
+    withheld: &str,
+    transmitted: Option<u32>,
+) -> CallToolResult {
+    use crate::tools::x402_create_payment::transmitted_authorization;
     use stellar_agent_network::mainnet::MainnetAuthorizationError;
     use stellar_agent_x402::X402Error;
     match error {
         X402Error::MainnetAuthorization(MainnetAuthorizationError::PolicyDenied(_)) => {
-            crate::tools::x402_create_payment::mainnet_x402_error(error, withheld)
+            crate::tools::x402_create_payment::mainnet_x402_error(error, withheld, transmitted)
         }
         X402Error::MainnetAuthorization(MainnetAuthorizationError::FeatureDisabled) => {
             crate::tools::common::x402_mainnet_signing_forbidden_result()
@@ -1245,14 +1265,46 @@ fn mainnet_payment_error(error: &stellar_agent_x402::X402Error, withheld: &str) 
         X402Error::MainnetAuthorization(_) | X402Error::MainnetAuthorizationRefused => {
             crate::tools::common::business_error_result(
                 stellar_agent_core::error::NetworkError::MainnetAuthorizationRefused.code(),
-                PAYMENT_REFUSAL_TEXT,
+                format!(
+                    "{PAYMENT_REFUSAL_TEXT}{}",
+                    transmitted_authorization(transmitted)
+                ),
             )
         }
         X402Error::EndpointIdentity(refusal) | X402Error::CrossCheck(refusal) => {
             crate::tools::common::endpoint_refusal_result(refusal)
         }
-        other => payment_build_error_result(&other.to_string()),
+        other => payment_build_error_result(&format!(
+            "{other}{}",
+            transmitted_authorization(transmitted)
+        )),
     }
+}
+
+/// Renders the refusal tombstone of the pending approval after the release
+/// consumption. A refused authorization answers with the payment refusal
+/// text, every other error with its own message after "payment withheld" and
+/// `withheld`; both end with the sentence of
+/// [`crate::tools::x402_create_payment::transmitted_authorization`] for
+/// `transmitted`.
+#[cfg(feature = "mainnet-write")]
+fn terminal_payment_error(
+    error: &stellar_agent_core::WalletError,
+    withheld: &str,
+    transmitted: Option<u32>,
+) -> CallToolResult {
+    let code = error.code();
+    let transmitted = crate::tools::x402_create_payment::transmitted_authorization(transmitted);
+    let message =
+        if code == stellar_agent_core::error::NetworkError::MainnetAuthorizationRefused.code() {
+            format!("{PAYMENT_REFUSAL_TEXT}{transmitted}")
+        } else {
+            format!(
+                "payment withheld {withheld}: {}{transmitted}",
+                error.message()
+            )
+        };
+    crate::tools::common::business_error_result(code, message)
 }
 
 // The x402 decode and error-envelope helpers are single-sourced in
@@ -1798,7 +1850,7 @@ mod tests {
             X402Error::MainnetAuthorization(A::Refused(P::ApprovalNonceReused)),
             X402Error::MainnetAuthorizationRefused,
         ] {
-            let result = mainnet_payment_error(&error, "after intent authorization");
+            let result = mainnet_payment_error(&error, "after intent authorization", None);
             let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
             assert_eq!(code, "network.mainnet_authorization_refused", "{error:?}");
             assert_eq!(message, PAYMENT, "{error:?}");
@@ -1809,6 +1861,7 @@ mod tests {
         let denied = mainnet_payment_error(
             &X402Error::MainnetAuthorization(A::PolicyDenied(Box::new(DenyReason::NoMatchingRule))),
             "before signed transmission",
+            None,
         );
         assert_eq!(
             crate::tools::common::assert_business_envelope(&denied).0,
@@ -1817,6 +1870,7 @@ mod tests {
         let disabled = mainnet_payment_error(
             &X402Error::MainnetAuthorization(A::FeatureDisabled),
             "before signed transmission",
+            None,
         );
         assert_eq!(
             crate::tools::common::assert_business_envelope(&disabled).0,
@@ -1827,11 +1881,79 @@ mod tests {
                 detail: "build failed".to_owned(),
             },
             "before signed transmission",
+            None,
         );
         assert_eq!(
             crate::tools::common::assert_business_envelope(&other).0,
             "x402.payment_build_failed"
         );
+    }
+
+    /// After the transmit gate the refusal, denial, build-failure and
+    /// terminal-approval texts end with the sentence naming the signature
+    /// expiration ledger, under unchanged codes; before it they do not.
+    #[cfg(feature = "mainnet-write")]
+    #[test]
+    fn post_gate_payment_errors_name_the_transmitted_authorization() {
+        use stellar_agent_network::mainnet::{
+            MainnetAuthorizationError as A, MainnetPrecondition as P,
+        };
+        use stellar_agent_x402::X402Error;
+        const SENTENCE: &str = "; the signed authorization may have reached the configured RPC \
+                                and is valid through ledger 1060";
+        let errors = [
+            (
+                X402Error::MainnetAuthorization(A::Refused(P::NotOpen)),
+                "network.mainnet_authorization_refused",
+            ),
+            (
+                X402Error::MainnetAuthorization(A::PolicyDenied(Box::new(
+                    DenyReason::NoMatchingRule,
+                ))),
+                "policy.deny.no_matching_rule",
+            ),
+            (
+                X402Error::RpcSimulateFailed {
+                    detail: "re-simulate returned error".to_owned(),
+                },
+                "x402.payment_build_failed",
+            ),
+        ];
+        for (error, expected) in &errors {
+            let before = mainnet_payment_error(error, "before signed transmission", None);
+            let (code, message, _) = crate::tools::common::assert_business_envelope(&before);
+            assert_eq!(code, *expected, "{error:?}");
+            assert!(!message.contains("valid through ledger"), "{message}");
+            let after = mainnet_payment_error(error, "after intent authorization", Some(1060));
+            let (code, message, _) = crate::tools::common::assert_business_envelope(&after);
+            assert_eq!(code, *expected, "{error:?}");
+            assert!(message.ends_with(SENTENCE), "{message}");
+        }
+        for (error, expected, prefix) in [
+            (
+                stellar_agent_core::WalletError::from(
+                    stellar_agent_core::error::NetworkError::MainnetAuthorizationRefused,
+                ),
+                "network.mainnet_authorization_refused",
+                PAYMENT_REFUSAL_TEXT.to_owned(),
+            ),
+            (
+                stellar_agent_core::WalletError::from(
+                    stellar_agent_core::error::ValidationError::ConfigInvalid {
+                        component: "approval",
+                        reason: "locked".to_owned(),
+                    },
+                ),
+                "validation.config_invalid",
+                "payment withheld at terminal approval: ".to_owned(),
+            ),
+        ] {
+            let result = terminal_payment_error(&error, "at terminal approval", Some(1060));
+            let (code, message, _) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(code, expected);
+            assert!(message.starts_with(&prefix), "{message}");
+            assert!(message.ends_with(SENTENCE), "{message}");
+        }
     }
 
     /// Each failure point of the payment after the identity gate selects the

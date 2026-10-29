@@ -148,6 +148,11 @@ pub enum MainnetPrecondition {
     Sequence,
     /// The Soroban intent digest differs.
     IntentDigest,
+    /// The authorization entry's nonce differs from the bound one.
+    EntryNonce,
+    /// The authorization entry's signature expiration ledger differs from
+    /// the bound one.
+    EntryExpiration,
     /// The parent intent record differs or does not qualify.
     IntentRecordMismatch,
     /// The final envelope digest differs.
@@ -285,6 +290,8 @@ impl MainnetPrecondition {
             Self::SourceAccount => "source_account",
             Self::Sequence => "sequence",
             Self::IntentDigest => "intent_digest",
+            Self::EntryNonce => "entry_nonce",
+            Self::EntryExpiration => "entry_expiration",
             Self::IntentRecordMismatch => "intent_record_mismatch",
             Self::FinalEnvelope => "final_envelope",
             Self::RootInvocation => "root_invocation",
@@ -507,6 +514,8 @@ mod tests {
             P::SourceAccount,
             P::Sequence,
             P::IntentDigest,
+            P::EntryNonce,
+            P::EntryExpiration,
             P::IntentRecordMismatch,
             P::FinalEnvelope,
             P::RootInvocation,
@@ -606,6 +615,8 @@ mod tests {
                 | P::SourceAccount
                 | P::Sequence
                 | P::IntentDigest
+                | P::EntryNonce
+                | P::EntryExpiration
                 | P::IntentRecordMismatch
                 | P::FinalEnvelope
                 | P::RootInvocation
@@ -714,6 +725,8 @@ mod tests {
             "source_account",
             "sequence",
             "intent_digest",
+            "entry_nonce",
+            "entry_expiration",
             "intent_record_mismatch",
             "final_envelope",
             "root_invocation",

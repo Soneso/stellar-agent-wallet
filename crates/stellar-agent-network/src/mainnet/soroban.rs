@@ -3,11 +3,14 @@
 //!
 //! The authorized SEP-43 signing path compares the preimage with the bound
 //! intent here. The intent digest is recomputed from the preimage's invocation
-//! under its network id. The invocation tree, root included, is bound; the nonce
-//! and signature expiration ledger, which the requester picks, are excluded.
+//! under its network id, so the invocation tree, root included, is bound. The
+//! preimage must also carry the entry's nonce and signature expiration ledger
+//! the authorization was resolved for. The host consumes each nonce once and
+//! accepts a signature through its expiration ledger, so the binding holds the
+//! authorization to one settlement within the approved window.
 
 use stellar_agent_core::profile::caip2::{Caip2, MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
-use stellar_agent_soroban_auth::{preimage_invocation, preimage_parts};
+use stellar_agent_soroban_auth::{preimage_entry, preimage_invocation, preimage_parts};
 use stellar_xdr::HashIdPreimage;
 
 use super::authorization::MainnetSorobanIntentAuthorization;
@@ -22,8 +25,9 @@ use super::{MainnetAuthorizationError, MainnetConsumer, MainnetPrecondition as P
 /// network passphrase. In order: the preimage must be envelope type 9 or 10
 /// and carry `network_id`; the network must be mainnet and the bound chain;
 /// `consumer` must be the bound consuming verb; the authorization must be
-/// unexpired at `now_ms`; and the intent digest of the preimage's invocation
-/// under `network_id` must be the bound one.
+/// unexpired at `now_ms`; the intent digest of the preimage's invocation
+/// under `network_id` must be the bound one; and the preimage's nonce and
+/// signature expiration ledger must be the bound entry's.
 ///
 /// # Errors
 ///
@@ -38,9 +42,11 @@ pub fn check_preimage_against_authorization(
     network_id: &[u8; 32],
     now_ms: u64,
 ) -> Result<(), MainnetAuthorizationError> {
-    let (Some((_, preimage_network, _)), Some(invocation)) =
-        (preimage_parts(preimage), preimage_invocation(preimage))
-    else {
+    let (Some((_, preimage_network, _)), Some(invocation), Some((nonce, expiration_ledger))) = (
+        preimage_parts(preimage),
+        preimage_invocation(preimage),
+        preimage_entry(preimage),
+    ) else {
         return Err(MainnetAuthorizationError::Refused(P::BindingMismatch));
     };
     require(&preimage_network == network_id, P::ChainMismatch)?;
@@ -49,7 +55,8 @@ pub fn check_preimage_against_authorization(
     authorization.check_not_expired(now_ms)?;
     let digest = soroban_intent_digest(network_id, invocation)
         .map_err(|_| MainnetAuthorizationError::Refused(P::IntentDigest))?;
-    authorization.check_intent_digest(&digest)
+    authorization.check_intent_digest(&digest)?;
+    authorization.check_entry(nonce, expiration_ledger)
 }
 
 /// The chain whose network id is `network_id`.
@@ -91,6 +98,11 @@ mod tests {
     use crate::policy_state::DomainBinding;
 
     const NOW: u64 = 1_800_000_000_000;
+    /// The nonce every authorization in this module binds.
+    const NONCE: i64 = 7;
+    /// The signature expiration ledger every authorization in this module
+    /// binds.
+    const EXPIRATION_LEDGER: u32 = 1_000;
 
     fn network_id(passphrase: &str) -> [u8; 32] {
         Sha256::digest(passphrase.as_bytes()).into()
@@ -154,7 +166,7 @@ mod tests {
     }
 
     /// An intent authorization for `X402Create` over the approved invocation
-    /// on mainnet, valid at [`NOW`].
+    /// under [`NONCE`] and [`EXPIRATION_LEDGER`] on mainnet, valid at [`NOW`].
     struct Case {
         _dir: TempDir,
         authorization: MainnetSorobanIntentAuthorization,
@@ -195,6 +207,8 @@ mod tests {
                     authorization_ttl_ms: TTL_MS,
                     header,
                     binding: DomainBinding::Soroban { intent_digest },
+                    nonce: NONCE,
+                    signature_expiration_ledger: EXPIRATION_LEDGER,
                 });
             Self {
                 _dir: dir,
@@ -226,13 +240,15 @@ mod tests {
         }
     }
 
+    /// A type 9 preimage over the approved invocation, under the bound nonce
+    /// and signature expiration ledger, is accepted.
     #[test]
     fn the_approved_preimage_is_accepted() {
         let case = Case::new();
         let mainnet = network_id(MAINNET_PASSPHRASE);
         case.check(
             MainnetConsumer::X402Create,
-            &preimage(mainnet, 7, 1_000, approved_invocation()),
+            &preimage(mainnet, NONCE, EXPIRATION_LEDGER, approved_invocation()),
             mainnet,
             NOW,
         )
@@ -240,7 +256,8 @@ mod tests {
     }
 
     /// A type 10 preimage, bound to its signer's address, over the approved
-    /// invocation is accepted as well.
+    /// invocation under the bound nonce and signature expiration ledger is
+    /// accepted as well.
     #[test]
     fn the_approved_address_bound_preimage_is_accepted() {
         let case = Case::new();
@@ -250,8 +267,8 @@ mod tests {
             &versioned_preimage(
                 AuthCredentialsVersion::V2,
                 mainnet,
-                7,
-                1_000,
+                NONCE,
+                EXPIRATION_LEDGER,
                 approved_invocation(),
             ),
             mainnet,
@@ -260,20 +277,59 @@ mod tests {
         .expect("the approved invocation in a type 10 preimage is accepted");
     }
 
-    /// The nonce and the signature expiration ledger are the requester's and
-    /// are not part of the intent digest.
+    /// The approved invocation under another nonce is another authorization
+    /// entry, which the host would settle on its own.
     #[test]
-    fn the_nonce_and_expiration_ledger_are_excluded() {
+    fn another_nonce_is_refused() {
         let case = Case::new();
         let mainnet = network_id(MAINNET_PASSPHRASE);
-        for (nonce, expiration_ledger) in [(7, 1_000), (-91, 77_777)] {
-            case.check(
-                MainnetConsumer::X402Create,
-                &preimage(mainnet, nonce, expiration_ledger, approved_invocation()),
-                mainnet,
-                NOW,
-            )
-            .expect("nonce and expiration ledger do not change the intent");
+        for version in [AuthCredentialsVersion::V1, AuthCredentialsVersion::V2] {
+            for nonce in [NONCE + 1, -91] {
+                assert_eq!(
+                    refused(case.check(
+                        MainnetConsumer::X402Create,
+                        &versioned_preimage(
+                            version,
+                            mainnet,
+                            nonce,
+                            EXPIRATION_LEDGER,
+                            approved_invocation(),
+                        ),
+                        mainnet,
+                        NOW,
+                    )),
+                    P::EntryNonce,
+                    "{version:?} nonce {nonce}"
+                );
+            }
+        }
+    }
+
+    /// The approved invocation under another signature expiration ledger,
+    /// earlier or later, is refused.
+    #[test]
+    fn another_expiration_ledger_is_refused() {
+        let case = Case::new();
+        let mainnet = network_id(MAINNET_PASSPHRASE);
+        for version in [AuthCredentialsVersion::V1, AuthCredentialsVersion::V2] {
+            for expiration_ledger in [EXPIRATION_LEDGER - 1, EXPIRATION_LEDGER + 1, 77_777] {
+                assert_eq!(
+                    refused(case.check(
+                        MainnetConsumer::X402Create,
+                        &versioned_preimage(
+                            version,
+                            mainnet,
+                            NONCE,
+                            expiration_ledger,
+                            approved_invocation(),
+                        ),
+                        mainnet,
+                        NOW,
+                    )),
+                    P::EntryExpiration,
+                    "{version:?} expiration {expiration_ledger}"
+                );
+            }
         }
     }
 
@@ -285,7 +341,7 @@ mod tests {
         assert_eq!(
             refused(case.check(
                 MainnetConsumer::X402Create,
-                &preimage(mainnet, 7, 1_000, changed),
+                &preimage(mainnet, NONCE, EXPIRATION_LEDGER, changed),
                 mainnet,
                 NOW,
             )),
@@ -301,7 +357,7 @@ mod tests {
         assert_eq!(
             refused(case.check(
                 MainnetConsumer::X402Create,
-                &preimage(mainnet, 7, 1_000, changed),
+                &preimage(mainnet, NONCE, EXPIRATION_LEDGER, changed),
                 mainnet,
                 NOW,
             )),
@@ -316,7 +372,7 @@ mod tests {
         assert_eq!(
             refused(case.check(
                 MainnetConsumer::X402Authenticated,
-                &preimage(mainnet, 7, 1_000, approved_invocation()),
+                &preimage(mainnet, NONCE, EXPIRATION_LEDGER, approved_invocation()),
                 mainnet,
                 NOW,
             )),
@@ -331,7 +387,7 @@ mod tests {
         assert_eq!(
             refused(case.check(
                 MainnetConsumer::X402Create,
-                &preimage(mainnet, 7, 1_000, approved_invocation()),
+                &preimage(mainnet, NONCE, EXPIRATION_LEDGER, approved_invocation()),
                 mainnet,
                 NOW + TTL_MS,
             )),
@@ -349,8 +405,8 @@ mod tests {
                 MainnetConsumer::X402Create,
                 &preimage(
                     network_id(TESTNET_PASSPHRASE),
-                    7,
-                    1_000,
+                    NONCE,
+                    EXPIRATION_LEDGER,
                     approved_invocation()
                 ),
                 network_id(MAINNET_PASSPHRASE),
@@ -367,7 +423,7 @@ mod tests {
         assert_eq!(
             refused(case.check(
                 MainnetConsumer::X402Create,
-                &preimage(testnet, 7, 1_000, approved_invocation()),
+                &preimage(testnet, NONCE, EXPIRATION_LEDGER, approved_invocation()),
                 testnet,
                 NOW,
             )),
@@ -382,7 +438,7 @@ mod tests {
         assert_eq!(
             refused(case.check(
                 MainnetConsumer::X402Create,
-                &preimage(unknown, 7, 1_000, approved_invocation()),
+                &preimage(unknown, NONCE, EXPIRATION_LEDGER, approved_invocation()),
                 unknown,
                 NOW,
             )),
