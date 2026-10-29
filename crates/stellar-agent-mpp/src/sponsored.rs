@@ -104,6 +104,16 @@ pub(crate) struct StoredPreparedCharge {
     artifact_hash: [u8; 32],
 }
 
+impl StoredPreparedCharge {
+    pub(crate) fn payer(&self) -> &str {
+        &self.payer
+    }
+
+    pub(crate) const fn selected(&self) -> &SelectedChallenge {
+        &self.selected
+    }
+}
+
 impl PreparedSponsoredCharge {
     /// Returns the validated challenge and charge terms.
     #[must_use]

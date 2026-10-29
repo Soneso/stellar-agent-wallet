@@ -2798,10 +2798,17 @@ impl AuditEntry {
     }
 
     /// Records an acknowledged MPP reset request before state mutation.
+    ///
+    /// `carried_generation` is the generation of the authenticated snapshot
+    /// the reset carries, `None` when it discards the history, and
+    /// `stale_carry` whether the committed counter proves that snapshot older
+    /// than the last committed one.
     #[must_use]
     pub fn new_mpp_state_reset(
         profile: impl Into<String>,
         discarded_generation: Option<u64>,
+        carried_generation: Option<u64>,
+        stale_carry: bool,
         reason: &str,
         request_id: impl Into<String>,
     ) -> Self {
@@ -2820,6 +2827,8 @@ impl AuditEntry {
             event_kind: EventKind::MppStateReset {
                 profile: profile.into(),
                 discarded_generation,
+                carried_generation,
+                stale_carry,
                 reason: crate::audit_log::schema::bound_recorded_str(reason),
             },
             previous_entry_hash: String::new(),

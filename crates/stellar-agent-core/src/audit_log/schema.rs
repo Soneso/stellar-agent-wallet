@@ -3172,12 +3172,20 @@ pub enum EventKind {
         generation: u64,
     },
 
-    /// An acknowledged MPP history reset was requested under the store lock.
+    /// An acknowledged MPP state reset was requested under the store lock.
     MppStateReset {
-        /// Profile whose replay markers are discarded.
+        /// Profile whose MPP state is reset.
         profile: String,
         /// Trusted generation discarded, or null for an absent/unparseable counter.
         discarded_generation: Option<u64>,
+        /// Generation of the authenticated snapshot the reset carries; absent
+        /// when no snapshot authenticates and the reset discards the history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        carried_generation: Option<u64>,
+        /// Whether the committed counter proves the carried snapshot older than
+        /// the last committed one; absent when false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stale_carry: bool,
         /// Bounded operator reason.
         reason: String,
     },
@@ -5845,8 +5853,14 @@ mod tests {
     fn mpp_state_lifecycle_events_round_trip() {
         use crate::audit_log::AuditEntry;
         let adopted = AuditEntry::new_mpp_state_adopted("alice", 7, "adopt-request");
-        let reset =
-            AuditEntry::new_mpp_state_reset("alice", Some(9), "operator recovery", "reset-request");
+        let reset = AuditEntry::new_mpp_state_reset(
+            "alice",
+            Some(9),
+            None,
+            false,
+            "operator recovery",
+            "reset-request",
+        );
         for (entry, kind, generation_field, generation) in [
             (adopted, "mpp_state_adopted", "generation", 7),
             (reset, "mpp_state_reset", "discarded_generation", 9),
@@ -5858,7 +5872,8 @@ mod tests {
             let decoded: AuditEntry = serde_json::from_value(value).unwrap();
             assert_eq!(decoded.event_kind, entry.event_kind);
         }
-        let missing = AuditEntry::new_mpp_state_reset("alice", None, "recovery", "request");
+        let missing =
+            AuditEntry::new_mpp_state_reset("alice", None, None, false, "recovery", "request");
         let wire = serde_json::to_value(&missing).unwrap();
         assert!(wire["discarded_generation"].is_null());
         let decoded: AuditEntry = serde_json::from_value(wire).unwrap();
@@ -6265,6 +6280,46 @@ mod tests {
                 serde_json::from_str::<WipedAccrualRecord>(&json).unwrap(),
                 record
             );
+        }
+    }
+
+    /// A discarding MPP reset row keeps its serialized bytes; a carrying row
+    /// adds the carried generation and, only when set, the stale flag.
+    #[test]
+    fn mpp_reset_row_carry_fields_are_additive() {
+        let golden =
+            r#"{"kind":"mpp_state_reset","profile":"alice","discarded_generation":4,"reason":"r"}"#;
+        let row: EventKind = serde_json::from_str(golden).unwrap();
+        assert!(matches!(
+            &row,
+            EventKind::MppStateReset {
+                carried_generation: None,
+                stale_carry: false,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_string(&row).unwrap(), golden);
+
+        for (stale_carry, expected) in [
+            (
+                false,
+                r#"{"kind":"mpp_state_reset","profile":"alice","discarded_generation":4,"carried_generation":3,"reason":"r"}"#,
+            ),
+            (
+                true,
+                r#"{"kind":"mpp_state_reset","profile":"alice","discarded_generation":4,"carried_generation":1,"stale_carry":true,"reason":"r"}"#,
+            ),
+        ] {
+            let row = EventKind::MppStateReset {
+                profile: "alice".to_owned(),
+                discarded_generation: Some(4),
+                carried_generation: Some(if stale_carry { 1 } else { 3 }),
+                stale_carry,
+                reason: "r".to_owned(),
+            };
+            let json = serde_json::to_string(&row).unwrap();
+            assert_eq!(json, expected);
+            assert_eq!(serde_json::from_str::<EventKind>(&json).unwrap(), row);
         }
     }
 

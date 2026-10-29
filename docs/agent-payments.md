@@ -223,9 +223,10 @@ trusted counter. A profile whose state key exists with neither a counter nor a
 state file holds no replay history; it refuses with a missing anchor, and a
 reset recovers it without discarding any record.
 
-With the headless keyring backend the counter is kept in a file on the same
-host. Anyone who can replace both that keyring file and the MPP state file can
-restore older history, so protect the headless keyring directory separately.
+With the headless keyring backend the committed and intent counters are kept
+in a file on the same host. Anyone who can replace both that keyring file and
+the MPP state file can restore older history, so protect the headless keyring
+directory separately.
 The same file holds the audit log's tip anchor, its re-anchor counter, the
 audit binding, and the policy window state's key and generation counter.
 Anyone who can write that file can restore older entries or delete one, which
@@ -239,13 +240,33 @@ recovery command is:
 stellar-agent profile reset-mpp-state default --acknowledge --reason "state recovery"
 ```
 
-This command discards all replay markers for prepared, authorized, indeterminate
-and settled charges. A charge settled before reset is no longer recognized as
-settled. Reset records the discarded generation in the audit log, rotates the
-state key, removes the state file, and resets the counter to zero. A newly
-minted key with counter zero and no file is a valid empty store. The next prepare
-can proceed. Reset requires a usable audit log and its key; it is never an
-automatic response to a state failure.
+Reset audits the request and keeps every record of the state file on disk when
+that file authenticates. It closes charges not yet committed as
+`expired_unresolved`; authorized, indeterminate, and settled statuses survive.
+It keeps the state key and publishes the carried history above both counters.
+The result includes `carried_records` and `carried_generation`.
+
+The carried snapshot is the one on disk. If the state file was rolled back to
+an older copy before the reset, the records written after that copy are lost.
+When the generation counter proves such a rollback, the result sets
+`stale_carry` and names it in `warnings`. Challenges those lost records answered
+are refused while they can still be live: for five minutes after the reset, a
+challenge expiring within that window returns `mpp.challenge_expired`.
+
+When no snapshot authenticates, reset discards every replay marker, rotates the
+state key, and starts an empty store with the same five-minute refusal window.
+A charge settled before that reset loses its settled status. A keyring or file
+access error refuses the reset and changes nothing; retry once the error
+clears. Reset requires a usable audit log and its key; it is never automatic.
+Interrupted writes keep the committed snapshot readable or complete on the next
+read when the published snapshot matches the intent counter.
+
+Repeated prepare matches the exact challenge, payer, and request context,
+independently of preparation time. Prune retains the largest expiry it removes
+and refuses new challenges expiring at or below that watermark with a host-clock
+message. Once a record is pruned, a challenge with a distant or absent expiry
+can prepare again under a correct clock. Replay protection is bounded by record
+retention; a payee can also issue a fresh challenge at any time.
 
 `mpp state prune` on a profile with no MPP history succeeds with `pruned: 0`
 and records the maintenance request in the audit log, the same as pruning a

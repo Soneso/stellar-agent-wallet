@@ -144,6 +144,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- MPP state adds a `default-generation-intent` keyring entry beside its committed
+  counter; `intent_account` and `generation_intent_account` derive its account.
+  `reset_for_profile` accepts the current time and returns `MppStateReset`.
+  The `reset-mpp-state` result adds `carried_records`, `carried_generation`,
+  `stale_carry` and `warnings`, and `AuditEntry::new_mpp_state_reset` takes the
+  carried generation and the stale flag, which the `mpp_state_reset` row records
+  when set. `find_for_prepare` looks up challenge identity before pending
+  approval creation.
 - `ToolsetGrantStore::find_matching` takes a `GrantQuery`, the attestation key,
   and the profile/chain binding. `GatedInvokeParams` gains `attestation_key`
   and `attestation_binding`; its debug output redacts the key.
@@ -567,6 +575,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Interrupted MPP writes leave the committed store readable or complete on the
+  next read. State reset keeps authenticated records and closes unclaimed
+  charges, and a keyring or file access error refuses it without changing
+  anything. A repeated prepare of a challenge whose unclaimed record expired
+  returns `mpp.challenge_expired`.
 - SEP-43 `signMessage` documentation describes the SEP-53 prefixed digest and
   standard base64 signature. Both message tools produce the same signature bytes.
 - The `minimum_reserve` criterion counts the transaction fee of a decoded
@@ -647,6 +660,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release publication uploads only the archives `SHA256SUMS` lists, with
   matching digests.
 - Release binaries build with the pinned toolchain.
+- MPP replay checks match challenge identity at any later preparation time while
+  its record is retained. A pruned-expiry watermark refuses challenges at or below
+  removed expiries after a host-clock regression. An MPP state reset that
+  discards history, or carries a snapshot the generation counter proves rolled
+  back, raises the watermark to five minutes past the reset, so a challenge
+  whose record it lost is refused while it can still be live.
 - `stellar_rule_create_commit` spends its approval before the install starts.
   A retry with the same approval and attestation, directly or through
   `stellar_toolset_invoke`, returns `policy.approval_consumed` whether the

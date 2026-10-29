@@ -189,6 +189,32 @@ impl AuthorizationRecord {
         &self.fingerprint
     }
 
+    /// Computes the replay identity from payer, request context, and exact challenge.
+    /// The identity is independent of the preparation time and effective expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted challenge error if context serialization fails.
+    pub(crate) fn challenge_identity(&self) -> Result<[u8; 32], MppError> {
+        let selected = self.prepared.selected();
+        let context_digest = selected.context().digest()?;
+        let mut hash = Sha256::new();
+        hash.update(b"stellar-agent-mpp-challenge:v1\0");
+        for value in [
+            self.prepared.payer().as_bytes(),
+            &context_digest,
+            selected.challenge_digest(),
+        ] {
+            hash.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hash.update(value);
+        }
+        Ok(hash.finalize().into())
+    }
+
+    pub(crate) const fn created_at(&self) -> i64 {
+        self.created_at
+    }
+
     /// Returns the current lifecycle state.
     #[must_use]
     pub const fn status(&self) -> AuthorizationStatus {
@@ -412,7 +438,8 @@ impl fmt::Debug for AuthorizationRecord {
 ///
 /// The bytes are those of
 /// [`stellar_agent_core::approval::mpp::authorization_fingerprint`], which
-/// pending approvals are checked against.
+/// pending approvals are checked against. Challenge identity supplies the replay
+/// key independently of the fingerprint and authorization identifier.
 ///
 /// # Errors
 ///

@@ -12,8 +12,9 @@ use super::caip2::Caip2;
 use super::loader::{guard_name_for_load, list_profiles_in_dir};
 use super::schema::{
     KeyringEntryRef, Profile, ProviderRole, WALLET_KEY_REFERENCE_FIELDS,
-    default_audit_log_path_for, default_profile_dir, generation_account, keyring_entry_alias,
-    mainnet_enablement_entry_ref, policy_pin_entry_ref, signer_identity_entry_ref,
+    default_audit_log_path_for, default_profile_dir, generation_account, generation_intent_account,
+    keyring_entry_alias, mainnet_enablement_entry_ref, policy_pin_entry_ref,
+    signer_identity_entry_ref,
 };
 
 /// A bounded, path-redacted keyring coordinate carried by a finding.
@@ -261,6 +262,7 @@ const REANCHOR_COUNTER: &str = "audit_log_hash_chain_key_id (reanchor counter)";
 const AUDIT_BINDING: &str = "audit binding (derived)";
 const MPP_STATE: &str = "mpp state (derived)";
 const MPP_GENERATION: &str = "mpp state (generation)";
+const MPP_GENERATION_INTENT: &str = "mpp state (generation intent)";
 
 fn read_document(path: &Path) -> Result<Option<ExplicitFields>, ()> {
     let bytes = match std::fs::read(path) {
@@ -388,9 +390,13 @@ fn effective_coordinates(
     entries.push((
         MPP_GENERATION,
         KeyringEntryRef {
-            service: mpp.service,
+            service: mpp.service.clone(),
             account: generation_account(&mpp.account),
         },
+    ));
+    entries.push((
+        MPP_GENERATION_INTENT,
+        KeyringEntryRef::new(mpp.service, generation_intent_account(&mpp.account)),
     ));
     entries
 }
@@ -1064,6 +1070,9 @@ mod tests {
             }
             MPP_STATE => mpp,
             MPP_GENERATION => KeyringEntryRef::new(&mpp.service, generation_account(&mpp.account)),
+            MPP_GENERATION_INTENT => {
+                KeyringEntryRef::new(&mpp.service, generation_intent_account(&mpp.account))
+            }
             other => panic!("no derived fixture for {other}"),
         }
     }
@@ -1126,6 +1135,7 @@ mod tests {
     fn mpp_entries_are_reserved() {
         derived_collision(MPP_STATE);
         derived_collision(MPP_GENERATION);
+        derived_collision(MPP_GENERATION_INTENT);
     }
 
     /// The policy pin, the mainnet enablement nonce, and the signer identity

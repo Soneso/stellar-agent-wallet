@@ -2254,6 +2254,8 @@ mod tests {
             EventKind::MppStateReset {
                 profile: "default".to_owned(),
                 discarded_generation: Some(7),
+                carried_generation: Some(6),
+                stale_carry: true,
                 reason: "recovery".to_owned(),
             },
             EventKind::PolicyWindowStateReset {

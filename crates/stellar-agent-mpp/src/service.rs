@@ -148,7 +148,7 @@ pub fn persist_prepared_authorization(
     let mut record =
         AuthorizationRecord::new(profile_name, network_passphrase, prepared, now_unix)?;
 
-    if let Ok(existing) = state_store.load(record.authorization_id()) {
+    if let Some(existing) = state_store.find_for_prepare(&record, now_unix)? {
         if disposition == ApprovalDisposition::RequireApproval
             && existing.approval_nonce().is_none()
         {
@@ -156,9 +156,10 @@ pub fn persist_prepared_authorization(
                 return Err(state_error());
             }
             let store = approval_store.take().ok_or_else(state_error)?;
+            let existing_prepared = existing.prepared_charge()?;
             let pending = new_pending_approval(
                 &existing,
-                prepared,
+                &existing_prepared,
                 profile_name,
                 network_passphrase,
                 process_uid,
@@ -707,6 +708,43 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn a_repeated_challenge_reuses_the_first_authorization() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let state = store(&directory);
+        let mut approvals = PendingApprovalStore::open(directory.path().join("approvals.toml"))
+            .expect("approval store");
+        let (prepared, _, _) = prepared_fixture(NOW).await;
+        let first = persist_prepared_authorization(
+            "mpp-profile",
+            TESTNET_PASSPHRASE,
+            &prepared,
+            ApprovalDisposition::RequireApproval,
+            "424242",
+            NOW,
+            &state,
+            Some(&mut approvals),
+        )
+        .expect("first pending approval");
+        let (prepared, _, _) = prepared_fixture(NOW + 10).await;
+        let later = persist_prepared_authorization(
+            "mpp-profile",
+            TESTNET_PASSPHRASE,
+            &prepared,
+            ApprovalDisposition::RequireApproval,
+            "424242",
+            NOW + 10,
+            &state,
+            Some(&mut approvals),
+        )
+        .expect("reuse pending approval");
+        assert_eq!(later.authorization_id, first.authorization_id);
+        assert_eq!(later.approval_id, first.approval_id);
+        assert_eq!(approvals.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn approval_service_paths_require_the_attested_binding() {
         use stellar_agent_core::approval::{AttestationBinding, Surface, attest_and_persist};
 
@@ -952,18 +990,24 @@ mod tests {
 
         let mut approvals = PendingApprovalStore::open(directory.path().join("approvals.toml"))
             .expect("approval store");
+        let (prepared, _, _) = prepared_fixture(NOW + 10).await;
         let promoted = persist_prepared_authorization(
             "policy-change",
             TESTNET_PASSPHRASE,
             &prepared,
             ApprovalDisposition::RequireApproval,
             "424242",
-            NOW + 1,
+            NOW + 10,
             &state,
             Some(&mut approvals),
         )
         .expect("promote to approval");
         assert_eq!(promoted.authorization_id, ready.authorization_id);
+        assert_eq!(promoted.expires_at_unix, ready.expires_at_unix);
+        assert_eq!(
+            promoted.prepared_artifact_hash,
+            ready.prepared_artifact_hash
+        );
         assert_eq!(promoted.status, AuthorizationStatus::ApprovalPending);
         assert!(promoted.approval_id.is_some());
         assert_eq!(approvals.len(), 1);

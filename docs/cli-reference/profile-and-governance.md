@@ -562,20 +562,41 @@ stellar-agent profile reset-window-state default --reason "store file corrupted 
 
 ### `reset-mpp-state <NAME> --acknowledge --reason <REASON>`
 
-Resets MPP authorization state after rollback, an interrupted write, or an
-unrecoverable generation mismatch. Supply exactly one of positional `<NAME>` or
+Recovers MPP authorization state after rollback or an unrecoverable generation
+mismatch. Supply exactly one of positional `<NAME>` or
 `--profile <NAME>`. Both `--reason <REASON>` and `--acknowledge` are required.
 
-The acknowledgement discards replay markers for every prepared, authorized,
-indeterminate and settled charge; a charge settled before reset is no longer
-recognized as settled. Reset requires a usable audit log and writes one
-`mpp_state_reset` request row naming the profile, discarded generation and reason.
-It takes the MPP store lock, rotates the HMAC key, removes the file, and sets the
-counter to zero. The next prepare starts from an empty store. A failed reset can
-be retried with acknowledgement; each attempt records its request before changing
-state. An absent or malformed counter has a null discarded generation.
-A blank or whitespace-only `--reason` exits `1` with `validation.reason_empty`
-before anything changes.
+The acknowledgement keeps every record of the state file on disk when it
+authenticates, and closes charges not yet committed as `expired_unresolved`.
+Authorized, indeterminate, and settled statuses survive. Reset holds the MPP
+store lock, keeps the key, and publishes the carried history above both
+generation counters. A state file rolled back to an older copy before the reset
+loses the records written after that copy. When the generation counter proves
+the rollback, the result sets `stale_carry` and names it in one `warnings` line.
+
+When no snapshot authenticates, reset discards every replay marker, rotates the
+key, removes the file, sets the committed counter to zero, deletes the intent,
+and publishes an empty store. A charge settled before that discard loses its
+settled status. A stale carry and a discard both refuse, with
+`mpp.challenge_expired`, every challenge that expires no later than five minutes
+after the reset, which covers every charge whose record the reset could not
+keep. A
+keyring access error, a file read error, or a state path that is not a regular
+file refuses the reset before its audit row and changes nothing.
+
+Reset requires a usable audit log and writes `mpp_state_reset` with the
+profile, discarded generation, carried generation, stale flag, and reason before
+mutation. The result adds `carried_records`, `carried_generation` (null on a
+discard), `stale_carry`, and `warnings`. An absent or malformed committed
+counter has a null discarded generation. A failed reset can be retried with
+acknowledgement; each attempt records its request. A blank or whitespace-only
+`--reason` exits `1` with `validation.reason_empty` before anything changes.
+
+A discarding reset row has no `carried_generation` and retains its serialized
+form. A carrying row adds `carried_generation`, and `stale_carry` when it is
+true; it verifies with this release or later. An older binary drops those
+fields when computing the row hash, with the same consequences as for the
+`wiped` field of `reset-window-state`.
 
 ```sh
 stellar-agent profile reset-mpp-state default --acknowledge --reason "MPP state recovery"

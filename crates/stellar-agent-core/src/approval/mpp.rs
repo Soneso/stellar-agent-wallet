@@ -1,8 +1,10 @@
 //! Binding between the displayed terms of an MPP charge approval and the
 //! authorization it commits.
 //!
-//! The authorization fingerprint is the MPP store's replay and idempotency key
-//! and the source of its `authorization_id`, so its bytes are fixed: the tag
+//! The authorization fingerprint is the source of the MPP store's
+//! `authorization_id` and of the approval binding, so its bytes are fixed.
+//! Reuse and replay of a challenge key on its challenge identity, which the
+//! store derives separately. The fingerprint uses the tag
 //! `stellar-agent-mpp-authorization:v1\0`, then the profile, the SHA-256 of
 //! the network passphrase, the payer, the request-context digest, the
 //! challenge digest, the scheme constants `stellar`, `charge` and

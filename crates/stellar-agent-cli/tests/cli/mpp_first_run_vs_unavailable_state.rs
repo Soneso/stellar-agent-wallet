@@ -667,8 +667,13 @@ fn mpp_reset_requires_acknowledgement_and_audits_recovery() {
     );
     assert_eq!(reset.code, 0, "{} {}", reset.stdout, reset.stderr);
     assert_eq!(reset.json()["data"]["discarded_generation"], 5);
-    assert_eq!(anchor.get_password().expect("counter"), "0");
-    assert!(!state_path(home.path()).exists());
+    assert_eq!(reset.json()["data"]["carried_records"], 0);
+    assert!(reset.json()["data"]["carried_generation"].is_null());
+    assert_eq!(reset.json()["data"]["stale_carry"], false);
+    assert_eq!(reset.json()["data"]["warnings"], serde_json::json!([]));
+    // The discard publishes an empty snapshot that carries the watermark.
+    assert_eq!(anchor.get_password().expect("counter"), "1");
+    assert!(state_path(home.path()).is_file());
     let clean = run_cli(home.path(), &status_args(), None);
     assert_eq!(clean.code_field(), NOT_FOUND_CODE);
     let rows: Vec<Value> = audit_log(home.path())
@@ -683,5 +688,88 @@ fn mpp_reset_requires_acknowledgement_and_audits_recovery() {
     let help = run_cli(home.path(), &["profile", "reset-mpp-state", "--help"], None);
     assert_eq!(help.code, 0);
     let help = help.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(help.contains("Discard replay markers for every prepared, authorized, indeterminate and settled charge; a charge settled before the reset is no longer recognized as settled."));
+    assert!(help.contains("Keep the records of the MPP snapshot on disk when it authenticates and close charges not yet committed. A state file rolled back before the reset loses the records written after that snapshot; the result reports a carry the generation counter proves stale. When no snapshot authenticates, every replay marker is discarded, and a charge settled before the reset loses its settled status."));
+}
+
+/// HMAC-SHA256 of the MPP state file: the domain the store authenticates
+/// under, then the body.
+fn mpp_state_tag(key: &[u8; 32], body: &[u8]) -> [u8; 32] {
+    const DOMAIN: &[u8] = b"stellar-agent-mpp-state:v1\0";
+    let mut inner_pad = [0x36_u8; 64];
+    let mut outer_pad = [0x5c_u8; 64];
+    for (index, byte) in key.iter().enumerate() {
+        inner_pad[index] ^= byte;
+        outer_pad[index] ^= byte;
+    }
+    let inner = Sha256::new()
+        .chain_update(inner_pad)
+        .chain_update(DOMAIN)
+        .chain_update(body)
+        .finalize();
+    Sha256::new()
+        .chain_update(outer_pad)
+        .chain_update(inner)
+        .finalize()
+        .into()
+}
+
+/// A snapshot more than one generation below the committed counter was
+/// rolled back. The reset carries it and names the stale carry in one
+/// warning line, in the result and in the audit row.
+#[test]
+#[serial]
+fn mpp_reset_reports_a_stale_carry() {
+    let home = fresh_home();
+    mint_audit_key(home.path());
+    mint_mpp_state_key(home.path());
+    let coord =
+        stellar_agent_core::profile::schema::KeyringEntryRef::default_mpp_state_key(PROFILE);
+    let body = br#"{"version":2,"generation":1,"records":[]}"#;
+    let path = state_path(home.path());
+    std::fs::create_dir_all(path.parent().expect("state directory")).expect("state directory");
+    std::fs::write(
+        &path,
+        [mpp_state_tag(&[9; 32], body).as_slice(), body.as_slice()].concat(),
+    )
+    .expect("authenticated snapshot");
+    let anchor = keyring_core::Entry::new(&coord.service, &format!("{}-generation", coord.account))
+        .expect("anchor");
+    anchor.set_password("5").expect("committed counter");
+    let rollback = run_cli(home.path(), &status_args(), None);
+    assert!(rollback.message_field().contains("rolled back"));
+    let reset = run_cli(
+        home.path(),
+        &[
+            "profile",
+            "reset-mpp-state",
+            PROFILE,
+            "--reason",
+            "recovery",
+            "--acknowledge",
+        ],
+        None,
+    );
+    assert_eq!(reset.code, 0, "{} {}", reset.stdout, reset.stderr);
+    let data = &reset.json()["data"];
+    assert_eq!(data["discarded_generation"], 5);
+    assert_eq!(data["carried_generation"], 1);
+    assert_eq!(data["carried_records"], 0);
+    assert_eq!(data["stale_carry"], true);
+    assert_eq!(
+        data["warnings"],
+        serde_json::json!([
+            "carried MPP snapshot generation 1 is older than committed generation 5; records written after it are lost"
+        ])
+    );
+    assert_eq!(anchor.get_password().expect("counter"), "6");
+    let rows: Vec<Value> = audit_log(home.path())
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("row"))
+        .filter(|row: &Value| row["kind"] == "mpp_state_reset")
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["carried_generation"], 1);
+    assert_eq!(rows[0]["stale_carry"], true);
+    let clean = run_cli(home.path(), &status_args(), None);
+    assert_eq!(clean.code_field(), NOT_FOUND_CODE);
 }
