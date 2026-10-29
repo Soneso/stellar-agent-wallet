@@ -41,7 +41,7 @@ use rand_core::OsRng;
 use serial_test::serial;
 use stellar_agent_core::approval::store::PendingApproval;
 use stellar_agent_core::approval::{
-    PendingApprovalStore, compute_attestation, envelope_sha256, process_uid_for_attestation,
+    PendingApprovalStore, compute_attestation_v4, envelope_sha256, process_uid_for_attestation,
 };
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
@@ -277,7 +277,7 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
 
     // The attestation blob exactly as `stellar-agent approve --id <nonce> --profile <name>` surfaces it.
     let sha = envelope_sha256(envelope_xdr.as_bytes());
-    let blob = compute_attestation(
+    let blob = compute_attestation_v4(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new(
             &server.profile_name_for_approval(),
@@ -287,8 +287,23 @@ async fn pay_with_approval_commits_and_submits_on_testnet() {
         &sha,
         &uid,
         &attested.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
+    {
+        // `approve` records the blob with its approver; the commit gate
+        // verifies the presented blob against that record.
+        let store_path = approval_dir.path().join(format!("{g_strkey}.toml"));
+        let mut store = PendingApprovalStore::open(store_path).expect("open store");
+        store
+            .record_attestation(
+                &approval_nonce,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
+            .expect("record the local approval");
+        // Store dropped: lock released so the commit gate can open it.
+    }
 
     // ── 3. Commit: gate verifies the attestation, signs, and submits on-chain ──
     let commit = server

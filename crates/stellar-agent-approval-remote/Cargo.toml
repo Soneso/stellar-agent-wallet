@@ -81,6 +81,9 @@ operator-enroll-browser-acceptance = ["test-helpers"]
 
 [dev-dependencies]
 stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
+# The operator-enroll browser acceptance suite posts real registrations from a
+# software authenticator over HTTP.
+stellar-agent-approval-ui = { path = "../stellar-agent-approval-ui", features = ["test-helpers"] }
 # The cross-port browser acceptance tests run a second loopback HTTP service
 # on a raw socket.
 tokio = { workspace = true, features = ["io-util", "net"] }

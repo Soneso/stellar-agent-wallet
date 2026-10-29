@@ -673,7 +673,7 @@ impl ResolverFixture {
             &AttestationBinding::new(name, profile.chain_id.caip2_str()),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit.writer().lock().unwrap()),
-            None,
+            &stellar_agent_core::approval::AttestedApprover::Local,
             |_, _| Err("unexpected grant".to_owned()),
         )
         .unwrap();

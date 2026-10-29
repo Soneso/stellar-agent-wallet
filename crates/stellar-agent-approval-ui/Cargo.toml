@@ -46,9 +46,13 @@ rand_core = { workspace = true }
 # Hex encoding for the tokens emitted in URLs / cookies / CSRF headers.
 hex = { workspace = true }
 
-# HMAC-SHA256 CSRF derivation over the approval nonce.
+# HMAC-SHA256 CSRF derivation over the approval nonce; SHA-256 of the RP ID
+# and of the enrollment confirmation code.
 hmac = { workspace = true }
 sha2 = { workspace = true }
+
+# P-256 point validation of the credential key an enrollment registers.
+p256 = { workspace = true }
 
 # JSON response bodies and the pending.json shape. The redacted view types are
 # serialised through their own `Serialize` impls in `stellar-agent-core`; this
@@ -71,6 +75,13 @@ thiserror = { workspace = true }
 
 # request_id generation for the ApprovalRejected audit event.
 uuid = { workspace = true }
+
+[features]
+# Exposes `operator_enroll::test_support`: a software registrar producing real
+# `none`-attestation registration responses, and a loopback client that drives
+# a running enrollment server. Enabled for tests and by the explicit
+# `test-helpers` feature; the release binaries are built without it.
+test-helpers = []
 
 [dev-dependencies]
 # ServiceExt::oneshot for in-process router tests.

@@ -3926,7 +3926,7 @@ pub(crate) mod tests {
             ),
             Surface::Cli,
             stellar_agent_core::approval::ConsentAudit::Writer(&mut consent_writer),
-            None,
+            &stellar_agent_core::approval::AttestedApprover::Local,
             |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
         )
         .unwrap()
@@ -4052,7 +4052,7 @@ pub(crate) mod tests {
             ),
             Surface::Cli,
             stellar_agent_core::approval::ConsentAudit::Writer(&mut consent_writer),
-            None,
+            &stellar_agent_core::approval::AttestedApprover::Local,
             |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
         )
         .unwrap()
@@ -4086,13 +4086,14 @@ pub(crate) mod tests {
             ("other-profile", "stellar:mainnet"),
             ("cross-check-acct", "stellar:testnet"),
         ] {
-            let wrong_blob = stellar_agent_core::approval::compute_attestation(
+            let wrong_blob = stellar_agent_core::approval::compute_attestation_v4(
                 &attestation_key,
                 &stellar_agent_core::approval::AttestationBinding::new(profile_name, chain_id),
                 &approval_nonce,
                 &stellar_agent_core::approval::envelope_sha256(envelope_xdr.as_bytes()),
                 &entry.process_uid,
                 &entry.attested_lifetime(),
+                &stellar_agent_core::approval::AttestedApprover::Local,
             );
             let wrong_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(wrong_blob);
             capture.clear();
@@ -4472,15 +4473,16 @@ pub(crate) mod tests {
     ) -> String {
         use base64::Engine as _;
         use stellar_agent_core::approval::{
-            AttestationBinding, PendingApprovalStore, compute_attestation, envelope_sha256,
+            AttestationBinding, PendingApprovalStore, compute_attestation_v4, envelope_sha256,
         };
-        let blob = compute_attestation(
+        let blob = compute_attestation_v4(
             &[77; 32],
             &AttestationBinding::new(&server.profile_name_for_approval(), "stellar:testnet"),
             &entry.approval_nonce,
             &envelope_sha256(b"AAAA"),
             &entry.process_uid,
             &entry.attested_lifetime(),
+            &stellar_agent_core::approval::AttestedApprover::Local,
         );
         let mut store = PendingApprovalStore::open(
             dir.join(format!("{}.toml", server.profile_name_for_approval())),
@@ -4491,7 +4493,11 @@ pub(crate) mod tests {
             store.insert(entry.clone(), now).unwrap();
         }
         store
-            .record_attestation(&entry.approval_nonce, blob)
+            .record_attestation(
+                &entry.approval_nonce,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
             .unwrap();
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob)
     }
@@ -5046,7 +5052,7 @@ pub(crate) mod tests {
                     &AttestationBinding::new(profile_name, chain),
                     Surface::Cli,
                     ConsentAudit::Writer(&mut readiness.writer().lock().unwrap()),
-                    None,
+                    &stellar_agent_core::approval::AttestedApprover::Local,
                     |_, _| Err("unexpected grant".to_owned()),
                 )
                 .unwrap();
@@ -6499,6 +6505,18 @@ pub(crate) mod tests {
             fn approved(&self, xdr: &str, ttl_ms: u64) -> serde_json::Value {
                 let entry = approval_for(self.tool, &self.f, xdr, ttl_ms);
                 let blob = self.f.attest(&entry);
+                self.commit_args_for(xdr, &entry.approval_nonce, &blob)
+            }
+
+            /// The run's commit arguments for `xdr` carrying the approval
+            /// `approval_nonce` with its attestation `blob`, and a protocol
+            /// nonce minted for `xdr` now.
+            fn commit_args_for(
+                &self,
+                xdr: &str,
+                approval_nonce: &str,
+                blob: &str,
+            ) -> serde_json::Value {
                 let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
                 let expiry = now + 60_000;
                 let nonce = self
@@ -6518,7 +6536,7 @@ pub(crate) mod tests {
                 args["envelope_xdr"] = serde_json::json!(xdr);
                 args["nonce"] = serde_json::json!(nonce.to_base64());
                 args["expires_at_unix_ms"] = serde_json::json!(expiry);
-                args["approval_nonce"] = serde_json::json!(entry.approval_nonce);
+                args["approval_nonce"] = serde_json::json!(approval_nonce);
                 args["approval_attestation"] = serde_json::json!(blob);
                 args
             }
@@ -6746,6 +6764,218 @@ pub(crate) mod tests {
         #[serial_test::serial(keyring)]
         async fn mainnet_trustline_accepts_and_consumes_once() {
             accept(Tool::Trustline).await;
+        }
+
+        /// The operator credential the remote-approval listener verified.
+        const REMOTE_CREDENTIAL: &str = "XFxcXFxcXFxcXFxcXFxcXA";
+        /// A second enrolled and allowed operator credential.
+        const OTHER_CREDENTIAL: &str = "YWFhYWFhYWFhYWFhYWFhYQ";
+
+        /// What changes on disk after the listener has persisted a remote
+        /// approval and released its audit writer.
+        #[derive(Clone, Copy, Debug)]
+        enum AfterListenerShutdown {
+            /// The other credential loses its allowlist entry and enrollment.
+            RevokeOther,
+            /// The approving credential loses its allowlist entry.
+            UnlistApprover,
+            /// The approving credential loses its enrollment.
+            UnenrollApprover,
+        }
+
+        /// A `[remote_approval]` block that allows `ids`.
+        fn remote_approval(
+            ids: &[&str],
+        ) -> stellar_agent_core::profile::schema::RemoteApprovalConfig {
+            serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "bind": "0.0.0.0:8443",
+                "rp_id": "wallet.example.invalid",
+                "allowed_credentials": ids,
+            }))
+            .unwrap()
+        }
+
+        /// Prepares a mainnet payment, has the remote-approval listener
+        /// approve it for [`REMOTE_CREDENTIAL`] through its own audit writer,
+        /// shows that a commit refuses while that writer is held, releases
+        /// it the way the listener's exit does, applies `after` to the files
+        /// on disk, and commits on the same server state.
+        ///
+        /// Returns the run, the remote approval and the final commit result.
+        async fn remote_commit_after_listener_shutdown(
+            after: AfterListenerShutdown,
+        ) -> (
+            ClassicRun,
+            stellar_agent_core::approval::PendingApproval,
+            serde_json::Value,
+        ) {
+            use stellar_agent_core::approval::{
+                AttestationBinding, AttestedApprover, ConsentAudit, OperatorApprovalCredential,
+                OperatorApprovalCredentialStore, PendingApprovalStore, Surface, attest_and_persist,
+                default_operator_approval_credentials_path, load_attestation_key,
+            };
+            let run = ClassicRun::with(
+                Tool::Pay,
+                |raw| raw,
+                |profile| {
+                    profile.remote_approval =
+                        Some(remote_approval(&[REMOTE_CREDENTIAL, OTHER_CREDENTIAL]));
+                },
+                |_| {},
+            )
+            .await;
+            let credentials = OperatorApprovalCredentialStore::new(
+                default_operator_approval_credentials_path("operator").unwrap(),
+            );
+            for (id, byte) in [(REMOTE_CREDENTIAL, 7u8), (OTHER_CREDENTIAL, 8u8)] {
+                let mut key = vec![0x04u8; 65];
+                key[1] = byte;
+                credentials
+                    .enroll(OperatorApprovalCredential {
+                        credential_id_b64url: id.to_owned(),
+                        public_key_sec1_b64: base64::Engine::encode(
+                            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                            key,
+                        ),
+                        rp_id: "wallet.example.invalid".to_owned(),
+                        label: "device".to_owned(),
+                        registered_at_unix_ms: 1,
+                        sign_count: None,
+                    })
+                    .unwrap();
+            }
+
+            // The listener is another process: its audit writer is its own,
+            // opened on the profile's log with the profile's keyring anchor,
+            // and it holds the log's lock until the listener exits.
+            let xdr = run.args["envelope_xdr"].as_str().unwrap().to_owned();
+            let entry = approval_for(Tool::Pay, &run.f, &xdr, 600_000);
+            stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test("operator");
+            let profile = run.f.server.security_profile();
+            let mut listener_writer = stellar_agent_core::audit_log::writer::AuditWriter::open(
+                profile.audit_log_path.clone(),
+                Some(
+                    stellar_agent_network::keyring::keyed_audit_access(
+                        profile,
+                        "operator",
+                        stellar_agent_core::audit_log::BindingCheck::Enforce,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+            let blob = {
+                let mut store = PendingApprovalStore::open(
+                    run.f
+                        .server
+                        .resolve_approval_dir()
+                        .unwrap()
+                        .join("operator.toml"),
+                )
+                .unwrap();
+                store
+                    .insert(
+                        entry.clone(),
+                        stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                    )
+                    .unwrap();
+                let key = load_attestation_key(
+                    &profile.attestation_key_id,
+                    &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
+                        "operator", profile,
+                    ),
+                )
+                .unwrap();
+                attest_and_persist(
+                    &mut store,
+                    &entry,
+                    &key,
+                    &AttestationBinding::new("operator", "stellar:mainnet"),
+                    Surface::ServeRemote,
+                    ConsentAudit::Writer(&mut listener_writer),
+                    &AttestedApprover::Remote {
+                        credential_id_b64url: REMOTE_CREDENTIAL.to_owned(),
+                    },
+                    |_, _| Err("unexpected grant".to_owned()),
+                )
+                .unwrap()
+                .unwrap()
+            };
+
+            let held = run
+                .commit_with(run.commit_args_for(&xdr, &entry.approval_nonce, &blob))
+                .await;
+            assert_eq!(held["ok"], false, "{held}");
+            assert_eq!(
+                held["error"]["code"], "audit.chain_key_unavailable",
+                "{held}"
+            );
+            assert!(
+                held["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("audit.writer_locked"),
+                "the listener's held writer refuses the commit: {held}"
+            );
+            assert_eq!(run.control.count("sendTransaction"), 0);
+            assert_eq!(run.seed_reads(), 0);
+            assert!(!is_consumed(
+                &stored_approval(&run.f, &entry.approval_nonce).unwrap()
+            ));
+            drop(listener_writer);
+
+            let mut stored = (*run.f.server.profile).clone();
+            match after {
+                AfterListenerShutdown::RevokeOther => {
+                    stored.remote_approval = Some(remote_approval(&[REMOTE_CREDENTIAL]));
+                    assert!(credentials.remove(OTHER_CREDENTIAL).unwrap());
+                }
+                AfterListenerShutdown::UnlistApprover => {
+                    stored.remote_approval = Some(remote_approval(&[OTHER_CREDENTIAL]));
+                }
+                AfterListenerShutdown::UnenrollApprover => {
+                    assert!(credentials.remove(REMOTE_CREDENTIAL).unwrap());
+                }
+            }
+            loader::save_to_dir("operator", &stored, &default_profile_dir().unwrap()).unwrap();
+
+            let result = run
+                .commit_with(run.commit_args_for(&xdr, &entry.approval_nonce, &blob))
+                .await;
+            (run, entry, result)
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn persisted_remote_approval_refuses_after_listener_shutdown() {
+            let (run, entry, result) =
+                remote_commit_after_listener_shutdown(AfterListenerShutdown::RevokeOther).await;
+            assert_eq!(result["ok"], true, "the still-authorized control: {result}");
+            assert_eq!(run.control.count("sendTransaction"), 1);
+            assert!(is_consumed(
+                &stored_approval(&run.f, &entry.approval_nonce).unwrap()
+            ));
+
+            for after in [
+                AfterListenerShutdown::UnlistApprover,
+                AfterListenerShutdown::UnenrollApprover,
+            ] {
+                let (run, entry, result) = remote_commit_after_listener_shutdown(after).await;
+                assert_eq!(result["ok"], false, "{after:?}: {result}");
+                assert_eq!(
+                    result["error"]["code"], "policy.approval_required",
+                    "{after:?}: {result}"
+                );
+                assert!(authorizations(&run.f).is_empty(), "{after:?}");
+                assert_eq!(run.seed_reads(), 0, "{after:?}");
+                assert_eq!(run.control.count("sendTransaction"), 0, "{after:?}");
+                assert_no_pre_send_entry(&run);
+                assert!(
+                    !is_consumed(&stored_approval(&run.f, &entry.approval_nonce).unwrap()),
+                    "{after:?}: the approval stays unspent"
+                );
+            }
         }
 
         /// Asserts the restart refusal with no action request, no seed read

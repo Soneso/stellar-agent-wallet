@@ -701,7 +701,13 @@ mod tests {
         );
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
-        store.record_attestation(&nonce, [0x11u8; 32]).unwrap();
+        store
+            .record_attestation(
+                &nonce,
+                [0x11u8; 32],
+                crate::approval::AttestedApprover::Local,
+            )
+            .unwrap();
 
         let views = store.snapshot(TEST_NOW_MS);
         assert!(

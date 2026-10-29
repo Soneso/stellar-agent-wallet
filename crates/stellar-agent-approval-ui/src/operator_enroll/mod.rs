@@ -3,10 +3,14 @@
 //! `approve operator enroll --interactive` starts this server instead of
 //! reading `--credential-id` / `--public-key` / `--rp-id` / `--label`
 //! arguments: the operator's authenticator creates the credential in place,
-//! and the credential (id, SEC1 public key, best-effort seeded sign count)
-//! is persisted server-side into the same
+//! over a challenge this server issues. The server verifies the registration
+//! response and stages the credential; it never writes the credential store.
+//! The process that started it receives a [`PendingOperatorEnrollment`],
+//! asks the operator to type the confirmation code the page shows, and only
+//! a matching code yields the [`ConfirmedOperatorEnrollment`] that persists
+//! the credential into the same
 //! [`stellar_agent_core::approval::operator_credentials::OperatorApprovalCredentialStore`]
-//! the argument-based mode writes to — never passing through the shell.
+//! the argument-based mode writes to.
 //!
 //! # rp-id binding is why this server exists
 //!
@@ -21,10 +25,30 @@
 //! # Enrollment never authorizes anything
 //!
 //! Enrolling here only writes to the credential store. The profile's
-//! `[remote_approval] allowed_credentials` list is the sole, separate,
-//! operator-controlled authorization step — this server's success page and
-//! the CLI summary both restate that reminder; the ceremony never touches
-//! the profile allowlist.
+//! `[remote_approval] allowed_credentials` list is the separate,
+//! operator-controlled authorization step; this server's page and the CLI
+//! summary both restate that reminder; the ceremony never touches the
+//! profile allowlist.
+//!
+//! # The ceremony
+//!
+//! 1. The operator's browser exchanges the one-time bootstrap token for a
+//!    session (see below) and loads `/enroll`.
+//! 2. `POST /enroll/challenge` returns the ceremony's single outstanding
+//!    registration challenge: a fresh 32-byte value valid for five minutes
+//!    on the session clock. A second request while it is outstanding
+//!    returns the same challenge; an expired one is replaced.
+//! 3. The page registers a credential over that challenge and posts the
+//!    response to `POST /enroll/credential`, which verifies it (see
+//!    `registration`). A response that fails verification changes nothing.
+//!    The first one that passes consumes the challenge and the single-use
+//!    completion latch together, and is handed to
+//!    [`OperatorEnrollHandle::await_completion`]; every later post is
+//!    refused with `already_completed`.
+//! 4. The page computes the confirmation code from the credential its own
+//!    ceremony created and shows it. The CLI asks for it at the terminal and
+//!    persists the credential only when the typed code matches, before the
+//!    ceremony deadline.
 //!
 //! # Single-use, single-server-run
 //!
@@ -35,18 +59,12 @@
 //! for an `HttpOnly; SameSite=Strict` session cookie and a session proof the
 //! bootstrap page keeps in the tab's `sessionStorage`. Every other route
 //! requires that cookie; an absent, malformed, mismatched, or expired cookie
-//! collapses to a bare `404`. A local process that never opened the bootstrap
-//! URL itself therefore cannot scrape a token from a served page and race the
-//! operator to `POST /enroll/credential`. The cookie is host-scoped, so a service on
+//! collapses to a bare `404`. The cookie is host-scoped, so a service on
 //! another `localhost` port can receive it; the proof is origin-scoped and
-//! never served again, and `POST /enroll/credential` refuses a request without
-//! it. The session uses the same lifetime limits as the approval inbox (see
+//! never served again, and both POST routes refuse a request without it.
+//! The session uses the same lifetime limits as the approval inbox (see
 //! `crate::auth`); the ceremony timeout of the caller is normally the shorter
-//! limit. `POST /enroll/credential` fires a single-use
-//! completion signal (see [`OperatorEnrollHandle::await_completion`]) the
-//! first time it persists a credential; see `routes::enroll_credential_post`
-//! for how the single-use latch is enforced atomically against concurrent
-//! requests.
+//! limit.
 //!
 //! # Defence stack
 //!
@@ -58,17 +76,18 @@
 //! → session-cookie exchange described above, mirroring
 //! [`crate::start_serve`]'s auth boundary.
 //!
-//! # Server-side attestation verification is intentionally omitted
+//! # What registration verification claims
 //!
-//! See `routes` module docs for the full rationale: enrollment authorizes
-//! nothing, so verifying the attestation statement would add a CBOR/COSE
-//! parser and a trust-anchor set in exchange for a guarantee this surface
-//! has no use for.
+//! The page requests the `none` attestation format, so no statement about
+//! the authenticator's make or certification is verified, and the response
+//! is no standalone proof of key possession. Verification binds the response
+//! to this server's challenge, the exact page origin and `localhost`; the
+//! session boundary and the terminal code bind it to the operator.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{Router, extract::DefaultBodyLimit};
 use tokio::net::TcpListener;
@@ -83,15 +102,25 @@ use stellar_agent_loopback_http::brand::PageIdentity;
 use crate::auth::{AuthState, OpaqueToken, SessionPurpose};
 use crate::{HostHeaderAllowlistLayer, OriginHeaderAllowlistLayer, SecurityHeadersLayer};
 
+mod confirmation;
 mod error;
+mod registration;
 mod routes;
 mod templates;
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_support;
 mod web;
 
 #[cfg(test)]
 mod router_tests;
 
+pub use confirmation::{
+    ConfirmedOperatorEnrollment, OperatorEnrollmentConfirmationError, PendingOperatorEnrollment,
+};
 pub use error::{OperatorEnrollAwaitError, OperatorEnrollShutdownError, OperatorEnrollStartError};
+
+use confirmation::StagedEnrollment;
+use registration::RegistrationChallenge;
 
 /// Maximum request body size accepted by this server, in bytes (16 KiB) —
 /// the same cap the approval-inbox server and the WebAuthn bridge apply.
@@ -109,8 +138,13 @@ struct OperatorEnrollState {
     /// Bootstrap-token / session-cookie auth state. See the module docs'
     /// "Single-use, single-server-run" section for the exchange this guards.
     auth: StdMutex<AuthState>,
-    /// The credential store this ceremony persists into.
+    /// The credential store the confirmed credential will be enrolled into.
+    /// The server only reads it, to refuse an already-enrolled ID before
+    /// staging; [`ConfirmedOperatorEnrollment::persist`] is the only writer.
     store: OperatorApprovalCredentialStore,
+    /// The exact origin the page runs at, `http://localhost:<bound port>`,
+    /// which a registration's `clientDataJSON` must name.
+    expected_origin: String,
     /// Optional label to pre-populate the `/enroll` page's label input with
     /// (from `--label` in interactive mode). `None` leaves the field empty
     /// for the operator to fill in.
@@ -118,13 +152,22 @@ struct OperatorEnrollState {
     /// The identity the enrollment page renders, neutral unless the
     /// deployment configured one.
     identity: PageIdentity,
-    /// Single-use completion latch: `Some` until the first successful
-    /// enrollment consumes it. Guarded by a `std::sync::Mutex` so the
-    /// check-then-persist-then-consume sequence in
-    /// `routes::enroll_credential_post` is atomic with respect to
-    /// concurrent POSTs — the guard is held only across synchronous work,
-    /// never across an `.await` point.
-    completion: StdMutex<Option<oneshot::Sender<()>>>,
+    /// The outstanding challenge and the single-use completion latch,
+    /// under one `std::sync::Mutex` so issuing, verifying against and
+    /// consuming them is atomic with respect to concurrent requests. The
+    /// guard is held only across synchronous work, never across an `.await`
+    /// point, and never while the `auth` lock is held.
+    ceremony: StdMutex<Ceremony>,
+}
+
+/// The mutable state of the one ceremony a server runs.
+struct Ceremony {
+    /// The challenge the page registers over: `None` until the first
+    /// `POST /enroll/challenge`, and again once a registration consumed it
+    /// or it expired.
+    challenge: Option<RegistrationChallenge>,
+    /// `Some` until the first verified registration consumes it.
+    completion: Option<oneshot::Sender<StagedEnrollment>>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -144,7 +187,7 @@ pub struct OperatorEnrollHandle {
     /// `Some` until [`Self::await_completion`] is called once; `take`n so a
     /// second call has a clear, typed error rather than reusing an already
     /// resolved future.
-    completion_rx: Option<oneshot::Receiver<()>>,
+    completion_rx: Option<oneshot::Receiver<StagedEnrollment>>,
     shutdown_tx: oneshot::Sender<()>,
     join_handle: JoinHandle<()>,
 }
@@ -197,26 +240,42 @@ impl OperatorEnrollHandle {
         )
     }
 
-    /// Await the single completion signal, or time out.
+    /// Await the verified registration the page posts, for at most
+    /// `timeout`. The returned [`PendingOperatorEnrollment`] expires at the
+    /// end of that window, so the terminal confirmation shares it.
     ///
     /// # Errors
     ///
-    /// - [`OperatorEnrollAwaitError::AlreadyAwaited`] — this handle's
-    ///   completion signal was already awaited (it can only be awaited
-    ///   once).
-    /// - [`OperatorEnrollAwaitError::Timeout`] — no enrollment completed
-    ///   within `timeout`.
-    /// - [`OperatorEnrollAwaitError::SenderDropped`] — the server task
-    ///   exited without ever completing an enrollment.
+    /// The errors of [`Self::await_completion_until`].
     pub async fn await_completion(
         &mut self,
         timeout: Duration,
-    ) -> Result<(), OperatorEnrollAwaitError> {
+    ) -> Result<PendingOperatorEnrollment, OperatorEnrollAwaitError> {
+        self.await_completion_until(Instant::now() + timeout).await
+    }
+
+    /// Await the verified registration the page posts, until `deadline`.
+    /// The returned [`PendingOperatorEnrollment`] carries `deadline`, after
+    /// which its confirmation refuses.
+    ///
+    /// # Errors
+    ///
+    /// - [`OperatorEnrollAwaitError::AlreadyAwaited`]: this handle's
+    ///   completion signal was already awaited (it can only be awaited
+    ///   once).
+    /// - [`OperatorEnrollAwaitError::Timeout`]: no registration was
+    ///   verified before `deadline`.
+    /// - [`OperatorEnrollAwaitError::SenderDropped`]: the server task
+    ///   exited without ever verifying a registration.
+    pub async fn await_completion_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<PendingOperatorEnrollment, OperatorEnrollAwaitError> {
         let Some(rx) = self.completion_rx.take() else {
             return Err(OperatorEnrollAwaitError::AlreadyAwaited);
         };
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(())) => Ok(()),
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), rx).await {
+            Ok(Ok(staged)) => Ok(staged.with_deadline(deadline)),
             Ok(Err(_recv_error)) => Err(OperatorEnrollAwaitError::SenderDropped),
             Err(_elapsed) => Err(OperatorEnrollAwaitError::Timeout),
         }
@@ -256,9 +315,10 @@ impl OperatorEnrollHandle {
 /// signal, and a graceful-shutdown handle.
 ///
 /// `store_path` is opened lazily by [`OperatorApprovalCredentialStore`] (no
-/// filesystem access happens here); `profile` is shown on the page for
-/// operator orientation only and has no bearing on the persisted
-/// credential, which is always recorded with `rp_id: "localhost"`.
+/// filesystem access happens here); the server only reads it, to refuse an
+/// already-enrolled credential ID before staging. `profile` is shown on the
+/// page for operator orientation only and has no bearing on the credential,
+/// which is always recorded with `rp_id: "localhost"`.
 /// `label_prefill` pre-populates the page's label input (from
 /// `--label <L>` in interactive mode); the operator can still edit it, and
 /// `None` leaves the field empty. `page_identity` is the identity the page
@@ -302,14 +362,18 @@ pub async fn start_operator_enroll_server(
     let bootstrap = OpaqueToken::generate();
     let bootstrap_token_hex = bootstrap.to_hex();
 
-    let (completion_tx, completion_rx) = oneshot::channel::<()>();
+    let (completion_tx, completion_rx) = oneshot::channel::<StagedEnrollment>();
     let state = Arc::new(OperatorEnrollState {
         profile: profile.into(),
         auth: StdMutex::new(AuthState::new(bootstrap, SessionPurpose::OperatorEnroll)),
         store: OperatorApprovalCredentialStore::new(store_path),
+        expected_origin: expected_origin(local_addr),
         label_prefill,
         identity: page_identity,
-        completion: StdMutex::new(Some(completion_tx)),
+        ceremony: StdMutex::new(Ceremony {
+            challenge: None,
+            completion: Some(completion_tx),
+        }),
     });
 
     let router = build_router(state, local_addr);
@@ -338,6 +402,12 @@ pub async fn start_operator_enroll_server(
         shutdown_tx,
         join_handle,
     })
+}
+
+/// The origin the enrollment page runs at: always `localhost` with the bound
+/// port, the form [`OperatorEnrollHandle::enroll_url`] opens.
+fn expected_origin(local_addr: SocketAddr) -> String {
+    format!("http://localhost:{}", local_addr.port())
 }
 
 /// Build the axum `Router` with state and the full Clone-compatible

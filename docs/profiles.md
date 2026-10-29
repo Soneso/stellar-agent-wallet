@@ -571,7 +571,7 @@ Optional; absent by default. Enables `approve serve --remote`; see
 | `enabled` | bool | no | `false` | Must be `true`, together with the CLI's `--confirm-remote-exposure` flag, for `--remote` to take effect. The profile block alone does not start remote mode. |
 | `bind` | string | yes (if block present) | none | Socket address to bind, e.g. `"0.0.0.0:8443"`. Must parse as a valid address; validated fail-closed before any TLS provisioning or bind attempt. |
 | `rp_id` | string | yes (if block present) | none | The WebAuthn Relying Party ID, a DNS hostname that resolves to this host from the approving device. Must NOT be an IP literal (WebAuthn Level 2 §5.1.2 forbids IP-literal Relying Party IDs); rejected fail-closed if it is one. |
-| `allowed_credentials` | array of strings | no | `[]` | Base64url WebAuthn credential IDs authorized to approve or reject. A credential enrolled via `approve operator enroll` but absent from this list is refused identically to an unknown credential. |
+| `allowed_credentials` | array of strings | no | `[]` | Base64url WebAuthn credential IDs authorized to approve or reject. A credential enrolled via `approve operator enroll` but absent from this list is refused identically to an unknown credential. A running listener reads this list at every login and decision, so removing an id revokes that credential at once, and a mainnet commit refuses the approvals it made that are not yet committed. To revoke a credential, remove its id here first, then remove its enrollment with `approve operator remove`. |
 
 ### `[served_pages]` block
 

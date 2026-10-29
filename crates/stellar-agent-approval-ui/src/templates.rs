@@ -1125,7 +1125,13 @@ mod tests {
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, NOW_MS).unwrap();
         if attested {
-            store.record_attestation(&nonce, [0x11u8; 32]).unwrap();
+            store
+                .record_attestation(
+                    &nonce,
+                    [0x11u8; 32],
+                    stellar_agent_core::approval::AttestedApprover::Local,
+                )
+                .unwrap();
         }
         store.snapshot(snapshot_at).into_iter().next().unwrap()
     }

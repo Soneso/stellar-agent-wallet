@@ -752,8 +752,9 @@ Both inboxes label it `INCONSISTENT` and offer only Reject.
 Nothing is attested for it on any surface.
 
 The `approve`, `approve gc`, `approve list`, and `approve serve` commands return failures with `error.code` and a plain diagnostic message.
-These failures carry `approval.*` codes: `approval.not_found`, `approval.expired`, `approval.already_attested`, `approval.user_mismatch`, `approval.clock_error`, `approval.sha256_hex_error`, `approval.key_decode_failed`, `approval.key_length_error`, `approval.binding_mismatch`, `approval.grant_persist`, `approval.wrong_kind`, `approval.rejected`, `approval.consumed`, `approval.record_failed`, `approval.uid_unavailable`, `approval.denied`, `approval.store_dir_error`, `approval.permission_denied`, `approval.invalid_nonce_length`, `approval.writer_locked`, `approval.store_open_failed`, `approval.gc_failed`, `approval.entry_inconsistent`.
+These failures carry `approval.*` codes: `approval.not_found`, `approval.expired`, `approval.already_attested`, `approval.user_mismatch`, `approval.clock_error`, `approval.sha256_hex_error`, `approval.key_decode_failed`, `approval.key_length_error`, `approval.binding_mismatch`, `approval.grant_persist`, `approval.wrong_kind`, `approval.rejected`, `approval.consumed`, `approval.record_failed`, `approval.uid_unavailable`, `approval.denied`, `approval.store_dir_error`, `approval.permission_denied`, `approval.invalid_nonce_length`, `approval.writer_locked`, `approval.store_open_failed`, `approval.gc_failed`, `approval.entry_inconsistent`, `approval.operator_credential_revoked`, `approval.remote_authorization_unavailable`.
 `approval.gc_failed` reports a collection failure from `approve gc`.
+`approval.operator_credential_revoked` reports a remote approval whose operator credential is missing from the profile's `allowed_credentials` list or from the operator-credential store; `approval.remote_authorization_unavailable` reports that the profile's remote-approval authorization or the operator-credential store could not be read, or that the profile does not enable remote approval for that chain.
 `approval.entry_inconsistent` reports a payment, claim, or trustline request whose stored digest is not the digest of its stored envelope, or whose envelope does not decode, and an MPP charge request whose shown terms do not match what it would authorize.
 Authentication, validation, and audit failures on approval paths carry their own codes.
 
@@ -926,33 +927,74 @@ A WebAuthn credential is bound to its `rp.id` at creation time, and that
 binding is what decides which of the two modes applies:
 
 - **`--interactive`** — for a loopback or SSH-tunnelled `approve serve
-  --remote` listener. Starts a one-shot local server, prints (and by default
-  opens) an enrollment page, and persists the credential automatically once
-  your authenticator completes the ceremony. The printed URL contains a
-  single-use bootstrap token: the first visit exchanges it for an HttpOnly
-  session cookie and an origin-scoped session proof that the page keeps in
-  the tab, and the token dies. Serving the page requires the cookie. The POST
-  that persists the credential requires the session cookie, an origin-scoped
-  session proof, and a CSRF value. Neither a local non-browser process nor
-  another loopback service that receives the cookie can complete the
-  ceremony. The session expires after 15 minutes without operator activity
-  or 8 hours after bootstrap. The browser opens through a private redirect
-  file that only the current user can read, so the browser launcher never
-  receives the bootstrap URL; the file is removed when the command ends. If
-  the browser cannot be opened, open the printed URL yourself. Until its
-  first use or until the command ends, the printed URL grants an enrollment
-  session to whoever opens it, so keep it out of shared logs. Ctrl-C ends
-  the wait: the command stops the server, removes the redirect file, and
-  exits `1`. The server binds `127.0.0.1` only and refuses non-loopback
+  --remote` listener. Needs a terminal on stdin and stderr, and refuses with
+  `approve.operator_enroll_tty_required` otherwise. Starts a one-shot local
+  server and prints (and by default opens) an enrollment page. The printed
+  URL contains a single-use bootstrap token: the first visit exchanges it
+  for an HttpOnly session cookie and an origin-scoped session proof that the
+  page keeps in the tab, and the token dies. Serving the page requires the
+  cookie; both POSTs of the ceremony require the session cookie, the session
+  proof, and a CSRF value. The session expires after 15 minutes without
+  operator activity or 8 hours after bootstrap.
+
+  The ceremony runs in four steps:
+
+  1. The page requests a registration challenge (`POST /enroll/challenge`).
+     The server issues one random 32-byte challenge per ceremony; it expires
+     after 300 seconds and is used once.
+  2. Your authenticator creates the credential over that challenge for
+     `rp.id` `localhost`, with user verification.
+  3. The page posts the credential (`POST /enroll/credential`) with the
+     authenticator's `clientDataJSON` and `attestationObject`. The server
+     checks the type, the challenge, the exact origin, the relying-party
+     hash, the user-presence, user-verification and attested-data flags, the
+     credential id, and the ES256 P-256 key against what the page posted. It
+     accepts only `none` attestation, so the check proves the response
+     answers this ceremony's challenge, not the authenticator's make or
+     model. A refused registration answers `registration_invalid`, an expired
+     challenge `registration_expired`, an id already enrolled
+     `duplicate_credential_id`, and a label that is empty, longer than 64
+     bytes, or holds a control character `label_invalid`. The verified
+     credential is staged; nothing is written yet.
+  4. The page shows a confirmation code of 16 hex digits in four groups,
+     computed from the challenge, the credential id and the public key it
+     created. The command prompts for that code and names the label, with
+     any control or format character shown as a visible escape. Only a
+     matching code typed before the timeout writes the credential; the
+     command never prints the expected code. One code is compared per
+     ceremony.
+
+  A wrong code (`approve.operator_enroll_confirmation_mismatch`), no code
+  (end of input or Ctrl-C at the prompt,
+  `approve.operator_enroll_confirmation_canceled`), or a code typed after
+  the timeout (`approve.operator_enroll_confirmation_expired`) writes
+  nothing and exits `1`. Ctrl-C before the page posts a credential stops the
+  server, removes the redirect file, and exits `1` with
+  `approve.operator_enroll_interactive_interrupted`; no registration before
+  the timeout exits with `approve.operator_enroll_interactive_timeout`. The
+  timeout covers the browser ceremony and the confirmation together.
+
+  The confirmation code binds the terminal to the ceremony the page ran: a
+  local process that obtains the session cannot enroll a credential of its
+  own without the operator typing that credential's code. The browser opens
+  through a private redirect file that only the current user can read, so
+  the browser launcher never receives the bootstrap URL; the file is removed
+  when the command ends. If the browser cannot be opened, open the printed
+  URL yourself. Until its first use or until the command ends, the printed
+  URL grants an enrollment session to whoever opens it, so keep it out of
+  shared logs. The server binds `127.0.0.1` only and refuses non-loopback
   hosts and origins. Always produces a credential bound to
   `rp_id: "localhost"`, the only effective domain a loopback origin can
-  claim.
+  claim. The stored sign count comes from the authenticator data the server
+  verified.
 - **`--credential-id` / `--public-key` / `--rp-id` / `--label`** (all four
   together) — for a domain-configured remote listener. Imports the id and
   public key from a WebAuthn ceremony run elsewhere: normally the remote
   listener's own `GET /enroll` page, which has to be served from
   `https://<rp_id>` for the resulting credential to bind to that domain. See
-  [Remote approval](../remote-approval.md) for that page's walkthrough.
+  [Remote approval](../remote-approval.md) for that page's walkthrough. The
+  command checks the shape of the id and the key; the operator who runs it
+  vouches that they came from their own ceremony.
 
 ```bash
 # Local or SSH-tunnelled listener
@@ -967,12 +1009,64 @@ stellar-agent approve operator enroll \
 
 - `--no-open` — print the enrollment URL instead of opening a browser
   (interactive mode only).
-- `--timeout-seconds <SECS>` — interactive-ceremony timeout (default: 300).
+- `--timeout-seconds <SECS>`: interactive-ceremony timeout, covering the
+  browser registration and the terminal confirmation (default: 300).
 - `--sign-count <U32>` — seeds the clone-detection baseline from a counter
   read at enrollment time (argument mode only; interactive mode extracts
   this automatically). Advisory only — a caller reporting a false value only
   weakens that credential's own clone-detection baseline and never affects
   authorization, which is decided solely by `allowed_credentials`.
+
+Every write to the operator-credential store (enrollment, removal, and the
+sign-count update after each remote login) holds the store's lock file
+(the store's path with `.lock` appended) across reading and replacing the
+file, so concurrent
+writers never lose an enrollment or lower a stored counter. A writer that
+cannot take the lock writes nothing, and each path reports it in its own way:
+
+- `approve operator enroll --interactive` and `approve operator remove`
+  refuse with `approval.writer_locked`. Retry the command.
+- `approve operator enroll` in argument mode refuses with
+  `internal.unexpected_state`, whose message names
+  `approve.operator_enroll_failed`. Retry the command.
+- A remote login answers `400` `webauthn_assertion_invalid`, the answer
+  every refused login gets, so the response does not reveal the contention.
+  Log in again.
+
+### `approve operator remove`
+
+```bash
+stellar-agent approve operator remove --credential-id <B64URL> --profile default
+```
+
+State-changing. Removes the enrolled operator credential with that id from
+the profile's operator-credential store.
+
+- `--credential-id <B64URL>` (required): the credential id to remove;
+  values that start with `-` are accepted.
+- `--profile <NAME>`: the profile whose store to edit. Resolves from
+  `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`. A name that
+  is not a safe file name (an absolute path, a path separator, or `..`)
+  refuses with `validation.config_invalid` before anything is read or
+  written; `approve operator enroll` applies the same rule.
+
+The command prints `{"removed": true}` when it removed a record and
+`{"removed": false}` when none had that id, and exits `0` in both cases. It
+never prints the credential id. It does not edit the profile. Lock
+contention refuses with `approval.writer_locked`; any other store failure
+refuses with `approve.operator_remove_failed`; neither writes anything.
+
+To revoke an operator credential, remove its id from the profile's
+`[remote_approval] allowed_credentials` list first, then run this command.
+Either step alone already revokes the credential: a running listener reads
+the list and the store at every login and decision and stops honoring the
+credential at once, and a mainnet commit refuses every pending approval
+that credential approved and that is not yet committed. Doing both keeps a
+later edit of one of them from authorizing the credential again.
+
+```json
+{"ok":true,"data":{"removed":true},"request_id":"..."}
+```
 
 ## `audit`
 

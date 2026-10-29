@@ -23,7 +23,8 @@ Memos retain their type: `none`, `text "<escaped value>"`, `id <n>`, `hash <hex>
 MPP terms and the network are checked against the authorization fingerprint before display or attestation; the charge commit checks the transport, authority, and target against the prepared request.
 The simulated fee reads `not bound to this approval`.
 A request whose stored digest is not the digest of its stored envelope, whose envelope does not decode, or whose MPP terms do not match its fingerprint shows as `INCONSISTENT` and offers only Reject; an approve of it is refused with the status `inconsistent` and attests nothing.
-A commit cannot tell whether an attestation came from the local inbox or the remote listener.
+Each pending approval records who approved it: the local operator, or the operator credential the remote listener verified. The HMAC covers that approver, so an edited or deleted approver invalidates the approval.
+A mainnet commit reads the profile's `allowed_credentials` list and the operator-credential store again, and refuses an approval whose credential is missing from that list or from that store.
 The audit log distinguishes remote `ApprovalAttestedRemote` / `ApprovalRejectedRemote` events from loopback `ApprovalAttested` / `ApprovalRejected` events.
 Each row is written before the decision takes effect; a decision whose row cannot be written is refused and the entry stays pending.
 
@@ -36,8 +37,9 @@ effect:
   different one, and a stolen session cookie alone can neither approve nor
   reject anything (it carries no assertion).
 - The wallet's own approval gate independently re-checks that the passkey
-  credential is on the profile's allowlist. Either layer refuses alone even
-  if the other were somehow mis-wired.
+  credential is on the profile's allowlist as the profile file reads at that
+  moment, and still enrolled. Either layer refuses alone even if the other
+  were somehow mis-wired.
 
 TLS is mandatory; there is no plaintext remote path. Session cookies are
 `HttpOnly`, `Secure`, and short-lived (see [Operational notes](#operational-notes)).
@@ -70,7 +72,14 @@ allowed_credentials = ["c9k3JGxPq1c_..."]
 - **`allowed_credentials`**: the base64url WebAuthn credential IDs permitted
   to approve or reject. A credential enrolled (see below) but absent from
   this list is refused exactly like an unrecognized credential. Enrollment
-  and authorization are two separate, both-required steps.
+  and authorization are two separate, both-required steps. The running
+  listener reads this list at every login and every decision. Removing an
+  id revokes that credential at once: its next login is refused, its open
+  sessions cannot approve or reject, and a mainnet commit refuses the
+  approvals it made that are not yet committed. An empty list authorizes no
+  one. To revoke a credential for good, remove its id here first, then run
+  `approve operator remove --credential-id <B64URL>` (see
+  [CLI reference: `approve operator remove`](cli-reference/profile-and-governance.md#approve-operator-remove)).
 
 ### Making `rp_id` resolve
 
@@ -137,8 +146,10 @@ Relying Party ID at creation time.
   SSH tunnel (no `[remote_approval]` domain involved at all), use
   `approve operator enroll --interactive` on the wallet host directly. See
   [CLI reference: `approve operator enroll`](cli-reference/profile-and-governance.md#approve-operator-enroll).
-  That mode only ever produces `rp_id: "localhost"` credentials, which is why
-  it cannot be used for this listener's domain-bound `rp_id`.
+  That mode verifies the registration against its own challenge and enrolls
+  the credential only after you type the code its page shows at the
+  terminal. It only ever produces `rp_id: "localhost"` credentials, which is
+  why it cannot be used for this listener's domain-bound `rp_id`.
 
 ### Argument-import mode: enrolling via this listener's `/enroll` page
 
@@ -170,10 +181,10 @@ endpoint, and the wallet's network-exposed surface never accepts a new
 credential over the wire (see [Trust model](#trust-model)). It only runs the
 registration ceremony and displays the result for you to copy. The actual
 enrollment write happens when you run the command above, on the wallet host.
-Server-verified registration (the wallet confirming the ceremony's
-attestation itself) is not implemented in this alpha; treat the displayed
-values as you would any other credential material you are about to hand to a
-CLI command over a channel you already trust.
+This import path does not verify the registration on the server: unlike
+`--interactive`, it has no server challenge and no terminal confirmation
+code. Treat the displayed values as you would any other credential material
+you are about to hand to a CLI command over a channel you already trust.
 
 - `--credential-id`: the base64url `PublicKeyCredential.id`, prefilled in
   the displayed command.
@@ -191,9 +202,12 @@ Finally, add the enrolled credential's id to the profile's
 `[remote_approval] allowed_credentials` list (see
 [Prerequisites](#the-remote_approval-profile-block)). Enrollment and
 authorization are two separate, both-required steps, in EITHER mode.
-`allowed_credentials` is read once when the listener starts, so restart
-`approve serve --remote` after editing it. The newly enrolled credential is
-not recognized until you do.
+A running `approve serve --remote` reads `allowed_credentials` and the
+credential store at every login and every decision, so a credential you add
+can log in without a restart. The other `[remote_approval]` settings are read
+when the listener starts: restart it after changing `bind`. A running
+listener refuses every login and decision while the profile disables remote
+approval, names another `rp_id` or another chain, or cannot be read.
 
 ## Logging in and approving
 

@@ -25,23 +25,27 @@
 //!    `sessionStorage` and replaces the location with `/enroll`, so the
 //!    ceremony below runs with the cookie and the proof a real operator's
 //!    tab holds.
-//! 4. Types a label into `#label-input`, clicks `#enroll-btn` — a REAL
-//!    `navigator.credentials.create()` runs through the shipped
+//! 4. Types a label into `#label-input`, clicks `#enroll-btn`: the page
+//!    requests the server's registration challenge, and a REAL
+//!    `navigator.credentials.create()` runs over it through the shipped
 //!    `/static/operator-enroll.js`, so the virtual authenticator generates
 //!    its own credential id and P-256 keypair, exactly as a hardware key
-//!    would.
-//! 5. `handle.await_completion` resolves once the POST persists the
-//!    credential; the page's `#status` text is polled to confirm the
-//!    shipped frontend also reflects success, not just the backend.
-//! 6. Rigorous cross-check (the part a DOM-only assertion cannot provide):
+//!    would, and returns its own `clientDataJSON` and `attestationObject`.
+//! 5. `handle.await_completion` resolves once the server has verified the
+//!    registration and staged the credential. The page shows its
+//!    confirmation code, and the credential store is still empty: nothing
+//!    is enrolled before the terminal confirmation.
+//! 6. The code the page shows is typed at the confirmation step the CLI
+//!    runs (`PendingOperatorEnrollment::confirm`), which persists the
+//!    staged credential.
+//! 7. Rigorous cross-check (the part a DOM-only assertion cannot provide):
 //!    `WebAuthn.getCredentials` returns the virtual authenticator's own
 //!    record of what it just created — the STORED SEC1 public key must
 //!    equal the public key derived from the PKCS#8 private key CDP
 //!    returns, and the STORED sign count must EXACTLY equal CDP's own
-//!    `signCount` — not merely "both present", an equality that only holds
-//!    if the shipped JS's `getAuthenticatorData()`-based extraction (see
-//!    `operator-enroll.js`) reads the real authenticator data correctly.
-//! 7. A raw second `POST /enroll/credential` carrying no session cookie
+//!    `signCount`, which the server reads from the authenticator data
+//!    inside the attestation object.
+//! 8. A raw second `POST /enroll/credential` carrying no session cookie
 //!    confirms the session gate refuses it (`404`) before the completion
 //!    latch is even consulted; the bootstrap token was already consumed by
 //!    step 3's navigation, so a fresh out-of-browser client cannot establish
@@ -52,7 +56,8 @@
 //! drive the real HTTP surface directly (no browser needed for those, each
 //! performing its own bootstrap exchange for the session cookie and proof) to
 //! confirm CSRF rejection and the duplicate-id refusal hold against a real
-//! TCP listener, not only the in-process router tests.
+//! TCP listener, not only the in-process router tests. Their registrations
+//! come from a software authenticator with a real P-256 key.
 //!
 //! # Cross-port isolation
 //!
@@ -62,8 +67,9 @@
 //! to the full origin, port included. `cross_port_cookie_does_not_authorize_*`
 //! show both halves against a real Chromium: a second loopback service
 //! receives the cookie, its page cannot read the proof, and the cookie plus a
-//! valid CSRF value without the proof cannot enroll a credential or decide an
-//! approval, while the operator's own tab still can.
+//! valid CSRF value without the proof can neither request a registration
+//! challenge, enroll a credential nor decide an approval, while the
+//! operator's own tab still can.
 //!
 //! # Gate
 //!
@@ -76,7 +82,7 @@
 //!
 //! - `CHROMIUM` or `chromium`/`chromium-browser`/`google-chrome` on `PATH`,
 //!   or the `CHROME` environment variable pointing to the executable
-//!   (`operator_enroll_browser_creates_and_persists_credential` and the
+//!   (`operator_enroll_browser_confirms_then_persists_credential` and the
 //!   `cross_port_cookie_does_not_authorize_*` tests).
 
 #![cfg(feature = "operator-enroll-browser-acceptance")]
@@ -104,7 +110,12 @@ use p256::SecretKey;
 use p256::elliptic_curve::sec1::ToEncodedPoint as _;
 use p256::pkcs8::DecodePrivateKey as _;
 use serial_test::serial;
-use stellar_agent_approval_ui::operator_enroll::start_operator_enroll_server;
+use stellar_agent_approval_ui::operator_enroll::test_support::{
+    EnrollmentClient, SoftwareRegistrar,
+};
+use stellar_agent_approval_ui::operator_enroll::{
+    OperatorEnrollHandle, PendingOperatorEnrollment, start_operator_enroll_server,
+};
 use stellar_agent_approval_ui::{DecisionContext, ServeConfig, start_serve};
 use stellar_agent_core::approval::operator_credentials::{
     OperatorApprovalCredential, OperatorApprovalCredentialStore,
@@ -139,9 +150,7 @@ impl Drop for BrowserGuard {
 }
 
 /// RAII guard that shuts down the operator-enroll server on drop.
-struct OperatorEnrollGuard(
-    Option<stellar_agent_approval_ui::operator_enroll::OperatorEnrollHandle>,
-);
+struct OperatorEnrollGuard(Option<OperatorEnrollHandle>);
 
 impl Drop for OperatorEnrollGuard {
     #[allow(
@@ -256,6 +265,56 @@ async fn poll_status_contains(page: &chromiumoxide::Page, needle: &str, deadline
     }
 }
 
+/// The confirmation code the page shows in `#confirmation-code`, or the
+/// empty string while the element is hidden.
+async fn displayed_code(page: &chromiumoxide::Page) -> String {
+    page.evaluate(evaluate_by_value(
+        "(function(){var el = document.getElementById('confirmation-code'); \
+         return el && !el.hidden ? el.textContent : '';})()",
+    ))
+    .await
+    .expect("evaluate must not error")
+    .into_value()
+    .expect("evaluate result must deserialise as String")
+}
+
+/// Awaits the registration the page posts to the server behind `guard` and
+/// returns the staged credential, after asserting that the page shows a
+/// well-formed confirmation code and that `store` is still empty.
+async fn staged_from_page(
+    guard: &mut OperatorEnrollGuard,
+    page: &chromiumoxide::Page,
+    store: &OperatorApprovalCredentialStore,
+) -> (PendingOperatorEnrollment, String) {
+    let pending = guard
+        .0
+        .as_mut()
+        .expect("handle must be present")
+        .await_completion(Duration::from_secs(30))
+        .await
+        .expect("the page's registration must verify within 30s");
+    poll_status_contains(
+        page,
+        "Awaiting confirmation",
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await;
+    let code = displayed_code(page).await;
+    let groups: Vec<&str> = code.split('-').collect();
+    assert_eq!(groups.len(), 4, "the page shows four groups: {code:?}");
+    assert!(
+        groups
+            .iter()
+            .all(|g| g.len() == 4 && g.bytes().all(|b| b.is_ascii_hexdigit())),
+        "each group holds four hex digits: {code:?}"
+    );
+    assert!(
+        store.list().expect("store must be readable").is_empty(),
+        "nothing is enrolled before the terminal confirmation"
+    );
+    (pending, code)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CDP binary decoding
 // ─────────────────────────────────────────────────────────────────────────────
@@ -280,16 +339,17 @@ fn decode_cdp_binary(bin: &chromiumoxide::Binary) -> Vec<u8> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Drives the real interactive enrollment ceremony through a headless
-/// Chromium end to end, cross-checks the persisted credential against the
-/// virtual authenticator's own record, and confirms the single-use latch
-/// refuses a second successful-shape POST on the same server.
+/// Chromium end to end: the server stages the verified registration, the
+/// page shows its code, nothing is stored until that code is confirmed, and
+/// the persisted credential matches the virtual authenticator's own record.
+/// A second POST without a session is refused on the same server.
 ///
 /// `flavor = "multi_thread"` is required for `tokio::task::block_in_place`
 /// (used by both RAII guards), mirroring the sibling suites.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "requires chromium and explicit --ignored flag"]
-async fn operator_enroll_browser_creates_and_persists_credential() {
+async fn operator_enroll_browser_confirms_then_persists_credential() {
     let dir = TempDir::new().expect("tempdir");
     let store_path = dir.path().join("default.toml");
 
@@ -353,23 +413,18 @@ async fn operator_enroll_browser_creates_and_persists_credential() {
         .await
         .expect("enroll button click must succeed");
 
-    // The Rust-side signal is authoritative: it resolves only after the
-    // POST handler's synchronous `store.enroll` call returns Ok, i.e. the
-    // credential is durably persisted before this await returns.
-    let mut enroll_handle_opt = enroll_guard.0.take();
-    {
-        let enroll_handle = enroll_handle_opt
-            .as_mut()
-            .expect("handle must be present before first await");
-        enroll_handle
-            .await_completion(Duration::from_secs(30))
-            .await
-            .expect("the ceremony must complete within 30s");
-    }
-    enroll_guard.0 = enroll_handle_opt;
+    // The server stages the verified registration and the page shows its
+    // code; the store stays empty until the operator types that code.
+    let store = OperatorApprovalCredentialStore::new(store_path.clone());
+    let (pending, code) = staged_from_page(&mut enroll_guard, &page, &store).await;
+    assert_eq!(pending.label(), "acceptance-test-laptop");
 
-    // The shipped frontend must ALSO reflect success — not just the backend.
-    poll_status_contains(&page, "Enrolled", Instant::now() + Duration::from_secs(5)).await;
+    // The operator types the displayed code at the terminal.
+    let enrolled = pending
+        .confirm(&code, std::time::Instant::now())
+        .expect("the displayed code confirms the staged credential")
+        .persist(&store)
+        .expect("the confirmed credential persists");
 
     // ── Rigorous cross-check ────────────────────────────────────────────
     let credentials = page
@@ -396,13 +451,14 @@ async fn operator_enroll_browser_creates_and_persists_credential() {
     let derived_pubkey_point = secret_key.public_key().to_encoded_point(false);
     let derived_pubkey_bytes = derived_pubkey_point.as_bytes();
 
-    let store = OperatorApprovalCredentialStore::new(store_path.clone());
-    let stored = store
-        .list()
-        .expect("store must be readable")
-        .into_iter()
-        .next()
-        .expect("exactly one credential must have been enrolled");
+    let listed = store.list().expect("store must be readable");
+    assert_eq!(listed.len(), 1, "exactly one credential is enrolled");
+    let stored = listed.into_iter().next().expect("one credential");
+    assert_eq!(
+        stored, enrolled,
+        "the store holds the record persist returned"
+    );
+    assert_eq!(stored.label, "acceptance-test-laptop");
 
     let stored_cred_id_bytes = URL_SAFE_NO_PAD
         .decode(&stored.credential_id_b64url)
@@ -425,8 +481,8 @@ async fn operator_enroll_browser_creates_and_persists_credential() {
         stored.sign_count,
         Some(cdp_sign_count),
         "the stored sign_count must EXACTLY equal CDP's own signCount — this validates the \
-         shipped JS's getAuthenticatorData()-based extraction against ground truth, not merely \
-         that some value was stored"
+         server's reading of the authenticator data inside the attestation object against \
+         ground truth, not merely that some value was stored"
     );
 
     // ── Session gate refuses an unauthenticated second POST ─────────────
@@ -449,7 +505,7 @@ async fn operator_enroll_browser_creates_and_persists_credential() {
         .post(format!("{base}/enroll/credential"))
         .header("Host", format!("127.0.0.1:{port}"))
         .header("Origin", &base)
-        .json(&synthetic_valid_body(200))
+        .json(&synthetic_valid_body(200, port))
         .send()
         .await
         .expect("POST must complete");
@@ -470,15 +526,14 @@ async fn operator_enroll_browser_creates_and_persists_credential() {
 // Negative paths against the real HTTP surface (no browser needed)
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn synthetic_valid_body(seed: u8) -> serde_json::Value {
-    let mut pubkey = vec![seed; 65];
-    pubkey[0] = 0x04;
-    serde_json::json!({
-        "credential_id_b64url": URL_SAFE_NO_PAD.encode([seed; 16]),
-        "public_key_sec1_b64": URL_SAFE_NO_PAD.encode(pubkey),
-        "label": "synthetic",
-        "sign_count": 1,
-    })
+/// A well-formed registration body from a software authenticator seeded with
+/// `seed`, over a challenge the server never issued, for requests the server
+/// must refuse before it reads the body.
+fn synthetic_valid_body(seed: u8, port: u16) -> serde_json::Value {
+    SoftwareRegistrar::new([seed; 32], vec![seed; 16])
+        .builder(&[seed; 32], &format!("http://localhost:{port}"))
+        .label("synthetic")
+        .json()
 }
 
 /// Parses the JSON data island `id` in a served page, as the offline
@@ -594,7 +649,7 @@ async fn post_wrong_csrf_is_refused_over_real_server() {
         .header(reqwest::header::COOKIE, &cookie)
         .header("x-stellar-approval-csrf", "f".repeat(64))
         .header("x-session-proof", &proof)
-        .json(&synthetic_valid_body(1))
+        .json(&synthetic_valid_body(1, port))
         .send()
         .await
         .expect("POST must complete");
@@ -605,28 +660,25 @@ async fn post_wrong_csrf_is_refused_over_real_server() {
     handle.shutdown().await.ok();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "part of the operator-enroll browser acceptance suite; run via --include-ignored"]
 async fn post_duplicate_credential_id_is_refused_over_real_server() {
     let dir = TempDir::new().expect("tempdir");
     let store_path = dir.path().join("default.toml");
 
-    let seed_store = OperatorApprovalCredentialStore::new(store_path.clone());
-    seed_store
-        .enroll(OperatorApprovalCredential {
-            credential_id_b64url: URL_SAFE_NO_PAD.encode([9u8; 16]),
-            public_key_sec1_b64: {
-                let mut b = vec![9u8; 65];
-                b[0] = 0x04;
-                URL_SAFE_NO_PAD.encode(b)
-            },
-            rp_id: "localhost".to_owned(),
-            label: "pre-existing".to_owned(),
-            registered_at_unix_ms: 1,
-            sign_count: None,
-        })
-        .expect("pre-seed must succeed");
+    // A real registration whose credential ID is already enrolled.
+    let duplicate = SoftwareRegistrar::new([9u8; 32], vec![9u8; 16]);
+    let store = OperatorApprovalCredentialStore::new(store_path.clone());
+    let seeded = OperatorApprovalCredential {
+        credential_id_b64url: duplicate.credential_id_b64url(),
+        public_key_sec1_b64: URL_SAFE_NO_PAD.encode(duplicate.public_key_sec1()),
+        rp_id: "localhost".to_owned(),
+        label: "pre-existing".to_owned(),
+        registered_at_unix_ms: 1,
+        sign_count: None,
+    };
+    store.enroll(seeded.clone()).expect("pre-seed must succeed");
 
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     let handle = start_operator_enroll_server(
@@ -638,71 +690,61 @@ async fn post_duplicate_credential_id_is_refused_over_real_server() {
     )
     .await
     .expect("start must succeed");
-    let port = handle.local_addr().port();
-    let base = format!("http://127.0.0.1:{port}");
-
-    let client = http_client();
-    let Session { cookie, proof } =
-        bootstrap_session(&client, port, handle.bootstrap_token_hex()).await;
-
-    let page_html = client
-        .get(format!("{base}/enroll"))
-        .header("Host", format!("127.0.0.1:{port}"))
-        .header(reqwest::header::COOKIE, &cookie)
-        .send()
-        .await
-        .expect("GET /enroll must succeed")
-        .text()
-        .await
-        .expect("body must be readable");
-    let csrf = extract_csrf(&page_html);
-
-    // Same credential id as the pre-seeded entry: refused as a duplicate.
-    let dup_pubkey = {
-        let mut b = vec![9u8; 65];
-        b[0] = 0x04;
-        URL_SAFE_NO_PAD.encode(b)
+    let mut guard = OperatorEnrollGuard(Some(handle));
+    let (addr, token) = {
+        let handle = guard.0.as_ref().expect("handle present");
+        (handle.local_addr(), handle.bootstrap_token_hex().to_owned())
     };
-    let dup_body = serde_json::json!({
-        "credential_id_b64url": URL_SAFE_NO_PAD.encode([9u8; 16]),
-        "public_key_sec1_b64": dup_pubkey,
-        "label": "attempted-duplicate",
-        "sign_count": 1,
-    });
-    let resp = client
-        .post(format!("{base}/enroll/credential"))
-        .header("Host", format!("127.0.0.1:{port}"))
-        .header("Origin", &base)
-        .header(reqwest::header::COOKIE, &cookie)
-        .header("x-stellar-approval-csrf", &csrf)
-        .header("x-session-proof", &proof)
-        .json(&dup_body)
-        .send()
+    let client = EnrollmentClient::connect(addr, &token)
+        .await
+        .expect("bootstrap, page and CSRF over the real listener");
+
+    // The verified registration of an enrolled ID is refused before it is
+    // staged, and the store is unchanged.
+    let (reply, _) = client
+        .register(&duplicate, "attempted-duplicate")
         .await
         .expect("POST must complete");
-    assert_eq!(resp.status().as_u16(), 409);
-    let body: serde_json::Value = resp.json().await.expect("body must be JSON");
-    assert_eq!(body["error"], "duplicate_credential_id");
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "duplicate_credential_id");
+    assert_eq!(store.list().expect("store readable"), vec![seeded.clone()]);
 
-    // The latch must still be available: a distinct id still succeeds.
-    let resp2 = client
-        .post(format!("{base}/enroll/credential"))
-        .header("Host", format!("127.0.0.1:{port}"))
-        .header("Origin", &base)
-        .header(reqwest::header::COOKIE, &cookie)
-        .header("x-stellar-approval-csrf", &csrf)
-        .header("x-session-proof", &proof)
-        .json(&synthetic_valid_body(77))
-        .send()
+    // The latch is not consumed: a distinct credential is staged, not
+    // enrolled, and enrolls once its code is confirmed.
+    let distinct = SoftwareRegistrar::new([77u8; 32], vec![77u8; 16]);
+    let (reply, code) = client
+        .register(&distinct, "distinct")
         .await
         .expect("second POST must complete");
     assert_eq!(
-        resp2.status().as_u16(),
-        200,
-        "the latch must not be consumed by a duplicate-id failure"
+        reply.status, 200,
+        "the latch must not be consumed by a duplicate-id failure: {}",
+        reply.body
+    );
+    assert_eq!(reply.json()["status"], "awaiting_confirmation");
+    assert_eq!(store.list().expect("store readable"), vec![seeded.clone()]);
+    let pending = guard
+        .0
+        .as_mut()
+        .expect("handle present")
+        .await_completion(Duration::from_secs(5))
+        .await
+        .expect("the distinct registration is staged");
+    let enrolled = pending
+        .confirm(&code, std::time::Instant::now())
+        .expect("the page's code confirms the staged credential")
+        .persist(&store)
+        .expect("the confirmed credential persists");
+    assert_eq!(
+        enrolled.credential_id_b64url,
+        distinct.credential_id_b64url()
+    );
+    assert_eq!(
+        store.list().expect("store readable"),
+        vec![seeded, enrolled]
     );
 
-    handle.shutdown().await.ok();
+    drop(guard);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -880,8 +922,10 @@ async fn browser_with_page() -> (
 
 /// A service on another loopback port receives the enrollment session cookie
 /// from the operator's browser, but its page cannot read the session proof,
-/// and the cookie plus a valid CSRF value without the proof cannot enroll a
-/// credential. The operator's own tab then enrolls normally.
+/// and the cookie plus a valid CSRF value without the proof can neither
+/// request a registration challenge nor post a credential. The operator's own
+/// tab then registers, and its credential enrolls once the displayed code is
+/// confirmed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "requires chromium and explicit --ignored flag"]
@@ -950,20 +994,28 @@ async fn cross_port_cookie_does_not_authorize_enrollment() {
         .expect("body must be readable");
     let csrf = extract_csrf(&page_html);
     assert!(!page_html.contains(&proof));
-    for attempt in [None, Some("f".repeat(64))] {
-        let mut request = client
-            .post(format!("{base}/enroll/credential"))
-            .header("Origin", &base)
-            .header(reqwest::header::COOKIE, &stolen)
-            .header("x-stellar-approval-csrf", &csrf)
-            .json(&synthetic_valid_body(3));
-        if let Some(wrong) = &attempt {
-            request = request.header("x-session-proof", wrong);
+    for (path, body) in [
+        ("/enroll/challenge", serde_json::json!({})),
+        ("/enroll/credential", synthetic_valid_body(3, port)),
+    ] {
+        for attempt in [None, Some("f".repeat(64))] {
+            let mut request = client
+                .post(format!("{base}{path}"))
+                .header("Origin", &base)
+                .header(reqwest::header::COOKIE, &stolen)
+                .header("x-stellar-approval-csrf", &csrf)
+                .json(&body);
+            if let Some(wrong) = &attempt {
+                request = request.header("x-session-proof", wrong);
+            }
+            let resp = request.send().await.expect("POST must complete");
+            assert_eq!(resp.status().as_u16(), 403, "{path} {attempt:?}");
+            let refusal: serde_json::Value = resp.json().await.expect("body must be JSON");
+            assert_eq!(
+                refusal["error"], "session_proof_invalid",
+                "{path} {attempt:?}"
+            );
         }
-        let resp = request.send().await.expect("POST must complete");
-        assert_eq!(resp.status().as_u16(), 403, "{attempt:?}");
-        let body: serde_json::Value = resp.json().await.expect("body must be JSON");
-        assert_eq!(body["error"], "session_proof_invalid", "{attempt:?}");
     }
     let store = OperatorApprovalCredentialStore::new(store_path.clone());
     assert!(store.list().expect("store must be readable").is_empty());
@@ -988,15 +1040,14 @@ async fn cross_port_cookie_does_not_authorize_enrollment() {
         .click()
         .await
         .expect("enroll button click must succeed");
-    let mut enroll_handle = enroll_guard.0.take().expect("handle present");
-    enroll_handle
-        .await_completion(Duration::from_secs(30))
-        .await
-        .expect("the operator's enrollment must complete");
-    enroll_guard.0 = Some(enroll_handle);
-    poll_status_contains(&page, "Enrolled", Instant::now() + Duration::from_secs(5)).await;
+    let (pending, code) = staged_from_page(&mut enroll_guard, &page, &store).await;
+    let confirmed = pending
+        .confirm(&code, std::time::Instant::now())
+        .expect("the displayed code confirms the staged credential")
+        .persist(&store)
+        .expect("the confirmed credential persists");
     let enrolled = store.list().expect("store must be readable");
-    assert_eq!(enrolled.len(), 1);
+    assert_eq!(enrolled, vec![confirmed]);
     assert_eq!(enrolled[0].label, "cross-port-operator");
 
     drop(enroll_guard);

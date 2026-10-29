@@ -2629,7 +2629,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
 
-        use stellar_agent_core::approval::attestation::compute_attestation;
+        use stellar_agent_core::approval::attestation::compute_attestation_v4;
         use stellar_agent_core::audit_log::{AuditEntry, AuditOutbox, AuditWriterRegistry};
         use stellar_agent_test_support::keyring_mock::{ReadHook, install_with_read_hooks};
 
@@ -2718,7 +2718,7 @@ mod tests {
                 .unwrap()
                 .clone()
         };
-        let blob = compute_attestation(
+        let blob = compute_attestation_v4(
             &attestation_key,
             &stellar_agent_core::approval::AttestationBinding::new(
                 &server.profile_name_for_approval(),
@@ -2728,6 +2728,7 @@ mod tests {
             &matching_digest_for(&smart_account),
             &process_uid_for_attestation().unwrap(),
             &stored.attested_lifetime(),
+            &stellar_agent_core::approval::AttestedApprover::Local,
         );
         {
             let approvals_dir = server.resolve_approval_dir().unwrap();
@@ -2735,7 +2736,11 @@ mod tests {
                 approvals_dir.join(format!("{}.toml", server.profile_name_for_approval()));
             let mut store = PendingApprovalStore::open(store_path).unwrap();
             store
-                .record_rule_proposal_attestation(&nonce, blob)
+                .record_rule_proposal_attestation(
+                    &nonce,
+                    blob,
+                    stellar_agent_core::approval::AttestedApprover::Local,
+                )
                 .unwrap();
         }
 
@@ -2898,7 +2903,7 @@ mod tests {
         StellarRuleCreateCommitArgs,
         std::path::PathBuf,
     ) {
-        use stellar_agent_core::approval::attestation::compute_attestation;
+        use stellar_agent_core::approval::attestation::compute_attestation_v4;
         use stellar_agent_network::Signer as _;
 
         stellar_agent_test_support::keyring_mock::install().ok();
@@ -2946,7 +2951,7 @@ mod tests {
         let smart_account = parse_c_strkey_to_smart_account(TEST_SMART_ACCOUNT).unwrap();
         let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
         let lifetime = store.get(&nonce).unwrap().attested_lifetime();
-        let blob = compute_attestation(
+        let blob = compute_attestation_v4(
             &attestation_key,
             &stellar_agent_core::approval::AttestationBinding::new(
                 &server.profile_name_for_approval(),
@@ -2956,9 +2961,14 @@ mod tests {
             &matching_digest_for(&smart_account),
             &process_uid_for_attestation().unwrap(),
             &lifetime,
+            &stellar_agent_core::approval::AttestedApprover::Local,
         );
         store
-            .record_rule_proposal_attestation(&nonce, blob)
+            .record_rule_proposal_attestation(
+                &nonce,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
             .unwrap();
         drop(store);
 

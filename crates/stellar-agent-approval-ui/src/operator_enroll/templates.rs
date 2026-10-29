@@ -17,7 +17,8 @@
 use stellar_agent_loopback_http::brand::{BRAND_STYLE, PageIdentity, TRUST_LINE_LOOPBACK};
 use stellar_agent_loopback_http::escape::html_escape;
 
-/// Enrollment-only rules: the label field and its caption.
+/// Enrollment-only rules: the label field, its caption, and the
+/// confirmation code.
 const ENROLL_STYLE: &str = r"
 .field { text-align: left; margin-bottom: 18px; }
 .field label {
@@ -38,6 +39,14 @@ const ENROLL_STYLE: &str = r"
   border: 2px solid var(--field-border);
   border-radius: 10px;
   padding: 11px 13px;
+}
+.confirmation-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: var(--ink-navy);
+  margin: 14px 0 0;
 }
 .enroll-btn {
   width: 100%;
@@ -75,9 +84,9 @@ fn json_data_island(value: &serde_json::Value) -> String {
 /// - `profile`: the wallet profile this credential is being enrolled for,
 ///   shown for operator orientation only — it plays no role in the
 ///   credential itself (which is always recorded with `rp_id: "localhost"`).
-/// - `csrf_hex`: the 64-character hex-encoded single-use CSRF token the page
-///   must echo back in the `X-Stellar-Approval-CSRF` header on
-///   `POST /enroll/credential`.
+/// - `csrf_hex`: the 64-character hex-encoded session CSRF token the page
+///   echoes back in the `X-Stellar-Approval-CSRF` header on
+///   `POST /enroll/challenge` and `POST /enroll/credential`.
 /// - `label_prefill`: an optional label to pre-populate the label input
 ///   with (from `approve operator enroll --interactive --label <L>`). The
 ///   operator can still edit it before submitting; `None` leaves the field
@@ -123,15 +132,18 @@ pub(super) fn render_enroll_page(
 {card_header}
       <h1>Enroll operator passkey</h1>
       <p class="lead">Profile <code class="chip">{profile_escaped}</code>, registering
-         against <code class="chip">localhost</code>. Name this device, then
-         confirm with Touch&nbsp;ID, Windows&nbsp;Hello, or your security key.</p>
+         against <code class="chip">localhost</code>. Name this device, confirm
+         with Touch&nbsp;ID, Windows&nbsp;Hello, or your security key, then type
+         the code this page shows at the terminal that started the enrollment.</p>
       <div class="field">
         <label for="label-input">Label (e.g. "laptop")</label>
         <input type="text" id="label-input" maxlength="64" autocomplete="off"{label_prefill_attr}>
       </div>
       <div class="status" id="status">Enter a label and create the passkey.</div>
+      <p class="confirmation-code" id="confirmation-code" hidden></p>
       <button class="enroll-btn" id="enroll-btn" type="button">Create passkey</button>
-      <p class="help">This credential will be able to consent to remote-approval
+      <p class="help">Nothing is enrolled until the terminal accepts the code.
+         This credential will be able to consent to remote-approval
          requests for this profile only after its id is added to this profile's
          <code>[remote_approval] allowed_credentials</code> list. Enrolling here
          does not grant that by itself.</p>
@@ -220,6 +232,17 @@ mod tests {
         let html = render_enroll_page("default", &"e".repeat(64), None, &neutral());
         assert!(html.contains(r#"id="label-input""#));
         assert!(html.contains(r#"id="enroll-btn""#));
+    }
+
+    /// The page has a hidden element for the confirmation code and tells the
+    /// operator that the terminal, not the page, completes the enrollment.
+    #[test]
+    fn page_has_a_hidden_code_element_and_names_the_terminal_step() {
+        let html = render_enroll_page("default", &"e".repeat(64), None, &neutral());
+        assert!(
+            html.contains(r#"<p class="confirmation-code" id="confirmation-code" hidden></p>"#)
+        );
+        assert!(html.contains("Nothing is enrolled until the terminal accepts the code."));
     }
 
     #[test]

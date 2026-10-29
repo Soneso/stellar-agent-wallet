@@ -23,19 +23,31 @@
 //! or a poisoned writer mutex, answers [`Outcome::Unavailable`] with the store
 //! unchanged. A poisoned mutex keeps refusing every decision until the
 //! inbox restarts.
+//!
+//! # Remote authorization
+//!
+//! A [`RequestIdentity::Remote`] decision reads the profile's current
+//! remote-approval authorization from disk through its
+//! [`RemoteApprovalAuthority`]: once when the request is resolved, and an
+//! approve again after the attestation key is loaded, immediately before its
+//! consent row and attestation are persisted, so a credential removed while
+//! the keyring prompt waits cannot approve. A credential the current files do
+//! not admit answers [`Outcome::Unauthorized`] with the store unchanged.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::approval::{
-    ApprovalKind, ApproverIdentity, ConsentAudit, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF,
-    PendingApprovalStore, Surface, attest_and_persist, load_and_validate_entry,
-    load_attestation_key, open_with_retry, process_uid_for_attestation,
+    ApprovalKind, ApproverIdentity, AttestedApprover, ConsentAudit, DEFAULT_RETRY_ATTEMPTS,
+    DEFAULT_RETRY_BACKOFF, PendingApprovalStore, RemoteApprovalAuthority, Surface,
+    attest_and_persist, load_and_validate_entry, load_attestation_key, open_with_retry,
+    process_uid_for_attestation,
 };
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::error::WalletError;
+use stellar_agent_core::profile::caip2::Caip2;
 use stellar_agent_core::profile::owner_key::OwnerKeyContext;
 use stellar_agent_core::profile::schema::KeyringEntryRef;
 use stellar_agent_core::timefmt;
@@ -57,19 +69,28 @@ pub const REJECT_TOMBSTONE_TTL_MS: u64 = 3_600_000;
 #[non_exhaustive]
 pub enum RequestIdentity {
     /// The loopback approval-inbox server: derive
-    /// `ApproverIdentity::OsUid(process_uid_for_attestation())` internally,
-    /// exactly as before this type existed. Byte-identical to the
-    /// pre-remote-approval behaviour; the allowlist is never consulted.
+    /// `ApproverIdentity::OsUid(process_uid_for_attestation())` internally.
+    /// The remote-approval allowlist is never consulted, and the attestation
+    /// names [`AttestedApprover::Local`].
     Local,
     /// A passkey-authenticated identity from the remote-approval HTTP
     /// surface, already verified by the caller (see
-    /// `ApproverIdentity::from_verified_passkey_assertion`), plus the
-    /// profile's operator-approval credential allowlist to check it against.
+    /// `ApproverIdentity::from_verified_passkey_assertion`), plus where the
+    /// profile's current authorization lives.
+    ///
+    /// The identity must be an `ApproverIdentity::PasskeyCredential`; any
+    /// other identity answers [`Outcome::Unauthorized`]. The attestation
+    /// names [`AttestedApprover::Remote`] with its credential ID.
     Remote {
         /// The verified `PasskeyCredential` identity.
         identity: ApproverIdentity,
-        /// The profile's `RemoteApprovalConfig::allowed_credentials`.
-        allowed_credentials: Vec<String>,
+        /// The serving profile's remote-approval authority, read again at
+        /// every check.
+        authority: Arc<RemoteApprovalAuthority>,
+        /// The chain the listener serves.
+        chain: Caip2,
+        /// The relying-party ID the listener verifies assertions for.
+        rp_id: String,
     },
 }
 
@@ -188,6 +209,11 @@ pub enum Outcome {
     /// that envelope does not decode, so no surface can show what an
     /// attestation would approve. Nothing was attested and no row written.
     Inconsistent,
+    /// A remote requester the profile's current authorization does not
+    /// admit: its credential is absent from `allowed_credentials` or from the
+    /// operator-credential store, remote approval is disabled, or the
+    /// authorization cannot be read. Nothing was attested and no row written.
+    Unauthorized,
 }
 
 /// Apply one operator [`Decision`] against the profile's approval store, on
@@ -214,63 +240,141 @@ pub fn apply_decision(
     }
 }
 
-/// Resolves `requester` into the `ApproverIdentity` and allowlist to gate
-/// with, plus the `Surface` and optional redacted-audit credential id to
-/// attribute the action to.
+/// A requester resolved against the current authorization.
+struct Resolved {
+    /// The identity the entry binding is checked against.
+    identity: ApproverIdentity,
+    /// The allowlist as read for this decision; empty for a local requester.
+    allowed_credentials: Vec<String>,
+    /// The surface the decision is attributed to.
+    surface: Surface,
+    /// The approver the attestation authenticates.
+    approver: AttestedApprover,
+}
+
+impl Resolved {
+    /// The operator credential ID the audit row redacts, for a remote
+    /// requester.
+    fn operator_credential_id(&self) -> Option<&str> {
+        match &self.approver {
+            AttestedApprover::Remote {
+                credential_id_b64url,
+            } => Some(credential_id_b64url),
+            _ => None,
+        }
+    }
+}
+
+/// Resolves `requester` into the identity and allowlist to gate with, the
+/// surface to attribute the action to, and the approver to attest.
 ///
 /// For [`RequestIdentity::Local`] this derives
-/// `ApproverIdentity::OsUid(process_uid_for_attestation())`, exactly as
-/// `apply_approve` / `apply_reject` did before remote approval existed.
+/// `ApproverIdentity::OsUid(process_uid_for_attestation())`. For
+/// [`RequestIdentity::Remote`] it reads the current authorization through
+/// [`authorize_remote`].
 ///
 /// # Errors
 ///
 /// Returns `Err(Outcome::Unavailable)` if process-UID derivation fails for
-/// `RequestIdentity::Local`.
+/// `RequestIdentity::Local`, and `Err(Outcome::Unauthorized)` for a remote
+/// requester the current authorization does not admit.
 #[allow(
     clippy::result_large_err,
     reason = "the Err variant is the ready-to-return Outcome for a derivation failure"
 )]
-fn resolve_requester(
-    requester: &RequestIdentity,
-) -> Result<(ApproverIdentity, Vec<String>, Surface, Option<String>), Outcome> {
+fn resolve_requester(requester: &RequestIdentity) -> Result<Resolved, Outcome> {
     match requester {
         RequestIdentity::Local => {
             let uid = process_uid_for_attestation().map_err(|e| {
                 tracing::warn!(error = %e, "decision: process uid derivation failed");
                 Outcome::Unavailable
             })?;
-            Ok((
-                ApproverIdentity::OsUid(uid),
-                Vec::new(),
-                Surface::Serve,
-                None,
-            ))
+            Ok(Resolved {
+                identity: ApproverIdentity::OsUid(uid),
+                allowed_credentials: Vec::new(),
+                surface: Surface::Serve,
+                approver: AttestedApprover::Local,
+            })
         }
-        RequestIdentity::Remote {
-            identity,
-            allowed_credentials,
-        } => {
-            let credential_id = match identity {
-                ApproverIdentity::PasskeyCredential {
-                    credential_id_b64url,
-                    ..
-                } => credential_id_b64url.clone(),
-                // `ApproverIdentity` is `#[non_exhaustive]` and defined in a
-                // different crate, so this match needs a wildcard arm. A
-                // caller passing an `OsUid` (or a future variant) inside
-                // `RequestIdentity::Remote` is a caller error, not a security
-                // gap: `is_authorized_for_entry` still fails closed against a
-                // passkey-only allowlist regardless of what this placeholder
-                // string is; there is simply no operator credential id to
-                // attribute in that case.
-                _ => "non-passkey-identity".to_owned(),
-            };
-            Ok((
-                identity.clone(),
-                allowed_credentials.clone(),
-                Surface::ServeRemote,
-                Some(credential_id),
-            ))
+        RequestIdentity::Remote { identity, .. } => {
+            let (credential_id, allowed_credentials) = authorize_remote(requester)?;
+            Ok(Resolved {
+                identity: identity.clone(),
+                allowed_credentials,
+                surface: Surface::ServeRemote,
+                approver: AttestedApprover::Remote {
+                    credential_id_b64url: credential_id,
+                },
+            })
+        }
+    }
+}
+
+/// Reads a remote requester's authorization from disk now and returns its
+/// credential ID and the current allowlist. A local requester needs none and
+/// returns an empty ID and list.
+///
+/// # Errors
+///
+/// `Err(Outcome::Unauthorized)` when the identity is not a passkey
+/// credential, or when the current profile and operator-credential store do
+/// not admit it for the listener's chain and relying-party ID.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err variant is the ready-to-return Outcome"
+)]
+fn authorize_remote(requester: &RequestIdentity) -> Result<(String, Vec<String>), Outcome> {
+    let RequestIdentity::Remote {
+        identity,
+        authority,
+        chain,
+        rp_id,
+    } = requester
+    else {
+        return Ok((String::new(), Vec::new()));
+    };
+    let ApproverIdentity::PasskeyCredential {
+        credential_id_b64url,
+        ..
+    } = identity
+    else {
+        tracing::warn!("decision: a remote requester carries no passkey identity");
+        return Err(Outcome::Unauthorized);
+    };
+    let authorization = authority
+        .require_credential(credential_id_b64url, *chain, Some(rp_id))
+        .map_err(|e| {
+            tracing::warn!(code = %e.code(), "decision: remote requester is not authorized");
+            Outcome::Unauthorized
+        })?;
+    Ok((
+        credential_id_b64url.clone(),
+        authorization.allowed_credentials().to_vec(),
+    ))
+}
+
+#[cfg(test)]
+pub(crate) mod wait_hook {
+    //! Runs a test action where a decision waits: right after approve's
+    //! attestation key loads, standing in for an interactive keyring prompt,
+    //! and right after reject takes the audit-writer lock, before its final
+    //! authorization read, standing in for a revocation while another
+    //! decision held the writer.
+
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Installs `action` for the next decision wait on this thread.
+    pub(crate) fn install(action: impl FnOnce() + 'static) {
+        HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(action)));
+    }
+
+    pub(super) fn fire() {
+        if let Some(action) = HOOK.with(|hook| hook.borrow_mut().take()) {
+            action();
         }
     }
 }
@@ -306,13 +410,17 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
         Err(outcome) => return outcome,
     };
 
-    let (identity, allowed_credentials, surface, operator_credential_id) =
-        match resolve_requester(requester) {
-            Ok(resolved) => resolved,
-            Err(outcome) => return outcome,
-        };
+    let resolved = match resolve_requester(requester) {
+        Ok(resolved) => resolved,
+        Err(outcome) => return outcome,
+    };
 
-    let entry = match load_and_validate_entry(&store, nonce, &identity, &allowed_credentials) {
+    let entry = match load_and_validate_entry(
+        &store,
+        nonce,
+        &resolved.identity,
+        &resolved.allowed_credentials,
+    ) {
         Ok(e) => e,
         Err(e) => {
             if approval_code_is(&e, "approval.user_mismatch") {
@@ -359,6 +467,8 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
             return Outcome::Unavailable;
         }
     };
+    #[cfg(test)]
+    wait_hook::fire();
 
     let mut store = match open_store(ctx, "approve-persist") {
         Ok(s) => s,
@@ -371,12 +481,19 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
     // decision refuses until the inbox restarts.
     let Ok(mut writer) = ctx.audit_writer.lock() else {
         tracing::error!(
-            event_kind = audit_event_kind(operator_credential_id.as_deref(), true),
+            event_kind = audit_event_kind(resolved.operator_credential_id(), true),
             "approve: audit writer mutex poisoned; refusing the decision until the inbox \
              restarts"
         );
         return Outcome::Unavailable;
     };
+
+    // The key load above may have waited on a keyring prompt, and the writer
+    // lock on other decisions: read the authorization again, immediately
+    // before the row and the attestation are persisted.
+    if let Err(outcome) = authorize_remote(requester) {
+        return outcome;
+    }
 
     let grant_override = ctx.grant_store_path_override.clone();
     let profile_name = ctx.context.profile_name.as_str();
@@ -385,9 +502,9 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
         &entry,
         &key,
         &ctx.context.binding(),
-        surface,
+        resolved.surface,
         ConsentAudit::Writer(&mut writer),
-        operator_credential_id.as_deref(),
+        &resolved.approver,
         |req, grant_key| {
             stellar_agent_toolsets_runtime::record_first_invoke_grant(
                 profile_name,
@@ -499,22 +616,22 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
     // just because it carries no attestation. Threaded symmetrically with
     // `apply_approve` via `is_authorized_for_entry`, so a `RequestIdentity::Remote`
     // reject is gated by the same allowlist + entry-binding checks as an
-    // approve.
-    let (identity, allowed_credentials, surface, operator_credential_id) =
-        match resolve_requester(requester) {
-            Ok(resolved) => resolved,
-            Err(outcome) => return outcome,
-        };
+    // approve. A remote requester's authorization is read here, after the
+    // store lock is held, and again once the audit-writer lock is held.
+    let resolved = match resolve_requester(requester) {
+        Ok(resolved) => resolved,
+        Err(outcome) => return outcome,
+    };
     // `entry` is `Some` here: `already_resolved` is `true` for every arm
     // above where it is `None`.
     let Some(entry) = entry else {
         tracing::warn!("reject: entry unexpectedly absent after not-already-resolved check");
         return Outcome::Unavailable;
     };
-    if !identity.is_authorized_for_entry(
+    if !resolved.identity.is_authorized_for_entry(
         &entry.process_uid,
         &entry.approval_nonce,
-        &allowed_credentials,
+        &resolved.allowed_credentials,
     ) {
         return Outcome::UserMismatch;
     }
@@ -532,7 +649,8 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
     // from this store, which holds its lock until it drops, so it is still the
     // entry being rejected. A poisoned mutex is never recovered: every later
     // decision refuses until the inbox restarts.
-    let event_kind = audit_event_kind(operator_credential_id.as_deref(), false);
+    let operator_credential_id = resolved.operator_credential_id();
+    let event_kind = audit_event_kind(operator_credential_id, false);
     let Ok(mut writer) = ctx.audit_writer.lock() else {
         tracing::error!(
             event_kind,
@@ -540,8 +658,19 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
         );
         return Outcome::Unavailable;
     };
+
+    // The writer lock may have waited on other decisions: read the
+    // authorization again before the rejection row. `write_entry` may still
+    // drain queued rows, repair the anchor or rotate the log before the row
+    // lands, so a revocation during that work does not stop this rejection;
+    // a rejection only denies the pending action.
+    #[cfg(test)]
+    wait_hook::fire();
+    if let Err(outcome) = authorize_remote(requester) {
+        return outcome;
+    }
     let kind_name = original_kind_name.unwrap_or_else(|| "unknown".to_owned());
-    let audit_entry = match &operator_credential_id {
+    let audit_entry = match operator_credential_id {
         Some(cred_id) => AuditEntry::new_approval_rejected_remote(
             kind_name,
             nonce,
@@ -551,7 +680,7 @@ fn apply_reject(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity)
         None => AuditEntry::new_approval_rejected(
             kind_name,
             nonce,
-            surface.as_str(),
+            resolved.surface.as_str(),
             uuid::Uuid::new_v4().to_string(),
         ),
     };
@@ -594,7 +723,10 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use keyring_core::Entry as KeyringEntry;
     use serial_test::serial;
-    use stellar_agent_core::approval::attestation::{compute_attestation, verify_attestation};
+    use stellar_agent_core::approval::attestation::{compute_attestation_v4, verify_attestation};
+    use stellar_agent_core::approval::operator_credentials::{
+        OperatorApprovalCredential, OperatorApprovalCredentialStore,
+    };
     use stellar_agent_core::approval::{
         DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, decode_sha256_hex, fixtures,
         process_uid_for_attestation,
@@ -838,13 +970,14 @@ mod tests {
 
         // Independently verify the surfaced blob against the attestation key.
         let sha = decode_sha256_hex(&envelope_sha256_hex).unwrap();
-        let expected = compute_attestation(
+        let expected = compute_attestation_v4(
             &fx.raw_key,
             &fx.ctx.context.binding(),
             &nonce,
             &sha,
             &process_uid,
             &attested.attested_lifetime(),
+            &AttestedApprover::Local,
         );
         let blob: [u8; 32] = URL_SAFE_NO_PAD
             .decode(&attestation)
@@ -852,13 +985,16 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(blob, expected);
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        let persisted = store.get(&nonce).unwrap();
+        assert!(persisted.attested_approver == Some(AttestedApprover::Local));
         assert!(verify_attestation(
             &fx.raw_key,
             &fx.ctx.context.binding(),
             &nonce,
             &sha,
             &process_uid,
-            &attested.attestation_scope().unwrap(),
+            &persisted.attestation_scope().unwrap(),
             &blob
         ));
     }
@@ -937,13 +1073,14 @@ mod tests {
 
         // Independently verify the surfaced blob against the attestation key.
         let sha = decode_sha256_hex(&envelope_sha256_hex).unwrap();
-        let expected = compute_attestation(
+        let expected = compute_attestation_v4(
             &fx.raw_key,
             &fx.ctx.context.binding(),
             &nonce,
             &sha,
             &process_uid,
             &attested.attested_lifetime(),
+            &AttestedApprover::Local,
         );
         let blob: [u8; 32] = URL_SAFE_NO_PAD
             .decode(&attestation)
@@ -951,13 +1088,16 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(blob, expected);
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        let persisted = store.get(&nonce).unwrap();
+        assert!(persisted.attested_approver == Some(AttestedApprover::Local));
         assert!(verify_attestation(
             &fx.raw_key,
             &fx.ctx.context.binding(),
             &nonce,
             &sha,
             &process_uid,
-            &attested.attestation_scope().unwrap(),
+            &persisted.attestation_scope().unwrap(),
             &blob
         ));
     }
@@ -1455,7 +1595,9 @@ mod tests {
                     return;
                 }
                 let mut other = PendingApprovalStore::open(path).unwrap();
-                other.record_attestation(&nonce, [0x01; 32]).unwrap();
+                other
+                    .record_attestation(&nonce, [0x01; 32], AttestedApprover::Local)
+                    .unwrap();
             }) as Arc<dyn Fn() + Send + Sync>
         };
         stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
@@ -1544,7 +1686,9 @@ mod tests {
     fn approving_an_entry_consumed_since_validation_is_already_resolved_with_no_row() {
         let (fx, outcome) =
             approve_an_entry_resolved_by_another_handle("raced-consumed", |store, nonce| {
-                store.record_attestation(nonce, [0x01; 32]).unwrap();
+                store
+                    .record_attestation(nonce, [0x01; 32], AttestedApprover::Local)
+                    .unwrap();
                 store
                     .consume(
                         nonce,
@@ -1685,5 +1829,312 @@ mod tests {
         );
         assert_eq!(rows_of_kind(&audit_path(&fx), "approval_attested"), 1);
         assert_eq!(rows_of_kind(&audit_path(&fx), "approval_rejected"), 1);
+    }
+
+    const RP_ID: &str = "wallet.test.internal";
+
+    fn credential_id(seed: u8) -> String {
+        URL_SAFE_NO_PAD.encode([seed; 16])
+    }
+
+    fn profile_dir(fx: &Fixture) -> std::path::PathBuf {
+        fx.ctx.store_path.parent().unwrap().join("profiles")
+    }
+
+    fn credentials_path(fx: &Fixture) -> std::path::PathBuf {
+        fx.ctx
+            .store_path
+            .parent()
+            .unwrap()
+            .join("operator-credentials.toml")
+    }
+
+    /// Writes the fixture's profile to disk with remote approval enabled for
+    /// `ids`.
+    fn allow(fx: &Fixture, ids: &[String]) {
+        let mut profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "default", "nonce", "default",
+        )
+        .build();
+        profile.remote_approval = Some(
+            serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "bind": "127.0.0.1:8443",
+                "rp_id": RP_ID,
+                "allowed_credentials": ids,
+            }))
+            .unwrap(),
+        );
+        stellar_agent_core::profile::loader::save_to_dir("ui-test", &profile, &profile_dir(fx))
+            .unwrap();
+    }
+
+    fn enroll(fx: &Fixture, id: &str) {
+        let mut key = vec![0x04u8; 65];
+        key[1] = 7;
+        OperatorApprovalCredentialStore::new(credentials_path(fx))
+            .enroll(OperatorApprovalCredential {
+                credential_id_b64url: id.to_owned(),
+                public_key_sec1_b64: URL_SAFE_NO_PAD.encode(key),
+                rp_id: RP_ID.to_owned(),
+                label: "device".to_owned(),
+                registered_at_unix_ms: 1,
+                sign_count: None,
+            })
+            .unwrap();
+    }
+
+    /// A remote requester whose assertion for `nonce` was verified for the
+    /// credential `id`, reading its authorization from the fixture's files.
+    fn remote_requester(fx: &Fixture, id: &str, nonce: &str) -> RequestIdentity {
+        let witness = stellar_agent_core::approval::VerifiedPasskeyAssertion::new_verified(
+            nonce,
+            Ok::<(), ()>(()),
+        )
+        .unwrap();
+        RequestIdentity::Remote {
+            identity: ApproverIdentity::from_verified_passkey_assertion(id, witness),
+            authority: Arc::new(
+                RemoteApprovalAuthority::from_paths(
+                    "ui-test".to_owned(),
+                    profile_dir(fx),
+                    credentials_path(fx),
+                )
+                .unwrap(),
+            ),
+            chain: Caip2::Testnet,
+            rp_id: RP_ID.to_owned(),
+        }
+    }
+
+    /// An authorized remote approval persists a version 4 attestation that
+    /// names the verified credential and writes the remote consent row.
+    #[test]
+    #[serial]
+    fn remote_approve_attests_the_verified_credential() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fx = fixture("remote-approve");
+        allow(&fx, &[credential_id(1)]);
+        enroll(&fx, &credential_id(1));
+        let entry = payment_entry(DEFAULT_TTL_MS);
+        let nonce = insert(&fx.ctx, entry);
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Approve {
+                nonce: nonce.clone(),
+            },
+            &remote_requester(&fx, &credential_id(1), &nonce),
+        );
+        assert!(matches!(outcome, Outcome::Attested { .. }), "{outcome:?}");
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        let record = store.get(&nonce).unwrap();
+        assert_eq!(record.attestation_version, 4);
+        assert!(
+            record.attested_approver
+                == Some(AttestedApprover::Remote {
+                    credential_id_b64url: credential_id(1),
+                })
+        );
+        assert_eq!(
+            rows_of_kind(&audit_path(&fx), "approval_attested_remote"),
+            1
+        );
+    }
+
+    /// The credential is removed from the allowlist while the attestation key
+    /// loads: the approval refuses after the wait, and neither the
+    /// attestation nor the consent row is persisted. Removing the enrollment
+    /// instead refuses the same way.
+    #[test]
+    #[serial]
+    fn revocation_during_keyring_wait_refuses() {
+        for revoke in ["allowlist", "enrollment"] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let fx = fixture(&format!("remote-wait-{revoke}"));
+            allow(&fx, &[credential_id(1), credential_id(2)]);
+            enroll(&fx, &credential_id(1));
+            enroll(&fx, &credential_id(2));
+            let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+            let profiles = profile_dir(&fx);
+            let credentials = credentials_path(&fx);
+            let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+            let hook_fired = std::rc::Rc::clone(&fired);
+            wait_hook::install(move || {
+                hook_fired.set(true);
+                revoke_first_credential(&profiles, &credentials, revoke);
+            });
+            let outcome = apply_decision(
+                &fx.ctx,
+                Decision::Approve {
+                    nonce: nonce.clone(),
+                },
+                &remote_requester(&fx, &credential_id(1), &nonce),
+            );
+            assert!(fired.get());
+            assert_eq!(outcome, Outcome::Unauthorized);
+            assert!(still_pending(&fx, &nonce));
+            assert_eq!(
+                rows_of_kind(&audit_path(&fx), "approval_attested_remote"),
+                0
+            );
+
+            // The credential the edit left authorized still approves.
+            let outcome = apply_decision(
+                &fx.ctx,
+                Decision::Approve {
+                    nonce: nonce.clone(),
+                },
+                &remote_requester(&fx, &credential_id(2), &nonce),
+            );
+            assert!(matches!(outcome, Outcome::Attested { .. }), "{outcome:?}");
+        }
+    }
+
+    /// Revokes `credential_id(1)` the way `revoke` names: by editing the
+    /// profile's allowlist or by removing its enrollment.
+    fn revoke_first_credential(
+        profiles: &std::path::Path,
+        credentials: &std::path::Path,
+        revoke: &str,
+    ) {
+        if revoke == "allowlist" {
+            let mut profile = stellar_agent_core::profile::loader::load_from_dir_without_overlays(
+                "ui-test", profiles, None,
+            )
+            .unwrap();
+            profile
+                .remote_approval
+                .as_mut()
+                .unwrap()
+                .allowed_credentials
+                .retain(|id| *id != credential_id(1));
+            stellar_agent_core::profile::loader::save_to_dir("ui-test", &profile, profiles)
+                .unwrap();
+        } else {
+            assert!(
+                OperatorApprovalCredentialStore::new(credentials.to_path_buf())
+                    .remove(&credential_id(1))
+                    .unwrap()
+            );
+        }
+    }
+
+    /// The credential is revoked while the reject waits for the audit-writer
+    /// lock: the rejection refuses after the wait, and neither the rejection
+    /// row nor the tombstone is written. The credential the edit left
+    /// authorized still rejects.
+    #[test]
+    #[serial]
+    fn revocation_while_reject_waits_for_the_writer_refuses() {
+        for revoke in ["allowlist", "enrollment"] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let fx = fixture(&format!("remote-reject-wait-{revoke}"));
+            allow(&fx, &[credential_id(1), credential_id(2)]);
+            enroll(&fx, &credential_id(1));
+            enroll(&fx, &credential_id(2));
+            let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+            let profiles = profile_dir(&fx);
+            let credentials = credentials_path(&fx);
+            let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+            let hook_fired = std::rc::Rc::clone(&fired);
+            wait_hook::install(move || {
+                hook_fired.set(true);
+                revoke_first_credential(&profiles, &credentials, revoke);
+            });
+            let outcome = apply_decision(
+                &fx.ctx,
+                Decision::Reject {
+                    nonce: nonce.clone(),
+                },
+                &remote_requester(&fx, &credential_id(1), &nonce),
+            );
+            assert!(fired.get(), "{revoke}");
+            assert_eq!(outcome, Outcome::Unauthorized, "{revoke}");
+            assert!(still_pending(&fx, &nonce), "{revoke}");
+            assert_eq!(
+                rows_of_kind(&audit_path(&fx), "approval_rejected_remote"),
+                0
+            );
+
+            let outcome = apply_decision(
+                &fx.ctx,
+                Decision::Reject {
+                    nonce: nonce.clone(),
+                },
+                &remote_requester(&fx, &credential_id(2), &nonce),
+            );
+            assert_eq!(outcome, Outcome::Rejected, "{revoke}");
+            assert_eq!(
+                rows_of_kind(&audit_path(&fx), "approval_rejected_remote"),
+                1
+            );
+            let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+            assert!(matches!(
+                store.get(&nonce).unwrap().kind,
+                ApprovalKind::Rejected { .. }
+            ));
+        }
+    }
+
+    /// A remote requester the current files do not admit can neither approve
+    /// nor reject, and a remote requester without a passkey identity is
+    /// refused the same way; nothing is persisted and no row is written.
+    #[test]
+    #[serial]
+    fn unauthorized_remote_requester_decides_nothing() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fx = fixture("remote-unauthorized");
+        allow(&fx, &[credential_id(2)]);
+        enroll(&fx, &credential_id(1));
+        enroll(&fx, &credential_id(2));
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        for decision in [
+            Decision::Approve {
+                nonce: nonce.clone(),
+            },
+            Decision::Reject {
+                nonce: nonce.clone(),
+            },
+        ] {
+            assert_eq!(
+                apply_decision(
+                    &fx.ctx,
+                    decision,
+                    &remote_requester(&fx, &credential_id(1), &nonce)
+                ),
+                Outcome::Unauthorized
+            );
+        }
+        let RequestIdentity::Remote {
+            authority,
+            chain,
+            rp_id,
+            ..
+        } = remote_requester(&fx, &credential_id(2), &nonce)
+        else {
+            unreachable!()
+        };
+        let os_identity = RequestIdentity::Remote {
+            identity: ApproverIdentity::OsUid(uid()),
+            authority,
+            chain,
+            rp_id,
+        };
+        for decision in [
+            Decision::Approve {
+                nonce: nonce.clone(),
+            },
+            Decision::Reject {
+                nonce: nonce.clone(),
+            },
+        ] {
+            assert_eq!(
+                apply_decision(&fx.ctx, decision, &os_identity),
+                Outcome::Unauthorized
+            );
+        }
+        assert!(still_pending(&fx, &nonce));
+        let log = std::fs::read_to_string(audit_path(&fx)).unwrap_or_default();
+        assert!(!log.contains("approval_"), "{log}");
     }
 }

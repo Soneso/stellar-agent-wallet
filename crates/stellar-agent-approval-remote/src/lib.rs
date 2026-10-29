@@ -14,10 +14,10 @@
 //! crate is additive: a new TLS listener, a new identity path
 //! (`ApproverIdentity::PasskeyCredential`, from `stellar-agent-core`), and
 //! two opt-in CLI flags gated behind explicit operator consent
-//! (`stellar-agent-cli`). The attestation this listener produces is
-//! byte-identical to the loopback path's — the distinction between a local
-//! and a remote approval lives only in the audit log
-//! (`EventKind::ApprovalAttestedRemote` / `ApprovalRejectedRemote`).
+//! (`stellar-agent-cli`). The attestation this listener produces uses the
+//! same key and layout as the loopback path's, and names the operator
+//! credential that approved; the audit log records the remote decision as
+//! `EventKind::ApprovalAttestedRemote` / `ApprovalRejectedRemote`.
 //!
 //! # Security posture
 //!
@@ -31,6 +31,14 @@
 //!   independently re-checks allowlist membership and the witness's
 //!   entry-binding. Either layer refuses alone even if the other is
 //!   mis-wired.
+//! - **Authorization is read at every check.** The listener keeps no copy of
+//!   the profile's `allowed_credentials` list. Every login, every
+//!   authenticated request and every decision reads the current list and
+//!   the current operator-credential store through a
+//!   `stellar_agent_core::approval::RemoteApprovalAuthority`, so a
+//!   credential removed from either stops logging in, its session stops
+//!   being served, and its decisions refuse, without a restart. A read that
+//!   fails refuses.
 //! - **What-you-see-is-what-you-sign.** The per-action challenge binds
 //!   `SHA-256(rand32 || envelope_sha256 || approval_nonce)`, where
 //!   `envelope_sha256` is derived from the PARKED pending-approval entry on
@@ -91,8 +99,10 @@ use axum_server::tls_rustls::RustlsConfig;
 /// [`axum_server::Handle`] specialised to a plain socket-address listener.
 type ServerHandle = axum_server::Handle<SocketAddr>;
 use stellar_agent_approval_ui::DecisionContext;
+use stellar_agent_core::approval::RemoteApprovalAuthority;
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::approval::operator_credentials::OperatorApprovalCredentialStore;
+use stellar_agent_core::profile::caip2::Caip2;
 use tokio::task::JoinHandle;
 
 use challenge_store::{ActionChallengeStore, LoginChallengeStore};
@@ -115,17 +125,15 @@ pub struct RemoteServeConfig {
     pub bind_addr: SocketAddr,
     /// WebAuthn Relying Party ID — a DNS hostname, never an IP literal.
     pub rp_id: String,
-    /// The profile's operator-approval credential allowlist
-    /// (`RemoteApprovalConfig::allowed_credentials`).
-    pub allowed_credentials: Vec<String>,
+    /// Where the served profile's current authorization lives: its
+    /// `[remote_approval] allowed_credentials` list and its
+    /// operator-credential store, both read again at every check.
+    pub authority: RemoteApprovalAuthority,
     /// The decision context (store path, keyring ref, audit writer, profile)
     /// — reused verbatim from `stellar-agent-approval-ui`, so this crate
     /// never re-implements attestation, grant persistence, or audit
     /// plumbing.
     pub decision_context: DecisionContext,
-    /// Path to the profile's operator-approval credential store
-    /// (`stellar_agent_core::approval::operator_credentials::default_operator_approval_credentials_path`).
-    pub operator_credentials_path: std::path::PathBuf,
     /// Provisioned TLS certificate and key (see [`provision_or_load`]).
     pub tls: ProvisionedTls,
     /// The identity the served pages announce.
@@ -146,17 +154,15 @@ impl RemoteServeConfig {
     pub fn new(
         bind_addr: SocketAddr,
         rp_id: impl Into<String>,
-        allowed_credentials: Vec<String>,
+        authority: RemoteApprovalAuthority,
         decision_context: DecisionContext,
-        operator_credentials_path: std::path::PathBuf,
         tls: ProvisionedTls,
     ) -> Self {
         Self {
             bind_addr,
             rp_id: rp_id.into(),
-            allowed_credentials,
+            authority,
             decision_context,
-            operator_credentials_path,
             tls,
             page_identity: PageIdentity::neutral(),
         }
@@ -179,7 +185,11 @@ pub(crate) struct RemoteServeState {
     /// [`remote_origin::expected_https_origin`]). Computed once here at
     /// server-start time, never per-request.
     pub(crate) expected_origin: std::sync::Arc<str>,
-    pub(crate) allowed_credentials: std::sync::Arc<Vec<String>>,
+    /// The served profile's authorization source, read at every check.
+    pub(crate) authority: std::sync::Arc<RemoteApprovalAuthority>,
+    /// The chain the served profile is on; a profile whose current chain
+    /// differs is no authorization.
+    pub(crate) chain: Caip2,
     pub(crate) ctx: std::sync::Arc<DecisionContext>,
     pub(crate) operator_credentials: std::sync::Arc<OperatorApprovalCredentialStore>,
     pub(crate) login_challenges: std::sync::Arc<StdMutex<LoginChallengeStore>>,
@@ -249,6 +259,12 @@ pub enum RemoteServeStartError {
         /// The I/O error kind.
         kind: std::io::ErrorKind,
     },
+    /// The decision context names a chain that is not a Stellar CAIP-2 ID.
+    #[error("remote-approval decision context names an unknown chain: {detail}")]
+    UnknownChain {
+        /// Non-secret diagnostic detail.
+        detail: String,
+    },
 }
 
 /// Starts the remote-approval HTTPS server.
@@ -266,8 +282,15 @@ pub async fn start_remote_serve(
                 detail: e.to_string(),
             })?;
 
+    let chain: Caip2 = config.decision_context.context.chain_id.parse().map_err(
+        |e: stellar_agent_core::profile::caip2::Caip2ParseError| {
+            RemoteServeStartError::UnknownChain {
+                detail: e.to_string(),
+            }
+        },
+    )?;
     let operator_credentials =
-        OperatorApprovalCredentialStore::new(config.operator_credentials_path);
+        OperatorApprovalCredentialStore::new(config.authority.credentials_path().to_path_buf());
 
     // Bind synchronously, before constructing anything origin-dependent: the
     // requested `config.bind_addr` may specify port 0 (OS-assigned ephemeral
@@ -292,7 +315,8 @@ pub async fn start_remote_serve(
     let state = RemoteServeState {
         rp_id: config.rp_id.clone().into(),
         expected_origin,
-        allowed_credentials: std::sync::Arc::new(config.allowed_credentials),
+        authority: std::sync::Arc::new(config.authority),
+        chain,
         ctx: std::sync::Arc::new(config.decision_context),
         operator_credentials: std::sync::Arc::new(operator_credentials),
         login_challenges: std::sync::Arc::new(StdMutex::new(LoginChallengeStore::new())),

@@ -35,7 +35,8 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tower::ServiceExt as _;
 
-use stellar_agent_core::approval::attestation::{compute_attestation, verify_attestation};
+use stellar_agent_core::approval::AttestedApprover;
+use stellar_agent_core::approval::attestation::{compute_attestation_v4, verify_attestation};
 use stellar_agent_core::approval::{
     ApprovalKind, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, decode_sha256_hex,
     fixtures, process_uid_for_attestation,
@@ -385,13 +386,14 @@ async fn approve_payment_mints_verifiable_attestation() {
     let blob_b64 = json["attestation"].as_str().unwrap();
 
     let sha = decode_sha256_hex(&envelope_sha256_hex).unwrap();
-    let expected = compute_attestation(
+    let expected = compute_attestation_v4(
         &h.raw_key,
         &h.state.ctx.context.binding(),
         &nonce,
         &sha,
         &process_uid,
         &attested.attested_lifetime(),
+        &AttestedApprover::Local,
     );
     let blob: [u8; 32] = URL_SAFE_NO_PAD
         .decode(blob_b64)
@@ -399,13 +401,17 @@ async fn approve_payment_mints_verifiable_attestation() {
         .try_into()
         .unwrap();
     assert_eq!(blob, expected);
+    let store = PendingApprovalStore::open(h.state.ctx.store_path.clone()).unwrap();
+    let persisted = store.get(&nonce).unwrap().clone();
+    drop(store);
+    assert!(persisted.attested_approver == Some(AttestedApprover::Local));
     assert!(verify_attestation(
         &h.raw_key,
         &h.state.ctx.context.binding(),
         &nonce,
         &sha,
         &process_uid,
-        &attested.attestation_scope().unwrap(),
+        &persisted.attestation_scope().unwrap(),
         &blob
     ));
 }
@@ -458,13 +464,14 @@ async fn serve_trustline_json_returns_attestation() {
     let blob_b64 = json["attestation"].as_str().unwrap();
 
     let sha = decode_sha256_hex(&envelope_sha256_hex).unwrap();
-    let expected = compute_attestation(
+    let expected = compute_attestation_v4(
         &h.raw_key,
         &h.state.ctx.context.binding(),
         &nonce,
         &sha,
         &process_uid,
         &attested.attested_lifetime(),
+        &AttestedApprover::Local,
     );
     let blob: [u8; 32] = URL_SAFE_NO_PAD
         .decode(blob_b64)
@@ -472,13 +479,17 @@ async fn serve_trustline_json_returns_attestation() {
         .try_into()
         .unwrap();
     assert_eq!(blob, expected);
+    let store = PendingApprovalStore::open(h.state.ctx.store_path.clone()).unwrap();
+    let persisted = store.get(&nonce).unwrap().clone();
+    drop(store);
+    assert!(persisted.attested_approver == Some(AttestedApprover::Local));
     assert!(verify_attestation(
         &h.raw_key,
         &h.state.ctx.context.binding(),
         &nonce,
         &sha,
         &process_uid,
-        &attested.attestation_scope().unwrap(),
+        &persisted.attestation_scope().unwrap(),
         &blob
     ));
     let req = Request::builder()

@@ -113,6 +113,7 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::assertion_input::{AssertionInput, validate_signature_compact};
+use super::attestation::AttestedApprover;
 use super::error::ApprovalError;
 use super::registration_input::{
     CREDENTIAL_ID_MAX_BYTES, CREDENTIAL_ID_MIN_BYTES, RegistrationInput,
@@ -1372,6 +1373,10 @@ struct PendingApprovalOnDisk {
     // An absent version decodes as version 2.
     #[serde(default = "legacy_attestation_version")]
     attestation_version: u32,
+    // The approver a version 4 attestation authenticates; absent on an
+    // unattested record and on every record written under version 2 or 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attested_approver: Option<AttestedApproverWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 
@@ -1449,6 +1454,51 @@ struct PendingApprovalOnDisk {
 /// The layout of an attestation stored before records named theirs.
 fn legacy_attestation_version() -> u32 {
     super::attestation::ATTESTATION_VERSION_V2
+}
+
+/// On-disk form of [`AttestedApprover`]: `{ kind = "local" }` or
+/// `{ kind = "remote", credential_id_b64url = "<id>" }`.
+///
+/// Unknown fields refuse, and so do a local approver that names a credential
+/// and a remote approver whose credential ID is absent or not canonical
+/// base64url, so a hand-edited approver never decodes as a different one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttestedApproverWire {
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_id_b64url: Option<String>,
+}
+
+impl AttestedApproverWire {
+    fn from_approver(approver: &AttestedApprover) -> Self {
+        match approver {
+            AttestedApprover::Local => Self {
+                kind: "local".to_owned(),
+                credential_id_b64url: None,
+            },
+            AttestedApprover::Remote {
+                credential_id_b64url,
+            } => Self {
+                kind: "remote".to_owned(),
+                credential_id_b64url: Some(credential_id_b64url.clone()),
+            },
+        }
+    }
+
+    fn into_approver(self) -> Result<AttestedApprover, String> {
+        let approver = match (self.kind.as_str(), self.credential_id_b64url) {
+            ("local", None) => AttestedApprover::Local,
+            ("remote", Some(credential_id_b64url)) => AttestedApprover::Remote {
+                credential_id_b64url,
+            },
+            _ => return Err("attested_approver is malformed".to_owned()),
+        };
+        if !approver.is_well_formed() {
+            return Err("attested_approver names a malformed credential id".to_owned());
+        }
+        Ok(approver)
+    }
 }
 
 /// Optional `summary_to` deserialiser — applies the G-strkey validator when
@@ -1628,11 +1678,22 @@ pub struct PendingApproval {
 
     /// The layout `attestation_blob_b64` is computed under.
     ///
-    /// [`super::attestation::ATTESTATION_VERSION`] for every record this build
-    /// creates and for every attestation it records, which covers the record's
-    /// kind and lifetime. A record written without the field reads as
-    /// [`super::attestation::ATTESTATION_VERSION_V2`].
+    /// [`super::attestation::PENDING_ATTESTATION_VERSION`] for every record
+    /// this build creates and for every attestation it records, which covers
+    /// the record's kind, its lifetime and [`Self::attested_approver`]. A
+    /// record written without the field reads as
+    /// [`super::attestation::ATTESTATION_VERSION_V2`]; a record under any
+    /// version other than 4 verifies nothing (see [`Self::attestation_scope`]).
     pub attestation_version: u32,
+
+    /// Who approved this record, as its version 4 attestation authenticates
+    /// it.
+    ///
+    /// `None` on an unattested record. Set in the same store replacement as
+    /// `attestation_blob_b64` and `attestation_version`, from the verified
+    /// identity of the approving surface. An attested record without an
+    /// approver never verifies: missing provenance is never read as local.
+    pub attested_approver: Option<AttestedApprover>,
 }
 
 impl std::fmt::Debug for PendingApproval {
@@ -1670,6 +1731,7 @@ impl std::fmt::Debug for PendingApproval {
             .field("attestation_blob_b64", &attest_display)
             .field("passkey_assertion", &passkey_display)
             .field("attestation_version", &self.attestation_version)
+            .field("attested_approver", &self.attested_approver)
             .finish()
     }
 }
@@ -2130,6 +2192,10 @@ impl Serialize for PendingApproval {
             created_at_unix_ms: self.created_at_unix_ms,
             expires_at_unix_ms: self.expires_at_unix_ms,
             attestation_version: self.attestation_version,
+            attested_approver: self
+                .attested_approver
+                .as_ref()
+                .map(AttestedApproverWire::from_approver),
             reason: self.reason.clone(),
             envelope_xdr_b64: envelope_xdr_b64.map(ToOwned::to_owned),
             envelope_sha256_hex: envelope_sha256_hex.map(ToOwned::to_owned),
@@ -2220,7 +2286,19 @@ impl<'de> Deserialize<'de> for PendingApproval {
     where
         D: Deserializer<'de>,
     {
-        let raw = PendingApprovalOnDisk::deserialize(deserializer)?;
+        let mut raw = PendingApprovalOnDisk::deserialize(deserializer)?;
+
+        // An approver is recorded together with the blob it authenticates;
+        // one without the other is a hand-edited record.
+        let attested_approver = match raw.attested_approver.take() {
+            None => None,
+            Some(_) if raw.attestation_blob_b64.is_none() => {
+                return Err(serde::de::Error::custom(
+                    "attested_approver is present without an attestation",
+                ));
+            }
+            Some(wire) => Some(wire.into_approver().map_err(serde::de::Error::custom)?),
+        };
 
         let present_subtables = [
             ("sign_with_passkey", raw.sign_with_passkey.is_some()),
@@ -2992,6 +3070,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
             attestation_blob_b64: raw.attestation_blob_b64,
             passkey_assertion: raw.passkey_assertion,
             attestation_version: raw.attestation_version,
+            attested_approver,
         })
     }
 }
@@ -3018,13 +3097,18 @@ impl PendingApproval {
         )
     }
 
-    /// The layout this record's attestation is verified under, or `None` for
-    /// a version this build does not read, which verifies nothing.
+    /// The layout this record's attestation is verified under: version 4
+    /// with the recorded approver, or `None`, which verifies nothing.
+    ///
+    /// A record under version 2 or 3, or one without a well-formed approver,
+    /// returns `None`, so editing a record's version or deleting its approver
+    /// never selects a layout that ignores who approved it.
     #[must_use]
     pub fn attestation_scope(&self) -> Option<super::attestation::AttestationScope<'_>> {
-        super::attestation::AttestationScope::from_version(
+        super::attestation::AttestationScope::pending(
             self.attestation_version,
             self.attested_lifetime(),
+            self.attested_approver.as_ref(),
         )
     }
 
@@ -3140,7 +3224,8 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
-            attestation_version: super::attestation::ATTESTATION_VERSION,
+            attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
+            attested_approver: None,
         })
     }
 
@@ -3284,7 +3369,8 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
-            attestation_version: super::attestation::ATTESTATION_VERSION,
+            attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
+            attested_approver: None,
         })
     }
 
@@ -3402,7 +3488,8 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
-            attestation_version: super::attestation::ATTESTATION_VERSION,
+            attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
+            attested_approver: None,
         })
     }
 
@@ -3505,7 +3592,8 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
-            attestation_version: super::attestation::ATTESTATION_VERSION,
+            attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
+            attested_approver: None,
         })
     }
 
@@ -3579,7 +3667,8 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
-            attestation_version: super::attestation::ATTESTATION_VERSION,
+            attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
+            attested_approver: None,
         })
     }
 
@@ -3631,7 +3720,8 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
-            attestation_version: super::attestation::ATTESTATION_VERSION,
+            attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
+            attested_approver: None,
         })
     }
 
@@ -3782,7 +3872,8 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
-            attestation_version: super::attestation::ATTESTATION_VERSION,
+            attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
+            attested_approver: None,
         })
     }
 
@@ -3843,7 +3934,8 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
-            attestation_version: super::attestation::ATTESTATION_VERSION,
+            attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
+            attested_approver: None,
         })
     }
 
@@ -3921,7 +4013,8 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
-            attestation_version: super::attestation::ATTESTATION_VERSION,
+            attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
+            attested_approver: None,
         })
     }
 
@@ -4063,7 +4156,8 @@ impl PendingApproval {
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
-            attestation_version: super::attestation::ATTESTATION_VERSION,
+            attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
+            attested_approver: None,
         })
     }
 
@@ -5063,6 +5157,8 @@ impl PendingApprovalStore {
     ///
     /// # Errors
     ///
+    /// - [`ApprovalError::Invalid`] if `approver` is a remote approver whose
+    ///   credential ID is not canonical base64url.
     /// - [`ApprovalError::NotFound`] if no entry with `approval_nonce` exists.
     /// - [`ApprovalError::Expired`] if the entry's TTL has elapsed.
     /// - [`ApprovalError::AlreadyAttested`] if the blob is already set.
@@ -5073,9 +5169,10 @@ impl PendingApprovalStore {
         &mut self,
         approval_nonce: &str,
         attestation_blob: [u8; 32],
+        approver: AttestedApprover,
     ) -> Result<(), ApprovalError> {
         let now_ms = approval_now_unix_ms()?;
-        self.record_attestation_at(approval_nonce, attestation_blob, now_ms)
+        self.record_attestation_at(approval_nonce, attestation_blob, approver, now_ms)
     }
 
     /// [`Self::record_attestation`] with the expiry checked against `now_ms`,
@@ -5084,8 +5181,14 @@ impl PendingApprovalStore {
         &mut self,
         approval_nonce: &str,
         attestation_blob: [u8; 32],
+        approver: AttestedApprover,
         now_ms: u64,
     ) -> Result<(), ApprovalError> {
+        if !approver.is_well_formed() {
+            return Err(ApprovalError::Invalid {
+                reason: "the approver's credential id is not canonical base64url".to_owned(),
+            });
+        }
         let entry = self
             .entries
             .iter_mut()
@@ -5116,9 +5219,11 @@ impl PendingApprovalStore {
             return Err(ApprovalError::AlreadyAttested);
         }
 
+        // The blob, its layout and the approver it authenticates are written
+        // in one store replacement.
         entry.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode(attestation_blob));
-        // The blob a recording caller computed is the producer's layout.
-        entry.attestation_version = super::attestation::ATTESTATION_VERSION;
+        entry.attestation_version = super::attestation::PENDING_ATTESTATION_VERSION;
+        entry.attested_approver = Some(approver);
         self.persist()
     }
 
@@ -5292,7 +5397,8 @@ impl PendingApprovalStore {
             kind: ApprovalKind::Rejected { original_kind_name },
             attestation_blob_b64: None,
             passkey_assertion: None,
-            attestation_version: super::attestation::ATTESTATION_VERSION,
+            attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
+            attested_approver: None,
         };
 
         self.persist()?;
@@ -5362,6 +5468,7 @@ impl PendingApprovalStore {
             attestation_blob_b64: existing.attestation_blob_b64.clone(),
             passkey_assertion: None,
             attestation_version: existing.attestation_version,
+            attested_approver: existing.attested_approver.clone(),
         };
 
         self.persist()?;
@@ -5586,13 +5693,15 @@ impl PendingApprovalStore {
     ///
     /// Called by `stellar-agent approve --id <nonce> --profile <name>` when the pending entry is
     /// of kind `TrustlineClawbackOptIn`.  The caller computes the attestation
-    /// blob via [`super::attestation::compute_attestation`] using the stored
+    /// blob via [`super::attestation::compute_attestation_v4`] using the stored
     /// `approval_nonce`, the SHA-256 commitment of `(network, code, issuer)`,
-    /// and the current `process_uid` — same key discipline as
-    /// `record_attestation` for `PaymentSimulated` entries.
+    /// the current `process_uid` and `approver`, with the same key discipline
+    /// as `record_attestation` for `PaymentSimulated` entries.
     ///
     /// # Errors
     ///
+    /// - [`ApprovalError::Invalid`] if `approver` is a remote approver whose
+    ///   credential ID is not canonical base64url.
     /// - [`ApprovalError::NotFound`] if no entry with `approval_nonce` exists.
     /// - [`ApprovalError::Expired`] if the entry's TTL has elapsed.
     /// - [`ApprovalError::AlreadyAttested`] if `attestation_blob_b64` is already set.
@@ -5602,6 +5711,7 @@ impl PendingApprovalStore {
     /// # Examples
     ///
     /// ```no_run
+    /// use stellar_agent_core::approval::AttestedApprover;
     /// use stellar_agent_core::approval::store::{PendingApprovalStore, PendingApproval, DEFAULT_TTL_MS};
     /// use stellar_agent_core::approval::user_id::process_uid_for_attestation;
     ///
@@ -5618,7 +5728,7 @@ impl PendingApprovalStore {
     /// let nonce = entry.approval_nonce.clone();
     /// let mut store = PendingApprovalStore::open(std::path::PathBuf::from("/tmp/t/default.toml"))?;
     /// store.insert(entry, now_ms)?;
-    /// store.record_trustline_clawback_opt_in_attestation(&nonce, [0x42u8; 32])?;
+    /// store.record_trustline_clawback_opt_in_attestation(&nonce, [0x42u8; 32], AttestedApprover::Local)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -5626,11 +5736,13 @@ impl PendingApprovalStore {
         &mut self,
         approval_nonce: &str,
         attestation_blob: [u8; 32],
+        approver: AttestedApprover,
     ) -> Result<(), ApprovalError> {
         let now_ms = approval_now_unix_ms()?;
         self.record_trustline_clawback_opt_in_attestation_at(
             approval_nonce,
             attestation_blob,
+            approver,
             now_ms,
         )
     }
@@ -5641,8 +5753,14 @@ impl PendingApprovalStore {
         &mut self,
         approval_nonce: &str,
         attestation_blob: [u8; 32],
+        approver: AttestedApprover,
         now_ms: u64,
     ) -> Result<(), ApprovalError> {
+        if !approver.is_well_formed() {
+            return Err(ApprovalError::Invalid {
+                reason: "the approver's credential id is not canonical base64url".to_owned(),
+            });
+        }
         let entry = self
             .entries
             .iter_mut()
@@ -5665,9 +5783,11 @@ impl PendingApprovalStore {
             return Err(ApprovalError::AlreadyAttested);
         }
 
+        // The blob, its layout and the approver it authenticates are written
+        // in one store replacement.
         entry.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode(attestation_blob));
-        // The blob a recording caller computed is the producer's layout.
-        entry.attestation_version = super::attestation::ATTESTATION_VERSION;
+        entry.attestation_version = super::attestation::PENDING_ATTESTATION_VERSION;
+        entry.attested_approver = Some(approver);
         self.persist()
     }
 
@@ -5682,6 +5802,8 @@ impl PendingApprovalStore {
     ///
     /// # Errors
     ///
+    /// - [`ApprovalError::Invalid`] if `approver` is a remote approver whose
+    ///   credential ID is not canonical base64url.
     /// - [`ApprovalError::NotFound`] if no entry with `approval_nonce` exists.
     /// - [`ApprovalError::Expired`] if the entry's TTL has elapsed.
     /// - [`ApprovalError::AlreadyAttested`] if `attestation_blob_b64` is already set.
@@ -5691,9 +5813,10 @@ impl PendingApprovalStore {
         &mut self,
         approval_nonce: &str,
         attestation_blob: [u8; 32],
+        approver: AttestedApprover,
     ) -> Result<(), ApprovalError> {
         let now_ms = approval_now_unix_ms()?;
-        self.record_rule_proposal_attestation_at(approval_nonce, attestation_blob, now_ms)
+        self.record_rule_proposal_attestation_at(approval_nonce, attestation_blob, approver, now_ms)
     }
 
     /// [`Self::record_rule_proposal_attestation`] with the expiry checked
@@ -5702,8 +5825,14 @@ impl PendingApprovalStore {
         &mut self,
         approval_nonce: &str,
         attestation_blob: [u8; 32],
+        approver: AttestedApprover,
         now_ms: u64,
     ) -> Result<(), ApprovalError> {
+        if !approver.is_well_formed() {
+            return Err(ApprovalError::Invalid {
+                reason: "the approver's credential id is not canonical base64url".to_owned(),
+            });
+        }
         let entry = self
             .entries
             .iter_mut()
@@ -5726,9 +5855,11 @@ impl PendingApprovalStore {
             return Err(ApprovalError::AlreadyAttested);
         }
 
+        // The blob, its layout and the approver it authenticates are written
+        // in one store replacement.
         entry.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode(attestation_blob));
-        // The blob a recording caller computed is the producer's layout.
-        entry.attestation_version = super::attestation::ATTESTATION_VERSION;
+        entry.attestation_version = super::attestation::PENDING_ATTESTATION_VERSION;
+        entry.attested_approver = Some(approver);
         self.persist()
     }
 
@@ -5870,7 +6001,7 @@ impl PendingApprovalStore {
 ///
 /// Lock is acquired via [`std::fs::File::try_lock`] (stable Rust 1.89).
 /// Released when the `LockHandle` is dropped (file descriptor closed).
-struct LockHandle {
+pub(super) struct LockHandle {
     /// Holding this `File` keeps the advisory exclusive lock active.
     _file: File,
 }
@@ -5884,7 +6015,7 @@ impl LockHandle {
     ///
     /// - [`ApprovalError::WriterLocked`] if the lock is held by another OFD.
     /// - [`ApprovalError::Io`] on open or lock failure.
-    fn acquire(lock_path: &Path) -> Result<Self, ApprovalError> {
+    pub(super) fn acquire(lock_path: &Path) -> Result<Self, ApprovalError> {
         let file = open_or_create_0600(lock_path).map_err(ApprovalError::from_io)?;
         match file.try_lock() {
             Ok(()) => Ok(Self { _file: file }),
@@ -5901,7 +6032,7 @@ impl LockHandle {
 /// Returns the sidecar `.lock` path for a store file.
 ///
 /// `default.toml` → `default.toml.lock`.
-fn lock_path(store_path: &Path) -> PathBuf {
+pub(super) fn lock_path(store_path: &Path) -> PathBuf {
     let name = store_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -6148,7 +6279,9 @@ mod tests {
         store.insert(entry, TEST_NOW_MS).unwrap();
 
         let blob = [0x42u8; 32];
-        store.record_attestation(&nonce, blob).unwrap();
+        store
+            .record_attestation(&nonce, blob, AttestedApprover::Local)
+            .unwrap();
 
         let found = store.get(&nonce).unwrap();
         assert!(found.attestation_blob_b64.is_some());
@@ -6169,9 +6302,13 @@ mod tests {
         store.insert(entry, TEST_NOW_MS).unwrap();
 
         let blob = [0x42u8; 32];
-        store.record_attestation(&nonce, blob).unwrap();
+        store
+            .record_attestation(&nonce, blob, AttestedApprover::Local)
+            .unwrap();
 
-        let err = store.record_attestation(&nonce, blob).unwrap_err();
+        let err = store
+            .record_attestation(&nonce, blob, AttestedApprover::Local)
+            .unwrap_err();
         assert!(
             matches!(err, ApprovalError::AlreadyAttested),
             "expected AlreadyAttested, got {err:?}"
@@ -6191,7 +6328,9 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
 
         let blob = [0x42u8; 32];
-        let err = store.record_attestation(&nonce, blob).unwrap_err();
+        let err = store
+            .record_attestation(&nonce, blob, AttestedApprover::Local)
+            .unwrap_err();
         assert!(
             matches!(err, ApprovalError::Expired),
             "expected Expired, got {err:?}"
@@ -6246,7 +6385,9 @@ mod tests {
             let entry = make_payment_entry(DEFAULT_TTL_MS);
             let nonce = entry.approval_nonce.clone();
             store.insert(entry, TEST_NOW_MS).unwrap();
-            store.record_attestation(&nonce, [0x42u8; 32]).unwrap();
+            store
+                .record_attestation(&nonce, [0x42u8; 32], AttestedApprover::Local)
+                .unwrap();
             assert!(store.get(&nonce).is_some());
 
             let removed = store.remove(&nonce).unwrap();
@@ -6345,7 +6486,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
         let err = store
-            .record_attestation("no-such-nonce", [0u8; 32])
+            .record_attestation("no-such-nonce", [0u8; 32], AttestedApprover::Local)
             .unwrap_err();
         assert!(matches!(err, ApprovalError::NotFound));
     }
@@ -6735,7 +6876,9 @@ expires_at_unix_ms = 9999999999999
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
 
-        let err = store.record_attestation(&nonce, [0x42u8; 32]).unwrap_err();
+        let err = store
+            .record_attestation(&nonce, [0x42u8; 32], AttestedApprover::Local)
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -7947,7 +8090,9 @@ expires_at_unix_ms = 9999999999999
         let entry = make_claim_entry(DEFAULT_TTL_MS);
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
-        store.record_attestation(&nonce, [0x11u8; 32]).unwrap();
+        store
+            .record_attestation(&nonce, [0x11u8; 32], AttestedApprover::Local)
+            .unwrap();
         let loaded = store.get(&nonce).unwrap();
         assert!(
             loaded.attestation_blob_b64.is_some(),
@@ -8253,7 +8398,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
     #[test]
     fn verify_attested_trustline_clawback_opt_in_rejects_forged_and_wrong_key() {
         use crate::approval::attestation::{
-            compute_attestation, compute_trustline_clawback_opt_in_digest,
+            compute_attestation_v4, compute_trustline_clawback_opt_in_digest,
         };
 
         let real_key: [u8; 32] = [0x11; 32];
@@ -8294,16 +8439,21 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
 
         // Attest with the REAL key over the canonical digest.
         let digest = compute_trustline_clawback_opt_in_digest(network, code, issuer);
-        let real_blob = compute_attestation(
+        let real_blob = compute_attestation_v4(
             &real_key,
             &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
             &nonce,
             &digest,
             &process_uid,
             &store.get(&nonce).unwrap().attested_lifetime(),
+            &AttestedApprover::Local,
         );
         store
-            .record_trustline_clawback_opt_in_attestation(&nonce, real_blob)
+            .record_trustline_clawback_opt_in_attestation(
+                &nonce,
+                real_blob,
+                AttestedApprover::Local,
+            )
             .unwrap();
 
         // Correct key → verifies.
@@ -8371,17 +8521,22 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         .unwrap();
         let forged_nonce = forged_entry.approval_nonce.clone();
         let forged_uid = forged_entry.process_uid.clone();
-        let attacker_blob = compute_attestation(
+        let attacker_blob = compute_attestation_v4(
             &wrong_key,
             &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
             &forged_nonce,
             &digest,
             &forged_uid,
             &forged_entry.attested_lifetime(),
+            &AttestedApprover::Local,
         );
         forged_store.insert(forged_entry, TEST_NOW_MS).unwrap();
         forged_store
-            .record_trustline_clawback_opt_in_attestation(&forged_nonce, attacker_blob)
+            .record_trustline_clawback_opt_in_attestation(
+                &forged_nonce,
+                attacker_blob,
+                AttestedApprover::Local,
+            )
             .unwrap();
         assert!(
             !forged_store.verify_attested_trustline_clawback_opt_in(
@@ -8887,7 +9042,9 @@ amount_max_stroops = 1000000
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
 
-        let err = store.record_attestation(&nonce, [0x42u8; 32]).unwrap_err();
+        let err = store
+            .record_attestation(&nonce, [0x42u8; 32], AttestedApprover::Local)
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -8907,7 +9064,11 @@ amount_max_stroops = 1000000
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
         let err = store
-            .record_trustline_clawback_opt_in_attestation("no-such-nonce", [0u8; 32])
+            .record_trustline_clawback_opt_in_attestation(
+                "no-such-nonce",
+                [0u8; 32],
+                AttestedApprover::Local,
+            )
             .unwrap_err();
         assert!(
             matches!(err, ApprovalError::NotFound),
@@ -8933,7 +9094,11 @@ amount_max_stroops = 1000000
         std::thread::sleep(std::time::Duration::from_millis(5));
 
         let err = store
-            .record_trustline_clawback_opt_in_attestation(&nonce, [0u8; 32])
+            .record_trustline_clawback_opt_in_attestation(
+                &nonce,
+                [0u8; 32],
+                AttestedApprover::Local,
+            )
             .unwrap_err();
         assert!(
             matches!(err, ApprovalError::Expired),
@@ -8950,7 +9115,11 @@ amount_max_stroops = 1000000
         store.insert(entry, TEST_NOW_MS).unwrap();
 
         let err = store
-            .record_trustline_clawback_opt_in_attestation(&nonce, [0x42u8; 32])
+            .record_trustline_clawback_opt_in_attestation(
+                &nonce,
+                [0x42u8; 32],
+                AttestedApprover::Local,
+            )
             .unwrap_err();
         assert!(
             matches!(
@@ -8980,11 +9149,19 @@ amount_max_stroops = 1000000
         store.insert(entry, TEST_NOW_MS).unwrap();
 
         store
-            .record_trustline_clawback_opt_in_attestation(&nonce, [0x42u8; 32])
+            .record_trustline_clawback_opt_in_attestation(
+                &nonce,
+                [0x42u8; 32],
+                AttestedApprover::Local,
+            )
             .unwrap();
 
         let err = store
-            .record_trustline_clawback_opt_in_attestation(&nonce, [0x43u8; 32])
+            .record_trustline_clawback_opt_in_attestation(
+                &nonce,
+                [0x43u8; 32],
+                AttestedApprover::Local,
+            )
             .unwrap_err();
         assert!(
             matches!(err, ApprovalError::AlreadyAttested),
@@ -9035,7 +9212,11 @@ amount_max_stroops = 1000000
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
         store
-            .record_trustline_clawback_opt_in_attestation(&nonce, [0x42u8; 32])
+            .record_trustline_clawback_opt_in_attestation(
+                &nonce,
+                [0x42u8; 32],
+                AttestedApprover::Local,
+            )
             .unwrap();
 
         // Different code → no match.
@@ -9077,7 +9258,11 @@ amount_max_stroops = 1000000
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
         store
-            .record_trustline_clawback_opt_in_attestation(&nonce, [0x42u8; 32])
+            .record_trustline_clawback_opt_in_attestation(
+                &nonce,
+                [0x42u8; 32],
+                AttestedApprover::Local,
+            )
             .unwrap();
 
         // now >= expiry → entry is expired, gate must stay closed.
@@ -9107,7 +9292,11 @@ amount_max_stroops = 1000000
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
         store
-            .record_trustline_clawback_opt_in_attestation(&nonce, [0x42u8; 32])
+            .record_trustline_clawback_opt_in_attestation(
+                &nonce,
+                [0x42u8; 32],
+                AttestedApprover::Local,
+            )
             .unwrap();
 
         assert!(
@@ -9402,7 +9591,9 @@ amount_max_stroops = 1000000
         let entry = make_payment_entry(DEFAULT_TTL_MS);
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
-        store.record_attestation(&nonce, [0x42u8; 32]).unwrap();
+        store
+            .record_attestation(&nonce, [0x42u8; 32], AttestedApprover::Local)
+            .unwrap();
 
         let found = store.get(&nonce).unwrap();
         let debug = format!("{found:?}");
@@ -9653,7 +9844,7 @@ csrf_token = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
     #[test]
     fn an_attested_trustline_clawback_opt_in_survives_a_reopen() {
         use crate::approval::attestation::{
-            compute_attestation, compute_trustline_clawback_opt_in_digest,
+            compute_attestation_v4, compute_trustline_clawback_opt_in_digest,
         };
 
         let key: [u8; 32] = [0x11; 32];
@@ -9678,18 +9869,23 @@ csrf_token = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
                 "USDC",
                 TESTNET_USDC_ISSUER,
             );
-            let blob = compute_attestation(
+            let blob = compute_attestation_v4(
                 &key,
                 &binding,
                 &opt_in_nonce,
                 &digest,
                 "1000",
                 &opt_in.attested_lifetime(),
+                &AttestedApprover::Local,
             );
             store.insert(opt_in, TEST_NOW_MS).unwrap();
             store.insert(other, TEST_NOW_MS).unwrap();
             store
-                .record_trustline_clawback_opt_in_attestation(&opt_in_nonce, blob)
+                .record_trustline_clawback_opt_in_attestation(
+                    &opt_in_nonce,
+                    blob,
+                    AttestedApprover::Local,
+                )
                 .unwrap();
             (opt_in_nonce, other_nonce)
         };
@@ -10042,7 +10238,9 @@ issuer = "{TESTNET_USDC_ISSUER}"
         let entry = make_payment_entry(DEFAULT_TTL_MS);
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
-        store.record_attestation(&nonce, [0x11u8; 32]).unwrap();
+        store
+            .record_attestation(&nonce, [0x11u8; 32], AttestedApprover::Local)
+            .unwrap();
         drop(store);
 
         let reopened = open_store(&dir);
@@ -10063,7 +10261,9 @@ issuer = "{TESTNET_USDC_ISSUER}"
         let entry = make_claim_entry(DEFAULT_TTL_MS);
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
-        store.record_attestation(&nonce, [0x22u8; 32]).unwrap();
+        store
+            .record_attestation(&nonce, [0x22u8; 32], AttestedApprover::Local)
+            .unwrap();
         drop(store);
 
         let reopened = open_store(&dir);
@@ -10085,7 +10285,7 @@ issuer = "{TESTNET_USDC_ISSUER}"
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
         store
-            .record_rule_proposal_attestation(&nonce, [0x33u8; 32])
+            .record_rule_proposal_attestation(&nonce, [0x33u8; 32], AttestedApprover::Local)
             .unwrap();
         drop(store);
 
@@ -10245,7 +10445,7 @@ is_proposer = true
         store.insert(entry, TEST_NOW_MS).unwrap();
 
         store
-            .record_rule_proposal_attestation(&nonce, [0x22u8; 32])
+            .record_rule_proposal_attestation(&nonce, [0x22u8; 32], AttestedApprover::Local)
             .unwrap();
 
         let loaded = store.get(&nonce).unwrap();
@@ -10261,7 +10461,7 @@ is_proposer = true
         store.insert(entry, TEST_NOW_MS).unwrap();
 
         let err = store
-            .record_rule_proposal_attestation(&nonce, [0x22u8; 32])
+            .record_rule_proposal_attestation(&nonce, [0x22u8; 32], AttestedApprover::Local)
             .unwrap_err();
         assert!(matches!(err, ApprovalError::WrongKind { .. }));
     }
@@ -10274,11 +10474,11 @@ is_proposer = true
         let nonce = entry.approval_nonce.clone();
         store.insert(entry, TEST_NOW_MS).unwrap();
         store
-            .record_rule_proposal_attestation(&nonce, [0x22u8; 32])
+            .record_rule_proposal_attestation(&nonce, [0x22u8; 32], AttestedApprover::Local)
             .unwrap();
 
         let err = store
-            .record_rule_proposal_attestation(&nonce, [0x33u8; 32])
+            .record_rule_proposal_attestation(&nonce, [0x33u8; 32], AttestedApprover::Local)
             .unwrap_err();
         assert!(matches!(err, ApprovalError::AlreadyAttested));
     }
@@ -10294,7 +10494,7 @@ is_proposer = true
         std::thread::sleep(std::time::Duration::from_millis(5));
 
         let err = store
-            .record_rule_proposal_attestation(&nonce, [0x22u8; 32])
+            .record_rule_proposal_attestation(&nonce, [0x22u8; 32], AttestedApprover::Local)
             .unwrap_err();
         assert!(matches!(err, ApprovalError::Expired));
     }
@@ -10304,7 +10504,11 @@ is_proposer = true
         let dir = TempDir::new().unwrap();
         let mut store = open_store(&dir);
         let err = store
-            .record_rule_proposal_attestation("unknown-nonce-AAAAAAAA", [0x22u8; 32])
+            .record_rule_proposal_attestation(
+                "unknown-nonce-AAAAAAAA",
+                [0x22u8; 32],
+                AttestedApprover::Local,
+            )
             .unwrap_err();
         assert!(matches!(err, ApprovalError::NotFound));
     }
@@ -10334,16 +10538,17 @@ is_proposer = true
         store.insert(entry, TEST_NOW_MS).unwrap();
 
         let key = [0x55u8; 32];
-        let blob = super::super::attestation::compute_attestation(
+        let blob = super::super::attestation::compute_attestation_v4(
             &key,
             &crate::approval::AttestationBinding::new("rule-profile", "stellar:mainnet"),
             &nonce,
             &digest,
             &process_uid,
             &store.get(&nonce).unwrap().attested_lifetime(),
+            &AttestedApprover::Local,
         );
         store
-            .record_rule_proposal_attestation(&nonce, blob)
+            .record_rule_proposal_attestation(&nonce, blob, AttestedApprover::Local)
             .unwrap();
 
         let result = store.verify_rule_proposal_gate(
@@ -10393,16 +10598,17 @@ is_proposer = true
         store.insert(entry, TEST_NOW_MS).unwrap();
 
         let key = [0x55u8; 32];
-        let blob = super::super::attestation::compute_attestation(
+        let blob = super::super::attestation::compute_attestation_v4(
             &key,
             &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             &nonce,
             &stored_digest,
             &process_uid,
             &store.get(&nonce).unwrap().attested_lifetime(),
+            &AttestedApprover::Local,
         );
         store
-            .record_rule_proposal_attestation(&nonce, blob)
+            .record_rule_proposal_attestation(&nonce, blob, AttestedApprover::Local)
             .unwrap();
 
         let mut recomputed_digest = stored_digest;
@@ -10435,16 +10641,17 @@ is_proposer = true
         store.insert(entry, TEST_NOW_MS).unwrap();
 
         let key = [0x55u8; 32];
-        let blob = super::super::attestation::compute_attestation(
+        let blob = super::super::attestation::compute_attestation_v4(
             &key,
             &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             &nonce,
             &digest,
             &process_uid,
             &store.get(&nonce).unwrap().attested_lifetime(),
+            &AttestedApprover::Local,
         );
         store
-            .record_rule_proposal_attestation(&nonce, blob)
+            .record_rule_proposal_attestation(&nonce, blob, AttestedApprover::Local)
             .unwrap();
 
         let wrong_key = [0x66u8; 32];
@@ -10605,15 +10812,18 @@ is_proposer = true
         let process_uid = entry.process_uid.clone();
         store.insert(entry, now).unwrap();
         let key = [0x33; 32];
-        let blob = super::super::attestation::compute_attestation(
+        let blob = super::super::attestation::compute_attestation_v4(
             &key,
             &crate::approval::AttestationBinding::new("mpp-profile", "stellar:testnet"),
             &nonce,
             &super::super::mpp::approval_subject(&fingerprint, &artifact),
             &process_uid,
             &store.get(&nonce).unwrap().attested_lifetime(),
+            &AttestedApprover::Local,
         );
-        store.record_attestation(&nonce, blob).unwrap();
+        store
+            .record_attestation(&nonce, blob, AttestedApprover::Local)
+            .unwrap();
         drop(store);
 
         let reopened = open_store(dir);
@@ -10909,16 +11119,17 @@ is_proposer = true
         store.insert(entry, TEST_NOW_MS).unwrap();
 
         let key = [0x55u8; 32];
-        let blob = super::super::attestation::compute_attestation(
+        let blob = super::super::attestation::compute_attestation_v4(
             &key,
             &crate::approval::AttestationBinding::new("rule-profile", "stellar:mainnet"),
             &nonce,
             &digest,
             &process_uid,
             &store.get(&nonce).unwrap().attested_lifetime(),
+            &AttestedApprover::Local,
         );
         store
-            .record_rule_proposal_attestation(&nonce, blob)
+            .record_rule_proposal_attestation(&nonce, blob, AttestedApprover::Local)
             .unwrap();
 
         let result = store.verify_rule_proposal_gate(
@@ -11277,7 +11488,7 @@ is_proposer = true
         let mut store = PendingApprovalStore::open(path.clone()).unwrap();
         store.insert(entry, TEST_NOW_MS).unwrap();
         store
-            .record_attestation_at(&nonce, [42; 32], TEST_NOW_MS)
+            .record_attestation_at(&nonce, [42; 32], AttestedApprover::Local, TEST_NOW_MS)
             .unwrap();
         drop(store);
         let mut store = PendingApprovalStore::open(path.clone()).unwrap();
@@ -11784,5 +11995,94 @@ asset = "CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR"
             &fixture.artifact,
             fixture.now
         ));
+    }
+
+    /// A remote approver round-trips through the file with its credential
+    /// ID and selects the version 4 layout. A malformed approver is refused
+    /// before anything is written, and a hand-edited approver that names
+    /// another shape, an unknown field, or no attestation refuses to load.
+    #[test]
+    fn remote_attestation_authenticates_approver() {
+        use super::super::attestation::{AttestationScope, PENDING_ATTESTATION_VERSION};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let approver = AttestedApprover::Remote {
+            credential_id_b64url: "AAECAw".to_owned(),
+        };
+        let nonce = {
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            let entry = make_payment_entry(DEFAULT_TTL_MS);
+            let nonce = entry.approval_nonce.clone();
+            store.insert(entry, TEST_NOW_MS).unwrap();
+            store
+                .record_attestation(&nonce, [0x42; 32], approver.clone())
+                .unwrap();
+            nonce
+        };
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[pending.attested_approver]"), "{text}");
+        let store = PendingApprovalStore::open(path.clone()).unwrap();
+        let record = store.get(&nonce).unwrap();
+        assert_eq!(record.attestation_version, PENDING_ATTESTATION_VERSION);
+        assert!(record.attested_approver.as_ref() == Some(&approver));
+        let scope = record.attestation_scope().unwrap();
+        assert!(matches!(scope, AttestationScope::V4(_, a) if *a == approver));
+        drop(store);
+
+        let malformed_dir = TempDir::new().unwrap();
+        let malformed_path = malformed_dir.path().join("default.toml");
+        let mut store = PendingApprovalStore::open(malformed_path.clone()).unwrap();
+        let entry = make_payment_entry(DEFAULT_TTL_MS);
+        let malformed_nonce = entry.approval_nonce.clone();
+        store.insert(entry, TEST_NOW_MS).unwrap();
+        for id in ["", "AAECAx", "AAECAw=="] {
+            let err = store
+                .record_attestation(
+                    &malformed_nonce,
+                    [0x42; 32],
+                    AttestedApprover::Remote {
+                        credential_id_b64url: id.to_owned(),
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, ApprovalError::Invalid { .. }),
+                "{id}: {err:?}"
+            );
+        }
+        drop(store);
+        let store = PendingApprovalStore::open(malformed_path).unwrap();
+        let record = store.get(&malformed_nonce).unwrap();
+        assert!(record.attestation_blob_b64.is_none());
+        assert!(record.attested_approver.is_none());
+        drop(store);
+
+        let original = std::fs::read_to_string(&path).unwrap();
+        let header =
+            "[pending.attested_approver]\nkind = \"remote\"\ncredential_id_b64url = \"AAECAw\"";
+        assert!(original.contains(header), "{original}");
+        for replacement in [
+            "[pending.attested_approver]\nkind = \"local\"\ncredential_id_b64url = \"AAECAw\"",
+            "[pending.attested_approver]\nkind = \"remote\"",
+            "[pending.attested_approver]\nkind = \"remote\"\ncredential_id_b64url = \"AAECAx\"",
+            "[pending.attested_approver]\nkind = \"operator\"\ncredential_id_b64url = \"AAECAw\"",
+            "[pending.attested_approver]\nkind = \"remote\"\ncredential_id_b64url = \"AAECAw\"\nrp_id = \"x\"",
+        ] {
+            std::fs::write(&path, original.replace(header, replacement)).unwrap();
+            assert!(
+                PendingApprovalStore::open(path.clone()).is_err(),
+                "{replacement}"
+            );
+        }
+        let without_blob: String = original
+            .lines()
+            .filter(|line| !line.starts_with("attestation_blob_b64"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_ne!(without_blob, original.trim_end());
+        std::fs::write(&path, without_blob).unwrap();
+        assert!(PendingApprovalStore::open(path.clone()).is_err());
+        std::fs::write(&path, &original).unwrap();
+        assert!(PendingApprovalStore::open(path).is_ok());
     }
 }

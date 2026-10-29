@@ -651,6 +651,33 @@ pub enum ApprovalFailure {
         /// Non-secret operator-facing diagnostic.
         detail: String,
     },
+    /// The operator credential behind a remote approval or a remote-approval
+    /// request is not authorized at this check: its ID is absent from the
+    /// profile's current `[remote_approval] allowed_credentials` list, or the
+    /// operator-credential store holds no record for it.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.operator_credential_revoked"`.
+    #[error("{detail}")]
+    OperatorCredentialRevoked {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
+    /// The current remote-approval authorization cannot be established: the
+    /// profile or the operator-credential store cannot be read, remote
+    /// approval is disabled or absent, or the profile's chain or relying
+    /// party ID differs from the one the caller serves. A remote approval or
+    /// request refuses rather than relying on an earlier copy.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.remote_authorization_unavailable"`.
+    #[error("{detail}")]
+    RemoteAuthorizationUnavailable {
+        /// Non-secret operator-facing diagnostic.
+        detail: String,
+    },
 }
 
 impl ApprovalFailure {
@@ -682,6 +709,10 @@ impl ApprovalFailure {
             Self::GcFailed { .. } => "approval.gc_failed",
             Self::AttestationInvalid { .. } => "approval.attestation_invalid",
             Self::EntryInconsistent { .. } => "approval.entry_inconsistent",
+            Self::OperatorCredentialRevoked { .. } => "approval.operator_credential_revoked",
+            Self::RemoteAuthorizationUnavailable { .. } => {
+                "approval.remote_authorization_unavailable"
+            }
         }
     }
 }
@@ -5342,6 +5373,18 @@ mod tests {
                     detail: "operator diagnostic".to_owned(),
                 },
                 "approval.entry_inconsistent",
+            ),
+            (
+                ApprovalFailure::OperatorCredentialRevoked {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.operator_credential_revoked",
+            ),
+            (
+                ApprovalFailure::RemoteAuthorizationUnavailable {
+                    detail: "operator diagnostic".to_owned(),
+                },
+                "approval.remote_authorization_unavailable",
             ),
         ];
         for (failure, code) in cases {

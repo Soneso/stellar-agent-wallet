@@ -939,15 +939,15 @@ Enrolls a WebAuthn passkey credential for the remote-approval surface. Runs enti
 
 A WebAuthn credential is bound to its `rp.id` at creation time, and a loopback origin can only claim `"localhost"` as an effective domain — that binding decides which mode applies:
 
-- **`--interactive`**: for a loopback or SSH-tunnelled `approve serve --remote` listener. Starts a one-shot local server, prints (and by default opens) an enrollment page, and persists the credential automatically once the ceremony completes. The printed URL carries a single-use bootstrap token. The first visit exchanges it for an HttpOnly session cookie and an origin-scoped session proof kept in the tab. Serving the page requires the cookie. The credential-persisting POST requires the session cookie, an origin-scoped session proof, and a CSRF value. The session expires after 15 minutes without operator activity or 8 hours after bootstrap, and the server binds `127.0.0.1` only. The browser opens through a private redirect file, so the launcher never receives the bootstrap URL; if it does not open, use the printed URL. Until its first use or until the command ends, the printed URL grants an enrollment session to whoever opens it, so keep it out of shared logs. Ctrl-C ends the wait, removes the redirect file, and exits `1`. Always produces `rp_id: "localhost"`.
+- **`--interactive`**: for a loopback or SSH-tunnelled `approve serve --remote` listener. Needs a terminal on stdin and stderr (`approve.operator_enroll_tty_required` otherwise). Starts a one-shot local server and prints (and by default opens) an enrollment page. The printed URL carries a single-use bootstrap token. The first visit exchanges it for an HttpOnly session cookie and an origin-scoped session proof kept in the tab. Serving the page requires the cookie; both POSTs of the ceremony require the session cookie, the session proof, and a CSRF value. The page requests the server's single-use registration challenge (valid 300 seconds), the authenticator creates the credential over it, and the server verifies the `clientDataJSON` and the `none`-attestation `attestationObject` against that challenge, the exact origin, `rp.id` `localhost`, user presence and verification, and the posted id and ES256 key. A refused registration answers `registration_invalid`, an expired challenge `registration_expired`, a label that is empty, longer than 64 bytes, or holds a control character `label_invalid`. The verified credential is staged, not written. The command's prompt names the label with any control or format character shown as a visible escape. The page then shows a 16-hex-digit confirmation code in four groups; the command writes the credential only when the operator types that code before the timeout, and never prints the expected code. A wrong code (`approve.operator_enroll_confirmation_mismatch`), no code (`approve.operator_enroll_confirmation_canceled`), or a late one (`approve.operator_enroll_confirmation_expired`) writes nothing. The session expires after 15 minutes without operator activity or 8 hours after bootstrap, and the server binds `127.0.0.1` only. The browser opens through a private redirect file, so the launcher never receives the bootstrap URL; if it does not open, use the printed URL. Until its first use or until the command ends, the printed URL grants an enrollment session to whoever opens it, so keep it out of shared logs. Ctrl-C before the page posts a credential stops the server, removes the redirect file, and exits `1` with `approve.operator_enroll_interactive_interrupted`. Always produces `rp_id: "localhost"`.
 - **`--credential-id` / `--public-key` / `--rp-id` / `--label`** (all four together) — for a domain-configured remote listener. Imports the id and public key from a WebAuthn ceremony run elsewhere, normally the remote listener's own `GET /enroll` page (which has to be served from `https://<rp_id>` for the credential to bind to that domain, and displays a ready-to-run copy of this command).
 
 | Flag | Meaning |
 |---|---|
-| `--profile <NAME>` | Profile whose operator-credential store to write |
+| `--profile <NAME>` | Profile whose operator-credential store to write; a name that is not a safe file name (absolute path, separator, `..`) refuses with `validation.config_invalid` |
 | `--interactive` | Start the loopback ceremony (mutually exclusive with the three credential-import flags `--credential-id`/`--public-key`/`--rp-id`; `--label` still applies, as a page pre-fill) |
 | `--no-open` | Print the enrollment URL instead of opening a browser (interactive mode only) |
-| `--timeout-seconds <SECS>` | Interactive-ceremony timeout (default: 300) |
+| `--timeout-seconds <SECS>` | Interactive-ceremony timeout covering the browser registration and the terminal confirmation (default: 300) |
 | `--credential-id <B64URL>` | Base64url WebAuthn credential id (16-64 raw bytes); import mode, requires the other three below |
 | `--public-key <B64URL>` | Base64url-encoded 65-byte uncompressed SEC1 P-256 public key (`0x04 \|\| X \|\| Y`); import mode only |
 | `--rp-id <HOSTNAME>` | Must match the profile's `[remote_approval] rp_id` exactly; import mode only |
@@ -962,6 +962,23 @@ stellar-agent approve operator enroll --interactive --label laptop
 stellar-agent approve operator enroll --credential-id <B64URL> \
   --public-key <B64URL> --rp-id wallet.example.internal --label laptop --sign-count <N>
 ```
+
+Every write to the operator-credential store (enrollment, removal, and the sign-count update after a remote login) holds the store's lock file. A writer that cannot take it writes nothing. Interactive enrollment and `remove` refuse with `approval.writer_locked`; argument-mode enrollment refuses with `internal.unexpected_state`, whose message names `approve.operator_enroll_failed`; a remote login answers `400` `webauthn_assertion_invalid`, like every refused login. In each case the operator retries.
+
+### `approve operator remove`
+
+Removes an enrolled operator credential from the profile's operator-credential store. Prints `{"removed": true}` when a record was removed and `{"removed": false}` when none had that id; both exit `0`. Never prints the credential id and never edits the profile. Lock contention refuses with `approval.writer_locked`, any other store failure with `approve.operator_remove_failed`.
+
+| Flag | Meaning |
+|---|---|
+| `--credential-id <B64URL>` | Required. The credential id to remove; values starting with `-` are accepted |
+| `--profile <NAME>` | Profile whose operator-credential store to edit; a name that is not a safe file name (absolute path, separator, `..`) refuses with `validation.config_invalid` |
+
+```bash
+stellar-agent approve operator remove --credential-id <B64URL> --profile default
+```
+
+To revoke a credential, remove its id from `[remote_approval] allowed_credentials` first, then remove the enrollment. Either step alone revokes it: the running listener reads both at every login and decision, and a mainnet commit refuses the uncommitted approvals that credential made.
 
 ---
 

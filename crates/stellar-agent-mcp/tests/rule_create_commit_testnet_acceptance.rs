@@ -27,7 +27,7 @@
 //!    `proposal_sha256_hex`.
 //! 5. Recompute the operator attestation exactly as `stellar-agent approve`
 //!    does for a `RuleProposalSimulated` entry
-//!    (`compute_attestation(key, binding, nonce, proposal_sha256, process_uid)`,
+//!    (`compute_attestation_v4(key, binding, nonce, proposal_sha256, process_uid, &stellar_agent_core::approval::AttestedApprover::Local)`,
 //!    verified by `PendingApprovalStore::verify_rule_proposal_gate` — the
 //!    dedicated rule-proposal gate, not the shared pay/claim attestation
 //!    gate).
@@ -68,7 +68,7 @@ use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore as _};
 use serial_test::serial;
-use stellar_agent_core::approval::{compute_attestation, process_uid_for_attestation};
+use stellar_agent_core::approval::{compute_attestation_v4, process_uid_for_attestation};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_mcp::server::{
     RuleCreateSignerArg, StellarRuleCreateArgs, StellarRuleCreateCommitArgs, WalletServer,
@@ -315,7 +315,7 @@ async fn t1_rule_create_commit_happy_path() {
     .get(&approval_nonce)
     .expect("the approval request is persisted")
     .clone();
-    let blob = compute_attestation(
+    let blob = compute_attestation_v4(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new(
             &server.profile_name_for_approval(),
@@ -325,8 +325,24 @@ async fn t1_rule_create_commit_happy_path() {
         &proposal_sha256,
         &uid,
         &stored.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
+    // `approve` records the blob with its approver; the commit gate verifies
+    // the presented blob against that record. The store drops at the end of
+    // the statement, so the commit gate can open it.
+    stellar_agent_core::approval::PendingApprovalStore::open(
+        stellar_agent_core::profile::schema::default_approval_dir()
+            .expect("approval dir")
+            .join(format!("{}.toml", server.profile_name_for_approval())),
+    )
+    .expect("open approval store")
+    .record_rule_proposal_attestation(
+        &approval_nonce,
+        blob,
+        stellar_agent_core::approval::AttestedApprover::Local,
+    )
+    .expect("record the local approval");
     let commit_args = || StellarRuleCreateCommitArgs {
         chain_id: TESTNET_CHAIN_ID.to_owned(),
         approval_nonce: approval_nonce.clone(),

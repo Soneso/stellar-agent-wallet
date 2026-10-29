@@ -1091,7 +1091,7 @@ fn seed_witness_opt_in(profile: &Profile, dir: &std::path::Path, case: Trustline
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use stellar_agent_core::approval::{
         AttestationBinding,
-        attestation::{compute_attestation, compute_trustline_clawback_opt_in_digest},
+        attestation::{compute_attestation_v4, compute_trustline_clawback_opt_in_digest},
         store::{PendingApproval, PendingApprovalStore},
     };
     let key = [0x42; 32];
@@ -1122,7 +1122,7 @@ fn seed_witness_opt_in(profile: &Profile, dir: &std::path::Path, case: Trustline
         },
         USDC_TESTNET_ISSUER,
     );
-    let blob = compute_attestation(
+    let blob = compute_attestation_v4(
         if case == TrustlineCase::ForgedOptIn {
             &[0x99; 32]
         } else {
@@ -1133,12 +1133,17 @@ fn seed_witness_opt_in(profile: &Profile, dir: &std::path::Path, case: Trustline
         &digest,
         &entry.process_uid,
         &entry.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     store
         .insert(entry, stellar_agent_core::timefmt::now_unix_ms().unwrap())
         .unwrap();
     store
-        .record_trustline_clawback_opt_in_attestation(&nonce, blob)
+        .record_trustline_clawback_opt_in_attestation(
+            &nonce,
+            blob,
+            stellar_agent_core::approval::AttestedApprover::Local,
+        )
         .unwrap();
 }
 
