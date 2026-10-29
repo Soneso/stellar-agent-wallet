@@ -87,6 +87,9 @@ pub mod counterparty;
 /// taxonomy overview, wire-format specification, and secret-material policy.
 pub mod error;
 
+/// Exclusive advisory file locks released when their guards drop.
+pub mod file_lock;
+
 /// Classifies platform-keyring failures with fixed labels.
 /// Exports `classify_keyring_operation_error`, `KeyringOperation`, and
 /// `map_keyring_operation_error` for core's callers.

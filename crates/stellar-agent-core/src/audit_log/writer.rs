@@ -43,12 +43,11 @@
 //!
 //! # File-lock implementation note
 //!
-//! `std::fs::File::lock()` acquires an exclusive OFD (open-file-description)
-//! advisory lock on POSIX (Linux `OFD_SETLK`, macOS `flock`).
-//! `std::fs::File::try_lock()` is the non-blocking variant; returns
-//! `Err(WouldBlock)` when the lock is held by another OFD.  The lock is
-//! released when the sidecar lock file's handle is dropped (OFD/handle
-//! closed).
+//! The sidecar lock is `std::fs::File::try_lock`, which is `flock` on Linux
+//! and macOS and `LockFileEx` on Windows.  It is non-blocking and returns
+//! `Err(WouldBlock)` when another open file description or handle holds the
+//! lock.  The lock is released when the writer's `AuditWriterLock` drops;
+//! the guard unlocks before it closes the handle.
 //!
 //! The stable standard-library `File::try_lock` API is used in preference to
 //! the `fd-lock` crate.

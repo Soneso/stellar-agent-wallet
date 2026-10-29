@@ -14,9 +14,10 @@
 //! at once,
 //! so a holder never calls an operation that acquires the lock itself.
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
+use crate::file_lock::HeldFileLock;
 use crate::profile::schema::KeyringEntryRef;
 
 /// Why the window-state lock could not be taken.
@@ -67,16 +68,15 @@ pub fn window_lock_path(window_path: &Path) -> PathBuf {
 /// An exclusive OFD-advisory lock over a profile's policy window-state store.
 ///
 /// Acquired with [`WindowStoreLock::acquire`] or
-/// [`WindowStoreLock::acquire_for`]; held until dropped. The kernel releases
-/// the lock when the file descriptor closes, which is when the guard drops.
+/// [`WindowStoreLock::acquire_for`]; explicitly unlocked when the guard drops.
 ///
 /// The guard retains the lock file it holds and, when acquired for a store,
 /// the store's keyring coordinate. Operations that require the guard check
 /// both against the scope they are asked to act on, so a guard over one
 /// profile's store never authorizes a write to another's.
 pub struct WindowStoreLock {
-    /// The open lock file. Closing it on drop releases the OFD lock.
-    _file: File,
+    /// The guard explicitly releases the lock on drop.
+    _file: HeldFileLock,
     /// The lock file this guard holds.
     path: PathBuf,
     /// The window-state key coordinate the guard was acquired for, when it
@@ -228,7 +228,7 @@ impl WindowStoreLock {
             .open(path)
             .map_err(|e| StateLockError::Io { kind: e.kind() })?;
 
-        file.try_lock().map_err(|e| match e {
+        let file = HeldFileLock::try_lock(file).map_err(|e| match e {
             std::fs::TryLockError::WouldBlock => StateLockError::WriterLocked,
             std::fs::TryLockError::Error(io_err) => StateLockError::Io {
                 kind: io_err.kind(),
@@ -266,6 +266,26 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_window_store_unlocks_with_a_duplicate_descriptor_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.lock");
+        let guard = WindowStoreLock::acquire(&path).unwrap();
+        let duplicate = guard._file.try_clone_file().unwrap();
+        assert!(matches!(
+            WindowStoreLock::acquire(&path),
+            Err(StateLockError::WriterLocked)
+        ));
+        drop(guard);
+        let _next = WindowStoreLock::acquire(&path).unwrap();
+        drop(duplicate);
+        assert!(matches!(
+            WindowStoreLock::acquire(&path),
+            Err(StateLockError::WriterLocked)
+        ));
+    }
 
     #[test]
     fn acquire_creates_lock_file() {

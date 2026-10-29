@@ -44,6 +44,8 @@ proptest.workspace = true
 rand_core.workspace = true
 reqwest.workspace = true
 serial_test.workspace = true
+# test-helpers exposes HeldFileLock::try_clone_file to the store lock test.
+stellar-agent-core = { workspace = true, features = ["test-helpers"] }
 # State tests use the in-memory keyring; reconciliation tests serve mocked
 # Stellar RPC answers through its wiremock responders.
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["wiremock-helpers"] }

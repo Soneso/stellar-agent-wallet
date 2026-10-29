@@ -112,13 +112,15 @@
 //! from `tempfile` uses `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+use crate::file_lock::HeldFileLock;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sidecar lock settings
@@ -802,8 +804,8 @@ impl StoreState {
 /// reader fail. Locking a sidecar file keeps cross-process exclusivity
 /// without placing an OS lock on the data readers touch.
 struct ReceiptStoreLock {
-    /// The open lock file. Closing it (on drop) releases the lock.
-    _file: File,
+    /// The guard explicitly releases the lock on drop.
+    _file: HeldFileLock,
 }
 
 impl std::fmt::Debug for ReceiptStoreLock {
@@ -867,7 +869,7 @@ impl ReceiptStoreLock {
 
         // Acquire the lock BEFORE any content check — a pre-lock check is a
         // TOCTOU race.
-        file.try_lock().map_err(|e| match e {
+        let file = HeldFileLock::try_lock(file).map_err(|e| match e {
             std::fs::TryLockError::WouldBlock => ReceiptStoreError::WriterLocked,
             std::fs::TryLockError::Error(io_err) => ReceiptStoreError::Io {
                 path: path.to_path_buf(),
@@ -2002,7 +2004,7 @@ fn persist_locked(guard: &mut MutexGuard<'_, StoreState>) -> Result<(), ReceiptS
         })?;
 
     #[cfg(unix)]
-    File::open(dir)
+    std::fs::File::open(dir)
         .and_then(|directory| directory.sync_all())
         .map_err(|source| ReceiptStoreError::Io {
             path: dir.to_path_buf(),
@@ -2063,6 +2065,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ReceiptStore::open_at(dir.path(), "test").unwrap();
         (dir, store)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_receipt_store_unlocks_with_a_duplicate_descriptor_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.lock");
+        let guard = ReceiptStoreLock::try_acquire(&path).unwrap();
+        let duplicate = guard._file.try_clone_file().unwrap();
+        assert!(matches!(
+            ReceiptStoreLock::try_acquire(&path),
+            Err(ReceiptStoreError::WriterLocked)
+        ));
+        drop(guard);
+        let _next = ReceiptStoreLock::try_acquire(&path).unwrap();
+        drop(duplicate);
+        assert!(matches!(
+            ReceiptStoreLock::try_acquire(&path),
+            Err(ReceiptStoreError::WriterLocked)
+        ));
     }
 
     /// `get` returns `None` for an unknown hash.

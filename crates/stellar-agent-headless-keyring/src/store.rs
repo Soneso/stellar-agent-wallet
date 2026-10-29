@@ -315,6 +315,24 @@ fn sealed_from_wire_entry(entry: &WireEntry) -> KcResult<Sealed> {
 // Atomic file I/O
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Owns the sidecar lock and explicitly releases it on drop.
+#[must_use]
+struct StoreLock {
+    file: fs::File,
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+impl std::fmt::Debug for StoreLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreLock").finish_non_exhaustive()
+    }
+}
+
 /// Bound on lock-acquisition retries in `acquire_store_lock` (40 x 50ms =
 /// a nominal 2s), sized for the store's write pattern: enrollments and
 /// rotations are one-shot operator actions, so genuine contention is brief.
@@ -331,11 +349,11 @@ const STORE_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_mi
 /// enrollment) would otherwise both read the same base file and silently
 /// discard one write on the last rename.
 ///
-/// The lock is held by the returned handle and released by the OS on drop or
-/// process death; a leftover `.lock` file is inert (the lock lives on the
+/// The returned guard explicitly unlocks on drop; process death also releases
+/// the lock. A leftover `.lock` file is inert (the lock lives on the
 /// open handle, not on the file's existence). Reads take no lock: the atomic
 /// rename guarantees a reader sees a complete former or current file.
-fn acquire_store_lock(path: &Path) -> KcResult<fs::File> {
+fn acquire_store_lock(path: &Path) -> KcResult<StoreLock> {
     let mut lock_path = path.to_path_buf();
     let name = lock_path
         .file_name()
@@ -357,7 +375,7 @@ fn acquire_store_lock(path: &Path) -> KcResult<fs::File> {
             std::thread::sleep(STORE_LOCK_RETRY_DELAY);
         }
         match file.try_lock() {
-            Ok(()) => return Ok(file),
+            Ok(()) => return Ok(StoreLock { file }),
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(e)) => {
                 return Err(KcError::PlatformFailure(Box::new(e)));
@@ -467,6 +485,30 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_store_unlocks_with_a_duplicate_descriptor_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keyring.json");
+        let guard = acquire_store_lock(&path).unwrap();
+        let duplicate = guard.file.try_clone().unwrap();
+        let contender = OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("keyring.json.lock"))
+            .unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(guard);
+        let _next = acquire_store_lock(&path).unwrap();
+        drop(duplicate);
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+    }
 
     #[test]
     #[cfg(target_os = "windows")]
