@@ -147,7 +147,12 @@ properties:
   the RPC re-simulation, and withhold it when that row cannot be written. An approval or
   rejection takes effect only after its audit row is durable, in the log or in the
   log's outbox. A queued row reaches the log before the consumer of the approval loads
-  a signing key.
+  a signing key. Queued rows are committed by count and SHA-256 chain head in the
+  platform keyring. A removed, changed, or reordered committed row refuses keyed
+  acquisition until `audit acknowledge-outbox-loss` records the loss and revokes
+  decided approvals and toolset grants. An absent outbox state reads as zero;
+  raw deletion or restore of that keyring entry shares the boundary below.
+  The queue commitment does not authenticate who appended a row.
 - Code running as the same OS user. Such code can write the audit log and the wallet's
   files. The wallet detects an edited or removed entry inside the log, a log rolled back
   or truncated behind the tip anchor the keyring holds, a deleted anchor on a log that

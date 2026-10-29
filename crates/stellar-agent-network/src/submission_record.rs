@@ -2438,7 +2438,13 @@ mod tests {
             let sub = submission();
             let holds = holds(&fx, 100);
             let (id, authorization) = grant(&fx, &sub, &holds, "approval-1");
-            let outbox = AuditOutbox::for_log(&fx.profile.audit_log_path);
+            let outbox = AuditOutbox::for_log(
+                &fx.profile.audit_log_path,
+                crate::keyring::KeyringTipAnchorStore::shared(
+                    &fx.profile.audit_log_hash_chain_key_id,
+                    &fx.profile.audit_log_path,
+                ),
+            );
             std::fs::write(outbox.path(), b"not an audit entry\n").unwrap();
 
             let error = wallet_refusal(

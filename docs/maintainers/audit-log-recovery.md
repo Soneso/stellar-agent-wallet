@@ -69,7 +69,7 @@ A repair against a held writer refuses with `audit.writer_locked` in the
 envelope's error detail. Stop a server holding that profile's writer, repair,
 and start it again. The same applies to `profile rotate-audit-key`.
 
-**Queued consent rows.** After its `audit_tip_anchored` rows, the acknowledging repair drains the audit outbox (section 8), so rows `stellar-agent approve` queued while the log was refused follow the repair rows. If the drain refuses, the repair still stands: the verb exits 0, omits `outbox_drained`, and lists the refusal under `warnings` (`audit.outbox_unusable`, `audit.outbox_busy`, or the condition an append refused on, such as `audit.io_error`). Every queued row stays queued for the next drain, which appends again any row the refused drain had appended. The reporting form leaves the log, the anchor, and the outbox unchanged.
+**Queued consent rows.** After its `audit_tip_anchored` rows, the acknowledging repair drains the audit outbox (section 8), so rows `stellar-agent approve` queued while the log was refused follow the repair rows. If the drain refuses, the repair still stands: the verb exits 0, omits `outbox_drained`, and lists the refusal under `warnings` (`audit.outbox_unusable`, `audit.outbox_busy`, `audit.outbox_rows_missing`, or the condition an append refused on, such as `audit.io_error`). Every queued row stays queued for the next drain, which appends again any row the refused drain had appended. The reporting form leaves the log, the anchor, and the outbox unchanged.
 
 ## 1.1 Missing tip anchor
 
@@ -247,7 +247,11 @@ A `rollback_acknowledged` or `binding_changed` row is the thing to look for when
 | `<log>.outbox.lock` | Held by every append and every drain while it touches the outbox. Waited on for up to 2 s, then `audit.outbox_busy`. |
 | `<log>.drain.lock` | Held for its whole life by every writer that drains: the MCP server, `approve serve`, and every keyed CLI verb. `approve --id` reads it once to tell a draining holder from one that does not drain. |
 
-**Drain points.** A draining writer appends every queued row, then truncates the outbox to zero:
+**Keyring commitment.** The audit key's service stores the queue's count and SHA-256 chain head at `<audit-account>-tip-<path-digest>-outbox`.
+Every append checks the committed prefix, syncs its new line, then stores the updated commitment.
+A failed state write truncates the append back and refuses consent.
+
+**Drain points.** A draining writer checks the commitment, appends every queued row, stores zero state, then truncates the outbox:
 
 - when it opens, right after the tip-anchor check;
 - on every keyed acquisition in a running process, under the same lock as that check;
@@ -261,7 +265,15 @@ A command that consumes an approval acquires the writer after it reads the appro
 
 **Timestamps.** A drained row keeps its consent timestamp. Every draining writer drains before its own rows, so the log stays in time order. Three cases can still put an older timestamp after a newer one. The first is a row from a writer that does not drain: the CLI startup advisory, the zero-config path, or the `audit reanchor` repair rows. The second is a repeated row after a crash. The third is the adoption row an acquisition appends when its drain refuses. `audit verify` can then report `backward_timestamp_jump`; with the `request_id` of a repeated row, or the row's kind, that warning is explained.
 
-**Outside the anchor.** Queued rows are not covered by the tip anchor until they are drained. A process that can write the audit directory can delete them undetected, as it can delete the outbox file itself. `audit verify` reports `outbox_pending`, the number of complete lines, read without taking the outbox lock. It omits the count, and warns `outbox_unreadable`, when the outbox cannot be read.
+**Committed queue.** A missing, shortened, changed, or reordered committed prefix refuses with `audit.outbox_rows_missing` before any queued row is appended.
+This blocks keyed acquisition and approval consumption until the operator acknowledges the loss.
+Rows beyond the commitment drain too, preserving delivery after an interrupted append or drain.
+An absent keyring state reads as zero for an outbox without a commitment.
+Raw deletion or restore of keyring entries outside the wallet rests on the platform keyring, as described in SECURITY.md.
+The commitment does not authenticate who queued a row.
+
+`audit verify --profile` checks the commitment under the outbox lock when the path is the profile's log.
+It reports `outbox_pending` separately and warns about torn, unparseable, or unreadable queued lines.
 
 ### 8.1 Unusable outbox
 
@@ -274,8 +286,8 @@ A command that consumes an approval acquires the writer after it reads the appro
 1. Stop the processes that use the profile: the MCP server, `approve serve`, and any CLI verb.
 2. Inspect the file: `cat -n <log>.outbox`. Each intact line is one consent row, with its `kind`, `ts`, `request_id`, and `nonce_prefix`.
 3. Move the file out of the audit directory: `mv <log>.outbox <somewhere-else>/outbox.saved`.
-4. Re-queue the intact lines. Copy each line that parses, in its original order and with its newline, into a new `<log>.outbox` with mode `0600`. Leave out only the unparseable lines.
-5. Start one keyed verb, or the MCP server. Its first acquisition drains the re-queued rows.
+4. Re-queue the intact lines byte-identically, in their original order and with each newline, into a new `<log>.outbox` with mode `0600`. Leave out only the unparseable lines.
+5. Start one keyed verb, or the MCP server. Its first acquisition checks and drains the re-queued rows. A missing or changed committed line reports `audit.outbox_rows_missing`; follow section 8.3.
 
 Deleting a line drops a consent row whose approval may already have taken effect. Keep the saved file with the incident record, and leave out only what does not parse.
 
@@ -286,6 +298,38 @@ Deleting a line drops a consent row whose approval may already have taken effect
 **What it means.** The outbox lock stayed held for the whole 2 s wait. Another process is appending to or draining the outbox, or a process holding it has stopped responding.
 
 **Recovery.** Retry. If it persists, find the process holding `<log>.outbox.lock` (`lsof <log>.outbox.lock` on Unix) and stop it; the lock is released when its holder exits. `approve --id` refuses with this code and persists nothing, so retrying it is safe.
+
+### 8.3 Lost or changed committed rows
+
+**Detail sub-code:** `audit.outbox_rows_missing`
+
+The keyring records a committed prefix that the outbox does not hold unchanged and in order.
+Every keyed writer acquisition and every draining write refuses.
+An append also refuses, so concurrent approvals cannot persist consent into a divergent queue.
+
+Stop processes using the profile and preserve the outbox for inspection.
+After investigating, the operator runs:
+
+```bash
+stellar-agent audit acknowledge-outbox-loss --profile default --reason "Queue inspected; missing consent requires fresh approval"
+```
+
+The command checks the log's tip anchor and takes its writer and drain locks.
+It checks that the loss holds and that every remaining complete line parses.
+It then revokes every decided, unexpired, unconsumed approval, including mainnet confirmations and recorded passkey assertions, and every toolset grant.
+Undecided requests remain.
+It appends `audit_outbox_loss_acknowledged`, drains the remaining complete rows, stores zero state, and truncates the outbox.
+The operator approves affected actions again, creating new consent rows.
+
+The result reports `profile`, `expected_rows`, `found_rows`, `drained`, `revoked_approvals`, and `revoked_grants`.
+A held writer refuses with `audit.writer_locked`.
+A log rolled back behind its tip anchor refuses with `audit.tip_anchor_mismatch`; follow section 1 first.
+No divergence refuses with `audit.outbox_loss_not_found` and writes no acknowledgement.
+A remaining line that does not parse refuses with `audit.outbox_unusable` before anything is revoked or written.
+Follow section 8.1 for that line, then rerun the acknowledgement.
+An append refusal after the acknowledgement row leaves the queue and commitment in place; a rerun records the loss again.
+A crash after revocation leaves the loss in place; rerunning revokes any remaining permissions.
+`audit verify` reports each acknowledgement as an `outbox_loss_acknowledged` warning without changing the chain verdict.
 
 ## 9. Tip anchor unavailable
 
@@ -315,6 +359,28 @@ anchor value it still owes; a keyed reopen absorbs an honest tail in the same
 generation. Reopening still refuses while the keyring is unavailable. Use
 `audit reanchor` only for an established mismatch, including the rotation
 outage in section 2.5.
+
+**Unusable outbox commitment.** A detail that contains `outbox state is
+unusable` names a different cause: the keyring holds a value at the outbox
+commitment's account, `<audit-account>-tip-<path-digest>-outbox` in the audit
+key's service, that does not parse. The wallet never writes such a value, so
+it was changed outside the wallet. Restoring keyring access does not clear
+it. Every drain, every keyed acquisition, every queued consent, and
+`audit acknowledge-outbox-loss` refuse with this sub-code, and nothing is
+read as "nothing queued".
+
+1. Stop the processes that use the profile: the MCP server, `approve serve`,
+   and any CLI verb.
+2. Copy `<log>.outbox` out of the audit directory with the incident record.
+3. Remove the keyring entry at that account with the platform keyring tool, as
+   in section 10. An absent commitment reads as zero.
+4. Start one keyed verb, or the MCP server. Its first acquisition drains every
+   complete queued line.
+
+Removing the entry gives up the check of the rows queued before it, as a
+deletion of the entry outside the wallet does (section 8, "Committed queue").
+Compare the saved outbox with the `approval_attested` rows the drain appended
+before approving anything new.
 
 ## 10. Unreadable or undecodable audit key
 

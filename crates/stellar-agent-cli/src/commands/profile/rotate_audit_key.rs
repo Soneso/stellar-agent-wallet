@@ -627,6 +627,10 @@ mod tests {
         let hook = {
             let queued = Arc::clone(&queued);
             let log_path = log_path.clone();
+            let outbox_store = stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &log_path,
+            );
             Arc::new(move || {
                 if queued.load(Ordering::SeqCst) {
                     return;
@@ -636,7 +640,7 @@ mod tests {
                     return;
                 }
                 queued.store(true, Ordering::SeqCst);
-                AuditOutbox::for_log(&log_path)
+                AuditOutbox::for_log(&log_path, outbox_store.clone())
                     .append(&AuditEntry::new_approval_attested(
                         "PaymentSimulated",
                         "stellar_pay_commit",

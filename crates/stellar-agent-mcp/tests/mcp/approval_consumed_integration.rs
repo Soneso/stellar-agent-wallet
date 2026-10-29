@@ -744,16 +744,22 @@ async fn pay_commit_logs_a_queued_consent_row_before_the_signer_loads() {
     .expect("writer cached");
     // `approve --id` beside this server: the row is queued, then the
     // attestation is persisted.
-    AuditOutbox::for_log(&profile.audit_log_path)
-        .append(&AuditEntry::new_approval_attested(
-            "PaymentSimulated",
-            "stellar_pay_commit",
-            None,
-            &approval_nonce,
-            "cli",
-            "queued-consent",
-        ))
-        .expect("queue the consent row");
+    AuditOutbox::for_log(
+        &profile.audit_log_path,
+        stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        ),
+    )
+    .append(&AuditEntry::new_approval_attested(
+        "PaymentSimulated",
+        "stellar_pay_commit",
+        None,
+        &approval_nonce,
+        "cli",
+        "queued-consent",
+    ))
+    .expect("queue the consent row");
     {
         let mut store = PendingApprovalStore::open(store_path.clone()).expect("approval store");
         store

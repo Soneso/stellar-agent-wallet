@@ -2376,7 +2376,13 @@ mod tests {
         .unwrap();
 
         let (mut store, entry) = pending_store(&dir);
-        let outbox = AuditOutbox::for_log(&profile.audit_log_path);
+        let outbox = AuditOutbox::for_log(
+            &profile.audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        );
         stellar_agent_core::audit_log::outbox::test_seam::arm_partial_write(outbox.path(), 5);
         let result = approve_in_process("approve-outbox-fails", &profile, &mut store, &entry);
         stellar_agent_core::audit_log::outbox::test_seam::disarm(outbox.path());

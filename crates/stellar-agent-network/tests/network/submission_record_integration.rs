@@ -1743,7 +1743,7 @@ async fn submit_after_a_queued_outbox_row(
     let mut fx = fixture(name);
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
-    AuditOutbox::for_log(&fx.profile.audit_log_path)
+    AuditOutbox::for_log(&fx.profile.audit_log_path, store.clone())
         .append(&unrelated_row("queued-consent"))
         .unwrap();
     let envelope = SignedTestEnvelope::for_source([seed; 32]);
@@ -1822,7 +1822,7 @@ async fn a_pending_row_append_failure_after_the_anchor_check_unwinds_the_receipt
     let mut fx = fixture("record-anchor-append");
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
-    let outbox = AuditOutbox::for_log(&fx.profile.audit_log_path);
+    let outbox = AuditOutbox::for_log(&fx.profile.audit_log_path, store.clone());
     std::fs::write(outbox.path(), b"not an audit entry\n").unwrap();
     let envelope = SignedTestEnvelope::for_source([0x6b; 32]);
     let server = MockServer::start().await;

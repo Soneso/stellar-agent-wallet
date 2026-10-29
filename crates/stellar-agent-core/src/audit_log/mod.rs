@@ -91,11 +91,14 @@
 //! A consent row that cannot take the writer because a draining writer in
 //! another process holds it is queued in `<audit_log_path>.outbox` instead
 //! ([`outbox`](crate::audit_log::outbox)). A draining writer is one opened with
-//! a tip-anchor store in `Check` mode. It holds `<audit_log_path>.drain.lock`
-//! for its life and drains the outbox at open, on every registry cache hit,
-//! and before each of its own rows. The repair writer has a tip-anchor store
-//! and does not drain at open. Delivery is at least once, and queued rows sit
-//! outside the tip anchor until drained.
+//! a tip-anchor store in `Check` mode, or for an outbox-loss acknowledgement.
+//! It holds `<audit_log_path>.drain.lock` for its life and drains the outbox
+//! at open, on every registry cache hit, and before each of its own rows; the
+//! acknowledgement writer defers the drain at open until it has recorded the
+//! loss. The repair writer has a tip-anchor store and does not drain at open.
+//! Delivery is at least once. Until they are drained, queued rows are
+//! committed in the same store as the tip anchor: their count and a chain
+//! head over them, which every append and every drain checks.
 //!
 //! # Redaction discipline
 //!
@@ -144,7 +147,10 @@ pub use binding::{
 };
 pub use entry::{AuditEntry, NewToolInvocation};
 pub use health::{AuditWriterHealth, AuditWriterHealthHandle};
-pub use outbox::{AuditOutbox, OutboxInspection, drain_lock_is_held, inspect_outbox};
+pub use outbox::{
+    AuditOutbox, OutboxInspection, OutboxLoss, OutboxState, check_outbox_commitment,
+    drain_lock_is_held, inspect_outbox, outbox_path,
+};
 pub use reader::{AuditLogIntegrityError, AuditReader, PinnedHashesRecord};
 pub use rotation::{SidecarResignError, resign_chain_root_sidecars};
 pub use schema::{
@@ -161,14 +167,16 @@ pub use signer_set::{
 };
 pub use tip_anchor::{
     KeyedAuditAccess, PriorAnchoring, TipAnchor, TipAnchorParseError, TipAnchorStore,
-    TipAnchorStoreError, log_path_sha256, reanchor_count_account,
-    reanchor_count_account_for_digest, tip_anchor_account, tip_anchor_account_for_digest,
+    TipAnchorStoreError, log_path_sha256, outbox_state_account, outbox_state_account_for_digest,
+    reanchor_count_account, reanchor_count_account_for_digest, tip_anchor_account,
+    tip_anchor_account_for_digest,
 };
 pub use verify::{
     FileVerifyResult, PartialRotationState, VerifiedTip, VerifyError, VerifyOk, VerifyWarning,
     check_anchor_against_walk, check_missing_anchor, stored_anchor_disagrees_with_walk, verify_log,
 };
 pub use writer::{
-    AuditWriter, AuditWriterRegistry, ReanchorAcknowledgement, ReanchorReport, StoredTipAnchor,
-    VerifiedTipFacts, WriterError, audit_log_unusable_detail, audit_writer_refusal,
+    AuditWriter, AuditWriterRegistry, OutboxLossReport, ReanchorAcknowledgement, ReanchorReport,
+    RevokedCounts, StoredTipAnchor, VerifiedTipFacts, WriterError, audit_log_unusable_detail,
+    audit_writer_refusal,
 };

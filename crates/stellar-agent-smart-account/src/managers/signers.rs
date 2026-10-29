@@ -10121,10 +10121,11 @@ pub(crate) mod tests {
         use stellar_agent_core::audit_log::tip_anchor::{InMemoryTipAnchorStore, TipAnchorStore};
 
         let audit_log_path = dir.join("audit").join("audit.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
         let writer = AuditWriter::open_with_tip_anchor(
             audit_log_path.clone(),
             None,
-            Arc::new(InMemoryTipAnchorStore::new()) as Arc<dyn TipAnchorStore>,
+            store.clone() as Arc<dyn TipAnchorStore>,
             stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
         .expect("a draining writer opens");
@@ -10139,7 +10140,7 @@ pub(crate) mod tests {
             "stellar:testnet".to_owned(),
         ))
         .expect("manager construction must succeed");
-        AuditOutbox::for_log(&audit_log_path)
+        AuditOutbox::for_log(&audit_log_path, store)
             .append(&AuditEntry::new_approval_attested(
                 "PaymentSimulated",
                 "stellar_pay_commit",

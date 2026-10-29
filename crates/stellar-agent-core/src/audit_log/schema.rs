@@ -3247,6 +3247,19 @@ pub enum EventKind {
         /// repair. `None` for adoption, which does not touch the counter.
         reanchor_count: Option<u64>,
     },
+    /// The operator acknowledges lost queued consent and revokes permissions.
+    AuditOutboxLossAcknowledged {
+        /// Number of rows committed in the keyring.
+        expected_rows: u64,
+        /// Number of complete lines found in the outbox.
+        found_rows: u64,
+        /// Bounded operator-supplied reason.
+        reason: String,
+        /// Decided approvals revoked before this row.
+        revoked_approvals: usize,
+        /// Toolset grants revoked before this row.
+        revoked_grants: usize,
+    },
 }
 
 /// Total number of [`EventKind`] variants.
@@ -3269,7 +3282,7 @@ pub enum EventKind {
 /// the test stays green, leaving the new variant unpinned by any tag assertion.
 /// Closing that would need the count derived from the enum itself, which needs a
 /// derive macro this workspace does not carry.
-pub const EVENT_KIND_VARIANT_COUNT: usize = 72;
+pub const EVENT_KIND_VARIANT_COUNT: usize = 73;
 
 /// Why an [`EventKind::AuditTipAnchored`] row was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

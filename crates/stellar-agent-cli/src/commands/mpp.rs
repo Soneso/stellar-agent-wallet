@@ -1840,7 +1840,13 @@ mod tests {
 
         // `approve --id` beside this process: queue the row, then persist.
         let entry = approvals.get(&nonce).expect("pending entry").clone();
-        let outbox = AuditOutbox::for_log(&case.profile.audit_log_path);
+        let outbox = AuditOutbox::for_log(
+            &case.profile.audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &case.profile.audit_log_hash_chain_key_id,
+                &case.profile.audit_log_path,
+            ),
+        );
         attest_and_persist(
             &mut approvals,
             &entry,

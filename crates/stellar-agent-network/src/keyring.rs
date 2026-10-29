@@ -812,6 +812,7 @@ impl KeyringAuditBindingStore {
 pub struct KeyringTipAnchorStore {
     anchor_ref: KeyringEntryRef,
     counter_ref: KeyringEntryRef,
+    outbox_ref: KeyringEntryRef,
 }
 
 impl KeyringTipAnchorStore {
@@ -837,6 +838,13 @@ impl KeyringTipAnchorStore {
             anchor_ref: KeyringEntryRef::new(
                 audit_key_ref.service.clone(),
                 tip_anchor_account_for_digest(&audit_key_ref.account, path_sha256),
+            ),
+            outbox_ref: KeyringEntryRef::new(
+                audit_key_ref.service.clone(),
+                stellar_agent_core::audit_log::outbox_state_account_for_digest(
+                    &audit_key_ref.account,
+                    path_sha256,
+                ),
             ),
             counter_ref: KeyringEntryRef::new(
                 audit_key_ref.service.clone(),
@@ -869,6 +877,23 @@ fn anchor_store_error(op: &str, e: &WalletError) -> TipAnchorStoreError {
 }
 
 impl TipAnchorStore for KeyringTipAnchorStore {
+    fn load_outbox_state(
+        &self,
+    ) -> Result<Option<stellar_agent_core::audit_log::OutboxState>, TipAnchorStoreError> {
+        read_keyring_string(&self.outbox_ref)
+            .map_err(|e| anchor_store_error("outbox state read failed", &e))?
+            .map(|raw| stellar_agent_core::audit_log::OutboxState::parse(&raw))
+            .transpose()
+    }
+
+    fn store_outbox_state(
+        &self,
+        state: &stellar_agent_core::audit_log::OutboxState,
+    ) -> Result<(), TipAnchorStoreError> {
+        write_keyring_string(&self.outbox_ref, &state.to_keyring_value())
+            .map_err(|e| anchor_store_error("outbox state write failed", &e))
+    }
+
     fn load_anchor(&self) -> Result<Option<TipAnchor>, TipAnchorStoreError> {
         let raw = read_keyring_string(&self.anchor_ref)
             .map_err(|e| anchor_store_error("anchor read failed", &e))?;
@@ -2432,6 +2457,46 @@ mod tests {
 
     fn audit_ref() -> KeyringEntryRef {
         KeyringEntryRef::new("stellar-agent-audit-anchor-test", "default")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn the_keyring_store_round_trips_the_outbox_state() {
+        use stellar_agent_core::audit_log::{OutboxState, log_path_sha256};
+        keyring_mock::install().unwrap();
+        let key = audit_ref();
+        let path = Path::new("/data/audit/outbox.jsonl");
+        let store = KeyringTipAnchorStore::new(&key, path);
+        let digest = stellar_agent_core::hex::encode(&log_path_sha256(path));
+        assert_eq!(store.outbox_ref.service, key.service);
+        assert_eq!(
+            store.outbox_ref.account,
+            format!("{}-tip-{}-outbox", key.account, &digest[..16])
+        );
+        assert_eq!(store.load_outbox_state().unwrap(), None);
+        let state = OutboxState {
+            pending: 2,
+            head: [0x42; 32],
+        };
+        store.store_outbox_state(&state).unwrap();
+        assert_eq!(store.load_outbox_state().unwrap(), Some(state.clone()));
+        assert_eq!(
+            read_keyring_string(&store.outbox_ref).unwrap(),
+            Some(state.to_keyring_value())
+        );
+        for raw in [
+            "broken",
+            r#"{"v":2,"pending":0,"head":"sha256:00"}"#,
+            r#"{"v":1,"pending":1,"head":"no hash"}"#,
+        ] {
+            write_keyring_string(&store.outbox_ref, raw).unwrap();
+            assert!(store.load_outbox_state().is_err());
+        }
+        store.store_outbox_state(&OutboxState::default()).unwrap();
+        assert_eq!(
+            store.load_outbox_state().unwrap(),
+            Some(OutboxState::default())
+        );
     }
 
     #[test]

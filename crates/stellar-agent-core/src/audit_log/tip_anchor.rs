@@ -15,6 +15,10 @@
 //! needs no key material. A deleted binding is recorded again from the
 //! profile file at the next keyed use.
 //!
+//! The same store holds the outbox commitment: its pending count and chain
+//! head are read and written under the outbox lock from any process.
+//! An absent outbox state reads as zero; an unparseable value refuses.
+//!
 //! # What the anchor is
 //!
 //! [`TipAnchor`] records three numbers about ONE log file:
@@ -99,6 +103,7 @@
 //! lagging one is absorbed there while the other refuses it. That configuration
 //! is unsupported; see `docs/maintainers/audit-log-recovery.md`.
 
+use super::outbox::OutboxState;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -295,18 +300,32 @@ impl TipAnchorStoreError {
     }
 }
 
-/// Read/write access to one log path's anchor and its re-anchor counter.
+/// Read/write access to a log's anchor, re-anchor counter, and outbox commitment.
 ///
 /// Implemented over the platform keyring in `stellar-agent-network`; this crate
-/// owns the writer and the check semantics, and never links a keyring backend of
-/// its own. Every method is called with the writer's sidecar lock already held,
-/// so implementations need no locking beyond what the backend provides.
+/// owns the writer and check semantics. Anchor and counter methods run under the
+/// writer's sidecar lock. Outbox methods run under the outbox lock from any
+/// process, independently of the writer's sidecar lock.
 ///
 /// `Any` is a supertrait so a holder of the trait object can establish which
 /// concrete store it is: the mainnet audit readiness accepts only the
 /// keyring-backed store at the profile's own coordinate, and an injected store
 /// of any other type never passes that check.
 pub trait TipAnchorStore: std::any::Any + std::fmt::Debug + Send + Sync {
+    /// Reads the outbox commitment under the outbox lock from any process.
+    /// An absent value means zero queued rows.
+    ///
+    /// # Errors
+    /// Returns an error for an unavailable backend or an unparseable value.
+    fn load_outbox_state(&self) -> Result<Option<OutboxState>, TipAnchorStoreError>;
+
+    /// Stores the outbox commitment under the outbox lock from any process.
+    /// The writer's sidecar lock need not be held.
+    ///
+    /// # Errors
+    /// Returns an error when the backend rejects the write.
+    fn store_outbox_state(&self, state: &OutboxState) -> Result<(), TipAnchorStoreError>;
+
     /// Reads the anchor. `Ok(None)` means no anchor has ever been written for
     /// this path — the adoption path.
     ///
@@ -626,6 +645,21 @@ pub fn reanchor_count_account_for_digest(base_account: &str, path_sha256: &[u8; 
     )
 }
 
+/// Derives the account holding the outbox commitment for `log_path`.
+#[must_use]
+pub fn outbox_state_account(base_account: &str, log_path: &Path) -> String {
+    outbox_state_account_for_digest(base_account, &log_path_sha256(log_path))
+}
+
+/// Derives the outbox account from the log path's digest.
+#[must_use]
+pub fn outbox_state_account_for_digest(base_account: &str, path_sha256: &[u8; 32]) -> String {
+    format!(
+        "{}-outbox",
+        tip_anchor_account_for_digest(base_account, path_sha256)
+    )
+}
+
 // ── In-memory store for tests ────────────────────────────────────────────────
 
 /// An in-process [`TipAnchorStore`] for tests that exercise the writer's anchor
@@ -642,6 +676,9 @@ pub struct InMemoryTipAnchorStore {
 #[cfg(any(test, feature = "test-helpers"))]
 #[derive(Debug, Default)]
 struct InMemoryAnchorState {
+    outbox: Option<OutboxState>,
+    outbox_fail_reads: bool,
+    outbox_fail_writes: bool,
     anchor: Option<TipAnchor>,
     reanchors: u64,
     fail: bool,
@@ -658,6 +695,17 @@ impl InMemoryTipAnchorStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets independent outbox read and write faults.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_outbox_failing(&self, reads: bool, writes: bool) {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        state.outbox_fail_reads = reads;
+        state.outbox_fail_writes = writes;
     }
 
     /// Returns the currently stored anchor, if any.
@@ -731,7 +779,7 @@ impl InMemoryTipAnchorStore {
         state.writes_to_fail = count;
     }
 
-    /// Makes every subsequent operation fail, simulating an unavailable
+    /// Makes anchor and counter operations fail, simulating an unavailable
     /// backend.
     ///
     /// # Panics
@@ -746,6 +794,25 @@ impl InMemoryTipAnchorStore {
 
 #[cfg(any(test, feature = "test-helpers"))]
 impl TipAnchorStore for InMemoryTipAnchorStore {
+    fn load_outbox_state(&self) -> Result<Option<OutboxState>, TipAnchorStoreError> {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let state = self.state.lock().expect("in-memory anchor store mutex");
+        if state.outbox_fail_reads {
+            return Err(TipAnchorStoreError::new("outbox read fault"));
+        }
+        Ok(state.outbox.clone())
+    }
+
+    fn store_outbox_state(&self, outbox: &OutboxState) -> Result<(), TipAnchorStoreError> {
+        #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
+        let mut state = self.state.lock().expect("in-memory anchor store mutex");
+        if state.outbox_fail_writes {
+            return Err(TipAnchorStoreError::new("outbox write fault"));
+        }
+        state.outbox = Some(outbox.clone());
+        Ok(())
+    }
+
     fn load_anchor(&self) -> Result<Option<TipAnchor>, TipAnchorStoreError> {
         #[allow(clippy::expect_used, reason = "test seam; poison means a failed test")]
         let state = self.state.lock().expect("in-memory anchor store mutex");

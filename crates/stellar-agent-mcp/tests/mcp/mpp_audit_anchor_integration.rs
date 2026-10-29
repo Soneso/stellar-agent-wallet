@@ -1110,7 +1110,13 @@ async fn mpp_commit_drains_a_queued_consent_row_before_the_signed_resimulation()
     let store_path = approvals.path().join(format!("{NAME}.toml"));
     let mut store = PendingApprovalStore::open(store_path).expect("approval store");
     let entry = store.get(&approval_id).expect("pending entry").clone();
-    let outbox = AuditOutbox::for_log(&fixture.profile.audit_log_path);
+    let outbox = AuditOutbox::for_log(
+        &fixture.profile.audit_log_path,
+        stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+            &fixture.profile.audit_log_hash_chain_key_id,
+            &fixture.profile.audit_log_path,
+        ),
+    );
     attest_and_persist(
         &mut store,
         &entry,
@@ -1394,7 +1400,13 @@ async fn split_mpp_approval_prepare_records_commit_request() {
                 )
                 .unwrap();
         } else if attempt == 2 {
-            let outbox = AuditOutbox::for_log(&fixture.profile.audit_log_path);
+            let outbox = AuditOutbox::for_log(
+                &fixture.profile.audit_log_path,
+                stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                    &fixture.profile.audit_log_hash_chain_key_id,
+                    &fixture.profile.audit_log_path,
+                ),
+            );
             attest_and_persist(
                 &mut store,
                 &entry,

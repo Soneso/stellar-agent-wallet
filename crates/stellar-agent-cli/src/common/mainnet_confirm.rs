@@ -999,8 +999,13 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let outbox =
-            stellar_agent_core::audit_log::AuditOutbox::for_log(&context.profile().audit_log_path);
+        let outbox = stellar_agent_core::audit_log::AuditOutbox::for_log(
+            &context.profile().audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &context.profile().audit_log_hash_chain_key_id,
+                &context.profile().audit_log_path,
+            ),
+        );
         stellar_agent_core::audit_log::outbox::test_seam::arm_partial_write(outbox.path(), 5);
         let summary =
             MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500).unwrap();

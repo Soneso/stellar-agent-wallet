@@ -24,6 +24,9 @@
 //! the marker's tag must verify before the walk. Without a key it is untrusted
 //! bookkeeping. Every subsequent bridge, entry, sidecar, and anchor check holds.
 //!
+//! Each acknowledged outbox loss produces [`VerifyWarning::OutboxLossAcknowledged`].
+//! The warning records the file, line, and counts without changing the chain verdict.
+//!
 //! # Wire codes (closed set)
 //!
 //! Error variant wire codes use a closed set: `audit.chain_broken`,
@@ -185,6 +188,17 @@ pub enum VerifyWarning {
     OutboxUnreadable {
         /// The I/O error kind.
         error_kind: String,
+    },
+    /// An operator acknowledges missing or changed queued consent rows.
+    OutboxLossAcknowledged {
+        /// Basename of the file containing the acknowledgement.
+        file: String,
+        /// One-based line of the acknowledgement.
+        line: usize,
+        /// Number of rows committed in the keyring.
+        expected_rows: u64,
+        /// Number of complete lines found.
+        found_rows: u64,
     },
 }
 
@@ -1070,6 +1084,22 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
                 // forensic rows. No rotation-handoff tracking needed; the
                 // hash-chain is maintained by the surrounding hash check.
             }
+            EventKind::AuditOutboxLossAcknowledged {
+                expected_rows,
+                found_rows,
+                ..
+            } => {
+                warnings.push(VerifyWarning::OutboxLossAcknowledged {
+                    file: path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    line: line_number,
+                    expected_rows: *expected_rows,
+                    found_rows: *found_rows,
+                });
+            }
             EventKind::AuditRotationHandoff { next_file_name } => {
                 if ctx.is_last_file {
                     return Err(VerifyError::ChainBroken {
@@ -1833,6 +1863,7 @@ mod tests {
             EventKind::MppStateAdopted { .. } => "mpp_state_adopted",
             EventKind::MppStateReset { .. } => "mpp_state_reset",
             EventKind::AuditTipAnchored { .. } => "audit_tip_anchored",
+            EventKind::AuditOutboxLossAcknowledged { .. } => "audit_outbox_loss_acknowledged",
         }
     }
 
@@ -2410,6 +2441,13 @@ mod tests {
                 profile: "default".to_owned(),
                 reason: "corrupt-file recovery".to_owned(),
             },
+            EventKind::AuditOutboxLossAcknowledged {
+                expected_rows: 2,
+                found_rows: 1,
+                reason: "inspection".to_owned(),
+                revoked_approvals: 1,
+                revoked_grants: 1,
+            },
             EventKind::AuditTipAnchored {
                 reason: TipAnchorReason::Adopted,
                 entry_count: 12,
@@ -2765,6 +2803,7 @@ mod tests {
                 "mpp_state_adopted",
                 "mpp_state_reset",
                 "policy_window_state_reset",
+                "audit_outbox_loss_acknowledged",
                 "audit_tip_anchored",
             ]
         );
@@ -5192,5 +5231,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(bytes.len() as u64, SIDECAR_READ_CAP);
+    }
+    #[test]
+    fn verify_warns_for_an_acknowledged_loss() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+        writer
+            .write_entry(AuditEntry::new_audit_outbox_loss_acknowledged(
+                2,
+                1,
+                "inspection",
+                1,
+                1,
+            ))
+            .unwrap();
+        drop(writer);
+        let result = verify_log(&path, None).unwrap();
+        assert_eq!(
+            result.warnings,
+            vec![VerifyWarning::OutboxLossAcknowledged {
+                file: "audit.jsonl".to_owned(),
+                line: 1,
+                expected_rows: 2,
+                found_rows: 1,
+            }]
+        );
     }
 }
