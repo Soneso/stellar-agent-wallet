@@ -1004,6 +1004,11 @@ When no anchor is stored for the profile's own log, the log must show that it wa
 
 On Unix, refuses to verify a log whose parent directory is owned by a different user. Exits `0` when the chain is intact, `1` on any integrity violation (broken chain, rotation gap, HMAC mismatch, missing sidecar, unparseable line, tip-anchor mismatch, missing tip anchor), path-contract failure, or I/O error.
 
+A `pruned_prefix` warning reports `first_file`, the oldest file walked, and
+`pruned_files`, the count in `<log>.pruned`. The marker seeds that file's first
+entry and is authenticated when an audit key is supplied. Verification checks
+every retained entry and bridge, and the warning leaves the verdict successful.
+
 `outbox_pending` counts the consent rows queued in the audit outbox beside the log (`<LOG_PATH>.outbox`) and not yet drained into it, read without taking the outbox lock. Queued rows sit outside the tip anchor until a draining writer appends them. A torn outbox adds an `outbox_torn_tail` warning and unparseable lines add `outbox_unparseable`. An unreadable outbox adds `outbox_unreadable` and omits `outbox_pending`, since no count is known. None of them changes the chain verdict.
 
 ```bash

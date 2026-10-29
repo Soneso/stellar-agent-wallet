@@ -70,6 +70,9 @@
 //! Each log file gets its own `<file>.root_hmac` sidecar, written on the first
 //! entry of that file.  On rotation the sidecar is renamed alongside the log
 //! file: `audit.jsonl.root_hmac` → `audit.jsonl.<ts>.root_hmac`.
+//! Retention writes `<log>.pruned` before deleting an archive. It holds the
+//! oldest retained file's seed, the outgoing file's seed, a file count, and an
+//! HMAC tag when the writer has a key.
 //!
 //! # Single-writer invariant
 //!
@@ -128,6 +131,8 @@ pub(crate) mod redact;
 pub mod rotation;
 pub mod schema;
 pub mod signer_set;
+#[cfg(all(test, unix))]
+mod test_fifo;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;
 pub mod tip_anchor;

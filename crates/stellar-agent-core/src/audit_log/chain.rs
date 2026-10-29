@@ -150,6 +150,12 @@ pub fn verify_chain_root(
 
 // ── Hex helpers ───────────────────────────────────────────────────────────────
 
+/// Encodes 32 bytes as the `"sha256:<64 lowercase hex chars>"` string every
+/// entry hash uses; the inverse of [`decode_hash`].
+pub(crate) fn encode_hash(bytes: &[u8; 32]) -> String {
+    format!("sha256:{}", hex::encode(bytes))
+}
+
 /// Decode a `"sha256:<64-hex-chars>"` string to 32 bytes.
 pub(crate) fn decode_hash(s: &str) -> Result<[u8; 32], HashError> {
     let hex_part = s.strip_prefix("sha256:").ok_or(HashError::InvalidFormat)?;

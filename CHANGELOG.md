@@ -637,6 +637,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   charges, and a keyring or file access error refuses it without changing
   anything. A repeated prepare of a challenge whose unclaimed record expired
   returns `mpp.challenge_expired`.
+- Audit verification follows retained history through the authenticated
+  `<log>.pruned` marker and reports a `pruned_prefix` warning with the first
+  retained file and pruned-file count. Audit-key rotation re-signs the marker.
 - SEP-43 `signMessage` documentation describes the SEP-53 prefixed digest and
   standard base64 signature. Both message tools produce the same signature bytes.
 - The `minimum_reserve` criterion counts the transaction fee of a decoded
@@ -740,6 +743,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and with it `approve operator enroll` argument import, refuses it as
   invalid. The terminal confirmation prompt shows the label with every
   control or format character as a visible escape.
+- Anchored audit appends refuse a file that grows beyond the writer's last
+  append offset, including complete foreign rows and torn prefixes. The
+  refusal latches under `audit.tip_anchor_mismatch` before writing a row.
+- The audit writer refuses a row longer than 1 MiB with `audit.row_too_large`
+  and never writes it. A rotation handoff is always its file's last entry, for
+  keyed and unkeyed writers alike: a rotation retried after a failed rename or
+  a failed handoff fsync, or after the file is reopened or reconciled, reuses
+  its one pending handoff, and the next row of any kind follows the rename. So
+  every archive the writer produces stays within the prune's read budget. A
+  rotation never renames over an existing file and refuses with
+  `audit.rotation_bridge_unusable` instead. Archive names sort in the order the
+  archives were created, also after the clock is set back.
+- A keyed audit open writes a missing chain-root tag only for a file its
+  anchor proves from byte 0: the replay yields the anchored entry count, and
+  the anchored entry ends exactly at the anchored offset and is the anchored
+  tip. An anchored file that fails the proof refuses with
+  `audit.tip_anchor_mismatch`.
+- The start of the retained audit history is authenticated the same way as
+  its end. Pruning requires the oldest archive to chain from the seed the
+  prune marker records for it, or from the zero seed when no marker exists. A
+  log whose oldest archives or marker were removed outside the writer stalls
+  pruning and fails `audit verify` until the operator moves it aside and
+  re-anchors a new log with `audit reanchor --acknowledge-rollback`. Pruning
+  and `audit verify` read that start by one rule, so a marker that names
+  neither boundary for the oldest archive stops both.
+- Audit rotation deletes only archives of one chain it proves from the
+  authenticated start of the oldest archive to the one just rotated, and stops
+  with a warning on any file in that range it cannot prove. A sibling placed
+  under a name that sorts after every archive precedes the next archive and
+  stops the prune until it is removed. The prune trusts the proof it just made;
+  a concurrent writer of the audit directory is outside its guarantee.
 - `stellar_rule_create_commit` spends its approval before the install starts.
   A retry with the same approval and attestation, directly or through
   `stellar_toolset_invoke`, returns `policy.approval_consumed` whether the

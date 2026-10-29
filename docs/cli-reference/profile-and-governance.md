@@ -1091,6 +1091,11 @@ Profile and ownership pre-checks carry their own codes.
 
 On Unix, the command refuses to verify a log whose parent directory is owned by a different user, since such a directory could be used to substitute log files or sidecars. It exits `0` when the chain is intact and `1` on any integrity violation (a broken chain, a rotation gap, an HMAC mismatch, a missing sidecar, an unparseable line, a tip-anchor mismatch, or a missing tip anchor), a path-contract failure, or an I/O error.
 
+A `pruned_prefix` warning reports `first_file`, the oldest file walked, and
+`pruned_files`, the count in `<log>.pruned`. The marker seeds that file's first
+entry and is authenticated when an audit key is supplied. Verification checks
+every retained entry and bridge, and the warning leaves the verdict successful.
+
 `outbox_pending` counts the consent rows queued in the audit outbox beside the log (`<LOG_PATH>.outbox`) and not yet drained into it, read without taking the outbox lock. Queued rows sit outside the tip anchor until a draining writer appends them. A torn outbox adds an `outbox_torn_tail` warning and unparseable lines add `outbox_unparseable`. An unreadable outbox adds `outbox_unreadable` and omits `outbox_pending`, since no count is known. None of them changes the chain verdict.
 
 ```bash

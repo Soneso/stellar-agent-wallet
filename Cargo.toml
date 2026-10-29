@@ -143,8 +143,8 @@ futures = { version = "=0.3.32", default-features = false, features = ["std"] }
 rmcp = { version = "=1.8.0", default-features = false, features = ["server", "macros", "transport-io", "schemars"] }
 # tokio-util: codec framing for the bounded-line transport (FramedRead / FramedWrite).
 tokio-util = { version = "=0.7.18", default-features = false, features = ["codec"] }
-# libc: raw prctl(2) on Linux for process isolation; #[cfg(target_os = "linux")]
-# only, a zero-dep no-op on macOS/Windows.
+# libc: raw prctl(2) on Linux for process isolation in the MCP crate, and the
+# Unix open flags of the core crate's audit-log regular-file open.
 libc = { version = "=0.2.186", default-features = false }
 stellar-agent-stablecoin = { path = "crates/stellar-agent-stablecoin", version = "0.1.0-alpha.12" }
 stellar-agent-sep48 = { path = "crates/stellar-agent-sep48", version = "0.1.0-alpha.12" }

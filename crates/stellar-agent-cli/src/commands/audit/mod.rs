@@ -75,7 +75,8 @@ pub(crate) fn audit_writer_error(
         // wrong one.
         WriterError::RotationBridgeUnusable { .. }
         | WriterError::OutboxBusy
-        | WriterError::OutboxUnusable { .. } => {
+        | WriterError::OutboxUnusable { .. }
+        | WriterError::RowTooLarge { .. } => {
             WalletError::Internal(InternalError::UnexpectedState {
                 detail: e.to_string(),
             })
@@ -221,24 +222,35 @@ mod tests {
 
     #[test]
     fn a_variant_with_its_own_code_does_not_get_a_second_one() {
-        let err = audit_writer_error(
-            &WriterError::RotationBridgeUnusable {
-                archive_name: "audit.jsonl.20260913T120000000".to_owned(),
-                reason: "test",
-            },
-            "audit.reanchor_failed",
-            "default",
-        );
-        assert!(
-            err.message().contains("audit.rotation_bridge_unusable"),
-            "message: {}",
-            err.message()
-        );
-        assert!(
-            !err.message().contains("audit.reanchor_failed"),
-            "two codes in one detail: {}",
-            err.message()
-        );
+        let cases = [
+            (
+                WriterError::RotationBridgeUnusable {
+                    archive_name: "audit.jsonl.20260913T120000000".to_owned(),
+                    reason: "test",
+                },
+                "audit.rotation_bridge_unusable",
+            ),
+            (
+                WriterError::RowTooLarge {
+                    bytes: 2_000_000,
+                    cap: 1_048_576,
+                },
+                "audit.row_too_large",
+            ),
+        ];
+        for (writer_error, own_code) in &cases {
+            let err = audit_writer_error(writer_error, "audit.reanchor_failed", "default");
+            assert!(
+                err.message().contains(own_code),
+                "message: {}",
+                err.message()
+            );
+            assert!(
+                !err.message().contains("audit.reanchor_failed"),
+                "two codes in one detail: {}",
+                err.message()
+            );
+        }
     }
 
     #[test]

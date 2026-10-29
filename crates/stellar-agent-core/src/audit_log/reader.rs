@@ -975,11 +975,13 @@ impl AuditReader {
 ///
 /// # Filename-ordering invariant
 ///
-/// Rotated filenames use the strict `<stem>.<YYYYMMDDTHHMMSSmmm>` pattern
-/// produced by `audit_log/writer.rs::compact_timestamp()`. This format is
-/// sortable by lexicographic string comparison and the lexicographic order
-/// equals chronological order. Consequently, `rotated.sort(); rotated.reverse()`
-/// correctly yields newest-first ordering.
+/// Rotated filenames use the strict `<stem>.<YYYYMMDDTHHMMSSmmm>` pattern,
+/// with a fixed-width counter appended when the clock does not place a
+/// rotation after the newest archive. The writer names each archive so it
+/// sorts after every existing one (`audit_log/writer.rs::next_archive_suffix`),
+/// so the lexicographic order equals the order the archives were created in.
+/// Consequently, `rotated.sort(); rotated.reverse()` correctly yields
+/// newest-first ordering.
 ///
 /// This invariant is verified by the `rotation_suffix_lex_sort_matches_chronological`
 /// unit test in `audit_log/rotation.rs::tests`.

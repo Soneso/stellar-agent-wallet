@@ -15,6 +15,15 @@
 //!    If `hmac_key` is `Some` and the sidecar is missing,
 //!    [`VerifyError::HmacSidecarMissing`] is returned.
 //!
+//! Without a `<log>.pruned` marker the first file starts from
+//! [`ZERO_BLOCK_HASH`]. With one, the first file starts from the seed the marker
+//! records for it as either boundary, the rule the prune applies too; a marker
+//! that names neither boundary fails with [`VerifyError::ChainBroken`] at line
+//! 1 of that file. A nonzero marker seed produces
+//! [`VerifyWarning::PrunedPrefix`]. With a key,
+//! the marker's tag must verify before the walk. Without a key it is untrusted
+//! bookkeeping. Every subsequent bridge, entry, sidecar, and anchor check holds.
+//!
 //! # Wire codes (closed set)
 //!
 //! Error variant wire codes use a closed set: `audit.chain_broken`,
@@ -45,10 +54,11 @@ use super::{
     binding::BindingHistory,
     chain::{ZERO_BLOCK_HASH, compute_entry_hash, verify_chain_root},
     entry::AuditEntry,
+    rotation::{MarkerNamesNoBoundary, oldest_retained_seed, read_prune_marker},
     schema::EventKind,
     tip_anchor::{PriorAnchoring, TipAnchor},
     writer::{
-        MAX_ROTATED_FILES, hmac_sidecar_path, is_rotated_sibling,
+        MAX_ROTATED_FILES, hmac_sidecar_path, is_rotated_sibling, prune_marker_path,
         wait_out_transient_rotation_window,
     },
 };
@@ -65,6 +75,11 @@ pub const BACKWARD_TS_WARN_THRESHOLD_MS: u64 = 60_000;
 /// Maximum number of rotated siblings `audit verify` will collect before
 /// rejecting the directory as polluted.
 const ROTATED_FILE_CHAIN_CAP: usize = MAX_ROTATED_FILES * 2 + 1;
+
+/// [`VerifyError::ChainBroken`] reason for a log whose oldest file is neither
+/// boundary its prune marker records, so nothing records what that file's
+/// first entry chains from. The prune stops at the same file.
+pub(super) const MARKER_NAMES_NO_BOUNDARY_REASON: &str = "prune_marker_names_neither_boundary";
 
 /// The outcome of a successful log verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +148,13 @@ pub struct FileVerifyResult {
 #[non_exhaustive]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VerifyWarning {
+    /// Retention removes a prefix whose boundary the prune marker records.
+    PrunedPrefix {
+        /// Basename of the first retained file in the walk.
+        first_file: String,
+        /// Number of archives the marker records as pruned.
+        pruned_files: u64,
+    },
     /// An entry timestamp moved backward beyond [`BACKWARD_TS_WARN_THRESHOLD_MS`].
     BackwardTimestampJump {
         /// Previous entry timestamp as it appeared in the log.
@@ -232,12 +254,44 @@ pub fn verify_log(log_path: &Path, hmac_key: Option<&[u8; 32]>) -> Result<Verify
             detail: "log path has no UTF-8 file name".to_owned(),
         })?;
 
-    // `expected_prev_hash` threads the last_hash from one file into the next
-    // to verify the cross-file chain bridge.
-    // None means "this is the very first file — use ZERO_BLOCK_HASH internally".
-    let mut expected_prev_hash: Option<String> = None;
+    let marker = read_prune_marker(log_path)?;
+    if let (Some(marker), Some(key)) = (&marker, hmac_key)
+        && !marker.verify_tag(key)
+    {
+        return Err(VerifyError::HmacMismatch {
+            file: basename_lossy(&prune_marker_path(log_path)),
+        });
+    }
+    let first_file = file_chain.first().map(|path| basename_lossy(path));
+    // The first file chains from the start the prune reads too; every later
+    // bridge uses the walk's tip. A first file that does not exist is reported
+    // by the walk.
+    let mut expected_prev_hash = match first_file
+        .as_deref()
+        .map(|file| oldest_retained_seed(marker.as_ref(), file))
+    {
+        Some(Ok(seed)) => Some(seed.to_owned()),
+        Some(Err(MarkerNamesNoBoundary)) if file_chain.first().is_some_and(|p| p.exists()) => {
+            return Err(VerifyError::ChainBroken {
+                line: 1,
+                file: first_file.unwrap_or_default(),
+                reason: MARKER_NAMES_NO_BOUNDARY_REASON,
+            });
+        }
+        Some(Err(MarkerNamesNoBoundary)) | None => None,
+    };
     let mut previous_timestamp: Option<(String, u64)> = None;
     let mut warnings = Vec::new();
+    if expected_prev_hash
+        .as_deref()
+        .is_some_and(|seed| seed != ZERO_BLOCK_HASH)
+        && let (Some(marker), Some(first_file)) = (&marker, first_file)
+    {
+        warnings.push(VerifyWarning::PrunedPrefix {
+            first_file,
+            pruned_files: marker.data.pruned_files,
+        });
+    }
     let mut per_file = Vec::new();
     // Tracks whether every per-file `SingleFileResult.sidecar_verified` was
     // true. AND-combined into `VerifyOk.hmac_verified` on success.
@@ -825,27 +879,7 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
         // Verify chain-root HMAC on the first entry of each file.
         if is_first_entry {
             if let Some(key) = ctx.hmac_key {
-                let sidecar = hmac_sidecar_path(path);
-                if sidecar.exists() {
-                    let tag = read_regular_file_to_string(&sidecar)?;
-                    let tag = tag.trim();
-                    verify_chain_root(key, &body, tag).map_err(|_| VerifyError::HmacMismatch {
-                        file: path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_owned(),
-                    })?;
-                } else {
-                    // HMAC key provided but sidecar missing — integrity violation.
-                    return Err(VerifyError::HmacSidecarMissing {
-                        file: path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_owned(),
-                    });
-                }
+                verify_root_sidecar(path, key, &body)?;
             }
             is_first_entry = false;
         }
@@ -1104,22 +1138,133 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
     })
 }
 
-fn open_regular_file(path: &Path) -> Result<File, VerifyError> {
-    let metadata = fs::symlink_metadata(path).map_err(VerifyError::Io)?;
-    if !metadata.file_type().is_file() {
-        return Err(VerifyError::NonRegularFileLogPath {
-            path: path.to_path_buf(),
-        });
-    }
-    File::open(path).map_err(VerifyError::Io)
+/// Verifies the chain-root tag in `log_file`'s `.root_hmac` sidecar over
+/// `first_body`, the canonical body of the file's first entry, under `key`.
+///
+/// The sidecar is opened with [`open_regular_file`] and read within
+/// [`SIDECAR_READ_CAP`]. An absent sidecar is
+/// [`VerifyError::HmacSidecarMissing`]. A tag that does not verify is
+/// [`VerifyError::HmacMismatch`], and so is a sidecar too long to hold one.
+pub(super) fn verify_root_sidecar(
+    log_file: &Path,
+    key: &[u8; 32],
+    first_body: &[u8],
+) -> Result<(), VerifyError> {
+    let file = || {
+        log_file
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let tag = match read_small_regular_file(&hmac_sidecar_path(log_file), SIDECAR_READ_CAP) {
+        Ok(Some(bytes)) => String::from_utf8(bytes).map_err(|e| {
+            VerifyError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?,
+        Ok(None) => return Err(VerifyError::HmacMismatch { file: file() }),
+        Err(VerifyError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(VerifyError::HmacSidecarMissing { file: file() });
+        }
+        Err(e) => return Err(e),
+    };
+    verify_chain_root(key, first_body, tag.trim())
+        .map_err(|_| VerifyError::HmacMismatch { file: file() })
 }
 
-fn read_regular_file_to_string(path: &Path) -> Result<String, VerifyError> {
-    let mut file = open_regular_file(path)?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(VerifyError::Io)?;
-    Ok(contents)
+/// Most bytes read from a sidecar: a `.root_hmac` tag or the `<log>.pruned`
+/// marker.
+///
+/// A tag is under a hundred bytes and a marker, which names two files of at
+/// most 255 bytes each with their seeds and a tag, under one kilobyte. The cap
+/// keeps a planted sidecar from making a reader allocate more than this.
+pub(super) const SIDECAR_READ_CAP: u64 = 16 * 1024;
+
+/// Reads the regular file at `path` whole when it holds at most `cap` bytes.
+///
+/// `Ok(None)` means the file is longer than `cap`; at most `cap + 1` bytes are
+/// read to find that out. The open is [`open_regular_file`].
+pub(super) fn read_small_regular_file(
+    path: &Path,
+    cap: u64,
+) -> Result<Option<Vec<u8>>, VerifyError> {
+    read_bounded(open_regular_file(path)?, cap).map_err(VerifyError::Io)
+}
+
+/// Reads `reader` to its end when it yields at most `cap` bytes, and returns
+/// `None` after reading `cap + 1` bytes otherwise.
+fn read_bounded(reader: impl Read, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    reader.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= cap).then_some(bytes))
+}
+
+/// Opens `path` for reading only when it is a regular file.
+///
+/// On Unix the open itself refuses a symlink (`O_NOFOLLOW`) and never waits
+/// (`O_NONBLOCK`), so a FIFO or device at the path cannot stall the caller. On
+/// Windows the open names the reparse point itself rather than its target
+/// (`FILE_FLAG_OPEN_REPARSE_POINT`), and a handle that carries the
+/// reparse-point attribute is refused. A `symlink_metadata` pre-check there
+/// refuses a non-regular file before the open, so a directory gets this
+/// refusal rather than the access error its open would return. On every
+/// platform the opened handle must then be a regular file. A refusal is
+/// [`VerifyError::NonRegularFileLogPath`].
+pub(super) fn open_regular_file(path: &Path) -> Result<File, VerifyError> {
+    let non_regular = || VerifyError::NonRegularFileLogPath {
+        path: path.to_path_buf(),
+    };
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(_) if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) => {
+                return Err(non_regular());
+            }
+            Err(e) => return Err(VerifyError::Io(e)),
+        }
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        let reparse_point = |metadata: &fs::Metadata| {
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        };
+        let metadata = fs::symlink_metadata(path).map_err(VerifyError::Io)?;
+        if !metadata.file_type().is_file() || reparse_point(&metadata) {
+            return Err(non_regular());
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(VerifyError::Io)?;
+        if reparse_point(&file.metadata().map_err(VerifyError::Io)?) {
+            return Err(non_regular());
+        }
+        file
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file = {
+        if !fs::symlink_metadata(path)
+            .map_err(VerifyError::Io)?
+            .file_type()
+            .is_file()
+        {
+            return Err(non_regular());
+        }
+        File::open(path).map_err(VerifyError::Io)?
+    };
+    if !file.metadata().map_err(VerifyError::Io)?.is_file() {
+        return Err(non_regular());
+    }
+    Ok(file)
 }
 
 /// Strips a trailing `\n`, and a `\r` before it, from a raw line.
@@ -1349,7 +1494,7 @@ pub enum VerifyError {
         file: String,
     },
 
-    /// The chain-root HMAC tag did not verify.
+    /// A chain-root or prune-marker HMAC tag did not verify.
     ///
     /// Wire code: `audit.hmac_mismatch`.  Detail: file basename.
     #[error("audit.hmac_mismatch: chain-root HMAC verification failed for {file}")]
@@ -4922,5 +5067,129 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["kind"], "backward_timestamp_jump");
         assert_eq!(v["drift_ms"], 180_000_u64);
+    }
+
+    // ── Regular-file open ─────────────────────────────────────────────────────
+
+    fn assert_refused_as_non_regular(result: Result<File, VerifyError>, path: &Path) {
+        match result {
+            Err(VerifyError::NonRegularFileLogPath { path: refused }) => {
+                assert_eq!(refused, path);
+            }
+            other => panic!("expected a non-regular-file refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_regular_file_opens_a_regular_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("regular");
+        fs::write(&path, b"bytes").unwrap();
+        let mut contents = String::new();
+        open_regular_file(&path)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        assert_eq!(contents, "bytes");
+    }
+
+    #[test]
+    fn open_regular_file_refuses_a_directory() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("directory");
+        fs::create_dir(&path).unwrap();
+        assert_refused_as_non_regular(open_regular_file(&path), &path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_file_refuses_a_symlink_to_a_regular_file() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, b"bytes").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_refused_as_non_regular(open_regular_file(&link), &link);
+    }
+
+    /// The refusal comes from the open, which never waits for a writer; a
+    /// blocking open would hang until the timeout releases it.
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_file_refuses_a_fifo_without_waiting() {
+        use crate::audit_log::test_fifo::{make_fifo, release_fifo};
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("fifo");
+        make_fifo(&fifo);
+        let (done, opened) = channel();
+        let opener = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                let _ = done.send(open_regular_file(&fifo));
+            })
+        };
+        match opened.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(result) => assert_refused_as_non_regular(result, &fifo),
+            Err(RecvTimeoutError::Disconnected) => match opener.join() {
+                Err(panic) => std::panic::resume_unwind(panic),
+                Ok(()) => panic!("the open thread ended without reporting"),
+            },
+            Err(RecvTimeoutError::Timeout) => {
+                release_fifo(&fifo);
+                panic!("opening a FIFO waited for a writer");
+            }
+        }
+        opener.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn open_regular_file_refuses_a_file_symlink() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, b"bytes").unwrap();
+        let link = dir.path().join("link");
+        std::os::windows::fs::symlink_file(&target, &link).unwrap();
+        assert_refused_as_non_regular(open_regular_file(&link), &link);
+    }
+
+    /// Serves `len` bytes and counts how many a reader asked for.
+    struct CountingReader {
+        len: u64,
+        served: u64,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let left = self.len - self.served;
+            let n = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
+            buf[..n].fill(b' ');
+            self.served += n as u64;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_bounded_read_stops_one_byte_past_the_cap() {
+        let mut reader = CountingReader {
+            len: 10 * SIDECAR_READ_CAP,
+            served: 0,
+        };
+        assert!(
+            read_bounded(&mut reader, SIDECAR_READ_CAP)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(reader.served, SIDECAR_READ_CAP + 1);
+
+        let mut reader = CountingReader {
+            len: SIDECAR_READ_CAP,
+            served: 0,
+        };
+        let bytes = read_bounded(&mut reader, SIDECAR_READ_CAP)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes.len() as u64, SIDECAR_READ_CAP);
     }
 }

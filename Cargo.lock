@@ -4705,6 +4705,7 @@ dependencies = [
  "hmac 0.13.0",
  "inventory",
  "keyring-core",
+ "libc",
  "proptest",
  "rand_core 0.6.4",
  "region",

@@ -8,7 +8,7 @@ For the cryptographic detail behind these states see [Security internals](securi
 
 **Wire code:** `audit.tip_anchor_mismatch`
 
-**What it means.** The keyring holds a tip anchor for the log file: the number of entries in it, the SHA-256 hash of its last entry, and the byte offset just past that entry. The log at that path no longer contains that tip. It is shorter than the anchor, or the entry ending at the anchored offset is not the anchored entry.
+**What it means.** The keyring holds a tip anchor for the log file: the number of entries in it, the SHA-256 hash of its last entry, and the byte offset just past that entry. The log at that path diverges from that tip. It is shorter than the anchor, or the entry ending at the anchored offset is not the anchored entry. A live writer also refuses growth beyond its own last append offset, including complete foreign rows or a torn prefix.
 
 **Why it is checked at all.** The hash chain links each entry to its predecessor, and each file's `.root_hmac` sidecar signs that file's first entry. Both verify a PREFIX. Restoring yesterday's copy of the active log, or truncating the last few entries off it, leaves a log that passes the chain walk and the root signature and looks clean. The anchor is the only thing that knows how far the log had got. The anchor, the re-anchor counter, and the audit binding live in the keyring, outside the log file. Anyone who can restore the keyring's own storage together with the log can restore an older state. With a headless keyring backend these entries are kept in a file on the same host. Anyone who can write that file can restore older entries or delete one, which needs no key material. A deleted binding is recorded again from the profile file at the next keyed use. A deleted anchor is refused while anything shows it was written (section 1.1). Mainnet readiness refuses a headless backend, because a restored copy of its file can make a truncated log and its anchor agree.
 
@@ -39,6 +39,8 @@ When the profile's audit binding has also changed, the verb needs `--acknowledge
 
 The reporting form prints the anchor in force and the anchor it would write, both as `<entry count>:<byte offset>`, and exits 1. A stored anchor that cannot be parsed at all is reported as `unusable (<field count> colon-separated fields, <n> bytes)` rather than echoed. This includes a corrupted value, or one written by a build that predates the current format. The acknowledging form replaces it. Every other verb refuses on such a value: reading it as "nothing is anchored" would turn a corrupted anchor into a silently disarmed guard. Nothing is written. The acknowledging form replays the whole log first (a log whose own chain is broken is refused here, not blessed). It writes the current tip as the anchor, increments a monotonic per-path re-anchor counter in the keyring, and appends an `audit_tip_anchored` row naming the superseded anchor. That row is permanent: the log carries its own record that a rollback was accepted, including how far back it went.
 
+**Growth underneath a live writer** refuses with the reason "the log is longer than the writer's last append". The writer stays latched after that refusal. Stop the process, preserve a copy of the log, and inspect the added bytes. Restore the last known intact prefix only after establishing which bytes are foreign or torn. Verify the repaired chain, then use the reporting and acknowledging `audit reanchor` forms above if the owed-row anchor requires repair. A chain that does not verify needs its bytes repaired first; re-anchoring cannot fix a splice. An intact tail ahead of the anchor at open remains acceptable, including a tail left by an anchor-write outage.
+
 **A log replaced underneath a live writer** can also cause this refusal.
 The MCP server normally caches an acquired writer until process exit.
 Replacing the log by `mv` leaves its handle on the previous file until that
@@ -57,7 +59,7 @@ The process then stops using that writer: the caller holding it is refused on it
 
 **A row refused on a replaced log leaves the anchor one entry ahead.** An append that is refused records, in the keyring, the row it was obliged to write: its count, its hash, and where it would have ended. That record retries once immediately and remains best-effort. When the keyring itself rejects it, the refusal still stands for the writer that made it and for every caller still holding that writer, but it does not survive the process. The signature described below is then absent, and the log looks like one that simply stopped. The action that row was going to prove has already committed, so the obligation outlives the process that failed to meet it. No file at the path satisfies the anchor afterward, including a byte-identical copy of the log as it stood a moment earlier. An anchor exactly one entry ahead of a log whose own chain verifies cleanly is that signature. `audit verify <log-path>` will report the chain intact while the anchored count exceeds the entry count by one. Treat it as a row that was owed and not written, establish what happened to the file, and recover with the acknowledging repair below. The `audit_tip_anchored` row it writes names the superseded anchor, which is the permanent record that a row went missing.
 
-The same durability applies to a log truncated or overwritten in place inside that span: the append refuses on the file's length or on the entry at its own last append, and anchors the owed row identically. One row can still be lost, in the adjacent syscalls between an append's check and its write; the anchor then describes the displaced file, which is what turns the loss into a refusal rather than into silence.
+The same durability applies to a log truncated, extended, or overwritten in place inside that span: the append refuses on the file's length or on the entry at its own last append, and anchors the owed row identically. One row can still be lost, in the adjacent syscalls between an append's check and its write; the anchor then describes the displaced file, which is what turns the loss into a refusal rather than into silence.
 
 The MCP server acquires its audit writer when an operation needs it, such as a commit preflight before signing. MCP balance reads do not acquire it. Under V1, payment simulations can reconcile overdue reservations, acquire the writer, and write settlement audit rows.
 
@@ -126,6 +128,10 @@ Recovery: the entries before it are intact. Truncate the file to the end of the 
 A file created by a rotation chains its first entry off the outgoing file's rotation-handoff entry, so opening the active file means reading that handoff out of the newest archive. This state means the archive's last entry is not a handoff naming that archive.
 
 Causes: the archive was truncated mid-entry, or something that is not a rotated sibling of this log was placed in the audit directory under a name matching the rotated-sibling pattern (`<stem>.<compact timestamp>`).
+
+The same code, with the reason "a file already exists under the rotation's archive name", refuses a rename onto an existing file. A rotation renames the active file and its sidecar only to names that are free. The writer names each archive so it sorts after every existing archive of the log. A fresh rotation therefore finds its name taken only by a stray `<name>.root_hmac` sidecar without its archive. An open, or an append after a failed handoff write, whose active file ends on a rotation handoff naming an existing file refuses before anything is written. Recovery: identify the file under that name. Move a stray sidecar without its archive out of the directory. If it is a genuine archive of this log, the handoff at the end of the active file was not written by the writer; investigate it as tampering (section 1).
+
+The same code, with the reason "the archive names after the newest archive are exhausted", means the rotation found no name that sorts after the newest archive, which the message names. The writer takes the current millisecond when that sorts after the archive. Otherwise it continues from the archive's name with a six-digit counter, so a clock set back or standing still keeps the names in creation order. The names run out only after 999,999 rotations while the clock stays behind the newest archive. A file placed in the directory under a name ending in a counter of six nines exhausts them at once. The rotation writes nothing. Recovery: check the system clock and the newest archive, and move a file that is not a genuine archive of this log out of the directory.
 
 The writer refuses rather than seeding the replay from an unverified hash. Recovery: list the audit directory, identify the file the message names, and confirm it is a genuine archive of this log. If it is not, move it out of the directory and reopen. If it is, it was truncated; `stellar-agent audit verify <log-path>` reports where.
 
@@ -321,3 +327,69 @@ outage in section 2.5.
 1. Remove that keyring entry with the platform keyring tool, such as Keychain Access on macOS, Seahorse on Linux, or Credential Manager on Windows. The entry's service and account are the profile's `audit_log_hash_chain_key_id`.
 2. Run `stellar-agent profile rotate-audit-key <name>` to mint a new key. It re-signs the log's chain-root sidecars under that key.
 3. If the log's anchor is gone, the rotation refuses with `audit.tip_anchor_missing` (section 1.1). Run `stellar-agent audit reanchor --profile <name> --acknowledge-rollback` after the checks that section names.
+
+## 11. Retained history without an authenticated start
+
+The retained history starts where `<log>.pruned` says its oldest archive
+starts, or at the zero seed when no prune has run. A log whose oldest archives
+were deleted outside the writer, for example by a build that pruned without the
+marker, by a log-management tool, or by hand, or whose marker was deleted, has
+an oldest archive that chains from neither. `audit verify` fails at line 1 of
+that archive. Every prune stops with a warning that names this section and
+keeps every archive, so the archives accumulate until open and verify refuse
+past 21 rotated files with `audit.too_many_rotated_files`. The writer never
+adopts such a start on its own: a missing archive or marker looks exactly like
+removed evidence.
+
+**Recovery.** Establish why the history is short, as for a mismatch (section
+1). Then keep the old log as the record and start a new one at the path:
+
+1. Stop every process that holds the profile's audit writer, such as a running
+   `stellar-agent-mcp` server.
+2. Copy the whole audit directory to a location outside it and keep the copy.
+3. Move the active log, every archive `<log>.<timestamp>`, each one's
+   `.root_hmac` sidecar, and `<log>.pruned` when present out of the audit
+   directory. Leave the lock file and the audit outbox in place.
+4. Run the repair against the now empty path:
+
+```
+stellar-agent audit reanchor --profile <name>               # creates the empty log, writes no row, exits 1
+stellar-agent audit reanchor --profile <name> --acknowledge-rollback
+```
+
+The reporting form creates the empty log at the path, writes no row and no
+anchor, and prints the anchor in force and `none` as the anchor it would
+write. The acknowledging form appends the log's first row, a
+`rollback_acknowledged` row naming the superseded anchor, anchors it, bumps the
+re-anchor counter, and drains the audit outbox; it creates the log as well when
+the reporting form did not run. `audit verify <log-path>` then verifies the new
+log from the zero seed. The moved files keep the earlier history.
+
+The prune and `audit verify` pick the start of the retained history by one
+rule: the zero seed without a marker, and otherwise the seed the marker records
+for the oldest archive as either of its boundaries. A marker that names neither
+boundary for the oldest archive stops every prune and fails `audit verify` with
+`audit.chain_broken`, reason `prune_marker_names_neither_boundary`, at line 1
+of that archive. When the full history from the zero seed sits beside such a
+marker, for example after the whole directory was restored from a copy taken
+before the first prune, move the marker out of the audit directory and keep it
+with the copy: verification and the next prune then start from the zero seed,
+and no reanchor is needed.
+
+A prune that stops logs a warning naming the file it stopped at and the cause,
+and the rotation still completes. A planted, edited, split, unreadable, or
+oversized file from the oldest archive to the one just rotated, a malformed
+handoff, an archive whose chain-root tag is missing or does not verify under
+the writer's key, a marker that does not parse or authenticate, or a failed
+marker write or removal keeps the excess archives and needs investigation. A
+sibling placed under a name that sorts after every archive precedes the next
+archive, which the writer names after it, and stops the prune the same way.
+Pruning resumes once the offending file is removed or
+restored; rotating cannot repair an interior edit. A keyed open writes a
+missing tag only for a file its anchor proves from byte 0; for a file it
+cannot prove, such as one adopted without an anchor, `audit reanchor` writes
+the tag after the operator acknowledges the file as it stands. Neither writes a
+tag for a file whose first entry does not start at byte 0. An archive that
+an unkeyed writer both started and rotated has no tag. After checking that it
+is genuine, `profile rotate-audit-key` re-signs every file. Past 21 rotated
+files, open and verify refuse with `audit.too_many_rotated_files`.

@@ -616,6 +616,37 @@ An outage covering both the handoff and first new-file anchor leaves the anchor
 on the pre-handoff tip. After process exit, open and verify report a mismatch
 on the honest log; investigate and use `audit reanchor` to recover.
 
+Retention keeps ten archives plus the active file when pruning succeeds. Before
+each deletion, `<log>.pruned` records the successor's seed, the outgoing file's
+seed, and a count of pruned files. A keyed writer signs that marker.
+`audit verify` uses the marker to walk retained history and reports
+`pruned_prefix`; it still refuses edits and deletions beyond that boundary. An
+interrupted deletion keeps its outgoing seed available for verification. The
+writer prunes after the new active file exists, and a prune never fails the
+rotation. It deletes only archives of one fully validated chain that ends at
+the archive just rotated: every archive opens as a regular file within a read
+budget, every entry chains from the one before it, under a keyed writer every
+archive's first entry carries a chain-root tag that verifies under its key, and
+the just-rotated archive matches the seed and handoff the writer holds in
+memory. The oldest archive must chain from the seed the marker records for it,
+or from the zero seed when none exists; `audit verify` reads that start by the
+same rule. A log whose oldest archives or marker were removed outside the
+writer stalls pruning until the operator moves it aside and runs
+`audit reanchor --acknowledge-rollback` on a new log. A planted, edited, split,
+unreadable, or oversized file in that range stalls pruning until it is removed.
+The writer names each archive so it sorts after every existing one, also after
+the clock is set back, so a sibling placed under a later name precedes the next
+archive and stalls pruning too. An append whose row exceeds 1 MiB refuses with
+`audit.row_too_large` and never writes the row. A rotation handoff is always
+its file's last entry, keyed or unkeyed, and a rotation never renames over an
+existing file. A keyed open writes a missing chain-root tag only for a file its
+anchor proves from byte 0; an anchored file that fails the proof refuses with
+`audit.tip_anchor_mismatch`.
+A marker that does not parse, does not authenticate, or names neither
+boundary, a failed marker write, or a failed removal also stops the prune.
+Every stop logs a warning and keeps excess archives in place. Past 21 rotated
+files, open and verify refuse with `audit.too_many_rotated_files`.
+
 Settlement and receipt-clear lookups walk retained files newest first, and a
 match leaves older files unvisited. Each visited file's own chain is verified;
 in a log with no archives the first row must chain from the zero hash. The
@@ -716,6 +747,11 @@ path-contract failure, or an I/O error. Verification failures use a closed set
 of wire codes, for example `audit.chain_broken`, `audit.rotation_gap`,
 `audit.hmac_mismatch`, `audit.tip_anchor_mismatch`, `audit.tip_anchor_missing`, with line and file detail
 kept out of the code.
+
+A `pruned_prefix` warning reports `first_file`, the oldest file walked, and
+`pruned_files`, the count in `<log>.pruned`. The marker seeds that file's first
+entry and is authenticated when an audit key is supplied. Verification checks
+every retained entry and bridge, and the warning leaves the verdict successful.
 
 `outbox_pending` counts the consent rows queued in the audit outbox beside the log (`<LOG_PATH>.outbox`) and not yet drained into it, read without taking the outbox lock. Queued rows sit outside the tip anchor until a draining writer appends them. A torn outbox adds an `outbox_torn_tail` warning and unparseable lines add `outbox_unparseable`. An unreadable outbox adds `outbox_unreadable` and omits `outbox_pending`, since no count is known. None of them changes the chain verdict.
 

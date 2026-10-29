@@ -58,6 +58,11 @@ stellar-agent-xdr-limits = { workspace = true }
 # Core itself never registers a platform backend.
 keyring-core = { workspace = true }
 
+# `O_NOFOLLOW` and `O_NONBLOCK` for the audit log's regular-file open, so a
+# FIFO or symlink beside the log never blocks or redirects a read.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 stellar-agent-windows-identity = { workspace = true }
 
