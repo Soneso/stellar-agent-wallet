@@ -669,7 +669,7 @@ impl WalletServer {
     ///
     /// Distinct entry point from [`Self::route_to_gated_resolver`] (the
     /// `sign-payment` resolver): rule-create has no `envelope_xdr` to decode
-    /// the authoritative bucket-matching fields from — the pending
+    /// the authoritative bucket-matching fields from. The pending
     /// `RuleProposalSimulated` entry (looked up by the caller-supplied
     /// `approval_nonce`, which `stellar_rule_create` always mints) is the
     /// SOLE source of the authoritative smart-account.
@@ -679,15 +679,18 @@ impl WalletServer {
     /// smart-account C-strkey as `authoritative_destination` and the fixed
     /// `matrix::SIGN_RULE_CREATE_ASSET_SENTINEL` /
     /// `matrix::SIGN_RULE_CREATE_AMOUNT_SENTINEL` for the asset/amount
-    /// dimensions, which carry no independent meaning for rule creation —
-    /// see that module's doc comments for the full rationale.
+    /// dimensions, which carry no independent meaning for rule creation.
+    /// See that module's doc comments for the full rationale.
     ///
     /// # Errors
     ///
-    /// - `toolset.gated_missing_approval_nonce` — `args.approval_nonce`
+    /// - `toolset.gated_missing_approval_nonce`: `args.approval_nonce`
     ///   absent, not a string, or does not resolve to a pending
     ///   `RuleProposalSimulated` entry.
-    /// - `toolset.first_invoke_approval_required` — gate fired, approval queued.
+    /// - `policy.approval_consumed` (a business result): `args.approval_nonce`
+    ///   resolves to an unexpired rule-proposal approval a commit already
+    ///   spent.
+    /// - `toolset.first_invoke_approval_required`: gate fired, approval queued.
     /// - All `stellar_rule_create_commit` errors (policy, attestation, chain, etc.).
     pub(crate) async fn route_to_gated_resolver_rule_create(
         &self,
@@ -750,8 +753,20 @@ impl WalletServer {
                 None,
             )
         })?;
+        let now_unix_ms = stellar_agent_core::timefmt::now_unix_ms()
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
         let smart_account = match &entry.kind {
             ApprovalKind::RuleProposalSimulated { smart_account, .. } => smart_account.clone(),
+            // The commit spends a rule-proposal approval before its install
+            // starts. A retry through the toolset is named as spent, as the
+            // commit names it, rather than as a nonce of the wrong kind.
+            ApprovalKind::Consumed {
+                original_kind_name, ..
+            } if original_kind_name == "RuleProposalSimulated"
+                && !entry.is_expired(now_unix_ms) =>
+            {
+                return Ok(crate::tools::common::rule_proposal_consumed_error());
+            }
             other => {
                 return Err(rmcp::ErrorData::invalid_params(
                     format!(
@@ -768,8 +783,6 @@ impl WalletServer {
         let process_uid = process_uid_for_attestation().map_err(|e| {
             rmcp::ErrorData::internal_error(format!("approval.uid_unavailable: {e}"), None)
         })?;
-        let now_unix_ms = stellar_agent_core::timefmt::now_unix_ms()
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
 
         #[cfg(not(feature = "test-helpers"))]
         let gated_params = GatedInvokeParams {

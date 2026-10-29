@@ -986,6 +986,21 @@ pub(crate) fn approval_consumed_error() -> rmcp::model::CallToolResult {
     )
 }
 
+/// Returns the wire error for a live `ApprovalKind::Consumed` tombstone of a
+/// rule proposal.
+///
+/// Same code as [`approval_consumed_error`]. A rule-create commit spends its
+/// approval before the install starts, so the tombstone holds the proposal
+/// digest rather than a transaction, and the install may or may not have
+/// landed. The next step is to read the account's rules, not a transaction.
+pub(crate) fn rule_proposal_consumed_error() -> rmcp::model::CallToolResult {
+    business_error_result(
+        "policy.approval_consumed",
+        "this rule-proposal approval is already spent; \
+         list the account's rules before proposing the rule again",
+    )
+}
+
 /// Returns the fail-closed wire error for a `RequireApproval` verdict on a
 /// single-shot sign tool.
 ///

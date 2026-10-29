@@ -33,7 +33,10 @@
 //!    gate).
 //! 6. Commit via `stellar_rule_create_commit`; assert the response reports a
 //!    non-bootstrap `rule_id` and a 64-hex-char confirmed `tx_hash`.
-//! 7. On-chain assert: `ContextRuleManager::get_rule` returns `Some(_)` for
+//! 7. Assert the approval is spent: the stored entry is a tombstone holding
+//!    the proposal digest, and a retry of the same commit returns
+//!    `policy.approval_consumed`.
+//! 8. On-chain assert: `ContextRuleManager::get_rule` returns `Some(_)` for
 //!    the newly installed rule.
 //!
 //! `stellar_rule_create` / `stellar_rule_create_commit` are called through
@@ -324,14 +327,15 @@ async fn t1_rule_create_commit_happy_path() {
         &stored.attested_lifetime(),
     );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
+    let commit_args = || StellarRuleCreateCommitArgs {
+        chain_id: TESTNET_CHAIN_ID.to_owned(),
+        approval_nonce: approval_nonce.clone(),
+        approval_attestation: Some(blob_b64.clone()),
+    };
 
     // ── 6. Commit: gate verifies the attestation, install_rule signs+submits ──
     let commit = server
-        .call_stellar_rule_create_commit(StellarRuleCreateCommitArgs {
-            chain_id: TESTNET_CHAIN_ID.to_owned(),
-            approval_nonce: approval_nonce.clone(),
-            approval_attestation: Some(blob_b64),
-        })
+        .call_stellar_rule_create_commit(commit_args())
         .await
         .expect("commit must pass the gate and install on-chain");
     let commit_json = result_json(&commit);
@@ -352,7 +356,49 @@ async fn t1_rule_create_commit_happy_path() {
         .expect("commit must report an on-chain tx_hash");
     assert_eq!(tx_hash.len(), 64, "tx_hash must be a 32-byte hex digest");
 
-    // ── 7. On-chain assert: the installed rule is fetchable ───────────────────
+    // ── 7. The confirmed install leaves the approval spent ────────────────────
+    let spent = stellar_agent_core::approval::PendingApprovalStore::open(
+        stellar_agent_core::profile::schema::default_approval_dir()
+            .expect("approval dir")
+            .join(format!("{}.toml", server.profile_name_for_approval())),
+    )
+    .expect("open approval store")
+    .get(&approval_nonce)
+    .expect("the spent approval stays as a tombstone")
+    .kind
+    .clone();
+    match spent {
+        stellar_agent_core::approval::ApprovalKind::Consumed {
+            original_kind_name,
+            tx_hash: spent_on,
+            outcome,
+        } => {
+            assert_eq!(original_kind_name, "RuleProposalSimulated");
+            assert_eq!(spent_on, proposal_sha256_hex);
+            assert_eq!(
+                outcome,
+                stellar_agent_core::approval::ConsumedOutcome::Unknown
+            );
+        }
+        other => panic!(
+            "the confirmed install must leave the approval spent, got {}",
+            other.kind_name()
+        ),
+    }
+    let retry = server
+        .call_stellar_rule_create_commit(commit_args())
+        .await
+        .expect("the spent approval returns a business envelope");
+    let retry_json = result_json(&retry);
+    assert_eq!(retry.is_error, Some(true), "{retry_json}");
+    assert_eq!(retry_json["error"]["code"], "policy.approval_consumed");
+    assert_eq!(
+        retry_json["error"]["message"],
+        "this rule-proposal approval is already spent; list the account's rules before \
+         proposing the rule again"
+    );
+
+    // ── 8. On-chain assert: the installed rule is fetchable ───────────────────
     let manager = ContextRuleManager::new(ContextRuleManagerConfig::new(
         TESTNET_RPC_URL.to_owned(),
         TESTNET_PASSPHRASE.to_owned(),

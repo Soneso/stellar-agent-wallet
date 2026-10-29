@@ -1133,8 +1133,11 @@ impl WalletServer {
         description = "Verify the operator's attestation and install the proposed context rule (commit \
                        step). Testnet-only; refuses chain_id=stellar:mainnet. Always requires operator \
                        attestation, regardless of the policy verdict. Requires approval_nonce from \
-                       stellar_rule_create and approval_attestation. Install and simulation refuse an \
-                       invalid simple-threshold parameter with sa.simple_threshold_install_refused. A \
+                       stellar_rule_create and approval_attestation. The commit spends the approval \
+                       before the install starts, so a retry with the same approval returns \
+                       policy.approval_consumed for every install outcome. Install and simulation \
+                       refuse an invalid simple-threshold parameter with \
+                       sa.simple_threshold_install_refused. A \
                        duplicate policy address or two simple-threshold policies refuse with \
                        sa.deployment_failed at phase build. An external entry whose pubkey_data_hex \
                        decodes to empty key data refuses with sa.auth_entry_construction_failed. Every \
@@ -1331,10 +1334,11 @@ impl WalletServer {
                     return Ok(approval_rejected_error());
                 }
                 // A spent approval is named as spent rather than as absent:
-                // the agent needs to know its approval was already used, and
-                // on which transaction, instead of being told to ask again.
+                // the agent needs to know this approval was already used, and
+                // that its install may have landed, instead of being told to
+                // ask again.
                 stellar_agent_core::approval::ApprovalKind::Consumed { .. } => {
-                    return Ok(crate::tools::common::approval_consumed_error());
+                    return Ok(crate::tools::common::rule_proposal_consumed_error());
                 }
                 stellar_agent_core::approval::ApprovalKind::RuleProposalSimulated {
                     smart_account,
@@ -1517,6 +1521,40 @@ impl WalletServer {
             }
         };
 
+        // ── Spend the approval before the install can send ───────────────────
+        // The entry was read and verified under this store's lock, so no
+        // concurrent commit passes the gate between that read and this write.
+        // Once the tombstone is persisted, every install outcome leaves the
+        // approval spent: a lost confirmation after the send, a refusal inside
+        // the install, and a confirmed install alike. A retry is refused with
+        // `policy.approval_consumed`; a new install needs a new proposal.
+        // A failed write refuses before the install. The approval stays live
+        // only when the write failed before it replaced the store file; a
+        // failure after the replacement leaves the tombstone in place, which
+        // refuses a retry.
+        let proposal_digest_hex = stellar_agent_core::hex::encode(&recomputed_digest);
+        match store.consume(
+            &args.approval_nonce,
+            &proposal_digest_hex,
+            stellar_agent_core::approval::ConsumedOutcome::Unknown,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(approval_required_indistinguishable(
+                    &self.profile_name_for_approval(),
+                ));
+            }
+            Err(e) => {
+                let err = stellar_agent_core::approval::attest::record_error(&e);
+                return Ok(crate::tools::common::business_error_result(
+                    err.code(),
+                    err.to_string(),
+                ));
+            }
+        }
+        // Release the store lock before the install's network round trips.
+        drop(store);
+
         let request_id = uuid::Uuid::new_v4().to_string();
         let install_result = manager
             .install_rule(
@@ -1540,16 +1578,6 @@ impl WalletServer {
                     decision = "committed",
                     "stellar_rule_create_commit: rule installed"
                 );
-
-                // Best-effort removal of the consumed approval entry.
-                if let Err(e) = store.remove(&args.approval_nonce) {
-                    tracing::warn!(
-                        nonce = %args.approval_nonce,
-                        error = %e,
-                        "stellar_rule_create_commit: approval entry remove failed after \
-                         successful install; entry will expire via gc"
-                    );
-                }
 
                 let view = json!({
                     "rule_id": output.rule_id,
@@ -2740,6 +2768,315 @@ mod tests {
         assert!(
             seen.iter().all(|in_log| *in_log),
             "the consent row must be in the log when the signing key loads: {seen:?}"
+        );
+    }
+
+    // ── The commit spends its approval before the install ────────────────────
+
+    /// The message of the rule-proposal consumed refusal.
+    const RULE_PROPOSAL_CONSUMED_MESSAGE: &str = "this rule-proposal approval is already spent; \
+                                                  list the account's rules before proposing the \
+                                                  rule again";
+
+    /// A loopback RPC endpoint that accepts, counts, and closes every
+    /// connection.
+    ///
+    /// On the first connection, before closing it, the endpoint records the
+    /// kind of the approval entry it watches. The install waits on that
+    /// connection while the record is taken, so the record shows the store as
+    /// the install found it when it first reached the network. Every
+    /// connection a commit opens is accepted before the commit returns, since
+    /// the client waits for the close.
+    struct FirstContactRpc {
+        address: std::net::SocketAddr,
+        state: std::sync::Arc<FirstContactState>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    /// State shared by [`FirstContactRpc`] and its accept worker.
+    struct FirstContactState {
+        accepted: std::sync::atomic::AtomicUsize,
+        watched: std::sync::OnceLock<(std::path::PathBuf, String)>,
+        first_kind: std::sync::Mutex<Option<String>>,
+        shutdown: std::sync::atomic::AtomicBool,
+    }
+
+    impl FirstContactState {
+        /// The kind of the watched entry, or why it could not be read.
+        fn watched_kind(&self) -> String {
+            let Some((store_path, nonce)) = self.watched.get() else {
+                return "no watched entry".to_owned();
+            };
+            match PendingApprovalStore::open(store_path.clone()) {
+                Ok(store) => store.get(nonce).map_or_else(
+                    || "absent".to_owned(),
+                    |entry| entry.kind.kind_name().to_owned(),
+                ),
+                Err(e) => format!("store unavailable: {e}"),
+            }
+        }
+    }
+
+    impl FirstContactRpc {
+        fn start() -> Self {
+            use std::sync::atomic::Ordering;
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let state = std::sync::Arc::new(FirstContactState {
+                accepted: std::sync::atomic::AtomicUsize::new(0),
+                watched: std::sync::OnceLock::new(),
+                first_kind: std::sync::Mutex::new(None),
+                shutdown: std::sync::atomic::AtomicBool::new(false),
+            });
+            let worker_state = std::sync::Arc::clone(&state);
+            let worker = std::thread::spawn(move || {
+                while !worker_state.shutdown.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _peer)) => {
+                            if worker_state.accepted.fetch_add(1, Ordering::SeqCst) == 0 {
+                                let kind = worker_state.watched_kind();
+                                *worker_state.first_kind.lock().unwrap() = Some(kind);
+                            }
+                            drop(stream);
+                        }
+                        Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                    }
+                }
+            });
+            Self {
+                address,
+                state,
+                worker: Some(worker),
+            }
+        }
+
+        fn uri(&self) -> String {
+            format!("http://{}", self.address)
+        }
+
+        /// Watches the entry under `nonce` in the store at `store_path`.
+        fn watch(&self, store_path: std::path::PathBuf, nonce: String) {
+            self.state.watched.set((store_path, nonce)).unwrap();
+        }
+
+        fn accepted(&self) -> usize {
+            self.state
+                .accepted
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// The watched entry's kind at the first connection.
+        fn first_kind(&self) -> Option<String> {
+            self.state.first_kind.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for FirstContactRpc {
+        fn drop(&mut self) {
+            self.state
+                .shutdown
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    /// A server whose profile signs as an enrolled signer seeded from a
+    /// deterministic test seed and reaches its RPC at `rpc_url`, with an
+    /// attested rule proposal in its approval store under `approvals_dir`.
+    /// Returns the server, the commit arguments that pass the gate, and the
+    /// store path.
+    async fn attested_commit_with_enrolled_signer(
+        dir: &std::path::Path,
+        approvals_dir: std::path::PathBuf,
+        rpc_url: String,
+    ) -> (
+        WalletServer,
+        StellarRuleCreateCommitArgs,
+        std::path::PathBuf,
+    ) {
+        use stellar_agent_core::approval::attestation::compute_attestation;
+        use stellar_agent_network::Signer as _;
+
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let seed = [0x5a_u8; 32];
+        let account = stellar_agent_network::signing::SoftwareSigningKey::new_from_bytes(seed)
+            .public_key()
+            .await
+            .unwrap()
+            .to_string()
+            .to_string();
+        let mut profile = test_profile(dir);
+        profile.rpc_url = rpc_url;
+        profile.mcp_signer_default.account.clone_from(&account);
+        keyring_core::Entry::new(&profile.mcp_signer_default.service, &account)
+            .unwrap()
+            .set_password(
+                &stellar_strkey::ed25519::PrivateKey(seed)
+                    .as_unredacted()
+                    .to_string(),
+            )
+            .unwrap();
+        {
+            let coord = &profile.audit_log_hash_chain_key_id;
+            keyring_core::Entry::new(&coord.service, &coord.account)
+                .unwrap()
+                .set_password(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x3a_u8; 32]),
+                )
+                .unwrap();
+        }
+        let attestation_key = [0x3b_u8; 32];
+        keyring_core::Entry::new(
+            &profile.attestation_key_id.service,
+            &profile.attestation_key_id.account,
+        )
+        .unwrap()
+        .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(attestation_key))
+        .unwrap();
+
+        std::fs::create_dir_all(&approvals_dir).unwrap();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.set_approval_dir_for_test(approvals_dir.clone());
+        let nonce = insert_rule_proposal_entry(&server, "stellar:testnet", None, DEFAULT_TTL_MS);
+        let store_path = approvals_dir.join(format!("{}.toml", server.profile_name_for_approval()));
+        let smart_account = parse_c_strkey_to_smart_account(TEST_SMART_ACCOUNT).unwrap();
+        let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+        let lifetime = store.get(&nonce).unwrap().attested_lifetime();
+        let blob = compute_attestation(
+            &attestation_key,
+            &stellar_agent_core::approval::AttestationBinding::new(
+                &server.profile_name_for_approval(),
+                "stellar:testnet",
+            ),
+            &nonce,
+            &matching_digest_for(&smart_account),
+            &process_uid_for_attestation().unwrap(),
+            &lifetime,
+        );
+        store
+            .record_rule_proposal_attestation(&nonce, blob)
+            .unwrap();
+        drop(store);
+
+        let mut args = commit_args("stellar:testnet", nonce);
+        args.approval_attestation =
+            Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob));
+        (server, args, store_path)
+    }
+
+    /// The approval entry stored under `nonce` at `store_path`.
+    fn stored_kind(
+        store_path: &std::path::Path,
+        nonce: &str,
+    ) -> stellar_agent_core::approval::ApprovalKind {
+        PendingApprovalStore::open(store_path.to_path_buf())
+            .unwrap()
+            .get(nonce)
+            .unwrap()
+            .kind
+            .clone()
+    }
+
+    /// The approval is spent before the install reaches the network, and an
+    /// install that then fails leaves it spent: the entry is a tombstone
+    /// holding the proposal digest, and a second commit with the same
+    /// approval and attestation is refused as consumed without contacting the
+    /// network. The install fails because the RPC endpoint closes every
+    /// connection.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn a_failed_install_spends_the_rule_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let (server, args, store_path) = attested_commit_with_enrolled_signer(
+            dir.path(),
+            dir.path().join("approvals"),
+            rpc.uri(),
+        )
+        .await;
+        let nonce = args.approval_nonce.clone();
+        rpc.watch(store_path.clone(), nonce.clone());
+
+        let result = server
+            .call_stellar_rule_create_commit(args.clone())
+            .await
+            .unwrap();
+        let (code, message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert!(
+            code.starts_with("sa.") && message.contains(&rpc.uri()),
+            "the commit must pass the gate and fail in the install: {code}: {message}"
+        );
+        assert!(rpc.accepted() > 0, "the install reached the network");
+        assert_eq!(
+            rpc.first_kind().as_deref(),
+            Some("Consumed"),
+            "the approval must be spent when the install first reaches the network"
+        );
+
+        let smart_account = parse_c_strkey_to_smart_account(TEST_SMART_ACCOUNT).unwrap();
+        let expected_digest = stellar_agent_core::hex::encode(&matching_digest_for(&smart_account));
+        match stored_kind(&store_path, &nonce) {
+            stellar_agent_core::approval::ApprovalKind::Consumed {
+                original_kind_name,
+                tx_hash,
+                outcome,
+            } => {
+                assert_eq!(original_kind_name, "RuleProposalSimulated");
+                assert_eq!(tx_hash, expected_digest);
+                assert_eq!(
+                    outcome,
+                    stellar_agent_core::approval::ConsumedOutcome::Unknown
+                );
+            }
+            other => panic!("the approval must be spent, got {}", other.kind_name()),
+        }
+
+        let contacts = rpc.accepted();
+        let retry = server.call_stellar_rule_create_commit(args).await.unwrap();
+        let (code, message, _text) = crate::tools::common::assert_business_envelope(&retry);
+        assert_eq!(code, "policy.approval_consumed");
+        assert_eq!(message, RULE_PROPOSAL_CONSUMED_MESSAGE);
+        assert_eq!(
+            rpc.accepted(),
+            contacts,
+            "the refused retry must not reach the network"
+        );
+    }
+
+    /// A tombstone write that fails before it replaces the store file refuses
+    /// the commit before the install reaches the network, and the approval
+    /// stays live. The write fails at the temporary file, which the
+    /// read-only approval directory refuses.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn a_consume_write_failure_refuses_before_the_install() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = FirstContactRpc::start();
+        let approvals_dir = dir.path().join("approvals");
+        let (server, args, store_path) =
+            attested_commit_with_enrolled_signer(dir.path(), approvals_dir.clone(), rpc.uri())
+                .await;
+        let nonce = args.approval_nonce.clone();
+        rpc.watch(store_path.clone(), nonce.clone());
+
+        std::fs::set_permissions(&approvals_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = server.call_stellar_rule_create_commit(args).await;
+        std::fs::set_permissions(&approvals_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let result = result.unwrap();
+        let (code, message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "approval.record_failed", "{message}");
+        assert_eq!(rpc.accepted(), 0, "the install must not reach the network");
+        assert_eq!(
+            stored_kind(&store_path, &nonce).kind_name(),
+            "RuleProposalSimulated"
         );
     }
 }

@@ -621,6 +621,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `stellar_rule_create_commit` spends its approval before the install starts.
+  A retry with the same approval and attestation, directly or through
+  `stellar_toolset_invoke`, returns `policy.approval_consumed` whether the
+  install confirmed, failed, or lost its confirmation, so one operator approval
+  installs at most one rule. The message asks the caller to list the account's
+  rules before proposing the rule again. A commit that cannot record the spent
+  approval refuses with `approval.record_failed` and installs nothing; the
+  approval stays usable only when the write failed before it replaced the
+  store file. `stellar-agent approve list` shows a spent rule proposal with its
+  proposal digest.
 - SEP-43 and SEP-53 message tools refuse signer-scope conflicts on every chain,
   including shared entries, collisions, out-of-scope references, and a mainnet
   sibling's enrolled identity. Unreadable profiles or directory scans refuse.
