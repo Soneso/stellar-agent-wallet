@@ -616,6 +616,7 @@ fn write_read_rules_toolset_pin(toolsets_root: &Path, toolset_name: &str, publis
 /// Full policy-observability-and-tuning flow: setup, read, transact, retune,
 /// squeeze, read through real MCP dispatch, negative identification.
 #[tokio::test]
+#[serial_test::serial]
 async fn policy_observability_full_flow_testnet_acceptance() {
     let tmp = tempfile::tempdir().expect("tempdir must be created");
     let registry_path = tmp.path().join("networks.toml");

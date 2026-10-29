@@ -541,6 +541,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   primary's `FAILED` goes on to the acknowledged clear, and a sent submission
   with a time bound is refused with `submission.still_pending` until that
   bound passes on the host clock.
+- The rustdoc of `stellar_agent_test_support::keyring_mock::install` and
+  `install_with_read_hooks` states their contract: each call replaces the
+  process-global store and discards every credential already seeded in the
+  process, so a test that installs or reads the mock keyring store holds the
+  same `serial_test` key as every other test in its binary that touches the
+  store or the process environment (`STELLAR_AGENT_HOME`).
 
 ### Removed
 

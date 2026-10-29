@@ -1273,6 +1273,7 @@ async fn negative_test_fixture() -> (WalletServer, TempDir, String, String, [u8;
 /// `approval_attestation` must return `policy.approval_required` — the
 /// dedicated `verify_rule_proposal_gate` never runs without one.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 #[ignore = "requires testnet and explicit --ignored flag"]
 async fn commit_without_attestation_is_approval_required() {
     let (server, _approval_dir, smart_account_strkey, proposer_g, _attestation_key) =
@@ -1317,6 +1318,7 @@ async fn commit_without_attestation_is_approval_required() {
 /// caught by the store-self-consistency digest recompute check —
 /// `simulation.divergence`, independent of the operator-consent question.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 #[ignore = "requires testnet and explicit --ignored flag"]
 async fn tampered_snapshot_is_simulation_divergence() {
     let (server, approval_dir, smart_account_strkey, proposer_g, _attestation_key) =
@@ -1368,6 +1370,7 @@ async fn tampered_snapshot_is_simulation_divergence() {
 /// distinguishable `policy.approval_rejected` (not the indistinguishable
 /// `policy.approval_required`).
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 #[ignore = "requires testnet and explicit --ignored flag"]
 async fn operator_reject_then_commit_is_rejected() {
     let (server, approval_dir, smart_account_strkey, proposer_g, _attestation_key) =
@@ -1426,6 +1429,7 @@ async fn operator_reject_then_commit_is_rejected() {
 /// lesson from Package B/A — the `ToolsetFirstInvokeGate` pending entry must
 /// be CONSUMED (removed) once the grant is recorded, not merely ignored.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 #[ignore = "requires testnet and explicit --ignored flag"]
 async fn toolset_gated_first_invoke_entry_is_consumed() {
     let (server, approval_dir, smart_account_strkey, proposer_g, attestation_key) =

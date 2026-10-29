@@ -371,6 +371,7 @@ fn run_trustline(
 /// `profile init` -> `profile enroll-signer` -> a real signing operation: the
 /// full round trip an `init`-minted profile must support end to end.
 #[tokio::test]
+#[serial_test::serial]
 async fn profile_init_then_enroll_signer_enables_a_real_signing_operation() {
     // `enroll-signer` and `trustline` both register the platform keyring
     // store before touching it, so this suite needs a functioning platform

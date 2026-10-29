@@ -449,6 +449,7 @@ fn run_pay(
 /// under-cap payment runs the full build-sign-submit pipeline and reaches
 /// ledger inclusion.
 #[tokio::test]
+#[serial_test::serial]
 async fn pay_v1_per_tx_cap_denies_over_cap_and_submits_under_cap() {
     // The v1 policy path registers the platform keyring store before the gate
     // and refuses when registration fails, so this suite needs a functioning

@@ -854,7 +854,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn soroban_prepare_keeps_the_oracle_credential_code() {
         use stellar_agent_core::profile::schema::{
             KeyringEntryRef, ProviderRecord, Providers, RpcCredentialPlacement,
