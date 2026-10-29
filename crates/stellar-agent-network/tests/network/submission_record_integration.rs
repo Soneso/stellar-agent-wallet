@@ -446,6 +446,73 @@ async fn a_pre_send_refusal_writes_no_record() {
     );
 }
 
+/// A `latestLedger` that names no ledger is refused before the send: the
+/// submission would be recorded against a ledger the retention guard cannot
+/// check, so nothing is sent and nothing is recorded.
+#[tokio::test]
+#[serial]
+async fn a_latest_ledger_that_names_no_ledger_refuses_before_the_send() {
+    for latest_ledger in [json!(0), json!(u64::from(u32::MAX) + 1), json!(-1)] {
+        let fx = fixture("record-latest-ledger");
+        let envelope = SignedTestEnvelope::for_source([0x23; 32]);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(json!({"method": "getNetwork"})))
+            .respond_with(rpc_ok(get_network_result(TESTNET_PASSPHRASE)))
+            .mount(&server)
+            .await;
+        let mut entries = envelope.ledger_entries_result();
+        entries["latestLedger"] = latest_ledger.clone();
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(json!({"method": "getLedgerEntries"})))
+            .respond_with(rpc_ok(entries))
+            .mount(&server)
+            .await;
+        mount_send_pending(&server, envelope.tx_hash_hex()).await;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorder = fx.recorder(&calls);
+        let client = StellarRpcClient::new(&server.uri()).unwrap();
+        let err = submit_transaction_and_wait(
+            &client,
+            envelope.envelope_xdr(),
+            SUBMIT_TIMEOUT,
+            TESTNET_PASSPHRASE,
+            None,
+            Some(&recorder),
+        )
+        .await
+        .expect_err("a latestLedger that names no ledger must refuse");
+
+        assert_eq!(
+            err.code(),
+            "network.rpc_response_malformed",
+            "latestLedger {latest_ledger}: {err}"
+        );
+        assert_eq!(
+            rpc_request_count(&server, "sendTransaction").await,
+            0,
+            "latestLedger {latest_ledger}: nothing is sent"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "latestLedger {latest_ledger}: nothing is recorded: {:?}",
+            calls.lock().unwrap()
+        );
+        let hash = envelope_hash(&envelope);
+        assert!(
+            fx.receipts.get(&hash).unwrap().is_none(),
+            "latestLedger {latest_ledger}: no receipt"
+        );
+        assert!(
+            !fx.reservation_is_open(&hash),
+            "latestLedger {latest_ledger}: no reservation"
+        );
+    }
+}
+
 /// A submission the endpoint accepts and never confirms reports a timeout and
 /// leaves everything it recorded standing.
 #[tokio::test]

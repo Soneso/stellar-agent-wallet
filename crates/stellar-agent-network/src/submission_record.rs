@@ -166,7 +166,8 @@ pub enum SubmissionOutcome {
     },
 
     /// The transaction applied and failed. The confirmation poll reported
-    /// `FAILED` with a `TransactionResult`.
+    /// `FAILED` with a `TransactionResult`; on mainnet the oracle reported
+    /// `FAILED` for the same hash as well, and the code is the oracle's.
     OnChainFailed {
         /// Stable wire code for the failure, from the same XDR mapping the
         /// returned error uses.
@@ -175,7 +176,8 @@ pub enum SubmissionOutcome {
 
     /// The send step refused the bytes definitively: `sendTransaction`
     /// answered `ERROR` with a real `TransactionResult`; no value moved, and the
-    /// refusal is not retried.
+    /// refusal is not retried. A mainnet send refusal is not reported this
+    /// way; see [`Self::TransportAfterSend`].
     Rejected {
         /// Stable wire code for the refusal.
         code: String,
@@ -196,9 +198,11 @@ pub enum SubmissionOutcome {
     ///
     /// Covers every post-send condition that settles nothing: a transport
     /// failure the layer cannot classify as transmitted or not, an endpoint
-    /// that stops answering the confirmation poll, and an endpoint whose
+    /// that stops answering the confirmation poll, an endpoint whose
     /// reported transaction hash does not describe the transaction that was
-    /// sent.
+    /// sent, and on mainnet a negative answer no independent witness
+    /// confirms: a send refusal, and a `FAILED` confirmation the oracle does
+    /// not report as `FAILED` itself.
     TransportAfterSend {
         /// Non-secret diagnostic detail naming the condition.
         error: String,

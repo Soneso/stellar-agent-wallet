@@ -1534,6 +1534,33 @@ impl WalletServer {
             .map_or(&self.profile, |context| context.profile())
     }
 
+    /// The oracle reconciliation asks before a negative answer of the
+    /// primary endpoint settles a mainnet reservation, built as this
+    /// server's network context builds its clients.
+    ///
+    /// `None` for a profile on another chain, whose reconciliation never
+    /// reads an oracle, and for a mainnet profile that names none. A client
+    /// that cannot be built is logged and also yields `None`: reconciliation
+    /// then keeps every reservation the primary reports as failed or
+    /// unknown, as it does when the oracle cannot be reached.
+    pub(crate) fn settlement_oracle(&self) -> Option<stellar_agent_network::StellarRpcClient> {
+        let profile = self.security_profile();
+        if !profile.chain_id.is_mainnet() {
+            return None;
+        }
+        match self.context.oracle_client(profile) {
+            Ok(oracle) => oracle,
+            Err(error) => {
+                tracing::warn!(
+                    code = %error.code(),
+                    "window reconcile: the oracle client could not be built; negative answers \
+                     of the primary endpoint settle nothing"
+                );
+                None
+            }
+        }
+    }
+
     pub(crate) fn mainnet_write_admission(
         &self,
         surface: stellar_agent_network::mainnet::MainnetConsumer,

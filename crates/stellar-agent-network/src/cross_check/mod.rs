@@ -347,6 +347,11 @@ impl OracleEndpoint {
         let _ = context;
         Self::from_profile(profile)
     }
+
+    /// The oracle's client, for a caller that reads the oracle directly.
+    pub(crate) fn into_client(self) -> StellarRpcClient {
+        self.client
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -359,7 +364,7 @@ fn unavailable(reason: Reason) -> WalletError {
     NetworkError::WitnessUnavailable { reason }.into()
 }
 
-fn identity_error(error: WalletError, authority: &str, chain: Caip2) -> WalletError {
+pub(crate) fn identity_error(error: WalletError, authority: &str, chain: Caip2) -> WalletError {
     let authority = authority.to_owned();
     match error {
         WalletError::Network(NetworkError::EndpointNetworkMismatch { .. }) => {

@@ -254,8 +254,18 @@ pub async fn run(args: &StatusArgs) -> i32 {
                 return 1;
             }
         };
+        // On a mainnet profile the oracle witnesses the primary's negative
+        // answers before the reservation settles on them.
+        let oracle = crate::commands::submission_record::settlement_oracle_in(&profile, &context);
         match window
-            .reconcile_one(&profile, &client, Some(&receipts), envelope_hash, now_ms)
+            .reconcile_one(
+                &profile,
+                &client,
+                oracle.as_ref(),
+                Some(&receipts),
+                envelope_hash,
+                now_ms,
+            )
             .await
         {
             Ok(report) if report.receipt_write_failed > 0 => tracing::warn!(

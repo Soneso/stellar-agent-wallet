@@ -418,10 +418,14 @@ When only the policy-state lock file is missing and the pin entry exists,
 the refusal names the lock file instead: a command that builds the V1 policy
 engine, such as starting the MCP server, recreates it, and the nonce stays.
 
-`--check` reports every check with the status `passed`, `failed`, or
-`not_evaluated` and a detail, and exits `1` when any check failed. The checks
-are the preconditions, `verified_policy`, `pin`, `enablement`, and every
-minimum restriction in either build. The restrictions are evaluated on the
+`--check` reports every check with the status `passed`, `failed`,
+`not_evaluated`, or `advisory` and a detail, and exits `1` when any check
+failed. An advisory never fails the check. The checks are the preconditions,
+`verified_policy`, `pin`, `enablement`, every minimum restriction in either
+build, and `oracle_provider_url`. The last is `advisory` on a profile without
+an oracle. There, a submission the primary endpoint reports failed, refused,
+or unknown keeps its reservation until `tx receipt clear` releases it.
+The restrictions are evaluated on the
 document the verified load read. Without a `[mainnet]` table the fee cap and
 every table restriction fail. When the policy does not verify, the
 restrictions and `enablement` are `not_evaluated`. The `enablement` check

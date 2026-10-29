@@ -437,6 +437,7 @@ where
         &profile_name,
         crate::common::profile_access::ProfileOrigin::Persisted,
         &rpc_client,
+        crate::commands::submission_record::settlement_oracle(&profile).as_ref(),
         now_ms,
     )
     .await;
@@ -1277,6 +1278,7 @@ where
         name,
         crate::common::profile_access::ProfileOrigin::Persisted,
         &client,
+        crate::commands::submission_record::settlement_oracle_in(profile, &net_context).as_ref(),
         now_ms,
     )
     .await;

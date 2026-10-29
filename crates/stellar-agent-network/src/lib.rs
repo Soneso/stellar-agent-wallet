@@ -94,7 +94,7 @@ pub use builder::{Asset, ClassicOpBuilder};
 pub use client::{StellarRpcClient, TransactionStatusView};
 pub use context::{MainnetEndpointFlags, MainnetWriteContext, NetworkContext};
 pub use endpoint_identity::{
-    EndpointIdentity, SUPPORTED_PROTOCOL_VERSIONS, check_protocol_version,
+    EndpointIdentity, MainnetOracle, SUPPORTED_PROTOCOL_VERSIONS, check_protocol_version,
 };
 pub use fee_bump::{FeeBumpError, build_and_sign_fee_bump};
 pub use fee_bump_retry::submit_fee_bump_idempotent;

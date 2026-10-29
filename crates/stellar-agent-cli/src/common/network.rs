@@ -24,7 +24,26 @@ use std::str::FromStr;
 use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_core::profile::caip2::Caip2;
 pub(crate) use stellar_agent_core::profile::caip2::TESTNET_RPC_URL;
-use stellar_agent_network::StellarRpcClient;
+use stellar_agent_network::{NetworkContext, StellarRpcClient};
+
+/// The network context of `profile` for a verb that reads its endpoints
+/// without a mainnet write context, such as `tx receipt clear`. In a test
+/// that routed hosts on this thread, the context's clients follow those
+/// routes.
+pub(crate) fn profile_network_context(
+    profile: &stellar_agent_core::profile::Profile,
+) -> NetworkContext {
+    let context = NetworkContext::from_profile(profile);
+    #[cfg(test)]
+    if let Some(routes) = crate::common::mainnet_write::test_routes_on_this_thread() {
+        let routes: Vec<(&str, &str)> = routes
+            .iter()
+            .map(|(host, url)| (host.as_str(), url.as_str()))
+            .collect();
+        return context.with_test_transport_routes(&routes);
+    }
+    context
+}
 
 /// An optional assertion that the loaded profile uses the named network.
 /// Profile creation uses the value to select the new file's chain.

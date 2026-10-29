@@ -25,13 +25,6 @@ pub(crate) struct TestTransportRoutes(Vec<(String, String)>);
 #[cfg(any(test, feature = "test-hooks"))]
 impl TestTransportRoutes {
     /// Routes for `(host, transport URL)` pairs.
-    #[cfg_attr(
-        not(any(test, feature = "mainnet-write")),
-        expect(
-            dead_code,
-            reason = "routes are installed through the mainnet write context"
-        )
-    )]
     pub(crate) fn new(routes: &[(&str, &str)]) -> Self {
         Self(
             routes
@@ -145,6 +138,43 @@ impl NetworkContext {
             return client;
         }
         rpc_client(&self.rpc_url, self.primary_credential.as_ref())
+    }
+
+    /// Builds the client for the oracle endpoint `profile` names, as the
+    /// cross-check builds it: a host with a test transport route gets the
+    /// routed client, and every other oracle the profile's credential-bound
+    /// client. No request is sent.
+    ///
+    /// On a mainnet profile the oracle is the independent witness a
+    /// negative answer of the primary endpoint needs before a submission
+    /// settles on it, in the submit path and in reconciliation.
+    ///
+    /// `Ok(None)` when the profile sets no `oracle_provider_url`.
+    ///
+    /// # Errors
+    ///
+    /// A credential refusal of the oracle's provider record, such as
+    /// `auth.keyring_not_found`, and `network.witness_unavailable` when the
+    /// client cannot be built from the URL.
+    pub fn oracle_client(
+        &self,
+        profile: &Profile,
+    ) -> Result<Option<StellarRpcClient>, WalletError> {
+        crate::cross_check::OracleEndpoint::from_context(profile, self)
+            .map(|oracle| oracle.map(crate::cross_check::OracleEndpoint::into_client))
+    }
+
+    /// Routes the requests of every client this context builds by endpoint
+    /// host, as [`MainnetWriteContext::with_test_transport_routes`] does for
+    /// a mainnet write context.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_test_transport_routes(self, routes: &[(&str, &str)]) -> Self {
+        Self {
+            test_transport_routes: TestTransportRoutes::new(routes),
+            ..self
+        }
     }
 
     /// Sets or clears the secondary endpoint selected by the command.
@@ -383,6 +413,29 @@ impl MainnetWriteContext {
                 return client;
             }
             rpc_client(&self.snapshot.rpc_url, self.primary_credential.as_ref())
+        }
+        #[cfg(not(feature = "mainnet-write"))]
+        {
+            self.absurd()
+        }
+    }
+
+    /// Builds the client for the stored profile's oracle endpoint, as
+    /// [`NetworkContext::oracle_client`] builds it for the network context
+    /// this one returns. No request is sent.
+    ///
+    /// The mainnet submit path asks this oracle before a `FAILED`
+    /// confirmation settles a submission.
+    ///
+    /// `Ok(None)` when the stored profile sets no `oracle_provider_url`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`NetworkContext::oracle_client`].
+    pub fn oracle_client(&self) -> Result<Option<StellarRpcClient>, WalletError> {
+        #[cfg(feature = "mainnet-write")]
+        {
+            self.network_context().oracle_client(&self.snapshot)
         }
         #[cfg(not(feature = "mainnet-write"))]
         {

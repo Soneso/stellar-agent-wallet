@@ -1377,6 +1377,11 @@ impl WalletServer {
     /// read all leave every reservation standing, which is the direction that
     /// keeps the operator's caps honest: a reservation that may still apply
     /// keeps counting.
+    ///
+    /// On a mainnet profile the pass asks the oracle before a negative answer
+    /// of the primary endpoint settles a reservation. An oracle client that
+    /// cannot be built is logged, and the pass then keeps every reservation
+    /// the primary reports as failed or unknown.
     async fn reconcile_open_reservations(&self) {
         let Ok(now_ms) = stellar_agent_core::timefmt::now_unix_ms() else {
             tracing::debug!("window reconcile: system clock unavailable; reservations stand");
@@ -1385,6 +1390,7 @@ impl WalletServer {
         let Ok(client) = self.context.primary_client() else {
             return;
         };
+        let oracle = self.settlement_oracle();
         let profile_name = self.profile_name_for_approval();
         let receipts = stellar_agent_core::profile::receipt::ReceiptStore::open(&profile_name).ok();
         let window = stellar_agent_network::policy_state::PersistedWindowStore::at_path(
@@ -1394,6 +1400,7 @@ impl WalletServer {
             .reconcile_due(
                 self.security_profile(),
                 &client,
+                oracle.as_ref(),
                 receipts.as_ref(),
                 now_ms,
                 stellar_agent_network::policy_state::RECONCILE_BUDGET,
@@ -5845,6 +5852,8 @@ pub(crate) mod tests {
             pub accounts_unavailable: AtomicBool,
             /// `sendTransaction` answers a definitive `ERROR` status.
             pub send_rejected: AtomicBool,
+            /// `getTransaction` answers `FAILED` with a `txBAD_SEQ` result.
+            pub transaction_failed: AtomicBool,
             /// `sendTransaction` answers a hash other than the envelope's.
             pub send_hash_mismatch: AtomicBool,
             /// The unsigned `simulateTransaction` answers an error.
@@ -6072,6 +6081,20 @@ pub(crate) mod tests {
                         serde_json::json!({"status":"healthy", "latestLedger":100, "oldestLedger":1, "ledgerRetentionWindow":100}),
                     ),
                     "sendTransaction" => answer(self.send(&body)),
+                    "getTransaction" if self.control.transaction_failed.load(Ordering::SeqCst) => {
+                        use stellar_xdr::*;
+                        let result = TransactionResult {
+                            fee_charged: 100,
+                            result: TransactionResultResult::TxBadSeq,
+                            ext: TransactionResultExt::V0,
+                        }
+                        .to_xdr_base64(Limits::none())
+                        .unwrap();
+                        answer(serde_json::json!({
+                            "status":"FAILED", "latestLedger":100, "oldestLedger":1,
+                            "txHash":body["params"]["hash"], "resultXdr":result
+                        }))
+                    }
                     "getTransaction" => answer(serde_json::json!({
                         "status":"SUCCESS", "ledger":101, "txHash":body["params"]["hash"],
                         "createdAt":(stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000)
@@ -7425,29 +7448,68 @@ pub(crate) mod tests {
 
         #[tokio::test]
         #[serial_test::serial(keyring)]
-        async fn mainnet_classic_definitive_rejection_releases_the_converted_rows() {
+        async fn mainnet_classic_refused_send_keeps_the_converted_rows() {
             for tool in Tool::ALL {
                 let run = ClassicRun::new(tool).await;
                 run.control.send_rejected.store(true, Ordering::SeqCst);
                 let result = run.commit().await;
                 assert_eq!(result["ok"], false, "{tool:?}: {result}");
+                assert_eq!(
+                    result["error"]["code"], "submission.tx_timeout",
+                    "{tool:?}: a refusal no independent answer confirms: {result}"
+                );
                 assert_eq!(run.control.count("sendTransaction"), 1, "{tool:?}");
                 let records = authorizations(&run.f);
                 assert_eq!(records.len(), 1, "{tool:?}");
                 assert_eq!(records[0]["state"], "used", "{tool:?}");
+                let rows = window_records(&run.f);
+                assert!(!rows.is_empty(), "{tool:?}: the rows stand");
                 assert!(
-                    window_records(&run.f).is_empty(),
-                    "{tool:?}: the rows are released"
+                    rows.iter().all(|row| row["status"] == "pending"),
+                    "{tool:?}: the converted rows stay pending: {rows:?}"
                 );
                 assert!(
                     ledger_state(&run.f)["holds"]
                         .as_array()
                         .is_none_or(Vec::is_empty),
-                    "{tool:?}"
+                    "{tool:?}: the holds became the submission's rows"
                 );
                 assert!(
-                    !is_consumed(&stored_approval(&run.f, &run.entry.approval_nonce).unwrap()),
-                    "{tool:?}: a refused send leaves the approval unspent"
+                    is_consumed(&stored_approval(&run.f, &run.entry.approval_nonce).unwrap()),
+                    "{tool:?}: a sent transaction spends its approval"
+                );
+            }
+        }
+
+        /// A `FAILED` confirmation settles a mainnet submission on the
+        /// oracle's own `FAILED`: the commit reports the failure and the
+        /// converted rows are released. Without the oracle's answer the
+        /// primary's alone would leave them pending behind the timeout shape.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn mainnet_classic_failure_the_oracle_confirms_releases_the_converted_rows() {
+            for tool in Tool::ALL {
+                let run = ClassicRun::new(tool).await;
+                run.control.transaction_failed.store(true, Ordering::SeqCst);
+                run.oracle_control
+                    .transaction_failed
+                    .store(true, Ordering::SeqCst);
+                let result = run.commit().await;
+                assert_eq!(result["ok"], false, "{tool:?}: {result}");
+                assert_eq!(
+                    result["error"]["code"], "submission.sequence_number_stale",
+                    "{tool:?}: the failure the oracle confirmed: {result}"
+                );
+                assert_eq!(run.control.count("sendTransaction"), 1, "{tool:?}");
+                assert_eq!(
+                    run.oracle_control.count("getTransaction"),
+                    1,
+                    "{tool:?}: the oracle was asked"
+                );
+                let rows = window_records(&run.f);
+                assert!(
+                    rows.is_empty(),
+                    "{tool:?}: the converted rows are released: {rows:?}"
                 );
             }
         }

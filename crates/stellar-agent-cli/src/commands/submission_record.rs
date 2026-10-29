@@ -28,7 +28,7 @@ use stellar_agent_network::mainnet::authorization::MainnetTxSignAuthorization;
 use stellar_agent_network::mainnet::consumed::AuthorizationConsumed;
 use stellar_agent_network::policy_state::{PersistedWindowStore, RECONCILE_BUDGET};
 use stellar_agent_network::{
-    ApprovalTombstone, AuditWriterHandle, MainnetSubmitGrant, MainnetWriteContext,
+    ApprovalTombstone, AuditWriterHandle, MainnetSubmitGrant, MainnetWriteContext, NetworkContext,
     StellarRpcClient, SubmissionIntent, SubmissionOutcome, SubmissionRecorder,
     WalletSubmissionRecorder, envelope_hash_hex,
 };
@@ -309,6 +309,44 @@ fn descriptor_for(tool: &'static str, chain_id: &str) -> ToolDescriptor {
     descriptor
 }
 
+/// The oracle a reconciliation pass of `profile` asks before a negative
+/// answer of the primary endpoint settles a mainnet reservation, built from
+/// the profile.
+///
+/// See [`settlement_oracle_in`].
+pub(crate) fn settlement_oracle(profile: &Profile) -> Option<StellarRpcClient> {
+    settlement_oracle_in(profile, &NetworkContext::from_profile(profile))
+}
+
+/// The oracle a reconciliation pass of `profile` asks before a negative
+/// answer of the primary endpoint settles a mainnet reservation, built as
+/// `context` builds its clients.
+///
+/// `None` for a profile on another chain, whose pass never reads an oracle,
+/// and for a mainnet profile that names none. An oracle client that cannot
+/// be built is logged and also yields `None`: the pass then keeps every
+/// reservation the primary reports as failed or unknown, as it does when the
+/// oracle cannot be reached.
+pub(crate) fn settlement_oracle_in(
+    profile: &Profile,
+    context: &NetworkContext,
+) -> Option<StellarRpcClient> {
+    if !profile.chain_id.is_mainnet() {
+        return None;
+    }
+    match context.oracle_client(profile) {
+        Ok(oracle) => oracle,
+        Err(e) => {
+            tracing::warn!(
+                code = %e.code(),
+                "window reconcile: the oracle client could not be built; negative answers of \
+                 the primary endpoint settle nothing this pass"
+            );
+            None
+        }
+    }
+}
+
 /// Settles the reservations that have stood long enough to be settleable,
 /// before the policy gate counts them.
 ///
@@ -318,6 +356,9 @@ fn descriptor_for(tool: &'static str, chain_id: &str) -> ToolDescriptor {
 /// endpoint leaves every reservation standing and the verb continues, because
 /// counting a reservation that may still apply is the safe direction.
 ///
+/// On a mainnet profile `oracle` witnesses the primary endpoint's negative
+/// answers; [`settlement_oracle`] builds it.
+///
 /// The settled rows are written under the audit binding check of `origin`,
 /// so a synthesized profile records no binding.
 pub(crate) async fn reconcile_open_reservations(
@@ -325,6 +366,7 @@ pub(crate) async fn reconcile_open_reservations(
     profile_name: &str,
     origin: ProfileOrigin,
     client: &StellarRpcClient,
+    oracle: Option<&StellarRpcClient>,
     now_ms: u64,
 ) {
     let receipts = match ReceiptStore::open(profile_name) {
@@ -340,7 +382,14 @@ pub(crate) async fn reconcile_open_reservations(
     };
     let window = PersistedWindowStore::for_profile(profile_name);
     let report = match window
-        .reconcile_due(profile, client, receipts.as_ref(), now_ms, RECONCILE_BUDGET)
+        .reconcile_due(
+            profile,
+            client,
+            oracle,
+            receipts.as_ref(),
+            now_ms,
+            RECONCILE_BUDGET,
+        )
         .await
     {
         Ok(report) => report,

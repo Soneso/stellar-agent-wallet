@@ -578,7 +578,7 @@ claimable-balance record. It does not re-read the source trustline at commit.
 | `stellar_claim_commit` | Recheck record, witness, sign, submit. | Signs and submits. Two-phase verb; approval spine. |
 | `stellar_balances` | Fetch native XLM balance and optional trustline balances for an account. | Read-only. |
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
-| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it, by its receipt or, when the receipt is missing, by its reservation. The way out of `submission.tx_timeout`. Reports `record.release_code` for a release on chain evidence and `reservation` for a hold that remains. | Reads the chain and writes the wallet's record; moves no value and never sends. Not annotated read-only. |
+| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it, by its receipt or, when the receipt is missing, by its reservation. The way out of `submission.tx_timeout`. Reports `record.release_code` for a release on chain evidence and `reservation` for a hold that remains. On a mainnet profile the primary's `FAILED` and `NOT_FOUND` settle nothing until the oracle confirms them. | Reads the chain and writes the wallet's record; moves no value and never sends. Not annotated read-only. |
 
 `stellar_pay` and `stellar_pay_commit` take at most one memo: `memo_text`, `memo_id`, `memo_hash_hex`, or `memo_return_hex`.
 `memo_text` is UTF-8 text of at most 28 bytes.

@@ -17,6 +17,12 @@
 //!   none younger than `RECONCILE_MIN_AGE_MS`.
 //! - Nothing releases a reservation on a transport error, and the pass reports
 //!   the first endpoint failure it met.
+//! - The receipt is never evidence: release evidence a receipt carries is
+//!   found again on the chain before anything is released.
+//! - Confirmed spend is never dated before its reservation was taken.
+//! - On a mainnet profile the primary's `FAILED` and `NOT_FOUND` settle
+//!   nothing alone: the oracle's own answer, and the oracle's retention,
+//!   chain time and account sequence, decide.
 //! - Reconciliation never sends: no pass calls `sendTransaction`.
 
 #![allow(
@@ -33,11 +39,13 @@ use serial_test::serial;
 use stellar_agent_core::policy::v1::criteria::state_store::{
     PolicyStateStore, StateKey, WindowEntry, WindowLimit,
 };
+use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 use stellar_agent_core::profile::receipt::{ReceiptStatus, ReceiptStore, ReleaseEvidence};
 use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
 use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::policy_state::{
-    PersistedWindowStore, RECONCILE_BUDGET, RECONCILE_MIN_AGE_MS, SettledSubmission, SubmissionHold,
+    PersistedWindowStore, RECONCILE_BUDGET, RECONCILE_MIN_AGE_MS, ReconcileFailure,
+    ReconcileFailureKind, SettledSubmission, SubmissionHold,
 };
 use stellar_agent_test_support::keyring_mock;
 use stellar_agent_test_support::signed_envelope::{
@@ -72,6 +80,20 @@ fn due_since(now: u64) -> u64 {
 
 fn test_profile(name: &str) -> Profile {
     let mut p = Profile::builder_testnet(name, "acct", "n-svc", "n-acct").build();
+    p.policy_window_state_key_id = KeyringEntryRef::default_policy_window_state_key(name);
+    p
+}
+
+fn mainnet_profile(name: &str) -> Profile {
+    let mut p = Profile::builder_mainnet_named(
+        name,
+        "https://rpc.example",
+        "reconcile-signer",
+        "acct",
+        "n-svc",
+        "n-acct",
+    )
+    .build();
     p.policy_window_state_key_id = KeyringEntryRef::default_policy_window_state_key(name);
     p
 }
@@ -208,7 +230,7 @@ fn get_transaction(status: &str) -> serde_json::Value {
     })
 }
 
-/// A `getTransaction` FAILED body carrying a real `txBadSeq` result.
+/// A `getTransaction` FAILED body carrying a real `txMALFORMED` result.
 fn get_transaction_failed() -> serde_json::Value {
     json!({
         "status": "FAILED",
@@ -232,10 +254,19 @@ struct Fixture {
 }
 
 fn fixture(name: &str) -> Fixture {
+    fixture_for(name, test_profile(name))
+}
+
+/// A fixture over a mainnet profile, whose primary's negative answers need
+/// the oracle.
+fn mainnet_fixture(name: &str) -> Fixture {
+    fixture_for(name, mainnet_profile(name))
+}
+
+fn fixture_for(name: &str, profile: Profile) -> Fixture {
     keyring_mock::install().unwrap();
     let dir = TempDir::new().unwrap();
     let receipt_dir = TempDir::new().unwrap();
-    let profile = test_profile(name);
     let window = PersistedWindowStore::at_path(dir.path().join(format!("{name}.window")));
     let receipts = ReceiptStore::open_at(receipt_dir.path(), name).unwrap();
     let receipt_file = receipt_dir.path().join(format!("{name}.json"));
@@ -248,6 +279,20 @@ fn fixture(name: &str) -> Fixture {
         receipts,
         receipt_file,
     }
+}
+
+/// A `getLedgerEntries` body reporting `source`'s account at `sequence`.
+fn account_at_sequence(source: &str, sequence: i64) -> serde_json::Value {
+    use stellar_xdr::{LedgerEntryData, Limits, ReadXdr, SequenceNumber, WriteXdr};
+    let mut result = ledger_entries_result_for(&[source]);
+    let xdr = &mut result["entries"][0]["xdr"];
+    let mut data = LedgerEntryData::from_xdr_base64(xdr.as_str().unwrap(), Limits::none()).unwrap();
+    let LedgerEntryData::Account(account) = &mut data else {
+        panic!("the fixture reports an account entry");
+    };
+    account.seq_num = SequenceNumber(sequence);
+    *xdr = json!(data.to_xdr_base64(Limits::none()).unwrap());
+    result
 }
 
 impl Fixture {
@@ -316,6 +361,7 @@ async fn success_confirms_the_reservation_and_finalizes_the_receipt() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -384,6 +430,7 @@ async fn success_with_undecodable_meta_confirms_the_reservation() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -408,8 +455,8 @@ async fn success_with_undecodable_meta_confirms_the_reservation() {
 }
 
 /// Confirmed spend is dated from the applying ledger's close time, not from
-/// the clock at settlement: a ledger two days old leaves the one-day window
-/// as soon as the reservation confirms.
+/// the clock at settlement: a reservation taken two days ago, whose ledger
+/// closed just after, leaves the one-day window as soon as it confirms.
 #[tokio::test]
 #[serial]
 async fn success_dates_the_spend_from_the_applying_ledger_close_time() {
@@ -417,7 +464,9 @@ async fn success_dates_the_spend_from_the_applying_ledger_close_time() {
     let fx = fixture("reconcile-success-close-time");
     let source = account_id_for_seed([0x12; 32]);
     let res = reservation(&"a8".repeat(32), &source, 7, due_since(now));
-    fx.take_reservation(now, &res, 500);
+    let two_days_ago = now / 1_000 - 2 * 86_400;
+    // Taken a second before the applying ledger closed.
+    fx.take_reservation(two_days_ago * 1_000 - 1_000, &res, 500);
     assert_eq!(
         fx.window_total(now),
         (500, 1),
@@ -426,7 +475,6 @@ async fn success_dates_the_spend_from_the_applying_ledger_close_time() {
 
     let counts = MethodCounts::default();
     let server = MockServer::start().await;
-    let two_days_ago = now / 1_000 - 2 * 86_400;
     mount(
         &server,
         "getTransaction",
@@ -447,6 +495,7 @@ async fn success_dates_the_spend_from_the_applying_ledger_close_time() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -503,6 +552,7 @@ async fn failed_releases_the_reservation_and_finalizes_the_receipt() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -580,6 +630,7 @@ async fn not_found_with_a_consumed_sequence_releases() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -659,6 +710,7 @@ async fn not_found_with_a_passed_time_bound_releases() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -752,6 +804,7 @@ async fn not_found_with_an_unconsumed_sequence_keeps_the_reservation() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -818,6 +871,7 @@ async fn not_found_past_the_retention_floor_keeps_the_reservation() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -896,6 +950,7 @@ async fn a_pass_is_bounded_and_takes_the_oldest_due_reservations() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -962,6 +1017,7 @@ async fn a_transport_failure_settles_nothing() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -1023,6 +1079,7 @@ async fn reconcile_one_settles_a_named_reservation_whatever_its_age() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -1036,7 +1093,7 @@ async fn reconcile_one_settles_a_named_reservation_whatever_its_age() {
 
     let named = fx
         .window
-        .reconcile_one(&fx.profile, &client, Some(&fx.receipts), &res.id, now)
+        .reconcile_one(&fx.profile, &client, None, Some(&fx.receipts), &res.id, now)
         .await
         .unwrap();
     assert_eq!(
@@ -1102,6 +1159,7 @@ async fn reservations_the_endpoint_cannot_answer_for_do_not_hold_the_budget() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -1121,8 +1179,9 @@ async fn reservations_the_endpoint_cannot_answer_for_do_not_hold_the_budget() {
     );
 }
 
-/// The automatic pass finishes a release after its receipt checkpoint, keeping
-/// the first evidence without another endpoint query.
+/// The automatic pass finishes a release whose window write failed after its
+/// receipt checkpoint, by finding the evidence again on the chain, and keeps
+/// the evidence the checkpoint recorded.
 #[tokio::test]
 #[serial]
 async fn the_automatic_pass_finishes_a_checkpointed_evidence_release() {
@@ -1158,7 +1217,7 @@ async fn the_automatic_pass_finishes_a_checkpointed_evidence_release() {
     let client = StellarRpcClient::new(&server.uri()).unwrap();
     assert!(matches!(
         fx.window
-            .reconcile_one(&fx.profile, &client, Some(&fx.receipts), &res.id, now)
+            .reconcile_one(&fx.profile, &client, None, Some(&fx.receipts), &res.id, now)
             .await,
         Err(stellar_agent_network::policy_state::WindowStoreError::WriterLocked)
     ));
@@ -1170,9 +1229,20 @@ async fn the_automatic_pass_finishes_a_checkpointed_evidence_release() {
     assert_eq!(fx.window_total(now), (500, 1));
     drop(held);
 
-    // The checkpoint finishes without asking the endpoint again.
+    // The checkpoint is not evidence: the pass asks the endpoint again, and
+    // the time bound it finds passed releases the reservation.
     counts.calls.lock().unwrap().clear();
     server.reset().await;
+    mount(
+        &server,
+        "getTransaction",
+        get_transaction("NOT_FOUND"),
+        &counts,
+    )
+    .await;
+    mount(&server, "getHealth", health(1), &counts).await;
+    mount(&server, "getLedgers", ledgers(now / 1_000, 1), &counts).await;
+    mount_send_guard(&server, &counts).await;
     // The durable receipt needs no second write, even while its writer is busy.
     let held_receipt = std::fs::OpenOptions::new()
         .create(true)
@@ -1186,6 +1256,7 @@ async fn the_automatic_pass_finishes_a_checkpointed_evidence_release() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -1205,15 +1276,23 @@ async fn the_automatic_pass_finishes_a_checkpointed_evidence_release() {
             .is_empty()
     );
     assert_eq!(fx.window_total(now), (0, 0));
-    assert_eq!(report.rpc_calls, 0);
-    assert!(counts.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        counts.count("getTransaction"),
+        2,
+        "the first answer and the fresh one after the evidence"
+    );
+    assert_eq!(report.rpc_calls, counts.calls.lock().unwrap().len());
+    assert!(report.rpc_calls > 0);
     assert_eq!(counts.count("sendTransaction"), 0);
 }
 
-/// Durable release evidence finishes the window step beyond endpoint retention.
+/// Release evidence a receipt recorded does not release a reservation whose
+/// submission ledger the endpoint no longer holds: the evidence cannot be
+/// found again, so the reservation stands for the operator and the pass
+/// reports it retention-expired.
 #[tokio::test]
 #[serial]
-async fn a_checkpointed_evidence_release_finishes_beyond_retention() {
+async fn a_checkpointed_evidence_release_beyond_retention_keeps_the_reservation() {
     let now = now_ms();
     let fx = fixture("reconcile-release-retention");
     let source = account_id_for_seed([0x38; 32]);
@@ -1241,6 +1320,7 @@ async fn a_checkpointed_evidence_release_finishes_beyond_retention() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -1248,19 +1328,20 @@ async fn a_checkpointed_evidence_release_finishes_beyond_retention() {
         .await
         .unwrap();
     assert_eq!(report.examined, 1);
-    assert_eq!(report.released, 1);
-    assert_eq!(report.rpc_calls, 0);
-    assert_eq!(report.settled.len(), 1);
-    assert_eq!(report.settled[0].release_code, checkpoint.release_code);
-    assert_eq!(fx.receipts.get(&res.id).unwrap().unwrap(), checkpoint);
-    assert!(
-        fx.window
-            .pending_reservations(&fx.profile)
-            .unwrap()
-            .is_empty()
+    assert_eq!(report.released, 0, "{report:?}");
+    assert_eq!(report.retention_expired, 1, "{report:?}");
+    assert!(report.settled.is_empty(), "{report:?}");
+    assert_eq!(
+        fx.window.pending_reservations(&fx.profile).unwrap(),
+        *std::slice::from_ref(&res),
+        "the reservation stands for the operator"
     );
-    assert_eq!(fx.window_total(now), (0, 0));
-    assert!(counts.calls.lock().unwrap().is_empty());
+    assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
+    let receipt = fx.receipts.get(&res.id).unwrap().unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Ambiguous);
+    assert_eq!(receipt.release_code, checkpoint.release_code);
+    assert_eq!(counts.count("getTransaction"), 1);
+    assert_eq!(report.rpc_calls, counts.calls.lock().unwrap().len());
 }
 
 /// A pending reservation older than the retention ceiling is kept.
@@ -1381,6 +1462,7 @@ async fn an_orphaned_reservation_is_released_once_its_sequence_is_consumed() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -1417,6 +1499,7 @@ async fn an_orphaned_reservation_is_released_once_its_sequence_is_consumed() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -1519,6 +1602,7 @@ async fn an_unreadable_receipt_store_keeps_every_reservation() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -1602,6 +1686,7 @@ async fn transaction_landing_during_sequence_read_keeps_its_debit() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -1661,6 +1746,7 @@ async fn lost_receipt_success_preserves_spend_and_restores_identity() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -1708,6 +1794,7 @@ async fn lost_receipt_outside_retention_keeps_the_reservation() {
         .reconcile_due(
             &fx.profile,
             &client,
+            None,
             Some(&fx.receipts),
             now,
             RECONCILE_BUDGET,
@@ -1793,6 +1880,7 @@ async fn host_clock_ahead_and_invalid_chain_times_keep_headroom() {
             .reconcile_due(
                 &fx.profile,
                 &client,
+                None,
                 Some(&fx.receipts),
                 now + 30 * 86_400_000,
                 RECONCILE_BUDGET,
@@ -1852,6 +1940,7 @@ async fn time_bound_fresh_answer_settles_success_and_failure() {
             .reconcile_due(
                 &fx.profile,
                 &client,
+                None,
                 Some(&fx.receipts),
                 now,
                 RECONCILE_BUDGET,
@@ -1912,6 +2001,7 @@ async fn unavailable_ledgers_leave_sequence_settlement_available() {
             fx.window.reconcile_due(
                 &fx.profile,
                 &client,
+                None,
                 Some(&fx.receipts),
                 now,
                 RECONCILE_BUDGET,
@@ -1967,7 +2057,7 @@ async fn orphan_markers_survive_restart_and_free_the_next_pass_budget() {
     let client = StellarRpcClient::new(&server.uri()).unwrap();
     let first = fx
         .window
-        .reconcile_due(&fx.profile, &client, Some(&fx.receipts), now, 5)
+        .reconcile_due(&fx.profile, &client, None, Some(&fx.receipts), now, 5)
         .await
         .unwrap();
     assert_eq!(first.examined, 5);
@@ -1977,14 +2067,14 @@ async fn orphan_markers_survive_restart_and_free_the_next_pass_budget() {
     assert_eq!(held.iter().filter(|r| r.operator_required).count(), 5);
     assert_eq!(fx.window_total(now), (70, 7));
     let second = reopened
-        .reconcile_due(&fx.profile, &client, Some(&fx.receipts), now, 5)
+        .reconcile_due(&fx.profile, &client, None, Some(&fx.receipts), now, 5)
         .await
         .unwrap();
     assert_eq!(second.examined, 2);
     assert_eq!(second.confirmed, 1);
     assert_eq!(second.retention_expired, 1);
     let third = reopened
-        .reconcile_due(&fx.profile, &client, Some(&fx.receipts), now, 5)
+        .reconcile_due(&fx.profile, &client, None, Some(&fx.receipts), now, 5)
         .await
         .unwrap();
     assert_eq!(third.examined, 0);
@@ -2024,7 +2114,7 @@ async fn failed_orphan_marker_write_keeps_the_reservation_selectable() {
     let client = StellarRpcClient::new(&server.uri()).unwrap();
     let result = fx
         .window
-        .reconcile_due(&fx.profile, &client, Some(&fx.receipts), now, 5)
+        .reconcile_due(&fx.profile, &client, None, Some(&fx.receipts), now, 5)
         .await;
     assert!(
         matches!(
@@ -2038,7 +2128,7 @@ async fn failed_orphan_marker_write_keeps_the_reservation_selectable() {
     drop(lock);
     let next = fx
         .window
-        .reconcile_due(&fx.profile, &client, Some(&fx.receipts), now, 5)
+        .reconcile_due(&fx.profile, &client, None, Some(&fx.receipts), now, 5)
         .await
         .unwrap();
     assert_eq!(next.examined, 1);
@@ -2072,7 +2162,7 @@ async fn chain_observation_is_shared_and_charged_once_per_pass() {
     let client = StellarRpcClient::new(&server.uri()).unwrap();
     let report = fx
         .window
-        .reconcile_due(&fx.profile, &client, Some(&fx.receipts), now, 2)
+        .reconcile_due(&fx.profile, &client, None, Some(&fx.receipts), now, 2)
         .await
         .unwrap();
     assert_eq!(report.released, 2);
@@ -2135,7 +2225,7 @@ async fn an_endpoint_failure_survives_a_later_successful_read() {
 
     let report = fx
         .window
-        .reconcile_one(&fx.profile, &client, Some(&fx.receipts), &res.id, now)
+        .reconcile_one(&fx.profile, &client, None, Some(&fx.receipts), &res.id, now)
         .await
         .unwrap();
 
@@ -2207,7 +2297,7 @@ async fn assert_receipt_checkpoint(status: &str, missing: bool) {
     let client = StellarRpcClient::new(&server.uri()).unwrap();
     let report = fx
         .window
-        .reconcile_one(&fx.profile, &client, Some(&fx.receipts), &res.id, now)
+        .reconcile_one(&fx.profile, &client, None, Some(&fx.receipts), &res.id, now)
         .await
         .unwrap();
     assert_eq!(report.receipt_write_failed, 1, "{report:?}");
@@ -2223,7 +2313,7 @@ async fn assert_receipt_checkpoint(status: &str, missing: bool) {
 
     let retried = fx
         .window
-        .reconcile_one(&fx.profile, &client, Some(&fx.receipts), &res.id, now)
+        .reconcile_one(&fx.profile, &client, None, Some(&fx.receipts), &res.id, now)
         .await
         .unwrap();
     assert_eq!(retried.receipt_write_failed, 0);
@@ -2267,4 +2357,1074 @@ async fn a_success_waits_for_its_receipt_and_retries() {
 #[serial]
 async fn a_missing_receipt_must_be_restored_before_release() {
     assert_receipt_checkpoint("NOT_FOUND", true).await;
+}
+
+// ── Confirmed spend is never dated before its reservation ────────────────
+
+/// A `SUCCESS` whose close time is earlier than the reservation itself is
+/// not a time the chain can produce: the spend counts from the reservation,
+/// so a backdated answer cannot take it out of the window.
+#[tokio::test]
+#[serial]
+async fn a_backdated_success_keeps_the_spend_in_the_window() {
+    let now = now_ms();
+    let fx = fixture("reconcile-success-backdated");
+    let source = account_id_for_seed([0x15; 32]);
+    let res = reservation(&"a9".repeat(32), &source, 7, due_since(now));
+    fx.take_reservation(now, &res, 500);
+
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    let two_days_ago = now / 1_000 - 2 * 86_400;
+    mount(
+        &server,
+        "getTransaction",
+        json!({
+            "status": "SUCCESS",
+            "latestLedger": 2_000,
+            "oldestLedger": 1,
+            "ledger": 1_500,
+            "createdAt": two_days_ago.to_string(),
+        }),
+        &counts,
+    )
+    .await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &client,
+            None,
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.confirmed, 1, "{report:?}");
+    assert!(
+        fx.window
+            .pending_reservations(&fx.profile)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fx.window_total(now),
+        (500, 1),
+        "the spend counts in the window from the time it was reserved"
+    );
+}
+
+// ── A submission ledger of 0 ─────────────────────────────────────────────
+
+/// A reservation recorded against ledger 0 carries no retention boundary, so
+/// a `NOT_FOUND` with a consumed sequence releases nothing.
+#[tokio::test]
+#[serial]
+async fn a_reservation_without_a_submission_ledger_never_releases_on_not_found() {
+    let now = now_ms();
+    let fx = fixture("reconcile-ledger-zero");
+    let source = account_id_for_seed([0x16; 32]);
+    let mut res = reservation(&"aa".repeat(32), &source, 1, due_since(now));
+    res.submission_ledger = 0;
+    fx.take_reservation(now, &res, 500);
+
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "getTransaction",
+        get_transaction("NOT_FOUND"),
+        &counts,
+    )
+    .await;
+    // An endpoint that reports its retention from ledger 0 holds every
+    // ledger, so the retention boundary alone does not stop a release.
+    mount(&server, "getHealth", health(0), &counts).await;
+    // The fixture account sits at sequence 1, the one the reservation needs.
+    mount(
+        &server,
+        "getLedgerEntries",
+        ledger_entries_result_for(&[&source]),
+        &counts,
+    )
+    .await;
+    mount_send_guard(&server, &counts).await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &client,
+            None,
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.kept_pending, 1, "{report:?}");
+    assert_eq!(report.released, 0, "{report:?}");
+    assert!(report.settled.is_empty(), "{report:?}");
+    assert_eq!(
+        fx.window.pending_reservations(&fx.profile).unwrap(),
+        *std::slice::from_ref(&res)
+    );
+    assert_eq!(fx.window_total(now), (500, 1));
+    assert_eq!(
+        fx.receipts.get(&res.id).unwrap().unwrap().status,
+        ReceiptStatus::Pending
+    );
+}
+
+// ── The receipt is never evidence ────────────────────────────────────────
+
+/// Rewrites the receipt file the way anything with write access to it can:
+/// the entry of `id` reads ambiguous, with `release_code` as its evidence.
+fn forge_released_receipt(fx: &Fixture, id: &str, release_code: &str) {
+    let mut map: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&fx.receipt_file).unwrap()).unwrap();
+    let entry = map
+        .get_mut(id)
+        .expect("the receipt file holds the submission's entry");
+    entry["status"] = json!({ "state": "ambiguous" });
+    entry["release_code"] = json!(release_code);
+    std::fs::write(&fx.receipt_file, serde_json::to_vec_pretty(&map).unwrap()).unwrap();
+    let forged = fx.receipts.get(id).unwrap().unwrap();
+    assert_eq!(forged.status, ReceiptStatus::Ambiguous, "the forgery reads");
+    assert_eq!(
+        forged.release_code.map(ReleaseEvidence::code),
+        Some(release_code)
+    );
+}
+
+/// A receipt edited to claim a release releases nothing: the pass asks the
+/// endpoint, which reports the transaction unknown with its sequence
+/// unconsumed and no time bound, so the reservation and its debit stand.
+#[tokio::test]
+#[serial]
+async fn a_forged_release_code_does_not_release_the_reservation() {
+    let now = now_ms();
+    let fx = fixture("reconcile-forged-not-found");
+    let source = account_id_for_seed([0x17; 32]);
+    // The fixture account sits at sequence 1; the transaction needs 7.
+    let res = reservation(&"ab".repeat(32), &source, 7, due_since(now));
+    fx.take_reservation(now, &res, 500);
+    forge_released_receipt(&fx, &res.id, "submission.sequence_consumed");
+
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "getTransaction",
+        get_transaction("NOT_FOUND"),
+        &counts,
+    )
+    .await;
+    mount(&server, "getHealth", health(1), &counts).await;
+    mount(&server, "getLedgers", ledgers(now / 1_000, 1), &counts).await;
+    mount(
+        &server,
+        "getLedgerEntries",
+        ledger_entries_result_for(&[&source]),
+        &counts,
+    )
+    .await;
+    mount_send_guard(&server, &counts).await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &client,
+            None,
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.examined, 1, "the forged receipt is selected");
+    assert_eq!(report.released, 0, "{report:?}");
+    assert_eq!(report.kept_pending, 1, "{report:?}");
+    assert!(report.settled.is_empty(), "{report:?}");
+    assert_eq!(
+        fx.window.pending_reservations(&fx.profile).unwrap(),
+        *std::slice::from_ref(&res)
+    );
+    assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
+    assert_eq!(
+        counts.count("getTransaction"),
+        1,
+        "the chain is asked about it"
+    );
+    assert_eq!(counts.count("sendTransaction"), 0);
+}
+
+/// A receipt edited to claim a release does not stop the chain's `SUCCESS`
+/// from confirming the spend.
+#[tokio::test]
+#[serial]
+async fn a_forged_release_code_does_not_stop_a_success_confirming() {
+    let now = now_ms();
+    let fx = fixture("reconcile-forged-success");
+    let source = account_id_for_seed([0x18; 32]);
+    let res = reservation(&"ac".repeat(32), &source, 7, due_since(now));
+    fx.take_reservation(now, &res, 500);
+    forge_released_receipt(&fx, &res.id, "submission.time_bound_passed");
+
+    let counts = MethodCounts::default();
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "getTransaction",
+        get_transaction("SUCCESS"),
+        &counts,
+    )
+    .await;
+    let client = StellarRpcClient::new(&server.uri()).unwrap();
+
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &client,
+            None,
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.confirmed, 1, "{report:?}");
+    assert_eq!(report.released, 0, "{report:?}");
+    assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
+    assert_eq!(
+        fx.receipts.get(&res.id).unwrap().unwrap().status,
+        ReceiptStatus::Success
+    );
+}
+
+// ── Mainnet: the oracle witnesses the primary's negative answers ─────────
+
+/// A `getTransaction` FAILED body carrying `result` as its result.
+fn get_transaction_failed_with(result: stellar_xdr::TransactionResultResult) -> serde_json::Value {
+    use stellar_xdr::{Limits, TransactionResult, TransactionResultExt, WriteXdr};
+    let result = TransactionResult {
+        fee_charged: 0,
+        result,
+        ext: TransactionResultExt::V0,
+    }
+    .to_xdr_base64(Limits::none())
+    .unwrap();
+    json!({
+        "status": "FAILED",
+        "latestLedger": 2_000,
+        "oldestLedger": 1,
+        "resultXdr": result,
+    })
+}
+
+/// A mock primary and a mock oracle, each with its own method counts.
+struct Endpoints {
+    primary: MockServer,
+    primary_counts: MethodCounts,
+    oracle: MockServer,
+    oracle_counts: MethodCounts,
+}
+
+impl Endpoints {
+    /// A primary and an oracle that both report the mainnet passphrase.
+    async fn start() -> Self {
+        Self::with_oracle_identity(get_network_result(MAINNET_PASSPHRASE)).await
+    }
+
+    /// A primary that reports the mainnet passphrase and an oracle that
+    /// answers `getNetwork` with `identity`.
+    async fn with_oracle_identity(identity: serde_json::Value) -> Self {
+        let endpoints = Self::without_oracle_identity().await;
+        endpoints.oracle_answers("getNetwork", identity).await;
+        endpoints
+    }
+
+    /// A primary that reports the mainnet passphrase and an oracle with no
+    /// `getNetwork` answer yet.
+    async fn without_oracle_identity() -> Self {
+        let endpoints = Self {
+            primary: MockServer::start().await,
+            primary_counts: MethodCounts::default(),
+            oracle: MockServer::start().await,
+            oracle_counts: MethodCounts::default(),
+        };
+        endpoints
+            .primary_answers("getNetwork", get_network_result(MAINNET_PASSPHRASE))
+            .await;
+        endpoints
+    }
+
+    /// A primary that reports the mainnet passphrase and an oracle that
+    /// reports it after `delay`, failing its first `getNetwork` with HTTP 500
+    /// when `fail_first` is set.
+    async fn with_oracle_identity_after(delay: std::time::Duration, fail_first: bool) -> Self {
+        let endpoints = Self::without_oracle_identity().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(json!({ "method": "getNetwork" })))
+            .respond_with(IdentityResponder {
+                counts: endpoints.oracle_counts.clone(),
+                delay,
+                fail_next: std::sync::atomic::AtomicBool::new(fail_first),
+            })
+            .mount(&endpoints.oracle)
+            .await;
+        endpoints
+    }
+
+    /// The requests the primary and the oracle received together.
+    async fn requests_sent(&self) -> usize {
+        self.primary.received_requests().await.unwrap().len()
+            + self.oracle.received_requests().await.unwrap().len()
+    }
+
+    async fn primary_answers(&self, rpc_method: &str, result: serde_json::Value) {
+        mount(&self.primary, rpc_method, result, &self.primary_counts).await;
+    }
+
+    async fn oracle_answers(&self, rpc_method: &str, result: serde_json::Value) {
+        mount(&self.oracle, rpc_method, result, &self.oracle_counts).await;
+    }
+
+    fn clients(&self) -> (StellarRpcClient, StellarRpcClient) {
+        (
+            StellarRpcClient::new(&self.primary.uri()).unwrap(),
+            StellarRpcClient::new(&self.oracle.uri()).unwrap(),
+        )
+    }
+}
+
+/// Answers `getNetwork` with the mainnet identity after `delay`, failing
+/// the next request with HTTP 500 while `fail_next` is set, and records each
+/// request.
+struct IdentityResponder {
+    counts: MethodCounts,
+    delay: std::time::Duration,
+    fail_next: std::sync::atomic::AtomicBool,
+}
+
+impl Respond for IdentityResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        self.counts
+            .calls
+            .lock()
+            .unwrap()
+            .push("getNetwork".to_owned());
+        let failing = self
+            .fail_next
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if failing {
+            return ResponseTemplate::new(500);
+        }
+        let id = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .ok()
+            .and_then(|body| body.get("id").cloned())
+            .unwrap_or_else(|| json!(1));
+        ResponseTemplate::new(200)
+            .set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": get_network_result(MAINNET_PASSPHRASE),
+            }))
+            .insert_header("content-type", "application/json")
+            .set_delay(self.delay)
+    }
+}
+
+/// A primary that reports `FAILED` for a transaction the oracle reports
+/// applied settles nothing on its own word: the oracle's `SUCCESS`
+/// confirms the spend.
+#[tokio::test]
+#[serial]
+async fn a_mainnet_failed_answer_the_oracle_reports_applied_confirms() {
+    let now = now_ms();
+    let fx = mainnet_fixture("reconcile-mainnet-oracle-success");
+    let source = account_id_for_seed([0x41; 32]);
+    let res = reservation(&"b1".repeat(32), &source, 7, due_since(now));
+    fx.take_reservation(now, &res, 500);
+
+    let endpoints = Endpoints::start().await;
+    endpoints
+        .primary_answers("getTransaction", get_transaction_failed())
+        .await;
+    endpoints
+        .oracle_answers("getTransaction", get_transaction("SUCCESS"))
+        .await;
+    let (primary, oracle) = endpoints.clients();
+
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &primary,
+            Some(&oracle),
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.confirmed, 1, "{report:?}");
+    assert_eq!(report.released, 0, "{report:?}");
+    assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
+    assert_eq!(
+        fx.receipts.get(&res.id).unwrap().unwrap().status,
+        ReceiptStatus::Success
+    );
+    assert_eq!(endpoints.oracle_counts.count("getTransaction"), 1);
+}
+
+/// The oracle's own `FAILED` releases the reservation, under the oracle's
+/// failure code: the primary's `txMALFORMED` would read `ledger.op_failed`,
+/// the oracle's `txBAD_SEQ` reads `submission.sequence_number_stale`.
+#[tokio::test]
+#[serial]
+async fn a_mainnet_failed_answer_the_oracle_confirms_releases() {
+    let now = now_ms();
+    let fx = mainnet_fixture("reconcile-mainnet-oracle-failed");
+    let source = account_id_for_seed([0x42; 32]);
+    let res = reservation(&"b2".repeat(32), &source, 7, due_since(now));
+    fx.take_reservation(now, &res, 500);
+
+    let endpoints = Endpoints::start().await;
+    endpoints
+        .primary_answers("getTransaction", get_transaction_failed())
+        .await;
+    endpoints
+        .oracle_answers(
+            "getTransaction",
+            get_transaction_failed_with(stellar_xdr::TransactionResultResult::TxBadSeq),
+        )
+        .await;
+    let (primary, oracle) = endpoints.clients();
+
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &primary,
+            Some(&oracle),
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.released, 1, "{report:?}");
+    assert_eq!(fx.window_total(now), (0, 0));
+    assert_eq!(
+        fx.receipts.get(&res.id).unwrap().unwrap().status,
+        ReceiptStatus::Failed {
+            code: "submission.sequence_number_stale".to_owned()
+        },
+        "the receipt carries the oracle's code"
+    );
+}
+
+/// A primary `FAILED` with an oracle that cannot answer, and with no oracle
+/// at all, keeps the reservation and reports why.
+#[tokio::test]
+#[serial]
+async fn a_mainnet_failed_answer_without_an_oracle_answer_stands() {
+    for with_oracle in [true, false] {
+        let now = now_ms();
+        let fx = mainnet_fixture(if with_oracle {
+            "reconcile-mainnet-oracle-down"
+        } else {
+            "reconcile-mainnet-no-oracle"
+        });
+        let source = account_id_for_seed([0x43; 32]);
+        let res = reservation(&"b3".repeat(32), &source, 7, due_since(now));
+        fx.take_reservation(now, &res, 500);
+
+        // The oracle answers nothing it is asked.
+        let endpoints = Endpoints::start().await;
+        endpoints
+            .primary_answers("getTransaction", get_transaction_failed())
+            .await;
+        let (primary, oracle) = endpoints.clients();
+
+        let report = fx
+            .window
+            .reconcile_due(
+                &fx.profile,
+                &primary,
+                with_oracle.then_some(&oracle),
+                Some(&fx.receipts),
+                now,
+                RECONCILE_BUDGET,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.kept_pending, 1, "{report:?}");
+        assert_eq!(report.released, 0, "{report:?}");
+        assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
+        assert_eq!(
+            fx.receipts.get(&res.id).unwrap().unwrap().status,
+            ReceiptStatus::Pending
+        );
+        let failure = report
+            .endpoint_failure
+            .expect("the missing witness is reported");
+        if with_oracle {
+            assert_eq!(failure.kind, ReconcileFailureKind::Unreachable);
+            assert_eq!(
+                failure.endpoint,
+                endpoints.oracle.uri(),
+                "the oracle is named"
+            );
+            assert!(
+                failure.reason.starts_with("getTransaction failed: "),
+                "{failure:?}"
+            );
+        } else {
+            assert_eq!(failure.kind, ReconcileFailureKind::OracleNotConfigured);
+            assert_eq!(
+                stellar_agent_core::error::WalletError::Network(failure.to_network_error()).code(),
+                "network.witness_unavailable"
+            );
+        }
+    }
+}
+
+/// The release rule reads the oracle's account sequence, not the primary's:
+/// a sequence the primary reports consumed releases nothing while the oracle
+/// reports it unconsumed.
+#[tokio::test]
+#[serial]
+async fn a_mainnet_release_reads_the_sequence_from_the_oracle() {
+    let now = now_ms();
+    let fx = mainnet_fixture("reconcile-mainnet-oracle-sequence");
+    let source = account_id_for_seed([0x44; 32]);
+    let res = reservation(&"b4".repeat(32), &source, 5, due_since(now));
+    fx.take_reservation(now, &res, 500);
+
+    let endpoints = Endpoints::start().await;
+    endpoints
+        .primary_answers("getTransaction", get_transaction("NOT_FOUND"))
+        .await;
+    endpoints.primary_answers("getHealth", health(1)).await;
+    endpoints
+        .primary_answers("getLedgers", ledgers(now / 1_000, 1))
+        .await;
+    endpoints
+        .primary_answers("getLedgerEntries", account_at_sequence(&source, 9))
+        .await;
+    endpoints
+        .oracle_answers("getTransaction", get_transaction("NOT_FOUND"))
+        .await;
+    endpoints.oracle_answers("getHealth", health(1)).await;
+    endpoints
+        .oracle_answers("getLedgers", ledgers(now / 1_000, 1))
+        .await;
+    endpoints
+        .oracle_answers("getLedgerEntries", account_at_sequence(&source, 3))
+        .await;
+    let (primary, oracle) = endpoints.clients();
+
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &primary,
+            Some(&oracle),
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.kept_pending, 1, "{report:?}");
+    assert_eq!(report.released, 0, "{report:?}");
+    assert_eq!(report.endpoint_failure, None, "{report:?}");
+    assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
+    assert_eq!(endpoints.oracle_counts.count("getLedgerEntries"), 1);
+    assert_eq!(
+        endpoints.primary_counts.count("getLedgerEntries"),
+        0,
+        "the primary's sequence is never read"
+    );
+    assert_eq!(
+        endpoints.primary_counts.count("getHealth"),
+        0,
+        "nor its retention"
+    );
+}
+
+/// The oracle's `NOT_FOUND`, asked again after the evidence, releases once
+/// the time bound has passed on the oracle's latest ledger.
+#[tokio::test]
+#[serial]
+async fn a_mainnet_release_on_the_oracle_time_bound() {
+    let now = now_ms();
+    let fx = mainnet_fixture("reconcile-mainnet-oracle-time");
+    let source = account_id_for_seed([0x45; 32]);
+    let mut res = reservation(&"b5".repeat(32), &source, 5, due_since(now));
+    res.max_time = now / 1_000 - 10;
+    fx.take_reservation(now, &res, 500);
+
+    let endpoints = Endpoints::start().await;
+    endpoints
+        .primary_answers("getTransaction", get_transaction("NOT_FOUND"))
+        .await;
+    endpoints
+        .oracle_answers("getTransaction", get_transaction("NOT_FOUND"))
+        .await;
+    endpoints.oracle_answers("getHealth", health(1)).await;
+    endpoints
+        .oracle_answers("getLedgers", ledgers(now / 1_000, 1))
+        .await;
+    endpoints
+        .oracle_answers("getLedgerEntries", account_at_sequence(&source, 9))
+        .await;
+    let (primary, oracle) = endpoints.clients();
+
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &primary,
+            Some(&oracle),
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.released, 1, "{report:?}");
+    assert_eq!(fx.window_total(now), (0, 0));
+    assert_eq!(
+        report.settled[0].release_code,
+        Some(ReleaseEvidence::TimeBoundPassed)
+    );
+    assert_eq!(
+        endpoints.oracle_counts.count("getTransaction"),
+        2,
+        "the oracle's first answer and its fresh one"
+    );
+    assert_eq!(endpoints.primary_counts.count("getTransaction"), 1);
+}
+
+/// `tx status` settles a mainnet reservation on the oracle's consumed
+/// sequence within its one-reservation allowance: the primary's transaction
+/// answer, the oracle's identity, its transaction answer, its retention and
+/// chain time, its account and its fresh answer.
+#[tokio::test]
+#[serial]
+async fn a_named_mainnet_reservation_releases_on_the_oracle_sequence() {
+    let now = now_ms();
+    let fx = mainnet_fixture("reconcile-mainnet-oracle-one");
+    let source = account_id_for_seed([0x46; 32]);
+    let res = reservation(&"b6".repeat(32), &source, 5, due_since(now));
+    fx.take_reservation(now, &res, 500);
+
+    let endpoints = Endpoints::start().await;
+    endpoints
+        .primary_answers("getTransaction", get_transaction("NOT_FOUND"))
+        .await;
+    endpoints
+        .oracle_answers("getTransaction", get_transaction("NOT_FOUND"))
+        .await;
+    endpoints.oracle_answers("getHealth", health(1)).await;
+    endpoints
+        .oracle_answers("getLedgers", ledgers(now / 1_000, 1))
+        .await;
+    endpoints
+        .oracle_answers("getLedgerEntries", account_at_sequence(&source, 9))
+        .await;
+    let (primary, oracle) = endpoints.clients();
+
+    let report = fx
+        .window
+        .reconcile_one(
+            &fx.profile,
+            &primary,
+            Some(&oracle),
+            Some(&fx.receipts),
+            &res.id,
+            now,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.released, 1, "{report:?}");
+    assert_eq!(report.rpc_calls, 7, "{report:?}");
+    assert_eq!(
+        report.settled[0].release_code,
+        Some(ReleaseEvidence::SequenceConsumed)
+    );
+    assert_eq!(fx.window_total(now), (0, 0));
+    let receipt = fx.receipts.get(&res.id).unwrap().unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Ambiguous);
+    assert_eq!(
+        receipt.release_code,
+        Some(ReleaseEvidence::SequenceConsumed)
+    );
+}
+
+/// Mounts on the oracle every answer the `NOT_FOUND` release rule would
+/// release `source`'s reservation on: `NOT_FOUND`, a retention floor below
+/// the submission ledger, a chain time past every time bound and a consumed
+/// sequence.
+async fn oracle_would_release(endpoints: &Endpoints, now: u64, source: &str) {
+    endpoints
+        .oracle_answers("getTransaction", get_transaction("NOT_FOUND"))
+        .await;
+    endpoints.oracle_answers("getHealth", health(1)).await;
+    endpoints
+        .oracle_answers("getLedgers", ledgers(now / 1_000, 1))
+        .await;
+    endpoints
+        .oracle_answers("getLedgerEntries", account_at_sequence(source, 9))
+        .await;
+}
+
+/// An oracle that reports the testnet passphrase is no witness for a
+/// mainnet reservation, however its answers read: its `NOT_FOUND` with a
+/// consumed sequence and a passed time bound releases nothing, its
+/// transaction is never asked, and the pass checks its identity once for
+/// both reservations.
+#[tokio::test]
+#[serial]
+async fn a_mainnet_oracle_on_another_network_settles_nothing() {
+    let now = now_ms();
+    let fx = mainnet_fixture("reconcile-mainnet-oracle-testnet");
+    let source = account_id_for_seed([0x47; 32]);
+    let mut first = reservation(&"b7".repeat(32), &source, 5, due_since(now));
+    first.max_time = now / 1_000 - 10;
+    let second = reservation(&"b8".repeat(32), &source, 6, due_since(now));
+    fx.take_reservation(now, &first, 500);
+    fx.take_reservation(now, &second, 300);
+
+    let endpoints = Endpoints::with_oracle_identity(get_network_result(TESTNET_PASSPHRASE)).await;
+    endpoints
+        .primary_answers("getTransaction", get_transaction("NOT_FOUND"))
+        .await;
+    oracle_would_release(&endpoints, now, &source).await;
+    let (primary, oracle) = endpoints.clients();
+
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &primary,
+            Some(&oracle),
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.kept_pending, 2, "{report:?}");
+    assert_eq!(report.released, 0, "{report:?}");
+    assert_eq!(fx.window_total(now), (800, 2), "the debits stay");
+    for res in [&first, &second] {
+        assert_eq!(
+            fx.receipts.get(&res.id).unwrap().unwrap().status,
+            ReceiptStatus::Pending
+        );
+    }
+    let failure = report
+        .endpoint_failure
+        .expect("the unverified oracle is reported");
+    assert_eq!(failure.kind, ReconcileFailureKind::OracleNetworkMismatch);
+    assert_eq!(
+        failure.endpoint,
+        endpoints.oracle.uri(),
+        "the oracle is named"
+    );
+    assert_witness_reason(&failure, &endpoints, "IdentityNetworkMismatch");
+    assert_eq!(
+        endpoints.oracle_counts.count("getNetwork"),
+        1,
+        "once per pass"
+    );
+    assert_eq!(
+        endpoints.oracle_counts.count("getTransaction"),
+        0,
+        "an unverified oracle is never asked about the transaction"
+    );
+    assert_eq!(endpoints.oracle_counts.count("getLedgerEntries"), 0);
+}
+
+/// An oracle whose identity cannot be read is no witness either: its
+/// `NOT_FOUND` with a consumed sequence releases nothing, and the pass
+/// reports the unread identity.
+#[tokio::test]
+#[serial]
+async fn a_mainnet_oracle_whose_identity_cannot_be_read_settles_nothing() {
+    let now = now_ms();
+    let fx = mainnet_fixture("reconcile-mainnet-oracle-anonymous");
+    let source = account_id_for_seed([0x48; 32]);
+    let res = reservation(&"b9".repeat(32), &source, 5, due_since(now));
+    fx.take_reservation(now, &res, 500);
+
+    // A `getNetwork` answer without a passphrase does not decode.
+    let endpoints = Endpoints::with_oracle_identity(json!({ "protocolVersion": 29 })).await;
+    endpoints
+        .primary_answers("getTransaction", get_transaction("NOT_FOUND"))
+        .await;
+    oracle_would_release(&endpoints, now, &source).await;
+    let (primary, oracle) = endpoints.clients();
+
+    let report = fx
+        .window
+        .reconcile_one(
+            &fx.profile,
+            &primary,
+            Some(&oracle),
+            Some(&fx.receipts),
+            &res.id,
+            now,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.kept_pending, 1, "{report:?}");
+    assert_eq!(report.released, 0, "{report:?}");
+    assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
+    let failure = report
+        .endpoint_failure
+        .expect("the unread identity is reported");
+    assert_eq!(
+        failure.kind,
+        ReconcileFailureKind::OracleIdentityUnavailable
+    );
+    assert_eq!(
+        failure.endpoint,
+        endpoints.oracle.uri(),
+        "the oracle is named"
+    );
+    assert_eq!(
+        stellar_agent_core::error::WalletError::Network(failure.to_network_error()).code(),
+        "network.witness_unavailable"
+    );
+    assert_eq!(endpoints.oracle_counts.count("getTransaction"), 0);
+}
+
+/// Asserts that `failure` reports `network.witness_unavailable` with the
+/// typed reason `expected` naming the oracle's authority.
+fn assert_witness_reason(failure: &ReconcileFailure, endpoints: &Endpoints, expected: &str) {
+    use stellar_agent_core::error::{
+        NetworkError, WalletError, WitnessUnavailableReason as Reason,
+    };
+    let error = failure.to_network_error();
+    let (reason, authority) = match &error {
+        NetworkError::WitnessUnavailable {
+            reason: Reason::IdentityNetworkMismatch { authority },
+        } => ("IdentityNetworkMismatch", authority),
+        NetworkError::WitnessUnavailable {
+            reason: Reason::IdentityProtocolUnsupported { authority },
+        } => ("IdentityProtocolUnsupported", authority),
+        NetworkError::WitnessUnavailable {
+            reason: Reason::IdentityUnavailable { authority },
+        } => ("IdentityUnavailable", authority),
+        other => panic!("expected an oracle identity reason, got {other:?}"),
+    };
+    assert_eq!(reason, expected, "{error}");
+    assert_eq!(authority, &endpoints.oracle.uri(), "the oracle is named");
+    assert_eq!(
+        WalletError::Network(error).code(),
+        "network.witness_unavailable"
+    );
+}
+
+/// An oracle that reports mainnet under a protocol version the protocol rule
+/// refuses for mainnet is no witness: its `NOT_FOUND` with a consumed
+/// sequence releases nothing, and the pass reports the unsupported protocol
+/// under its own kind and reason.
+#[tokio::test]
+#[serial]
+async fn a_mainnet_oracle_on_an_unsupported_protocol_settles_nothing() {
+    let now = now_ms();
+    let fx = mainnet_fixture("reconcile-mainnet-oracle-protocol");
+    let source = account_id_for_seed([0x49; 32]);
+    let res = reservation(&"ba".repeat(32), &source, 5, due_since(now));
+    fx.take_reservation(now, &res, 500);
+
+    let mut identity = get_network_result(MAINNET_PASSPHRASE);
+    identity["protocolVersion"] = json!(1);
+    let endpoints = Endpoints::with_oracle_identity(identity).await;
+    endpoints
+        .primary_answers("getTransaction", get_transaction("NOT_FOUND"))
+        .await;
+    oracle_would_release(&endpoints, now, &source).await;
+    let (primary, oracle) = endpoints.clients();
+
+    let report = fx
+        .window
+        .reconcile_one(
+            &fx.profile,
+            &primary,
+            Some(&oracle),
+            Some(&fx.receipts),
+            &res.id,
+            now,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.kept_pending, 1, "{report:?}");
+    assert_eq!(report.released, 0, "{report:?}");
+    assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
+    let failure = report
+        .endpoint_failure
+        .expect("the unsupported protocol is reported");
+    assert_eq!(
+        failure.kind,
+        ReconcileFailureKind::OracleProtocolUnsupported
+    );
+    assert_witness_reason(&failure, &endpoints, "IdentityProtocolUnsupported");
+    assert_eq!(endpoints.oracle_counts.count("getTransaction"), 0);
+}
+
+/// The pass reads the oracle's identity with one request and does not
+/// retry it, so every request the pass sends is one it counts: an identity
+/// request that fails once keeps the reservation within the allowance, and
+/// the next pass, whose identity request succeeds, releases it on the
+/// consumed sequence with its own count still equal to the requests sent.
+#[tokio::test]
+#[serial]
+async fn an_oracle_identity_request_that_fails_is_counted_and_not_retried() {
+    let now = now_ms();
+    let fx = mainnet_fixture("reconcile-mainnet-oracle-identity-500");
+    let source = account_id_for_seed([0x4a; 32]);
+    let res = reservation(&"bb".repeat(32), &source, 5, due_since(now));
+    fx.take_reservation(now, &res, 500);
+
+    let endpoints = Endpoints::with_oracle_identity_after(std::time::Duration::ZERO, true).await;
+    endpoints
+        .primary_answers("getTransaction", get_transaction("NOT_FOUND"))
+        .await;
+    oracle_would_release(&endpoints, now, &source).await;
+    let (primary, oracle) = endpoints.clients();
+    let allowance = 4 + 3;
+
+    let first = fx
+        .window
+        .reconcile_one(
+            &fx.profile,
+            &primary,
+            Some(&oracle),
+            Some(&fx.receipts),
+            &res.id,
+            now,
+        )
+        .await
+        .unwrap();
+
+    let sent_first = endpoints.requests_sent().await;
+    assert_eq!(first.rpc_calls, sent_first, "{first:?}");
+    assert!(sent_first <= allowance, "{sent_first}");
+    assert_eq!(first.kept_pending, 1, "{first:?}");
+    assert_eq!(first.released, 0, "{first:?}");
+    assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
+    let failure = first
+        .endpoint_failure
+        .expect("the failed identity request is reported");
+    assert_eq!(
+        failure.kind,
+        ReconcileFailureKind::OracleIdentityUnavailable
+    );
+    assert_witness_reason(&failure, &endpoints, "IdentityUnavailable");
+    assert_eq!(endpoints.oracle_counts.count("getNetwork"), 1, "no retry");
+
+    let second = fx
+        .window
+        .reconcile_one(
+            &fx.profile,
+            &primary,
+            Some(&oracle),
+            Some(&fx.receipts),
+            &res.id,
+            now,
+        )
+        .await
+        .unwrap();
+
+    let sent_second = endpoints.requests_sent().await - sent_first;
+    assert_eq!(second.rpc_calls, sent_second, "{second:?}");
+    assert!(sent_second <= allowance, "{sent_second}");
+    assert_eq!(second.released, 1, "{second:?}");
+    assert_eq!(
+        second.settled[0].release_code,
+        Some(ReleaseEvidence::SequenceConsumed)
+    );
+    assert_eq!(fx.window_total(now), (0, 0));
+}
+
+/// An oracle whose identity answer arrives late is no witness, and the pass
+/// does not wait for it: the identity request ends at the pass's own
+/// two-second bound, the reservation stands, and the oracle's transaction is
+/// never asked.
+#[tokio::test]
+#[serial]
+async fn a_mainnet_oracle_whose_identity_answers_late_settles_nothing() {
+    const IDENTITY_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+    let now = now_ms();
+    let fx = mainnet_fixture("reconcile-mainnet-oracle-identity-late");
+    let source = account_id_for_seed([0x4b; 32]);
+    let res = reservation(&"bc".repeat(32), &source, 5, due_since(now));
+    fx.take_reservation(now, &res, 500);
+
+    let endpoints =
+        Endpoints::with_oracle_identity_after(std::time::Duration::from_secs(30), false).await;
+    endpoints
+        .primary_answers("getTransaction", get_transaction("NOT_FOUND"))
+        .await;
+    oracle_would_release(&endpoints, now, &source).await;
+    let (primary, oracle) = endpoints.clients();
+
+    let started = std::time::Instant::now();
+    let report = fx
+        .window
+        .reconcile_due(
+            &fx.profile,
+            &primary,
+            Some(&oracle),
+            Some(&fx.receipts),
+            now,
+            RECONCILE_BUDGET,
+        )
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < IDENTITY_BOUND + std::time::Duration::from_millis(1500),
+        "the identity bound ends the wait: {elapsed:?}"
+    );
+    assert_eq!(report.kept_pending, 1, "{report:?}");
+    assert_eq!(report.released, 0, "{report:?}");
+    assert_eq!(fx.window_total(now), (500, 1), "the debit stays");
+    let failure = report
+        .endpoint_failure
+        .expect("the unanswered identity is reported");
+    assert_eq!(
+        failure.kind,
+        ReconcileFailureKind::OracleIdentityUnavailable
+    );
+    assert_eq!(endpoints.oracle_counts.count("getTransaction"), 0);
 }

@@ -366,6 +366,13 @@ pub(crate) async fn authorize_and_submit(
     let name = context.profile_name();
     let profile = context.profile();
 
+    // The oracle confirms a negative answer of the primary endpoint after the
+    // send. A profile whose oracle client cannot be built is refused here,
+    // before anything is confirmed, recorded or signed.
+    let oracle = context
+        .oracle_client()
+        .map_err(|e| Envelope::<()>::err(&e))?;
+
     // The enrolled proof reads the identity record, never the seed, and
     // refuses an unenrolled key before any prompt or pending entry.
     let source_key = stellar_strkey::ed25519::PublicKey::from_string(source)
@@ -487,6 +494,7 @@ pub(crate) async fn authorize_and_submit(
 
     let result = submit_authorized_transaction_and_wait(
         client,
+        oracle.as_ref(),
         &signed_xdr,
         submit_timeout,
         context.network_passphrase(),
@@ -593,6 +601,12 @@ fn apply_test_routes(context: MainnetWriteContext) -> MainnetWriteContext {
         }
         None => context,
     }
+}
+
+/// The `(host, transport URL)` routes a test set on this thread, if any.
+#[cfg(test)]
+pub(crate) fn test_routes_on_this_thread() -> Option<Vec<(String, String)>> {
+    TEST_ROUTES.with(|routes| routes.borrow().clone())
 }
 
 /// Appends the stage label and the result of an invalidation to this

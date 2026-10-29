@@ -669,7 +669,9 @@ impl StellarRpcClient {
         expected_passphrase: &str,
         deadline: Instant,
     ) -> Result<EndpointIdentity, WalletError> {
-        let network = self.reported_network(deadline).await?;
+        let network = self
+            .reported_network(&RetryPolicy::default(), deadline)
+            .await?;
 
         // Agreement with a mainnet declaration is still a mainnet write.
         if network.passphrase == MAINNET_PASSPHRASE {
@@ -708,7 +710,36 @@ impl StellarRpcClient {
         &self,
         deadline: Instant,
     ) -> Result<EndpointIdentity, WalletError> {
-        let network = self.reported_network(deadline).await?;
+        self.mainnet_identity_under(&RetryPolicy::default(), deadline)
+            .await
+    }
+
+    /// [`Self::mainnet_endpoint_identity`] with exactly one `getNetwork`
+    /// request and no retry, for a caller that counts every request it sends.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::mainnet_endpoint_identity`]; a failure that a retry might
+    /// have overcome is [`NetworkError::EndpointIdentityUnavailable`].
+    pub(crate) async fn mainnet_endpoint_identity_once(
+        &self,
+        deadline: Instant,
+    ) -> Result<EndpointIdentity, WalletError> {
+        let single = RetryPolicy {
+            max_attempts: 1,
+            ..RetryPolicy::default()
+        };
+        self.mainnet_identity_under(&single, deadline).await
+    }
+
+    /// The mainnet identity check, its `getNetwork` request issued under
+    /// `policy`.
+    async fn mainnet_identity_under(
+        &self,
+        policy: &RetryPolicy,
+        deadline: Instant,
+    ) -> Result<EndpointIdentity, WalletError> {
+        let network = self.reported_network(policy, deadline).await?;
         if network.passphrase != MAINNET_PASSPHRASE {
             return Err(WalletError::Network(
                 NetworkError::EndpointNetworkMismatch {
@@ -737,14 +768,14 @@ impl StellarRpcClient {
         }
     }
 
-    /// Issues the bounded, retried `getNetwork` request of the identity probes
-    /// and maps a failure to the probe's refusal.
+    /// Issues the bounded `getNetwork` request of the identity probes, retried
+    /// as `policy` allows, and maps a failure to the probe's refusal.
     async fn reported_network(
         &self,
+        policy: &RetryPolicy,
         deadline: Instant,
     ) -> Result<stellar_rpc_client::GetNetworkResponse, WalletError> {
-        let policy = RetryPolicy::default();
-        retry_with_backoff(&policy, deadline, is_retryable_identity_error, || async {
+        retry_with_backoff(policy, deadline, is_retryable_identity_error, || async {
             #[cfg(test)]
             self.identity_requests
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

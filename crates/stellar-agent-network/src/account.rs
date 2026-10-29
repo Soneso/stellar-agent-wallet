@@ -790,6 +790,8 @@ pub async fn fetch_account(
 ///   exist has no signer set, so its signatures cannot be bound to a network.
 /// - [`WalletError::Network`] wrapping [`NetworkError::RpcUnreachable`] if the
 ///   query does not complete before `deadline`.
+/// - [`WalletError::Network`] wrapping [`NetworkError::RpcResponseMalformed`]
+///   if the response's `latestLedger` is 0 or does not fit a ledger sequence.
 pub(crate) async fn fetch_account_signers(
     client: &StellarRpcClient,
     account_ids: &[String],
@@ -868,8 +870,22 @@ pub(crate) async fn fetch_account_signers(
     // The endpoint's view of the chain at the moment the signer sets were
     // read. The submission that follows is recorded against this ledger, so a
     // later reconciliation can tell "the endpoint never saw the transaction"
-    // apart from "the endpoint no longer remembers that far back".
-    let latest_ledger = u32::try_from(response.latest_ledger).unwrap_or(0);
+    // apart from "the endpoint no longer remembers that far back". A value
+    // that is 0 or not a ledger sequence gives reconciliation no retention
+    // boundary to compare, so the answer is refused before anything is
+    // recorded or sent.
+    let latest_ledger = u32::try_from(response.latest_ledger)
+        .ok()
+        .filter(|ledger| *ledger > 0)
+        .ok_or_else(|| {
+            WalletError::Network(NetworkError::RpcResponseMalformed {
+                method: "getLedgerEntries".to_owned(),
+                detail: format!(
+                    "latestLedger {} is not a ledger sequence",
+                    response.latest_ledger
+                ),
+            })
+        })?;
 
     Ok((signers_by_account, latest_ledger))
 }

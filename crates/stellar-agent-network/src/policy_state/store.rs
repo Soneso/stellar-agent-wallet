@@ -23,6 +23,7 @@ use stellar_agent_core::profile::schema::{
 };
 use subtle::ConstantTimeEq as _;
 
+use crate::endpoint_identity::MainnetOracle;
 use crate::policy_state::WindowStoreError;
 use crate::policy_state::ledger::{self, WireAuthorization, WireAuthorizationHold};
 use crate::policy_state::lock::{WindowStoreLock, window_lock_path};
@@ -47,11 +48,30 @@ pub(super) const RETENTION_MS: u64 = 604_800 * 1_000;
 /// Bounds the chain-time observation independently of the transport timeout.
 const LEDGER_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Bounds the oracle's single identity request independently of the
+/// transport timeout.
+const ORACLE_IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Chain observations and RPC allowance shared by one reconciliation pass.
-struct ReconcilePass {
+///
+/// The observations belong to one endpoint, the one the release rule asks:
+/// the primary on testnet, the oracle on a mainnet profile. They are keyed to
+/// that client, so values read from one endpoint are never applied to an
+/// answer of another.
+struct ReconcilePass<'o> {
     remaining: usize,
     spent: usize,
-    observed: bool,
+    /// Whether the pass established that the oracle serves mainnet. The
+    /// check runs once per pass, on the first answer that needs the oracle,
+    /// unless the caller hands the pass an oracle it already checked.
+    oracle: OracleCheck<'o>,
+    /// When every read of the oracle ends, its identity request included:
+    /// the deadline of a caller that holds a resource across the pass. A
+    /// read still open then is abandoned and counts as a failed read.
+    oracle_deadline: Option<tokio::time::Instant>,
+    /// The id of the client whose retention floor and chain time the pass
+    /// holds.
+    observed: Option<u64>,
     oldest_ledger: Option<u32>,
     chain: Option<(u32, u64)>,
     /// A ledger-time failure, promoted only when a sent, timed reservation needs it.
@@ -61,12 +81,33 @@ struct ReconcilePass {
     failure: Option<ReconcileFailure>,
 }
 
-impl ReconcilePass {
-    fn new(budget: usize) -> Self {
+/// The oracle identity check of one reconciliation pass.
+#[derive(Clone, Copy)]
+enum OracleCheck<'o> {
+    /// No answer of the pass has needed the oracle yet.
+    Unchecked,
+    /// The oracle reported mainnet.
+    Verified(MainnetOracle<'o>),
+    /// The oracle reported another network, or its identity could not be
+    /// read; it settles nothing for the rest of the pass.
+    Refused,
+}
+
+impl<'o> ReconcilePass<'o> {
+    /// A pass over `budget` reservations. A mainnet profile's reservation can
+    /// cost one read more than a testnet one, the oracle's transaction answer
+    /// beside the primary's, and the pass shares one more read, the oracle's
+    /// identity.
+    fn new(budget: usize, mainnet: bool) -> Self {
+        let (per_reservation, shared) = if mainnet { (4, 3) } else { (3, 2) };
         Self {
-            remaining: budget.saturating_mul(3).saturating_add(2),
+            remaining: budget
+                .saturating_mul(per_reservation)
+                .saturating_add(shared),
             spent: 0,
-            observed: false,
+            oracle: OracleCheck::Unchecked,
+            oracle_deadline: None,
+            observed: None,
             oldest_ledger: None,
             chain: None,
             ledger_failure: None,
@@ -80,7 +121,94 @@ impl ReconcilePass {
             self.failure = Some(ReconcileFailure {
                 endpoint: client.url.authority().to_owned(),
                 reason,
+                kind: ReconcileFailureKind::Unreachable,
             });
+        }
+    }
+
+    /// Records that a mainnet profile names no oracle, so a negative answer of
+    /// the primary had no witness, keeping the first failure the pass met.
+    fn fail_without_oracle(&mut self) {
+        if self.failure.is_none() {
+            self.failure = Some(ReconcileFailure {
+                endpoint: String::new(),
+                reason: stellar_agent_core::error::WitnessUnavailableReason::OracleNotConfigured
+                    .to_string(),
+                kind: ReconcileFailureKind::OracleNotConfigured,
+            });
+        }
+    }
+
+    /// A pass that takes `oracle` as checked and ends every read of it by
+    /// `deadline`.
+    fn with_checked_oracle(
+        mut self,
+        oracle: Option<MainnetOracle<'o>>,
+        deadline: tokio::time::Instant,
+    ) -> Self {
+        if let Some(oracle) = oracle {
+            self.oracle = OracleCheck::Verified(oracle);
+        }
+        self.oracle_deadline = Some(deadline);
+        self
+    }
+
+    /// When a read of `client` must end: the caller's oracle deadline for a
+    /// read of the checked oracle, no deadline for any other read.
+    fn deadline_of(
+        &self,
+        client: &crate::client::StellarRpcClient,
+    ) -> Option<tokio::time::Instant> {
+        match self.oracle {
+            OracleCheck::Verified(oracle) if oracle.client().id() == client.id() => {
+                self.oracle_deadline
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns `oracle` once it has reported mainnet, checking its identity on
+    /// the first call of the pass with one `getNetwork` request, charged to
+    /// the allowance and never retried, so the pass's count holds every
+    /// request it sent. An oracle that reports another network, or whose
+    /// identity read fails or finds the allowance spent, yields `None`; the
+    /// first two are recorded as the pass's failure and hold for the rest of
+    /// the pass.
+    async fn verified_oracle(
+        &mut self,
+        oracle: &'o crate::client::StellarRpcClient,
+    ) -> Option<MainnetOracle<'o>> {
+        match self.oracle {
+            OracleCheck::Verified(verified) => return Some(verified),
+            OracleCheck::Refused => return None,
+            OracleCheck::Unchecked => {}
+        }
+        if !self.charge() {
+            return None;
+        }
+        let own = tokio::time::Instant::now() + ORACLE_IDENTITY_TIMEOUT;
+        let deadline = self.oracle_deadline.map_or(own, |caller| caller.min(own));
+        match MainnetOracle::verify_once(oracle, deadline).await {
+            Ok(verified) => {
+                self.oracle = OracleCheck::Verified(verified);
+                Some(verified)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "window reconcile: the oracle did not establish that it serves mainnet; \
+                     its answers settle nothing"
+                );
+                self.oracle = OracleCheck::Refused;
+                if self.failure.is_none() {
+                    self.failure = Some(ReconcileFailure {
+                        endpoint: oracle.url.authority().to_owned(),
+                        reason: error.to_string(),
+                        kind: ReconcileFailureKind::of_oracle_identity(&error),
+                    });
+                }
+                None
+            }
         }
     }
 
@@ -93,19 +221,34 @@ impl ReconcilePass {
         true
     }
 
+    /// Reads `client`'s retention floor and latest ledger close time once per
+    /// pass. Asked about another client, the pass drops what it holds and
+    /// observes that client instead.
     async fn observe(&mut self, client: &crate::client::StellarRpcClient) {
-        if self.observed {
+        if self.observed == Some(client.id()) {
             return;
         }
-        self.observed = true;
+        self.observed = Some(client.id());
+        self.oldest_ledger = None;
+        self.chain = None;
+        self.ledger_failure = None;
         if !self.charge() {
             return;
         }
-        let health = match client.get_health().await {
-            Ok(health) => health,
-            Err(error) => {
+        let deadline = self.deadline_of(client);
+        let health = match within(deadline, client.get_health()).await {
+            Some(Ok(health)) => health,
+            Some(Err(error)) => {
                 tracing::debug!(%error, "window reconcile: retention observation unavailable; reservation stands");
                 self.fail(client, network_failure_reason(error));
+                return;
+            }
+            None => {
+                tracing::debug!(
+                    "window reconcile: retention observation not answered by the deadline; \
+                     reservation stands"
+                );
+                self.fail(client, deadline_passed("getHealth"));
                 return;
             }
         };
@@ -113,8 +256,9 @@ impl ReconcilePass {
         if !self.charge() {
             return;
         }
-        let answer = tokio::time::timeout(
-            LEDGER_OBSERVATION_TIMEOUT,
+        let own = tokio::time::Instant::now() + LEDGER_OBSERVATION_TIMEOUT;
+        let answer = tokio::time::timeout_at(
+            deadline.map_or(own, |caller| caller.min(own)),
             client.inner.get_ledgers(
                 stellar_rpc_client::LedgerStart::Ledger(health.latest_ledger),
                 Some(1),
@@ -135,6 +279,7 @@ impl ReconcilePass {
             }
             Ok(Ok(_)) => "getLedgers answered without a valid ledger close time".to_owned(),
             Ok(Err(error)) => format!("getLedgers failed: {}", client.url.scrub_display(&error)),
+            Err(_) if deadline.is_some_and(|caller| caller < own) => deadline_passed("getLedgers"),
             Err(_) => format!(
                 "getLedgers did not answer within {}s",
                 LEDGER_OBSERVATION_TIMEOUT.as_secs()
@@ -146,8 +291,26 @@ impl ReconcilePass {
         self.ledger_failure = Some(ReconcileFailure {
             endpoint: client.url.authority().to_owned(),
             reason,
+            kind: ReconcileFailureKind::Unreachable,
         });
     }
+}
+
+/// Runs `read`, abandoning it at `deadline` when one is set. `None` means the
+/// deadline passed before the read completed.
+async fn within<F: std::future::Future>(
+    deadline: Option<tokio::time::Instant>,
+    read: F,
+) -> Option<F::Output> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, read).await.ok(),
+        None => Some(read.await),
+    }
+}
+
+/// The failure reason of a read the caller's deadline ended.
+fn deadline_passed(rpc_method: &str) -> String {
+    format!("{rpc_method} did not answer before the caller's deadline")
 }
 
 /// The reason text of a failed endpoint read, without the endpoint's
@@ -193,7 +356,9 @@ pub(super) fn select_wire_version(wire: &WireFile) -> u32 {
 /// round trips it can spend: at most this many reservations, each costing at
 /// most three transaction/account reads, plus one shared retention query and
 /// one ledger observation. Every RPC consumes that pass's `3 * budget + 2`
-/// allowance, including the ledger observation.
+/// allowance, including the ledger observation. On a mainnet profile a
+/// reservation can also cost the oracle's transaction read, the pass shares
+/// the oracle's identity read, and the allowance is `4 * budget + 3`.
 pub const RECONCILE_BUDGET: usize = 5;
 
 /// How long a reservation must stand before a reconciliation pass looks at it.
@@ -354,24 +519,91 @@ pub struct ReconcileReport {
     pub endpoint_failure: Option<ReconcileFailure>,
 }
 
-/// An endpoint read a reconciliation pass could not complete.
+/// An endpoint read a reconciliation pass could not complete, the oracle a
+/// mainnet profile does not name, or an oracle that did not establish that
+/// it serves mainnet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileFailure {
-    /// The endpoint's scheme, host and port.
+    /// The endpoint's scheme, host and port; empty for
+    /// [`ReconcileFailureKind::OracleNotConfigured`].
     pub endpoint: String,
     /// What failed, scrubbed of credentials and credential-bearing URLs.
     pub reason: String,
+    /// Which condition the failure is.
+    pub kind: ReconcileFailureKind,
+}
+
+/// Which condition a [`ReconcileFailure`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReconcileFailureKind {
+    /// A read of the primary endpoint or the oracle did not complete.
+    Unreachable,
+    /// A mainnet profile names no oracle, so a `FAILED` or `NOT_FOUND`
+    /// answer of the primary endpoint had no independent witness and settled
+    /// nothing.
+    OracleNotConfigured,
+    /// The oracle reported a network other than mainnet, so its answers
+    /// settled nothing.
+    OracleNetworkMismatch,
+    /// The oracle reported a protocol version the protocol rule refuses for
+    /// mainnet, so its answers settled nothing.
+    OracleProtocolUnsupported,
+    /// The oracle's network identity could not be read, so its answers
+    /// settled nothing.
+    OracleIdentityUnavailable,
+}
+
+impl ReconcileFailureKind {
+    /// The kind of a failed oracle identity check, from the error
+    /// the identity check of a [`MainnetOracle`] returned.
+    fn of_oracle_identity(error: &stellar_agent_core::error::WalletError) -> Self {
+        use stellar_agent_core::error::{NetworkError, WalletError, WitnessUnavailableReason};
+        match error {
+            WalletError::Network(NetworkError::WitnessUnavailable {
+                reason: WitnessUnavailableReason::IdentityNetworkMismatch { .. },
+            }) => Self::OracleNetworkMismatch,
+            WalletError::Network(NetworkError::WitnessUnavailable {
+                reason: WitnessUnavailableReason::IdentityProtocolUnsupported { .. },
+            }) => Self::OracleProtocolUnsupported,
+            _ => Self::OracleIdentityUnavailable,
+        }
+    }
 }
 
 impl ReconcileFailure {
-    /// The error the wallet reports for the failure,
-    /// `network.rpc_unreachable`: the code the status surfaces report when
-    /// the endpoint cannot be asked about a transaction.
+    /// The error the wallet reports for the failure:
+    /// `network.rpc_unreachable` for an endpoint that could not be read, the
+    /// code the status surfaces report when the endpoint cannot be asked
+    /// about a transaction, and `network.witness_unavailable` for a mainnet
+    /// profile without an oracle or with an oracle that did not establish
+    /// that it serves mainnet, the code the cross-check reports for them.
     #[must_use]
     pub fn to_network_error(&self) -> stellar_agent_core::error::NetworkError {
-        stellar_agent_core::error::NetworkError::RpcUnreachable {
-            url: self.endpoint.clone(),
-            reason: self.reason.clone(),
+        use stellar_agent_core::error::{NetworkError, WitnessUnavailableReason as Reason};
+        let witness = |reason| NetworkError::WitnessUnavailable { reason };
+        let authority = || self.endpoint.clone();
+        match self.kind {
+            ReconcileFailureKind::Unreachable => NetworkError::RpcUnreachable {
+                url: self.endpoint.clone(),
+                reason: self.reason.clone(),
+            },
+            ReconcileFailureKind::OracleNotConfigured => witness(Reason::OracleNotConfigured),
+            ReconcileFailureKind::OracleNetworkMismatch => {
+                witness(Reason::IdentityNetworkMismatch {
+                    authority: authority(),
+                })
+            }
+            ReconcileFailureKind::OracleProtocolUnsupported => {
+                witness(Reason::IdentityProtocolUnsupported {
+                    authority: authority(),
+                })
+            }
+            ReconcileFailureKind::OracleIdentityUnavailable => {
+                witness(Reason::IdentityUnavailable {
+                    authority: authority(),
+                })
+            }
         }
     }
 }
@@ -944,8 +1176,13 @@ impl PersistedWindowStore {
 
     /// Marks every record held by reservation `id` confirmed.
     ///
-    /// Confirmed spend ages from the applying ledger's close time. A missing
-    /// or invalid close time leaves the hold pending because its age is unknown.
+    /// Confirmed spend ages from the applying ledger's close time, and never
+    /// from a time before the record was taken: a transaction applies after
+    /// it was sent, so a reported close time earlier than the record's own
+    /// timestamp is not one the chain can produce, and taking it would date
+    /// the spend out of its window at once. A close time later than the
+    /// record's timestamp is kept as received. A missing or invalid close
+    /// time leaves the hold pending because its age is unknown.
     ///
     /// # Errors
     ///
@@ -972,7 +1209,7 @@ impl PersistedWindowStore {
                 for record in &mut bucket.records {
                     if record.id == id && record.status == RecordStatus::Pending {
                         record.status = RecordStatus::Confirmed;
-                        record.ts_ms = close_ms;
+                        record.ts_ms = close_ms.max(record.ts_ms);
                         touched = true;
                     }
                 }
@@ -1077,32 +1314,57 @@ impl PersistedWindowStore {
     }
 
     /// Settles up to `budget` reservations that have stood at least
-    /// [`RECONCILE_MIN_AGE_MS`], oldest first, on receipt evidence or chain
-    /// answers.
+    /// [`RECONCILE_MIN_AGE_MS`], oldest first, on chain answers.
     ///
-    /// Per reservation, recorded release evidence or `getTransaction` answers:
+    /// Per reservation, `getTransaction` answers of `client`, the primary
+    /// endpoint:
     ///
-    /// - A reservation whose receipt already records release evidence is
-    ///   released on it with no endpoint call, and the receipt is not written
-    ///   again.
     /// - `SUCCESS` confirms the reservation and finalizes the receipt.
     /// - `FAILED` releases the reservation and finalizes the receipt failed.
     /// - `NOT_FOUND` is only evidence when the endpoint would still remember
     ///   the transaction. When the reservation's submission ledger predates
     ///   the endpoint's retention floor it proves nothing, so the reservation
     ///   stands and the receipt is marked ambiguous, without release evidence,
-    ///   for an operator to resolve. Otherwise the reservation is released
-    ///   when the source account's sequence has reached the one the
-    ///   transaction needs, or an observed ledger close time is strictly past
-    ///   its nonzero time bound. Both arms require a fresh `NOT_FOUND`; a
-    ///   fresh definitive answer settles the spend. Missing chain time closes
-    ///   only the time arm.
+    ///   for an operator to resolve. A submission ledger of 0 cannot be
+    ///   compared with the floor, so that reservation stands as well.
+    ///   Otherwise the reservation is released when the source account's
+    ///   sequence has reached the one the transaction needs, or an observed
+    ///   ledger close time is strictly past its nonzero time bound. Both arms
+    ///   require a fresh `NOT_FOUND`; a fresh definitive answer settles the
+    ///   spend. Missing chain time closes only the time arm.
     /// - A release on that evidence marks the receipt ambiguous and records
     ///   the evidence on it ([`ReleaseEvidence::SequenceConsumed`] or
     ///   [`ReleaseEvidence::TimeBoundPassed`]). A missing receipt is restored
     ///   from the reservation's identity first, the way a definitive answer
     ///   restores one, and the release is reported in
     ///   [`ReconcileReport::settled`] so the caller writes its settled row.
+    ///
+    /// The receipt is never evidence. A receipt that already records release
+    /// evidence, from a release whose window write did not complete, is
+    /// settled by the rule above like any other: both release conditions
+    /// stay true once they hold, so the evidence is found again while the
+    /// endpoint holds the submission's ledger range, and the release then
+    /// carries the evidence the receipt recorded.
+    ///
+    /// # Mainnet
+    ///
+    /// On a mainnet profile the primary endpoint's `FAILED` and `NOT_FOUND`
+    /// settle nothing by themselves; `oracle`, the profile's oracle endpoint,
+    /// is asked for the same hash. Before its first answer counts, the pass
+    /// checks once that the oracle reports the mainnet passphrase, with one
+    /// `getNetwork` request charged to the pass's allowance and not retried;
+    /// an oracle that reports another
+    /// network, or whose identity cannot be read, settles nothing in that
+    /// pass. Its `SUCCESS` confirms and its `FAILED` releases, as above. Its
+    /// `NOT_FOUND` runs the `NOT_FOUND` rule above against the oracle alone:
+    /// the oracle's retention floor, its latest ledger close time, its
+    /// account sequence and its fresh answer. With no oracle (`oracle` is
+    /// `None`), an oracle that fails the identity check, or an oracle that
+    /// cannot answer, the reservation stands and the failure is reported in
+    /// [`ReconcileReport::endpoint_failure`], as
+    /// [`ReconcileFailureKind::OracleNotConfigured`] when there is no oracle.
+    /// The primary's `SUCCESS` confirms as on any chain. `oracle` is not read
+    /// for any other profile.
     ///
     /// An endpoint that cannot answer leaves the reservation standing and is
     /// reported in [`ReconcileReport::endpoint_failure`]. Nothing here
@@ -1119,6 +1381,7 @@ impl PersistedWindowStore {
         &self,
         profile: &Profile,
         client: &crate::client::StellarRpcClient,
+        oracle: Option<&crate::client::StellarRpcClient>,
         receipts: Option<&ReceiptStore>,
         now_ms: u64,
         budget: usize,
@@ -1129,8 +1392,8 @@ impl PersistedWindowStore {
 
         // Oldest first, skipping ambiguous receipts without release evidence:
         // the budget goes only to reservations the endpoint can still answer
-        // for or a receipt can finish. An ambiguous receipt with evidence is a
-        // release whose window step did not complete; this pass finishes it.
+        // for. An ambiguous receipt with evidence is a release whose window
+        // step did not complete; this pass settles it again from the chain.
         // Cleared receipts also need no endpoint answer.
         // One read of the receipt file for the whole pass. The filter below
         // consults it per candidate, and re-reading it each time would cost a
@@ -1167,12 +1430,12 @@ impl PersistedWindowStore {
             .collect();
 
         let mut report = ReconcileReport::default();
-        let mut pass = ReconcilePass::new(budget);
+        let mut pass = ReconcilePass::new(budget, profile.chain_id.is_mainnet());
 
         for reservation in due {
             report.examined += 1;
             let settlement = self
-                .settle_reservation(profile, client, receipts, &reservation, &mut pass)
+                .settle_reservation(profile, client, oracle, receipts, &reservation, &mut pass)
                 .await?;
             record_settlement(&mut report, &reservation, settlement);
         }
@@ -1195,6 +1458,9 @@ impl PersistedWindowStore {
     /// receipt when the window file holds no record for it. Settling the
     /// window is then a no-op.
     ///
+    /// On a mainnet profile `oracle` witnesses the primary's negative
+    /// answers, as [`Self::reconcile_due`] describes.
+    ///
     /// # Errors
     ///
     /// See [`WindowStoreError`].
@@ -1202,9 +1468,67 @@ impl PersistedWindowStore {
         &self,
         profile: &Profile,
         client: &crate::client::StellarRpcClient,
+        oracle: Option<&crate::client::StellarRpcClient>,
         receipts: Option<&ReceiptStore>,
         id: &str,
         _now_ms: u64,
+    ) -> Result<ReconcileReport, WindowStoreError> {
+        let pass = ReconcilePass::new(1, profile.chain_id.is_mainnet());
+        self.reconcile_one_in(profile, client, oracle, receipts, id, pass)
+            .await
+    }
+
+    /// Settles one named submission as [`Self::reconcile_one`] does, for a
+    /// caller that already checked the oracle and holds a resource across the
+    /// pass.
+    ///
+    /// `oracle` is taken as checked: its identity is not read again. Every
+    /// read of it ends by `oracle_deadline`; a read still open then leaves
+    /// the reservation standing and is reported in
+    /// [`ReconcileReport::endpoint_failure`] as an unreachable endpoint, so
+    /// the pass returns by that deadline whatever the oracle does. Reads of
+    /// the primary endpoint keep their own bounds.
+    ///
+    /// # Errors
+    ///
+    /// See [`WindowStoreError`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the arguments of reconcile_one plus the checked oracle's deadline"
+    )]
+    pub async fn reconcile_one_within(
+        &self,
+        profile: &Profile,
+        client: &crate::client::StellarRpcClient,
+        oracle: Option<MainnetOracle<'_>>,
+        receipts: Option<&ReceiptStore>,
+        id: &str,
+        _now_ms: u64,
+        oracle_deadline: tokio::time::Instant,
+    ) -> Result<ReconcileReport, WindowStoreError> {
+        let pass = ReconcilePass::new(1, profile.chain_id.is_mainnet())
+            .with_checked_oracle(oracle, oracle_deadline);
+        self.reconcile_one_in(
+            profile,
+            client,
+            oracle.map(MainnetOracle::client),
+            receipts,
+            id,
+            pass,
+        )
+        .await
+    }
+
+    /// The single-submission pass of [`Self::reconcile_one`] and
+    /// [`Self::reconcile_one_within`], run with `pass`.
+    async fn reconcile_one_in<'o>(
+        &self,
+        profile: &Profile,
+        client: &crate::client::StellarRpcClient,
+        oracle: Option<&'o crate::client::StellarRpcClient>,
+        receipts: Option<&ReceiptStore>,
+        id: &str,
+        mut pass: ReconcilePass<'o>,
     ) -> Result<ReconcileReport, WindowStoreError> {
         let open = match self.read_for_inspection(profile)? {
             Some(wire) => collect_pending(&wire).into_iter().find(|r| r.id == id),
@@ -1220,9 +1544,8 @@ impl PersistedWindowStore {
             examined: 1,
             ..ReconcileReport::default()
         };
-        let mut pass = ReconcilePass::new(1);
         let settlement = self
-            .settle_reservation(profile, client, receipts, &reservation, &mut pass)
+            .settle_reservation(profile, client, oracle, receipts, &reservation, &mut pass)
             .await?;
         record_settlement(&mut report, &reservation, settlement);
         report.rpc_calls = pass.spent;
@@ -1561,38 +1884,29 @@ impl PersistedWindowStore {
         Ok(())
     }
 
-    /// Settles one reservation on receipt evidence or a chain answer. See
-    /// [`Self::reconcile_due`] for the rule this implements.
-    async fn settle_reservation(
+    /// Settles one reservation on chain answers. See [`Self::reconcile_due`]
+    /// for the rule this implements.
+    async fn settle_reservation<'o>(
         &self,
         profile: &Profile,
         client: &crate::client::StellarRpcClient,
+        oracle: Option<&'o crate::client::StellarRpcClient>,
         receipts: Option<&ReceiptStore>,
         reservation: &SubmissionHold,
-        pass: &mut ReconcilePass,
+        pass: &mut ReconcilePass<'o>,
     ) -> Result<Settlement, WindowStoreError> {
-        // A reservation whose receipt already records release evidence is
-        // released on it with no endpoint call, and the receipt is not written
-        // again. A missing receipt leaves the authenticated reservation as the
-        // submission identity. Its chain outcome and retention boundary still
-        // govern settlement. An unreadable receipt store keeps the hold.
-        if let Some(store) = receipts {
-            match store.get(&reservation.id) {
-                Ok(Some(receipt)) if receipt.status == ReceiptStatus::Ambiguous => {
-                    if let Some(evidence) = receipt.release_code {
-                        return self.release_on_evidence(profile, receipts, reservation, evidence);
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        "window reconcile: the receipt store could not be read; the \
-                         reservation stands"
-                    );
-                    return Ok(Settlement::KeptPending);
-                }
-            }
+        // The receipt is unauthenticated, so nothing it records releases a
+        // reservation: release evidence it carries is found again on the chain
+        // below. A missing receipt leaves the authenticated reservation as the
+        // submission identity. An unreadable receipt store keeps the hold.
+        if let Some(store) = receipts
+            && let Err(e) = store.get(&reservation.id)
+        {
+            tracing::debug!(
+                error = %e,
+                "window reconcile: the receipt store could not be read; the reservation stands"
+            );
+            return Ok(Settlement::KeptPending);
         }
 
         let Ok(hash_bytes) = stellar_agent_core::hex::decode_hex32(&reservation.tx_hash) else {
@@ -1621,9 +1935,83 @@ impl PersistedWindowStore {
             }
         };
 
+        // On a mainnet profile the primary's negative answers are claims the
+        // oracle has to confirm, and only an oracle that reports mainnet can
+        // confirm them; the primary's SUCCESS confirms as on any chain, which
+        // keeps the debit.
+        if profile.chain_id.is_mainnet() && matches!(record.status(), "FAILED" | "NOT_FOUND") {
+            let Some(oracle) = oracle else {
+                tracing::debug!(
+                    "window reconcile: the primary endpoint's negative answer has no oracle to \
+                     confirm it; reservation stands"
+                );
+                pass.fail_without_oracle();
+                return Ok(Settlement::KeptPending);
+            };
+            let Some(oracle) = pass.verified_oracle(oracle).await else {
+                return Ok(Settlement::KeptPending);
+            };
+            return self
+                .settle_on_oracle(profile, oracle, receipts, reservation, &tx_hash, pass)
+                .await;
+        }
         if record.status() == "NOT_FOUND" {
             return self
                 .settle_not_found(profile, client, receipts, reservation, pass)
+                .await;
+        }
+        self.settle_chain_answer(profile, receipts, reservation, &record)
+    }
+
+    /// Settles a mainnet reservation whose primary endpoint answered `FAILED`
+    /// or `NOT_FOUND`, on the oracle's answers alone.
+    ///
+    /// The oracle's `SUCCESS` and `FAILED` settle as a definitive answer
+    /// does. Its `NOT_FOUND` runs the `NOT_FOUND` rule with the oracle as the
+    /// endpoint, so the retention floor, the chain time, the account sequence
+    /// and the fresh answer are all the oracle's. An oracle read that fails
+    /// keeps the reservation and reports the failure.
+    async fn settle_on_oracle(
+        &self,
+        profile: &Profile,
+        oracle: MainnetOracle<'_>,
+        receipts: Option<&ReceiptStore>,
+        reservation: &SubmissionHold,
+        tx_hash: &stellar_xdr::Hash,
+        pass: &mut ReconcilePass<'_>,
+    ) -> Result<Settlement, WindowStoreError> {
+        let oracle = oracle.client();
+        if !pass.charge() {
+            return Ok(Settlement::KeptPending);
+        }
+        let deadline = pass.deadline_of(oracle);
+        let record = match within(deadline, oracle.get_transaction_record(tx_hash)).await {
+            Some(Ok(r)) => r,
+            None => {
+                tracing::debug!(
+                    tx_hash = %crate::submit::redact_tx_hash(&reservation.tx_hash),
+                    "window reconcile: the oracle's getTransaction did not answer by the \
+                     deadline; reservation stands"
+                );
+                pass.fail(oracle, deadline_passed("getTransaction"));
+                return Ok(Settlement::KeptPending);
+            }
+            Some(Err(e)) => {
+                tracing::debug!(
+                    tx_hash = %crate::submit::redact_tx_hash(&reservation.tx_hash),
+                    error = %oracle.url.scrub_display(&e),
+                    "window reconcile: the oracle's getTransaction failed; reservation stands"
+                );
+                pass.fail(
+                    oracle,
+                    format!("getTransaction failed: {}", oracle.url.scrub_display(&e)),
+                );
+                return Ok(Settlement::KeptPending);
+            }
+        };
+        if record.status() == "NOT_FOUND" {
+            return self
+                .settle_not_found(profile, oracle, receipts, reservation, pass)
                 .await;
         }
         self.settle_chain_answer(profile, receipts, reservation, &record)
@@ -1689,8 +2077,15 @@ impl PersistedWindowStore {
         client: &crate::client::StellarRpcClient,
         receipts: Option<&ReceiptStore>,
         reservation: &SubmissionHold,
-        pass: &mut ReconcilePass,
+        pass: &mut ReconcilePass<'_>,
     ) -> Result<Settlement, WindowStoreError> {
+        // A submission ledger of 0 records no view of the chain, so the
+        // retention boundary below cannot be checked against it and a
+        // NOT_FOUND carries no information. The reservation stands for the
+        // operator.
+        if reservation.submission_ledger == 0 {
+            return Ok(Settlement::KeptPending);
+        }
         // The retention boundary first: an endpoint that no longer holds the
         // ledger range the submission was made in cannot report the
         // transaction whatever happened to it, so its NOT_FOUND carries no
@@ -1699,7 +2094,7 @@ impl PersistedWindowStore {
         let Some(floor) = pass.oldest_ledger else {
             return Ok(Settlement::KeptPending);
         };
-        if reservation.submission_ledger > 0 && reservation.submission_ledger < floor {
+        if reservation.submission_ledger < floor {
             if let Some(receipts) = receipts {
                 match receipts.get(&reservation.id) {
                     Ok(None) => self.mark_operator_required(profile, &reservation.id)?,
@@ -1758,12 +2153,25 @@ impl PersistedWindowStore {
         if !pass.charge() {
             return Ok(Settlement::KeptPending);
         }
-        let account = match crate::account::fetch_account(client, &reservation.source, &[]).await {
-            Ok(a) => a,
-            Err(stellar_agent_core::error::WalletError::Network(
+        let deadline = pass.deadline_of(client);
+        let account = match within(
+            deadline,
+            crate::account::fetch_account(client, &reservation.source, &[]),
+        )
+        .await
+        {
+            Some(Ok(a)) => a,
+            Some(Err(stellar_agent_core::error::WalletError::Network(
                 stellar_agent_core::error::NetworkError::AccountNotFound { .. },
-            )) => return Ok(Settlement::KeptPending),
-            Err(e) => {
+            ))) => return Ok(Settlement::KeptPending),
+            None => {
+                tracing::debug!(
+                    "window reconcile: source account not read by the deadline; reservation stands"
+                );
+                pass.fail(client, deadline_passed("getLedgerEntries"));
+                return Ok(Settlement::KeptPending);
+            }
+            Some(Err(e)) => {
                 tracing::debug!(
                     error = %e,
                     "window reconcile: source account fetch failed; reservation stands"
@@ -1804,7 +2212,7 @@ impl PersistedWindowStore {
         client: &crate::client::StellarRpcClient,
         receipts: Option<&ReceiptStore>,
         reservation: &SubmissionHold,
-        pass: &mut ReconcilePass,
+        pass: &mut ReconcilePass<'_>,
         evidence: ReleaseEvidence,
     ) -> Result<Settlement, WindowStoreError> {
         let Ok(hash) = stellar_agent_core::hex::decode_hex32(&reservation.tx_hash) else {
@@ -1813,12 +2221,23 @@ impl PersistedWindowStore {
         if !pass.charge() {
             return Ok(Settlement::KeptPending);
         }
-        let record = match client
-            .get_transaction_record(&stellar_xdr::Hash(hash))
-            .await
+        let deadline = pass.deadline_of(client);
+        let record = match within(
+            deadline,
+            client.get_transaction_record(&stellar_xdr::Hash(hash)),
+        )
+        .await
         {
-            Ok(record) => record,
-            Err(e) => {
+            Some(Ok(record)) => record,
+            None => {
+                tracing::debug!(
+                    "window reconcile: confirmation query not answered by the deadline; \
+                     reservation stands"
+                );
+                pass.fail(client, deadline_passed("getTransaction"));
+                return Ok(Settlement::KeptPending);
+            }
+            Some(Err(e)) => {
                 tracing::debug!(error = %client.url.scrub_display(&e),
                     "window reconcile: confirmation query failed; reservation stands");
                 pass.fail(

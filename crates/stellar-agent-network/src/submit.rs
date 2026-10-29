@@ -51,6 +51,7 @@ use stellar_xdr::{
 };
 
 use crate::client::{RpcEndpoint, StellarRpcClient, rpc_unreachable, unexpected_status};
+use crate::endpoint_identity::MainnetOracle;
 use crate::mainnet::authorization::MainnetTxSignAuthorization;
 use crate::mainnet::consumed::AuthorizationConsumed;
 use crate::mainnet::refusal::AuthorizedPathError;
@@ -270,6 +271,7 @@ pub async fn submit_transaction_and_wait(
         timeout,
         recorder,
         signer_kind,
+        FailureWitness::Primary,
     )
     .await
 }
@@ -313,6 +315,31 @@ pub enum MainnetSubmitGrant {
 /// 7. The envelope is sent once, through the retry of transport failures
 ///    that resends the same bytes, and the confirmation is polled.
 ///
+/// # Negative answers need the oracle
+///
+/// A negative answer of `client` alone settles nothing, because a primary
+/// endpoint that reports a failure for a transaction that applies would
+/// erase a real debit from the operator's spending window:
+///
+/// - A `FAILED` confirmation is checked against `oracle`: one `getNetwork`
+///   that has to report the mainnet passphrase, then one `getTransaction`
+///   for the same hash, both bounded by the remaining deadline. Only the
+///   oracle's own `FAILED` settles the submission as failed on chain, with
+///   the oracle's result code, and that failure is returned. Any other
+///   oracle answer, an oracle that reports another network or whose
+///   identity cannot be read, an oracle error, no answer before the
+///   deadline, or no oracle (`oracle` is `None`) records
+///   [`SubmissionOutcome::TransportAfterSend`] and returns
+///   [`SubmissionError::TxTimeout`]: the reservation, the receipt and the
+///   pending audit row stand until reconciliation settles them.
+/// - A `sendTransaction` refusal is never confirmed, since a refused
+///   transaction has no record an oracle could report. It records
+///   [`SubmissionOutcome::TransportAfterSend`] naming the refusal and
+///   returns [`SubmissionError::TxTimeout`] the same way.
+///
+/// A refusal of the consumption proof before the send still settles the
+/// submission as rejected: nothing was sent.
+///
 /// Compiled in every build; without mainnet writes no grant exists, so the
 /// function cannot be called.
 ///
@@ -325,7 +352,9 @@ pub enum MainnetSubmitGrant {
 /// - [`WalletError::Network`] wrapping
 ///   [`NetworkError::EndpointNetworkMismatch`] if the endpoint does not serve
 ///   mainnet, and the other errors of [`submit_transaction_and_wait`] for the
-///   identity probe, the signature binding, the send, and the poll.
+///   identity probe, the signature binding, the send, and the poll, except
+///   that a send refusal and an unconfirmed `FAILED` confirmation return
+///   [`SubmissionError::TxTimeout`] as described above.
 /// - The recorder's refusal from
 ///   [`SubmissionRecorder::pre_send_authorized`].
 ///
@@ -334,10 +363,12 @@ pub enum MainnetSubmitGrant {
 /// Never panics.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the inputs of submit_transaction_and_wait plus the consuming verb and the grant"
+    reason = "the inputs of submit_transaction_and_wait plus the oracle, the consuming verb and \
+              the grant"
 )]
 pub async fn submit_authorized_transaction_and_wait(
     client: &StellarRpcClient,
+    oracle: Option<&StellarRpcClient>,
     envelope_xdr: &str,
     timeout: Duration,
     network_passphrase: &str,
@@ -348,6 +379,7 @@ pub async fn submit_authorized_transaction_and_wait(
 ) -> Result<SubmissionResult, WalletError> {
     authorized_submission(
         client,
+        oracle,
         envelope_xdr,
         timeout,
         network_passphrase,
@@ -368,6 +400,7 @@ pub async fn submit_authorized_transaction_and_wait(
 )]
 pub(crate) async fn authorized_submission(
     client: &StellarRpcClient,
+    oracle: Option<&StellarRpcClient>,
     envelope_xdr: &str,
     timeout: Duration,
     network_passphrase: &str,
@@ -461,8 +494,22 @@ pub(crate) async fn authorized_submission(
         timeout,
         Some(recorder),
         signer_kind,
+        FailureWitness::Oracle(oracle),
     )
     .await?)
+}
+
+/// What settles a negative answer of the endpoint a submission was sent to.
+#[derive(Clone, Copy)]
+enum FailureWitness<'a> {
+    /// The endpoint's own `FAILED` confirmation and its own send refusal
+    /// settle the submission.
+    Primary,
+    /// A mainnet submission: a `FAILED` confirmation settles the submission
+    /// only when this oracle reports `FAILED` for the same hash, and a send
+    /// refusal settles nothing. `None` is a profile without an oracle, whose
+    /// negative answers therefore settle nothing.
+    Oracle(Option<&'a StellarRpcClient>),
 }
 
 /// The local gate of a mainnet submission, before any request: the chain,
@@ -518,7 +565,8 @@ fn proof_matches(
 
 /// Sends the recorded envelope once, through the retry of transport failures
 /// that resends the same bytes, compares the endpoint's hash with the local
-/// one, and polls for the confirmation.
+/// one, and polls for the confirmation. `witness` decides what settles a
+/// negative answer.
 #[allow(
     clippy::too_many_arguments,
     reason = "the facts both submit paths established before the send"
@@ -532,6 +580,7 @@ async fn send_and_confirm(
     timeout: Duration,
     recorder: Option<&dyn SubmissionRecorder>,
     signer_kind: Option<SubmissionSignerKind>,
+    witness: FailureWitness<'_>,
 ) -> Result<SubmissionResult, WalletError> {
     let retry_policy = RetryPolicy::default();
     let redacted = redact_tx_hash(&intent.tx_hash);
@@ -567,9 +616,15 @@ async fn send_and_confirm(
     let server_tx_hash = match server_tx_hash {
         Ok(h) => h,
         Err(e) => {
-            return Err(
-                handle_send_failure(recorder, intent, &e, &client.url, timeout.as_secs()).await,
-            );
+            return Err(handle_send_failure(
+                recorder,
+                intent,
+                &e,
+                &client.url,
+                timeout.as_secs(),
+                witness,
+            )
+            .await);
         }
     };
 
@@ -609,6 +664,7 @@ async fn send_and_confirm(
         intent,
         recorder,
         signer_kind,
+        witness,
     )
     .await
 }
@@ -675,8 +731,15 @@ fn lose_send_answer(
 /// abort the submission. Every path ends at the deadline at the latest, even
 /// when every poll errors.
 ///
+/// A `FAILED` answer settles the record as [`settle_failed_answer`] decides
+/// under `witness`.
+///
 /// Keep in sync with the poll loop in `idempotent_submit.rs`: any change to
 /// the deadline or retryable-error treatment here must be mirrored there.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the poll seam plus the facts the record settles against"
+)]
 async fn poll_for_confirmation<P, F>(
     mut poll: P,
     url: &RpcEndpoint,
@@ -685,6 +748,7 @@ async fn poll_for_confirmation<P, F>(
     intent: &SubmissionIntent,
     recorder: Option<&dyn SubmissionRecorder>,
     signer_kind: Option<SubmissionSignerKind>,
+    witness: FailureWitness<'_>,
 ) -> Result<SubmissionResult, WalletError>
 where
     P: FnMut() -> F,
@@ -776,22 +840,15 @@ where
             }
 
             "FAILED" => {
-                let err = map_failed_record(&record);
-                tracing::warn!(
-                    tx_hash = %redacted,
-                    error = %err,
-                    "submit_transaction_and_wait: transaction failed on-chain"
-                );
-                if let Some(rec) = recorder {
-                    rec.outcome(
-                        intent,
-                        &SubmissionOutcome::OnChainFailed {
-                            code: err.code().to_owned(),
-                        },
-                    )
-                    .await;
-                }
-                return Err(err);
+                return Err(settle_failed_answer(
+                    &record,
+                    witness,
+                    send_deadline,
+                    timeout_secs,
+                    intent,
+                    recorder,
+                )
+                .await);
             }
 
             // NOT_FOUND: transaction not yet in a ledger. Continue polling.
@@ -819,6 +876,140 @@ where
         }
 
         sleep_before_next_poll(POLL_INTERVAL, send_deadline).await;
+    }
+}
+
+/// Settles the record for a `FAILED` confirmation answer, and builds the
+/// error the caller returns.
+///
+/// Under [`FailureWitness::Primary`] the answer settles the submission as
+/// failed on chain, and the failure it maps to is returned. Under
+/// [`FailureWitness::Oracle`] the answer is a claim the oracle has to
+/// confirm: only the oracle's own `FAILED` for the same hash settles the
+/// submission, under the code mapped from the oracle's record. Anything
+/// else leaves the outcome unknown, so the record stands as for a lost
+/// answer and the caller gets the timeout shape.
+async fn settle_failed_answer(
+    record: &TransactionRecord,
+    witness: FailureWitness<'_>,
+    send_deadline: tokio::time::Instant,
+    timeout_secs: u64,
+    intent: &SubmissionIntent,
+    recorder: Option<&dyn SubmissionRecorder>,
+) -> WalletError {
+    let redacted = redact_tx_hash(&intent.tx_hash);
+    let confirmed = match witness {
+        FailureWitness::Primary => Ok(map_failed_record(record)),
+        FailureWitness::Oracle(oracle) => oracle_failed_answer(oracle, intent, send_deadline)
+            .await
+            .map(|oracle_record| map_failed_record(&oracle_record)),
+    };
+    let err = match confirmed {
+        Ok(err) => err,
+        Err(unconfirmed) => {
+            tracing::warn!(
+                tx_hash = %redacted,
+                reason = %unconfirmed,
+                "submit_transaction_and_wait: the endpoint reported the transaction failed and \
+                 the oracle did not confirm it; the record stands"
+            );
+            if let Some(rec) = recorder {
+                rec.outcome(
+                    intent,
+                    &SubmissionOutcome::TransportAfterSend {
+                        error: format!(
+                            "the endpoint reported the transaction FAILED and the oracle did not \
+                             confirm it: {unconfirmed}"
+                        ),
+                    },
+                )
+                .await;
+            }
+            return WalletError::Submission(SubmissionError::TxTimeout {
+                tx_hash: intent.tx_hash.clone(),
+                seconds: timeout_secs,
+            });
+        }
+    };
+    tracing::warn!(
+        tx_hash = %redacted,
+        error = %err,
+        "submit_transaction_and_wait: transaction failed on-chain"
+    );
+    if let Some(rec) = recorder {
+        rec.outcome(
+            intent,
+            &SubmissionOutcome::OnChainFailed {
+                code: err.code().to_owned(),
+            },
+        )
+        .await;
+    }
+    err
+}
+
+/// Asks `oracle` for the submission's transaction, bounded by `deadline`,
+/// and returns its answer when that answer is `FAILED`.
+///
+/// The oracle's answer counts only once the oracle reports the mainnet
+/// passphrase: its identity is checked first, within the same deadline, and
+/// an oracle that serves another network or whose identity cannot be read
+/// confirms nothing.
+///
+/// # Errors
+///
+/// Why the oracle did not confirm the failure, as non-secret text: no oracle,
+/// a failed identity check, no answer before the deadline, a read error, or
+/// an answer other than `FAILED`.
+async fn oracle_failed_answer(
+    oracle: Option<&StellarRpcClient>,
+    intent: &SubmissionIntent,
+    deadline: tokio::time::Instant,
+) -> Result<TransactionRecord, String> {
+    let Some(oracle) = oracle else {
+        return Err("the profile names no oracle".to_owned());
+    };
+    let oracle = MainnetOracle::verify(oracle, deadline)
+        .await
+        .map_err(|e| format!("the oracle did not establish that it serves mainnet: {e}"))?;
+    oracle_failed_record(oracle, intent, deadline).await
+}
+
+/// Reads the verified oracle's answer for the submission's transaction,
+/// bounded by `deadline`, and returns it when it is `FAILED`.
+///
+/// An answer that completes at or after the deadline is not read, as in the
+/// confirmation poll.
+///
+/// # Errors
+///
+/// As [`oracle_failed_answer`], without the identity cases.
+async fn oracle_failed_record(
+    oracle: MainnetOracle<'_>,
+    intent: &SubmissionIntent,
+    deadline: tokio::time::Instant,
+) -> Result<TransactionRecord, String> {
+    let oracle = oracle.client();
+    let hash = tx_hash_bytes(&intent.tx_hash).map_err(|e| e.to_string())?;
+    let answer = tokio::time::timeout_at(
+        deadline,
+        oracle.get_transaction_record(&stellar_xdr::Hash(hash)),
+    )
+    .await;
+    if tokio::time::Instant::now() >= deadline {
+        return Err("the oracle did not answer before the submission deadline".to_owned());
+    }
+    match answer {
+        Err(_) => Err("the oracle did not answer before the submission deadline".to_owned()),
+        Ok(Err(e)) => Err(format!(
+            "the oracle could not be read: {}",
+            oracle.url.scrub_display(&e)
+        )),
+        Ok(Ok(record)) if record.status() == "FAILED" => Ok(record),
+        Ok(Ok(record)) => Err(format!(
+            "the oracle reported {}",
+            oracle.url.scrub(record.status())
+        )),
     }
 }
 
@@ -871,12 +1062,18 @@ async fn record_timeout(
 ///   is mid-flight rather than a dead endpoint. The record stands and the
 ///   caller gets the timeout shape, which is what the agent's recovery
 ///   protocol is written against.
+///
+/// Under [`FailureWitness::Oracle`] a refusal settles nothing either: it is
+/// the endpoint's word alone, and no oracle can confirm it because a refused
+/// transaction has no record. It is recorded as an unknown outcome naming
+/// the refusal, and the caller gets the timeout shape.
 async fn handle_send_failure(
     recorder: Option<&dyn SubmissionRecorder>,
     intent: &SubmissionIntent,
     error: &stellar_rpc_client::Error,
     url: &RpcEndpoint,
     timeout_secs: u64,
+    witness: FailureWitness<'_>,
 ) -> WalletError {
     let mapped = map_send_error(error, url, timeout_secs);
     let definitive = is_definitive_send_refusal(error);
@@ -884,6 +1081,31 @@ async fn handle_send_failure(
     let Some(rec) = recorder else {
         return mapped;
     };
+
+    if definitive && matches!(witness, FailureWitness::Oracle(_)) {
+        tracing::warn!(
+            tx_hash = %redact_tx_hash(&intent.tx_hash),
+            code = mapped.code(),
+            "submit_transaction_and_wait: the endpoint refused the send; without an independent \
+             witness the record stands"
+        );
+        rec.outcome(
+            intent,
+            &SubmissionOutcome::TransportAfterSend {
+                error: format!(
+                    "the endpoint refused the send with {}, which no independent answer \
+                     confirms: {}",
+                    mapped.code(),
+                    url.scrub_display(error)
+                ),
+            },
+        )
+        .await;
+        return WalletError::Submission(SubmissionError::TxTimeout {
+            tx_hash: intent.tx_hash.clone(),
+            seconds: timeout_secs,
+        });
+    }
 
     if definitive {
         rec.outcome(
@@ -1903,6 +2125,7 @@ mod tests {
                 &intent,
                 Some(&recorder),
                 None,
+                FailureWitness::Primary,
             )
             .await;
 
@@ -1950,6 +2173,7 @@ mod tests {
             &intent,
             Some(&recorder),
             None,
+            FailureWitness::Primary,
         )
         .await;
         assert_eq!(polls.get(), 1, "no poll starts after the clamped sleep");
@@ -1989,6 +2213,7 @@ mod tests {
         use serde_json::json;
         use serial_test::serial;
         use stellar_agent_core::policy::v1::criteria::state_store::WindowEntry;
+        use stellar_agent_core::profile::receipt::ReceiptStatus;
         use stellar_agent_test_support::SubmissionEchoResponder;
         use stellar_agent_test_support::signed_envelope::{
             SignedTestEnvelope, TESTNET_PASSPHRASE, get_network_result,
@@ -2091,6 +2316,39 @@ mod tests {
             }
         }
 
+        /// The `txBadSeq` result a `FAILED` answer of the primary carries.
+        const BAD_SEQ_RESULT_XDR: &str = "AAAAAAAAAGT////7AAAAAA==";
+
+        /// A base64 `TransactionResult` carrying `result`.
+        fn result_xdr(result: TransactionResultResult) -> String {
+            use stellar_xdr::{Limits, TransactionResultExt, WriteXdr};
+            TransactionResult {
+                fee_charged: 0,
+                result,
+                ext: TransactionResultExt::V0,
+            }
+            .to_xdr_base64(Limits::none())
+            .unwrap()
+        }
+
+        /// A `getTransaction` answer for `envelope` with `status`, carrying
+        /// `result` as its result XDR.
+        fn transaction_answer(
+            envelope: &SignedTestEnvelope,
+            status: &str,
+            result: Option<&str>,
+        ) -> serde_json::Value {
+            json!({
+                "status": status,
+                "txHash": envelope.tx_hash_hex(),
+                "ledger": 4567,
+                "createdAt": "1700000000",
+                "envelopeXdr": null,
+                "resultXdr": result,
+                "resultMetaXdr": null
+            })
+        }
+
         /// Mounts the endpoint for `envelope`: it reports `passphrase`, the
         /// envelope's signer sets, `sends` accepted sends, and the
         /// transaction's success.
@@ -2099,6 +2357,33 @@ mod tests {
             envelope: &SignedTestEnvelope,
             passphrase: &str,
             sends: u64,
+        ) {
+            mount_answers(
+                server,
+                envelope,
+                passphrase,
+                sends,
+                json!({
+                    "hash": envelope.tx_hash_hex(),
+                    "status": "PENDING",
+                    "latestLedger": 1000,
+                    "latestLedgerCloseTime": "1699999999"
+                }),
+                transaction_answer(envelope, "SUCCESS", None),
+            )
+            .await;
+        }
+
+        /// Mounts the endpoint for `envelope`: it reports `passphrase` and the
+        /// envelope's signer sets, answers `sends` sends with `send`, and
+        /// answers every `getTransaction` with `poll`.
+        async fn mount_answers(
+            server: &MockServer,
+            envelope: &SignedTestEnvelope,
+            passphrase: &str,
+            sends: u64,
+            send: serde_json::Value,
+            poll: serde_json::Value,
         ) {
             for (rpc_method, result) in [
                 ("getNetwork", get_network_result(passphrase)),
@@ -2112,35 +2397,87 @@ mod tests {
             }
             Mock::given(method("POST"))
                 .and(body_partial_json(json!({ "method": "sendTransaction" })))
-                .respond_with(SubmissionEchoResponder::new(
-                    json!({
-                        "hash": envelope.tx_hash_hex(),
-                        "status": "PENDING",
-                        "latestLedger": 1000,
-                        "latestLedgerCloseTime": "1699999999"
-                    }),
-                    MAINNET_PASSPHRASE,
-                ))
+                .respond_with(SubmissionEchoResponder::new(send, MAINNET_PASSPHRASE))
                 .expect(sends)
                 .named("sendTransaction")
                 .mount(server)
                 .await;
             Mock::given(method("POST"))
                 .and(body_partial_json(json!({ "method": "getTransaction" })))
-                .respond_with(SubmissionEchoResponder::new(
-                    json!({
-                        "status": "SUCCESS",
-                        "txHash": envelope.tx_hash_hex(),
-                        "ledger": 4567,
-                        "createdAt": "1700000000",
-                        "envelopeXdr": null,
-                        "resultXdr": null,
-                        "resultMetaXdr": null
-                    }),
-                    MAINNET_PASSPHRASE,
-                ))
+                .respond_with(SubmissionEchoResponder::new(poll, MAINNET_PASSPHRASE))
                 .mount(server)
                 .await;
+        }
+
+        /// A mock oracle reporting the mainnet passphrase and answering every
+        /// `getTransaction` with `answer`, and a client of it.
+        async fn oracle_answering(answer: serde_json::Value) -> (MockServer, StellarRpcClient) {
+            oracle_reporting(MAINNET_PASSPHRASE, Duration::ZERO, answer, Duration::ZERO).await
+        }
+
+        /// A mock oracle reporting `passphrase` after `identity_delay` and
+        /// answering every `getTransaction` with `answer` after `delay`, and a
+        /// client of it.
+        async fn oracle_reporting(
+            passphrase: &str,
+            identity_delay: Duration,
+            answer: serde_json::Value,
+            delay: Duration,
+        ) -> (MockServer, StellarRpcClient) {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({ "method": "getNetwork" })))
+                .respond_with(DelayedResponder {
+                    inner: SubmissionEchoResponder::new(
+                        get_network_result(passphrase),
+                        MAINNET_PASSPHRASE,
+                    ),
+                    delay: identity_delay,
+                })
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({ "method": "getTransaction" })))
+                .respond_with(DelayedResponder {
+                    inner: SubmissionEchoResponder::new(answer, MAINNET_PASSPHRASE),
+                    delay,
+                })
+                .mount(&server)
+                .await;
+            let client = StellarRpcClient::new(&server.uri()).unwrap();
+            (server, client)
+        }
+
+        /// Answers as `inner` does, after `delay`.
+        struct DelayedResponder {
+            inner: SubmissionEchoResponder,
+            delay: Duration,
+        }
+
+        impl wiremock::Respond for DelayedResponder {
+            fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+                wiremock::Respond::respond(&self.inner, request).set_delay(self.delay)
+            }
+        }
+
+        /// How far past its deadline a submission may return in the deadline
+        /// tests: the work around the bounded wait, never a second wait.
+        const SLACK: Duration = Duration::from_millis(1500);
+
+        /// The JSON-RPC methods `server` was asked, in order.
+        async fn methods_asked(server: &MockServer) -> Vec<String> {
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|request| {
+                    serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["method"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect()
         }
 
         /// The number of requests `server` received.
@@ -2222,6 +2559,7 @@ mod tests {
             ) -> Result<SubmissionResult, AuthorizedPathError> {
                 authorized_submission(
                     client,
+                    None,
                     self.envelope.envelope_xdr(),
                     TIMEOUT,
                     passphrase,
@@ -2247,6 +2585,90 @@ mod tests {
                 )
                 .await
             }
+
+            /// Submits under a fresh grant through the public entry point,
+            /// with `oracle` as the witness of negative answers.
+            async fn submit_witnessed(
+                &self,
+                recorder: &CountingRecorder<'_>,
+                oracle: Option<&StellarRpcClient>,
+            ) -> Result<SubmissionResult, WalletError> {
+                self.submit_witnessed_within(recorder, oracle, TIMEOUT)
+                    .await
+            }
+
+            /// [`Self::submit_witnessed`] with `timeout` as the submission
+            /// deadline.
+            async fn submit_witnessed_within(
+                &self,
+                recorder: &CountingRecorder<'_>,
+                oracle: Option<&StellarRpcClient>,
+                timeout: Duration,
+            ) -> Result<SubmissionResult, WalletError> {
+                submit_authorized_transaction_and_wait(
+                    &self.client,
+                    oracle,
+                    self.envelope.envelope_xdr(),
+                    timeout,
+                    MAINNET_PASSPHRASE,
+                    None,
+                    recorder,
+                    MainnetConsumer::CliPay,
+                    MainnetSubmitGrant::Tx(self.grant()),
+                )
+                .await
+            }
+
+            /// The envelope hash the submission is recorded under.
+            fn envelope_hash(&self) -> String {
+                envelope_hash_hex(self.envelope.envelope_xdr())
+            }
+
+            /// Whether the window still holds the submission's reservation.
+            fn reservation_is_open(&self) -> bool {
+                let id = self.envelope_hash();
+                self.fx
+                    .window
+                    .pending_reservations(&self.fx.profile)
+                    .unwrap()
+                    .iter()
+                    .any(|reservation| reservation.id == id)
+            }
+
+            /// The status the submission's receipt records.
+            fn receipt_status(&self) -> ReceiptStatus {
+                self.fx
+                    .receipts
+                    .get(&self.envelope_hash())
+                    .unwrap()
+                    .expect("the submission's receipt exists")
+                    .status
+            }
+        }
+
+        /// Asserts that a submission whose negative answer nothing confirmed
+        /// stands: the call returned the timeout shape for the local hash,
+        /// the recorder saw one unknown outcome, the reservation and the
+        /// pending receipt stand, and no failed row was written.
+        fn assert_submission_stands(
+            case: &Case,
+            recorder: &CountingRecorder<'_>,
+            result: Result<SubmissionResult, WalletError>,
+        ) {
+            match result {
+                Err(WalletError::Submission(SubmissionError::TxTimeout { tx_hash, .. })) => {
+                    assert_eq!(tx_hash, case.envelope.tx_hash_hex());
+                }
+                other => panic!("expected the timeout shape, got {other:?}"),
+            }
+            assert_eq!(recorder.outcomes(), ["transport_after_send"]);
+            assert!(case.reservation_is_open(), "the reservation stands");
+            assert_eq!(case.receipt_status(), ReceiptStatus::Pending);
+            assert_eq!(
+                case.fx.audit_kinds(),
+                ["value_action_pending"],
+                "no row settles the submission"
+            );
         }
 
         fn refused(result: Result<SubmissionResult, AuthorizedPathError>) -> MainnetPrecondition {
@@ -2280,6 +2702,7 @@ mod tests {
 
             let result = submit_authorized_transaction_and_wait(
                 &case.client,
+                None,
                 case.envelope.envelope_xdr(),
                 TIMEOUT,
                 MAINNET_PASSPHRASE,
@@ -2587,6 +3010,300 @@ mod tests {
             .await;
         }
 
+        /// A primary endpoint that reports `FAILED` for a transaction the
+        /// oracle reports applied settles nothing: the reservation keeps the
+        /// debit and the caller gets the timeout shape.
+        #[tokio::test]
+        #[serial]
+        async fn a_failed_confirmation_the_oracle_reports_applied_keeps_the_reservation() {
+            let case = Case::new("submit-failed-oracle-success").await;
+            mount_answers(
+                &case.server,
+                &case.envelope,
+                MAINNET_PASSPHRASE,
+                1,
+                json!({ "hash": case.envelope.tx_hash_hex(), "status": "PENDING",
+                    "latestLedger": 1000, "latestLedgerCloseTime": "1699999999" }),
+                transaction_answer(&case.envelope, "FAILED", Some(BAD_SEQ_RESULT_XDR)),
+            )
+            .await;
+            let (oracle_server, oracle) =
+                oracle_answering(transaction_answer(&case.envelope, "SUCCESS", None)).await;
+            let recorder = case.recorder(None);
+
+            let result = case.submit_witnessed(&recorder, Some(&oracle)).await;
+
+            assert_submission_stands(&case, &recorder, result);
+            assert_eq!(
+                methods_asked(&oracle_server).await,
+                ["getNetwork", "getTransaction"],
+                "the oracle's identity, then one question"
+            );
+            case.server.verify().await;
+        }
+
+        /// The oracle's own `FAILED` settles the submission as failed on
+        /// chain, under the code of the oracle's result.
+        #[tokio::test]
+        #[serial]
+        async fn a_failed_confirmation_the_oracle_confirms_releases_with_the_oracle_code() {
+            let case = Case::new("submit-failed-oracle-failed").await;
+            mount_answers(
+                &case.server,
+                &case.envelope,
+                MAINNET_PASSPHRASE,
+                1,
+                json!({ "hash": case.envelope.tx_hash_hex(), "status": "PENDING",
+                    "latestLedger": 1000, "latestLedgerCloseTime": "1699999999" }),
+                transaction_answer(&case.envelope, "FAILED", Some(BAD_SEQ_RESULT_XDR)),
+            )
+            .await;
+            let oracle_result = result_xdr(TransactionResultResult::TxInsufficientFee);
+            let (_oracle_server, oracle) = oracle_answering(transaction_answer(
+                &case.envelope,
+                "FAILED",
+                Some(&oracle_result),
+            ))
+            .await;
+            let recorder = case.recorder(None);
+
+            let error = case
+                .submit_witnessed(&recorder, Some(&oracle))
+                .await
+                .expect_err("a confirmed failure is returned");
+
+            assert_eq!(error.code(), "ledger.op_failed", "the oracle's code");
+            assert_eq!(recorder.outcomes(), ["on_chain_failed"]);
+            assert!(!case.reservation_is_open(), "the reservation is released");
+            assert_eq!(
+                case.receipt_status(),
+                ReceiptStatus::Failed {
+                    code: "ledger.op_failed".to_owned()
+                }
+            );
+            assert_eq!(
+                case.fx.audit_kinds(),
+                ["value_action_pending", "value_action_failed"]
+            );
+            let log = std::fs::read_to_string(&case.fx.profile.audit_log_path).unwrap();
+            assert!(log.contains("\"ledger.op_failed\""), "{log}");
+            assert!(!log.contains("submission.sequence_number_stale"), "{log}");
+            case.server.verify().await;
+        }
+
+        /// A `FAILED` confirmation with an oracle that cannot be reached, and
+        /// with no oracle at all, settles nothing.
+        #[tokio::test]
+        #[serial]
+        async fn a_failed_confirmation_without_an_oracle_answer_keeps_the_reservation() {
+            let unreachable = StellarRpcClient::new("http://127.0.0.1:9").unwrap();
+            for (label, oracle) in [
+                ("submit-failed-oracle-unreachable", Some(&unreachable)),
+                ("submit-failed-no-oracle", None),
+            ] {
+                let case = Case::new(label).await;
+                mount_answers(
+                    &case.server,
+                    &case.envelope,
+                    MAINNET_PASSPHRASE,
+                    1,
+                    json!({ "hash": case.envelope.tx_hash_hex(), "status": "PENDING",
+                        "latestLedger": 1000, "latestLedgerCloseTime": "1699999999" }),
+                    transaction_answer(&case.envelope, "FAILED", Some(BAD_SEQ_RESULT_XDR)),
+                )
+                .await;
+                let recorder = case.recorder(None);
+
+                let result = case.submit_witnessed(&recorder, oracle).await;
+
+                assert_submission_stands(&case, &recorder, result);
+                case.server.verify().await;
+            }
+        }
+
+        /// An oracle that reports the testnet passphrase confirms nothing: its
+        /// `FAILED` for the same hash does not settle the submission, and its
+        /// transaction is never asked.
+        #[tokio::test]
+        #[serial]
+        async fn a_failed_confirmation_an_oracle_on_another_network_reports_keeps_the_reservation()
+        {
+            let case = Case::new("submit-failed-oracle-testnet").await;
+            mount_answers(
+                &case.server,
+                &case.envelope,
+                MAINNET_PASSPHRASE,
+                1,
+                json!({ "hash": case.envelope.tx_hash_hex(), "status": "PENDING",
+                    "latestLedger": 1000, "latestLedgerCloseTime": "1699999999" }),
+                transaction_answer(&case.envelope, "FAILED", Some(BAD_SEQ_RESULT_XDR)),
+            )
+            .await;
+            let (oracle_server, oracle) = oracle_reporting(
+                TESTNET_PASSPHRASE,
+                Duration::ZERO,
+                transaction_answer(&case.envelope, "FAILED", Some(BAD_SEQ_RESULT_XDR)),
+                Duration::ZERO,
+            )
+            .await;
+            let recorder = case.recorder(None);
+
+            let result = case.submit_witnessed(&recorder, Some(&oracle)).await;
+
+            assert_submission_stands(&case, &recorder, result);
+            assert_eq!(methods_asked(&oracle_server).await, ["getNetwork"]);
+            case.server.verify().await;
+        }
+
+        /// An oracle whose answer arrives after the submission deadline
+        /// confirms nothing: the call returns the timeout shape at the
+        /// deadline, before the oracle's late `FAILED`, and the reservation
+        /// stands.
+        #[tokio::test]
+        #[serial]
+        async fn a_failed_confirmation_the_oracle_confirms_after_the_deadline_keeps_the_reservation()
+         {
+            const DEADLINE: Duration = Duration::from_secs(2);
+            const LATE: Duration = Duration::from_secs(30);
+            let case = Case::new("submit-failed-oracle-late").await;
+            mount_answers(
+                &case.server,
+                &case.envelope,
+                MAINNET_PASSPHRASE,
+                1,
+                json!({ "hash": case.envelope.tx_hash_hex(), "status": "PENDING",
+                    "latestLedger": 1000, "latestLedgerCloseTime": "1699999999" }),
+                transaction_answer(&case.envelope, "FAILED", Some(BAD_SEQ_RESULT_XDR)),
+            )
+            .await;
+            let (oracle_server, oracle) = oracle_reporting(
+                MAINNET_PASSPHRASE,
+                Duration::ZERO,
+                transaction_answer(&case.envelope, "FAILED", Some(BAD_SEQ_RESULT_XDR)),
+                LATE,
+            )
+            .await;
+            let recorder = case.recorder(None);
+
+            let started = std::time::Instant::now();
+            let result = case
+                .submit_witnessed_within(&recorder, Some(&oracle), DEADLINE)
+                .await;
+            let elapsed = started.elapsed();
+
+            assert_submission_stands(&case, &recorder, result);
+            assert!(
+                elapsed < DEADLINE + SLACK,
+                "the deadline ends the wait for the oracle: {elapsed:?}"
+            );
+            assert_eq!(
+                methods_asked(&oracle_server).await,
+                ["getNetwork", "getTransaction"],
+                "the oracle was asked and did not answer in time"
+            );
+            case.server.verify().await;
+        }
+
+        /// An oracle whose identity answer arrives after the submission
+        /// deadline confirms nothing: the identity check ends at the
+        /// deadline, the call returns the timeout shape, the transaction is
+        /// never asked, and the reservation stands.
+        #[tokio::test]
+        #[serial]
+        async fn a_failed_confirmation_whose_oracle_identity_answers_after_the_deadline_keeps_the_reservation()
+         {
+            const DEADLINE: Duration = Duration::from_secs(2);
+            const LATE: Duration = Duration::from_secs(30);
+            let case = Case::new("submit-failed-oracle-identity-late").await;
+            mount_answers(
+                &case.server,
+                &case.envelope,
+                MAINNET_PASSPHRASE,
+                1,
+                json!({ "hash": case.envelope.tx_hash_hex(), "status": "PENDING",
+                    "latestLedger": 1000, "latestLedgerCloseTime": "1699999999" }),
+                transaction_answer(&case.envelope, "FAILED", Some(BAD_SEQ_RESULT_XDR)),
+            )
+            .await;
+            let (oracle_server, oracle) = oracle_reporting(
+                MAINNET_PASSPHRASE,
+                LATE,
+                transaction_answer(&case.envelope, "FAILED", Some(BAD_SEQ_RESULT_XDR)),
+                Duration::ZERO,
+            )
+            .await;
+            let recorder = case.recorder(None);
+
+            let started = std::time::Instant::now();
+            let result = case
+                .submit_witnessed_within(&recorder, Some(&oracle), DEADLINE)
+                .await;
+            let elapsed = started.elapsed();
+
+            assert_submission_stands(&case, &recorder, result);
+            assert!(
+                elapsed < DEADLINE + SLACK,
+                "the deadline ends the identity check: {elapsed:?}"
+            );
+            assert_eq!(
+                methods_asked(&oracle_server).await,
+                ["getNetwork"],
+                "an oracle whose identity is unread is not asked about the transaction"
+            );
+            case.server.verify().await;
+        }
+
+        /// A send the primary refuses with a result settles nothing on
+        /// mainnet: the reservation and the pending receipt stand, and the
+        /// sequence stays held against a second submission.
+        #[tokio::test]
+        #[serial]
+        async fn a_refused_send_keeps_the_reservation_and_the_sequence() {
+            let case = Case::new("submit-refused").await;
+            let refusal = result_xdr(TransactionResultResult::TxInsufficientFee);
+            mount_answers(
+                &case.server,
+                &case.envelope,
+                MAINNET_PASSPHRASE,
+                1,
+                json!({ "hash": case.envelope.tx_hash_hex(), "status": "ERROR",
+                    "latestLedger": 1000, "latestLedgerCloseTime": "1699999999",
+                    "errorResultXdr": refusal }),
+                transaction_answer(&case.envelope, "SUCCESS", None),
+            )
+            .await;
+            let (oracle_server, oracle) =
+                oracle_answering(transaction_answer(&case.envelope, "NOT_FOUND", None)).await;
+            let recorder = case.recorder(None);
+
+            let result = case.submit_witnessed(&recorder, Some(&oracle)).await;
+
+            assert_submission_stands(&case, &recorder, result);
+            assert_eq!(
+                requests(&oracle_server).await,
+                0,
+                "a refusal has no record an oracle could report"
+            );
+
+            let rebuilt = SignedTestEnvelope::builder(SIGNER_SEED)
+                .network_passphrase(MAINNET_PASSPHRASE)
+                .sequence(SEQUENCE)
+                .amount_stroops(7_654_321)
+                .build();
+            assert_ne!(rebuilt.envelope_xdr(), case.envelope.envelope_xdr());
+            match case
+                .recorder(None)
+                .pre_send(&fixtures::intent(&rebuilt))
+                .await
+            {
+                Err(WalletError::Submission(SubmissionError::TxAlreadySubmitted { hash })) => {
+                    assert_eq!(hash, case.envelope.tx_hash_hex());
+                }
+                other => panic!("the held sequence refuses a second submission: {other:?}"),
+            }
+            case.server.verify().await;
+        }
+
         /// A refusal leaves the public entry point as the generic mainnet
         /// authorization refusal.
         #[tokio::test]
@@ -2598,6 +3315,7 @@ mod tests {
 
             let error = submit_authorized_transaction_and_wait(
                 &case.client,
+                None,
                 case.envelope.envelope_xdr(),
                 TIMEOUT,
                 MAINNET_PASSPHRASE,
