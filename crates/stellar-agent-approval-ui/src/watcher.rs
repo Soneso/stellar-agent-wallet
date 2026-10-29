@@ -125,14 +125,40 @@ fn pending_count(views: &[stellar_agent_core::approval::PendingApprovalView]) ->
 /// `ApprovalKind::kind_name()` value for a rejected tombstone.
 const REJECTED_KIND_NAME: &str = "Rejected";
 
-/// Spawns the watcher task. Returns its [`JoinHandle`]; the task runs until
-/// `shutdown_rx` resolves.
+/// Spawns the watcher task with the platform OS toast. Returns its
+/// [`JoinHandle`]; the task runs until `shutdown_rx` resolves.
 pub(crate) fn spawn_watcher(
     store_path: PathBuf,
     notify_enabled: bool,
     on_pending_count_changed: UnboundedSender<usize>,
-    mut shutdown_rx: oneshot::Receiver<()>,
+    shutdown_rx: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
+    spawn_watcher_with_toast(
+        store_path,
+        notify_enabled,
+        fire_toast,
+        on_pending_count_changed,
+        shutdown_rx,
+    )
+}
+
+/// Spawns the watcher task, handing each due toast argv to `toast`.
+///
+/// The toast sink is a parameter so the tick logic runs under test without
+/// starting a child process. A child process created while any approval store
+/// in the process is open holds a reference to that store's lock until the
+/// child execs, so an opener elsewhere in the process can observe
+/// `WriterLocked` after the store's owner has dropped it.
+fn spawn_watcher_with_toast<F>(
+    store_path: PathBuf,
+    notify_enabled: bool,
+    toast: F,
+    on_pending_count_changed: UnboundedSender<usize>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) -> JoinHandle<()>
+where
+    F: Fn(Vec<String>) + Send + 'static,
+{
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(WATCH_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -172,7 +198,7 @@ pub(crate) fn spawn_watcher(
                         let _ = on_pending_count_changed.send(new_count);
                         if notify_enabled && toast_due(last_toast_at) {
                             if let Some(argv) = os_toast_argv(new_count) {
-                                fire_toast(argv);
+                                toast(argv);
                             }
                             last_toast_at = Some(Instant::now());
                         }
@@ -313,13 +339,25 @@ mod tests {
     /// subsequent decrease (reject back down to 1) reports nothing further;
     /// a later increase (back to 2) reports again. Shutdown then joins
     /// cleanly.
+    ///
+    /// With notifications disabled, none of the increases reaches the toast
+    /// sink.
     #[tokio::test]
     async fn spawn_watcher_reports_increases_and_stays_silent_on_decrease() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("default.toml");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let (toast_tx, toast_rx) = std::sync::mpsc::channel::<Vec<String>>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let handle = spawn_watcher(path.clone(), false, tx, shutdown_rx);
+        let handle = spawn_watcher_with_toast(
+            path.clone(),
+            false,
+            move |argv| {
+                let _ = toast_tx.send(argv);
+            },
+            tx,
+            shutdown_rx,
+        );
 
         insert_entry(&path);
         let first = tokio::time::timeout(StdDuration::from_secs(3), rx.recv())
@@ -367,6 +405,11 @@ mod tests {
             .await
             .expect("watcher task must join within the timeout")
             .expect("watcher task must not panic");
+        let toasts: Vec<Vec<String>> = toast_rx.try_iter().collect();
+        assert!(
+            toasts.is_empty(),
+            "notify disabled must not fire a toast, got: {toasts:?}"
+        );
     }
 
     /// A `WriterLocked` tick is skipped silently (no panic, no notice); once
@@ -405,18 +448,27 @@ mod tests {
             .expect("watcher task must not panic");
     }
 
-    /// `notify_enabled: true` drives the watcher through the toast-firing
-    /// branch (`os_toast_argv` + `fire_toast`) without panicking. The OS
-    /// notifier binary itself is best-effort and may be absent in CI; only
-    /// the Rust-side branch execution is asserted here, not the subprocess
-    /// outcome.
+    /// `notify_enabled: true` hands the platform toast argv for the new count
+    /// to the toast sink exactly once for a single increase, and nothing on a
+    /// platform without a wired notifier. The sink records the argv instead of
+    /// starting the notifier, so no test in this binary starts a child
+    /// process (see [`spawn_watcher_with_toast`]).
     #[tokio::test]
-    async fn spawn_watcher_with_notify_enabled_does_not_panic() {
+    async fn spawn_watcher_with_notify_enabled_hands_the_platform_argv_to_the_toast() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("default.toml");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let (toast_tx, toast_rx) = std::sync::mpsc::channel::<Vec<String>>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let handle = spawn_watcher(path.clone(), true, tx, shutdown_rx);
+        let handle = spawn_watcher_with_toast(
+            path.clone(),
+            true,
+            move |argv| {
+                let _ = toast_tx.send(argv);
+            },
+            tx,
+            shutdown_rx,
+        );
 
         insert_entry(&path);
         let count = tokio::time::timeout(StdDuration::from_secs(3), rx.recv())
@@ -430,5 +482,8 @@ mod tests {
             .await
             .expect("watcher task must join within the timeout")
             .expect("watcher task must not panic");
+        let toasts: Vec<Vec<String>> = toast_rx.try_iter().collect();
+        let expected: Vec<Vec<String>> = os_toast_argv(1).into_iter().collect();
+        assert_eq!(toasts, expected);
     }
 }

@@ -217,6 +217,28 @@ pub fn preimage_invocation(preimage: &HashIdPreimage) -> Option<&SorobanAuthoriz
     }
 }
 
+/// Returns the entry fields a Soroban authorization preimage commits to: the
+/// `nonce` and the `signature_expiration_ledger` of the entry it was built
+/// from.
+///
+/// Both authorization cases carry them; every other `HashIdPreimage` case
+/// returns `None`. A verifier that binds an approval to one entry reads them
+/// here together with [`preimage_invocation`].
+#[must_use]
+pub fn preimage_entry(preimage: &HashIdPreimage) -> Option<(i64, u32)> {
+    match preimage {
+        HashIdPreimage::SorobanAuthorization(v1) => {
+            Some((v1.nonce, v1.signature_expiration_ledger))
+        }
+        HashIdPreimage::SorobanAuthorizationWithAddress(v2) => {
+            Some((v2.nonce, v2.signature_expiration_ledger))
+        }
+        HashIdPreimage::OpId(_)
+        | HashIdPreimage::PoolRevokeOpId(_)
+        | HashIdPreimage::ContractId(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -519,6 +541,31 @@ mod tests {
 
         for other in other_preimage_cases() {
             assert_eq!(preimage_invocation(&other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn preimage_entry_maps_all_five_cases() {
+        for version in [AuthCredentialsVersion::V1, AuthCredentialsVersion::V2] {
+            for (nonce, expiration) in [(NONCE, EXPIRATION), (-91, 77_777)] {
+                let preimage = build_auth_preimage(
+                    version,
+                    network_id(),
+                    nonce,
+                    expiration,
+                    &account(0x44),
+                    invocation(),
+                );
+                assert_eq!(
+                    preimage_entry(&preimage),
+                    Some((nonce, expiration)),
+                    "{version:?}"
+                );
+            }
+        }
+
+        for other in other_preimage_cases() {
+            assert_eq!(preimage_entry(&other), None, "{other:?}");
         }
     }
 }

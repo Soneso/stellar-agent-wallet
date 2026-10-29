@@ -47,8 +47,9 @@ use stellar_xdr::{
 
 use crate::server::{WalletServer, X402AuthenticatedPaymentArgs};
 use crate::tools::common::tests::mainnet::{
-    Fixture, RpcControl, authorizations, mount_rpc, observe, put, routed_fixture_with,
-    stored_approval, wire,
+    Fixture, HookGuard, ReadOnlyDir, RpcControl, assert_names_the_transmitted_ledger,
+    authorizations, mount_rpc, observe, put, refusals, routed_fixture_with, stored_approval, wire,
+    x402_authorized_rows,
 };
 use crate::tools::common::{GatedApprovalKind, verify_attestation_subject_gate, x402_value_leg};
 
@@ -444,26 +445,6 @@ fn released_transaction(result: &serde_json::Value) -> String {
         .to_owned()
 }
 
-/// The refusal lines of the authorized paths that `capture` saw, as their
-/// path and precondition.
-fn refusals(capture: &stellar_agent_test_support::WarningCapture) -> Vec<(String, String)> {
-    capture
-        .seen()
-        .into_iter()
-        .filter(|fields| {
-            fields
-                .get("message")
-                .is_some_and(|message| message.contains("mainnet authorization refused"))
-        })
-        .map(|fields| {
-            (
-                fields["path"].trim_matches('"').to_owned(),
-                fields["precondition"].trim_matches('"').to_owned(),
-            )
-        })
-        .collect()
-}
-
 fn approval_file_exists(f: &Fixture) -> bool {
     f.server
         .resolve_approval_dir()
@@ -739,7 +720,9 @@ async fn a_partial_approval_pair_refuses_without_a_request() {
 
 /// Call 2 below the threshold signs the challenge under the Message record,
 /// builds the payment as its Soroban child, and releases the payload after
-/// the submission record is used and the approval is tombstoned.
+/// the submission record is used and the approval is tombstoned. The oracle
+/// answers its identity and its latest ledger, which bounds the ledger the
+/// signature expiration derives from, and simulates nothing.
 #[tokio::test]
 #[serial_test::serial(keyring)]
 async fn call_two_accepts_below_the_threshold() {
@@ -750,11 +733,136 @@ async fn call_two_accepts_below_the_threshold() {
         result["data"]["cross_check"]["status"], "not_required",
         "{result}"
     );
-    assert!(
-        run.oracle_control.methods().is_empty(),
-        "no witness below the threshold"
+    assert_eq!(
+        run.oracle_control.methods(),
+        ["getNetwork", "getLatestLedger"],
+        "the oracle's identity request and its latest ledger below the threshold"
     );
     assert_accepted(&run, &approval, &result).await;
+}
+
+/// Call 2 below the threshold refuses when the oracle's latest ledger trails
+/// the primary's simulation by three ledgers: the primary's ledger is not
+/// shown current. No payment authorization is signed or minted, and the reply
+/// names no transmitted authorization.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn call_two_refuses_a_lagging_oracle_below_the_threshold() {
+    let run = Run::new().await;
+    let approval = run.prepare().await;
+    run.oracle_control
+        .latest_ledger_behind
+        .store(3, Ordering::SeqCst);
+    let result = run.pay(HOME, &approval).await;
+    assert_eq!(result["error"]["code"], "simulation.divergence", "{result}");
+    let message = result["error"]["message"].as_str().unwrap();
+    assert!(!message.contains("valid through ledger"), "{result}");
+    assert!(
+        result
+            .get("data")
+            .is_none_or(|data| data.get("paymentSignature").is_none())
+    );
+    assert_eq!(
+        run.oracle_control.methods(),
+        ["getNetwork", "getLatestLedger"]
+    );
+    assert_eq!(run.simulations(), 1, "no signed simulation");
+    assert_eq!(run.f.seed_reads.load(Ordering::SeqCst), 0);
+    assert!(records(&run.f, "soroban").is_empty());
+    assert!(
+        audit_rows(&run.f)
+            .iter()
+            .all(|row| row["kind"] != "x402_payment_authorized")
+    );
+}
+
+/// Call 2 below the threshold, with the oracle two ledgers behind the
+/// primary, signs the entry under the expiration ledger of the primary's
+/// simulation ledger: ledger 100 plus the 12 ledgers of the 60-second
+/// timeout. The `x402_payment_authorized` row records the same ledger.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn call_two_derives_the_expiration_from_the_primary_ledger() {
+    let run = Run::new().await;
+    let approval = run.prepare().await;
+    run.oracle_control
+        .latest_ledger_behind
+        .store(2, Ordering::SeqCst);
+    let result = run.pay(HOME, &approval).await;
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(
+        run.oracle_control.methods(),
+        ["getNetwork", "getLatestLedger"]
+    );
+    assert_eq!(run.control.signed_expiration_ledgers(), [112]);
+    let rows = x402_authorized_rows(&run.f);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["signature_expiration_ledger"], 112, "{rows:?}");
+}
+
+/// A re-simulation failure after the transmit gate passed withholds the
+/// payment, and the reply and the `x402_payment_authorized` row name the
+/// signature expiration ledger of the entry the primary received.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn a_resimulation_failure_names_the_transmitted_authorization() {
+    let run = Run::new().await;
+    let approval = run.prepare().await;
+    run.control.resimulation_error.store(true, Ordering::SeqCst);
+    let result = run.pay(HOME, &approval).await;
+    assert_eq!(result["ok"], false, "{result}");
+    assert_eq!(
+        result["error"]["code"], "x402.payment_build_failed",
+        "{result}"
+    );
+    let message = result["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("RPC simulate failed: re-simulate returned error"),
+        "{result}"
+    );
+    assert_names_the_transmitted_ledger(&run.f, &run.control, message);
+    assert!(
+        result
+            .get("data")
+            .is_none_or(|data| data.get("paymentSignature").is_none())
+    );
+    assert_eq!(run.simulations(), 2);
+}
+
+/// A pending approval that cannot be consumed after the release withholds
+/// the payment at terminal approval, and the reply and the
+/// `x402_payment_authorized` row name the signature expiration ledger of the
+/// entry the primary received.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn a_terminal_approval_failure_names_the_transmitted_authorization() {
+    let run = Run::new().await;
+    let approval = run.prepare().await;
+    let guard = HookGuard::default();
+    let hold = Arc::clone(&guard);
+    let approvals = run.f.server.resolve_approval_dir().unwrap();
+    run.control.on_request(move |method| {
+        if method == "simulateTransaction" {
+            let mut held = hold.lock().unwrap();
+            if held.is_none() {
+                *held = Some(ReadOnlyDir::new(&approvals));
+            }
+        }
+    });
+    let result = run.pay(HOME, &approval).await;
+    drop(guard.lock().unwrap().take());
+    assert_eq!(result["ok"], false, "{result}");
+    let message = result["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("payment withheld at terminal approval"),
+        "{result}"
+    );
+    assert_names_the_transmitted_ledger(&run.f, &run.control, message);
+    assert!(
+        result
+            .get("data")
+            .is_none_or(|data| data.get("paymentSignature").is_none())
+    );
 }
 
 /// Call 2 above the threshold obtains the oracle witness through the routed

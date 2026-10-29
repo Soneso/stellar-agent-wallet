@@ -2156,6 +2156,7 @@ mod tests {
             },
             EventKind::X402PaymentAuthorized {
                 witness: None,
+                signature_expiration_ledger: None,
                 legs: vec![ValueLegRecord {
                     action: ValueActionKind::X402Payment,
                     amount: Some(2_500_000),
@@ -2329,6 +2330,94 @@ mod tests {
             entry.ts = (*ts).to_owned();
             writer.write_entry(entry).unwrap();
         }
+    }
+
+    /// A payment row that records the signature expiration ledger and one
+    /// that does not both chain and verify; the field is written only when
+    /// present.
+    #[test]
+    fn x402_rows_with_and_without_the_expiration_ledger_verify() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+        for ledger in [Some(1_060), None] {
+            writer
+                .write_entry(AuditEntry::new_x402_payment_authorized(
+                    "stellar_x402_create_payment",
+                    "stellar:mainnet",
+                    vec![],
+                    "stellar:mainnet",
+                    "exact",
+                    PolicyDecision::Allow,
+                    uuid::Uuid::new_v4().to_string(),
+                    None,
+                    ledger,
+                ))
+                .unwrap();
+        }
+        drop(writer);
+
+        assert_eq!(verify_log(&path, None).unwrap().entries_verified, 2);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["kind"], "x402_payment_authorized");
+        assert_eq!(rows[0]["signature_expiration_ledger"], 1_060);
+        assert_eq!(rows[1]["kind"], "x402_payment_authorized");
+        assert!(
+            rows[1]
+                .as_object()
+                .unwrap()
+                .get("signature_expiration_ledger")
+                .is_none(),
+            "{}",
+            rows[1]
+        );
+    }
+
+    /// The signature expiration ledger is part of a row's hash input: a
+    /// payment row whose ledger changes after a following row was written
+    /// breaks the chain.
+    #[test]
+    fn a_changed_expiration_ledger_breaks_the_chain() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let mut writer = AuditWriter::open(path.clone(), None).unwrap();
+        writer
+            .write_entry(AuditEntry::new_x402_payment_authorized(
+                "stellar_x402_create_payment",
+                "stellar:mainnet",
+                vec![],
+                "stellar:mainnet",
+                "exact",
+                PolicyDecision::Allow,
+                uuid::Uuid::new_v4().to_string(),
+                None,
+                Some(1_060),
+            ))
+            .unwrap();
+        writer.write_entry(tool_entry()).unwrap();
+        drop(writer);
+        verify_log(&path, None).unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+        let mut rows: Vec<serde_json::Value> = original
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        rows[0]["signature_expiration_ledger"] = serde_json::json!(1_061);
+        let tampered = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, tampered + "\n").unwrap();
+        assert!(matches!(
+            verify_log(&path, None),
+            Err(VerifyError::ChainBroken { .. })
+        ));
     }
 
     #[test]

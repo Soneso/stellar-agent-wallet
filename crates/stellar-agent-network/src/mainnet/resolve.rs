@@ -9,8 +9,8 @@
 
 use super::audit_readiness::AuditReadiness;
 use super::authorization::{
-    MainnetMessageSignAuthorization, MainnetSorobanIntentAuthorization, MainnetSubmitAuthorization,
-    MainnetTxSignAuthorization,
+    MainnetMessageSignAuthorization, MainnetSignedSorobanIntent, MainnetSorobanIntentAuthorization,
+    MainnetSubmitAuthorization, MainnetTxSignAuthorization,
 };
 use super::message::{MessageFacts, MessageUseReceipt};
 use super::{AuthorizationId, MainnetAuthorizationError, MainnetConsumer};
@@ -134,6 +134,11 @@ pub struct SorobanIntentRequest<'a> {
     pub context: &'a MainnetWriteContext,
     /// Payment intent derived from the enrolled public key.
     pub intent: &'a SorobanIntent<'a>,
+    /// The nonce of the authorization entry the signing must carry.
+    pub nonce: i64,
+    /// The signature expiration ledger of the authorization entry the
+    /// signing must carry.
+    pub signature_expiration_ledger: u32,
     /// The context's primary client.
     pub client: &'a StellarRpcClient,
     /// Budget for the endpoint identity probe.
@@ -269,13 +274,18 @@ pub async fn resolve_soroban_intent(
     }
 }
 
-/// Consumes an intent once and retains its debit before payload construction.
+/// Consumes a signed intent once and retains its debit before payload
+/// construction.
+///
+/// It takes the [`MainnetSignedSorobanIntent`] the authorized signing
+/// returned, so the intent it consumes is one whose single signature was
+/// produced.
 ///
 /// # Errors
 /// Refuses changed intent or audit facts, and failed store transitions.
 pub fn consume_soroban_intent(
     context: &MainnetWriteContext,
-    auth: MainnetSorobanIntentAuthorization,
+    auth: MainnetSignedSorobanIntent,
     intent: &SorobanIntent<'_>,
     store: &PersistedWindowStore,
 ) -> Result<IntentUseReceipt, MainnetAuthorizationError> {
@@ -1162,6 +1172,8 @@ mod enabled {
             entries: request.holds,
             facts: request.bindings,
             authorization_ttl_ms: request.authorization_ttl_ms,
+            nonce: req.nonce,
+            signature_expiration_ledger: req.signature_expiration_ledger,
         }))
     }
     pub(super) fn message(
@@ -1301,10 +1313,13 @@ mod enabled {
     }
     pub(super) fn consume_intent(
         context: &MainnetWriteContext,
-        auth: MainnetSorobanIntentAuthorization,
+        signed: MainnetSignedSorobanIntent,
         intent: &SorobanIntent<'_>,
         store: &PersistedWindowStore,
     ) -> Result<IntentUseReceipt, MainnetAuthorizationError> {
+        // The bound facts are compared through the authorization's checks;
+        // the rebuilt value lives inside this function and signs nothing.
+        let auth = MainnetSorobanIntentAuthorization(signed.into_inner());
         let digest = soroban_intent_digest(&intent.network_id, intent.root_invocation)
             .map_err(|_| refused(P::IntentShape))?;
         auth.check_intent_digest(&digest)?;
@@ -1452,6 +1467,12 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
     use super::super::{MainnetPrecondition as P, fixtures::ResolverFixture};
     use super::*;
+
+    /// The entry nonce every intent request in this module names.
+    const INTENT_NONCE: i64 = 41;
+    /// The signature expiration ledger every intent request in this module
+    /// names.
+    const INTENT_EXPIRATION_LEDGER: u32 = 1_060;
 
     fn request<'a>(
         f: &'a ResolverFixture,
@@ -1979,6 +2000,8 @@ mod tests {
         SorobanIntentRequest {
             context,
             intent,
+            nonce: INTENT_NONCE,
+            signature_expiration_ledger: INTENT_EXPIRATION_LEDGER,
             client,
             probe_deadline: Duration::from_secs(1),
             witness: None,
@@ -2130,7 +2153,9 @@ mod tests {
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let auth = resolved_intent(&f, &context, &root).await;
         let id = auth.id();
-        let receipt = consume_soroban_intent(&context, auth, &intent(&root), &f.window).unwrap();
+        let receipt =
+            consume_soroban_intent(&context, auth.into_signed(), &intent(&root), &f.window)
+                .unwrap();
         assert_eq!(receipt.header.id, id);
         assert_eq!(f.wire()["authorizations"][0]["state"], "used");
     }
@@ -2146,7 +2171,7 @@ mod tests {
         changed.sub_invocations = vec![root.clone()].try_into().unwrap();
         let before = f.wire();
         assert_refused(
-            consume_soroban_intent(&context, auth, &intent(&changed), &f.window),
+            consume_soroban_intent(&context, auth.into_signed(), &intent(&changed), &f.window),
             P::IntentDigest,
             &f,
             &before,
@@ -2164,7 +2189,7 @@ mod tests {
         f.clock.set(expires);
         let before = f.wire();
         assert!(matches!(
-            consume_soroban_intent(&context, auth, &intent(&root), &f.window),
+            consume_soroban_intent(&context, auth.into_signed(), &intent(&root), &f.window),
             Err(MainnetAuthorizationError::Refused(P::NotOpen))
         ));
         assert_eq!(f.wire(), before, "a refused consumption writes nothing");
@@ -2184,7 +2209,9 @@ mod tests {
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let auth = resolved_intent(&f, &context, &root).await;
         let id = auth.id();
-        let receipt = consume_soroban_intent(&context, auth, &intent(&root), &f.window).unwrap();
+        let receipt =
+            consume_soroban_intent(&context, auth.into_signed(), &intent(&root), &f.window)
+                .unwrap();
         let (envelope, entries) = final_envelope(&f, &root);
         let child = resolve_soroban_submit(SorobanSubmitRequest {
             context: &context,
@@ -2211,7 +2238,9 @@ mod tests {
         let server = f.server().await;
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let auth = resolved_intent(&f, &context, &root).await;
-        let receipt = consume_soroban_intent(&context, auth, &intent(&root), &f.window).unwrap();
+        let receipt =
+            consume_soroban_intent(&context, auth.into_signed(), &intent(&root), &f.window)
+                .unwrap();
         let before = f.wire()["entries"].clone();
         let buckets = before.as_array().unwrap();
         let debit = buckets
@@ -2247,7 +2276,9 @@ mod tests {
         let server = f.server().await;
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let auth = resolved_intent(&f, &context, &root).await;
-        let receipt = consume_soroban_intent(&context, auth, &intent(&root), &f.window).unwrap();
+        let receipt =
+            consume_soroban_intent(&context, auth.into_signed(), &intent(&root), &f.window)
+                .unwrap();
         let (envelope, entries) = final_envelope(&f, &root);
         let child = resolve_soroban_submit(SorobanSubmitRequest {
             context: &context,
@@ -2901,7 +2932,8 @@ mod tests {
         let auth = resolved_intent(&f, &context, &root).await;
         if release {
             let receipt =
-                consume_soroban_intent(&context, auth, &intent(&root), &f.window).unwrap();
+                consume_soroban_intent(&context, auth.into_signed(), &intent(&root), &f.window)
+                    .unwrap();
             let (envelope, entries) = final_envelope(&f, &root);
             let child = resolve_soroban_submit(SorobanSubmitRequest {
                 context: &context,
@@ -2931,7 +2963,8 @@ mod tests {
                     .store(false, std::sync::atomic::Ordering::SeqCst);
             }
             let before = f.wire();
-            let result = consume_soroban_intent(&context, auth, &intent(&root), &f.window);
+            let result =
+                consume_soroban_intent(&context, auth.into_signed(), &intent(&root), &f.window);
             if repair {
                 result.unwrap();
                 assert_eq!(f.wire()["authorizations"][0]["state"], "used");
@@ -2962,7 +2995,9 @@ mod tests {
         let server = f.server().await;
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let auth = resolved_intent(&f, &context, &root).await;
-        let receipt = consume_soroban_intent(&context, auth, &intent(&root), &f.window).unwrap();
+        let receipt =
+            consume_soroban_intent(&context, auth.into_signed(), &intent(&root), &f.window)
+                .unwrap();
         let (envelope, mut entries) = final_envelope(&f, &root);
         let TransactionEnvelope::Tx(mut tx) =
             TransactionEnvelope::from_xdr_base64(&envelope, Limits::none()).unwrap()
@@ -3086,7 +3121,7 @@ mod tests {
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let auth = resolved_intent(&f, &context, &root).await;
         let id = auth.id();
-        consume_soroban_intent(&context, auth, &intent(&root), &f.window).unwrap();
+        consume_soroban_intent(&context, auth.into_signed(), &intent(&root), &f.window).unwrap();
         let before = f.wire();
         assert_refused(
             invalidate_unconsumed(
@@ -3989,6 +4024,297 @@ mod tests {
         "third_host",
         Some(P::WitnessOracleUnbound)
     );
+
+    /// How the oracle of a below-threshold payment answers.
+    enum BelowThresholdOracle {
+        /// The oracle reports mainnet and answers `getLatestLedger` with this
+        /// ledger.
+        Ledger(u32),
+        /// The profile names no oracle.
+        Unconfigured,
+        /// The oracle reports the testnet passphrase and answers
+        /// `getLatestLedger` with the primary's ledger.
+        Testnet,
+    }
+
+    /// The methods `server` received, in order.
+    async fn received_methods(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| {
+                request.body_json::<serde_json::Value>().unwrap()["method"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// Runs the bound Soroban witness of the `soroban_witness_case` payment
+    /// with a value of 10 below the token's threshold of 1000. The primary
+    /// simulated at ledger 1000 and the signature expires at ledger 1060.
+    /// Returns the outcome with the methods the primary and the oracle
+    /// received.
+    async fn below_threshold_case(
+        oracle: BelowThresholdOracle,
+    ) -> (
+        Result<crate::cross_check::CrossCheckOutcome, stellar_agent_core::error::WalletError>,
+        Vec<String>,
+        Vec<String>,
+    ) {
+        use crate::cross_check::{
+            BoundSorobanInputs, SorobanWitnessInputs, obtain_soroban_witness_bound,
+        };
+        use stellar_agent_core::{
+            asset_id::CanonicalAsset,
+            cross_check::{
+                CrossCheckRequirement, CrossCheckValue, ThresholdSet, cross_check_requirement,
+            },
+            profile::caip2::{Caip2, MAINNET_PASSPHRASE, TESTNET_PASSPHRASE},
+        };
+        use stellar_agent_test_support::{EchoIdResponder, signed_envelope::get_network_result};
+        use wiremock::matchers::body_partial_json;
+        let token = token();
+        let f = ResolverFixture::configured(oracle_profile, |raw| {
+            raw.replace("stellar_pay", "stellar_x402_create_payment")
+                .replace("\"native\"", &format!("\"{token}\""))
+                .replace(
+                    "native = \"10000000000\"",
+                    &format!("\"{token}\" = \"1000\""),
+                )
+        });
+        let root = root(&f);
+        let primary_server = f.server().await;
+        let oracle_server = wiremock::MockServer::start().await;
+        let (passphrase, ledger) = match oracle {
+            BelowThresholdOracle::Ledger(ledger) => (MAINNET_PASSPHRASE, ledger),
+            BelowThresholdOracle::Unconfigured => (MAINNET_PASSPHRASE, 1000),
+            BelowThresholdOracle::Testnet => (TESTNET_PASSPHRASE, 1000),
+        };
+        wiremock::Mock::given(body_partial_json(
+            serde_json::json!({"method": "getNetwork"}),
+        ))
+        .respond_with(EchoIdResponder::new(get_network_result(passphrase)))
+        .mount(&oracle_server)
+        .await;
+        wiremock::Mock::given(body_partial_json(
+            serde_json::json!({"method": "getLatestLedger"}),
+        ))
+        .respond_with(EchoIdResponder::new(serde_json::json!({
+            "id": "0".repeat(64),
+            "protocolVersion": 23,
+            "sequence": ledger,
+        })))
+        .mount(&oracle_server)
+        .await;
+        let context = f.context_with_routes(&[
+            ("rpc.example.invalid", &primary_server.uri()),
+            ("oracle.example.invalid", &oracle_server.uri()),
+        ]);
+        let mut profile = f.profile.clone();
+        if matches!(oracle, BelowThresholdOracle::Unconfigured) {
+            profile.oracle_provider_url = None;
+            profile.providers.as_mut().unwrap().oracle = None;
+        } else {
+            profile.oracle_provider_url = Some("https://oracle.example.invalid".parse().unwrap());
+            profile.providers.as_mut().unwrap().oracle =
+                Some(stellar_agent_core::profile::schema::ProviderRecord::new(
+                    "oracle",
+                    "oracle.example.invalid",
+                    true,
+                ));
+        }
+        let (encoded, _) = final_envelope(&f, &root);
+        let envelope = TransactionEnvelope::from_xdr_base64(encoded, Limits::none()).unwrap();
+        let entry = SorobanAuthorizationEntry {
+            credentials: stellar_xdr::SorobanCredentials::Address(
+                stellar_xdr::SorobanAddressCredentials {
+                    address: ScAddress::Account(stellar_xdr::AccountId(
+                        stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(
+                            f.signer.public_key(),
+                        )),
+                    )),
+                    nonce: 7,
+                    signature_expiration_ledger: 0,
+                    signature: ScVal::Void,
+                },
+            ),
+            root_invocation: root.clone(),
+        };
+        let primary = serde_json::from_value(serde_json::json!({
+            "transactionData": "AAAA",
+            "minResourceFee": "1000",
+            "latestLedger": 1000,
+            "results": [{
+                "auth": [entry.to_xdr_base64(Limits::none()).unwrap()],
+                "xdr": ScVal::Void.to_xdr_base64(Limits::none()).unwrap(),
+            }],
+        }))
+        .unwrap();
+        let inputs = SorobanWitnessInputs {
+            envelope: &envelope,
+            primary: &primary,
+            expiration_ledger: 1060,
+            resource_fee_ceiling: 10_000_000,
+        };
+        let thresholds = ThresholdSet::from_profile_and_signed(
+            &profile,
+            f.policy.mainnet().unwrap().cross_check_thresholds.as_ref(),
+        );
+        let asset = CanonicalAsset::contract(&token).unwrap();
+        let value = CrossCheckValue::Amount {
+            asset: &asset,
+            base_units: 10,
+        };
+        assert_eq!(
+            cross_check_requirement(
+                Caip2::Mainnet,
+                value,
+                &thresholds,
+                profile.oracle_provider_url.is_some(),
+                false,
+            )
+            .unwrap(),
+            CrossCheckRequirement::NotRequired
+        );
+        let outcome = obtain_soroban_witness_bound(
+            &profile,
+            &context.network_context(),
+            value,
+            &thresholds,
+            &BoundSorobanInputs {
+                inputs: &inputs,
+                expected_root: &root,
+                payer: f.source.source(),
+            },
+            "stellar_x402_create_payment",
+        )
+        .await;
+        (
+            outcome,
+            received_methods(&primary_server).await,
+            received_methods(&oracle_server).await,
+        )
+    }
+
+    /// The `simulation.divergence` field of a refused below-threshold payment.
+    fn divergence_field(
+        outcome: Result<
+            crate::cross_check::CrossCheckOutcome,
+            stellar_agent_core::error::WalletError,
+        >,
+    ) -> stellar_agent_core::cross_check::WitnessField {
+        match outcome {
+            Err(stellar_agent_core::error::WalletError::Network(
+                stellar_agent_core::error::NetworkError::WitnessDivergence {
+                    entry: stellar_agent_core::cross_check::WitnessEntry::SorobanSimulation,
+                    field,
+                    sequence_delta: None,
+                },
+            )) => field,
+            other => panic!("expected a Soroban simulation divergence, got {other:?}"),
+        }
+    }
+
+    /// Below the threshold on mainnet the oracle answers its identity and its
+    /// latest ledger, and simulates nothing; a current ledger passes as
+    /// `NotRequired`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn below_threshold_mainnet_payment_reads_the_oracle_ledger() {
+        let (outcome, primary, oracle) =
+            below_threshold_case(BelowThresholdOracle::Ledger(1000)).await;
+        assert!(
+            matches!(
+                outcome,
+                Ok(crate::cross_check::CrossCheckOutcome::NotRequired)
+            ),
+            "{outcome:?}"
+        );
+        assert!(primary.is_empty(), "{primary:?}");
+        assert_eq!(oracle, ["getNetwork", "getLatestLedger"]);
+    }
+
+    /// An oracle three ledgers behind the primary's simulation cannot vouch
+    /// for it: a primary that inflates its ledger is refused before signing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn below_threshold_oracle_three_ledgers_behind_refuses() {
+        let (outcome, _, oracle) = below_threshold_case(BelowThresholdOracle::Ledger(997)).await;
+        assert_eq!(
+            divergence_field(outcome),
+            stellar_agent_core::cross_check::WitnessField::LedgerSkew
+        );
+        assert_eq!(oracle, ["getNetwork", "getLatestLedger"]);
+    }
+
+    /// An oracle already at the signature expiration ledger refuses.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn below_threshold_oracle_at_the_expiration_refuses() {
+        let (outcome, _, _) = below_threshold_case(BelowThresholdOracle::Ledger(1060)).await;
+        assert_eq!(
+            divergence_field(outcome),
+            stellar_agent_core::cross_check::WitnessField::Expiration
+        );
+    }
+
+    /// A mainnet profile without an oracle refuses a payment below the
+    /// threshold before any request, naming `oracle_provider_url`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn below_threshold_mainnet_without_an_oracle_refuses() {
+        let (outcome, primary, oracle) =
+            below_threshold_case(BelowThresholdOracle::Unconfigured).await;
+        let error = outcome.unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                stellar_agent_core::error::WalletError::Network(
+                    stellar_agent_core::error::NetworkError::WitnessUnavailable {
+                        reason:
+                            stellar_agent_core::error::WitnessUnavailableReason::OracleNotConfigured,
+                    }
+                )
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.code(), "network.witness_unavailable");
+        assert!(error.to_string().contains("oracle_provider_url"), "{error}");
+        assert!(primary.is_empty(), "{primary:?}");
+        assert!(oracle.is_empty(), "{oracle:?}");
+    }
+
+    /// An oracle that reports another network refuses at its identity check
+    /// and is never asked for its ledger.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn below_threshold_oracle_on_another_network_refuses() {
+        let (outcome, _, oracle) = below_threshold_case(BelowThresholdOracle::Testnet).await;
+        let error = outcome.unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                stellar_agent_core::error::WalletError::Network(
+                    stellar_agent_core::error::NetworkError::WitnessUnavailable {
+                        reason: stellar_agent_core::error::WitnessUnavailableReason::IdentityNetworkMismatch { .. },
+                    }
+                )
+            ),
+            "{error:?}"
+        );
+        assert!(
+            !oracle.iter().any(|method| method == "getLatestLedger"),
+            "{oracle:?}"
+        );
+        assert!(
+            oracle.iter().all(|method| method == "getNetwork"),
+            "{oracle:?}"
+        );
+    }
     #[tokio::test]
     #[serial_test::serial]
     async fn changed_audit_provenance_refuses_intent_consume() {
@@ -4005,7 +4331,7 @@ mod tests {
         assert!(poisoned.is_err());
         let before = f.wire();
         assert_refused(
-            consume_soroban_intent(&context, auth, &intent(&root), &f.window),
+            consume_soroban_intent(&context, auth.into_signed(), &intent(&root), &f.window),
             P::AuditProvenance,
             &f,
             &before,
@@ -4785,6 +5111,8 @@ mod tests {
         let mut req = SorobanIntentRequest {
             context: &context,
             intent: &intent,
+            nonce: INTENT_NONCE,
+            signature_expiration_ledger: INTENT_EXPIRATION_LEDGER,
             client: &client,
             probe_deadline: Duration::from_secs(1),
             witness: None,

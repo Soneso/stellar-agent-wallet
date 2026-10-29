@@ -422,11 +422,26 @@ pub(super) fn soroban_subject(
 /// The check runs first, so a mismatch refuses even where no comparison is
 /// required.
 ///
+/// On mainnet the oracle bounds the ledger of every payment. A payment whose
+/// value requires the witness has it from the oracle's simulation. A payment
+/// below its threshold has it from the oracle's latest ledger: the oracle
+/// answers the mainnet identity, then `getLatestLedger`, and its ledger must
+/// trail the primary's simulation ledger by at most two ledgers and lie
+/// before the signature expiration ledger. The outcome stays
+/// [`CrossCheckOutcome::NotRequired`]. A mainnet profile without
+/// `oracle_provider_url` refuses every payment, so a primary alone never
+/// decides the ledger a mainnet signature's window derives from. On testnet a
+/// payment below its threshold sends no oracle request.
+///
 /// # Errors
 ///
 /// `network.witness_unavailable` naming the part that does not match, and
 /// every refusal of [`SorobanCrossCheck::prepare`] and
-/// [`SorobanCrossCheck::witness`].
+/// [`SorobanCrossCheck::witness`]. On mainnet below the threshold:
+/// `network.witness_unavailable` with `OracleNotConfigured` when the profile
+/// names no oracle, `simulation.divergence` with `LedgerSkew` or `Expiration`
+/// when the oracle's ledger is out of bounds, and the oracle read's
+/// refusals.
 pub async fn obtain_soroban_witness_bound(
     profile: &Profile,
     context: &NetworkContext,
@@ -468,7 +483,13 @@ pub(crate) async fn obtain_soroban_witness_bound_with_timing(
         profile.oracle_provider_url.is_some(),
         false,
     )? {
-        CrossCheckRequirement::NotRequired => return Ok(CrossCheckOutcome::NotRequired),
+        CrossCheckRequirement::NotRequired => {
+            if context.chain_id.is_mainnet() {
+                let oracle = super::required_oracle(profile, context, tool)?;
+                super::oracle_ledger_bound(&oracle, context, bound.inputs, timing, tool).await?;
+            }
+            return Ok(CrossCheckOutcome::NotRequired);
+        }
         CrossCheckRequirement::Skipped(reason) => {
             warn_skipped(tool, reason);
             return Ok(CrossCheckOutcome::Skipped(reason));

@@ -211,6 +211,9 @@ ed25519-dalek              = { workspace = true }
 zeroize                    = { workspace = true }
 # x402 wire types + XDR decode in the testnet acceptance tests.
 stellar-agent-x402 = { path = "../stellar-agent-x402" }
+# Builds the authorization-entry preimages the mainnet signing-boundary tests
+# sign.
+stellar-agent-soroban-auth = { workspace = true }
 stellar-strkey             = { workspace = true }
 stellar-xdr                = { workspace = true }
 # SHA-256 for HashIdPreimage construction in the x402 / claim testnet

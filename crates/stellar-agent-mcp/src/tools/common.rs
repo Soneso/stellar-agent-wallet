@@ -5909,6 +5909,8 @@ pub(crate) mod tests {
             state_at_send: std::sync::Mutex<Vec<serde_json::Value>>,
             /// The ledger at each signed `simulateTransaction`.
             state_at_signed_simulation: std::sync::Mutex<Vec<serde_json::Value>>,
+            /// The envelope each signed `simulateTransaction` carried.
+            signed_simulations: std::sync::Mutex<Vec<String>>,
             /// Whether the authorized x402 row preceded each signed simulation.
             row_before_signed_simulation: std::sync::Mutex<Vec<bool>>,
             /// `getNetwork` reports testnet once the seed was read.
@@ -5929,6 +5931,9 @@ pub(crate) mod tests {
             pub resimulation_error: AtomicBool,
             /// The signed `simulateTransaction` answers another authorization.
             pub resimulation_other_auth: AtomicBool,
+            /// How many ledgers the `getLatestLedger` answer trails ledger
+            /// 100, the ledger of the double's other answers.
+            pub latest_ledger_behind: AtomicU32,
             /// Ledger entries that replace the fixture's.
             pub entries: std::sync::Mutex<Option<Vec<serde_json::Value>>>,
             /// Runs before each answer with the request method.
@@ -5957,7 +5962,39 @@ pub(crate) mod tests {
                 self.sent.lock().unwrap().clear();
                 self.state_at_send.lock().unwrap().clear();
                 self.state_at_signed_simulation.lock().unwrap().clear();
+                self.signed_simulations.lock().unwrap().clear();
                 self.row_before_signed_simulation.lock().unwrap().clear();
+            }
+
+            /// The signature expiration ledger of the one authorization entry
+            /// each signed `simulateTransaction` carried.
+            pub(crate) fn signed_expiration_ledgers(&self) -> Vec<u32> {
+                use stellar_xdr::{
+                    Limits, OperationBody, ReadXdr as _, SorobanCredentials, TransactionEnvelope,
+                };
+                self.signed_simulations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|envelope| {
+                        let TransactionEnvelope::Tx(envelope) =
+                            TransactionEnvelope::from_xdr_base64(envelope, Limits::none()).unwrap()
+                        else {
+                            panic!("transaction expected")
+                        };
+                        let OperationBody::InvokeHostFunction(op) = &envelope.tx.operations[0].body
+                        else {
+                            panic!("invocation expected")
+                        };
+                        let [entry] = op.auth.as_slice() else {
+                            panic!("one authorization entry expected")
+                        };
+                        let SorobanCredentials::Address(credentials) = &entry.credentials else {
+                            panic!("address credentials expected")
+                        };
+                        credentials.signature_expiration_ledger
+                    })
+                    .collect()
             }
 
             pub(crate) fn sent(&self) -> Vec<String> {
@@ -6014,6 +6051,11 @@ pub(crate) mod tests {
                         .lock()
                         .unwrap()
                         .push(self.state());
+                    self.control
+                        .signed_simulations
+                        .lock()
+                        .unwrap()
+                        .push(body["params"]["transaction"].as_str().unwrap().to_owned());
                     let row = std::fs::read_to_string(&self.audit_path)
                         .unwrap_or_default()
                         .lines()
@@ -6168,6 +6210,12 @@ pub(crate) mod tests {
                             .to_string()
                     })),
                     "simulateTransaction" => answer(self.simulate(&body)),
+                    "getLatestLedger" => answer(serde_json::json!({
+                        "id": "0".repeat(64),
+                        "protocolVersion": 23,
+                        "sequence": 100_u32
+                            .saturating_sub(self.control.latest_ledger_behind.load(Ordering::SeqCst)),
+                    })),
                     other => panic!("unexpected method {other}"),
                 }
             }
@@ -8298,6 +8346,73 @@ pub(crate) mod tests {
             assert_eq!(run.simulations(), 1, "no signed simulation");
         }
 
+        /// The `x402_payment_authorized` rows of the fixture's audit log.
+        pub(crate) fn x402_authorized_rows(f: &Fixture) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&f.server.security_profile().audit_log_path)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|row| row["kind"] == "x402_payment_authorized")
+                .collect()
+        }
+
+        /// Asserts that the reply `message` ends with the sentence naming the
+        /// signature expiration ledger of the one signed entry `control` saw,
+        /// and that the one `x402_payment_authorized` row records the same
+        /// ledger; returns it.
+        pub(crate) fn assert_names_the_transmitted_ledger(
+            f: &Fixture,
+            control: &RpcControl,
+            message: &str,
+        ) -> u32 {
+            let transmitted = control.signed_expiration_ledgers();
+            let [ledger] = transmitted.as_slice() else {
+                panic!("one signed simulation: {transmitted:?}")
+            };
+            let rows = x402_authorized_rows(f);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(
+                rows[0]["signature_expiration_ledger"], *ledger,
+                "the row names the ledger of the transmitted entry: {rows:?}"
+            );
+            assert!(
+                message.ends_with(&format!(
+                    "; the signed authorization may have reached the configured RPC and is \
+                     valid through ledger {ledger}"
+                )),
+                "the reply names the ledger of the transmitted entry: {message}"
+            );
+            *ledger
+        }
+
+        /// An accepted mainnet payment below the threshold records, in its
+        /// `x402_payment_authorized` row, the signature expiration ledger of
+        /// the signed entry the re-simulation carried, after the oracle's
+        /// identity and latest ledger bounded it.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn mainnet_x402_authorized_row_records_the_transmitted_expiration_ledger() {
+            let run = X402Run::new().await;
+            let result = run.pay().await;
+            assert_eq!(result["ok"], true, "{result}");
+            assert_eq!(
+                result["data"]["cross_check"]["status"], "not_required",
+                "{result}"
+            );
+            assert_eq!(run.control.count("getLatestLedger"), 1);
+            let transmitted = run.control.signed_expiration_ledgers();
+            let [ledger] = transmitted.as_slice() else {
+                panic!("one signed simulation: {transmitted:?}")
+            };
+            assert!(
+                *ledger > 100,
+                "the window starts after ledger 100: {ledger}"
+            );
+            let rows = x402_authorized_rows(&run.f);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["signature_expiration_ledger"], *ledger, "{rows:?}");
+        }
+
         /// A failure after the intent was consumed keeps it used, keeps its
         /// debit, and mints no child.
         #[tokio::test]
@@ -8317,13 +8432,12 @@ pub(crate) mod tests {
                 let result = run.pay().await;
                 assert_eq!(result["ok"], false, "{result}");
                 assert_eq!(result["error"]["code"], code, "{result}");
+                let message = result["error"]["message"].as_str().unwrap();
                 assert!(
-                    result["error"]["message"]
-                        .as_str()
-                        .unwrap()
-                        .starts_with("payment withheld after intent authorization"),
+                    message.starts_with("payment withheld after intent authorization"),
                     "{result}"
                 );
+                assert_names_the_transmitted_ledger(&run.f, &run.control, message);
                 assert!(result["data"].get("paymentSignature").is_none());
                 let records = authorizations(&run.f);
                 assert_eq!(records.len(), 1, "no child");
@@ -8391,13 +8505,12 @@ pub(crate) mod tests {
             let result = run.pay().await;
             drop(guard.lock().unwrap().take());
             assert_eq!(result["ok"], false, "{result}");
+            let message = result["error"]["message"].as_str().unwrap();
             assert!(
-                result["error"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("payment withheld at terminal approval"),
+                message.starts_with("payment withheld at terminal approval"),
                 "{result}"
             );
+            assert_names_the_transmitted_ledger(&run.f, &run.control, message);
             assert!(result["data"].get("paymentSignature").is_none());
             let records = authorizations(&run.f);
             assert_eq!(records.len(), 2);
@@ -8413,93 +8526,372 @@ pub(crate) mod tests {
             assert_eq!(rows[0]["failure_stage"], "terminal_approval");
         }
 
+        /// The proofs of an approved plain x402 payment of the fixture's
+        /// requirements, from the public producers over the fixture's state:
+        /// the operator attests the pending approval of the payment's root
+        /// invocation, and the tool's gate verifies it.
+        struct X402Approval<'a> {
+            guard: crate::server::MainnetWriteGuard<'a>,
+            approval: stellar_agent_core::approval::witness::ApprovalWitness,
+            signer: stellar_agent_network::keyring::EnrolledSigner,
+            handle: stellar_agent_network::keyring::KeyringSignHandle,
+            store: stellar_agent_network::policy_state::PersistedWindowStore,
+            root: stellar_xdr::SorobanAuthorizedInvocation,
+            network_id: [u8; 32],
+        }
+
+        impl<'a> X402Approval<'a> {
+            async fn new(f: &'a Fixture) -> Self {
+                use stellar_agent_core::approval::{PendingApproval, process_uid_for_attestation};
+                let requirements = f.requirements();
+                let root =
+                    stellar_agent_x402::exact::payment_root(&requirements, f.envelope.source())
+                        .unwrap();
+                let network_id =
+                    sha2::Sha256::digest(f.server.context.network_passphrase().as_bytes()).into();
+                let entry = PendingApproval::new_x402_pending(
+                    &network_id,
+                    &root,
+                    None,
+                    process_uid_for_attestation().unwrap(),
+                    600_000,
+                )
+                .unwrap();
+                let blob = f.attest(&entry);
+                let outcome = f
+                    .server
+                    .dispatch_preparation(
+                        "stellar_x402_create_payment",
+                        &serde_json::json!({"chain_id":"stellar:mainnet"}),
+                        "stellar:mainnet",
+                        stellar_agent_core::policy::v1::ValueClass::single(x402_value_leg(
+                            &requirements,
+                            10,
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                let outcome = f
+                    .server
+                    .force_mainnet_confirmation("stellar_x402_create_payment", outcome)
+                    .unwrap();
+                let digest =
+                    stellar_agent_x402::exact::intent_digest(&requirements, f.envelope.source())
+                        .unwrap();
+                let approval = verify_attestation_subject_gate(
+                    &f.server,
+                    &outcome,
+                    GatedApprovalKind::X402.expectation(
+                        stellar_agent_core::approval::subject::approval_subject_x402(&digest),
+                    ),
+                    Some(&entry.approval_nonce),
+                    Some(&blob),
+                    "stellar_x402_create_payment",
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let guard = f
+                    .server
+                    .mainnet_write_admission(
+                        stellar_agent_network::mainnet::MainnetConsumer::X402Create,
+                    )
+                    .unwrap();
+                let signer = f.server.mainnet_enrolled_signer(&guard).unwrap();
+                let handle = stellar_agent_network::keyring::lazy_signer_from_keyring(
+                    signer.seed_entry(),
+                    f.envelope.source(),
+                )
+                .unwrap();
+                let store = stellar_agent_network::policy_state::PersistedWindowStore::at_path(
+                    f.server.window_path.clone(),
+                );
+                Self {
+                    guard,
+                    approval,
+                    signer,
+                    handle,
+                    store,
+                    root,
+                    network_id,
+                }
+            }
+
+            /// A one-use audit readiness lease of the guard's profile.
+            fn audit(&self) -> stellar_agent_network::mainnet::audit_readiness::AuditReadiness {
+                stellar_agent_network::mainnet::audit_readiness::audit_readiness(
+                    self.guard.context.profile(),
+                    "operator",
+                )
+                .unwrap()
+            }
+
+            /// Resolves the payment's intent, through the public resolver,
+            /// for an authorization entry with `nonce` and
+            /// `signature_expiration_ledger`.
+            async fn resolve(
+                &self,
+                nonce: i64,
+                signature_expiration_ledger: u32,
+            ) -> stellar_agent_network::mainnet::authorization::MainnetSorobanIntentAuthorization
+            {
+                use stellar_agent_network::mainnet::resolve::{
+                    SorobanIntent, SorobanIntentRequest, resolve_soroban_intent,
+                };
+                let client = self.guard.context.primary_client().unwrap();
+                let intent = SorobanIntent {
+                    consumer: stellar_agent_network::mainnet::MainnetConsumer::X402Create,
+                    root_invocation: &self.root,
+                    network_id: self.network_id,
+                };
+                resolve_soroban_intent(SorobanIntentRequest {
+                    context: self.guard.context,
+                    intent: &intent,
+                    nonce,
+                    signature_expiration_ledger,
+                    client: &client,
+                    probe_deadline: std::time::Duration::from_secs(5),
+                    witness: None,
+                    signer: &self.signer,
+                    policy: self.guard.policy,
+                    enablement: self.guard.enablement,
+                    approval: &self.approval,
+                    audit: self.audit(),
+                    store: &self.store,
+                    authenticated: None,
+                })
+                .await
+                .unwrap()
+            }
+        }
+
+        /// A signer that counts every call before it delegates to the
+        /// keyring handle.
+        struct CountingSigner<'a> {
+            inner: &'a stellar_agent_network::keyring::KeyringSignHandle,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+
+        impl CountingSigner<'_> {
+            fn count(&self) {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl stellar_agent_network::signing::Signer for CountingSigner<'_> {
+            async fn sign_tx_payload(
+                &self,
+                payload: &[u8; 32],
+            ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+                self.count();
+                self.inner.sign_tx_payload(payload).await
+            }
+
+            async fn sign_auth_digest(
+                &self,
+                digest: &[u8; 32],
+            ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+                self.count();
+                self.inner.sign_auth_digest(digest).await
+            }
+
+            async fn sign_soroban_address_auth_payload(
+                &self,
+                payload: &[u8; 32],
+            ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+                self.count();
+                self.inner.sign_soroban_address_auth_payload(payload).await
+            }
+
+            async fn sign_webauthn_assertion(
+                &self,
+                auth_digest: &[u8; 32],
+                credential_id: &[u8],
+            ) -> Result<
+                stellar_agent_network::signing::WebAuthnAssertion,
+                stellar_agent_core::WalletError,
+            > {
+                self.count();
+                self.inner
+                    .sign_webauthn_assertion(auth_digest, credential_id)
+                    .await
+            }
+
+            async fn public_key(
+                &self,
+            ) -> Result<stellar_strkey::ed25519::PublicKey, stellar_agent_core::WalletError>
+            {
+                self.count();
+                stellar_agent_network::signing::Signer::public_key(self.inner).await
+            }
+        }
+
+        /// What one authorized entry signing under a resolved intent did.
+        struct IntentSigning {
+            result: Result<String, stellar_agent_sep43::Sep43Error>,
+            signer_calls: usize,
+            seed_reads: u32,
+            refusals: Vec<(String, String)>,
+        }
+
+        /// Resolves the fixture payment's intent for the entry fields
+        /// `bound`, then signs, through `sign_soroban_auth_entry_authorized`
+        /// with a counting signer, the preimage of the payment's root
+        /// invocation under the entry fields `signed`. Both pairs are a
+        /// nonce and a signature expiration ledger.
+        async fn sign_under_intent(bound: (i64, u32), signed: (i64, u32)) -> IntentSigning {
+            use stellar_agent_soroban_auth::{AuthCredentialsVersion, build_auth_preimage};
+            use stellar_xdr::{Limits, WriteXdr as _};
+            let rpc = wiremock::MockServer::start().await;
+            let f = routed_fixture(|raw| raw, &rpc);
+            let _control = mount_rpc(&f, &rpc).await;
+            let approved = X402Approval::new(&f).await;
+            let authorization = approved.resolve(bound.0, bound.1).await;
+            let payer =
+                stellar_strkey::ed25519::PublicKey::from_string(f.envelope.source()).unwrap();
+            let preimage = build_auth_preimage(
+                AuthCredentialsVersion::V1,
+                approved.network_id,
+                signed.0,
+                signed.1,
+                &stellar_xdr::ScAddress::Account(stellar_xdr::AccountId(
+                    stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(payer.0)),
+                )),
+                approved.root.clone(),
+            )
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+            let signer = CountingSigner {
+                inner: &approved.handle,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let (capture, _subscriber) =
+                stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
+            let result = stellar_agent_sep43::signing::sign_soroban_auth_entry_authorized(
+                &preimage,
+                &signer,
+                &payer,
+                stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
+                None,
+                stellar_agent_network::mainnet::MainnetConsumer::X402Create,
+                authorization,
+            )
+            .await
+            .map(|(signature, _signed)| signature);
+            IntentSigning {
+                result,
+                signer_calls: signer.calls.load(Ordering::SeqCst),
+                seed_reads: f.seed_reads.load(Ordering::SeqCst),
+                refusals: refusals(&capture),
+            }
+        }
+
+        /// The refusal lines of the authorized paths that `capture` saw, as
+        /// their path and precondition.
+        pub(crate) fn refusals(
+            capture: &stellar_agent_test_support::WarningCapture,
+        ) -> Vec<(String, String)> {
+            capture
+                .seen()
+                .into_iter()
+                .filter(|fields| {
+                    fields
+                        .get("message")
+                        .is_some_and(|message| message.contains("mainnet authorization refused"))
+                })
+                .map(|fields| {
+                    (
+                        fields["path"].trim_matches('"').to_owned(),
+                        fields["precondition"].trim_matches('"').to_owned(),
+                    )
+                })
+                .collect()
+        }
+
+        /// The nonce and signature expiration ledger an intent of the
+        /// signing-boundary tests is resolved for.
+        const BOUND_ENTRY: (i64, u32) = (4_242, 1_060);
+
+        /// Asserts that `signing` refused at `precondition` before the signer
+        /// was called or the seed read.
+        fn assert_refused_before_the_signer(signing: &IntentSigning, precondition: &str) {
+            assert!(
+                matches!(
+                    signing.result,
+                    Err(stellar_agent_sep43::Sep43Error::MainnetAuthorizationRefused)
+                ),
+                "{precondition}: {:?}",
+                signing.result
+            );
+            assert_eq!(
+                signing.refusals,
+                [(
+                    "sign_soroban_auth_entry_authorized".to_owned(),
+                    precondition.to_owned()
+                )]
+            );
+            assert_eq!(signing.signer_calls, 0, "{precondition}");
+            assert_eq!(signing.seed_reads, 0, "{precondition}");
+        }
+
+        /// The authorized signer signs the preimage under the nonce and the
+        /// signature expiration ledger the intent was resolved for.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn the_authorized_signer_signs_the_bound_entry() {
+            let signing = sign_under_intent(BOUND_ENTRY, BOUND_ENTRY).await;
+            signing
+                .result
+                .as_ref()
+                .unwrap_or_else(|error| panic!("the bound entry signs: {error:?}"));
+            assert!(signing.refusals.is_empty(), "{:?}", signing.refusals);
+            assert_eq!(signing.signer_calls, 2, "the key report and the signature");
+            assert_eq!(signing.seed_reads, 1);
+        }
+
+        /// The authorized signer refuses a preimage under another nonce than
+        /// the intent was resolved for, before the signer is called.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn the_authorized_signer_refuses_another_nonce() {
+            let signing = sign_under_intent(BOUND_ENTRY, (BOUND_ENTRY.0 + 1, BOUND_ENTRY.1)).await;
+            assert_refused_before_the_signer(&signing, "entry_nonce");
+        }
+
+        /// The authorized signer refuses a preimage under another signature
+        /// expiration ledger than the intent was resolved for, before the
+        /// signer is called.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn the_authorized_signer_refuses_another_expiration_ledger() {
+            let signing = sign_under_intent(BOUND_ENTRY, (BOUND_ENTRY.0, BOUND_ENTRY.1 + 1)).await;
+            assert_refused_before_the_signer(&signing, "entry_expiration");
+        }
+
         #[tokio::test]
         #[serial_test::serial(keyring)]
         async fn mainnet_x402_transmit_gate_invalidates_the_open_intent() {
-            use stellar_agent_core::approval::{PendingApproval, process_uid_for_attestation};
             use stellar_agent_network::mainnet::MainnetConsumer;
             use stellar_agent_x402::exact::{X402MainnetProofs, create_payment_authorized};
             let rpc = wiremock::MockServer::start().await;
             let f = routed_fixture(|raw| raw, &rpc);
             let control = mount_rpc(&f, &rpc).await;
             let requirements = f.requirements();
-            let root = stellar_agent_x402::exact::payment_root(&requirements, f.envelope.source())
-                .unwrap();
-            let network_id =
-                sha2::Sha256::digest(f.server.context.network_passphrase().as_bytes()).into();
-            let entry = PendingApproval::new_x402_pending(
-                &network_id,
-                &root,
-                None,
-                process_uid_for_attestation().unwrap(),
-                600_000,
-            )
-            .unwrap();
-            let blob = f.attest(&entry);
-            let outcome = f
-                .server
-                .dispatch_preparation(
-                    "stellar_x402_create_payment",
-                    &serde_json::json!({"chain_id":"stellar:mainnet"}),
-                    "stellar:mainnet",
-                    stellar_agent_core::policy::v1::ValueClass::single(x402_value_leg(
-                        &requirements,
-                        10,
-                    )),
-                )
-                .await
-                .unwrap();
-            let outcome = f
-                .server
-                .force_mainnet_confirmation("stellar_x402_create_payment", outcome)
-                .unwrap();
-            let digest =
-                stellar_agent_x402::exact::intent_digest(&requirements, f.envelope.source())
-                    .unwrap();
-            let approval = verify_attestation_subject_gate(
-                &f.server,
-                &outcome,
-                GatedApprovalKind::X402.expectation(
-                    stellar_agent_core::approval::subject::approval_subject_x402(&digest),
-                ),
-                Some(&entry.approval_nonce),
-                Some(&blob),
-                "stellar_x402_create_payment",
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            let guard = f
-                .server
-                .mainnet_write_admission(MainnetConsumer::X402Create)
-                .unwrap();
-            let signer = f.server.mainnet_enrolled_signer(&guard).unwrap();
-            let handle = stellar_agent_network::keyring::lazy_signer_from_keyring(
-                signer.seed_entry(),
-                f.envelope.source(),
-            )
-            .unwrap();
-            let audit = stellar_agent_network::mainnet::audit_readiness::audit_readiness(
-                guard.context.profile(),
-                "operator",
-            )
-            .unwrap();
-            let store = stellar_agent_network::policy_state::PersistedWindowStore::at_path(
-                f.server.window_path.clone(),
-            );
+            let approved = X402Approval::new(&f).await;
             let asset = x402_canonical_asset(&requirements).unwrap();
             let result = create_payment_authorized(
                 &requirements,
                 MainnetConsumer::X402Create,
                 X402MainnetProofs::new(
-                    guard.context,
-                    guard.policy,
-                    guard.enablement,
-                    &approval,
-                    &signer,
-                    &handle,
-                    audit,
-                    &store,
+                    approved.guard.context,
+                    approved.guard.policy,
+                    approved.guard.enablement,
+                    &approved.approval,
+                    &approved.signer,
+                    &approved.handle,
+                    approved.audit(),
+                    &approved.store,
                 ),
                 stellar_agent_core::cross_check::CrossCheckValue::Amount {
                     asset: &asset,

@@ -790,8 +790,16 @@ identity check, so a refusal there, or any later failure, keeps the admitted
 spend.
 
 Results include `cross_check`, and the `x402_payment_authorized` row carries a
-passed witness when the payment required one. Below the asset's threshold,
-the result reports `not_required`, with or without an oracle. On testnet, a
+passed witness when the payment required one. The row also records
+`signature_expiration_ledger`, the last ledger at which the signed
+authorization is valid. Below the asset's threshold, the result reports
+`not_required`. On mainnet the oracle still bounds the ledger of such a
+payment: it answers `getNetwork` and `getLatestLedger`, and its ledger must
+trail the primary's simulation by at most two ledgers and lie before the
+expiration ledger, or the payment refuses with `simulation.divergence`. A
+mainnet profile without `oracle_provider_url` refuses every x402 payment with
+`network.witness_unavailable` before the payer signs. On testnet, a payment
+below the threshold sends no oracle request, with or without an oracle, and a
 payment at or above the threshold without an oracle reports `skipped`.
 An asset without a threshold reports `skipped` on testnet, with or without
 an oracle.
@@ -861,10 +869,12 @@ Call 2 repeats the request with both approval arguments and runs these steps:
    The seed is read only at signing.
 7. The bound primary client is built. Its first request checks that the
    configured endpoint serves mainnet.
-8. The unsigned simulation, the required witness, and the health read run
-   before the payer signs.
-9. The payment intent authorization is minted, and the payer signs the
-   authorization entry.
+8. The unsigned simulation, the oracle check, and the health read run before
+   the payer signs. At or above the threshold the oracle simulates the
+   payment; below it the oracle answers its latest ledger.
+9. The payment intent authorization is minted over the invocation, the
+   entry's nonce, and its signature expiration ledger, and the payer signs
+   that one authorization entry.
 10. The `x402_payment_authorized` audit row is written and anchored.
 11. The payment intent is consumed, and the signed re-simulation follows.
 12. The release authorization is minted for the final envelope, and the payload
@@ -900,8 +910,18 @@ the mainnet authorization for this payment was refused; the payment payload was 
 
 A withheld payment payload does not establish that no signature exists. The
 configured RPC can already have received the signed authorization during
-re-simulation. A consumed payment intent retains its debit after a later
-failure. An open intent can be invalidated before consumption.
+re-simulation. Every mainnet x402 error reply after the transmit gate passes
+appends this sentence, where `<L>` is the `signature_expiration_ledger` of the
+audit row of step 10:
+
+```text
+; the signed authorization may have reached the configured RPC and is valid through ledger <L>
+```
+
+The authorization can still settle until ledger `L`, so a new payment for the
+same resource before then can pay twice. A consumed payment intent retains its
+debit after a later failure. An open intent can be invalidated before
+consumption.
 
 After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
 A live consumed approval returns `policy.approval_consumed`. Without its

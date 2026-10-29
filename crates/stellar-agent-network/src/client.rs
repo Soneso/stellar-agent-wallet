@@ -537,6 +537,23 @@ impl StellarRpcClient {
         Ok(response)
     }
 
+    /// Reads the endpoint's latest ledger and keeps the raw error, so the
+    /// cross-check witness classifies it as it classifies
+    /// [`Self::witness_simulate`]'s.
+    ///
+    /// The request is `getLatestLedger` with no parameters. Its `sequence`
+    /// bounds the ledger a payment's signature expiration derives from where
+    /// no oracle simulation runs.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the witness classifies the raw transport error before mapping it"
+    )]
+    pub(crate) async fn witness_latest_ledger(
+        &self,
+    ) -> Result<stellar_rpc_client::GetLatestLedgerResponse, stellar_rpc_client::Error> {
+        self.inner.get_latest_ledger().await
+    }
+
     /// Asks the endpoint what became of one transaction.
     ///
     /// Returns the `getTransaction` status string (`SUCCESS`, `FAILED`,

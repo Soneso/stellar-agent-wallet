@@ -50,7 +50,9 @@ use stellar_agent_core::error::{MAINNET_SIGNING_REFUSAL_DETAIL, WalletError};
 use stellar_agent_core::observability::redact::redact_strkey_first5_last5;
 use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 #[cfg(feature = "mainnet-write")]
-use stellar_agent_network::mainnet::authorization::MainnetSorobanIntentAuthorization;
+use stellar_agent_network::mainnet::authorization::{
+    MainnetSignedSorobanIntent, MainnetSorobanIntentAuthorization,
+};
 #[cfg(feature = "mainnet-write")]
 use stellar_agent_network::mainnet::soroban::check_preimage_against_authorization;
 #[cfg(feature = "mainnet-write")]
@@ -208,15 +210,23 @@ pub async fn sign_soroban_auth_entry(
 /// Signs a mainnet SEP-43 `signAuthEntry` request under a Soroban intent
 /// authorization.
 ///
+/// One authorization signs one preimage. The call takes `authorization` by
+/// value; it returns the signature with the [`MainnetSignedSorobanIntent`]
+/// that takes the authorization's place, and on a refusal the authorization
+/// is dropped. The preimage must carry the bound invocation, nonce, and
+/// signature expiration ledger, so the one signature covers exactly the
+/// approved entry.
+///
 /// The mainnet counterpart of [`sign_soroban_auth_entry`], with the same
-/// input, output, and preimage checks, in this order:
+/// input and preimage checks, in this order:
 ///
 /// 1. The checks 1 to 4 of [`sign_soroban_auth_entry`].
 /// 2. A type 10 preimage must be bound to the authorization's signer.
 /// 3. `expected_signer` must be the authorization's signer.
 /// 4. The preimage must be the one `authorization` covers, for `consumer`, on
-///    the mainnet clock: the chain, the consuming verb, the expiry, and the
-///    intent digest of the preimage's invocation, through
+///    the mainnet clock: the chain, the consuming verb, the expiry, the
+///    intent digest of the preimage's invocation, and the entry's nonce and
+///    signature expiration ledger, through
 ///    [`check_preimage_against_authorization`].
 /// 5. The signer's reported public key must be the authorization's agent
 ///    signer. This is the only step that calls the signer before it signs.
@@ -248,8 +258,8 @@ pub async fn sign_soroban_auth_entry_authorized(
     expected_network_passphrase: &str,
     network_passphrase_override: Option<&str>,
     consumer: MainnetConsumer,
-    authorization: &MainnetSorobanIntentAuthorization,
-) -> Result<String, Sep43Error> {
+    authorization: MainnetSorobanIntentAuthorization,
+) -> Result<(String, MainnetSignedSorobanIntent), Sep43Error> {
     const PATH: &str = "sign_soroban_auth_entry_authorized";
     let refuse = |error: MainnetAuthorizationError| wallet_error_to_sep43(error.report(PATH));
 
@@ -267,7 +277,7 @@ pub async fn sign_soroban_auth_entry_authorized(
     }
     let now_ms = stellar_agent_network::mainnet::clock::now_ms().map_err(wallet_error_to_sep43)?;
     check_preimage_against_authorization(
-        authorization,
+        &authorization,
         consumer,
         &received.preimage,
         &received.network_id,
@@ -290,7 +300,10 @@ pub async fn sign_soroban_auth_entry_authorized(
         )));
     }
 
-    Ok(base64::engine::general_purpose::STANDARD.encode(sig_bytes))
+    Ok((
+        base64::engine::general_purpose::STANDARD.encode(sig_bytes),
+        authorization.into_signed(),
+    ))
 }
 
 /// A received authorization-entry preimage that passed the input checks.

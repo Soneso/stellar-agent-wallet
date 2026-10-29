@@ -2941,6 +2941,11 @@ pub enum EventKind {
         /// Independent oracle witness, when a comparison is required.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         witness: Option<CrossCheckRecord>,
+        /// The last ledger at which the signed authorization is valid on
+        /// chain: the host accepts it through this ledger and refuses it
+        /// after. Absent in rows that do not record it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature_expiration_ledger: Option<u32>,
         /// The value legs the policy gate sized for this authorization. Each
         /// leg's `destination_redacted` identifies the redacted `pay_to`
         /// recipient; the leg `asset` is the SAC token contract (a non-secret
@@ -5666,6 +5671,7 @@ mod tests {
     fn event_kind_x402_payment_authorized_round_trip() {
         let ev = EventKind::X402PaymentAuthorized {
             witness: None,
+            signature_expiration_ledger: None,
             legs: vec![ValueLegRecord {
                 action: ValueActionKind::X402Payment,
                 amount: Some(2_500_000),
@@ -6153,6 +6159,7 @@ mod tests {
         fn x402_without_witness_serializes_unchanged() {
             let event = EventKind::X402PaymentAuthorized {
                 witness: None,
+                signature_expiration_ledger: None,
                 legs: vec![],
                 network: "stellar:testnet".into(),
                 scheme: "exact".into(),
@@ -6164,6 +6171,40 @@ mod tests {
                     "\"network\":\"stellar:testnet\",\"scheme\":\"exact\"}"
                 )
             );
+        }
+        #[test]
+        fn x402_with_the_expiration_ledger_round_trips() {
+            let event = EventKind::X402PaymentAuthorized {
+                witness: None,
+                signature_expiration_ledger: Some(1_060),
+                legs: vec![],
+                network: "stellar:mainnet".into(),
+                scheme: "exact".into(),
+            };
+            let text = serde_json::to_string(&event).unwrap();
+            assert_eq!(
+                text,
+                concat!(
+                    "{\"kind\":\"x402_payment_authorized\",",
+                    "\"signature_expiration_ledger\":1060,\"legs\":[],",
+                    "\"network\":\"stellar:mainnet\",\"scheme\":\"exact\"}"
+                )
+            );
+            let decoded: EventKind = serde_json::from_str(&text).unwrap();
+            assert_eq!(decoded, event);
+            let without: EventKind = serde_json::from_str(concat!(
+                "{\"kind\":\"x402_payment_authorized\",\"legs\":[],",
+                "\"network\":\"stellar:mainnet\",\"scheme\":\"exact\"}"
+            ))
+            .unwrap();
+            let EventKind::X402PaymentAuthorized {
+                signature_expiration_ledger,
+                ..
+            } = without
+            else {
+                panic!("wrong event kind");
+            };
+            assert_eq!(signature_expiration_ledger, None);
         }
         #[test]
         fn pending_submitted_and_x402_with_witness_round_trip() {
@@ -6179,6 +6220,7 @@ mod tests {
             };
             let x402 = EventKind::X402PaymentAuthorized {
                 witness: Some(soroban.clone()),
+                signature_expiration_ledger: None,
                 legs: vec![],
                 network: "stellar:testnet".into(),
                 scheme: "exact".into(),
@@ -6209,6 +6251,7 @@ mod tests {
                 },
                 EventKind::X402PaymentAuthorized {
                     witness: Some(witness.clone()),
+                    signature_expiration_ledger: None,
                     legs: vec![],
                     network: "stellar:testnet".into(),
                     scheme: "exact".into(),

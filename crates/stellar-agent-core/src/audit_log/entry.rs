@@ -2422,7 +2422,8 @@ impl AuditEntry {
     /// sized.
     /// `network` and `scheme` are non-secret settle identifiers; no signature,
     /// token, or secret is recorded. `policy_decision` carries the gate's
-    /// actual decision (`Allow` on this path).
+    /// actual decision (`Allow` on this path). `signature_expiration_ledger`
+    /// is the last ledger at which the signed authorization is valid on chain.
     #[must_use]
     #[allow(clippy::too_many_arguments, reason = "flat audit-field constructor")]
     pub fn new_x402_payment_authorized(
@@ -2434,6 +2435,7 @@ impl AuditEntry {
         policy_decision: PolicyDecision,
         request_id: impl Into<String>,
         witness: Option<super::schema::CrossCheckRecord>,
+        signature_expiration_ledger: Option<u32>,
     ) -> Self {
         Self {
             ts: current_iso8601_utc(),
@@ -2452,6 +2454,7 @@ impl AuditEntry {
             // hash-chained rows.
             event_kind: EventKind::X402PaymentAuthorized {
                 witness,
+                signature_expiration_ledger,
                 legs,
                 network: super::schema::bound_recorded_str(&network.into()),
                 scheme: super::schema::bound_recorded_str(&scheme.into()),
@@ -7667,6 +7670,7 @@ mod tests {
             oversized,
             crate::audit_log::schema::PolicyDecision::Allow,
             "req-1",
+            None,
             None,
         );
         let EventKind::X402PaymentAuthorized {

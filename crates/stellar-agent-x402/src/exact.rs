@@ -65,6 +65,12 @@
 //! expiration derives from is current. The oracle's answer is never signed and
 //! never replaces the primary's; the payload carries the primary's nonce and
 //! resource data.
+//!
+//! On mainnet the oracle checks that ledger for every payment. Below the
+//! threshold it answers `getLatestLedger` and simulates nothing, and its
+//! ledger meets the same two bounds; a mainnet profile without an oracle
+//! refuses the payment before anything is signed. On testnet the ledger is
+//! shown current only when a witness is required.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -666,9 +672,11 @@ impl Drop for OpenAuthorization<'_> {
 /// The ledger checks of steps 5 and 8 compare answers of `client`'s endpoint
 /// with each other. They tolerate one ledger of skew between load-balanced
 /// backends and bound the signed window at 60 ledger advances plus that skew.
-/// The cross-check witness of step 5 compares the first answer's ledger with
-/// the oracle's, which establishes that it is current when a witness is
-/// required.
+/// Step 5 also compares the first answer's ledger with the oracle's, which
+/// establishes that it is current. On mainnet this holds for every payment:
+/// at or above the threshold the oracle's simulation carries the ledger, and
+/// below it the oracle's latest-ledger read does. On testnet the comparison
+/// runs only when a witness is required.
 ///
 /// The health read keeps the absolute `identity_deadline`, so a witness that
 /// runs past it refuses at the health read, before anything is signed.
@@ -1037,6 +1045,8 @@ async fn create_payment_inner(
         let authorization = resolve_soroban_intent(SorobanIntentRequest {
             context: proofs.context,
             intent: &intent,
+            nonce: payer_credentials.nonce,
+            signature_expiration_ledger,
             client,
             probe_deadline: identity_deadline.saturating_duration_since(Instant::now()),
             witness: cross_check.witness(),
@@ -1059,8 +1069,12 @@ async fn create_payment_inner(
     } else {
         None
     };
+    // The authorization moves into the signing and comes back as the signed
+    // intent, the only value the consumption below accepts.
     #[cfg(feature = "mainnet-write")]
-    let signature = if let Some(authorization) = &authorization {
+    let mut signed_intent = None;
+    #[cfg(feature = "mainnet-write")]
+    let signature = if let Some(authorization) = authorization {
         stellar_agent_sep43::signing::sign_soroban_auth_entry_authorized(
             &preimage_xdr,
             signer,
@@ -1071,6 +1085,10 @@ async fn create_payment_inner(
             authorization,
         )
         .await
+        .map(|(signature, signed)| {
+            signed_intent = Some(signed);
+            signature
+        })
     } else {
         sign_soroban_auth_entry(&preimage_xdr, signer, &payer_key, network_passphrase, None).await
     };
@@ -1171,7 +1189,7 @@ async fn create_payment_inner(
     })?;
 
     #[cfg(feature = "mainnet-write")]
-    let receipt = if let Some(authorization) = authorization {
+    let receipt = if let Some(signed) = signed_intent {
         let (proofs, _, _) = mainnet
             .as_ref()
             .ok_or_else(|| X402Error::TransactionBuildFailed {
@@ -1180,7 +1198,7 @@ async fn create_payment_inner(
         if let Some(open) = &mut open_intent {
             open.point = FailurePoint::IntentConsume;
         }
-        let receipt = consume_soroban_intent(proofs.context, authorization, &intent, proofs.store)?;
+        let receipt = consume_soroban_intent(proofs.context, signed, &intent, proofs.store)?;
         if let Some(open) = &mut open_intent {
             open.point = FailurePoint::IntentUsed;
         }
