@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify the version line and the embedded feature marker of a release binary.
+# Verify the version line, feature marker, and absence of test overrides.
 set -euo pipefail
 if [ "$#" -ne 2 ] || { [ "$2" != on ] && [ "$2" != off ]; }; then
   echo 'usage: check-binary-marker.sh <binary> <on|off>' >&2
@@ -24,4 +24,10 @@ if ! LC_ALL=C grep -aFq "$prefix$expected" "$binary"; then
   echo 'marker: expected literal is absent' >&2
   exit 1
 fi
+for literal in STELLAR_AGENT_HOME STELLAR_AGENT_TEST_; do
+  if LC_ALL=C grep -aFq "$literal" "$binary"; then
+    echo "marker: test override literal $literal is embedded" >&2
+    exit 1
+  fi
+done
 printf 'marker: %s is %s\n' "$binary" "$expected"

@@ -2,7 +2,8 @@
 """Synthetic Cargo fixtures and isolated rule regressions.
 
 Every rule has a regression: a fixture that violates that rule alone,
-which the rule must reject. A clean synthetic workspace passes D1 to D4,
+which the rule must reject. A clean synthetic workspace passes D1 to D4
+and D13,
 and the copied live inputs pass D5 to D12 before each edit. Named unit
 cases pin the command scanner, the translation, the Rust lexer and each
 refusal branch; --case runs one of them, or units, graphs or a rule.
@@ -34,7 +35,7 @@ ROOT = HERE.parent.parent
 RULE_INPUTS = {'D5': (), 'D6': ('Cross.toml',), 'D7': (),
                'D8': ('docs/maintainers/building.md',), 'D9': (),
                'D10': ('docs/maintainers/building.md',), 'D11': (),
-               'D12': ('crates',)}
+               'D12': ('crates',), 'D13': ()}
 # Violating variants per rule. D1 has a core forward missing from network's
 # declaration, a sep10 forward missing from x402-identity's, an x402-identity
 # forward missing from mcp's, and an x402-identity test-helpers feature that
@@ -44,7 +45,7 @@ RULE_INPUTS = {'D5': (), 'D6': ('Cross.toml',), 'D7': (),
 # on graph of cli and mcp whose declaration does not forward to it. D7 has
 # the workflow env map, an echo that appends a lower-case refused name to
 # the environment file and a lower-case PowerShell assignment.
-VARIANTS = {'D1': 4, 'D2': 2, 'D3': 2, 'D7': 3}
+VARIANTS = {'D1': 4, 'D2': 2, 'D3': 2, 'D7': 3, 'D13': 6}
 # The normal dependencies of each synthetic workspace member, in the order
 # its mainnet-write declaration forwards to them; other declares no feature.
 FIXTURE_DEPENDENCIES = {
@@ -184,7 +185,38 @@ def live_root(rule, root):
 
 
 def rule_fixture(m, rule, directory, variant=0):
-    if rule in ('D1', 'D2', 'D3', 'D4'):
+    if rule == 'D13':
+        root = directory / rule
+        def setup(r):
+            replace(r, 'core/Cargo.toml', 'default=[]', 'default=[]\ntest-helpers=[]')
+            replace(r, 'other/Cargo.toml', 'default=[]', 'default=[]\ntest-helpers=[]')
+            replace(r, 'Cargo.toml', 'members=[', 'members=["test-support",')
+            (r / 'test-support/src').mkdir(parents=True)
+            (r / 'test-support/src/lib.rs').write_text('pub fn sample() {}\n')
+            (r / 'test-support/Cargo.toml').write_text(
+                '[package]\nname="stellar-agent-test-support"\nversion="0.0.0"\nedition="2024"\n')
+        workspace(root, setup)
+        c = m.Checker(root)
+        c.D13()
+        assert not c.errors, f'D13: baseline rejected: {c.errors}'
+        manifest = 'other/Cargo.toml'
+        if variant == 0:
+            replace(root, manifest, 'default=[]', 'default=["test-helpers"]')
+        elif variant in (1, 2):
+            kind = '[build-dependencies]\n' if variant == 2 else ''
+            append(root, manifest, kind + 'stellar-agent-core={path="../core",features=["test-helpers"]}\n')
+        elif variant == 3:
+            replace(root, manifest, 'default=[]', 'default=[]\nunclassified=[]')
+        elif variant == 4:
+            append(root, manifest, 'stellar-agent-test-support={path="../test-support"}\n')
+        else:
+            replace(root, manifest, 'default=[]', 'default=["dep:stellar-agent-test-support"]')
+            append(root, manifest, 'stellar-agent-test-support={path="../test-support",optional=true}\n')
+        c = m.Checker(root)
+        for other in ('D1', 'D2', 'D4'):
+            getattr(c, other)()
+        assert not c.errors, f'D13: another rule rejects the fixture: {c.errors}'
+    elif rule in ('D1', 'D2', 'D3', 'D4'):
         root = directory / rule
         def mutate(r):
             if rule == 'D1' and variant == 0:
@@ -713,6 +745,31 @@ def case_guard_root(m, tmp, checker):
         f'guard-root: the guard ignored the named checkout: {result.returncode} {result.stderr}'
 
 
+@unit('test-feature-topology')
+def case_test_feature_topology(m, tmp, checker):
+    dependency = {'name': 'stellar-agent-test-support', 'rename': 'support',
+                  'features': ['test-helpers'], 'uses_default_features': False,
+                  'kind': None, 'optional': True}
+    package = {'features': {'default': [], 'test-helpers': ['dep:support']},
+               'dependencies': [dependency]}
+    c = bare_checker(m, packages={'fixture': package})
+    c.D13()
+    assert not c.errors, f'test-only optional dependency rejected: {c.errors}'
+    for edge in ('dep:support', 'support/test-helpers', 'support/default'):
+        package['features']['default'] = [edge]
+        c.errors = []
+        c.D13()
+        assert c.errors == ['D13: fixture/default reaches a test feature or package'], (edge, c.errors)
+    dependency['name'] = 'stellar-agent-smart-account-acceptance'
+    package['features']['default'] = ['dep:support']
+    c.errors = []
+    c.D13()
+    assert c.errors == ['D13: fixture/default reaches a test feature or package'], c.errors
+    dependency['name'] = 'member'
+    c.packages['member'] = {'features': {'default': ['test-hooks'], 'test-hooks': []}, 'dependencies': []}
+    assert c.reaches('fixture', 'default', set(m.TEST_FEATURES)), 'transitive dependency default missed'
+
+
 @unit('topology')
 def case_topology(m, tmp, checker):
     c = bare_checker(m)
@@ -723,12 +780,12 @@ def case_topology(m, tmp, checker):
                                          'weak': ['renamed?/alias'], 'dep': ['dep:renamed']},
                             'dependencies': [dependency]}}
     for feature in ('local', 'weak', 'dep'):
-        assert c.reaches('other', feature), f'topology-{feature}: activation missed'
-    assert c.dependency_reaches(dependency), 'topology-default: activation missed'
+        assert c.reaches('other', feature, {m.FEATURE}), f'topology-{feature}: activation missed'
+    assert c.dependency_reaches(dependency, {m.FEATURE}), 'topology-default: activation missed'
     dependency['uses_default_features'] = False
-    assert not c.dependency_reaches(dependency), 'topology-default-disabled'
+    assert not c.dependency_reaches(dependency, {m.FEATURE}), 'topology-default-disabled'
     dependency['features'] = ['alias']
-    assert c.dependency_reaches(dependency), 'topology-dependency-features'
+    assert c.dependency_reaches(dependency, {m.FEATURE}), 'topology-dependency-features'
     for kind in ('dev', 'build'):
         for target in (None, 'cfg(windows)'):
             c.errors = []
@@ -1268,7 +1325,7 @@ def main():
     parser.add_argument('--case')
     parser.add_argument('--checker', type=pathlib.Path, default=HERE / 'check-feature-discipline.py')
     args = parser.parse_args()
-    rules = [f'D{i}' for i in range(1, 13)]
+    rules = [f'D{i}' for i in range(1, 14)]
     if args.case and args.case not in (*UNITS, *GRAPHS, *rules, 'units', 'graphs'):
         print(f'FAIL unknown case {args.case}', file=sys.stderr)
         return 2

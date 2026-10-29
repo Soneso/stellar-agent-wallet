@@ -59,6 +59,9 @@ Rules:
       except default and mainnet-write
   D11 the release, publish and rehearsal workflows expect the marker off
   D12 the marker literal appears in crates/ only in core's two cfg arms
+  D13 every declared feature is classified as product or test; product
+      features reach no test features or optional test packages, and no
+      non-optional normal or build dependency enables either
 """
 import argparse
 import ast
@@ -74,6 +77,11 @@ import sys
 import tomllib
 
 FEATURE = 'mainnet-write'
+TEST_FEATURES = ('test-helpers', 'test-hooks', 'test-loopback', 'testnet-acceptance',
+                 'testnet-helpers', 'testnet-integration', 'wiremock-helpers',
+                 'verifier-registry', 'operator-enroll-browser-acceptance')
+PRODUCT_FEATURES = ('default', 'mainnet-write', 'deploy-cli')
+TEST_PACKAGES = ('stellar-agent-test-support', 'stellar-agent-smart-account-acceptance')
 ALL_FEATURES = '--all-' + 'features'
 MARKER = 'STELLAR_AGENT_BUILD_' + 'MAINNET_WRITE='
 PACKAGES = tuple('stellar-agent-' + name for name in (
@@ -929,13 +937,13 @@ class Checker:
     def fail(self, rule, message):
         self.errors.append(f'{rule}: {message}')
 
-    def reaches(self, package, feature, seen=None):
+    def reaches(self, package, feature, targets, seen=None, test_packages=()):
         seen = set() if seen is None else seen
         key = (package, feature)
         if key in seen:
             return False
         seen.add(key)
-        if feature == FEATURE:
+        if feature in targets:
             return True
         data = self.packages.get(package)
         if not data:
@@ -945,21 +953,27 @@ class Checker:
                 dependency, child = edge.split('/', 1)
                 dependency = dependency.rstrip('?')
                 for dep in data['dependencies']:
-                    if (dep.get('rename') or dep['name']) == dependency and self.reaches(dep['name'], child, seen):
+                    if (dep.get('rename') or dep['name']) != dependency:
+                        continue
+                    if self.reaches(dep['name'], child, targets, seen, test_packages):
+                        return True
+                    if '?' not in edge and dep.get('optional') and self.dependency_reaches(dep, targets, seen, test_packages):
                         return True
             elif edge.startswith('dep:'):
                 for dep in data['dependencies']:
-                    if (dep.get('rename') or dep['name']) == edge[4:] and self.dependency_reaches(dep, seen):
+                    if (dep.get('rename') or dep['name']) == edge[4:] and self.dependency_reaches(dep, targets, seen, test_packages):
                         return True
-            elif self.reaches(package, edge, seen):
+            elif self.reaches(package, edge, targets, seen, test_packages):
                 return True
         return False
 
-    def dependency_reaches(self, dependency, seen=None):
+    def dependency_reaches(self, dependency, targets, seen=None, test_packages=()):
+        if dependency['name'] in test_packages:
+            return True
         features = list(dependency['features'])
         if dependency['uses_default_features']:
             features.append('default')
-        return any(self.reaches(dependency['name'], feature, seen) for feature in features)
+        return any(self.reaches(dependency['name'], feature, targets, seen, test_packages) for feature in features)
 
     def D1(self):
         """The pinned declarations hold; nothing else reaches the feature."""
@@ -970,17 +984,17 @@ class Checker:
             for feature in package['features']:
                 if feature == FEATURE and name in DECLARATIONS:
                     continue
-                if self.reaches(name, feature):
+                if self.reaches(name, feature, {FEATURE}):
                     self.fail('D1', f'{name}/{feature} reaches {FEATURE}')
             for dependency in package['dependencies']:
-                if dependency['kind'] is None and self.dependency_reaches(dependency):
+                if dependency['kind'] is None and self.dependency_reaches(dependency, {FEATURE}):
                     self.fail('D1', f'{name}: normal dependency {dependency["name"]} enables {FEATURE}')
 
     def D2(self):
         """No dev or build dependency declaration reaches the feature."""
         for name, package in self.packages.items():
             for dependency in package['dependencies']:
-                if dependency['kind'] in ('dev', 'build') and self.dependency_reaches(dependency):
+                if dependency['kind'] in ('dev', 'build') and self.dependency_reaches(dependency, {FEATURE}):
                     self.fail('D2', f'{name}: {dependency["kind"]} dependency enables {FEATURE}')
 
     def D3(self):
@@ -1227,9 +1241,23 @@ class Checker:
             if count != expected:
                 self.fail('D12', f'{path.relative_to(self.root)}: {count} marker literals, expected {expected}')
 
+    def D13(self):
+        """Product features and dependencies activate no test-only code."""
+        tests, products = set(TEST_FEATURES), set(PRODUCT_FEATURES)
+        for name, package in self.packages.items():
+            for feature in package['features']:
+                if (feature in tests) == (feature in products):
+                    self.fail('D13', f'{name}/{feature} must be classified exactly once')
+                if feature in products and self.reaches(name, feature, tests, test_packages=TEST_PACKAGES):
+                    self.fail('D13', f'{name}/{feature} reaches a test feature or package')
+            for dependency in package['dependencies']:
+                if dependency['kind'] in (None, 'build') and not dependency['optional'] and self.dependency_reaches(
+                        dependency, tests, test_packages=TEST_PACKAGES):
+                    self.fail('D13', f'{name}: {dependency["kind"] or "normal"} dependency {dependency["name"]} enables test code')
+
     def run(self):
         self.workflows, self.scripts = workflow_inputs(self.root)
-        for number in range(1, 13):
+        for number in range(1, 14):
             rule = f'D{number}'
             try:
                 getattr(self, rule)()

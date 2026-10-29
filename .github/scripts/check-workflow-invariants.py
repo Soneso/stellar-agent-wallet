@@ -6,7 +6,8 @@ Usage: ``check-workflow-invariants.py [repository-root]``
 
 Reads ``release.yml``, ``publish.yml``, ``notarize-smoke.yml``, ``labels.yml``,
 ``stale.yml``, ``triage.yml``, ``triage-review.yml``, ``triage-sweep.yml``,
-``welcome.yml``, ``coverage.yml``, ``release-rehearsal.yml``, and ``ci.yml``
+``welcome.yml``, ``coverage.yml``, ``release-rehearsal.yml``, ``ci.yml``,
+and ``vendored-wasm.yml``
 under ``.github/workflows/``.
 Also reads the composite action
 ``.github/actions/macos-sign-notarize/action.yml``, the shared build script
@@ -145,10 +146,29 @@ runs the function.
   not run on ``${{ matrix.os }}``, the archive check does not take
   ``TARGET`` from ``${{ matrix.target }}``, or the job's first step is not
   the Rosetta check of the Intel macOS target.
-- ``release-toolchain``: ``RELEASE_TOOLCHAIN`` of ``release-rehearsal.yml``
-  differs from that of ``publish.yml``, or ``verify-crates`` does not
-  install it, does not pin ``RUSTUP_TOOLCHAIN`` to it, or pins it outside
-  the steps between the install and the packaging.
+- ``release-cache``: a job of ``release.yml`` or ``release-rehearsal.yml``
+  uses ``Swatinem/rust-cache``, ``actions/cache``, or a sub-action of either,
+  in any letter case, or passes a ``cache`` input to an ``actions/setup-*``
+  action.
+- ``release-wasm-gate``: the release lacks an unconditional local
+  ``vendored-wasm`` workflow call without inputs or secrets, or ``hashes``
+  or ``publish`` does not need it, so signing, provenance, and publication
+  wait for the rebuild. The called workflow must declare ``workflow_call``.
+  Its cache guards must lead with ``github.ref_type != 'tag'``; its rebuild
+  must read both stellar-cli artifacts of its own run and use no cache. No
+  job or step of it sets ``continue-on-error``, and no step of ``check``,
+  ``rebuild``, or ``vendored-wasm`` suppresses a failure as for
+  ``release-check-unconditional``. ``rebuild`` runs exactly on
+  ``needs.check.outputs.rebuild == 'true'`` and its full-mode step
+  unconditionally. The ``vendored-wasm`` job runs on ``always()``, needs
+  exactly ``WASM_GATE_NEEDS``, and has one unconditional gate step that runs
+  ``WASM_GATE_CALL`` with ``WASM_GATE_ENV``.
+- ``release-publish-sums``: ``publish`` does not run the archive checksum
+  check unconditionally before the GitHub Release action.
+- ``release-toolchain``: ``RELEASE_TOOLCHAIN`` of ``release.yml`` or
+  ``release-rehearsal.yml`` differs from that of ``publish.yml``, or either
+  build job or the rehearsal's ``verify-crates`` does not install it and pin
+  ``RUSTUP_TOOLCHAIN`` between the install and the build or packaging.
 - ``ci-feature-jobs``: a job of ``CI_FEATURE_JOBS`` is missing, it or one of
   its steps sets ``if`` or ``continue-on-error``, or it does not run each of
   its commands unconditionally; or ``check-host.sh`` does not run each
@@ -168,7 +188,28 @@ except ImportError:
 
 WORKFLOWS = ("release.yml", "publish.yml", "notarize-smoke.yml", "labels.yml", "stale.yml", "triage.yml",
              "triage-review.yml", "triage-sweep.yml", "welcome.yml", "coverage.yml", "release-rehearsal.yml",
-             "ci.yml")
+             "ci.yml", "vendored-wasm.yml")
+# GitHub resolves action names in any letter case.
+CACHE_ACTION = re.compile(r"(Swatinem/rust-cache|actions/cache)(/[\w.-]+)*@", re.IGNORECASE)
+SETUP_ACTION = re.compile(r"actions/setup-[\w.-]+@", re.IGNORECASE)
+# The jobs of vendored-wasm.yml whose results the gate job reads, the gate
+# command, and the environment it reads them from. A tag run passes the gate
+# only after a rebuild, so the release's dependents wait for one.
+WASM_GATE_NEEDS = ["check", "rebuild", "stellar-cli-25", "stellar-cli-28"]
+WASM_GATE_CALL = ('bash .github/scripts/rebuild-vendored-wasm.sh --gate "$CHECK" "$REBUILD" "$CLI25" "$CLI28" '
+                  '"$REBUILD_JOB" "$REF_TYPE"')
+WASM_GATE_ENV = {
+    "CHECK": "${{ needs.check.result }}",
+    "REBUILD": "${{ needs.check.outputs.rebuild }}",
+    "CLI25": "${{ needs.stellar-cli-25.result }}",
+    "CLI28": "${{ needs.stellar-cli-28.result }}",
+    "REBUILD_JOB": "${{ needs.rebuild.result }}",
+    "REF_TYPE": "${{ github.ref_type }}",
+}
+WASM_REBUILD_CONDITION = "needs.check.outputs.rebuild == 'true'"
+WASM_FULL_MODE = "rebuild-vendored-wasm.sh --repo-root"
+# Inputs that make actions/download-artifact read another run or repository.
+FOREIGN_ARTIFACT_INPUTS = ("run-id", "github-token", "repository")
 COMPOSITE = pathlib.PurePosixPath(".github/actions/macos-sign-notarize")
 SIGNING_JOBS = {("release.yml", "sign-macos"), ("notarize-smoke.yml", "sign")}
 TOOLCHAIN_ALLOWED = {("publish.yml", "publish")}
@@ -409,6 +450,20 @@ class Checker:
         return run is not None and any(text in line for line in self.logical_lines(run))
 
     @staticmethod
+    def unwrap_expression(value):
+        """A condition's text without surrounding blanks and one enclosing ${{ }}."""
+        text = str(value).strip()
+        if text.startswith("${{") and text.endswith("}}"):
+            text = text[3:-2].strip()
+        return text
+
+    def suppresses(self, step):
+        """Whether a step's run: block turns off errexit or ends a line with
+        an operator whose right side succeeds."""
+        run = self.run_text(step)
+        return bool(ERREXIT_OFF.search(run)) or any(SUPPRESSION.search(line) for line in self.logical_lines(run))
+
+    @staticmethod
     def may_skip(step):
         """Whether the runner can skip a step, or the step can fail without failing its job."""
         return "if" in step or "continue-on-error" in step
@@ -446,7 +501,7 @@ class Checker:
                 self.report(where, "cred-compile", f"names {relative}, which does not exist")
 
     def check_step_uses(self, where, uses, workflow, job_id):
-        if re.match(r"(Swatinem/rust-cache|actions/cache)(/[\w.-]+)*@", uses):
+        if CACHE_ACTION.match(uses):
             self.report(where, "cred-compile", f"uses {uses}")
         if re.search(r"rust-toolchain@", uses) and (workflow, job_id) not in TOOLCHAIN_ALLOWED:
             self.report(where, "cred-toolchain", f"installs a Rust toolchain ({uses})")
@@ -667,9 +722,7 @@ class Checker:
         job = jobs["coverage"]
         condition = job.get("if") if isinstance(job, dict) else None
         if isinstance(condition, str):
-            condition = condition.strip()
-            if condition.startswith("${{") and condition.endswith("}}"):
-                condition = condition[3:-2].strip()
+            condition = self.unwrap_expression(condition)
         if condition != COVERAGE_CONDITION:
             self.report(workflow, "coverage-condition", "coverage job runs without the label condition")
 
@@ -931,8 +984,7 @@ class Checker:
                     rosetta = step.get("run") == ROSETTA["run"] and step.get("if") == ROSETTA["if"]
                     if "continue-on-error" in step or ("if" in step and not rosetta):
                         self.report(workflow, "release-check-unconditional", f"{name} step can be bypassed")
-                    run = self.run_text(step)
-                    if ERREXIT_OFF.search(run) or any(SUPPRESSION.search(line) for line in self.logical_lines(run)):
+                    if self.suppresses(step):
                         self.report(workflow, "release-check-unconditional", f"{name} suppresses failures")
 
     def check_verification_credentials(self):
@@ -975,26 +1027,126 @@ class Checker:
             if steps[0].get("run") != ROSETTA["run"] or steps[0].get("if") != ROSETTA["if"]:
                 self.report(workflow, "release-verify-matrix", "the first verify-packaged step is not the Rosetta check")
 
+    def check_release_cache(self):
+        for workflow in ("release.yml", REHEARSAL_WORKFLOW):
+            for name, job in (self.docs.get(workflow, {}).get("jobs") or {}).items():
+                for step in job.get("steps", []):
+                    uses = step.get("uses") or ""
+                    if CACHE_ACTION.match(uses):
+                        self.report(f"{workflow}:{name}", "release-cache", f"uses {uses}")
+                    inputs = step.get("with") or {}
+                    if SETUP_ACTION.match(uses) and any(str(key).lower() == "cache" for key in inputs):
+                        self.report(f"{workflow}:{name}", "release-cache", f"passes a cache input to {uses}")
+
+    def check_release_wasm_gate(self):
+        rule = "release-wasm-gate"
+        job = self.job("release.yml", "vendored-wasm") or {}
+        if job.get("uses") != "./.github/workflows/vendored-wasm.yml" or any(
+                key in job for key in ("if", "with", "secrets", "continue-on-error")):
+            self.report("release.yml", rule, "vendored-wasm must call the local workflow unconditionally without inputs or secrets")
+        self.needs("release.yml", "hashes", "vendored-wasm", rule)
+        self.needs("release.yml", "publish", "vendored-wasm", rule)
+        workflow = "vendored-wasm.yml"
+        doc = self.docs.get(workflow, {})
+        triggers = doc.get("on", doc.get(True))
+        if not isinstance(triggers, dict) or "workflow_call" not in triggers:
+            self.report(workflow, rule, "workflow_call is absent")
+        for name, job in (doc.get("jobs") or {}).items():
+            where = f"{workflow}:{name}"
+            if "continue-on-error" in job:
+                self.report(where, rule, f"{name} continues on error")
+            for index, step in enumerate(job.get("steps", [])):
+                if "continue-on-error" in step:
+                    self.report(where, rule, f"{name} step {index + 1} continues on error")
+                if name in ("check", "rebuild", "vendored-wasm") and self.suppresses(step):
+                    self.report(where, rule, f"{name} step {index + 1} suppresses failures")
+                if not CACHE_ACTION.match(step.get("uses") or ""):
+                    continue
+                if name == "rebuild":
+                    self.report(where, rule, "rebuild uses a cache")
+                condition = self.unwrap_expression(step.get("if", ""))
+                guard = "github.ref_type != 'tag'"
+                if condition != guard and not condition.startswith(guard + " && "):
+                    self.report(where, rule, "cache guard must lead with github.ref_type != 'tag'")
+        self.check_wasm_rebuild(workflow, rule)
+        self.check_wasm_gate_job(workflow, rule)
+
+    def check_wasm_rebuild(self, workflow, rule):
+        job = self.job(workflow, "rebuild") or {}
+        if self.unwrap_expression(job.get("if", "")) != WASM_REBUILD_CONDITION:
+            self.report(workflow, rule, f"rebuild must run exactly on {WASM_REBUILD_CONDITION}")
+        steps = job.get("steps", [])
+        full = [step for step in steps if self.runs(step.get("run"), WASM_FULL_MODE)]
+        if not full or any("if" in step for step in full):
+            self.report(workflow, rule, "rebuild must rebuild and compare unconditionally")
+        for step in steps:
+            if not (step.get("uses") or "").startswith("actions/download-artifact@"):
+                continue
+            for key in FOREIGN_ARTIFACT_INPUTS:
+                if key in (step.get("with") or {}):
+                    self.report(workflow, rule, f"rebuild downloads an artifact with {key}")
+        for version in (25, 28):
+            artifact = f"vendored-wasm-stellar-cli-{version}"
+            if not any((step.get("uses") or "").startswith("actions/download-artifact@")
+                       and (step.get("with") or {}).get("name") == artifact
+                       and not self.may_skip(step) for step in steps):
+                self.report(workflow, rule, f"rebuild does not download {artifact} unconditionally")
+
+    def check_wasm_gate_job(self, workflow, rule):
+        job = self.job(workflow, "vendored-wasm") or {}
+        if self.unwrap_expression(job.get("if", "")) != "always()":
+            self.report(workflow, rule, "the vendored-wasm job must run on always()")
+        needs = job.get("needs", [])
+        needs = [needs] if isinstance(needs, str) else needs
+        if not isinstance(needs, list) or sorted(str(value) for value in needs) != WASM_GATE_NEEDS:
+            self.report(workflow, rule, f"the vendored-wasm job must need exactly {', '.join(WASM_GATE_NEEDS)}")
+        gates = [step for step in job.get("steps", []) if self.runs(step.get("run"), "rebuild-vendored-wasm.sh --gate")]
+        if len(gates) != 1 or "if" in gates[0]:
+            self.report(workflow, rule, "the vendored-wasm job must run one gate step unconditionally")
+        elif self.run_text(gates[0]).strip(BLANKS + "\n") != WASM_GATE_CALL:
+            self.report(workflow, rule, f"the gate step must run exactly: {WASM_GATE_CALL}")
+        if len(gates) == 1 and gates[0].get("env") != WASM_GATE_ENV:
+            self.report(workflow, rule, "the gate step must read each job result and the ref type from its expression")
+
+    def check_release_publish_sums(self):
+        rule = "release-publish-sums"
+        command = 'bash .github/scripts/release/verify-sums.sh "$RUNNER_TEMP/release"'
+        check = self.runs_in_job("release.yml", "publish", command, rule)
+        steps = (self.job("release.yml", "publish") or {}).get("steps", [])
+        releases = [i for i, step in enumerate(steps)
+                    if (step.get("uses") or "").startswith("softprops/action-gh-release@")]
+        if (check < 0 or self.may_skip(steps[check])
+                or self.may_skip(self.job("release.yml", "publish") or {})
+                or not releases or any(check >= release for release in releases)):
+            self.report("release.yml", rule, "publish must verify sums unconditionally before the release action")
+
     def check_release_toolchain(self):
         publish = (self.docs.get("publish.yml", {}).get("env") or {}).get("RELEASE_TOOLCHAIN")
-        rehearsal = (self.docs.get(REHEARSAL_WORKFLOW, {}).get("env") or {}).get("RELEASE_TOOLCHAIN")
-        if publish is None or rehearsal != publish:
-            self.report(REHEARSAL_WORKFLOW, "release-toolchain", "RELEASE_TOOLCHAIN differs from publish.yml")
-        job = self.job(REHEARSAL_WORKFLOW, "verify-crates") or {}
-        installs = [i for i, step in enumerate(job.get("steps", []))
-                    if re.match(r"dtolnay/rust-toolchain@", step.get("uses") or "")
-                    and (step.get("with") or {}).get("toolchain") == "${{ env.RELEASE_TOOLCHAIN }}"]
-        pin = self.runs_in_job(REHEARSAL_WORKFLOW, "verify-crates", TOOLCHAIN_PIN, "release-toolchain")
-        build = self.runs_in_job(REHEARSAL_WORKFLOW, "verify-crates", PACKAGE_BUILD, "release-toolchain")
-        install = installs[0] if installs else -1
-        problem = "verify-crates does not package with RELEASE_TOOLCHAIN"
-        if not installs:
-            self.report(REHEARSAL_WORKFLOW, "release-toolchain", f"{problem}: it installs another toolchain")
-        elif pin < 0:
-            self.report(REHEARSAL_WORKFLOW, "release-toolchain", f"{problem}: it does not pin RUSTUP_TOOLCHAIN")
-        elif not install < pin < build:
-            self.report(REHEARSAL_WORKFLOW, "release-toolchain",
-                        f"{problem}: RUSTUP_TOOLCHAIN is not pinned between the install and the packaging")
+        for workflow in ("release.yml", REHEARSAL_WORKFLOW):
+            value = (self.docs.get(workflow, {}).get("env") or {}).get("RELEASE_TOOLCHAIN")
+            if publish is None or value != publish:
+                self.report(workflow, "release-toolchain", "RELEASE_TOOLCHAIN differs from publish.yml")
+        for workflow, name, command in ((REHEARSAL_WORKFLOW, "verify-crates", PACKAGE_BUILD),
+                                        ("release.yml", "build", BUILD_CALLS[-1]),
+                                        (REHEARSAL_WORKFLOW, "build", BUILD_CALLS[-1])):
+            job = self.job(workflow, name) or {}
+            installs = [i for i, step in enumerate(job.get("steps", []))
+                        if re.match(r"dtolnay/rust-toolchain@", step.get("uses") or "")
+                        and (step.get("with") or {}).get("toolchain") == "${{ env.RELEASE_TOOLCHAIN }}"
+                        and (name != "build" or (step.get("with") or {}).get("targets") == "${{ matrix.target }}")
+                        and not self.may_skip(step)]
+            pin = self.runs_in_job(workflow, name, TOOLCHAIN_PIN, "release-toolchain")
+            build = self.runs_in_job(workflow, name, command, "release-toolchain")
+            install = installs[0] if installs else -1
+            problem, action = ((f"{name} does not package with RELEASE_TOOLCHAIN", "packaging")
+                               if name == "verify-crates" else ("build does not compile with RELEASE_TOOLCHAIN", "build"))
+            if not installs:
+                self.report(workflow, "release-toolchain", f"{problem}: it installs another toolchain")
+            elif pin < 0 or self.may_skip(job["steps"][pin]):
+                self.report(workflow, "release-toolchain", f"{problem}: it does not pin RUSTUP_TOOLCHAIN")
+            elif not install < pin < build:
+                self.report(workflow, "release-toolchain",
+                            f"{problem}: RUSTUP_TOOLCHAIN is not pinned between the install and the {action}")
 
     def check_ci_feature_jobs(self):
         for name, commands in CI_FEATURE_JOBS.items():
@@ -1024,6 +1176,9 @@ class Checker:
         self.check_unconditional()
         self.check_verification_credentials()
         self.check_verify_matrix()
+        self.check_release_cache()
+        self.check_release_wasm_gate()
+        self.check_release_publish_sums()
         self.check_release_toolchain()
         self.check_ci_feature_jobs()
 

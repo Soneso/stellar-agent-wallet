@@ -90,6 +90,16 @@ tar -cJf "$tmp/$stem.tar.xz" -C "$tmp" "$stem"
 expect archive-mcp 1 "${archive[@]}" x86_64-unknown-linux-gnu off
 expect_output archive-mcp "/stellar-agent is off"
 
+for literal in STELLAR_AGENT_HOME STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE; do
+  make_binary "$tmp/$stem/stellar-agent-mcp"
+  printf '# %s\n' "$literal" >> "$tmp/$stem/stellar-agent-mcp"
+  tar -cJf "$tmp/$stem.tar.xz" -C "$tmp" "$stem"
+  expect "archive-test-override-$literal" 1 "${archive[@]}" x86_64-unknown-linux-gnu off
+  expected_literal=$literal
+  [ "$literal" != STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE ] || expected_literal=STELLAR_AGENT_TEST_
+  expect_output "archive-test-override-$literal" "marker: test override literal $expected_literal is embedded"
+done
+
 # The Windows archive is a ZIP that the stub 7z extracts.
 mkdir "$tmp/bin" "$tmp/runner"
 cat > "$tmp/bin/7z" <<'STUB'
@@ -174,4 +184,114 @@ if [ -e "$tmp/sudo.log" ]; then
   echo 'FAIL host-libudev: check-host.sh ran sudo' >&2
   exit 1
 fi
+# Fixed download bytes cannot match the reviewed MSVC archive digest.
+cat > "$tmp/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --output ]; then
+    printf 'fixed download bytes\n' > "$2"
+    exit 0
+  fi
+  shift
+done
+exit 2
+STUB
+chmod +x "$tmp/bin/curl"
+touch "$tmp/github-env"
+# The split literal keeps the environment-file scanner of
+# check-feature-discipline.py from reading this fixture line as a write.
+expect sodium-digest 1 env PATH="$tmp/bin:$PATH" "GITHUB""_ENV=$tmp/github-env" \
+  bash .github/scripts/release/sodium.sh
+expect_output sodium-digest 'sodium: MSVC archive SHA-256 differs from the pinned digest'
+if [ -s "$tmp/github-env" ]; then
+  echo 'FAIL sodium-digest: exports an unverified install root' >&2
+  exit 1
+fi
+for name in libsodium-1.0.22-stable-msvc.zip libsodium-1.0.22-stable-msvc.zip.minisig LATEST.tar.gz LATEST.tar.gz.minisig; do
+  [ -s "$RUNNER_TEMP/sodium-dist/$name" ] || { echo "FAIL sodium-digest: missing $name" >&2; exit 1; }
+done
+# A copy pinned to the digest of the stub bytes exports the directory once.
+stub_digest=$(printf 'fixed download bytes\n' |
+  python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')
+sed "s/^SODIUM_MSVC_SHA256=.*\$/SODIUM_MSVC_SHA256=$stub_digest/" .github/scripts/release/sodium.sh > "$tmp/sodium-pinned.sh"
+if [ "$(grep -c -x "SODIUM_MSVC_SHA256=$stub_digest" "$tmp/sodium-pinned.sh")" != 1 ]; then
+  echo 'FAIL sodium-match: the pinned copy does not set the stub digest' >&2
+  exit 1
+fi
+: > "$tmp/github-env"
+expect sodium-match 0 env PATH="$tmp/bin:$PATH" "GITHUB""_ENV=$tmp/github-env" \
+  bash "$tmp/sodium-pinned.sh"
+if [ "$(cat "$tmp/github-env")" != "SODIUM_DIST_DIR=$RUNNER_TEMP/sodium-dist" ]; then
+  echo 'FAIL sodium-match: the environment file is not exactly one SODIUM_DIST_DIR line' >&2
+  cat "$tmp/github-env" >&2
+  exit 1
+fi
+
+release="$tmp/publication"
+mkdir -p "$release/all-artifacts/linux" "$release/all-artifacts/windows" "$release/release-combined"
+printf 'linux archive\n' > "$release/all-artifacts/linux/fixture.tar.xz"
+printf 'windows archive\n' > "$release/all-artifacts/windows/fixture.zip"
+python3 - "$release" <<'PY_SUMS'
+import hashlib, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+with (root / 'release-combined/SHA256SUMS').open('w') as sums:
+    for path in sorted((root / 'all-artifacts').rglob('*')):
+        if path.is_file():
+            sums.write(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n')
+PY_SUMS
+sums=(bash .github/scripts/release/verify-sums.sh "$release")
+expect sums-equal 0 "${sums[@]}"
+expect_output sums-equal '2 archives match SHA256SUMS'
+cp "$release/all-artifacts/windows/fixture.zip" "$release/all-artifacts/windows/extra.zip"
+expect sums-extra 1 "${sums[@]}"
+expect_output sums-extra 'archive set differs'
+rm "$release/all-artifacts/windows/extra.zip"
+mv "$release/all-artifacts/windows/fixture.zip" "$tmp/fixture.zip"
+expect sums-missing 1 "${sums[@]}"
+expect_output sums-missing 'archive set differs'
+mv "$tmp/fixture.zip" "$release/all-artifacts/windows/fixture.zip"
+size=$(wc -c < "$release/all-artifacts/windows/fixture.zip")
+printf X | dd of="$release/all-artifacts/windows/fixture.zip" bs=1 seek=3 conv=notrunc 2>/dev/null
+if [ "$(wc -c < "$release/all-artifacts/windows/fixture.zip")" != "$size" ]; then
+  echo 'FAIL sums-changed-byte: the archive length changed' >&2
+  exit 1
+fi
+expect sums-changed-byte 1 "${sums[@]}"
+expect_output sums-changed-byte 'SHA-256 differs: fixture.zip'
+printf 'windows archive\n' > "$release/all-artifacts/windows/fixture.zip"
+cp "$release/all-artifacts/windows/fixture.zip" "$release/all-artifacts/linux/fixture.zip"
+expect sums-duplicate-archive 1 "${sums[@]}"
+expect_output sums-duplicate-archive 'duplicate archive name'
+rm "$release/all-artifacts/linux/fixture.zip"
+cp "$release/release-combined/SHA256SUMS" "$tmp/sums"
+cat "$tmp/sums" >> "$release/release-combined/SHA256SUMS"
+expect sums-duplicate-entry 1 "${sums[@]}"
+expect_output sums-duplicate-entry 'duplicate SHA256SUMS name'
+: > "$release/release-combined/SHA256SUMS"
+expect sums-empty 1 "${sums[@]}"
+expect_output sums-empty 'SHA256SUMS is empty'
+for name in 'linux/fixture.tar.xz' 'linux\fixture.tar.xz'; do
+  python3 -c 'import sys; text = open(sys.argv[1]).read(); print(text.replace("  fixture.tar.xz\n", f"  {sys.argv[2]}\n"), end="")' \
+    "$tmp/sums" "$name" > "$release/release-combined/SHA256SUMS"
+  if ! grep -qF -- "  $name" "$release/release-combined/SHA256SUMS"; then
+    echo "FAIL sums-path-separator: the entry $name was not written" >&2
+    exit 1
+  fi
+  expect "sums-path-separator $name" 1 "${sums[@]}"
+  expect_output "sums-path-separator $name" 'invalid SHA256SUMS entry'
+done
+cp "$tmp/sums" "$release/release-combined/SHA256SUMS"
+expect sums-restored 0 "${sums[@]}"
+mv "$release/all-artifacts/windows/fixture.zip" "$tmp/fixture.zip"
+ln -s "$tmp/fixture.zip" "$release/all-artifacts/windows/fixture.zip"
+expect sums-symlink 1 "${sums[@]}"
+expect_output sums-symlink 'archive is not a regular file: fixture.zip'
+rm "$release/all-artifacts/windows/fixture.zip"
+mkdir "$release/all-artifacts/windows/fixture.zip"
+expect sums-directory 1 "${sums[@]}"
+expect_output sums-directory 'archive is not a regular file: fixture.zip'
+rmdir "$release/all-artifacts/windows/fixture.zip"
+mv "$tmp/fixture.zip" "$release/all-artifacts/windows/fixture.zip"
+expect sums-final 0 "${sums[@]}"
 echo 'release assertion tests passed'

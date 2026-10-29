@@ -817,7 +817,8 @@ binary, build command, and digest.
 
 The `vendored-wasm` workflow (`.github/workflows/vendored-wasm.yml`) runs
 `.github/scripts/rebuild-vendored-wasm.sh`, which holds the manifest of
-rebuildable files, the exception list, and every pinned version.
+rebuildable files, the exception list, and every pinned version. Tag runs
+happen inside the release through its local reusable workflow call.
 
 - The tree check runs on every pull request, every push to `main`, every tag,
   twice a week, and on dispatch. It fails unless every tracked Wasm file is a
@@ -851,9 +852,13 @@ rebuildable files, the exception list, and every pinned version.
   deployment wrappers, in the builds they run.
 - When a change touches `vendor/`, `build.rs`, `contracts/`, the two scripts,
   or the workflow, and on every tag, scheduled, or dispatched run, two macOS
-  jobs build the pinned stellar-cli binaries. The `rebuild` job then rebuilds
-  every manifest file from its pinned source with its pinned toolchain and
-  fails unless the rebuilt bytes equal the vendored file.
+  jobs provide the pinned stellar-cli binaries. The stellar-cli caches serve
+  pull request, `main`, scheduled, and dispatched runs only. A tag run builds
+  both binaries from source. Each job packs its install root as a tar artifact
+  to preserve executable permissions. The `rebuild` job reads those artifacts
+  from the same run and uses no cache. It rebuilds every manifest file from
+  its pinned source with its pinned toolchain and fails unless the rebuilt
+  bytes equal the vendored file.
 - The unit tests in `src/vendored_wasm_tests.rs` and the integration target
   `tests/vendored_wasm_release_cfg.rs` bind the table, embedded constants,
   digest constants, and three allowlists to vendored files. The integration
@@ -868,7 +873,9 @@ rebuildable files, the exception list, and every pinned version.
   file. An exception is a vendored file that no pinned source rebuilds; the
   tree check holds its bytes at one frozen digest.
 
-The `vendored-wasm` job reads every job result and is the check to require.
+The `vendored-wasm` job reads every job result. On a tag it passes only after
+a rebuild, and release signing, provenance, and publication wait for the
+rebuild of the tagged commit.
 
 Run the identity and deployment gates locally with:
 
@@ -1003,18 +1010,19 @@ and every constant and allowlist entry that pins it in the same change.
   `contracts/multicall-router/`), the rebuild proves the bytes match the
   committed source; review of the source diff remains the defense. A
   compromise of an upstream source at its pinned commit is outside this check.
-- Two checks prove a cached stellar-cli binary: its version line and the byte
-  comparison of its output. A binary that writes the vendored bytes whatever
-  its input passes both. Every workflow of a branch shares the cache. Code that
+- On non-tag runs, two checks test a cached stellar-cli binary: its version
+  line and the byte comparison of its output. A binary that writes the
+  vendored bytes whatever its input passes both. Every workflow of a branch
+  shares the cache. Code that
   runs in any job on `main` can therefore create an entry under a key that does
   not exist yet, such as after an eviction or a recipe revision bump. An
   existing entry never changes. Delete the stellar-cli cache entries after any
   suspected compromise of a workflow run on `main`, and after reverting a
   change to the workflow or the scripts.
-- A failed cache save is a warning in the stellar-cli job, and the `rebuild`
-  job then fails on the cache miss. Two concurrent cold runs on `main` can do
-  the same. A re-run clears both.
-- A tag run does not gate the release workflow.
+- Cache saves serve future non-tag runs. The current rebuild consumes the
+  install-root artifacts produced by its own stellar-cli jobs. Tag runs build
+  both binaries from source and gate release signing, provenance, and
+  publication.
 - Pull-request CI does not run the release-profile tests. The deploy's digest
   check runs in every profile; review and the release-profile test run keep it
   out of a `debug_assertions` gate. The local release gate also checks the
@@ -1157,11 +1165,16 @@ error message names the rule that failed:
 - D11: the release, publish, and rehearsal workflows expect the marker off.
 - D12: the marker literal appears in `crates/` only in the two cfg arms of the
   core crate.
+- D13: every declared feature belongs to exactly one of the product and test
+  sets in the checker. Product features reach no workspace test feature and
+  activate no optional dependency on a test package. Non-optional normal and
+  build dependencies request no test feature and name no test package.
 
 Release builds refuse compiler overrides and cargo configuration files
 through the checker's `--env-guard` mode, which `build.sh` runs on its own
 checkout. `check-binary-marker.sh <binary> off` checks the second version
-line, the embedded expected marker, and the absence of the opposite marker.
+line, the embedded expected marker, and the absence of the opposite marker
+and test-override literals.
 
 `check-host.sh` builds the release binaries for the host target through
 `build.sh` and checks both markers; the preflight row `release-shape` runs it.

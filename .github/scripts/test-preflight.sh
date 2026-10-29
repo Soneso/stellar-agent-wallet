@@ -50,7 +50,7 @@ REAL_PYTHON=$(python3 -c 'import sys; print(sys.executable)')
 FIXTURE="$TMP/fixture"
 
 CASES="docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
-release-rehearsal-workflow
+release-rehearsal-workflow vendored-wasm-workflow
 triage-workflow triage-review-workflow triage-sweep-workflow
 ci-yml-only python-check-script shell-check-script skill inbox-web one-crate two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
@@ -304,7 +304,7 @@ expect_list() {
   fi
   local extra=() argument
   case "$CASE_NAME" in
-    deleted-install-surface-doc | welcome-workflow | release-workflow | release-rehearsal-workflow | triage-workflow | triage-review-workflow | triage-sweep-workflow | ci-yml-only | python-check-script | shell-check-script | one-crate | two-owners | target-specific-edge | dev-dependency-edge | optional-dependency-edge | root-manifest | lockfile | wallet-manifest | removed-member | untracked-test-file | staged-rename-record | spaces-and-an-apostrophe | action-script | invariants-helper | release-build-scripts | duplicate-triggers | changed-self-test | deleted-shell-script | deleted-self-test | the-preflight-itself)
+    deleted-install-surface-doc | welcome-workflow | release-workflow | release-rehearsal-workflow | vendored-wasm-workflow | triage-workflow | triage-review-workflow | triage-sweep-workflow | ci-yml-only | python-check-script | shell-check-script | one-crate | two-owners | target-specific-edge | dev-dependency-edge | optional-dependency-edge | root-manifest | lockfile | wallet-manifest | removed-member | untracked-test-file | staged-rename-record | spaces-and-an-apostrophe | action-script | invariants-helper | release-build-scripts | duplicate-triggers | changed-self-test | deleted-shell-script | deleted-self-test | the-preflight-itself)
       extra+=(feature-discipline self-test:test-check-feature-discipline.py)
       ;;
   esac
@@ -1076,6 +1076,12 @@ case_release_rehearsal_workflow() {
   expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py
 }
 
+case_vendored_wasm_workflow() {
+  start_case
+  edit .github/workflows/vendored-wasm.yml
+  expect_list "${ALWAYS[@]}" actionlint workflow-invariants self-test:test-check-workflow-invariants.py
+}
+
 case_ci_yml_only() {
   start_case
   edit .github/workflows/ci.yml
@@ -1328,7 +1334,8 @@ case_invariants_helper() {
 
 # release-rehearsal.yml names the release build scripts in a subdirectory of
 # .github/scripts/, so the computed input set of the invariants gate holds
-# them, and a change to one selects the check and its self-test.
+# them, and a change to one selects the check and its self-test. A change to
+# sodium.sh also selects the release checks, which hold its stub-download test.
 case_release_build_scripts() {
   local script
   start_case
@@ -1344,6 +1351,10 @@ case_release_build_scripts() {
   expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
     "shellcheck-changed=shellcheck -s bash .github/scripts/release/build.sh"
   git checkout -q -- .github/scripts/release/build.sh
+  edit .github/scripts/release/sodium.sh
+  expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py \
+    self-test:test-release-checks.sh "shellcheck-changed=shellcheck -s bash .github/scripts/release/sodium.sh"
+  git checkout -q -- .github/scripts/release/sodium.sh
   edit .github/scripts/release/windows-perl.ps1
   expect_list "${ALWAYS[@]}" workflow-invariants self-test:test-check-workflow-invariants.py
 }

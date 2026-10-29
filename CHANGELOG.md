@@ -637,6 +637,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Release and rehearsal builds restore and save no cache.
+- Release signing, provenance, and publication wait for the vendored Wasm
+  rebuild of the tagged commit, and a tag run of the vendored Wasm workflow
+  passes only after that rebuild.
+- No test feature reaches a release build, and release binaries are checked
+  for test overrides.
+- The Windows libsodium archive requires a matching digest pin.
+- Release publication uploads only the archives `SHA256SUMS` lists, with
+  matching digests.
+- Release binaries build with the pinned toolchain.
 - `stellar_rule_create_commit` spends its approval before the install starts.
   A retry with the same approval and attestation, directly or through
   `stellar_toolset_invoke`, returns `policy.approval_consumed` whether the

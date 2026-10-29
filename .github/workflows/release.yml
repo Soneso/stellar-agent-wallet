@@ -4,7 +4,11 @@ name: Release
 # five-target build matrix producing one archive per target (both binaries in
 # each archive), macOS signing and notarization in a separate job, a combined
 # SHA256SUMS, cosign keyless signatures, SLSA provenance, and a GitHub
-# Release.
+# Release. The release restores and saves no cache, so every build compiles
+# from the locked sources. The vendored-wasm job rebuilds the vendored
+# contract Wasm files of the tagged commit; the hashes job needs it, so the
+# cosign signatures, the provenance, and the publication wait for that
+# rebuild to pass.
 #
 # The per-push CI workflow gates fmt, clippy, tests, and licenses/advisories
 # on every commit that reaches main. The preflight refuses a tag whose commit
@@ -38,6 +42,8 @@ permissions:
 
 env:
   EXPECTED_MAINNET_WRITE: "off"
+  # The toolchain publish.yml packages with; every build leg compiles with it.
+  RELEASE_TOOLCHAIN: "1.99.0"
 
 jobs:
   preflight:
@@ -148,11 +154,22 @@ jobs:
             exit 1
           fi
 
+  # Rebuilds every vendored contract Wasm file of the tagged commit from its
+  # pinned source and compares the bytes. On a tag the called workflow's gate
+  # passes only after that rebuild. hashes and publish need this job, so
+  # signing, provenance, and publication wait for the rebuild.
+  vendored-wasm:
+    name: vendored-wasm
+    needs: preflight
+    permissions:
+      contents: read
+    uses: ./.github/workflows/vendored-wasm.yml
+
   build:
     name: build ${{ matrix.target }}
     needs: preflight
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -174,12 +191,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RELEASE_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: ${{ matrix.target }}
+      - name: Pin the build toolchain
+        shell: bash
+        run: echo "RUSTUP_TOOLCHAIN=$RELEASE_TOOLCHAIN" >> "$GITHUB_ENV"
 
       # stellar-agent-network depends on stellar-ledger, which pulls hidapi;
       # hidapi links libudev on Linux for HID device enumeration. Only the
@@ -200,13 +217,11 @@ jobs:
         with:
           python-version: "3.13"
 
-      # stellar-baselib links libsodium; on MSVC its build script fetches the
-      # prebuilt archive from download.libsodium.org over plain HTTP with no
-      # retry, which is flaky from Windows runners. Pre-fetching the same
-      # archive over HTTPS with retries into SODIUM_DIST_DIR makes the build
-      # script consume the local copy instead; it still verifies the
-      # archive's minisign signature against its pinned upstream key, so
-      # integrity does not rest on this download step.
+      # On MSVC the libsodium build script fetches its prebuilt archive over
+      # plain HTTP with no retry, which is flaky from Windows runners. The
+      # sodium setup fetches the archive over HTTPS with retries and pins it by
+      # digest; the build script consumes the local copy and verifies its
+      # minisign signature against the pinned upstream key.
       # The vendored OpenSSL build runs OpenSSL's perl-based Configure, which
       # needs a Windows-native Perl with its full module set; the MSYS perl
       # that Git for Windows puts on PATH lacks it. openssl-src honors
@@ -428,7 +443,7 @@ jobs:
 
   hashes:
     name: hashes
-    needs: [preflight, build, sign-macos, verify-packaged]
+    needs: [preflight, vendored-wasm, build, sign-macos, verify-packaged]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -592,7 +607,7 @@ jobs:
 
   publish:
     name: publish
-    needs: [preflight, build, sign-macos, sign, hashes, provenance, verify-provenance]
+    needs: [preflight, vendored-wasm, build, sign-macos, sign, hashes, provenance, verify-provenance]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -662,6 +677,9 @@ jobs:
             echo "No release notes found for v$VERSION in CHANGELOG.md"
             exit 1
           fi
+
+      - name: Verify the publication archives
+        run: bash .github/scripts/release/verify-sums.sh "$RUNNER_TEMP/release"
 
       # The release action uploads with its token input, which defaults to the
       # job's GITHUB_TOKEN; the checkout keeps no credential.

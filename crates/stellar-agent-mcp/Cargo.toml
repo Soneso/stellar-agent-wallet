@@ -26,7 +26,7 @@ path = "src/main.rs"
 # cargo-binstall 1.8.0 and later, turns off the third-party binary host and the
 # source build, so binstall fails when no such archive exists; `cargo install
 # --locked` or a source build applies there. binstall checks the download over
-# TLS only, with no signature; the README "Verifying a release" section covers
+# TLS only, with no signature; docs/verifying-releases.md covers
 # signature and provenance checks.
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/stellar-agent-{ version }-{ target }.tar.xz"

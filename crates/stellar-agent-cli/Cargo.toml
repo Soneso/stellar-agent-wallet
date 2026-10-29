@@ -22,7 +22,7 @@ path = "src/main.rs"
 # cargo-binstall 1.8.0 and later, turns off the third-party binary host and the
 # source build, so binstall fails when no such archive exists; `cargo install
 # --locked` or a source build applies there. binstall checks the download over
-# TLS only, with no signature; the README "Verifying a release" section covers
+# TLS only, with no signature; docs/verifying-releases.md covers
 # signature and provenance checks.
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/stellar-agent-{ version }-{ target }.tar.xz"
@@ -191,8 +191,8 @@ test-helpers = []
 # These tests are NOT run under default `cargo test`; invoke with:
 #   cargo test -p stellar-agent-cli --features testnet-acceptance \
 #     --test claim_testnet_acceptance
-# This feature is CI/dev-only and MUST NOT be enabled in any release-artefact
-# feature set.
+# D13 in check-feature-discipline.py keeps this CI/dev-only feature out of
+# every product feature set.
 #
 # Forwards `test-helpers` (this crate's own gate on
 # `commands::policy_engine::owner_pubkey_raw`'s file-based owner-PUBLIC-key

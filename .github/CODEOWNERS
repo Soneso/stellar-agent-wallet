@@ -35,3 +35,14 @@
 /crates/stellar-agent-cli/ @christian-rogobete
 /crates/stellar-agent-mcp/ @christian-rogobete
 /crates/stellar-agent-test-support/ @christian-rogobete
+/crates/stellar-agent-anchor/ @christian-rogobete
+/crates/stellar-agent-claimable/ @christian-rogobete
+/crates/stellar-agent-loopback-http/ @christian-rogobete
+/crates/stellar-agent-mcp-macros/ @christian-rogobete
+/crates/stellar-agent-sep48/ @christian-rogobete
+/crates/stellar-agent-sep7/ @christian-rogobete
+/crates/stellar-agent-toolsets/ @christian-rogobete
+/crates/stellar-agent-xdr-limits/ @christian-rogobete
+/skills/ @christian-rogobete
+/contracts/ @christian-rogobete
+/.claude-plugin/ @christian-rogobete

@@ -67,7 +67,7 @@ OFFLINE_FEATURES=test-helpers,test-hooks,test-loopback,verifier-registry
 VENDORED_CRATE=stellar-agent-smart-account
 # The workflows that check-workflow-invariants.py reads, as its docstring
 # names them.
-INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci"
+INVARIANT_WORKFLOWS="release publish notarize-smoke labels stale triage triage-review triage-sweep welcome coverage release-rehearsal ci vendored-wasm"
 
 die() {
   echo "preflight: $*" >&2
@@ -366,7 +366,7 @@ select_for_path() {
   esac
   case "$path" in
     .github/scripts/check-binary-marker.sh) select_gate self-test:test-check-binary-marker.sh; select_gate self-test:test-release-checks.sh ;;
-    .github/scripts/check-packaged-markers.sh | .github/scripts/release/verify-*.sh) select_gate self-test:test-release-checks.sh ;;
+    .github/scripts/check-packaged-markers.sh | .github/scripts/release/verify-*.sh | .github/scripts/release/sodium.sh) select_gate self-test:test-release-checks.sh ;;
     .github/scripts/check-provenance.py | .github/scripts/fixtures/*) select_gate self-test:test-check-provenance.py ;;
   esac
   case "$path" in
