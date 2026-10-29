@@ -28,6 +28,10 @@
 //! [`escape`] is the third: the single HTML-escaping definition every page
 //! applies to dynamic text.
 //!
+//! [`request_trace`] is the fourth: the route label each listener's request
+//! span records in place of the request path, which can carry a bearer
+//! secret.
+//!
 //! [`stellar-agent-approval-remote`](https://docs.rs/stellar-agent-approval-remote)
 //! serves over TLS on a private network rather than loopback; it uses the same
 //! response headers and the same brand surface, so it depends on this crate
@@ -39,4 +43,5 @@ pub mod brand;
 pub mod escape;
 pub mod host_header;
 pub mod origin_header;
+pub mod request_trace;
 pub mod security_headers;

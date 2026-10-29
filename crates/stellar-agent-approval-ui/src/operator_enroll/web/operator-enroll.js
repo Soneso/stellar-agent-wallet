@@ -3,7 +3,11 @@
 // Same-origin, no build step. Served only after the operator's browser has
 // exchanged the one-time bootstrap token for a session cookie at
 // GET /bootstrap/{token}; this file and the /enroll page it runs inside are
-// both gated on that cookie. Runs navigator.credentials.create() against
+// both gated on that cookie. The bootstrap page also stored a session proof
+// in this tab's sessionStorage (see /static/session-bootstrap.js); the POST
+// carries it in the X-Session-Proof header, and a tab without it refuses to
+// start the ceremony, because the server would refuse the result. Runs
+// navigator.credentials.create() against
 // rp.id "localhost" — the only rp.id a loopback HTTP origin can claim (a
 // WebAuthn credential is bound to its rp.id at creation) — extracts the
 // uncompressed SEC1 public key and a best-effort sign-count seed
@@ -19,6 +23,17 @@
 
 (function () {
   "use strict";
+
+  var PROOF_KEY = "stellar-agent-operator-enroll-session-proof";
+
+  function readProof() {
+    try {
+      var proof = window.sessionStorage.getItem(PROOF_KEY);
+      return typeof proof === "string" && proof.length > 0 ? proof : null;
+    } catch (e) {
+      return null;
+    }
+  }
 
   function b64urlFromBytes(bytes) {
     var bin = "";
@@ -93,13 +108,14 @@
   // failed" would be false; the operator's actual situation is a link that no
   // longer resolves. The raw reason (a browser-specific TypeError) goes to the
   // console instead, where it is available for diagnosis.
-  function postCredential(island, credentialIdB64url, pubkeyB64url, label, signCount) {
+  function postCredential(island, proof, credentialIdB64url, pubkeyB64url, label, signCount) {
     return fetch("/enroll/credential", {
       method: "POST",
       credentials: "same-origin",
       headers: {
         "content-type": "application/json",
         "x-stellar-approval-csrf": island.csrfToken,
+        "x-session-proof": proof,
       },
       body: JSON.stringify({
         credential_id_b64url: credentialIdB64url,
@@ -125,6 +141,14 @@
     var label = labelInput ? labelInput.value.trim() : "";
     if (!label) {
       setStatus("Enter a label first.", "error");
+      return;
+    }
+    var proof = readProof();
+    if (!proof) {
+      setStatus(
+        "This tab has no wallet session. Use the tab the command opened, or restart it for a new link.",
+        "error"
+      );
       return;
     }
 
@@ -159,7 +183,7 @@
         var pubkey = b64urlFromBytes(sec1FromSpki(spki));
         var signCount = extractSignCount(credential.response);
         setStatus("Passkey created. Finishing enrollment\u2026", "busy");
-        return postCredential(island, credentialId, pubkey, label, signCount);
+        return postCredential(island, proof, credentialId, pubkey, label, signCount);
       })
       .then(function (resp) {
         // An unusable-public-key branch above returns without posting; its

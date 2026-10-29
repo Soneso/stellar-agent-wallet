@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import vm from "node:vm";
 import renderers from "./app_shared.js";
 
 for (const [limit, rendered] of [
@@ -88,4 +89,319 @@ test("memo types remain distinct through JSON and DOM rendering", () => {
   for (const kind of ["hash", "return"]) {
     assert.ok(meta({kind, value: Array(32).fill(171)}).endsWith(kind + " " + "ab".repeat(32)));
   }
+});
+
+// ── Session proof: the bootstrap page, the inbox, and the enrollment page ──
+//
+// Each browser script runs in a fresh VM context with a minimal DOM, a
+// recorded sessionStorage, a recorded fetch, and a manual clock, so the tests
+// observe exactly what the script stores, requests, and navigates to.
+
+const INBOX_PROOF_KEY = "stellar-agent-approval-session-proof";
+const ENROLL_PROOF_KEY = "stellar-agent-operator-enroll-session-proof";
+const PROOF = "ab".repeat(32);
+
+function source(relative) {
+  return readFileSync(new URL(relative, import.meta.url), "utf8");
+}
+
+function fakeElement(name) {
+  return {
+    name,
+    textContent: "",
+    className: "",
+    hidden: false,
+    value: "",
+    children: [],
+    attributes: {},
+    listeners: {},
+    appendChild(child) {
+      this.children.push(child);
+      return child;
+    },
+    setAttribute(key, value) {
+      this.attributes[key] = String(value);
+    },
+    getAttribute(key) {
+      return key in this.attributes ? this.attributes[key] : null;
+    },
+    addEventListener(type, listener) {
+      (this.listeners[type] ||= []).push(listener);
+    },
+  };
+}
+
+function browser({ islands = {}, elements = [], storage = {}, storageThrows = false, readBackDiffers = false } = {}) {
+  const byId = {};
+  for (const [id, value] of Object.entries(islands)) {
+    byId[id] = fakeElement(id);
+    byId[id].textContent = typeof value === "string" ? value : JSON.stringify(value);
+  }
+  for (const id of elements) {
+    byId[id] ||= fakeElement(id);
+  }
+  const stored = new Map(Object.entries(storage));
+  const log = [];
+  const fetches = [];
+  const intervals = [];
+  const documentListeners = {};
+  const clock = { now: 1_000_000 };
+  const sessionStorage = {
+    getItem(key) {
+      if (storageThrows) throw new Error("storage denied");
+      return stored.has(key) ? stored.get(key) : null;
+    },
+    setItem(key, value) {
+      if (storageThrows) throw new Error("storage denied");
+      log.push(["setItem", key]);
+      stored.set(key, readBackDiffers ? "other" : String(value));
+    },
+  };
+  class FakeDate extends Date {
+    static now() {
+      return clock.now;
+    }
+  }
+  const document = {
+    documentElement: fakeElement("html"),
+    getElementById(id) {
+      return byId[id] || null;
+    },
+    createElement(tag) {
+      return fakeElement(tag);
+    },
+    createTextNode(text) {
+      return { textContent: text, children: [] };
+    },
+    addEventListener(type, listener) {
+      (documentListeners[type] ||= []).push(listener);
+    },
+  };
+  const credentialCalls = [];
+  const context = {
+    document,
+    window: {
+      sessionStorage,
+      location: {
+        replace(url) {
+          log.push(["replace", url]);
+        },
+      },
+    },
+    navigator: {
+      credentials: {
+        create(options) {
+          credentialCalls.push(options);
+          const spki = new Uint8Array(91).fill(7);
+          const authData = new Uint8Array(37);
+          authData[36] = 5;
+          return Promise.resolve({
+            rawId: new Uint8Array(16).fill(1).buffer,
+            response: {
+              getPublicKey: () => spki.buffer,
+              getAuthenticatorData: () => authData.buffer,
+            },
+          });
+        },
+      },
+    },
+    crypto: { getRandomValues: (array) => array.fill(3) },
+    btoa,
+    console,
+    Date: FakeDate,
+    setInterval(callback, ms) {
+      intervals.push({ callback, ms });
+      return intervals.length;
+    },
+    fetch(url, init) {
+      fetches.push({ url, init: init || {} });
+      return new Promise(() => {});
+    },
+  };
+  vm.createContext(context);
+  return {
+    byId,
+    stored,
+    log,
+    fetches,
+    intervals,
+    clock,
+    credentialCalls,
+    run(file) {
+      vm.runInContext(source(file), context, { filename: file });
+    },
+    dispatch(type, isTrusted) {
+      for (const listener of documentListeners[type] || []) {
+        listener({ type, isTrusted });
+      }
+    },
+  };
+}
+
+async function settle() {
+  for (let i = 0; i < 10; i++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+test("bootstrap script stores the proof, clears it from the page, then navigates", () => {
+  const page = browser({
+    islands: { "session-bootstrap-data": { proof: PROOF, storageKey: INBOX_PROOF_KEY, next: "/inbox" } },
+    elements: ["bootstrap-status"],
+  });
+  page.run("./session_bootstrap.js");
+  assert.equal(page.stored.get(INBOX_PROOF_KEY), PROOF);
+  assert.deepEqual(page.log, [["setItem", INBOX_PROOF_KEY], ["replace", "/inbox"]]);
+  assert.equal(page.byId["session-bootstrap-data"].textContent, "");
+});
+
+for (const [label, options] of [
+  ["throws", { storageThrows: true }],
+  ["does not keep the value", { readBackDiffers: true }],
+]) {
+  test(`bootstrap script does not navigate when storage ${label}`, () => {
+    const page = browser({
+      islands: { "session-bootstrap-data": { proof: PROOF, storageKey: INBOX_PROOF_KEY, next: "/inbox" } },
+      elements: ["bootstrap-status"],
+      ...options,
+    });
+    page.run("./session_bootstrap.js");
+    assert.ok(!page.log.some(([kind]) => kind === "replace"));
+    assert.match(page.byId["bootstrap-status"].textContent, /did not let the wallet keep its session/);
+    assert.equal(page.byId["session-bootstrap-data"].textContent, "");
+  });
+}
+
+for (const next of ["https://example.invalid/", "//example.invalid", "/approval/x", ""]) {
+  test(`bootstrap script refuses the landing path ${JSON.stringify(next)}`, () => {
+    const page = browser({
+      islands: { "session-bootstrap-data": { proof: PROOF, storageKey: INBOX_PROOF_KEY, next } },
+      elements: ["bootstrap-status"],
+    });
+    page.run("./session_bootstrap.js");
+    assert.deepEqual(page.log, []);
+  });
+}
+
+function detailPage(storage) {
+  const page = browser({
+    islands: {
+      "approval-data": { nonce: "NONCE", csrf: "c".repeat(64), activity_csrf: "d".repeat(64), approvable: true },
+    },
+    elements: ["approve-btn", "reject-btn", "result"],
+    storage,
+  });
+  page.run("./app_shared.js");
+  page.run("./app.js");
+  return page;
+}
+
+for (const action of ["approve", "reject"]) {
+  test(`${action} carries the session proof and the CSRF value`, () => {
+    const page = detailPage({ [INBOX_PROOF_KEY]: PROOF });
+    page.byId[`${action}-btn`].listeners.click[0]();
+    assert.equal(page.fetches.length, 1);
+    const { url, init } = page.fetches[0];
+    assert.equal(url, `/approval/NONCE/${action}`);
+    assert.equal(init.method, "POST");
+    assert.equal(init.headers["X-Session-Proof"], PROOF);
+    assert.equal(init.headers["X-Stellar-Approval-CSRF"], "c".repeat(64));
+  });
+
+  test(`${action} without a stored proof sends nothing and says why`, () => {
+    const page = detailPage({});
+    page.byId[`${action}-btn`].listeners.click[0]();
+    assert.equal(page.fetches.length, 0);
+    assert.match(page.byId.result.textContent, /no wallet session/);
+    assert.equal(page.byId.result.className, "result refused");
+  });
+}
+
+test("background polling never sends activity; trusted interaction does, once a minute", () => {
+  const page = browser({
+    islands: {
+      "pending-data": { pending: [], expired_count: 0, include_expired: false, activity_csrf: "d".repeat(64) },
+    },
+    elements: ["inbox", "status", "empty-state"],
+    storage: { [INBOX_PROOF_KEY]: PROOF },
+  });
+  page.run("./app_shared.js");
+  page.run("./app.js");
+  assert.equal(page.intervals.length, 1);
+  for (let i = 0; i < 600; i++) {
+    page.clock.now += 2000;
+    page.intervals[0].callback();
+  }
+  assert.equal(page.fetches.length, 600);
+  assert.ok(page.fetches.every(({ url, init }) => url.startsWith("/pending.json") && !init.method));
+
+  page.dispatch("pointerdown", false);
+  page.dispatch("keydown", false);
+  assert.equal(page.fetches.length, 600, "synthetic events send nothing");
+
+  page.dispatch("pointerdown", true);
+  const activity = page.fetches.slice(600);
+  assert.equal(activity.length, 1);
+  assert.equal(activity[0].url, "/session/activity");
+  assert.equal(activity[0].init.method, "POST");
+  assert.equal(activity[0].init.keepalive, true);
+  assert.equal(activity[0].init.headers["X-Session-Proof"], PROOF);
+  assert.equal(activity[0].init.headers["X-Stellar-Approval-CSRF"], "d".repeat(64));
+
+  page.clock.now += 59_999;
+  page.dispatch("keydown", true);
+  assert.equal(page.fetches.length, 601, "throttled within the minute");
+  page.clock.now += 1;
+  page.dispatch("wheel", true);
+  assert.equal(page.fetches.length, 602);
+});
+
+test("the activity throttle spans page loads in the same tab", () => {
+  const storage = { [INBOX_PROOF_KEY]: PROOF };
+  const first = detailPage(storage);
+  first.dispatch("pointerdown", true);
+  assert.equal(first.fetches.length, 1);
+  const lastSent = first.stored.get("stellar-agent-approval-session-activity-at");
+  const second = detailPage({ [INBOX_PROOF_KEY]: PROOF, "stellar-agent-approval-session-activity-at": lastSent });
+  second.clock.now = first.clock.now + 30_000;
+  second.dispatch("pointerdown", true);
+  assert.equal(second.fetches.length, 0);
+});
+
+test("a page without a proof sends no activity", () => {
+  const page = detailPage({});
+  page.dispatch("pointerdown", true);
+  assert.equal(page.fetches.length, 0);
+});
+
+function enrollPage(storage) {
+  const page = browser({
+    islands: { "enroll-data": { csrfToken: "e".repeat(64), rpId: "localhost" } },
+    elements: ["label-input", "enroll-btn", "status"],
+    storage,
+  });
+  page.byId["label-input"].value = "laptop";
+  page.run("../operator_enroll/web/operator-enroll.js");
+  return page;
+}
+
+test("enrollment posts the credential with the session proof", async () => {
+  const page = enrollPage({ [ENROLL_PROOF_KEY]: PROOF });
+  page.byId["enroll-btn"].listeners.click[0]();
+  await settle();
+  assert.equal(page.credentialCalls.length, 1);
+  assert.equal(page.fetches.length, 1);
+  const { url, init } = page.fetches[0];
+  assert.equal(url, "/enroll/credential");
+  assert.equal(init.headers["x-session-proof"], PROOF);
+  assert.equal(init.headers["x-stellar-approval-csrf"], "e".repeat(64));
+});
+
+test("enrollment without a stored proof creates no passkey and sends nothing", async () => {
+  const page = enrollPage({ [INBOX_PROOF_KEY]: PROOF });
+  page.byId["enroll-btn"].listeners.click[0]();
+  await settle();
+  assert.equal(page.credentialCalls.length, 0);
+  assert.equal(page.fetches.length, 0);
+  assert.match(page.byId.status.textContent, /no wallet session/);
 });

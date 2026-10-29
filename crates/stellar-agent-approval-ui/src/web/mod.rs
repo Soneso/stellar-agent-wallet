@@ -3,6 +3,8 @@
 //! Two wallet-authored, same-origin scripts, loaded in order by every page:
 //! [`APP_SHARED_JS`] at `GET /static/app-shared.js`, then [`APP_JS`] at
 //! `GET /static/app.js`. Vanilla JS, no build step, no external dependency.
+//! A third, [`SESSION_BOOTSTRAP_JS`], runs only on the page the bootstrap
+//! exchange returns, on this server and on the operator-enrollment server.
 //!
 //! The split is a single-source-of-truth boundary, not a size optimisation.
 //! [`APP_SHARED_JS`] renders an approval — the row markup, the kind labels, the
@@ -31,6 +33,16 @@ pub const APP_SHARED_JS: &[u8] = include_bytes!("app_shared.js");
 /// Source-of-truth: `src/web/app.js`.
 pub(crate) const APP_JS: &[u8] = include_bytes!("app.js");
 
+/// Session bootstrap glue served at `GET /static/session-bootstrap.js` by
+/// both loopback servers.
+///
+/// Stores the session proof from the bootstrap page's data island in
+/// `sessionStorage` and replaces the location with the fixed landing page.
+/// Carries no secret itself, so both servers serve it without a session.
+///
+/// Source-of-truth: `src/web/session_bootstrap.js`.
+pub(crate) const SESSION_BOOTSTRAP_JS: &[u8] = include_bytes!("session_bootstrap.js");
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -56,6 +68,28 @@ mod tests {
         let body = std::str::from_utf8(APP_JS).unwrap();
         assert!(body.contains("X-Stellar-Approval-CSRF"));
         assert!(body.contains("/pending.json"));
+    }
+
+    /// The page script reads the proof from the key the bootstrap page
+    /// stores it under, and sends it in the header the server checks.
+    #[test]
+    fn app_js_reads_the_inbox_proof_key_and_sends_the_proof_header() {
+        let body = std::str::from_utf8(APP_JS).unwrap();
+        assert!(body.contains(&format!(
+            "\"{}\"",
+            crate::auth::SessionPurpose::Inbox.proof_storage_key()
+        )));
+        assert!(body.contains("X-Session-Proof"));
+        assert!(crate::auth::SESSION_PROOF_HEADER_NAME.eq_ignore_ascii_case("X-Session-Proof"));
+    }
+
+    #[test]
+    fn session_bootstrap_js_is_valid_utf8_and_reads_its_island() {
+        let body = std::str::from_utf8(SESSION_BOOTSTRAP_JS).unwrap();
+        assert!(body.contains("session-bootstrap-data"));
+        assert!(body.contains("sessionStorage"));
+        assert!(body.contains("location.replace"));
+        assert!(!body.contains("innerHTML"));
     }
 
     /// The two files are one program split across two `<script>` elements:

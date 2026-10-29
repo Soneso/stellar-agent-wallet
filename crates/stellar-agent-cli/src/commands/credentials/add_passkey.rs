@@ -6,11 +6,15 @@
 //! 3. Construct `CredentialsManager::new` with the shared store Arc.
 //! 4. Start the WebAuthn bridge with the same shared store Arc.
 //! 5. Insert `PendingApproval { kind: RegisterPasskey }` via `CredentialsManager`.
-//! 6. Launch the browser (fallback: print URL to stderr and continue polling).
-//! 7. Poll the shared store until ceremony completes or deadline expires.
-//! 8. Shut down the bridge.
+//! 6. Print the registration URL to stderr and open the browser through a
+//!    private redirect file, so the launcher never receives the URL itself.
+//!    A failed launch is reported and polling continues.
+//! 7. Poll the shared store until the ceremony completes, the deadline
+//!    expires, or the operator presses Ctrl-C.
+//! 8. Shut down the bridge, then remove the redirect file.
 //! 9. Write the credential metadata to the passkeys registry.
-//! 10. Print the JSON result envelope.
+//! 10. Print the JSON result envelope; an interrupt ends with
+//!     `credentials.registration_user_canceled` and exit code `1`.
 //!
 //! # Shared store design
 //!
@@ -42,7 +46,7 @@ use std::{
     io::{self, BufRead as _, Write as _},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex as StdMutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use clap::Args;
@@ -54,18 +58,21 @@ use stellar_agent_core::audit_log::writer::{AuditWriter, AuditWriterRegistry};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::redact_first5_last5;
-use stellar_agent_smart_account::managers::credentials::{AddPasskeyOutcome, CredentialsManager};
-use stellar_agent_webauthn_bridge::start_bridge_register_only;
+use stellar_agent_smart_account::managers::credentials::{
+    AddPasskeyOutcome, CredentialsError, CredentialsManager,
+};
+use stellar_agent_webauthn_bridge::{BridgeHandle, start_bridge_register_only};
 use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::commands::credentials::credentials_error_code;
+use crate::common::private_open;
 use crate::common::profile_access::{
     ProfileAccessError, load_profile_reconciled, profile_access_envelope,
 };
 use crate::common::render::render_json;
 use crate::common::served_pages::page_identity_for;
-use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
+use crate::common::{interrupted, resolve_profile_name, validate_path_component_ascii_safe};
 use stellar_agent_loopback_http::brand::PageIdentity;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -260,20 +267,10 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
         }
     };
 
-    // ── Launch browser (fallback: print URL to stderr, continue polling) ───
-    // Browser-launch failure is non-fatal: the operator can open the URL
-    // manually. The polling loop continues regardless. The launch outcome is
-    // NOT surfaced through `AddPasskeyOutcome`.
-    let browser_launched = launch_browser(&handle.url);
-    if !browser_launched {
-        #[allow(clippy::print_stderr)]
-        {
-            eprintln!(
-                "stellar-agent: browser launch failed. Open the following URL to complete registration:\n  {}",
-                handle.url
-            );
-        }
-    }
+    // ── Print the manual handoff ───────────────────────────────────────────
+    // The URL goes to stderr first: it is the manual handoff when the launch
+    // fails and when a sandboxed browser cannot read the redirect file.
+    print_registration_handoff(&handle.url);
 
     // ── Open audit writer (non-fatal: warn on failure, continue) ──────────
     // Wire a real AuditWriter so PasskeyRegistered events are emitted. If the
@@ -302,23 +299,95 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
         None => None,
     };
 
-    // ── Poll for registration completion ───────────────────────────────────
-    let deadline = Instant::now() + std::time::Duration::from_secs(args.timeout_seconds);
+    // ── Open the browser, poll for completion, shut down ──────────────────
+    // The browser opens through a private redirect file. Polling continues
+    // whether or not the launch succeeds, and the launch outcome is not
+    // surfaced through `AddPasskeyOutcome`. The registration timeout counts
+    // from the end of the launch.
+    let end = register_until_done(
+        bridge,
+        &handle.url,
+        private_open::browser_opener,
+        Duration::from_secs(args.timeout_seconds),
+        |deadline| mgr.poll_registration(&args.name, &handle.nonce, deadline, audit_writer_ref),
+        tokio::signal::ctrl_c(),
+    )
+    .await;
 
-    let outcome = mgr
-        .poll_registration(&args.name, &handle.nonce, deadline, audit_writer_ref)
-        .await;
+    report_registration_end(end, &args.name)
+}
 
-    // ── Shut down the bridge ───────────────────────────────────────────────
+/// How the registration phase ended.
+#[derive(Debug)]
+enum RegistrationEnd {
+    /// Polling returned an outcome or an error.
+    Finished(Result<AddPasskeyOutcome, CredentialsError>),
+    /// The operator interrupted the wait (Ctrl-C).
+    Interrupted,
+}
+
+/// Runs the registration ceremony on the started bridge until the polling
+/// loop returns or `interrupt` resolves.
+///
+/// Opens the registration URL through a private redirect file first;
+/// `opener` receives only the file's URL, never the registration URL with
+/// its nonce. The polling deadline is `timeout` after the opener returns, so
+/// a slow launcher never shortens the operator's window; `registration`
+/// builds the polling loop for that deadline. The file stays while polling
+/// runs. Every end, an interrupt included, then shuts the bridge down and
+/// removes the file and its directory. When the open fails, the URL printed
+/// by [`print_registration_handoff`] is the handoff.
+async fn register_until_done<F>(
+    bridge: BridgeHandle,
+    url: &str,
+    opener: impl FnOnce(&str) -> io::Result<()>,
+    timeout: Duration,
+    registration: impl FnOnce(Instant) -> F,
+    interrupt: impl Future<Output = io::Result<()>>,
+) -> RegistrationEnd
+where
+    F: Future<Output = Result<AddPasskeyOutcome, CredentialsError>>,
+{
+    let browser_handoff =
+        private_open::open_or_point_to_handoff(url, opener, "the registration URL printed above");
+    let polling = registration(Instant::now() + timeout);
+
+    let end = tokio::select! {
+        outcome = polling => RegistrationEnd::Finished(outcome),
+        () = interrupted(interrupt) => RegistrationEnd::Interrupted,
+    };
+
     if let Err(e) = bridge.shutdown().await {
-        // Non-fatal: the ceremony has already completed or timed out.
+        // Non-fatal: the ceremony has already completed, timed out or been
+        // interrupted.
         #[allow(clippy::print_stderr)]
         {
             eprintln!("stellar-agent: bridge shutdown warning: {e}");
         }
     }
+    if let Some(handoff) = browser_handoff
+        && let Err(e) = handoff.close()
+    {
+        tracing::debug!(
+            error.kind = ?e.kind(),
+            "credentials add-passkey: redirect file cleanup failed"
+        );
+    }
+    end
+}
 
-    // ── Emit result JSON ───────────────────────────────────────────────────
+/// Renders the result envelope for how the registration phase ended and
+/// returns the exit code: `0` for a registered credential, `1` otherwise.
+fn report_registration_end(end: RegistrationEnd, name: &str) -> i32 {
+    let outcome = match end {
+        RegistrationEnd::Finished(outcome) => outcome,
+        RegistrationEnd::Interrupted => {
+            return emit_error(
+                "credentials.registration_user_canceled",
+                format!("registration of '{name}' was interrupted before the ceremony completed"),
+            );
+        }
+    };
     match outcome {
         Ok(AddPasskeyOutcome::Registered { metadata }) => {
             render_json(&Envelope::ok(RegisteredSuccess {
@@ -331,20 +400,16 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
         }
         Ok(AddPasskeyOutcome::Timeout) => emit_error(
             "credentials.registration_timeout",
-            format!(
-                "registration of '{}' timed out before the ceremony completed",
-                args.name
-            ),
+            format!("registration of '{name}' timed out before the ceremony completed"),
         ),
         Ok(AddPasskeyOutcome::UserCanceled) => emit_error(
             "credentials.registration_user_canceled",
-            format!("registration of '{}' was canceled by the user", args.name),
+            format!("registration of '{name}' was canceled by the user"),
         ),
         Ok(AddPasskeyOutcome::EntryMissing) => emit_error(
             "credentials.registration_entry_missing",
             format!(
-                "registration of '{}' failed: the approval-store entry was not found (TTL-expired or never persisted)",
-                args.name
+                "registration of '{name}' failed: the approval-store entry was not found (TTL-expired or never persisted)"
             ),
         ),
         Err(e) => emit_error(credentials_error_code(&e), e.to_string()),
@@ -413,16 +478,16 @@ fn emit_rp_id_binding_warning_declined() -> i32 {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Attempts to open the given URL in the OS default browser.
-///
-/// Returns `true` if `webbrowser::open` succeeded, `false` otherwise.
-///
-/// Shell-injection defence: the URL is passed as a `&str` argument to
-/// `webbrowser::open`, which on macOS calls `open(1)` with the URL as a
-/// direct `Command::arg` — not via shell interpolation. Shell metacharacters
-/// in the URL cannot escape into a shell command.
-fn launch_browser(url: &str) -> bool {
-    webbrowser::open(url).is_ok()
+/// Prints the registration URL to stderr, keeping stdout reserved for the
+/// JSON envelope.
+#[allow(
+    clippy::print_stderr,
+    reason = "CLI binary intentional user output: manual registration handoff"
+)]
+fn print_registration_handoff(url: &str) {
+    eprintln!(
+        "stellar-agent: if the browser does not show the registration page, open this URL:\n  {url}"
+    );
 }
 
 /// Opens or retrieves the cached `Arc<StdMutex<AuditWriter>>` for the passkey
@@ -518,6 +583,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
 
@@ -531,6 +597,204 @@ mod tests {
             let error = result.expect_err("protected refusal was swallowed");
             assert_eq!(error.code(), expected);
         }
+    }
+
+    type SharedStore = Arc<Mutex<stellar_agent_core::approval::store::PendingApprovalStore>>;
+
+    /// A started register-only bridge on a temporary approval store, a
+    /// manager sharing that store with its passkeys registry in `dir`, and
+    /// the store.
+    async fn start_test_registration(
+        dir: &tempfile::TempDir,
+        tag: &str,
+    ) -> (BridgeHandle, CredentialsManager, SharedStore) {
+        let store = stellar_agent_core::approval::store::PendingApprovalStore::open(
+            dir.path().join(format!("{tag}.toml")),
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let bridge = start_bridge_register_only(
+            Arc::clone(&store),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            PageIdentity::neutral(),
+        )
+        .await
+        .unwrap();
+        let mgr = CredentialsManager::new(
+            dir.path().join(format!("{tag}-passkeys")),
+            tag,
+            "localhost",
+            Some(Arc::clone(&store)),
+        );
+        (bridge, mgr, store)
+    }
+
+    /// Completes the browser side of the registration for `nonce`: POSTs a
+    /// structurally valid credential to the bridge with the entry's CSRF
+    /// value, as the registration page does.
+    async fn complete_registration_in_browser(
+        bridge_addr: SocketAddr,
+        store: &SharedStore,
+        nonce: &str,
+    ) {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use stellar_agent_core::approval::ApprovalKind;
+
+        let csrf = {
+            let guard = store.lock().await;
+            match &guard.get(nonce).expect("the pending registration").kind {
+                ApprovalKind::RegisterPasskey { csrf_token, .. } => hex::encode(csrf_token),
+                _ => panic!("the pending entry is a registration"),
+            }
+        };
+        let credential_id = URL_SAFE_NO_PAD.encode([0x42_u8; 16]);
+        let mut public_key = [0x01_u8; 65];
+        public_key[0] = 0x04;
+        let payload = serde_json::json!({
+            "id": credential_id,
+            "rawId": credential_id,
+            "type": "public-key",
+            "response": {
+                "clientDataJSON": "ZHVtbXk",
+                "attestationObject": "ZHVtbXk",
+                "publicKeySec1B64": STANDARD.encode(public_key),
+                "transports": ["internal"]
+            }
+        });
+        let response = reqwest::Client::new()
+            .post(format!("http://{bridge_addr}/register/{nonce}/credential"))
+            .header("Origin", format!("http://{bridge_addr}"))
+            .header("X-Stellar-Approval-CSRF", csrf)
+            .header("Content-Type", "application/json")
+            .body(payload.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+    }
+
+    /// The registration timeout counts from the end of the browser launch: a
+    /// launcher slower than the whole timeout does not turn a registration
+    /// the browser already completed into a timeout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn registration_deadline_starts_after_the_launch() {
+        use crate::common::private_open::handoff_probe::HandoffProbe;
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, mgr, store) = start_test_registration(&dir, "slow-launch").await;
+        let bridge_addr = bridge.local_addr();
+        let handle = mgr
+            .prepare_registration("laptop", bridge_addr, None)
+            .await
+            .unwrap();
+        complete_registration_in_browser(bridge_addr, &store, &handle.nonce).await;
+
+        let timeout = Duration::from_millis(100);
+        let probe = HandoffProbe::default();
+        let launch = probe.opener(Ok(()));
+        let slow_launch = move |url: &str| {
+            std::thread::sleep(timeout * 4);
+            launch(url)
+        };
+        let end = tokio::time::timeout(
+            Duration::from_secs(30),
+            register_until_done(
+                bridge,
+                &handle.url,
+                slow_launch,
+                timeout,
+                |deadline| mgr.poll_registration("laptop", &handle.nonce, deadline, None),
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("polling returns");
+        assert!(
+            matches!(
+                end,
+                RegistrationEnd::Finished(Ok(AddPasskeyOutcome::Registered { .. }))
+            ),
+            "{end:?}"
+        );
+        assert_eq!(probe.launched().len(), 1);
+    }
+
+    /// The registration phase hands the browser only the private redirect
+    /// file's URL and keeps the file while polling runs. An interrupt ends
+    /// polling; the bridge stops, the file and its directory are removed,
+    /// and the command exits `1`. A failed open makes one attempt with the
+    /// file URL, leaves nothing behind, and polling still runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_passkey_uses_private_open() {
+        use crate::common::private_open::handoff_probe::HandoffProbe;
+        // Far beyond the test's bound: only the interrupt can end polling.
+        let patience = Duration::from_secs(3600);
+        let bound = Duration::from_secs(30);
+        let dir = tempfile::tempdir().unwrap();
+
+        let (bridge, mgr, _store) = start_test_registration(&dir, "opened").await;
+        let bridge_addr = bridge.local_addr();
+        let handle = mgr
+            .prepare_registration("laptop", bridge_addr, None)
+            .await
+            .unwrap();
+        let probe = HandoffProbe::default();
+        let end = tokio::time::timeout(
+            bound,
+            register_until_done(
+                bridge,
+                &handle.url,
+                probe.opener(Ok(())),
+                patience,
+                |deadline| mgr.poll_registration("laptop", &handle.nonce, deadline, None),
+                probe.interrupt(),
+            ),
+        )
+        .await
+        .expect("the interrupt ends the registration wait");
+        assert!(matches!(end, RegistrationEnd::Interrupted), "{end:?}");
+        probe.assert_private_handoff(&handle.url, &handle.nonce);
+        assert!(
+            std::net::TcpStream::connect(bridge_addr).is_err(),
+            "the bridge stopped"
+        );
+        crate::common::render::take_rendered_for_test();
+        assert_eq!(report_registration_end(end, "laptop"), 1);
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert_eq!(rendered[0]["ok"], false, "{rendered:?}");
+        assert_eq!(
+            rendered[0]["error"]["code"], "credentials.registration_user_canceled",
+            "{rendered:?}"
+        );
+        assert_eq!(
+            rendered[0]["error"]["message"],
+            "registration of 'laptop' was interrupted before the ceremony completed",
+            "{rendered:?}"
+        );
+
+        let (bridge, mgr, _store) = start_test_registration(&dir, "failed").await;
+        let handle = mgr
+            .prepare_registration("laptop", bridge.local_addr(), None)
+            .await
+            .unwrap();
+        let probe = HandoffProbe::default();
+        let end = tokio::time::timeout(
+            bound,
+            register_until_done(
+                bridge,
+                &handle.url,
+                probe.opener(Err(io::Error::other("no browser"))),
+                patience,
+                |deadline| mgr.poll_registration("laptop", &handle.nonce, deadline, None),
+                probe.interrupt(),
+            ),
+        )
+        .await
+        .expect("the interrupt ends the registration wait");
+        assert!(matches!(end, RegistrationEnd::Interrupted), "{end:?}");
+        assert!(probe.waited());
+        probe.assert_failed_open_left_nothing(&handle.nonce);
     }
 
     /// Audit writer failure must not prevent registration.

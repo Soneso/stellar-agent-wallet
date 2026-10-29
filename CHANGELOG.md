@@ -161,6 +161,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A mainnet profile whose `policy_window_state_key_id` names an entry other
   than `stellar-agent-policy-window-<profile>` / `default` is refused with
   `profile.key_scope_conflict`, also when the profile file names that entry.
+- Loopback approval sessions expire after 15 minutes of inactivity and 8 hours overall.
+- Ctrl-C during `approve operator enroll --interactive` and `credentials add-passkey`
+  stops the listener, removes the redirect file, and exits 1. Enrollment reports
+  `internal.unexpected_state`; registration reports `credentials.registration_user_canceled`.
 - The opt-in stale-if-error fallback returns expired entries only on transient
   fetch failures and only within one TTL past expiry, and never an entry whose
   fetch time lies more than five minutes in the future. It never writes them back.
@@ -652,6 +656,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another window-state entry. No wallet command establishes the pin of an
   installation with a nonce. The pin and the nonce stay at the profile's
   default window-state entry, which a mainnet profile cannot move.
+- Bearer browser URLs open through private redirect files. Loopback mutations
+  require an origin-scoped proof in addition to cookies and CSRF values.
+- Request traces of the three loopback listeners record the matched route
+  template, never a request path that carries a token or nonce.
 - An expired binding does not satisfy the `HOME_DOMAIN` kind of a
   `counterparty_allowlist` criterion or `home_domain_resolved`:
   `counterparty list` and the policy snapshot skip cache entries past their TTL.

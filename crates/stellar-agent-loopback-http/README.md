@@ -8,6 +8,8 @@ It provides three tower/axum middleware layers: a `Host:` header allowlist for D
 
 The `brand` module carries the presentation those listeners' pages share: `BRAND_STYLE` (the stylesheet with the design tokens and the common components), `BUDDY_MARK_SVG` (the inline brand mark), and the card fragments the single-card pages repeat. They are constants emitted inline rather than served assets, because the Content-Security-Policy above admits no external origin and a self-hosted wallet has no CDN to fall back to. Nothing in the module emits a script, an event-handler attribute, or an external URL.
 
+The `request_trace` module gives each listener's request span the matched route template, such as `/register/{nonce}`, instead of the request path. A path on these listeners can carry a bootstrap token or a nonce, so the raw path never reaches a log.
+
 It is published as part of the stellar-agent-wallet workspace to complete the dependency graph on crates.io and is not designed for standalone use.
 
 ## Status

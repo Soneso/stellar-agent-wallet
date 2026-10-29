@@ -602,7 +602,7 @@ Every subcommand's failure `error.code` is one of a closed set: the verb-specifi
 
 ### `credentials add-passkey <NAME>`
 
-State-changing (writes the registry; performs a browser WebAuthn ceremony). Opens the OS default browser to the wallet-owned bridge registration URL and polls the approval store until the browser-side ceremony completes or the deadline elapses. On success it writes the credential metadata to the registry. If the browser cannot be launched, the URL is printed to stderr and polling continues.
+State-changing (writes the registry; performs a browser WebAuthn ceremony). Prints the wallet-owned bridge registration URL to stderr, opens it in the OS default browser, and polls the approval store until the browser-side ceremony completes or the deadline elapses. On success it writes the credential metadata to the registry. The browser opens through a private redirect file that only the current user can read. The browser launcher receives only that file's address, never the registration URL, and the file is removed when the command ends. If the browser cannot be launched, or does not show the page, open the printed URL yourself; polling continues either way. Until registration completes, the entry expires, or the bridge stops, whoever has the URL can register a passkey. Keep it out of shared logs. Ctrl-C ends polling: the command stops the bridge, removes the redirect file, and exits `1` with `credentials.registration_user_canceled`.
 
 - `<NAME>` (positional, required) — a name for the credential. 1 to 64 printable ASCII characters; `/`, `\`, and `:` are not allowed.
 - `--profile <NAME>` — profile override (see above).
@@ -822,9 +822,27 @@ to start while another process, such as a running MCP server, holds the audit
 writer (`audit.writer_locked`).
 
 The printed URL contains a single-use bootstrap token: the first visit
-exchanges it for an HttpOnly session cookie and the token dies. All state
-mutation requires that cookie plus a per-action CSRF header; the server binds
-`127.0.0.1` only and refuses non-loopback hosts and origins.
+exchanges it for an HttpOnly session cookie and an origin-scoped session
+proof, and the token dies. The page keeps the proof in the tab's session
+storage. Mutating requests require the session cookie, an origin-scoped
+session proof, and a CSRF value. The server binds `127.0.0.1` only and
+refuses non-loopback hosts and origins.
+
+The inbox session expires after 15 minutes without operator activity or 8 hours after bootstrap. Background polling does not extend it. Restart `approve serve` to establish a new session.
+
+Browsers send a loopback cookie to every port on the same host, so another
+local service the browser visits can receive the session cookie. That service
+cannot read the proof, so the cookie alone cannot approve or reject. It can
+still read what the cookie authorizes, the inbox listing and the approval
+details, until the session expires.
+
+Unless `--no-open` is passed, the browser opens the URL through a private
+redirect file that only the current user can read. The browser launcher
+receives only that file's address, never the bootstrap URL, and the file is
+removed when the server stops. If the browser cannot be opened, open the
+printed URL yourself. Until its first use or until the server stops, the
+printed URL grants an inbox session to whoever opens it, so keep it out of
+shared logs.
 
 - `--port <PORT>` — fixed port (default: ephemeral). Use a fixed port when
   tunneling.
@@ -882,11 +900,22 @@ binding is what decides which of the two modes applies:
   opens) an enrollment page, and persists the credential automatically once
   your authenticator completes the ceremony. The printed URL contains a
   single-use bootstrap token: the first visit exchanges it for an HttpOnly
-  session cookie and the token dies, and both serving the page and the POST
-  that persists the credential require that cookie, so a local non-browser
-  process cannot drive the ceremony. The server binds `127.0.0.1` only and
-  refuses non-loopback hosts and origins. Always produces a credential bound
-  to `rp_id: "localhost"` — the only effective domain a loopback origin can
+  session cookie and an origin-scoped session proof that the page keeps in
+  the tab, and the token dies. Serving the page requires the cookie. The POST
+  that persists the credential requires the session cookie, an origin-scoped
+  session proof, and a CSRF value. Neither a local non-browser process nor
+  another loopback service that receives the cookie can complete the
+  ceremony. The session expires after 15 minutes without operator activity
+  or 8 hours after bootstrap. The browser opens through a private redirect
+  file that only the current user can read, so the browser launcher never
+  receives the bootstrap URL; the file is removed when the command ends. If
+  the browser cannot be opened, open the printed URL yourself. Until its
+  first use or until the command ends, the printed URL grants an enrollment
+  session to whoever opens it, so keep it out of shared logs. Ctrl-C ends
+  the wait: the command stops the server, removes the redirect file, and
+  exits `1`. The server binds `127.0.0.1` only and refuses non-loopback
+  hosts and origins. Always produces a credential bound to
+  `rp_id: "localhost"`, the only effective domain a loopback origin can
   claim.
 - **`--credential-id` / `--public-key` / `--rp-id` / `--label`** (all four
   together) — for a domain-configured remote listener. Imports the id and
