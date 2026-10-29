@@ -107,7 +107,9 @@ Four approval kinds bind extra fields by hashing them into the 32-byte slot that
 - `RuleProposalSimulated`: the shared HMAC binds the versioned proposal digest over the resolved rule installation arguments.
 - `MppChargeSimulated`: the shared HMAC binds the prepared artifact hash. The store verifier also compares the stored profile and chain with the binding.
 
-The first-invoke gate is a re-prompt suppressor only. The per-action `PaymentSimulated` approval still fires unconditionally on every toolset-routed payment and binds the actual executed envelope through `envelope_sha256`. So a forged or tampered grant can suppress at most the re-prompt. It cannot bypass the per-action approval, whose tag the keyring-only HMAC key protects.
+A matching grant requires a version 3 HMAC that verifies under the profile's attestation key and profile/chain binding. It must be unexpired, with a lifetime of at most 30 days, and issued no later than the current time and at or after the second following the current installation. An invalid install time honors no grant. Consent issued in the install second re-prompts once. A forged or edited grant suppresses nothing.
+
+The first-invoke grant suppresses only its re-prompt. Per-action `PaymentSimulated` approval fires on every toolset-routed payment and binds the executed envelope through `envelope_sha256`.
 
 ## Audit hash-chain
 

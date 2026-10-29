@@ -297,7 +297,7 @@ async fn gated_toolset_first_invoke_and_forced_per_action_testnet() {
         now_ms,
         TOOLSET_GRANT_DEFAULT_TTL_MS,
         &attestation_key,
-        &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
+        &stellar_agent_core::approval::AttestationBinding::new(&profile_name, TESTNET_CHAIN_ID),
     )
     .expect("build_attested_grant");
 

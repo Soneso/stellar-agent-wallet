@@ -36,7 +36,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
-use super::error::ApprovalError;
+use super::error::{ApprovalError, toml_error_position};
 use crate::redact_first5_last5;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -287,7 +287,10 @@ impl OperatorApprovalCredentialStore {
         }
         let content = fs::read_to_string(&self.path).map_err(ApprovalError::from_io)?;
         toml::from_str(&content).map_err(|e| ApprovalError::Toml {
-            detail: format!("operator_credentials: {e}"),
+            detail: format!(
+                "operator_credentials: {}",
+                toml_error_position(&content, e.span().map(|s| s.start))
+            ),
         })
     }
 
@@ -690,6 +693,31 @@ mod tests {
             !debug_str.contains(&cred.public_key_sec1_b64),
             "full public_key_sec1_b64 must not appear in Debug output: {debug_str}"
         );
+    }
+
+    #[test]
+    fn load_parse_error_names_the_position_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let public_key = valid_pubkey_b64();
+        fs::write(
+            &path,
+            format!(
+                "[[credentials]]\nrp_id = \"wallet.internal\"\npublic_key_sec1_b64 = \"{public_key}"
+            ),
+        )
+        .unwrap();
+        let err = OperatorApprovalCredentialStore::new(path)
+            .list()
+            .unwrap_err();
+        assert!(matches!(err, ApprovalError::Toml { .. }));
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("operator_credentials: TOML parse error at line 3, column "),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(&public_key), "{rendered}");
+        assert!(!rendered.contains("public_key_sec1_b64"), "{rendered}");
     }
 
     #[cfg(unix)]

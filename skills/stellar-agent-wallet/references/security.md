@@ -307,9 +307,12 @@ Toolset-routed payments use two distinct controls, and only one is suppressible:
   every toolset-routed payment, and its attestation binds the actual executed
   envelope.
 
-A forged or tampered grant can at most suppress a re-prompt; it cannot bypass the
-per-action approval, because that approval is forced regardless of any grant and is
-bound to the real transaction.
+A matching grant requires a version 3 HMAC that verifies under the profile's
+attestation key and profile/chain binding. It must be unexpired, with a lifetime
+of at most 30 days, and issued no later than the current time and at or after
+the second following the current installation. An invalid install time honors
+no grant. Consent issued in the install second re-prompts once. A forged or
+edited grant suppresses nothing.
 
 Agent rule: expect a gated action to pause for operator approval. Do not interpret
 a `RequireApproval` / `policy.approval_required` outcome as a failure to retry; it

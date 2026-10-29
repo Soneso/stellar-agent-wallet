@@ -240,12 +240,16 @@ nonce. The operator approves out of band with
 `stellar-agent approve --id <nonce> --profile <name>`, which records a time-boxed grant. The
 agent then re-invokes.
 
-A matching grant suppresses only the first-invoke re-prompt. The per-action
-payment approval fires unconditionally on every toolset-routed payment: a
-policy-engine `Allow` is overridden to `RequireApproval`, and the approval binds
-the actual executed envelope. A forged or tampered grant can at most suppress
-the re-prompt; it cannot bypass the forced per-action approval, whose
-attestation key lives only in the keyring.
+A matching grant requires a version 3 HMAC that verifies under the profile's
+attestation key and profile/chain binding. It must be unexpired, with a lifetime
+of at most 30 days, and issued no later than the current time and at or after
+the second following the current installation. An invalid install time honors
+no grant. Consent issued in the install second re-prompts once. A forged or
+edited grant suppresses nothing.
+
+A matching grant suppresses only the first-invoke re-prompt. Per-action payment
+approval fires on every toolset-routed payment: a policy-engine `Allow` becomes
+`RequireApproval`, and the approval binds the actual executed envelope.
 
 ## How an agent invokes a toolset action
 
@@ -394,7 +398,9 @@ or `toolset.tool_not_allowed`.
 Removes an installed toolset's directory and pin record. Refuses if the toolset is
 not installed. Uninstall reads the pin, re-validates the stored package name,
 reconstructs the directory path from that validated name (never from a stored
-path), refuses a symlinked leaf, and removes the directory and pin.
+path), refuses a symlinked leaf, and removes the directory and pin. Grants
+approved for the removed package do not apply to a later install, including a
+forced reinstall or an install after manual removal.
 
 Positional: `<PACKAGE>`: the package name (`[a-z0-9-]`).
 

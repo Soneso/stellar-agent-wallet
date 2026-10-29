@@ -109,6 +109,72 @@ pub fn format_rfc3339_utc(t: std::time::SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
+/// Parses exactly `YYYY-MM-DDTHH:MM:SSZ` as Unix seconds.
+///
+/// Accepts valid Gregorian dates with four-digit years from 1970, and seconds
+/// from 00 through 59. Other forms and invalid calendar fields return `None`.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::{Duration, UNIX_EPOCH};
+/// use stellar_agent_core::timefmt::{format_rfc3339_utc, parse_rfc3339_utc};
+///
+/// let seconds = 1_777_552_496;
+/// let text = format_rfc3339_utc(UNIX_EPOCH + Duration::from_secs(seconds));
+/// assert_eq!(parse_rfc3339_utc(&text), Some(seconds));
+/// ```
+#[must_use]
+pub fn parse_rfc3339_utc(text: &str) -> Option<u64> {
+    if text.len() != 20 {
+        return None;
+    }
+    for (i, byte) in text.bytes().enumerate() {
+        let valid = match i {
+            4 | 7 => byte == b'-',
+            10 => byte == b'T',
+            13 | 16 => byte == b':',
+            19 => byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        };
+        if !valid {
+            return None;
+        }
+    }
+    let year: u32 = text.get(0..4)?.parse().ok()?;
+    let month: usize = text.get(5..7)?.parse().ok()?;
+    let day: u32 = text.get(8..10)?.parse().ok()?;
+    let hour: u64 = text.get(11..13)?.parse().ok()?;
+    let minute: u64 = text.get(14..16)?.parse().ok()?;
+    let second: u64 = text.get(17..19)?.parse().ok()?;
+    if year < 1970 || !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let days_in_month = [
+        31,
+        if is_leap_year(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if day == 0 || day > days_in_month[month - 1] {
+        return None;
+    }
+    let prior_year_days: u64 = (1970..year)
+        .map(|y| if is_leap_year(y) { 366 } else { 365 })
+        .sum();
+    let prior_month_days: u32 = days_in_month[..month - 1].iter().sum();
+    let days = prior_year_days + u64::from(prior_month_days + day - 1);
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
 /// Returns the current UTC time as an ISO-8601 string with millisecond
 /// precision: `YYYY-MM-DDTHH:MM:SS.mmmZ`.
 ///
@@ -252,6 +318,51 @@ pub(crate) fn is_leap_year(year: u32) -> bool {
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test-only")]
     use super::*;
+
+    #[test]
+    fn parse_rfc3339_utc_inverts_format() {
+        use std::time::{Duration, UNIX_EPOCH};
+        for (seconds, text) in [
+            (0, "1970-01-01T00:00:00Z"),
+            (1_709_251_199, "2024-02-29T23:59:59Z"),
+            (1_777_552_496, "2026-04-30T12:34:56Z"),
+            (4_107_542_400, "2100-03-01T00:00:00Z"),
+            (13_574_563_200, "2400-02-29T00:00:00Z"),
+        ] {
+            assert_eq!(
+                format_rfc3339_utc(UNIX_EPOCH + Duration::from_secs(seconds)),
+                text
+            );
+            assert_eq!(parse_rfc3339_utc(text), Some(seconds));
+        }
+    }
+
+    #[test]
+    fn parse_rfc3339_utc_refuses_other_forms() {
+        for text in [
+            "2026-04-30T12:34:56.000Z",
+            "2026-04-30T12:34:56+00:00",
+            "2026-04-30t12:34:56Z",
+            "2026-04-30T12:34:56z",
+            "2026-13-30T12:34:56Z",
+            "2026-00-30T12:34:56Z",
+            "2024-02-30T12:34:56Z",
+            "2026-02-29T12:34:56Z",
+            "2100-02-29T12:34:56Z",
+            "2026-04-00T12:34:56Z",
+            "2026-04-31T12:34:56Z",
+            "2026-04-30T24:34:56Z",
+            "2026-04-30T12:60:56Z",
+            "2026-04-30T12:34:60Z",
+            "1969-12-31T23:59:59Z",
+            "2026-04-30T12:34:56Z trailing",
+            "2026/04-30T12:34:56Z",
+            "2026-04-30T12:34:5é",
+            "",
+        ] {
+            assert_eq!(parse_rfc3339_utc(text), None, "{text}");
+        }
+    }
 
     #[test]
     fn format_rfc3339_utc_known_timestamp() {

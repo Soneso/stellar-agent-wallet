@@ -27,10 +27,10 @@ pub enum ApprovalError {
 
     /// A TOML parse or serialise error occurred.
     ///
-    /// `detail` is a non-secret diagnostic string derived from the TOML error.
+    /// Parse diagnostics name only the position of the error.
     #[error("approval TOML error: {detail}")]
     Toml {
-        /// Non-secret diagnostic detail string.
+        /// Non-secret diagnostic; parse errors name the position only.
         detail: String,
     },
 
@@ -204,6 +204,24 @@ pub enum ApprovalError {
     },
 }
 
+/// Names a TOML error's line and character column without including input text.
+///
+/// A missing start or a start outside a character boundary gives the fixed
+/// diagnostic `TOML parse error`.
+pub(crate) fn toml_error_position(body: &str, start: Option<usize>) -> String {
+    let Some(prefix) = start.and_then(|start| body.get(..start)) else {
+        return "TOML parse error".to_owned();
+    };
+    let line = prefix.matches('\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, tail)| tail)
+        .chars()
+        .count()
+        + 1;
+    format!("TOML parse error at line {line}, column {column}")
+}
+
 impl ApprovalError {
     /// Constructs an [`ApprovalError::Io`] from an `io::Error`.
     ///
@@ -294,6 +312,33 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
     use super::*;
+
+    #[test]
+    fn toml_error_position_names_line_and_character_column() {
+        assert_eq!(
+            toml_error_position("a\néébc", Some(7)),
+            "TOML parse error at line 2, column 4"
+        );
+        assert_eq!(
+            toml_error_position("a = 1\nb = ", Some(10)),
+            "TOML parse error at line 2, column 5"
+        );
+        assert_eq!(
+            toml_error_position("", Some(0)),
+            "TOML parse error at line 1, column 1"
+        );
+    }
+
+    #[test]
+    fn toml_error_position_without_a_start_names_no_position() {
+        assert_eq!(toml_error_position("abc", None), "TOML parse error");
+    }
+
+    #[test]
+    fn toml_error_position_outside_a_character_boundary_names_no_position() {
+        assert_eq!(toml_error_position("aéb", Some(2)), "TOML parse error");
+        assert_eq!(toml_error_position("abc", Some(4)), "TOML parse error");
+    }
 
     #[test]
     fn redact_nonce_short_passes_through() {

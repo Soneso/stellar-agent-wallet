@@ -118,6 +118,23 @@ fn setup_mock_keyring() {
     entry.set_password(&encoded).expect("set nonce key");
 }
 
+/// Seeds the profile's attestation key for gated invocations.
+fn setup_gated_mock_keyring() -> [u8; 32] {
+    use base64::Engine as _;
+    setup_mock_keyring();
+    let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
+    let key = [0x42u8; 32];
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+    keyring_core::Entry::new(
+        &profile.attestation_key_id.service,
+        &profile.attestation_key_id.account,
+    )
+    .expect("attestation key entry")
+    .set_password(&encoded)
+    .expect("set attestation key");
+    key
+}
+
 /// Build a `WalletServer` for testnet with an Allow policy and all path overrides.
 fn build_allow_server_with_overrides(
     toolsets_root: &std::path::Path,
@@ -434,7 +451,7 @@ async fn dangerous_key_tojson_rejected_gated() {
     };
     use stellar_agent_core::timefmt::now_unix_ms;
 
-    setup_mock_keyring();
+    let attestation_key = setup_gated_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();
     let approval_dir = tmp.path().join("approvals");
@@ -447,8 +464,6 @@ async fn dangerous_key_tojson_rejected_gated() {
     let env_xdr = payment_envelope_xdr(SOURCE_G, DEST_G, 1_000_000);
 
     // Seed a valid grant for (TOOLSET_SIGN_PAYMENT, sign-payment, DEST_G, XLM).
-    // attestation_key matches the [0x42u8;32] nonce key seeded by setup_mock_keyring.
-    let attestation_key = [0x42u8; 32];
     let process_uid = process_uid_for_attestation().expect("process uid");
     let now_ms = now_unix_ms().expect("now_unix_ms");
     let grant = build_attested_grant(
@@ -462,7 +477,7 @@ async fn dangerous_key_tojson_rejected_gated() {
         now_ms,
         TOOLSET_GRANT_DEFAULT_TTL_MS,
         &attestation_key,
-        &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
+        &stellar_agent_core::approval::AttestationBinding::new("acct", "stellar:testnet"),
     )
     .expect("build_attested_grant");
     let mut store = ToolsetGrantStore::open(grant_store_path.clone(), now_ms).expect("open grants");
@@ -526,7 +541,7 @@ async fn dangerous_key_chain_id_injected_gated_still_caught() {
     };
     use stellar_agent_core::timefmt::now_unix_ms;
 
-    setup_mock_keyring();
+    let attestation_key = setup_gated_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();
     let approval_dir = tmp.path().join("approvals");
@@ -537,12 +552,7 @@ async fn dangerous_key_chain_id_injected_gated_still_caught() {
 
     let env_xdr = payment_envelope_xdr(SOURCE_G, DEST_G, 1_000_000);
 
-    // Use the same attestation_key as setup_mock_keyring for consistency.
-    // The grant-store match_and_verify path checks HMAC against the nonce key;
-    // for this test the guard fires before any HMAC verification, so the exact
-    // key value does not affect the test outcome — but [0x42u8;32] matches the
-    // seeded nonce key and avoids a latent confusion if the test is extended.
-    let attestation_key = [0x42u8; 32];
+    // The grant verifies under the profile's attestation key and binding.
     let process_uid = process_uid_for_attestation().expect("process uid");
     let now_ms = now_unix_ms().expect("now_unix_ms");
     let grant = build_attested_grant(
@@ -556,7 +566,7 @@ async fn dangerous_key_chain_id_injected_gated_still_caught() {
         now_ms,
         TOOLSET_GRANT_DEFAULT_TTL_MS,
         &attestation_key,
-        &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
+        &stellar_agent_core::approval::AttestationBinding::new("acct", "stellar:testnet"),
     )
     .expect("build_attested_grant");
     let mut store = ToolsetGrantStore::open(grant_store_path.clone(), now_ms).expect("open grants");
@@ -747,7 +757,7 @@ async fn malicious_toolset_declares_real_cap_names_denylist_tool() {
 #[tokio::test]
 #[serial]
 async fn malicious_toolset_gated_no_grant() {
-    setup_mock_keyring();
+    setup_gated_mock_keyring();
     let tmp = TempDir::new().unwrap();
     let toolsets_root = tmp.path().to_path_buf();
     let approval_dir = tmp.path().join("approvals");
