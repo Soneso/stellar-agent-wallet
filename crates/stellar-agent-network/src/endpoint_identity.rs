@@ -165,6 +165,85 @@ impl EndpointIdentity {
     }
 }
 
+/// An oracle client whose endpoint reported the mainnet passphrase and a
+/// protocol version the protocol rule accepts for mainnet.
+///
+/// [`MainnetOracle::verify`] is the only public constructor, and the
+/// crate's single-request form of it is the only other one. Both ask the
+/// endpoint `getNetwork` through the client and return a value only when the
+/// answer names mainnet and passes [`check_protocol_version`]. The settlement steps
+/// that release or confirm a mainnet submission on the oracle's word take
+/// this type rather than a bare client, so an oracle endpoint that serves
+/// another network, or whose identity could not be read, is never asked for
+/// that evidence.
+///
+/// ```compile_fail,E0451
+/// use stellar_agent_network::{MainnetOracle, StellarRpcClient};
+/// fn forge(client: &StellarRpcClient) -> MainnetOracle<'_> { MainnetOracle { client } }
+/// ```
+#[derive(Clone, Copy)]
+pub struct MainnetOracle<'a> {
+    client: &'a crate::StellarRpcClient,
+}
+
+impl<'a> MainnetOracle<'a> {
+    /// Checks that `client`'s endpoint serves mainnet, with the identity
+    /// probe's retries bounded by `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// `network.witness_unavailable` naming the oracle when the endpoint
+    /// reports another network, an unsupported protocol version, or no
+    /// identity before `deadline`; `network.rpc_credential_refused` when it
+    /// answers HTTP 401 or 403.
+    pub async fn verify(
+        client: &'a crate::StellarRpcClient,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, stellar_agent_core::error::WalletError> {
+        client
+            .mainnet_endpoint_identity(deadline)
+            .await
+            .map_err(|error| {
+                crate::cross_check::identity_error(error, &client.url.authority(), Caip2::Mainnet)
+            })?;
+        Ok(Self { client })
+    }
+
+    /// [`Self::verify`] with exactly one `getNetwork` request and no retry,
+    /// for a caller that charges every request it sends against an
+    /// allowance.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify`].
+    pub(crate) async fn verify_once(
+        client: &'a crate::StellarRpcClient,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, stellar_agent_core::error::WalletError> {
+        client
+            .mainnet_endpoint_identity_once(deadline)
+            .await
+            .map_err(|error| {
+                crate::cross_check::identity_error(error, &client.url.authority(), Caip2::Mainnet)
+            })?;
+        Ok(Self { client })
+    }
+
+    /// The verified client.
+    #[must_use]
+    pub fn client(self) -> &'a crate::StellarRpcClient {
+        self.client
+    }
+}
+
+impl std::fmt::Debug for MainnetOracle<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MainnetOracle")
+            .field("authority", &self.client.url.authority())
+            .finish()
+    }
+}
+
 /// Applies the protocol rule to the version an endpoint reported.
 ///
 /// A version inside [`SUPPORTED_PROTOCOL_VERSIONS`] passes. Outside it, a

@@ -170,10 +170,14 @@ impl WalletServer {
                     "the system clock is unavailable",
                 ));
             };
+            // On a mainnet profile the oracle witnesses the primary's negative
+            // answers before the reservation settles on them.
+            let oracle = self.settlement_oracle();
             match window
                 .reconcile_one(
                     &self.profile,
                     &client,
+                    oracle.as_ref(),
                     Some(&receipts),
                     envelope_hash,
                     now_ms,

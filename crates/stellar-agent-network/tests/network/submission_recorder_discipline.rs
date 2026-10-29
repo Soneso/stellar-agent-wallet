@@ -70,9 +70,9 @@ const ALLOWED_NONE: &[(&str, usize, &str)] = &[
 /// arguments. The recorder is the last argument.
 const SEAM_CALLEES: &[&str] = &["submit_transaction_and_wait", "submit_and_wait"];
 
-/// The authorized submission seam: eight arguments, the recorder at index 5.
+/// The authorized submission seam: nine arguments, the recorder at index 6.
 /// Its recorder parameter is a reference, so a call always names one.
-const AUTHORIZED_SEAM: (&str, usize, usize) = ("submit_authorized_transaction_and_wait", 8, 5);
+const AUTHORIZED_SEAM: (&str, usize, usize) = ("submit_authorized_transaction_and_wait", 9, 6);
 
 /// Files that submit through a shared helper instead of calling the seam,
 /// with the helper's callee name and the number of production calls each

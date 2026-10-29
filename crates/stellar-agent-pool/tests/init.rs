@@ -650,6 +650,7 @@ async fn timed_out_initialization_is_recorded_and_reconcilable() {
     .reconcile_one(
         &fixture.profile,
         &client,
+        None,
         Some(&fixture.receipts),
         &records[0].envelope_hash,
         1_700_000_002_000,

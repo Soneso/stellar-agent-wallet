@@ -192,8 +192,8 @@ pub use ledger::{
 };
 pub use store::{
     MintOutcome, POLICY_STATE_KEY_FIELD, PersistedWindowStore, RECONCILE_BUDGET,
-    RECONCILE_MIN_AGE_MS, ReconcileFailure, ReconcileReport, ResetError, ResetOutcome, ResetRecord,
-    SettledSubmission, StateDefect, SubmissionHold,
+    RECONCILE_MIN_AGE_MS, ReconcileFailure, ReconcileFailureKind, ReconcileReport, ResetError,
+    ResetOutcome, ResetRecord, SettledSubmission, StateDefect, SubmissionHold,
 };
 
 /// Records a confirmed call's contribution into `engine`'s window state and

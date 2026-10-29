@@ -406,6 +406,15 @@ A mainnet profile requires `providers.oracle`, a host distinct from `rpc_url`,
 and a `[providers.primary]` record. Endpoint validation and URL redaction apply.
 `providers.oracle` can name a keyring credential for the endpoint.
 
+On mainnet the oracle also witnesses settlement, once it reports the mainnet
+passphrase. A submission the primary endpoint reports failed, refused, or
+unknown is settled on the oracle's answers: its transaction status, and for an
+unknown transaction its retention window, ledger close time and account
+sequence. A mainnet profile without `oracle_provider_url` keeps every such
+submission pending, with its spending-window reservation held, until the
+operator clears it with `stellar-agent tx receipt clear`;
+`profile enable-mainnet --check` reports this as an advisory.
+
 ### Provider attestations
 
 Edit the profile file to configure the optional URLs and provider records.

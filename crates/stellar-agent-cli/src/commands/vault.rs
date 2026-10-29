@@ -453,6 +453,7 @@ where
         &profile_name,
         crate::common::profile_access::ProfileOrigin::Persisted,
         &primary_rpc,
+        crate::commands::submission_record::settlement_oracle(&profile).as_ref(),
         now_ms,
     )
     .await;
@@ -861,6 +862,7 @@ where
         &profile_name,
         crate::common::profile_access::ProfileOrigin::Persisted,
         &primary_rpc,
+        crate::commands::submission_record::settlement_oracle(&profile).as_ref(),
         now_ms,
     )
     .await;

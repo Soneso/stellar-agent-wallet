@@ -349,6 +349,10 @@ pub(crate) async fn sign_and_submit_classic(
                 "audit readiness missing",
             )
         })?;
+        // The oracle confirms a negative answer of the primary endpoint after
+        // the send; a client that cannot be built refuses before the signer
+        // loads.
+        let oracle = guard.context.oracle_client().map_err(render)?;
         let signer = server.mainnet_enrolled_signer(guard).map_err(render)?;
         let handle = stellar_agent_network::keyring::lazy_signer_from_keyring(
             signer.seed_entry(),
@@ -401,6 +405,7 @@ pub(crate) async fn sign_and_submit_classic(
         };
         let result = submit_authorized_transaction_and_wait(
             client,
+            oracle.as_ref(),
             &signed,
             timeout,
             guard.context.network_passphrase(),

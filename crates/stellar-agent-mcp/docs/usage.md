@@ -414,6 +414,8 @@ Three error codes describe a submission whose outcome the wallet cannot settle o
 - `FAILED`: the transaction applied and failed. Nothing moved, and the reservation is released.
 - `NOT_FOUND`: the endpoint has no record of it. Within the retention window, two kinds of chain evidence say the transaction can no longer apply: an observed ledger close time strictly past its time bound, or a source account sequence that has reached the transaction's. Either is followed by a second transaction lookup: `SUCCESS` records the spend, `FAILED` releases it, and a second `NOT_FOUND` releases the reservation. The record becomes `ambiguous` with `release_code` set to `submission.sequence_consumed` or `submission.time_bound_passed`, and a `value_action_failed` row is written under that code. Without such evidence the record stands: call again later.
 
+On a mainnet profile the primary endpoint's `FAILED` and `NOT_FOUND` settle nothing on their own. The call asks the oracle named by `oracle_provider_url` about the same transaction. The oracle's `SUCCESS` records the spend, and its `FAILED` releases the reservation under the oracle's failure code. Its `NOT_FOUND` runs the rule above with the oracle as the endpoint: the retention window, the ledger close time, the account sequence and the second lookup are all the oracle's. The oracle's answers count only once it reports the mainnet passphrase, which the call checks first. An oracle that reports another network, whose identity cannot be read, or that cannot answer, and a mainnet profile without an oracle, leave the record pending.
+
 `submission.time_bound_passed` needs a transaction with a time bound. The
 wallet's commit tools build classic envelopes without one, so on those the
 evidence is a consumed sequence. A presented envelope, such as one the SEP-43
@@ -421,7 +423,10 @@ tool submits, can carry a time bound, and so can the inner transaction of a
 fee-bump.
 
 The receipt keeps its `release_code` when the reservation is released, so
-a later call can retry any settled row still owed. A receipt released without
+a later call can retry any settled row still owed. The code names the evidence
+for that row and releases nothing by itself: a receipt that carries one while
+its reservation is still held is settled on the chain like any other, which
+finds the evidence again. A receipt released without
 recorded evidence, for example by an older binary, reads as `ambiguous` with no
 `release_code`, and no row is written for it.
 When the settlement lookup cannot read the retained audit history, the call
@@ -438,7 +443,9 @@ status is safe.
 
 A submission whose ledger has fallen outside the endpoint's retention window can never be settled this way. `stellar_transaction_status` reports it as `ambiguous` with no `release_code`, or, when its receipt is missing, as `reservation` with `operator_required: true`; the operator resolves it with `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`.
 
-A send the endpoint refused outright is settled at the send and never reaches this protocol. When `sendTransaction` answers `ERROR` with a transaction result, the endpoint has reported a validation error for the envelope: the commit returns that error's code, the receipt records the failure, the reservation is released, and the wallet never sends those bytes again. They did leave the wallet, though. A copy relayed elsewhere that later becomes valid applies without being counted against the window, and its receipt stays `failed`.
+On a testnet profile, a send the endpoint refused outright is settled at the send and never reaches this protocol. When `sendTransaction` answers `ERROR` with a transaction result, the endpoint has reported a validation error for the envelope: the commit returns that error's code, the receipt records the failure, the reservation is released, and the wallet never sends those bytes again. They did leave the wallet, though. A copy relayed elsewhere that later becomes valid applies without being counted against the window, and its receipt stays `failed`.
+
+On a mainnet profile no second endpoint confirms a refusal at the send, so the commit returns `submission.tx_timeout`, and the receipt, the pending row and the reservation stand until `stellar_transaction_status` settles them on the oracle's answers. A refused envelope without a time bound stays pending until another transaction consumes its sequence or the operator clears it with `stellar-agent tx receipt clear`.
 
 No recovery path sends a transaction again.
 

@@ -502,6 +502,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commit whose pending entry shows another transport, authority, or target
   than the prepared request refuses with `approval.entry_inconsistent`
   (`MppErrorCode::EntryInconsistent`).
+- `stellar_agent_network::submit::submit_authorized_transaction_and_wait`
+  takes the oracle client as its second parameter, an
+  `Option<&StellarRpcClient>`. On the mainnet path the primary's `FAILED`
+  confirmation settles as `OnChainFailed` only when the oracle reports the
+  mainnet passphrase and then the same transaction `FAILED`, under the oracle's
+  code; a refusal at the send, and a `FAILED` the oracle does not confirm,
+  return `submission.tx_timeout` with the receipt, the pending row and the
+  reservation standing.
+- `PersistedWindowStore::reconcile_due` and `reconcile_one` take the oracle
+  client after the primary client. On a mainnet profile the primary's `FAILED`
+  and `NOT_FOUND` settle on the answers of an oracle that reports the mainnet
+  passphrase, checked once per pass with one `getNetwork` request that is not
+  retried, and a pass may spend four reads per reservation and one for the
+  oracle's identity. `reconcile_one_within` settles one submission on an
+  oracle the caller already checked, a `MainnetOracle`, and ends every read of
+  that oracle by the caller's deadline. `ReconcileFailure` gains
+  `kind`, a `ReconcileFailureKind` (`Unreachable`, `OracleNotConfigured`,
+  `OracleNetworkMismatch`, `OracleProtocolUnsupported` or
+  `OracleIdentityUnavailable`); code that constructs it must set the field.
+  `NetworkContext::oracle_client` and `MainnetWriteContext::oracle_client`
+  build the oracle client a profile names, and `MainnetOracle::verify` returns
+  that client once its endpoint reports the mainnet passphrase.
+- `profile enable-mainnet --check` reports `oracle_provider_url`, with the new
+  status `advisory` on a profile without an oracle. An advisory never fails the
+  check.
+- `tx receipt clear` on a mainnet profile with an oracle asks the oracle before
+  it clears, and refuses with `submission.not_clearable` when the oracle does
+  not report the mainnet passphrase, reports `SUCCESS` or `FAILED`, or cannot
+  answer. Every oracle read of the clear, its reconciliation's included, ends
+  by one deadline, the profile's submit timeout, so a stalled oracle cannot
+  hold the audit writer past it; a reconciliation read still open then refuses
+  with `network.rpc_unreachable`. On a mainnet profile without an oracle, the
+  primary's `FAILED` goes on to the acknowledged clear, and a sent submission
+  with a time bound is refused with `submission.still_pending` until that
+  bound passes on the host clock.
 
 ### Removed
 
@@ -756,6 +791,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memo or as no memo, and render control and format characters as visible
   escapes, so a memo or another shown value cannot move the cursor, recolor,
   or reorder the lines the operator reads.
+
+- On mainnet a spending-window reservation is released automatically only on
+  the oracle's `FAILED`, or on its fresh `NOT_FOUND` after a passed time bound
+  or a consumed sequence that oracle observed, and only from an oracle that
+  reports the mainnet passphrase. A send the primary endpoint refuses keeps
+  its reservation pending. A profile without an oracle keeps such a
+  reservation until `tx receipt clear`.
+- The release code a submission receipt records releases nothing by itself:
+  reconciliation finds the evidence on the chain again, and `tx receipt clear`
+  treats the code as evidence only when the spending window bears it out.
+- Confirmed spend is never dated before its reservation was taken, so a
+  `createdAt` older than the reservation cannot move the spend out of the
+  window.
+- A `getLedgerEntries` answer whose `latestLedger` is 0 or does not fit a
+  ledger sequence refuses with `network.rpc_response_malformed` before the
+  send, and a reservation recorded against ledger 0 never releases on
+  `NOT_FOUND`.
 
 ## [0.1.0-alpha.12] - 2026-10-15
 

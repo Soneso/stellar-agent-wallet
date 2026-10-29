@@ -775,6 +775,7 @@ where
         &resolved.name,
         origin,
         &client,
+        crate::commands::submission_record::settlement_oracle(profile).as_ref(),
         now_ms,
     )
     .await;
@@ -1336,6 +1337,7 @@ where
         &resolved.name,
         origin,
         &client,
+        crate::commands::submission_record::settlement_oracle(profile).as_ref(),
         now_ms,
     )
     .await;
@@ -2119,6 +2121,7 @@ where
         name,
         ProfileOrigin::Persisted,
         &client,
+        crate::commands::submission_record::settlement_oracle_in(profile, &net_context).as_ref(),
         now_ms,
     )
     .await;
@@ -6758,12 +6761,13 @@ mod tests {
             );
         }
 
-        /// Tombstone and holds: a refused send releases the payment's window
-        /// rows, so another payment under a cap admitting one succeeds.
+        /// Tombstone and holds: a send the primary refuses is a claim no
+        /// independent answer confirms, so the payment's window rows stand
+        /// and another payment under a cap admitting one is denied.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn a_refused_send_releases_its_window_rows() {
-            let fixture = Spec::new("mainnet-pay-released")
+        async fn a_refused_send_keeps_its_window_rows() {
+            let fixture = Spec::new("mainnet-pay-refused-held")
                 .rules(vec![pay_rule_capped(AMOUNT, 100)])
                 .primary(accounts().with_script(|method, index, body| {
                     (method == "sendTransaction" && index == 0).then(|| refused_send(body))
@@ -6778,14 +6782,89 @@ mod tests {
             other.memo_text = Some("invoice 8".to_owned());
             let second = run(&fixture, &other).await;
 
+            assert_eq!(first.code(), "submission.tx_timeout", "{}", first.envelope);
+            assert_eq!(fixture.pending_reservations(), 1, "the hold stands");
             assert_eq!(
-                first.code(),
-                "submission.tx_malformed",
+                second.code(),
+                "policy.deny.per_period_cap_exceeded",
                 "{}",
-                first.envelope
+                second.envelope
             );
-            assert_eq!(second.code, 0, "{}", second.envelope);
-            assert_eq!(fixture.sent_envelopes().await.len(), 2);
+            assert_eq!(fixture.sent_envelopes().await.len(), 1);
+        }
+
+        /// A `getTransaction` answer reporting the transaction failed with
+        /// a bad sequence.
+        fn failed_confirmation() -> Value {
+            json!({
+                "status": "FAILED",
+                "latestLedger": 1006,
+                "oldestLedger": 1,
+                "resultXdr": "AAAAAAAAAGT////7AAAAAA=="
+            })
+        }
+
+        /// A confirmation the primary and the oracle both answer `FAILED`
+        /// settles as failed under the oracle's failure: the payment exits
+        /// with it and its reservation is released.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_failed_confirmation_the_oracle_confirms_releases() {
+            let fixture = Spec::new("mainnet-pay-failed-witnessed")
+                .primary(accounts().with_script(|method, _, _| {
+                    (method == "getTransaction").then(failed_confirmation)
+                }))
+                .oracle(accounts().with_script(|method, _, _| {
+                    // The oracle reports an insufficient fee, so the failure
+                    // that settles names the oracle's answer.
+                    (method == "getTransaction").then(|| {
+                        let mut answer = failed_confirmation();
+                        answer["resultXdr"] = json!("AAAAAAAAAGT////3AAAAAA==");
+                        answer
+                    })
+                }))
+                .build()
+                .await;
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(run.code(), "ledger.op_failed", "{}", run.envelope);
+            assert_eq!(fixture.sent_envelopes().await.len(), 1);
+            assert_eq!(
+                fixture.pending_reservations(),
+                0,
+                "the reservation is released"
+            );
+        }
+
+        /// A confirmation the primary answers `FAILED` and the oracle reports
+        /// applied is no failure: the payment exits with the timeout shape
+        /// and its reservation stands for reconciliation.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_failed_confirmation_the_oracle_reports_applied_stands() {
+            let fixture = Spec::new("mainnet-pay-failed-unwitnessed")
+                .primary(accounts().with_script(|method, _, _| {
+                    (method == "getTransaction").then(failed_confirmation)
+                }))
+                .build()
+                .await;
+
+            let run = run(&fixture, &memo_args(&fixture)).await;
+
+            assert_eq!(run.code, 1, "{}", run.envelope);
+            assert_eq!(run.code(), "submission.tx_timeout", "{}", run.envelope);
+            assert_eq!(fixture.sent_envelopes().await.len(), 1);
+            assert_eq!(fixture.pending_reservations(), 1, "the reservation stands");
+            assert!(
+                fixture
+                    .oracle_methods()
+                    .await
+                    .iter()
+                    .any(|method| method == "getTransaction"),
+                "the oracle is asked about the failure"
+            );
         }
 
         /// Sizing: the native-pay rule's amount cap and rate limit each hold

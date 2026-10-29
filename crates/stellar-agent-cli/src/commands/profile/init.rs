@@ -401,7 +401,7 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
 /// payment simulation requires the commit-nonce key. The V1 list then names
 /// owner enrollment, attestation key rotation, the policy file `sign-policy`
 /// reads, and policy signing, in that order. A mainnet V1 profile adds the
-/// oracle setting.
+/// oracle setting and what running without it costs.
 fn next_steps(profile_name: &str, engine: PolicyEngineKind, network: TargetNetwork) -> Vec<String> {
     let mut steps = vec![
         format!(
@@ -440,7 +440,9 @@ fn next_steps(profile_name: &str, engine: PolicyEngineKind, network: TargetNetwo
                 "Set `oracle_provider_url`, `[providers.oracle]`, and `[providers.primary]` in \
                  the profile file. Choose an independently administered endpoint on a different \
                  host; a mainnet profile without `oracle_provider_url` cannot run the MCP payment \
-                 and account-creation commits that need a witness."
+                 and account-creation commits that need a witness, and a submission its primary \
+                 endpoint reports failed, refused, or unknown keeps its spending-window \
+                 reservation until `stellar-agent tx receipt clear` releases it."
                     .to_owned(),
             );
         }
@@ -1027,6 +1029,14 @@ mod tests {
             steps[7].contains(
                 "a mainnet profile without `oracle_provider_url` cannot run the MCP payment \
                  and account-creation commits that need a witness"
+            ),
+            "{}",
+            steps[7]
+        );
+        assert!(
+            steps[7].contains(
+                "keeps its spending-window reservation until `stellar-agent tx receipt clear` \
+                 releases it"
             ),
             "{}",
             steps[7]

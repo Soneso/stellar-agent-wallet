@@ -120,6 +120,11 @@ properties:
   released only when the operator runs `approve`, which mints an HMAC-SHA256 attestation
   proving the keyring holder approved it. The attestation is constant-time verified and
   binds the approval nonce, the envelope SHA-256, and the OS process uid.
+- Settlement on an independent answer. On mainnet a spending-window reservation
+  is released only on the answer of the oracle named by `oracle_provider_url`,
+  once that oracle reports the mainnet passphrase: a failure, refusal, or
+  unknown outcome the primary endpoint reports keeps the reservation until the
+  oracle confirms it or the operator clears it.
 - Tamper-evident audit log. Approvals, submission lifecycle events, and explicit
   authorization, key-management, and lifecycle events are appended to a per-profile
   hash-chained JSONL audit log. A balance read writes no row.

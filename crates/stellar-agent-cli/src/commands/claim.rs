@@ -743,6 +743,7 @@ where
         &resolved.name,
         origin,
         &client,
+        crate::commands::submission_record::settlement_oracle(profile).as_ref(),
         now_ms,
     )
     .await;
@@ -1199,6 +1200,7 @@ where
         &resolved.name,
         origin,
         &client,
+        crate::commands::submission_record::settlement_oracle(profile).as_ref(),
         now_ms,
     )
     .await;
@@ -1859,6 +1861,7 @@ where
         name,
         ProfileOrigin::Persisted,
         &client,
+        crate::commands::submission_record::settlement_oracle_in(profile, &net_context).as_ref(),
         now_ms,
     )
     .await;

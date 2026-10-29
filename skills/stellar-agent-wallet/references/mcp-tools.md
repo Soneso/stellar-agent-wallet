@@ -300,7 +300,7 @@ their own `x402.*` code before the `chain_id` check.
 | `stellar_create_account_commit` | Verify the nonce, re-check the envelope, sign, submit. | Signs and submits. Two-phase; approval spine. |
 | `stellar_balances` | Fetch native XLM balance and optional trustline balances. | Read-only. |
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
-| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it, by its receipt or, when the receipt is missing, by its reservation. Returns `record` (with `release_code`) and `reservation`. | Reads the chain, writes the wallet's record; moves no value and never sends. The way out of `submission.tx_timeout`. |
+| `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it, by its receipt or, when the receipt is missing, by its reservation. Returns `record` (with `release_code`) and `reservation`. On a mainnet profile the primary's `FAILED` and `NOT_FOUND` settle nothing until the oracle confirms them. | Reads the chain, writes the wallet's record; moves no value and never sends. The way out of `submission.tx_timeout`. |
 
 ### stellar_pay (simulate) arguments
 
@@ -886,7 +886,7 @@ whose outcome never comes back keeps that record, and three codes report one:
 
 | Code | What happened |
 | --- | --- |
-| `submission.tx_timeout` | The submission ended without a confirmed outcome: the deadline passed, the endpoint reported an unexpected status, or a transport failure struck during or after the send. It may still apply; settle it by transaction hash. |
+| `submission.tx_timeout` | The submission ended without a confirmed outcome: the deadline passed, the endpoint reported an unexpected status, or a transport failure struck during or after the send. On a mainnet profile it also reports a failure or a refusal the primary endpoint reported and the oracle did not confirm. It may still apply; settle it by transaction hash. |
 | `submission.tx_already_submitted` | A pending record already holds this transaction's source account and sequence, or the spending window already holds these signed bytes. Nothing was sent. |
 | `submission.hash_mismatch` | The endpoint reported a hash that does not describe the transaction that was sent. |
 
@@ -919,6 +919,10 @@ transaction again.
   simulate-and-commit is the next step.
 - `NOT_FOUND` with `record.status: "pending"`: nothing is settled yet. The
   transaction can still apply. Wait and call again.
+- On a mainnet profile, `chain_status` is the primary endpoint's answer, and
+  its `FAILED` or `NOT_FOUND` settles nothing until the oracle confirms it. A
+  profile without `oracle_provider_url` keeps such a record `pending` until
+  the operator clears it with `stellar-agent tx receipt clear`.
 - `NOT_FOUND` with `record.status: "ambiguous"` and a `record.release_code`:
   the transaction can no longer apply. `submission.sequence_consumed` means
   another transaction used its sequence; `submission.time_bound_passed` means

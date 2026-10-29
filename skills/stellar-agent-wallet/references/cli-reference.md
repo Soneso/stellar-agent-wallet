@@ -684,10 +684,14 @@ When only the policy-state lock file is missing and the pin entry exists,
 the refusal names the lock file instead: a command that builds the V1 policy
 engine, such as starting the MCP server, recreates it, and the nonce stays.
 
-`--check` reports every check with the status `passed`, `failed`, or
-`not_evaluated` and a detail, and exits `1` when any check failed. The checks
-are the preconditions, `verified_policy`, `pin`, `enablement`, and every
-minimum restriction in either build. The restrictions are evaluated on the
+`--check` reports every check with the status `passed`, `failed`,
+`not_evaluated`, or `advisory` and a detail, and exits `1` when any check
+failed. An advisory never fails the check. The checks are the preconditions,
+`verified_policy`, `pin`, `enablement`, every minimum restriction in either
+build, and `oracle_provider_url`. The last is `advisory` on a profile without
+an oracle. There, a submission the primary endpoint reports failed, refused,
+or unknown keeps its reservation until `tx receipt clear` releases it.
+The restrictions are evaluated on the
 document the verified load read. Without a `[mainnet]` table the fee cap and
 every table restriction fail. When the policy does not verify, the
 restrictions and `enablement` are `not_evaluated`. The `enablement` check
@@ -1042,20 +1046,24 @@ Returns `{tx_hash, chain_status, ledger, record, reservation}`, omitting absent 
 
 `SUCCESS` records the spend and writes the value-action row the submission never got to write; `FAILED` releases the reservation. `NOT_FOUND` releases it only on chain evidence that the transaction can no longer apply, confirmed by a second `NOT_FOUND`: its sequence has been consumed, or an observed ledger close time is past its time bound. The record then reads `ambiguous` with `release_code` set to `submission.sequence_consumed` or `submission.time_bound_passed`, and a `value_action_failed` row is written under that code. Otherwise the record stands. A time bound exists only on an envelope that carries one: the wallet builds classic envelopes without it. The verb is repeatable: a submission already accounted for gets no second row, and a row a release still owes is written from the receipt. When the settlement lookup cannot read the retained audit history, the verb logs the error and writes no settled row. It never sends.
 
+On a mainnet profile the primary endpoint's `FAILED` and `NOT_FOUND` settle nothing on their own: the oracle named by `oracle_provider_url` answers for the same transaction, and its `NOT_FOUND` runs the rule above on the oracle's retention window, ledger close time and account sequence. The oracle counts only once it reports the mainnet passphrase. An oracle that reports another network, whose identity cannot be read, or that cannot answer, and a mainnet profile without an oracle, leave the record pending. A `release_code` on a receipt whose reservation is still held releases nothing by itself; the chain is asked again.
+
 Writing the settled row needs the audit writer's exclusive lock, so while a `stellar-agent-mcp` server holds that writer the verb refuses with `audit.writer_locked`. Stop the server, reconcile, start it again.
 
 ### `tx receipt clear <ENVELOPE_HASH> --acknowledge [flags]`
 
-Closes a submission record after reconciling it against the chain. A record recorded as `success`, `failed`, `reorged` or `cleared_by_operator` is refused with `submission.not_clearable` before anything else, and so is an endpoint answer of `SUCCESS` or `FAILED` and an endpoint that cannot answer at all. A reservation whose receipt is missing is cleared only when the endpoint reports `NOT_FOUND` below its retention floor.
+Closes a submission record after reconciling it against the chain. A record recorded as `success`, `failed`, `reorged` or `cleared_by_operator` is refused with `submission.not_clearable` before anything else, and so is an endpoint answer of `SUCCESS` or `FAILED` and an endpoint that cannot answer at all. A reservation whose receipt is missing is cleared only when the endpoint reports `NOT_FOUND` below its retention floor. On a mainnet profile with an oracle, the oracle is asked as well and refuses the clear the same way, and so does an oracle that does not report the mainnet passphrase. Without an oracle nothing confirms the endpoint's `FAILED`, so it does not refuse the clear and the acknowledgement decides; the endpoint's `SUCCESS` still refuses.
 
 Without `--acknowledge` nothing is reconciled or written: the exit code is 1 with `submission.acknowledgement_required`, and the message names the next step. While a sent transaction's time bound is open that is to wait or run `tx status`; otherwise it is `--acknowledge`. With the flag the verb reconciles the submission the way `tx status` does, then:
 
 - The reconciled outcome could not be recorded on its receipt: refused with `submission.record_unavailable`, naming the receipt-store error. Run `stellar-agent tx status` again.
 - The receipt disagrees with its reconciliation: refused with `submission.record_unavailable`. Run `stellar-agent tx status` again.
-- Released on chain evidence (`release_code` set): it writes the `value_action_failed` row under that code first, then clears; the clear row records the evidence. A row that cannot be written refuses with the audit error and leaves the record clearable.
-- `ambiguous` without evidence, `pending` with no time bound, `pending` and never sent, or a restored orphan: it releases the reservation and clears; the clear row records no evidence.
+- Released on chain evidence (`release_code` set, and this run released the reservation under it or the spending window no longer holds it): it writes the `value_action_failed` row under that code first, then clears; the clear row records the evidence. A row that cannot be written refuses with the audit error and leaves the record clearable.
+- `ambiguous` without evidence or with a `release_code` the spending window does not bear out, `pending` with no time bound, `pending` and never sent, or a restored orphan: it releases the reservation and clears; the clear row records no evidence.
 - `pending`, sent, with an open time bound and an unconsumed sequence: refused with `submission.still_pending`, naming the time bound.
-- A ledger-time read failed for a sent, timed submission, or another reconciliation read failed: refused with `network.rpc_unreachable`.
+- A mainnet profile without an oracle: a `pending`, sent record whose time bound has not passed on this host's clock is refused with `submission.still_pending`; any other `pending` record is cleared on the acknowledgement. A refused send without a time bound stays pending until this clear.
+- A ledger-time read failed for a sent, timed submission, or another reconciliation read of the endpoint or the oracle failed: refused with `network.rpc_unreachable`.
+- A reconciliation read of the oracle was still open at the verb's oracle deadline: refused with `network.rpc_unreachable`. Every oracle read of the verb ends by one deadline, the profile's `submit_timeout_seconds` counted from the oracle's identity read, so a stalled oracle cannot hold the audit writer past it. Reconciliation asks the oracle the verb already found serving mainnet and does not read its identity again, so an oracle identity failure refuses before the acknowledgement with `submission.not_clearable`, never during reconciliation.
 
 Where the profile has an audit writer, the settlement lookup of an evidence release and the check for an earlier clear row read the retained audit history. An unreadable history refuses with the verifier's code, such as `audit.chain_broken` for a broken chain, before the clear row is written, and keeps the receipt. A synthesized profile with no audit writer skips the history lookups and marks the receipt cleared without writing audit rows.
 

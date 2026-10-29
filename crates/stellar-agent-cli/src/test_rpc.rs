@@ -64,6 +64,9 @@ pub(crate) struct ClassicRpc {
     script: Option<Script>,
     /// Requests received per method.
     counts: Arc<Mutex<std::collections::HashMap<String, usize>>>,
+    /// `(method, first delayed index, delay)`: the answers to that method
+    /// from that request on arrive after the delay.
+    stall: Arc<Mutex<Option<(String, usize, std::time::Duration)>>>,
 }
 
 impl ClassicRpc {
@@ -89,6 +92,7 @@ impl ClassicRpc {
             send_passphrase: passphrase,
             script: None,
             counts: Arc::default(),
+            stall: Arc::default(),
             accounts: Arc::new(accounts.iter().map(|a| (*a).to_owned()).collect()),
             accepted_sends: Arc::default(),
             entries: Arc::new(
@@ -124,6 +128,20 @@ impl ClassicRpc {
     ) -> Self {
         self.script = Some(Arc::new(script));
         self
+    }
+
+    /// Answers the next `prompt` requests of `rpc_method` at once and every
+    /// later one after `delay`.
+    #[cfg(feature = "mainnet-write")]
+    pub(crate) fn stall_after(&self, rpc_method: &str, prompt: usize, delay: std::time::Duration) {
+        let asked = self
+            .counts
+            .lock()
+            .unwrap()
+            .get(rpc_method)
+            .copied()
+            .unwrap_or(0);
+        *self.stall.lock().unwrap() = Some((rpc_method.to_owned(), asked + prompt, delay));
     }
 
     /// Reports `passphrase` from every later `getNetwork`.
@@ -192,13 +210,21 @@ impl Respond for ClassicRpc {
             *count += 1;
             index
         };
+        let delay = self
+            .stall
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(stalled, from, _)| stalled == method_name && index >= *from)
+            .map_or(std::time::Duration::ZERO, |(_, _, delay)| *delay);
         if let Some(result) = self
             .script
             .as_ref()
             .and_then(|script| script(method_name, index, &body))
         {
             return ResponseTemplate::new(200)
-                .set_body_json(json!({ "jsonrpc": "2.0", "id": body["id"], "result": result }));
+                .set_body_json(json!({ "jsonrpc": "2.0", "id": body["id"], "result": result }))
+                .set_delay(delay);
         }
         let result = match method_name {
             "getNetwork" => get_network_result(&self.network.lock().unwrap()),
@@ -246,6 +272,7 @@ impl Respond for ClassicRpc {
         };
         ResponseTemplate::new(200)
             .set_body_json(json!({ "jsonrpc": "2.0", "id": body["id"], "result": result }))
+            .set_delay(delay)
     }
 }
 

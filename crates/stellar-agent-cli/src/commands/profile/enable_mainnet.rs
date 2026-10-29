@@ -15,7 +15,9 @@
 //! errors retain their own codes. A process on a headless keyring backend is
 //! refused with `network.mainnet_keyring_backend_unsupported` in both modes,
 //! before any keyring entry is read. `--check` reports every check as
-//! `passed`, `failed`, or `not_evaluated` and writes nothing.
+//! `passed`, `failed`, `not_evaluated`, or `advisory` and writes nothing. An
+//! advisory names a setting the profile can run without, at a cost the detail
+//! states; it never fails the check.
 
 use super::sign_policy::atomic_write_string;
 use crate::{
@@ -86,6 +88,32 @@ enum Status {
     Passed,
     Failed,
     NotEvaluated,
+    /// A setting the profile runs without, reported with its cost.
+    Advisory,
+}
+
+/// The oracle check: a mainnet profile without `oracle_provider_url` runs,
+/// but no second endpoint confirms a negative answer of the primary, so a
+/// submission the primary reports failed, refused, or unknown keeps its
+/// reservation until an operator clears it.
+fn oracle_check(profile: &Profile) -> Check {
+    match profile.oracle_provider_url {
+        Some(_) => Check {
+            item: "oracle_provider_url".into(),
+            status: Status::Passed,
+            detail: None,
+        },
+        None => Check {
+            item: "oracle_provider_url".into(),
+            status: Status::Advisory,
+            detail: Some(
+                "no oracle is set: a submission the primary endpoint reports failed, refused, \
+                 or unknown keeps its spending-window reservation until `stellar-agent tx \
+                 receipt clear` releases it"
+                    .into(),
+            ),
+        },
+    }
 }
 
 #[derive(Serialize)]
@@ -322,6 +350,7 @@ pub(super) fn execute(
                 )
             });
         checks.extend(inspection_checks(&inspection, name, profile, profile_dir));
+        checks.push(oracle_check(profile));
         let valid = checks.iter().all(|c| c.status != Status::Failed);
         return Ok(serde_json::json!({
             "profile": name,
@@ -1306,6 +1335,7 @@ mod tests {
                 .iter()
                 .map(|r| (*r).to_owned()),
         );
+        expected_items.push("oracle_provider_url".to_owned());
         assert_eq!(items, expected_items);
         assert_eq!(output["valid"], false);
         for item in &expected_items {
@@ -1318,6 +1348,7 @@ mod tests {
                 ),
                 "mainnet_table" | "fee_cap" | "thresholds" | "ttl" => ("failed", missing_table),
                 "pin" => ("passed", Some("absent (first use)".to_owned())),
+                "oracle_provider_url" => ("advisory", oracle_check(&fixture.profile).detail),
                 "enablement" => (
                     "failed",
                     Some(
@@ -1405,6 +1436,36 @@ mod tests {
             "profile.enable_mainnet_nonce_exists"
         );
         assert_eq!(exit_code(&refused), 1);
+    }
+    /// A profile without an oracle passes the check with an advisory that
+    /// states what it costs; a profile with one passes the oracle check.
+    #[test]
+    #[serial]
+    fn check_advises_on_a_profile_without_an_oracle() {
+        let mut fixture = Fixture::new();
+        fixture.run().unwrap();
+        fixture.signed_body(7);
+        fixture.args.check = true;
+
+        let output = fixture.run().unwrap();
+        assert_eq!(output["valid"], true, "{output}");
+        assert_eq!(exit_code(&Ok(output.clone())), 0);
+        let (status, detail) = check_of(&output, "oracle_provider_url");
+        assert_eq!(status, "advisory");
+        let detail = detail.expect("the advisory states its cost");
+        assert!(
+            detail.contains("keeps its spending-window reservation"),
+            "{detail}"
+        );
+        assert!(detail.contains("tx receipt clear"), "{detail}");
+
+        fixture.profile.oracle_provider_url =
+            Some(url::Url::parse("https://oracle.example.invalid").unwrap());
+        let output = fixture.run().unwrap();
+        assert_eq!(
+            check_of(&output, "oracle_provider_url"),
+            ("passed".to_owned(), None)
+        );
     }
     #[test]
     #[serial]
