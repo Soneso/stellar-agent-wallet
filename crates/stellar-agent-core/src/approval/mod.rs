@@ -111,8 +111,8 @@ pub use store::{
     generate_csrf_token, governing_ttl_ms,
 };
 pub use toolset_grant::{
-    TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrant, ToolsetGrantStore, build_attested_grant,
-    default_toolset_grants_path,
+    GrantQuery, TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrant, ToolsetGrantStore,
+    build_attested_grant, default_toolset_grants_path,
 };
 pub use user_id::{ApproverIdentity, VerifiedPasskeyAssertion, process_uid_for_attestation};
 pub use view::{ApprovalSummaryView, PendingApprovalView};

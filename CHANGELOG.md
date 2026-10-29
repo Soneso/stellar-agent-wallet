@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `stellar_agent_core::approval::GrantQuery` describes the invocation and
+  installation cutoff for a verified toolset grant lookup.
+  `timefmt::parse_rfc3339_utc` parses second-precision UTC install timestamps.
 - `stellar_agent_core::profile::key_scope` exposes
   `enforce_message_signing_scope` and `enforce_message_signing_scope_in_dir`,
   which refuse an unsafe message-signing identity on every chain before key
@@ -141,6 +144,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `ToolsetGrantStore::find_matching` takes a `GrantQuery`, the attestation key,
+  and the profile/chain binding. `GatedInvokeParams` gains `attestation_key`
+  and `attestation_binding`; its debug output redacts the key.
 - `KeyScopeKind` gains `MainnetSignerIdentity`. The enum is exhaustive, so
   downstream exhaustive matches must add the arm.
 - `profile sign-policy --previous-owner-secret-env` builds an owner rotation
@@ -635,6 +641,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   approval stays usable only when the write failed before it replaced the
   store file. `stellar-agent approve list` shows a spent rule proposal with its
   proposal digest.
+- First-invoke toolset grants require a verified version 3 attestation, a bounded
+  lifetime, and issuance after the current installation and not after the
+  current time. A forged or edited grant suppresses no prompt. Per-action
+  payment approval fires on every toolset-routed payment.
+- Toolset grant, pending-approval and operator-credential store parse errors
+  report only the error position, keeping store lines out of diagnostics.
 - SEP-43 and SEP-53 message tools refuse signer-scope conflicts on every chain,
   including shared entries, collisions, out-of-scope references, and a mainnet
   sibling's enrolled identity. Unreadable profiles or directory scans refuse.

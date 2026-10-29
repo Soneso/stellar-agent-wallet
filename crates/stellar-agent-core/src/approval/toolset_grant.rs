@@ -22,27 +22,27 @@
 //! - `asset` == canonical `code:issuer` or `"XLM"` of the envelope asset.
 //! - `amount_min_stroops` ≤ envelope_amount ≤ `amount_max_stroops`.
 //! - The grant is not expired (TTL check).
+//! - Its version 3 HMAC verifies under the profile's key and profile/chain binding.
+//! - Its lifetime is at most 30 days and its issue time meets the install cutoff.
+//! - Its issue time does not lie after the current time.
 //!
 //! # Durability properties
 //!
-//! - **Bounded TTL**: re-prompt on expiry.
-//! - **Revoke-on-uninstall**: the caller MUST call `revoke_toolset` when a toolset
-//!   is uninstalled.
-//! - **Invalidate-on-capabilities-change**: the caller MUST call
-//!   `revoke_toolset` when the toolset's pinned capabilities change.
+//! - **Bounded TTL**: verified grants expire within 30 days of issuance.
+//! - **Install epoch**: grants must be issued at or after the start of the
+//!   second following the current pin's install time. A reinstall requires
+//!   fresh consent, including a forced install or an install after manual removal.
+//! - An invalid install time honors no grant. Consent issued in the install
+//!   second re-prompts once.
 //!
 //! # Tamper framing
 //!
-//! The structural guarantee is the unconditional per-action
-//! `PaymentSimulated` approval for toolset-routed payments.  A forged or
-//! tampered grant can at worst suppress the first-invoke re-prompt; it
-//! CANNOT bypass the forced per-action approval.  The per-action approval
-//! binds the actual executed envelope.
+//! A forged or edited grant fails attestation verification and suppresses
+//! nothing. The verified lookup binds the grant's fields, kind, lifetime,
+//! profile, and chain under the profile's attestation key.
 //!
-//! The `attestation_blob_b64` field (produced by the wallet's HMAC key at
-//! approve time) provides defence-in-depth against local file tampering —
-//! a hand-edited grant without a valid HMAC blob will be rejected by
-//! `verify_grant_attestation`.
+//! The per-action `PaymentSimulated` approval fires on every toolset-routed
+//! payment and binds the actual executed envelope.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,7 +52,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
-use super::error::ApprovalError;
+use super::error::{ApprovalError, toml_error_position};
 use crate::approval::attestation::{
     ATTESTATION_VERSION, ATTESTATION_VERSION_V2, AttestationScope, AttestedLifetime,
     compute_attestation, compute_toolset_gate_digest, verify_toolset_gate_attestation,
@@ -116,12 +116,9 @@ pub struct ToolsetGrant {
 
     /// HMAC-SHA256 attestation blob (URL-safe base64 no-pad, 32 bytes).
     ///
-    /// `None` for grants not yet attested (should not happen in normal flow).
-    /// `Some(blob)` after `verify_grant_attestation` passes.
-    ///
-    /// The HMAC binds `grant_id` + the `compute_toolset_gate_digest` of
-    /// (toolset_name, capability, destination, asset, amount_min, amount_max)
-    /// + `process_uid_at_grant`.
+    /// The verified lookup requires a valid blob under the profile's key and
+    /// binding. Version 3 binds the grant's fields, user identity, kind, and
+    /// lifetime. A missing or invalid blob suppresses no first-invoke prompt.
     pub attestation_blob_b64: Option<String>,
 
     /// Platform-stable user identity at grant time (used to rebind HMAC).
@@ -143,20 +140,10 @@ impl ToolsetGrant {
         self.expires_at_unix_ms <= now_unix_ms
     }
 
-    /// Returns `true` if this grant matches the given payment parameters.
+    /// Compares the payment fields and clock against this grant's bucket and expiry.
     ///
-    /// Matching is conservative (fail-closed): any param not provably inside
-    /// the grant bucket → no match.
-    ///
-    /// # HMAC note
-    ///
-    /// The grant HMAC (`attestation_blob_b64`) is intentionally NOT verified on
-    /// this read path.  The structural defence is that even a grant that passes
-    /// field-level matching still forces a per-action `PaymentSimulated` approval
-    /// via `verify_attestation_gate` before the commit can proceed.  Verifying
-    /// the HMAC here would not add security because an attacker who can forge a
-    /// grant can also replay a previously-observed valid HMAC; the per-action
-    /// attestation is what binds the approval to the specific transaction.
+    /// This is a field and clock comparison only. Use
+    /// [`ToolsetGrantStore::find_matching`] for a verified lookup.
     #[must_use]
     pub fn matches(
         &self,
@@ -248,6 +235,25 @@ struct GrantStoreFile {
 // ToolsetGrantStore
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The invocation a grant must cover to suppress the first-invoke gate.
+#[derive(Debug, Clone, Copy)]
+pub struct GrantQuery<'a> {
+    /// Installed toolset name from the invocation.
+    pub toolset_name: &'a str,
+    /// Signing-adjacent capability required by the action.
+    pub capability: &'a str,
+    /// Canonical destination from the authoritative invocation data.
+    pub destination: &'a str,
+    /// Canonical asset identifier from the authoritative invocation data.
+    pub asset: &'a str,
+    /// Amount in stroops from the authoritative invocation data.
+    pub amount_stroops: i64,
+    /// Current Unix time in milliseconds for the expiry and issue-time checks.
+    pub now_unix_ms: u64,
+    /// Grants issued before this instant belong to an earlier installation.
+    pub not_before_unix_ms: u64,
+}
+
 /// TOML-file-backed store of first-invoke grants.
 ///
 /// Stored at `<grants_dir>/<profile>.toolset_grants.toml` with mode `0o600` on
@@ -302,7 +308,10 @@ impl ToolsetGrantStore {
         let grants = if path.exists() {
             let content = fs::read_to_string(&path).map_err(ApprovalError::from_io)?;
             let sf: GrantStoreFile = toml::from_str(&content).map_err(|e| ApprovalError::Toml {
-                detail: e.to_string(),
+                detail: format!(
+                    "toolset grant store: {}",
+                    toml_error_position(&content, e.span().map(|s| s.start))
+                ),
             })?;
             // Prune expired grants on load.
             sf.grants
@@ -316,34 +325,34 @@ impl ToolsetGrantStore {
         Ok(Self { path, grants })
     }
 
-    /// Returns the first current (non-expired) grant matching the given
-    /// payment parameters, or `None` if no such grant exists.
+    /// Returns the first verified grant covering the invocation, or `None`.
     ///
-    /// # HMAC note
-    ///
-    /// The grant HMAC is intentionally NOT verified on this read path — see the
-    /// [`ToolsetGrant::matches`] rustdoc for the rationale.  The per-action
-    /// `PaymentSimulated` attestation gate in `verify_attestation_gate` is the
-    /// structural defence against forged or replayed grants.
+    /// The grant must use the current attestation version, verify under the
+    /// supplied key and binding, and expire within the default TTL of issuance.
+    /// Its issue time must meet the query's installation cutoff and must not lie
+    /// after the query's current time, so a grant dated in the future never
+    /// carries over to a later installation.
     #[must_use]
     pub fn find_matching(
         &self,
-        toolset_name: &str,
-        capability: &str,
-        destination: &str,
-        asset: &str,
-        amount_stroops: i64,
-        now_unix_ms: u64,
+        query: &GrantQuery<'_>,
+        attestation_key: &[u8; 32],
+        binding: &super::AttestationBinding<'_>,
     ) -> Option<&ToolsetGrant> {
         self.grants.iter().find(|g| {
             g.matches(
-                toolset_name,
-                capability,
-                destination,
-                asset,
-                amount_stroops,
-                now_unix_ms,
-            )
+                query.toolset_name,
+                query.capability,
+                query.destination,
+                query.asset,
+                query.amount_stroops,
+                query.now_unix_ms,
+            ) && g.attestation_version == ATTESTATION_VERSION
+                && g.verify_attestation(attestation_key, binding)
+                && g.expires_at_unix_ms.saturating_sub(g.granted_at_unix_ms)
+                    <= TOOLSET_GRANT_DEFAULT_TTL_MS
+                && g.granted_at_unix_ms >= query.not_before_unix_ms
+                && g.granted_at_unix_ms <= query.now_unix_ms
         })
     }
 
@@ -362,8 +371,7 @@ impl ToolsetGrantStore {
         self.persist()
     }
 
-    /// Removes all grants for the given `toolset_name` (revoke-on-uninstall and
-    /// revoke-on-capabilities-change).
+    /// Removes all grants for the given `toolset_name`.
     ///
     /// Returns the number of grants removed.
     ///
@@ -583,6 +591,223 @@ mod tests {
             &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
         )
         .unwrap()
+    }
+
+    fn test_query() -> GrantQuery<'static> {
+        GrantQuery {
+            toolset_name: "my-toolset",
+            capability: "sign-payment",
+            destination: DEST_G,
+            asset: "XLM",
+            amount_stroops: 5,
+            now_unix_ms: NOW_MS,
+            not_before_unix_ms: 0,
+        }
+    }
+
+    fn store_with_grant(dir: &tempfile::TempDir, grant: ToolsetGrant) -> ToolsetGrantStore {
+        let path = dir.path().join("default.toolset_grants.toml");
+        let mut store = ToolsetGrantStore::open(path, NOW_MS).unwrap();
+        store.insert(grant).unwrap();
+        store
+    }
+
+    /// `grant` re-attested under the version 2 layout, which binds the
+    /// profile, chain, grant id, gate digest and user identity but neither the
+    /// kind nor the lifetime.
+    fn version_2_grant(
+        grant: &ToolsetGrant,
+        key: &[u8; 32],
+        binding: &crate::approval::AttestationBinding<'_>,
+    ) -> ToolsetGrant {
+        use hmac::{Hmac, KeyInit as _, Mac as _};
+        let digest = compute_toolset_gate_digest(
+            &grant.toolset_name,
+            &grant.capability,
+            &grant.destination,
+            &grant.asset,
+            grant.amount_min_stroops,
+            grant.amount_max_stroops,
+        );
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
+        mac.update(b"stellar-agent-approval-attestation:v2");
+        for field in [
+            binding.profile_name.as_bytes(),
+            binding.chain_id.as_bytes(),
+            grant.grant_id.as_bytes(),
+        ] {
+            mac.update(&u32::try_from(field.len()).unwrap().to_be_bytes());
+            mac.update(field);
+        }
+        mac.update(&digest);
+        let uid = grant.process_uid_at_grant.as_bytes();
+        mac.update(&u32::try_from(uid.len()).unwrap().to_be_bytes());
+        mac.update(uid);
+        let mut legacy = grant.clone();
+        legacy.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()));
+        legacy.attestation_version = ATTESTATION_VERSION_V2;
+        legacy
+    }
+
+    #[test]
+    fn find_matching_ignores_a_grant_without_a_valid_attestation() {
+        let key = [0x42; 32];
+        let binding = crate::approval::AttestationBinding::new("default", "stellar:testnet");
+        let valid = make_grant("my-toolset", "sign-payment", 0, 10, 86_400_000, &key);
+        let valid_control = valid.clone();
+        let mut missing = valid.clone();
+        missing.attestation_blob_b64 = None;
+        let mut random = valid;
+        random.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode([0xa5; 32]));
+        let wrong_key = make_grant("my-toolset", "sign-payment", 0, 10, 86_400_000, &[0x24; 32]);
+        for grant in [missing, random, wrong_key] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let store = store_with_grant(&dir, grant);
+            assert!(store.find_matching(&test_query(), &key, &binding).is_none());
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store_with_grant(&dir, valid_control);
+        assert!(store.find_matching(&test_query(), &key, &binding).is_some());
+    }
+
+    #[test]
+    fn find_matching_ignores_an_edited_lifetime() {
+        let key = [0x42; 32];
+        let binding = crate::approval::AttestationBinding::new("default", "stellar:testnet");
+        let grant = make_grant("my-toolset", "sign-payment", 0, 10, 86_400_000, &key);
+        let mut edited = grant.clone();
+        edited.expires_at_unix_ms += 1;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store_with_grant(&dir, edited);
+        assert!(store.find_matching(&test_query(), &key, &binding).is_none());
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store_with_grant(&dir, grant);
+        assert!(store.find_matching(&test_query(), &key, &binding).is_some());
+    }
+
+    #[test]
+    fn find_matching_ignores_a_version_2_grant() {
+        let key = [0x42; 32];
+        let binding = crate::approval::AttestationBinding::new("default", "stellar:testnet");
+        let grant = make_grant("my-toolset", "sign-payment", 0, 10, 86_400_000, &key);
+        let legacy = version_2_grant(&grant, &key, &binding);
+        assert!(legacy.verify_attestation(&key, &binding));
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store_with_grant(&dir, legacy);
+        assert!(store.find_matching(&test_query(), &key, &binding).is_none());
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store_with_grant(&dir, grant);
+        assert!(store.find_matching(&test_query(), &key, &binding).is_some());
+    }
+
+    #[test]
+    fn find_matching_ignores_another_binding() {
+        let key = [0x42; 32];
+        let grant = make_grant("my-toolset", "sign-payment", 0, 10, 86_400_000, &key);
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store_with_grant(&dir, grant);
+        for binding in [
+            crate::approval::AttestationBinding::new("other", "stellar:testnet"),
+            crate::approval::AttestationBinding::new("default", "stellar:pubnet"),
+        ] {
+            assert!(store.find_matching(&test_query(), &key, &binding).is_none());
+        }
+        let own = crate::approval::AttestationBinding::new("default", "stellar:testnet");
+        assert!(store.find_matching(&test_query(), &key, &own).is_some());
+    }
+
+    #[test]
+    fn find_matching_ignores_a_lifetime_beyond_the_default_ttl() {
+        let key = [0x42; 32];
+        let binding = crate::approval::AttestationBinding::new("default", "stellar:testnet");
+        let grant = make_grant(
+            "my-toolset",
+            "sign-payment",
+            0,
+            10,
+            TOOLSET_GRANT_DEFAULT_TTL_MS + 1,
+            &key,
+        );
+        assert!(grant.verify_attestation(&key, &binding));
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store_with_grant(&dir, grant);
+        assert!(store.find_matching(&test_query(), &key, &binding).is_none());
+        let default_ttl = make_grant(
+            "my-toolset",
+            "sign-payment",
+            0,
+            10,
+            TOOLSET_GRANT_DEFAULT_TTL_MS,
+            &key,
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store_with_grant(&dir, default_ttl);
+        assert!(store.find_matching(&test_query(), &key, &binding).is_some());
+    }
+
+    #[test]
+    fn find_matching_ignores_a_grant_issued_before_the_install() {
+        let key = [0x42; 32];
+        let binding = crate::approval::AttestationBinding::new("default", "stellar:testnet");
+        let grant = make_grant("my-toolset", "sign-payment", 0, 10, 86_400_000, &key);
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store_with_grant(&dir, grant);
+        let mut query = test_query();
+        query.not_before_unix_ms = NOW_MS + 1;
+        assert!(store.find_matching(&query, &key, &binding).is_none());
+        query.not_before_unix_ms = NOW_MS;
+        assert!(store.find_matching(&query, &key, &binding).is_some());
+    }
+
+    #[test]
+    fn find_matching_ignores_a_grant_dated_in_the_future() {
+        let key = [0x42; 32];
+        let binding = crate::approval::AttestationBinding::new("default", "stellar:testnet");
+        let grant = make_grant("my-toolset", "sign-payment", 0, 10, 86_400_000, &key);
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store_with_grant(&dir, grant);
+        let mut query = test_query();
+        query.now_unix_ms = NOW_MS - 1;
+        assert!(store.find_matching(&query, &key, &binding).is_none());
+        query.now_unix_ms = NOW_MS;
+        assert!(store.find_matching(&query, &key, &binding).is_some());
+    }
+
+    #[test]
+    fn find_matching_finds_a_valid_grant_behind_a_forged_one() {
+        let key = [0x42; 32];
+        let binding = crate::approval::AttestationBinding::new("default", "stellar:testnet");
+        let valid = make_grant("my-toolset", "sign-payment", 0, 10, 86_400_000, &key);
+        let mut forged = make_grant("my-toolset", "sign-payment", 0, 10, 86_400_000, &[0x24; 32]);
+        forged.attestation_blob_b64 = None;
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = store_with_grant(&dir, forged);
+        store.insert(valid.clone()).unwrap();
+        let found = store
+            .find_matching(&test_query(), &key, &binding)
+            .expect("the valid grant behind the forged one matches");
+        assert_eq!(found.grant_id, valid.grant_id);
+    }
+
+    #[test]
+    fn open_parse_error_names_the_position_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("grants.toml");
+        let blob = "Q".repeat(43);
+        fs::write(
+            &path,
+            format!("[[grants]]\ngrant_id = \"test\"\nattestation_blob_b64 = \"{blob}"),
+        )
+        .unwrap();
+        let err = ToolsetGrantStore::open(path, NOW_MS).unwrap_err();
+        assert!(matches!(err, ApprovalError::Toml { .. }));
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("toolset grant store: TOML parse error at line 3"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(&blob), "{rendered}");
+        assert!(!rendered.contains("attestation_blob_b64"), "{rendered}");
     }
 
     // ── ToolsetGrant::matches ──────────────────────────────────────────────────
@@ -830,12 +1055,13 @@ mod tests {
 
         // Should find the matching grant.
         let found = store.find_matching(
-            "test-toolset",
-            "sign-payment",
-            DEST_G,
-            "XLM",
-            5_000_000,
-            NOW_MS,
+            &GrantQuery {
+                toolset_name: "test-toolset",
+                amount_stroops: 5_000_000,
+                ..test_query()
+            },
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
         );
         assert!(found.is_some(), "should find matching grant");
     }
@@ -890,22 +1116,24 @@ mod tests {
 
         // toolset-a is gone; toolset-b remains.
         let found_a = store.find_matching(
-            "toolset-a",
-            "sign-payment",
-            DEST_G,
-            "XLM",
-            5_000_000,
-            NOW_MS,
+            &GrantQuery {
+                toolset_name: "toolset-a",
+                amount_stroops: 5_000_000,
+                ..test_query()
+            },
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
         );
         assert!(found_a.is_none(), "toolset-a grant must be revoked");
 
         let found_b = store.find_matching(
-            "toolset-b",
-            "sign-payment",
-            DEST_G,
-            "XLM",
-            5_000_000,
-            NOW_MS,
+            &GrantQuery {
+                toolset_name: "toolset-b",
+                amount_stroops: 5_000_000,
+                ..test_query()
+            },
+            &key,
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
         );
         assert!(found_b.is_some(), "toolset-b grant must still exist");
     }
@@ -921,12 +1149,13 @@ mod tests {
         let store = ToolsetGrantStore::open(path, NOW_MS).unwrap();
 
         let found = store.find_matching(
-            "fresh-toolset",
-            "sign-payment",
-            DEST_G,
-            "XLM",
-            1_000_000,
-            NOW_MS,
+            &GrantQuery {
+                toolset_name: "fresh-toolset",
+                amount_stroops: 1_000_000,
+                ..test_query()
+            },
+            &[0x42; 32],
+            &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
         );
         assert!(
             found.is_none(),
@@ -1065,29 +1294,7 @@ mod tests {
         stretched.expires_at_unix_ms += 1;
         assert!(!stretched.verify_attestation(&key, &binding));
 
-        let mut legacy = grant.clone();
-        let digest =
-            compute_toolset_gate_digest("my-toolset", "sign-payment", DEST_G, "XLM", 0, 10);
-        let v2_blob = {
-            use hmac::{Hmac, KeyInit as _, Mac as _};
-            let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).unwrap();
-            mac.update(b"stellar-agent-approval-attestation:v2");
-            for field in [
-                b"default".as_slice(),
-                b"stellar:testnet",
-                legacy.grant_id.as_bytes(),
-            ] {
-                mac.update(&u32::try_from(field.len()).unwrap().to_be_bytes());
-                mac.update(field);
-            }
-            mac.update(&digest);
-            mac.update(&4_u32.to_be_bytes());
-            mac.update(b"1000");
-            let blob: [u8; 32] = mac.finalize().into_bytes().into();
-            blob
-        };
-        legacy.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode(v2_blob));
-        legacy.attestation_version = ATTESTATION_VERSION_V2;
+        let mut legacy = version_2_grant(&grant, &key, &binding);
         assert!(legacy.verify_attestation(&key, &binding));
         let mut text = toml::to_string(&legacy).unwrap();
         text = text

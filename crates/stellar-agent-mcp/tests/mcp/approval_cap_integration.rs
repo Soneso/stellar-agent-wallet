@@ -723,7 +723,7 @@ async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
         now,
         TOOLSET_GRANT_DEFAULT_TTL_MS,
         &ATTESTATION_KEY,
-        &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
+        &stellar_agent_core::approval::AttestationBinding::new(&h.name, "stellar:testnet"),
     )
     .unwrap();
     ToolsetGrantStore::open(grant_path.clone(), now)
@@ -1052,7 +1052,7 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
         now,
         TOOLSET_GRANT_DEFAULT_TTL_MS,
         &ATTESTATION_KEY,
-        &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
+        &stellar_agent_core::approval::AttestationBinding::new(&h.name, "stellar:testnet"),
     )
     .unwrap();
     ToolsetGrantStore::open(grant_path.clone(), now)

@@ -20,9 +20,10 @@
 //! 5. **grant_store_empty_after_synthetic_install** — installing (writing a pin)
 //!    does not write a grant; the grant store is empty; first invoke always hits
 //!    the gate.
-//! 6. **forged_grant_still_forces_per_action_approval** — a forged grant (wrong
-//!    HMAC) still triggers the forced per-action approval (structural), and the
-//!    approved payment's audit rows record the approval decision and nonce.
+//! 6. **forged_grant_does_not_suppress_the_first_invoke_gate**: a grant attested
+//!    under another key fails verification, so the invoke answers
+//!    `toolset.first_invoke_approval_required` and queues a new
+//!    `ToolsetFirstInvokeGate` entry.
 //! 7. **adversarial_different_destination_reprompts** — a plain `G...` destination
 //!    different from the grant's destination re-prompts the first-invoke gate.
 //! 8. **adversarial_muxed_destination_reprompts** — muxed `M...` destination
@@ -51,6 +52,15 @@
 //!     install that fails after the commit spent the approval leaves it spent,
 //!     and a retry through the toolset answers `policy.approval_consumed`
 //!     without contacting the RPC endpoint.
+//! 17. **hand_written_grant_does_not_suppress_the_first_invoke_gate**: an appended
+//!     `[[grants]]` table with an `i64::MAX` bucket and no blob answers
+//!     `toolset.first_invoke_approval_required` and queues a new
+//!     `ToolsetFirstInvokeGate` entry.
+//! 18. **payment_without_attestation_key_refuses_before_the_grant_lookup**: with
+//!     no attestation key, a payment answers `policy.approval_required` and
+//!     queues nothing, even beside a grant attested under the all-zero key.
+//! 19. **rule_create_without_attestation_key_refuses_before_the_grant_lookup**:
+//!     the same for the rule-create action over a pending rule proposal.
 //!
 //! # `#[serial]` requirement
 //!
@@ -218,7 +228,7 @@ fn seed_nonce_key(nonce_key_b64: &str) {
     entry.set_password(nonce_key_b64).expect("set nonce key");
 }
 
-/// Installs the keyring mock and seeds a deterministic 32-byte nonce key.
+/// Installs the keyring mock and seeds deterministic nonce and attestation keys.
 /// Returns the raw 32-byte key for computing HMACs in tests.
 fn setup_mock_keyring() -> [u8; 32] {
     use base64::Engine as _;
@@ -226,6 +236,7 @@ fn setup_mock_keyring() -> [u8; 32] {
     let key = [0x42u8; 32];
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
     seed_nonce_key(&encoded);
+    seed_attestation_key(&testnet_profile(), &key);
     key
 }
 
@@ -331,6 +342,22 @@ async fn assert_approved_submission_audit(
     profile.submit_timeout_seconds = Some(30);
     seed_attestation_key(&profile, key);
     let server = allow_server_for(profile.clone(), approval_dir, grant_file, toolsets_root);
+    // This approval belongs to the audit profile and its current installation.
+    stellar_agent_toolsets_runtime::record_first_invoke_grant(
+        name,
+        TOOLSET_NAME,
+        CAPABILITY,
+        DEST_G,
+        ASSET_XLM,
+        0,
+        10_000_000,
+        &process_uid_for_attestation().unwrap(),
+        now_unix_ms().unwrap(),
+        key,
+        &stellar_agent_core::approval::ApprovalContext::from_profile(name, &profile).binding(),
+        Some(grant_file.to_path_buf()),
+    )
+    .unwrap();
     let simulated = server
         .call_stellar_pay(
             serde_json::from_value(serde_json::json!({
@@ -911,16 +938,14 @@ async fn permissive_policy_forces_per_action_approval() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test 6: forged grant still forces per-action approval (structural)
+// Forged grant requires first-invoke approval
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A grant with a wrong HMAC (forged) still triggers the forced per-action
-/// approval — because even with a matching grant, the commit step ALWAYS
-/// requires a valid per-action `PaymentSimulated` attestation.
+/// A grant attested under another key requires fresh first-invoke consent.
 #[tokio::test]
 #[serial]
-async fn forged_grant_still_forces_per_action_approval() {
-    let key = setup_mock_keyring();
+async fn forged_grant_does_not_suppress_the_first_invoke_gate() {
+    setup_mock_keyring();
     let toolsets_dir = TempDir::new().unwrap();
     let approval_dir = TempDir::new().unwrap();
     let grant_file = approval_dir.path().join("grants.toml");
@@ -948,10 +973,6 @@ async fn forged_grant_still_forces_per_action_approval() {
         toolset: TOOLSET_NAME.to_owned(),
         action: "stellar_pay_commit".to_owned(),
         chain_id: Some("stellar:testnet".to_owned()),
-        // Use a syntactically valid nonce format so the code reaches
-        // verify_attestation_gate (not nonce parse failure).
-        // The forged grant passes find_matching (field-only match) so we
-        // reach the per-action approval gate, which refuses on missing entry.
         args: serde_json::json!({
             "envelope_xdr": envelope_xdr,
             "source": SOURCE_G,
@@ -966,28 +987,196 @@ async fn forged_grant_still_forces_per_action_approval() {
         }),
     };
 
-    let result = server.call_stellar_toolset_invoke(args).await.expect(
-        "forged grant must not allow commit; commit must be refused via an Ok(is_error) envelope",
+    let err = server.call_stellar_toolset_invoke(args).await.unwrap_err();
+    assert_first_invoke_queued(&err, approval_dir.path());
+}
+
+/// Checks that the refusal identifies a new, stored first-invoke approval.
+fn assert_first_invoke_queued(err: &rmcp::ErrorData, approval_dir: &std::path::Path) {
+    use stellar_agent_core::approval::store::ApprovalKind;
+    assert!(
+        err.message
+            .contains("toolset.first_invoke_approval_required"),
+        "{err:?}"
     );
-    // The forged grant passes find_matching (field-only; HMAC is not checked on the
-    // read path by design — see toolset_grant.rs rustdoc on `matches` and
-    // `find_matching`).  The per-action forced approval fires: the invented
-    // approval_nonce is not in the store → `policy.approval_required`.
-    // This must NOT be `first_invoke_approval_required` because the grant fields
-    // matched; only the per-action attestation failed.
-    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
-    assert_eq!(
-        code, "policy.approval_required",
-        "forged grant must trigger per-action approval_required (not first_invoke gate); got: {code}"
+    let payload = error_payload(err);
+    let nonce = payload["approval_nonce"].as_str().unwrap();
+    let store =
+        PendingApprovalStore::open(approval_dir.join(format!("{TEST_PROFILE_NAME}.toml"))).unwrap();
+    assert_eq!(store.len(), 1);
+    assert!(matches!(
+        &store.get(nonce).unwrap().kind,
+        ApprovalKind::ToolsetFirstInvokeGate { toolset_name, capability, destination, .. }
+            if toolset_name == TOOLSET_NAME && capability == CAPABILITY && destination == DEST_G
+    ));
+}
+
+/// A hand-written grant without a blob requires first-invoke consent.
+///
+/// The grant is issued now and expires after the default TTL, the farthest
+/// expiry the lifetime and issue-time checks admit, so only its missing
+/// attestation refuses it.
+#[tokio::test]
+#[serial]
+async fn hand_written_grant_does_not_suppress_the_first_invoke_gate() {
+    use std::io::Write as _;
+    setup_mock_keyring();
+    let toolsets_dir = TempDir::new().unwrap();
+    let approval_dir = TempDir::new().unwrap();
+    let grant_file = approval_dir.path().join("grants.toml");
+    write_pin_with_sign_payment(toolsets_dir.path(), TOOLSET_NAME);
+    let expiry = now_unix_ms().unwrap() + TOOLSET_GRANT_DEFAULT_TTL_MS;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&grant_file)
+        .unwrap();
+    writeln!(
+        file,
+        r#"[[grants]]
+grant_id = "hand-written"
+toolset_name = "{TOOLSET_NAME}"
+capability = "{CAPABILITY}"
+destination = "{DEST_G}"
+asset = "XLM"
+amount_min_stroops = 0
+amount_max_stroops = 9223372036854775807
+granted_at_unix_ms = {}
+expires_at_unix_ms = {expiry}
+process_uid_at_grant = "1000"
+attestation_version = 3
+"#,
+        expiry - TOOLSET_GRANT_DEFAULT_TTL_MS
+    )
+    .unwrap();
+    let server = build_allow_server(approval_dir.path(), &grant_file, toolsets_dir.path());
+    let err = server
+        .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+            toolset: TOOLSET_NAME.to_owned(),
+            action: "stellar_pay_commit".to_owned(),
+            chain_id: Some("stellar:testnet".to_owned()),
+            args: serde_json::json!({
+                "envelope_xdr": payment_envelope_xdr(SOURCE_G, DEST_G, 10_000_000),
+                "chain_id": "stellar:testnet"
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_first_invoke_queued(&err, approval_dir.path());
+}
+
+/// Builds a testnet profile whose attestation key coordinate holds no key.
+fn profile_without_attestation_key() -> Profile {
+    let mut profile = testnet_profile();
+    profile.attestation_key_id = stellar_agent_core::profile::schema::KeyringEntryRef::new(
+        "stellar-agent-attestation-unseeded",
+        "default",
     );
-    assert_approved_submission_audit(
-        "forced-audit-forged",
+    profile
+}
+
+/// Without the attestation key a payment refuses with the uniform approval
+/// error before the grant lookup: a grant attested under the all-zero key,
+/// which anyone can compute, clears no gate and queues no approval.
+#[tokio::test]
+#[serial]
+async fn payment_without_attestation_key_refuses_before_the_grant_lookup() {
+    setup_mock_keyring();
+    let toolsets_dir = TempDir::new().unwrap();
+    let approval_dir = TempDir::new().unwrap();
+    let grant_file = approval_dir.path().join("grants.toml");
+    write_pin_with_sign_payment(toolsets_dir.path(), TOOLSET_NAME);
+    let amount_stroops: i64 = 10_000_000;
+    insert_valid_grant(
+        &grant_file,
+        TOOLSET_NAME,
+        CAPABILITY,
+        DEST_G,
+        ASSET_XLM,
+        0,
+        amount_stroops,
+        &[0u8; 32],
+    );
+    let server = allow_server_for(
+        profile_without_attestation_key(),
         approval_dir.path(),
         &grant_file,
         toolsets_dir.path(),
-        &key,
-    )
-    .await;
+    );
+
+    let result = server
+        .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+            toolset: TOOLSET_NAME.to_owned(),
+            action: "stellar_pay_commit".to_owned(),
+            chain_id: Some("stellar:testnet".to_owned()),
+            args: serde_json::json!({
+                "envelope_xdr": payment_envelope_xdr(SOURCE_G, DEST_G, amount_stroops),
+                "source": SOURCE_G,
+                "destination": DEST_G,
+                "nonce": "fake-nonce",
+                "expires_at_unix_ms": 9_999_999_999_u64,
+                "asset": "native",
+                "amount": "1 XLM",
+                "chain_id": "stellar:testnet"
+            }),
+        })
+        .await
+        .expect("a missing attestation key returns a business envelope");
+    let (code, message, _text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "policy.approval_required", "{message}");
+    assert_eq!(
+        count_pending_approvals(approval_dir.path(), TEST_PROFILE_NAME),
+        0,
+        "neither a first-invoke nor a per-action approval is queued"
+    );
+}
+
+/// Without the attestation key a rule-create invoke over a pending proposal
+/// refuses with the uniform approval error before the grant lookup and
+/// queues no first-invoke approval beside the proposal.
+#[tokio::test]
+#[serial]
+async fn rule_create_without_attestation_key_refuses_before_the_grant_lookup() {
+    use stellar_agent_core::approval::store::ApprovalKind;
+
+    setup_mock_keyring();
+    let toolsets_dir = TempDir::new().unwrap();
+    let approval_dir = TempDir::new().unwrap();
+    let grant_dir = TempDir::new().unwrap();
+    let grant_file = grant_dir.path().join("grants.toml");
+    write_pin_with_capabilities(toolsets_dir.path(), TOOLSET_NAME, &["sign-rule-create"]);
+    let server = allow_server_for(
+        profile_without_attestation_key(),
+        approval_dir.path(),
+        &grant_file,
+        toolsets_dir.path(),
+    );
+    let store_path = approval_dir
+        .path()
+        .join(format!("{TEST_PROFILE_NAME}.toml"));
+    let (approval_nonce, _) =
+        insert_rule_proposal(&store_path, TESTNET_PASSPHRASE, "stellar:testnet");
+
+    let result = server
+        .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+            toolset: TOOLSET_NAME.to_owned(),
+            action: "stellar_rule_create_commit".to_owned(),
+            chain_id: Some("stellar:testnet".to_owned()),
+            args: serde_json::json!({
+                "approval_nonce": approval_nonce,
+                "chain_id": "stellar:testnet"
+            }),
+        })
+        .await
+        .expect("a missing attestation key returns a business envelope");
+    let (code, message, _text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(code, "policy.approval_required", "{message}");
+    let store = PendingApprovalStore::open(store_path).expect("open approval store");
+    assert_eq!(store.len(), 1, "only the pending proposal remains");
+    assert!(matches!(
+        store.get(&approval_nonce).expect("pending proposal").kind,
+        ApprovalKind::RuleProposalSimulated { .. }
+    ));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

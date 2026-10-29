@@ -4832,7 +4832,7 @@ impl PendingApprovalStore {
         let entries = if path.exists() {
             let content = fs::read_to_string(&path).map_err(ApprovalError::from_io)?;
             let sf: StoreFile = toml::from_str(&content).map_err(|e| ApprovalError::Toml {
-                detail: e.to_string(),
+                detail: super::error::toml_error_position(&content, e.span().map(|s| s.start)),
             })?;
             // Serde validators on approval_nonce and process_uid run during
             // TOML deserialisation.  Double-check nonce length for defence-in-depth.
@@ -6026,6 +6026,27 @@ mod tests {
     }
 
     // ── Open / empty ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn open_parse_error_names_the_position_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let blob = "Q".repeat(43);
+        fs::write(
+            &path,
+            format!("[[pending]]\napproval_nonce = \"test\"\nattestation_blob_b64 = \"{blob}"),
+        )
+        .unwrap();
+        let err = PendingApprovalStore::open(path).unwrap_err();
+        assert!(matches!(err, ApprovalError::Toml { .. }));
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("TOML parse error at line 3"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(&blob), "{rendered}");
+        assert!(!rendered.contains("attestation_blob_b64"), "{rendered}");
+    }
 
     #[test]
     fn open_empty_store_succeeds() {
@@ -7764,22 +7785,17 @@ rp_id = \"localhost\"
 user_handle = {zero32}
 "
         );
+        let parse_error = toml::from_str::<StoreFile>(&bad_toml).unwrap_err();
+        assert!(
+            parse_error.message().contains("register_passkey"),
+            "{parse_error}"
+        );
         std::fs::write(&path, &bad_toml).unwrap();
         let err = PendingApprovalStore::open(path).unwrap_err();
-        assert!(
-            matches!(err, ApprovalError::Toml { .. }),
-            "TOML with both sign_with_passkey AND register_passkey sub-tables \
-             must be rejected by the routing-priority contamination check: \
-             {err:?}"
-        );
-        // Confirm the contamination loop is the rejection path: error message
-        // must name `register_passkey` as the contaminating field, not the
-        // upstream TOML type system.
-        let err_msg = format!("{err}");
-        assert!(
-            err_msg.contains("register_passkey"),
-            "rejection must be from the contamination guard naming 'register_passkey', \
-             got: {err_msg}"
+        assert!(matches!(err, ApprovalError::Toml { .. }));
+        assert_eq!(
+            err.to_string(),
+            "approval TOML error: TOML parse error at line 1, column 1"
         );
     }
 
@@ -9724,15 +9740,17 @@ code = "USDC"
 issuer = "{TESTNET_USDC_ISSUER}"
 "#
         );
-        std::fs::write(&path, bad_toml).unwrap();
-
-        let err = PendingApprovalStore::open(path).unwrap_err();
-        let msg = format!("{err:?}");
+        let parse_error = toml::from_str::<StoreFile>(&bad_toml).unwrap_err();
         assert!(
-            msg.contains("contamination")
-                || msg.contains("cross-kind")
-                || msg.contains("summary_to"),
-            "must reject cross-kind contamination; got: {msg}"
+            parse_error.message().contains("summary_to"),
+            "{parse_error}"
+        );
+        std::fs::write(&path, &bad_toml).unwrap();
+        let err = PendingApprovalStore::open(path).unwrap_err();
+        assert!(matches!(err, ApprovalError::Toml { .. }));
+        assert_eq!(
+            err.to_string(),
+            "approval TOML error: TOML parse error at line 2, column 1"
         );
     }
 
@@ -10148,18 +10166,18 @@ is_proposer = true
 "#,
             "a".repeat(64),
         );
-        std::fs::write(&path, bad_toml).unwrap();
-
-        let err = PendingApprovalStore::open(path).unwrap_err();
-        let msg = format!("{err:?}");
+        let parse_error = toml::from_str::<StoreFile>(&bad_toml).unwrap_err();
         assert!(
-            msg.contains("contamination") || msg.contains("summary_to"),
-            "the whole-file load must fail on the second entry's real contamination; \
-             got: {msg}"
+            parse_error.message().contains("summary_to"),
+            "{parse_error}"
         );
-        // The first (well-formed) entry is NOT independently recoverable —
-        // `PendingApprovalStore::open` never returned a partially-loaded
-        // store; the `Err` above is the only observable outcome.
+        std::fs::write(&path, &bad_toml).unwrap();
+        let err = PendingApprovalStore::open(path).unwrap_err();
+        assert!(matches!(err, ApprovalError::Toml { .. }));
+        assert_eq!(
+            err.to_string(),
+            "approval TOML error: TOML parse error at line 2, column 1"
+        );
     }
 
     /// Cross-kind contamination: a TOML entry with both
@@ -10204,15 +10222,17 @@ address = "{VALID_SUMMARY_TO}"
 is_proposer = true
 "#
         );
-        std::fs::write(&path, bad_toml).unwrap();
-
-        let err = PendingApprovalStore::open(path).unwrap_err();
-        let msg = format!("{err:?}");
+        let parse_error = toml::from_str::<StoreFile>(&bad_toml).unwrap_err();
         assert!(
-            msg.contains("contamination")
-                || msg.contains("cross-kind")
-                || msg.contains("summary_to"),
-            "must reject cross-kind contamination; got: {msg}"
+            parse_error.message().contains("summary_to"),
+            "{parse_error}"
+        );
+        std::fs::write(&path, &bad_toml).unwrap();
+        let err = PendingApprovalStore::open(path).unwrap_err();
+        assert!(matches!(err, ApprovalError::Toml { .. }));
+        assert_eq!(
+            err.to_string(),
+            "approval TOML error: TOML parse error at line 2, column 1"
         );
     }
 

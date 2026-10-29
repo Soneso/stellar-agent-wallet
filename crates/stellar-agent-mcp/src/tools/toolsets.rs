@@ -386,6 +386,38 @@ impl WalletServer {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl WalletServer {
+    /// Loads the profile's attestation key and the binding its toolset grants
+    /// are attested under, for the gated resolver's verified grant lookup.
+    ///
+    /// The binding is the profile and chain pair every approval surface
+    /// attests a first-invoke grant under, so a grant recorded by `approve`
+    /// verifies here and a grant attested for another profile or chain does
+    /// not.
+    ///
+    /// # Errors
+    ///
+    /// Returns the uniform `policy.approval_required` result of
+    /// [`crate::tools::common::load_attestation_key`] when the key is absent,
+    /// unreadable or refused; without the key no grant is honored.
+    fn load_gated_attestation_key<'a>(
+        &'a self,
+        profile_name: &'a str,
+    ) -> Result<
+        (
+            zeroize::Zeroizing<[u8; 32]>,
+            stellar_agent_core::approval::AttestationBinding<'a>,
+        ),
+        CallToolResult,
+    > {
+        let key =
+            zeroize::Zeroizing::new(crate::tools::common::load_attestation_key(&self.profile)?);
+        let binding = stellar_agent_core::approval::AttestationBinding::new(
+            profile_name,
+            self.context.chain_id.caip2_str(),
+        );
+        Ok((key, binding))
+    }
+
     /// Route a toolset-routed `sign-payment` action through the GATED resolver.
     ///
     /// This is the DISTINCT internal entry point for the gated tier.  NOT a
@@ -512,12 +544,20 @@ impl WalletServer {
         let now_unix_ms = stellar_agent_core::timefmt::now_unix_ms()
             .map_err(|e| rmcp::ErrorData::internal_error(format!("clock_error: {e}"), None))?;
 
+        let (attestation_key, attestation_binding) =
+            match self.load_gated_attestation_key(&profile_name) {
+                Ok(loaded) => loaded,
+                Err(result) => return Ok(result),
+            };
+
         #[cfg(not(feature = "test-helpers"))]
         let gated_params = GatedInvokeParams {
             toolset_name,
             action,
             toolsets_root,
             profile_name: &profile_name,
+            attestation_key: &attestation_key,
+            attestation_binding: &attestation_binding,
             authoritative_destination: &destination,
             authoritative_asset: &asset,
             authoritative_amount_stroops: amount_stroops,
@@ -530,6 +570,8 @@ impl WalletServer {
             action,
             toolsets_root,
             profile_name: &profile_name,
+            attestation_key: &attestation_key,
+            attestation_binding: &attestation_binding,
             authoritative_destination: &destination,
             authoritative_asset: &asset,
             authoritative_amount_stroops: amount_stroops,
@@ -784,12 +826,20 @@ impl WalletServer {
             rmcp::ErrorData::internal_error(format!("approval.uid_unavailable: {e}"), None)
         })?;
 
+        let (attestation_key, attestation_binding) =
+            match self.load_gated_attestation_key(&profile_name) {
+                Ok(loaded) => loaded,
+                Err(result) => return Ok(result),
+            };
+
         #[cfg(not(feature = "test-helpers"))]
         let gated_params = GatedInvokeParams {
             toolset_name,
             action,
             toolsets_root,
             profile_name: &profile_name,
+            attestation_key: &attestation_key,
+            attestation_binding: &attestation_binding,
             authoritative_destination: &smart_account,
             authoritative_asset:
                 stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_ASSET_SENTINEL,
@@ -804,6 +854,8 @@ impl WalletServer {
             action,
             toolsets_root,
             profile_name: &profile_name,
+            attestation_key: &attestation_key,
+            attestation_binding: &attestation_binding,
             authoritative_destination: &smart_account,
             authoritative_asset:
                 stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_ASSET_SENTINEL,
