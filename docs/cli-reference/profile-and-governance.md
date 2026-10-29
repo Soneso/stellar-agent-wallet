@@ -1107,7 +1107,7 @@ The tip anchor is checked only when `--profile` is supplied AND `<LOG_PATH>` is 
 
 When no anchor is stored for the profile's own log, the command checks for evidence of prior anchoring. Each of these shows the log was anchored: an audit binding recorded for the profile, a chain-root sidecar beside the active file, or an `audit_tip_anchored` row in it. With any of them the command fails with `audit.tip_anchor_missing`, and the message says `anchor: missing` and names the evidence. For an empty active file, only the sidecar counts as evidence. Profile verification checks the hash chain and HMAC sidecars before reporting anchor agreement, unless this missing-anchor rule applies. The missing-anchor check follows an unkeyed chain walk and precedes HMAC verification. Without evidence, a log reports `anchor.status` as `"not_checked"` only if its chain and HMAC checks pass.
 
-Verifier failures use `audit.chain_broken`, `audit.rotation_gap`, `audit.hmac_mismatch`, `audit.hmac_sidecar_missing`, `audit.too_many_rotated_files`, `audit.non_regular_file_log_path`, `audit.parse_error`, `audit.path_contract`, `audit.log_not_found`, `audit.io_error`, `audit.signer_set_canonical_body`, `audit.partial_rotation`, `audit.tip_anchor_mismatch`, `audit.tip_anchor_missing`; see [security internals](../maintainers/security-internals.md#audit-hash-chain).
+Verifier failures use `audit.chain_broken`, `audit.rotation_gap`, `audit.hmac_mismatch`, `audit.hmac_sidecar_missing`, `audit.too_many_rotated_files`, `audit.non_regular_file_log_path`, `audit.parse_error`, `audit.path_contract`, `audit.log_not_found`, `audit.io_error`, `audit.signer_set_canonical_body`, `audit.partial_rotation`, `audit.tip_anchor_mismatch`, `audit.tip_anchor_missing`, `audit.outbox_rows_missing`, `audit.outbox_busy`; see [security internals](../maintainers/security-internals.md#audit-hash-chain).
 Profile and ownership pre-checks carry their own codes.
 
 - `<LOG_PATH>` (positional, required) — path to the audit log file. By default this is `~/.local/share/stellar-agent/audit/<profile>.jsonl` on Linux, `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl` on macOS, and `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` on Windows.
@@ -1121,7 +1121,9 @@ A `pruned_prefix` warning reports `first_file`, the oldest file walked, and
 entry and is authenticated when an audit key is supplied. Verification checks
 every retained entry and bridge, and the warning leaves the verdict successful.
 
-`outbox_pending` counts the consent rows queued in the audit outbox beside the log (`<LOG_PATH>.outbox`) and not yet drained into it, read without taking the outbox lock. Queued rows sit outside the tip anchor until a draining writer appends them. A torn outbox adds an `outbox_torn_tail` warning and unparseable lines add `outbox_unparseable`. An unreadable outbox adds `outbox_unreadable` and omits `outbox_pending`, since no count is known. None of them changes the chain verdict.
+`outbox_pending` counts complete queued consent lines. With `--profile` and the profile's log path, verification checks the keyring commitment under the outbox lock after the chain walk. A missing or changed committed prefix fails with `audit.outbox_rows_missing`; a held lock fails with `audit.outbox_busy`. Without a profile, no commitment is checked. The separate count inspection can report `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` warnings.
+
+An `outbox_loss_acknowledged` warning names each loss acknowledgement's file, line, `expected_rows`, and `found_rows`. It leaves the chain verdict unchanged.
 
 ```bash
 stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --profile default
@@ -1151,7 +1153,7 @@ A flag the matrix does not require is ignored. The binding is checked before the
 
 After the operator investigates, reanchor accepts an intact prefix with the required flags. It replays the whole log first and refuses a broken chain. It writes the current tip as the anchor, bumps the current path's re-anchor counter held in the keyring once, and appends the rows, each carrying that count. `rollback_acknowledged` names the superseded anchor. `binding_changed` names the anchor of the log path the previous binding named, or none when the record was unreadable. The rows are permanent: the log carries its own record that a rollback or a binding change was accepted. The new binding is stored last, so a run that stops earlier leaves the refusal in place, and an absent binding is recorded after a rollback repair. The envelope lists the conditions acknowledged and how the recorded binding compared.
 
-Queued consent rows follow the repair rows and are counted in `outbox_drained`. A drain refusal leaves the repair in force and exits `0`. It omits `outbox_drained`, since every queued row stays queued, and lists the refusal under `warnings`: `audit.outbox_unusable`, `audit.outbox_busy`, or the condition an append refused on, such as `audit.io_error`.
+Queued consent rows follow the repair rows and are counted in `outbox_drained`. A drain refusal leaves the repair in force and exits `0`. It omits `outbox_drained`, since every queued row stays queued, and lists the refusal under `warnings`: `audit.outbox_unusable`, `audit.outbox_busy`, `audit.outbox_rows_missing`, or the condition an append refused on, such as `audit.io_error`.
 
 The command takes the audit writer's exclusive lock. Stop an MCP server that holds this profile's writer before a rollback repair. See [Key-rotation subcommands](#key-rotation-subcommands) for acquisition and replacement eviction. A binding change needs no stop: a server running the edited profile refuses before it opens the new path, so it holds no lock there. A server still running the old profile refuses after the acknowledgement until it restarts.
 
@@ -1166,6 +1168,26 @@ stellar-agent audit reanchor --profile default --acknowledge-binding-change
 ```
 
 For the causes worth ruling out before acknowledging, see [Audit-log recovery](../maintainers/audit-log-recovery.md).
+
+### `audit acknowledge-outbox-loss --profile <NAME> --reason <TEXT>`
+
+Operator-only recovery for `audit.outbox_rows_missing`; an agent must not run it on its own initiative.
+Stop the process holding the profile's writer and inspect the queued rows first.
+`--reason` is required, non-empty, and recorded with the audit string bound.
+
+The command checks the tip anchor, checks that the loss holds and that every remaining queued row parses, and then revokes every decided, unexpired, unconsumed approval and every toolset grant.
+Mainnet confirmations and recorded passkey assertions count as decided approvals.
+It records `audit_outbox_loss_acknowledged`, drains the remaining complete rows, resets the commitment, and empties the outbox.
+Approve affected actions again to record fresh consent.
+
+The result contains `profile`, `expected_rows`, `found_rows`, `drained`, `revoked_approvals`, and `revoked_grants`.
+No loss returns `audit.outbox_loss_not_found` without an acknowledgement; a held writer returns `audit.writer_locked`; a log rolled back behind its tip anchor returns `audit.tip_anchor_mismatch`.
+A remaining row that does not parse returns `audit.outbox_unusable` before anything is revoked or written.
+A row that cannot append leaves the queue and commitment in place for inspection and retry.
+
+```bash
+stellar-agent audit acknowledge-outbox-loss --profile default --reason "Queue inspected; fresh approval required"
+```
 
 ## The governance loop
 

@@ -66,6 +66,10 @@ pub(crate) fn acquire_consent_sink(
     match drain_lock_is_held(&profile.audit_log_path) {
         Ok(true) => Ok(ConsentSink::Outbox(AuditOutbox::for_log(
             &profile.audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
         ))),
         Ok(false) => Err(contention.into_wallet_error(profile_name)),
         Err(error) => Err(KeyedAcquireError::Writer(error).into_wallet_error(profile_name)),

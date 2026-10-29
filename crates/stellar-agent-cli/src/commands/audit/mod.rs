@@ -13,6 +13,7 @@
 //! enum.  The top-level [`crate::main`] function routes `Commands::Audit(args)`
 //! to [`run`], which delegates to the appropriate subcommand handler.
 
+pub mod acknowledge_outbox_loss;
 pub mod reanchor;
 pub mod verify;
 
@@ -67,6 +68,16 @@ pub(crate) fn audit_writer_error(
             WalletError::Validation(ValidationError::AuditTipAnchorMissing {
                 profile: profile_name.to_owned(),
                 evidence: evidence.describe().to_owned(),
+            })
+        }
+        WriterError::OutboxRowsMissing { .. } => {
+            WalletError::Validation(ValidationError::AuditOutboxRowsMissing {
+                detail: e.to_string(),
+            })
+        }
+        WriterError::OutboxLossNotFound => {
+            WalletError::Validation(ValidationError::AuditOutboxLossNotFound {
+                detail: e.to_string(),
             })
         }
         // Variants whose own Display already leads with an `audit.*` code carry
@@ -124,6 +135,8 @@ pub enum AuditSubcommand {
     /// Exits 0 on success; exits 1 without a required acknowledgement and on
     /// any failure.
     Reanchor(reanchor::ReanchorArgs),
+    /// Acknowledge lost queued consent and revoke the profile's permissions.
+    AcknowledgeOutboxLoss(acknowledge_outbox_loss::AcknowledgeOutboxLossArgs),
 }
 
 /// Runs the `audit` subcommand group.
@@ -143,6 +156,7 @@ pub async fn run(args: &AuditArgs) -> i32 {
     match &args.subcommand {
         AuditSubcommand::Verify(a) => verify::run(a).await,
         AuditSubcommand::Reanchor(a) => reanchor::run(a).await,
+        AuditSubcommand::AcknowledgeOutboxLoss(a) => acknowledge_outbox_loss::run(a).await,
     }
 }
 
@@ -159,6 +173,7 @@ impl AuditArgs {
         match &self.subcommand {
             AuditSubcommand::Verify(a) => a.profile.as_deref(),
             AuditSubcommand::Reanchor(a) => Some(a.profile.as_str()),
+            AuditSubcommand::AcknowledgeOutboxLoss(a) => Some(a.profile.as_str()),
         }
     }
 }
@@ -224,6 +239,17 @@ mod tests {
     fn a_variant_with_its_own_code_does_not_get_a_second_one() {
         let cases = [
             (
+                WriterError::OutboxRowsMissing {
+                    recorded: 2,
+                    found: 1,
+                },
+                "audit.outbox_rows_missing",
+            ),
+            (
+                WriterError::OutboxLossNotFound,
+                "audit.outbox_loss_not_found",
+            ),
+            (
                 WriterError::RotationBridgeUnusable {
                     archive_name: "audit.jsonl.20260913T120000000".to_owned(),
                     reason: "test",
@@ -240,6 +266,12 @@ mod tests {
         ];
         for (writer_error, own_code) in &cases {
             let err = audit_writer_error(writer_error, "audit.reanchor_failed", "default");
+            if matches!(
+                writer_error,
+                WriterError::OutboxRowsMissing { .. } | WriterError::OutboxLossNotFound
+            ) {
+                assert_eq!(err.code(), *own_code);
+            }
             assert!(
                 err.message().contains(own_code),
                 "message: {}",

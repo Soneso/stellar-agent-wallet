@@ -490,7 +490,11 @@ approval and before it loads the signing key. Its delivery gate writes
 `mpp_charge_authorized` before it releases the credential, and withholds the
 credential when that row cannot be written (see
 [Agent payments with MPP](agent-payments.md)). Every keyed acquisition also
-drains the audit outbox. A consent row `stellar-agent approve` queued while this
+drains the audit outbox. The queue's count and chain head are committed in the
+platform keyring. A missing or changed committed prefix refuses acquisition with
+`audit.outbox_rows_missing`, before a signing key loads. The operator investigates
+and runs `audit acknowledge-outbox-loss`, which revokes decided approvals and
+toolset grants before recording the loss. A consent row `stellar-agent approve` queued while this
 server held the writer enters the log there. A commit that consumes an approval
 therefore has its consent row in the log before the signing key loads.
 

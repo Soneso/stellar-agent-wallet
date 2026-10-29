@@ -388,6 +388,19 @@ impl ToolsetGrantStore {
         Ok(removed)
     }
 
+    /// Removes every toolset grant and returns the number removed.
+    ///
+    /// # Errors
+    /// Returns an approval-store error if persistence fails.
+    pub fn revoke_all(&mut self) -> Result<usize, ApprovalError> {
+        let removed = self.grants.len();
+        if removed > 0 {
+            self.grants.clear();
+            self.persist()?;
+        }
+        Ok(removed)
+    }
+
     /// Returns the number of grants currently in the store.
     #[must_use]
     pub fn len(&self) -> usize {

@@ -132,6 +132,7 @@ struct X402Rpc {
     /// row that arrives after the audit pre-flight and before the transmit
     /// gate, so the gate's own acquisition drains it.
     queue_on_first: Arc<Mutex<Option<stellar_agent_core::audit_log::AuditEntry>>>,
+    outbox_store: Arc<Mutex<Option<Arc<dyn stellar_agent_core::audit_log::TipAnchorStore>>>>,
     observed: Arc<Mutex<Observed>>,
 }
 
@@ -147,6 +148,7 @@ impl X402Rpc {
             roll_back_to: Arc::new(Mutex::new(None)),
             forget_on_first: None,
             queue_on_first: Arc::new(Mutex::new(None)),
+            outbox_store: Arc::new(Mutex::new(None)),
             observed: Arc::new(Mutex::new(Observed::default())),
         }
     }
@@ -291,9 +293,16 @@ impl Respond for X402Rpc {
                 std::fs::write(&self.log_path, bytes).expect("roll the audit log back");
             }
             if let Some(row) = self.queue_on_first.lock().unwrap().take() {
-                stellar_agent_core::audit_log::AuditOutbox::for_log(&self.log_path)
-                    .append(&row)
-                    .expect("queue the consent row");
+                stellar_agent_core::audit_log::AuditOutbox::for_log(
+                    &self.log_path,
+                    self.outbox_store
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .expect("queued row store"),
+                )
+                .append(&row)
+                .expect("queue the consent row");
             }
             if let Some((service, account)) = &self.forget_on_first {
                 keyring_core::Entry::new(service, account)
@@ -2875,6 +2884,7 @@ async fn an_anchor_behind_before_the_authorized_row_withholds_both_x402_transmis
         let fixture = fixture(&name, [seed; 32], |_| {}).await;
         *fixture.rpc.queue_on_first.lock().unwrap() = Some(queued_consent_row());
         let (_writer, store) = cache_writer_over_scripted_anchor(&fixture);
+        *fixture.rpc.outbox_store.lock().unwrap() = Some(store.clone());
         store.fail_next_writes(3);
         let result = call(&fixture, tool).await;
         assert_withheld_before_the_authorized_row(tool, &fixture, &result);
@@ -2899,9 +2909,12 @@ async fn an_anchor_left_behind_by_the_pre_flight_drain_withholds_both_x402_trans
         let name = format!("x402-anchor-drain-{}", tool.name());
         let fixture = fixture(&name, [seed; 32], |_| {}).await;
         let (_writer, store) = cache_writer_over_scripted_anchor(&fixture);
-        stellar_agent_core::audit_log::AuditOutbox::for_log(&fixture.profile.audit_log_path)
-            .append(&queued_consent_row())
-            .expect("queue the consent row");
+        stellar_agent_core::audit_log::AuditOutbox::for_log(
+            &fixture.profile.audit_log_path,
+            store.clone(),
+        )
+        .append(&queued_consent_row())
+        .expect("queue the consent row");
         store.fail_next_writes(3);
         let result = call(&fixture, tool).await;
         assert_withheld_before_the_authorized_row(tool, &fixture, &result);

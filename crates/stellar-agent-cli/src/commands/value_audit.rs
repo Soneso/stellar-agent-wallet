@@ -783,6 +783,14 @@ mod tests {
                 "audit.outbox_unusable",
             ),
             (
+                WriterError::OutboxRowsMissing {
+                    recorded: 2,
+                    found: 1,
+                },
+                "audit.chain_key_unavailable",
+                "audit.outbox_rows_missing",
+            ),
+            (
                 WriterError::RotationBridgeUnusable {
                     archive_name: "audit.jsonl.20260913T120000000".to_owned(),
                     reason: "the archive does not end with a rotation handoff entry",

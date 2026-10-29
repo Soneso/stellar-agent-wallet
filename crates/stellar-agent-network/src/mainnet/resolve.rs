@@ -2914,15 +2914,21 @@ mod tests {
         use stellar_agent_core::audit_log::{
             AuditEntry, AuditOutbox, NewToolInvocation, PolicyDecision,
         };
-        AuditOutbox::for_log(&f.profile.audit_log_path)
-            .append(&AuditEntry::new_tool_invocation(NewToolInvocation::new(
-                "stellar_x402_create_payment",
-                "stellar:mainnet",
-                vec![],
-                PolicyDecision::Allow,
-                "00000000-0000-4000-8000-000000000000",
-            )))
-            .unwrap();
+        AuditOutbox::for_log(
+            &f.profile.audit_log_path,
+            crate::keyring::KeyringTipAnchorStore::shared(
+                &f.profile.audit_log_hash_chain_key_id,
+                &f.profile.audit_log_path,
+            ),
+        )
+        .append(&AuditEntry::new_tool_invocation(NewToolInvocation::new(
+            "stellar_x402_create_payment",
+            "stellar:mainnet",
+            vec![],
+            PolicyDecision::Allow,
+            "00000000-0000-4000-8000-000000000000",
+        )))
+        .unwrap();
     }
     async fn anchor_consume(repair: bool, release: bool) {
         let f = soroban_fixture();

@@ -2146,7 +2146,10 @@ mod tests {
             store
                 .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
                 .unwrap();
-            let outbox = AuditOutbox::for_log(&dir.path().join("audit").join("audit.jsonl"));
+            let outbox = AuditOutbox::for_log(
+                &dir.path().join("audit").join("audit.jsonl"),
+                std::sync::Arc::new(crate::audit_log::tip_anchor::InMemoryTipAnchorStore::new()),
+            );
             crate::audit_log::outbox::test_seam::arm_partial_write(outbox.path(), 9);
             let mut grant_persisted = false;
             let result = attest_and_persist(

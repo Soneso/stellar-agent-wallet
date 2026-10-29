@@ -1328,6 +1328,20 @@ pub enum ValidationError {
         detail: String,
     },
 
+    /// Committed queued consent rows are missing, changed, or reordered.
+    #[error("{detail}")]
+    AuditOutboxRowsMissing {
+        /// Diagnostic led by the outbox-loss code and its recovery command.
+        detail: String,
+    },
+
+    /// An outbox-loss acknowledgement finds no committed loss.
+    #[error("{detail}")]
+    AuditOutboxLossNotFound {
+        /// Diagnostic describing the refused acknowledgement.
+        detail: String,
+    },
+
     /// A verb that writes audit rows refused because the profile's audit
     /// chain-root HMAC key could not be loaded from the platform keyring.
     ///
@@ -1936,6 +1950,8 @@ impl ValidationError {
             // Audit taxonomy code on a validation-class variant: see
             // `AuditLogNotFound` above for the same rationale.
             Self::AuditTipAnchorMissing { .. } => "audit.tip_anchor_missing",
+            Self::AuditOutboxRowsMissing { .. } => "audit.outbox_rows_missing",
+            Self::AuditOutboxLossNotFound { .. } => "audit.outbox_loss_not_found",
             // Same wire code as the two variants above by design — see this
             // variant's doc comment for why the code stays unified while the
             // remedy in the message differs.
@@ -3748,6 +3764,18 @@ mod tests {
                 "audit.tip_anchor_missing",
             ),
             (
+                ValidationError::AuditOutboxRowsMissing {
+                    detail: "missing queued rows".to_owned(),
+                },
+                "audit.outbox_rows_missing",
+            ),
+            (
+                ValidationError::AuditOutboxLossNotFound {
+                    detail: "no queued-row loss".to_owned(),
+                },
+                "audit.outbox_loss_not_found",
+            ),
+            (
                 ValidationError::AuditLogUnusable {
                     profile: "default".to_owned(),
                     detail: "audit.writer_locked: the lock is held".to_owned(),
@@ -4035,6 +4063,16 @@ mod tests {
                     ValidationError::AuditTipAnchorMissing {
                         profile: profile.clone(),
                         evidence: evidence.clone(),
+                    }
+                }
+                ValidationError::AuditOutboxRowsMissing { detail } => {
+                    ValidationError::AuditOutboxRowsMissing {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::AuditOutboxLossNotFound { detail } => {
+                    ValidationError::AuditOutboxLossNotFound {
+                        detail: detail.clone(),
                     }
                 }
                 ValidationError::AuditLogUnusable { profile, detail } => {

@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `audit acknowledge-outbox-loss --profile <NAME> --reason <TEXT>` records
+  queued consent loss and revokes the profile's decided approvals and toolset
+  grants. Verification reports each record with an `outbox_loss_acknowledged`
+  warning.
+- `stellar_agent_core::audit_log` exposes `OutboxState`, `OutboxLoss`,
+  `check_outbox_commitment`, `outbox_path`, `outbox_state_account`, and
+  `outbox_state_account_for_digest`, and `OutboxLossReport` and `RevokedCounts`
+  for `AuditWriter::open_for_outbox_acknowledgement`, `AuditWriter::outbox_loss`,
+  and `AuditWriter::acknowledge_outbox_loss`.
+  `ToolsetGrantStore::revoke_all` removes every toolset grant.
+  `ValidationError` gains `AuditOutboxRowsMissing` and
+  `AuditOutboxLossNotFound`, `EventKind` gains `AuditOutboxLossAcknowledged`
+  with its `AuditEntry::new_audit_outbox_loss_acknowledged` constructor, and
+  `VerifyWarning` gains `OutboxLossAcknowledged`.
+
 - `stellar_agent_core::approval::GrantQuery` describes the invocation and
   installation cutoff for a verified toolset grant lookup.
   `timefmt::parse_rfc3339_utc` parses second-precision UTC install timestamps.
@@ -184,6 +199,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Wallet::unlock` and `Wallet::unlock_with_clock` take `&[u8; 32]` and run
   synchronously. `signer_from_wallet` consumes the wallet. `LockedSeed::seed`
   is public, and `Wallet::into_locked_seed` transfers its stable seed home.
+- `AuditOutbox::for_log` requires the log's shared tip-anchor store, and
+  `AuditOutbox` drops its `PartialEq` and `Eq` implementations.
+  `TipAnchorStore` requires `load_outbox_state` and `store_outbox_state`, called
+  under the outbox lock from any process. Explicit outbox drains require an
+  attached store.
+- `WriterError` gains `OutboxRowsMissing` and `OutboxLossNotFound`. The enum is
+  not `#[non_exhaustive]`, so an exhaustive match on it needs the two arms.
 - MPP state adds a `default-generation-intent` keyring entry beside its committed
   counter; `intent_account` and `generation_intent_account` derive its account.
   `reset_for_profile` accepts the current time and returns `MppStateReset`.
@@ -755,6 +777,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Environment signing locks the seed's stable home before copying into it.
   Signing reads that home; disposal zeroizes before unlocking and freeing it.
   Mainnet environment signing records tolerated lock failures in the audit log.
+- Queued consent rows are committed in the platform keyring. Removed or changed
+  committed rows refuse the profile's keyed writers until `audit acknowledge-outbox-loss`
+  records the loss and revokes decided approvals and toolset grants.
 - Release and rehearsal builds restore and save no cache.
 - Release signing, provenance, and publication wait for the vendored Wasm
   rebuild of the tagged commit, and a tag run of the vendored Wasm workflow

@@ -176,7 +176,8 @@ struct ReanchorData {
     #[serde(skip_serializing_if = "Option::is_none")]
     outbox_drained: Option<usize>,
     /// Conditions the repair stood despite, each led by its `audit.*`
-    /// sub-code: `audit.outbox_unusable`, `audit.outbox_busy`, or the
+    /// sub-code: `audit.outbox_unusable`, `audit.outbox_busy`,
+    /// `audit.outbox_rows_missing`, or the
     /// condition an append of the drain refused on, such as
     /// `audit.io_error`. Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -781,8 +782,14 @@ mod tests {
         vec![
             std::fs::read(&old.audit_log_path).ok(),
             std::fs::read(&new.audit_log_path).ok(),
-            std::fs::read(AuditOutbox::for_log(&old.audit_log_path).path()).ok(),
-            std::fs::read(AuditOutbox::for_log(&new.audit_log_path).path()).ok(),
+            std::fs::read(stellar_agent_core::audit_log::outbox_path(
+                &old.audit_log_path,
+            ))
+            .ok(),
+            std::fs::read(stellar_agent_core::audit_log::outbox_path(
+                &new.audit_log_path,
+            ))
+            .ok(),
             raw_anchor(old).map(String::into_bytes),
             raw_anchor(new).map(String::into_bytes),
             raw_binding(name).map(String::into_bytes),
@@ -799,9 +806,15 @@ mod tests {
         record_binding("bind-refuse", &old);
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
-        AuditOutbox::for_log(&new.audit_log_path)
-            .append(&queued_consent("queued-refused"))
-            .expect("queue");
+        AuditOutbox::for_log(
+            &new.audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &new.audit_log_hash_chain_key_id,
+                &new.audit_log_path,
+            ),
+        )
+        .append(&queued_consent("queued-refused"))
+        .expect("queue");
         let before = snapshot("bind-refuse", &old, &new);
 
         let err = run_reanchor(&args_with("bind-refuse", true, false), &new)
@@ -1132,9 +1145,15 @@ mod tests {
         new.audit_log_path = dir.path().join("new.jsonl");
 
         for id in ["queued-1", "queued-2"] {
-            AuditOutbox::for_log(&new.audit_log_path)
-                .append(&queued_consent(id))
-                .expect("queue");
+            AuditOutbox::for_log(
+                &new.audit_log_path,
+                stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                    &new.audit_log_hash_chain_key_id,
+                    &new.audit_log_path,
+                ),
+            )
+            .append(&queued_consent(id))
+            .expect("queue");
         }
 
         let data = run_reanchor(&args_with("bind-accept", false, true), &new)
@@ -1224,9 +1243,15 @@ mod tests {
         write_anchored(&new, 2);
         roll_back(&new);
         let superseded = anchor_coordinates(&new);
-        AuditOutbox::for_log(&new.audit_log_path)
-            .append(&queued_consent("queued-refused"))
-            .expect("queue");
+        AuditOutbox::for_log(
+            &new.audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &new.audit_log_hash_chain_key_id,
+                &new.audit_log_path,
+            ),
+        )
+        .append(&queued_consent("queued-refused"))
+        .expect("queue");
         let before = snapshot("bind-both", &old, &new);
 
         let err = run_reanchor(&args_with("bind-both", false, true), &new)
@@ -1277,9 +1302,15 @@ mod tests {
         let superseded = anchor_coordinates(&new);
         let before = log_rows(&new);
         for id in ["queued-1", "queued-2"] {
-            AuditOutbox::for_log(&new.audit_log_path)
-                .append(&queued_consent(id))
-                .expect("queue");
+            AuditOutbox::for_log(
+                &new.audit_log_path,
+                stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                    &new.audit_log_hash_chain_key_id,
+                    &new.audit_log_path,
+                ),
+            )
+            .append(&queued_consent(id))
+            .expect("queue");
         }
 
         let data = run_reanchor(&args_with("bind-both-outbox", true, true), &new)
@@ -1336,7 +1367,13 @@ mod tests {
                 roll_back(&new);
             }
             let before = log_rows(&new);
-            let outbox = AuditOutbox::for_log(&new.audit_log_path);
+            let outbox = AuditOutbox::for_log(
+                &new.audit_log_path,
+                stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                    &new.audit_log_hash_chain_key_id,
+                    &new.audit_log_path,
+                ),
+            );
             outbox.append(&queued_consent("queued-1")).expect("queue");
             let mut bytes = std::fs::read(outbox.path()).expect("outbox");
             bytes.extend_from_slice(b"not an audit entry\n");
@@ -1473,9 +1510,15 @@ mod tests {
         let mut new = old.clone();
         new.audit_log_path = dir.path().join("new.jsonl");
 
-        AuditOutbox::for_log(&new.audit_log_path)
-            .append(&queued_consent("queued-before-binding-failure"))
-            .expect("queue");
+        AuditOutbox::for_log(
+            &new.audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &new.audit_log_hash_chain_key_id,
+                &new.audit_log_path,
+            ),
+        )
+        .append(&queued_consent("queued-before-binding-failure"))
+        .expect("queue");
 
         let err = run_reanchor(&args_with("bind-rerun", false, true), &new)
             .expect_err("the binding write fails");
@@ -1540,7 +1583,10 @@ mod tests {
     }
 
     fn outbox_file(profile: &Profile) -> Vec<u8> {
-        std::fs::read(AuditOutbox::for_log(&profile.audit_log_path).path()).unwrap_or_default()
+        std::fs::read(stellar_agent_core::audit_log::outbox_path(
+            &profile.audit_log_path,
+        ))
+        .unwrap_or_default()
     }
 
     #[tokio::test]
@@ -1549,9 +1595,15 @@ mod tests {
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = rolled_back_profile("reanchor-outbox-gate", dir.path());
-        AuditOutbox::for_log(&profile.audit_log_path)
-            .append(&queued_consent("queued-1"))
-            .expect("queue");
+        AuditOutbox::for_log(
+            &profile.audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        )
+        .append(&queued_consent("queued-1"))
+        .expect("queue");
         let store = TestAnchorStore::new(
             &profile.audit_log_hash_chain_key_id,
             &profile.audit_log_path,
@@ -1597,9 +1649,15 @@ mod tests {
             .expect("anchored")
             .coordinates();
         for id in ["queued-1", "queued-2"] {
-            AuditOutbox::for_log(&profile.audit_log_path)
-                .append(&queued_consent(id))
-                .expect("queue");
+            AuditOutbox::for_log(
+                &profile.audit_log_path,
+                stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                    &profile.audit_log_hash_chain_key_id,
+                    &profile.audit_log_path,
+                ),
+            )
+            .append(&queued_consent(id))
+            .expect("queue");
         }
 
         let args = ReanchorArgs {
@@ -1640,7 +1698,13 @@ mod tests {
         keyring_mock::install().expect("mock keyring store");
         let dir = tempfile::tempdir().expect("tmp dir");
         let profile = rolled_back_profile("reanchor-outbox-unusable", dir.path());
-        let outbox = AuditOutbox::for_log(&profile.audit_log_path);
+        let outbox = AuditOutbox::for_log(
+            &profile.audit_log_path,
+            stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        );
         outbox.append(&queued_consent("queued-1")).expect("queue");
         let mut bytes = std::fs::read(outbox.path()).expect("outbox");
         bytes.extend_from_slice(b"not an audit entry\n");
@@ -1668,9 +1732,31 @@ mod tests {
             "a refused drain reports no count: {data}"
         );
 
-        // The repair stands: the log opens cleanly under the ordinary path once
-        // the outbox is moved aside.
+        // Removing committed consent still refuses after a successful tip repair.
         std::fs::remove_file(outbox.path()).expect("move the outbox aside");
+        let store = TestAnchorStore::shared(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        );
+        assert!(matches!(
+            AuditWriter::open_with_tip_anchor(
+                profile.audit_log_path.clone(),
+                None,
+                store,
+                stellar_agent_core::audit_log::BindingHistory::NotRecorded
+            ),
+            Err(WriterError::OutboxRowsMissing {
+                recorded: 1,
+                found: 0
+            })
+        ));
+        // Keep the committed line byte-identical; discard only the invalid suffix.
+        let end = bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .expect("complete line")
+            + 1;
+        std::fs::write(outbox.path(), &bytes[..end]).expect("restore committed consent");
         let key = load_audit_hmac_key(&profile, "reanchor-outbox-unusable").expect("load key");
         AuditWriter::open_with_tip_anchor(
             profile.audit_log_path.clone(),

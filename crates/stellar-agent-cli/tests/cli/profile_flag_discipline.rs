@@ -76,7 +76,7 @@ const ALLOW_SET: &[AllowEntry] = &[];
 /// visibility class (say every `pub(crate)` field) would still clear a loose
 /// floor and report a clean tree. Adding or removing a profile-selecting
 /// subcommand is expected to move this number — update it in the same commit.
-const PROFILE_FIELDS: usize = 79;
+const PROFILE_FIELDS: usize = 80;
 
 /// Call-site shapes that substitute the literal `"default"` for an absent
 /// profile name, discarding the environment variable the flag left `None` for.
@@ -686,6 +686,7 @@ fn from_flag_is_confined_to_explicit_argument_boundaries() {
         ("commands/mpp.rs", "prune"),
         ("commands/audit/verify.rs", "resolve_profile_inputs"),
         ("commands/audit/reanchor.rs", "load_profile"),
+        ("commands/audit/acknowledge_outbox_loss.rs", "load_profile"),
     ];
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();

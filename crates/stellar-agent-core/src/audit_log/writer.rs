@@ -266,7 +266,7 @@ pub struct AuditWriter {
     /// sections.  This field is never read; its only purpose is to hold the
     /// lock for as long as the `AuditWriter` lives.
     _lock: crate::audit_log::lock::AuditWriterLock,
-    /// `true` for a writer opened with a tip-anchor store in `Check` mode.
+    /// `true` for checked and acknowledgement writers with a tip-anchor store.
     ///
     /// A draining writer drains the outbox at open after anchor
     /// reconciliation, in every [`AuditWriter::verify_tip_anchor`] (which
@@ -274,6 +274,13 @@ pub struct AuditWriter {
     /// [`AuditWriter::write_entry`] and [`AuditWriter::write_built`]. A queued
     /// row therefore precedes the writer's own next row.
     drains: bool,
+    /// `true` for a writer opened for an outbox-loss acknowledgement, until
+    /// [`AuditWriter::acknowledge_outbox_loss`] succeeds.
+    ///
+    /// While it is set, the drain at open and in
+    /// [`AuditWriter::verify_tip_anchor`] is deferred, and only such a writer
+    /// acknowledges a loss.
+    acknowledge_outbox: bool,
     /// The single OS handle used for every read and write against the active
     /// log file.
     ///
@@ -427,6 +434,30 @@ pub struct AuditWriter {
     owed_row_anchored: bool,
 }
 
+/// Counts of permissions revoked before acknowledging an outbox loss.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RevokedCounts {
+    /// Decided, unexpired, unconsumed approvals removed.
+    pub approvals: usize,
+    /// Toolset grants removed.
+    pub grants: usize,
+}
+
+/// The result of acknowledging an outbox loss.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OutboxLossReport {
+    /// Committed rows before acknowledgement.
+    pub expected_rows: u64,
+    /// Complete rows found in the outbox.
+    pub found_rows: u64,
+    /// Remaining rows appended after the acknowledgement.
+    pub drained: usize,
+    /// Approvals revoked by the caller.
+    pub revoked_approvals: usize,
+    /// Grants revoked by the caller.
+    pub revoked_grants: usize,
+}
+
 /// How [`AuditWriter::open`] treats an attached tip-anchor store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TipAnchorOpenMode {
@@ -435,6 +466,8 @@ enum TipAnchorOpenMode {
     /// truncated file is refused, and so is an absent anchor that
     /// [`PriorAnchoring`] shows was written before.
     Check,
+    /// Check the anchor and hold the drain lock, deferring the initial drain.
+    Acknowledge,
     /// Skip the check so a refused file can be opened for repair. Only
     /// [`AuditWriter::open_for_reanchor`] uses this; the caller must follow it
     /// with [`AuditWriter::reanchor`].
@@ -596,7 +629,8 @@ pub struct ReanchorReport {
     /// Why the outbox could not be drained after a successful repair, led by
     /// its `audit.*` sub-code, or `None` when the drain succeeded.
     ///
-    /// The sub-code is `audit.outbox_unusable`, `audit.outbox_busy`, or the
+    /// The sub-code is `audit.outbox_unusable`, `audit.outbox_busy`,
+    /// `audit.outbox_rows_missing`, or the
     /// condition an append of the drain refused on, such as `audit.io_error`.
     /// The repair itself stands either way; the rows stay queued for the next
     /// drain.
@@ -809,6 +843,26 @@ impl AuditWriter {
         )
     }
 
+    /// Opens for outbox-loss acknowledgement while enforcing the tip anchor.
+    /// The drain lock is held, and the initial outbox drain is deferred.
+    ///
+    /// # Errors
+    /// Returns the errors of a checked writer open, except outbox drain errors.
+    pub fn open_for_outbox_acknowledgement(
+        path: PathBuf,
+        hmac_key: Option<Zeroizing<[u8; 32]>>,
+        tip_anchor: Arc<dyn TipAnchorStore>,
+        binding: BindingHistory,
+    ) -> Result<Self, WriterError> {
+        Self::open_inner(
+            path,
+            hmac_key,
+            Some(tip_anchor),
+            binding,
+            TipAnchorOpenMode::Acknowledge,
+        )
+    }
+
     fn open_inner(
         path: PathBuf,
         hmac_key: Option<Zeroizing<[u8; 32]>>,
@@ -855,7 +909,7 @@ impl AuditWriter {
         // held drain lock always means a draining writer owns the log. The
         // repair writer and writers without an anchor store do not drain and
         // do not take it.
-        let drains = tip_anchor.is_some() && anchor_mode == TipAnchorOpenMode::Check;
+        let drains = tip_anchor.is_some() && anchor_mode != TipAnchorOpenMode::Repair;
         let drain_lock = if drains {
             Some(super::outbox::acquire_drain_lock(&path)?)
         } else {
@@ -903,6 +957,7 @@ impl AuditWriter {
             _drain_lock: drain_lock,
             _lock: lock,
             drains,
+            acknowledge_outbox: anchor_mode == TipAnchorOpenMode::Acknowledge,
             file,
             last_hash: scan.last_hash,
             segment_start_hash,
@@ -914,7 +969,7 @@ impl AuditWriter {
             pending_tip_anchor: None,
             log_diverged: None,
             owed_row_anchored: false,
-            checked_open: tip_anchor.is_some() && anchor_mode == TipAnchorOpenMode::Check,
+            checked_open: tip_anchor.is_some() && anchor_mode != TipAnchorOpenMode::Repair,
             tip_anchor,
             binding,
             #[cfg(test)]
@@ -942,7 +997,7 @@ impl AuditWriter {
             partial_rotation_archive: None,
         };
 
-        if writer.tip_anchor.is_some() && anchor_mode == TipAnchorOpenMode::Check {
+        if writer.tip_anchor.is_some() && anchor_mode != TipAnchorOpenMode::Repair {
             let outcome = writer.reconcile_tip_anchor()?;
             // Only an outcome that proved the file from byte 0 against the
             // anchor, and before any append, which may rotate it.
@@ -1136,40 +1191,55 @@ impl AuditWriter {
     /// Appends every row queued in the audit outbox to the log, then empties
     /// the outbox.
     ///
-    /// Drains whatever writer it is called on. Under the outbox lock it reads
-    /// the file, discards a final segment with no terminating newline (an
-    /// append that never returned `Ok`) with a `warn`, and parses every
-    /// complete line before appending any. Each entry keeps the consent
-    /// timestamp it was queued with. Only after every entry is appended is the
+    /// Requires an attached tip-anchor store, which holds the outbox
+    /// commitment. Under the outbox lock it reads the file and the
+    /// commitment, checks the committed prefix, discards a final segment with
+    /// no terminating newline (an append that never returned `Ok`) with a
+    /// `warn`, and parses every complete line before appending any. Each entry
+    /// keeps the consent timestamp it was queued with. Only after every entry
+    /// is appended is the commitment reset to zero, and only then is the
     /// outbox truncated to zero.
     ///
     /// Delivery is at least once. A refusal leaves the outbox unchanged, and
     /// the entries appended before the refusal are appended again by the next
-    /// drain, with the same `request_id`. Queued rows sit outside the tip
-    /// anchor until they are drained.
+    /// drain, with the same `request_id`. Queued rows are committed in the
+    /// keyring until they are drained.
     ///
     /// Returns the number of rows appended.
     ///
     /// # Errors
     ///
+    /// - [`WriterError::TipAnchorUnavailable`] without an attached store.
     /// - [`WriterError::OutboxBusy`] when the outbox lock stays held.
+    /// - [`WriterError::TipAnchorStore`] when the commitment cannot be read or
+    ///   reset.
+    /// - [`WriterError::OutboxRowsMissing`] when committed rows are missing,
+    ///   changed, or reordered. Nothing is appended and the outbox is left
+    ///   unchanged.
     /// - [`WriterError::OutboxUnusable`] when a complete line does not parse.
     ///   Nothing is appended and the outbox is left unchanged.
     /// - Every error of the append, for example
     ///   [`WriterError::TipAnchorMismatch`]. The outbox is left unchanged.
     /// - [`WriterError::Io`] when the outbox cannot be read or truncated.
     pub fn drain_outbox(&mut self) -> Result<usize, WriterError> {
-        let Some(mut batch) = super::outbox::OutboxBatch::take(&self.path)? else {
+        let store = self
+            .tip_anchor
+            .clone()
+            .ok_or(WriterError::TipAnchorUnavailable)?;
+        let Some(batch) = super::outbox::OutboxBatch::take(&self.path, store.as_ref())? else {
             return Ok(0);
         };
         if batch.is_empty() {
             return Ok(0);
         }
-        let entries = batch.take_entries();
+        let entries = batch.parse_entries()?;
         let drained = entries.len();
         for entry in entries {
             self.append_checked(entry)?;
         }
+        store
+            .store_outbox_state(&super::outbox::OutboxState::default())
+            .map_err(WriterError::TipAnchorStore)?;
         #[cfg(test)]
         if self.skip_outbox_truncate {
             return Ok(drained);
@@ -1183,6 +1253,109 @@ impl AuditWriter {
             );
         }
         Ok(drained)
+    }
+
+    /// Reports a loss of committed outbox rows, checked under the outbox lock
+    /// and released before it returns.
+    ///
+    /// `Ok(None)` means the outbox holds its committed prefix unchanged and in
+    /// order. When it does not, every complete line that remains is parsed
+    /// too, so a loss whose acknowledgement would refuse on an unusable line
+    /// refuses here, before the caller revokes anything.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::TipAnchorUnavailable`] without an attached store.
+    /// - [`WriterError::OutboxBusy`] when the outbox lock stays held.
+    /// - [`WriterError::TipAnchorStore`] when the commitment cannot be read.
+    /// - [`WriterError::OutboxUnusable`] when a loss exists and a remaining
+    ///   complete line does not parse.
+    /// - [`WriterError::Io`] when the outbox cannot be read.
+    pub fn outbox_loss(&self) -> Result<Option<super::outbox::OutboxLoss>, WriterError> {
+        let store = self
+            .tip_anchor
+            .as_ref()
+            .ok_or(WriterError::TipAnchorUnavailable)?;
+        let batch = super::outbox::OutboxBatch::read_locked(&self.path, store.as_ref())?;
+        let Some(loss) = batch.loss() else {
+            return Ok(None);
+        };
+        batch.parse_entries()?;
+        Ok(Some(loss))
+    }
+
+    /// Records a loss of committed outbox rows, then drains the complete rows
+    /// that remain, all under the outbox lock.
+    ///
+    /// Only a writer from [`AuditWriter::open_for_outbox_acknowledgement`]
+    /// acknowledges, because only that open checks the tip anchor and defers
+    /// the drain the loss refuses. The caller revokes the profile's decided
+    /// approvals and grants first and passes their counts in `revoked`.
+    ///
+    /// Every remaining line is parsed before the
+    /// `audit_outbox_loss_acknowledged` row is appended, so an unusable line
+    /// refuses with nothing written. After the row, the remaining entries are
+    /// appended in queue order, the commitment is reset to zero, and the
+    /// outbox is truncated. A refusal after the row leaves the commitment and
+    /// the outbox in place, so the loss still holds and a rerun records it
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::Io`] of kind `InvalidInput` on a writer opened any
+    ///   other way, before anything is read or written.
+    /// - [`WriterError::TipAnchorUnavailable`] without an attached store.
+    /// - [`WriterError::OutboxBusy`] when the outbox lock stays held.
+    /// - [`WriterError::TipAnchorStore`] when the commitment cannot be read or
+    ///   reset.
+    /// - [`WriterError::OutboxLossNotFound`] when the outbox holds its
+    ///   committed prefix. Nothing is written.
+    /// - [`WriterError::OutboxUnusable`] when a remaining complete line does
+    ///   not parse. Nothing is written.
+    /// - Every error of the appends, and [`WriterError::Io`] when the outbox
+    ///   cannot be truncated.
+    pub fn acknowledge_outbox_loss(
+        &mut self,
+        reason: &str,
+        revoked: RevokedCounts,
+    ) -> Result<OutboxLossReport, WriterError> {
+        if !self.acknowledge_outbox {
+            return Err(WriterError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an outbox loss is acknowledged only through a writer opened for the \
+                 acknowledgement",
+            )));
+        }
+        let store = self
+            .tip_anchor
+            .clone()
+            .ok_or(WriterError::TipAnchorUnavailable)?;
+        let batch = super::outbox::OutboxBatch::read_locked(&self.path, store.as_ref())?;
+        let loss = batch.loss().ok_or(WriterError::OutboxLossNotFound)?;
+        let entries = batch.parse_entries()?;
+        self.append_checked(AuditEntry::new_audit_outbox_loss_acknowledged(
+            loss.expected_rows,
+            loss.found_rows,
+            reason,
+            revoked.approvals,
+            revoked.grants,
+        ))?;
+        let drained = entries.len();
+        for entry in entries {
+            self.append_checked(entry)?;
+        }
+        store
+            .store_outbox_state(&super::outbox::OutboxState::default())
+            .map_err(WriterError::TipAnchorStore)?;
+        batch.clear()?;
+        self.acknowledge_outbox = false;
+        Ok(OutboxLossReport {
+            expected_rows: loss.expected_rows,
+            found_rows: loss.found_rows,
+            drained,
+            revoked_approvals: revoked.approvals,
+            revoked_grants: revoked.grants,
+        })
     }
 
     /// Appends `entry` with every check an append makes, without draining.
@@ -2399,6 +2572,7 @@ impl AuditWriter {
         entry_count: u64,
     ) -> Result<(), WriterError> {
         if self.drains
+            && !self.acknowledge_outbox
             && let Err(refusal) = self.drain_outbox()
         {
             self.record_adoption(outcome, entry_count);
@@ -4566,6 +4740,21 @@ pub enum WriterError {
         /// The cap, [`MAX_ROW_BYTES`].
         cap: u64,
     },
+    /// The outbox does not contain its committed prefix unchanged and in order.
+    #[error(
+        "audit.outbox_rows_missing: the audit outbox does not hold the {recorded} queued rows the keyring records, unchanged and in order ({found} complete lines found); queued consent rows were removed or changed outside the wallet; see `stellar-agent audit acknowledge-outbox-loss`"
+    )]
+    OutboxRowsMissing {
+        /// Number of rows committed in the keyring.
+        recorded: u64,
+        /// Number of complete lines found.
+        found: u64,
+    },
+    /// No committed outbox loss remains to acknowledge.
+    #[error(
+        "audit.outbox_loss_not_found: no committed outbox loss was found; nothing was acknowledged"
+    )]
+    OutboxLossNotFound,
 }
 
 /// Returns the condition an audit-writer acquisition failure describes, led by
@@ -4592,7 +4781,9 @@ pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
         | WriterError::IntegrityViolation(_)
         | WriterError::OutboxBusy
         | WriterError::OutboxUnusable { .. }
-        | WriterError::RowTooLarge { .. } => Some(e.to_string()),
+        | WriterError::RowTooLarge { .. }
+        | WriterError::OutboxRowsMissing { .. }
+        | WriterError::OutboxLossNotFound => Some(e.to_string()),
         WriterError::ChainBrokenAtOpen { entry_idx, .. } => Some(format!(
             "audit.chain_broken: the log's own hash chain is broken at entry {entry_idx}; \
              the file was modified outside the writer"
@@ -9458,7 +9649,7 @@ mod tests {
             snapshot
         };
         fs::write(&path, &snapshot).unwrap();
-        let outbox = super::super::outbox::AuditOutbox::for_log(&path);
+        let outbox = super::super::outbox::AuditOutbox::for_log(&path, store.clone());
         for request_id in ["queued-1", "queued-2", "queued-3"] {
             outbox
                 .append(&AuditEntry::new_approval_attested(
@@ -10696,6 +10887,19 @@ mod tests {
             armed: AtomicBool,
         }
         impl TipAnchorStore for InterruptedStore {
+            fn load_outbox_state(
+                &self,
+            ) -> Result<Option<super::super::outbox::OutboxState>, TipAnchorStoreError>
+            {
+                self.inner.load_outbox_state()
+            }
+            fn store_outbox_state(
+                &self,
+                state: &super::super::outbox::OutboxState,
+            ) -> Result<(), TipAnchorStoreError> {
+                self.inner.store_outbox_state(state)
+            }
+
             fn load_anchor(&self) -> Result<Option<TipAnchor>, TipAnchorStoreError> {
                 self.inner.load_anchor()
             }
@@ -11726,7 +11930,7 @@ mod tests {
         let store = Arc::new(InMemoryTipAnchorStore::new());
         let mut writer = keyed_anchor_writer(&path, &store);
         writer.write_entry(make_entry("")).unwrap();
-        super::super::outbox::AuditOutbox::for_log(&path)
+        super::super::outbox::AuditOutbox::for_log(&path, store.clone())
             .append(&AuditEntry::new_approval_attested(
                 "PaymentSimulated",
                 "stellar_pay_commit",
@@ -11752,7 +11956,7 @@ mod tests {
         let store = Arc::new(InMemoryTipAnchorStore::new());
         let mut writer = keyed_anchor_writer(&path, &store);
         writer.write_entry(make_entry("")).unwrap();
-        super::super::outbox::AuditOutbox::for_log(&path)
+        super::super::outbox::AuditOutbox::for_log(&path, store.clone())
             .append(&AuditEntry::new_approval_attested(
                 "PaymentSimulated",
                 "stellar_pay_commit",
@@ -11793,7 +11997,7 @@ mod tests {
         let store = Arc::new(InMemoryTipAnchorStore::new());
         let mut writer = keyed_anchor_writer(&path, &store);
         writer.write_entry(make_entry("")).unwrap();
-        let outbox = super::super::outbox::AuditOutbox::for_log(&path);
+        let outbox = super::super::outbox::AuditOutbox::for_log(&path, store.clone());
         for request_id in ["queued-1", "queued-2"] {
             outbox
                 .append(&AuditEntry::new_approval_attested(

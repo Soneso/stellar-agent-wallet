@@ -258,6 +258,7 @@ const WINDOW_POLICY_PIN: &str = "policy_window_state_key_id (policy pin)";
 const WINDOW_ENABLEMENT: &str = "policy_window_state_key_id (mainnet enablement)";
 const SIGNER_IDENTITY: &str = "mcp_signer_default (enrolled identity)";
 const TIP_ANCHOR: &str = "audit_log_hash_chain_key_id (tip anchor)";
+const OUTBOX_STATE: &str = "audit_log_hash_chain_key_id (outbox state)";
 const REANCHOR_COUNTER: &str = "audit_log_hash_chain_key_id (reanchor counter)";
 const AUDIT_BINDING: &str = "audit binding (derived)";
 const MPP_STATE: &str = "mpp state (derived)";
@@ -380,9 +381,16 @@ fn effective_coordinates(
     entries.push((
         REANCHOR_COUNTER,
         KeyringEntryRef {
-            service: audit.service,
+            service: audit.service.clone(),
             account: reanchor_count_account(&audit.account, &path),
         },
+    ));
+    entries.push((
+        OUTBOX_STATE,
+        KeyringEntryRef::new(
+            &audit.service,
+            crate::audit_log::outbox_state_account(&audit.account, &path),
+        ),
     ));
     entries.push((AUDIT_BINDING, KeyringEntryRef::default_audit_binding(name)));
     let mpp = KeyringEntryRef::default_mpp_state_key(name);
@@ -1049,6 +1057,10 @@ mod tests {
                 &audit.service,
                 tip_anchor_account(&audit.account, &a.audit_log_path),
             ),
+            OUTBOX_STATE => KeyringEntryRef::new(
+                &audit.service,
+                crate::audit_log::outbox_state_account(&audit.account, &a.audit_log_path),
+            ),
             REANCHOR_COUNTER => KeyringEntryRef::new(
                 &audit.service,
                 reanchor_count_account(&audit.account, &a.audit_log_path),
@@ -1122,6 +1134,12 @@ mod tests {
     #[serial_test::serial]
     fn reanchor_counter_is_reserved() {
         derived_collision(REANCHOR_COUNTER);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn outbox_state_is_reserved() {
+        derived_collision(OUTBOX_STATE);
     }
 
     #[test]

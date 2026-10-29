@@ -2840,6 +2840,41 @@ impl AuditEntry {
         }
     }
 
+    /// Constructs the forensic record of an acknowledged outbox loss.
+    #[must_use]
+    pub fn new_audit_outbox_loss_acknowledged(
+        expected_rows: u64,
+        found_rows: u64,
+        reason: &str,
+        revoked_approvals: usize,
+        revoked_grants: usize,
+    ) -> Self {
+        let bounded_reason = super::schema::bound_recorded_str(reason);
+        let truncated = bounded_reason != reason;
+        let reason = bounded_reason;
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "audit.acknowledge_outbox_loss".to_owned(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            event_kind: EventKind::AuditOutboxLossAcknowledged {
+                expected_rows,
+                found_rows,
+                reason,
+                revoked_approvals,
+                revoked_grants,
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
     /// Constructs an `AuditTipAnchored` audit entry.
     ///
     /// Written by the audit writer itself, not by a tool: the `tool` field

@@ -193,6 +193,7 @@ loads a signing key for the approved action. The command refuses and persists no
 beside a process that does not drain the outbox (`audit.writer_locked`), and on
 any other audit failure. After upgrading, restart a running MCP server and
 `approve serve`: `approve --id` refuses beside an older one.
+The queue's count and chain head are committed in the platform keyring before approval persists. Removed or changed committed rows refuse acquisition with `audit.outbox_rows_missing`.
 
 ```json
 {"ok":true,"data":{"approval_nonce":"ABCxyzNonce","attested":true,"process_uid":"501","expires_at_unix_ms":1717000000000,"approval_attestation":"q83vEjRWeJq83v...","audit":"written"},"request_id":"..."}
@@ -753,7 +754,9 @@ A `pruned_prefix` warning reports `first_file`, the oldest file walked, and
 entry and is authenticated when an audit key is supplied. Verification checks
 every retained entry and bridge, and the warning leaves the verdict successful.
 
-`outbox_pending` counts the consent rows queued in the audit outbox beside the log (`<LOG_PATH>.outbox`) and not yet drained into it, read without taking the outbox lock. Queued rows sit outside the tip anchor until a draining writer appends them. A torn outbox adds an `outbox_torn_tail` warning and unparseable lines add `outbox_unparseable`. An unreadable outbox adds `outbox_unreadable` and omits `outbox_pending`, since no count is known. None of them changes the chain verdict.
+`outbox_pending` counts complete queued consent lines. With `--profile` and the profile's log path, verification checks the keyring commitment under the outbox lock after the chain walk. A missing or changed committed prefix fails with `audit.outbox_rows_missing`; a held lock fails with `audit.outbox_busy`. Without a profile, no commitment is checked. The separate count inspection can report `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` warnings.
+
+An `outbox_loss_acknowledged` warning names each loss acknowledgement's file, line, `expected_rows`, and `found_rows`. It leaves the chain verdict unchanged.
 
 ```bash
 stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --profile default
@@ -802,10 +805,30 @@ no stop: a server running the edited profile refuses before it opens the new
 path, so it holds no lock there. A server still running the old profile refuses
 after the acknowledgement until it restarts.
 
-Queued consent rows follow the repair rows and are counted in `outbox_drained`. A drain refusal leaves the repair in force and exits `0`. It omits `outbox_drained`, since every queued row stays queued, and lists the refusal under `warnings`: `audit.outbox_unusable`, `audit.outbox_busy`, or the condition an append refused on, such as `audit.io_error`.
+Queued consent rows follow the repair rows and are counted in `outbox_drained`. A drain refusal leaves the repair in force and exits `0`. It omits `outbox_drained`, since every queued row stays queued, and lists the refusal under `warnings`: `audit.outbox_unusable`, `audit.outbox_busy`, `audit.outbox_rows_missing`, or the condition an append refused on, such as `audit.io_error`.
 
 ```json
 {"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1,"acknowledged":["rollback"],"recorded_binding":"equal","previous_binding_anchor":null,"outbox_drained":0},"request_id":"..."}
+```
+
+### `audit acknowledge-outbox-loss --profile <NAME> --reason <TEXT>`
+
+Operator-only recovery for `audit.outbox_rows_missing`; an agent must not run it on its own initiative.
+Stop the process holding the profile's writer and inspect the queued rows first.
+`--reason` is required, non-empty, and recorded with the audit string bound.
+
+The command checks the tip anchor, checks that the loss holds and that every remaining queued row parses, and then revokes every decided, unexpired, unconsumed approval and every toolset grant.
+Mainnet confirmations and recorded passkey assertions count as decided approvals.
+It records `audit_outbox_loss_acknowledged`, drains the remaining complete rows, resets the commitment, and empties the outbox.
+Approve affected actions again to record fresh consent.
+
+The result contains `profile`, `expected_rows`, `found_rows`, `drained`, `revoked_approvals`, and `revoked_grants`.
+No loss returns `audit.outbox_loss_not_found` without an acknowledgement; a held writer returns `audit.writer_locked`; a log rolled back behind its tip anchor returns `audit.tip_anchor_mismatch`.
+A remaining row that does not parse returns `audit.outbox_unusable` before anything is revoked or written.
+A row that cannot append leaves the queue and commitment in place for inspection and retry.
+
+```bash
+stellar-agent audit acknowledge-outbox-loss --profile default --reason "Queue inspected; fresh approval required"
 ```
 
 ## The governance loop end to end

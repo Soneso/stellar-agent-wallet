@@ -56,10 +56,10 @@ use serde::{Deserialize, Serialize};
 use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::{
     audit_log::{
-        BindingCheck, BindingHistory,
+        BindingCheck, BindingHistory, WriterError,
         health::AuditWriterHealth,
         outbox::inspect_outbox,
-        tip_anchor::{TipAnchor, TipAnchorStore as _, normalize_path_lexically},
+        tip_anchor::{TipAnchor, normalize_path_lexically},
         verify::{
             FileVerifyResult, VerifyError, VerifyWarning, check_missing_anchor,
             verify_log_with_health,
@@ -152,13 +152,15 @@ pub struct AuditVerifyResult {
     pub anchor: AuditAnchorStatus,
     /// Number of consent rows queued in the audit outbox beside the log and
     /// not yet drained into it: the newline-terminated lines of
-    /// `<log>.outbox`, read without taking the outbox lock.
+    /// `<log>.outbox`, counted after the commitment check and apart from it.
     ///
-    /// Queued rows sit outside the tip anchor until a draining writer appends
-    /// them. A torn or unparseable outbox adds a warning and leaves the chain
-    /// verdict unchanged. An outbox that cannot be read has no count: the
-    /// field is omitted, an `outbox_unreadable` warning names the condition,
-    /// and the chain verdict is unchanged.
+    /// Queued rows are committed in the keyring until a draining writer
+    /// appends them. With `--profile` on the profile's own log, verification
+    /// checks that commitment under the outbox lock and fails when committed
+    /// rows are missing or changed. A torn or unparseable outbox adds a
+    /// warning and leaves the chain verdict unchanged. An outbox that cannot
+    /// be read has no count: the field is omitted, an `outbox_unreadable`
+    /// warning names the condition, and the chain verdict is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outbox_pending: Option<usize>,
 }
@@ -288,6 +290,7 @@ fn verify_resolved(
         anchor,
         anchor_skip_reason,
         missing_anchor_binding,
+        outbox_check,
     } = inputs;
 
     // Create a fresh health instance — in the CLI context the health latch is
@@ -307,6 +310,10 @@ fn verify_resolved(
         verify_log_with_health(log_path, hmac_key.as_deref(), anchor.as_ref(), &handle)
             .map_err(|err| verify_failure(&err))?;
 
+    if let Some(check) = outbox_check {
+        stellar_agent_core::audit_log::check_outbox_commitment(log_path, check.store.as_ref())
+            .map_err(|e| outbox_commitment_failure(&e, &check.profile_name))?;
+    }
     let ok = ok_with_health.verify_ok;
     let mut warnings = ok.warnings;
     let outbox_pending = inspect_outbox_into(log_path, &mut warnings);
@@ -325,12 +332,46 @@ fn verify_resolved(
     })
 }
 
+/// Maps a refused outbox commitment check onto the verify failure model.
+///
+/// A held outbox lock carries `audit.outbox_busy`, and an outbox that cannot
+/// be read carries `audit.io_error`, the verifier's code for a file it cannot
+/// read. Missing or changed committed rows carry `audit.outbox_rows_missing`,
+/// as the writer's refusal does, and a commitment that cannot be read carries
+/// `audit.tip_anchor_unavailable`, as an anchor that cannot be read does.
+fn outbox_commitment_failure(e: &WriterError, profile_name: &str) -> VerifyFailure {
+    match e {
+        WriterError::OutboxBusy => VerifyFailure::Raw {
+            code: "audit.outbox_busy",
+            message: e.to_string(),
+        },
+        WriterError::Io(io) => VerifyFailure::Raw {
+            code: "audit.io_error",
+            message: format!(
+                "audit.io_error: the audit outbox could not be read ({})",
+                io.kind()
+            ),
+        },
+        WriterError::TipAnchorStore(store) => {
+            VerifyFailure::Wallet(WalletError::Internal(InternalError::UnexpectedState {
+                detail: format!("audit.tip_anchor_unavailable: {store}"),
+            }))
+        }
+        _ => VerifyFailure::Wallet(super::audit_writer_error(
+            e,
+            "audit.tip_anchor_unavailable",
+            profile_name,
+        )),
+    }
+}
+
 /// Counts the rows queued in the audit outbox beside `log_path`, adding a
 /// warning for a torn, unparseable, or unreadable outbox.
 ///
-/// Reads without the outbox lock, so the count describes the file at the
-/// moment it was read. An absent outbox counts zero; an outbox that cannot be
-/// read has no count, `None`. Nothing here changes the chain verdict.
+/// The count is read apart from the locked commitment check, so it describes
+/// the file at the moment it was read. An absent outbox counts zero; an
+/// outbox that cannot be read has no count, `None`. Nothing here changes the
+/// chain verdict.
 fn inspect_outbox_into(
     log_path: &std::path::Path,
     warnings: &mut Vec<VerifyWarning>,
@@ -358,8 +399,18 @@ fn inspect_outbox_into(
     }
 }
 
+/// The outbox commitment `audit verify` checks for the profile's own log.
+struct OutboxCommitmentCheck {
+    /// The store holding the commitment: the profile's tip-anchor store.
+    store: std::sync::Arc<dyn stellar_agent_core::audit_log::TipAnchorStore>,
+    /// The profile name a refusal names.
+    profile_name: String,
+}
+
 /// What `--profile` contributed to this verification.
 struct ResolvedVerifyInputs {
+    /// The outbox commitment check, only for the profile's own log path.
+    outbox_check: Option<OutboxCommitmentCheck>,
     /// The profile's audit chain-root HMAC key, when `--profile` was supplied.
     hmac_key: Option<Zeroizing<[u8; 32]>>,
     /// The keyring-held tip anchor, when it applies to the supplied path and
@@ -388,6 +439,7 @@ fn resolve_profile_inputs(
 ) -> Result<ResolvedVerifyInputs, WalletError> {
     let Some(profile_name) = profile_name else {
         return Ok(ResolvedVerifyInputs {
+            outbox_check: None,
             hmac_key: None,
             anchor: None,
             anchor_skip_reason: Some(
@@ -423,6 +475,7 @@ fn resolve_profile_inputs_with_profile(
 
     if normalize_path_lexically(log_path) != normalize_path_lexically(&profile.audit_log_path) {
         return Ok(ResolvedVerifyInputs {
+            outbox_check: None,
             hmac_key,
             anchor: None,
             anchor_skip_reason: Some(format!(
@@ -433,15 +486,23 @@ fn resolve_profile_inputs_with_profile(
         });
     }
 
-    let store = KeyringTipAnchorStore::new(&profile.audit_log_hash_chain_key_id, log_path);
+    let store = KeyringTipAnchorStore::shared(&profile.audit_log_hash_chain_key_id, log_path);
     match store.load_anchor() {
         Ok(Some(anchor)) => Ok(ResolvedVerifyInputs {
+            outbox_check: Some(OutboxCommitmentCheck {
+                store: store.clone(),
+                profile_name: profile_name.to_owned(),
+            }),
             hmac_key,
             anchor: Some(anchor),
             anchor_skip_reason: None,
             missing_anchor_binding: None,
         }),
         Ok(None) => Ok(ResolvedVerifyInputs {
+            outbox_check: Some(OutboxCommitmentCheck {
+                store: store.clone(),
+                profile_name: profile_name.to_owned(),
+            }),
             hmac_key,
             anchor: None,
             anchor_skip_reason: Some(
@@ -1483,26 +1544,31 @@ mod tests {
     // ── The audit outbox ──────────────────────────────────────────────────────
 
     fn queue_consent(path: &std::path::Path, request_id: &str) {
-        stellar_agent_core::audit_log::AuditOutbox::for_log(path)
-            .append(
-                &stellar_agent_core::audit_log::AuditEntry::new_approval_attested(
-                    "PaymentSimulated",
-                    "stellar_pay_commit",
-                    None,
-                    "ABCDEFGHIJKLMNOPQRSTUV",
-                    "cli",
-                    request_id,
-                ),
-            )
-            .unwrap();
+        stellar_agent_core::audit_log::AuditOutbox::for_log(
+            path,
+            std::sync::Arc::new(
+                stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore::new(),
+            ),
+        )
+        .append(
+            &stellar_agent_core::audit_log::AuditEntry::new_approval_attested(
+                "PaymentSimulated",
+                "stellar_pay_commit",
+                None,
+                "ABCDEFGHIJKLMNOPQRSTUV",
+                "cli",
+                request_id,
+            ),
+        )
+        .unwrap();
     }
 
     fn append_to_outbox(path: &std::path::Path, bytes: &[u8]) {
         use std::io::Write as _;
-        let outbox = stellar_agent_core::audit_log::AuditOutbox::for_log(path);
+        let outbox = stellar_agent_core::audit_log::outbox_path(path);
         std::fs::OpenOptions::new()
             .append(true)
-            .open(outbox.path())
+            .open(&outbox)
             .unwrap()
             .write_all(bytes)
             .unwrap();
@@ -1590,7 +1656,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("audit.jsonl");
         make_writer_and_entries(path.clone(), 2, None);
-        let outbox = stellar_agent_core::audit_log::AuditOutbox::for_log(&path);
+        let outbox = stellar_agent_core::audit_log::AuditOutbox::for_log(
+            &path,
+            std::sync::Arc::new(
+                stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore::new(),
+            ),
+        );
         let args = || VerifyArgs {
             log_path: path.clone(),
             profile: None,
@@ -1622,5 +1693,108 @@ mod tests {
             json.get("outbox_pending").is_none(),
             "an unreadable outbox omits the count: {json}"
         );
+    }
+    #[test]
+    #[serial]
+    fn verify_fails_on_a_deleted_outbox_line() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "verify-outbox-loss";
+        let profile = keyed_unanchored_profile(name, dir.path(), 0);
+        let store = KeyringTipAnchorStore::shared(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        );
+        let outbox =
+            stellar_agent_core::audit_log::AuditOutbox::for_log(&profile.audit_log_path, store);
+        for id in ["one", "two"] {
+            outbox
+                .append(
+                    &stellar_agent_core::audit_log::AuditEntry::new_approval_attested(
+                        "PaymentSimulated",
+                        "stellar_pay_commit",
+                        None,
+                        "AAAAAAAAAAAAAAAAAAAAAA",
+                        "cli",
+                        id,
+                    ),
+                )
+                .unwrap();
+        }
+        let bytes = std::fs::read_to_string(outbox.path()).unwrap();
+        std::fs::write(
+            outbox.path(),
+            bytes.split_inclusive('\n').skip(1).collect::<String>(),
+        )
+        .unwrap();
+        let error = verify_profile_log(&profile, name).unwrap_err();
+        assert!(
+            matches!(error, VerifyFailure::Wallet(ref e) if e.code() == "audit.outbox_rows_missing" && e.message().starts_with("audit.outbox_rows_missing")),
+            "{error:?}"
+        );
+    }
+
+    /// A held outbox lock fails the profile's verification with
+    /// `audit.outbox_busy` once the lock wait runs out.
+    #[test]
+    #[serial]
+    fn verify_reports_a_held_outbox_lock_as_outbox_busy() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "verify-outbox-busy";
+        let profile = keyed_unanchored_profile(name, dir.path(), 0);
+        let lock_path = dir.path().join("audit.jsonl.outbox.lock");
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        held.lock().unwrap();
+        let error = verify_profile_log(&profile, name).unwrap_err();
+        drop(held);
+        assert!(
+            matches!(error, VerifyFailure::Raw { code: "audit.outbox_busy", ref message }
+                if message.starts_with("audit.outbox_busy")),
+            "{error:?}"
+        );
+    }
+
+    /// An outbox that cannot be read fails the profile's verification with
+    /// `audit.io_error`, the code of a file the verifier cannot read.
+    #[test]
+    #[serial]
+    fn verify_reports_an_unreadable_outbox_as_io_error() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "verify-outbox-unreadable";
+        let profile = keyed_unanchored_profile(name, dir.path(), 0);
+        std::fs::create_dir(stellar_agent_core::audit_log::outbox_path(
+            &profile.audit_log_path,
+        ))
+        .unwrap();
+        let error = verify_profile_log(&profile, name).unwrap_err();
+        assert!(
+            matches!(error, VerifyFailure::Raw { code: "audit.io_error", ref message }
+                if message.starts_with("audit.io_error: the audit outbox")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn verify_without_a_profile_checks_no_commitment() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        make_writer_and_entries(path.clone(), 1, None);
+        queue_consent(&path, "lost");
+        std::fs::remove_file(stellar_agent_core::audit_log::outbox_path(&path)).unwrap();
+        let result = verify_to_result(&VerifyArgs {
+            log_path: path,
+            profile: None,
+            output: OutputFormat::DEFAULT,
+        })
+        .unwrap();
+        assert_eq!(result.entries_verified, 1);
+        assert_eq!(result.outbox_pending, Some(0));
     }
 }

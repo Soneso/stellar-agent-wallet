@@ -467,9 +467,15 @@ mod tests {
             stellar_agent_core::audit_log::log_path_sha256(&profile.audit_log_path)
         );
         first.writer().lock().unwrap().write_entry(row()).unwrap();
-        AuditOutbox::for_log(&profile.audit_log_path)
-            .append(&row())
-            .unwrap();
+        AuditOutbox::for_log(
+            &profile.audit_log_path,
+            crate::keyring::KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        )
+        .append(&row())
+        .unwrap();
         let second = audit_readiness(&profile, name).unwrap();
         assert_eq!(
             second.anchored_count(),
@@ -745,9 +751,15 @@ mod tests {
         let proof = audit_readiness(&profile, name).unwrap();
         assert!(proof.fresh_facts().is_ok());
         failing.store(true, std::sync::atomic::Ordering::SeqCst);
-        AuditOutbox::for_log(&profile.audit_log_path)
-            .append(&row())
-            .unwrap();
+        AuditOutbox::for_log(
+            &profile.audit_log_path,
+            crate::keyring::KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        )
+        .append(&row())
+        .unwrap();
         assert!(matches!(
             proof.fresh_facts(),
             Err(MainnetAuthorizationError::Refused(
