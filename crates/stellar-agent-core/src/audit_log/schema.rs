@@ -475,12 +475,32 @@ pub const RECORDED_STR_MAX: usize = 128;
 
 /// Truncates `s` to [`RECORDED_STR_MAX`] characters (char-boundary safe) for
 /// recording in an audit row.
-pub(super) fn bound_recorded_str(s: &str) -> String {
+pub fn bound_recorded_str(s: &str) -> String {
     if s.chars().count() <= RECORDED_STR_MAX {
         s.to_string()
     } else {
         s.chars().take(RECORDED_STR_MAX).collect()
     }
+}
+
+/// Maximum reset-reason length in Unicode characters. Even JSON-escaped
+/// control characters fit the audit row alongside the largest authorization.
+pub const WINDOW_RESET_REASON_MAX: usize = 80;
+
+/// Bounds a reset reason before both signing and recording it.
+pub fn bound_window_reset_reason(reason: &str) -> String {
+    reason.chars().take(WINDOW_RESET_REASON_MAX).collect()
+}
+
+/// The pinned owner's authorization of a window-state reset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowResetAuthorization {
+    /// The first-five-last-five redaction of the pinned owner's G-strkey.
+    pub owner_redacted: RedactedStrkey,
+    /// SHA-256 of the store bytes read, in lowercase hex; `None` when absent.
+    pub store_sha256: Option<String>,
+    /// Ed25519 signature over the reset digest, as 128 lowercase hex characters.
+    pub signature: String,
 }
 
 /// Authentication disposition of the store observed before a reset.
@@ -3149,11 +3169,14 @@ pub enum EventKind {
         /// The profile whose window-state store was reset.
         profile: String,
         /// Operator-supplied reason for the reset (bounded to
-        /// [`RECORDED_STR_MAX`] characters at construction).
+        /// [`WINDOW_RESET_REASON_MAX`] characters at construction).
         reason: String,
         /// Snapshot recorded before mutation; absent in older rows.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wiped: Option<WipedAccrualRecord>,
+        /// The pinned owner's signature over this reset, when supplied.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_authorization: Option<WindowResetAuthorization>,
     },
 
     /// An installation binding was authorized before the nonce was written.
@@ -5894,8 +5917,32 @@ mod tests {
         let ev = EventKind::PolicyWindowStateReset {
             profile: "alice".to_owned(),
             reason: "corrupt-file recovery".to_owned(),
+            owner_authorization: None,
             wiped: None,
         };
+        assert!(
+            serde_json::to_value(&ev)
+                .unwrap()
+                .get("owner_authorization")
+                .is_none()
+        );
+        let authorized = EventKind::PolicyWindowStateReset {
+            profile: "alice".to_owned(),
+            reason: "repair".to_owned(),
+            wiped: None,
+            owner_authorization: Some(WindowResetAuthorization {
+                owner_redacted: RedactedStrkey::from_full(
+                    &stellar_strkey::ed25519::PublicKey([0x55; 32]).to_string(),
+                ),
+                store_sha256: Some("11".repeat(32)),
+                signature: "22".repeat(64),
+            }),
+        };
+        let encoded = serde_json::to_value(&authorized).unwrap();
+        assert_eq!(
+            serde_json::from_value::<EventKind>(encoded).unwrap(),
+            authorized
+        );
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
         assert_eq!(ev, back, "PolicyWindowStateReset must round-trip cleanly");

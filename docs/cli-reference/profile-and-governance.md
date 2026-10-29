@@ -258,7 +258,7 @@ Enrolls the policy-file owner PUBLIC key into the profile's `policy_owner_key_id
 - `--expected-address <G_STRKEY>` — refuse unless the seed derives to this address.
 - `--force`: replace an enrolled owner key. When an enablement nonce or a policy pin exists at the profile's window-state entry, or an enablement nonce exists at its default entry (`stellar-agent-policy-window-<NAME>` / `default`), whatever chain the profile file names, a key other than the pinned owner requires an installed policy signed by that key with a valid statement from the pinned owner. Enrolling the pinned owner's key needs no statement and restores a lost owner entry.
 
-The owner coordinate's `account` is the literal `"default"` (the value the engine reads); the stored value is the public key's G-strkey. A G-strkey decodes as URL-safe base64 to 42 bytes, so no 32-byte symmetric-key loader accepts it. Every owner reader also accepts the older form, URL-safe base64 of the 32 key bytes. The V1 engine build rewrites an older-form entry as its G-strkey, best effort, and the first build in a process also rewrites every other profile's older-form owner entry in the profile directory. This command rewrites them too. Under `headless-dpapi` an older-form owner entry can be moved to another coordinate until it is rewritten, so run one V1 verb or this command after upgrading. On success the data object reports the derived `owner_address`, the `keyring_service`/`keyring_account` written, and `replaced`. The prior key's stored value is never decoded or reported. A prior entry at this coordinate may have held an owner seed in the older encoding, so rendering it could print a private key. `replaced: true` conveys that a prior entry existed.
+The owner coordinate's `account` is the literal `"default"` (the value the engine reads); the stored value is the public key's G-strkey. A G-strkey decodes as URL-safe base64 to 42 bytes, so no 32-byte symmetric-key loader accepts it. Owner readers accept only the G-strkey form. Older base64 entries stay unchanged and refuse until the owner public key is enrolled again. Under `headless-dpapi`, enroll the owner public key again after upgrading: an older-form entry can be moved to a symmetric-key coordinate. On success the data object reports the derived `owner_address`, the `keyring_service`/`keyring_account` written, and `replaced`. The prior key's stored value is never decoded or reported. A prior entry at this coordinate may have held an owner seed in the older encoding, so rendering it could print a private key. `replaced: true` conveys that a prior entry existed.
 
 ```json
 {"ok":true,"data":{"profile":"default","enrolled":true,"owner_address":"G...","keyring_service":"stellar-agent-owner-default","keyring_account":"default","replaced":false},"request_id":"..."}
@@ -297,7 +297,7 @@ Signs a v1 or v2 policy file so the engine accepts it. The engine loads `<state_
 - `--profile <NAME>`: profile whose policy file is signed (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
 - `--file <PATH>` — sign a policy file at a non-default path (default `<state_dir>/policies/<profile>.toml`, the only location the engine loads).
 
-Without the rotation flag, the seed's derived public key is cross-checked against the enrolled owner key; a seed that does not match is refused (`sign_policy.owner_key_mismatch`) so a file the engine would reject is never produced. Before signing, the command also checks the body as the engine loads it, with the `scope` compared against the profile, and refuses a body the engine would reject. A refusal leaves the file unchanged. Signing does not require a valid previous signature: re-signing a file with a stale or malformed `[signature]` table replaces that table in place, dropping any extra key in it, and reports `replaced: true` with the previous `owner_id`. On success the data object reports the `owner_address`, the `policy_path`, the `digest` (hex), and the `signature` (hex):
+Without the rotation flag, the seed's derived public key is cross-checked against the enrolled owner key; a seed that does not match is refused (`sign_policy.owner_key_mismatch`) so a file the engine would reject is never produced. Before signing, the command also checks the body as the engine loads it, with the `scope` compared against the profile, and refuses a body the engine would reject. A refusal leaves the file unchanged. Mismatch errors identify stored owner bytes by a domain-separated SHA-256 fingerprint. They show the derived address and fingerprint; a previous owner from a verified pin keeps its address. Signing does not require a valid previous signature: re-signing a file with a stale or malformed `[signature]` table replaces that table in place, dropping any extra key in it, and reports `replaced: true` with the previous `owner_id`. On success the data object reports the `owner_address`, the `policy_path`, the `digest` (hex), and the `signature` (hex):
 
 ```json
 {"ok":true,"data":{"profile":"default","signed":true,"owner_address":"G...","policy_path":".../policies/default.toml","digest":"<hex>","signature":"<hex>","replaced":false},"request_id":"..."}
@@ -306,6 +306,7 @@ Without the rotation flag, the seed's derived public key is cross-checked agains
 Exits `1` on refusal:
 
 - `validation.profile_not_found`: the profile does not exist.
+- `sign_policy.owner_key_older_form`: enroll the owner public key again with `profile enroll-owner-key --force`.
 - `sign_policy.owner_key_unavailable`: no owner key is enrolled; run `enroll-owner-key` first.
 - `sign_policy.owner_key_mismatch`: the seed does not match the enrolled owner key, or the previous seed does not match the pinned owner (the enrolled owner when no pin exists).
 - `sign_policy.policy_file_unreadable`: the policy file is missing.
@@ -520,6 +521,29 @@ including testnet. It acquires that writer before the window-store lock and
 writes the reset row before minting a key, advancing the generation or replacing
 the store. A reset whose row cannot be written does not happen.
 
+An installation with a mainnet enablement nonce requires `--owner-secret-env <VAR>`
+in every build, whatever chain the profile file names. The variable holds the
+pinned policy owner's `S...` strkey; the flag takes its name, never the secret.
+The seed is unlocked before audit acquisition. The nonce and pin are checked
+under the window-store lock. A pin alone does not require the flag.
+When supplied, the seed must match the pin even without an enablement nonce.
+
+Missing owner authorization refuses with `profile.reset_window_state_owner_required`.
+A different seed refuses with `profile.reset_window_state_owner_mismatch`.
+A supplied seed without a pin refuses with `policy.pin_absent`; an unreadable
+pin refuses with `policy.pin_unusable`. These refusals write no reset row and
+change no store, generation or key. Seed input errors report
+`validation.secret_env_not_set`, `validation.secret_env_invalid` or
+`wallet_state.unlock_failed` before acquiring either writer or store lock.
+
+With the flag, the row adds `owner_authorization`: a redacted owner,
+`store_sha256` (lowercase hex, or null for a missing file), and a 128-character
+lowercase hex signature. The pinned owner signs `window_reset_digest` over the
+profile, chain, store digest, generation pair, bounded recorded reason and
+request id. The recorded reason is bounded to 80 Unicode characters before
+signing, and the signed and recorded bytes are identical.
+A reset without the nonce or flag omits this field.
+
 The reset requires a current tip anchor before and after its row. If repair
 fails, `audit.chain_key_unavailable` carries `audit.tip_anchor_unavailable`,
 and the window state and generation remain unchanged. A reset row can therefore
@@ -558,15 +582,16 @@ and the MCP server's start open it. Generation equality alone does not establish
 completion.
 A blank `--reason` refuses with `validation.reason_empty` before anything changes.
 
-A reset row without `wiped` retains its serialized form and verifies unchanged.
-A row with `wiped` verifies with this release or later. An older binary drops
-that field when computing the row hash. It refuses a log once a checked root
-HMAC, successor row or tip anchor covers the new row. An uncovered tail can
-still be read by that binary with `wiped` dropped. If it then appends a row,
-this release refuses the extended log at that row.
+A reset row without `wiped` or `owner_authorization` retains its serialized form
+and verifies unchanged. A row with either field verifies with this release or
+later. An older binary drops both fields when computing the row hash. It refuses
+a log once a checked root HMAC, successor row or tip anchor covers the new row.
+An uncovered tail can still be read by that binary with both fields dropped.
+If it then appends a row, this release refuses the extended log at that row.
 
 ```bash
 stellar-agent profile reset-window-state default --reason "store file corrupted after disk failure"
+stellar-agent profile reset-window-state operator --reason "store file corrupted after disk failure" --owner-secret-env WALLET_OWNER_SK
 ```
 
 ### `reset-mpp-state <NAME> --acknowledge --reason <REASON>`

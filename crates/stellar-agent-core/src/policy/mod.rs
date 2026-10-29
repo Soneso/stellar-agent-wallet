@@ -184,34 +184,22 @@ pub enum BuildRegistryError {
         detail: String,
     },
 
-    /// The value stored in the owner keyring entry could not be decoded as
-    /// URL-safe base64.
-    ///
-    /// `detail` is the base64 decode error message (no secret material —
-    /// the encoded bytes are not echoed back).
-    #[error("owner key for profile '{profile}' is not valid URL-safe base64: {detail}")]
-    OwnerKeyDecodeFailed {
-        /// Profile name whose owner key failed to decode.
+    /// The owner entry is in the ambiguous older base64 form.
+    #[error(
+        "owner key for profile '{profile}' is in the older base64 form; enroll the owner public key again"
+    )]
+    OwnerKeyOlderForm {
+        /// Profile whose owner entry needs enrollment.
         profile: String,
-        /// Non-secret decode error description.
-        detail: String,
     },
 
-    /// The decoded owner key has an unexpected byte length.
-    ///
-    /// Ed25519 public keys are exactly 32 bytes.  A stored key of the wrong
-    /// length indicates storage corruption or a wrong key type.
-    #[error(
-        "owner key for profile '{profile}' has unexpected length \
-         {actual_len} (expected {expected_len})"
-    )]
-    OwnerKeyLengthMismatch {
-        /// Profile name whose key has the wrong length.
+    /// The owner entry is neither a G-strkey nor the older form.
+    #[error("owner key for profile '{profile}' cannot be decoded: {detail}")]
+    OwnerKeyDecodeFailed {
+        /// Profile whose owner entry cannot be decoded.
         profile: String,
-        /// Actual decoded byte length.
-        actual_len: usize,
-        /// Expected byte length (always 32 for ed25519).
-        expected_len: usize,
+        /// Fixed diagnostic with no stored value.
+        detail: String,
     },
 
     /// The OS-conventional policy directory could not be resolved.

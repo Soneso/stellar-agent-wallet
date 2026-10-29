@@ -656,9 +656,10 @@ half is enrolled with `stellar-agent profile enroll-owner-key` (from an operator
 policy files via `stellar-agent profile sign-policy`. Re-enrolling a different
 owner key invalidates policy files signed by the previous one. Every symmetric
 key loader refuses a coordinate in the owner namespace and a key equal to the
-owner public key, with `validation.key_matches_owner_public_key`. An owner entry
-in the older base64 form is rewritten as its G-strkey by the next V1 verb or
-`enroll-owner-key`, for every profile in the profile directory.
+owner public key, with `validation.key_matches_owner_public_key`. Owner readers
+accept only the G-strkey. An older base64 entry stays unchanged
+and refuses until the owner public key is enrolled again. Enroll it again
+after upgrading. Symmetric-key loaders compare both forms.
 
 | Command | Mints into | Notes |
 |---------|------------|-------|

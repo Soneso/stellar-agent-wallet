@@ -69,16 +69,23 @@ async fn split_pay_approval_through_operator_cli() {
         (&profile.mcp_nonce_key_alias, [9; 32]),
         (&profile.attestation_key_id, [0x42; 32]),
         (&profile.audit_log_hash_chain_key_id, [0x24; 32]),
-        (
-            &profile.policy_owner_key_id,
-            signer.verifying_key().to_bytes(),
-        ),
     ] {
         keyring_core::Entry::new(&coordinate.service, &coordinate.account)
             .unwrap()
             .set_password(&URL_SAFE_NO_PAD.encode(bytes))
             .unwrap();
     }
+    keyring_core::Entry::new(
+        &profile.policy_owner_key_id.service,
+        &profile.policy_owner_key_id.account,
+    )
+    .unwrap()
+    .set_password(
+        &stellar_agent_core::profile::owner_key::encode_owner_public_key(
+            &signer.verifying_key().to_bytes(),
+        ),
+    )
+    .unwrap();
     let body = format!(
         r#"version = 1
 scope = "profile:{NAME}"

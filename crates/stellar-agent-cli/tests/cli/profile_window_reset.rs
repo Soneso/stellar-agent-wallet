@@ -40,7 +40,7 @@ impl Fixture {
                 )),
             ),
         ));
-        let profile = Profile::builder_mainnet_named(
+        let mut profile = Profile::builder_mainnet_named(
             NAME,
             "https://rpc.example",
             "signer",
@@ -51,6 +51,7 @@ impl Fixture {
         .with_noop_engine()
         .audit_log_path(home.path().join("audit/reset.jsonl"))
         .build();
+        profile.wallet.mlock_required = stellar_agent_core::wallet::MlockRequired::Warn;
         std::fs::create_dir_all(profile.audit_log_path.parent().unwrap()).unwrap();
         std::fs::write(&profile.audit_log_path, b"").unwrap();
         put(
@@ -91,8 +92,13 @@ impl Fixture {
     }
 
     fn run(&self) -> serde_json::Value {
-        let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
-            .args(["profile", "reset-window-state", NAME, "--reason", "repair"])
+        self.run_owner(None, "repair")
+    }
+
+    fn command(&self, reason: &str) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-agent"));
+        command
+            .args(["profile", "reset-window-state", NAME, "--reason", reason])
             .env("STELLAR_AGENT_HOME", self.home.path())
             .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
             .env(
@@ -100,9 +106,28 @@ impl Fixture {
                 URL_SAFE_NO_PAD.encode(HEADLESS_KEY),
             )
             .env_remove("STELLAR_AGENT_PROFILE")
-            .env_remove("STELLAR_AGENT_RPC_URL")
-            .output()
-            .unwrap();
+            .env_remove("STELLAR_AGENT_RPC_URL");
+        command
+    }
+
+    fn run_owner(&self, seed: Option<[u8; 32]>, reason: &str) -> serde_json::Value {
+        let mut command = self.command(reason);
+        if let Some(seed) = seed {
+            command
+                .args(["--owner-secret-env", "RESET_OWNER_SEED"])
+                .env(
+                    "RESET_OWNER_SEED",
+                    stellar_strkey::ed25519::PrivateKey(seed)
+                        .as_unredacted()
+                        .to_string()
+                        .as_str(),
+                );
+        }
+        Self::output(command)
+    }
+
+    fn output(mut command: Command) -> serde_json::Value {
+        let output = command.output().unwrap();
         let text = String::from_utf8(output.stdout).unwrap();
         let json: serde_json::Value = serde_json::from_str(text.trim()).unwrap_or_else(|e| {
             panic!(
@@ -115,6 +140,74 @@ impl Fixture {
             Some(if json["ok"] == true { 0 } else { 1 })
         );
         json
+    }
+
+    fn enable(&self) {
+        put(
+            &stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
+                &self.profile.policy_window_state_key_id,
+            ),
+            "test-nonce",
+        );
+    }
+
+    fn pin(&self, seed: [u8; 32]) {
+        use stellar_agent_core::policy::{
+            pin::{self, Pin, PinScope},
+            state_lock::WindowStoreLock,
+        };
+        std::fs::create_dir_all(self.path.parent().unwrap()).unwrap();
+        let lock =
+            WindowStoreLock::acquire_for(&self.path, &self.profile.policy_window_state_key_id)
+                .unwrap();
+        let owner = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        pin::write(
+            &lock,
+            &PinScope::for_profile(&self.path, &self.profile),
+            &Pin::new(1, [0x33; 32], owner).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn assert_refusal(&self, seed: Option<[u8; 32]>, code: &str) {
+        let before = self.state();
+        let output = self.run_owner(seed, "repair");
+        assert_eq!(output["ok"], false, "{output}");
+        assert_eq!(output["error"]["code"], code, "{output}");
+        assert_eq!(self.state(), before);
+        let rows = verified_audit_entries_from_path(&self.profile.audit_log_path);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row.event_kind, EventKind::PolicyWindowStateReset { .. }))
+        );
+    }
+
+    fn assert_seed_refusal(&self, value: Option<&str>, code: &str) {
+        for (audit, window) in [(false, false), (true, false), (false, true), (true, true)] {
+            let before = self.state();
+            let _audit = audit.then(|| lock(&sidecar(&self.profile.audit_log_path, ".lock")));
+            let _window = window.then(|| lock(&sidecar(&self.path, ".lock")));
+            let mut command = self.command("repair");
+            command
+                .args(["--owner-secret-env", "RESET_OWNER_SEED"])
+                .env_remove("RESET_OWNER_SEED");
+            if let Some(value) = value {
+                command.env("RESET_OWNER_SEED", value);
+            }
+            let output = Self::output(command);
+            assert_eq!(output["ok"], false, "{output}");
+            assert_eq!(output["error"]["code"], code, "{output}");
+            assert_eq!(self.state(), before);
+            let rows = verified_audit_entries_from_path(&self.profile.audit_log_path);
+            assert!(
+                !rows
+                    .iter()
+                    .any(|row| matches!(row.event_kind, EventKind::PolicyWindowStateReset { .. }))
+            );
+        }
     }
 
     fn state(&self) -> (Option<Vec<u8>>, Option<String>, Option<String>) {
@@ -307,4 +400,175 @@ fn mint_is_recorded_even_when_the_store_write_fails() {
         }
     ));
     assert!(get(&f.profile.policy_window_state_key_id).is_some());
+}
+
+#[test]
+#[serial]
+fn an_enabled_reset_without_the_owner_seed_refuses() {
+    for existing in [false, true] {
+        let f = Fixture::new(existing);
+        f.enable();
+        f.pin([0x51; 32]);
+        f.assert_refusal(None, "profile.reset_window_state_owner_required");
+    }
+}
+
+#[test]
+#[serial]
+fn an_enabled_reset_with_another_seed_refuses() {
+    let f = Fixture::new(true);
+    f.enable();
+    f.pin([0x51; 32]);
+    f.assert_refusal(
+        Some([0x52; 32]),
+        "profile.reset_window_state_owner_mismatch",
+    );
+}
+
+#[test]
+#[serial]
+fn an_owner_seed_without_a_nonce_must_match_the_pin() {
+    let f = Fixture::new(true);
+    f.pin([0x51; 32]);
+    f.assert_refusal(
+        Some([0x52; 32]),
+        "profile.reset_window_state_owner_mismatch",
+    );
+}
+
+#[test]
+#[serial]
+fn an_unset_owner_seed_refuses_before_either_lock() {
+    let f = Fixture::new(true);
+    f.enable();
+    f.pin([0x51; 32]);
+    f.assert_seed_refusal(None, "validation.secret_env_not_set");
+}
+
+#[test]
+#[serial]
+fn an_invalid_owner_seed_refuses_before_either_lock() {
+    let f = Fixture::new(true);
+    f.enable();
+    f.pin([0x51; 32]);
+    f.assert_seed_refusal(Some("invalid-S-strkey"), "validation.secret_env_invalid");
+}
+
+#[test]
+#[serial]
+fn an_enabled_reset_without_a_pin_refuses() {
+    let f = Fixture::new(true);
+    f.enable();
+    f.assert_refusal(Some([0x51; 32]), "policy.pin_absent");
+}
+
+#[test]
+#[serial]
+fn an_owner_seed_without_a_pin_refuses() {
+    let f = Fixture::new(false);
+    f.assert_refusal(Some([0x51; 32]), "policy.pin_absent");
+}
+
+#[test]
+#[serial]
+fn a_reset_without_a_nonce_needs_no_seed() {
+    let f = Fixture::new(true);
+    f.pin([0x51; 32]);
+    assert_eq!(f.run()["ok"], true);
+    let rows = verified_audit_entries_from_path(&f.profile.audit_log_path);
+    let row = rows
+        .iter()
+        .find(|row| matches!(row.event_kind, EventKind::PolicyWindowStateReset { .. }))
+        .unwrap();
+    assert!(
+        serde_json::to_value(row)
+            .unwrap()
+            .get("owner_authorization")
+            .is_none()
+    );
+}
+
+#[test]
+#[serial]
+fn an_enabled_reset_by_the_pinned_owner_records_the_signature() {
+    use sha2::{Digest as _, Sha256};
+    use stellar_agent_core::policy::v1::signature::{
+        WindowResetStatement, verify, window_reset_digest,
+    };
+    for existing in [false, true] {
+        let f = Fixture::new(existing);
+        f.enable();
+        f.pin([0x51; 32]);
+        let hash: Option<[u8; 32]> = f.state().0.map(|bytes| Sha256::digest(bytes).into());
+        let reason = "réparation".repeat(30);
+        let output = f.run_owner(Some([0x51; 32]), &reason);
+        assert_eq!(output["ok"], true, "{output}");
+        let rows = verified_audit_entries_from_path(&f.profile.audit_log_path);
+        let row = rows
+            .iter()
+            .find(|row| matches!(row.event_kind, EventKind::PolicyWindowStateReset { .. }))
+            .unwrap();
+        let EventKind::PolicyWindowStateReset {
+            profile,
+            reason: recorded,
+            wiped: Some(wiped),
+            owner_authorization: Some(auth),
+        } = &row.event_kind
+        else {
+            panic!("missing authorization")
+        };
+        assert_eq!(recorded, &"réparation".repeat(8));
+        assert_eq!(
+            auth.store_sha256,
+            hash.map(|hash| stellar_agent_core::hex::encode(&hash))
+        );
+        assert_eq!(auth.signature.len(), 128);
+        assert!(
+            auth.signature
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        );
+        let signature: Vec<u8> = auth
+            .signature
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32])
+            .verifying_key()
+            .to_bytes();
+        assert_eq!(
+            auth.owner_redacted,
+            stellar_agent_core::observability::RedactedStrkey::from_full(
+                &stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner),
+            )
+        );
+        let digest = window_reset_digest(&WindowResetStatement {
+            profile,
+            chain_id: row.chain_id.as_deref().unwrap(),
+            store_sha256: hash,
+            generation_before: wiped.generation_before,
+            generation_after: wiped.generation_after,
+            reason: recorded,
+            request_id: &row.request_id,
+        });
+        verify(&digest, &signature.try_into().unwrap(), &owner, NAME).unwrap();
+        let state = stellar_agent_core::policy::v1::PolicyStateStore::new();
+        PersistedWindowStore::at_path(f.path.clone())
+            .load_into(NAME, &f.profile, &state)
+            .unwrap();
+        assert_eq!(
+            state
+                .query_window(
+                    &StateKey::new(NAME, 3, "native", 86_400),
+                    stellar_agent_core::timefmt::now_unix_ms().unwrap()
+                )
+                .unwrap(),
+            (0, 0)
+        );
+        let generation: serde_json::Value = serde_json::from_str(&f.state().2.unwrap()).unwrap();
+        assert_eq!(generation["generation"], wiped.generation_after);
+    }
 }

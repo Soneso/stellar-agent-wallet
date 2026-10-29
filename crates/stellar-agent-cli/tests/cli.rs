@@ -36,8 +36,8 @@ mod mpp_first_run_vs_unavailable_state;
 mod multicall_policy;
 #[path = "cli/output_failure_exit_code.rs"]
 mod output_failure_exit_code;
-#[path = "cli/owner_key_sweep_cli.rs"]
-mod owner_key_sweep_cli;
+#[path = "cli/owner_key_older_form_cli.rs"]
+mod owner_key_older_form_cli;
 #[path = "cli/pool_init_lifecycle.rs"]
 mod pool_init_lifecycle;
 #[path = "cli/profile_env_var_resolution.rs"]

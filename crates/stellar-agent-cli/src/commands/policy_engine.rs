@@ -26,7 +26,7 @@
 //!
 //! - `PolicyEngineKind::Noop` → `NoopPolicyEngine` (permissive; no key fetch).
 //! - `PolicyEngineKind::V1` → [`load_v1_policy_engine`]: full owner-key fetch,
-//!   base64 decode, length check, OS-state-dir resolve, window-state
+//!   G-strkey decode, OS-state-dir resolve, window-state
 //!   hydration, and the verified signed-policy load with its pin comparison;
 //!   every failure arm returns `Err`.
 //! - Unknown engine kinds → `Err` (fail-closed), matching the MCP server.
@@ -60,10 +60,7 @@ use stellar_agent_core::policy::v1::verified::OwnerKeySource;
 use stellar_agent_core::profile::name::{
     OWNER_KEY_SERVICE_PREFIX, ProfileNameSource, derive_profile_name_from_owner_key,
 };
-use stellar_agent_core::profile::owner_key::{
-    OwnerKeyForm, decode_owner_public_key, log_owner_entry_rewrite,
-    rewrite_older_form_owner_entries_once, rewrite_owner_value_if_older,
-};
+use stellar_agent_core::profile::owner_key::{OwnerKeyDecodeError, decode_owner_public_key};
 use stellar_agent_core::profile::schema::{PolicyEngineKind, Profile, default_policy_dir};
 use stellar_agent_network::MainnetWriteContext;
 use stellar_agent_network::policy_engine::{
@@ -219,8 +216,7 @@ struct OwnerKeyPrelude {
 }
 
 /// Derives the owner-key namespace of `profile`, reads and decodes the owner
-/// public key, rewrites an older-form keyring value, and resolves the policy
-/// directory.
+/// public key as a G-strkey, and resolves the policy directory.
 ///
 /// Every V1 loader runs this before it builds its engine, so the testnet and
 /// the mainnet loader verify the signed policy under the same key.
@@ -234,9 +230,6 @@ fn resolve_owner_key(
     verb: &str,
     profile: &stellar_agent_core::profile::schema::Profile,
 ) -> Result<OwnerKeyPrelude, String> {
-    use base64::Engine as _;
-    use ed25519_dalek::PUBLIC_KEY_LENGTH;
-
     // Derive profile name from the service field (strips prefix).
     // `account` is always the literal "default", so we MUST use `service`.
     let service = &profile.policy_owner_key_id.service;
@@ -251,48 +244,24 @@ fn resolve_owner_key(
         }
     };
 
-    // Resolve the owner PUBLIC key, a G-strkey or URL-safe base64 in the
-    // older form, from the OS keyring (production) or from a gated
-    // test-only file source.
     let (raw_key, source) = owner_pubkey_raw(&profile_name, verb)?;
-
     let public_key = match decode_owner_public_key(&raw_key) {
-        Some((key, form)) => {
-            // Only a keyring entry is rewritten, never the test-only
-            // file source.
-            if form == OwnerKeyForm::OlderBase64 && source == OwnerKeySource::Keyring {
-                let outcome = rewrite_owner_value_if_older(
-                    &stellar_agent_core::profile::schema::KeyringEntryRef::default_owner_key(
-                        &profile_name,
-                    ),
-                    &raw_key,
-                );
-                log_owner_entry_rewrite(&profile_name, &outcome);
-            }
-            key
-        }
-        None => {
-            let key_bytes =
-                match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw_key.trim()) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        return Err(format!(
-                            "policy.engine is 'v1' but the owner key for profile \
-                         '{profile_name}' is neither a G-strkey nor valid base64 ({e}); \
-                         {verb} refuses (fail closed)"
-                        ));
-                    }
-                };
+        Ok(key) => key,
+        Err(OwnerKeyDecodeError::OlderForm) => {
             return Err(format!(
-                "policy.engine is 'v1' but the owner key for profile '{profile_name}' has \
-                 length {} (expected {PUBLIC_KEY_LENGTH}); {verb} refuses (fail closed)",
-                key_bytes.len()
+                "policy.engine is 'v1' but the owner key entry of profile '{profile_name}' is in \
+                 the older base64 form, which owner readers refuse; enroll the owner public key \
+                 again with `stellar-agent profile enroll-owner-key --profile {profile_name} \
+                 --force`; {verb} refuses (fail closed)"
+            ));
+        }
+        Err(_) => {
+            return Err(format!(
+                "policy.engine is 'v1' but the owner key for profile '{profile_name}' is neither \
+                 a G-strkey nor the older form; {verb} refuses (fail closed)"
             ));
         }
     };
-    if source == OwnerKeySource::Keyring {
-        rewrite_older_form_owner_entries_once(Some(&profile_name));
-    }
 
     // Resolve the policy directory.
     let policy_dir = match default_policy_dir() {
@@ -642,22 +611,29 @@ fn value_descriptor(
 /// the env var (or outside a test/`test-helpers` build), this function reads
 /// the owner public key from the OS keyring exactly as production always has.
 ///
-/// The stored value is the key's G-strkey or, in the older form, URL-safe
-/// base64 of its 32 bytes; the caller decodes either. The returned source
-/// says whether the value came from the keyring, the only source an
-/// older-form value is rewritten in.
+/// The caller accepts only a G-strkey and refuses older base64 entries.
+/// The source tracks whether the key came from the keyring or the test file.
 ///
 /// # Errors
 ///
 /// Returns `Err(human-readable message)` — naming `verb` and carrying no
 /// secret material — when the file (test-only path) or keyring (production
 /// path) cannot be read.
-fn owner_pubkey_raw(profile_name: &str, verb: &str) -> Result<(String, OwnerKeySource), String> {
+fn owner_pubkey_raw(
+    profile_name: &str,
+    verb: &str,
+) -> Result<(zeroize::Zeroizing<String>, OwnerKeySource), String> {
     #[cfg(any(test, feature = "test-helpers"))]
     if let Some(path) = std::env::var_os("STELLAR_AGENT_TEST_OWNER_PUBKEY_FILE") {
         let path = std::path::PathBuf::from(path);
         return std::fs::read_to_string(&path)
-            .map(|s| (s.trim().to_owned(), OwnerKeySource::TestFile))
+            .map(zeroize::Zeroizing::new)
+            .map(|raw| {
+                (
+                    zeroize::Zeroizing::new(raw.trim().to_owned()),
+                    OwnerKeySource::TestFile,
+                )
+            })
             .map_err(|e| {
                 format!(
                     "policy.engine is 'v1' but the test-only owner_pubkey file at {} could not \
@@ -684,7 +660,7 @@ fn owner_pubkey_raw(profile_name: &str, verb: &str) -> Result<(String, OwnerKeyS
         .map_err(|e| failure(e, KeyringOperation::Construct))?;
     entry
         .get_password()
-        .map(|raw| (raw, OwnerKeySource::Keyring))
+        .map(|raw| (zeroize::Zeroizing::new(raw), OwnerKeySource::Keyring))
         .map_err(|e| failure(e, KeyringOperation::Read))
 }
 
@@ -2154,12 +2130,10 @@ decision = "allow"
             .unwrap();
     }
 
-    /// An engine build that reads an older-form keyring entry rewrites it as
-    /// the G-strkey. The build reads the key before the policy file, so the
-    /// rewrite holds even though no policy file exists here.
+    /// An older-form entry refuses the build and stays byte-identical.
     #[test]
     #[serial_test::serial]
-    fn the_engine_builder_rewrites_an_older_form_keyring_entry() {
+    fn the_engine_builder_refuses_an_older_form_keyring_entry() {
         use base64::Engine as _;
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let home = tempfile::TempDir::new().unwrap();
@@ -2172,11 +2146,20 @@ decision = "allow"
             &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner),
         );
         let profile = stellar_agent_core::profile::loader::load(name, None).unwrap();
-        let _ = build_v1_policy_engine("pay", &profile.policy.engine, &profile, name);
+        let error = build_v1_policy_engine("pay", &profile.policy.engine, &profile, name)
+            .err()
+            .unwrap();
+        assert!(error.contains("older base64 form"), "{error}");
+        assert!(
+            error.contains(
+                "stellar-agent profile enroll-owner-key --profile engine-rewrite --force"
+            ),
+            "{error}"
+        );
         assert!(
             owner_entry(name)
-                == Some(stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner)),
-            "the older-form entry is rewritten as the G-strkey"
+                == Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner)),
+            "the older-form entry stays byte-identical"
         );
     }
 
@@ -2184,7 +2167,7 @@ decision = "allow"
     /// keyring entry is left as it is.
     #[test]
     #[serial_test::serial]
-    fn the_engine_builder_never_rewrites_the_test_owner_file() {
+    fn the_engine_builder_refuses_an_older_form_test_owner_file() {
         use base64::Engine as _;
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let home = tempfile::TempDir::new().unwrap();
@@ -2200,7 +2183,14 @@ decision = "allow"
             pubkey_file.as_os_str(),
         );
         let profile = stellar_agent_core::profile::loader::load(name, None).unwrap();
-        let _ = build_v1_policy_engine("pay", &profile.policy.engine, &profile, name);
+        let error = build_v1_policy_engine("pay", &profile.policy.engine, &profile, name)
+            .err()
+            .unwrap();
+        assert!(error.contains("older base64 form"), "{error}");
+        assert!(
+            error.contains("enroll-owner-key --profile engine-file --force"),
+            "{error}"
+        );
         assert!(
             std::fs::read_to_string(&pubkey_file).unwrap() == older_form,
             "the test file is never rewritten"
@@ -2218,7 +2208,6 @@ decision = "allow"
     #[test]
     #[serial_test::serial]
     fn build_v1_policy_engine_forged_signature_fails_closed() {
-        use base64::Engine as _;
         use ed25519_dalek::SigningKey;
         use rand_core::OsRng;
 
@@ -2259,7 +2248,7 @@ decision = "allow"
         let pubkey_file = home.path().join("owner_pubkey.txt");
         std::fs::write(
             &pubkey_file,
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner_pk),
+            stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner_pk),
         )
         .expect("write owner pubkey file");
 
@@ -2303,7 +2292,6 @@ decision = "allow"
     #[test]
     #[serial_test::serial]
     fn build_v1_policy_engine_cross_invocation_persists_window_state() {
-        use base64::Engine as _;
         use ed25519_dalek::SigningKey;
         use rand_core::OsRng;
         use stellar_agent_core::policy::v1::{ActionKind, ValueClass, ValueEffects, ValueLeg};
@@ -2346,7 +2334,7 @@ decision = "allow"
         let pubkey_file = home.path().join("owner_pubkey.txt");
         std::fs::write(
             &pubkey_file,
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner_pk),
+            stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner_pk),
         )
         .expect("write owner pubkey file");
 
@@ -2448,7 +2436,6 @@ decision = "allow"
     /// Callers MUST be `#[serial]`: the home, owner-pubkey, and keyring-store
     /// overrides are all process-global.
     fn divergent_name_fixture() -> DivergentNameFixture {
-        use base64::Engine as _;
         use ed25519_dalek::SigningKey;
         use rand_core::OsRng;
 
@@ -2490,7 +2477,7 @@ decision = "allow"
         let pubkey_file = home.path().join("owner_pubkey.txt");
         std::fs::write(
             &pubkey_file,
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner_pk),
+            stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner_pk),
         )
         .expect("write owner pubkey file");
 

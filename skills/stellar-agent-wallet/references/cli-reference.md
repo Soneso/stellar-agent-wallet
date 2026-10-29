@@ -596,8 +596,8 @@ a positional name or `--profile`, without a default.
 | `migrate <NAME>` | `profile migrate default` | State-changing (atomic temp+rename). No-op if already current (`status:"no_op"`); else `status:"migrated"` with `from_version`/`to_version`/`path`. A refused migration exits `1`, writes nothing, and leaves the v1 file unchanged. A missing profile file: `validation.profile_not_found`. A v1 mainnet file without `rpc_url`: `validation.mainnet_rpc_url_required`, because mainnet has no default endpoint; add `rpc_url` to the v1 file and run the command again. An endpoint URL that breaks the endpoint rule, or a file that cannot be read: `validation.config_invalid`. |
 | `enroll-signer` | `profile enroll-signer --profile default --secret-env WALLET_SK` | State-changing (keyring, and the profile TOML when the account is still a placeholder). Imports the operator's `S...` ed25519 seed from the named env var and stores it verbatim at the profile's `mcp_signer_default` coordinate (the signer every MCP fund-movement tool and keyring-signing CLI verb resolves). Classification uses the raw on-disk value: the literal placeholder `"default"` is pinned to the derived G-strkey (only that key is patched); a pinned G-strkey mismatch refuses; any other value refuses as malformed (`enroll_signer.account_malformed`). `--secret-env <VAR>` (required, the variable name), `--profile <NAME>` (resolves `--profile` → `STELLAR_AGENT_PROFILE` → `default`), `--expected-address <G_STRKEY>`, `--force`. |
 | `enroll-rpc-credential` | `profile enroll-rpc-credential --profile default --role primary --header X-API-Key` | State-changing (keyring, and the profile TOML when the record names no reference). Stores an RPC provider key at the keyring entry the role's provider record names, or at the default `stellar-agent-rpc-<profile>` / `<role>`, and adds `credential` and `placement` to a record without them. Reads the key from a hidden prompt, or from standard input with `--stdin`; the key is never printed. The role's URL and record must exist; the loader's credential checks run on the record before anything is written. `--role <primary\|secondary\|oracle>` (required), `--header <NAME>` \| `--query <NAME>` \| `--path` (required when the record names no placement), `--stdin`, `--force`. Refusals: `enroll_rpc_credential.record_missing`, `.placement_required`, `.placement_mismatch`, `.entry_exists`, `.terminal_required`, `.input_unreadable`, `validation.provider_attestation_invalid`, `network.rpc_credential_refused`. See [Provider credentials](profiles-and-keys.md#provider-credentials). |
-| `enroll-owner-key` | `profile enroll-owner-key --profile default --secret-env WALLET_OWNER_SK` | State-changing (keyring). Derives the owner ed25519 PUBLIC key from an operator `S...` seed and stores it at `policy_owner_key_id` (the key the V1 engine verifies against) as its G-strkey, a form no 32-byte symmetric-key loader accepts. Also rewrites every other profile's older-form (base64) owner entry. The seed is never stored. `--expected-address`, `--force`. When an enablement nonce or a policy pin exists at the profile's window-state entry, or an enablement nonce exists at its default entry, whatever chain the profile file names, a key other than the pinned owner requires an installed policy carrying a valid previous-owner rotation statement; re-enrolling the pinned owner's key needs none. |
-| `sign-policy` | `profile sign-policy --profile default --secret-env WALLET_OWNER_SK` | State-changing (writes the policy file, atomic). Signs `<state_dir>/policies/<profile>.toml` (or `--file`) with the owner seed and writes the `[signature]` table. Requires the enrolled seed, or `--previous-owner-secret-env VAR` to authorize the new owner with the previous seed, which must match the pinned owner, or the enrolled owner when no pin exists. |
+| `enroll-owner-key` | `profile enroll-owner-key --profile default --secret-env WALLET_OWNER_SK` | State-changing (keyring). Derives the owner ed25519 PUBLIC key from an operator `S...` seed and stores it at `policy_owner_key_id` (the key the V1 engine verifies against) as its G-strkey, a form no 32-byte symmetric-key loader accepts. Owner readers refuse older base64 entries; enroll the owner public key again after upgrading. The seed is never stored. `--expected-address`, `--force`. When an enablement nonce or a policy pin exists at the profile's window-state entry, or an enablement nonce exists at its default entry, whatever chain the profile file names, a key other than the pinned owner requires an installed policy carrying a valid previous-owner rotation statement; re-enrolling the pinned owner's key needs none. |
+| `sign-policy` | `profile sign-policy --profile default --secret-env WALLET_OWNER_SK` | State-changing (writes the policy file, atomic). Signs `<state_dir>/policies/<profile>.toml` (or `--file`) with the owner seed and writes the `[signature]` table. Older base64 entries refuse with `sign_policy.owner_key_older_form`; enroll the owner public key again. Mismatch errors identify enrolled bytes by fingerprint. Requires the enrolled seed, or `--previous-owner-secret-env VAR` to authorize the new owner with the previous seed, which must match the pinned owner, or the enrolled owner when no pin exists. |
 
 `profile init` writes a new profile TOML with per-profile keyring references.
 The signer and nonce accounts start as `"default"` placeholders. It reports
@@ -780,6 +780,29 @@ including testnet. It acquires that writer before the window-store lock and
 writes the reset row before minting a key, advancing the generation or replacing
 the store. A reset whose row cannot be written does not happen.
 
+An installation with a mainnet enablement nonce requires `--owner-secret-env <VAR>`
+in every build, whatever chain the profile file names. The variable holds the
+pinned policy owner's `S...` strkey; the flag takes its name, never the secret.
+The seed is unlocked before audit acquisition. The nonce and pin are checked
+under the window-store lock. A pin alone does not require the flag.
+When supplied, the seed must match the pin even without an enablement nonce.
+
+Missing owner authorization refuses with `profile.reset_window_state_owner_required`.
+A different seed refuses with `profile.reset_window_state_owner_mismatch`.
+A supplied seed without a pin refuses with `policy.pin_absent`; an unreadable
+pin refuses with `policy.pin_unusable`. These refusals write no reset row and
+change no store, generation or key. Seed input errors report
+`validation.secret_env_not_set`, `validation.secret_env_invalid` or
+`wallet_state.unlock_failed` before acquiring either writer or store lock.
+
+With the flag, the row adds `owner_authorization`: a redacted owner,
+`store_sha256` (lowercase hex, or null for a missing file), and a 128-character
+lowercase hex signature. The pinned owner signs `window_reset_digest` over the
+profile, chain, store digest, generation pair, bounded recorded reason and
+request id. The recorded reason is bounded to 80 Unicode characters before
+signing, and the signed and recorded bytes are identical.
+A reset without the nonce or flag omits this field.
+
 The reset requires a current tip anchor before and after its row. If repair
 fails, `audit.chain_key_unavailable` carries `audit.tip_anchor_unavailable`,
 and the window state and generation remain unchanged. A reset row can therefore
@@ -814,12 +837,12 @@ and the MCP server's start open it. Generation equality alone does not establish
 completion.
 A blank `--reason` refuses with `validation.reason_empty` before anything changes.
 
-A reset row without `wiped` retains its serialized form and verifies unchanged.
-A row with `wiped` verifies with this release or later. An older binary drops
-that field when computing the row hash. It refuses a log once a checked root
-HMAC, successor row or tip anchor covers the new row. An uncovered tail can
-still be read by that binary with `wiped` dropped. If it then appends a row,
-this release refuses the extended log at that row.
+A reset row without `wiped` or `owner_authorization` retains its serialized form
+and verifies unchanged. A row with either field verifies with this release or
+later. An older binary drops both fields when computing the row hash. It refuses
+a log once a checked root HMAC, successor row or tip anchor covers the new row.
+An uncovered tail can still be read by that binary with both fields dropped.
+If it then appends a row, this release refuses the extended log at that row.
 
 The counterparty cache reads and mints its HMAC key at
 `counterparty_cache_key_id`, the entry `profile rotate-counterparty-key` writes.

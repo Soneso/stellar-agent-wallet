@@ -322,11 +322,8 @@ pub use crate::tools::x402_parse_receipt::X402ParseReceiptArgs;
 /// `stellar-agent-owner-<profile_name>` / `"default"`.
 ///
 /// The stored value is the key's G-strkey, or URL-safe base64 of its 32 bytes
-/// in the older form. An older-form entry is rewritten as the G-strkey, best
-/// effort: a failed rewrite logs at `warn` with the keyring code, the build
-/// continues from the value read, and the next build retries. The first build
-/// in the process also rewrites the older-form owner entry of every other
-/// profile in the profile directory.
+/// in the older form. Only the G-strkey is accepted; older entries require
+/// enrollment of the owner public key again and stay unchanged.
 ///
 /// # Errors
 ///
@@ -335,9 +332,8 @@ pub use crate::tools::x402_parse_receipt::X402ParseReceiptArgs;
 /// - [`BuildRegistryError::OwnerKeyAbsent`] if the entry exists but has no
 ///   stored value.
 /// - [`BuildRegistryError::OwnerKeyDecodeFailed`] if the stored value is
-///   neither a G-strkey nor valid URL-safe base64.
-/// - [`BuildRegistryError::OwnerKeyLengthMismatch`] if the base64 value does
-///   not decode to exactly 32 bytes.
+///   neither a G-strkey nor the older form.
+/// - [`BuildRegistryError::OwnerKeyOlderForm`] if the entry is older base64.
 fn fetch_owner_pubkey_from_keyring(
     profile_name: &str,
 ) -> Result<[u8; PUBLIC_KEY_LENGTH], BuildRegistryError> {
@@ -356,52 +352,38 @@ fn fetch_owner_pubkey_from_keyring(
         }
     })?;
 
-    let raw = entry.get_password().map_err(|e| match &e {
-        // Absence keeps the OwnerKeyAbsent contract; any other cause is
-        // classified and surfaced so a non-interactive Windows session is not
-        // misreported as an absent key.
-        keyring_core::Error::NoEntry => BuildRegistryError::OwnerKeyAbsent {
-            profile: profile_name.to_owned(),
-            detail: "No matching credential found".to_owned(),
-        },
-        other => {
-            let classified =
-                map_keyring_operation_error(other, KeyringOperation::Read, &entry_ref.service);
-            BuildRegistryError::OwnerKeyringReadFailed {
+    let raw = entry
+        .get_password()
+        .map(zeroize::Zeroizing::new)
+        .map_err(|e| match &e {
+            // Absence keeps the OwnerKeyAbsent contract; any other cause is
+            // classified and surfaced so a non-interactive Windows session is not
+            // misreported as an absent key.
+            keyring_core::Error::NoEntry => BuildRegistryError::OwnerKeyAbsent {
                 profile: profile_name.to_owned(),
-                code: classified.code(),
-                detail: classified.message(),
+                detail: "No matching credential found".to_owned(),
+            },
+            other => {
+                let classified =
+                    map_keyring_operation_error(other, KeyringOperation::Read, &entry_ref.service);
+                BuildRegistryError::OwnerKeyringReadFailed {
+                    profile: profile_name.to_owned(),
+                    code: classified.code(),
+                    detail: classified.message(),
+                }
             }
-        }
-    })?;
+        })?;
 
     use stellar_agent_core::profile::owner_key;
-    let key = match owner_key::decode_owner_public_key(&raw) {
-        Some((key, form)) => {
-            if form == owner_key::OwnerKeyForm::OlderBase64 {
-                let outcome = owner_key::rewrite_owner_value_if_older(&entry_ref, &raw);
-                owner_key::log_owner_entry_rewrite(profile_name, &outcome);
-            }
-            key
-        }
-        None => {
-            // Neither form: report the base64 failure the older form implies.
-            use base64::Engine as _;
-            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(raw.trim())
-                .map_err(|e| BuildRegistryError::OwnerKeyDecodeFailed {
-                    profile: profile_name.to_owned(),
-                    detail: e.to_string(),
-                })?;
-            return Err(BuildRegistryError::OwnerKeyLengthMismatch {
-                profile: profile_name.to_owned(),
-                actual_len: bytes.len(),
-                expected_len: PUBLIC_KEY_LENGTH,
-            });
-        }
-    };
-    owner_key::rewrite_older_form_owner_entries_once(Some(profile_name));
-    Ok(key)
+    owner_key::decode_owner_public_key(&raw).map_err(|error| match error {
+        owner_key::OwnerKeyDecodeError::OlderForm => BuildRegistryError::OwnerKeyOlderForm {
+            profile: profile_name.to_owned(),
+        },
+        _ => BuildRegistryError::OwnerKeyDecodeFailed {
+            profile: profile_name.to_owned(),
+            detail: "the entry is neither a G-strkey nor the older form".to_owned(),
+        },
+    })
 }
 
 /// Derives the profile name from `profile.policy_owner_key_id.service` by
@@ -492,10 +474,8 @@ fn build_counterparty_resolver(profile: &Profile) -> Arc<dyn CounterpartyResolve
 /// - [`BuildRegistryError::OwnerKeyringEntryUnreadable`]: keyring entry
 ///   could not be opened.
 /// - [`BuildRegistryError::OwnerKeyAbsent`]: owner key not in keyring.
-/// - [`BuildRegistryError::OwnerKeyDecodeFailed`]: stored value is not
-///   valid base64.
-/// - [`BuildRegistryError::OwnerKeyLengthMismatch`]: decoded key is not
-///   32 bytes.
+/// - [`BuildRegistryError::OwnerKeyDecodeFailed`]: entry cannot be decoded.
+/// - [`BuildRegistryError::OwnerKeyOlderForm`]: entry is older base64.
 /// - [`BuildRegistryError::PolicyDirResolutionFailed`]: OS state directory
 ///   could not be determined.
 /// - [`BuildRegistryError::PolicyFileLoadFailed`]: policy file I/O,
@@ -1826,84 +1806,27 @@ mod tests {
             .unwrap()
     }
 
-    /// An engine build that reads the older form returns the key and rewrites
-    /// the entry as its G-strkey; a G-strkey entry reads unchanged.
+    /// Older entries refuse unchanged; G-strkey entries supply their key.
     #[test]
     #[serial_test::serial(keyring)]
-    fn fetch_owner_pubkey_rewrites_the_older_form() {
+    fn fetch_owner_pubkey_refuses_the_older_form() {
         use base64::Engine as _;
-        stellar_agent_test_support::keyring_mock::install().ok();
+        stellar_agent_test_support::keyring_mock::install().unwrap();
         let owner = [0x31_u8; 32];
-        put_owner(
-            "mcp-owner-older",
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner),
-        );
-        assert!(
-            fetch_owner_pubkey_from_keyring("mcp-owner-older").unwrap() == owner,
-            "the older form reads as the key"
-        );
-        let strkey = stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner);
-        assert!(
-            get_owner("mcp-owner-older") == strkey,
-            "rewritten as the G-strkey"
-        );
-        assert!(
-            fetch_owner_pubkey_from_keyring("mcp-owner-older").unwrap() == owner,
-            "the G-strkey reads as the same key"
-        );
-        assert!(
-            get_owner("mcp-owner-older") == strkey,
-            "a G-strkey entry is left"
-        );
-    }
-
-    /// A failed rewrite logs at `warn` with the keyring code and the build
-    /// continues from the value read.
-    #[test]
-    #[serial_test::serial(keyring)]
-    fn a_failed_owner_rewrite_warns_and_the_build_continues() {
-        use base64::Engine as _;
-        let coord = KeyringEntryRef::default_owner_key("mcp-owner-write-error");
-        let owner = [0x32_u8; 32];
         let older = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(owner);
-        stellar_agent_test_support::keyring_mock::install_with_write_error(
-            &coord.service,
-            &coord.account,
-            Some(&older),
-            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other("planted"))),
-        )
-        .unwrap();
-        let writer = stellar_agent_test_support::CaptureWriter::new();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let fetched = tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            fetch_owner_pubkey_from_keyring("mcp-owner-write-error")
-        });
-        assert!(
-            fetched.unwrap() == owner,
-            "the build continues from the value read"
+        put_owner("mcp-owner-older", &older);
+        assert!(matches!(
+            fetch_owner_pubkey_from_keyring("mcp-owner-older"),
+            Err(BuildRegistryError::OwnerKeyOlderForm { .. })
+        ));
+        assert_eq!(get_owner("mcp-owner-older"), older);
+        let strkey = stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner);
+        put_owner("mcp-owner-older", &strkey);
+        assert_eq!(
+            fetch_owner_pubkey_from_keyring("mcp-owner-older").unwrap(),
+            owner
         );
-        assert!(
-            get_owner("mcp-owner-write-error") == older,
-            "the entry keeps its form"
-        );
-        let logs = String::from_utf8(writer.captured()).unwrap();
-        assert!(!logs.contains(&older), "the value is never logged");
-        assert!(logs.contains("WARN"), "{logs}");
-        assert!(logs.contains("auth.keyring_platform_error"), "{logs}");
-        assert!(logs.contains("mcp-owner-write-error"), "{logs}");
-
-        // The next build retries, and with the failure spent it rewrites.
-        fetch_owner_pubkey_from_keyring("mcp-owner-write-error").unwrap();
-        assert!(
-            get_owner("mcp-owner-write-error")
-                == stellar_agent_core::profile::owner_key::encode_owner_public_key(&owner),
-            "the retry rewrites the entry"
-        );
+        assert_eq!(get_owner("mcp-owner-older"), strkey);
     }
 
     #[test]

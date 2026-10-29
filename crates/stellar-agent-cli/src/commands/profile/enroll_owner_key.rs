@@ -6,10 +6,8 @@
 //! (see `fetch_owner_pubkey_from_keyring` in `stellar-agent-mcp` and
 //! `build_v1_policy_engine` in this crate).  The stored value is the public
 //! key's G-strkey. A G-strkey decodes as URL-safe base64 to 42 bytes, so no
-//! 32-byte symmetric-key loader accepts it. Every owner reader also accepts
-//! the older form, URL-safe base64 of the 32 key bytes, and this command
-//! rewrites the older-form owner entry of every other profile in the profile
-//! directory, best effort.
+//! 32-byte symmetric-key loader accepts it. Owner readers refuse older base64
+//! entries until the owner public key is enrolled again.
 //!
 //! # Why the online agent holds only the public key
 //!
@@ -322,21 +320,6 @@ where
     }
 
     drop(rotation_lock);
-
-    // Every other profile's older-form owner entry is rewritten as its
-    // G-strkey, best effort: a missing or unreadable entry is skipped with a
-    // warn and never fails the enrolment.
-    match stellar_agent_core::profile::schema::default_profile_dir() {
-        Ok(dir) => stellar_agent_core::profile::owner_key::rewrite_older_form_owner_entries_in_dir(
-            &dir,
-            Some(&profile_name),
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "enroll-owner-key: no profile directory; the owner key rewrite of other profiles \
-             was skipped"
-        ),
-    }
 
     let request_id = Uuid::new_v4().to_string();
     emit_keyring_key_written(
@@ -696,13 +679,8 @@ mod tests {
             Some(42),
             "a G-strkey decodes as URL-safe base64 to 42 bytes"
         );
-        let (decoded, form) =
-            stellar_agent_core::profile::owner_key::decode_owner_public_key(&stored)
-                .expect("the engine decodes the stored form");
-        assert_eq!(
-            form,
-            stellar_agent_core::profile::owner_key::OwnerKeyForm::Strkey
-        );
+        let decoded = stellar_agent_core::profile::owner_key::decode_owner_public_key(&stored)
+            .expect("the engine decodes the stored form");
         assert!(decoded == pk_bytes, "stored value must be the public key");
         assert!(
             decoded != [0x11u8; 32],
@@ -710,18 +688,17 @@ mod tests {
         );
     }
 
-    /// Enrolment rewrites the older-form owner entry of every other profile in
-    /// the profile directory, and leaves an entry already in the stored form.
+    /// Enrollment leaves every sibling owner entry byte-identical.
     #[tokio::test]
     #[serial]
-    async fn enroll_rewrites_other_profiles_older_form_entries() {
+    async fn enroll_preserves_other_profiles_older_form_entries() {
         keyring_mock::install().expect("mock store");
         let home = tempfile::tempdir().expect("home");
         let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
         let profile_dir =
             stellar_agent_core::profile::schema::default_profile_dir().expect("profile dir");
         std::fs::create_dir_all(&profile_dir).unwrap();
-        let (_s_b, g_b, pk_b) = seed_material([0x51u8; 32]);
+        let (_s_b, _g_b, pk_b) = seed_material([0x51u8; 32]);
         let (_s_c, g_c, _pk_c) = seed_material([0x52u8; 32]);
         for (name, value) in [
             ("enroll-other-b", URL_SAFE_NO_PAD.encode(pk_b)),
@@ -735,9 +712,9 @@ mod tests {
                 .unwrap();
         }
 
-        let profile_name = "enroll-owner-sweep";
+        let profile_name = "enroll-owner-siblings";
         let (s_strkey, _g, _pk) = seed_material([0x53u8; 32]);
-        let var = unique_var("SWEEP");
+        let var = unique_var("SIBLINGS");
         let _guard = EnvGuard::set(var.clone(), &s_strkey);
         let profile = profile_for(profile_name);
         let code = run_with_dependencies(
@@ -755,7 +732,7 @@ mod tests {
                 .get_password()
                 .unwrap()
         };
-        assert!(read("enroll-other-b") == g_b, "the older form is rewritten");
+        assert_eq!(read("enroll-other-b"), URL_SAFE_NO_PAD.encode(pk_b));
         assert!(read("enroll-other-c") == g_c, "the stored form is left");
     }
 
@@ -831,9 +808,9 @@ mod tests {
         let coord = KeyringEntryRef::default_owner_key(profile_name);
 
         // Pre-seed with a different valid public key.
-        let (_other_s, other_g, other_pk) = seed_material([0x66u8; 32]);
+        let (_other_s, other_g, _other_pk) = seed_material([0x66u8; 32]);
         let pre = KeyringEntry::new(&coord.service, &coord.account).unwrap();
-        pre.set_password(&URL_SAFE_NO_PAD.encode(other_pk)).unwrap();
+        pre.set_password(&other_g).unwrap();
         assert_ne!(derived_g, other_g);
 
         let code = run_with_dependencies(
@@ -850,7 +827,7 @@ mod tests {
             stored == derived_g,
             "coordinate must hold the new public key"
         );
-        let (decoded, _form) =
+        let decoded =
             stellar_agent_core::profile::owner_key::decode_owner_public_key(&stored).unwrap();
         assert!(
             decoded == pk_bytes,

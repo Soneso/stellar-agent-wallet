@@ -703,13 +703,13 @@ on error.
 
 | Command | Mints into | Notes |
 |---------|------------|-------|
-| `stellar-agent profile enroll-owner-key` | `policy_owner_key_id` | Enrols the owner ed25519 PUBLIC key from an operator seed, stored as its G-strkey, which no 32-byte symmetric-key loader accepts. It also rewrites every other profile's older-form owner entry. Sign policy files with `profile sign-policy`; re-enrolling a different key invalidates policy files signed by the previous one. |
+| `stellar-agent profile enroll-owner-key` | `policy_owner_key_id` | Enrols the owner ed25519 PUBLIC key from an operator seed, stored as its G-strkey, which no 32-byte symmetric-key loader accepts. Owner readers refuse older base64 entries; enroll the owner public key again after upgrading. Sign policy files with `profile sign-policy`; re-enrolling a different key invalidates policy files signed by the previous one. |
 | `stellar-agent profile rotate-attestation-key <name>` | `attestation_key_id` | Fresh 32-byte HMAC key. All pending approvals are invalidated. |
 | `stellar-agent profile rotate-audit-key <name>` | `audit_log_hash_chain_key_id` | Fresh 32-byte HMAC key. Rotation re-signs every existing per-file chain-root sidecar with the new key, so the whole log verifies under it; the old key stops verifying. |
 | `stellar-agent profile rotate-counterparty-key <name>` | `counterparty_cache_key_id` | Fresh 32-byte HMAC key. Cached `stellar.toml` entries read as absent until a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. |
 | `stellar-agent profile rotate-nonce-key <name>` | `mcp_nonce_key_alias` | Fresh 32-byte HMAC key. Outstanding nonces minted with the old key are invalidated. |
 | `stellar-agent profile rotate-policy-state-key <name>` | `policy_window_state_key_id` | Fresh 32-byte HMAC key. Unlike the other rotations, the accumulated window-state store is re-signed under the new key, so `per_period_cap` / `rate_limit` history is preserved, not invalidated. |
-| `stellar-agent profile reset-window-state <name> --reason <reason>` | `policy_window_state_key_id` (mints if absent) | Re-initialises the window-state store to empty. Recovery path for an unreadable, tampered, or unparseable store. The affected criteria fail closed until reset. Discards history only after its audit row is written under the audit writer and store lock. Stop the MCP server first. |
+| `stellar-agent profile reset-window-state <name> --reason <reason>` | `policy_window_state_key_id` (mints if absent) | Re-initialises the window-state store to empty. Recovery path for an unreadable, tampered, or unparseable store. The affected criteria fail closed until reset. Discards history only after its audit row is written under the audit writer and store lock. Stop the MCP server first. An enablement nonce requires `--owner-secret-env VAR` matching the pinned owner in every build. The audit row records the owner signature. |
 
 ### Enroll the MCP signer
 
@@ -1007,6 +1007,9 @@ or `trustline.policy_engine_unavailable`.
 | `enroll_signer.repair_unpinned` | Identity repair requires the stored public-key pin. |
 | `enroll_signer.identity_conflict` | The stored identity conflicts with the enrolled signer. |
 | `auth.enrolled_identity_unusable` | The enrolled identity cannot establish the signer proof. Ledger enrollment is unavailable. |
+| `profile.reset_window_state_owner_required` | Supply `--owner-secret-env VAR` with the pinned owner's seed on an enabled installation. |
+| `profile.reset_window_state_owner_mismatch` | The supplied seed must derive to the pinned owner. |
+| `sign_policy.owner_key_older_form` | Enroll the owner public key again with `profile enroll-owner-key --force`. |
 | `profile.reset_window_state_newer_version` | This build cannot reset an unsupported newer state format. |
 | `policy.window_state_unverifiable` | Enabled-mainnet state cannot be verified. Follow the operator recovery procedure. |
 | `profile.reset_window_state_open_authorizations` | Effective open authorizations prevent reset. |

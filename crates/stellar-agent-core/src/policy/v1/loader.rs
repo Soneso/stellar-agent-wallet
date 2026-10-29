@@ -35,8 +35,8 @@
 //! The dispatch site is responsible for:
 //!
 //! 1. Fetching the owner public key from the keyring entry
-//!    `stellar-agent-owner-<profile_name>` (stored as base64-encoded 32 bytes).
-//! 2. Decoding it from base64 to `[u8; 32]`.
+//!    `stellar-agent-owner-<profile_name>` (stored as a G-strkey).
+//! 2. Decoding the G-strkey to `[u8; 32]`.
 //! 3. Passing it to `load_signed_policy`.
 //!
 //! If the keyring entry is absent, the dispatch site maps the absence to
@@ -421,7 +421,7 @@ impl RuleMatch {
 /// dep).  The dispatch site is responsible for:
 ///
 /// 1. Fetching the keyring entry `stellar-agent-owner-<profile_name>`.
-/// 2. Decoding it from base64 to `[u8; 32]`.
+/// 2. Decoding the G-strkey to `[u8; 32]`.
 /// 3. Passing it to this function as `owner_pubkey`.
 ///
 /// If the keyring entry is absent, the dispatch site maps the absence to

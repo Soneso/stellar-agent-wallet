@@ -235,11 +235,17 @@ decision = "allow"
             &profile.attestation_key_id.account,
             &ATTESTATION_KEY,
         );
-        seed_key(
+        keyring_core::Entry::new(
             &profile.policy_owner_key_id.service,
             &profile.policy_owner_key_id.account,
-            &signer.verifying_key().to_bytes(),
-        );
+        )
+        .unwrap()
+        .set_password(
+            &stellar_agent_core::profile::owner_key::encode_owner_public_key(
+                &signer.verifying_key().to_bytes(),
+            ),
+        )
+        .unwrap();
 
         let body = format!("version = 1\nscope = \"profile:{name}\"\n{rules}");
         let signature = hex::encode(

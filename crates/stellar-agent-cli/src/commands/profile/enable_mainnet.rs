@@ -153,9 +153,12 @@ fn read_owner_key(coordinate: &KeyringEntryRef) -> Result<[u8; 32], String> {
             return Err(format!("owner key unreadable ({classified})"));
         }
     };
-    decode_owner_public_key(&raw)
-        .map(|(key, _)| key)
-        .ok_or_else(|| "owner key is not a G-strkey or a 32-byte base64 public key".into())
+    decode_owner_public_key(&raw).map_err(|error| match error {
+        stellar_agent_core::profile::owner_key::OwnerKeyDecodeError::OlderForm => {
+            "owner key is in the older base64 form; enroll the owner public key again".into()
+        }
+        _ => "owner key is not a G-strkey".into(),
+    })
 }
 
 /// Runs the ceremony or its read-only inspection and renders a JSON envelope.
@@ -1351,7 +1354,7 @@ mod tests {
     }
     #[test]
     #[serial]
-    fn check_reports_v1_minimum_and_preserves_older_owner_form() {
+    fn check_reports_an_older_form_owner_entry_as_failed() {
         use base64::Engine as _;
         let mut fixture = Fixture::new();
         fixture.args.check = true;
@@ -1359,14 +1362,6 @@ mod tests {
         let older = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(fixture.owner.verifying_key().to_bytes());
         put(&owner, &older);
-        let mut doc = std::fs::read_to_string(fixture.path())
-            .unwrap()
-            .parse::<toml_edit::DocumentMut>()
-            .unwrap();
-        doc.remove("signature");
-        doc.remove("sequence");
-        doc["version"] = toml_edit::value(1);
-        fixture.sign(&doc.to_string());
         let output = fixture.run().unwrap();
         let items: Vec<_> = output["checks"]
             .as_array()
@@ -1398,22 +1393,25 @@ mod tests {
         assert_eq!(output["valid"], false);
         for item in &expected_items {
             let (status, detail) = check_of(&output, item);
-            let missing_table = Some("the [mainnet] table is missing".to_owned());
             let expected = match item.as_str() {
-                "body_version" => (
-                    "failed",
-                    Some("version must be 2 with a positive integer sequence".to_owned()),
-                ),
-                "mainnet_table" | "fee_cap" | "thresholds" | "ttl" => ("failed", missing_table),
-                "pin" => ("passed", Some("absent (first use)".to_owned())),
-                "enablement" => (
+                "owner_key" | "verified_policy" => (
                     "failed",
                     Some(
-                        stellar_agent_core::error::ValidationError::MainnetEnablementInvalid {
-                            binding: "mainnet_table",
-                        }
-                        .to_string(),
+                        "owner key is in the older base64 form; enroll the owner public key again"
+                            .to_owned(),
                     ),
+                ),
+                "pin" => (
+                    "not_evaluated",
+                    Some("the verified load stopped before the pin comparison".to_owned()),
+                ),
+                "enablement" => (
+                    "not_evaluated",
+                    Some("the verified policy did not load".to_owned()),
+                ),
+                item if mainnet_minimum::REQUIREMENTS.contains(&item) => (
+                    "not_evaluated",
+                    Some("the verified policy did not load".to_owned()),
                 ),
                 _ => ("passed", None),
             };
@@ -1917,7 +1915,7 @@ mod tests {
                 ),
                 "owner" => (
                     "profile.enable_mainnet_precondition",
-                    "owner_key: owner key is not a G-strkey or a 32-byte base64 public key",
+                    "owner_key: owner key is not a G-strkey",
                 ),
                 "owner_absent" => (
                     "profile.enable_mainnet_precondition",

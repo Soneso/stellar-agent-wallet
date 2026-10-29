@@ -32,7 +32,6 @@
 
 use std::sync::Arc;
 
-use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
 use serial_test::serial;
@@ -535,12 +534,9 @@ fn test_profile_name(suffix: &str) -> String {
     format!("{TEST_PROFILE_PREFIX}_{suffix}")
 }
 
-/// Returns the URL-safe base64-encoded (no padding) form of a 32-byte public key.
-///
-/// This matches the format stored by `stellar-agent policy sign` and expected
-/// by `fetch_owner_pubkey_from_keyring` in `server.rs`.
+/// Encodes an enrolled owner's public key in the G-strkey form.
 fn encode_owner_pubkey(pk_bytes: &[u8; 32]) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pk_bytes)
+    stellar_agent_core::profile::owner_key::encode_owner_public_key(pk_bytes)
 }
 
 /// Installs the in-memory mock keyring and populates the

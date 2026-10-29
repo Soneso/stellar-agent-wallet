@@ -540,9 +540,12 @@ fn build_failure_next_step(
              or run from an interactive desktop session"
                 .to_owned(),
         ),
-        E::OwnerKeyDecodeFailed { .. } | E::OwnerKeyLengthMismatch { .. } => Some(format!(
+        E::OwnerKeyOlderForm { profile } => Some(format!(
+            "re-enrol the owner public key with `stellar-agent profile enroll-owner-key --profile {profile} --force`"
+        )),
+        E::OwnerKeyDecodeFailed { .. } => Some(format!(
             "the stored owner key is not a usable ed25519 public key; re-enrol it with \
-             `stellar-agent profile enroll-owner-key --profile {profile_name}`"
+             `stellar-agent profile enroll-owner-key --profile {profile_name} --force`"
         )),
         E::PolicyFileLoadFailed {
             source: PolicyError::PolicyFileLoadFailed { .. },
