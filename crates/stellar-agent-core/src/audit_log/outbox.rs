@@ -350,13 +350,15 @@ impl AuditOutbox {
     /// - [`WriterError::Serialise`] when the entry cannot be serialized.
     /// - [`WriterError::Io`] on any read, write, flush, or sync failure.
     pub fn append(&self, entry: &AuditEntry) -> Result<(), WriterError> {
-        let mut line = serde_json::to_vec(entry).map_err(WriterError::Serialise)?;
-        line.push(b'\n');
+        self.prepare_append()?.append(entry)
+    }
 
+    /// Acquires the outbox lock and loads the state needed for one append.
+    pub(crate) fn prepare_append(&self) -> Result<PreparedOutboxAppend<'_>, WriterError> {
         if let Some(parent) = self.path.parent() {
             create_private_dir(parent)?;
         }
-        let _lock = lock_outbox(&self.lock_path)?;
+        let lock = lock_outbox(&self.lock_path)?;
         let state = load_state(self.state.as_ref())?;
         let created = !self.path.try_exists()?;
         if created && state.pending > 0 {
@@ -374,23 +376,48 @@ impl AuditOutbox {
         check_committed_prefix(&lines, &state)?;
         repair_torn_tail(&file, &self.path, &bytes)?;
 
-        let mut committed = OutboxState::over(&lines);
-        committed.push(&line[..line.len() - 1]);
-        let before = file.metadata()?.len();
+        Ok(PreparedOutboxAppend {
+            outbox: self,
+            before: file.metadata()?.len(),
+            file,
+            committed: OutboxState::over(&lines),
+            created,
+            _lock: lock,
+        })
+    }
+}
+
+/// One append with the outbox lock and commitment state already acquired.
+pub(crate) struct PreparedOutboxAppend<'a> {
+    outbox: &'a AuditOutbox,
+    file: File,
+    committed: OutboxState,
+    before: u64,
+    created: bool,
+    _lock: AuditWriterLock,
+}
+
+impl PreparedOutboxAppend<'_> {
+    /// Writes one row and commits it while retaining the acquired lock.
+    pub(crate) fn append(mut self, entry: &AuditEntry) -> Result<(), WriterError> {
+        let mut line = serde_json::to_vec(entry).map_err(WriterError::Serialise)?;
+        line.push(b'\n');
+        self.committed.push(&line[..line.len() - 1]);
         // The append that created the file also makes the creation durable,
         // so a crash cannot keep the synced line and lose the directory entry.
-        let appended = write_line(&mut file, &self.path, &line).and_then(|()| {
-            if created {
-                sync_parent_dir(&self.path)?;
+        let appended = write_line(&mut self.file, &self.outbox.path, &line).and_then(|()| {
+            if self.created {
+                sync_parent_dir(&self.outbox.path)?;
             }
-            self.state
-                .store_outbox_state(&committed)
+            self.outbox
+                .state
+                .store_outbox_state(&self.committed)
                 .map_err(WriterError::TipAnchorStore)
         });
         if let Err(error) = appended {
-            if let Err(rollback) = truncate_in_place(&file, before) {
+            if let Err(rollback) = truncate_in_place(&self.file, self.before) {
                 tracing::error!(
-                    outbox = %basename(&self.path),
+                    outbox = %basename(&self.outbox.path),
                     error = %rollback,
                     "audit outbox: a refused append could not be truncated back; a line \
                      for a consent that did not take effect may remain"

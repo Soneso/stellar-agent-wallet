@@ -44,6 +44,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::fact::{FACT_LABEL_POLICY, FactDigest};
+use crate::approval::presence::MainnetApprovalCredential;
 use crate::policy::v1::PolicyEngineV1;
 
 /// The mainnet section of a signed policy document.
@@ -67,6 +68,9 @@ pub struct MainnetBody {
     /// Per-asset cross-check thresholds, in base units, when the document
     /// sets them.
     pub cross_check_thresholds: Option<BTreeMap<String, i128>>,
+    /// The approval credentials the owner admits for mainnet consent, 1 to
+    /// 16 entries with unique IDs, in ascending order of their raw IDs.
+    pub approval_credentials: Vec<MainnetApprovalCredential>,
 }
 
 /// A signed policy the loader verified, with its engine.
@@ -218,9 +222,12 @@ impl VerifiedPolicy {
     /// owner key, then the optional mainnet section: `lp(profile)`,
     /// `lp(endpoint_host)`, the 32-byte installation nonce digest,
     /// `u32be(classic_max_fee_per_op_stroops)`, the optional
-    /// `u32be(authorization_ttl_seconds)`, and the optional threshold table.
-    /// The engine is not a fact: the digest already names the document it was
-    /// built from.
+    /// `u32be(authorization_ttl_seconds)`, the optional threshold table, and
+    /// the approval credentials: `u32be(count)`, then per credential in
+    /// ascending ID order `lp(raw_id)` and the 65-byte SEC1 key. The policy
+    /// parser bounds the list to 16 entries of at most 64-byte IDs, so every
+    /// length fits its `u32` prefix. The engine is not a fact: the digest
+    /// already names the document it was built from.
     #[must_use]
     pub fn fact_digest(&self) -> [u8; 32] {
         let mut digest = FactDigest::new(FACT_LABEL_POLICY);
@@ -236,7 +243,13 @@ impl VerifiedPolicy {
                 .fixed(&body.installation_nonce_sha256)
                 .u32(body.classic_max_fee_per_op_stroops)
                 .opt_u32(body.authorization_ttl_seconds)
-                .thresholds(body.cross_check_thresholds.as_ref());
+                .thresholds(body.cross_check_thresholds.as_ref())
+                .u32(u32::try_from(body.approval_credentials.len()).unwrap_or(u32::MAX));
+            for credential in &body.approval_credentials {
+                digest
+                    .bytes(credential.credential_id())
+                    .fixed(credential.public_key_sec1());
+            }
         }
         digest.finish()
     }
@@ -244,6 +257,13 @@ impl VerifiedPolicy {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test-only; panics acceptable in unit tests"
+    )]
+
     use super::*;
     use crate::policy::v1::{PolicyDocument, ScopeId};
 
@@ -259,6 +279,18 @@ mod tests {
         ))
     }
 
+    fn credential() -> MainnetApprovalCredential {
+        let authenticator = stellar_agent_test_support::webauthn::TestAuthenticator::from_seed(
+            [0x21; 32],
+            vec![0x5a; 16],
+        );
+        MainnetApprovalCredential::from_raw(
+            authenticator.credential_id(),
+            &authenticator.public_key_sec1(),
+        )
+        .expect("fixture credential")
+    }
+
     fn body() -> MainnetBody {
         let mut thresholds = BTreeMap::new();
         thresholds.insert("USDC:GA".to_owned(), 5_i128);
@@ -269,6 +301,7 @@ mod tests {
             classic_max_fee_per_op_stroops: 1_000,
             authorization_ttl_seconds: Some(60),
             cross_check_thresholds: Some(thresholds),
+            approval_credentials: vec![credential()],
         }
     }
 
@@ -306,11 +339,15 @@ mod tests {
         expected.extend(7_u32.to_be_bytes());
         expected.extend(b"USDC:GA");
         expected.extend(5_i128.to_be_bytes());
+        expected.extend(1_u32.to_be_bytes());
+        expected.extend(16_u32.to_be_bytes());
+        expected.extend([0x5a; 16]);
+        expected.extend(credential().public_key_sec1());
         let independent: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&expected).into();
         assert_eq!(policy.fact_digest(), independent);
         assert_eq!(
             crate::hex::encode(&policy.fact_digest()),
-            "dff7364c85ba9a686ecf8c8de19630d98b0a71026dfeabff990fcb06f1a32d78"
+            "1de9d5c8d749b4077eecbd02f0bc63f5be21b41852809b2ccf184b322ad93900"
         );
 
         let bare = VerifiedPolicy::from_verified(0, b"canonical", [9; 32], engine(), None);
@@ -319,5 +356,26 @@ mod tests {
         assert_ne!(bare.digest(), policy.digest());
         assert!(bare.mainnet().is_none());
         assert_ne!(bare.fact_digest(), policy.fact_digest());
+
+        // Each credential field is a fact: a changed ID, a changed key, or an
+        // absent credential changes the digest.
+        let other_key = stellar_agent_test_support::webauthn::TestAuthenticator::from_seed(
+            [0x22; 32],
+            vec![0x5a; 16],
+        )
+        .public_key_sec1();
+        for credentials in [
+            vec![
+                MainnetApprovalCredential::from_raw(&[0x5b; 16], credential().public_key_sec1())
+                    .expect("fixture"),
+            ],
+            vec![MainnetApprovalCredential::from_raw(&[0x5a; 16], &other_key).expect("fixture")],
+            Vec::new(),
+        ] {
+            let mut changed = body();
+            changed.approval_credentials = credentials;
+            let changed = VerifiedPolicy::from_verified(4, b"", [9; 32], engine(), Some(changed));
+            assert_ne!(changed.fact_digest(), policy.fact_digest());
+        }
     }
 }

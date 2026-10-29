@@ -1847,12 +1847,7 @@ mod tests {
             use crate::mainnet::digest::{BindingFacts, approval_subject_classic, bindings_digest};
             use crate::policy_state::{FeeBumpFacts, SubmissionBinding};
             use crate::signing::{Signer, SoftwareSigningKey};
-            use base64::Engine as _;
-            use stellar_agent_core::approval::store::{PendingApproval, PendingApprovalStore};
-            use stellar_agent_core::approval::witness::{
-                ApprovalExpectation, ApprovedKind, verify_approval,
-            };
-            use stellar_agent_core::approval::{AttestationBinding, compute_attestation_v4};
+            use stellar_agent_core::approval::store::PendingApproval;
             use stellar_agent_core::mainnet::fact::{
                 FACT_LABEL_ENABLEMENT, FACT_LABEL_POLICY, FactDigest,
             };
@@ -1863,8 +1858,6 @@ mod tests {
                 loader::save_to_dir, schema::signer_identity_entry_ref,
             };
             use stellar_agent_test_support::signed_envelope::SignedTestEnvelope;
-            keyring_mock::install().unwrap();
-            let dir = TempDir::new().unwrap();
             let name = format!(
                 "composition-{}-{}",
                 domain.tag(),
@@ -1873,6 +1866,31 @@ mod tests {
             let signer = SoftwareSigningKey::new_from_bytes([1; 32]);
             let public = signer.public_key().await.unwrap();
             let source = public.to_string().to_string();
+            let envelope = SignedTestEnvelope::builder([1; 32])
+                .network_passphrase(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE)
+                .sequence(42)
+                .build();
+            let envelope_text = envelope.envelope_xdr().to_owned();
+            // The approval of the envelope is consented and verified on a
+            // mainnet profile of the same name under its own home and
+            // keyring, which the setup below replaces.
+            let approval = crate::mainnet::fixtures::witness_under_own_home(&name, |_| {
+                PendingApproval::new_payment_pending(
+                    envelope_text.clone(),
+                    envelope_text.as_bytes(),
+                    source.clone(),
+                    1,
+                    "XLM".to_owned(),
+                    None,
+                    100,
+                    42,
+                    "1000".to_owned(),
+                    600_000,
+                )
+                .unwrap()
+            });
+            keyring_mock::install().unwrap();
+            let dir = TempDir::new().unwrap();
             let mut profile = Profile::builder_mainnet_named(
                 &name,
                 "https://rpc.example",
@@ -1934,11 +1952,6 @@ mod tests {
                 .u32(1000)
                 .opt_u32(Some(60))
                 .thresholds(None);
-            let envelope = SignedTestEnvelope::builder([1; 32])
-                .network_passphrase(&profile.network_passphrase)
-                .sequence(42)
-                .build();
-            let envelope_text = envelope.envelope_xdr().to_owned();
             let tx_hash = stellar_agent_core::hex::decode_hex32(envelope.tx_hash_hex()).unwrap();
             let witness = crate::cross_check::CrossCheckWitness::for_crate_tests(
                 "https://oracle.example",
@@ -1947,57 +1960,10 @@ mod tests {
                 vec![],
             )
             .bound_for_crate_tests(tx_hash);
-            let approval_record = PendingApproval::new_payment_pending(
-                envelope_text.clone(),
-                envelope_text.as_bytes(),
-                source.clone(),
-                1,
-                "XLM".to_owned(),
-                None,
-                100,
-                42,
-                "1000".to_owned(),
-                600_000,
-            )
-            .unwrap();
-            let now = approval_record.created_at_unix_ms;
+            let now = approval.created_at_ms();
             let _clock = set_now_ms_for_test(now);
-            let nonce = approval_record.approval_nonce.clone();
-            let key = [0x51; 32];
-            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
-            crate::keyring::write_keyring_string(&profile.attestation_key_id, &encoded).unwrap();
+            let nonce = approval.nonce().to_owned();
             let subject = approval_subject_classic(&envelope_text);
-            let blob = compute_attestation_v4(
-                &key,
-                &AttestationBinding::new(&name, "stellar:mainnet"),
-                &nonce,
-                &subject,
-                "1000",
-                &approval_record.attested_lifetime(),
-                &stellar_agent_core::approval::AttestedApprover::Local,
-            );
-            let mut pending = PendingApprovalStore::open(dir.path().join("pending.toml")).unwrap();
-            pending.insert(approval_record, now).unwrap();
-            pending
-                .record_attestation(
-                    &nonce,
-                    blob,
-                    stellar_agent_core::approval::AttestedApprover::Local,
-                )
-                .unwrap();
-            let approval = verify_approval(
-                &pending,
-                &profile,
-                &name,
-                &nonce,
-                &blob,
-                &ApprovalExpectation {
-                    kind: ApprovedKind::Payment,
-                    subject,
-                },
-                now,
-            )
-            .unwrap();
             crate::keyring::rotate_keyring_secret_32(
                 &profile.audit_log_hash_chain_key_id.service,
                 &profile.audit_log_hash_chain_key_id.account,
@@ -2277,6 +2243,75 @@ mod tests {
                     &consumption,
                 )
                 .unwrap();
+        }
+
+        /// A real witness consented under the operator's signed policy does
+        /// not authorize under a separately verified policy whose sequence,
+        /// enablement facts and evaluation are equal: the classic and the
+        /// authenticated message resolvers refuse at the final checks with
+        /// the ledger untouched, so nothing reaches a signer. The same
+        /// requests under the policy the consent named resolve.
+        #[tokio::test]
+        #[serial]
+        async fn mainnet_authorization_rejects_receipt_from_another_policy() {
+            use crate::mainnet::MainnetAuthorizationError;
+            use crate::mainnet::fixtures::{
+                MESSAGE_HOME_DOMAIN, ResolverFixture, message_facts, x402_fixture, x402_intent,
+                x402_root,
+            };
+            use crate::mainnet::resolve::{TxSignRequest, resolve_message_sign, resolve_tx_sign};
+            let policy_refusal = |error: MainnetAuthorizationError| {
+                assert!(
+                    matches!(
+                        error,
+                        MainnetAuthorizationError::Refused(P::ApprovalPolicyMismatch)
+                    ),
+                    "{error:?}"
+                );
+            };
+
+            let f = ResolverFixture::new();
+            let server = f.server().await;
+            let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
+            let client = context.primary_client().unwrap();
+            let approval = f.approval(&f.envelope, f.now, 600_000);
+            let other = f.another_policy();
+            assert_eq!(other.sequence(), f.policy.sequence());
+            assert_eq!(other.mainnet(), f.policy.mainnet());
+            assert_ne!(other.digest(), f.policy.digest());
+            assert_eq!(approval.policy_digest(), f.policy.digest());
+            let request = |policy| TxSignRequest {
+                context: &context,
+                consumer: MainnetConsumer::CliPay,
+                unsigned_envelope_xdr: &f.envelope,
+                client: &client,
+                probe_deadline: std::time::Duration::from_secs(1),
+                witness: None,
+                signer: &f.signer,
+                policy,
+                enablement: &f.enablement,
+                approval: &approval,
+                audit: f.audit(),
+                store: &f.window,
+            };
+            let before = f.wire();
+            policy_refusal(resolve_tx_sign(request(&other)).await.unwrap_err());
+            assert_eq!(f.wire(), before, "the refusal records nothing");
+            resolve_tx_sign(request(&f.policy)).await.unwrap();
+            drop(f);
+
+            let f = x402_fixture();
+            let root = x402_root(&f);
+            let intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
+            let message = message_facts([1; 32], [0xe1; 32]);
+            let approval = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now);
+            let other = f.another_policy();
+            let mut req = f.message_request(&intent, &message, &approval);
+            req.policy = &other;
+            let before = f.wire();
+            policy_refusal(resolve_message_sign(req).unwrap_err());
+            assert_eq!(f.wire(), before, "the refusal records nothing");
+            resolve_message_sign(f.message_request(&intent, &message, &approval)).unwrap();
         }
 
         #[tokio::test]

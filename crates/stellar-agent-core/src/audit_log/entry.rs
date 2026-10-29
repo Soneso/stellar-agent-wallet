@@ -46,8 +46,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::schema::{
-    ContractKind, EventKind, ExecutableRefPin, KeyPurpose, PinsUpdateReason, PolicyDecision,
-    ValueLegRecord, VerifierAdvisoryKind, executable_refs_or_empty,
+    ContractKind, EventKind, ExecutableRefPin, KeyPurpose, MainnetPresenceAudit, PinsUpdateReason,
+    PolicyDecision, ValueLegRecord, VerifierAdvisoryKind, executable_refs_or_empty,
 };
 use crate::error::ValidationError;
 use crate::observability::RedactedStrkey;
@@ -3627,6 +3627,52 @@ impl AuditEntry {
                 envelope_sha256_hex,
                 nonce_prefix: nonce_prefix8(approval_nonce),
                 origin: origin.into(),
+                mainnet_presence: None,
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs the `ApprovalAttested` audit entry of a mainnet consent.
+    ///
+    /// As [`Self::new_approval_attested`], plus the full CAIP-2 `chain_id`
+    /// and the verified ceremony's [`MainnetPresenceAudit`]. `request_id` is
+    /// the consent request ID the challenge bound, so the row and the
+    /// receipt name the same ceremony.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one audit row: each argument is a distinct recorded field"
+    )]
+    pub fn new_mainnet_approval_attested(
+        approval_kind: impl Into<String>,
+        gated_tool: impl Into<String>,
+        envelope_sha256_hex: Option<String>,
+        approval_nonce: &str,
+        origin: impl Into<String>,
+        request_id: impl Into<String>,
+        chain_id: impl Into<String>,
+        presence: MainnetPresenceAudit,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "approval.attested".to_owned(),
+            chain_id: Some(chain_id.into()),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::ApprovalAttested {
+                approval_kind: approval_kind.into(),
+                gated_tool: gated_tool.into(),
+                envelope_sha256_hex,
+                nonce_prefix: nonce_prefix8(approval_nonce),
+                origin: origin.into(),
+                mainnet_presence: Some(presence),
             },
             previous_entry_hash: String::new(),
         }

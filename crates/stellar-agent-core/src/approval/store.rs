@@ -117,6 +117,7 @@ use crate::file_lock::HeldFileLock;
 use super::assertion_input::{AssertionInput, validate_signature_compact};
 use super::attestation::AttestedApprover;
 use super::error::ApprovalError;
+use super::presence::MainnetPresenceReceipt;
 use super::registration_input::{
     CREDENTIAL_ID_MAX_BYTES, CREDENTIAL_ID_MIN_BYTES, RegistrationInput,
     validate_registration_input_invariants,
@@ -881,6 +882,43 @@ impl ApprovalKind {
             Self::Consumed { .. } => "Consumed",
         }
     }
+
+    /// Whether a record of this kind can carry a mainnet presence receipt:
+    /// a kind with a mainnet consent path, or the consumed tombstone of one.
+    #[must_use]
+    pub(crate) fn admits_mainnet_presence(&self) -> bool {
+        const MAINNET_CONSENT_KINDS: &[&str] = &[
+            "PaymentSimulated",
+            "ClaimSimulated",
+            "TrustlineSimulated",
+            "X402Payment",
+            "TrustlineClawbackOptIn",
+        ];
+        match self {
+            Self::Consumed {
+                original_kind_name, ..
+            } => MAINNET_CONSENT_KINDS.contains(&original_kind_name.as_str()),
+            other => MAINNET_CONSENT_KINDS.contains(&other.kind_name()),
+        }
+    }
+}
+
+/// Refuses an approver the version 4 record paths cannot store: a malformed
+/// credential ID, or a mainnet passkey approver, which only the mainnet
+/// attester records, with its receipt, under version 5.
+fn refuse_version_4_approver(approver: &AttestedApprover) -> Result<(), ApprovalError> {
+    if matches!(approver, AttestedApprover::MainnetPasskey { .. }) {
+        return Err(ApprovalError::Invalid {
+            reason: "a mainnet passkey approval is recorded only with its presence receipt"
+                .to_owned(),
+        });
+    }
+    if !approver.is_well_formed() {
+        return Err(ApprovalError::Invalid {
+            reason: "the approver's credential id is not canonical base64url".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for ApprovalKind {
@@ -1359,6 +1397,104 @@ struct MppChargeSimulatedWire {
     simulated_fee_stroops: u32,
 }
 
+/// Receipt source spans let the reader cap each receipt before typed decoding.
+#[derive(Deserialize)]
+struct StoreReceiptSpans {
+    #[serde(default)]
+    pending: Vec<PendingReceiptSpan>,
+}
+
+#[derive(Deserialize)]
+struct PendingReceiptSpan {
+    mainnet_presence: Option<toml::Spanned<ReceiptSourceSpans>>,
+}
+
+type ReceiptFieldSpan = Option<toml::Spanned<serde::de::IgnoredAny>>;
+
+/// TOML table spans cover headers; leaf spans include each field's raw bytes.
+#[derive(Deserialize)]
+struct ReceiptSourceSpans {
+    version: ReceiptFieldSpan,
+    request_id: ReceiptFieldSpan,
+    random_b64url: ReceiptFieldSpan,
+    policy_sequence: ReceiptFieldSpan,
+    policy_digest_hex: ReceiptFieldSpan,
+    policy_owner_hex: ReceiptFieldSpan,
+    expected_origin: ReceiptFieldSpan,
+    issued_at_unix_ms: ReceiptFieldSpan,
+    expires_at_unix_ms: ReceiptFieldSpan,
+    verified_at_unix_ms: ReceiptFieldSpan,
+    assertion: Option<toml::Spanned<AssertionSourceSpans>>,
+}
+
+#[derive(Deserialize)]
+struct AssertionSourceSpans {
+    credential_id: ReceiptFieldSpan,
+    authenticator_data: ReceiptFieldSpan,
+    client_data_json: ReceiptFieldSpan,
+    signature_compact: ReceiptFieldSpan,
+}
+
+impl ReceiptSourceSpans {
+    fn serialized_span(&self, mut span: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        let mut include = |field: std::ops::Range<usize>| {
+            span.start = span.start.min(field.start);
+            span.end = span.end.max(field.end);
+        };
+        for field in [
+            &self.version,
+            &self.request_id,
+            &self.random_b64url,
+            &self.policy_sequence,
+            &self.policy_digest_hex,
+            &self.policy_owner_hex,
+            &self.expected_origin,
+            &self.issued_at_unix_ms,
+            &self.expires_at_unix_ms,
+            &self.verified_at_unix_ms,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            include(field.span());
+        }
+        if let Some(assertion) = &self.assertion {
+            include(assertion.span());
+            let fields = assertion.get_ref();
+            for field in [
+                &fields.credential_id,
+                &fields.authenticator_data,
+                &fields.client_data_json,
+                &fields.signature_compact,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                include(field.span());
+            }
+        }
+        span
+    }
+}
+
+fn check_receipt_lengths(content: &str) -> Result<(), ApprovalError> {
+    let spans: StoreReceiptSpans =
+        toml::from_str(content).map_err(|error| ApprovalError::Toml {
+            detail: super::error::toml_error_position(content, error.span().map(|span| span.start)),
+        })?;
+    for entry in spans.pending {
+        if entry.mainnet_presence.is_some_and(|receipt| {
+            receipt.get_ref().serialized_span(receipt.span()).len()
+                > super::presence::MAINNET_PRESENCE_RECEIPT_MAX_BYTES
+        }) {
+            return Err(ApprovalError::InvalidEntry {
+                detail: "mainnet_presence exceeds its serialized byte bound".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Flat on-disk representation of a `PendingApproval` entry.
 ///
 /// Used by the custom `Serialize`/`Deserialize` impls to map the kinded
@@ -1379,6 +1515,10 @@ struct PendingApprovalOnDisk {
     // unattested record and on every record written under version 2 or 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     attested_approver: Option<AttestedApproverWire>,
+    // The presence receipt a version 5 attestation binds; present only with
+    // a mainnet passkey approver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mainnet_presence: Option<MainnetPresenceReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 
@@ -1458,12 +1598,14 @@ fn legacy_attestation_version() -> u32 {
     super::attestation::ATTESTATION_VERSION_V2
 }
 
-/// On-disk form of [`AttestedApprover`]: `{ kind = "local" }` or
-/// `{ kind = "remote", credential_id_b64url = "<id>" }`.
+/// On-disk form of [`AttestedApprover`]: `{ kind = "local" }`,
+/// `{ kind = "remote", credential_id_b64url = "<id>" }` or
+/// `{ kind = "mainnet_passkey", credential_id_b64url = "<id>" }`.
 ///
 /// Unknown fields refuse, and so do a local approver that names a credential
-/// and a remote approver whose credential ID is absent or not canonical
-/// base64url, so a hand-edited approver never decodes as a different one.
+/// and a remote or mainnet passkey approver whose credential ID is absent or
+/// not canonical base64url, so a hand-edited approver never decodes as a
+/// different one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AttestedApproverWire {
@@ -1485,6 +1627,12 @@ impl AttestedApproverWire {
                 kind: "remote".to_owned(),
                 credential_id_b64url: Some(credential_id_b64url.clone()),
             },
+            AttestedApprover::MainnetPasskey {
+                credential_id_b64url,
+            } => Self {
+                kind: "mainnet_passkey".to_owned(),
+                credential_id_b64url: Some(credential_id_b64url.clone()),
+            },
         }
     }
 
@@ -1492,6 +1640,9 @@ impl AttestedApproverWire {
         let approver = match (self.kind.as_str(), self.credential_id_b64url) {
             ("local", None) => AttestedApprover::Local,
             ("remote", Some(credential_id_b64url)) => AttestedApprover::Remote {
+                credential_id_b64url,
+            },
+            ("mainnet_passkey", Some(credential_id_b64url)) => AttestedApprover::MainnetPasskey {
                 credential_id_b64url,
             },
             _ => return Err("attested_approver is malformed".to_owned()),
@@ -1696,6 +1847,15 @@ pub struct PendingApproval {
     /// identity of the approving surface. An attested record without an
     /// approver never verifies: missing provenance is never read as local.
     pub attested_approver: Option<AttestedApprover>,
+
+    /// The WebAuthn presence receipt of a mainnet consent.
+    ///
+    /// Present only with a version 5 attestation and a
+    /// [`AttestedApprover::MainnetPasskey`] approver, all three written in
+    /// one store replacement by the mainnet attester. Distinct from
+    /// [`Self::passkey_assertion`], which belongs to `SignWithPasskey`. A
+    /// consumed tombstone retains it with the blob it is bound into.
+    pub mainnet_presence: Option<MainnetPresenceReceipt>,
 }
 
 impl std::fmt::Debug for PendingApproval {
@@ -1734,6 +1894,7 @@ impl std::fmt::Debug for PendingApproval {
             .field("passkey_assertion", &passkey_display)
             .field("attestation_version", &self.attestation_version)
             .field("attested_approver", &self.attested_approver)
+            .field("mainnet_presence", &self.mainnet_presence)
             .finish()
     }
 }
@@ -2198,6 +2359,7 @@ impl Serialize for PendingApproval {
                 .attested_approver
                 .as_ref()
                 .map(AttestedApproverWire::from_approver),
+            mainnet_presence: self.mainnet_presence.clone(),
             reason: self.reason.clone(),
             envelope_xdr_b64: envelope_xdr_b64.map(ToOwned::to_owned),
             envelope_sha256_hex: envelope_sha256_hex.map(ToOwned::to_owned),
@@ -2301,6 +2463,39 @@ impl<'de> Deserialize<'de> for PendingApproval {
             }
             Some(wire) => Some(wire.into_approver().map_err(serde::de::Error::custom)?),
         };
+        // A presence receipt, a mainnet passkey approver for the receipt's
+        // credential and version 5 are recorded together; any one without
+        // the others is a hand-edited or cross-version record.
+        let mainnet_presence = raw.mainnet_presence.take();
+        let passkey_approver = matches!(
+            attested_approver,
+            Some(AttestedApprover::MainnetPasskey { .. })
+        );
+        let mainnet_version =
+            raw.attestation_version == super::attestation::MAINNET_ATTESTATION_VERSION;
+        let same_credential = match (&attested_approver, &mainnet_presence) {
+            (
+                Some(AttestedApprover::MainnetPasskey {
+                    credential_id_b64url,
+                }),
+                Some(receipt),
+            ) => receipt.credential_id_b64url() == *credential_id_b64url,
+            _ => true,
+        };
+        if mainnet_presence.is_some() && raw.attestation_blob_b64.is_none() {
+            return Err(serde::de::Error::custom(
+                "mainnet_presence is present without an attestation",
+            ));
+        }
+        if mainnet_presence.is_some() != passkey_approver
+            || passkey_approver != mainnet_version
+            || !same_credential
+        {
+            return Err(serde::de::Error::custom(
+                "mainnet_presence, a mainnet_passkey approver and attestation version 5 are \
+                 recorded together",
+            ));
+        }
 
         let present_subtables = [
             ("sign_with_passkey", raw.sign_with_passkey.is_some()),
@@ -3062,6 +3257,12 @@ impl<'de> Deserialize<'de> for PendingApproval {
             }
         };
 
+        if mainnet_presence.is_some() && !kind.admits_mainnet_presence() {
+            return Err(serde::de::Error::custom(
+                "mainnet_presence is present on a kind without a mainnet consent",
+            ));
+        }
+
         Ok(PendingApproval {
             approval_nonce: raw.approval_nonce,
             process_uid: raw.process_uid,
@@ -3073,6 +3274,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
             passkey_assertion: raw.passkey_assertion,
             attestation_version: raw.attestation_version,
             attested_approver,
+            mainnet_presence,
         })
     }
 }
@@ -3100,17 +3302,21 @@ impl PendingApproval {
     }
 
     /// The layout this record's attestation is verified under: version 4
-    /// with the recorded approver, or `None`, which verifies nothing.
+    /// with a recorded local or remote approver, version 5 with a mainnet
+    /// passkey approver and its presence receipt, or `None`, which verifies
+    /// nothing.
     ///
-    /// A record under version 2 or 3, or one without a well-formed approver,
-    /// returns `None`, so editing a record's version or deleting its approver
-    /// never selects a layout that ignores who approved it.
+    /// A record under version 2 or 3, one without a well-formed approver, or
+    /// one whose version, approver and receipt do not belong together returns
+    /// `None`, so editing a record's version or deleting its approver or
+    /// receipt never selects a layout that ignores who approved it.
     #[must_use]
     pub fn attestation_scope(&self) -> Option<super::attestation::AttestationScope<'_>> {
         super::attestation::AttestationScope::pending(
             self.attestation_version,
             self.attested_lifetime(),
             self.attested_approver.as_ref(),
+            self.mainnet_presence.as_ref(),
         )
     }
 
@@ -3228,6 +3434,7 @@ impl PendingApproval {
             passkey_assertion: None,
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
+            mainnet_presence: None,
         })
     }
 
@@ -3373,6 +3580,7 @@ impl PendingApproval {
             passkey_assertion: None,
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
+            mainnet_presence: None,
         })
     }
 
@@ -3492,6 +3700,7 @@ impl PendingApproval {
             passkey_assertion: None,
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
+            mainnet_presence: None,
         })
     }
 
@@ -3596,6 +3805,7 @@ impl PendingApproval {
             passkey_assertion: None,
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
+            mainnet_presence: None,
         })
     }
 
@@ -3671,6 +3881,7 @@ impl PendingApproval {
             passkey_assertion: None,
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
+            mainnet_presence: None,
         })
     }
 
@@ -3724,6 +3935,7 @@ impl PendingApproval {
             passkey_assertion: None,
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
+            mainnet_presence: None,
         })
     }
 
@@ -3876,6 +4088,7 @@ impl PendingApproval {
             passkey_assertion: None,
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
+            mainnet_presence: None,
         })
     }
 
@@ -3938,6 +4151,7 @@ impl PendingApproval {
             passkey_assertion: None,
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
+            mainnet_presence: None,
         })
     }
 
@@ -4017,6 +4231,7 @@ impl PendingApproval {
             passkey_assertion: None,
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
+            mainnet_presence: None,
         })
     }
 
@@ -4160,6 +4375,7 @@ impl PendingApproval {
             passkey_assertion: None,
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
+            mainnet_presence: None,
         })
     }
 
@@ -4927,6 +5143,7 @@ impl PendingApprovalStore {
         // Load existing entries if the file exists.
         let entries = if path.exists() {
             let content = fs::read_to_string(&path).map_err(ApprovalError::from_io)?;
+            check_receipt_lengths(&content)?;
             let sf: StoreFile = toml::from_str(&content).map_err(|e| ApprovalError::Toml {
                 detail: super::error::toml_error_position(&content, e.span().map(|s| s.start)),
             })?;
@@ -5160,7 +5377,8 @@ impl PendingApprovalStore {
     /// # Errors
     ///
     /// - [`ApprovalError::Invalid`] if `approver` is a remote approver whose
-    ///   credential ID is not canonical base64url.
+    ///   credential ID is not canonical base64url, or a mainnet passkey
+    ///   approver, which only the mainnet attester records.
     /// - [`ApprovalError::NotFound`] if no entry with `approval_nonce` exists.
     /// - [`ApprovalError::Expired`] if the entry's TTL has elapsed.
     /// - [`ApprovalError::AlreadyAttested`] if the blob is already set.
@@ -5186,11 +5404,7 @@ impl PendingApprovalStore {
         approver: AttestedApprover,
         now_ms: u64,
     ) -> Result<(), ApprovalError> {
-        if !approver.is_well_formed() {
-            return Err(ApprovalError::Invalid {
-                reason: "the approver's credential id is not canonical base64url".to_owned(),
-            });
-        }
+        refuse_version_4_approver(&approver)?;
         let entry = self
             .entries
             .iter_mut()
@@ -5401,6 +5615,7 @@ impl PendingApprovalStore {
             passkey_assertion: None,
             attestation_version: super::attestation::PENDING_ATTESTATION_VERSION,
             attested_approver: None,
+            mainnet_presence: None,
         };
 
         self.persist()?;
@@ -5471,6 +5686,7 @@ impl PendingApprovalStore {
             passkey_assertion: None,
             attestation_version: existing.attestation_version,
             attested_approver: existing.attested_approver.clone(),
+            mainnet_presence: existing.mainnet_presence.clone(),
         };
 
         self.persist()?;
@@ -5578,6 +5794,11 @@ impl PendingApprovalStore {
     /// load the attestation key MUST fail-closed (return `false`) rather than
     /// falling back to the presence-only check.
     ///
+    /// A mainnet binding or a mainnet `network` always returns `false`: a
+    /// mainnet opt-in is verified only by
+    /// [`Self::verify_mainnet_trustline_clawback_opt_in`], which requires the
+    /// signed presence proof.
+    ///
     /// # Key discipline
     ///
     /// The caller wraps the key in `zeroize::Zeroizing<[u8; 32]>` and passes
@@ -5618,6 +5839,12 @@ impl PendingApprovalStore {
     ) -> bool {
         use super::attestation::{compute_trustline_clawback_opt_in_digest, verify_attestation};
 
+        if binding.chain_id == super::presence::MAINNET_CHAIN_ID
+            || network == super::presence::MAINNET_CHAIN_ID
+            || network == crate::profile::caip2::MAINNET_PASSPHRASE
+        {
+            return false;
+        }
         let digest = compute_trustline_clawback_opt_in_digest(network, code, issuer);
 
         self.entries.iter().any(|e| {
@@ -5667,6 +5894,154 @@ impl PendingApprovalStore {
         })
     }
 
+    /// Whether the store holds a live, mainnet-consented
+    /// `TrustlineClawbackOptIn` for `(binding.chain_id, code, issuer)`.
+    ///
+    /// The current owner-signed policy of `binding.profile_name` must be
+    /// `policy`. A matching entry counts only with a version 5 attestation
+    /// that verifies under `key` and a presence receipt that names `policy`
+    /// and whose assertion verifies again under the credential key `policy`
+    /// signs. The opt-in keeps its own lifetime; every trustline transaction
+    /// still needs its own consent.
+    ///
+    /// # Errors
+    ///
+    /// `approval.presence_policy_unavailable` when the current policy cannot
+    /// be loaded or differs from `policy`; an unavailable authority is never
+    /// read as an opt-in.
+    pub fn verify_mainnet_trustline_clawback_opt_in(
+        &self,
+        key: &[u8; 32],
+        binding: &super::AttestationBinding<'_>,
+        code: &str,
+        issuer: &str,
+        policy: &crate::mainnet::verified_policy::VerifiedPolicy,
+        now_ms: u64,
+    ) -> Result<bool, crate::error::WalletError> {
+        use super::attestation::{
+            AttestationScope, compute_trustline_clawback_opt_in_digest, verify_attestation,
+        };
+
+        if binding.chain_id != super::presence::MAINNET_CHAIN_ID {
+            return Ok(false);
+        }
+        let current =
+            super::presence_policy::MainnetApprovalAuthority::for_profile(binding.profile_name)?
+                .load_current_compare_only()?;
+        if !current.is(policy) {
+            return Err(crate::error::WalletError::Approval(
+                crate::error::ApprovalFailure::PresencePolicyUnavailable,
+            ));
+        }
+        let digest = compute_trustline_clawback_opt_in_digest(binding.chain_id, code, issuer);
+        Ok(self.entries.iter().any(|e| {
+            if e.is_expired(now_ms) {
+                return false;
+            }
+            let matches_kind = matches!(
+                &e.kind,
+                ApprovalKind::TrustlineClawbackOptIn {
+                    network: n,
+                    code: c,
+                    issuer: iss,
+                } if n == binding.chain_id && c == code && iss == issuer
+            );
+            if !matches_kind {
+                return false;
+            }
+            let Some(blob) = e
+                .attestation_blob_b64
+                .as_deref()
+                .and_then(|blob| URL_SAFE_NO_PAD.decode(blob).ok())
+                .and_then(|blob| <[u8; 32]>::try_from(blob).ok())
+            else {
+                return false;
+            };
+            let Some(scope @ AttestationScope::V5(_, _, receipt)) = e.attestation_scope() else {
+                return false;
+            };
+            verify_attestation(
+                key,
+                binding,
+                &e.approval_nonce,
+                &digest,
+                &e.process_uid,
+                &scope,
+                &blob,
+            ) && super::presence::verify_receipt(e, receipt, binding, policy, now_ms).is_ok()
+        }))
+    }
+
+    /// Records a mainnet consent: the version 5 blob, the mainnet passkey
+    /// approver, and the presence receipt the blob binds, in one store
+    /// replacement.
+    ///
+    /// Only the mainnet attester calls it, after verifying the assertion and
+    /// rechecking the locked entry and the current policy. Expiry and an
+    /// existing attestation refuse before anything changes.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApprovalError::Invalid`] for an approver that is not a well-formed
+    ///   mainnet passkey approver, a receipt that is not well formed, or a
+    ///   receipt whose assertion names another credential.
+    /// - [`ApprovalError::NotFound`], [`ApprovalError::Expired`],
+    ///   [`ApprovalError::AlreadyAttested`].
+    /// - [`ApprovalError::WrongKind`] for a kind without a mainnet consent
+    ///   path.
+    /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on persistence failure.
+    pub(crate) fn record_mainnet_attestation_at(
+        &mut self,
+        approval_nonce: &str,
+        attestation_blob: [u8; 32],
+        approver: AttestedApprover,
+        receipt: MainnetPresenceReceipt,
+        now_ms: u64,
+    ) -> Result<(), ApprovalError> {
+        let AttestedApprover::MainnetPasskey {
+            credential_id_b64url,
+        } = &approver
+        else {
+            return Err(ApprovalError::Invalid {
+                reason: "a mainnet consent is recorded only with a mainnet passkey approver"
+                    .to_owned(),
+            });
+        };
+        if !approver.is_well_formed()
+            || !receipt.is_well_formed()
+            || receipt.credential_id_b64url() != *credential_id_b64url
+        {
+            return Err(ApprovalError::Invalid {
+                reason: "the presence receipt does not match its approver".to_owned(),
+            });
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.approval_nonce == approval_nonce)
+            .ok_or(ApprovalError::NotFound)?;
+        if entry.is_expired(now_ms) {
+            return Err(ApprovalError::Expired);
+        }
+        if matches!(entry.kind, ApprovalKind::Consumed { .. })
+            || !entry.kind.admits_mainnet_presence()
+        {
+            return Err(ApprovalError::WrongKind {
+                expected: "PaymentSimulated, ClaimSimulated, TrustlineSimulated, X402Payment, or \
+                           TrustlineClawbackOptIn",
+                actual: entry.kind.kind_name(),
+            });
+        }
+        if entry.attestation_blob_b64.is_some() {
+            return Err(ApprovalError::AlreadyAttested);
+        }
+        entry.attestation_blob_b64 = Some(URL_SAFE_NO_PAD.encode(attestation_blob));
+        entry.attestation_version = super::attestation::MAINNET_ATTESTATION_VERSION;
+        entry.attested_approver = Some(approver);
+        entry.mainnet_presence = Some(receipt);
+        self.persist()
+    }
+
     /// Removes all entries where `expires_at_unix_ms <= now_unix_ms`.
     ///
     /// Returns the count of removed entries.
@@ -5703,7 +6078,8 @@ impl PendingApprovalStore {
     /// # Errors
     ///
     /// - [`ApprovalError::Invalid`] if `approver` is a remote approver whose
-    ///   credential ID is not canonical base64url.
+    ///   credential ID is not canonical base64url, or a mainnet passkey
+    ///   approver, which only the mainnet attester records.
     /// - [`ApprovalError::NotFound`] if no entry with `approval_nonce` exists.
     /// - [`ApprovalError::Expired`] if the entry's TTL has elapsed.
     /// - [`ApprovalError::AlreadyAttested`] if `attestation_blob_b64` is already set.
@@ -5758,11 +6134,7 @@ impl PendingApprovalStore {
         approver: AttestedApprover,
         now_ms: u64,
     ) -> Result<(), ApprovalError> {
-        if !approver.is_well_formed() {
-            return Err(ApprovalError::Invalid {
-                reason: "the approver's credential id is not canonical base64url".to_owned(),
-            });
-        }
+        refuse_version_4_approver(&approver)?;
         let entry = self
             .entries
             .iter_mut()
@@ -5805,7 +6177,8 @@ impl PendingApprovalStore {
     /// # Errors
     ///
     /// - [`ApprovalError::Invalid`] if `approver` is a remote approver whose
-    ///   credential ID is not canonical base64url.
+    ///   credential ID is not canonical base64url, or a mainnet passkey
+    ///   approver, which only the mainnet attester records.
     /// - [`ApprovalError::NotFound`] if no entry with `approval_nonce` exists.
     /// - [`ApprovalError::Expired`] if the entry's TTL has elapsed.
     /// - [`ApprovalError::AlreadyAttested`] if `attestation_blob_b64` is already set.
@@ -5830,11 +6203,7 @@ impl PendingApprovalStore {
         approver: AttestedApprover,
         now_ms: u64,
     ) -> Result<(), ApprovalError> {
-        if !approver.is_well_formed() {
-            return Err(ApprovalError::Invalid {
-                reason: "the approver's credential id is not canonical base64url".to_owned(),
-            });
-        }
+        refuse_version_4_approver(&approver)?;
         let entry = self
             .entries
             .iter_mut()
@@ -8425,7 +8794,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
 
         let real_key: [u8; 32] = [0x11; 32];
         let wrong_key: [u8; 32] = [0x22; 32];
-        let network = "stellar:mainnet";
+        let network = "stellar:testnet";
         let code = "USDC";
         let issuer = TESTNET_USDC_ISSUER;
 
@@ -8450,7 +8819,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         assert!(
             !store.verify_attested_trustline_clawback_opt_in(
                 &real_key,
-                &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
+                &crate::approval::AttestationBinding::new("clawback-profile", "stellar:testnet"),
                 network,
                 code,
                 issuer,
@@ -8463,7 +8832,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         let digest = compute_trustline_clawback_opt_in_digest(network, code, issuer);
         let real_blob = compute_attestation_v4(
             &real_key,
-            &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
+            &crate::approval::AttestationBinding::new("clawback-profile", "stellar:testnet"),
             &nonce,
             &digest,
             &process_uid,
@@ -8482,7 +8851,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         assert!(
             store.verify_attested_trustline_clawback_opt_in(
                 &real_key,
-                &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
+                &crate::approval::AttestationBinding::new("clawback-profile", "stellar:testnet"),
                 network,
                 code,
                 issuer,
@@ -8493,7 +8862,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
 
         assert!(!store.verify_attested_trustline_clawback_opt_in(
             &real_key,
-            &crate::approval::AttestationBinding::new("other", "stellar:mainnet"),
+            &crate::approval::AttestationBinding::new("other", "stellar:testnet"),
             network,
             code,
             issuer,
@@ -8503,7 +8872,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         assert!(
             !store.verify_attested_trustline_clawback_opt_in(
                 &wrong_key,
-                &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
+                &crate::approval::AttestationBinding::new("clawback-profile", "stellar:testnet"),
                 network,
                 code,
                 issuer,
@@ -8516,7 +8885,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         assert!(
             !store.verify_attested_trustline_clawback_opt_in(
                 &real_key,
-                &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
+                &crate::approval::AttestationBinding::new("clawback-profile", "stellar:testnet"),
                 network,
                 "EURC",
                 issuer,
@@ -8545,7 +8914,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         let forged_uid = forged_entry.process_uid.clone();
         let attacker_blob = compute_attestation_v4(
             &wrong_key,
-            &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
+            &crate::approval::AttestationBinding::new("clawback-profile", "stellar:testnet"),
             &forged_nonce,
             &digest,
             &forged_uid,
@@ -8563,7 +8932,7 @@ user_handle = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         assert!(
             !forged_store.verify_attested_trustline_clawback_opt_in(
                 &real_key,
-                &crate::approval::AttestationBinding::new("clawback-profile", "stellar:mainnet"),
+                &crate::approval::AttestationBinding::new("clawback-profile", "stellar:testnet"),
                 network,
                 code,
                 issuer,

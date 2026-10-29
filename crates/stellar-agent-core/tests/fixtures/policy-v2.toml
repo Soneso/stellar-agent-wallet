@@ -8,6 +8,9 @@ profile = "operator"
 installation_nonce_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 classic_max_fee_per_op_stroops = 500
 authorization_ttl_seconds = 60
+approval_credentials = [
+    { credential_id_b64url = "WlpaWlpaWlpaWlpaWlpaWg", public_key_sec1_b64url = "BEYtuhrk_BqWi02s8gzdbb4frjSqlxUUpj00BcPRz9ODtYu7CMEzg0KMWFPHHEyFHhNLBWgh5Gj-Cpd6v0MT3eE" },
+]
 [mainnet.cross_check_thresholds]
 native = "10000000000"
 "USD:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" = "100"

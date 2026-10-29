@@ -22,9 +22,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use stellar_agent_core::approval::{
-    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry,
-};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 use stellar_agent_core::mainnet::oracle::require_mainnet_oracle;
@@ -45,7 +42,7 @@ use stellar_agent_network::{
     StellarRpcClient, submit_authorized_transaction_and_wait,
 };
 
-use crate::commands::approve::{approval_store_dir, approval_store_open_error};
+use crate::commands::approve::approval_store_dir;
 use crate::commands::policy_engine::{MainnetEvaluation, MainnetPolicy, MainnetVerdict};
 use crate::commands::submission_record::{error_envelope, prepare_mainnet_recorder};
 use crate::commands::value_audit::drain_consent_rows_before_signing;
@@ -399,25 +396,24 @@ pub(crate) async fn authorize_and_submit(
     )
     .map_err(|e| enrollment_refusal(&e, &choice))?;
 
-    // The operator confirms the decoded envelope by typing the profile name.
-    // The store closes at the end of the block, so the recorder's tombstone
-    // can open it after the submit.
+    // The operator consents to the decoded envelope with a verified passkey
+    // assertion. The confirmation opens the pending store only around its
+    // own reads and writes, never across the presence wait, so the
+    // recorder's tombstone can open it after the submit.
     let summary = MainnetWriteSummary::from_envelope(unsigned_xdr, consumer, effective_cap)
         .map_err(|e| Envelope::<()>::err(&e))?;
-    let approval = {
-        let path = approval_store_dir()
-            .map_err(|e| Envelope::<()>::err(&e))?
-            .join(format!("{name}.toml"));
-        let mut store = open_with_retry(&path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
-            .map_err(|e| Envelope::<()>::err(&approval_store_open_error(&e)))?;
-        confirm_mainnet_write(
-            &summary,
-            confirm_decision(evaluation.verdict),
-            context,
-            &mut store,
-        )
+    let store_path = approval_store_dir()
         .map_err(|e| Envelope::<()>::err(&e))?
-    };
+        .join(format!("{name}.toml"));
+    let approval = confirm_mainnet_write(
+        &summary,
+        confirm_decision(evaluation.verdict),
+        context,
+        &policy.verified,
+        &store_path,
+    )
+    .await
+    .map_err(|e| Envelope::<()>::err(&e))?;
 
     drain_consent_rows_before_signing(profile, name)
         .map_err(|e| refused(PipelineStep::ConsentDrain, &e, "", verb, None))?;

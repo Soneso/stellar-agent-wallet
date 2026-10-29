@@ -83,7 +83,13 @@ Keep the following properties of the current alpha in mind when assessing impact
 
 Out of scope: defects in your own keyring backend, operating system, RPC endpoint, or
 anchor; and issues that require already holding the wallet's keyring secrets (the seed,
-nonce key, or HMAC keys), since custody of those secrets is the security boundary.
+nonce key, or HMAC keys), since custody of those secrets is the security boundary. On
+mainnet the attestation HMAC key alone mints no consent: a mainnet approval also needs
+a verified passkey assertion from an approval credential in the owner-signed policy.
+Two residues remain. A same-user process that holds the HMAC key can wrap a version 5
+record around a user-verified assertion that its own localhost page obtained, so a
+misleading local page is a residue. The owner seed admits approval credentials, so
+signing the policy on a host where same-user code runs exposes that seed.
 
 For code running as the same OS user, the owner of an enabled mainnet profile
 changes only with a statement signed by the previous owner. The policy pin and
@@ -91,6 +97,31 @@ the enablement nonce that carry this continuity sit at the profile's default
 window-state entry, and a mainnet profile that names another entry is refused.
 Raw deletion of the pin, enablement, and owner entry outside the wallet rests
 on the platform keyring.
+
+Mainnet consent requires a fresh WebAuthn assertion with user presence and user
+verification from a credential in the owner-signed policy. The assertion binds the
+exact consent, request, profile, chain and policy. The wallet verifies it before
+recording consent and again before mainnet authorization. Terminal input and a
+same-user process identity provide no mainnet presence proof.
+
+User verification is the authenticator's signed statement that its configured
+verification ceremony succeeds. It does not prove that a human reads or understands
+the transaction. The browser displays the transaction; the authenticator need not
+display it. Credential enrollment verifies a registration response and a terminal code,
+and the owner admits the public key by signing the policy. The wallet does not certify
+authenticator hardware or detect credential clones from signature counters.
+
+These checks constrain actions through the wallet. Same-user code with an extracted
+signing seed can sign outside those paths. Protection of authenticator private keys,
+user-verification prompts, browser integrity and platform keyring items rests on the
+platform. Raw deletion or restoration of keyring state outside wallet commands also
+rests on the platform. A compromised authenticator or browser, a misleading approval
+page outside the wallet, or an operator approving an unwanted request can defeat the
+intended consent. The wallet requires the signed proof and does not claim an
+operating-system security boundary against all same-user code.
+
+This release connects no presence ceremony to the consent surfaces, so every mainnet
+consent is refused and mainnet writes are unavailable.
 
 ## Security model summary
 
@@ -124,7 +155,10 @@ properties:
   approval is required, the action is recorded in a per-profile pending-approval store and
   released only when the operator runs `approve`, which mints an HMAC-SHA256 attestation
   proving the keyring holder approved it. The attestation is constant-time verified and
-  binds the approval nonce, the envelope SHA-256, and the OS process uid.
+  binds the approval nonce, the envelope SHA-256, and the OS process uid. A mainnet
+  approval is a version 5 attestation that also binds a verified passkey assertion from
+  an approval credential in the owner-signed policy; terminal input and the HMAC key
+  alone record no mainnet consent.
 - Settlement on an independent answer. On mainnet a spending-window reservation
   is released only on the answer of the oracle named by `oracle_provider_url`,
   once that oracle reports the mainnet passphrase: a failure, refusal, or

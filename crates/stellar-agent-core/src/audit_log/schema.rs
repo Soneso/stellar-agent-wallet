@@ -644,6 +644,43 @@ impl std::fmt::Display for KeyPurpose {
     }
 }
 
+// ── MainnetPresenceAudit ─────────────────────────────────────────────────────
+
+/// What a mainnet consent's WebAuthn ceremony proved, as an audit row
+/// records it.
+///
+/// Every value is a digest, a public policy fact, or a bit read from the
+/// signed authenticator data; the row carries no credential ID, public key,
+/// assertion byte, session bearer or proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MainnetPresenceAudit {
+    /// `sha256:` and the lowercase hex SHA-256 of
+    /// `b"stellar-agent-mainnet-approval-credential:v1" || lp(id) || key`.
+    pub credential_fingerprint: String,
+    /// The lowercase hex challenge, itself a SHA-256 digest of the consent.
+    pub challenge_sha256_hex: String,
+    /// The lowercase hex receipt digest the version 5 attestation binds.
+    pub receipt_sha256_hex: String,
+    /// The lowercase hex BLAKE3 digest of the signed policy.
+    pub policy_digest_hex: String,
+    /// The signed policy sequence.
+    pub policy_sequence: i64,
+    /// The relying-party ID, `localhost`.
+    pub rp_id: String,
+    /// The origin the browser reported and the challenge bound.
+    pub webauthn_origin: String,
+    /// The UP bit of the signed authenticator data.
+    pub user_present: bool,
+    /// The UV bit of the signed authenticator data.
+    pub user_verified: bool,
+    /// The signature counter of the signed authenticator data, recorded as
+    /// an observation only.
+    pub sign_count: u32,
+    /// When the assertion was verified, in Unix milliseconds.
+    pub verified_at_unix_ms: u64,
+}
+
 // ── EventKind ────────────────────────────────────────────────────────────────
 
 /// All known audit-log event kinds.
@@ -2656,6 +2693,10 @@ pub enum EventKind {
         /// Which origin attested the entry: `"cli"`, `"serve"`,
         /// `"serve-remote"`, or `"cli-mainnet-confirm"`.
         origin: String,
+        /// The verified WebAuthn ceremony of a mainnet consent; absent for
+        /// every other approval.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mainnet_presence: Option<MainnetPresenceAudit>,
     },
 
     /// A pending approval was rejected by the operator.
@@ -5350,6 +5391,7 @@ mod tests {
             envelope_sha256_hex: Some("a".repeat(64)),
             nonce_prefix: "AAAAAAAA".to_owned(),
             origin: "cli".to_owned(),
+            mainnet_presence: None,
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
@@ -5378,6 +5420,7 @@ mod tests {
             envelope_sha256_hex: None,
             nonce_prefix: "AAAAAAAA".to_owned(),
             origin: "cli".to_owned(),
+            mainnet_presence: None,
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
@@ -5385,6 +5428,53 @@ mod tests {
         assert!(
             !s.contains("envelope_sha256_hex"),
             "absent envelope_sha256_hex must be skipped, not null: {s}"
+        );
+    }
+
+    /// A mainnet consent row carries its presence object, round-trips, and
+    /// a row without one omits the member rather than writing `null`.
+    #[test]
+    fn event_kind_approval_attested_carries_mainnet_presence() {
+        let presence = MainnetPresenceAudit {
+            credential_fingerprint: format!("sha256:{}", "c".repeat(64)),
+            challenge_sha256_hex: "d".repeat(64),
+            receipt_sha256_hex: "e".repeat(64),
+            policy_digest_hex: "f".repeat(64),
+            policy_sequence: 3,
+            rp_id: "localhost".to_owned(),
+            webauthn_origin: "http://localhost:4100".to_owned(),
+            user_present: true,
+            user_verified: true,
+            sign_count: 12,
+            verified_at_unix_ms: 1_700_000_000_000,
+        };
+        let ev = EventKind::ApprovalAttested {
+            approval_kind: "PaymentSimulated".to_owned(),
+            gated_tool: "stellar_pay_commit".to_owned(),
+            envelope_sha256_hex: Some("a".repeat(64)),
+            nonce_prefix: "AAAAAAAA".to_owned(),
+            origin: "cli".to_owned(),
+            mainnet_presence: Some(presence),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains("\"mainnet_presence\""), "presence object: {s}");
+        assert!(s.contains("\"sign_count\":12"), "counter: {s}");
+        let back: EventKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back);
+
+        let legacy = r#"{"kind":"approval_attested","approval_kind":"PaymentSimulated","gated_tool":"stellar_pay_commit","nonce_prefix":"AAAAAAAA","origin":"cli"}"#;
+        let parsed: EventKind = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(
+            parsed,
+            EventKind::ApprovalAttested {
+                mainnet_presence: None,
+                ..
+            }
+        ));
+        assert!(
+            !serde_json::to_string(&parsed)
+                .unwrap()
+                .contains("mainnet_presence")
         );
     }
 

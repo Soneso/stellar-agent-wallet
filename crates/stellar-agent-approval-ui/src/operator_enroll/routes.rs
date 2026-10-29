@@ -21,8 +21,9 @@
 //! `enroll_credential_post` verifies the posted registration response
 //! against the challenge `enroll_challenge_post` issued (see
 //! `super::registration`) and hands the verified credential to the CLI. It
-//! never writes the credential store: the CLI persists the credential only
-//! after the operator types the page's confirmation code at the terminal.
+//! never writes the credential store: the CLI persists an operator
+//! credential, or exports a mainnet approval credential, only after the
+//! operator types the page's confirmation code at the terminal.
 //!
 //! # Error responses are distinguishable, not collapsed
 //!
@@ -203,6 +204,7 @@ async fn enroll_page_get(
         &csrf,
         state.label_prefill.as_deref(),
         &state.identity,
+        state.purpose,
     ))
     .into_response()
 }
@@ -435,10 +437,11 @@ fn verify_against_ceremony(
 ///    `registration_expired` and is dropped, so the page asks for a fresh
 ///    one; any other failure answers `400` `registration_invalid` and keeps
 ///    the challenge.
-/// 5. A credential ID the store already holds answers `409`
-///    `duplicate_credential_id`. The read takes no store lock, and
-///    [`super::ConfirmedOperatorEnrollment::persist`] refuses a duplicate
-///    again under the store's write lock.
+/// 5. For an operator credential, a credential ID the store already holds
+///    answers `409` `duplicate_credential_id`. The read takes no store lock,
+///    and [`super::ConfirmedOperatorEnrollment::persist`] refuses a duplicate
+///    again under the store's write lock. A mainnet approval ceremony has no
+///    store; the owner-signed policy parser refuses a duplicate ID.
 ///
 /// # Single-use enforcement
 ///
@@ -483,18 +486,17 @@ async fn enroll_credential_post(
             Err(OperatorRegistrationError::Expired) => return bad_request("registration_expired"),
             Err(OperatorRegistrationError::Invalid) => return bad_request("registration_invalid"),
         };
-    match state
-        .store
-        .find_by_credential_id(verified.credential_id_b64url())
-    {
-        Ok(None) => {}
-        Ok(Some(_)) => return conflict("duplicate_credential_id"),
-        Err(error) => {
-            tracing::warn!(error = %error, "operator enroll: credential store read failed");
-            return internal_error();
+    if let Some(store) = state.store.as_ref() {
+        match store.find_by_credential_id(verified.credential_id_b64url()) {
+            Ok(None) => {}
+            Ok(Some(_)) => return conflict("duplicate_credential_id"),
+            Err(error) => {
+                tracing::warn!(error = %error, "operator enroll: credential store read failed");
+                return internal_error();
+            }
         }
     }
-    let staged = StagedEnrollment::new(verified, &challenge);
+    let staged = StagedEnrollment::new(verified, &challenge, state.purpose);
     ceremony.challenge = None;
     let Some(completion) = ceremony.completion.take() else {
         return conflict("already_completed");

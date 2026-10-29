@@ -302,13 +302,25 @@ profile without `oracle_provider_url` refuses at admission with
 profile at startup, so it applies an oracle change from its next start.
 
 After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
+Startup refuses a mainnet policy without approval credentials, read-only use
+included, with `policy.mainnet_minimum_unmet` and
+`requirement=approval_credentials`; see
+[Approval credentials](profiles.md#approval-credentials).
 Freshness compares current policy and enablement facts without advancing the pin.
 A changed binding reports `network.mainnet_write_forbidden` with
 `enablement or policy changed, restart the server`. Missing startup authority
 instead names the missing prerequisite.
 
 Missing, invalid, expired, or unverifiable approvals use
-`policy.approval_required`. A live rejection uses `policy.approval_rejected`. A
+`policy.approval_required`. On mainnet that includes every approval without a
+verified presence receipt: a version 4 approval, an assertion that does not
+verify or comes from a credential the signed policy does not list, and a
+receipt bound to a policy other than the current one. Mainnet consent
+requires a verified passkey assertion from an approval credential in the
+owner-signed policy, and this release refuses every mainnet consent with
+`approval.presence_required`, so a mainnet commit cannot succeed yet. The
+approval hint names the same `stellar-agent approve --id <nonce> --profile <name>`
+command on every network. A live rejection uses `policy.approval_rejected`. A
 live consumed approval or an approval held by a submission receipt uses
 `policy.approval_consumed`. Expired tombstones use `policy.approval_required`.
 Authorization consumption followed by pre-send recording failure can leave an
@@ -853,6 +865,8 @@ payment payload. Its fields are `approval_nonce`, `profile`, `chain_id`,
 
 Approve x402 payments through `stellar-agent approve --id <nonce> --profile <name>`
 in a terminal. Approval-ui and remote approval do not attest this approval kind.
+On mainnet that command refuses with `approval.presence_required` in this
+release, as every mainnet consent does.
 For an x402 payment, `stellar-agent approve` shows the payee, amount, and asset,
 and a `Home domain:` line that reads `none` for the plain tool.
 The authenticated approval subject binds the payment intent digest and home

@@ -772,7 +772,7 @@ set pinned and verified by the release.
 | Configuration | Behavior | Admitted operations | Exclusions | Preconditions and outcomes |
 |---|---|---|---|---|
 | `mainnet-write` off | Refuses mainnet signing and transaction writes. Reports `STELLAR_AGENT_BUILD_MAINNET_WRITE=off`. | None. | Every mainnet signing and transaction-write surface. | Setup cannot change the compiled feature state. Wallet guards report `network.mainnet_write_forbidden`. Excluded protocols retain their documented codes. |
-| `mainnet-write` on, classic CLI | Authorizes each supported action before signing and submission. Reports `STELLAR_AGENT_BUILD_MAINNET_WRITE=on`. | Full-mode `pay`, `claim`, sponsored `accounts create`, and `trustline`. | Build-only, sign-only, submit-only, Friendbot creation, `accounts create --generate`, relayer paths, and the excluded surfaces below. | Requires an explicit nondefault mainnet profile, matching stored configuration, enrolled identities, enablement, an owner-signed v2 policy, valid pin and audit state, required witness, and confirmation. |
+| `mainnet-write` on, classic CLI | Authorizes each supported action before signing and submission. Reports `STELLAR_AGENT_BUILD_MAINNET_WRITE=on`. | Full-mode `pay`, `claim`, sponsored `accounts create`, and `trustline`. | Build-only, sign-only, submit-only, Friendbot creation, `accounts create --generate`, relayer paths, and the excluded surfaces below. | Requires an explicit nondefault mainnet profile, matching stored configuration, enrolled identities, enablement, an owner-signed v2 policy with approval credentials, valid pin and audit state, required witness, and passkey consent. |
 | `mainnet-write` on, classic MCP | Authorizes each supported commit before signing and submission. | `stellar_pay_commit`, `stellar_claim_commit`, `stellar_create_account_commit`, and `stellar_trustline_commit`. | Other generic signing tools, toolset signing actions, and the excluded surfaces below. | Requires the same installation and policy checks, plus approval bound to the action. Both prepare and commit policy names need matching rules. |
 | Classic failure classification | Reports the boundary that refused the action. | No admission follows from an error code. | A policy decision alone does not authorize signing. | Structural and context refusals use `network.mainnet_write_forbidden`. CLI engine construction preserves enablement errors and wraps other failures as `policy.engine_unavailable` or `trustline.policy_engine_unavailable`. Resolver setup gaps use `network.mainnet_authorization_refused`. Policy denials retain `policy.deny.*`. |
 | `mainnet-write` on, x402 | Releases an authorized payment payload through the supported flow. | `stellar_x402_create_payment`; `stellar_x402_authenticated_payment`, including its bound SEP-10 identity operation. | Generic SEP-10 signing, generic message signing, and unrelated Soroban operations. | Requires installation binding, signed policy, payment approval, required witness, authorized signing, and authorized payload release. Authenticated payments also bind the identity operation. |
@@ -802,9 +802,24 @@ verified policy, or enablement before the resolver runs.
 
 Ledger and `--secret-env` signers must satisfy the enrolled-identity requirement.
 `profile enroll-signer` accepts `--secret-env` only and cannot enroll a Ledger
-key. Classic approvals support the CLI, approval-ui, and approval-remote
-attestation surfaces. CLI `approve` requires a terminal and refuses `--yes` on
-mainnet. Direct CLI confirmation requires the exact typed profile name.
+key. Whatever the signer, every mainnet consent also needs a passkey listed in
+the owner-signed policy as an approval credential:
+
+1. Run `stellar-agent approve credential enroll --profile <NAME>`, create the
+   passkey in the local browser, and type the code the page shows.
+2. Review the printed `policy_entry_toml` and add it to
+   `mainnet.approval_credentials` in the policy file.
+3. Sign the policy with `profile sign-policy`, which assigns a higher sequence.
+4. Restart the MCP server and every `approve serve` inbox of the profile.
+
+This release connects no presence ceremony to the consent surfaces. Direct CLI
+confirmation, `approve`, and the local inbox refuse every mainnet consent with
+`approval.presence_required`, the remote listener refuses it with
+`approval.mainnet_remote_unsupported`, and an MCP commit refuses any approval
+without a verified presence receipt. Mainnet writes therefore remain
+unavailable. Enrollment, policy signing, reads, and simulation work as
+documented, and testnet approvals use the CLI, the local inbox, and the remote
+listener.
 
 See [Mainnet write behavior](cli-reference/index.md#mainnet-write-behavior),
 [Mainnet policy body](profiles.md#mainnet-policy-body), and

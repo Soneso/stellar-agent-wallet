@@ -1,4 +1,5 @@
-// Stellar Agent Wallet — interactive operator-enrollment ceremony (loopback).
+// Stellar Agent Wallet: interactive enrollment ceremony (loopback), for an
+// operator credential or a mainnet approval credential.
 //
 // Same-origin, no build step. Served only after the operator's browser has
 // exchanged the one-time bootstrap token for a session cookie at
@@ -22,23 +23,51 @@
 //    The server stages the credential; it does not enroll it.
 // 4. The page computes the confirmation code from the credential its own
 //    ceremony created, never from anything the server returns, and shows it.
-//    The operator types it at the terminal, which enrolls the credential
-//    only when the codes match.
+//    The operator types it at the terminal, which enrolls or exports the
+//    credential only when the codes match.
 //
-// The code is the first 16 hex characters of SHA-256 over
-// "stellar-agent-operator-enrollment-confirmation:v1" || challenge (32) ||
-// u32 big-endian credential-ID length || credential ID || SEC1 key (65),
-// shown as four groups of four.
+// The server renders the ceremony's purpose into the data island's
+// data-purpose attribute; the page never reads it from the URL. The purpose
+// selects the session proof key and the code domain, so a code shown for one
+// purpose never confirms the other. A page without a known purpose starts
+// nothing.
+//
+// The code is the first 16 hex characters of SHA-256 over the purpose's
+// domain || challenge (32) || u32 big-endian credential-ID length ||
+// credential ID || SEC1 key (65), shown as four groups of four.
 
 (function () {
   "use strict";
 
-  var PROOF_KEY = "stellar-agent-operator-enroll-session-proof";
-  var CODE_DOMAIN = "stellar-agent-operator-enrollment-confirmation:v1";
+  var PURPOSES = {
+    "remote-operator": {
+      proofKey: "stellar-agent-operator-enroll-session-proof",
+      codeDomain: "stellar-agent-operator-enrollment-confirmation:v1",
+      confirmed:
+        "The credential is enrolled only after the terminal accepts the code, and it " +
+        "must still be added to this profile's [remote_approval] allowed_credentials " +
+        "list before it can approve anything.",
+    },
+    "mainnet-approval": {
+      proofKey: "stellar-agent-mainnet-approval-enroll-session-proof",
+      codeDomain: "stellar-agent-mainnet-approval-enrollment-confirmation:v1",
+      confirmed:
+        "The terminal prints the policy entry only after it accepts the code. The " +
+        "credential approves mainnet consent only after the owner adds it to " +
+        "mainnet.approval_credentials and signs the policy.",
+    },
+  };
 
-  function readProof() {
+  // The purpose the server rendered into the data island, or null.
+  function readPurpose() {
+    var el = document.getElementById("enroll-data");
+    var value = el ? el.getAttribute("data-purpose") : null;
+    return Object.prototype.hasOwnProperty.call(PURPOSES, value) ? PURPOSES[value] : null;
+  }
+
+  function readProof(purpose) {
     try {
-      var proof = window.sessionStorage.getItem(PROOF_KEY);
+      var proof = window.sessionStorage.getItem(purpose.proofKey);
       return typeof proof === "string" && proof.length > 0 ? proof : null;
     } catch (e) {
       return null;
@@ -78,13 +107,14 @@
     return bytes.slice(bytes.length - 65);
   }
 
-  // The confirmation code of the credential this page's ceremony created.
-  function confirmationCode(challenge, credentialId, sec1) {
-    var length = CODE_DOMAIN.length + challenge.length + 4 + credentialId.length + sec1.length;
+  // The confirmation code, under `domain`, of the credential this page's
+  // ceremony created.
+  function confirmationCode(domain, challenge, credentialId, sec1) {
+    var length = domain.length + challenge.length + 4 + credentialId.length + sec1.length;
     var input = new Uint8Array(length);
     var offset = 0;
-    for (var i = 0; i < CODE_DOMAIN.length; i++) {
-      input[offset++] = CODE_DOMAIN.charCodeAt(i);
+    for (var i = 0; i < domain.length; i++) {
+      input[offset++] = domain.charCodeAt(i);
     }
     input.set(challenge, offset);
     offset += challenge.length;
@@ -182,14 +212,14 @@
       });
   }
 
-  function enroll(island) {
+  function enroll(island, purpose) {
     var labelInput = document.getElementById("label-input");
     var label = labelInput ? labelInput.value.trim() : "";
     if (!label) {
       setStatus("Enter a label first.", "error");
       return;
     }
-    var proof = readProof();
+    var proof = readProof(purpose);
     if (!proof) {
       setStatus(
         "This tab has no wallet session. Use the tab the command opened, or restart it for a new link.",
@@ -255,15 +285,18 @@
         if (!resp.ok) {
           return refused(resp);
         }
-        return confirmationCode(ceremony.challenge, ceremony.credentialId, ceremony.sec1);
+        return confirmationCode(
+          purpose.codeDomain,
+          ceremony.challenge,
+          ceremony.credentialId,
+          ceremony.sec1
+        );
       })
       .then(function (code) {
         showCode(code);
         setStatus(
           "Awaiting confirmation. Type the code " + code + " at the terminal that " +
-            "started this enrollment. The credential is enrolled only after the " +
-            "terminal accepts the code, and it must still be added to this profile's " +
-            "[remote_approval] allowed_credentials list before it can approve anything.",
+            "started this enrollment. " + purpose.confirmed,
           "ok"
         );
       })
@@ -281,10 +314,15 @@
   }
 
   var island = readIsland("enroll-data");
+  var purpose = readPurpose();
   var btn = document.getElementById("enroll-btn");
   if (btn && island) {
     btn.addEventListener("click", function () {
-      enroll(island);
+      if (!purpose) {
+        setStatus("This page names no enrollment purpose. Restart the command for a new link.", "error");
+        return;
+      }
+      enroll(island, purpose);
     });
   }
 })();

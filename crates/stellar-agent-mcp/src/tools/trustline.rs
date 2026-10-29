@@ -292,8 +292,12 @@ impl WalletServer {
     /// Whether a current clawback opt-in whose attestation verifies covers
     /// `code:issuer` on this network at `now_ms`.
     ///
-    /// Every failure on the way (the attestation key, the approval directory,
-    /// the store) reads as no opt-in, so a clawback-enabled issuer refuses.
+    /// On mainnet only a version 5 opt-in with a presence receipt that
+    /// verifies again under the current signed policy counts, and a server
+    /// without mainnet admission state, or whose policy changed since
+    /// startup, has none. Every failure on the way (the attestation key, the
+    /// approval directory, the store, the policy) reads as no opt-in, so a
+    /// clawback-enabled issuer refuses.
     fn verified_clawback_opt_in(&self, code: &str, issuer: &str, now_ms: u64) -> bool {
         let key = match crate::tools::common::load_attestation_key(self.security_profile()) {
             Ok(key) => key,
@@ -314,13 +318,26 @@ impl WalletServer {
             return false;
         };
         let network = self.context.chain_id.caip2_str();
+        let binding = stellar_agent_core::approval::AttestationBinding::new(&profile_name, network);
+        if self.context.chain_id.is_mainnet() {
+            let Some(policy) = self.current_mainnet_policy() else {
+                tracing::debug!("no current mainnet policy; treating clawback opt-in as absent");
+                return false;
+            };
+            return store
+                .verify_mainnet_trustline_clawback_opt_in(
+                    &key, &binding, code, issuer, policy, now_ms,
+                )
+                .unwrap_or_else(|error| {
+                    tracing::debug!(
+                        code = error.code(),
+                        "mainnet clawback opt-in refused; treating it as absent"
+                    );
+                    false
+                });
+        }
         store.verify_attested_trustline_clawback_opt_in(
-            &key,
-            &stellar_agent_core::approval::AttestationBinding::new(&profile_name, network),
-            network,
-            code,
-            issuer,
-            now_ms,
+            &key, &binding, network, code, issuer, now_ms,
         )
     }
 

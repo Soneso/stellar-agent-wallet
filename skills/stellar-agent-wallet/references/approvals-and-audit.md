@@ -65,21 +65,22 @@ envelope signature. Reads retain their selection and key-scope checks.
 
 ### Classic mainnet confirmation
 
-Pending-approval attestations use version 4: approval kind, creation time,
-expiry, and the approver (the local operator or the remote operator credential
-the listener verified). Every pending-approval commit requires
-`attestation_version = 4`; an approval recorded under version 2 or 3 needs
-fresh consent. For a remote approver, mainnet proof verification reads the
-profile's `allowed_credentials` list and the operator-credential store again
-and refuses a credential that is missing from either.
-`approval.attestation_invalid` covers missing version 4 coverage or a mismatched
-subject. MCP reports failed approval proofs as `policy.approval_required`.
+Testnet pending-approval attestations use version 4: approval kind, creation
+time, expiry, and the approver (the local operator or the remote operator
+credential the listener verified); an approval recorded under version 2 or 3
+needs fresh consent. A mainnet consent is a version 5 attestation that also
+binds a verified WebAuthn presence receipt from an approval credential in the
+owner-signed policy. `approval.attestation_invalid` covers missing coverage or
+a mismatched subject. MCP reports failed approval proofs as
+`policy.approval_required`.
 
-Direct CLI confirmation requires terminal stdin and stderr. It renders and
-flushes the summary, then compares the typed profile name after stripping only
-the line ending. Terminal or name refusal precedes pending insertion.
-Successful confirmation writes consent and persists its attestation before
-returning the witness. Its audit origin is `cli-mainnet-confirm`.
+This release connects no presence ceremony to the consent surfaces. Direct CLI
+confirmation and `approve` render the summary, then refuse every mainnet
+consent with `approval.presence_required` before anything is recorded; neither
+reads terminal input. The local inbox refuses mainnet approval the same way,
+and the remote listener refuses it with `approval.mainnet_remote_unsupported`.
+Mainnet writes therefore remain unavailable. Never attempt a mainnet approval
+on the operator's behalf.
 
 Allow supplies a 600-second confirmation lifetime. RequireApproval supplies its
 configured lifetime. Classic MCP approvals expire at the shorter prepare/commit
@@ -91,10 +92,10 @@ Minted authorization holds count against window headroom. Consumption,
 invalidation, or expiry releases or converts them. Consumption is single-use
 within retained history and checks the policy pin under the state lock.
 
-CLI `approve` uses a y/n prompt and requires a terminal on mainnet. It refuses
-`--yes` before terminal checks or store access in both builds with
-`approve.yes_refused_on_mainnet`. Classic UI and remote approvals retain their
-supported attestations. CLI `approval.*` errors retain their codes.
+On mainnet, CLI `approve` refuses `--yes` before store access in both builds
+with `approve.yes_refused_on_mainnet`. Testnet approvals keep the CLI y/n
+prompt, the local inbox, and the remote listener. CLI `approval.*` errors
+retain their codes.
 
 Live consumed or receipt-held MCP approvals use `policy.approval_consumed`.
 Consumption followed by pre-send recording failure can leave no tombstone.

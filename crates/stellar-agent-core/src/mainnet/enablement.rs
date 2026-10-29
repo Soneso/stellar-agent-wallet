@@ -303,7 +303,8 @@ pub fn has_enablement_nonce(
     }
 }
 
-/// Verifies the installation bindings of a cryptographically verified policy.
+/// Verifies the installation bindings of a cryptographically verified policy
+/// for a profile the operator selected with `--profile`.
 ///
 /// # Errors
 /// Refuses any name, source, endpoint, or nonce binding mismatch.
@@ -318,7 +319,6 @@ pub fn verify_enablement(
     ) -> Result<String, crate::error::ValidationError>,
 ) -> Result<EnablementRecord, crate::error::ValidationError> {
     use crate::error::ValidationError;
-    use sha2::Digest as _;
     let invalid = |binding| ValidationError::MainnetEnablementInvalid { binding };
     let body = policy.mainnet().ok_or_else(|| invalid("mainnet_table"))?;
     if body.profile != profile_name {
@@ -326,6 +326,36 @@ pub fn verify_enablement(
     }
     if name_source != crate::profile::name::ProfileNameSource::Flag {
         return Err(invalid("source"));
+    }
+    verify_enablement_bindings(policy, profile_name, profile, profile_dir, keyring)
+}
+
+/// Verifies the installation bindings of a cryptographically verified policy
+/// for the persisted profile `profile_name`: the policy's mainnet section
+/// names it, it is not `default`, its stored and merged chains are mainnet,
+/// both endpoints match the signed host, and the keyring nonce matches the
+/// signed digest.
+///
+/// It makes no claim about how the name was selected; [`verify_enablement`]
+/// adds the selection check for a write entry point.
+///
+/// # Errors
+/// Refuses any name, endpoint, or nonce binding mismatch.
+pub(crate) fn verify_enablement_bindings(
+    policy: &super::verified_policy::VerifiedPolicy,
+    profile_name: &str,
+    profile: &crate::profile::schema::Profile,
+    profile_dir: &std::path::Path,
+    keyring: &impl Fn(
+        &crate::profile::schema::KeyringEntryRef,
+    ) -> Result<String, crate::error::ValidationError>,
+) -> Result<EnablementRecord, crate::error::ValidationError> {
+    use crate::error::ValidationError;
+    use sha2::Digest as _;
+    let invalid = |binding| ValidationError::MainnetEnablementInvalid { binding };
+    let body = policy.mainnet().ok_or_else(|| invalid("mainnet_table"))?;
+    if body.profile != profile_name {
+        return Err(invalid("profile"));
     }
     if profile_name == "default" {
         return Err(invalid("default"));

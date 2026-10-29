@@ -525,6 +525,7 @@ where
         &resolved,
         issuer_flags.as_ref(),
         args.limit_stroops,
+        None,
     ) {
         Ok(preview) => preview,
         Err(code) => return code,
@@ -811,15 +812,21 @@ async fn build_change_trust(
 
 /// Runs the wallet-controlled clawback gate of a trustline to `resolved`.
 ///
-/// Reads the HMAC-verified opt-in from the approval store, builds the
-/// preview, and applies its gate decision. A clawback-enabled issuer without
-/// a verified opt-in gets an opt-in pending entry and the
-/// `clawback_opt_in_required` outcome.
+/// Reads the verified opt-in from the approval store, builds the preview,
+/// and applies its gate decision. On testnet the opt-in is HMAC-verified; on
+/// mainnet, where `mainnet_policy` is the verified policy the write runs
+/// under, it must also carry a verified passkey receipt under that policy,
+/// still current. A clawback-enabled issuer without a verified opt-in gets an
+/// opt-in pending entry and the `clawback_opt_in_required` outcome.
 ///
 /// # Errors
 ///
 /// Returns the exit code after writing the gate's outcome or refusal to
 /// `out`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct input of the clawback gate"
+)]
 fn clawback_gate(
     out: &mut dyn Write,
     profile: &Profile,
@@ -828,6 +835,7 @@ fn clawback_gate(
     resolved: &ResolvedAsset,
     issuer_flags: Option<&AccountFlagsView>,
     limit_stroops: Option<i64>,
+    mainnet_policy: Option<&stellar_agent_core::mainnet::verified_policy::VerifiedPolicy>,
 ) -> Result<TrustlinePreview, i32> {
     // ── GATE 5: Wallet-controlled clawback opt-in lookup (HMAC-verified) ────
     //
@@ -863,17 +871,30 @@ fn clawback_gate(
                         let store_path = dir.join(format!("{profile_name}.toml"));
                         open_with_retry(&store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
                             .map(|store| {
-                                store.verify_attested_trustline_clawback_opt_in(
-                                    &attestation_key,
-                                    &stellar_agent_core::approval::AttestationBinding::new(
-                                        profile_name,
-                                        chain.caip2_str(),
+                                let binding = stellar_agent_core::approval::AttestationBinding::new(
+                                    profile_name,
+                                    chain.caip2_str(),
+                                );
+                                match mainnet_policy {
+                                    Some(policy) => store
+                                        .verify_mainnet_trustline_clawback_opt_in(
+                                            &attestation_key,
+                                            &binding,
+                                            &resolved.code,
+                                            &resolved.issuer,
+                                            policy,
+                                            now_ms,
+                                        )
+                                        .unwrap_or(false),
+                                    None => store.verify_attested_trustline_clawback_opt_in(
+                                        &attestation_key,
+                                        &binding,
+                                        network_key,
+                                        &resolved.code,
+                                        &resolved.issuer,
+                                        now_ms,
                                     ),
-                                    network_key,
-                                    &resolved.code,
-                                    &resolved.issuer,
-                                    now_ms,
-                                )
+                                }
                             })
                             .unwrap_or(false)
                     })
@@ -1349,6 +1370,7 @@ where
         &asset,
         issuer_flags.as_ref(),
         args.limit_stroops,
+        Some(&policy.verified),
     ) {
         Ok(preview) => preview,
         Err(code) => return code,
@@ -2930,7 +2952,7 @@ mod tests {
 
             assert_refused_before_confirmation(&fixture, &run, "auth.enrolled_signer_unpinned")
                 .await;
-            fixture.assert_terminal_untouched();
+            fixture.assert_no_consent_ceremony();
         }
 
         /// Enrollment: a `--from` other than the enrolled key refuses with the
@@ -2951,7 +2973,7 @@ mod tests {
                 "{}",
                 run.message()
             );
-            fixture.assert_terminal_untouched();
+            fixture.assert_no_consent_ceremony();
         }
 
         /// Clawback: a clawback-enabled issuer without an opt-in mints the
@@ -2976,7 +2998,7 @@ mod tests {
             assert_eq!(entries[0].kind_name, "TrustlineClawbackOptIn");
             assert!(fixture.open_authorizations(now()).is_empty());
             assert!(records(&fixture).is_empty());
-            assert!(fixture.prompts().is_empty(), "no mainnet confirmation");
+            assert!(fixture.summaries().is_empty(), "no mainnet confirmation");
         }
 
         /// Clawback: an opt-in entry that cannot be written refuses the
@@ -3009,7 +3031,7 @@ mod tests {
                 run.envelope
             );
             assert!(records(&fixture).is_empty());
-            assert!(fixture.prompts().is_empty(), "no mainnet confirmation");
+            assert!(fixture.summaries().is_empty(), "no mainnet confirmation");
         }
 
         /// Trustline keyring seed: the enrolled proof reads only the identity

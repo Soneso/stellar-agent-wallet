@@ -275,9 +275,13 @@ stellar-agent approve --id <nonce> --profile <name>
 ```
 
 `approve` renders a wallet-controlled summary (the destination G-strkey and asset
-are validated on deserialize so a hostile entry cannot inject terminal content),
-the operator confirms at the terminal, and the command records an HMAC-SHA256
-attestation. The attestation:
+are validated on deserialize so a hostile entry cannot inject terminal content).
+On testnet the operator confirms at the terminal, and the command records an
+HMAC-SHA256 attestation. On mainnet a consent also needs a fresh WebAuthn
+assertion, with user presence and user verification, from an approval
+credential in the owner-signed policy; terminal input and the HMAC key alone
+record no mainnet consent, and this release refuses every mainnet consent with
+`approval.presence_required`. The attestation:
 
 - Is keyed by the profile's attestation key, which lives only in the keyring.
 - Binds the profile name, CAIP-2 chain id, approval nonce, envelope digest, and OS process uid under a versioned domain tag.
@@ -419,7 +423,11 @@ needs approval for, or that the audit log records.
 Unauthorized mainnet signing, payload release, or submission is also in scope. Out
 of scope: defects in your own keyring backend, OS, RPC endpoint, or anchor; and
 any issue that requires already holding the wallet's keyring secrets, since custody
-of those secrets is the security boundary.
+of those secrets is the security boundary. Two residues remain on mainnet: a
+same-user process that holds the attestation HMAC key can wrap a version 5
+record around a user-verified assertion that its own localhost page obtained,
+and the owner seed admits approval credentials, so signing the policy on a host
+where same-user code runs exposes that seed.
 
 For code running as the same OS user, the owner of an enabled mainnet profile
 changes only with a statement signed by the previous owner. The policy pin and

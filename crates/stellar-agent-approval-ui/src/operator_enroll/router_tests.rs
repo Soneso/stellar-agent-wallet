@@ -65,9 +65,10 @@ impl Harness {
         let cookie_name = auth.cookie_name().to_owned();
         let local_addr: SocketAddr = HOST.parse().unwrap();
         let state = Arc::new(OperatorEnrollState {
+            purpose: super::EnrollmentPurpose::RemoteOperator,
             profile: "default".to_owned(),
             auth: StdMutex::new(auth),
-            store: OperatorApprovalCredentialStore::new(store_path.clone()),
+            store: Some(OperatorApprovalCredentialStore::new(store_path.clone())),
             expected_origin: expected_origin(local_addr),
             label_prefill,
             identity: PageIdentity::neutral(),
@@ -299,8 +300,9 @@ fn extract_cookie_value(cookie_name: &str, set_cookie: &str) -> String {
 }
 
 fn extract_island(html: &str, id: &str) -> serde_json::Value {
-    let open = format!(r#"<script type="application/json" id="{id}">"#);
-    let start = html.find(&open).expect("data island opening tag") + open.len();
+    let open = format!(r#"<script type="application/json" id="{id}""#);
+    let tag = html.find(&open).expect("data island opening tag");
+    let start = tag + html[tag..].find('>').expect("data island opening tag end") + 1;
     let rest = &html[start..];
     let end = rest.find("</script>").expect("data island closing tag");
     serde_json::from_str(&rest[..end]).expect("data island must be valid JSON")

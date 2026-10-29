@@ -575,7 +575,14 @@ where
     };
     match pending.confirm(&line, Instant::now()) {
         Ok(confirmed) => EnrollmentEnd::Confirmed(confirmed),
-        Err(OperatorEnrollmentConfirmationError::Mismatch) => EnrollmentEnd::Mismatch,
+        // The confirmation refuses only with a mismatch or the deadline; the
+        // export refusals belong to the mainnet approval export and refuse
+        // like a mismatch if they arise.
+        Err(
+            OperatorEnrollmentConfirmationError::Mismatch
+            | OperatorEnrollmentConfirmationError::WrongPurpose
+            | OperatorEnrollmentConfirmationError::CredentialInvalid,
+        ) => EnrollmentEnd::Mismatch,
         Err(OperatorEnrollmentConfirmationError::Expired) => EnrollmentEnd::Expired,
     }
 }
@@ -584,7 +591,7 @@ where
 ///
 /// A blocking read cannot be cancelled, so the thread is not joined: when
 /// the caller stops waiting, the line it may read later goes nowhere.
-fn read_code_from_terminal() -> impl Future<Output = io::Result<Option<String>>> {
+pub(super) fn read_code_from_terminal() -> impl Future<Output = io::Result<Option<String>>> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let spawned = std::thread::Builder::new()
         .name("operator-enroll-code".to_owned())
@@ -706,7 +713,7 @@ fn print_interactive_startup(url: &str) {
     clippy::print_stderr,
     reason = "CLI binary intentional prompt; stdout stays JSON-only"
 )]
-fn print_confirmation_prompt(label: &str) {
+pub(super) fn print_confirmation_prompt(label: &str) {
     eprint!("{}", confirmation_prompt(label));
 }
 
@@ -716,7 +723,7 @@ fn print_confirmation_prompt(label: &str) {
 /// [`escape_for_terminal`]: a control or format character appears as a
 /// visible escape and cannot move the cursor, erase the prompt or reach the
 /// terminal's clipboard. The expected code is never part of the prompt.
-fn confirmation_prompt(label: &str) -> String {
+pub(super) fn confirmation_prompt(label: &str) -> String {
     format!(
         "stellar-agent: a passkey labelled \"{}\" was registered.\n  \
          Type the confirmation code the enrollment page shows, then press Enter: ",

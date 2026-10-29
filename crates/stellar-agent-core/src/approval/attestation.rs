@@ -57,6 +57,17 @@
 //! Toolset grants are versioned on their own and keep using
 //! [`compute_attestation`] and [`AttestationScope::from_version`].
 //!
+//! # Version 5: mainnet consent
+//!
+//! A mainnet consent is recorded under version 5
+//! ([`MAINNET_ATTESTATION_VERSION`]) with a mainnet passkey approver
+//! (`0x02`, followed by the length-prefixed credential ID) and the 32-byte
+//! digest of the stored WebAuthn presence receipt appended after the
+//! approver. [`compute_attestation_v5`] produces it. Version 4 bytes are
+//! unchanged, and a version 4 blob never verifies as version 5 or the
+//! reverse, so a local or remote approval cannot stand for a mainnet
+//! consent.
+//!
 //! Lengths count UTF-8 bytes, encoded as big-endian u32 with saturation.
 //! The tags and the 32-byte digest have no prefix or NUL terminator.
 //! The tag separates this HMAC from every other use of the key.
@@ -78,6 +89,8 @@
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+
+use super::presence::MainnetPresenceReceipt;
 
 /// Profile and chain that mint or verify an approval.
 ///
@@ -127,19 +140,31 @@ pub const PENDING_ATTESTATION_VERSION: u32 = 4;
 /// HMAC domain tag of version 4.
 const ATTESTATION_TAG_V4: &[u8] = b"stellar-agent-approval-attestation:v4";
 
+/// The attestation layout of a mainnet consent: version 4's fields with a
+/// mainnet passkey approver, plus the digest of the retained WebAuthn
+/// receipt. Testnet approvals keep [`PENDING_ATTESTATION_VERSION`].
+pub const MAINNET_ATTESTATION_VERSION: u32 = 5;
+
+/// HMAC domain tag of version 5.
+const ATTESTATION_TAG_V5: &[u8] = b"stellar-agent-approval-attestation:v5";
+
 /// The approver byte of a local approval in the version 4 layout.
 const APPROVER_TAG_LOCAL: u8 = 0x00;
 
 /// The approver byte of a remote approval in the version 4 layout.
 const APPROVER_TAG_REMOTE: u8 = 0x01;
 
+/// The approver byte of a mainnet passkey approval in the version 5 layout.
+const APPROVER_TAG_MAINNET_PASSKEY: u8 = 0x02;
+
 /// Who approved a pending approval, as its version 4 attestation
 /// authenticates it.
 ///
 /// Derived from the verified identity of the surface that approved, never
-/// from request input: a loopback or CLI surface records [`Self::Local`], and
-/// the remote listener records [`Self::Remote`] with the credential ID its
-/// WebAuthn verification matched.
+/// from request input: a loopback or CLI surface records [`Self::Local`], the
+/// remote listener records [`Self::Remote`] with the credential ID its
+/// WebAuthn verification matched, and a mainnet consent records
+/// [`Self::MainnetPasskey`] with the credential ID of the verified assertion.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AttestedApprover {
@@ -150,11 +175,19 @@ pub enum AttestedApprover {
         /// The canonical base64url credential ID the listener verified.
         credential_id_b64url: String,
     },
+    /// An approval credential of the owner-signed mainnet policy whose
+    /// assertion, with user presence and user verification, the wallet
+    /// verified. Valid only in the version 5 layout.
+    MainnetPasskey {
+        /// The canonical base64url ID of the credential that signed.
+        credential_id_b64url: String,
+    },
 }
 
 impl AttestedApprover {
     /// Whether the approver is well formed: a remote approver names a
-    /// non-empty, canonical base64url credential ID.
+    /// non-empty, canonical base64url credential ID, and a mainnet passkey
+    /// approver a canonical base64url ID of 16 to 64 bytes.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         match self {
@@ -162,6 +195,14 @@ impl AttestedApprover {
             Self::Remote {
                 credential_id_b64url,
             } => is_canonical_b64url(credential_id_b64url),
+            Self::MainnetPasskey {
+                credential_id_b64url,
+            } => super::presence::decode_canonical_b64url(
+                credential_id_b64url,
+                super::presence::CREDENTIAL_ID_MIN_BYTES,
+                super::presence::CREDENTIAL_ID_MAX_BYTES,
+            )
+            .is_some(),
         }
     }
 }
@@ -174,6 +215,15 @@ impl std::fmt::Debug for AttestedApprover {
                 credential_id_b64url,
             } => f
                 .debug_struct("Remote")
+                .field(
+                    "credential_id_b64url",
+                    &crate::redact_first5_last5(credential_id_b64url),
+                )
+                .finish(),
+            Self::MainnetPasskey {
+                credential_id_b64url,
+            } => f
+                .debug_struct("MainnetPasskey")
                 .field(
                     "credential_id_b64url",
                     &crate::redact_first5_last5(credential_id_b64url),
@@ -230,8 +280,16 @@ pub enum AttestationScope<'a> {
     /// Version 3: the record's kind and lifetime.
     V3(AttestedLifetime<'a>),
     /// Version 4: the record's kind and lifetime and its authenticated
-    /// approver. The only layout a pending approval verifies under.
+    /// approver. A pending testnet approval verifies under it.
     V4(AttestedLifetime<'a>, &'a AttestedApprover),
+    /// Version 5: version 4's fields with a mainnet passkey approver, plus
+    /// the digest of the presence receipt. A mainnet consent verifies under
+    /// it.
+    V5(
+        AttestedLifetime<'a>,
+        &'a AttestedApprover,
+        &'a MainnetPresenceReceipt,
+    ),
 }
 
 impl<'a> AttestationScope<'a> {
@@ -251,19 +309,38 @@ impl<'a> AttestationScope<'a> {
     }
 
     /// Selects a pending approval's layout: version 4 with a well-formed
-    /// approver, and nothing else.
+    /// local or remote approver and no presence receipt, or version 5 with a
+    /// well-formed mainnet passkey approver and a well-formed receipt whose
+    /// assertion names the same credential.
     ///
-    /// A pending record under version 2 or 3, or without an approver, or
-    /// with a malformed one, verifies nothing.
+    /// Every other combination verifies nothing: version 2 or 3, a missing
+    /// or malformed approver, a mainnet passkey approver under version 4, a
+    /// local or remote approver under version 5, a receipt under version 4,
+    /// and version 5 without a receipt or with another credential's.
     #[must_use]
     pub fn pending(
         version: u32,
         lifetime: AttestedLifetime<'a>,
         approver: Option<&'a AttestedApprover>,
+        receipt: Option<&'a MainnetPresenceReceipt>,
     ) -> Option<Self> {
-        match (version, approver) {
-            (PENDING_ATTESTATION_VERSION, Some(approver)) if approver.is_well_formed() => {
-                Some(Self::V4(lifetime, approver))
+        let approver = approver.filter(|approver| approver.is_well_formed())?;
+        match (version, approver, receipt) {
+            (
+                PENDING_ATTESTATION_VERSION,
+                AttestedApprover::Local | AttestedApprover::Remote { .. },
+                None,
+            ) => Some(Self::V4(lifetime, approver)),
+            (
+                MAINNET_ATTESTATION_VERSION,
+                AttestedApprover::MainnetPasskey {
+                    credential_id_b64url,
+                },
+                Some(receipt),
+            ) if receipt.is_well_formed()
+                && receipt.credential_id_b64url() == *credential_id_b64url =>
+            {
+                Some(Self::V5(lifetime, approver, receipt))
             }
             _ => None,
         }
@@ -276,6 +353,7 @@ impl<'a> AttestationScope<'a> {
             Self::V2 => ATTESTATION_VERSION_V2,
             Self::V3(_) => ATTESTATION_VERSION,
             Self::V4(..) => PENDING_ATTESTATION_VERSION,
+            Self::V5(..) => MAINNET_ATTESTATION_VERSION,
         }
     }
 }
@@ -793,10 +871,53 @@ pub fn compute_attestation_v4(
     )
 }
 
+/// Computes a version 5 attestation of a mainnet consent.
+///
+/// The preimage is version 4's with the version 5 domain tag, the mainnet
+/// passkey approver, and the receipt digest appended:
+///
+/// ```text
+/// mac.update(b"stellar-agent-approval-attestation:v5")
+/// (profile_name, chain_id, approval_nonce, envelope_sha256, process_uid,
+///  kind, created_at_unix_ms, expires_at_unix_ms, as version 4 lays them out)
+/// mac.update([0x02])                                  mainnet passkey
+/// mac.update(u32_be(len(credential_id)))              approver, with its
+/// mac.update(credential_id)                           credential ID
+/// mac.update(receipt_digest)                          32 bytes
+/// ```
+///
+/// [`MainnetPresenceReceipt::digest`] defines the receipt digest. Same key
+/// discipline as [`compute_attestation`].
+#[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct field of the attested preimage"
+)]
+pub fn compute_attestation_v5(
+    key: &[u8; 32],
+    binding: &AttestationBinding<'_>,
+    approval_nonce: &str,
+    envelope_sha256: &[u8; 32],
+    process_uid: &str,
+    lifetime: &AttestedLifetime<'_>,
+    approver: &AttestedApprover,
+    receipt: &MainnetPresenceReceipt,
+) -> [u8; 32] {
+    compute_with_scope(
+        key,
+        binding,
+        approval_nonce,
+        envelope_sha256,
+        process_uid,
+        &AttestationScope::V5(*lifetime, approver, receipt),
+    )
+}
+
 /// Computes the blob of `scope`'s layout. [`compute_attestation`] produces
-/// version 3 for toolset grants and [`compute_attestation_v4`] produces
-/// version 4 for pending approvals; verification recomputes version 2 for
-/// grants stored under it.
+/// version 3 for toolset grants, [`compute_attestation_v4`] version 4 for
+/// pending testnet approvals and [`compute_attestation_v5`] version 5 for
+/// mainnet consents; verification recomputes version 2 for grants stored
+/// under it.
 fn compute_with_scope(
     key: &[u8; 32],
     binding: &AttestationBinding<'_>,
@@ -824,6 +945,7 @@ fn compute_with_scope(
         AttestationScope::V2 => ATTESTATION_TAG_V2,
         AttestationScope::V3(_) => ATTESTATION_TAG_V3,
         AttestationScope::V4(..) => ATTESTATION_TAG_V4,
+        AttestationScope::V5(..) => ATTESTATION_TAG_V5,
     });
     length_prefixed(&mut mac, binding.profile_name.as_bytes());
     length_prefixed(&mut mac, binding.chain_id.as_bytes());
@@ -831,12 +953,15 @@ fn compute_with_scope(
     // envelope_sha256 is always 32 bytes (fixed-length); no length prefix needed.
     mac.update(envelope_sha256);
     length_prefixed(&mut mac, process_uid.as_bytes());
-    if let AttestationScope::V3(lifetime) | AttestationScope::V4(lifetime, _) = scope {
+    if let AttestationScope::V3(lifetime)
+    | AttestationScope::V4(lifetime, _)
+    | AttestationScope::V5(lifetime, ..) = scope
+    {
         length_prefixed(&mut mac, lifetime.kind.as_bytes());
         mac.update(&lifetime.created_at_unix_ms.to_be_bytes());
         mac.update(&lifetime.expires_at_unix_ms.to_be_bytes());
     }
-    if let AttestationScope::V4(_, approver) = scope {
+    if let AttestationScope::V4(_, approver) | AttestationScope::V5(_, approver, _) = scope {
         match approver {
             AttestedApprover::Local => mac.update(&[APPROVER_TAG_LOCAL]),
             AttestedApprover::Remote {
@@ -845,6 +970,20 @@ fn compute_with_scope(
                 mac.update(&[APPROVER_TAG_REMOTE]);
                 length_prefixed(&mut mac, credential_id_b64url.as_bytes());
             }
+            AttestedApprover::MainnetPasskey {
+                credential_id_b64url,
+            } => {
+                mac.update(&[APPROVER_TAG_MAINNET_PASSKEY]);
+                length_prefixed(&mut mac, credential_id_b64url.as_bytes());
+            }
+        }
+    }
+    if let AttestationScope::V5(_, _, receipt) = scope {
+        // A receipt that is not well formed has no digest; its blob then
+        // matches no recordable receipt, and `pending` never selects it.
+        match receipt.digest() {
+            Some(digest) => mac.update(&digest),
+            None => mac.update(&[0xff]),
         }
     }
 
@@ -1706,6 +1845,9 @@ mod tests {
                     mac.update(&6_u32.to_be_bytes());
                     mac.update(credential_id_b64url.as_bytes());
                 }
+                AttestedApprover::MainnetPasskey { .. } => {
+                    unreachable!("only version 4 approvers are listed")
+                }
             }
             let expected: [u8; 32] = mac.finalize().into_bytes().into();
             assert_eq!(
@@ -1758,20 +1900,23 @@ mod tests {
         assert!(verifies(AttestationScope::pending(
             4,
             LIFETIME,
-            Some(&approver)
+            Some(&approver),
+            None
         )));
         let other = remote("AAECBA");
         assert!(!verifies(AttestationScope::pending(
             4,
             LIFETIME,
-            Some(&other)
+            Some(&other),
+            None
         )));
         assert!(!verifies(AttestationScope::pending(
             4,
             LIFETIME,
-            Some(&AttestedApprover::Local)
+            Some(&AttestedApprover::Local),
+            None
         )));
-        assert!(AttestationScope::pending(4, LIFETIME, None).is_none());
+        assert!(AttestationScope::pending(4, LIFETIME, None, None).is_none());
         assert!(!verifies(Some(AttestationScope::V3(LIFETIME))));
         assert!(!verifies(Some(AttestationScope::V2)));
 
@@ -1792,10 +1937,10 @@ mod tests {
     fn pending_layout_is_version_4_with_a_well_formed_approver() {
         let local = AttestedApprover::Local;
         for version in [0, 1, ATTESTATION_VERSION_V2, ATTESTATION_VERSION, 5] {
-            assert!(AttestationScope::pending(version, LIFETIME, Some(&local)).is_none());
+            assert!(AttestationScope::pending(version, LIFETIME, Some(&local), None).is_none());
         }
         assert_eq!(
-            AttestationScope::pending(4, LIFETIME, Some(&local))
+            AttestationScope::pending(4, LIFETIME, Some(&local), None)
                 .unwrap()
                 .version(),
             PENDING_ATTESTATION_VERSION
@@ -1805,7 +1950,7 @@ mod tests {
                 credential_id_b64url: id.to_owned(),
             };
             assert!(!malformed.is_well_formed(), "{id}");
-            assert!(AttestationScope::pending(4, LIFETIME, Some(&malformed)).is_none());
+            assert!(AttestationScope::pending(4, LIFETIME, Some(&malformed), None).is_none());
         }
         let debug = format!(
             "{:?}",
@@ -1815,5 +1960,60 @@ mod tests {
         );
         assert!(!debug.contains("BwcHBwcHBwcHBwcHBwcHBw"), "{debug}");
         assert!(AttestationScope::from_version(4, LIFETIME).is_none());
+        assert!(AttestationScope::from_version(5, LIFETIME).is_none());
+
+        // A mainnet passkey approver never selects version 4, and the
+        // well-formedness rule bounds its ID to 16 to 64 bytes.
+        let passkey = AttestedApprover::MainnetPasskey {
+            credential_id_b64url: "BwcHBwcHBwcHBwcHBwcHBw".to_owned(),
+        };
+        assert!(passkey.is_well_formed());
+        assert!(AttestationScope::pending(4, LIFETIME, Some(&passkey), None).is_none());
+        assert!(AttestationScope::pending(5, LIFETIME, Some(&passkey), None).is_none());
+        for id in ["AAECAw", "", "BwcHBwcHBwcHBwcHBwcHBw=="] {
+            assert!(
+                !AttestedApprover::MainnetPasskey {
+                    credential_id_b64url: id.to_owned()
+                }
+                .is_well_formed(),
+                "{id}"
+            );
+        }
+        let debug = format!("{passkey:?}");
+        assert!(!debug.contains("BwcHBwcHBwcHBwcHBwcHBw"), "{debug}");
+    }
+
+    /// The version 4 layout of a local and a remote approval is frozen.
+    #[test]
+    fn version_4_known_answers_are_unchanged() {
+        let binding = AttestationBinding::new("default", "stellar:testnet");
+        let local = compute_attestation_v4(
+            &[0x42; 32],
+            &binding,
+            "nonce",
+            &[1; 32],
+            "1000",
+            &LIFETIME,
+            &AttestedApprover::Local,
+        );
+        let remote = compute_attestation_v4(
+            &[0x42; 32],
+            &binding,
+            "nonce",
+            &[1; 32],
+            "1000",
+            &LIFETIME,
+            &AttestedApprover::Remote {
+                credential_id_b64url: "AAECAw".to_owned(),
+            },
+        );
+        assert_eq!(
+            crate::hex::encode(&local),
+            "638a4456b01167ffd03cf0f474ec9e4560189c9cd2250f8a2fb1b8cc14250682"
+        );
+        assert_eq!(
+            crate::hex::encode(&remote),
+            "f92567fa7d210f4c11467319bf9d5d36d4e6b3309fb1bd55421899f877a0d223"
+        );
     }
 }

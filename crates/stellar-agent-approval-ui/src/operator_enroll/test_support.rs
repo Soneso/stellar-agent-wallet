@@ -14,7 +14,8 @@ use p256::elliptic_curve::sec1::ToEncodedPoint as _;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use super::confirmation::operator_enrollment_confirmation_code;
+use super::EnrollmentPurpose;
+use super::confirmation::enrollment_confirmation_code;
 use super::registration::{
     COSE_ALG_ES256, EnrollCredentialRequest, FLAG_AT, FLAG_UP, FLAG_UV, REGISTRATION_RP_ID,
 };
@@ -408,10 +409,18 @@ impl RegistrationBuilder {
         })
     }
 
-    /// The confirmation code the page shows for this response.
+    /// The operator credential confirmation code the page shows for this
+    /// response.
     #[must_use]
     pub fn confirmation_code(&self) -> String {
-        operator_enrollment_confirmation_code(
+        self.confirmation_code_for(EnrollmentPurpose::RemoteOperator)
+    }
+
+    /// The confirmation code a `purpose` page shows for this response.
+    #[must_use]
+    pub fn confirmation_code_for(&self, purpose: EnrollmentPurpose) -> String {
+        enrollment_confirmation_code(
+            purpose,
             &self.challenge,
             &self.posted_credential_id,
             &self.posted_public_key,
@@ -534,7 +543,7 @@ impl EnrollmentClient {
 
     /// Runs the page's ceremony with `registrar`: requests a challenge,
     /// registers over it, posts the response, and returns the server's reply
-    /// with the code the page would show.
+    /// with the code an operator credential page shows.
     ///
     /// # Errors
     ///
@@ -545,6 +554,22 @@ impl EnrollmentClient {
         registrar: &SoftwareRegistrar,
         label: &str,
     ) -> std::io::Result<(HttpReply, String)> {
+        let (reply, builder) = self.register_response(registrar, label).await?;
+        Ok((reply, builder.confirmation_code()))
+    }
+
+    /// [`Self::register`], returning the posted response, from which the
+    /// code of either page purpose follows through
+    /// [`RegistrationBuilder::confirmation_code_for`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::register`].
+    pub async fn register_response(
+        &self,
+        registrar: &SoftwareRegistrar,
+        label: &str,
+    ) -> std::io::Result<(HttpReply, RegistrationBuilder)> {
         let reply = self.challenge().await?;
         let challenge: [u8; 32] = reply.json()["challenge"]
             .as_str()
@@ -553,14 +578,15 @@ impl EnrollmentClient {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no challenge"))?;
         let builder = registrar.builder(&challenge, &self.origin()).label(label);
         let reply = self.post_credential(&builder.json()).await?;
-        Ok((reply, builder.confirmation_code()))
+        Ok((reply, builder))
     }
 }
 
 /// The JSON data island with `id` in `html`.
 fn island(html: &str, id: &str) -> Option<serde_json::Value> {
-    let open = format!(r#"<script type="application/json" id="{id}">"#);
-    let start = html.find(&open)? + open.len();
+    let open = format!(r#"<script type="application/json" id="{id}""#);
+    let tag = html.find(&open)?;
+    let start = tag + html[tag..].find('>')? + 1;
     let rest = &html[start..];
     let end = rest.find("</script>")?;
     serde_json::from_str(&rest[..end]).ok()

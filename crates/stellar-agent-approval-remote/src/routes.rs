@@ -914,6 +914,10 @@ fn outcome_to_response(outcome: stellar_agent_approval_ui::Outcome) -> Response 
         // like an invalid assertion, so the response does not tell a
         // removed credential from a bad signature.
         Outcome::Unauthorized => return assertion_invalid(),
+        Outcome::PresenceRefused { code, message } => (
+            StatusCode::FORBIDDEN,
+            json!({"status": "presence_refused", "code": code, "error": message}),
+        ),
         _ => (
             StatusCode::SERVICE_UNAVAILABLE,
             json!({"status": "unavailable", "retriable": false}),

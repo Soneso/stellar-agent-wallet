@@ -1124,7 +1124,9 @@ async fn mpp_commit_drains_a_queued_consent_row_before_the_signed_resimulation()
         &AttestationBinding::new(NAME, "stellar:testnet"),
         Surface::Cli,
         ConsentAudit::Outbox(&outbox),
-        &stellar_agent_core::approval::AttestedApprover::Local,
+        stellar_agent_core::approval::ConsentAuthorization::Standard(
+            &stellar_agent_core::approval::AttestedApprover::Local,
+        ),
         |_, _| Err("no grant".to_owned()),
     )
     .expect("approve");
@@ -1414,7 +1416,9 @@ async fn split_mpp_approval_prepare_records_commit_request() {
                 &AttestationBinding::new(NAME, "stellar:testnet"),
                 Surface::Cli,
                 ConsentAudit::Outbox(&outbox),
-                &stellar_agent_core::approval::AttestedApprover::Local,
+                stellar_agent_core::approval::ConsentAuthorization::Standard(
+                    &stellar_agent_core::approval::AttestedApprover::Local,
+                ),
                 |_, _| Err("no grant".into()),
             )
             .unwrap();

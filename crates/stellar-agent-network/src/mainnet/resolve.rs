@@ -759,6 +759,7 @@ mod enabled {
     )]
     pub(super) fn final_checks(
         context: &MainnetWriteContext,
+        policy: &VerifiedPolicy,
         approval: &ApprovalWitness,
         subject: [u8; 32],
         kind: ApprovedKind,
@@ -772,6 +773,13 @@ mod enabled {
             P::ApprovalProfileMismatch,
         )?;
         require(approval.chain().is_mainnet(), P::ApprovalChainMismatch)?;
+        // The consent names the owner-signed policy whose credential it was
+        // verified against; an authorization minted under any other policy
+        // would carry a consent that policy never admitted.
+        require(
+            approval.policy_digest() == policy.digest(),
+            P::ApprovalPolicyMismatch,
+        )?;
         require(approval.subject() == subject, P::ApprovalSubjectMismatch)?;
         require(approval.kind() == kind, P::ApprovalKindMismatch)?;
         require(approval.created_at_ms() <= now, P::NotYetValid)?;
@@ -957,6 +965,7 @@ mod enabled {
         let digest = approval_subject_classic(req.unsigned_envelope_xdr);
         final_checks(
             req.context,
+            req.policy,
             req.approval,
             digest,
             kind,
@@ -1121,6 +1130,7 @@ mod enabled {
         )?;
         final_checks(
             req.context,
+            req.policy,
             req.approval,
             authenticated.map_or_else(
                 || approval_subject_x402(&digest),
@@ -1198,6 +1208,10 @@ mod enabled {
             P::ApprovalProfileMismatch,
         )?;
         require(approval.chain().is_mainnet(), P::ApprovalChainMismatch)?;
+        require(
+            approval.policy_digest() == req.policy.digest(),
+            P::ApprovalPolicyMismatch,
+        )?;
         require(
             approval.kind() == ApprovedKind::X402Payment,
             P::ApprovalKindMismatch,
@@ -1981,14 +1995,7 @@ mod tests {
             || approval_subject_x402(&digest),
             |domain| approval_subject_x402_authenticated(&digest, domain),
         );
-        f.attested(
-            &entry,
-            &f.profile,
-            "operator",
-            ApprovedKind::X402Payment,
-            subject,
-            f.now,
-        )
+        f.attested(&entry, ApprovedKind::X402Payment, subject)
     }
     fn intent_request<'a>(
         f: &'a ResolverFixture,
@@ -2716,14 +2723,12 @@ mod tests {
     }
 
     async fn final_binding_refusal(case: &str, expected: P) {
+        let foreign =
+            (case == "profile").then(|| super::super::fixtures::foreign_profile_approval("other"));
         let f = ResolverFixture::new();
         let server = f.server().await;
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let client = context.primary_client().unwrap();
-        let mut profile = f.profile.clone();
-        if case == "chain" {
-            profile.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
-        }
         let envelope = if case == "subject" {
             changed_envelope(&f, |tx| {
                 tx.tx.memo = stellar_xdr::Memo::Text(b"other".to_vec().try_into().unwrap())
@@ -2774,13 +2779,9 @@ mod tests {
             entry.expires_at_unix_ms = f.now + 600_000;
             kind = stellar_agent_core::approval::witness::ApprovedKind::Trustline;
         }
-        let name = if case == "profile" {
-            "other"
-        } else {
-            "operator"
-        };
         let subject = stellar_agent_core::approval::subject::approval_subject_classic(&envelope);
-        let approval = f.attested(&entry, &profile, name, kind, subject, f.now);
+        let approval = foreign.unwrap_or_else(|| f.attested(&entry, kind, subject));
+        let another = (case == "policy").then(|| f.another_policy());
         let signer = crate::keyring::enrolled_signer(
             "operator",
             &f.dir.path().join("profiles"),
@@ -2792,6 +2793,9 @@ mod tests {
         let mut req = request(&f, &context, &client, &approval);
         if case == "signer_role" {
             req.signer = &signer;
+        }
+        if let Some(policy) = &another {
+            req.policy = policy;
         }
         if case == "audit_age" {
             f.clock
@@ -2818,7 +2822,7 @@ mod tests {
         };
     }
     binding_case!(approval_profile_refuses, "profile", ApprovalProfileMismatch);
-    binding_case!(approval_chain_refuses, "chain", ApprovalChainMismatch);
+    binding_case!(approval_policy_refuses, "policy", ApprovalPolicyMismatch);
     binding_case!(approval_subject_refuses, "subject", ApprovalSubjectMismatch);
     binding_case!(
         a_trustline_approval_does_not_authorize_a_payment,
@@ -2872,6 +2876,7 @@ mod tests {
         let check = |kind| {
             enabled::final_checks(
                 &f.context,
+                &f.policy,
                 &approval,
                 subject,
                 kind,
@@ -3152,14 +3157,22 @@ mod tests {
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let auth = resolved_intent(&f, &context, &root).await;
         let before = f.wire();
-        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::set_permissions(
+            f.window_path().parent().unwrap(),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
         let result = invalidate_unconsumed(
             &f.window,
             &context,
             auth.id(),
             InvalidationStage::SignRefused,
         );
-        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            f.window_path().parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         assert_refused(result, P::StoreUnavailable, &f, &before);
     }
 
@@ -3233,60 +3246,11 @@ mod tests {
         assert_eq!(f.enablement.policy_sequence(), f.policy.sequence());
     }
 
-    fn alternate_policy(
-        f: &ResolverFixture,
-        edit: impl FnOnce(&mut toml_edit::DocumentMut),
-        profile: &stellar_agent_core::profile::schema::Profile,
-        name: &str,
-    ) -> VerifiedPolicy {
-        use stellar_agent_core::policy::v1::{
-            canonical, signature,
-            verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
-        };
-        let owner = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
-        let mut raw = std::fs::read_to_string(f.dir.path().join("policy.toml"))
-            .unwrap()
-            .parse::<toml_edit::DocumentMut>()
-            .unwrap();
-        raw.remove("signature");
-        edit(&mut raw);
-        let canonical = canonical::canonical_bytes(&raw.to_string()).unwrap();
-        let signature = signature::sign(&signature::digest(&canonical), &owner);
-        let path = f.dir.path().join("alternate-policy.toml");
-        std::fs::write(
-            &path,
-            format!(
-                "{raw}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
-                stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()),
-                stellar_agent_core::hex::encode(&signature)
-            ),
-        )
-        .unwrap();
-        let mut profile = profile.clone();
-        profile
-            .policy_window_state_key_id
-            .account
-            .push_str("-alternate");
-        load_verified_policy(
-            &PolicyLoad {
-                path: &path,
-                profile: &profile,
-                profile_name: name,
-                owner_pubkey: &owner.verifying_key().to_bytes(),
-                owner_source: OwnerKeySource::Keyring,
-                window_path: &f.dir.path().join("alternate.window"),
-            },
-            stellar_agent_core::policy::v1::criteria::state_store::PolicyStateStore::new(),
-            PinMode::Advance,
-        )
-        .unwrap()
-    }
     async fn policy_binding_refusal(case: &str, expected: P) {
         let f = ResolverFixture::new();
         let approval = f.approval(&f.envelope, f.now, 600_000);
         let profile = f.profile.clone();
-        let policy = alternate_policy(
-            &f,
+        let policy = f.alternate_policy(
             |doc| match case {
                 "body" => {
                     doc.remove("mainnet");
@@ -3334,8 +3298,7 @@ mod tests {
         if !other_name {
             profile.rpc_url = "https://other.example.invalid".into();
         }
-        let policy = alternate_policy(
-            &f,
+        let policy = f.alternate_policy(
             |doc| {
                 doc["scope"] = toml_edit::value(format!("profile:{name}"));
                 doc["mainnet"]["profile"] = toml_edit::value(name);
@@ -3491,9 +3454,12 @@ mod tests {
             &before,
         );
     }
+    /// An approval consented under the policy before its rule was shortened
+    /// refuses under the re-signed policy: the consent names the policy it
+    /// was verified against, whatever lifetime the new rule would allow.
     #[tokio::test]
     #[serial_test::serial]
-    async fn approval_outliving_shortened_rule_refuses() {
+    async fn approval_before_a_shortened_rule_refuses_as_another_policy() {
         let mut f = ResolverFixture::configured(
             |_| {},
             |raw| {
@@ -3504,8 +3470,7 @@ mod tests {
             },
         );
         let approval = f.approval(&f.envelope, f.now, 3_600_000);
-        let policy = alternate_policy(
-            &f,
+        let policy = f.alternate_policy(
             |doc| {
                 doc["sequence"] = toml_edit::value(8);
                 doc["rules"][0]["ttl_secs"] = toml_edit::value(600);
@@ -3533,7 +3498,7 @@ mod tests {
                 profile_name: "operator",
                 owner_pubkey: &owner.verifying_key().to_bytes(),
                 owner_source: OwnerKeySource::Keyring,
-                window_path: &f.dir.path().join("state.window"),
+                window_path: &f.window_path(),
             },
             stellar_agent_core::policy::v1::criteria::state_store::PolicyStateStore::new(),
             PinMode::Advance,
@@ -3545,7 +3510,7 @@ mod tests {
         let before = f.wire();
         assert_refused(
             resolve_tx_sign(request(&f, &context, &client, &approval)).await,
-            P::ApprovalTtlExceedsRule,
+            P::ApprovalPolicyMismatch,
             &f,
             &before,
         );
@@ -3591,9 +3556,17 @@ mod tests {
         let approval = f.approval(&f.envelope, f.now, 600_000);
         let before = f.wire();
         let req = request(&f, &context, &client, &approval);
-        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::set_permissions(
+            f.window_path().parent().unwrap(),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
         let result = resolve_tx_sign(req).await;
-        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            f.window_path().parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         assert_refused(result, P::StoreUnavailable, &f, &before);
     }
     #[tokio::test]
@@ -3662,11 +3635,8 @@ mod tests {
         let subject = stellar_agent_core::approval::subject::approval_subject_x402(&digest);
         let approval = f.attested(
             &entry,
-            &f.profile,
-            "operator",
             stellar_agent_core::approval::witness::ApprovedKind::X402Payment,
             subject,
-            created,
         );
         f.clock.set(created - 8 * 24 * 60 * 60 * 1000);
         let before = f.wire();
@@ -3767,11 +3737,8 @@ mod tests {
             entry.expires_at_unix_ms = f.now + 600_000;
             let second = f.attested(
                 &entry,
-                &f.profile,
-                "operator",
                 stellar_agent_core::approval::witness::ApprovedKind::Payment,
                 stellar_agent_core::approval::subject::approval_subject_classic(&envelope),
-                f.now,
             );
             let before = f.wire();
             let mut req = request(&f, &context, &client, &second);
@@ -3790,6 +3757,8 @@ mod tests {
             subject::{approval_subject_x402, soroban_intent_digest},
             witness::ApprovedKind,
         };
+        let foreign =
+            (case == "profile").then(|| super::super::fixtures::foreign_profile_approval("other"));
         let f = soroban_fixture();
         let root = root(&f);
         let mut approved = root.clone();
@@ -3801,11 +3770,7 @@ mod tests {
             values[2] = ScVal::I128(stellar_xdr::Int128Parts { hi: 0, lo: 11 });
             args.args = values.try_into().unwrap();
         }
-        let mut profile = f.profile.clone();
-        if case == "chain" {
-            profile.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
-        }
-        let network_id = Sha256::digest(profile.chain_id.network_passphrase().as_bytes()).into();
+        let network_id = Sha256::digest(f.profile.chain_id.network_passphrase().as_bytes()).into();
         let mut entry = PendingApproval::new_x402_pending(
             &network_id,
             &approved,
@@ -3818,38 +3783,22 @@ mod tests {
         entry.expires_at_unix_ms = f.now + if case == "ttl" { 601_000 } else { 600_000 };
         let subject =
             approval_subject_x402(&soroban_intent_digest(&network_id, &approved).unwrap());
-        let approval = f.attested(
-            &entry,
-            &profile,
-            if case == "profile" {
-                "other"
-            } else {
-                "operator"
-            },
-            ApprovedKind::X402Payment,
-            subject,
-            f.now,
-        );
+        let approval =
+            foreign.unwrap_or_else(|| f.attested(&entry, ApprovedKind::X402Payment, subject));
+        let another = (case == "policy").then(|| f.another_policy());
         let server = f.server().await;
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let client = context.primary_client().unwrap();
         if case == "expired" {
             f.clock.set(f.now + 600_000);
         }
+        let intent = intent(&root);
+        let mut req = intent_request(&f, &context, &client, &intent, &approval);
+        if let Some(policy) = &another {
+            req.policy = policy;
+        }
         let before = f.wire();
-        assert_refused(
-            resolve_soroban_intent(intent_request(
-                &f,
-                &context,
-                &client,
-                &intent(&root),
-                &approval,
-            ))
-            .await,
-            expected,
-            &f,
-            &before,
-        );
+        assert_refused(resolve_soroban_intent(req).await, expected, &f, &before);
     }
     macro_rules! soroban_approval_case {
         ($name:ident, $case:literal, $expected:ident) => {
@@ -3866,9 +3815,9 @@ mod tests {
         ApprovalProfileMismatch
     );
     soroban_approval_case!(
-        soroban_approval_chain_refuses,
-        "chain",
-        ApprovalChainMismatch
+        soroban_approval_policy_refuses,
+        "policy",
+        ApprovalPolicyMismatch
     );
     soroban_approval_case!(
         soroban_approval_subject_refuses,
@@ -4366,42 +4315,6 @@ mod tests {
             .clone()
     }
 
-    /// The operator's attestation of the authenticated payment `root` for
-    /// `home_domain`, bound to `profile` under `name`.
-    fn bound_x402_approval(
-        f: &ResolverFixture,
-        root: &SorobanAuthorizedInvocation,
-        profile: &stellar_agent_core::profile::schema::Profile,
-        name: &str,
-    ) -> ApprovalWitness {
-        use stellar_agent_core::approval::subject::{
-            approval_subject_x402_authenticated, soroban_intent_digest,
-        };
-        let network_id = Sha256::digest(profile.chain_id.network_passphrase().as_bytes()).into();
-        let mut entry = stellar_agent_core::approval::PendingApproval::new_x402_pending(
-            &network_id,
-            root,
-            Some(MESSAGE_HOME_DOMAIN.to_owned()),
-            "1000".into(),
-            600_000,
-        )
-        .unwrap();
-        entry.created_at_unix_ms = f.now;
-        entry.expires_at_unix_ms = f.now + 600_000;
-        let subject = approval_subject_x402_authenticated(
-            &soroban_intent_digest(&network_id, root).unwrap(),
-            MESSAGE_HOME_DOMAIN,
-        );
-        f.attested(
-            &entry,
-            profile,
-            name,
-            ApprovedKind::X402Payment,
-            subject,
-            f.now,
-        )
-    }
-
     /// The accepted record of each lifetime source: the policy's
     /// `authorization_ttl_seconds`, the default, and an approval that
     /// expires first.
@@ -4476,6 +4389,8 @@ mod tests {
     }
 
     fn message_refusal(case: &str, expected: P) {
+        let foreign = (case == "approval_profile")
+            .then(|| super::super::fixtures::foreign_profile_approval("other"));
         let f = x402_fixture();
         let root = x402_root(&f);
         let mut intent = x402_intent(&root, MainnetConsumer::X402Authenticated);
@@ -4490,37 +4405,32 @@ mod tests {
             _ => {}
         }
         let message = message_facts([1; 32], EPHEMERAL);
-        let mut chain_profile = f.profile.clone();
-        chain_profile.chain_id = stellar_agent_core::profile::caip2::Caip2::Testnet;
         let approval = match case {
-            "approval_profile" => bound_x402_approval(&f, &root, &f.profile, "other"),
-            "approval_chain" => bound_x402_approval(&f, &root, &chain_profile, "operator"),
+            "approval_profile" => foreign.unwrap(),
             "approval_kind" => f.approval(&f.envelope, f.now, 600_000),
             "approval_other_domain" => f.x402_approval(&root, Some("other.example.com"), f.now),
             "approval_plain" => f.x402_approval(&root, None, f.now),
             _ => f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), f.now),
         };
         let policy = match case {
-            "policy_body" => Some(alternate_policy(
-                &f,
+            "policy_body" => Some(f.alternate_policy(
                 |doc| {
                     doc.remove("mainnet");
                 },
                 &f.profile,
                 "operator",
             )),
-            "enablement_sequence" => Some(alternate_policy(
-                &f,
+            "enablement_sequence" => Some(f.alternate_policy(
                 |doc| doc["sequence"] = toml_edit::value(8),
                 &f.profile,
                 "operator",
             )),
+            "approval_policy" => Some(f.another_policy()),
             _ => None,
         };
         let other_enablement = (case == "enablement_profile").then(|| {
             let profile = f.profile.clone();
-            let policy = alternate_policy(
-                &f,
+            let policy = f.alternate_policy(
                 |doc| {
                     doc["scope"] = toml_edit::value("profile:other");
                     doc["mainnet"]["profile"] = toml_edit::value("other");
@@ -4609,9 +4519,9 @@ mod tests {
         ApprovalProfileMismatch
     );
     message_case!(
-        message_approval_chain_refuses,
-        "approval_chain",
-        ApprovalChainMismatch
+        message_approval_policy_refuses,
+        "approval_policy",
+        ApprovalPolicyMismatch
     );
     message_case!(
         message_approval_kind_refuses,
@@ -4651,33 +4561,28 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn message_resolver_refusals_follow_the_check_order() {
-        use stellar_agent_core::profile::caip2::{Caip2, TESTNET_PASSPHRASE};
+        use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
         const OTHER: &str = "other-message-audit";
+        let other_profile = super::super::fixtures::foreign_profile_approval("other");
         let f = x402_fixture();
         let root = x402_root(&f);
         let message = message_facts([1; 32], EPHEMERAL);
         let mainnet = x402_intent(&root, MainnetConsumer::X402Authenticated).network_id;
         let testnet: [u8; 32] = Sha256::digest(TESTNET_PASSPHRASE.as_bytes()).into();
-        let without_mainnet = alternate_policy(
-            &f,
+        let without_mainnet = f.alternate_policy(
             |doc| {
                 doc.remove("mainnet");
             },
             &f.profile,
             "operator",
         );
-        let mut testnet_profile = f.profile.clone();
-        testnet_profile.chain_id = Caip2::Testnet;
+        let another = f.another_policy();
         stellar_agent_core::audit_log::writer::AuditWriterRegistry::remove_for_test(OTHER);
         let mut other_audit_profile = f.profile.clone();
         other_audit_profile.audit_log_path = f.dir.path().join("other-message-audit.jsonl");
         // An approval created now is created after the fixture's clock.
         let created = stellar_agent_core::timefmt::now_unix_ms().unwrap();
         assert!(created > f.now);
-        let other_profile =
-            f.approval_under(&f.envelope, created, 600_000, &testnet_profile, "other");
-        let other_chain =
-            f.approval_under(&f.envelope, created, 600_000, &testnet_profile, "operator");
         let other_kind = f.approval(&f.envelope, created, 600_000);
         let other_subject = f.x402_approval(&root, Some("other.example.com"), created);
         let approval = f.x402_approval(&root, Some(MESSAGE_HOME_DOMAIN), created);
@@ -4731,16 +4636,16 @@ mod tests {
             attempt(authenticated, &f.policy, testnet, &other_profile, audit),
             P::IntentNetworkMismatch,
         );
-        for (witness, expected) in [
-            (&other_profile, P::ApprovalProfileMismatch),
-            (&other_chain, P::ApprovalChainMismatch),
-            (&other_kind, P::ApprovalKindMismatch),
-            (&other_subject, P::ApprovalSubjectMismatch),
-            (&approval, P::NotYetValid),
+        for (policy, witness, expected) in [
+            (&f.policy, &other_profile, P::ApprovalProfileMismatch),
+            (&another, &approval, P::ApprovalPolicyMismatch),
+            (&f.policy, &other_kind, P::ApprovalKindMismatch),
+            (&f.policy, &other_subject, P::ApprovalSubjectMismatch),
+            (&f.policy, &approval, P::NotYetValid),
         ] {
             let audit = stale(&other_audit_profile, OTHER, f.now);
             refused(
-                attempt(authenticated, &f.policy, mainnet, witness, audit),
+                attempt(authenticated, policy, mainnet, witness, audit),
                 expected,
             );
         }
@@ -4787,14 +4692,7 @@ mod tests {
             &soroban_intent_digest(&intent.network_id, &root).unwrap(),
             MESSAGE_HOME_DOMAIN,
         );
-        let approval = f.attested(
-            &entry,
-            &f.profile,
-            "operator",
-            ApprovedKind::X402Payment,
-            subject,
-            created,
-        );
+        let approval = f.attested(&entry, ApprovedKind::X402Payment, subject);
         f.clock.set(created - 8 * 24 * 60 * 60 * 1000);
         let message = message_facts([1; 32], EPHEMERAL);
         let req = f.message_request(&intent, &message, &approval);
@@ -5056,10 +4954,18 @@ mod tests {
         f.anchor_failure
             .store(true, std::sync::atomic::Ordering::SeqCst);
         append_audit(&f);
-        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::set_permissions(
+            f.window_path().parent().unwrap(),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
         let (result, warnings) =
             mainnet_warnings(|| consume_message_sign(&f.context, auth, &f.window));
-        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            f.window_path().parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         f.anchor_failure
             .store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(

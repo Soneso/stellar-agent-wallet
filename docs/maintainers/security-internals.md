@@ -592,26 +592,106 @@ transaction binding, and signatures. `SubmissionRecorder::pre_send_authorized`
 durably consumes authorization before `sendTransaction`. Refusal after signing
 withholds submission; it does not establish that no signature exists.
 
-Pending-approval attestations use version 4: the version 3 fields (approval
-kind, creation time, and expiry) plus the approver, either the local operator
-or the remote operator credential the listener verified. Every pending-approval
-consumer requires `attestation_version = 4` with a well-formed approver; a
-record under version 2 or 3, or without an approver, verifies nothing, so
-pending approvals made before version 4 need fresh consent. Toolset grants keep
-their own versions. After the HMAC, kind, subject and lifetime checks, mainnet
-proof verification reads the profile's `[remote_approval]` block and the
-operator-credential store again for a remote approver and refuses when the
-credential is not listed (`approval.operator_credential_revoked`), is not
-enrolled (the same code), or the authorization cannot be read
-(`approval.remote_authorization_unavailable`). `approval.attestation_invalid`
-covers missing version 4 coverage or a mismatched subject. MCP reports failed
-approval proofs as `policy.approval_required`.
+Pending-approval attestations on testnet use version 4: the version 3 fields
+(approval kind, creation time, and expiry) plus the approver, either the local
+operator or the remote operator credential the listener verified. Every
+testnet pending-approval consumer requires `attestation_version = 4` with a
+well-formed approver; a record under version 2 or 3, or without an approver,
+verifies nothing. Toolset grants keep their own versions.
+`approval.attestation_invalid` covers missing coverage or a mismatched
+subject. MCP reports failed approval proofs as `policy.approval_required`.
 
-Direct CLI confirmation requires terminal stdin and stderr. The summary is
-rendered and flushed before reading the exact profile name. Terminal or name
-refusal occurs before pending insertion. Successful confirmation writes consent
-and persists its attestation before returning the witness. Its approval surface
-and audit origin are `cli-mainnet-confirm`.
+#### Mainnet presence consent
+
+A mainnet consent is a version 5 attestation with a mainnet passkey approver
+and a WebAuthn presence receipt. The attester takes a sealed
+`ConsentAuthorization`: `Standard` (local or remote approver) refuses on a
+mainnet binding with `approval.presence_required` before any row or store
+write, and `Mainnet` carries a `VerifiedMainnetPresence`, which only
+`verify_mainnet_presence` produces, with the current verified policy.
+
+A same-user process holding the audit HMAC key can wrap a version 5 record
+around a user-verified assertion that its own localhost page obtains. A
+misleading local page remains a risk. The owner seed admits approval
+credentials, so signing the policy on a host where same-user code runs
+exposes that seed.
+
+The ceremony issues one challenge per pending entry from
+`issue_mainnet_presence`, under the policy that `MainnetApprovalAuthority`
+loads from the persisted profile's owner key, signed policy, pin, and
+enablement, never from a request:
+
+```text
+challenge = SHA-256(
+  b"stellar-agent-mainnet-presence:v1" ||
+  random32 || lp(consent_request_id) || lp(approval_nonce) ||
+  lp(profile_name) || lp(chain_caip2) || lp(kind_name) ||
+  subject32 || lp(process_uid) ||
+  u64be(entry_created_at_ms) || u64be(entry_expires_at_ms) ||
+  i64be(policy_sequence) || policy_digest32 || policy_owner32 ||
+  lp(b"localhost") || lp(expected_origin) ||
+  u64be(challenge_issued_at_ms) || u64be(challenge_expires_at_ms)
+)
+```
+
+`lp(x)` is `u32be(len(x)) || x`. The subject is the classic envelope subject,
+the x402 subject with its home domain, or the trustline clawback opt-in digest;
+other kinds have no mainnet consent path. The challenge lives for the shorter
+of 120 seconds and the entry's remaining life, on the monotonic and the wall
+clock, and verifies at most once. The relying-party ID is `localhost`; the
+expected origin is exactly `http://localhost:<port>` from the bound listener,
+`crossOrigin` must be absent or false, and `topOrigin` absent.
+
+Verification runs the shared assertion primitive in
+`stellar-agent-core::approval::webauthn`, beside the DER-to-compact low-S
+normalization; the smart-account verification functions forward to both. The
+primitive checks the type, challenge, relying-party hash, user
+presence, user verification, the backup flag pair, and the ES256 signature over
+`authenticator_data || SHA-256(client_data_json)` under the public key the
+signed policy lists for the asserted credential ID.
+
+The receipt keeps the consent request ID, the random input, the policy
+sequence, digest, and owner, the expected origin, the issue, expiry, and
+verification times, and the raw assertion. Its digest is SHA-256 of
+`b"stellar-agent-mainnet-presence-receipt:v1"`, `u32(version)`,
+`lp(request_id)`, the random bytes, `i64(policy_sequence)`, the policy digest
+and owner bytes, `lp(expected_origin)`, the three times as `u64`, then `lp` of
+the credential ID, authenticator data, `clientDataJSON`, and compact signature.
+The version 5 HMAC is the version 4 preimage under the tag
+`stellar-agent-approval-attestation:v5`, with the approver tag `0x02` and the
+length-prefixed credential ID, followed by the 32-byte receipt digest. The
+store records version, approver, receipt, and blob together; the version 4
+record methods refuse a mainnet passkey approver.
+
+Before the row, the attester rechecks the locked entry's nonce, kind, uid, and
+both lifetime fields against the challenged snapshot, recomputes subject and
+challenge, requires the current policy to equal the challenge's policy by
+sequence, digest, and owner, and checks both deadlines again after the keyring
+and audit waits. The commit witness repeats the receipt checks without the
+browser session or the monotonic clock: version 5, the mainnet passkey
+approver, the HMAC, the raw assertion under the current signed key, the
+challenge recomputed from the stored record, `issued <= verified < expires`,
+`expires <= entry_expires`, at most 120 seconds of challenge life, and
+`verified <= now`. The witness binds the receipt digest and the policy digest,
+and authorization requires the policy digest to match the policy it resolves
+under (`approval_policy_mismatch`).
+
+The authority loads the policy with `PinMode::Advance` at challenge issue, so
+an observed credential removal cannot be rolled back through wallet commands,
+and with `PinMode::CompareOnly` at the witness. Lock order: the pending store,
+then the window state; no presence code runs while the window-state lock is
+held.
+
+The `approval_attested` row of a mainnet consent carries `mainnet_presence`:
+the credential fingerprint, the challenge and receipt digests, the policy
+digest and sequence, the relying-party ID and origin, the UP and UV flags, the
+signature counter, and the verification time. The counter is recorded only; no
+durable counter is kept and no clone is detected.
+
+This release connects no presence ceremony: direct CLI confirmation and bare
+`approve` render the summary and refuse with `approval.presence_required`, the
+local inbox refuses the same way, and the remote listener refuses with
+`approval.mainnet_remote_unsupported`. No mainnet consent is recorded.
 
 ### Endpoint identity before the first signed read
 
@@ -868,6 +948,10 @@ network-aware asset identity. A classic asset and its SAC count together;
 a SAC derived on another network does not match the classic identity.
 Claim legs have no asset and are not covered by the allowlist.
 
+Every build requires `mainnet.approval_credentials` with 1 to 16 credentials
+in any policy with a `[mainnet]` table; the loader, the minimum evaluator, the
+profile-body validator, and the canonicalizer share one parser, and the
+canonical form sorts the entries by raw credential ID.
 A `mainnet-write` build enforces the minimum policy when a mainnet profile
 loads or signs a v2 body with `[mainnet]`. It requires a positive sequence,
 a profile-specific scope, at least one rule, exact mainnet chain and tool

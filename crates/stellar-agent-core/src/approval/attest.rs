@@ -24,6 +24,20 @@
 //! [`attest_and_persist`] writes the consent row through a required
 //! [`ConsentAudit`] sink before it persists anything. A sink that refuses
 //! refuses the approval with nothing persisted.
+//!
+//! # Mainnet consent
+//!
+//! A mainnet binding admits only [`ConsentAuthorization::Mainnet`]: a
+//! [`VerifiedMainnetPresence`] and the current owner-signed policy. A
+//! [`ConsentAuthorization::Standard`] approver refuses with
+//! `approval.presence_required` before the key is read, a row is written or
+//! anything is persisted, in every build. The mainnet path rechecks the
+//! locked entry against the challenged snapshot, reloads the current policy,
+//! verifies the receipt again, checks both challenge deadlines immediately
+//! before the row, and records a version 5 attestation with its receipt.
+//! After the row is durable, the keyring anchor advance and store record can
+//! wait on the keyring, and every consumer rechecks the entry's expiry and
+//! the current policy at consumption.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -31,8 +45,10 @@ use keyring_core::Entry as KeyringEntry;
 use zeroize::Zeroizing;
 
 use crate::audit_log::entry::AuditEntry;
-use crate::audit_log::outbox::AuditOutbox;
-use crate::audit_log::writer::{AuditWriter, WriterError, audit_writer_refusal};
+use crate::audit_log::outbox::{AuditOutbox, PreparedOutboxAppend};
+use crate::audit_log::writer::{
+    AuditWriter, PreparedAuditEntry, WriterError, audit_writer_refusal,
+};
 use crate::error::{ApprovalFailure, WalletError};
 use crate::keyring_errors::{KeyringOperation, map_keyring_operation_error};
 use crate::profile::schema::KeyringEntryRef;
@@ -41,12 +57,15 @@ use crate::timefmt;
 use crate::envelope_decode::{ClassicSummary, ClassicTransactionKind, classic_summary};
 
 use super::attestation::{
-    AttestedApprover, compute_attestation_v4, compute_trustline_clawback_opt_in_digest,
+    AttestedApprover, compute_attestation_v4, compute_attestation_v5,
+    compute_trustline_clawback_opt_in_digest,
 };
 use super::error::ApprovalError;
+use super::presence::{MAINNET_CHAIN_ID, VerifiedMainnetPresence};
 use super::store::{ApprovalKind, PendingApproval, PendingApprovalStore};
 use super::subject::approval_subject_classic;
 use super::user_id::ApproverIdentity;
+use crate::mainnet::verified_policy::VerifiedPolicy;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Surface
@@ -393,12 +412,62 @@ pub enum ConsentAudit<'a> {
 }
 
 impl ConsentAudit<'_> {
+    fn prepare(&mut self) -> Result<PreparedConsentAudit<'_>, WriterError> {
+        match self {
+            Self::Writer(writer) => writer.prepare_entry().map(PreparedConsentAudit::Writer),
+            Self::Outbox(outbox) => outbox.prepare_append().map(PreparedConsentAudit::Outbox),
+        }
+    }
+
     fn write(&mut self, entry: AuditEntry) -> Result<(), WriterError> {
         match self {
             Self::Writer(writer) => writer.write_entry(entry),
             Self::Outbox(outbox) => outbox.append(&entry),
         }
     }
+}
+
+/// A consent sink with its pre-row waits complete.
+enum PreparedConsentAudit<'a> {
+    Writer(PreparedAuditEntry<'a>),
+    Outbox(PreparedOutboxAppend<'a>),
+}
+
+impl PreparedConsentAudit<'_> {
+    fn write(self, entry: AuditEntry) -> Result<(), WriterError> {
+        match self {
+            Self::Writer(writer) => writer.write(entry),
+            Self::Outbox(outbox) => outbox.append(&entry),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ConsentAuthorization
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What authorizes a consent.
+///
+/// Not `Clone`: a [`Self::Mainnet`] value carries a verified presence that
+/// one attestation consumes.
+#[derive(Debug)]
+#[non_exhaustive]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one value is built per consent and moved straight into the attester"
+)]
+pub enum ConsentAuthorization<'a> {
+    /// The approver the approving surface verified, for a testnet binding.
+    /// A mainnet binding refuses it with `approval.presence_required`.
+    Standard(&'a AttestedApprover),
+    /// A verified WebAuthn presence and the current owner-signed policy the
+    /// caller loaded after its waits, for a mainnet binding.
+    Mainnet {
+        /// The verified ceremony, consumed by the attestation.
+        presence: VerifiedMainnetPresence,
+        /// The current verified policy.
+        policy: &'a VerifiedPolicy,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -432,11 +501,16 @@ impl ConsentAudit<'_> {
 ///    after the row returns that failure, and the row then records a consent
 ///    that did not take effect.
 ///
-/// `approver` is the identity the approving surface verified, never a value
-/// read from request input: [`Surface::ServeRemote`] requires a
-/// [`AttestedApprover::Remote`] approver and every other surface requires
-/// [`AttestedApprover::Local`]; any other pairing refuses with
-/// `approval.user_mismatch` before anything is written.
+/// `authorization` is what the approving surface verified, never a value
+/// read from request input. For [`ConsentAuthorization::Standard`],
+/// [`Surface::ServeRemote`] requires a [`AttestedApprover::Remote`] approver
+/// and every other surface requires [`AttestedApprover::Local`]; any other
+/// pairing refuses with `approval.user_mismatch` before anything is written.
+/// A mainnet binding refuses `Standard` with `approval.presence_required`
+/// before anything else. [`ConsentAuthorization::Mainnet`] is admitted on a
+/// mainnet binding only, from every surface but [`Surface::ServeRemote`],
+/// for a payment, claim, trustline, x402 payment or trustline clawback
+/// opt-in; the module documentation describes its checks.
 ///
 /// # Errors
 ///
@@ -457,6 +531,13 @@ impl ConsentAudit<'_> {
 ///   `approval.consumed`, or `approval.wrong_kind`.
 /// - A refused consent row, with the `audit.*` code of the refusal.
 /// - A store or `persist_toolset_grant` failure after the row.
+/// - On mainnet: `approval.presence_required` for a standard approver,
+///   `approval.mainnet_remote_unsupported` from the remote surface,
+///   `approval.presence_policy_unavailable` when the current policy cannot be
+///   loaded or differs from the challenged one, `approval.presence_expired`
+///   past a challenge deadline, and `approval.presence_invalid` for a receipt
+///   that does not verify again. A mainnet authorization on another chain
+///   refuses with `approval.binding_mismatch`.
 #[allow(
     clippy::too_many_arguments,
     reason = "every attester passes the store, the entry, the key, the binding and the surface explicitly"
@@ -472,9 +553,21 @@ pub fn attest_and_persist(
     binding: &super::AttestationBinding<'_>,
     surface: Surface,
     mut audit: ConsentAudit<'_>,
-    approver: &AttestedApprover,
+    authorization: ConsentAuthorization<'_>,
     persist_toolset_grant: impl FnOnce(&ToolsetGrantRequest<'_>, &[u8; 32]) -> Result<(), String>,
 ) -> Result<Option<String>, WalletError> {
+    let approver = match authorization {
+        ConsentAuthorization::Standard(_) if binding.chain_id == MAINNET_CHAIN_ID => {
+            return Err(WalletError::Approval(ApprovalFailure::PresenceRequired));
+        }
+        ConsentAuthorization::Standard(approver) => approver,
+        ConsentAuthorization::Mainnet { presence, policy } => {
+            let gated_tool = mainnet_gated_tool(&entry.kind)?;
+            return attest_mainnet_presence(
+                store, entry, key_bytes, binding, surface, &mut audit, presence, policy, gated_tool,
+            );
+        }
+    };
     let operator_credential_id_b64url = approver_matches_surface(surface, approver)?;
     let (key_arr, now_ms) = prepare_attestation(store, entry, key_bytes, binding)?;
     let profile = binding.profile_name;
@@ -871,8 +964,8 @@ fn prepare_attestation<'k>(
 ///
 /// The caller validated `validated` earlier, possibly through another store
 /// handle, and another process may have attested, rejected, consumed, or
-/// replaced it since. The same pending entry means the whole `kind` value and
-/// the `process_uid` are equal. Each refusal carries the code
+/// replaced it since. The same pending entry means the whole `kind` value,
+/// the `process_uid`, and both lifetime fields are equal. Each refusal carries the code
 /// [`record_attestation_on_store`] gives for the same condition, so a caller
 /// maps both the same way. No row is written for a refused entry.
 fn refuse_unless_still_pending(
@@ -883,7 +976,11 @@ fn refuse_unless_still_pending(
     let Some(current) = store.get(&validated.approval_nonce) else {
         return Err(record_error(&ApprovalError::NotFound));
     };
-    if current.kind != validated.kind || current.process_uid != validated.process_uid {
+    if current.kind != validated.kind
+        || current.process_uid != validated.process_uid
+        || current.created_at_unix_ms != validated.created_at_unix_ms
+        || current.expires_at_unix_ms != validated.expires_at_unix_ms
+    {
         return Err(match current.kind {
             ApprovalKind::Rejected { .. } => rejected_error(),
             ApprovalKind::Consumed { .. } => consumed_error(),
@@ -908,12 +1005,20 @@ fn refuse_unless_still_pending(
     Ok(())
 }
 
-/// Attests a classic mainnet confirmation after rechecking its pending record.
+/// Attests a direct mainnet confirmation of a classic transaction with its
+/// verified presence, after rechecking the pending record.
 ///
-/// Consent is durable before the attestation is persisted.
+/// The consent is the version 5 attestation [`attest_and_persist`] records
+/// for [`ConsentAuthorization::Mainnet`], under [`Surface::CliMainnetConfirm`]
+/// and `gated_tool`; the row is durable before the attestation is persisted.
 ///
 /// # Errors
-/// Returns the approval validation, consent, or persistence error.
+/// `approval.wrong_kind` for a kind other than a payment, claim or trustline;
+/// otherwise the errors of the mainnet path of [`attest_and_persist`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the store, entry, key, binding, sink, tool, policy and proof are each explicit"
+)]
 pub fn attest_mainnet_confirmation(
     store: &mut PendingApprovalStore,
     entry: &PendingApproval,
@@ -921,9 +1026,145 @@ pub fn attest_mainnet_confirmation(
     binding: &super::AttestationBinding<'_>,
     mut audit: ConsentAudit<'_>,
     gated_tool: &str,
+    policy: &VerifiedPolicy,
+    presence: VerifiedMainnetPresence,
 ) -> Result<(), WalletError> {
-    let (key_arr, now_ms) = prepare_attestation(store, entry, key_bytes, binding)?;
-    let digest = match &entry.kind {
+    if !matches!(
+        entry.kind,
+        ApprovalKind::PaymentSimulated { .. }
+            | ApprovalKind::ClaimSimulated { .. }
+            | ApprovalKind::TrustlineSimulated { .. }
+    ) {
+        return Err(WalletError::Approval(ApprovalFailure::WrongKind {
+            detail: "mainnet confirmation requires a classic transaction".to_owned(),
+        }));
+    }
+    attest_mainnet_presence(
+        store,
+        entry,
+        key_bytes,
+        binding,
+        Surface::CliMainnetConfirm,
+        &mut audit,
+        presence,
+        policy,
+        gated_tool,
+    )
+    .map(|_| ())
+}
+
+/// The commit tool a mainnet consent to `kind` gates.
+fn mainnet_gated_tool(kind: &ApprovalKind) -> Result<&'static str, WalletError> {
+    match kind {
+        ApprovalKind::PaymentSimulated { .. } => Ok("stellar_pay_commit"),
+        ApprovalKind::ClaimSimulated { .. } => Ok("stellar_claim_commit"),
+        ApprovalKind::TrustlineSimulated { .. } | ApprovalKind::TrustlineClawbackOptIn { .. } => {
+            Ok("stellar_trustline_commit")
+        }
+        ApprovalKind::X402Payment { .. } => Ok("stellar_x402_create_payment"),
+        ApprovalKind::Rejected { .. } => Err(rejected_error()),
+        ApprovalKind::Consumed { .. } => Err(consumed_error()),
+        _ => Err(WalletError::Approval(ApprovalFailure::WrongKind {
+            detail: super::presence::UNSUPPORTED_KIND_MESSAGE.to_owned(),
+        })),
+    }
+}
+
+/// The mainnet consent path of [`attest_and_persist`].
+///
+/// In order, all before the row:
+///
+/// 1. The surface is local, the binding is mainnet and names the profile and
+///    chain the challenge bound, and `entry` is the challenged entry.
+/// 2. The key is 32 bytes, and the audit sink completes its acquisition,
+///    drain and state waits; the locked store still holds the challenged
+///    snapshot: same nonce, kind, process UID and both lifetime fields,
+///    unattested and live.
+/// 3. The current owner-signed policy, loaded again without advancing the
+///    pin, is `policy` and is the policy the challenge bound.
+/// 4. The receipt verifies again over the locked entry: the recomputed
+///    subject and challenge, the raw assertion under the signed key.
+/// 5. Both challenge deadlines are still live, checked immediately before
+///    the row because the keyring, policy and audit waits can cross them.
+///
+/// Then the row, then one store replacement with the version 5 blob, the
+/// mainnet passkey approver and the receipt.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the store, entry, key, binding, surface, sink, proof, policy and tool are each explicit"
+)]
+fn attest_mainnet_presence(
+    store: &mut PendingApprovalStore,
+    entry: &PendingApproval,
+    key_bytes: &[u8],
+    binding: &super::AttestationBinding<'_>,
+    surface: Surface,
+    audit: &mut ConsentAudit<'_>,
+    presence: VerifiedMainnetPresence,
+    policy: &VerifiedPolicy,
+    gated_tool: &str,
+) -> Result<Option<String>, WalletError> {
+    if surface == Surface::ServeRemote {
+        return Err(WalletError::Approval(
+            ApprovalFailure::MainnetRemoteUnsupported,
+        ));
+    }
+    let mismatch = || {
+        WalletError::Approval(ApprovalFailure::BindingMismatch {
+            detail: "this request belongs to another profile or network".to_owned(),
+        })
+    };
+    if binding.chain_id != MAINNET_CHAIN_ID {
+        return Err(mismatch());
+    }
+    let parts = presence.into_parts();
+    if parts.profile_name != binding.profile_name
+        || parts.chain_id != binding.chain_id
+        || parts.entry.approval_nonce != entry.approval_nonce
+    {
+        return Err(mismatch());
+    }
+    let key: &[u8; 32] = key_bytes.try_into().map_err(|_| {
+        WalletError::Approval(ApprovalFailure::KeyLengthError {
+            detail: format!("attestation key must be 32 bytes, got {}", key_bytes.len()),
+        })
+    })?;
+    let audit = audit
+        .prepare()
+        .map_err(|error| audit_writer_refusal(binding.profile_name, &error))?;
+    let now_ms = timefmt::now_unix_ms().map_err(|e| map_clock_error(&e))?;
+    refuse_unless_still_pending(store, &parts.entry, now_ms)?;
+    let current = store
+        .get(&parts.entry.approval_nonce)
+        .cloned()
+        .ok_or_else(|| record_error(&ApprovalError::NotFound))?;
+
+    let loaded =
+        super::presence_policy::MainnetApprovalAuthority::for_profile(binding.profile_name)?
+            .load_current_compare_only()?;
+    if !loaded.is(policy) || !super::presence_policy::same_policy(policy, &parts.policy) {
+        return Err(WalletError::Approval(
+            ApprovalFailure::PresencePolicyUnavailable,
+        ));
+    }
+
+    let subject = super::presence::mainnet_consent_subject(&current, binding)?;
+    let stored =
+        super::presence::verify_receipt(&current, &parts.receipt, binding, policy, now_ms)?;
+    let approver = AttestedApprover::MainnetPasskey {
+        credential_id_b64url: parts.receipt.credential_id_b64url(),
+    };
+    let attestation_blob = compute_attestation_v5(
+        key,
+        binding,
+        &current.approval_nonce,
+        &subject,
+        &current.process_uid,
+        &current.attested_lifetime(),
+        &approver,
+        &parts.receipt,
+    );
+    let envelope_sha256_hex = match &current.kind {
         ApprovalKind::PaymentSimulated {
             envelope_sha256_hex,
             ..
@@ -935,27 +1176,49 @@ pub fn attest_mainnet_confirmation(
         | ApprovalKind::TrustlineSimulated {
             envelope_sha256_hex,
             ..
-        } => envelope_sha256_hex,
-        _ => {
-            return Err(WalletError::Approval(ApprovalFailure::WrongKind {
-                detail: "mainnet confirmation requires a classic transaction".to_owned(),
-            }));
-        }
+        } => Some(envelope_sha256_hex.clone()),
+        ApprovalKind::X402Payment { .. } => Some(crate::hex::encode(&subject)),
+        _ => None,
     };
-    attest_envelope_and_persist(
-        store,
-        entry,
-        key_arr,
-        binding,
-        &mut audit,
-        Surface::CliMainnetConfirm,
-        &AttestedApprover::Local,
-        now_ms,
-        digest,
-        entry.kind.kind_name(),
+
+    let row_ms = timefmt::now_unix_ms().map_err(|e| map_clock_error(&e))?;
+    if std::time::Instant::now() >= parts.deadline
+        || row_ms < parts.receipt.issued_at_unix_ms()
+        || row_ms >= parts.receipt.expires_at_unix_ms()
+    {
+        return Err(WalletError::Approval(ApprovalFailure::PresenceExpired));
+    }
+    let row = AuditEntry::new_mainnet_approval_attested(
+        current.kind.kind_name(),
         gated_tool,
-    )
-    .map(|_| ())
+        envelope_sha256_hex,
+        &current.approval_nonce,
+        surface.as_str(),
+        parts.receipt.request_id(),
+        binding.chain_id,
+        super::presence::presence_audit(&stored, &parts.receipt),
+    );
+    audit.write(row).map_err(|e| {
+        tracing::warn!(
+            error = %e,
+            approval_kind = current.kind.kind_name(),
+            "mainnet approval attest: the consent row was not written; nothing is persisted"
+        );
+        audit_writer_refusal(binding.profile_name, &e)
+    })?;
+    store
+        .record_mainnet_attestation_at(
+            &current.approval_nonce,
+            attestation_blob,
+            approver,
+            parts.receipt,
+            row_ms,
+        )
+        .map_err(|e| record_error(&e))?;
+    Ok(match current.kind {
+        ApprovalKind::TrustlineClawbackOptIn { .. } => None,
+        _ => Some(URL_SAFE_NO_PAD.encode(attestation_blob)),
+    })
 }
 
 /// Maps a pending-store failure to its `approval.*` refusal.
@@ -1203,7 +1466,7 @@ mod tests {
             &binding(),
             Surface::Cli,
             ConsentAudit::Writer(&mut writer),
-            &AttestedApprover::Local,
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
             |_, _| {
                 grant_persisted = true;
                 Ok(())
@@ -1630,7 +1893,7 @@ mod tests {
             &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            &AttestedApprover::Local,
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
             |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
         )
         .unwrap();
@@ -1683,7 +1946,7 @@ mod tests {
             &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            &AttestedApprover::Local,
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
             |_req, _key| Err("must not be called".to_owned()),
         )
         .unwrap_err();
@@ -1723,7 +1986,7 @@ mod tests {
             &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            &AttestedApprover::Local,
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
             |req, _key| {
                 assert_eq!(req.toolset_name, "my-toolset");
                 assert_eq!(req.capability, "sign-payment");
@@ -1773,7 +2036,7 @@ mod tests {
             &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            &AttestedApprover::Local,
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
             |_req, _key| Err("grant store unavailable".to_owned()),
         )
         .unwrap_err();
@@ -1850,7 +2113,7 @@ mod tests {
             &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            &AttestedApprover::Local,
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
             |_req, _key| Err("must not be called for RuleProposalSimulated".to_owned()),
         )
         .unwrap();
@@ -1903,7 +2166,7 @@ mod tests {
             &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            &AttestedApprover::Local,
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
             |_req, _key| Err("must not be called".to_owned()),
         )
         .unwrap_err();
@@ -1915,7 +2178,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut audit_writer = test_audit_writer(&dir);
         let mut store = PendingApprovalStore::open(dir.path().join("a.toml")).unwrap();
-        let entry = make_rule_proposal_entry(DEFAULT_TTL_MS);
+        let mut entry = make_rule_proposal_entry(DEFAULT_TTL_MS);
+        let ApprovalKind::RuleProposalSimulated { chain_id, .. } = &mut entry.kind else {
+            unreachable!()
+        };
+        "stellar:mainnet".clone_into(chain_id);
         store
             .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
             .unwrap();
@@ -1923,10 +2190,10 @@ mod tests {
             &mut store,
             &entry,
             &[0x42; 32],
-            &crate::approval::AttestationBinding::new("a", "stellar:mainnet"),
+            &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            &AttestedApprover::Local,
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
             |_, _| Ok(()),
         )
         .unwrap_err();
@@ -1980,7 +2247,7 @@ mod tests {
                 &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
                 Surface::Cli,
                 ConsentAudit::Writer(&mut audit_writer),
-                &AttestedApprover::Local,
+                ConsentAuthorization::Standard(&AttestedApprover::Local),
                 |_, _| Ok(()),
             )
             .unwrap_err();
@@ -2117,7 +2384,7 @@ mod tests {
                 &binding(),
                 Surface::Cli,
                 ConsentAudit::Writer(&mut writer),
-                &AttestedApprover::Local,
+                ConsentAuthorization::Standard(&AttestedApprover::Local),
                 |_, _| {
                     grant_persisted = true;
                     Ok(())
@@ -2159,7 +2426,7 @@ mod tests {
                 &binding(),
                 Surface::Cli,
                 ConsentAudit::Outbox(&outbox),
-                &AttestedApprover::Local,
+                ConsentAuthorization::Standard(&AttestedApprover::Local),
                 |_, _| {
                     grant_persisted = true;
                     Ok(())
@@ -2210,7 +2477,7 @@ mod tests {
                 &binding(),
                 Surface::Cli,
                 ConsentAudit::Writer(&mut writer),
-                &AttestedApprover::Local,
+                ConsentAuthorization::Standard(&AttestedApprover::Local),
                 |_, _| {
                     row_before_grant = Some(
                         std::fs::read_to_string(&audit_path)
@@ -2292,7 +2559,7 @@ mod tests {
                 &binding(),
                 Surface::Cli,
                 ConsentAudit::Writer(&mut writer),
-                &AttestedApprover::Local,
+                ConsentAuthorization::Standard(&AttestedApprover::Local),
                 |_, _| {
                     grant_persisted = true;
                     Ok(())
@@ -2322,7 +2589,7 @@ mod tests {
             &binding(),
             Surface::Cli,
             ConsentAudit::Writer(&mut writer),
-            &AttestedApprover::Local,
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
             |_, _| {
                 grant_persisted = true;
                 Ok(())
@@ -2333,22 +2600,21 @@ mod tests {
         err
     }
 
-    /// The stored entry expired after the caller validated its copy. The
-    /// re-read refuses before the row, so no row records a consent the store
-    /// then refuses.
+    /// The entry expired after the caller validated it. The re-read refuses
+    /// before the row, so no row records a consent the store then refuses.
     #[test]
     fn an_entry_that_expired_since_validation_refuses_with_no_row() {
-        for (kind, entry) in every_attestable_kind() {
+        for (kind, mut entry) in every_attestable_kind() {
             let dir = TempDir::new().unwrap();
             let store_path = dir.path().join("a.toml");
             let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
-            // The stored entry is the validated one with its expiry passed.
-            let mut stored = entry.clone();
-            stored.expires_at_unix_ms = stored.created_at_unix_ms;
+            entry.expires_at_unix_ms = entry.created_at_unix_ms + 1;
             store
-                .insert(stored, entry.created_at_unix_ms.saturating_sub(1))
+                .insert(entry.clone(), entry.created_at_unix_ms)
                 .unwrap();
-            assert!(!entry.is_expired(timefmt::now_unix_ms().unwrap()));
+            while !entry.is_expired(timefmt::now_unix_ms().unwrap()) {
+                std::thread::yield_now();
+            }
 
             let err = attest_validated_copy(&dir, &mut store, &entry);
             assert_eq!(err.code(), "approval.expired", "{kind}: {err}");
@@ -2360,6 +2626,38 @@ mod tests {
                 left.is_some_and(|e| e.attestation_blob_b64.is_none()),
                 "{kind}: nothing is persisted"
             );
+        }
+    }
+
+    /// Another process replaced the entry under the same nonce with one of
+    /// another lifetime. The attestation binds the lifetime, so the re-read
+    /// compares both lifetime fields and refuses before the row; otherwise the
+    /// stored entry would carry a blob over a lifetime it does not have.
+    #[test]
+    fn an_entry_whose_lifetime_changed_since_validation_refuses_with_no_row() {
+        for (kind, entry) in every_attestable_kind() {
+            for field in ["created", "expires"] {
+                let dir = TempDir::new().unwrap();
+                let store_path = dir.path().join("a.toml");
+                let mut store = PendingApprovalStore::open(store_path.clone()).unwrap();
+                let mut stored = entry.clone();
+                if field == "created" {
+                    stored.created_at_unix_ms -= 1;
+                } else {
+                    stored.expires_at_unix_ms += 1;
+                }
+                store
+                    .insert(stored, timefmt::now_unix_ms().unwrap())
+                    .unwrap();
+                let err = attest_validated_copy(&dir, &mut store, &entry);
+                assert_eq!(err.code(), "approval.wrong_kind", "{kind} {field}: {err}");
+                assert!(consent_rows(&dir).is_empty(), "{kind} {field}");
+                drop(store);
+                assert!(
+                    still_pending(&store_path, &entry.approval_nonce),
+                    "{kind} {field}"
+                );
+            }
         }
     }
 
@@ -2461,7 +2759,7 @@ mod tests {
                     Surface::Cli
                 },
                 ConsentAudit::Writer(&mut writer),
-                &approver,
+                ConsentAuthorization::Standard(&approver),
                 |_, _| panic!("trustlines do not mint grants"),
             )
             .unwrap()
@@ -2542,22 +2840,6 @@ mod tests {
                 "approval.expired",
                 "{kind}"
             );
-            {
-                let mut writer = test_audit_writer(&dir);
-                assert_eq!(
-                    attest_mainnet_confirmation(
-                        &mut store,
-                        &entry,
-                        &[0x42; 32],
-                        &binding(),
-                        ConsentAudit::Writer(&mut writer),
-                        "stellar_pay"
-                    )
-                    .unwrap_err()
-                    .code(),
-                    "approval.expired"
-                );
-            }
             assert!(consent_rows(&dir).is_empty());
             assert!(
                 store
@@ -2569,16 +2851,16 @@ mod tests {
         }
     }
 
+    /// The direct mainnet confirmation rechecks the locked entry against the
+    /// challenged snapshot: a changed process UID, an attestation by another
+    /// handle, or a changed lifetime refuses with no row.
     #[test]
+    #[serial_test::serial]
     fn mainnet_confirmation_rechecks_the_pending_entry() {
-        for (_, entry) in every_attestable_kind().into_iter().filter(|(_, e)| {
-            matches!(
-                e.kind,
-                ApprovalKind::PaymentSimulated { .. }
-                    | ApprovalKind::TrustlineSimulated { .. }
-                    | ApprovalKind::ClaimSimulated { .. }
-            )
-        }) {
+        use crate::approval::mainnet_fixtures::{ATTESTATION_KEY, MainnetConsentFixture};
+        let fixture = MainnetConsentFixture::new("confirm");
+        let policy = fixture.current_policy();
+        for (kind, entry) in classic_entries() {
             for case in 0..3 {
                 let dir = TempDir::new().unwrap();
                 let mut store =
@@ -2594,30 +2876,69 @@ mod tests {
                         "approval.already_attested"
                     }
                     _ => {
-                        current.expires_at_unix_ms = current.created_at_unix_ms;
-                        "approval.expired"
+                        current.expires_at_unix_ms -= 1;
+                        "approval.wrong_kind"
                     }
                 };
-                store
-                    .insert(current, entry.created_at_unix_ms.saturating_sub(1))
-                    .unwrap();
+                store.insert(current, entry.created_at_unix_ms).unwrap();
+                let presence = fixture.presence(&entry, &policy);
                 let mut writer = test_audit_writer(&dir);
                 assert_eq!(
                     attest_mainnet_confirmation(
                         &mut store,
                         &entry,
-                        &[0x42; 32],
-                        &binding(),
+                        &ATTESTATION_KEY,
+                        &fixture.binding(),
                         ConsentAudit::Writer(&mut writer),
-                        "stellar_pay"
+                        "stellar_pay",
+                        &policy,
+                        presence,
                     )
                     .unwrap_err()
                     .code(),
-                    expected
+                    expected,
+                    "{kind} case {case}"
                 );
-                assert!(consent_rows(&dir).is_empty());
+                assert!(consent_rows(&dir).is_empty(), "{kind} case {case}");
             }
         }
+    }
+
+    /// The direct mainnet confirmation admits only classic transactions.
+    #[test]
+    #[serial_test::serial]
+    fn mainnet_confirmation_refuses_non_classic_kinds() {
+        use crate::approval::mainnet_fixtures::{ATTESTATION_KEY, MainnetConsentFixture};
+        let fixture = MainnetConsentFixture::new("confirm");
+        let policy = fixture.current_policy();
+        let payment = fixture.payment(DEFAULT_TTL_MS);
+        let presence = fixture.presence(&payment, &policy);
+        let dir = TempDir::new().unwrap();
+        let mut store = PendingApprovalStore::open(dir.path().join("pending.toml")).unwrap();
+        let opt_in = PendingApproval::new_trustline_clawback_opt_in_pending(
+            "stellar:mainnet".to_owned(),
+            "USDC".to_owned(),
+            USDC_ISSUER.to_owned(),
+            process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        store
+            .insert(opt_in.clone(), opt_in.created_at_unix_ms)
+            .unwrap();
+        let error = attest_mainnet_confirmation(
+            &mut store,
+            &opt_in,
+            &ATTESTATION_KEY,
+            &fixture.binding(),
+            ConsentAudit::Writer(&mut test_audit_writer(&dir)),
+            "stellar_trustline_commit",
+            &policy,
+            presence,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "approval.wrong_kind");
+        assert!(consent_rows(&dir).is_empty());
     }
 
     fn x402_root(amount: i128) -> stellar_xdr::SorobanAuthorizedInvocation {
@@ -2672,43 +2993,47 @@ mod tests {
             &binding(),
             surface,
             ConsentAudit::Writer(writer),
-            &AttestedApprover::Local,
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
             |_, _| panic!("no grant"),
         )
         .map(|_| ())
     }
 
-    fn x402_verify(
-        store: &PendingApprovalStore,
-        entry: &PendingApproval,
-        subject: [u8; 32],
-    ) -> Result<crate::approval::witness::ApprovalWitness, WalletError> {
-        use crate::approval::witness::{ApprovalExpectation, ApprovedKind, verify_approval};
-        let profile =
-            crate::profile::schema::Profile::builder_testnet("a", "acct", "n", "acct").build();
-        keyring_core::Entry::new(
-            &profile.attestation_key_id.service,
-            &profile.attestation_key_id.account,
-        )
-        .unwrap()
-        .set_password(&URL_SAFE_NO_PAD.encode([0x42; 32]))
-        .unwrap();
-        let blob = URL_SAFE_NO_PAD
+    /// Whether the stored attestation of `entry` verifies over `subject`
+    /// under the test key and binding.
+    fn x402_verify(entry: &PendingApproval, subject: [u8; 32]) -> bool {
+        let blob: [u8; 32] = URL_SAFE_NO_PAD
             .decode(entry.attestation_blob_b64.as_ref().unwrap())
             .unwrap()
             .try_into()
             .unwrap();
-        verify_approval(
-            store,
-            &profile,
-            "a",
+        crate::approval::verify_attestation(
+            &[0x42; 32],
+            &binding(),
             &entry.approval_nonce,
+            &subject,
+            &entry.process_uid,
+            &entry.attestation_scope().unwrap(),
             &blob,
-            &ApprovalExpectation {
-                kind: ApprovedKind::X402Payment,
-                subject,
-            },
-            entry.created_at_unix_ms,
+        )
+    }
+
+    /// The subject of a stored x402 entry on the test binding's network.
+    fn x402_stored_subject(entry: &PendingApproval) -> Result<[u8; 32], WalletError> {
+        let ApprovalKind::X402Payment {
+            intent_digest,
+            root_invocation_xdr,
+            home_domain,
+            ..
+        } = &entry.kind
+        else {
+            unreachable!()
+        };
+        crate::approval::subject::verified_x402_subject(
+            intent_digest,
+            root_invocation_xdr,
+            home_domain.as_deref(),
+            crate::profile::caip2::Caip2::Testnet.network_passphrase(),
         )
     }
 
@@ -2737,12 +3062,8 @@ mod tests {
         drop(store);
         let store = PendingApprovalStore::open(path).unwrap();
         let entry = store.get(&entry.approval_nonce).unwrap();
-        let witness = x402_verify(&store, entry, subject).unwrap();
-        assert_eq!(witness.subject(), subject);
-        assert_eq!(
-            witness.kind(),
-            crate::approval::witness::ApprovedKind::X402Payment
-        );
+        assert_eq!(x402_stored_subject(entry).unwrap(), subject);
+        assert!(x402_verify(entry, subject));
         assert_eq!(
             consent_rows(&dir)[0]["gated_tool"],
             "stellar_x402_create_payment"
@@ -2777,12 +3098,9 @@ mod tests {
                 Surface::Cli,
             )
             .unwrap();
-            assert_eq!(
-                x402_verify(&store, store.get(&entry.approval_nonce).unwrap(), subject)
-                    .unwrap()
-                    .subject(),
-                subject
-            );
+            let stored = store.get(&entry.approval_nonce).unwrap();
+            assert_eq!(x402_stored_subject(stored).unwrap(), subject);
+            assert!(x402_verify(stored, subject));
         }
     }
 
@@ -2812,34 +3130,18 @@ mod tests {
                 Surface::Cli,
             )
             .unwrap();
-            let mut edited = store.get(&entry.approval_nonce).unwrap().clone();
-            let ApprovalKind::X402Payment {
-                intent_digest,
-                root_invocation_xdr,
-                home_domain,
-                ..
-            } = &mut edited.kind
-            else {
+            let attested = store.get(&entry.approval_nonce).unwrap().clone();
+            assert!(x402_verify(
+                &attested,
+                x402_stored_subject(&attested).unwrap()
+            ));
+            let mut edited = attested.clone();
+            let ApprovalKind::X402Payment { home_domain, .. } = &mut edited.kind else {
                 unreachable!()
             };
             *home_domain = after.map(str::to_owned);
-            let subject = crate::approval::subject::verified_x402_subject(
-                intent_digest,
-                root_invocation_xdr,
-                home_domain.as_deref(),
-                crate::profile::caip2::Caip2::Testnet.network_passphrase(),
-            )
-            .unwrap();
-            drop(store);
-            let other_path = dir.path().join("edited.toml");
-            let mut other = PendingApprovalStore::open(other_path).unwrap();
-            other
-                .insert(edited.clone(), edited.created_at_unix_ms)
-                .unwrap();
-            assert_eq!(
-                x402_verify(&other, &edited, subject).unwrap_err().code(),
-                "approval.attestation_invalid"
-            );
+            let subject = x402_stored_subject(&edited).unwrap();
+            assert!(!x402_verify(&edited, subject));
         }
     }
 
@@ -2867,7 +3169,8 @@ mod tests {
         )
         .unwrap();
         let attested = store.get(&entry.approval_nonce).unwrap().clone();
-        assert!(x402_verify(&store, &attested, subject).is_ok());
+        assert_eq!(x402_stored_subject(&attested).unwrap(), subject);
+        assert!(x402_verify(&attested, subject));
         drop(store);
 
         let mut edited = attested.clone();
@@ -2881,11 +3184,7 @@ mod tests {
         *root_invocation_xdr = x402_root(11)
             .to_xdr_base64(stellar_xdr::Limits::none())
             .unwrap();
-        let mut other = PendingApprovalStore::open(dir.path().join("edited.toml")).unwrap();
-        other
-            .insert(edited.clone(), edited.created_at_unix_ms)
-            .unwrap();
-        let error = x402_verify(&other, &edited, subject).unwrap_err();
+        let error = x402_stored_subject(&edited).unwrap_err();
         assert_eq!(error.code(), "approval.attestation_invalid");
         assert!(
             error
@@ -3022,8 +3321,8 @@ mod tests {
     }
 
     /// An envelope that does not decode as the entry's kind is refused even
-    /// when the stored digest is its digest, on the approve path and on the
-    /// mainnet confirmation path.
+    /// when the stored digest is its digest, on the approve path and by the
+    /// mainnet consent subject.
     #[test]
     fn attestation_refuses_an_entry_whose_envelope_does_not_decode() {
         let uid = process_uid_for_attestation().unwrap();
@@ -3067,13 +3366,9 @@ mod tests {
                     .contains("the stored envelope does not decode"),
                 "{err}"
             );
-            let err = attest_mainnet_confirmation(
-                &mut store,
+            let err = crate::approval::mainnet_consent_subject(
                 &entry,
-                &[0x42; 32],
-                &binding(),
-                ConsentAudit::Writer(&mut test_audit_writer(&dir)),
-                "stellar_pay_commit",
+                &crate::approval::AttestationBinding::new(BINDING_PROFILE, "stellar:mainnet"),
             )
             .unwrap_err();
             assert_eq!(err.code(), "approval.entry_inconsistent", "{err}");
@@ -3134,7 +3429,7 @@ mod tests {
                 &binding(),
                 Surface::Cli,
                 ConsentAudit::Writer(&mut test_audit_writer(&dir)),
-                &AttestedApprover::Local,
+                ConsentAuthorization::Standard(&AttestedApprover::Local),
                 |_, _| panic!("no grant"),
             )
             .unwrap()
@@ -3184,7 +3479,7 @@ mod tests {
             &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            &AttestedApprover::Local,
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
             |_, _| Ok(()),
         )
         .unwrap_err();

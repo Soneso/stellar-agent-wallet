@@ -33,15 +33,27 @@
 //! consent row and attestation are persisted, so a credential removed while
 //! the keyring prompt waits cannot approve. A credential the current files do
 //! not admit answers [`Outcome::Unauthorized`] with the store unchanged.
+//!
+//! # Mainnet
+//!
+//! A mainnet consent needs a verified WebAuthn assertion from an approval
+//! credential in the owner-signed policy, which neither a local session nor
+//! a remote listener's allowlist supplies. A remote approve on mainnet
+//! refuses before any read with `approval.mainnet_remote_unsupported`. A
+//! local approve reaches the shared attester, which refuses the standard
+//! authorization on a mainnet binding with `approval.presence_required`
+//! before any row or attestation. Both answer [`Outcome::PresenceRefused`]
+//! with the store unchanged. A reject needs no presence and is unchanged.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::approval::error::ApprovalError;
+use stellar_agent_core::approval::presence::MAINNET_CHAIN_ID;
 use stellar_agent_core::approval::{
-    ApprovalKind, ApproverIdentity, AttestedApprover, ConsentAudit, DEFAULT_RETRY_ATTEMPTS,
-    DEFAULT_RETRY_BACKOFF, PendingApprovalStore, RemoteApprovalAuthority, Surface,
-    attest_and_persist, load_and_validate_entry, load_attestation_key, open_with_retry,
+    ApprovalKind, ApproverIdentity, AttestedApprover, ConsentAudit, ConsentAuthorization,
+    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApprovalStore, RemoteApprovalAuthority,
+    Surface, attest_and_persist, load_and_validate_entry, load_attestation_key, open_with_retry,
     process_uid_for_attestation,
 };
 use stellar_agent_core::audit_log::entry::AuditEntry;
@@ -214,6 +226,68 @@ pub enum Outcome {
     /// operator-credential store, remote approval is disabled, or the
     /// authorization cannot be read. Nothing was attested and no row written.
     Unauthorized,
+    /// A mainnet consent this surface cannot record. `code` is the stable
+    /// `approval.*` code and `message` its fixed text, both from the fixed
+    /// presence refusal table. Nothing was attested and no row written.
+    PresenceRefused {
+        /// The stable `approval.*` code.
+        code: &'static str,
+        /// The fixed operator-facing message of the code.
+        message: &'static str,
+    },
+}
+
+/// The mainnet presence refusal of `error`, when it is one: its stable code
+/// and fixed message.
+///
+/// The table is fixed text, so a refusal carries no detail of the failure
+/// and needs no `Clone` or `Eq` on the error.
+#[must_use]
+pub(crate) fn presence_refusal(error: &WalletError) -> Option<Outcome> {
+    use stellar_agent_core::ApprovalFailure as F;
+    let WalletError::Approval(failure) = error else {
+        return None;
+    };
+    let message = match failure {
+        F::PresenceRequired => {
+            "Mainnet consent requires a verified assertion from an approval credential in the \
+             owner-signed policy."
+        }
+        F::PresenceInvalid => {
+            "The mainnet presence assertion is invalid; start a new approval ceremony."
+        }
+        F::PresenceChanged => {
+            "The consent details have changed; reload the approval page and review them again."
+        }
+        F::PresenceExpired => {
+            "The mainnet presence challenge has expired; start a new approval ceremony."
+        }
+        F::PresenceConsumed => {
+            "The mainnet presence challenge is unavailable or already used; start a new \
+             approval ceremony."
+        }
+        F::PresencePolicyUnavailable => {
+            "The current owner-signed mainnet approval policy cannot be verified; restore a \
+             valid policy and start a new approval ceremony."
+        }
+        F::PresenceBrowserRequired => {
+            "Mainnet consent requires a local browser with WebAuthn user verification; no \
+             approval is recorded."
+        }
+        F::PresenceUnavailable => {
+            "The mainnet presence ceremony cannot start or complete; no approval is recorded."
+        }
+        F::PresenceCanceled => "Mainnet consent is canceled; no approval is recorded.",
+        F::MainnetRemoteUnsupported => {
+            "Mainnet consent uses the local localhost passkey page; remote approval is \
+             unavailable for mainnet."
+        }
+        _ => return None,
+    };
+    Some(Outcome::PresenceRefused {
+        code: failure.code(),
+        message,
+    })
 }
 
 /// Apply one operator [`Decision`] against the profile's approval store, on
@@ -405,6 +479,14 @@ fn approval_code_is(err: &WalletError, code: &str) -> bool {
 }
 
 fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity) -> Outcome {
+    if ctx.context.chain_id == MAINNET_CHAIN_ID
+        && matches!(requester, RequestIdentity::Remote { .. })
+    {
+        return presence_refusal(&WalletError::Approval(
+            stellar_agent_core::ApprovalFailure::MainnetRemoteUnsupported,
+        ))
+        .unwrap_or(Outcome::Unavailable);
+    }
     let store = match open_store(ctx, "approve") {
         Ok(s) => s,
         Err(outcome) => return outcome,
@@ -504,7 +586,7 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
         &ctx.context.binding(),
         resolved.surface,
         ConsentAudit::Writer(&mut writer),
-        &resolved.approver,
+        ConsentAuthorization::Standard(&resolved.approver),
         |req, grant_key| {
             stellar_agent_toolsets_runtime::record_first_invoke_grant(
                 profile_name,
@@ -531,6 +613,9 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
             expires_at_unix_ms: entry.expires_at_unix_ms,
         },
         Err(e) => {
+            if let Some(refusal) = presence_refusal(&e) {
+                return refusal;
+            }
             if approval_code_is(&e, "approval.binding_mismatch") {
                 return Outcome::BindingMismatch;
             }
@@ -1041,23 +1126,50 @@ mod tests {
         assert!(entry.attestation_blob_b64.is_none(), "nothing is attested");
     }
 
+    /// Every presence code maps to its own code and the exact core message,
+    /// and no other approval failure is a presence refusal.
+    #[test]
+    fn presence_refusals_carry_the_core_code_and_message() {
+        use stellar_agent_core::ApprovalFailure as F;
+        for failure in [
+            F::PresenceRequired,
+            F::PresenceInvalid,
+            F::PresenceChanged,
+            F::PresenceExpired,
+            F::PresenceConsumed,
+            F::PresencePolicyUnavailable,
+            F::PresenceBrowserRequired,
+            F::PresenceUnavailable,
+            F::PresenceCanceled,
+            F::MainnetRemoteUnsupported,
+        ] {
+            let expected = Outcome::PresenceRefused {
+                code: failure.code(),
+                message: Box::leak(failure.to_string().into_boxed_str()),
+            };
+            assert_eq!(
+                presence_refusal(&WalletError::Approval(failure)),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            presence_refusal(&WalletError::Approval(F::UserMismatch {
+                detail: "x".to_owned()
+            })),
+            None
+        );
+    }
+
+    /// A local approve on mainnet reaches the shared attester, which refuses
+    /// the standard authorization: the decision answers the presence
+    /// refusal, and neither an attestation nor a row is persisted.
     #[test]
     #[serial]
-    fn approve_payment_mainnet_mints_verifiable_attestation() {
+    fn a_local_mainnet_approve_is_refused_and_records_nothing() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut fx = fixture("payment-mainnet");
         fx.ctx.context.chain_id = "stellar:mainnet".to_owned();
-        let entry = payment_entry(DEFAULT_TTL_MS);
-        let process_uid = entry.process_uid.clone();
-        let envelope_sha256_hex = match &entry.kind {
-            ApprovalKind::PaymentSimulated {
-                envelope_sha256_hex,
-                ..
-            } => envelope_sha256_hex.clone(),
-            _ => unreachable!(),
-        };
-        let attested = entry.clone();
-        let nonce = insert(&fx.ctx, entry);
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
 
         let outcome = apply_decision(
             &fx.ctx,
@@ -1066,40 +1178,19 @@ mod tests {
             },
             &RequestIdentity::Local,
         );
-        let attestation = match outcome {
-            Outcome::Attested { attestation, .. } => attestation.expect("payment surfaces a blob"),
-            other => panic!("expected Attested, got {other:?}"),
-        };
-
-        // Independently verify the surfaced blob against the attestation key.
-        let sha = decode_sha256_hex(&envelope_sha256_hex).unwrap();
-        let expected = compute_attestation_v4(
-            &fx.raw_key,
-            &fx.ctx.context.binding(),
-            &nonce,
-            &sha,
-            &process_uid,
-            &attested.attested_lifetime(),
-            &AttestedApprover::Local,
+        assert_eq!(
+            outcome,
+            Outcome::PresenceRefused {
+                code: "approval.presence_required",
+                message: "Mainnet consent requires a verified assertion from an approval \
+                          credential in the owner-signed policy.",
+            }
         );
-        let blob: [u8; 32] = URL_SAFE_NO_PAD
-            .decode(&attestation)
-            .unwrap()
-            .try_into()
-            .unwrap();
-        assert_eq!(blob, expected);
         let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
-        let persisted = store.get(&nonce).unwrap();
-        assert!(persisted.attested_approver == Some(AttestedApprover::Local));
-        assert!(verify_attestation(
-            &fx.raw_key,
-            &fx.ctx.context.binding(),
-            &nonce,
-            &sha,
-            &process_uid,
-            &persisted.attestation_scope().unwrap(),
-            &blob
-        ));
+        let entry = store.get(&nonce).expect("the entry stays");
+        assert!(entry.attestation_blob_b64.is_none());
+        assert!(entry.attested_approver.is_none());
+        assert_eq!(rows_of_kind(&audit_path(&fx), "approval_attested"), 0);
     }
 
     #[test]
@@ -1959,6 +2050,51 @@ mod tests {
             rows_of_kind(&audit_path(&fx), "approval_attested_remote"),
             1
         );
+    }
+
+    /// A remote approve on mainnet refuses as unsupported before the store,
+    /// the authorization or the key is read, even for an admitted
+    /// credential, and records nothing. A remote reject stays available.
+    #[test]
+    #[serial]
+    fn a_remote_mainnet_approve_is_refused_as_unsupported() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut fx = fixture("remote-mainnet");
+        fx.ctx.context.chain_id = "stellar:mainnet".to_owned();
+        allow(&fx, &[credential_id(1)]);
+        enroll(&fx, &credential_id(1));
+        let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Approve {
+                nonce: nonce.clone(),
+            },
+            &remote_requester(&fx, &credential_id(1), &nonce),
+        );
+        assert_eq!(
+            outcome,
+            Outcome::PresenceRefused {
+                code: "approval.mainnet_remote_unsupported",
+                message: "Mainnet consent uses the local localhost passkey page; remote \
+                          approval is unavailable for mainnet.",
+            }
+        );
+        let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
+        let entry = store.get(&nonce).expect("the entry stays");
+        assert!(entry.attestation_blob_b64.is_none());
+        assert_eq!(
+            rows_of_kind(&audit_path(&fx), "approval_attested_remote"),
+            0
+        );
+        drop(store);
+        let outcome = apply_decision(
+            &fx.ctx,
+            Decision::Reject {
+                nonce: nonce.clone(),
+            },
+            &remote_requester(&fx, &credential_id(1), &nonce),
+        );
+        assert_eq!(outcome, Outcome::Rejected);
     }
 
     /// The credential is removed from the allowlist while the attestation key

@@ -443,8 +443,14 @@ impl LedgerFixture {
 }
 
 /// Resolver inputs produced by the signed-policy, enrollment, approval, and audit verifiers.
+///
+/// The fixture's directory is the process `STELLAR_AGENT_HOME` while it
+/// lives: the signed policy and its pin sit where the approval authority
+/// reads them, so the witness producer loads the policy the resolver is
+/// handed. A test that uses it runs under `#[serial]`.
 pub(crate) struct ResolverFixture {
     pub(crate) dir: TempDir,
+    _home: stellar_agent_test_support::StellarAgentHomeGuard,
     pub(crate) profile: Profile,
     pub(crate) context: crate::MainnetWriteContext,
     pub(crate) policy: stellar_agent_core::mainnet::verified_policy::VerifiedPolicy,
@@ -483,6 +489,7 @@ impl ResolverFixture {
         stellar_agent_core::audit_log::writer::AuditWriterRegistry::remove_for_test("operator");
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let dir = TempDir::new().unwrap();
+        let home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
         let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() - 300_000;
         let clock = set_now_ms_for_test(now);
         // The served source account is at sequence 1, so its next
@@ -562,7 +569,8 @@ impl ResolverFixture {
         let raw = policy_edit(&raw);
         let canonical = canonical::canonical_bytes(&raw).unwrap();
         let signature = signature::sign(&signature::digest(&canonical), &owner);
-        let policy_path = dir.path().join("policy.toml");
+        let policy_path = Self::default_policy_path();
+        std::fs::create_dir_all(policy_path.parent().unwrap()).unwrap();
         std::fs::write(
             &policy_path,
             format!(
@@ -572,7 +580,8 @@ impl ResolverFixture {
             ),
         )
         .unwrap();
-        let window_path = dir.path().join("state.window");
+        let window_path = Self::default_window_path();
+        std::fs::create_dir_all(window_path.parent().unwrap()).unwrap();
         let policy = load_verified_policy(
             &PolicyLoad {
                 path: &policy_path,
@@ -618,6 +627,7 @@ impl ResolverFixture {
         .unwrap();
         Self {
             dir,
+            _home: home,
             profile,
             context,
             policy,
@@ -632,25 +642,37 @@ impl ResolverFixture {
         }
     }
 
+    /// The signed policy file, where the approval authority reads it.
+    fn default_policy_path() -> std::path::PathBuf {
+        stellar_agent_core::profile::schema::default_policy_dir()
+            .unwrap()
+            .join("operator.toml")
+    }
+
+    /// The window-state file the policy pin and the ledger share, where the
+    /// approval authority reads the pin.
+    fn default_window_path() -> std::path::PathBuf {
+        stellar_agent_core::profile::schema::default_policy_window_state_path_for("operator")
+    }
+
+    /// The signed policy file of the fixture.
+    pub(crate) fn policy_path(&self) -> std::path::PathBuf {
+        Self::default_policy_path()
+    }
+
+    /// The window-state file of the fixture.
+    pub(crate) fn window_path(&self) -> std::path::PathBuf {
+        Self::default_window_path()
+    }
+
+    /// The classic payment approval of `envelope`, created at `created` and
+    /// expiring `ttl` later, consented and verified as [`Self::attested`]
+    /// describes.
     pub(crate) fn approval(
         &self,
         envelope: &str,
         created: u64,
         ttl: u64,
-    ) -> stellar_agent_core::approval::witness::ApprovalWitness {
-        self.approval_under(envelope, created, ttl, &self.profile, "operator")
-    }
-
-    /// The classic payment approval of `envelope`, created at `created` and
-    /// expiring `ttl` later, attested and verified at `created` for `profile`
-    /// under `name`.
-    pub(crate) fn approval_under(
-        &self,
-        envelope: &str,
-        created: u64,
-        ttl: u64,
-        profile: &Profile,
-        name: &str,
     ) -> stellar_agent_core::approval::witness::ApprovalWitness {
         use stellar_agent_core::approval::PendingApproval;
         let args = stellar_agent_core::envelope_decode::decode_authoritative_args(
@@ -675,50 +697,88 @@ impl ResolverFixture {
         entry.expires_at_unix_ms = created + ttl;
         self.attested(
             &entry,
-            profile,
-            name,
             stellar_agent_core::approval::witness::ApprovedKind::Payment,
             stellar_agent_core::approval::subject::approval_subject_classic(envelope),
-            created,
         )
     }
 
+    /// The operator's witness of `entry` as `kind` over `subject`.
+    ///
+    /// The entry is inserted into its own store and consented through the
+    /// production attester with a presence the fixture credential signs over
+    /// a challenge issued under the current signed policy; the witness comes
+    /// from the production producer under the same policy. The attester and
+    /// the producer read the wall clock, so `entry`'s lifetime covers the
+    /// present; the resolver reads the fixture's clock.
     pub(crate) fn attested(
         &self,
         entry: &stellar_agent_core::approval::PendingApproval,
-        profile: &Profile,
-        name: &str,
         kind: stellar_agent_core::approval::witness::ApprovedKind,
         subject: [u8; 32],
-        now: u64,
     ) -> stellar_agent_core::approval::witness::ApprovalWitness {
         use base64::Engine as _;
         use stellar_agent_core::approval::{
-            AttestationBinding, ConsentAudit, PendingApprovalStore, Surface, attest_and_persist,
+            AttestationBinding, ConsentAudit, ConsentAuthorization, MainnetApprovalAuthority,
+            PendingApprovalStore, Surface, attest_and_persist, issue_mainnet_presence,
             load_attestation_key,
+            mainnet_fixtures::MainnetConsentFixture,
+            verify_mainnet_presence,
             witness::{ApprovalExpectation, verify_approval},
         };
+        let wall = || stellar_agent_core::timefmt::now_unix_ms().unwrap();
         let path = self.dir.path().join(format!(
             "{}-{}.toml",
             entry.approval_nonce,
             stellar_agent_core::hex::encode(&subject)
         ));
         let mut store = PendingApprovalStore::open(path).unwrap();
-        store.insert(entry.clone(), now).unwrap();
-        let audit = self.audit();
+        store.insert(entry.clone(), wall()).unwrap();
         let key = load_attestation_key(
-            &profile.attestation_key_id,
-            &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(name, profile),
+            &self.profile.attestation_key_id,
+            &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
+                "operator",
+                &self.profile,
+            ),
         )
         .unwrap();
+        let binding = AttestationBinding::new("operator", self.profile.chain_id.caip2_str());
+        let policy = MainnetApprovalAuthority::for_profile("operator")
+            .unwrap()
+            .load_current()
+            .unwrap()
+            .into_policy();
+        let challenge = issue_mainnet_presence(
+            entry,
+            &binding,
+            &policy,
+            &MainnetConsentFixture::origin(),
+            wall(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        let assertion = MainnetConsentFixture::sign(
+            &stellar_agent_test_support::webauthn::fixture_authenticator(),
+            &challenge,
+        );
+        let presence = verify_mainnet_presence(
+            challenge,
+            MainnetConsentFixture::input(&assertion),
+            wall(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        let audit = self.audit();
         attest_and_persist(
             &mut store,
             entry,
             &key,
-            &AttestationBinding::new(name, profile.chain_id.caip2_str()),
+            &binding,
             Surface::Cli,
             ConsentAudit::Writer(&mut audit.writer().lock().unwrap()),
-            &stellar_agent_core::approval::AttestedApprover::Local,
+            ConsentAuthorization::Mainnet {
+                presence,
+                policy: &policy,
+            },
             |_, _| Err("unexpected grant".to_owned()),
         )
         .unwrap();
@@ -735,14 +795,91 @@ impl ResolverFixture {
             .unwrap();
         verify_approval(
             &store,
-            profile,
-            name,
+            &self.profile,
+            "operator",
             &entry.approval_nonce,
             &blob,
             &ApprovalExpectation { kind, subject },
-            now,
+            &policy,
+            wall(),
         )
         .unwrap()
+    }
+
+    /// The fixture's signed policy with `edit` applied, signed by the same
+    /// owner and verified for `profile` under `name` with a pin of its own
+    /// for each distinct body.
+    pub(crate) fn alternate_policy(
+        &self,
+        edit: impl FnOnce(&mut toml_edit::DocumentMut),
+        profile: &Profile,
+        name: &str,
+    ) -> stellar_agent_core::mainnet::verified_policy::VerifiedPolicy {
+        use stellar_agent_core::policy::v1::{
+            canonical, signature,
+            verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+        };
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let mut raw = std::fs::read_to_string(self.policy_path())
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        raw.remove("signature");
+        edit(&mut raw);
+        let canonical = canonical::canonical_bytes(&raw.to_string()).unwrap();
+        let digest = signature::digest(&canonical);
+        let signature = signature::sign(&digest, &owner);
+        let label = stellar_agent_core::hex::encode(&digest[..8]);
+        let path = self.dir.path().join("alternate-policy.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "{raw}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+                stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()),
+                stellar_agent_core::hex::encode(&signature)
+            ),
+        )
+        .unwrap();
+        let mut profile = profile.clone();
+        profile
+            .policy_window_state_key_id
+            .account
+            .push_str(&format!("-alternate-{label}"));
+        load_verified_policy(
+            &PolicyLoad {
+                path: &path,
+                profile: &profile,
+                profile_name: name,
+                owner_pubkey: &owner.verifying_key().to_bytes(),
+                owner_source: OwnerKeySource::Keyring,
+                window_path: &self.dir.path().join(format!("alternate-{label}.window")),
+            },
+            stellar_agent_core::policy::v1::criteria::state_store::PolicyStateStore::new(),
+            PinMode::Advance,
+        )
+        .unwrap()
+    }
+
+    /// [`Self::alternate_policy`] for the operator with one rule bound
+    /// raised: the enablement facts, the sequence and every evaluation the
+    /// fixtures make are unchanged, and only the policy digest differs.
+    pub(crate) fn another_policy(
+        &self,
+    ) -> stellar_agent_core::mainnet::verified_policy::VerifiedPolicy {
+        let profile = self.profile.clone();
+        self.alternate_policy(
+            |doc| {
+                let raised = doc.to_string().replace("max_calls = 10", "max_calls = 11");
+                assert_ne!(
+                    raised,
+                    doc.to_string(),
+                    "the fixture policy has a rate limit"
+                );
+                *doc = raised.parse().unwrap();
+            },
+            &profile,
+            "operator",
+        )
     }
 
     pub(crate) fn context_with_routes(
@@ -760,7 +897,7 @@ impl ResolverFixture {
     }
 
     pub(crate) fn wire(&self) -> serde_json::Value {
-        let path = self.dir.path().join("state.window");
+        let path = self.window_path();
         if !path.exists() {
             return serde_json::json!({});
         }
@@ -826,6 +963,64 @@ pub(crate) fn x402_fixture() -> ResolverFixture {
     ResolverFixture::configured(|_| {}, |raw| x402_policy(raw, |rule| rule))
 }
 
+/// The witness of the payment record `entry` builds, consented on the
+/// enabled mainnet profile `name` under that profile's own temporary home
+/// and keyring.
+///
+/// A resolver fixture and the authorization tests install their own keyring
+/// and home, so a test takes this witness before it builds them.
+pub(crate) fn witness_under_own_home(
+    name: &str,
+    entry: impl FnOnce(
+        &stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture,
+    ) -> stellar_agent_core::approval::PendingApproval,
+) -> stellar_agent_core::approval::witness::ApprovalWitness {
+    use base64::Engine as _;
+    use stellar_agent_core::approval::{
+        ApprovalKind,
+        mainnet_fixtures::MainnetConsentFixture,
+        subject::approval_subject_classic,
+        witness::{ApprovalExpectation, ApprovedKind, verify_approval},
+    };
+    let fixture = MainnetConsentFixture::new(name);
+    let entry = entry(&fixture);
+    let ApprovalKind::PaymentSimulated {
+        envelope_xdr_b64, ..
+    } = &entry.kind
+    else {
+        unreachable!("the record is a payment");
+    };
+    let subject = approval_subject_classic(envelope_xdr_b64);
+    let (store, surfaced) = fixture.consent(&entry);
+    let blob: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(surfaced.unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    verify_approval(
+        &store,
+        fixture.profile(),
+        name,
+        &entry.approval_nonce,
+        &blob,
+        &ApprovalExpectation {
+            kind: ApprovedKind::Payment,
+            subject,
+        },
+        &fixture.current_policy(),
+        stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+    )
+    .unwrap()
+}
+
+/// The witness of a payment consented on another enabled mainnet profile
+/// `name`, as [`witness_under_own_home`] produces it.
+pub(crate) fn foreign_profile_approval(
+    name: &str,
+) -> stellar_agent_core::approval::witness::ApprovalWitness {
+    witness_under_own_home(name, |fixture| fixture.payment(600_000))
+}
+
 /// The payment root of the x402 fixtures: a transfer of 10 of the token from
 /// the fixture's signer to its destination, with no sub-invocations.
 pub(crate) fn x402_root(f: &ResolverFixture) -> stellar_xdr::SorobanAuthorizedInvocation {
@@ -887,8 +1082,8 @@ pub(crate) fn message_facts(content: [u8; 32], key: [u8; 32]) -> super::message:
 impl ResolverFixture {
     /// The operator's approval of the x402 payment `root`, for the
     /// authenticated subject over `home_domain` or the plain subject without
-    /// one, created at `created` and expiring 600 seconds later, attested and
-    /// verified at `created` through the real producers.
+    /// one, created at `created` and expiring 600 seconds later, consented
+    /// and verified as [`Self::attested`] describes.
     pub(crate) fn x402_approval(
         &self,
         root: &stellar_xdr::SorobanAuthorizedInvocation,
@@ -912,14 +1107,11 @@ impl ResolverFixture {
         let digest = soroban_intent_digest(&intent.network_id, root).unwrap();
         self.attested(
             &entry,
-            &self.profile,
-            "operator",
             stellar_agent_core::approval::witness::ApprovedKind::X402Payment,
             home_domain.map_or_else(
                 || approval_subject_x402(&digest),
                 |domain| approval_subject_x402_authenticated(&digest, domain),
             ),
-            created,
         )
     }
 

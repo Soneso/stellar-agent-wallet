@@ -17,6 +17,8 @@
 use stellar_agent_loopback_http::brand::{BRAND_STYLE, PageIdentity, TRUST_LINE_LOOPBACK};
 use stellar_agent_loopback_http::escape::html_escape;
 
+use super::EnrollmentPurpose;
+
 /// Enrollment-only rules: the label field, its caption, and the
 /// confirmation code.
 const ENROLL_STYLE: &str = r"
@@ -88,9 +90,12 @@ fn json_data_island(value: &serde_json::Value) -> String {
 ///   echoes back in the `X-Stellar-Approval-CSRF` header on
 ///   `POST /enroll/challenge` and `POST /enroll/credential`.
 /// - `label_prefill`: an optional label to pre-populate the label input
-///   with (from `approve operator enroll --interactive --label <L>`). The
-///   operator can still edit it before submitting; `None` leaves the field
-///   empty.
+///   with (from `--label <L>`). The operator can still edit it before
+///   submitting; `None` leaves the field empty.
+/// - `purpose`: rendered into the data island's `data-purpose` attribute,
+///   from which the page derives its confirmation-code domain and session
+///   proof key; the heading and the closing note name what the credential is
+///   for.
 ///
 /// # rp-id binding
 ///
@@ -104,9 +109,29 @@ pub(super) fn render_enroll_page(
     csrf_hex: &str,
     label_prefill: Option<&str>,
     identity: &PageIdentity,
+    purpose: EnrollmentPurpose,
 ) -> String {
     let profile_escaped = html_escape(profile);
-    let title = identity.page_title("Enroll operator passkey");
+    let (heading, note) = match purpose {
+        EnrollmentPurpose::RemoteOperator => (
+            "Enroll operator passkey",
+            "Nothing is enrolled until the terminal accepts the code.
+         This credential can approve remote requests for this profile
+         only after its ID is added to this profile's
+         <code>[remote_approval] allowed_credentials</code> list. Enrolling here
+         does not grant that by itself.",
+        ),
+        EnrollmentPurpose::MainnetApproval => (
+            "Enroll mainnet approval passkey",
+            "Nothing is exported until the terminal accepts the code.
+         The terminal then prints this credential's policy entry. It approves
+         mainnet consent only after the owner adds it to
+         <code>mainnet.approval_credentials</code> and signs the policy.
+         Enrolling here does not grant that by itself.",
+        ),
+    };
+    let title = identity.page_title(heading);
+    let purpose_value = purpose.page_value();
     let card_header = identity.card_header_html();
     let label_prefill_attr = label_prefill
         .map(|l| format!(r#" value="{}""#, html_escape(l)))
@@ -130,7 +155,7 @@ pub(super) fn render_enroll_page(
   <main class="page">
     <div class="card">
 {card_header}
-      <h1>Enroll operator passkey</h1>
+      <h1>{heading}</h1>
       <p class="lead">Profile <code class="chip">{profile_escaped}</code>, registering
          against <code class="chip">localhost</code>. Name this device, confirm
          with Touch&nbsp;ID, Windows&nbsp;Hello, or your security key, then type
@@ -142,15 +167,11 @@ pub(super) fn render_enroll_page(
       <div class="status" id="status">Enter a label and create the passkey.</div>
       <p class="confirmation-code" id="confirmation-code" hidden></p>
       <button class="enroll-btn" id="enroll-btn" type="button">Create passkey</button>
-      <p class="help">Nothing is enrolled until the terminal accepts the code.
-         This credential will be able to consent to remote-approval
-         requests for this profile only after its id is added to this profile's
-         <code>[remote_approval] allowed_credentials</code> list. Enrolling here
-         does not grant that by itself.</p>
+      <p class="help">{note}</p>
 {TRUST_LINE_LOOPBACK}
     </div>
   </main>
-  <script type="application/json" id="enroll-data">{data_island}</script>
+  <script type="application/json" id="enroll-data" data-purpose="{purpose_value}">{data_island}</script>
   <script src="/static/operator-enroll.js"></script>
 </body>
 </html>"#
@@ -181,8 +202,9 @@ mod tests {
     const MARK_PATH_DATA: &str = r##"d="M40 84 Q60 100 80 84""##;
 
     fn data_island(html: &str) -> &str {
-        let open = r#"<script type="application/json" id="enroll-data">"#;
-        let start = html.find(open).expect("data island opening tag") + open.len();
+        let open = r#"<script type="application/json" id="enroll-data""#;
+        let tag = html.find(open).expect("data island opening tag");
+        let start = tag + html[tag..].find('>').expect("data island opening tag end") + 1;
         let rest = &html[start..];
         let end = rest.find("</script>").expect("data island closing tag");
         &rest[..end]
@@ -194,7 +216,13 @@ mod tests {
 
     #[test]
     fn page_data_island_carries_localhost_rp_id_profile_and_csrf() {
-        let html = render_enroll_page("default", &"a".repeat(64), None, &neutral());
+        let html = render_enroll_page(
+            "default",
+            &"a".repeat(64),
+            None,
+            &neutral(),
+            EnrollmentPurpose::RemoteOperator,
+        );
         let parsed = parse_island(&html);
         assert_eq!(parsed["rpId"], "localhost");
         assert_eq!(parsed["profile"], "default");
@@ -203,7 +231,13 @@ mod tests {
 
     #[test]
     fn page_has_no_inline_event_handler_attributes() {
-        let html = render_enroll_page("default", &"b".repeat(64), None, &neutral());
+        let html = render_enroll_page(
+            "default",
+            &"b".repeat(64),
+            None,
+            &neutral(),
+            EnrollmentPurpose::RemoteOperator,
+        );
         assert!(
             !html.to_lowercase().contains("onclick="),
             "page must not use inline event handler attributes"
@@ -212,7 +246,13 @@ mod tests {
 
     #[test]
     fn page_loads_only_the_same_origin_script() {
-        let html = render_enroll_page("default", &"c".repeat(64), None, &neutral());
+        let html = render_enroll_page(
+            "default",
+            &"c".repeat(64),
+            None,
+            &neutral(),
+            EnrollmentPurpose::RemoteOperator,
+        );
         assert!(html.contains(r#"src="/static/operator-enroll.js""#));
         // No other <script src=...> beyond the one same-origin file and the
         // JSON data island (which carries no `src` attribute).
@@ -222,14 +262,26 @@ mod tests {
 
     #[test]
     fn page_neutralises_angle_brackets_in_profile() {
-        let html = render_enroll_page("<script>x</script>", &"d".repeat(64), None, &neutral());
+        let html = render_enroll_page(
+            "<script>x</script>",
+            &"d".repeat(64),
+            None,
+            &neutral(),
+            EnrollmentPurpose::RemoteOperator,
+        );
         assert!(!html.contains("<script>x</script>"));
         assert_eq!(parse_island(&html)["profile"], "<script>x</script>");
     }
 
     #[test]
     fn page_contains_label_input_and_button() {
-        let html = render_enroll_page("default", &"e".repeat(64), None, &neutral());
+        let html = render_enroll_page(
+            "default",
+            &"e".repeat(64),
+            None,
+            &neutral(),
+            EnrollmentPurpose::RemoteOperator,
+        );
         assert!(html.contains(r#"id="label-input""#));
         assert!(html.contains(r#"id="enroll-btn""#));
     }
@@ -238,7 +290,13 @@ mod tests {
     /// operator that the terminal, not the page, completes the enrollment.
     #[test]
     fn page_has_a_hidden_code_element_and_names_the_terminal_step() {
-        let html = render_enroll_page("default", &"e".repeat(64), None, &neutral());
+        let html = render_enroll_page(
+            "default",
+            &"e".repeat(64),
+            None,
+            &neutral(),
+            EnrollmentPurpose::RemoteOperator,
+        );
         assert!(
             html.contains(r#"<p class="confirmation-code" id="confirmation-code" hidden></p>"#)
         );
@@ -247,19 +305,37 @@ mod tests {
 
     #[test]
     fn page_without_prefill_has_no_value_attribute() {
-        let html = render_enroll_page("default", &"f".repeat(64), None, &neutral());
+        let html = render_enroll_page(
+            "default",
+            &"f".repeat(64),
+            None,
+            &neutral(),
+            EnrollmentPurpose::RemoteOperator,
+        );
         assert!(!html.contains(r#"id="label-input" maxlength="64" autocomplete="off" value"#));
     }
 
     #[test]
     fn page_with_prefill_populates_label_input_value() {
-        let html = render_enroll_page("default", &"g".repeat(64), Some("my-laptop"), &neutral());
+        let html = render_enroll_page(
+            "default",
+            &"g".repeat(64),
+            Some("my-laptop"),
+            &neutral(),
+            EnrollmentPurpose::RemoteOperator,
+        );
         assert!(html.contains(r#"value="my-laptop""#));
     }
 
     #[test]
     fn page_prefill_html_escapes_the_label() {
-        let html = render_enroll_page("default", &"h".repeat(64), Some("<b>x</b>"), &neutral());
+        let html = render_enroll_page(
+            "default",
+            &"h".repeat(64),
+            Some("<b>x</b>"),
+            &neutral(),
+            EnrollmentPurpose::RemoteOperator,
+        );
         assert!(!html.contains("<b>x</b>"));
         assert!(html.contains("&lt;b&gt;x&lt;/b&gt;"));
     }
@@ -275,7 +351,13 @@ mod tests {
             PageIdentity::new(Some("Acme Ops"), false),
             PageIdentity::new(Some("Acme Ops"), true),
         ] {
-            let html = render_enroll_page("default", &"i".repeat(64), None, &identity);
+            let html = render_enroll_page(
+                "default",
+                &"i".repeat(64),
+                None,
+                &identity,
+                EnrollmentPurpose::RemoteOperator,
+            );
             assert_eq!(html.matches(BRAND_STYLE).count(), 1);
         }
     }
@@ -283,7 +365,13 @@ mod tests {
     /// An unconfigured deployment serves no project identity.
     #[test]
     fn an_unconfigured_deployment_serves_no_mark_and_no_wordmark() {
-        let html = render_enroll_page("default", &"i".repeat(64), None, &neutral());
+        let html = render_enroll_page(
+            "default",
+            &"i".repeat(64),
+            None,
+            &neutral(),
+            EnrollmentPurpose::RemoteOperator,
+        );
         assert!(!html.contains(MARK_PATH_DATA), "{html}");
         assert!(!html.contains(">STELLAR<"), "{html}");
         assert!(!html.contains("Agent Wallet"), "{html}");
@@ -298,6 +386,7 @@ mod tests {
             &"i".repeat(64),
             None,
             &PageIdentity::new(Some("<b>Acme</b>"), false),
+            EnrollmentPurpose::RemoteOperator,
         );
         assert!(named.contains("&lt;b&gt;Acme&lt;/b&gt;"), "{named}");
         assert!(!named.contains("<b>Acme</b>"), "{named}");
@@ -308,6 +397,7 @@ mod tests {
             &"i".repeat(64),
             None,
             &PageIdentity::new(Some("Acme Ops"), true),
+            EnrollmentPurpose::RemoteOperator,
         );
         assert!(marked.contains(MARK_PATH_DATA), "{marked}");
     }
@@ -316,7 +406,13 @@ mod tests {
     /// would render a hole rather than fail loudly.
     #[test]
     fn page_references_no_external_origin() {
-        let html = render_enroll_page("default", &"j".repeat(64), None, &neutral());
+        let html = render_enroll_page(
+            "default",
+            &"j".repeat(64),
+            None,
+            &neutral(),
+            EnrollmentPurpose::RemoteOperator,
+        );
         assert!(!html.contains("http://"));
         assert!(!html.contains("https://"));
     }
@@ -327,7 +423,13 @@ mod tests {
     /// `SocketAddr::ip().is_loopback()`, which admits `::1` too.
     #[test]
     fn page_carries_the_loopback_trust_line() {
-        let html = render_enroll_page("default", &"k".repeat(64), None, &neutral());
+        let html = render_enroll_page(
+            "default",
+            &"k".repeat(64),
+            None,
+            &neutral(),
+            EnrollmentPurpose::RemoteOperator,
+        );
         assert!(html.contains(TRUST_LINE_LOOPBACK));
         assert!(
             !html.contains("127.0.0.1"),
@@ -335,10 +437,46 @@ mod tests {
         );
     }
 
+    /// The server renders the purpose into the island's `data-purpose`
+    /// attribute; the mainnet page names the policy list and the owner's
+    /// signature as the step that grants anything, and not the remote
+    /// allowlist.
+    #[test]
+    fn page_renders_its_purpose_and_the_step_that_grants_authority() {
+        let remote = render_enroll_page(
+            "main",
+            &"m".repeat(64),
+            None,
+            &neutral(),
+            EnrollmentPurpose::RemoteOperator,
+        );
+        assert!(remote.contains(r#"id="enroll-data" data-purpose="remote-operator">"#));
+        let mainnet = render_enroll_page(
+            "main",
+            &"m".repeat(64),
+            None,
+            &neutral(),
+            EnrollmentPurpose::MainnetApproval,
+        );
+        assert!(mainnet.contains(r#"id="enroll-data" data-purpose="mainnet-approval">"#));
+        assert!(mainnet.contains("<h1>Enroll mainnet approval passkey</h1>"));
+        assert!(mainnet.contains("mainnet.approval_credentials"));
+        assert!(mainnet.contains("signs the policy"));
+        assert!(mainnet.contains("Nothing is exported until the terminal accepts the code."));
+        assert!(!mainnet.contains("allowed_credentials"));
+        assert_eq!(parse_island(&mainnet)["csrfToken"], "m".repeat(64));
+    }
+
     /// Enrolling grants nothing on its own; the page has to say so.
     #[test]
     fn page_states_that_enrollment_alone_grants_nothing() {
-        let html = render_enroll_page("default", &"l".repeat(64), None, &neutral());
+        let html = render_enroll_page(
+            "default",
+            &"l".repeat(64),
+            None,
+            &neutral(),
+            EnrollmentPurpose::RemoteOperator,
+        );
         assert!(html.contains("allowed_credentials"));
         assert!(html.contains("does not grant that by itself"));
     }

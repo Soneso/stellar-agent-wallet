@@ -1141,6 +1141,17 @@ impl AuditWriter {
         self.append_checked(entry)
     }
 
+    /// Completes drain, state and rotation waits before a consent is checked.
+    pub(crate) fn prepare_entry(&mut self) -> Result<PreparedAuditEntry<'_>, WriterError> {
+        if self.drains {
+            self.drain_outbox()?;
+        }
+        self.prepare_append().map_err(|refusal| match refusal {
+            AppendRefusal::LogMoved(error) | AppendRefusal::Other(error) => error,
+        })?;
+        Ok(PreparedAuditEntry { writer: self })
+    }
+
     /// Drains the audit outbox, then builds an entry from the writer's current
     /// state and appends it, with nothing appended in between.
     ///
@@ -5238,6 +5249,18 @@ fn classify_last_line(
 /// `AuditWriterRegistry` is a wallet-side observability primitive.  On-chain
 /// smart-account contracts have no audit-log surface.
 pub struct AuditWriterRegistry;
+
+/// One row whose writer completes all pre-row acquisition and state work.
+pub(crate) struct PreparedAuditEntry<'a> {
+    writer: &'a mut AuditWriter,
+}
+
+impl PreparedAuditEntry<'_> {
+    /// Writes the row and runs the writer's post-row durability steps.
+    pub(crate) fn write(self, entry: AuditEntry) -> Result<(), WriterError> {
+        self.writer.commit_append(entry)
+    }
+}
 
 /// Metadata stored alongside each `Arc<Mutex<AuditWriter>>` in the registry.
 ///

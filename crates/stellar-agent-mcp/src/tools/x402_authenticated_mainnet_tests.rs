@@ -54,7 +54,7 @@ use crate::tools::common::tests::mainnet::{
 use crate::tools::common::{GatedApprovalKind, verify_attestation_subject_gate, x402_value_leg};
 
 const TOOL: &str = "stellar_x402_authenticated_payment";
-const HOME: &str = "anchor.example.com";
+pub(super) const HOME: &str = "anchor.example.com";
 /// The host of the web auth endpoint the identity transport points at.
 const WEB_AUTH_DOMAIN: &str = "127.0.0.1";
 const SEP10_REFUSAL: &str = "the mainnet authorization for this SEP-10 authentication was \
@@ -296,7 +296,7 @@ impl wiremock::Respond for JwtResponder {
 
 /// A SEP-10 server for `HOME`: its stellar.toml names a web auth endpoint on
 /// `HOME`, and the identity transport sends the SEP-10 requests here.
-struct Sep10Double {
+pub(super) struct Sep10Double {
     server: wiremock::MockServer,
     control: Arc<Sep10Control>,
 }
@@ -350,11 +350,11 @@ impl Sep10Double {
         );
     }
 
-    async fn requests(&self) -> usize {
+    pub(super) async fn requests(&self) -> usize {
         self.server.received_requests().await.unwrap().len()
     }
 
-    async fn posts(&self) -> usize {
+    pub(super) async fn posts(&self) -> usize {
         self.server
             .received_requests()
             .await
@@ -417,7 +417,7 @@ fn used_message_record(f: &Fixture) -> serde_json::Value {
     messages[0].clone()
 }
 
-fn signings() -> Vec<serde_json::Value> {
+pub(super) fn signings() -> Vec<serde_json::Value> {
     take_authorized_signings_for_test()
         .into_iter()
         .map(|id| serde_json::to_value(id).unwrap())
@@ -459,17 +459,17 @@ fn approval_file_exists(f: &Fixture) -> bool {
 
 /// A mainnet server whose primary and oracle hosts route to their own RPC
 /// doubles and whose identity gate uses the SEP-10 double.
-struct Run {
-    f: Fixture,
+pub(super) struct Run {
+    pub(super) f: Fixture,
     _primary: wiremock::MockServer,
     _oracle: wiremock::MockServer,
-    control: Arc<RpcControl>,
+    pub(super) control: Arc<RpcControl>,
     oracle_control: Arc<RpcControl>,
-    double: Sep10Double,
+    pub(super) double: Sep10Double,
 }
 
 impl Run {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         Self::with(|raw| authenticated_policy(&raw)).await
     }
 
@@ -516,7 +516,7 @@ impl Run {
     }
 
     /// Runs call 1 for `HOME` and attests its pending approval.
-    async fn prepare(&self) -> (String, String) {
+    pub(super) async fn prepare(&self) -> (String, String) {
         let prepared = self.call(self.args(HOME, None)).await;
         assert_eq!(prepared["ok"], true, "{prepared}");
         let nonce = prepared["data"]["approval"]["approval_nonce"]
@@ -529,7 +529,7 @@ impl Run {
 
     /// Runs call 2 for `home` with the approval; the RPC histories then hold
     /// this call's requests only.
-    async fn pay(&self, home: &str, approval: &(String, String)) -> serde_json::Value {
+    pub(super) async fn pay(&self, home: &str, approval: &(String, String)) -> serde_json::Value {
         self.control.clear();
         self.oracle_control.clear();
         self.call(self.args(home, Some((&approval.0, &approval.1))))

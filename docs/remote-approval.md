@@ -24,7 +24,7 @@ MPP terms and the network are checked against the authorization fingerprint befo
 The simulated fee reads `not bound to this approval`.
 A request whose stored digest is not the digest of its stored envelope, whose envelope does not decode, or whose MPP terms do not match its fingerprint shows as `INCONSISTENT` and offers only Reject; an approve of it is refused with the status `inconsistent` and attests nothing.
 Each pending approval records who approved it: the local operator, or the operator credential the remote listener verified. The HMAC covers that approver, so an edited or deleted approver invalidates the approval.
-A mainnet commit reads the profile's `allowed_credentials` list and the operator-credential store again, and refuses an approval whose credential is missing from that list or from that store.
+The remote listener approves testnet requests only. An approve of a mainnet request answers HTTP 403 with `approval.mainnet_remote_unsupported` and records nothing: mainnet consent requires a verified passkey assertion from an approval credential in the owner-signed policy (see [Approval credentials](profiles.md#approval-credentials)), recorded under attestation version 5 with its receipt, and the listener's allowlist and operator-credential store do not supply one. Reject works on both networks.
 The audit log distinguishes remote `ApprovalAttestedRemote` / `ApprovalRejectedRemote` events from loopback `ApprovalAttested` / `ApprovalRejected` events.
 Each row is written before the decision takes effect; a decision whose row cannot be written is refused and the entry stays pending.
 
@@ -74,9 +74,9 @@ allowed_credentials = ["c9k3JGxPq1c_..."]
   this list is refused exactly like an unrecognized credential. Enrollment
   and authorization are two separate, both-required steps. The running
   listener reads this list at every login and every decision. Removing an
-  id revokes that credential at once: its next login is refused, its open
-  sessions cannot approve or reject, and a mainnet commit refuses the
-  approvals it made that are not yet committed. An empty list authorizes no
+  id revokes that credential at once: its next login is refused, and its open
+  sessions cannot approve or reject. This list does not change the mainnet
+  approval credentials of the signed policy. An empty list authorizes no
   one. To revoke a credential for good, remove its id here first, then run
   `approve operator remove --credential-id <B64URL>` (see
   [CLI reference: `approve operator remove`](cli-reference/profile-and-governance.md#approve-operator-remove)).

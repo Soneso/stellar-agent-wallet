@@ -1,6 +1,6 @@
 ---
 name: stellar-agent-wallet
-description: Operate the Stellar Agent Wallet, a self-custodial Stellar wallet built for AI agents, through its stellar-agent CLI and stellar-agent-mcp MCP server. Use when an agent needs to read Stellar account state, send XLM or asset payments, create accounts, manage trustlines, or claim claimable balances. Also use for OpenZeppelin smart-account governance, DeFi trading/deposits, and SEP, x402, and sponsored MPP charge flows. The wallet provides a local policy engine and an operator-approval gate. Its audit log records transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events. MCP balance reads and payment simulations produce no automatic invocation row. Under V1, payment simulations can reconcile overdue reservations and write settlement audit rows. Approval is satisfiable via the CLI, a local web inbox, or a TLS-protected remote-approval surface. Covers the two-phase build-then-commit signing pattern, the simulate-approve-commit handshake, chain_id and the JSON result envelope, and configured mainnet authorization. Reach for it when the user mentions the stellar-agent wallet, an AI-agent wallet on Stellar, MCP-driven Stellar payments, or autonomous-agent key custody.
+description: Operate the Stellar Agent Wallet, a self-custodial Stellar wallet built for AI agents, through its stellar-agent CLI and stellar-agent-mcp MCP server. Use when an agent needs to read Stellar account state, send XLM or asset payments, create accounts, manage trustlines, or claim claimable balances. Also use for OpenZeppelin smart-account governance, DeFi trading/deposits, and SEP, x402, and sponsored MPP charge flows. The wallet provides a local policy engine and an operator-approval gate. Its audit log records transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events. MCP balance reads and payment simulations produce no automatic invocation row. Under V1, payment simulations can reconcile overdue reservations and write settlement audit rows. Testnet approval is satisfiable via the CLI, a local web inbox, or a TLS-protected remote-approval surface; mainnet consent requires an owner-pinned passkey and is refused in this release. Covers the two-phase build-then-commit signing pattern, the simulate-approve-commit handshake, chain_id and the JSON result envelope, and configured mainnet authorization. Reach for it when the user mentions the stellar-agent wallet, an AI-agent wallet on Stellar, MCP-driven Stellar payments, or autonomous-agent key custody.
 license: Apache-2.0
 compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.12 public alpha; install from crates.io with a pinned version, for example cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.12 stellar-agent-mcp@0.1.0-alpha.12, or build from source). Targets Stellar testnet (default) and mainnet.
 metadata:
@@ -410,7 +410,11 @@ reconcile the transaction. Keep credential and receipt values out of logs.
 must approve and relay the `approval_attestation`. Retrying the commit unchanged
 will keep failing.
 
-**Mainnet actions require operator setup and approval.** The version marker
+**Mainnet actions require operator setup and approval.** Mainnet consent
+requires a verified passkey assertion from an approval credential in the
+owner-signed policy. This release refuses every mainnet consent with
+`approval.presence_required`, so mainnet writes stay unavailable; report it to
+the operator and never attempt the approval yourself. The version marker
 reports compiled state. `network.mainnet_write_forbidden` identifies an excluded
 operation, a feature-off build, or a missing admitted context. Resolver gaps
 use `network.mainnet_authorization_refused`; policy denials retain `policy.deny.*`.

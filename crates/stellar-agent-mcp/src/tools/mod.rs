@@ -94,5 +94,9 @@ mod mainnet_entry_refusal_tests;
 #[cfg(all(test, feature = "mainnet-write"))]
 mod x402_authenticated_mainnet_tests;
 
+// Mainnet consent at the commit boundary: presence-backed version 5 proofs only.
+#[cfg(all(test, feature = "mainnet-write"))]
+mod mainnet_presence_tests;
+
 #[cfg(test)]
 mod message_signing_tests;

@@ -1,14 +1,16 @@
-//! The approval witness: proof that a pending approval record, attested by
-//! the operator under version 4, approves one subject, is live, and was
-//! given by an approver still authorized when the witness is produced.
+//! The approval witness: proof that a pending mainnet approval record,
+//! attested under version 5 with a verified WebAuthn presence, approves one
+//! subject, is live, and is still authorized by the current owner-signed
+//! policy when the witness is produced.
 //!
 //! [`verify_approval`] is the only producer. It reads the record from the
-//! pending store by nonce and the attestation key from the keyring itself,
-//! derives the key coordinate and the owner context from the profile exactly
-//! as the approve path does, and accepts nothing else from its caller but
-//! the nonce, the presented attestation, the binding, the expectation, and
-//! the time. A witness therefore records facts the producer established, and
-//! its fields are private:
+//! pending store by nonce, the attestation key from the keyring, and the
+//! current signed policy from the wallet's own locations itself, derives the
+//! key coordinate and the owner context from the profile exactly as the
+//! approve path does, and accepts nothing else from its caller but the
+//! nonce, the presented attestation, the binding, the expectation, the
+//! policy the caller authorizes under, and the time. A witness therefore
+//! records facts the producer established, and its fields are private:
 //!
 //! ```compile_fail,E0451
 //! use stellar_agent_core::approval::witness::ApprovalWitness;
@@ -50,36 +52,35 @@
 //! need::<ApprovalWitness>();
 //! ```
 //!
-//! # Why version 4
+//! # Mainnet only, version 5 only
 //!
-//! The pending file is not a security boundary, and a version 2 attestation
-//! covers the profile, chain, nonce, subject, and process UID only. Under
-//! version 2, a record's kind and lifetime are whatever the file says. A
-//! version 3 attestation also covers them, so the witness's expiry is the
-//! one the operator approved. A version 4 attestation also covers who
-//! approved: the local operator, or the operator credential the remote
-//! listener verified. A version 3 record cannot tell the two apart, so it is
-//! no proof.
+//! A witness is mainnet proof, and [`verify_approval`] refuses every binding
+//! that is not mainnet. The record must carry a version 5 attestation with a
+//! mainnet passkey approver and its presence receipt: a version 4 local or
+//! remote approval, which a terminal, a same-user process or the remote
+//! allowlist can produce, is no proof, however genuine its HMAC.
 //!
-//! # Revocation reaches the commit
+//! # The current policy decides
 //!
-//! For a remote approver, [`verify_approval`] reads the profile's current
-//! `[remote_approval] allowed_credentials` list and the current
-//! operator-credential store again, through
-//! [`super::remote_authorization::RemoteApprovalAuthority`], after every
-//! other check. A credential removed from either record after it approved
-//! produces no witness, so its approvals that were not yet committed
-//! refuse. The read is fresh for every call; nothing is cached across
-//! commits, and the caller's [`Profile`] value is never taken as the current
-//! list.
+//! The producer loads the current owner-signed policy of the profile again,
+//! comparing it with the pin without advancing it, and requires it to be the
+//! policy the caller authorizes under and the policy the receipt names. It
+//! then verifies the stored assertion again under the key that policy signs
+//! for the credential, over the challenge recomputed from the record. A
+//! credential the owner removed at a higher sequence, a policy signed since
+//! the consent, or an unsigned edit produces no witness. The read is fresh
+//! for every call. The pending-store lock precedes the window-state lock,
+//! and the window-state lock is released before assertion verification.
 
 use super::attest::{decode_sha256_hex, load_attestation_key};
-use super::attestation::{AttestationBinding, AttestedApprover, verify_attestation};
-use super::remote_authorization::RemoteApprovalAuthority;
+use super::attestation::{AttestationBinding, AttestationScope, verify_attestation};
+use super::presence::MAINNET_CHAIN_ID;
+use super::presence_policy::{CurrentMainnetApprovalPolicy, MainnetApprovalAuthority};
 use super::store::{ApprovalKind, PendingApprovalStore};
 use super::subject::approval_subject_classic;
 use crate::error::{ApprovalFailure, WalletError};
 use crate::mainnet::fact::{FACT_LABEL_APPROVAL, FactDigest};
+use crate::mainnet::verified_policy::VerifiedPolicy;
 use crate::profile::caip2::Caip2;
 use crate::profile::owner_key::OwnerKeyContext;
 use crate::profile::schema::Profile;
@@ -125,9 +126,9 @@ pub struct ApprovalExpectation {
     pub subject: [u8; 32],
 }
 
-/// Proof that a version 4 attestation approves `subject`, was live at the
-/// time [`verify_approval`] checked it, and came from an approver authorized
-/// at that time.
+/// Proof that a version 5 attestation with a verified presence approves
+/// `subject`, was live at the time [`verify_approval`] checked it, and is
+/// authorized by the current owner-signed policy at that time.
 ///
 /// See the module documentation for the producer and the sealing.
 /// The `profile` field cannot be projected outside this crate.
@@ -229,6 +230,8 @@ pub struct ApprovalWitness {
     subject: [u8; 32],
     created_at_ms: u64,
     expires_at_ms: u64,
+    presence_receipt_digest: [u8; 32],
+    policy_digest: [u8; 32],
 }
 
 impl std::fmt::Debug for ApprovalWitness {
@@ -273,7 +276,7 @@ impl ApprovalWitness {
         self.subject
     }
 
-    /// When the record was created, in Unix milliseconds, as the version 4
+    /// When the record was created, in Unix milliseconds, as the version 5
     /// attestation covers it.
     #[must_use]
     pub fn created_at_ms(&self) -> u64 {
@@ -281,17 +284,31 @@ impl ApprovalWitness {
     }
 
     /// When the approval expires, in Unix milliseconds: the stored expiry the
-    /// version 4 attestation covers.
+    /// version 5 attestation covers.
     #[must_use]
     pub fn expires_at_ms(&self) -> u64 {
         self.expires_at_ms
+    }
+
+    /// The digest of the presence receipt the attestation binds.
+    #[must_use]
+    pub fn presence_receipt_digest(&self) -> [u8; 32] {
+        self.presence_receipt_digest
+    }
+
+    /// The BLAKE3 digest of the owner-signed policy the witness was verified
+    /// under. An authorization under another policy refuses.
+    #[must_use]
+    pub fn policy_digest(&self) -> [u8; 32] {
+        self.policy_digest
     }
 
     /// The fact digest under `stellar-agent-authz-fact:approval:v1`.
     ///
     /// Fields, in order: `lp(profile)`, `lp(chain)` as its CAIP-2 text,
     /// `lp(nonce)`, the kind's one-byte tag, the 32-byte subject,
-    /// `u64be(created_at_ms)`, and `u64be(expires_at_ms)`.
+    /// `u64be(created_at_ms)`, `u64be(expires_at_ms)`, the 32-byte presence
+    /// receipt digest, and the 32-byte policy digest.
     #[must_use]
     pub fn fact_digest(&self) -> [u8; 32] {
         let mut digest = FactDigest::new(FACT_LABEL_APPROVAL);
@@ -302,7 +319,9 @@ impl ApprovalWitness {
             .tag(self.kind.tag())
             .fixed(&self.subject)
             .u64(self.created_at_ms)
-            .u64(self.expires_at_ms);
+            .u64(self.expires_at_ms)
+            .fixed(&self.presence_receipt_digest)
+            .fixed(&self.policy_digest);
         digest.finish()
     }
 }
@@ -313,29 +332,31 @@ fn invalid(detail: &str) -> WalletError {
     })
 }
 
-/// Verifies the approval `nonce` as mainnet proof for `expected` and returns
-/// its witness.
+/// Verifies the approval `nonce` as mainnet proof for `expected` under
+/// `policy` and returns its witness.
 ///
 /// In order:
 ///
-/// 1. `binding` must name `profile_name` and `profile`'s chain.
+/// 1. `profile` must be a mainnet profile; every other chain refuses.
 /// 2. The record is read from `pending` by `nonce`. A rejected or consumed
-///    record refuses, and so does a kind other than the three
-///    [`ApprovedKind`]s or other than `expected.kind`.
-/// 3. The record must store attestation version 4 with a well-formed
-///    approver.
-/// 4. The subject is recomputed from the record's envelope text; it must
-///    equal the stored digest and `expected.subject`.
+///    record refuses, and so does a kind other than the [`ApprovedKind`]s or
+///    other than `expected.kind`.
+/// 3. The record must store attestation version 5 with a mainnet passkey
+///    approver and a presence receipt for the same credential.
+/// 4. The subject is recomputed from the record; it must equal the stored
+///    digest and `expected.subject`.
 /// 5. The attestation key is loaded from `profile.attestation_key_id`,
 ///    refused when it is or may be the owner public key of `profile_name`,
-///    and the attestation must verify under version 4 over the record's
-///    nonce, subject, process UID, kind, lifetime, and approver.
+///    and the attestation must verify under version 5 over the record's
+///    nonce, subject, process UID, kind, lifetime, approver and receipt.
 /// 6. `created_at <= now_ms < expires_at` on the stored, attested times.
-/// 7. For a remote approver, the authority of `profile_name` at the wallet's
-///    own locations is read again: the profile's current
-///    `allowed_credentials` list must name the recorded credential ID, the
-///    operator-credential store must still hold it, and remote approval must
-///    still be enabled for `profile`'s chain.
+/// 7. The current owner-signed policy of `profile_name` is loaded again
+///    without advancing the pin; it must be a mainnet policy for the same
+///    chain and be `policy` (sequence, digest and owner).
+/// 8. The receipt must name `policy`, its times must satisfy the challenge
+///    bounds, and its raw assertion must verify again under the key `policy`
+///    signs for the credential, over the challenge recomputed from the
+///    record and the binding.
 ///
 /// The witness's expiry is the stored expiry. A caller that governs the
 /// approval by a shorter lifetime compares [`ApprovalWitness::created_at_ms`]
@@ -343,16 +364,18 @@ fn invalid(detail: &str) -> WalletError {
 ///
 /// # Errors
 ///
+/// - `approval.binding_mismatch` for a profile that is not mainnet.
 /// - `approval.not_found`, `approval.rejected`, `approval.consumed`, or
 ///   `approval.wrong_kind` for the record.
-/// - `approval.attestation_invalid` for a version other than 4, a missing
-///   or malformed approver, a subject mismatch, or an attestation that does
-///   not verify.
+/// - `approval.presence_required` for a record without a version 5
+///   attestation, a mainnet passkey approver and its receipt.
+/// - `approval.attestation_invalid` for a subject mismatch or an attestation
+///   that does not verify.
 /// - `approval.expired` outside the record's lifetime.
 /// - The key loader's errors, including the owner-key refusal.
-/// - `approval.operator_credential_revoked` or
-///   `approval.remote_authorization_unavailable` when a remote approver is
-///   not authorized now or its authorization cannot be read.
+/// - `approval.presence_policy_unavailable` when the current policy cannot
+///   be loaded or is not `policy`, or the receipt names another policy.
+/// - `approval.presence_invalid` for a receipt that does not verify again.
 #[allow(
     clippy::too_many_arguments,
     reason = "the producer takes each input it does not derive itself"
@@ -364,6 +387,7 @@ pub fn verify_approval(
     nonce: &str,
     attestation: &[u8; 32],
     expected: &ApprovalExpectation,
+    policy: &VerifiedPolicy,
     now_ms: u64,
 ) -> Result<ApprovalWitness, WalletError> {
     verify_approval_with(
@@ -373,16 +397,18 @@ pub fn verify_approval(
         nonce,
         attestation,
         expected,
+        policy,
         now_ms,
-        RemoteApprovalAuthority::for_profile,
+        |name| MainnetApprovalAuthority::for_profile(name)?.load_current_compare_only(),
     )
 }
 
-/// [`verify_approval`] with the remote authority resolved by `authority`
-/// from the profile name, so a test can point it at isolated files.
+/// [`verify_approval`] with the current policy read by `current` from the
+/// profile name.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the producer takes each input it does not derive itself"
+    clippy::too_many_lines,
+    reason = "the producer takes each input it does not derive itself, in its documented order"
 )]
 pub(crate) fn verify_approval_with(
     pending: &PendingApprovalStore,
@@ -391,10 +417,17 @@ pub(crate) fn verify_approval_with(
     nonce: &str,
     attestation: &[u8; 32],
     expected: &ApprovalExpectation,
+    policy: &VerifiedPolicy,
     now_ms: u64,
-    authority: impl FnOnce(&str) -> Result<RemoteApprovalAuthority, WalletError>,
+    current: impl FnOnce(&str) -> Result<CurrentMainnetApprovalPolicy, WalletError>,
 ) -> Result<ApprovalWitness, WalletError> {
-    let binding = AttestationBinding::new(profile_name, profile.chain_id.caip2_str());
+    let chain_id = profile.chain_id.caip2_str();
+    if chain_id != MAINNET_CHAIN_ID || !profile.chain_id.is_mainnet() {
+        return Err(WalletError::Approval(ApprovalFailure::BindingMismatch {
+            detail: "an approval witness is mainnet proof only".to_owned(),
+        }));
+    }
+    let binding = AttestationBinding::new(profile_name, chain_id);
     let record = pending.get(nonce).ok_or_else(|| {
         WalletError::Approval(ApprovalFailure::NotFound {
             detail: "no pending approval with that nonce".to_owned(),
@@ -466,11 +499,8 @@ pub(crate) fn verify_approval_with(
             detail: "the approval is for another kind of action".to_owned(),
         }));
     }
-    let Some(scope) = record.attestation_scope() else {
-        return Err(invalid(
-            "the approval's attestation does not cover its kind, lifetime and approver; \
-             approve the action again",
-        ));
+    let Some(scope @ AttestationScope::V5(_, _, receipt)) = record.attestation_scope() else {
+        return Err(WalletError::Approval(ApprovalFailure::PresenceRequired));
     };
     if stored_digest != subject || subject != expected.subject {
         return Err(invalid("the approval approves another transaction"));
@@ -501,19 +531,13 @@ pub(crate) fn verify_approval_with(
             detail: "the approval is outside its lifetime".to_owned(),
         }));
     }
-    match &record.attested_approver {
-        Some(AttestedApprover::Local) => {}
-        Some(AttestedApprover::Remote {
-            credential_id_b64url,
-        }) => {
-            authority(profile_name)?.require_credential(
-                credential_id_b64url,
-                profile.chain_id,
-                None,
-            )?;
-        }
-        None => return Err(invalid("the approval names no approver")),
+    let current = current(profile_name)?;
+    if current.profile().chain_id != profile.chain_id || !current.is(policy) {
+        return Err(WalletError::Approval(
+            ApprovalFailure::PresencePolicyUnavailable,
+        ));
     }
+    let stored = verify_stored_mainnet_presence(record, receipt, &binding, policy, now_ms)?;
     Ok(ApprovalWitness {
         profile: profile_name.to_owned(),
         chain: profile.chain_id,
@@ -522,7 +546,21 @@ pub(crate) fn verify_approval_with(
         subject,
         created_at_ms: record.created_at_unix_ms,
         expires_at_ms: record.expires_at_unix_ms,
+        presence_receipt_digest: stored.receipt_digest,
+        policy_digest: policy.digest(),
     })
+}
+
+/// Verifies a stored presence receipt as the consent to `record` under
+/// `policy`: the receipt checks of [`super::presence`], never a live proof.
+fn verify_stored_mainnet_presence(
+    record: &super::store::PendingApproval,
+    receipt: &super::presence::MainnetPresenceReceipt,
+    binding: &AttestationBinding<'_>,
+    policy: &VerifiedPolicy,
+    now_ms: u64,
+) -> Result<super::presence::StoredPresence, WalletError> {
+    super::presence::verify_receipt(record, receipt, binding, policy, now_ms)
 }
 
 #[cfg(test)]
@@ -536,842 +574,496 @@ mod tests {
 
     use super::*;
     use crate::approval::attestation::{
-        AttestedLifetime, PENDING_ATTESTATION_VERSION, compute_attestation, compute_attestation_v4,
+        AttestedApprover, compute_attestation_v4, compute_attestation_v5,
     };
-    use crate::approval::operator_credentials::{
-        OperatorApprovalCredential, OperatorApprovalCredentialStore,
-    };
-    use crate::approval::store::{DEFAULT_TTL_MS, PendingApproval};
-    use crate::profile::schema::{KeyringEntryRef, RemoteApprovalConfig};
+    use crate::approval::mainnet_fixtures::{ATTESTATION_KEY, MainnetConsentFixture};
+    use crate::approval::presence::MainnetPresenceReceipt;
+    use crate::approval::store::{ConsumedOutcome, DEFAULT_TTL_MS, PendingApproval};
+    use crate::approval::subject::approval_subject_x402;
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use serial_test::serial;
-    use stellar_agent_test_support::keyring_mock;
-    use tempfile::TempDir;
+    use sha2::Digest as _;
+    use stellar_agent_test_support::webauthn::TestAuthenticator;
 
     const NAME: &str = "witness";
-    static ENVELOPE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
-        super::super::fixtures::payment_envelope(&source, &source, "XLM", 1000, None, 100, 7)
-    });
-    const KEY: [u8; 32] = [0x5a; 32];
-    const RP_ID: &str = "wallet.test.internal";
 
-    struct Fixture {
-        dir: TempDir,
-        path: std::path::PathBuf,
-        profile: Profile,
+    /// A mainnet consent to `entry` through the production attester: the
+    /// store holding it, the nonce, the surfaced blob, and the policy the
+    /// consent bound.
+    struct Consented {
+        store: PendingApprovalStore,
         nonce: String,
         blob: [u8; 32],
-        created: u64,
-        expires: u64,
+        policy: VerifiedPolicy,
     }
 
-    fn profile() -> Profile {
-        Profile::builder_mainnet_named(NAME, "https://rpc.example.invalid", "s", "a", "n", "a")
-            .build()
-    }
-
-    fn put_key(entry: &KeyringEntryRef, key: &[u8; 32]) {
-        keyring_core::Entry::new(&entry.service, &entry.account)
+    fn consent(fixture: &MainnetConsentFixture, entry: &PendingApproval) -> Consented {
+        let policy = fixture.current_policy();
+        let (store, surfaced) = fixture.consent(entry);
+        let blob = URL_SAFE_NO_PAD
+            .decode(surfaced.expect("a classic or x402 consent surfaces its blob"))
             .unwrap()
-            .set_password(&URL_SAFE_NO_PAD.encode(key))
+            .try_into()
             .unwrap();
-    }
-
-    fn binding() -> AttestationBinding<'static> {
-        AttestationBinding::new(NAME, "stellar:mainnet")
-    }
-
-    fn credential_id(seed: u8) -> String {
-        URL_SAFE_NO_PAD.encode([seed; 16])
-    }
-
-    fn remote(seed: u8) -> AttestedApprover {
-        AttestedApprover::Remote {
-            credential_id_b64url: credential_id(seed),
-        }
-    }
-
-    fn remote_config(enabled: bool, ids: Vec<String>) -> RemoteApprovalConfig {
-        let mut config: RemoteApprovalConfig = toml::from_str(&format!(
-            "enabled = {enabled}\nbind = \"127.0.0.1:8443\"\nrp_id = \"{RP_ID}\"\n"
-        ))
-        .unwrap();
-        config.allowed_credentials = ids;
-        config
-    }
-
-    fn profile_dir(dir: &std::path::Path) -> std::path::PathBuf {
-        dir.join("profiles")
-    }
-
-    fn credentials_path(dir: &std::path::Path) -> std::path::PathBuf {
-        dir.join("credentials").join(format!("{NAME}.toml"))
-    }
-
-    /// The authority of [`NAME`] over the files under `dir`.
-    fn authority(dir: &std::path::Path) -> RemoteApprovalAuthority {
-        RemoteApprovalAuthority::from_paths(
-            NAME.to_owned(),
-            profile_dir(dir),
-            credentials_path(dir),
-        )
-        .unwrap()
-    }
-
-    /// Writes `profile` to disk under `dir` with remote approval enabled for
-    /// `ids`, the way `approve operator allow` does.
-    fn allow(dir: &std::path::Path, profile: &Profile, ids: &[String]) {
-        let mut stored = profile.clone();
-        stored.remote_approval = Some(remote_config(true, ids.to_vec()));
-        crate::profile::loader::save_to_dir(NAME, &stored, &profile_dir(dir)).unwrap();
-    }
-
-    fn enroll(dir: &std::path::Path, credential_id_b64url: &str) {
-        let mut key = vec![0x04u8; 65];
-        key[1] = 7;
-        OperatorApprovalCredentialStore::new(credentials_path(dir))
-            .enroll(OperatorApprovalCredential {
-                credential_id_b64url: credential_id_b64url.to_owned(),
-                public_key_sec1_b64: URL_SAFE_NO_PAD.encode(key),
-                rp_id: RP_ID.to_owned(),
-                label: "device".to_owned(),
-                registered_at_unix_ms: 1,
-                sign_count: None,
-            })
-            .unwrap();
-    }
-
-    /// Inserts `entry` into the store at `path` and records a version 4
-    /// attestation of `subject` by `approver`, the way the approve path
-    /// attests. Returns the nonce and the blob.
-    fn attest_entry(
-        path: &std::path::Path,
-        entry: PendingApproval,
-        subject: &[u8; 32],
-        approver: &AttestedApprover,
-    ) -> (String, [u8; 32]) {
-        assert_eq!(entry.attestation_version, PENDING_ATTESTATION_VERSION);
-        let nonce = entry.approval_nonce.clone();
-        let created = entry.created_at_unix_ms;
-        let blob = compute_attestation_v4(
-            &KEY,
-            &binding(),
-            &nonce,
-            subject,
-            "1000",
-            &entry.attested_lifetime(),
-            approver,
-        );
-        let mut store = PendingApprovalStore::open(path.to_path_buf()).unwrap();
-        store.insert(entry, created).unwrap();
-        store
-            .record_attestation_at(&nonce, blob, approver.clone(), created)
-            .unwrap();
-        (nonce, blob)
-    }
-
-    fn payment_entry() -> PendingApproval {
-        PendingApproval::new_payment_pending(
-            ENVELOPE.to_string(),
-            ENVELOPE.as_bytes(),
-            stellar_strkey::ed25519::PublicKey([1; 32])
-                .to_string()
-                .to_string(),
-            1_000,
-            "XLM".to_owned(),
-            None,
-            100,
-            7,
-            "1000".to_owned(),
-            DEFAULT_TTL_MS,
-        )
-        .unwrap()
-    }
-
-    /// A payment approval for [`ENVELOPE`] by the local operator, attested
-    /// with [`KEY`] under the record's own kind and lifetime.
-    fn fixture() -> Fixture {
-        fixture_by(&AttestedApprover::Local)
-    }
-
-    /// A payment approval for [`ENVELOPE`] by `approver`. A remote
-    /// approver's credential is enrolled and allowed on disk, and the
-    /// returned profile carries the same `[remote_approval]` block, as the
-    /// commit's in-memory profile does.
-    fn fixture_by(approver: &AttestedApprover) -> Fixture {
-        keyring_mock::install().unwrap();
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join(format!("{NAME}.toml"));
-        let mut profile = profile();
-        put_key(&profile.attestation_key_id, &KEY);
-        if let AttestedApprover::Remote {
-            credential_id_b64url,
-        } = approver
-        {
-            let ids = vec![credential_id_b64url.clone()];
-            allow(dir.path(), &profile, &ids);
-            profile.remote_approval = Some(remote_config(true, ids));
-            enroll(dir.path(), credential_id_b64url);
-        }
-        let entry = payment_entry();
-        let created = entry.created_at_unix_ms;
-        let expires = entry.expires_at_unix_ms;
-        let (nonce, blob) =
-            attest_entry(&path, entry, &approval_subject_classic(&ENVELOPE), approver);
-        Fixture {
-            dir,
-            path,
-            profile,
-            nonce,
+        Consented {
+            store,
+            nonce: entry.approval_nonce.clone(),
             blob,
-            created,
-            expires,
+            policy,
         }
     }
 
-    fn expectation() -> ApprovalExpectation {
+    fn payment_expectation(entry: &PendingApproval) -> ApprovalExpectation {
+        let ApprovalKind::PaymentSimulated {
+            envelope_xdr_b64, ..
+        } = &entry.kind
+        else {
+            unreachable!()
+        };
         ApprovalExpectation {
             kind: ApprovedKind::Payment,
-            subject: approval_subject_classic(&ENVELOPE),
+            subject: approval_subject_classic(envelope_xdr_b64),
         }
     }
 
-    fn verify(f: &Fixture, blob: &[u8; 32], now: u64) -> Result<ApprovalWitness, WalletError> {
-        let store = PendingApprovalStore::open(f.path.clone()).unwrap();
-        verify_approval_with(
-            &store,
-            &f.profile,
-            NAME,
-            &f.nonce,
-            blob,
-            &expectation(),
-            now,
-            |name| {
-                assert_eq!(name, NAME);
-                Ok(authority(f.dir.path()))
-            },
+    fn verify(
+        fixture: &MainnetConsentFixture,
+        consented: &Consented,
+        expected: &ApprovalExpectation,
+        policy: &VerifiedPolicy,
+        now_ms: u64,
+    ) -> Result<ApprovalWitness, WalletError> {
+        verify_approval(
+            &consented.store,
+            fixture.profile(),
+            fixture.name(),
+            &consented.nonce,
+            &consented.blob,
+            expected,
+            policy,
+            now_ms,
         )
     }
 
-    /// Applies `edit` to the first record of the pending file as a TOML
-    /// table, the way anyone with write access to the file can.
-    fn edit_record(path: &std::path::Path, edit: impl FnOnce(&mut toml_edit::Table)) {
-        let mut doc: toml_edit::DocumentMut =
-            std::fs::read_to_string(path).unwrap().parse().unwrap();
-        let record = doc["pending"]
-            .as_array_of_tables_mut()
+    fn now() -> u64 {
+        crate::timefmt::now_unix_ms().unwrap()
+    }
+
+    fn receipt_of(store: &PendingApprovalStore, nonce: &str) -> MainnetPresenceReceipt {
+        store
+            .get(nonce)
             .unwrap()
-            .get_mut(0)
-            .unwrap();
-        edit(record);
-        std::fs::write(path, doc.to_string()).unwrap();
+            .mainnet_presence
+            .clone()
+            .expect("a mainnet consent stores its receipt")
     }
 
-    fn approver_table(kind: &str, credential_id_b64url: Option<&str>) -> toml_edit::Item {
-        let mut table = toml_edit::Table::new();
-        table["kind"] = toml_edit::value(kind);
-        if let Some(id) = credential_id_b64url {
-            table["credential_id_b64url"] = toml_edit::value(id);
-        }
-        toml_edit::Item::Table(table)
-    }
-
-    /// Rewrites `field = value` lines of the pending file, the way anyone
-    /// with write access to it can.
-    fn rewrite(path: &std::path::Path, field: &str, value: u64) {
-        let text = std::fs::read_to_string(path).unwrap();
-        let rewritten = text
-            .lines()
-            .map(|line| {
-                if line.trim_start().starts_with(&format!("{field} =")) {
-                    format!("{field} = {value}")
-                } else {
-                    line.to_owned()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(path, rewritten).unwrap();
-    }
-
-    /// An attested, live, matching approval yields a witness of exactly the
-    /// record's facts, and its fact digest follows the documented layout.
+    /// A mainnet consent yields a witness of exactly the record's facts, and
+    /// its fact digest follows the documented layout, receipt and policy
+    /// digests included.
     #[test]
     #[serial]
-    fn a_live_version_4_approval_yields_its_witness() {
-        let f = fixture();
-        let witness = verify(&f, &f.blob, f.created).unwrap();
+    fn a_mainnet_presence_approval_yields_its_witness() {
+        let fixture = MainnetConsentFixture::new(NAME);
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let consented = consent(&fixture, &entry);
+        let expected = payment_expectation(&entry);
+        let witness = verify(&fixture, &consented, &expected, &consented.policy, now()).unwrap();
+        let receipt = receipt_of(&consented.store, &consented.nonce);
         assert_eq!(witness.profile(), NAME);
         assert_eq!(witness.chain(), Caip2::Mainnet);
-        assert_eq!(witness.nonce(), f.nonce);
+        assert_eq!(witness.nonce(), entry.approval_nonce);
         assert_eq!(witness.kind(), ApprovedKind::Payment);
-        assert_eq!(witness.subject(), approval_subject_classic(&ENVELOPE));
-        assert_eq!(witness.created_at_ms(), f.created);
-        assert_eq!(witness.expires_at_ms(), f.expires);
+        assert_eq!(witness.subject(), expected.subject);
+        assert_eq!(witness.created_at_ms(), entry.created_at_unix_ms);
+        assert_eq!(witness.expires_at_ms(), entry.expires_at_unix_ms);
+        assert_eq!(witness.presence_receipt_digest(), receipt.digest().unwrap());
+        assert_eq!(witness.policy_digest(), consented.policy.digest());
 
-        let mut expected = FACT_LABEL_APPROVAL.to_vec();
-        for field in [NAME.as_bytes(), b"stellar:mainnet", f.nonce.as_bytes()] {
-            expected.extend(u32::try_from(field.len()).unwrap().to_be_bytes());
-            expected.extend(field);
+        let mut preimage = FACT_LABEL_APPROVAL.to_vec();
+        for field in [
+            NAME.as_bytes(),
+            b"stellar:mainnet",
+            entry.approval_nonce.as_bytes(),
+        ] {
+            preimage.extend(u32::try_from(field.len()).unwrap().to_be_bytes());
+            preimage.extend(field);
         }
-        expected.push(1);
-        expected.extend(approval_subject_classic(&ENVELOPE));
-        expected.extend(f.created.to_be_bytes());
-        expected.extend(f.expires.to_be_bytes());
-        let independent: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&expected).into();
+        preimage.push(1);
+        preimage.extend(expected.subject);
+        preimage.extend(entry.created_at_unix_ms.to_be_bytes());
+        preimage.extend(entry.expires_at_unix_ms.to_be_bytes());
+        preimage.extend(receipt.digest().unwrap());
+        preimage.extend(consented.policy.digest());
+        let independent: [u8; 32] = sha2::Sha256::digest(&preimage).into();
         assert_eq!(witness.fact_digest(), independent);
     }
 
-    /// The lifetime holds at its first millisecond and refuses before it and
-    /// at the expiry itself.
+    /// The witness holds from the moment the consent was verified to the
+    /// last millisecond of the stored lifetime, and refuses before creation
+    /// and at the expiry itself.
     #[test]
     #[serial]
     fn freshness_holds_on_the_stored_boundaries() {
-        let f = fixture();
-        assert!(verify(&f, &f.blob, f.created).is_ok());
-        assert!(verify(&f, &f.blob, f.expires - 1).is_ok());
-        for now in [f.created - 1, f.expires, f.expires + 1] {
-            let err = verify(&f, &f.blob, now).unwrap_err();
-            assert_eq!(err.code(), "approval.expired", "{now}");
+        let fixture = MainnetConsentFixture::new(NAME);
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let consented = consent(&fixture, &entry);
+        let expected = payment_expectation(&entry);
+        let verified_at = receipt_of(&consented.store, &consented.nonce).verified_at_unix_ms();
+        let policy = &consented.policy;
+        assert!(verify(&fixture, &consented, &expected, policy, verified_at).is_ok());
+        assert!(
+            verify(
+                &fixture,
+                &consented,
+                &expected,
+                policy,
+                entry.expires_at_unix_ms - 1
+            )
+            .is_ok()
+        );
+        for refused in [entry.created_at_unix_ms - 1, entry.expires_at_unix_ms] {
+            assert_eq!(
+                verify(&fixture, &consented, &expected, policy, refused)
+                    .unwrap_err()
+                    .code(),
+                "approval.expired",
+                "{refused}"
+            );
         }
+        assert_eq!(
+            verify(&fixture, &consented, &expected, policy, verified_at - 1)
+                .unwrap_err()
+                .code(),
+            "approval.presence_invalid",
+            "no witness predates its consent"
+        );
     }
 
     /// An approval that expired unused, whose stored creation and expiry are
-    /// then moved forward in the file, does not verify: version 4 covers both.
+    /// then moved forward in the file, does not verify: version 5 covers both.
     #[test]
     #[serial]
-    fn moving_an_expired_approval_forward_refuses() {
-        let f = fixture();
-        let later = f.expires + 10_000;
+    fn moving_an_expired_mainnet_approval_forward_refuses() {
+        let fixture = MainnetConsentFixture::new(NAME);
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let consented = consent(&fixture, &entry);
+        let expected = payment_expectation(&entry);
+        let after_expiry = entry.expires_at_unix_ms + 1;
         assert_eq!(
-            verify(&f, &f.blob, later).unwrap_err().code(),
+            verify(
+                &fixture,
+                &consented,
+                &expected,
+                &consented.policy,
+                after_expiry
+            )
+            .unwrap_err()
+            .code(),
             "approval.expired"
         );
-        rewrite(&f.path, "created_at_unix_ms", later - 1);
-        rewrite(&f.path, "expires_at_unix_ms", later + DEFAULT_TTL_MS);
-        let store = PendingApprovalStore::open(f.path.clone()).unwrap();
-        let moved = store.get(&f.nonce).unwrap();
-        assert_eq!(moved.created_at_unix_ms, later - 1);
-        drop(store);
+
+        let text = std::fs::read_to_string(fixture.store_path()).unwrap();
+        let mut doc: toml_edit::DocumentMut = text.parse().unwrap();
+        let table = doc["pending"]
+            .as_array_of_tables_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|t| t["approval_nonce"].as_str() == Some(entry.approval_nonce.as_str()))
+            .unwrap();
+        let shift = i64::try_from(DEFAULT_TTL_MS).unwrap();
+        for field in ["created_at_unix_ms", "expires_at_unix_ms"] {
+            let stored = table[field].as_integer().unwrap();
+            table[field] = toml_edit::value(stored + shift);
+        }
+        let moved_path = fixture.home().join("moved.toml");
+        std::fs::write(&moved_path, doc.to_string()).unwrap();
+        let moved = Consented {
+            store: PendingApprovalStore::open(moved_path).unwrap(),
+            nonce: consented.nonce.clone(),
+            blob: consented.blob,
+            policy: consented.policy.clone(),
+        };
         assert_eq!(
-            verify(&f, &f.blob, later).unwrap_err().code(),
+            verify(&fixture, &moved, &expected, &moved.policy, after_expiry)
+                .unwrap_err()
+                .code(),
             "approval.attestation_invalid"
         );
     }
 
-    /// A record without a stored version reads as version 2 and refuses as
-    /// mainnet proof, even with the genuine blob its attestation step wrote.
+    /// A version 4 record on a mainnet profile, with the genuine blob of a
+    /// local or remote approver, is no mainnet proof.
     #[test]
     #[serial]
-    fn a_version_2_record_refuses_as_mainnet_proof() {
-        let f = fixture();
-        let text = std::fs::read_to_string(&f.path).unwrap();
-        let without: String = text
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("attestation_version"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(&f.path, without).unwrap();
-        let store = PendingApprovalStore::open(f.path.clone()).unwrap();
-        assert_eq!(store.get(&f.nonce).unwrap().attestation_version, 2);
-        drop(store);
-        assert_eq!(
-            verify(&f, &f.blob, f.created).unwrap_err().code(),
-            "approval.attestation_invalid"
-        );
+    fn a_genuine_version_4_record_refuses_as_mainnet_proof() {
+        let fixture = MainnetConsentFixture::new(NAME);
+        let policy = fixture.current_policy();
+        for approver in [
+            AttestedApprover::Local,
+            AttestedApprover::Remote {
+                credential_id_b64url: "AAECAw".to_owned(),
+            },
+        ] {
+            let entry = fixture.payment(DEFAULT_TTL_MS);
+            let expected = payment_expectation(&entry);
+            let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+            store.insert(entry.clone(), now()).unwrap();
+            let blob = compute_attestation_v4(
+                &ATTESTATION_KEY,
+                &fixture.binding(),
+                &entry.approval_nonce,
+                &expected.subject,
+                &entry.process_uid,
+                &entry.attested_lifetime(),
+                &approver,
+            );
+            store
+                .record_attestation_at(&entry.approval_nonce, blob, approver.clone(), now())
+                .unwrap();
+            let consented = Consented {
+                store,
+                nonce: entry.approval_nonce.clone(),
+                blob,
+                policy: policy.clone(),
+            };
+            assert_eq!(
+                verify(&fixture, &consented, &expected, &policy, now())
+                    .unwrap_err()
+                    .code(),
+                "approval.presence_required",
+                "{approver:?}"
+            );
+        }
     }
 
     /// An attestation computed with another key does not verify against the
-    /// key the producer loads from the keyring, and the record's own blob does
-    /// not verify once the keyring holds another key.
+    /// key the producer loads, and the record's own blob does not verify once
+    /// the keyring holds another key.
     #[test]
     #[serial]
     fn a_wrong_key_attestation_refuses_against_the_loaded_key() {
-        let f = fixture();
-        let store = PendingApprovalStore::open(f.path.clone()).unwrap();
-        let record = store.get(&f.nonce).unwrap().clone();
-        drop(store);
-        let forged = compute_attestation_v4(
+        let fixture = MainnetConsentFixture::new(NAME);
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let mut consented = consent(&fixture, &entry);
+        let expected = payment_expectation(&entry);
+        let receipt = receipt_of(&consented.store, &consented.nonce);
+        let genuine = consented.blob;
+        consented.blob = compute_attestation_v5(
             &[0x11; 32],
-            &binding(),
-            &f.nonce,
-            &approval_subject_classic(&ENVELOPE),
-            "1000",
-            &AttestedLifetime::new(
-                record.kind.kind_name(),
-                record.created_at_unix_ms,
-                record.expires_at_unix_ms,
-            ),
-            &AttestedApprover::Local,
+            &fixture.binding(),
+            &entry.approval_nonce,
+            &expected.subject,
+            &entry.process_uid,
+            &entry.attested_lifetime(),
+            &AttestedApprover::MainnetPasskey {
+                credential_id_b64url: receipt.credential_id_b64url(),
+            },
+            &receipt,
         );
+        let policy = consented.policy.clone();
         assert_eq!(
-            verify(&f, &forged, f.created).unwrap_err().code(),
+            verify(&fixture, &consented, &expected, &policy, now())
+                .unwrap_err()
+                .code(),
             "approval.attestation_invalid"
         );
-        put_key(&f.profile.attestation_key_id, &[0x11; 32]);
+        consented.blob = genuine;
+        let coordinate = &fixture.profile().attestation_key_id;
+        keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+            .unwrap()
+            .set_password(&URL_SAFE_NO_PAD.encode([0x11; 32]))
+            .unwrap();
         assert_eq!(
-            verify(&f, &f.blob, f.created).unwrap_err().code(),
+            verify(&fixture, &consented, &expected, &policy, now())
+                .unwrap_err()
+                .code(),
             "approval.attestation_invalid"
         );
-        assert!(verify(&f, &forged, f.created).is_ok());
     }
 
-    /// The kind, the subject, the binding, rejection, consumption, an unknown
-    /// nonce, and a missing key each refuse on their own.
+    /// The kind, the subject, the chain, rejection, consumption, and an
+    /// unknown nonce each refuse on their own.
     #[test]
     #[serial]
     fn each_mismatch_refuses_on_its_own() {
-        let f = fixture();
-        let store = PendingApprovalStore::open(f.path.clone()).unwrap();
-        let call = |expected: &ApprovalExpectation, profile: &Profile, name: &str, nonce: &str| {
-            verify_approval(&store, profile, name, nonce, &f.blob, expected, f.created)
-                .map(|_| ())
-                .unwrap_err()
-                .code()
+        let fixture = MainnetConsentFixture::new(NAME);
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let mut consented = consent(&fixture, &entry);
+        let expected = payment_expectation(&entry);
+        let policy = consented.policy.clone();
+
+        let other_kind = ApprovalExpectation {
+            kind: ApprovedKind::Claim,
+            ..expected
         };
         assert_eq!(
-            call(
-                &ApprovalExpectation {
-                    kind: ApprovedKind::Claim,
-                    ..expectation()
-                },
-                &f.profile,
-                NAME,
-                &f.nonce
-            ),
+            verify(&fixture, &consented, &other_kind, &policy, now())
+                .unwrap_err()
+                .code(),
             "approval.wrong_kind"
         );
+        let other_subject = ApprovalExpectation {
+            subject: [7; 32],
+            ..expected
+        };
         assert_eq!(
-            call(
-                &ApprovalExpectation {
-                    subject: [0; 32],
-                    ..expectation()
-                },
-                &f.profile,
+            verify(&fixture, &consented, &other_subject, &policy, now())
+                .unwrap_err()
+                .code(),
+            "approval.attestation_invalid"
+        );
+        let testnet =
+            crate::profile::schema::Profile::builder_testnet("a", "acct", "n", "acct").build();
+        assert_eq!(
+            verify_approval(
+                &consented.store,
+                &testnet,
                 NAME,
-                &f.nonce
-            ),
-            "approval.attestation_invalid"
+                &consented.nonce,
+                &consented.blob,
+                &expected,
+                &policy,
+                now(),
+            )
+            .unwrap_err()
+            .code(),
+            "approval.binding_mismatch"
         );
-        let mut other = f.profile.clone();
-        other.chain_id = Caip2::Testnet;
+        let unknown = Consented {
+            store: PendingApprovalStore::open(fixture.home().join("empty.toml")).unwrap(),
+            nonce: consented.nonce.clone(),
+            blob: consented.blob,
+            policy: policy.clone(),
+        };
         assert_eq!(
-            call(&expectation(), &other, NAME, &f.nonce),
-            "approval.attestation_invalid"
-        );
-        assert_eq!(
-            call(&expectation(), &f.profile, "other", &f.nonce),
-            "approval.attestation_invalid"
-        );
-        assert_eq!(
-            call(&expectation(), &f.profile, NAME, "AAAAAAAAAAAAAAAAAAAAAA"),
+            verify(&fixture, &unknown, &expected, &policy, now())
+                .unwrap_err()
+                .code(),
             "approval.not_found"
         );
-        drop(store);
 
-        keyring_core::Entry::new(
-            &f.profile.attestation_key_id.service,
-            &f.profile.attestation_key_id.account,
-        )
-        .unwrap()
-        .delete_credential()
-        .unwrap();
-        assert_eq!(
-            verify(&f, &f.blob, f.created).unwrap_err().code(),
-            "auth.keyring_not_found"
-        );
-        put_key(&f.profile.attestation_key_id, &KEY);
-
-        let mut store = PendingApprovalStore::open(f.path.clone()).unwrap();
-        store
+        consented
+            .store
             .consume(
-                &f.nonce,
+                &consented.nonce,
                 &"ab".repeat(32),
-                crate::approval::store::ConsumedOutcome::Unknown,
+                ConsumedOutcome::Confirmed,
             )
             .unwrap();
-        drop(store);
         assert_eq!(
-            verify(&f, &f.blob, f.created).unwrap_err().code(),
+            verify(&fixture, &consented, &expected, &policy, now())
+                .unwrap_err()
+                .code(),
             "approval.consumed"
         );
 
-        let g = fixture();
-        let mut store = PendingApprovalStore::open(g.path.clone()).unwrap();
-        store.reject(&g.nonce, g.created, DEFAULT_TTL_MS).unwrap();
-        drop(store);
+        let rejected = fixture.payment(DEFAULT_TTL_MS);
+        let mut store = PendingApprovalStore::open(fixture.home().join("rejected.toml")).unwrap();
+        store.insert(rejected.clone(), now()).unwrap();
+        assert!(
+            store
+                .reject(&rejected.approval_nonce, now(), DEFAULT_TTL_MS)
+                .unwrap()
+        );
+        let rejected = Consented {
+            store,
+            nonce: rejected.approval_nonce.clone(),
+            blob: [0; 32],
+            policy: policy.clone(),
+        };
         assert_eq!(
-            verify(&g, &g.blob, g.created).unwrap_err().code(),
+            verify(&fixture, &rejected, &expected, &policy, now())
+                .unwrap_err()
+                .code(),
             "approval.rejected"
         );
     }
 
+    /// A payment, a claim, a trustline and an x402 payment consented with
+    /// presence each yield a witness of their own kind and subject.
     #[test]
     #[serial]
-    fn configured_attestation_coordinates_and_owner_context_are_used() {
-        let mut f = fixture();
-        f.profile.attestation_key_id = KeyringEntryRef::new("custom-attestation", "custom");
-        put_key(&KeyringEntryRef::default_attestation_key(NAME), &[8; 32]);
-        put_key(&f.profile.attestation_key_id, &KEY);
-        assert!(verify(&f, &f.blob, f.created).is_ok());
-        f.profile.policy_owner_key_id = KeyringEntryRef::new("custom-owner", "public");
-        keyring_core::Entry::new("custom-owner", "public")
-            .unwrap()
-            .set_password(stellar_strkey::ed25519::PublicKey(KEY).to_string().as_ref())
-            .unwrap();
-        assert_eq!(
-            verify(&f, &f.blob, f.created).unwrap_err().code(),
-            "validation.key_matches_owner_public_key"
+    fn every_mainnet_kind_yields_a_version_5_witness() {
+        let fixture = MainnetConsentFixture::new(NAME);
+        let uid = super::super::process_uid_for_attestation().unwrap();
+        let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
+        let claim = super::super::fixtures::claim_pending(
+            &source,
+            [9; 32],
+            None,
+            100,
+            7,
+            uid.clone(),
+            DEFAULT_TTL_MS,
         );
-        keyring_core::Entry::new("custom-owner", "public")
-            .unwrap()
-            .set_password(
-                stellar_strkey::ed25519::PublicKey([3; 32])
-                    .to_string()
-                    .as_ref(),
-            )
-            .unwrap();
-        assert!(verify(&f, &f.blob, f.created).is_ok());
-    }
-
-    #[test]
-    #[serial]
-    fn the_stored_subject_digest_is_compared() {
-        let f = fixture();
-        assert!(verify(&f, &f.blob, f.created).is_ok());
-        let text = std::fs::read_to_string(&f.path).unwrap();
-        let good = crate::hex::encode(&approval_subject_classic(&ENVELOPE));
-        assert!(text.contains(&good));
-        std::fs::write(&f.path, text.replace(&good, &"00".repeat(32))).unwrap();
-        assert_eq!(
-            verify(&f, &f.blob, f.created).unwrap_err().code(),
-            "approval.entry_inconsistent"
-        );
-    }
-
-    /// A payment, a claim and a trustline approval over real envelopes, each
-    /// with the subject the commit expects.
-    fn classic_entries() -> Vec<(ApprovedKind, PendingApproval, [u8; 32])> {
-        let address = stellar_strkey::ed25519::PublicKey([1; 32])
-            .to_string()
-            .to_string();
-        let balance = stellar_strkey::ClaimableBalance::V0([1; 32])
-            .to_string()
-            .to_string();
-        let claim_xdr = super::super::fixtures::claim_envelope(&address, [1; 32], 100, 7);
-        let trust_xdr = super::super::fixtures::change_trust_envelope(
-            &address,
+        let trustline = super::super::fixtures::trustline_pending(
+            &source,
             "USD",
-            &address,
+            &source,
             Some(100),
             100,
             7,
+            uid,
+            DEFAULT_TTL_MS,
         );
-        vec![
-            (
-                ApprovedKind::Payment,
-                payment_entry(),
-                approval_subject_classic(&ENVELOPE),
-            ),
-            (
-                ApprovedKind::Claim,
-                PendingApproval::new_claim_pending(
-                    claim_xdr.clone(),
-                    claim_xdr.as_bytes(),
-                    format!("00000000{}", "01".repeat(32)),
-                    balance,
-                    "XLM".to_owned(),
-                    1,
-                    address.clone(),
-                    100,
-                    7,
-                    "1000".to_owned(),
-                    DEFAULT_TTL_MS,
-                )
-                .unwrap(),
-                approval_subject_classic(&claim_xdr),
-            ),
+        let x402 = x402_entry();
+        let ApprovalKind::X402Payment { intent_digest, .. } = &x402.kind else {
+            unreachable!()
+        };
+        let x402_subject = approval_subject_x402(intent_digest);
+        let classic_subject = |entry: &PendingApproval| match &entry.kind {
+            ApprovalKind::ClaimSimulated {
+                envelope_xdr_b64, ..
+            }
+            | ApprovalKind::TrustlineSimulated {
+                envelope_xdr_b64, ..
+            } => approval_subject_classic(envelope_xdr_b64),
+            other => panic!("{}", other.kind_name()),
+        };
+        let cases = [
+            (ApprovedKind::Claim, classic_subject(&claim), claim),
             (
                 ApprovedKind::Trustline,
-                PendingApproval::new_trustline_pending(
-                    trust_xdr.clone(),
-                    trust_xdr.as_bytes(),
-                    address.clone(),
-                    "USD".to_owned(),
-                    address,
-                    Some(100),
-                    100,
-                    7,
-                    "1000".to_owned(),
-                    DEFAULT_TTL_MS,
-                )
-                .unwrap(),
-                approval_subject_classic(&trust_xdr),
+                classic_subject(&trustline),
+                trustline,
             ),
-        ]
-    }
-
-    #[test]
-    #[serial]
-    fn claim_and_trustline_approvals_yield_witnesses() {
-        keyring_mock::install().unwrap();
-        let dir = TempDir::new().unwrap();
-        let profile = profile();
-        put_key(&profile.attestation_key_id, &KEY);
-        for (kind, entry, subject) in classic_entries() {
-            let now = entry.created_at_unix_ms;
-            let path = dir.path().join(format!("{kind:?}.toml"));
-            let (nonce, blob) = attest_entry(&path, entry, &subject, &AttestedApprover::Local);
-            let store = PendingApprovalStore::open(path).unwrap();
-            let witness = verify_approval(
-                &store,
-                &profile,
-                NAME,
-                &nonce,
-                &blob,
+            (ApprovedKind::X402Payment, x402_subject, x402),
+        ];
+        for (kind, subject, entry) in cases {
+            let consented = consent(&fixture, &entry);
+            let witness = verify(
+                &fixture,
+                &consented,
                 &ApprovalExpectation { kind, subject },
-                now,
+                &consented.policy,
+                now(),
             )
             .unwrap();
             assert_eq!(witness.kind(), kind);
-        }
-    }
-
-    /// Version 2 and 3 records, a version 4 record whose approver was
-    /// deleted, and a remote approval rewritten to another approver each
-    /// refuse with the genuine blob of the layout the record claims. Version
-    /// 4 approvals by the local operator and by an authorized remote
-    /// credential verify.
-    #[test]
-    #[serial]
-    fn legacy_pending_attestation_cannot_bypass_revocation() {
-        for approver in [AttestedApprover::Local, remote(1)] {
-            let f = fixture_by(&approver);
-            let witness = verify(&f, &f.blob, f.created).unwrap();
-            assert_eq!(witness.nonce(), f.nonce);
-        }
-
-        // A version 3 record with the genuine version 3 blob, with and
-        // without its approver: that layout does not attest who approved.
-        for keep_approver in [false, true] {
-            let f = fixture_by(&remote(1));
-            let lifetime = {
-                let store = PendingApprovalStore::open(f.path.clone()).unwrap();
-                let record = store.get(&f.nonce).unwrap();
-                (
-                    record.kind.kind_name(),
-                    record.created_at_unix_ms,
-                    record.expires_at_unix_ms,
-                )
-            };
-            let v3_blob = compute_attestation(
-                &KEY,
-                &binding(),
-                &f.nonce,
-                &approval_subject_classic(&ENVELOPE),
-                "1000",
-                &AttestedLifetime::new(lifetime.0, lifetime.1, lifetime.2),
-            );
-            edit_record(&f.path, |record| {
-                record["attestation_version"] = toml_edit::value(3);
-                record["attestation_blob_b64"] = toml_edit::value(URL_SAFE_NO_PAD.encode(v3_blob));
-                if !keep_approver {
-                    record.remove("attested_approver");
-                }
-            });
-            let store = PendingApprovalStore::open(f.path.clone()).unwrap();
-            assert_eq!(store.get(&f.nonce).unwrap().attestation_version, 3);
-            drop(store);
+            assert_eq!(witness.subject(), subject);
             assert_eq!(
-                verify(&f, &v3_blob, f.created).unwrap_err().code(),
-                "approval.attestation_invalid",
-                "keep_approver = {keep_approver}"
-            );
-        }
-
-        // A version 4 record whose approver was deleted.
-        let f = fixture_by(&remote(1));
-        edit_record(&f.path, |record| {
-            record.remove("attested_approver").unwrap();
-        });
-        let store = PendingApprovalStore::open(f.path.clone()).unwrap();
-        let record = store.get(&f.nonce).unwrap();
-        assert!(record.attested_approver.is_none());
-        assert!(record.attestation_scope().is_none());
-        drop(store);
-        assert_eq!(
-            verify(&f, &f.blob, f.created).unwrap_err().code(),
-            "approval.attestation_invalid"
-        );
-
-        // A remote approval rewritten to the local operator, or to another
-        // credential that is itself allowed and enrolled.
-        for rewritten in [
-            approver_table("local", None),
-            approver_table("remote", Some(&credential_id(2))),
-        ] {
-            let f = fixture_by(&remote(1));
-            allow(
-                f.dir.path(),
-                &f.profile,
-                &[credential_id(1), credential_id(2)],
-            );
-            enroll(f.dir.path(), &credential_id(2));
-            edit_record(&f.path, |record| {
-                record["attested_approver"] = rewritten;
-            });
-            assert_eq!(
-                verify(&f, &f.blob, f.created).unwrap_err().code(),
-                "approval.attestation_invalid"
+                consented
+                    .store
+                    .get(&consented.nonce)
+                    .unwrap()
+                    .attestation_version,
+                5
             );
         }
     }
 
-    /// A remote approval attested while its credential was authorized
-    /// refuses at the commit once the profile on disk stops allowing it or
-    /// disables remote approval, although the commit's in-memory profile
-    /// still lists it. Payment, claim and trustline approvals alike.
+    /// A version 5 record whose stored claim envelope carries a memo that is
+    /// not UTF-8 refuses as inconsistent before any HMAC or assertion work,
+    /// although its blob is genuine for that envelope.
     #[test]
     #[serial]
-    fn witness_reloads_revocation_after_attestation() {
-        keyring_mock::install().unwrap();
-        for (kind, entry, subject) in classic_entries() {
-            for edit in ["removed", "disabled"] {
-                let dir = TempDir::new().unwrap();
-                let mut profile = profile();
-                put_key(&profile.attestation_key_id, &KEY);
-                let ids = vec![credential_id(1), credential_id(2)];
-                allow(dir.path(), &profile, &ids);
-                profile.remote_approval = Some(remote_config(true, ids));
-                enroll(dir.path(), &credential_id(1));
-                enroll(dir.path(), &credential_id(2));
-                let now = entry.created_at_unix_ms;
-                let path = dir.path().join("pending.toml");
-                let (nonce, blob) = attest_entry(&path, entry.clone(), &subject, &remote(1));
-                let check = || {
-                    let store = PendingApprovalStore::open(path.clone()).unwrap();
-                    verify_approval_with(
-                        &store,
-                        &profile,
-                        NAME,
-                        &nonce,
-                        &blob,
-                        &ApprovalExpectation { kind, subject },
-                        now,
-                        |_| Ok(authority(dir.path())),
-                    )
-                };
-                assert_eq!(check().unwrap().kind(), kind);
-                let expected = match edit {
-                    "removed" => {
-                        allow(dir.path(), &profile, &[credential_id(2)]);
-                        "approval.operator_credential_revoked"
-                    }
-                    _ => {
-                        let mut stored = profile.clone();
-                        stored.remote_approval = Some(remote_config(false, vec![credential_id(1)]));
-                        crate::profile::loader::save_to_dir(
-                            NAME,
-                            &stored,
-                            &profile_dir(dir.path()),
-                        )
-                        .unwrap();
-                        "approval.remote_authorization_unavailable"
-                    }
-                };
-                assert!(
-                    profile
-                        .remote_approval
-                        .as_ref()
-                        .unwrap()
-                        .allowed_credentials
-                        .contains(&credential_id(1))
-                );
-                assert_eq!(check().unwrap_err().code(), expected, "{kind:?} {edit}");
-            }
-        }
-    }
-
-    /// Removing a credential's enrollment while the profile still allows it
-    /// refuses its outstanding approval at the commit, and leaves the
-    /// approvals of another enrolled credential valid.
-    #[test]
-    #[serial]
-    fn credential_removal_revokes_pending_approval() {
-        let f = fixture_by(&remote(1));
-        let other = fixture_by(&remote(2));
-        verify(&f, &f.blob, f.created).unwrap();
-        verify(&other, &other.blob, other.created).unwrap();
-        assert!(
-            OperatorApprovalCredentialStore::new(credentials_path(f.dir.path()))
-                .remove(&credential_id(1))
-                .unwrap()
-        );
-        assert!(
-            authority(f.dir.path())
-                .load_current()
-                .unwrap()
-                .allows(&credential_id(1))
-        );
-        assert_eq!(
-            verify(&f, &f.blob, f.created).unwrap_err().code(),
-            "approval.operator_credential_revoked"
-        );
-        verify(&other, &other.blob, other.created).unwrap();
-    }
-
-    /// The authority is resolved for the approval's profile name only when
-    /// the approver is remote; a local approval never reads it.
-    #[test]
-    #[serial]
-    fn local_approval_never_reads_remote_authority() {
-        let f = fixture();
-        let store = PendingApprovalStore::open(f.path.clone()).unwrap();
-        verify_approval_with(
-            &store,
-            &f.profile,
-            NAME,
-            &f.nonce,
-            &f.blob,
-            &expectation(),
-            f.created,
-            |_| panic!("a local approval has no remote authority to read"),
-        )
-        .unwrap();
-        drop(store);
-        let r = fixture_by(&remote(1));
-        let store = PendingApprovalStore::open(r.path.clone()).unwrap();
-        let err = verify_approval_with(
-            &store,
-            &r.profile,
-            NAME,
-            &r.nonce,
-            &r.blob,
-            &expectation(),
-            r.created,
-            |name| {
-                assert_eq!(name, NAME);
-                Err(WalletError::Approval(
-                    ApprovalFailure::RemoteAuthorizationUnavailable {
-                        detail: "unreadable".to_owned(),
-                    },
-                ))
-            },
-        )
-        .unwrap_err();
-        assert_eq!(err.code(), "approval.remote_authorization_unavailable");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn resolution_refuses_previously_attested_non_utf8_claim_memo() {
+    fn a_version_5_claim_with_a_non_utf8_memo_refuses_as_inconsistent() {
         use stellar_xdr::{Limits, Memo, ReadXdr as _, TransactionEnvelope, WriteXdr as _};
-        keyring_mock::install().unwrap();
-        let dir = TempDir::new().unwrap();
-        let profile = profile();
-        put_key(&profile.attestation_key_id, &KEY);
+        let fixture = MainnetConsentFixture::new(NAME);
+        let genuine = consent(&fixture, &fixture.payment(DEFAULT_TTL_MS));
+        let receipt = receipt_of(&genuine.store, &genuine.nonce);
         let source = stellar_strkey::ed25519::PublicKey([1; 32]).to_string();
         let xdr = super::super::fixtures::claim_envelope(&source, [9; 32], 100, 7);
         let TransactionEnvelope::Tx(mut tx) =
@@ -1394,31 +1086,194 @@ mod tests {
             source.to_string(),
             100,
             7,
-            "1000".to_owned(),
+            super::super::process_uid_for_attestation().unwrap(),
             DEFAULT_TTL_MS,
         )
         .unwrap();
         let subject = approval_subject_classic(&xdr);
-        let now = entry.created_at_unix_ms;
-        let path = dir.path().join("claim.toml");
-        let (nonce, blob) = attest_entry(&path, entry, &subject, &AttestedApprover::Local);
-        let store = PendingApprovalStore::open(path).unwrap();
+        let approver = AttestedApprover::MainnetPasskey {
+            credential_id_b64url: receipt.credential_id_b64url(),
+        };
+        let blob = compute_attestation_v5(
+            &ATTESTATION_KEY,
+            &fixture.binding(),
+            &entry.approval_nonce,
+            &subject,
+            &entry.process_uid,
+            &entry.attested_lifetime(),
+            &approver,
+            &receipt,
+        );
+        let mut store = PendingApprovalStore::open(fixture.home().join("memo.toml")).unwrap();
+        store.insert(entry.clone(), now()).unwrap();
+        store
+            .record_mainnet_attestation_at(&entry.approval_nonce, blob, approver, receipt, now())
+            .unwrap();
+        let record = Consented {
+            store,
+            nonce: entry.approval_nonce.clone(),
+            blob,
+            policy: genuine.policy.clone(),
+        };
         assert_eq!(
-            verify_approval(
-                &store,
-                &profile,
-                NAME,
-                &nonce,
-                &blob,
+            verify(
+                &fixture,
+                &record,
                 &ApprovalExpectation {
                     kind: ApprovedKind::Claim,
                     subject
                 },
-                now
+                &genuine.policy,
+                now(),
             )
             .unwrap_err()
             .code(),
             "approval.entry_inconsistent"
         );
+    }
+
+    fn x402_entry() -> PendingApproval {
+        use stellar_xdr::{
+            AccountId, ContractId, Hash, InvokeContractArgs, PublicKey, ScAddress, ScVal,
+            SorobanAuthorizedFunction, SorobanAuthorizedInvocation, Uint256,
+        };
+        let account = |byte| {
+            ScVal::Address(ScAddress::Account(AccountId(
+                PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32])),
+            )))
+        };
+        let root = SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([3; 32]))),
+                function_name: "transfer".try_into().unwrap(),
+                args: vec![account(4), account(5), ScVal::from(10_i128)]
+                    .try_into()
+                    .unwrap(),
+            }),
+            sub_invocations: vec![].try_into().unwrap(),
+        };
+        PendingApproval::new_x402_pending(
+            &sha2::Sha256::digest(Caip2::Mainnet.network_passphrase().as_bytes()).into(),
+            &root,
+            None,
+            super::super::process_uid_for_attestation().unwrap(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap()
+    }
+
+    /// A stored receipt whose assertion fails verification refuses although
+    /// its version 5 blob, recomputed over the altered receipt, verifies: the
+    /// witness checks the raw assertion again under the signed key.
+    #[test]
+    #[serial]
+    fn mainnet_witness_reverifies_the_assertion() {
+        let fixture = MainnetConsentFixture::new(NAME);
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let consented = consent(&fixture, &entry);
+        let expected = payment_expectation(&entry);
+        let policy = consented.policy.clone();
+        let genuine = receipt_of(&consented.store, &consented.nonce);
+
+        let mut wire = serde_json::to_value(&genuine).unwrap();
+        let client = wire["assertion"]["client_data_json"]
+            .as_array_mut()
+            .unwrap();
+        assert_eq!(client.pop().unwrap(), serde_json::json!(b'}'));
+        client.extend(b",\"extra\":1}".iter().map(|b| serde_json::json!(b)));
+        let altered: MainnetPresenceReceipt = serde_json::from_value(wire).unwrap();
+        assert!(altered.is_well_formed());
+
+        let approver = AttestedApprover::MainnetPasskey {
+            credential_id_b64url: altered.credential_id_b64url(),
+        };
+        let blob = compute_attestation_v5(
+            &ATTESTATION_KEY,
+            &fixture.binding(),
+            &entry.approval_nonce,
+            &expected.subject,
+            &entry.process_uid,
+            &entry.attested_lifetime(),
+            &approver,
+            &altered,
+        );
+        let mut store = PendingApprovalStore::open(fixture.home().join("altered.toml")).unwrap();
+        store.insert(entry.clone(), now()).unwrap();
+        store
+            .record_mainnet_attestation_at(&entry.approval_nonce, blob, approver, altered, now())
+            .unwrap();
+        let altered = Consented {
+            store,
+            nonce: entry.approval_nonce.clone(),
+            blob,
+            policy: policy.clone(),
+        };
+        assert_eq!(
+            verify(&fixture, &altered, &expected, &policy, now())
+                .unwrap_err()
+                .code(),
+            "approval.presence_invalid"
+        );
+        assert!(verify(&fixture, &consented, &expected, &policy, now()).is_ok());
+    }
+
+    /// The witness reads the current owner-signed policy again: a credential
+    /// removed at a higher sequence, a policy re-signed at a higher sequence
+    /// with the same credential, an unsigned edit, and a policy signed by
+    /// another owner each refuse an approval consented before. A caller that
+    /// authorizes under the new policy is refused as well, because the receipt
+    /// names the old one.
+    #[test]
+    #[serial]
+    fn mainnet_witness_reloads_current_policy() {
+        let other = TestAuthenticator::from_seed([0x33; 32], vec![0x44; 16]);
+        let fixture_auth = stellar_agent_test_support::webauthn::fixture_authenticator();
+        type Change = fn(&mut MainnetConsentFixture, &TestAuthenticator, &TestAuthenticator);
+        let changes: [(&str, Change); 4] = [
+            ("credential removed", |fixture, other, _| {
+                fixture.sign_policy(&[other]);
+            }),
+            ("same credential re-signed", |fixture, _, own| {
+                fixture.sign_policy(&[own]);
+            }),
+            ("unsigned edit", |fixture, _, _| {
+                let path = fixture.policy_path();
+                let text = std::fs::read_to_string(&path).unwrap();
+                assert!(text.contains("ttl_secs = 3600"));
+                std::fs::write(&path, text.replace("ttl_secs = 3600", "ttl_secs = 3601")).unwrap();
+            }),
+            ("another owner", |fixture, _, own| {
+                let body = fixture.policy_body(fixture.sequence(), &[own]);
+                fixture.write_signed_by(&body, &ed25519_dalek::SigningKey::from_bytes(&[12; 32]));
+            }),
+        ];
+        for (label, change) in changes {
+            let mut fixture = MainnetConsentFixture::new(NAME);
+            let entry = fixture.payment(DEFAULT_TTL_MS);
+            let consented = consent(&fixture, &entry);
+            let expected = payment_expectation(&entry);
+            let policy = consented.policy.clone();
+            assert!(
+                verify(&fixture, &consented, &expected, &policy, now()).is_ok(),
+                "{label}"
+            );
+            change(&mut fixture, &other, &fixture_auth);
+            assert_eq!(
+                verify(&fixture, &consented, &expected, &policy, now())
+                    .unwrap_err()
+                    .code(),
+                "approval.presence_policy_unavailable",
+                "{label}"
+            );
+            if let Ok(current) = fixture.authority().load_current_compare_only() {
+                assert_eq!(
+                    verify(&fixture, &consented, &expected, current.policy(), now())
+                        .unwrap_err()
+                        .code(),
+                    "approval.presence_policy_unavailable",
+                    "{label}: the receipt names the old policy"
+                );
+            }
+        }
     }
 }

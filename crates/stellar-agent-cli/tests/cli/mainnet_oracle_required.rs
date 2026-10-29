@@ -207,13 +207,18 @@ const DESTINATION: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMW
 
 /// The signed version 2 policy the enablement ceremony leaves for
 /// [`PROFILE`]: bound to `endpoint_host` and the digest of [`NONCE`], with the
-/// mainnet restrictions and one allowing native payment rule.
+/// mainnet restrictions, one approval credential and one allowing native
+/// payment rule.
 fn bound_policy(endpoint_host: &str) -> String {
     let digest = stellar_agent_core::hex::encode(&sha2::Sha256::digest(NONCE.as_bytes()));
     format!(
         "version = 2\nscope = \"profile:{PROFILE}\"\n\n[mainnet]\nprofile = \"{PROFILE}\"\n\
          endpoint_host = \"{endpoint_host}\"\ninstallation_nonce_sha256 = \"{digest}\"\n\
          classic_max_fee_per_op_stroops = 500\nauthorization_ttl_seconds = 60\n\
+         approval_credentials = [\n\
+         {{ credential_id_b64url = \"WlpaWlpaWlpaWlpaWlpaWg\", \
+         public_key_sec1_b64url = \"BEYtuhrk_BqWi02s8gzdbb4frjSqlxUUpj00BcPRz9ODtYu7CMEzg0KMWFPHHEyFHhNLBWgh5Gj-Cpd6v0MT3eE\" }},\n\
+         ]\n\
          [mainnet.cross_check_thresholds]\nnative = \"10000000000\"\n\n\
          [[rules]]\nmatch = {{ tool = \"stellar_pay\", chain = \"stellar:mainnet\" }}\n\
          criteria = [\n\

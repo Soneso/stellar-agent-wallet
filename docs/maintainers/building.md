@@ -416,7 +416,9 @@ gate except `shellcheck-changed`, which needs a changed shell script.
 16. `machete`, `deny`, `coverage`, `coverage-floors`, `coverage:feature-on`,
     and `coverage-floors:feature-on`: `--full` only. Each floor check
     requires its own successful measurement in the current run.
-17. `inbox-js`: a change under `crates/stellar-agent-approval-ui/src/web/`.
+17. `inbox-js` and `mainnet-presence-js`: a change under
+    `crates/stellar-agent-approval-ui/src/web/` or
+    `crates/stellar-agent-approval-ui/src/operator_enroll/web/`.
 18. `interop:mpp` and `interop:sdk-v17`: `--full` only.
 
 `package-skill.sh`, `run-testnet-acceptance.sh`, and

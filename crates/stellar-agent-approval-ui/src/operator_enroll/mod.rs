@@ -76,6 +76,21 @@
 //! → session-cookie exchange described above, mirroring
 //! [`crate::start_serve`]'s auth boundary.
 //!
+//! # Mainnet approval credentials
+//!
+//! [`start_mainnet_approval_enroll`] runs the same ceremony for an approval
+//! credential of the owner-signed mainnet policy
+//! ([`EnrollmentPurpose::MainnetApproval`]). It has its own session purpose,
+//! so its cookie name and proof storage key differ from the operator
+//! enrollment's, and its own confirmation-code domain, so a code computed
+//! for one purpose never confirms the other. The server renders the purpose
+//! into the page, which derives the code domain from it. This mode neither
+//! reads nor writes any credential store: the confirmed credential is only
+//! exported, through
+//! [`ConfirmedOperatorEnrollment::into_mainnet_policy_credential`], for the
+//! owner to add to `mainnet.approval_credentials` and sign. Enrollment alone
+//! grants no approval authority.
+//!
 //! # What registration verification claims
 //!
 //! The page requests the `none` attestation format, so no statement about
@@ -101,6 +116,7 @@ use stellar_agent_loopback_http::brand::PageIdentity;
 
 use crate::auth::{AuthState, OpaqueToken, SessionPurpose};
 use crate::{HostHeaderAllowlistLayer, OriginHeaderAllowlistLayer, SecurityHeadersLayer};
+use confirmation::{MAINNET_APPROVAL_CODE_DOMAIN, OPERATOR_CODE_DOMAIN};
 
 mod confirmation;
 mod error;
@@ -131,17 +147,58 @@ const BODY_LIMIT_BYTES: usize = 16 * 1024;
 /// Shutdown deadline for [`OperatorEnrollHandle::shutdown`].
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
+/// What a ceremony enrolls a credential for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollmentPurpose {
+    /// An operator credential of the remote-approval surface, persisted to
+    /// the profile's operator credential store.
+    RemoteOperator,
+    /// An approval credential of the owner-signed mainnet policy, exported
+    /// for the owner and never persisted by the ceremony.
+    MainnetApproval,
+}
+
+impl EnrollmentPurpose {
+    /// The session purpose of a server running this ceremony.
+    fn session_purpose(self) -> SessionPurpose {
+        match self {
+            Self::RemoteOperator => SessionPurpose::OperatorEnroll,
+            Self::MainnetApproval => SessionPurpose::MainnetApprovalEnroll,
+        }
+    }
+
+    /// The value the server renders into the page's `data-purpose`
+    /// attribute, from which the page derives its code domain.
+    pub(crate) fn page_value(self) -> &'static str {
+        match self {
+            Self::RemoteOperator => "remote-operator",
+            Self::MainnetApproval => "mainnet-approval",
+        }
+    }
+
+    /// The domain separator of this purpose's confirmation code.
+    pub(crate) fn code_domain(self) -> &'static [u8] {
+        match self {
+            Self::RemoteOperator => OPERATOR_CODE_DOMAIN,
+            Self::MainnetApproval => MAINNET_APPROVAL_CODE_DOMAIN,
+        }
+    }
+}
+
 /// Shared axum state for the operator-enrollment handlers.
 struct OperatorEnrollState {
+    /// What the ceremony enrolls a credential for.
+    purpose: EnrollmentPurpose,
     /// Wallet profile name, shown on the page for operator orientation only.
     profile: String,
     /// Bootstrap-token / session-cookie auth state. See the module docs'
     /// "Single-use, single-server-run" section for the exchange this guards.
     auth: StdMutex<AuthState>,
-    /// The credential store the confirmed credential will be enrolled into.
-    /// The server only reads it, to refuse an already-enrolled ID before
-    /// staging; [`ConfirmedOperatorEnrollment::persist`] is the only writer.
-    store: OperatorApprovalCredentialStore,
+    /// The credential store the confirmed credential will be enrolled into,
+    /// for [`EnrollmentPurpose::RemoteOperator`] only. The server only reads
+    /// it, to refuse an already-enrolled ID before staging;
+    /// [`ConfirmedOperatorEnrollment::persist`] is the only writer.
+    store: Option<OperatorApprovalCredentialStore>,
     /// The exact origin the page runs at, `http://localhost:<bound port>`,
     /// which a registration's `clientDataJSON` must name.
     expected_origin: String,
@@ -341,6 +398,55 @@ pub async fn start_operator_enroll_server(
     label_prefill: Option<String>,
     page_identity: PageIdentity,
 ) -> Result<OperatorEnrollHandle, OperatorEnrollStartError> {
+    start(
+        EnrollmentPurpose::RemoteOperator,
+        Some(OperatorApprovalCredentialStore::new(store_path)),
+        profile.into(),
+        bind_addr,
+        label_prefill,
+        page_identity,
+    )
+    .await
+}
+
+/// Start the enrollment server for an approval credential of the
+/// owner-signed mainnet policy, bound to `127.0.0.1:0`.
+///
+/// The ceremony is the one [`start_operator_enroll_server`] runs, under
+/// [`EnrollmentPurpose::MainnetApproval`]: its own session purpose and
+/// confirmation-code domain, and no credential store. `profile` is shown on
+/// the page for orientation only; `label_prefill` and `page_identity` are as
+/// there.
+///
+/// # Errors
+///
+/// [`OperatorEnrollStartError::Bind`] when the loopback listener cannot be
+/// bound.
+pub async fn start_mainnet_approval_enroll(
+    profile: String,
+    label_prefill: Option<String>,
+    page_identity: PageIdentity,
+) -> Result<OperatorEnrollHandle, OperatorEnrollStartError> {
+    start(
+        EnrollmentPurpose::MainnetApproval,
+        None,
+        profile,
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+        label_prefill,
+        page_identity,
+    )
+    .await
+}
+
+/// Binds the listener and spawns the server of one ceremony for `purpose`.
+async fn start(
+    purpose: EnrollmentPurpose,
+    store: Option<OperatorApprovalCredentialStore>,
+    profile: String,
+    bind_addr: SocketAddr,
+    label_prefill: Option<String>,
+    page_identity: PageIdentity,
+) -> Result<OperatorEnrollHandle, OperatorEnrollStartError> {
     if !bind_addr.ip().is_loopback() {
         return Err(OperatorEnrollStartError::NonLoopbackBind { addr: bind_addr });
     }
@@ -364,9 +470,10 @@ pub async fn start_operator_enroll_server(
 
     let (completion_tx, completion_rx) = oneshot::channel::<StagedEnrollment>();
     let state = Arc::new(OperatorEnrollState {
-        profile: profile.into(),
-        auth: StdMutex::new(AuthState::new(bootstrap, SessionPurpose::OperatorEnroll)),
-        store: OperatorApprovalCredentialStore::new(store_path),
+        purpose,
+        profile,
+        auth: StdMutex::new(AuthState::new(bootstrap, purpose.session_purpose())),
+        store,
         expected_origin: expected_origin(local_addr),
         label_prefill,
         identity: page_identity,

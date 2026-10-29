@@ -1,8 +1,8 @@
 //! Off-chain WebAuthn assertion pre-verifier.
 //!
-//! Implements the 7-step pipeline that the wallet applies to every WebAuthn
-//! passkey assertion BEFORE chain-submission. Rejecting a malformed assertion
-//! here avoids burning a testnet (or mainnet) round-trip when the on-chain OZ
+//! Applies the 7-step pipeline to every WebAuthn passkey assertion BEFORE
+//! chain-submission. Rejecting a malformed assertion here avoids burning a
+//! testnet (or mainnet) round-trip when the on-chain OZ
 //! `verifiers/webauthn.rs` would have rejected it anyway.
 //!
 //! # Pipeline
@@ -16,6 +16,15 @@
 //! | 5 | §17 | `webauthn.rs:217-221`, `:346` | UV bit unconditionally set |
 //! | 6 | spec ext | `webauthn.rs:222-261`, `:347` | BE=0 && BS=1 is invalid |
 //! | 7 | §19+20 | `webauthn.rs:350-356` | secp256r1 sig verify via `COSEKey::verify_signature` |
+//!
+//! # One implementation
+//!
+//! Steps 1 to 6 and their order are the shared workspace implementation in
+//! [`stellar_agent_core::approval::webauthn`], which the mainnet consent
+//! verifier also runs. This module supplies step 7 through the
+//! `webauthn-rs-core` adapter below and maps each shared reason to the same
+//! [`WebAuthnInvalidReason`] sub-code, so the `SaError` contract of
+//! [`pre_verify_assertion`] holds for every input.
 //!
 //! # Adapter shim (step 7)
 //!
@@ -62,8 +71,7 @@
 //! malformed assertion). The on-chain OZ verifier remains the canonical
 //! authority for every step's correctness; the pre-verifier mirrors it.
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use sha2::{Digest, Sha256};
+use stellar_agent_core::approval::webauthn::{WebAuthnAssertionError, pre_verify_assertion_with};
 use webauthn_rs_core::proto::{COSEAlgorithm, COSEEC2Key, COSEKey, COSEKeyType, ECDSACurve};
 
 use crate::SaError;
@@ -75,7 +83,7 @@ use crate::error::WebAuthnInvalidReason;
 
 /// Verify a WebAuthn assertion off-chain before chain-submission.
 ///
-/// Implements the 7-step pipeline:
+/// Runs the 7-step pipeline:
 ///
 /// 1. `clientDataJSON.type == "webauthn.get"` (W3C step 11;
 ///    on-chain OZ `webauthn.rs:121-126`, SHA `a9c4216`).
@@ -93,6 +101,9 @@ use crate::error::WebAuthnInvalidReason;
 ///    (W3C steps 19+20; on-chain `webauthn.rs:350-356`).
 ///    Routed through `webauthn_rs_core::proto::COSEKey::verify_signature`
 ///    (`webauthn-rs-core/src/crypto.rs:558`).
+///
+/// Steps 1 to 6 run in the shared implementation
+/// [`stellar_agent_core::approval::webauthn::pre_verify_assertion_with`].
 ///
 /// # Arguments
 ///
@@ -120,191 +131,72 @@ pub fn pre_verify_assertion(
     signature_compact: &[u8; 64],
     rp_id_hash: &[u8; 32],
 ) -> Result<(), SaError> {
-    // ── STEP 1 — type field ───────────────────────────────────────────────
-    // W3C step 11; on-chain webauthn.rs:121-126.
-    let (type_field, challenge_field) = parse_client_data_type_and_challenge(client_data_json)?;
-    if type_field != "webauthn.get" {
-        return Err(WebAuthnInvalidReason::WrongType.into());
-    }
-
-    // ── STEP 2 — challenge binding ────────────────────────────────────────
-    // W3C step 12; on-chain webauthn.rs:151-163.
-    // The challenge is base64url-no-pad encoding of challenge[0..32]
-    // (identical to OZ's base64_url_encode over the first 32 bytes of
-    // signature_payload at webauthn.rs:155-158).
-    let expected_challenge = URL_SAFE_NO_PAD.encode(challenge);
-    if challenge_field != expected_challenge {
-        return Err(WebAuthnInvalidReason::ChallengeMismatch.into());
-    }
-
-    // ── STEP 3 — RP-ID-hash (wallet-only defence-in-depth) ───────────────
-    // NOT on-chain. On-chain webauthn.rs:9-15 explicitly omits this check
-    // per the docstring: "RP ID hash validation: Verification of `rpIdHash`
-    // in authenticatorData against expected RP ID hash is omitted."
-    // Wallet adds it as off-chain hardening against "credential bound to a
-    // different RP-ID" UX confusion.
-    if authenticator_data.len() < 37 {
-        // authenticator_data must be at least 37 bytes to contain rp_id_hash
-        // (bytes 0..32) plus the flags byte (byte 32) plus the 4-byte counter.
-        return Err(WebAuthnInvalidReason::AuthDataTooShort.into());
-    }
-    if &authenticator_data[..32] != rp_id_hash {
-        return Err(WebAuthnInvalidReason::WrongRpId.into());
-    }
-
-    // ── STEP 4 — UP bit ──────────────────────────────────────────────────
-    // W3C step 16; on-chain webauthn.rs:184-189 (validate_user_present_bit_set).
-    // AUTH_DATA_FLAGS_UP = 0x01 (webauthn.rs:35).
-    let flags = authenticator_data[32];
-    if (flags & 0x01) == 0 {
-        return Err(WebAuthnInvalidReason::UpUnset.into());
-    }
-
-    // ── STEP 5 — UV bit (UNCONDITIONAL) ──────────────────────────────────
-    // W3C step 17; on-chain webauthn.rs:217-221 (validate_user_verified_bit_set)
-    // called UNCONDITIONALLY at webauthn.rs:346.
-    // AUTH_DATA_FLAGS_UV = 0x04 (webauthn.rs:37).
-    //
-    // IMPORTANT: the on-chain OZ verifier at webauthn.rs:346 calls
-    // validate_user_verified_bit_set UNCONDITIONALLY. UV-required is not
-    // optional; mirroring on-chain semantics is the only correct posture.
-    if (flags & 0x04) == 0 {
-        return Err(WebAuthnInvalidReason::UvUnset.into());
-    }
-
-    // ── STEP 6 — BE/BS validity ───────────────────────────────────────────
-    // On-chain webauthn.rs:257-261 (validate_backup_eligibility_and_state)
-    // called UNCONDITIONALLY at webauthn.rs:347.
-    // AUTH_DATA_FLAGS_BE = 0x08, AUTH_DATA_FLAGS_BS = 0x10 (webauthn.rs:39-41).
-    // Invalid state: BE=0 && BS=1 (credential backed up but not eligible).
-    if (flags & 0x08) == 0 && (flags & 0x10) != 0 {
-        return Err(WebAuthnInvalidReason::BeBsInvalid.into());
-    }
-
-    // ── STEP 7 — secp256r1 signature verification ─────────────────────────
-    // W3C steps 19+20; on-chain webauthn.rs:350-356.
-    //
-    // message_digest = sha256(authenticator_data || sha256(client_data_json))
-    //
-    // Routed through COSEKey::verify_signature (webauthn-rs-core/src/crypto.rs:558),
-    // which constructs an OpenSSL ES256 verifier (webauthn-rs-core/src/crypto.rs:30)
-    // that internally hashes verification_data with SHA-256. We therefore pass
-    // the UNHASHED concatenation (authenticator_data || sha256(client_data_json))
-    // as verification_data; OpenSSL performs the outer SHA-256 internally.
-    verify_secp256r1_signature(
+    pre_verify_assertion_with(
+        challenge,
         pubkey_uncompressed,
         authenticator_data,
         client_data_json,
         signature_compact,
+        rp_id_hash,
+        verify_secp256r1_signature,
     )
+    .map_err(|error| SaError::from(invalid_reason(&error)))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Parse `type` and `challenge` string values from the raw `clientDataJSON`
-/// bytes via [`serde_json::from_slice`].
-///
-/// Uses a proper JSON parser rather than a hand-rolled scan: clientDataJSON
-/// manipulation is a known WebAuthn attack vector, and a sound parser must
-/// handle escape sequences, Unicode escapes, and nested string-value
-/// collisions correctly. The OZ on-chain verifier uses a `serde_json_core`
-/// flat-object parse (`webauthn.rs:325-327`) for the same reason; the wallet
-/// uses `serde_json::from_slice` because the off-chain context has no
-/// `no_std` constraint.
-///
-/// Returns `(type_value, challenge_value)` as owned `String`s on success.
-///
-/// # Errors
-///
-/// Returns `SaError::WebAuthnAssertionInvalid { reason: MalformedClientDataJson }`
-/// if the bytes are not valid UTF-8 JSON, do not deserialize as an object, or
-/// the `type` / `challenge` fields are absent / non-string. Any other JSON
-/// fields (e.g. `origin`, `crossOrigin`) are ignored — the wallet binds only
-/// `type` and `challenge` per W3C steps 11-12 (on-chain `webauthn.rs:121-163`).
-fn parse_client_data_type_and_challenge(
-    client_data_json: &[u8],
-) -> Result<(String, String), SaError> {
-    let parsed: ClientDataFields = serde_json::from_slice(client_data_json)
-        .map_err(|_| SaError::from(WebAuthnInvalidReason::MalformedClientDataJson))?;
-
-    Ok((parsed.type_field, parsed.challenge))
+/// The `SaError` sub-code of each shared assertion reason; the names match
+/// one to one.
+fn invalid_reason(error: &WebAuthnAssertionError) -> WebAuthnInvalidReason {
+    match error {
+        WebAuthnAssertionError::WrongType => WebAuthnInvalidReason::WrongType,
+        WebAuthnAssertionError::ChallengeMismatch => WebAuthnInvalidReason::ChallengeMismatch,
+        WebAuthnAssertionError::WrongRpId => WebAuthnInvalidReason::WrongRpId,
+        WebAuthnAssertionError::AuthDataTooShort => WebAuthnInvalidReason::AuthDataTooShort,
+        WebAuthnAssertionError::UpUnset => WebAuthnInvalidReason::UpUnset,
+        WebAuthnAssertionError::UvUnset => WebAuthnInvalidReason::UvUnset,
+        WebAuthnAssertionError::BeBsInvalid => WebAuthnInvalidReason::BeBsInvalid,
+        WebAuthnAssertionError::SignatureInvalid => WebAuthnInvalidReason::SignatureInvalid,
+        WebAuthnAssertionError::MalformedClientDataJson => {
+            WebAuthnInvalidReason::MalformedClientDataJson
+        }
+    }
 }
 
-/// Minimal serde-derived view over `clientDataJSON`.
-///
-/// Only the two fields the wallet actually binds are deserialised:
-/// `type` (renamed because `type` is a Rust keyword) and `challenge`. Any
-/// other JSON fields present (e.g. `origin`, `crossOrigin`, `tokenBinding`)
-/// are accepted and ignored — they are not part of the wallet's W3C step
-/// 11-12 binding surface.
-#[derive(serde::Deserialize)]
-struct ClientDataFields {
-    #[serde(rename = "type")]
-    type_field: String,
-    challenge: String,
-}
-
-/// Verify the secp256r1 signature using the webauthn-rs-core adapter.
+/// Step 7 through the webauthn-rs-core adapter.
 ///
 /// Constructs a [`COSEKey`] for the ES256/SECP256R1 algorithm from the 65-byte
 /// uncompressed public key, converts the compact 64-byte r||s signature to
 /// DER format, then calls `COSEKey::verify_signature`
 /// (`webauthn-rs-core/src/crypto.rs:558`).
 ///
-/// The `verification_data` passed to `COSEKey::verify_signature` is the
-/// unhashed concatenation `authenticator_data || sha256(client_data_json)`.
-/// The OpenSSL ES256 verifier inside the adapter hashes this data with SHA-256
-/// internally (`webauthn-rs-core/src/crypto.rs:30`), matching step 20 of the
-/// W3C assertion procedure and the on-chain path at `webauthn.rs:350-356`.
+/// `verification_data` is the unhashed concatenation
+/// `authenticator_data || sha256(client_data_json)` the shared pipeline
+/// builds. The OpenSSL ES256 verifier inside the adapter hashes it with
+/// SHA-256 internally (`webauthn-rs-core/src/crypto.rs:30`), matching step 20
+/// of the W3C assertion procedure and the on-chain path at
+/// `webauthn.rs:350-356`.
 ///
-/// # Errors
-///
-/// Returns `SaError::WebAuthnAssertionInvalid { reason: SignatureInvalid }` on
-/// malformed public-key input, any OpenSSL verification error, or if the
-/// signature does not verify.
+/// Returns `false` on malformed public-key input, any OpenSSL verification
+/// error, or a signature that does not verify.
 fn verify_secp256r1_signature(
     pubkey_uncompressed: &[u8; 65],
-    authenticator_data: &[u8],
-    client_data_json: &[u8],
+    verification_data: &[u8],
     signature_compact: &[u8; 64],
-) -> Result<(), SaError> {
-    // Build the COSEKey from the 65-byte uncompressed EC point.
+) -> bool {
     // pubkey_uncompressed layout: 0x04 || x[32] || y[32]
-    // (verified by the caller via the `&[u8; 65]` type contract; the 0x04
-    // prefix is the SEC1 uncompressed-point tag per X9.62).
-    let cose_key =
-        build_es256_cose_key(pubkey_uncompressed).ok_or(WebAuthnInvalidReason::SignatureInvalid)?;
-
-    // Build the verification data (unhashed):
-    // verification_data = authenticator_data || sha256(client_data_json)
-    // On-chain webauthn.rs:349-354 (steps 19+20):
-    //   client_data_hash = sha256(client_data)
-    //   message_digest   = authenticator_data || client_data_hash
-    //   e.crypto().secp256r1_verify(pub_key, sha256(message_digest), signature)
-    // The COSEKey::verify_signature OpenSSL backend hashes verification_data
-    // with SHA-256 internally (webauthn-rs-core/src/crypto.rs:30), so we pass
-    // the unhashed concatenation and let OpenSSL perform the outer hash.
-    let client_data_hash = Sha256::digest(client_data_json);
-    let mut verification_data = Vec::with_capacity(authenticator_data.len() + 32);
-    verification_data.extend_from_slice(authenticator_data);
-    verification_data.extend_from_slice(&client_data_hash);
-
-    // Convert compact r||s to DER for OpenSSL.
+    // (the SEC1 uncompressed-point tag per X9.62).
+    let Some(cose_key) = build_es256_cose_key(pubkey_uncompressed) else {
+        return false;
+    };
     // COSEKey::verify_signature delegates to openssl::sign::Verifier::verify_oneshot
-    // which expects a DER-encoded ECDSA signature (SEQUENCE { INTEGER r, INTEGER b }).
+    // which expects a DER-encoded ECDSA signature (SEQUENCE { INTEGER r, INTEGER s }).
     let der_sig = compact_to_der(signature_compact);
-
-    let verified = cose_key
-        .verify_signature(&der_sig, &verification_data)
-        .map_err(|_| SaError::from(WebAuthnInvalidReason::SignatureInvalid))?;
-
-    if verified {
-        Ok(())
-    } else {
-        Err(WebAuthnInvalidReason::SignatureInvalid.into())
-    }
+    cose_key
+        .verify_signature(&der_sig, verification_data)
+        .unwrap_or(false)
 }
 
 /// Build an ES256/SECP256R1 `COSEKey` from a 65-byte uncompressed public key.
@@ -411,6 +303,9 @@ mod tests {
     )]
 
     use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use sha2::{Digest as _, Sha256};
 
     // ── Fixture constants ─────────────────────────────────────────────────
     //
@@ -861,8 +756,8 @@ mod tests {
     /// Verifies that a clientDataJSON missing the `challenge` field is rejected.
     ///
     /// Asserts `WebAuthnInvalidReason::MalformedClientDataJson`. Exercises the
-    /// `serde_json::from_slice` parse-failure branch at
-    /// `parse_client_data_type_and_challenge`. Serde-derived parsing is used
+    /// `serde_json::from_slice` parse-failure branch of the shared
+    /// `clientDataJSON` parser. Serde-derived parsing is used
     /// for soundness against escape sequences, Unicode escapes, and
     /// nested-string collisions that hand-rolled scanners mishandle.
     #[test]
@@ -897,5 +792,80 @@ mod tests {
             ),
             "expected MalformedClientDataJson variant: {err:?}"
         );
+    }
+
+    /// The `webauthn-rs-core` adapter of step 7 and the shared ES256
+    /// verifier agree on every signature: genuine ones under several keys and
+    /// messages, high-S twins, and signatures changed in a byte, made by
+    /// another key or over other data.
+    #[test]
+    fn the_cose_adapter_agrees_with_the_shared_es256_verifier() {
+        use p256::ecdsa::{Signature, SigningKey, signature::hazmat::PrehashSigner};
+        use stellar_agent_core::approval::webauthn::pre_verify_assertion as shared;
+
+        let client_data = make_client_data_json(&URL_SAFE_NO_PAD.encode(CHALLENGE), "webauthn.get");
+        for seed in 1_u8..=16 {
+            let signing_key = SigningKey::from_slice(&[seed; 32]).unwrap();
+            let mut pubkey = [0u8; 65];
+            pubkey.copy_from_slice(
+                signing_key
+                    .verifying_key()
+                    .to_encoded_point(false)
+                    .as_bytes(),
+            );
+            let mut auth_data = make_auth_data(AUTH_DATA_FLAGS);
+            auth_data[36] = seed;
+            let mut other_data = auth_data.clone();
+            other_data[36] ^= 0xff;
+            let mut signed = auth_data.clone();
+            signed.extend_from_slice(&Sha256::digest(&client_data));
+            let signature: Signature = signing_key.sign_prehash(&Sha256::digest(&signed)).unwrap();
+            let low = signature.normalize_s().unwrap_or(signature);
+            let (r, s) = low.split_scalars();
+            let high = Signature::from_scalars(r, -*s).unwrap();
+            let other_key = SigningKey::from_slice(&[seed.wrapping_add(100); 32]).unwrap();
+            let other: Signature = other_key.sign_prehash(&Sha256::digest(&signed)).unwrap();
+            let mut flipped: [u8; 64] = low.to_bytes().into();
+            flipped[usize::from(seed) % 64] ^= 0x01;
+            let cases: [([u8; 64], &[u8]); 5] = [
+                (low.to_bytes().into(), &auth_data),
+                (high.to_bytes().into(), &auth_data),
+                (flipped, &auth_data),
+                (other.to_bytes().into(), &auth_data),
+                (low.to_bytes().into(), &other_data),
+            ];
+            for (index, (signature, auth_data)) in cases.iter().enumerate() {
+                let adapter = pre_verify_assertion(
+                    &CHALLENGE,
+                    &pubkey,
+                    auth_data,
+                    &client_data,
+                    signature,
+                    &RP_ID_HASH,
+                );
+                let reference = shared(
+                    &CHALLENGE,
+                    &pubkey,
+                    auth_data,
+                    &client_data,
+                    signature,
+                    &RP_ID_HASH,
+                );
+                assert_eq!(
+                    adapter.is_ok(),
+                    reference.is_ok(),
+                    "seed {seed} case {index}: {adapter:?} {reference:?}"
+                );
+                if index == 0 {
+                    assert!(
+                        adapter.is_ok(),
+                        "seed {seed}: the genuine signature verifies"
+                    );
+                }
+                if index >= 2 {
+                    assert!(adapter.is_err(), "seed {seed} case {index}");
+                }
+            }
+        }
     }
 }

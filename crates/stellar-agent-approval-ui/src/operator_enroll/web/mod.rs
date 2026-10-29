@@ -1,4 +1,4 @@
-//! Static web assets for the interactive operator-enrollment server.
+//! Static web assets for the interactive enrollment server.
 //!
 //! Holds the wallet-authored, same-origin `operator-enroll.js` served at
 //! `GET /static/operator-enroll.js`. Vanilla JS, no build step, no external
@@ -61,24 +61,42 @@ mod tests {
         assert!(!body.contains("getAuthenticatorData"));
     }
 
-    /// The code domain is the one the server derives the expected code
-    /// under.
+    /// Each purpose's code domain is the one the server derives that
+    /// purpose's expected code under, keyed by the value the server renders.
     #[test]
     fn operator_enroll_js_derives_the_code_under_the_server_domain() {
+        use super::super::EnrollmentPurpose;
         let body = std::str::from_utf8(OPERATOR_ENROLL_JS).unwrap();
-        assert!(body.contains(r#""stellar-agent-operator-enrollment-confirmation:v1""#));
+        for purpose in [
+            EnrollmentPurpose::RemoteOperator,
+            EnrollmentPurpose::MainnetApproval,
+        ] {
+            let domain = std::str::from_utf8(purpose.code_domain()).unwrap();
+            let entry = body
+                .find(&format!("\"{}\": {{", purpose.page_value()))
+                .unwrap_or_else(|| panic!("no entry for {purpose:?}"));
+            let next = body[entry..].find("},").unwrap();
+            assert!(
+                body[entry..entry + next].contains(&format!("codeDomain: \"{domain}\"")),
+                "{purpose:?}"
+            );
+        }
         assert!(body.contains(r#"crypto.subtle.digest("SHA-256""#));
+        assert!(body.contains(r#"getAttribute("data-purpose")"#));
     }
 
     /// The ceremony reads the proof from the key the bootstrap page stores it
-    /// under and sends it in the header the server checks.
+    /// under for the page's purpose and sends it in the header the server
+    /// checks.
     #[test]
     fn operator_enroll_js_reads_the_enrollment_proof_key_and_sends_the_proof_header() {
         let body = std::str::from_utf8(OPERATOR_ENROLL_JS).unwrap();
-        assert!(body.contains(&format!(
-            "\"{}\"",
-            crate::auth::SessionPurpose::OperatorEnroll.proof_storage_key()
-        )));
+        for purpose in [
+            crate::auth::SessionPurpose::OperatorEnroll,
+            crate::auth::SessionPurpose::MainnetApprovalEnroll,
+        ] {
+            assert!(body.contains(&format!("proofKey: \"{}\"", purpose.proof_storage_key())));
+        }
         assert!(body.contains(&format!(
             "\"{}\": proof",
             crate::auth::SESSION_PROOF_HEADER_NAME

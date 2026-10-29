@@ -3395,7 +3395,7 @@ mod tests {
 
             assert_refused_before_confirmation(&fixture, &run, "auth.enrolled_signer_unpinned")
                 .await;
-            fixture.assert_terminal_untouched();
+            fixture.assert_no_consent_ceremony();
         }
 
         /// Enrollment: a sponsor other than the enrolled key refuses with the
@@ -3417,7 +3417,7 @@ mod tests {
                     .unwrap()
                     .contains("public_key_mismatch")
             );
-            fixture.assert_terminal_untouched();
+            fixture.assert_no_consent_ceremony();
         }
 
         /// `--generate`: refused on mainnet before the keyring, with no key

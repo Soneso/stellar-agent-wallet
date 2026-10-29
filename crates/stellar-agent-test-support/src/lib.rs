@@ -37,6 +37,8 @@
 //! - [`connection_counter::ConnectionCounter`] counts the connections a
 //!   loopback TCP listener accepts, for tests that assert no contact with an
 //!   `https://` endpoint.
+//! - [`webauthn::TestAuthenticator`] signs real ES256 WebAuthn assertions
+//!   with a fixed P-256 key, for tests of the assertion verifiers.
 //! - [`source_order`] asserts that one call sits between two others inside a
 //!   production function, for tests that pin the order of a read, an
 //!   acquisition, and a signer load.
@@ -70,6 +72,8 @@ pub mod testnet_helpers;
 pub mod testnet_strkeys;
 #[cfg(feature = "verifier-registry")]
 pub mod verifier_registry;
+#[cfg(feature = "test-helpers")]
+pub mod webauthn;
 #[cfg(feature = "test-helpers")]
 pub mod xdr_fixtures;
 

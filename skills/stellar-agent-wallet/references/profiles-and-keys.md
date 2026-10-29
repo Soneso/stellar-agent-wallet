@@ -467,7 +467,7 @@ the `--confirm-remote-exposure` flag at start time.
 | `enabled` | bool | no | `false` | Must be `true`, together with `--confirm-remote-exposure`, for `--remote` to take effect. |
 | `bind` | string | yes (if block present) | none | Socket address to bind, validated before any TLS provisioning or bind attempt. |
 | `rp_id` | string | yes (if block present) | none | WebAuthn Relying Party ID, a DNS hostname; an IP literal is refused. |
-| `allowed_credentials` | array of strings | no | `[]` | Base64url WebAuthn credential IDs authorized to approve or reject. The running listener reads it at every login and decision; removing an id revokes that credential at once, including its uncommitted mainnet approvals. Remove the id here first, then the enrollment with `approve operator remove`. |
+| `allowed_credentials` | array of strings | no | `[]` | Base64url WebAuthn credential IDs authorized to approve or reject. The running listener reads it at every login and decision; removing an id revokes that credential at once. The listener approves testnet requests only; this list does not revoke a mainnet [approval credential](#approval-credentials). Remove the id here first, then the enrollment with `approve operator remove`. |
 
 ### `[served_pages]` block
 
@@ -735,7 +735,8 @@ build, enablement, a signed v2 policy, and approval for each action.
 The first enablement requires a signed v2 policy and pins its sequence, digest,
 and owner before storing the nonce. A v1 or unsigned policy is refused and
 nothing is written. Prepare this policy without `[mainnet]`, sign it, run
-`enable-mainnet`, then complete and sign the bound policy.
+`enable-mainnet`, then complete and sign the bound policy. The completed policy
+lists at least one [approval credential](#approval-credentials).
 An installation with a stored enablement nonce refuses an absent pin with
 `policy.pin_absent`: every mainnet write and both forms of `enable-mainnet`
 refuse, and no wallet command establishes that pin. Nonce rotation and
@@ -753,7 +754,8 @@ one refuses with `policy.owner_rotation_invalid`.
 Engine `v1`, policy-body version 2, and profile-schema version 2 are separate.
 The enabled-policy minimum applies to feature-on mainnet profiles with a
 signed v2 body containing `[mainnet]`. `profile enable-mainnet --check`
-evaluates the restrictions in either build.
+evaluates the restrictions in either build. The `approval_credentials`
+requirement holds in either build for every policy with a `[mainnet]` table.
 
 The profile file and policy file are separate documents. This policy example
 contains complete payment rules for CLI and MCP. Replace the destination with
@@ -773,6 +775,9 @@ profile = "operator"
 installation_nonce_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 classic_max_fee_per_op_stroops = 500
 authorization_ttl_seconds = 60
+approval_credentials = [
+    { credential_id_b64url = "WlpaWlpaWlpaWlpaWlpaWg", public_key_sec1_b64url = "BEYtuhrk_BqWi02s8gzdbb4frjSqlxUUpj00BcPRz9ODtYu7CMEzg0KMWFPHHEyFHhNLBWgh5Gj-Cpd6v0MT3eE" },
+]
 [mainnet.cross_check_thresholds]
 native = "10000000000"
 "USD:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" = "100"
@@ -816,8 +821,42 @@ reason = "review"
 | `[mainnet].installation_nonce_sha256` | Installation nonce digest as 64 lowercase hexadecimal characters. |
 | `[mainnet].classic_max_fee_per_op_stroops` | Required signed `u32` classic per-operation cap. |
 | `[mainnet].authorization_ttl_seconds` | Optional lifetime from 1 through 120 seconds, distinct from approval lifetime. |
+| `[mainnet].approval_credentials` | Required. 1 to 16 inline tables with exactly `credential_id_b64url` and `public_key_sec1_b64url`, placed in `[mainnet]` before any `[mainnet.*]` subtable. Both values are canonical unpadded base64url: an ID of 16 to 64 bytes and a 65-byte uncompressed SEC1 P-256 point. IDs are unique. The example entry is a placeholder; use the entry `approve credential enroll` prints. |
 | `[mainnet.cross_check_thresholds]` | Optional signed thresholds, each a positive TOML integer or a positive decimal string within the i128 range, such as `native = "10000000000"`. |
-| Signature coverage | V2 signs sequence and mainnet fields. Match and criterion keys are sorted canonically. |
+| Signature coverage | V2 signs sequence and mainnet fields. Match and criterion keys are sorted canonically. The approval credentials are signed sorted by raw credential ID, so reordering entries or their keys keeps the signed bytes. |
+
+#### Approval credentials
+
+Mainnet consent requires a fresh WebAuthn assertion, with user presence and
+user verification, from a credential this list names. The owner admits a
+credential by signing the policy that lists it; enrollment alone grants
+nothing.
+
+1. Run `stellar-agent approve credential enroll --profile <name>` on the wallet
+   host, create the passkey in the local browser, and type the code the page
+   shows. The command prints the credential and its `policy_entry_toml`; see
+   [`approve credential enroll`](cli-reference.md#approve-credential-enroll).
+2. Review the credential and add the entry to `approval_credentials` in the
+   `[mainnet]` table.
+3. Sign the policy with `profile sign-policy`, which assigns a higher sequence,
+   then restart the MCP server and every `approve serve` inbox of the profile.
+
+A missing or empty list refuses with `policy.mainnet_minimum_unmet` and
+`requirement=approval_credentials`. A malformed list, an unknown key, a
+duplicate ID, or an invalid ID or key refuses with
+`policy.policy_file_parse_failed` and a fixed detail that names the problem.
+`sign-policy` refuses both and writes nothing. An existing mainnet policy
+without the list needs it and a new signature before the MCP server or
+`approve serve` starts on that profile, read-only use included.
+
+To revoke a credential, remove its entry and sign the policy at a higher
+sequence. An approval recorded under an earlier policy needs fresh consent,
+also when its credential stays listed. The `[remote_approval]` allowlist and
+`approve operator remove` do not change the approval credentials.
+
+This release connects no presence ceremony to the consent surfaces: every
+mainnet consent refuses with `approval.presence_required`, so mainnet writes
+remain unavailable. See [Mainnet write behavior](cli-reference.md#mainnet-write-behavior).
 
 #### Enabled-policy minimum
 
@@ -840,6 +879,7 @@ reason = "review"
 | `fee_cap` | The signed mainnet table contains the classic per-operation cap. |
 | `thresholds` | Signed thresholds use pinned identities and positive i128 values. The native threshold meets the floor. |
 | `ttl` | Authorization TTL is absent or from 1 through 120 seconds. |
+| `approval_credentials` | The `[mainnet]` table lists 1 to 16 approval credentials. Required in either build. |
 
 The minimum has no memo criterion. SEP-29 still refuses a missing memo when
 the destination's `config.memo_required` entry is `1`. The operator supplies
