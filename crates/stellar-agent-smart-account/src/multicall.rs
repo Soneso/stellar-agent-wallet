@@ -44,7 +44,10 @@ use stellar_agent_network::signing::Signer;
 use crate::SaError;
 use crate::error::PostSubmitVerificationKind;
 use crate::managers::rules::parse_c_strkey_to_smart_account;
-use crate::submit::{MulticallCheck, ResolvedFeePerOp, SubmitInvokeArgs, submit_signed_invoke};
+use crate::submit::{
+    DeclaredSubInvocations, MulticallCheck, ResolvedFeePerOp, SubmitInvokeArgs,
+    submit_signed_invoke,
+};
 
 // ── WASM provenance constants ─────────────────────────────────────────────────
 
@@ -1199,7 +1202,41 @@ fn normalize_simulated_nonce_keys(
 /// - `SaError::MulticallFailed { phase: "build", .. }` on any XDR encoding
 ///   failure (invalid C-strkey, invalid symbol, argument encoding error).
 pub fn build_exec_invocations(bundle: &[MulticallInvocation]) -> Result<Vec<ScVal>, SaError> {
-    use stellar_xdr::{ContractId, Hash, ScAddress};
+    bundle_calls(bundle)?
+        .into_iter()
+        .enumerate()
+        .map(|(idx, call)| {
+            // The (Address, Symbol, Vec<Val>) tuple as a ScVal::Vec.
+            let tuple_elements: VecM<ScVal> = vec![
+                ScVal::Address(call.contract_address),
+                ScVal::Symbol(call.function_name),
+                ScVal::Vec(Some(call.args.into())),
+            ]
+            .try_into()
+            .map_err(|_| SaError::MulticallFailed {
+                phase: "build",
+                redacted_reason: format!("inner[{idx}]: tuple VecM encoding failed"),
+                post_submit_kind: None,
+            })?;
+            Ok(ScVal::Vec(Some(tuple_elements.into())))
+        })
+        .collect()
+}
+
+/// Encodes each bundle entry as the call the router's `exec` dispatches:
+/// target contract, function name and arguments.
+///
+/// [`build_exec_invocations`] encodes the same calls for the router's
+/// `invocations` argument, and [`submit_multicall_bundle`] declares them as
+/// the sub-invocations the wallet authorizes under `exec`, so the signed
+/// tree holds only calls the bundle names.
+///
+/// # Errors
+///
+/// - `SaError::MulticallFailed { phase: "build", .. }` on any XDR encoding
+///   failure (invalid C-strkey, invalid symbol, argument encoding error).
+fn bundle_calls(bundle: &[MulticallInvocation]) -> Result<Vec<InvokeContractArgs>, SaError> {
+    use stellar_xdr::{ContractId, Hash};
 
     let build_err = |reason: String| SaError::MulticallFailed {
         phase: "build",
@@ -1210,33 +1247,33 @@ pub fn build_exec_invocations(bundle: &[MulticallInvocation]) -> Result<Vec<ScVa
     let mut result = Vec::with_capacity(bundle.len());
 
     for (idx, invocation) in bundle.iter().enumerate() {
-        // 1. Encode the contract address as ScVal::Address.
+        // 1. The target contract address.
         let contract_strkey = stellar_strkey::Contract::from_string(&invocation.target_contract)
             .map_err(|e| {
                 build_err(format!(
                     "inner[{idx}]: invalid target_contract C-strkey: {e}"
                 ))
             })?;
-        let contract_id = ContractId(Hash(contract_strkey.0));
-        let address_val = ScVal::Address(ScAddress::Contract(contract_id));
 
-        // 2. Encode the function name as ScVal::Symbol.
+        // 2. The function name as a Soroban symbol.
         let symbol_str = validate_soroban_symbol(&invocation.fn_name)
             .map_err(|e| build_err(format!("inner[{idx}]: invalid fn_name symbol: {e}")))?;
-        let symbol_val =
-            ScVal::Symbol(ScSymbol(symbol_str.as_bytes().try_into().map_err(
-                |_| build_err(format!("inner[{idx}]: fn_name symbol encoding failed")),
-            )?));
+        let function_name = ScSymbol(
+            symbol_str
+                .as_bytes()
+                .try_into()
+                .map_err(|_| build_err(format!("inner[{idx}]: fn_name symbol encoding failed")))?,
+        );
 
-        // 3. Encode the JSON args as ScVal::Vec of ScVal elements.
+        // 3. The JSON args as the call's argument vector.
         let args = json_args_to_scval_vec(&invocation.args_json, idx)
             .map_err(|e| build_err(format!("inner[{idx}]: args encoding failed: {e}")))?;
 
-        // 4. Build the (Address, Symbol, Vec<Val>) tuple as a ScVal::Vec.
-        let tuple_elements: VecM<ScVal> = vec![address_val, symbol_val, args]
-            .try_into()
-            .map_err(|_| build_err(format!("inner[{idx}]: tuple VecM encoding failed")))?;
-        result.push(ScVal::Vec(Some(tuple_elements.into())));
+        result.push(InvokeContractArgs {
+            contract_address: ScAddress::Contract(ContractId(Hash(contract_strkey.0))),
+            function_name,
+            args,
+        });
     }
 
     Ok(result)
@@ -1529,6 +1566,10 @@ pub async fn submit_multicall_bundle(
 
     // Build the exec invocations XDR arg.
     let exec_invocations_xdr = build_exec_invocations(&args.bundle)?;
+    // The same calls, declared as the sub-invocations the wallet authorizes
+    // under `exec`: a simulated subtree holding any other call is refused
+    // before signing.
+    let declared_calls = bundle_calls(&args.bundle)?;
 
     // Build the InvokeContractArgs for the router's `exec` function.
     let exec_invocations_scval: VecM<ScVal> =
@@ -1597,13 +1638,15 @@ pub async fn submit_multicall_bundle(
     let recorder = build_bundle_recorder(&args, &tool, &bundle_view)?;
 
     // The transaction invokes the router's `exec`; the wallet is the
-    // authorizing address whose credentials sign the simulated tree.
+    // authorizing address whose credentials sign `exec` as the root, with the
+    // bundle's wallet-authorized calls under it.
     let submit_result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
             .target_contract(&registry_entry.address)
             .auth_address(args.smart_account)
             .auth_rule_ids(&auth_rule_ids)
             .host_function(host_function)
+            .sub_invocations(DeclaredSubInvocations::Calls(&declared_calls))
             .signer(args.signer)
             .primary_rpc_url(args.primary_rpc_url)
             .secondary_rpc_url(args.secondary_rpc_url)
@@ -1817,7 +1860,10 @@ fn validate_soroban_symbol(s: &str) -> Result<&str, String> {
 /// # Errors
 ///
 /// Returns a description string on encoding failure or unsupported JSON shape.
-fn json_args_to_scval_vec(args_json: &serde_json::Value, idx: usize) -> Result<ScVal, String> {
+fn json_args_to_scval_vec(
+    args_json: &serde_json::Value,
+    idx: usize,
+) -> Result<VecM<ScVal>, String> {
     use stellar_xdr::{Int128Parts, ScString};
 
     let arr = match args_json {
@@ -1881,11 +1927,9 @@ fn json_args_to_scval_vec(args_json: &serde_json::Value, idx: usize) -> Result<S
         elements.push(scval);
     }
 
-    let vecm: VecM<ScVal> = elements
+    elements
         .try_into()
-        .map_err(|_| format!("inner[{idx}] args VecM encoding failed"))?;
-
-    Ok(ScVal::Vec(Some(vecm.into())))
+        .map_err(|_| format!("inner[{idx}] args VecM encoding failed"))
 }
 
 /// Builds `MulticallInnerResult` values from the confirmed on-chain return value.

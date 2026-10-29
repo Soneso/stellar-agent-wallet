@@ -59,7 +59,8 @@ use stellar_xdr as xdr_curr;
 use stellar_xdr::{
     BytesM, ContractId, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, Limits,
     Operation, OperationBody, ReadXdr, ScAddress, ScBytes, ScMap, ScMapEntry, ScString, ScSymbol,
-    ScVal, ScVec, SorobanAuthorizationEntry, SorobanCredentials, VecM, WriteXdr,
+    ScVal, ScVec, SorobanAuthorizationEntry, SorobanAuthorizedInvocation, SorobanCredentials, VecM,
+    WriteXdr,
 };
 use tracing::warn;
 
@@ -4459,7 +4460,8 @@ pub(crate) fn locate_smart_account_auth_entry(
 }
 
 /// Computes a redaction-safe fingerprint of the auth-context invocation
-/// (first-8 hex chars of the SHA-256 of the root-invocation XDR).
+/// (the first 16 hex characters of the SHA-256 of the root-invocation XDR),
+/// an attribution label for operator-facing messages.
 pub(crate) fn fingerprint_invocation(entry: &SorobanAuthorizationEntry) -> AuthContextFingerprint {
     let xdr = entry
         .root_invocation
@@ -4468,6 +4470,37 @@ pub(crate) fn fingerprint_invocation(entry: &SorobanAuthorizationEntry) -> AuthC
     let digest = Sha256::digest(&xdr);
     let hex_full: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     AuthContextFingerprint::new(format!("invoke:{}", &hex_full[..16]))
+}
+
+/// Fingerprints every node of an authorized invocation tree, in depth-first
+/// order: one `node:<sha256>:<children>` entry per node, where `<sha256>` is
+/// the full 64-hex SHA-256 of the node's `SorobanAuthorizedFunction` XDR and
+/// `<children>` its number of direct sub-invocations.
+///
+/// The list is the per-context projection the simulation-divergence check
+/// compares: two trees yield equal lists exactly when they hold the same
+/// functions in the same shape, so the list of the simulated tree differs
+/// from the list of the signed tree whenever a root, an argument or a node
+/// differs. Its length is the number of `auth::Context` entries OZ
+/// `__check_auth` receives for the tree.
+pub(crate) fn fingerprint_invocation_nodes(
+    root: &SorobanAuthorizedInvocation,
+) -> Vec<AuthContextFingerprint> {
+    fn visit(node: &SorobanAuthorizedInvocation, out: &mut Vec<AuthContextFingerprint>) {
+        let xdr = node.function.to_xdr(Limits::none()).unwrap_or_default();
+        let digest = Sha256::digest(&xdr);
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        out.push(AuthContextFingerprint::new(format!(
+            "node:{hex}:{}",
+            node.sub_invocations.len()
+        )));
+        for child in node.sub_invocations.iter() {
+            visit(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    visit(root, &mut out);
+    out
 }
 
 /// Short stable fingerprint of the network passphrase for the simulation /
@@ -7858,6 +7891,114 @@ mod tests {
             fp3.as_str(),
             "different invocations must produce different fingerprints"
         );
+    }
+
+    // ── fingerprint_invocation_nodes ──────────────────────────────────────────
+
+    fn tree_call(
+        byte: u8,
+        function: &str,
+        args: Vec<ScVal>,
+    ) -> stellar_xdr::SorobanAuthorizedFunction {
+        stellar_xdr::SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+            contract_address: ScAddress::Contract(ContractId(stellar_xdr::Hash([byte; 32]))),
+            function_name: ScSymbol::try_from(function).unwrap(),
+            args: args.try_into().unwrap(),
+        })
+    }
+
+    fn tree(
+        root: stellar_xdr::SorobanAuthorizedFunction,
+        subs: Vec<stellar_xdr::SorobanAuthorizedFunction>,
+    ) -> SorobanAuthorizedInvocation {
+        SorobanAuthorizedInvocation {
+            function: root,
+            sub_invocations: subs
+                .into_iter()
+                .map(|function| SorobanAuthorizedInvocation {
+                    function,
+                    sub_invocations: VecM::default(),
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+        }
+    }
+
+    /// One `node:<64-hex>:<children>` fingerprint per node, depth first; a
+    /// substituted root contract, a substituted argument and an extra node
+    /// each change the list, and an equal tree yields an equal list.
+    #[test]
+    fn node_fingerprints_differ_for_a_substituted_root_or_subtree() {
+        let wallet_tree = || {
+            tree(
+                tree_call(0x57, "swap", vec![ScVal::U32(5)]),
+                vec![tree_call(0x70, "transfer", vec![ScVal::U32(1)])],
+            )
+        };
+        let nodes = fingerprint_invocation_nodes(&wallet_tree());
+
+        assert_eq!(nodes.len(), 2, "one fingerprint per node");
+        let root = nodes[0].as_str();
+        let (hex, children) = root
+            .strip_prefix("node:")
+            .and_then(|rest| rest.split_once(':'))
+            .unwrap();
+        assert_eq!(hex.len(), 64, "the full SHA-256: {root}");
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{root}");
+        assert_eq!(children, "1", "the root's child count: {root}");
+        assert!(nodes[1].as_str().ends_with(":0"), "a leaf has no children");
+        assert_ne!(nodes[0], nodes[1]);
+
+        assert_eq!(fingerprint_invocation_nodes(&wallet_tree()), nodes);
+
+        let other_root_contract = tree(
+            tree_call(0xAA, "swap", vec![ScVal::U32(5)]),
+            vec![tree_call(0x70, "transfer", vec![ScVal::U32(1)])],
+        );
+        let other_argument = tree(
+            tree_call(0x57, "swap", vec![ScVal::U32(6)]),
+            vec![tree_call(0x70, "transfer", vec![ScVal::U32(1)])],
+        );
+        let other_sub_argument = tree(
+            tree_call(0x57, "swap", vec![ScVal::U32(5)]),
+            vec![tree_call(0x70, "transfer", vec![ScVal::U32(2)])],
+        );
+        let extra_node = extra_node_tree();
+        for substituted in [
+            other_root_contract,
+            other_argument,
+            other_sub_argument,
+            extra_node,
+        ] {
+            assert_ne!(fingerprint_invocation_nodes(&substituted), nodes);
+        }
+
+        // The same three functions in another shape: the second transfer
+        // nested under the first instead of beside it.
+        let reshaped = SorobanAuthorizedInvocation {
+            function: tree_call(0x57, "swap", vec![ScVal::U32(5)]),
+            sub_invocations: vec![tree(
+                tree_call(0x70, "transfer", vec![ScVal::U32(1)]),
+                vec![tree_call(0x70, "transfer", vec![ScVal::U32(1)])],
+            )]
+            .try_into()
+            .unwrap(),
+        };
+        assert_ne!(
+            fingerprint_invocation_nodes(&reshaped),
+            fingerprint_invocation_nodes(&extra_node_tree())
+        );
+    }
+
+    fn extra_node_tree() -> SorobanAuthorizedInvocation {
+        tree(
+            tree_call(0x57, "swap", vec![ScVal::U32(5)]),
+            vec![
+                tree_call(0x70, "transfer", vec![ScVal::U32(1)]),
+                tree_call(0x70, "transfer", vec![ScVal::U32(1)]),
+            ],
+        )
     }
 
     // ── build_add_context_rule_args: policy encoding ──────────────────────────

@@ -45,6 +45,8 @@ mod simulate_install_rule_mock;
 mod submission_records_mock;
 #[path = "smart_account/submit_signed_invoke_sequence_floor_mock.rs"]
 mod submit_signed_invoke_sequence_floor_mock;
+#[path = "smart_account/submit_signed_invoke_signed_tree_mock.rs"]
+mod submit_signed_invoke_signed_tree_mock;
 #[path = "smart_account/upper_bound_max_scan_id_parity_test.rs"]
 mod upper_bound_max_scan_id_parity_test;
 #[path = "smart_account/verify_rule_wasm_pins_paths.rs"]

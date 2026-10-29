@@ -66,7 +66,10 @@ use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_defi::adapter::{DefiAdapter, DefiAdapterCtx, DefiAdapterError, DefiPreview};
 
 use stellar_agent_defi::dispatch::SubmitWitness;
-use stellar_agent_smart_account::submit::{SubmitInvokeArgs, submit_signed_invoke};
+use stellar_agent_defi::scval::contract_strkey_to_sc_address;
+use stellar_agent_smart_account::submit::{
+    DeclaredSubInvocations, DeclaredTransfer, SubmitInvokeArgs, submit_signed_invoke,
+};
 
 use crate::abi::{
     DEFAULT_DEADLINE_OFFSET_SECS, MAX_DEADLINE_OFFSET_SECS, MAX_PATH_LEN, MIN_PATH_LEN, TradeArgs,
@@ -287,6 +290,14 @@ impl DefiAdapter for DexSwapAdapter {
     ///   `locate_smart_account_auth_entry` to find the wallet's auth entry.
     /// - `.auth_rule_ids(&[ContextRuleId::new(0)])` — the OZ bootstrap rule
     ///   (installed at deploy) that authorises all operations.
+    /// - `.sub_invocations(TokenTransfers(..))`: transfers of the input token
+    ///   (`path[0]`) from the wallet, totaling at most `amount_in`, to
+    ///   recipients the router chooses.
+    ///
+    /// Rule 0 accepts any context, so the declaration is what bounds the
+    /// signed tree: `submit_signed_invoke` refuses a simulated root other than
+    /// the router call this adapter built, and any sub-invocation outside that
+    /// declaration, before anything is signed.
     ///
     /// # Errors
     ///
@@ -480,6 +491,11 @@ impl DefiAdapter for DexSwapAdapter {
             args: swap_args_vecm,
         });
 
+        // ── Declared sub-invocation ───────────────────────────────────────
+        // Any simulated subtree other than the router's transfer of the input
+        // token is refused before signing.
+        let declared_transfers = declared_input_transfer(&canonical_path, trade_args.amount_in)?;
+
         // ── Determine secondary RPC URL ────────────────────────────────────
         let secondary_rpc_url = ctx
             .secondary_rpc
@@ -520,6 +536,7 @@ impl DefiAdapter for DexSwapAdapter {
                 // stays `None`); any other rule would be refused without one.
                 .auth_rule_ids(&[ContextRuleId::new(0)])
                 .host_function(host_function)
+                .sub_invocations(DeclaredSubInvocations::TokenTransfers(&declared_transfers))
                 .signer(signer)
                 .primary_rpc_url(ctx.primary_rpc.url())
                 .maybe_secondary_rpc_url(secondary_rpc_url)
@@ -612,6 +629,38 @@ fn map_submit_invoke_error(error: &stellar_agent_smart_account::SaError) -> Defi
 // ─────────────────────────────────────────────────────────────────────────────
 // Validation helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// The transfers a swap authorizes under the router call.
+///
+/// The router moves the input token with `transfer(from = wallet, to = pair,
+/// amount_in)`. The pair is the router's choice, so the recipient stays open;
+/// the token is `canonical_path[0]`, and the transfers of it total at most the
+/// trade's `amount_in`.
+///
+/// # Errors
+///
+/// [`DefiAdapterError::InvalidArguments`] when the path is empty or its first
+/// entry is not a C-strkey.
+fn declared_input_transfer(
+    canonical_path: &[String],
+    amount_in: i128,
+) -> Result<[DeclaredTransfer; 1], DefiAdapterError> {
+    let input_token = canonical_path
+        .first()
+        .ok_or_else(|| DefiAdapterError::InvalidArguments {
+            reason: "swap path is empty".to_owned(),
+        })?;
+    let token = contract_strkey_to_sc_address(input_token).map_err(|e| {
+        DefiAdapterError::InvalidArguments {
+            reason: format!("input token address invalid: {e}"),
+        }
+    })?;
+    Ok([DeclaredTransfer {
+        token,
+        to: None,
+        max_amount: amount_in,
+    }])
+}
 
 /// Validates [`TradeArgs`] fields.
 ///
@@ -791,6 +840,31 @@ mod tests {
             ],
             deadline: Some(now + 300),
         }
+    }
+
+    #[test]
+    fn the_swap_declares_the_input_token_transfer_bounded_by_amount_in() {
+        let path = vec![
+            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_owned(),
+            "CB3TLW74NBIOT3BUWOZ3TUM6RFDF6A4GVIRUQRQZABG5KPOUL4JJOV2F".to_owned(),
+        ];
+        let [declared] = declared_input_transfer(&path, 1_234).unwrap();
+        assert_eq!(
+            declared.token,
+            contract_strkey_to_sc_address(&path[0]).unwrap(),
+            "the input token is the path's first entry"
+        );
+        assert_eq!(declared.to, None, "the router chooses the pair");
+        assert_eq!(declared.max_amount, 1_234);
+
+        assert!(matches!(
+            declared_input_transfer(&[], 1),
+            Err(DefiAdapterError::InvalidArguments { .. })
+        ));
+        assert!(matches!(
+            declared_input_transfer(&["native".to_owned()], 1),
+            Err(DefiAdapterError::InvalidArguments { .. })
+        ));
     }
 
     #[test]

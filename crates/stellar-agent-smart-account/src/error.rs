@@ -877,7 +877,9 @@ pub enum SaError {
     ///
     /// Signing aborts before signature bytes are produced when simulation context
     /// and the envelope-to-sign disagree. Guards against context-rule-ID binding
-    /// tampering and Soroban auth-entry manipulation between simulate and sign.
+    /// tampering and against a simulated invocation tree other than the one the
+    /// wallet built: a root on another contract, function or argument, or
+    /// sub-invocations the caller did not declare.
     #[error("simulation divergence: {sub_code:?} ({redacted_reason})")]
     #[serde(rename = "simulation.divergence")]
     SimulationDivergence {
@@ -1686,8 +1688,9 @@ pub enum SaError {
     /// - `"strkey_parse"` — signer public-key strkey parse failure during
     ///   auth-entry construction. Surfaces from
     ///   `managers/signers.rs`.
-    /// - `"quorum_external_contract_guard"` — external-contract quorum guard
-    ///   failure (reject if any quorum entry is an unregistered external contract).
+    /// - `"quorum_external_contract_guard"`: the quorum path signs the
+    ///   wallet's own entrypoints only; refused when the host function targets
+    ///   another contract or the simulated tree carries sub-invocations.
     ///   Surfaces from `submit.rs`.
     /// - `"quorum_signatures"` — quorum-signature collection failure (too few
     ///   registered signers could sign). Surfaces from `submit.rs`.
@@ -2699,7 +2702,10 @@ pub enum SimulationDivergenceSubCode {
     /// `context_rule_ids` order or membership differs between simulation and
     /// the to-be-submitted envelope.
     ContextRuleIds,
-    /// `auth_contexts` array (per-context invocation list) differs.
+    /// The simulated invocation tree is not the tree the wallet signs: its
+    /// root differs from the host function, its sub-invocations fall outside
+    /// the caller's declaration, or the per-node `auth_contexts`
+    /// fingerprints of the simulated and the signed tree differ.
     AuthContexts,
     /// Network identity (passphrase + ledger-version + chain-id) differs.
     Network,

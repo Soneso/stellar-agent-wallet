@@ -32,7 +32,10 @@
 //! 3. Required-check enforcement + `Option<*Check>` dispatch.
 //! 4. Cross-RPC simulate check (passthrough when `secondary_rpc_url` is `None`
 //!    or `multicall_check` is `None`).
-//! 5. Sign: auth-entry via `build_authorization_entry` substrate.
+//! 5. Sign: the simulated root invocation must be the caller's host function
+//!    and its sub-invocations must match the caller's
+//!    [`DeclaredSubInvocations`]; the wallet then signs its own root with the
+//!    accepted subtree via the `build_authorization_entry` substrate.
 //! 6. Submit: send signed envelope.
 //! 7. Return `Result<SubmitInvokeResult, SaError>` to caller.
 
@@ -49,25 +52,27 @@ use stellar_baselib::transaction::TransactionBehavior;
 use stellar_baselib::transaction_builder::{TransactionBuilder, TransactionBuilderBehavior};
 use stellar_rpc_client::Client;
 use stellar_xdr::{
-    HostFunction, InvokeHostFunctionOp, Operation, OperationBody, ScAddress, ScVal,
-    SorobanAuthorizationEntry, SorobanAuthorizedInvocation, SorobanCredentials, VecM,
+    HostFunction, InvokeContractArgs, InvokeHostFunctionOp, Operation, OperationBody, ScAddress,
+    ScVal, SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+    SorobanCredentials, VecM,
 };
 use tracing::info;
 
 use crate::SaError;
-use crate::error::pin_check_reason;
+use crate::error::{SimulationDivergenceSubCode, pin_check_reason};
 use crate::managers::auth_entry::{
     AuthorizationSimulation, PartialSorobanAuthorizationEntry, PreSubmitBudget,
-    bound_pre_submit_stage, build_authorization_entry,
-    build_authorization_entry_with_sub_invocations, complete_authorization_entry,
+    bound_pre_submit_stage, build_authorization_entry_with_sub_invocations,
+    complete_authorization_entry,
 };
 use crate::managers::authorization::collect_quorum_signatures;
 use crate::managers::rules::{
     AUTH_VALIDITY_LEDGERS, BASE_FEE_STROOPS, ExpiryCheck, HorizonCheck, augment_with_oz_error_name,
     build_and_sign_delegated_g_key_entry, build_signed_invoke_envelope, chain_id_fingerprint,
-    check_rule_not_expired_standalone, fingerprint_invocation, locate_smart_account_auth_entry,
-    parse_c_strkey_to_smart_account, parse_min_resource_fee, passphrase_fingerprint,
-    resimulate_with_signed_auth, scaddress_to_strkey, validate_latest_ledger,
+    check_rule_not_expired_standalone, fingerprint_invocation, fingerprint_invocation_nodes,
+    locate_smart_account_auth_entry, parse_c_strkey_to_smart_account, parse_min_resource_fee,
+    passphrase_fingerprint, resimulate_with_signed_auth, scaddress_to_strkey,
+    validate_latest_ledger,
 };
 use crate::managers::signers::{
     BorrowedRuleLocks, RuleLockGuard, SignersManager, V1Handling, find_rule_guard,
@@ -78,7 +83,8 @@ use crate::managers::verifiers::{
     verify_policy_pins_present,
 };
 use crate::signing::divergence::{
-    EnvelopeContext, FeeEnvelopeContext, NetworkContext, SequenceContext, SimulationContext,
+    AuthContextFingerprint, EnvelopeContext, FeeEnvelopeContext, NetworkContext, SequenceContext,
+    SimulationContext,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -361,6 +367,59 @@ impl ExpectedReturn {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DeclaredSubInvocations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The sub-invocations a submission authorizes under the wallet's root
+/// invocation.
+///
+/// [`submit_signed_invoke`] signs the caller's own host function as the root
+/// of the authorized tree and refuses a simulated root that differs from it.
+/// The sub-invocations under that root come from the simulation, so the
+/// caller declares the ones it means: a simulated subtree outside the
+/// declaration is refused before anything is signed, with
+/// [`SaError::SimulationDivergence`] and wire code
+/// `simulation.divergence.auth_contexts`. Every accepted sub-invocation is a
+/// leaf; a nested node under any of them is refused.
+///
+/// A wallet entrypoint authorizes its own frame, and the contracts it calls
+/// are authorized through invoker-contract auth without adding a node to the
+/// wallet's tree, so wallet self-calls keep the default [`Self::None`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeclaredSubInvocations<'a> {
+    /// The simulated root carries no sub-invocations.
+    #[default]
+    None,
+    /// Each sub-invocation is a leaf `transfer(from, to, amount)` on a declared
+    /// token, `from` is the authorizing address, and the amounts per token sum
+    /// to at most the declared bound.
+    ///
+    /// A transfer counts against the first declared entry whose token matches
+    /// and whose recipient, when set, matches. A negative amount is refused.
+    TokenTransfers(&'a [DeclaredTransfer]),
+    /// The sub-invocations are leaves equal to declared calls, in declared
+    /// order, each used at most once.
+    ///
+    /// A declared call that requires no authorization from the wallet adds no
+    /// node to its tree, so the simulated sub-invocations may skip declared
+    /// calls but never reorder or repeat them.
+    Calls(&'a [InvokeContractArgs]),
+}
+
+/// One token transfer a submission authorizes under
+/// [`DeclaredSubInvocations::TokenTransfers`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclaredTransfer {
+    /// The token contract whose `transfer` is authorized.
+    pub token: ScAddress,
+    /// The recipient, or `None` when the invoked contract chooses it.
+    pub to: Option<ScAddress>,
+    /// The upper bound of the amounts this entry's transfers move together.
+    pub max_amount: i128,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ResolvedFeePerOp
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -467,6 +526,11 @@ pub struct SubmitInvokeResult {
 ///   rule without one; `smart-account execute` and the multicall submit pass
 ///   a manager built from the profile; the DeFi adapters sign under rule 0
 ///   only and pass `None`.
+/// - `sub_invocations` ([`DeclaredSubInvocations`]): `rules.rs`, `signers.rs`
+///   and `smart-account execute` keep the default `None`; the DEX adapter
+///   declares the router's transfer of the input token, the DeFindex deposit
+///   one transfer per vault asset to the vault, and the multicall submit its
+///   bundle entries as calls.
 const EMPTY_REQUIRED_CHECKS: &[&str] = &[];
 
 /// Arguments for [`submit_signed_invoke`].
@@ -504,7 +568,22 @@ pub struct SubmitInvokeArgs<'a> {
     pub auth_rule_ids: &'a [ContextRuleId],
 
     /// Pre-built host function (caller builds `HostFunction::InvokeContract`).
+    ///
+    /// It is the root of the invocation tree the wallet signs: a simulated
+    /// root that differs from it in contract, function name or any argument
+    /// is refused before signing with [`SaError::SimulationDivergence`].
     pub host_function: HostFunction,
+
+    /// The sub-invocations the wallet authorizes under
+    /// [`Self::host_function`]; see [`DeclaredSubInvocations`].
+    ///
+    /// The default, [`DeclaredSubInvocations::None`], accepts a simulated
+    /// root without sub-invocations, the shape of every wallet entrypoint. A
+    /// caller whose invoked contract moves the wallet's tokens or calls
+    /// further contracts on the wallet's authority declares those calls here;
+    /// a simulated subtree outside the declaration is refused before signing.
+    #[builder(default)]
+    pub sub_invocations: DeclaredSubInvocations<'a>,
 
     /// Signer for the smart-account auth-digest and source-account envelope.
     pub signer: &'a (dyn Signer + Send + Sync),
@@ -752,7 +831,12 @@ pub struct SubmitInvokeArgs<'a> {
 /// 4. **Cross-RPC simulate check** (`secondary_rpc_url.is_some()`): passthrough
 ///    for single-invocation callers (who pass `multicall_check: None`). The
 ///    multicall path activates this.
-/// 5. **Sign**: auth-entry via `build_authorization_entry` +
+/// 5. **Sign**: the signed-tree binding first: the simulated root invocation
+///    must equal `host_function` in contract, function name and every
+///    argument, and its sub-invocations must match `sub_invocations` (see
+///    [`DeclaredSubInvocations`]). Then the auth entry over the wallet's own
+///    root and the accepted subtree via
+///    `build_authorization_entry_with_sub_invocations` +
 ///    `complete_authorization_entry` + delegated G-key entry.
 /// 6. **Submit**: `resimulate_with_signed_auth` + `build_signed_invoke_envelope`
 ///    + `attach_signature` + `submit_transaction_and_wait`.
@@ -802,8 +886,14 @@ pub struct SubmitInvokeArgs<'a> {
 /// - [`SaError::DeploymentFailed`]: simulate error, a simulated return
 ///   value of another shape than `expected_return`, envelope build, or
 ///   submission failure.
+/// - [`SaError::SimulationDivergence`] with sub-code `AuthContexts` (wire code
+///   `simulation.divergence.auth_contexts`): the simulated root invocation
+///   differs from `host_function`, or its sub-invocations fall outside
+///   `sub_invocations`. Raised before anything is signed.
 /// - [`SaError::RuleIdMismatch`] / [`SaError::SimulationDivergence`] — from
-///   [`build_authorization_entry`].
+///   [`build_authorization_entry_with_sub_invocations`], whose divergence
+///   check compares the node fingerprints of the simulated tree with those of
+///   the signed tree.
 #[allow(
     clippy::too_many_lines,
     reason = "seven-stage flow; splitting across multiple functions would obscure \
@@ -1154,36 +1244,45 @@ pub async fn submit_signed_invoke(
         }
     };
 
-    // Capture sub_invocations from the simulate-returned root invocation BEFORE
-    // prepared_entry is moved into fingerprint_invocation.
-    // For the multicall path (multicall_check.is_some()), the Soroban-RPC simulate
-    // host populates root_invocation.sub_invocations with the inner calls the router
-    // will dispatch. Threading these into build_authorization_entry ensures the auth
-    // digest is computed over the correct invocation tree matching on-chain __check_auth.
-    let simulate_sub_invocations: VecM<SorobanAuthorizedInvocation> =
-        prepared_entry.root_invocation.sub_invocations.clone();
+    // ── Signed-tree binding ───────────────────────────────────────────────────
+    // The root of the tree the wallet signs is its own host function, and the
+    // sub-invocations under it are the ones the caller declared. The simulated
+    // tree comes from the RPC, and Address credentials are not bound to a
+    // transaction: a signature over an RPC-chosen tree is an authorization the
+    // RPC could submit on its own. Both checks refuse before anything is
+    // signed.
+    let simulated_root_fingerprint = fingerprint_invocation(&prepared_entry);
+    check_simulated_root(&prepared_entry.root_invocation.function, &invoke)
+        .and_then(|()| {
+            check_declared_sub_invocations(
+                &prepared_entry.root_invocation.sub_invocations,
+                &args.sub_invocations,
+                &auth_scaddr,
+            )
+        })
+        .map_err(|err| {
+            attribute_signed_tree_refusal(err, args.op_label, &simulated_root_fingerprint)
+        })?;
 
-    // Count the number of invocation contexts in the root invocation tree.
-    // OZ `__check_auth` receives one `auth::Context` per `require_auth()` call
-    // within the authorized invocation tree — one per node in the tree (root +
-    // all sub-invocations recursively).  The `context_rule_ids` in the payload
-    // MUST have exactly this many entries (`ContextRuleIdsLengthMismatch` = 3014
-    // if mismatched).
-    //
-    // For OZ wallet entrypoints (no sub-invocations): count = 1.
-    // For external-contract calls (e.g. Soroswap ROUTER-DIRECT where the router
-    // also calls `SAC.transfer(from=wallet)` as a sub-invocation): count = 2+.
-    //
-    // The context types are collected by a recursive depth-first traversal of
-    // the invocation tree, yielding one context per node.
-    fn count_invocation_contexts(inv: &SorobanAuthorizedInvocation) -> usize {
-        1 + inv
-            .sub_invocations
-            .iter()
-            .map(count_invocation_contexts)
-            .sum::<usize>()
-    }
-    let invocation_context_count = count_invocation_contexts(&prepared_entry.root_invocation);
+    // The tree the wallet signs: its own root with the accepted subtree. An
+    // external contract that moves the wallet's tokens (the Soroswap router's
+    // `transfer(from = wallet)`, a DeFindex deposit) or a multicall router
+    // dispatching wallet-authorized calls places those calls under the root,
+    // and on-chain `__check_auth` verifies the digest over the whole tree.
+    let signed_root = SorobanAuthorizedInvocation {
+        function: SorobanAuthorizedFunction::ContractFn(invoke.clone()),
+        sub_invocations: prepared_entry.root_invocation.sub_invocations.clone(),
+    };
+
+    // OZ `__check_auth` receives one `auth::Context` per node of the
+    // authorized invocation tree (the root and every sub-invocation, depth
+    // first), and the payload's `context_rule_ids` MUST have exactly that many
+    // entries (`ContextRuleIdsLengthMismatch` = 3014 otherwise). The node
+    // fingerprints of the simulated and of the signed tree feed the
+    // divergence check of the auth-entry builder.
+    let simulated_auth_contexts = fingerprint_invocation_nodes(&prepared_entry.root_invocation);
+    let signed_auth_contexts = fingerprint_invocation_nodes(&signed_root);
+    let invocation_context_count = signed_auth_contexts.len();
 
     // A multicall's authorization rules follow the simulated invocation tree.
     // A single rule expands across that tree; an explicit list must cover it.
@@ -1226,17 +1325,12 @@ pub async fn submit_signed_invoke(
         } else {
             args.auth_rule_ids.to_vec()
         };
-    let auth_context_fingerprint = fingerprint_invocation(&prepared_entry);
-    // `auth_contexts_vec` is a count-carrier: one fingerprint replica per tree
-    // node for length alignment with `expanded_auth_rule_ids` in the
-    // `build_authorization_entry_with_sub_invocations` length check.
-    // This is NOT a per-node tamper-detection vector; the divergence-detector
-    // uses `auth_context_fingerprint` independently.
-    let auth_contexts_vec: Vec<_> =
-        vec![auth_context_fingerprint.clone(); invocation_context_count];
+    // The builder's divergence check compares the simulated tree with the
+    // tree the wallet signs, node by node: a second check behind the root
+    // binding and the declared sub-invocations above.
     let context = SimulationContext {
         context_rule_ids: expanded_auth_rule_ids.clone(),
-        auth_contexts: auth_contexts_vec.clone(),
+        auth_contexts: simulated_auth_contexts,
         network: NetworkContext {
             passphrase_fingerprint: passphrase_fingerprint(args.network_passphrase),
             ledger_protocol_version: 0,
@@ -1253,7 +1347,7 @@ pub async fn submit_signed_invoke(
     };
     let envelope = EnvelopeContext {
         context_rule_ids: expanded_auth_rule_ids,
-        auth_contexts: auth_contexts_vec,
+        auth_contexts: signed_auth_contexts,
         network: context.network.clone(),
         sequence: context.sequence.clone(),
         fee_envelope: context.fee_envelope.clone(),
@@ -1276,50 +1370,29 @@ pub async fn submit_signed_invoke(
     //   separate and always signs the outer transaction envelope.
     //
     // Single-signer path:
-    //   Build partial auth entry (refusal-path checks fire here).
-    //   For the multicall path (multicall_check.is_some()), the simulate-returned
-    //   sub_invocations captured above are threaded into the auth digest.
-    //   The Soroban-RPC simulate host populates root_invocation.sub_invocations
-    //   with the inner calls the router will dispatch; the auth digest MUST be
-    //   computed over the same invocation tree to pass on-chain __check_auth.
-
-    // Derive `invocation_contract` here (before the quorum/single-signer split)
-    // so the quorum-path external-contract guard below can compare it against
-    // `auth_scaddr` without duplicating the extraction logic.
-    let invocation_contract_for_guard: ScAddress = match &prepared_entry.root_invocation.function {
-        stellar_xdr::SorobanAuthorizedFunction::ContractFn(cfn) => cfn.contract_address.clone(),
-        // Non-ContractFn (e.g. CreateContractHostFn) — fall back to
-        // auth_scaddr so existing behaviour is preserved.
-        _ => auth_scaddr.clone(),
-    };
+    //   Build the partial auth entry over `signed_root` (refusal-path checks
+    //   fire here), then sign it with the Delegated G-key or the
+    //   External-Ed25519 rule signer.
 
     let auth_entries: Vec<SorobanAuthorizationEntry> = if let Some(authz) = args.authorization {
         // ── Quorum path ───────────────────────────────────────────────────────
         //
-        // External-contract guard:
+        // Wallet-entrypoint guard:
         //
-        // The quorum path was written for OZ wallet entrypoints where
-        // `invocation_contract == auth_scaddr == wallet`.  It passes `auth_scaddr`
-        // (wallet) as the credential address to `collect_quorum_signatures`, which
-        // in turn passes it to `build_authorization_entry` as `target_contract`.
-        // For external-contract invocations (where the simulated root invocation
-        // targets a contract other than the wallet, e.g. a Soroswap router or a
-        // DeFindex vault), `target_contract` would be wrong: the auth digest must
-        // cover the external contract's function, not the wallet's.  Signing over
-        // the wrong target passes off-chain but is rejected by on-chain
-        // `__check_auth` because the digest covers the wrong contract address.
-        //
-        // Rather than silently producing an unsubmittable transaction, fail closed
-        // here.  Full quorum + external-contract support requires per-node rule
-        // resolution + quorum path naming.
-        if invocation_contract_for_guard != auth_scaddr {
+        // `collect_quorum_signatures` builds the root invocation with the
+        // wallet (`auth_scaddr`) as its contract and no sub-invocations, the
+        // shape of an OZ wallet entrypoint. A host function on another
+        // contract (a Soroswap router, a DeFindex vault) or an accepted
+        // subtree would make that digest cover a tree other than the one
+        // on-chain `__check_auth` re-hashes, so the quorum path refuses both
+        // before anything is signed.
+        if invoke.contract_address != auth_scaddr || !signed_root.sub_invocations.is_empty() {
             return Err(SaError::AuthEntryConstructionFailed {
                 stage: "quorum_external_contract_guard",
                 redacted_reason: format!(
-                    "{}: quorum + external-contract submit not yet supported; \
-                     the simulated root invocation targets a contract other than \
-                     the wallet smart-account (per-node rule resolution and the \
-                     quorum-path are not yet implemented)",
+                    "{}: the quorum path signs the wallet's own entrypoints only; \
+                     the host function targets a contract other than the wallet \
+                     smart-account or the simulated tree carries sub-invocations",
                     args.op_label
                 ),
             });
@@ -1346,77 +1419,33 @@ pub async fn submit_signed_invoke(
         //
         // External-contract single-signer pattern:
         //
-        // `build_authorization_entry` builds the root_invocation from
-        // `target_contract` and computes the auth digest over it.  The
-        // on-chain `__check_auth` verifies the digest against the invocation
-        // that called `require_auth()`.  For external contracts (e.g. the
-        // Soroswap router), the invocation that called `to.require_auth()` is
-        // `router.swap_exact_tokens_for_tokens(args)` — NOT `wallet.fn(args)`.
+        // On-chain `__check_auth` verifies the digest against the invocation
+        // that called `require_auth()`. For an external contract (e.g. the
+        // Soroswap router) that invocation is
+        // `router.swap_exact_tokens_for_tokens(args)`, not `wallet.fn(args)`,
+        // so the root of the signed tree is the host function's own contract,
+        // function and arguments (`signed_root`, bound to the simulation
+        // above), with the accepted subtree under it.
         //
-        // Strategy: pass `invocation_contract` (the simulate-returned
-        // root_invocation's contract address) as `target_contract` so the auth
-        // digest is correct.  Then overwrite `partial.smart_account` with
-        // `auth_scaddr` (the wallet) so the final `SorobanCredentials::Address`
-        // carries the correct credential address.
-        //
-        // For OZ wallet entrypoints: `invocation_contract == auth_scaddr ==
-        // target_contract_scaddr` (wallet), so the overwrite is a no-op.
-        //
-        // For external-contract calls: `invocation_contract = router ≠ wallet`.
-        // The partial is built with `target_contract = router` (correct root
-        // invocation hash), then `partial.smart_account` is patched to `wallet`
-        // (correct credentials address). The two uses of `target_contract` in
-        // `build_authorization_entry_with_sub_invocations` (invocation contract
-        // vs credential address) are separated here at the call-site, keeping
-        // the inner function's contract stable.
-        //
-        // `invocation_contract_for_guard` was derived before the quorum/single
-        // split (to allow the quorum guard above to compare it); reuse it here
-        // rather than re-deriving from the same `prepared_entry`.
-        let invocation_contract = invocation_contract_for_guard;
-        let mut partial: PartialSorobanAuthorizationEntry = if !simulate_sub_invocations.is_empty()
-        {
-            // Sub-invocations present in the simulate response: include them in
-            // the auth digest so on-chain `__check_auth` verifies the full
-            // invocation tree (not just the root).
-            //
-            // This handles two cases:
-            //  1. Multicall path (args.multicall_check.is_some()): the inner
-            //     router dispatches sub-invocations that were captured above.
-            //  2. External-contract path (e.g. Soroswap ROUTER-DIRECT): the
-            //     router calls `SAC.transfer(from=wallet)` as a sub-invocation.
-            //     Soroban's `__check_auth` verifies the authorized invocation tree
-            //     matches the actual call tree; omitting sub_invocations from the
-            //     digest would produce a tree mismatch and reject the auth.
-            // Empirically confirmed on testnet: omitting sub_invocations
-            // produces an auth rejection on-chain.
+        // The builder takes one address for both the root contract and the
+        // credential address; `partial.smart_account` is then set to
+        // `auth_scaddr` so the final `SorobanCredentials::Address` names the
+        // wallet. For OZ wallet entrypoints the two are the same address and
+        // the assignment changes nothing.
+        let mut partial: PartialSorobanAuthorizationEntry =
             build_authorization_entry_with_sub_invocations(
-                invocation_contract,
+                invoke.contract_address.clone(),
                 function_name.clone(),
                 invoke.args.to_vec(),
                 simulation.context.context_rule_ids.clone(),
                 &simulation,
                 &envelope,
-                simulate_sub_invocations,
+                signed_root.sub_invocations.clone(),
             )
-            .await?
-        } else {
-            build_authorization_entry(
-                invocation_contract,
-                function_name.clone(),
-                invoke.args.to_vec(),
-                simulation.context.context_rule_ids.clone(),
-                &simulation,
-                &envelope,
-            )
-            .await?
-        };
-        // Patch credential address: the simulate-returned root_invocation's
-        // contract may differ from the credential address when an external
-        // contract calls `wallet.require_auth()`.  The credential MUST identify
-        // the wallet, not the external contract.  This patch applies
-        // identically to both signing arms below — the credential address is
-        // orthogonal to which OZ `Signer` variant authenticates it.
+            .await?;
+        // The credential MUST identify the wallet, not the external contract.
+        // This applies identically to both signing arms below: the credential
+        // address is orthogonal to which OZ `Signer` variant authenticates it.
         partial.smart_account = auth_scaddr.clone();
 
         // Route on `ed25519_rule_signer`: External-Ed25519 (no G-key
@@ -1733,6 +1762,228 @@ pub(crate) fn map_submit_error(
             redacted_reason: format!("{op_label} submission failed: {error}"),
         },
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Signed-tree checks
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The refusal of a simulated invocation tree the wallet does not sign.
+fn signed_tree_divergence(redacted_reason: String) -> SaError {
+    SaError::SimulationDivergence {
+        sub_code: SimulationDivergenceSubCode::AuthContexts,
+        redacted_reason,
+    }
+}
+
+/// Prefixes a signed-tree refusal with the operation label and the
+/// redaction-safe fingerprint of the simulated root invocation, so an
+/// operator can attribute the refused tree without seeing its values.
+pub(crate) fn attribute_signed_tree_refusal(
+    err: SaError,
+    op_label: &str,
+    simulated_root: &AuthContextFingerprint,
+) -> SaError {
+    match err {
+        SaError::SimulationDivergence {
+            sub_code,
+            redacted_reason,
+        } => SaError::SimulationDivergence {
+            sub_code,
+            redacted_reason: format!(
+                "{op_label}: simulated tree {}: {redacted_reason}",
+                simulated_root.as_str()
+            ),
+        },
+        other => other,
+    }
+}
+
+/// Requires the simulated root invocation to be the wallet's own host
+/// function: contract, function name and every argument, compared as XDR
+/// values.
+///
+/// # Errors
+///
+/// [`SaError::SimulationDivergence`] with sub-code `AuthContexts`, naming the
+/// part that differs (the contract, the function, the argument count, or the
+/// index of the first differing argument), never a value.
+pub(crate) fn check_simulated_root(
+    simulated: &SorobanAuthorizedFunction,
+    invoke: &InvokeContractArgs,
+) -> Result<(), SaError> {
+    let SorobanAuthorizedFunction::ContractFn(simulated) = simulated else {
+        return Err(signed_tree_divergence(
+            "the simulated root invocation is not a contract call".to_owned(),
+        ));
+    };
+    let part = if simulated.contract_address != invoke.contract_address {
+        "its contract".to_owned()
+    } else if simulated.function_name != invoke.function_name {
+        "its function".to_owned()
+    } else if simulated.args.len() != invoke.args.len() {
+        format!(
+            "its argument count ({} against {})",
+            simulated.args.len(),
+            invoke.args.len()
+        )
+    } else if let Some(index) = simulated
+        .args
+        .iter()
+        .zip(invoke.args.iter())
+        .position(|(simulated, wallet)| simulated != wallet)
+    {
+        format!("argument {index}")
+    } else {
+        return Ok(());
+    };
+    Err(signed_tree_divergence(format!(
+        "the simulated root invocation differs from the host function in {part}"
+    )))
+}
+
+/// Requires the simulated sub-invocations under the root to be the ones the
+/// caller declared; see [`DeclaredSubInvocations`].
+///
+/// `authorizer` is the wallet whose credentials sign the tree: a declared
+/// token transfer must move its tokens. Every accepted sub-invocation is a
+/// leaf.
+///
+/// # Errors
+///
+/// [`SaError::SimulationDivergence`] with sub-code `AuthContexts`, naming the
+/// index of the refused sub-invocation and the reason, never a value.
+pub(crate) fn check_declared_sub_invocations(
+    subs: &[SorobanAuthorizedInvocation],
+    declared: &DeclaredSubInvocations<'_>,
+    authorizer: &ScAddress,
+) -> Result<(), SaError> {
+    if let Some(index) = subs.iter().position(|sub| !sub.sub_invocations.is_empty()) {
+        return Err(signed_tree_divergence(format!(
+            "sub-invocation {index} carries nested sub-invocations"
+        )));
+    }
+    match declared {
+        DeclaredSubInvocations::None => {
+            if subs.is_empty() {
+                Ok(())
+            } else {
+                Err(signed_tree_divergence(format!(
+                    "the simulated root carries {} undeclared sub-invocations",
+                    subs.len()
+                )))
+            }
+        }
+        DeclaredSubInvocations::TokenTransfers(declared) => {
+            check_declared_transfers(subs, declared, authorizer)
+        }
+        DeclaredSubInvocations::Calls(declared) => check_declared_calls(subs, declared),
+    }
+}
+
+/// The parts of a leaf `transfer(from, to, amount)` call.
+struct TransferCall<'a> {
+    token: &'a ScAddress,
+    from: &'a ScAddress,
+    to: &'a ScAddress,
+    amount: i128,
+}
+
+/// Reads `function` as `transfer(Address from, Address to, I128 amount)`;
+/// any other function name or argument shape is `None`.
+fn transfer_call(function: &SorobanAuthorizedFunction) -> Option<TransferCall<'_>> {
+    let SorobanAuthorizedFunction::ContractFn(call) = function else {
+        return None;
+    };
+    if call.function_name.0.as_slice() != b"transfer" {
+        return None;
+    }
+    let [
+        ScVal::Address(from),
+        ScVal::Address(to),
+        ScVal::I128(amount),
+    ] = call.args.as_slice()
+    else {
+        return None;
+    };
+    Some(TransferCall {
+        token: &call.contract_address,
+        from,
+        to,
+        amount: (i128::from(amount.hi) << 64) | i128::from(amount.lo),
+    })
+}
+
+/// [`DeclaredSubInvocations::TokenTransfers`]: every sub-invocation is a
+/// transfer from `authorizer` on a declared token to an accepted recipient,
+/// and the transfers counted against each declared entry stay within its
+/// bound.
+fn check_declared_transfers(
+    subs: &[SorobanAuthorizedInvocation],
+    declared: &[DeclaredTransfer],
+    authorizer: &ScAddress,
+) -> Result<(), SaError> {
+    let mut totals = vec![0_i128; declared.len()];
+    for (index, sub) in subs.iter().enumerate() {
+        let Some(transfer) = transfer_call(&sub.function) else {
+            return Err(signed_tree_divergence(format!(
+                "sub-invocation {index} is not a transfer(from, to, amount) call"
+            )));
+        };
+        if transfer.from != authorizer {
+            return Err(signed_tree_divergence(format!(
+                "sub-invocation {index} transfers from an address other than the authorizing one"
+            )));
+        }
+        if transfer.amount < 0 {
+            return Err(signed_tree_divergence(format!(
+                "sub-invocation {index} transfers a negative amount"
+            )));
+        }
+        let Some((entry, total)) = declared.iter().zip(totals.iter_mut()).find(|(entry, _)| {
+            entry.token == *transfer.token && entry.to.as_ref().is_none_or(|to| to == transfer.to)
+        }) else {
+            let reason = if declared.iter().any(|entry| entry.token == *transfer.token) {
+                "to an undeclared recipient"
+            } else {
+                "on an undeclared token"
+            };
+            return Err(signed_tree_divergence(format!(
+                "sub-invocation {index} transfers {reason}"
+            )));
+        };
+        *total = total
+            .checked_add(transfer.amount)
+            .filter(|sum| *sum <= entry.max_amount)
+            .ok_or_else(|| {
+                signed_tree_divergence(format!(
+                    "the transfers through sub-invocation {index} exceed the declared bound"
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+/// [`DeclaredSubInvocations::Calls`]: every sub-invocation equals a declared
+/// call, in declared order, each declared call used at most once.
+fn check_declared_calls(
+    subs: &[SorobanAuthorizedInvocation],
+    declared: &[InvokeContractArgs],
+) -> Result<(), SaError> {
+    let mut remaining = declared.iter();
+    for (index, sub) in subs.iter().enumerate() {
+        let SorobanAuthorizedFunction::ContractFn(call) = &sub.function else {
+            return Err(signed_tree_divergence(format!(
+                "sub-invocation {index} is not a contract call"
+            )));
+        };
+        if !remaining.any(|declared_call| declared_call == call) {
+            return Err(signed_tree_divergence(format!(
+                "sub-invocation {index} is not a declared call in declared order"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Refuses a [`SubmitInvokeArgs`] whose fields contradict each other,
@@ -2816,5 +3067,395 @@ mod tests {
             "credential address must be the patched wallet address, not the \
              invocation-target contract"
         );
+    }
+
+    // ── Signed-tree checks ───────────────────────────────────────────────────
+
+    mod signed_tree {
+        use stellar_xdr::{
+            ContractId, Hash, Int128Parts, InvokeContractArgs, ScAddress, ScSymbol, ScVal,
+            SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+        };
+
+        use super::super::{
+            DeclaredSubInvocations, DeclaredTransfer, check_declared_sub_invocations,
+            check_simulated_root,
+        };
+        use crate::SaError;
+        use crate::error::SimulationDivergenceSubCode;
+
+        fn contract(byte: u8) -> ScAddress {
+            ScAddress::Contract(ContractId(Hash([byte; 32])))
+        }
+
+        fn wallet() -> ScAddress {
+            contract(0x57)
+        }
+
+        fn token() -> ScAddress {
+            contract(0x70)
+        }
+
+        fn other() -> ScAddress {
+            contract(0xAA)
+        }
+
+        fn call(target: ScAddress, function: &str, args: Vec<ScVal>) -> InvokeContractArgs {
+            InvokeContractArgs {
+                contract_address: target,
+                function_name: ScSymbol(function.try_into().unwrap()),
+                args: args.try_into().unwrap(),
+            }
+        }
+
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "i128 -> Int128Parts split: hi = high 64 bits, lo = low 64 bits"
+        )]
+        fn amount(value: i128) -> ScVal {
+            ScVal::I128(Int128Parts {
+                hi: (value >> 64) as i64,
+                lo: value as u64,
+            })
+        }
+
+        fn transfer(
+            token: ScAddress,
+            from: ScAddress,
+            to: ScAddress,
+            value: i128,
+        ) -> InvokeContractArgs {
+            call(
+                token,
+                "transfer",
+                vec![ScVal::Address(from), ScVal::Address(to), amount(value)],
+            )
+        }
+
+        fn leaf(call: InvokeContractArgs) -> SorobanAuthorizedInvocation {
+            SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(call),
+                sub_invocations: Default::default(),
+            }
+        }
+
+        fn with_child(
+            call: InvokeContractArgs,
+            child: SorobanAuthorizedInvocation,
+        ) -> SorobanAuthorizedInvocation {
+            SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(call),
+                sub_invocations: vec![child].try_into().unwrap(),
+            }
+        }
+
+        /// The reason of a signed-tree refusal; panics on anything else.
+        fn refusal(result: Result<(), SaError>) -> String {
+            match result {
+                Err(SaError::SimulationDivergence {
+                    sub_code: SimulationDivergenceSubCode::AuthContexts,
+                    redacted_reason,
+                }) => redacted_reason,
+                other => panic!("expected the auth-contexts divergence, got {other:?}"),
+            }
+        }
+
+        fn check(
+            subs: &[SorobanAuthorizedInvocation],
+            declared: &DeclaredSubInvocations<'_>,
+        ) -> Result<(), SaError> {
+            check_declared_sub_invocations(subs, declared, &wallet())
+        }
+
+        const BOUND: i128 = 100;
+
+        fn bounded(to: Option<ScAddress>) -> [DeclaredTransfer; 1] {
+            [DeclaredTransfer {
+                token: token(),
+                to,
+                max_amount: BOUND,
+            }]
+        }
+
+        #[test]
+        fn the_root_must_be_the_host_function() {
+            let wallet_call = call(wallet(), "set_limit", vec![ScVal::U32(5)]);
+            let as_fn = |call: InvokeContractArgs| SorobanAuthorizedFunction::ContractFn(call);
+
+            check_simulated_root(&as_fn(wallet_call.clone()), &wallet_call).unwrap();
+
+            let mut on_other = wallet_call.clone();
+            on_other.contract_address = other();
+            assert!(
+                refusal(check_simulated_root(&as_fn(on_other), &wallet_call))
+                    .contains("in its contract")
+            );
+
+            let mut renamed = wallet_call.clone();
+            renamed.function_name = ScSymbol("upgrade".try_into().unwrap());
+            assert!(
+                refusal(check_simulated_root(&as_fn(renamed), &wallet_call))
+                    .contains("in its function")
+            );
+
+            let mut longer = wallet_call.clone();
+            longer.args = vec![ScVal::U32(5), ScVal::U32(6)].try_into().unwrap();
+            assert!(
+                refusal(check_simulated_root(&as_fn(longer), &wallet_call))
+                    .contains("in its argument count (2 against 1)")
+            );
+
+            let mut changed = wallet_call.clone();
+            changed.args = vec![ScVal::U32(6)].try_into().unwrap();
+            assert!(
+                refusal(check_simulated_root(&as_fn(changed), &wallet_call))
+                    .contains("in argument 0")
+            );
+
+            let not_a_call =
+                SorobanAuthorizedFunction::CreateContractHostFn(stellar_xdr::CreateContractArgs {
+                    contract_id_preimage: stellar_xdr::ContractIdPreimage::Address(
+                        stellar_xdr::ContractIdPreimageFromAddress {
+                            address: wallet(),
+                            salt: stellar_xdr::Uint256([0; 32]),
+                        },
+                    ),
+                    executable: stellar_xdr::ContractExecutable::StellarAsset,
+                });
+            assert!(
+                refusal(check_simulated_root(&not_a_call, &wallet_call))
+                    .contains("not a contract call")
+            );
+        }
+
+        #[test]
+        fn none_accepts_only_an_empty_subtree() {
+            check(&[], &DeclaredSubInvocations::None).unwrap();
+            let drain = leaf(transfer(token(), wallet(), other(), 1));
+            assert!(
+                refusal(check(&[drain], &DeclaredSubInvocations::None))
+                    .contains("1 undeclared sub-invocations")
+            );
+        }
+
+        #[test]
+        fn a_declared_transfer_within_its_bound_is_accepted() {
+            let declared = bounded(None);
+            let declaration = DeclaredSubInvocations::TokenTransfers(&declared);
+            check(
+                &[leaf(transfer(token(), wallet(), other(), BOUND))],
+                &declaration,
+            )
+            .unwrap();
+            check(
+                &[
+                    leaf(transfer(token(), wallet(), other(), BOUND / 2)),
+                    leaf(transfer(token(), wallet(), other(), BOUND / 2)),
+                ],
+                &declaration,
+            )
+            .unwrap();
+            check(&[], &declaration).unwrap();
+        }
+
+        #[test]
+        fn a_transfer_above_its_bound_is_refused() {
+            let declared = bounded(None);
+            let declaration = DeclaredSubInvocations::TokenTransfers(&declared);
+            assert!(
+                refusal(check(
+                    &[leaf(transfer(token(), wallet(), other(), BOUND + 1))],
+                    &declaration
+                ))
+                .contains("through sub-invocation 0 exceed the declared bound")
+            );
+        }
+
+        #[test]
+        fn two_transfers_above_the_bound_together_are_refused() {
+            let declared = bounded(None);
+            let declaration = DeclaredSubInvocations::TokenTransfers(&declared);
+            let part = BOUND / 2 + 1;
+            assert!(
+                refusal(check(
+                    &[
+                        leaf(transfer(token(), wallet(), other(), part)),
+                        leaf(transfer(token(), wallet(), other(), part)),
+                    ],
+                    &declaration,
+                ))
+                .contains("through sub-invocation 1 exceed the declared bound")
+            );
+        }
+
+        #[test]
+        fn a_sum_that_overflows_is_refused() {
+            let declared = [DeclaredTransfer {
+                token: token(),
+                to: None,
+                max_amount: i128::MAX,
+            }];
+            let declaration = DeclaredSubInvocations::TokenTransfers(&declared);
+            assert!(
+                refusal(check(
+                    &[
+                        leaf(transfer(token(), wallet(), other(), i128::MAX)),
+                        leaf(transfer(token(), wallet(), other(), 1)),
+                    ],
+                    &declaration,
+                ))
+                .contains("exceed the declared bound")
+            );
+        }
+
+        #[test]
+        fn a_negative_amount_is_refused() {
+            let declared = bounded(None);
+            let declaration = DeclaredSubInvocations::TokenTransfers(&declared);
+            assert!(
+                refusal(check(
+                    &[
+                        leaf(transfer(token(), wallet(), other(), -BOUND)),
+                        leaf(transfer(token(), wallet(), other(), BOUND)),
+                    ],
+                    &declaration,
+                ))
+                .contains("sub-invocation 0 transfers a negative amount")
+            );
+        }
+
+        #[test]
+        fn a_transfer_on_another_token_is_refused() {
+            let declared = bounded(None);
+            let declaration = DeclaredSubInvocations::TokenTransfers(&declared);
+            assert!(
+                refusal(check(
+                    &[leaf(transfer(other(), wallet(), other(), 1))],
+                    &declaration
+                ))
+                .contains("on an undeclared token")
+            );
+        }
+
+        #[test]
+        fn a_transfer_from_another_address_is_refused() {
+            let declared = bounded(None);
+            let declaration = DeclaredSubInvocations::TokenTransfers(&declared);
+            assert!(
+                refusal(check(
+                    &[leaf(transfer(token(), other(), other(), 1))],
+                    &declaration
+                ))
+                .contains("from an address other than the authorizing one")
+            );
+        }
+
+        #[test]
+        fn a_declared_transfer_to_another_recipient_is_refused() {
+            let declared = bounded(Some(contract(0x73)));
+            let declaration = DeclaredSubInvocations::TokenTransfers(&declared);
+            check(
+                &[leaf(transfer(token(), wallet(), contract(0x73), 1))],
+                &declaration,
+            )
+            .unwrap();
+            assert!(
+                refusal(check(
+                    &[leaf(transfer(token(), wallet(), other(), 1))],
+                    &declaration
+                ))
+                .contains("to an undeclared recipient")
+            );
+        }
+
+        #[test]
+        fn another_shape_than_transfer_is_refused() {
+            let declared = bounded(None);
+            let declaration = DeclaredSubInvocations::TokenTransfers(&declared);
+            let approve = call(
+                token(),
+                "approve",
+                vec![ScVal::Address(wallet()), ScVal::Address(other()), amount(1)],
+            );
+            let short = call(
+                token(),
+                "transfer",
+                vec![ScVal::Address(wallet()), amount(1)],
+            );
+            let wrong_amount = call(
+                token(),
+                "transfer",
+                vec![
+                    ScVal::Address(wallet()),
+                    ScVal::Address(other()),
+                    ScVal::U64(1),
+                ],
+            );
+            for shape in [approve, short, wrong_amount] {
+                assert!(
+                    refusal(check(&[leaf(shape)], &declaration))
+                        .contains("is not a transfer(from, to, amount) call")
+                );
+            }
+        }
+
+        #[test]
+        fn a_nested_node_under_a_transfer_is_refused() {
+            let declared = bounded(None);
+            let declaration = DeclaredSubInvocations::TokenTransfers(&declared);
+            let nested = with_child(
+                transfer(token(), wallet(), other(), 1),
+                leaf(transfer(token(), wallet(), other(), 1)),
+            );
+            assert!(
+                refusal(check(&[nested], &declaration))
+                    .contains("sub-invocation 0 carries nested sub-invocations")
+            );
+        }
+
+        fn first() -> InvokeContractArgs {
+            call(contract(0x81), "deposit", vec![ScVal::U32(1)])
+        }
+
+        fn second() -> InvokeContractArgs {
+            call(contract(0x82), "stake", vec![ScVal::U32(2)])
+        }
+
+        #[test]
+        fn declared_calls_in_order_are_accepted() {
+            let declared = [first(), second()];
+            let declaration = DeclaredSubInvocations::Calls(&declared);
+            check(&[leaf(first()), leaf(second())], &declaration).unwrap();
+            check(&[leaf(second())], &declaration).unwrap();
+            check(&[], &declaration).unwrap();
+        }
+
+        #[test]
+        fn an_extra_or_reordered_call_is_refused() {
+            let declared = [first(), second()];
+            let declaration = DeclaredSubInvocations::Calls(&declared);
+            for subs in [
+                vec![leaf(second()), leaf(first())],
+                vec![leaf(first()), leaf(first())],
+                vec![leaf(first()), leaf(transfer(token(), wallet(), other(), 1))],
+            ] {
+                assert!(
+                    refusal(check(&subs, &declaration))
+                        .contains("sub-invocation 1 is not a declared call in declared order")
+                );
+            }
+            let mut changed = first();
+            changed.args = vec![ScVal::U32(9)].try_into().unwrap();
+            assert!(
+                refusal(check(&[leaf(changed)], &declaration))
+                    .contains("sub-invocation 0 is not a declared call")
+            );
+            let nested = with_child(first(), leaf(second()));
+            assert!(
+                refusal(check(&[nested], &declaration))
+                    .contains("sub-invocation 0 carries nested sub-invocations")
+            );
+        }
     }
 }

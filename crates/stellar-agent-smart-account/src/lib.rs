@@ -9,6 +9,12 @@
 //! pinning, verifier migration,
 //! active-rule enumeration, multicall, and upgrade timelock (configurable on-chain execution delay).
 //!
+//! Every signed submission signs the caller's own host function as the root
+//! of the authorized invocation tree, with only the sub-invocations the caller
+//! declares under it (see [`submit::DeclaredSubInvocations`]). A simulated
+//! tree outside that is refused before anything is signed, so the RPC that
+//! answers the simulation cannot choose what the wallet authorizes.
+//!
 //! # What this crate does NOT do
 //!
 //! - Submit transactions or connect to a network (that is `stellar-agent-network`).

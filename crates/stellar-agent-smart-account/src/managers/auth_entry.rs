@@ -234,13 +234,9 @@ fn check_partial_against_passphrase(
 ///
 /// # Sub-invocations
 ///
-/// The `prepared_sub_invocations` parameter carries the sub-invocations list
-/// from Soroban-RPC's `simulateTransaction` response. For single-contract
-/// invocations (all non-multicall paths), this is `VecM::default()` (empty).
-/// For the multicall router path, the simulate response returns the router's
-/// sub-invocations (one per inner); passing them here ensures the auth digest
-/// is computed over the correct `SorobanAuthorizedInvocation` tree, which
-/// matches what the on-chain `__check_auth` will re-hash.
+/// The root invocation carries no sub-invocations. A caller that signs a
+/// tree with sub-invocations uses
+/// [`build_authorization_entry_with_sub_invocations`].
 ///
 /// # Refusal path
 ///
@@ -250,13 +246,24 @@ fn check_partial_against_passphrase(
 /// - Wallet-internal XDR encode/conversion failure returns
 ///   [`SaError::AuthEntryConstructionFailed`] with the corresponding stage.
 ///
+/// # Divergence check
+///
+/// [`detect_simulation_divergence`] compares `simulation.context` with
+/// `envelope`. In [`crate::submit::submit_signed_invoke`] the two sides come
+/// from different sources: `simulation.context.auth_contexts` holds the node
+/// fingerprints of the simulated invocation tree, and
+/// `envelope.auth_contexts` those of the tree the wallet signs (its own root
+/// with the accepted subtree). A tree the wallet does not sign therefore
+/// refuses here, as a second check behind the root binding and the declared
+/// sub-invocations that `submit_signed_invoke` applies first.
+///
 /// # Errors
 ///
 /// - [`SaError::RuleIdMismatch`] — index-alignment failures between `rule_ids`
 ///   and the simulation auth-context list.
-/// - [`SaError::SimulationDivergence`] — simulation context diverges from the
-///   to-be-submitted envelope (tamper detection: checks both cryptographic binding
-///   and simulation-context consistency).
+/// - [`SaError::SimulationDivergence`]: the simulation context differs from
+///   the envelope context: rule IDs, the per-node auth-context fingerprints
+///   of the simulated and the signed tree, network, sequence or fee envelope.
 /// - [`SaError::AuthEntryConstructionFailed`] — wallet-internal XDR encoding
 ///   or container-conversion failure during auth-entry assembly. Stage values:
 ///   `"context_rule_ids"` (rule-IDs encode), `"auth_contexts_args"` (args
@@ -286,11 +293,12 @@ pub async fn build_authorization_entry(
 /// Identical to [`build_authorization_entry`] but allows the caller to inject
 /// a pre-constructed `sub_invocations` tree into the root invocation.
 ///
-/// Used by the multicall path (`submit_multicall_bundle`) where the
-/// Soroban-RPC simulate response returns sub-invocations for each inner
-/// contract call. Threading these into the auth digest ensures the wallet
-/// signs the correct invocation tree, matching what the on-chain
-/// `__check_auth` will re-verify.
+/// Used by [`crate::submit::submit_signed_invoke`], which passes the
+/// simulated sub-invocations only after they matched the caller's
+/// [`crate::submit::DeclaredSubInvocations`]: a router's token transfer from
+/// the wallet, a DeFindex deposit's transfers, or a multicall router's
+/// wallet-authorized calls. The auth digest then covers the same tree the
+/// on-chain `__check_auth` re-verifies.
 ///
 /// # Errors
 ///

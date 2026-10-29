@@ -17,6 +17,9 @@
 //! - [`signed_envelope`] — envelopes whose signatures are real and whose
 //!   source accounts are answerable by a mocked `getLedgerEntries`, for tests
 //!   that exercise a submit path.
+//! - [`auth_tree_rpc`]: a mocked RPC endpoint whose simulation hands an
+//!   authorizing address an invocation tree the test chooses, for tests that
+//!   drive a whole adapter submit flow.
 //! - [`testnet_helpers`] — live-network helpers (Friendbot funding, RPC) for
 //!   consumer crates' testnet-acceptance tests; behind the `testnet-helpers`
 //!   feature and exercised only by those live tests.
@@ -49,6 +52,8 @@
 //! - `verifier-registry` — WebAuthn-verifier WASM registry.
 //! - `wiremock-helpers` — HTTP test doubles.
 
+#[cfg(feature = "test-helpers")]
+pub mod auth_tree_rpc;
 pub mod connection_counter;
 #[cfg(feature = "wiremock-helpers")]
 pub mod echo_id_responder;

@@ -18,7 +18,7 @@ use stellar_agent_network::SoftwareSigningKey;
 use stellar_agent_smart_account::multicall::MULTICALL_WASM_SHA256;
 use stellar_agent_smart_account::{
     SaError,
-    submit::{MulticallCheck, SubmitInvokeArgs, submit_signed_invoke},
+    submit::{DeclaredSubInvocations, MulticallCheck, SubmitInvokeArgs, submit_signed_invoke},
 };
 use stellar_agent_test_support::signed_envelope::{
     account_id_for_seed, get_network_result, send_transaction_hash_hex,
@@ -35,6 +35,15 @@ use crate::rpc_mock_helpers as rpc_helpers;
 
 const PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const SEED: [u8; 32] = [0x53; 32];
+
+/// The one inner call the simulated tree places under the router's `exec`.
+fn nested_call() -> InvokeContractArgs {
+    InvokeContractArgs {
+        contract_address: ScAddress::Contract(ContractId(Hash([0x55; 32]))),
+        function_name: ScSymbol("nested".try_into().unwrap()),
+        args: Default::default(),
+    }
+}
 
 struct Rpc(Arc<AtomicUsize>);
 
@@ -77,15 +86,7 @@ impl Respond for Rpc {
                         root_invocation: SorobanAuthorizedInvocation {
                             function: SorobanAuthorizedFunction::ContractFn(invoke.clone()),
                             sub_invocations: vec![SorobanAuthorizedInvocation {
-                                function: SorobanAuthorizedFunction::ContractFn(
-                                    InvokeContractArgs {
-                                        contract_address: ScAddress::Contract(ContractId(Hash(
-                                            [0x55; 32],
-                                        ))),
-                                        function_name: ScSymbol("nested".try_into().unwrap()),
-                                        args: Default::default(),
-                                    },
-                                ),
+                                function: SorobanAuthorizedFunction::ContractFn(nested_call()),
                                 sub_invocations: Default::default(),
                             }]
                             .try_into()
@@ -131,6 +132,9 @@ async fn submit(
     let target = stellar_strkey::Contract([0x54; 32]).to_string().to_string();
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
     let ids = vec![ContextRuleId::new(0); rule_count];
+    // The bundle declares the inner call the simulation places under `exec`,
+    // so the rule coverage of a two-context tree is what these tests reach.
+    let declared_calls = [nested_call()];
     let result = submit_signed_invoke(
         SubmitInvokeArgs::builder()
             .target_contract(&target)
@@ -140,6 +144,7 @@ async fn submit(
                 function_name: ScSymbol("exec".try_into().unwrap()),
                 args: Default::default(),
             }))
+            .sub_invocations(DeclaredSubInvocations::Calls(&declared_calls))
             .signer(&signer)
             .primary_rpc_url(&mock.uri())
             .network_passphrase(PASSPHRASE)
