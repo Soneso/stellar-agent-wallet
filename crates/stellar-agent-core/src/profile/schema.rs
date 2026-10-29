@@ -545,9 +545,10 @@ pub struct WalletConfig {
 
     /// Unlock-window TTL in seconds.  Default: 30.
     ///
-    /// The wallet handle is held for at most this many seconds across
-    /// approval + sign + submit; on TTL fire the seed is zeroized and
-    /// the next sign attempt re-loads from the keyring.
+    /// The clock refuses wallet seed access and transfer after this window.
+    /// The seed remains in its stable home until its wallet or signer drops.
+    /// Mainnet environment signers drop it after each signature; testnet
+    /// environment signers keep it for their command, which can outlast the TTL.
     ///
     /// Passed directly to [`crate::wallet::Wallet::unlock`], which enforces
     /// `(0, MAX_TTL_SECONDS]` (`MAX_TTL_SECONDS` = 600 seconds): a value of

@@ -175,6 +175,9 @@ pub fn registered_backend() -> Option<&'static str> {
 /// Registers the headless keyring store as the process default, per
 /// [`BACKEND_ENV_VAR`]'s value.
 ///
+/// The root key environment variable retains its value for the process lifetime.
+/// The local copy zeroizes on drop.
+///
 /// One store, one file, for the whole process — mirroring the platform
 /// keyring's own shape (one Keychain / one Secret Service collection / one
 /// Credential Manager vault shared by every profile on the host). This is
@@ -199,16 +202,16 @@ pub fn registered_backend() -> Option<&'static str> {
 pub fn init_headless_store(backend: &str) -> Result<(), HeadlessKeyringInitError> {
     let mode = match backend {
         "headless-env" => {
-            let raw = std::env::var(ENV_KEY_VAR).map_err(|_| {
+            let raw = Zeroizing::new(std::env::var(ENV_KEY_VAR).map_err(|_| {
                 HeadlessKeyringInitError::InvalidEnvKey("environment variable is not set")
-            })?;
+            })?);
             let key = crypto::parse_env_key(&raw).map_err(|e| match e {
                 crypto::CryptoError::InvalidEnvKey(detail) => {
                     HeadlessKeyringInitError::InvalidEnvKey(detail)
                 }
                 _ => HeadlessKeyringInitError::InvalidEnvKey("key parse failed"),
             })?;
-            ProtectionMode::EnvKey(Arc::new(Zeroizing::new(*key)))
+            ProtectionMode::EnvKey(Arc::new(key))
         }
         "headless-dpapi" => {
             if cfg!(not(target_os = "windows")) {

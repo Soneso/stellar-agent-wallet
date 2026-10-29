@@ -169,7 +169,9 @@ fn channels(
             requested: size,
         }));
     }
-    let wallet = Sep5Wallet::from_bip39_seed_zeroizing(Zeroizing::new(**seed));
+    let mut seed_copy = Zeroizing::new([0u8; 64]);
+    seed_copy.copy_from_slice(seed.as_ref());
+    let wallet = Sep5Wallet::from_bip39_seed_zeroizing(seed_copy);
     (1..=size as u32)
         .map(|index| {
             wallet
@@ -573,7 +575,9 @@ where
         .channels
         .iter()
         .map(|channel| {
-            derive_channel_signer(Zeroizing::new(*seed), channel.index)
+            let mut seed_copy = Zeroizing::new([0u8; 64]);
+            seed_copy.copy_from_slice(seed.as_ref());
+            derive_channel_signer(seed_copy, channel.index)
                 .map_err(|error| pool_err_to_wallet_err(&error))
         })
         .collect::<Result<_, _>>()?;
@@ -773,7 +777,10 @@ fn probe_keyring_entry(service: &str, account: &str) -> KeyringProbe {
         }
     };
     match entry.get_password() {
-        Ok(_) => KeyringProbe::Present,
+        Ok(secret) => {
+            drop(Zeroizing::new(secret));
+            KeyringProbe::Present
+        }
         Err(keyring_core::Error::NoEntry) => KeyringProbe::Absent,
         Err(e) => KeyringProbe::BackendError(e, KeyringOperation::Read),
     }

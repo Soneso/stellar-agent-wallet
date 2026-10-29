@@ -13,8 +13,7 @@
 //! per-profile configuration ([`profile`]), and the mainnet write-tools policy
 //! gate ([`policy`]).
 //!
-//! All APIs are synchronous except [`wallet::Wallet::unlock`], which is async
-//! and must be awaited inside a Tokio runtime (the `time` feature).
+//! Wallet unlock and seed access are synchronous and require no Tokio runtime.
 //!
 //! # Primary consumers
 //!
@@ -26,8 +25,7 @@
 //! # Non-goals
 //!
 //! - Network transport, transaction assembly, and signing live in
-//!   `stellar-agent-network`.  This crate uses Tokio only for the unlock-TTL
-//!   timer in [`wallet::Wallet::unlock`]; it carries no network runtime.
+//!   `stellar-agent-network`. This crate carries no network runtime.
 //! - Smart-account transaction submission lives in `stellar-agent-network`.
 //!
 //! # Related crates
@@ -169,7 +167,7 @@ pub mod wire_stroops;
 
 /// Short-in-memory-unlock window: `mlock`-protected signing seed with RAII dispose.
 ///
-/// Provides [`wallet::Wallet`] (unlock + TTL + RAII dispose),
+/// Provides [`wallet::Wallet`] (clock-checked access and RAII disposal),
 /// [`wallet::LockedSeed`] (region-backed locked seed buffer),
 /// [`wallet::MlockRequired`] (three-posture config enum), and
 /// [`wallet::WalletLifecycleError`] (typed lifecycle errors).

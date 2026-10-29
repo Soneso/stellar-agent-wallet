@@ -167,11 +167,11 @@ pub fn derive_channel_signer(
     // seed has been consumed; the wallet holds the only live copy.
     let account = wallet.derive_account(index)?;
 
-    // Extract the secret seed from the DerivedAccount's SecretBox into a
-    // Zeroizing buffer for the SoftwareSigningKey constructor.
-    // `expose_secret()` is the only way to access the inner [u8; 32].
-    // The Zeroizing wrapper ensures the intermediate stack copy is cleared.
-    let raw: Zeroizing<[u8; 32]> = Zeroizing::new(*account.secret_seed().expose_secret());
+    // Copy the secret seed from the DerivedAccount's SecretBox into a zeroed
+    // Zeroizing buffer for the SoftwareSigningKey constructor. Copying from the
+    // borrowed bytes forms no bare [u8; 32] temporary outside a wrapper.
+    let mut raw = Zeroizing::new([0u8; 32]);
+    raw.copy_from_slice(account.secret_seed().expose_secret());
 
     // `new_from_zeroizing` moves `raw` into a SecretBox and zeroes the source.
     Ok(SoftwareSigningKey::new_from_zeroizing(raw))

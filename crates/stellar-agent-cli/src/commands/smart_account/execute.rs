@@ -1328,17 +1328,14 @@ mod tests {
         let seed: Zeroizing<[u8; 32]> = Zeroizing::new(seed_bytes);
         let wallet = Wallet::unlock(
             "seed-ceremony-test".to_owned(),
-            seed,
+            &seed,
             DEFAULT_TTL_SECONDS,
             MlockRequired::Warn,
         )
-        .await
         .unwrap();
-        let signer = signer_from_wallet(&wallet).unwrap();
+        let signer = signer_from_wallet(wallet).unwrap();
         let derived_pubkey = signer.public_key().await.unwrap();
         drop(signer);
-        let mut wallet = wallet;
-        wallet.dispose();
 
         let expected_pubkey = signing_key.verifying_key().to_bytes();
         assert_eq!(

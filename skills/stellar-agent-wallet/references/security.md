@@ -121,7 +121,7 @@ The custody boundary is the keyring secret. An attacker who already holds the
 seed, nonce key, or HMAC keys is outside the threat model; everything below
 assumes those secrets stay in the keyring.
 
-## The unlock window: TTL-bounded, zeroize-on-drop, memory-locked
+## The unlock window: clock-checked seed access in a zeroize-on-drop home
 
 When a CLI command signs with a seed read from a `--*-secret-env` variable, the
 32-byte signing seed is loaded into a short unlock window. Keyring signers, the
@@ -129,16 +129,15 @@ Ledger, and the MCP server never enter it. A keyring signer loads its key for
 each signature into a zeroize-on-drop buffer without a memory lock. The unlock
 window works as follows:
 
-- The seed is moved into a zeroize-on-drop buffer, and its backing page is pinned
-  in physical RAM via `mlock` (Linux/macOS) or `VirtualLock` (Windows). Pinning the
-  page keeps the seed out of swap. The pin is eager: pages are populated and locked
-  at lock time, so there is no pre-first-fault swap-disclosure window.
-- The window is TTL-bounded. The default is 30 seconds; `wallet.unlock_ttl_seconds`
-  honors any value from 1 through 600 seconds. `ttl_seconds == 0` or `> 600` is
-  rejected, never clamped.
-- A background timer fires at the TTL and marks the wallet disposed.
-- On every exit path, including normal return, error propagation (`?`), and
-  panic-unwind, the seed is zeroized and the lock released.
+- The wallet allocates an isolated zeroed home, attempts the configured memory
+  lock, then copies the borrowed seed into it. A successful lock keeps it out of swap.
+- The clock bounds wallet seed access and transfer. The default is 30 seconds;
+  `wallet.unlock_ttl_seconds` accepts 1 through 600 seconds and refuses other values.
+- The seed stays in a zeroize-on-drop page, locked when the lock succeeds, until
+  its wallet or signer drops it. Drop zeroizes before unlocking and freeing,
+  including on panic unwind.
+- Mainnet environment signers unlock once per signature and drop the seed afterward.
+  Testnet environment signers keep it for the command, which can outlast the TTL.
 
 The `mlock_required` posture in `[wallet]` controls what happens when pinning
 fails:

@@ -292,7 +292,7 @@ where
     let raw = prepared.raw;
 
     // ── Sign the digest inside an mlock-protected window ──────────────────────
-    // The policy signature is a raw ed25519 signature over the BLAKE3 digest — a
+    // The policy signature is a raw ed25519 signature over the BLAKE3 digest, a
     // pre-image class distinct from every `Signer` trait method (Stellar tx/auth
     // payloads, which MUST NOT be substituted). The owner seed is pinned via
     // `Wallet::unlock` (matching `enroll-owner-key`'s mlock ceremony posture:

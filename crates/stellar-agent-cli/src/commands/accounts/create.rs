@@ -57,7 +57,7 @@
 //!
 //! The `--secret-env` sponsored-mode path routes through the shared
 //! `resolve_software_signer_from_env` ceremony (`Wallet::unlock` →
-//! `LockedSeed` mlock-protected page → `signer_from_wallet` → dispose) →
+//! `LockedSeed` mlock-protected page → `signer_from_wallet`) →
 //! `attach_signature` → drop. The `--sign-with-ledger` path uses
 //! `signer_from_ledger` (hardware signer; no seed ever held in process memory).
 //!
@@ -1139,10 +1139,10 @@ struct SignedBy<'a> {
 ///
 /// - `--sign-with-ledger`: hardware signer; seed never in process memory.
 /// - `--secret-env VAR`: mlock-protected signing window. The S-strkey is
-///   parsed from the env var, moved into a `Wallet` (LockedSeed), and consumed
-///   by `signer_from_wallet`. Both the `SoftwareSigningKey` and the `Wallet`
-///   drop after `attach_signature`, triggering SecretBox zeroization and
-///   LockedSeed munlock.
+///   parsed from the env var and borrowed into a `Wallet`. `signer_from_wallet`
+///   transfers the stable seed home into the signer. Drop zeroizes before
+///   unlocking and freeing. Mainnet unlocks per signature; testnet keeps the
+///   signer for the command, which can outlast the unlock TTL.
 ///
 /// # Errors
 ///

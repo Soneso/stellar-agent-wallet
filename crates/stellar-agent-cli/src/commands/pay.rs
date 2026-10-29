@@ -51,14 +51,14 @@
 //! into a [`stellar_agent_core::wallet::Wallet`] via
 //! [`stellar_agent_core::wallet::Wallet::unlock`], and consumed by
 //! [`stellar_agent_network::signing::wallet::signer_from_wallet`].  The
-//! `LockedSeed` (mlock-protected) is held only for the duration of the parse
-//! and derive; the `SoftwareSigningKey` returned to this module drops at the
-//! end of the signing block, ensuring zeroization fires on every exit path.
+//! signer owns the wallet's stable seed home until drop, which zeroizes
+//! before unlocking and freeing it. Mainnet unlocks per signature; testnet
+//! retains the signer for the command, which can outlast the unlock TTL.
 //!
 //! # mlock-protected signing window
 //!
 //! The `--secret-env` path routes through the shared ceremony
-//! (`Wallet::unlock` → `LockedSeed` → `signer_from_wallet` → dispose) →
+//! (`Wallet::unlock` → `LockedSeed` → `signer_from_wallet`) →
 //! `attach_signature` → drop. The `--sign-with-ledger` path uses
 //! `signer_from_ledger` (hardware signer; no seed ever in memory).
 //!
@@ -5533,7 +5533,8 @@ mod tests {
         };
 
         use crate::common::mainnet_write::{
-            bound_recorders_on_this_thread, invalidations_on_this_thread,
+            bound_recorders_on_this_thread, bound_request_ids_on_this_thread,
+            invalidations_on_this_thread,
         };
         use crate::common::mainnet_write_fixture::{
             AGENT_SEED, AGENT_VAR, DESTINATION, ISSUER, MainnetFixture, Spec,
@@ -5703,6 +5704,125 @@ mod tests {
             let agent =
                 stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
             ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER])
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_degraded_mainnet_env_signature_writes_the_mlock_row() {
+            use crate::common::signer_ceremony::{SignerCeremonyOutcome, set_env_ceremony_factory};
+            use stellar_agent_core::wallet::MlockDegradation;
+            for degraded in [true, false] {
+                // The audit writer registry is process-wide and keyed by
+                // profile name, so each fixture home needs its own name.
+                let name = if degraded {
+                    "mainnet-pay-mlock-degraded"
+                } else {
+                    "mainnet-pay-mlock-healthy"
+                };
+                let fixture = Spec::new(name).build().await;
+                let _factory = set_env_ceremony_factory(std::rc::Rc::new(move || {
+                    Ok(SignerCeremonyOutcome {
+                        signer: stellar_agent_network::SoftwareSigningKey::new_from_bytes(
+                            AGENT_SEED,
+                        ),
+                        mlock_degradation: degraded.then(|| MlockDegradation {
+                            reason: "test lock failure".to_owned(),
+                            errno: Some(12),
+                        }),
+                    })
+                }));
+                let run = run(&fixture, &memo_args(&fixture)).await;
+                assert_eq!(run.code, 0, "{}", run.envelope);
+                let rows: Vec<Value> = std::fs::read_to_string(&fixture.profile().audit_log_path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                let failures: Vec<_> = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| row["kind"] == "wallet_mlock_failed")
+                    .collect();
+                assert_eq!(failures.len(), usize::from(degraded));
+                if degraded {
+                    let (failure_index, failure) = failures[0];
+                    let submitted_index = rows
+                        .iter()
+                        .rposition(|row| row["kind"] == "value_action_submitted")
+                        .unwrap();
+                    assert!(failure_index > submitted_index);
+                    assert!(
+                        failure["request_id"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty())
+                    );
+                    assert_eq!(failure["request_id"], rows[submitted_index]["request_id"]);
+                    assert_eq!(failure["reason"], "test lock failure");
+                    assert_eq!(failure["errno"], 12);
+                }
+            }
+        }
+
+        /// A degraded environment ceremony whose seed is not the enrolled
+        /// key: the attach refuses with the key mismatch, and the refusal
+        /// arm writes one `wallet_mlock_failed` row with the recorder's
+        /// request id. A healthy ceremony on the same arm writes none.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_degraded_env_signer_refused_at_the_attach_writes_the_mlock_row() {
+            use crate::common::signer_ceremony::{SignerCeremonyOutcome, set_env_ceremony_factory};
+            use stellar_agent_core::wallet::MlockDegradation;
+            for degraded in [true, false] {
+                let name = if degraded {
+                    "mainnet-pay-mlock-attach-degraded"
+                } else {
+                    "mainnet-pay-mlock-attach-healthy"
+                };
+                let fixture = Spec::new(name).build().await;
+                let _factory = set_env_ceremony_factory(std::rc::Rc::new(move || {
+                    Ok(SignerCeremonyOutcome {
+                        signer: stellar_agent_network::SoftwareSigningKey::new_from_bytes(
+                            [0x5c; 32],
+                        ),
+                        mlock_degradation: degraded.then(|| MlockDegradation {
+                            reason: "test lock failure".to_owned(),
+                            errno: Some(12),
+                        }),
+                    })
+                }));
+                let invalidations_before = invalidations_on_this_thread().len();
+                let bound_before = bound_request_ids_on_this_thread().len();
+                let signatures_before = env_signatures_on_this_thread();
+
+                let run = run(&fixture, &memo_args(&fixture)).await;
+
+                assert_eq!(run.code, 1, "{}", run.envelope);
+                assert_eq!(run.code(), "auth.signer_key_mismatch", "{}", run.envelope);
+                assert_eq!(env_signatures_on_this_thread(), signatures_before);
+                assert_eq!(
+                    invalidations_on_this_thread()[invalidations_before..],
+                    [("sign_refused", Ok(()))]
+                );
+                assert!(fixture.sent_envelopes().await.is_empty());
+                let bound = bound_request_ids_on_this_thread();
+                assert_eq!(bound.len(), bound_before + 1, "one recorder is bound");
+                let request_id = &bound[bound_before];
+                let rows: Vec<Value> = std::fs::read_to_string(&fixture.profile().audit_log_path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                let failures: Vec<&Value> = rows
+                    .iter()
+                    .filter(|row| row["kind"] == "wallet_mlock_failed")
+                    .collect();
+                assert_eq!(failures.len(), usize::from(degraded), "{rows:?}");
+                if degraded {
+                    assert_eq!(failures[0]["request_id"], request_id.as_str());
+                    assert_eq!(failures[0]["reason"], "test lock failure");
+                    assert_eq!(failures[0]["errno"], 12);
+                }
+            }
         }
 
         /// Accept: a payment with a memo below the threshold needs no

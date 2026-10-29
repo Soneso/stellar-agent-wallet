@@ -460,11 +460,13 @@ Each profile command that writes long-lived key material to the keyring records 
 
 ## Wallet unlock lifecycle
 
-The unlock window holds a 32-byte signing seed in pinned, zeroize-on-drop memory for a bounded TTL. It is entered by the CLI secret-env signing path; the MCP server signs through keyring signer handles and never enters it. The lifecycle manager is `Wallet` in `crates/stellar-agent-core/src/wallet/lifecycle.rs`; the locked seed holder is `LockedSeed` in `wallet/mlock.rs`.
+The unlock window bounds when the CLI environment signing path can access or transfer a 32-byte seed. The MCP server uses keyring signer handles. `Wallet` manages access; `LockedSeed` owns the stable home.
 
 ### Zeroizing seed and eager pin
 
-`Wallet::unlock(profile_name, seed, ttl_seconds, mlock_required)` is async (Tokio). The seed is moved into a `Zeroizing<[u8; 32]>` and its backing page is pinned with `region::lock`, which calls plain `mlock(2)` (POSIX) or `VirtualLock` (Windows). Plain `mlock(2)` eagerly populates and pins pages at lock time; for a small, immediately-read seed this is at least as strong as `mlock2(MLOCK_ONFAULT)` and closes the pre-first-fault swap-disclosure window that the on-fault variant would leave open.
+`Wallet::unlock(profile_name, &seed, ttl_seconds, mlock_required)` is synchronous. It allocates a zeroed 64 KiB-aligned home, attempts its configured lock, then copies the borrowed seed into it. `region::lock` eagerly pins with `mlock(2)` on POSIX or `VirtualLock` on Windows. Each home occupies a separate allocation so another seed's drop cannot unlock its page. A page size above 64 KiB is a lock failure under `True` and `Warn`.
+
+`signer_from_wallet` consumes the wallet and transfers its `LockedSeed` into the signing key. Signing reads that same address. Drop zeroizes in place before unlocking and freeing the home, including on panic unwind.
 
 ### MlockRequired postures
 
@@ -472,19 +474,19 @@ The unlock window holds a 32-byte signing seed in pinned, zeroize-on-drop memory
 
 | Value | Behaviour on `mlock` failure |
 |-------|------------------------------|
-| `true` (default Linux/macOS) | Fail closed: `WalletLifecycleError::MlockUnavailable`; unlock aborted, seed zeroed. |
+| `true` (default Linux/macOS) | Fail closed: `WalletLifecycleError::MlockUnavailable`; unlock refused before the seed enters the home. |
 | `"warn"` (default Windows) | Proceed with unprotected memory; emit `tracing::warn!`. |
 | `false` | No lock attempted; no warning (operator accepts swap-disclosure risk). |
 
 The posture is set in the profile file and is not overlayable.
 
-On `mlock` failure the module emits a structured `tracing::warn!` carrying `profile`, `reason`, and `errno`, never the seed. The `EventKind::WalletMlockFailed` audit emission is wired at the calling CLI surface; this module's handover point is the tracing span.
+A tolerated lock failure emits a structured warning with `profile`, `reason`, and `errno`, and returns those details to the caller. The mainnet environment path appends `wallet_mlock_failed` after submission or attach refusal. This ordering keeps an audit rotation from invalidating the authorization before submission.
 
 ### TTL cap and RAII dispose
 
 The default TTL is `DEFAULT_TTL_SECONDS` (30); the hard cap is `MAX_TTL_SECONDS` (600). `unlock` rejects `ttl_seconds == 0` or `ttl_seconds > 600` with `WalletLifecycleError::TtlInvalid`. The profile field `wallet.unlock_ttl_seconds` is validated against that range when the window is constructed: a value of 0 or above 600 is refused, never clamped.
 
-A background `tokio` task sleeps for the TTL and then marks the wallet disposed. A shared `AtomicBool` cancel flag lets an early `dispose()` short-circuit the timer. On every drop path (normal return, `?` propagation, or panic-unwind), `Drop` calls `dispose()` unconditionally, zeroizing the seed and releasing the lock. `Wallet` is intentionally **not** `Send + Sync`; callers needing shared access wrap it in `Arc<Mutex<Wallet>>` or use the MCP server's per-request ownership model.
+`Wallet::seed` and `Wallet::into_locked_seed` check the clock and refuse access after expiry. The seed stays in a zeroize-on-drop page, locked when the lock succeeds, until its wallet or receiving signer drops it. Mainnet environment signers unlock once per signature and drop the seed afterward. Testnet environment signers keep it for their command, which can outlast the TTL. `Wallet` and `SoftwareSigningKey` are `Send + Sync`; shared mutation requires caller synchronization.
 
 ## Headless keyring store
 

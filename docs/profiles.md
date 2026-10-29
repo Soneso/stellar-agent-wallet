@@ -546,9 +546,10 @@ public data; the pool master seed stays in the keyring.
 
 These controls apply to every CLI seed read from a `--*-secret-env` variable, including `pay`, `claim`, and `accounts create`. Keyring signers, the Ledger, and the MCP server never enter the unlock window. The zero-config testnet profile uses the `"warn"` posture and a 30-second TTL.
 
-Controls the [unlock window](concepts.md). This is the short, TTL-bounded period
-during which the 32-byte signing seed is resident in pinned, zeroize-on-drop
-memory.
+Controls the [unlock window](concepts.md): the period in which the unlocked
+wallet hands out its 32-byte signing seed. The seed stays in its zeroize-on-drop
+home, locked when the lock succeeds, for as long as the wallet or the signer
+built from it holds it. A testnet environment signer keeps it for its command.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|

@@ -8,11 +8,12 @@
 //! 2. Parse it into a 32-byte seed; wrap the seed in `Zeroizing<[u8; 32]>`.
 //! 3. Explicitly zeroize the `Copy` residue left in `PrivateKey.0` (until
 //!    `stellar-strkey` gains its own `Drop`/`Zeroize` impl for the type).
-//! 4. Move the seed into `Wallet::unlock`, mlock-pinning the page for the
-//!    resolved profile's `[wallet]` posture and TTL.
-//! 5. Derive the `SoftwareSigningKey` via `signer_from_wallet`.
-//! 6. Dispose the wallet (munlock + zeroize the `LockedSeed`) before
-//!    returning the signer.
+//! 4. Borrow the seed into `Wallet::unlock`, which copies into a stable home
+//!    after the resolved profile's configured lock attempt.
+//! 5. Transfer that home into `SoftwareSigningKey` via `signer_from_wallet`.
+//!    The signer zeroizes before unlocking and freeing its home on drop.
+//!    Mainnet drops it after each signature; testnet keeps it for the command,
+//!    which can outlast the wallet's clock-checked unlock TTL.
 //!
 //! [`resolve_software_signer_from_env`] is the single call site for this
 //! ceremony. Every CLI verb that resolves a signer from an env var routes
@@ -27,7 +28,8 @@
 //! audit writer when it resolves the signer writes the `WalletMlockFailed`
 //! entry through [`record_mlock_degradation`]: the smart-account handler
 //! context, `execute`, `multicall`, the timelock verbs, and `accounts
-//! deploy-c` with `--profile`. Every other caller relies on the
+//! deploy-c` with `--profile`, and the mainnet write pipeline after submission
+//! or an attach refusal. Every other caller relies on the
 //! `tracing::warn!` that `Wallet::unlock` emits.
 //!
 //! # Enrolled signer identity
@@ -121,6 +123,33 @@ pub(crate) fn set_ledger_signer_factory(factory: LedgerSignerFactory) -> LedgerS
     LedgerSignerFactoryGuard(LEDGER_SIGNER_FACTORY.with(|slot| slot.replace(Some(factory))))
 }
 
+/// Supplies a deferred environment ceremony on the calling test thread.
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) type EnvCeremonyFactory =
+    std::rc::Rc<dyn Fn() -> Result<SignerCeremonyOutcome, WalletError>>;
+
+#[cfg(all(test, feature = "mainnet-write"))]
+thread_local! {
+    static ENV_CEREMONY_FACTORY: std::cell::RefCell<Option<EnvCeremonyFactory>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the thread's ceremony factory on drop.
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) struct EnvCeremonyFactoryGuard(Option<EnvCeremonyFactory>);
+
+#[cfg(all(test, feature = "mainnet-write"))]
+impl Drop for EnvCeremonyFactoryGuard {
+    fn drop(&mut self) {
+        ENV_CEREMONY_FACTORY.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+/// Override the deferred environment ceremony until the returned guard drops.
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) fn set_env_ceremony_factory(factory: EnvCeremonyFactory) -> EnvCeremonyFactoryGuard {
+    EnvCeremonyFactoryGuard(ENV_CEREMONY_FACTORY.with(|slot| slot.replace(Some(factory))))
+}
+
 /// How many signatures [`DeferredEnvSigner`] produced on the calling thread.
 #[cfg(all(test, feature = "mainnet-write"))]
 pub(crate) fn env_signatures_on_this_thread() -> usize {
@@ -157,8 +186,7 @@ pub(crate) async fn resolve_software_signer_from_env(
     zeroize::Zeroize::zeroize(&mut private_key.0);
     drop(s_strkey);
 
-    let mut wallet = Wallet::unlock(wallet_label.to_owned(), seed, ttl_seconds, mlock_required)
-        .await
+    let wallet = Wallet::unlock(wallet_label.to_owned(), &seed, ttl_seconds, mlock_required)
         .map_err(|e| {
             WalletError::WalletState(WalletStateError::UnlockFailed {
                 detail: e.to_string(),
@@ -166,14 +194,7 @@ pub(crate) async fn resolve_software_signer_from_env(
         })?;
     let mlock_degradation = wallet.mlock_degradation().cloned();
 
-    let signer = match signer_from_wallet(&wallet) {
-        Ok(s) => s,
-        Err(e) => {
-            wallet.dispose();
-            return Err(e);
-        }
-    };
-    wallet.dispose();
+    let signer = signer_from_wallet(wallet)?;
     Ok(SignerCeremonyOutcome {
         signer,
         mlock_degradation,
@@ -359,6 +380,7 @@ impl MainnetSignerChoice {
 pub(crate) struct MainnetSigner<'a> {
     signer: Box<dyn Signer + Send + Sync + 'a>,
     handle_failure: Option<Arc<AtomicBool>>,
+    mlock_degradation: Option<Arc<Mutex<Option<MlockDegradation>>>>,
 }
 
 impl<'a> MainnetSigner<'a> {
@@ -375,6 +397,16 @@ impl<'a> MainnetSigner<'a> {
         self.handle_failure
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+
+    /// The environment ceremony's tolerated lock failure, if any.
+    pub(crate) fn mlock_degradation(&self) -> Option<MlockDegradation> {
+        self.mlock_degradation.as_ref().and_then(|value| {
+            value
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        })
     }
 }
 
@@ -399,16 +431,18 @@ pub(crate) async fn mainnet_signer<'a>(
         MainnetSignerChoice::Ledger { account_index } => Ok(MainnetSigner {
             signer: ledger_signer(*account_index, source).await?,
             handle_failure: None,
+            mlock_degradation: None,
         }),
-        MainnetSignerChoice::Env { var_name, label } => Ok(MainnetSigner {
-            signer: Box::new(DeferredEnvSigner::new(
-                var_name.clone(),
-                label,
-                profile,
-                enrolled.public_key(),
-            )),
-            handle_failure: None,
-        }),
+        MainnetSignerChoice::Env { var_name, label } => {
+            let signer =
+                DeferredEnvSigner::new(var_name.clone(), label, profile, enrolled.public_key());
+            let mlock_degradation = Arc::clone(&signer.mlock_degradation);
+            Ok(MainnetSigner {
+                signer: Box::new(signer),
+                handle_failure: None,
+                mlock_degradation: Some(mlock_degradation),
+            })
+        }
         MainnetSignerChoice::Keyring => {
             let handle = lazy_signer_from_keyring(enrolled.seed_entry(), source)?;
             let failed = Arc::new(AtomicBool::new(false));
@@ -418,6 +452,7 @@ pub(crate) async fn mainnet_signer<'a>(
                     failed: Arc::clone(&failed),
                 }),
                 handle_failure: Some(failed),
+                mlock_degradation: None,
             })
         }
     }
@@ -447,6 +482,7 @@ pub(crate) struct DeferredEnvSigner<'a> {
     label: &'static str,
     profile: &'a Profile,
     expected: [u8; 32],
+    mlock_degradation: Arc<Mutex<Option<MlockDegradation>>>,
 }
 
 impl<'a> DeferredEnvSigner<'a> {
@@ -464,6 +500,7 @@ impl<'a> DeferredEnvSigner<'a> {
             label,
             profile,
             expected,
+            mlock_degradation: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -473,6 +510,15 @@ impl<'a> DeferredEnvSigner<'a> {
             requested_primitive,
         })
     }
+
+    /// Runs the environment ceremony for one signature.
+    async fn ceremony(&self) -> Result<SignerCeremonyOutcome, WalletError> {
+        #[cfg(all(test, feature = "mainnet-write"))]
+        if let Some(factory) = ENV_CEREMONY_FACTORY.with(|slot| slot.borrow().clone()) {
+            return factory();
+        }
+        resolve_software_signer_from_env(&self.var_name, self.label, self.profile).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -480,8 +526,19 @@ impl Signer for DeferredEnvSigner<'_> {
     async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
         let SignerCeremonyOutcome {
             signer,
-            mlock_degradation: _,
-        } = resolve_software_signer_from_env(&self.var_name, self.label, self.profile).await?;
+            mlock_degradation,
+        } = self.ceremony().await?;
+        // The first degraded ceremony stays recorded: a later healthy
+        // signature does not clear the record of an unprotected one.
+        {
+            let mut recorded = self
+                .mlock_degradation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if recorded.is_none() {
+                *recorded = mlock_degradation;
+            }
+        }
         let derived = signer.public_key().await?;
         if derived.0 != self.expected {
             return Err(AuthError::SignerKeyMismatch {
@@ -904,12 +961,85 @@ mod tests {
         let seed_bytes = Zeroizing::new(seed);
         let result = Wallet::unlock(
             "unit-test".to_owned(),
-            seed_bytes,
+            &seed_bytes,
             over_max,
             MlockRequired::Warn,
-        )
-        .await;
+        );
         assert!(result.is_err(), "TTL above MAX_TTL_SECONDS must be refused");
+    }
+
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    async fn deferred_env_signer_reports_its_degradation() {
+        for degraded in [true, false] {
+            let _factory = set_env_ceremony_factory(std::rc::Rc::new(move || {
+                Ok(SignerCeremonyOutcome {
+                    signer: SoftwareSigningKey::new_from_bytes([42; 32]),
+                    mlock_degradation: degraded.then(|| MlockDegradation {
+                        reason: "test lock failure".to_owned(),
+                        errno: Some(12),
+                    }),
+                })
+            }));
+            let profile = test_profile();
+            let expected = ed25519_dalek::SigningKey::from_bytes(&[42; 32])
+                .verifying_key()
+                .to_bytes();
+            let deferred =
+                DeferredEnvSigner::new("TEST_ENV".to_owned(), "test", &profile, expected);
+            let degradation = Arc::clone(&deferred.mlock_degradation);
+            let signer = MainnetSigner {
+                signer: Box::new(deferred),
+                handle_failure: None,
+                mlock_degradation: Some(degradation),
+            };
+            assert!(signer.mlock_degradation().is_none());
+            signer.signer().sign_tx_payload(&[7; 32]).await.unwrap();
+            let observed = signer.mlock_degradation();
+            assert_eq!(observed.is_some(), degraded);
+            if let Some(observed) = observed {
+                assert_eq!(observed.reason, "test lock failure");
+                assert_eq!(observed.errno, Some(12));
+            }
+        }
+    }
+
+    /// A healthy signature after a degraded one keeps the degraded record.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    async fn a_later_healthy_signature_keeps_the_first_degradation() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let factory_calls = std::rc::Rc::clone(&calls);
+        let _factory = set_env_ceremony_factory(std::rc::Rc::new(move || {
+            let call = factory_calls.get();
+            factory_calls.set(call + 1);
+            Ok(SignerCeremonyOutcome {
+                signer: SoftwareSigningKey::new_from_bytes([42; 32]),
+                mlock_degradation: (call == 0).then(|| MlockDegradation {
+                    reason: "first lock failure".to_owned(),
+                    errno: Some(12),
+                }),
+            })
+        }));
+        let profile = test_profile();
+        let expected = ed25519_dalek::SigningKey::from_bytes(&[42; 32])
+            .verifying_key()
+            .to_bytes();
+        let deferred = DeferredEnvSigner::new("TEST_ENV".to_owned(), "test", &profile, expected);
+        let degradation = Arc::clone(&deferred.mlock_degradation);
+        let signer = MainnetSigner {
+            signer: Box::new(deferred),
+            handle_failure: None,
+            mlock_degradation: Some(degradation),
+        };
+        signer.signer().sign_tx_payload(&[7; 32]).await.unwrap();
+        signer.signer().sign_tx_payload(&[8; 32]).await.unwrap();
+        assert_eq!(calls.get(), 2, "each signature runs its own ceremony");
+        let observed = signer
+            .mlock_degradation()
+            .expect("the degraded first signature stays recorded");
+        assert_eq!(observed.reason, "first lock failure");
+        assert_eq!(observed.errno, Some(12));
     }
 
     // ── mlock-degradation detection ─────────────────────────────────────────
@@ -929,11 +1059,10 @@ mod tests {
         let seed_bytes = Zeroizing::new([0x44u8; 32]);
         let mut wallet = Wallet::unlock(
             "unit-test-mlock-false".to_owned(),
-            seed_bytes,
+            &seed_bytes,
             DEFAULT_TTL_SECONDS,
             MlockRequired::False,
         )
-        .await
         .expect("unlock under MlockRequired::False must always succeed");
         assert!(
             wallet.mlock_degradation().is_none(),

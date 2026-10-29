@@ -1,35 +1,21 @@
-//! Software `SoftwareSigningKey` — ed25519 secret key in a
-//! `secrecy::SecretBox`, zeroised on drop.
+//! Software ed25519 signing with a zeroize-on-drop seed home.
 //!
-//! # Zeroize-on-drop guarantee
-//!
-//! `SoftwareSigningKey` holds its secret in a `secrecy::SecretBox<[u8; 32]>`,
-//! whose `Drop` implementation calls `zeroize::Zeroize::zeroize` on the
-//! heap-allocated array before freeing.  The explicit `impl Drop` below fires
-//! before the struct fields are dropped.  The body is empty because `SecretBox`
-//! already does the work; the `impl Drop` declaration is an auditable guarantee
-//! that no future refactor can accidentally remove the zeroize-on-drop
-//! discipline without touching this explicit impl first.
-//!
-//! # `new_from_zeroizing` vs `new_from_bytes`
-//!
-//! Production call sites MUST use `new_from_zeroizing(Zeroizing<[u8; 32]>)`:
-//! the `Zeroizing` wrapper zeroes the stack/heap temporary when it falls out
-//! of scope, so the secret bytes are cleared on both the source and inside the
-//! `SecretBox`.  `new_from_bytes([u8; 32])` is retained for fixture/test use
-//! only; the caller bears responsibility for zeroing the source array.
+//! Keyring and fixture constructors use `secrecy::SecretBox`. Wallet signers
+//! take ownership of a `LockedSeed` and read its stable home directly.
+//! Both homes zeroize before freeing; a locked home also unlocks after zeroizing.
 
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretBox};
 use stellar_agent_core::error::{AuthError, WalletError};
+use stellar_agent_core::wallet::LockedSeed;
 use zeroize::Zeroizing;
 
 use crate::signing::{Signer, WebAuthnAssertion};
 
 /// A zeroize-on-drop wrapper around a 32-byte ed25519 secret seed.
 ///
-/// Wraps `secrecy::SecretBox<[u8; 32]>`.  Callers pass `&SoftwareSigningKey`
-/// (or `&dyn Signer`) to signing functions — never the raw bytes by value.
+/// Holds either a boxed secret or the locked home transferred by a wallet.
+/// Callers pass `&SoftwareSigningKey` or `&dyn Signer` to signing functions.
 ///
 /// See the [module-level documentation](crate::signing::software) for the
 /// `Drop` and `Zeroizing` discipline.
@@ -57,37 +43,20 @@ use crate::signing::{Signer, WebAuthnAssertion};
 /// drop(key); // inner bytes zeroed by SecretBox::drop
 /// ```
 ///
-/// # `#[non_exhaustive]` exemption
-///
-/// `SoftwareSigningKey` is a newtype tuple struct with a single private field
-/// (`SecretBox<[u8; 32]>`).  External callers cannot construct it via
-/// struct-literal or tuple syntax; the only construction paths are
-/// [`SoftwareSigningKey::new_from_zeroizing`] (production) and
-/// [`SoftwareSigningKey::new_from_bytes`] (fixtures/tests).  Adding
-/// `#[non_exhaustive]` provides no additional forward-compat guarantee for a
-/// private-field newtype and is therefore omitted.  Any structural change would
-/// require a public-API semver bump regardless.
-pub struct SoftwareSigningKey(SecretBox<[u8; 32]>);
+/// The private seed home keeps construction behind the named constructors.
+pub struct SoftwareSigningKey(SeedHome);
+
+enum SeedHome {
+    Boxed(SecretBox<[u8; 32]>),
+    Locked(LockedSeed),
+}
 
 impl SoftwareSigningKey {
     /// Constructs a `SoftwareSigningKey` from a `Zeroizing<[u8; 32]>` container.
     ///
-    /// The `Zeroizing` wrapper zeroes the source bytes when `raw` drops at the
-    /// end of this call frame.  The bytes are moved into a `SecretBox` which
-    /// zeroes the heap allocation on drop.
-    ///
-    /// Production call sites MUST use this constructor rather than
-    /// `new_from_bytes`.
-    ///
-    /// # Ownership contract
-    ///
-    /// `raw` is taken **by value** deliberately. clippy's `needless_pass_by_value`
-    /// lint suggests taking a reference because `[u8; 32]` is `Copy`, but the
-    /// caller MUST relinquish ownership of `raw` so that its `Drop` impl fires
-    /// when this function returns, zeroing the caller's stack copy. Taking a `&`
-    /// reference would allow the caller to retain and re-use the `Zeroizing`
-    /// container, defeating the discipline. The `#[allow(clippy::needless_pass_by_value)]`
-    /// on this function is the documented exception.
+    /// Copies into a heap-allocated `SecretBox`. The `raw` parameter zeroizes
+    /// when this function returns; the box zeroizes when the signing key drops.
+    /// Wallet signers transfer their locked home through `signer_from_wallet`.
     ///
     /// # Examples
     ///
@@ -101,27 +70,22 @@ impl SoftwareSigningKey {
     #[must_use]
     #[allow(
         clippy::needless_pass_by_value,
-        reason = "ownership is required so the caller's Zeroizing<[u8;32]> is dropped on return"
+        reason = "the owned Zeroizing parameter zeroizes on return"
     )]
     pub fn new_from_zeroizing(raw: Zeroizing<[u8; 32]>) -> Self {
-        // `SecretBox::init_with_mut` initialises `S` in-place inside the
-        // `SecretBox`'s heap allocation via a mutable reference — no stack
-        // temporary is materialised for the secret bytes.
-        // `[u8; 32]` satisfies `Zeroize + Default` (both required by the
-        // `impl<S: Zeroize + Default> SecretBox<S>` bound).
-        // The `Zeroizing<[u8; 32]>` wrapper is consumed by this call so its
-        // `Drop` impl fires on return, zeroing the caller's copy.
-        Self(SecretBox::init_with_mut(|dst: &mut [u8; 32]| {
-            dst.copy_from_slice(&*raw);
-        }))
+        // Initialize the boxed seed in place from the zeroizing input.
+        Self(SeedHome::Boxed(SecretBox::init_with_mut(
+            |dst: &mut [u8; 32]| {
+                dst.copy_from_slice(&*raw);
+            },
+        )))
     }
 
     /// Constructs a `SoftwareSigningKey` from 32 raw bytes.
     ///
     /// **Test and fixture use only.** The caller is responsible for zeroing
-    /// the source bytes after this call.  Production code MUST use
-    /// [`SoftwareSigningKey::new_from_zeroizing`] instead, which enforces the
-    /// caller-side zeroise discipline via the `Zeroizing<T>` type wrapper.
+    /// the source bytes after this call. Production code uses
+    /// [`SoftwareSigningKey::new_from_zeroizing`] or transfers a locked wallet home.
     ///
     /// # Examples
     ///
@@ -134,7 +98,12 @@ impl SoftwareSigningKey {
     /// ```
     #[must_use]
     pub fn new_from_bytes(bytes: [u8; 32]) -> Self {
-        Self(SecretBox::new(Box::new(bytes)))
+        Self(SeedHome::Boxed(SecretBox::new(Box::new(bytes))))
+    }
+
+    /// Take ownership of a wallet's stable seed home without copying its bytes.
+    pub(crate) fn from_locked_seed(seed: LockedSeed) -> Self {
+        Self(SeedHome::Locked(seed))
     }
 
     /// Exposes the raw 32-byte secret key seed for the signing implementation.
@@ -142,21 +111,17 @@ impl SoftwareSigningKey {
     /// `pub(crate)` — called by `SoftwareSigningKey::sign_tx_payload` and
     /// `SoftwareSigningKey::public_key` only.
     pub(crate) fn expose_secret_for_signing(&self) -> &[u8; 32] {
-        self.0.expose_secret()
+        match &self.0 {
+            SeedHome::Boxed(seed) => seed.expose_secret(),
+            SeedHome::Locked(seed) => seed.seed(),
+        }
     }
 }
 
-/// Explicit `Drop` for `SoftwareSigningKey`.
-///
-/// The body is intentionally empty: `secrecy::SecretBox` already calls
-/// `zeroize::Zeroize::zeroize` on its heap-allocated array before freeing.
-/// The explicit `impl Drop` is an auditable guarantee: a future refactor that
-/// swaps `SecretBox` for a non-zeroizing holder will fail to compile cleanly
-/// while this impl exists, making the invariant visible to any reviewer.
+/// Both seed homes zeroize through their field's drop implementation.
 impl Drop for SoftwareSigningKey {
     fn drop(&mut self) {
-        // SecretBox's own Drop handles the actual zeroize.
-        // This impl exists as the explicit audit point for the zeroize guarantee.
+        // SecretBox zeroizes before freeing; LockedSeed zeroizes before unlocking.
     }
 }
 

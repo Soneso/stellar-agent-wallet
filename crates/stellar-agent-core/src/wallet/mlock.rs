@@ -1,312 +1,192 @@
 //! Region-backed memory-locked seed buffer.
 //!
-//! Provides [`LockedSeed`] — an opaque 32-byte seed holder that:
+//! [`LockedSeed`] allocates an isolated home, locks it before copying the seed,
+//! and keeps that address stable through ownership transfers. Drop zeroizes the
+//! seed before unlocking and freeing its home, including during panic unwind.
 //!
-//! 1. Wraps the seed bytes in [`zeroize::Zeroizing`] so they are zeroed on
-//!    drop, including on panic-unwind (Rust's `Drop` glue runs during unwind).
-//! 2. Calls `region::lock` to pin the seed's backing page in physical RAM via
-//!    `mlock(2)` (POSIX) or `VirtualLock` (Windows), preventing the page from
-//!    being swapped to disk (threat T6 swap-disclosure).
-//! 3. Releases the lock and zeroes the seed when dropped or when
-//!    `dispose()` is called explicitly.
+//! `region::lock` uses `mlock(2)` on POSIX and `VirtualLock` on Windows.
+//! It rounds the range to whole pages. Locks do not nest, so each seed owns
+//! a separate aligned allocation to keep another seed's drop from unlocking it.
 //!
-//! # `region` crate and mlock(2) vs mlock2(MLOCK_ONFAULT)
-//!
-//! The `region` crate calls `libc::mlock(2)` directly — plain POSIX `mlock`,
-//! not `mlock2(MLOCK_ONFAULT)`.  Plain `mlock(2)` eagerly populates and pins
-//! pages at lock time, which is at least as strong as `mlock2(MLOCK_ONFAULT)`
-//! for the wallet's small, definitely-accessed seed region.  `MLOCK_ONFAULT`
-//! is a performance optimisation for large regions that may never be faulted
-//! in; for a 32-byte seed buffer it is operationally inert.
-//!
-//! # `region::lock` alignment semantics
-//!
-//! `region::lock(address, size)` accepts arbitrary addresses and rounds down to
-//! the nearest page boundary internally (`util::round_to_page_boundaries` is
-//! called before the syscall).  No manual page-alignment of the seed buffer is
-//! required by this crate.  The consequence is that the locked range covers the
-//! entire page containing the seed, which may include adjacent allocations on
-//! that page.  This is the standard behaviour of `mlock(2)`.
-//!
-//! # `Send`/`Sync` invariants for `region::LockGuard`
-//!
-//! `region::LockGuard` carries `unsafe impl Send` and `unsafe impl Sync`
-//! without inline `// SAFETY:` documentation (upstream convention gap).
-//! Because `stellar-agent-core` uses `#![forbid(unsafe_code)]` we cannot add
-//! a wrapper newtype with `unsafe impl` in this crate.  The upstream invariants
-//! are:
-//!
-//! - **`Send`** is sound because `munlock(addr, size)` (called by
-//!   `LockGuard::drop`) is a process-scoped syscall, not bound to the thread
-//!   that called `mlock`.  Moving the guard to another thread and dropping it
-//!   there is safe.
-//! - **`Sync`** is sound because `LockGuard` exposes no `&self` API that
-//!   touches the locked memory; the only operation is `Drop` (exclusive).
+//! `region::LockGuard` is `Send + Sync`: unlocking is process-scoped, and the
+//! guard exposes no shared-reference operation that touches the locked memory.
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::{config::MlockRequired, error::WalletLifecycleError};
 
-// ── LockedSeed ────────────────────────────────────────────────────────────────
+// Memory locks do not nest. A separate 64 KiB-aligned allocation isolates each
+// seed on supported 4 KiB, 16 KiB, and 64 KiB pages, including at unlock time.
+const SEED_PAGE_ALIGN: usize = 65536;
 
-/// An `mlock`-protected 32-byte signing seed.
+#[repr(C, align(65536))]
+struct SeedPage([u8; 32]);
+
+const _: () = assert!(std::mem::align_of::<SeedPage>() == SEED_PAGE_ALIGN);
+
+impl Zeroize for SeedPage {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+fn seed_page_isolates(page_size: usize) -> bool {
+    page_size <= SEED_PAGE_ALIGN
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static ZEROIZED_BEFORE_UNLOCK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// A 32-byte signing seed with a stable, isolated, zeroize-on-drop home.
 ///
-/// The seed bytes are stored in a [`Zeroizing<[u8; 32]>`] so they are zeroed
-/// on drop regardless of the drop path (normal return, `?` propagation, or
-/// panic-unwind).  When `MlockRequired::True` or `MlockRequired::Warn` is in
-/// effect and `mlock` succeeds, the backing page is additionally pinned in RAM
-/// via `region::lock`.
+/// When the configured posture requires or attempts locking, the home is locked
+/// before the seed enters it. A tolerated lock failure is available to callers
+/// through the wallet's degradation accessor.
 ///
-/// # Construction
-///
-/// Use `LockedSeed::new`; the raw `seed: [u8; 32]` parameter is moved into
-/// a `Zeroizing` wrapper immediately on entry so the stack copy is zeroed when
-/// the wrapper drops.
-///
-/// # Disposal
-///
-/// Call [`LockedSeed::dispose`] for explicit cleanup, or rely on [`Drop`].
-/// Both paths zeroize the seed bytes and release the memory lock.
+/// [`Drop`] and [`LockedSeed::dispose`] zeroize the seed, unlock, then free it.
 pub struct LockedSeed {
-    /// Seed bytes, zeroized on drop.  `Option` so `dispose()` can take
-    /// ownership and zero explicitly before the field drops.
-    seed: Option<Zeroizing<[u8; 32]>>,
-    /// The memory-lock guard.  `None` when `MlockRequired::False` is set or
-    /// when `mlock` failed under `MlockRequired::Warn`.  Dropped before
-    /// `seed` to follow the invariant: release lock first, then zero.
-    ///
-    /// `region::LockGuard` carries `unsafe impl Send + Sync`; the invariants
-    /// (munlock is process-scoped; no &self API on the guard) are documented in
-    /// the module-level rustdoc.
+    /// Drop zeroizes this home, releases the guard, then frees the box.
+    home: Box<Zeroizing<SeedPage>>,
+    /// Absent when locking is disabled or a failure is tolerated.
     guard: Option<region::LockGuard>,
-    /// Whether this seed has been explicitly disposed.
-    disposed: bool,
-    /// `Some` when `mlock` was attempted and failed under
-    /// `MlockRequired::Warn` (the process proceeded with unprotected memory).
-    ///
-    /// `None` both when `mlock` succeeded and when `MlockRequired::False`
-    /// meant locking was never attempted — this field distinguishes
-    /// "degraded" from "opted out", which `guard.is_none()` alone cannot.
     mlock_degradation: Option<MlockDegradation>,
+    #[cfg(test)]
+    lock_target: Option<usize>,
 }
 
 /// Details of an `mlock` failure tolerated under `MlockRequired::Warn`.
-///
-/// Carries the same fields [`WalletLifecycleError::MlockUnavailable`] would
-/// carry had `MlockRequired::True` been in effect, so a caller recording a
-/// `WalletMlockFailed` audit-log entry has the OS-level reason and errno
-/// available rather than only a boolean.
 #[derive(Debug, Clone)]
 pub struct MlockDegradation {
-    /// Human-readable reason string from the OS error.
+    /// Human-readable reason for the lock failure.
     pub reason: String,
-    /// `errno` value from the failed `mlock` / `VirtualLock` syscall, when
-    /// the underlying OS error exposed one.
+    /// OS error number, when the failure exposes one.
     pub errno: Option<i32>,
 }
 
 impl LockedSeed {
-    /// Create a new `LockedSeed`, optionally locking the backing page in RAM.
+    /// Allocate a zeroed home, attempt its lock, then copy the borrowed seed.
     ///
-    /// The `seed` parameter is already wrapped in `Zeroizing<[u8; 32]>`; this
-    /// function moves it directly into the locked page owner without making an
-    /// additional bare stack copy.
-    ///
-    /// `profile_name` is used to populate the `profile` field in the
-    /// `tracing::warn!` emitted under `MlockRequired::Warn` when `mlock`
-    /// fails.  Pass the owning wallet's profile name (e.g. `"default"`).
-    ///
-    /// Behaviour on `mlock` failure depends on `required`:
-    ///
-    /// - [`MlockRequired::True`] — returns
-    ///   [`WalletLifecycleError::MlockUnavailable`]; the seed is zeroed and
-    ///   this function does not return `Ok`.
-    /// - [`MlockRequired::Warn`] — returns `Ok` with `guard: None`; emits a
-    ///   structured `tracing::warn!` and records the failure in
-    ///   [`Self::mlock_degradation`] for the caller to surface as a
-    ///   `WalletMlockFailed` audit-log entry.
-    /// - [`MlockRequired::False`] — `mlock` is not attempted; always returns
-    ///   `Ok` with `guard: None`.
+    /// `True` refuses a lock failure before copying any seed bytes. `Warn`
+    /// records the failure and proceeds. `False` skips the lock attempt.
+    /// The caller keeps responsibility for zeroizing the borrowed input.
     ///
     /// # Errors
     ///
-    /// Returns [`WalletLifecycleError::MlockUnavailable`] when
-    /// `required == MlockRequired::True` and the OS refuses the lock.
-    ///
+    /// Returns [`WalletLifecycleError::MlockUnavailable`] under `True` when
+    /// the OS refuses the lock or its page size exceeds the home's alignment.
     pub(crate) fn new(
-        zeroizing_seed: Zeroizing<[u8; 32]>,
+        seed: &[u8; 32],
         required: MlockRequired,
         profile_name: &str,
     ) -> Result<Self, WalletLifecycleError> {
-        let mut mlock_degradation: Option<MlockDegradation> = None;
+        Self::with_page_size(seed, required, profile_name, region::page::size())
+    }
+
+    /// Build the home as [`LockedSeed::new`] does, checking isolation against
+    /// `page_size` instead of the host's page size.
+    fn with_page_size(
+        seed: &[u8; 32],
+        required: MlockRequired,
+        profile_name: &str,
+        page_size: usize,
+    ) -> Result<Self, WalletLifecycleError> {
+        let mut home = Box::new(Zeroizing::new(SeedPage([0u8; 32])));
+        let mut mlock_degradation = None;
+        #[cfg(test)]
+        let mut lock_target = None;
         let guard = match required {
             MlockRequired::False => None,
             MlockRequired::True | MlockRequired::Warn => {
-                // Obtain a stable address for the seed bytes.  The Zeroizing
-                // wrapper is on the stack here; we take the address of the
-                // inner array.  region::lock rounds the address down to the
-                // page boundary internally.
-                let addr = zeroizing_seed.as_ptr();
-                let size = std::mem::size_of::<[u8; 32]>();
-
-                match region::lock(addr, size) {
+                let addr = home.0.as_ptr();
+                #[cfg(test)]
+                {
+                    lock_target = Some(addr as usize);
+                }
+                let result = if seed_page_isolates(page_size) {
+                    region::lock(addr, 32)
+                } else {
+                    Err(region::Error::InvalidParameter(
+                        "page size exceeds seed alignment",
+                    ))
+                };
+                match result {
                     Ok(guard) => Some(guard),
                     Err(err) => {
                         let reason = err.to_string();
-                        // Extract errno from the inner io::Error if present.
                         let errno = extract_os_errno(&err);
-
-                        match required {
-                            MlockRequired::True => {
-                                // zeroizing_seed is dropped here, zeroing the
-                                // stack copy before the error propagates.
-                                return Err(WalletLifecycleError::MlockUnavailable {
-                                    reason,
-                                    errno,
-                                });
-                            }
-                            MlockRequired::Warn => {
-                                // Proceed with unprotected memory.  The warn!
-                                // is structured so the `tracing-json`
-                                // subscriber layer captures profile, reason,
-                                // and errno as individual JSON fields.
-                                tracing::warn!(
-                                    profile = %profile_name,
-                                    reason = %reason,
-                                    errno = errno,
-                                    "wallet.mlock_failed: mlock unavailable; \
-                                     proceeding with unprotected memory (warn mode)."
-                                );
-                                mlock_degradation = Some(MlockDegradation {
-                                    reason,
-                                    // `extract_os_errno` returns `0` when the
-                                    // underlying `region::Error` carried no OS
-                                    // errno (e.g. `InvalidParameter`); map that
-                                    // sentinel to `None` for the audit-log field.
-                                    errno: if errno == 0 { None } else { Some(errno) },
-                                });
-                                None
-                            }
-                            // MlockRequired::False is handled in the outer
-                            // match and cannot reach this arm.
-                            MlockRequired::False => None,
+                        if required == MlockRequired::True {
+                            return Err(WalletLifecycleError::MlockUnavailable { reason, errno });
                         }
+                        tracing::warn!(
+                            profile = %profile_name,
+                            reason = %reason,
+                            errno = errno,
+                            "wallet.mlock_failed: mlock unavailable; proceeding with unprotected memory (warn mode)."
+                        );
+                        mlock_degradation = Some(MlockDegradation {
+                            reason,
+                            errno: if errno == 0 { None } else { Some(errno) },
+                        });
+                        None
                     }
                 }
             }
         };
-
+        home.0.copy_from_slice(seed);
         Ok(Self {
-            seed: Some(zeroizing_seed),
+            home,
             guard,
-            disposed: false,
             mlock_degradation,
+            #[cfg(test)]
+            lock_target,
         })
     }
 
-    /// Returns the `mlock` degradation details when `mlock` was attempted
-    /// and failed under `MlockRequired::Warn`.
-    ///
-    /// Returns `None` both when `mlock` succeeded and when
-    /// `MlockRequired::False` meant locking was never attempted.
-    #[must_use]
+    /// Return details of a tolerated lock failure, if any.
     pub(crate) fn mlock_degradation(&self) -> Option<&MlockDegradation> {
         self.mlock_degradation.as_ref()
     }
 
-    /// Borrow the seed bytes.
-    ///
-    /// The borrow lifetime keeps the `LockedSeed` alive (and thus the lock
-    /// guard alive) for as long as the caller holds the reference.
-    ///
-    /// This method is `pub(crate)` — external callers access the seed
-    /// through [`super::lifecycle::Wallet::seed`], which enforces TTL and
-    /// disposed-flag checks before delegating here.
-    #[allow(
-        clippy::expect_used,
-        reason = "Provably infallible: seed is Some whenever disposed == false. \
-                  The assert! below catches violations at runtime; the expect is \
-                  the unreachable fallthrough after the assert.  See INVARIANT comment."
-    )]
-    pub(crate) fn seed(&self) -> &[u8; 32] {
-        // INVARIANT: `seed` is `Some` whenever `disposed == false`.
-        // The only code path that sets `seed` to `None` is `internal_dispose()`,
-        // which also sets `disposed = true`.  This method is `pub(crate)` and
-        // the only external caller is `lifecycle::Wallet::seed()`, which gates
-        // on `disposed` before calling here.  Failing this assert indicates a
-        // programming error in `stellar-agent-core` internals, not user input.
-        //
-        // Note: `// SAFETY:` is reserved for `unsafe` blocks.
-        // This is a safe invariant assertion, not an unsafe precondition.
-        assert!(
-            self.seed.is_some(),
-            "LockedSeed::seed() called after dispose(): seed is None \
-             (invariant: disposed == false implies seed.is_some())"
-        );
-        // `Zeroizing<[u8; 32]>` implements `Deref<Target = [u8; 32]>`;
-        // `as_deref` gives `Option<&[u8; 32]>`.
-        self.seed
-            .as_deref()
-            .expect("invariant: disposed == false implies seed.is_some()")
+    /// Borrow the seed from its stable home for this owner's lifetime.
+    pub fn seed(&self) -> &[u8; 32] {
+        &self.home.0
     }
 
-    /// Explicitly zeroize the seed bytes and release the memory lock.
-    ///
-    /// After `dispose()` returns, the seed bytes are zeroed and the
-    /// `region::LockGuard` is dropped (which calls `munlock`).  Calling
-    /// `dispose()` more than once is a no-op.
-    ///
-    /// [`Drop`] also calls the same zeroise + unlock path, so explicit
-    /// disposal is optional but may be preferable for auditability.
-    pub fn dispose(mut self) {
-        self.internal_dispose();
-        // Prevent Drop from running internal_dispose a second time.
-        std::mem::forget(self);
+    /// Zeroize the seed, unlock its page, and free its home.
+    pub fn dispose(self) {
+        drop(self);
     }
 
-    /// Returns `true` if this seed has been disposed.
-    pub fn is_disposed(&self) -> bool {
-        self.disposed
+    #[cfg(test)]
+    pub(super) fn lock_target(&self) -> Option<usize> {
+        self.lock_target
     }
 
-    /// Internal dispose logic shared between `dispose()` and `Drop`.
-    fn internal_dispose(&mut self) {
-        if self.disposed {
-            return;
-        }
-        self.disposed = true;
-        // Drop the guard first (calls munlock), then the seed (calls zeroize).
-        // This ordering ensures the page is unlocked before the seed bytes are
-        // cleared, which is the safe order: the page may be swapped after
-        // unlock, but by then zeroize has already cleared the bytes.
+    /// Release the memory lock on the home. The caller zeroizes the home first.
+    fn release_lock(&mut self) {
+        #[cfg(test)]
+        ZEROIZED_BEFORE_UNLOCK.set(Some(self.home.0.iter().all(|byte| *byte == 0)));
         drop(self.guard.take());
-        drop(self.seed.take());
     }
 }
 
 impl Drop for LockedSeed {
     fn drop(&mut self) {
-        self.internal_dispose();
+        self.home.zeroize();
+        self.release_lock();
     }
 }
 
-// ── errno extraction ──────────────────────────────────────────────────────────
-
 /// Extract the OS errno from a `region::Error`, falling back to `0`.
-///
-/// `region::Error::SystemCall` wraps `io::Error`; `io::Error::raw_os_error()`
-/// returns the errno as `Option<i32>`.
 fn extract_os_errno(err: &region::Error) -> i32 {
-    // region::Error::SystemCall(io::Error) — the inner io::Error carries errno.
-    // Other region error variants (InvalidParameter, etc.) have no errno.
     if let region::Error::SystemCall(io_err) = err {
         io_err.raw_os_error().unwrap_or(0)
     } else {
         0
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -326,12 +206,7 @@ mod tests {
     #[test]
     fn false_mode_succeeds_without_lock() {
         // MlockRequired::False must always succeed regardless of rlimit.
-        let locked = LockedSeed::new(
-            Zeroizing::new(TEST_SEED),
-            MlockRequired::False,
-            "test-profile",
-        )
-        .unwrap();
+        let locked = LockedSeed::new(&TEST_SEED, MlockRequired::False, "test-profile").unwrap();
         assert_eq!(locked.seed(), &TEST_SEED);
         assert!(locked.guard.is_none(), "False mode must not hold a guard");
         locked.dispose();
@@ -340,8 +215,7 @@ mod tests {
     #[test]
     fn false_mode_seed_matches_input() {
         let seed: [u8; 32] = core::array::from_fn(|i| i as u8);
-        let locked =
-            LockedSeed::new(Zeroizing::new(seed), MlockRequired::False, "test-profile").unwrap();
+        let locked = LockedSeed::new(&seed, MlockRequired::False, "test-profile").unwrap();
         assert_eq!(locked.seed(), &seed);
         locked.dispose();
     }
@@ -351,12 +225,7 @@ mod tests {
     #[test]
     fn warn_mode_succeeds_or_falls_back() {
         // Warn mode must return Ok regardless of whether mlock succeeds.
-        let locked = LockedSeed::new(
-            Zeroizing::new(TEST_SEED),
-            MlockRequired::Warn,
-            "test-profile",
-        )
-        .unwrap();
+        let locked = LockedSeed::new(&TEST_SEED, MlockRequired::Warn, "test-profile").unwrap();
         assert_eq!(locked.seed(), &TEST_SEED);
         locked.dispose();
     }
@@ -368,11 +237,7 @@ mod tests {
         // On most development machines RLIMIT_MEMLOCK allows at least one page.
         // If the lock fails, skip rather than fail — we cannot control rlimit
         // in CI without root.
-        match LockedSeed::new(
-            Zeroizing::new(TEST_SEED),
-            MlockRequired::True,
-            "test-profile",
-        ) {
+        match LockedSeed::new(&TEST_SEED, MlockRequired::True, "test-profile") {
             Ok(locked) => {
                 assert_eq!(locked.seed(), &TEST_SEED);
                 locked.dispose();
@@ -388,100 +253,17 @@ mod tests {
 
     // ── Dispose + zeroise ────────────────────────────────────────────────────
 
-    #[test]
-    fn dispose_marks_as_disposed() {
-        let mut locked = LockedSeed::new(
-            Zeroizing::new(TEST_SEED),
-            MlockRequired::False,
-            "test-profile",
-        )
-        .unwrap();
-        assert!(!locked.is_disposed());
-        locked.internal_dispose();
-        assert!(locked.is_disposed());
-        // Seed option is taken.
-        assert!(locked.seed.is_none(), "seed must be None after dispose");
-        // Guard is taken.
-        assert!(locked.guard.is_none(), "guard must be None after dispose");
-        // Prevent double-dispose via Drop.
-        std::mem::forget(locked);
-    }
-
-    #[test]
-    fn drop_zeroes_seed_field() {
-        // Verify that LockedSeed::new + drop compiles and runs without panic.
-        // The authoritative zeroing guarantee is provided by the Zeroizing<T>
-        // contract (verified by the zeroize crate's own MIRI-tested suite) and
-        // the panic-injection test `drop_runs_on_panic_unwind`.
-        //
-        // Direct post-drop memory reads require unsafe + UB (reading freed
-        // memory), which is prohibited by #![forbid(unsafe_code)].  Instead we
-        // verify the Drop path executes via the dispose_marks_as_disposed test.
-        let locked = LockedSeed::new(
-            Zeroizing::new([0xA5u8; 32]),
-            MlockRequired::False,
-            "test-profile",
-        )
-        .unwrap();
-        drop(locked);
-        // If we reach here, Drop ran without panic.
-    }
-
-    #[test]
-    fn double_dispose_is_idempotent() {
-        let mut locked = LockedSeed::new(
-            Zeroizing::new(TEST_SEED),
-            MlockRequired::False,
-            "test-profile",
-        )
-        .unwrap();
-        locked.internal_dispose();
-        // Second call must not panic or double-free.
-        locked.internal_dispose();
-        std::mem::forget(locked);
-    }
-
     // ── Panic-safety regression ──────────────────────────────────────────────
 
     #[test]
     fn drop_runs_on_panic_unwind() {
-        // Create a LockedSeed inside a catch_unwind closure.  If the seed
-        // bytes are still present after unwind, Zeroizing has failed.
-        //
-        // We cannot read the freed memory directly, but we CAN verify that
-        // drop was called by observing a side-effect via an Arc<AtomicBool>.
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
-
-        struct SentinelDropper(Arc<AtomicBool>);
-        impl Drop for SentinelDropper {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let dropped = Arc::new(AtomicBool::new(false));
-        let dropped_clone = dropped.clone();
-
-        let result = std::panic::catch_unwind(move || {
-            // Bind the LockedSeed to a variable so it lives until the panic.
-            let _locked = LockedSeed::new(
-                Zeroizing::new(TEST_SEED),
-                MlockRequired::False,
-                "test-profile",
-            )
-            .unwrap();
-            let _sentinel = SentinelDropper(dropped_clone);
+        ZEROIZED_BEFORE_UNLOCK.set(None);
+        let result = std::panic::catch_unwind(|| {
+            let _locked = LockedSeed::new(&TEST_SEED, MlockRequired::False, "test").unwrap();
             panic!("injected panic for drop-on-unwind test");
         });
-
-        assert!(result.is_err(), "catch_unwind should capture the panic");
-        assert!(
-            dropped.load(Ordering::SeqCst),
-            "Drop must run during panic unwind (Zeroizing relies on this)"
-        );
+        assert!(result.is_err());
+        assert_eq!(ZEROIZED_BEFORE_UNLOCK.get(), Some(true));
     }
 
     // ── Error type correctness ───────────────────────────────────────────────
@@ -519,32 +301,12 @@ mod tests {
         );
     }
 
-    // ── is_disposed() state machine ──────────────────────────────────────────
-
-    #[test]
-    fn is_disposed_false_before_any_dispose() {
-        let locked = LockedSeed::new(
-            Zeroizing::new(TEST_SEED),
-            MlockRequired::False,
-            "test-profile",
-        )
-        .unwrap();
-        assert!(
-            !locked.is_disposed(),
-            "newly created LockedSeed must report disposed=false"
-        );
-        // Drop runs internal_dispose but we cannot observe is_disposed after drop;
-        // verify the initial state before drop.
-        drop(locked);
-    }
-
     // ── seed content is preserved exactly ────────────────────────────────────
 
     #[test]
     fn seed_content_preserved_exactly_for_all_zero_seed() {
         let all_zeros = [0u8; 32];
-        let locked =
-            LockedSeed::new(Zeroizing::new(all_zeros), MlockRequired::False, "test").unwrap();
+        let locked = LockedSeed::new(&all_zeros, MlockRequired::False, "test").unwrap();
         assert_eq!(
             locked.seed(),
             &all_zeros,
@@ -556,7 +318,7 @@ mod tests {
     #[test]
     fn seed_content_preserved_exactly_for_all_ones_seed() {
         let all_ff = [0xFFu8; 32];
-        let locked = LockedSeed::new(Zeroizing::new(all_ff), MlockRequired::False, "test").unwrap();
+        let locked = LockedSeed::new(&all_ff, MlockRequired::False, "test").unwrap();
         assert_eq!(
             locked.seed(),
             &all_ff,
@@ -568,7 +330,7 @@ mod tests {
     #[test]
     fn seed_content_preserved_for_ascending_byte_pattern() {
         let seed: [u8; 32] = core::array::from_fn(|i| i as u8);
-        let locked = LockedSeed::new(Zeroizing::new(seed), MlockRequired::False, "test").unwrap();
+        let locked = LockedSeed::new(&seed, MlockRequired::False, "test").unwrap();
         assert_eq!(
             locked.seed(),
             &seed,
@@ -581,55 +343,17 @@ mod tests {
 
     /// In Warn mode the guard is either Some (mlock succeeded) or None (mlock
     /// failed but we proceeded).  In both cases `seed()` must return the
-    /// original bytes and `is_disposed()` must be false.
+    /// original bytes.
     #[test]
     fn warn_mode_seed_bytes_available_regardless_of_mlock_outcome() {
-        let locked = LockedSeed::new(
-            Zeroizing::new(TEST_SEED),
-            MlockRequired::Warn,
-            "test-profile",
-        )
-        .unwrap();
+        let locked = LockedSeed::new(&TEST_SEED, MlockRequired::Warn, "test-profile").unwrap();
         // The seed must be readable regardless of whether mlock succeeded or not.
         assert_eq!(
             locked.seed(),
             &TEST_SEED,
             "seed must be readable in Warn mode regardless of mlock outcome"
         );
-        assert!(
-            !locked.is_disposed(),
-            "Warn-mode LockedSeed must not be disposed at creation"
-        );
         locked.dispose();
-    }
-
-    // ── Drop ordering: guard released before seed zeroed ────────────────────
-
-    /// Verifies that `internal_dispose` sets `disposed = true` before
-    /// returning, so that a second `internal_dispose` call (from Drop) is
-    /// a no-op.  This exercises the idempotent guard `if self.disposed { return }`.
-    #[test]
-    fn internal_dispose_idempotent_guard_is_set_before_field_drops() {
-        let mut locked = LockedSeed::new(
-            Zeroizing::new(TEST_SEED),
-            MlockRequired::False,
-            "test-profile",
-        )
-        .unwrap();
-        // First dispose: sets disposed=true, takes seed and guard.
-        locked.internal_dispose();
-        assert!(
-            locked.disposed,
-            "disposed flag must be set after first call"
-        );
-        assert!(locked.seed.is_none(), "seed must be taken after dispose");
-        assert!(locked.guard.is_none(), "guard must be taken after dispose");
-
-        // Second dispose: must be a no-op (early return via `if self.disposed`).
-        locked.internal_dispose();
-        // State must be unchanged (already disposed; no panic).
-        assert!(locked.disposed);
-        std::mem::forget(locked);
     }
 
     // ── Multiple seeds sequentially do not interfere ─────────────────────────
@@ -639,10 +363,8 @@ mod tests {
         let seed_a: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(3));
         let seed_b: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(7));
 
-        let la =
-            LockedSeed::new(Zeroizing::new(seed_a), MlockRequired::False, "profile-a").unwrap();
-        let lb =
-            LockedSeed::new(Zeroizing::new(seed_b), MlockRequired::False, "profile-b").unwrap();
+        let la = LockedSeed::new(&seed_a, MlockRequired::False, "profile-a").unwrap();
+        let lb = LockedSeed::new(&seed_b, MlockRequired::False, "profile-b").unwrap();
 
         assert_eq!(
             la.seed(),
@@ -666,11 +388,7 @@ mod tests {
     /// RLIMIT_MEMLOCK), skip the guard assertion rather than fail the test.
     #[test]
     fn true_mode_guard_is_some_when_mlock_succeeds() {
-        let result = LockedSeed::new(
-            Zeroizing::new(TEST_SEED),
-            MlockRequired::True,
-            "test-profile",
-        );
+        let result = LockedSeed::new(&TEST_SEED, MlockRequired::True, "test-profile");
         match result {
             Ok(locked) => {
                 assert!(
@@ -709,5 +427,89 @@ mod tests {
             display.contains("11"),
             "display must contain errno: {display}"
         );
+    }
+
+    #[test]
+    fn the_lock_target_is_the_address_seed_returns() {
+        fn returned(seed: LockedSeed) -> LockedSeed {
+            seed
+        }
+        let locked = LockedSeed::new(&TEST_SEED, MlockRequired::Warn, "test").unwrap();
+        let address = locked.seed().as_ptr() as usize;
+        assert_eq!(locked.lock_target(), Some(address));
+        let mut values = Vec::new();
+        values.push(locked);
+        assert_eq!(values[0].seed().as_ptr() as usize, address);
+        assert_eq!(values[0].lock_target(), Some(address));
+        let boxed = Box::new(values.pop().unwrap());
+        assert_eq!(boxed.seed().as_ptr() as usize, address);
+        assert_eq!(boxed.lock_target(), Some(address));
+        let returned = returned(*boxed);
+        assert_eq!(returned.seed().as_ptr() as usize, address);
+        assert_eq!(returned.lock_target(), Some(address));
+    }
+
+    #[test]
+    fn drop_zeroizes_before_it_unlocks() {
+        ZEROIZED_BEFORE_UNLOCK.set(None);
+        let locked = LockedSeed::new(&TEST_SEED, MlockRequired::Warn, "test").unwrap();
+        drop(locked);
+        assert_eq!(ZEROIZED_BEFORE_UNLOCK.get(), Some(true));
+    }
+
+    #[test]
+    fn dispose_zeroizes_before_it_unlocks() {
+        ZEROIZED_BEFORE_UNLOCK.set(None);
+        LockedSeed::new(&TEST_SEED, MlockRequired::False, "test")
+            .unwrap()
+            .dispose();
+        assert_eq!(ZEROIZED_BEFORE_UNLOCK.get(), Some(true));
+    }
+
+    #[test]
+    fn seed_pages_do_not_share_a_page() {
+        let a = LockedSeed::new(&TEST_SEED, MlockRequired::False, "a").unwrap();
+        let b = LockedSeed::new(&TEST_SEED, MlockRequired::False, "b").unwrap();
+        let a = a.seed().as_ptr() as usize;
+        let b = b.seed().as_ptr() as usize;
+        assert_eq!(SEED_PAGE_ALIGN, 65536);
+        assert_eq!(a % SEED_PAGE_ALIGN, 0);
+        assert_eq!(b % SEED_PAGE_ALIGN, 0);
+        assert!(a.abs_diff(b) >= SEED_PAGE_ALIGN);
+    }
+
+    #[test]
+    fn seed_page_isolates_up_to_its_alignment() {
+        for size in [4096, 16384, 65536] {
+            assert!(seed_page_isolates(size));
+        }
+        assert!(!seed_page_isolates(131072));
+    }
+
+    #[test]
+    fn a_page_larger_than_the_home_refuses_or_degrades() {
+        let oversized = SEED_PAGE_ALIGN * 2;
+        match LockedSeed::with_page_size(&TEST_SEED, MlockRequired::True, "test", oversized) {
+            Err(WalletLifecycleError::MlockUnavailable { reason, errno }) => {
+                assert_eq!(
+                    reason,
+                    "Invalid parameter value: page size exceeds seed alignment"
+                );
+                assert_eq!(errno, 0);
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+            Ok(_) => panic!("True mode must refuse a page larger than the home"),
+        }
+
+        let warned =
+            LockedSeed::with_page_size(&TEST_SEED, MlockRequired::Warn, "test", oversized).unwrap();
+        let degradation = warned.mlock_degradation().unwrap();
+        assert_eq!(
+            degradation.reason,
+            "Invalid parameter value: page size exceeds seed alignment"
+        );
+        assert_eq!(degradation.errno, None);
+        assert!(warned.guard.is_none(), "an unisolated home stays unlocked");
+        assert_eq!(warned.seed(), &TEST_SEED);
     }
 }

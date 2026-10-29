@@ -762,8 +762,9 @@ fn identifier_call(line: &str, needle: &str) -> bool {
 /// selecting the signer. The mainnet ceremony is held to the key the
 /// enrolled proof read before the confirmation: `ledger_signer` opens the
 /// Ledger against the enrolled source, and the deferred environment signer's
-/// `sign_tx_payload` compares the derived key with the enrolled one before it
-/// signs. Those two are the only resolvers without the call.
+/// `ceremony` reads the seed for its only caller, `sign_tx_payload`, which
+/// compares the derived key with the enrolled one before it signs. Those two
+/// are the only resolvers without the call.
 #[test]
 fn every_seed_and_ledger_resolver_checks_enrollment() {
     use std::collections::BTreeSet;
@@ -813,7 +814,7 @@ fn every_seed_and_ledger_resolver_checks_enrollment() {
         ),
         (
             "common/signer_ceremony.rs".to_owned(),
-            "sign_tx_payload".to_owned(),
+            "ceremony".to_owned(),
         ),
     ]);
     assert!(

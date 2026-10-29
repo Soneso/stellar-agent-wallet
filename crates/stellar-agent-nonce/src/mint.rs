@@ -946,9 +946,8 @@ impl NonceMint {
             },
         )?;
 
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&decoded);
-        let key_z: Zeroizing<[u8; 32]> = Zeroizing::new(key);
+        let mut key_z = Zeroizing::new([0u8; 32]);
+        key_z.copy_from_slice(&decoded);
 
         // Panic-injection hook — only compiled when `test-hooks` feature is enabled.
         // Placed AFTER the secret-bearing `Zeroizing<T>` wrappers (raw, decoded,

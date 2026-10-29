@@ -1163,13 +1163,10 @@ pub(crate) fn mainnet_write_forbidden_result() -> rmcp::model::CallToolResult {
 ///
 /// # Security
 ///
-/// The returned key MUST be wrapped in `zeroize::Zeroizing` by the caller to
-/// ensure the bytes are zeroed on drop.  This function returns a plain
-/// `[u8; 32]` because [`zeroize::Zeroizing`] is not in scope here; the caller
-/// wraps immediately.
+/// Loaded text, decoded bytes, and the returned key zeroize on drop.
 pub(crate) fn load_attestation_key(
     profile: &stellar_agent_core::profile::schema::Profile,
-) -> Result<[u8; 32], rmcp::model::CallToolResult> {
+) -> Result<zeroize::Zeroizing<[u8; 32]>, rmcp::model::CallToolResult> {
     use base64::Engine as _;
     use keyring_core::Entry as KeyringEntry;
     use stellar_agent_network::keyring::{KeyringOperation, classify_keyring_operation_error};
@@ -1203,20 +1200,22 @@ pub(crate) fn load_attestation_key(
         approval_required_indistinguishable(&profile_name)
     })?;
 
-    let raw = entry.get_password().map_err(|e| {
+    let raw = zeroize::Zeroizing::new(entry.get_password().map_err(|e| {
         tracing::debug!(
             cause = ?classify_keyring_operation_error(&e, KeyringOperation::Read, &entry_ref.service),
             "attestation key read failed"
         );
         approval_required_indistinguishable(&profile_name)
-    })?;
+    })?);
 
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(raw.trim())
-        .map_err(|e| {
-            tracing::debug!(error = %e, "attestation key base64 decode failed");
-            approval_required_indistinguishable(&profile_name)
-        })?;
+    let bytes = zeroize::Zeroizing::new(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(raw.trim())
+            .map_err(|e| {
+                tracing::debug!(error = %e, "attestation key base64 decode failed");
+                approval_required_indistinguishable(&profile_name)
+            })?,
+    );
 
     if bytes.len() != 32 {
         tracing::debug!(len = bytes.len(), "attestation key length mismatch");
@@ -1245,7 +1244,7 @@ pub(crate) fn load_attestation_key(
         }
     })?;
 
-    let mut arr = [0u8; 32];
+    let mut arr = zeroize::Zeroizing::new([0u8; 32]);
     arr.copy_from_slice(&bytes);
     Ok(arr)
 }
@@ -2303,7 +2302,7 @@ pub(crate) async fn verify_attestation_subject_gate(
 
     if server.mainnet_context.is_some() {
         // Preserve the key-loader's indistinguishable rendering and operator diagnostics.
-        let _key = zeroize::Zeroizing::new(load_attestation_key(server.security_profile())?);
+        let _key = load_attestation_key(server.security_profile())?;
         return stellar_agent_core::approval::witness::verify_approval(
             &store,
             server.security_profile(),
@@ -2372,8 +2371,7 @@ pub(crate) async fn verify_attestation_subject_gate(
     }
 
     // 7. Load attestation key from keyring (zeroized via drop).
-    let attestation_key_bytes = load_attestation_key(&server.profile)?;
-    let attestation_key = zeroize::Zeroizing::new(attestation_key_bytes);
+    let attestation_key = load_attestation_key(&server.profile)?;
 
     // 8. Verify HMAC (constant-time) under the layout the record names; a
     // version this build does not read verifies nothing.
@@ -4073,7 +4071,7 @@ pub(crate) mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
         tracing::callsite::rebuild_interest_cache();
         assert_eq!(
-            load_attestation_key(&server.profile).unwrap(),
+            *load_attestation_key(&server.profile).unwrap(),
             attestation_key
         );
         assert!(
