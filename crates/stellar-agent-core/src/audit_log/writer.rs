@@ -76,7 +76,18 @@
 //! log file.  In the current sidecar format the prefix is the first entry's
 //! canonical body.  A crash after entry fsync but before sidecar write can
 //! therefore leave the sidecar absent; it must never leave a sidecar tag for an
-//! entry that was not first written and fsynced to the log.  Conceptually, a
+//! entry that was not first written and fsynced to the log.  The sidecar is
+//! replaced atomically, through a temp file and a rename, so a crash never
+//! leaves a torn tag.  A keyed writer that opens a file with entries and no
+//! sidecar writes the tag only when it can prove the file is its lineage's:
+//! the anchor check proved the file from byte 0 (the anchored prefix is
+//! current, advanced past, or the file a completed rotation created; see
+//! `AnchorOutcome::proved_the_file`), and the replayed chain root starts at
+//! offset 0.  It writes it before its first append.  An adopted or otherwise
+//! unproved file, or one whose first entry does not start at byte 0, keeps no
+//! tag; `audit reanchor`, the operator's acknowledgement of the file as it
+//! stands, writes it for a chain root at offset 0, and `profile
+//! rotate-audit-key` re-signs every file.  Conceptually, a
 //! verifier would treat `chain-root-tag covers a strict superset of log entries`
 //! as the impossible `ChainRootAhead` state.
 //!
@@ -92,6 +103,15 @@
 //!    hash as `previous_entry_hash` (cross-file chain bridge).
 //! 5. Retains at most [`MAX_ROTATED_FILES`] (10) rotated copies.
 //!
+//! The handoff is always its file's last entry. A rotation whose renames fail
+//! leaves it pending, and so does any replay that finds the active file ending
+//! on one: the next append of any row first completes the rename under the
+//! handoff's archive name, and a writer whose handoff write, flush, or fsync
+//! failed rebuilds its state from the file before that append. Neither rename
+//! replaces an existing file. Each archive name sorts after every existing
+//! archive of the log, so the name order is the creation order whatever the
+//! clock says.
+//!
 //! See [`crate::audit_log`] module-level rustdoc § First-entry-per-file rule
 //! for the canonical statement of which hash a new file's first entry chains
 //! from (zero-block hash for the very first file; handoff entry hash for all
@@ -102,10 +122,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use sha2::{Digest, Sha256};
@@ -113,8 +130,12 @@ use zeroize::Zeroizing;
 
 use super::{
     binding::BindingHistory,
-    chain::{ZERO_BLOCK_HASH, decode_hash, sign_chain_root},
+    chain::{ZERO_BLOCK_HASH, decode_hash, encode_hash, sign_chain_root},
     entry::AuditEntry,
+    rotation::{
+        MarkerNamesNoBoundary, PruneMarker, PruneMarkerData, PruneSeed, oldest_retained_seed,
+        read_prune_marker,
+    },
     schema::{EventKind, TipAnchorReason},
     tip_anchor::{
         KeyedAuditAccess, PriorAnchoring, TipAnchor, TipAnchorStore, TipAnchorStoreError,
@@ -128,9 +149,6 @@ pub use super::rotation::{MAX_ROTATED_FILES, ROTATION_THRESHOLD_BYTES};
 
 #[cfg(test)]
 static FORCE_NEXT_ROTATION_CREATE_FAILURE_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
-
-static LAST_ROTATION_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
-static ROTATION_COLLISION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Reason carried by the tip-anchor refusal for a log replaced underneath the
 /// writer's own handle.
@@ -148,6 +166,44 @@ const LOG_REPLACED_REASON: &str = "the log at the path was replaced underneath t
 /// happened. Appending anyway would chain the new row off a tip the file no
 /// longer holds and then anchor over the splice.
 const LOG_TRUNCATED_REASON: &str = "the log is shorter than the writer's last append";
+
+/// Reason for a log that extends past where this writer last appended.
+///
+/// Extra bytes have no place in the writer's cached chain. The next append
+/// must refuse before it can join a foreign row or a torn prefix.
+const LOG_GREW_REASON: &str = "the log is longer than the writer's last append";
+
+/// A test hook run on the just-rotated archive's path right after the rename.
+#[cfg(test)]
+type RotationRenameHook = Box<dyn FnOnce(&Path) + Send + Sync>;
+
+/// Longest row the writer appends, newline included.
+///
+/// An honest row stays within a few kilobytes: [`super::entry::MAX_ENTRY_BYTES`]
+/// (4096) bounds the argument keys and every recorded string is capped. The cap
+/// is 256 times that, so no row the wallet builds reaches it, and an append
+/// over it refuses with [`WriterError::RowTooLarge`] and never writes the row.
+/// The prune reads archives within the same bound, so every row the writer
+/// appends stays readable to it.
+pub const MAX_ROW_BYTES: u64 = 1024 * 1024;
+
+/// Reason for a file whose replay reaches the anchored tip at the anchored
+/// offset through a different number of entries.
+///
+/// The tip hash and the offset fix only where the anchored prefix ends. The
+/// count is what fixes where it starts: blank lines that replace a removed
+/// prefix keep the offset and the tip, and change only the count.
+const LOG_COUNT_REASON: &str = "the entries up to the anchored offset are not the anchored count";
+
+/// Reason for a file whose anchored entry does not end exactly at the
+/// anchored offset.
+///
+/// The writer ends every row with one `\n` right after its JSON, so the anchored
+/// entry's line ends on the byte before the anchored offset. A reader that skips
+/// whitespace still finds the entry when bytes around it changed, for example a
+/// carriage return inserted before its newline, and such a file proves nothing
+/// about where the anchored prefix ends.
+const LOG_ENTRY_END_REASON: &str = "the anchored entry does not end at the anchored offset";
 
 /// Reason for a log whose last entry is no longer the one this writer wrote.
 ///
@@ -249,6 +305,9 @@ pub struct AuditWriter {
     /// when the file ends on an entry boundary, which it always does after a
     /// successful [`AuditWriter::write_entry`].
     end_offset: u64,
+    /// Length established by the latest replay or successful append. A replay
+    /// can include trailing blank lines beyond the last entry's anchor offset.
+    checked_len: u64,
     /// An anchor write that failed and is still outstanding.
     ///
     /// The value can name a durable tip (an append's new entry), a rotation's
@@ -301,6 +360,48 @@ pub struct AuditWriter {
     /// outbox truncation: the drain appends and returns without truncating.
     #[cfg(test)]
     skip_outbox_truncate: bool,
+    /// Test-only fault seam that stops a prune after its durable marker write,
+    /// modelling a crash before the archive's deletion.
+    #[cfg(test)]
+    skip_prune_removal: bool,
+    /// Test-only fault seam: the append's `write_all` completes and its
+    /// `sync_data` reports failure, leaving a full line the writer's state does
+    /// not account for.
+    #[cfg(test)]
+    fail_sync_after_entry_write: bool,
+    /// Test-only fault seam: the rotation handoff's `write_all` completes and
+    /// its `sync_data` reports failure, leaving the handoff in the file and
+    /// unaccounted for in the writer's state.
+    #[cfg(test)]
+    fail_sync_after_handoff_write: bool,
+    /// Test-only fault seam run on the archive path right after a rotation's
+    /// rename and before the new active file exists, modelling a file swapped
+    /// in under the just-rotated archive's name.
+    #[cfg(test)]
+    after_rotation_rename: Option<RotationRenameHook>,
+    /// Test-only fault seam: the number of further rotation attempts whose
+    /// renames fail after the handoff is in place.
+    #[cfg(test)]
+    rotation_renames_to_fail: u32,
+    /// Test-only seam: the current time, in archive-name form, that every
+    /// later rotation names its archive from.
+    #[cfg(test)]
+    archive_clock: Option<String>,
+    /// The rotation handoff the active file ends on, when its rotation has
+    /// not completed: the renames failed, or the process stopped before them.
+    ///
+    /// The next rotation attempt renames the file under this handoff's archive
+    /// name and appends no second handoff, so every archive holds exactly one
+    /// handoff, its last entry. Any appended entry clears it.
+    pending_handoff: Option<PendingHandoff>,
+    /// Set while a rotation handoff is being written, and cleared once the
+    /// writer's state accounts for it.
+    ///
+    /// A failed write, flush, or fsync leaves it set with none, part, or all
+    /// of the handoff in the file. The next append then rebuilds the state
+    /// from the file, or refuses, before it rotates or chains a row; see
+    /// [`AuditWriter::append_rotation_handoff`].
+    handoff_unsettled: bool,
     /// Archive name produced by a failed mid-rotation active-lock acquisition.
     ///
     /// Once set, the writer refuses all future writes. The caller must discard
@@ -360,6 +461,25 @@ enum AnchorOutcome {
     /// The anchor named the newest archive's rotation handoff and the path held
     /// the file that rotation created; the anchor was moved onto that file.
     RotationCompleted,
+}
+
+impl AnchorOutcome {
+    /// Whether the check proved the active file from byte 0 against an anchor
+    /// this writer's lineage stored.
+    ///
+    /// [`Self::Current`] and [`Self::Advanced`] replayed the file from byte 0
+    /// and reached the anchored tip at the anchored offset through exactly the
+    /// anchored count; an advance also chained every later entry from that
+    /// tip. [`Self::RotationCompleted`] found the anchor on the handoff the
+    /// file's first entry chains from, so the anchored prefix of this file is
+    /// empty and all of it chains from the anchored tip. An adoption had no
+    /// anchor to prove anything against.
+    fn proved_the_file(&self) -> bool {
+        matches!(
+            self,
+            Self::Current | Self::Advanced | Self::RotationCompleted
+        )
+    }
 }
 
 /// What the anchor store holds for a path, from the repair verb's point of view.
@@ -770,11 +890,13 @@ impl AuditWriter {
         // post-rotation active file as a broken chain.
         let seed = initial_chain_seed(&path)?;
         let segment_start_hash = decode_hash(&seed).map_err(WriterError::Hash)?;
-        let scan = if is_new_file {
+        let mut scan = if is_new_file {
             ChainScan::empty(seed)
         } else {
             read_and_verify_entry_chain(&file, 0, &seed)?
         };
+        let root = scan.first_entry.take();
+        let pending_handoff = PendingHandoff::from_scan(&path, &scan)?;
 
         let mut writer = Self {
             path,
@@ -788,6 +910,7 @@ impl AuditWriter {
             hmac_key,
             entry_count: scan.entry_count,
             end_offset: scan.end_offset,
+            checked_len: scan.checked_len,
             pending_tip_anchor: None,
             log_diverged: None,
             owed_row_anchored: false,
@@ -802,19 +925,86 @@ impl AuditWriter {
             appends_before_fault: None,
             #[cfg(test)]
             skip_outbox_truncate: false,
+            #[cfg(test)]
+            skip_prune_removal: false,
+            #[cfg(test)]
+            fail_sync_after_entry_write: false,
+            #[cfg(test)]
+            fail_sync_after_handoff_write: false,
+            #[cfg(test)]
+            after_rotation_rename: None,
+            #[cfg(test)]
+            rotation_renames_to_fail: 0,
+            #[cfg(test)]
+            archive_clock: None,
+            pending_handoff,
+            handoff_unsettled: false,
             partial_rotation_archive: None,
         };
 
         if writer.tip_anchor.is_some() && anchor_mode == TipAnchorOpenMode::Check {
             let outcome = writer.reconcile_tip_anchor()?;
+            // Only an outcome that proved the file from byte 0 against the
+            // anchor, and before any append, which may rotate it.
+            if outcome.proved_the_file() {
+                writer.repair_root_sidecar(root.as_ref())?;
+            }
             let anchored_count = writer.entry_count;
-            // Drain point: at open, after anchor reconciliation and before any
-            // row of the writer's own, so a queued consent row enters the log
-            // before the opener can act on the approval it records.
+            // Drain point: at open, after anchor reconciliation and before
+            // any row of the writer's own, so a queued consent row enters
+            // the log before the opener can act on the approval it records.
             writer.drain_then_record_adoption(outcome, anchored_count)?;
         }
 
         Ok(writer)
+    }
+
+    /// Writes the active file's chain-root sidecar when a keyed writer finds a
+    /// file with entries and none beside it.
+    ///
+    /// A keyed writer writes the tag after the first entry is durable, so a
+    /// crash or a failed sidecar write in between leaves a keyed file with no
+    /// tag. A tag binds where a file starts, so it is minted only for content
+    /// this writer's lineage provably wrote: `root` comes from a replay of the
+    /// whole file that the caller accepted, the open's after an anchor check
+    /// that proved the file from byte 0 (see [`AnchorOutcome::proved_the_file`]),
+    /// or a re-anchor's after the operator acknowledged the file. The root
+    /// entry must also start at byte 0: an honest writer writes no blank line
+    /// and no indentation, so any byte before it is foreign and nothing is
+    /// written. The tag covers exactly that entry, as the first append would
+    /// have written it, and is written before the writer's first append can
+    /// rotate the file into an archive. A sidecar that exists is left as it is,
+    /// whatever it holds.
+    fn repair_root_sidecar(&self, root: Option<&ChainRoot>) -> Result<(), WriterError> {
+        let (Some(key), Some(root)) = (&self.hmac_key, root) else {
+            return Ok(());
+        };
+        if root.offset != 0 {
+            tracing::warn!(
+                log = %basename_lossy_path(&self.path),
+                offset = root.offset,
+                "audit log chain-root sidecar is missing and the first entry does not \
+                 start the file; no tag is written"
+            );
+            return Ok(());
+        }
+        match fs::symlink_metadata(hmac_sidecar_path(&self.path)) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(WriterError::Io(e)),
+        }
+        let body = root
+            .entry
+            .canonical_json_body()
+            .map_err(WriterError::Serialise)?;
+        let tag = sign_chain_root(key.as_ref(), &body)
+            .map_err(|e| WriterError::Io(io::Error::other(format!("HMAC sign failed: {e}"))))?;
+        self.write_root_hmac_sidecar(&tag)?;
+        tracing::warn!(
+            log = %basename_lossy_path(&self.path),
+            "audit log chain-root sidecar was missing; written from the verified first entry"
+        );
+        Ok(())
     }
 
     /// Returns the SHA-256 hash of the last entry written to the current file.
@@ -883,11 +1073,14 @@ impl AuditWriter {
     /// - [`WriterError::Io`] on I/O failure.
     /// - [`WriterError::Serialise`] if the entry cannot be serialised.
     /// - [`WriterError::Hash`] if the hash computation fails.
+    /// - [`WriterError::RowTooLarge`] if the serialized row is longer than
+    ///   [`MAX_ROW_BYTES`]. Nothing is written.
     ///
     /// An anchor-write failure after fsync retries once and leaves the append
     /// successful. Value actions call [`Self::require_anchor_current`] around
     /// their pre-action row to withhold the action while repair is owed.
-    pub fn write_entry(&mut self, entry: AuditEntry) -> Result<(), WriterError> {
+    pub fn write_entry(&mut self, mut entry: AuditEntry) -> Result<(), WriterError> {
+        refuse_oversized_row(&mut entry)?;
         if self.drains {
             self.drain_outbox()?;
         }
@@ -999,7 +1192,8 @@ impl AuditWriter {
     /// through [`Self::prepare_append`] and [`Self::commit_append`].
     /// [`AuditWriter::write_entry`], [`AuditWriter::write_built`], and
     /// [`AuditWriter::drain_outbox`] append only through these two methods.
-    fn append_checked(&mut self, entry: AuditEntry) -> Result<(), WriterError> {
+    fn append_checked(&mut self, mut entry: AuditEntry) -> Result<(), WriterError> {
+        refuse_oversized_row(&mut entry)?;
         if let Err(refusal) = self.prepare_append() {
             return Err(match refusal {
                 AppendRefusal::LogMoved(e) => {
@@ -1067,6 +1261,13 @@ impl AuditWriter {
         self.refuse_if_log_moved_on_append()
             .map_err(AppendRefusal::LogMoved)?;
 
+        // A rotation handoff whose write, flush, or fsync failed can sit in the
+        // file unaccounted for. The state is rebuilt from the file first, so the
+        // rotation below renames under that handoff rather than appending a
+        // second one chained from the entry before it.
+        self.settle_unsettled_handoff()
+            .map_err(AppendRefusal::Other)?;
+
         // Repair an anchor left behind by an earlier failed write, before this
         // append moves the tip again. The value written names the entry most
         // recently fsynced, so it is safe at any point and subsumes however many
@@ -1074,8 +1275,10 @@ impl AuditWriter {
         let _ = self.retry_tip_anchor_if_behind();
 
         // Rotate if needed before the row is built and written, so the
-        // rotation's handoff entry is the row's predecessor.
-        if self.needs_rotation().map_err(AppendRefusal::Other)? {
+        // rotation's handoff entry is the row's predecessor. A file that ends on
+        // a pending handoff takes no row before its rotation completes, whatever
+        // its size: the handoff is always its file's last entry.
+        if self.pending_handoff.is_some() || self.needs_rotation().map_err(AppendRefusal::Other)? {
             self.rotate().map_err(AppendRefusal::Other)?;
         }
         Ok(())
@@ -1089,8 +1292,10 @@ impl AuditWriter {
     ///
     /// [`WriterError::Io`], [`WriterError::Serialise`], or
     /// [`WriterError::Hash`] when the row cannot be hashed, serialised, or
-    /// written. Anchor writes retry once and remain best-effort after the row
-    /// is durable. Call [`Self::require_anchor_current`] to gate a value action.
+    /// written. [`WriterError::RowTooLarge`] when the serialized row is longer
+    /// than [`MAX_ROW_BYTES`]; nothing is written. Anchor writes retry once and
+    /// remain best-effort after the row is durable. Call
+    /// [`Self::require_anchor_current`] to gate a value action.
     fn commit_append(&mut self, mut entry: AuditEntry) -> Result<(), WriterError> {
         // Truncate arg_keys if needed.
         entry.truncate_arg_keys_if_needed()?;
@@ -1105,10 +1310,23 @@ impl AuditWriter {
         let json = serde_json::to_vec(&entry).map_err(WriterError::Serialise)?;
         let mut line = json;
         line.push(b'\n');
+        let bytes = line.len() as u64;
+        if bytes > MAX_ROW_BYTES {
+            return Err(WriterError::RowTooLarge {
+                bytes,
+                cap: MAX_ROW_BYTES,
+            });
+        }
 
         // O_APPEND write + fsync.
         self.file.write_all(&line)?;
         self.file.flush()?;
+        #[cfg(test)]
+        if self.fail_sync_after_entry_write {
+            return Err(WriterError::Io(io::Error::other(
+                "test fault: sync_data failed after a full write",
+            )));
+        }
         self.file.sync_data()?;
 
         #[cfg(test)]
@@ -1137,7 +1355,9 @@ impl AuditWriter {
         // An anchor outage must leave the next append on this row's hash.
         self.entry_count = self.entry_count.saturating_add(1);
         self.end_offset = self.entry_end_offset()?;
+        self.checked_len = self.end_offset;
         self.last_hash = current_hash;
+        self.pending_handoff = None;
         let current = TipAnchor::new(self.entry_count, self.last_hash.clone(), self.end_offset);
         self.store_tip_anchor_best_effort(&current);
         Ok(())
@@ -1172,6 +1392,34 @@ impl AuditWriter {
         self.skip_outbox_truncate = enabled;
     }
 
+    /// Enables a test-only fault seam that fails an append's `sync_data` after
+    /// its `write_all` completed.
+    #[cfg(test)]
+    pub(crate) fn set_fail_sync_after_entry_write(&mut self, enabled: bool) {
+        self.fail_sync_after_entry_write = enabled;
+    }
+
+    /// Enables a test-only fault seam that fails a rotation handoff's
+    /// `sync_data` after its `write_all` completed.
+    #[cfg(test)]
+    pub(crate) fn set_fail_sync_after_handoff_write(&mut self, enabled: bool) {
+        self.fail_sync_after_handoff_write = enabled;
+    }
+
+    /// Makes the renames of the next `attempts` rotation attempts fail after
+    /// the handoff is in place, as a directory that refuses renames would.
+    #[cfg(test)]
+    pub(crate) fn set_rotation_renames_to_fail(&mut self, attempts: u32) {
+        self.rotation_renames_to_fail = attempts;
+    }
+
+    /// Makes every later rotation of this writer name its archive as if the
+    /// current time were `now`, a `YYYYMMDDTHHMMSSmmm` timestamp.
+    #[cfg(test)]
+    pub(crate) fn set_archive_clock_for_test(&mut self, now: &str) {
+        self.archive_clock = Some(now.to_owned());
+    }
+
     /// Forces a log rotation without waiting for the size threshold.
     ///
     /// `pub(crate)` and `#[cfg(test)]` — only for unit tests that need to
@@ -1202,7 +1450,7 @@ impl AuditWriter {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("audit.jsonl");
-        let rotated_name = format!("{stem}.{}", compact_timestamp());
+        let rotated_name = self.next_archive_name(stem)?;
         self.append_rotation_handoff(&rotated_name)
     }
 
@@ -1403,7 +1651,7 @@ impl AuditWriter {
         let previous = self.stored_tip_anchor()?;
 
         let scan = self.replay_active_file()?;
-        self.adopt_scan_state(&scan);
+        self.adopt_scan_state(&scan)?;
         let repaired_count = scan.entry_count;
         if scan.entry_count > 0 {
             let repaired =
@@ -1412,6 +1660,8 @@ impl AuditWriter {
                 .store_anchor(&repaired)
                 .map_err(WriterError::TipAnchorStore)?;
         }
+        // The operator acknowledged this file as it stands.
+        self.repair_root_sidecar(scan.first_entry.as_ref())?;
         let reanchor_count = store
             .bump_reanchor_count()
             .map_err(WriterError::TipAnchorStore)?;
@@ -1631,8 +1881,13 @@ impl AuditWriter {
         // touching the audit directory.
         let intact = self.entry_is_intact_at(anchor.end_offset, &anchor.tip_hash)?;
         if intact && len == anchor.end_offset {
-            self.entry_count = anchor.entry_count;
-            self.end_offset = anchor.end_offset;
+            // The writer's counters come from replaying this file from byte 0
+            // at open, or from its own appends since: they must reach the
+            // anchored offset through exactly the anchored entries.
+            if self.end_offset != anchor.end_offset || self.entry_count != anchor.entry_count {
+                return Err(self.tip_anchor_mismatch(&anchor, len, LOG_COUNT_REASON));
+            }
+            self.checked_len = len;
             self.is_new_file = false;
             self.last_hash.clone_from(&anchor.tip_hash);
             return Ok(AnchorOutcome::Current);
@@ -1664,19 +1919,42 @@ impl AuditWriter {
                 "the entry at the anchored offset is not the anchored entry",
             ));
         }
+        if !self.entry_ends_exactly_at(anchor.end_offset, &anchor.tip_hash)? {
+            return Err(self.tip_anchor_mismatch(&anchor, len, LOG_ENTRY_END_REASON));
+        }
 
         // The file moved forward past the anchor. Replay only the appended tail,
         // which validates that it chains off the anchored tip.
         let tail = read_and_verify_entry_chain(&self.file, anchor.end_offset, &anchor.tip_hash)?;
+        // The prefix up to the anchored offset must hold exactly the anchored
+        // entries. The writer's counters reach either the anchored offset
+        // itself or, after the open's replay, the tail's end.
+        let prefix_count = if self.end_offset == anchor.end_offset {
+            Some(self.entry_count)
+        } else if self.end_offset == tail.end_offset {
+            self.entry_count.checked_sub(tail.entry_count)
+        } else {
+            None
+        };
+        if prefix_count != Some(anchor.entry_count) {
+            return Err(self.tip_anchor_mismatch(&anchor, len, LOG_COUNT_REASON));
+        }
         let advanced = TipAnchor::new(
             anchor.entry_count.saturating_add(tail.entry_count),
             tail.last_hash.clone(),
             tail.end_offset,
         );
+        // The tail's last entry decides whether the file ends on a pending
+        // handoff, for example one whose fsync failed after its bytes landed.
+        if tail.entry_count > 0 {
+            self.pending_handoff = PendingHandoff::from_scan(&self.path, &tail)?;
+        }
         self.entry_count = advanced.entry_count;
         self.end_offset = advanced.end_offset;
+        self.checked_len = tail.checked_len;
         self.is_new_file = false;
         self.last_hash.clone_from(&advanced.tip_hash);
+        self.handoff_unsettled = false;
         store
             .store_anchor(&advanced)
             .map_err(WriterError::TipAnchorStore)?;
@@ -1708,7 +1986,7 @@ impl AuditWriter {
         store: &dyn TipAnchorStore,
     ) -> Result<AnchorOutcome, WriterError> {
         let scan = self.replay_active_file()?;
-        self.adopt_scan_state(&scan);
+        self.adopt_scan_state(&scan)?;
         if scan.entry_count > 0 {
             let rotated = TipAnchor::new(scan.entry_count, scan.last_hash.clone(), scan.end_offset);
             store
@@ -1744,13 +2022,14 @@ impl AuditWriter {
             // the first append writes the first real anchor.
             self.entry_count = 0;
             self.end_offset = 0;
+            self.checked_len = 0;
             return Ok(AnchorOutcome::AdoptedEmpty);
         }
 
         let scan = self.replay_active_file()?;
         self.refuse_if_anchored_before(scan.entry_count, scan.holds_anchoring_row, len)?;
         let adopted = TipAnchor::new(scan.entry_count, scan.last_hash.clone(), scan.end_offset);
-        self.adopt_scan_state(&scan);
+        self.adopt_scan_state(&scan)?;
         store
             .store_anchor(&adopted)
             .map_err(WriterError::TipAnchorStore)?;
@@ -1799,14 +2078,44 @@ impl AuditWriter {
         Ok(hash == tip_hash)
     }
 
-    /// Adopts a full-file replay result as the writer's in-memory state.
-    fn adopt_scan_state(&mut self, scan: &ChainScan) {
+    /// Returns `true` when the line that ends exactly at `end_offset` is the
+    /// entry hashing to `tip_hash`, written as the writer writes a row: its
+    /// newline is the byte before `end_offset`, and no whitespace opens or
+    /// closes its JSON.
+    fn entry_ends_exactly_at(&self, end_offset: u64, tip_hash: &str) -> Result<bool, WriterError> {
+        let Some(line) = read_line_ending_at(&self.file, end_offset)? else {
+            return Ok(false);
+        };
+        let (Some(first), Some(last)) = (line.first(), line.last()) else {
+            return Ok(false);
+        };
+        if first.is_ascii_whitespace() || last.is_ascii_whitespace() {
+            return Ok(false);
+        }
+        let Ok(entry) = serde_json::from_slice::<AuditEntry>(&line) else {
+            return Ok(false);
+        };
+        Ok(compute_entry_hash_streamed(&entry, &entry.previous_entry_hash)? == tip_hash)
+    }
+
+    /// Adopts a full-file replay result as the writer's in-memory state,
+    /// including the handoff the file ends on when its rotation is pending.
+    ///
+    /// # Errors
+    ///
+    /// Every error of [`PendingHandoff::from_scan`]; the state is unchanged.
+    fn adopt_scan_state(&mut self, scan: &ChainScan) -> Result<(), WriterError> {
+        let pending_handoff = PendingHandoff::from_scan(&self.path, scan)?;
         self.entry_count = scan.entry_count;
         self.end_offset = scan.end_offset;
+        self.checked_len = scan.checked_len;
         self.is_new_file = scan.entry_count == 0;
         if scan.entry_count > 0 {
             self.last_hash.clone_from(&scan.last_hash);
         }
+        self.pending_handoff = pending_handoff;
+        self.handoff_unsettled = false;
+        Ok(())
     }
 
     /// Refuses when the file now at the path is not the file this writer holds.
@@ -1851,12 +2160,14 @@ impl AuditWriter {
     /// of its last line and one hash. No keyring round trip: the refusal reports
     /// the writer's own counters rather than reloading the anchor to name them.
     ///
-    /// The three findings are distinct because the file diverged in three ways.
-    /// A rename leaves the identity behind; an in-place truncation keeps the
-    /// identity and moves the end; an in-place overwrite of the same length
-    /// keeps both and changes the bytes. All three would otherwise let this
-    /// writer chain a row off a tip the file at the path does not hold and then
-    /// anchor over the result.
+    /// The exact length includes any blank tail validated during replay. The
+    /// anchored offset still names the last entry, so reopen and acquisition
+    /// retain their blank-line tolerance.
+    ///
+    /// Four shapes diverge from the writer's cached state. A rename changes
+    /// identity; truncation shortens the file; growth extends it; an overwrite
+    /// keeps identity and length but changes the tip. Each refuses before a row
+    /// can chain from the stale tip and anchor over the result.
     fn refuse_if_log_moved_on_append(&mut self) -> Result<(), WriterError> {
         if self.tip_anchor.is_none() {
             return Ok(());
@@ -1864,8 +2175,14 @@ impl AuditWriter {
         self.refuse_if_replaced(None)?;
         // Identity is proven, so the held handle and the path are one file and
         // the reads below can go through the handle.
-        if fs::metadata(&self.path)?.len() < self.end_offset {
-            return Err(self.latch(None, LOG_TRUNCATED_REASON));
+        let len = fs::metadata(&self.path)?.len();
+        if len != self.checked_len {
+            let reason = if len < self.checked_len {
+                LOG_TRUNCATED_REASON
+            } else {
+                LOG_GREW_REASON
+            };
+            return Err(self.latch(None, reason));
         }
         let tip = self.last_hash.clone();
         if self.entry_count > 0 && !self.entry_is_intact_at(self.end_offset, &tip)? {
@@ -1892,7 +2209,7 @@ impl AuditWriter {
     /// path nothing has anchored yet the writer's own counters say the same
     /// thing about the file it holds, which is what the divergence departed
     /// from. The length is the one at the path now; a path holding no file
-    /// reports zero, and the reason names which of the three it was.
+    /// reports zero, and the reason names the shape it was.
     fn diverged_error(&self, anchor: Option<&TipAnchor>, reason: &'static str) -> WriterError {
         let (expected_count, expected_offset) = anchor
             .map_or((self.entry_count, self.end_offset), |anchor| {
@@ -2130,7 +2447,8 @@ impl AuditWriter {
     /// Rotates the active log file.
     ///
     /// Writes a handoff entry, renames the current file + its HMAC sidecar,
-    /// prunes excess rotated files, and opens a fresh active file.
+    /// opens a fresh active file, and then prunes excess rotated files. A
+    /// prune that stops is logged and never fails the rotation.
     ///
     /// # Errors
     ///
@@ -2143,11 +2461,12 @@ impl AuditWriter {
     ///
     /// **Recoverable — handoff written but `fs::rename` failed:**
     /// The active file ends with an `AuditRotationHandoff` entry, but the file
-    /// has not been renamed.  On the next `AuditWriter::open` the writer resumes
-    /// appending to the still-active file.  `audit verify` will not see a gap
-    /// because the rotated archive does not exist yet; however the handoff entry
-    /// is "orphaned" — it names an archive file that does not exist at that point.
-    /// Recovery: the next successful rotation produces a correctly-named archive.
+    /// has not been renamed.  `audit verify` will not see a gap because the
+    /// rotated archive does not exist yet; the handoff names an archive file
+    /// that does not exist at that point.  The writer, or the next
+    /// `AuditWriter::open`, holds it as the pending handoff, and the next
+    /// rotation attempt renames the file under that handoff's name without
+    /// appending another, so the archive ends on its one handoff.
     ///
     /// **Potentially unrecoverable — `fs::rename` succeeded but
     /// `create_new_active_file_after_rotation` failed:**
@@ -2163,25 +2482,91 @@ impl AuditWriter {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("audit.jsonl");
-        let ts = compact_timestamp();
-        let rotated_name = format!("{stem}.{ts}");
-        let rotated_path = self
-            .path
-            .parent()
-            .map(|p| p.join(&rotated_name))
-            .unwrap_or_else(|| PathBuf::from(&rotated_name));
+        // A handoff whose rotation did not complete already names the archive
+        // and carries the anchor; appending another would put two in one file.
+        let (rotated_name, handoff_hash) = match &self.pending_handoff {
+            Some(pending) => (pending.archive_name.clone(), pending.hash.clone()),
+            None => {
+                let rotated_name = self.next_archive_name(stem)?;
+                let handoff_hash = self.append_rotation_handoff(&rotated_name)?;
+                (rotated_name, handoff_hash)
+            }
+        };
+        let rotated_path = self.path.with_file_name(&rotated_name);
+        let active_hmac_sidecar = hmac_sidecar_path(&self.path);
+        let rotated_hmac_sidecar = hmac_sidecar_path(&rotated_path);
+        refuse_taken_rotation_target(&rotated_path, &rotated_name)?;
+        let moves_sidecar = active_hmac_sidecar.exists();
+        if moves_sidecar {
+            refuse_taken_rotation_target(&rotated_hmac_sidecar, &rotated_name)?;
+        }
 
-        let handoff_hash = self.append_rotation_handoff(&rotated_name)?;
+        #[cfg(test)]
+        if self.rotation_renames_to_fail > 0 {
+            self.rotation_renames_to_fail -= 1;
+            return Err(WriterError::Io(io::Error::other(
+                "test fault: rotation rename failed",
+            )));
+        }
 
         // Rename the HMAC sidecar before renaming the log file so both
         // renames are co-located in time.
-        let active_hmac_sidecar = hmac_sidecar_path(&self.path);
-        let rotated_hmac_sidecar = hmac_sidecar_path(&rotated_path);
-        if active_hmac_sidecar.exists() {
+        if moves_sidecar {
             fs::rename(&active_hmac_sidecar, &rotated_hmac_sidecar)?;
         }
 
         self.finish_rotation(&rotated_path, &rotated_name, handoff_hash)
+    }
+
+    /// The name of the archive the next rotation creates, which sorts after
+    /// every existing archive of this log.
+    ///
+    /// The newest archive is the last rotated sibling in the order the prune,
+    /// [`initial_chain_seed`], and `audit verify` read the chain in, so the
+    /// archive created here is always the chain's last archive, whatever the
+    /// clock says; see [`next_archive_suffix`]. Neither the archive nor its
+    /// chain-root sidecar may exist under the name, since a rename replaces its
+    /// destination.
+    ///
+    /// # Errors
+    ///
+    /// [`WriterError::RotationBridgeUnusable`] when a file exists under the
+    /// name, or, with [`ARCHIVE_NAMES_EXHAUSTED_REASON`], when no name sorts
+    /// after the newest archive. [`WriterError::IntegrityViolation`] when the
+    /// sibling listing fails, and [`WriterError::Io`] when a name cannot be
+    /// checked.
+    fn next_archive_name(&self, stem: &str) -> Result<String, WriterError> {
+        let chain = super::verify::collect_file_chain(&self.path)?;
+        // The listing holds the rotated siblings oldest first, then the active path.
+        let newest = chain
+            .len()
+            .checked_sub(2)
+            .and_then(|idx| chain.get(idx))
+            .map(|archive| basename_lossy_path(archive));
+        let newest_suffix = newest
+            .as_deref()
+            .and_then(|name| name.strip_prefix(stem))
+            .and_then(|rest| rest.strip_prefix('.'));
+        let Some(suffix) = next_archive_suffix(&self.archive_clock(), newest_suffix) else {
+            return Err(WriterError::RotationBridgeUnusable {
+                archive_name: newest.unwrap_or_default(),
+                reason: ARCHIVE_NAMES_EXHAUSTED_REASON,
+            });
+        };
+        let name = format!("{stem}.{suffix}");
+        let archive = self.path.with_file_name(&name);
+        refuse_taken_rotation_target(&archive, &name)?;
+        refuse_taken_rotation_target(&hmac_sidecar_path(&archive), &name)?;
+        Ok(name)
+    }
+
+    /// The current time in archive-name form, or the time a test set.
+    fn archive_clock(&self) -> String {
+        #[cfg(test)]
+        if let Some(now) = &self.archive_clock {
+            return now.clone();
+        }
+        compact_timestamp()
     }
 
     /// Appends the rotation handoff entry to the outgoing file and advances the
@@ -2191,6 +2576,18 @@ impl AuditWriter {
     /// inside the rotation window and observe that the rollback guard is still
     /// armed there. Returns the handoff entry's hash, which the new file's first
     /// entry chains from.
+    ///
+    /// Once the handoff's bytes can have reached the file, the writer must not
+    /// append from its earlier state: a row chained from the entry before the
+    /// handoff, or a second handoff, would leave the handoff inside its file.
+    /// `handoff_unsettled` is therefore set before the write and cleared only
+    /// once the state accounts for the handoff: here after its fsync, or in
+    /// [`AuditWriter::settle_unsettled_handoff`], which the next append runs
+    /// before anything else touches the file. That replay adopts the file as it
+    /// stands past the writer's last entry and holds a handoff the file ends on
+    /// as pending, or refuses. An anchored writer adopts the handoff in the
+    /// anchor check of its next acquisition; an append without that check
+    /// refuses the grown file earlier, in the append's log check, and latches.
     fn append_rotation_handoff(&mut self, rotated_name: &str) -> Result<String, WriterError> {
         // Write the rotation handoff entry to the current file.
         let mut handoff = AuditEntry::new_rotation_handoff(
@@ -2213,11 +2610,27 @@ impl AuditWriter {
         let json = serde_json::to_vec(&handoff).map_err(WriterError::Serialise)?;
         let mut line = json;
         line.push(b'\n');
+        self.handoff_unsettled = true;
         self.file.write_all(&line)?;
         self.file.flush()?;
+        #[cfg(test)]
+        if self.fail_sync_after_handoff_write {
+            return Err(WriterError::Io(io::Error::other(
+                "test fault: sync_data failed after a full handoff write",
+            )));
+        }
         self.file.sync_data()?;
         self.entry_count = self.entry_count.saturating_add(1);
         self.end_offset = self.entry_end_offset()?;
+        self.checked_len = self.end_offset;
+        // The handoff is now the file's tip and stays pending until the
+        // rotation completes, so a failed rename is retried under its name.
+        self.last_hash.clone_from(&handoff_hash);
+        self.pending_handoff = Some(PendingHandoff {
+            archive_name: rotated_name.to_owned(),
+            hash: handoff_hash.clone(),
+        });
+        self.handoff_unsettled = false;
 
         // Advance the anchor onto the handoff entry — the outgoing file's true
         // tip — BEFORE the renames.
@@ -2241,8 +2654,44 @@ impl AuditWriter {
         Ok(handoff_hash)
     }
 
-    /// Performs the renames, the prune, and the new-file create — the second
-    /// half of [`AuditWriter::rotate`].
+    /// Rebuilds the writer's state from the file after a rotation handoff
+    /// whose write, flush, or fsync failed, or refuses.
+    ///
+    /// Replays the file from the writer's last entry, which proves that what
+    /// follows chains from it, and adopts the result as the anchor
+    /// reconciliation adopts an advanced tail: a file ending on the handoff
+    /// holds it as pending, so the next rotation renames under it. A file with
+    /// nothing past that entry leaves the state as it is. A tail that does not
+    /// replay refuses, and the next append replays it again.
+    ///
+    /// # Errors
+    ///
+    /// Every error of the replay and of [`PendingHandoff::from_scan`]; the
+    /// state is unchanged.
+    fn settle_unsettled_handoff(&mut self) -> Result<(), WriterError> {
+        if !self.handoff_unsettled {
+            return Ok(());
+        }
+        let tail = read_and_verify_entry_chain(&self.file, self.end_offset, &self.last_hash)?;
+        if tail.entry_count > 0 {
+            let pending_handoff = PendingHandoff::from_scan(&self.path, &tail)?;
+            self.entry_count = self.entry_count.saturating_add(tail.entry_count);
+            self.end_offset = tail.end_offset;
+            self.checked_len = tail.checked_len;
+            self.is_new_file = false;
+            self.last_hash.clone_from(&tail.last_hash);
+            self.pending_handoff = pending_handoff;
+        }
+        self.handoff_unsettled = false;
+        Ok(())
+    }
+
+    /// Performs the rename, the new-file create, the state swap, and the
+    /// prune: the second half of [`AuditWriter::rotate`].
+    ///
+    /// The prune runs last, once the new active file exists and the writer
+    /// holds it. A prune error is logged and the rotation still returns `Ok`,
+    /// so retention can never leave the active path missing.
     fn finish_rotation(
         &mut self,
         rotated_path: &Path,
@@ -2252,12 +2701,21 @@ impl AuditWriter {
         // The new segment starts at the handoff hash. It is decoded before any
         // rename or state change, so a decode error leaves the writer whole.
         let segment_start_hash = decode_hash(&handoff_hash).map_err(WriterError::Hash)?;
+        // The just-rotated archive's boundaries as this writer holds them, taken
+        // before the swap replaces them: the prune proves the archive against
+        // these and never against what the file at its name says.
+        let rotated = RotatedArchive {
+            path: rotated_path,
+            seed: encode_hash(&self.segment_start_hash),
+            handoff: handoff_hash.clone(),
+        };
 
         // Rename the current log file to the rotated name.
         fs::rename(&self.path, rotated_path)?;
-
-        // Prune excess rotated files.
-        self.prune_rotated_files()?;
+        #[cfg(test)]
+        if let Some(hook) = self.after_rotation_rename.take() {
+            hook(rotated_path);
+        }
 
         // Open the new active file BEFORE swapping the writer state.
         //
@@ -2265,10 +2723,10 @@ impl AuditWriter {
         // sidecar lock acquired in `AuditWriter::open` is held continuously
         // across the whole rotation (never released, never re-acquired), so
         // no other process can ever hold the writer role while we are
-        // between `fs::rename` and this `create_new` call — the active path
+        // between `fs::rename` and this `create_new` call. The active path
         // being briefly absent from the directory is a filesystem-visible
         // detail, not a lock-ownership race. A concurrent READER observing
-        // this brief absence is expected and handled — see
+        // this brief absence is expected and handled; see
         // `reader::collect_files_newest_first`'s rotation-window tolerance.
         //
         // Use create_new (O_CREAT|O_EXCL) to defend against a race where an
@@ -2292,9 +2750,11 @@ impl AuditWriter {
         self.file = new_file;
         self.segment_start_hash = segment_start_hash;
         self.last_hash = handoff_hash;
+        self.pending_handoff = None;
         self.is_new_file = true;
         self.entry_count = 0;
         self.end_offset = 0;
+        self.checked_len = 0;
 
         // The anchor is deliberately left naming the archive's handoff entry.
         // There is no anchor value for a file with no entries: offset 0 is a
@@ -2303,90 +2763,176 @@ impl AuditWriter {
         // instead of refused.  Until this file's first append advances the
         // anchor, `reconcile_tip_anchor`'s rotation-completed rule carries every
         // open and pre-flight, and it proves the generation by hash.
+
+        // Retention is best effort: an error stops the prune with every
+        // remaining archive kept, and the rotation stands.
+        if let Err(e) = self.prune_rotated_files(&rotated) {
+            tracing::warn!(
+                log = %basename_lossy_path(&self.path),
+                error = %e,
+                "audit log prune stopped; the remaining archives are kept"
+            );
+        }
         Ok(())
     }
 
-    /// Removes the oldest rotated files, keeping at most [`MAX_ROTATED_FILES`].
+    /// Removes the oldest archives of the proven chain, keeping at most
+    /// [`MAX_ROTATED_FILES`].
     ///
-    /// Only deletes files whose names match the strict rotated-sibling pattern
-    /// (via [`is_rotated_sibling`]) to avoid accidentally removing sidecars.
+    /// The chain runs from the oldest rotated sibling (by the strict pattern of
+    /// [`is_rotated_sibling`]) to `rotated`, the archive this rotation created.
+    /// [`prove_prune_chain`] validates every archive in it in full before any
+    /// deletion, its chain-root tag included for a keyed writer, and one
+    /// failure stops the prune with nothing deleted. A sibling that sorts after
+    /// `rotated` is outside the chain, so it is never deleted and never counted
+    /// toward the excess.
+    ///
+    /// The oldest archive must start at the seed the `<log>.pruned` marker
+    /// records for it, or at the zero seed when no marker exists; the archive
+    /// never supplies its own start, so archives or a marker removed outside the
+    /// prune stall it. A durable marker covers each deletion. A marker that
+    /// names neither boundary for the oldest archive and a failed removal also
+    /// stop the prune. Every stop keeps the remaining archives and logs a warning
+    /// naming the file and the cause.
     ///
     /// # Errors
     ///
-    /// Returns [`WriterError::Io`] if the directory cannot be read.
-    fn prune_rotated_files(&self) -> Result<(), WriterError> {
-        let dir = match self.path.parent() {
-            Some(d) => d,
-            None => return Ok(()),
+    /// Returns [`WriterError`] when the sibling listing fails, when the marker
+    /// does not parse or does not authenticate under the writer's key, or when
+    /// a marker write fails. [`AuditWriter::finish_rotation`] logs the error
+    /// and completes the rotation.
+    fn prune_rotated_files(&self, rotated: &RotatedArchive<'_>) -> Result<(), WriterError> {
+        let mut siblings = super::verify::collect_file_chain(&self.path)?;
+        // The listing holds the rotated siblings oldest first, then the active path.
+        siblings.pop();
+        let Some(newest) = siblings
+            .iter()
+            .position(|path| path.file_name() == rotated.path.file_name())
+        else {
+            self.warn_prune_stopped(&PruneStop::new(
+                rotated.path.to_path_buf(),
+                PruneStopCause::NotListed,
+            ));
+            return Ok(());
         };
-        let stem = self
-            .path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("audit.jsonl");
-
-        let mut rotated: Vec<PathBuf> = fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|s| s.to_str())
-                    .map(|name| is_rotated_sibling(stem, name))
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        if rotated.len() <= MAX_ROTATED_FILES {
+        let chain = &siblings[..=newest];
+        let excess = chain.len().saturating_sub(MAX_ROTATED_FILES);
+        if excess == 0 {
             return Ok(());
         }
 
-        rotated.sort();
-        let excess = rotated.len() - MAX_ROTATED_FILES;
-        for path in rotated.iter().take(excess) {
-            let _ = fs::remove_file(path);
-            // Also remove the matching HMAC sidecar if present.
-            let sidecar = hmac_sidecar_path(path);
-            if sidecar.exists() {
-                let _ = fs::remove_file(&sidecar);
+        let mut marker = read_prune_marker(&self.path)?;
+        if let (Some(marker), Some(key)) = (&marker, &self.hmac_key)
+            && !marker.verify_tag(key)
+        {
+            return Err(super::verify::VerifyError::HmacMismatch {
+                file: basename_lossy_path(&prune_marker_path(&self.path)),
             }
+            .into());
+        }
+        // The retained history starts where the marker says the oldest archive
+        // starts, or at the zero seed when nothing was ever pruned. The oldest
+        // archive never supplies its own start: a log missing its oldest
+        // archives, its marker, or both, stalls here.
+        let start_seed =
+            match oldest_retained_seed(marker.as_ref(), &basename_lossy_path(&chain[0])) {
+                Ok(seed) => seed.to_owned(),
+                Err(MarkerNamesNoBoundary) => {
+                    self.warn_prune_stopped(&PruneStop::new(
+                        chain[0].clone(),
+                        PruneStopCause::MarkerBoundary,
+                    ));
+                    return Ok(());
+                }
+            };
+        let handoffs =
+            match prove_prune_chain(chain, &start_seed, rotated, self.hmac_key.as_deref()) {
+                Ok(handoffs) => handoffs,
+                Err(stop) => {
+                    self.warn_prune_stopped(&stop);
+                    return Ok(());
+                }
+            };
+
+        let deletions = chain.iter().zip(&chain[1..]).zip(handoffs).take(excess);
+        for ((archive, successor), hash) in deletions {
+            let file = basename_lossy_path(archive);
+            let seed = match oldest_retained_seed(marker.as_ref(), &file) {
+                Ok(seed) => seed.to_owned(),
+                Err(MarkerNamesNoBoundary) => {
+                    self.warn_prune_stopped(&PruneStop::new(
+                        archive.clone(),
+                        PruneStopCause::MarkerBoundary,
+                    ));
+                    return Ok(());
+                }
+            };
+            // A retained previous file retries the same recorded deletion.
+            let retry = marker.as_ref().is_some_and(|m| {
+                m.data
+                    .previous
+                    .as_ref()
+                    .is_some_and(|previous| previous.file == file)
+            });
+            let count = marker.as_ref().map_or(0, |m| m.data.pruned_files);
+            let mut next = PruneMarker {
+                data: PruneMarkerData {
+                    version: 1,
+                    oldest: PruneSeed {
+                        file: basename_lossy_path(successor),
+                        initial_prev_hash: hash,
+                    },
+                    previous: Some(PruneSeed {
+                        file,
+                        initial_prev_hash: seed,
+                    }),
+                    pruned_files: count.saturating_add(u64::from(!retry)),
+                },
+                tag: None,
+            };
+            next.write(&self.path, self.hmac_key.as_deref())
+                .map_err(io::Error::other)?;
+            #[cfg(test)]
+            if self.skip_prune_removal {
+                return Ok(());
+            }
+            if let Err(e) = fs::remove_file(archive) {
+                self.warn_prune_stopped(&PruneStop::new(
+                    archive.clone(),
+                    PruneStopCause::Removal(e),
+                ));
+                return Ok(());
+            }
+            let _ = fs::remove_file(hmac_sidecar_path(archive));
+            marker = Some(next);
         }
         Ok(())
+    }
+
+    /// Logs a prune that stopped at a file, which it keeps with every other
+    /// remaining archive.
+    fn warn_prune_stopped(&self, stop: &PruneStop) {
+        tracing::warn!(
+            log = %basename_lossy_path(&self.path),
+            file = %basename_lossy_path(&stop.file),
+            cause = %stop.cause,
+            "audit log prune stopped; the remaining archives are kept"
+        );
     }
 
     /// Writes the chain-root HMAC tag to a `<file>.root_hmac` sidecar file.
     ///
-    /// File is created with mode `0600` on POSIX.
+    /// The sidecar is replaced atomically through a temp file and a rename, so
+    /// a crash leaves either no tag or the whole tag, and a symlink at either
+    /// path is replaced rather than followed. The file is created with mode
+    /// `0600` on POSIX.
     ///
     /// # Errors
     ///
     /// Returns [`WriterError::Io`] on I/O failure.
     fn write_root_hmac_sidecar(&self, tag: &str) -> Result<(), WriterError> {
-        let sidecar = hmac_sidecar_path(&self.path);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&sidecar)?;
-            f.write_all(tag.as_bytes())?;
-            f.write_all(b"\n")?;
-            f.sync_data()?;
-        }
-        #[cfg(not(unix))]
-        {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&sidecar)?;
-            f.write_all(tag.as_bytes())?;
-            f.write_all(b"\n")?;
-            f.sync_data()?;
-        }
-        Ok(())
+        super::rotation::write_sidecar_atomic(&hmac_sidecar_path(&self.path), tag.as_bytes())
+            .map_err(|detail| WriterError::Io(io::Error::other(detail)))
     }
 }
 
@@ -2400,8 +2946,10 @@ impl AuditWriter {
 /// - `YYYYMMDDTHHMMSS` — 8 date digits + `T` + 6 time digits (second precision).
 /// - `YYYYMMDDTHHMMSSmmm` — 8 date digits + `T` + 9 time digits (millisecond
 ///   precision, as produced by [`compact_timestamp`]).
-/// - `YYYYMMDDTHHMMSSmmm-N` - millisecond precision plus a decimal collision
-///   counter for multiple rotations in the same millisecond.
+/// - `YYYYMMDDTHHMMSSmmm-N` - millisecond precision plus a decimal counter,
+///   which the writer adds when the clock does not place a rotation after the
+///   newest archive (see [`next_archive_suffix`]). The writer writes six
+///   digits; any count is read.
 ///
 /// Requiring an exact digit count prevents future-format collisions (e.g. a
 /// nanosecond-precision suffix starting with the same 15 characters) and
@@ -2418,7 +2966,7 @@ impl AuditWriter {
 ///
 /// For stem `audit.jsonl`: `audit.jsonl.20260428T123456` (second precision),
 /// `audit.jsonl.20260428T123456789` (millisecond precision), and
-/// `audit.jsonl.20260428T123456789-1` (same-ms collision suffix) match.
+/// `audit.jsonl.20260428T123456789-000001` (counter) match.
 /// `audit.jsonl.lock`, `audit.jsonl.root_hmac`, `other.jsonl.20260428T123456`,
 /// and any suffix with the wrong digit count do not.
 pub(crate) fn is_rotated_sibling(stem: &str, name: &str) -> bool {
@@ -2524,6 +3072,11 @@ fn adoption_row(entry_count: u64) -> AuditEntry {
 /// For `audit.jsonl.20260428T123456` → `audit.jsonl.20260428T123456.root_hmac`.
 pub(super) fn hmac_sidecar_path(log_path: &Path) -> PathBuf {
     sidecar_path(log_path, ".root_hmac")
+}
+
+/// Returns the retention marker path beside the active log.
+pub(crate) fn prune_marker_path(log_path: &Path) -> PathBuf {
+    sidecar_path(log_path, ".pruned")
 }
 
 /// Returns the path beside `log_path` whose file name is the log's full file
@@ -2817,40 +3370,70 @@ fn open_create_new_0600(path: &Path) -> io::Result<File> {
     }
 }
 
-/// Returns a compact ISO-8601-like timestamp for rotation file naming.
-///
-/// Format: `YYYYMMDDTHHMMSSmmm`, with `-N` appended for additional calls that
-/// land in the same millisecond.
+/// Returns the current UTC time in archive-name form, `YYYYMMDDTHHMMSSmmm`.
 fn compact_timestamp() -> String {
-    let ts = current_iso8601_utc();
     // "2026-04-28T12:34:56.123Z" → "20260428T123456123"
-    let compact = ts
+    current_iso8601_utc()
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect::<String>()
-        .replace('Z', "");
-    let timestamp_ms = compact
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse::<u64>()
-        .unwrap_or(0);
+        .filter(|c| c.is_ascii_alphanumeric() && *c != 'Z')
+        .collect()
+}
 
-    loop {
-        let previous = LAST_ROTATION_TIMESTAMP_MS.load(Ordering::Acquire);
-        if timestamp_ms > previous {
-            if LAST_ROTATION_TIMESTAMP_MS
-                .compare_exchange(previous, timestamp_ms, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return compact;
-            }
-            continue;
-        }
+/// Length of a second-precision archive suffix, `YYYYMMDDTHHMMSS`.
+const SECOND_SUFFIX_LEN: usize = 15;
 
-        let suffix = ROTATION_COLLISION_COUNTER.fetch_add(1, Ordering::AcqRel) + 1;
-        return format!("{compact}-{suffix}");
+/// Digits of the counter an archive suffix carries when the clock does not
+/// place a rotation after the newest archive.
+///
+/// The width is fixed, so the counters' lexical order is their numeric order.
+const ARCHIVE_COUNTER_WIDTH: usize = 6;
+
+/// Reason for a rotation that finds no archive name after the newest archive.
+const ARCHIVE_NAMES_EXHAUSTED_REASON: &str =
+    "the archive names after the newest archive are exhausted";
+
+/// The archive suffix, the part of the name after `<stem>.`, of the next
+/// rotation: the smallest one the writer produces that sorts strictly after
+/// `newest`, the suffix of the newest existing archive, or `now` itself.
+///
+/// `now` is the current time as [`compact_timestamp`] gives it, used whenever
+/// it sorts after `newest`. A clock that stands still or was set back
+/// continues from `newest` instead: a second-precision suffix takes its
+/// millisecond form, a millisecond suffix takes the counter `-000001`, and a
+/// suffix with a counter takes the next counter of [`ARCHIVE_COUNTER_WIDTH`]
+/// digits. A counter shorter than that width is padded with zeros on the
+/// right, so `-9` continues as `-900000`. Returns
+/// `None` when no counter of that width sorts after `newest`'s, which only a
+/// counter opening with that many nines leaves.
+///
+/// Archive names sort, and are read as a chain, by their bytes. Taking the
+/// next name from the newest archive rather than from the clock alone keeps
+/// that order the order the archives were created in.
+fn next_archive_suffix(now: &str, newest: Option<&str>) -> Option<String> {
+    let Some(newest) = newest else {
+        return Some(now.to_owned());
+    };
+    if now > newest {
+        return Some(now.to_owned());
     }
+    let (base, counter) = match newest.split_once('-') {
+        Some((base, counter)) => (base, Some(counter)),
+        None => (newest, None),
+    };
+    let counter = match counter {
+        None if base.len() == SECOND_SUFFIX_LEN => return Some(format!("{base}000")),
+        None => 1,
+        Some(counter) if counter.len() < ARCHIVE_COUNTER_WIDTH => {
+            return Some(format!("{base}-{counter:0<ARCHIVE_COUNTER_WIDTH$}"));
+        }
+        Some(counter) => counter
+            .get(..ARCHIVE_COUNTER_WIDTH)?
+            .parse::<u32>()
+            .ok()?
+            .checked_add(1)?,
+    };
+    let next = format!("{counter:0ARCHIVE_COUNTER_WIDTH$}");
+    (next.len() == ARCHIVE_COUNTER_WIDTH).then(|| format!("{base}-{next}"))
 }
 
 // ── Recover chain hash from existing file ────────────────────────────────────
@@ -2886,12 +3469,123 @@ struct ChainScan {
     last_hash: String,
     /// Number of entries in the replayed range.
     entry_count: u64,
-    /// Byte offset just past the replayed range — the file length when the
-    /// range ran to end of file.
+    /// Byte offset just past the last entry in the replayed range.
     end_offset: u64,
+    /// Byte offset just past all replayed bytes, including trailing blank lines.
+    checked_len: u64,
     /// Whether the replayed range holds an `audit_tip_anchored` row, which only
     /// a writer with an anchor store appends.
     holds_anchoring_row: bool,
+    /// The file name the last entry hands off to, when that entry is a
+    /// rotation handoff.
+    last_handoff: Option<String>,
+    /// The first entry of the replayed range, which a replay from offset 0
+    /// makes the file's chain root.
+    first_entry: Option<ChainRoot>,
+}
+
+/// Refuses `entry` with [`WriterError::RowTooLarge`] when its serialized line,
+/// newline included, would be longer than [`MAX_ROW_BYTES`].
+///
+/// Applies the append's argument-key truncation first, which the append would
+/// apply anyway and which leaves an already truncated entry unchanged, and
+/// measures with a placeholder predecessor hash: every entry hash serializes
+/// to the same length, so the measure is the length the append writes. It
+/// runs before the append's checks, rotation, or drain, so an oversized row
+/// changes nothing. Bytes are counted, not buffered.
+fn refuse_oversized_row(entry: &mut AuditEntry) -> Result<(), WriterError> {
+    /// Counts the bytes serialized into it.
+    struct ByteCount(u64);
+    impl Write for ByteCount {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len() as u64);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    entry.truncate_arg_keys_if_needed()?;
+    let previous = std::mem::replace(&mut entry.previous_entry_hash, ZERO_BLOCK_HASH.to_owned());
+    let mut count = ByteCount(0);
+    let measured = serde_json::to_writer(&mut count, &*entry);
+    entry.previous_entry_hash = previous;
+    measured?;
+    let bytes = count.0.saturating_add(1);
+    if bytes > MAX_ROW_BYTES {
+        return Err(WriterError::RowTooLarge {
+            bytes,
+            cap: MAX_ROW_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// A rotation handoff the active file ends on whose rotation has not completed.
+struct PendingHandoff {
+    /// The archive name the handoff names.
+    archive_name: String,
+    /// The handoff's entry hash, which the anchor and the next file chain from.
+    hash: String,
+}
+
+impl PendingHandoff {
+    /// The handoff a replay of the active file at `log_path` ends on, when it
+    /// names a rotated sibling of that file. A handoff naming anything else is
+    /// never a rename target.
+    ///
+    /// # Errors
+    ///
+    /// [`WriterError::RotationBridgeUnusable`] when a file already exists under
+    /// the handoff's archive name: the rename would replace it, and no honest
+    /// rotation leaves its handoff pending over an existing archive.
+    /// [`WriterError::Io`] when that name cannot be checked.
+    fn from_scan(log_path: &Path, scan: &ChainScan) -> Result<Option<Self>, WriterError> {
+        let Some(stem) = log_path.file_name().and_then(|name| name.to_str()) else {
+            return Ok(None);
+        };
+        let Some(archive_name) = scan.last_handoff.as_ref() else {
+            return Ok(None);
+        };
+        if !is_rotated_sibling(stem, archive_name) {
+            return Ok(None);
+        }
+        refuse_taken_rotation_target(&log_path.with_file_name(archive_name), archive_name)?;
+        Ok(Some(Self {
+            archive_name: archive_name.clone(),
+            hash: scan.last_hash.clone(),
+        }))
+    }
+}
+
+/// Reason for a rotation whose archive name is already taken.
+const ROTATION_TARGET_TAKEN_REASON: &str =
+    "a file already exists under the rotation's archive name";
+
+/// Refuses a rotation rename onto `target`, the archive `archive_name` or its
+/// chain-root sidecar, when anything already exists there.
+///
+/// A rename replaces its destination, and an existing file under an archive
+/// name is never the writer's to overwrite. The check runs right before the
+/// renames; a concurrent writer of the audit directory between the check and
+/// the rename is outside its guarantee.
+fn refuse_taken_rotation_target(target: &Path, archive_name: &str) -> Result<(), WriterError> {
+    match fs::symlink_metadata(target) {
+        Ok(_) => Err(WriterError::RotationBridgeUnusable {
+            archive_name: archive_name.to_owned(),
+            reason: ROTATION_TARGET_TAKEN_REASON,
+        }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(WriterError::Io(e)),
+    }
+}
+
+/// The first entry of a replayed range and where its JSON starts.
+struct ChainRoot {
+    entry: AuditEntry,
+    /// Byte offset of the entry's first byte in the file, past any blank lines
+    /// before it and any whitespace that opens its own line.
+    offset: u64,
 }
 
 impl ChainScan {
@@ -2901,7 +3595,10 @@ impl ChainScan {
             last_hash: seed,
             entry_count: 0,
             end_offset: 0,
+            checked_len: 0,
             holds_anchoring_row: false,
+            last_handoff: None,
+            first_entry: None,
         }
     }
 }
@@ -2919,15 +3616,52 @@ fn read_and_verify_entry_chain(
     start_offset: u64,
     seed_hash: &str,
 ) -> Result<ChainScan, WriterError> {
+    scan_entry_chain(file, start_offset, Some(seed_hash), None)
+}
+
+/// The chain replay behind [`read_and_verify_entry_chain`], over `file` from
+/// `start_offset`.
+///
+/// With `seed_hash` `None` the first entry's own `previous_entry_hash` starts
+/// the chain, and every later entry must chain from the one before it. With a
+/// `budget`, a line or a file past its limit fails with an
+/// [`io::ErrorKind::InvalidData`] error carrying [`ReadBudgetExceeded`]; see
+/// [`scan_entry_reader`] for how the reads are bounded.
+fn scan_entry_chain(
+    file: &File,
+    start_offset: u64,
+    seed_hash: Option<&str>,
+    budget: Option<ScanBudget>,
+) -> Result<ChainScan, WriterError> {
     // Reuse the caller's already-open (and already-locked) handle rather than
-    // opening a second one — see the module-level "Single-handle requirement
+    // opening a second one; see the module-level "Single-handle requirement
     // (Windows)" section.
     let mut cursor = file;
     cursor.seek(SeekFrom::Start(start_offset))?;
-    let mut reader = BufReader::new(cursor);
+    scan_entry_reader(cursor, start_offset, seed_hash, budget)
+}
 
-    let mut expected_previous_hash = seed_hash.to_owned();
-    let mut last_hash = seed_hash.to_owned();
+/// Replays the entries `source` yields, `start_offset` being the file offset
+/// of its first byte.
+///
+/// With a `budget`, the file limit sits below the buffer: at most the file
+/// limit plus one byte is ever read from `source`, however fast the file grows,
+/// so a line read never passes what remains of the file limit by more than that
+/// one byte. Each line read is bounded by the line limit plus one byte above
+/// the buffer.
+fn scan_entry_reader(
+    source: impl Read,
+    start_offset: u64,
+    seed_hash: Option<&str>,
+    budget: Option<ScanBudget>,
+) -> Result<ChainScan, WriterError> {
+    let source_limit = budget.map_or(u64::MAX, |budget| budget.file.saturating_add(1));
+    let mut reader = BufReader::new(source.take(source_limit));
+
+    let mut expected_previous_hash = seed_hash.map(str::to_owned);
+    let mut last_hash = seed_hash.unwrap_or_default().to_owned();
+    let mut last_handoff = None;
+    let mut first_entry = None;
     let mut entry_idx = 0usize;
     let mut consumed = start_offset;
     // Offset just past the last ENTRY, which is what the anchor records: bytes
@@ -2939,10 +3673,28 @@ fn read_and_verify_entry_chain(
 
     loop {
         raw.clear();
-        let read = reader.read_until(b'\n', &mut raw)?;
+        let read = match budget {
+            Some(budget) => {
+                let file_left = budget
+                    .file
+                    .saturating_sub(consumed.saturating_sub(start_offset));
+                let read = (&mut reader)
+                    .take(budget.line.saturating_add(1))
+                    .read_until(b'\n', &mut raw)?;
+                if read as u64 > budget.line {
+                    return Err(budget_exceeded("line", budget.line));
+                }
+                if read as u64 > file_left {
+                    return Err(budget_exceeded("file", budget.file));
+                }
+                read
+            }
+            None => reader.read_until(b'\n', &mut raw)?,
+        };
         if read == 0 {
             break;
         }
+        let line_start = consumed;
         consumed = consumed.saturating_add(read as u64);
 
         let line = strip_line_terminator(&raw);
@@ -2952,27 +3704,51 @@ fn read_and_verify_entry_chain(
 
         entry_idx += 1;
         let entry: AuditEntry = serde_json::from_slice(line).map_err(WriterError::Serialise)?;
-        if entry.previous_entry_hash != expected_previous_hash {
+        let expected =
+            expected_previous_hash.get_or_insert_with(|| entry.previous_entry_hash.clone());
+        if entry.previous_entry_hash != *expected {
             return Err(WriterError::ChainBrokenAtOpen {
                 entry_idx,
-                expected_hex: expected_previous_hash,
+                expected_hex: expected.clone(),
                 got_hex: entry.previous_entry_hash,
             });
         }
 
         let hash = compute_entry_hash_streamed(&entry, &entry.previous_entry_hash)?;
-        expected_previous_hash = hash.clone();
+        expected_previous_hash = Some(hash.clone());
         last_hash = hash;
         end_offset = consumed;
         holds_anchoring_row |= matches!(entry.event_kind, EventKind::AuditTipAnchored { .. });
+        if first_entry.is_none() {
+            let indent = line.iter().take_while(|b| b.is_ascii_whitespace()).count();
+            first_entry = Some(ChainRoot {
+                entry: entry.clone(),
+                offset: line_start.saturating_add(indent as u64),
+            });
+        }
+        last_handoff = match entry.event_kind {
+            EventKind::AuditRotationHandoff { next_file_name } => Some(next_file_name),
+            _ => None,
+        };
     }
 
     Ok(ChainScan {
         last_hash,
         entry_count: entry_idx as u64,
         end_offset,
+        checked_len: consumed,
         holds_anchoring_row,
+        last_handoff,
+        first_entry,
     })
+}
+
+/// The error a budgeted scan returns at a read limit.
+fn budget_exceeded(limit: &'static str, bytes: u64) -> WriterError {
+    WriterError::Io(io::Error::new(
+        io::ErrorKind::InvalidData,
+        ReadBudgetExceeded { limit, bytes },
+    ))
 }
 
 /// Returns the hash the active file's first entry must chain from.
@@ -3011,14 +3787,25 @@ pub(super) fn initial_chain_seed(log_path: &Path) -> Result<String, WriterError>
     let Some(newest_archive) = chain.len().checked_sub(2).and_then(|idx| chain.get(idx)) else {
         return Ok(ZERO_BLOCK_HASH.to_owned());
     };
-    let archive_name = basename_lossy_path(newest_archive);
-    let file = match File::open(newest_archive) {
-        Ok(file) => file,
-        Err(_) => return Ok(ZERO_BLOCK_HASH.to_owned()),
+    Ok(read_archive_handoff_hash(newest_archive)?.unwrap_or_else(|| ZERO_BLOCK_HASH.to_owned()))
+}
+
+/// Hashes an archive's handoff entry, or returns `None` when the archive cannot
+/// be opened or holds no non-blank line.
+///
+/// [`initial_chain_seed`] seeds the successor of such an archive with the zero
+/// block, so the replay reports the bridge at the active file's own first entry.
+///
+/// A last line that is not a handoff naming this archive refuses with
+/// [`WriterError::RotationBridgeUnusable`].
+fn read_archive_handoff_hash(archive: &Path) -> Result<Option<String>, WriterError> {
+    let archive_name = basename_lossy_path(archive);
+    let Ok(file) = super::verify::open_regular_file(archive) else {
+        return Ok(None);
     };
     let len = file.metadata()?.len();
     let Some(line) = read_last_line_before(&file, len)? else {
-        return Ok(ZERO_BLOCK_HASH.to_owned());
+        return Ok(None);
     };
     let entry: AuditEntry =
         serde_json::from_slice(&line).map_err(|_| WriterError::RotationBridgeUnusable {
@@ -3041,7 +3828,276 @@ pub(super) fn initial_chain_seed(log_path: &Path) -> Result<String, WriterError>
             });
         }
     }
-    compute_entry_hash_streamed(&entry, &entry.previous_entry_hash)
+    compute_entry_hash_streamed(&entry, &entry.previous_entry_hash).map(Some)
+}
+
+// ── Retention proof ──────────────────────────────────────────────────────────
+
+/// Longest line the prune reads from an archive, terminator included.
+///
+/// The writer refuses any row longer than [`MAX_ROW_BYTES`], so no archive it
+/// wrote holds a longer line, and the prune refuses one rather than buffer it.
+const PRUNE_LINE_CAP: u64 = MAX_ROW_BYTES;
+
+/// Largest archive the prune reads.
+///
+/// Every append checks the threshold before it writes, so an archive holds
+/// less than [`ROTATION_THRESHOLD_BYTES`] before its last row, then that row
+/// and the rotation handoff, each within [`MAX_ROW_BYTES`]. There is one
+/// handoff: a rotation attempt whose renames fail leaves its handoff pending,
+/// and the next attempt renames the file under it and appends no second
+/// handoff, so retries never grow an archive.
+const PRUNE_FILE_CAP: u64 = ROTATION_THRESHOLD_BYTES + 2 * MAX_ROW_BYTES;
+
+/// The archive a rotation just created, with the boundaries the writer holds
+/// for it in memory.
+struct RotatedArchive<'a> {
+    /// The archive's path.
+    path: &'a Path,
+    /// The hash its first entry chains from: the outgoing segment's start.
+    seed: String,
+    /// The hash of the rotation handoff the writer appended to it.
+    handoff: String,
+}
+
+/// The file a prune stopped at, and why. A stop deletes nothing further.
+///
+/// The cause is boxed: it can carry a [`super::verify::VerifyError`], and the
+/// stop is the error type of every proof step.
+#[derive(Debug)]
+struct PruneStop {
+    file: PathBuf,
+    cause: Box<PruneStopCause>,
+}
+
+impl PruneStop {
+    fn new(file: PathBuf, cause: PruneStopCause) -> Self {
+        Self {
+            file,
+            cause: Box::new(cause),
+        }
+    }
+
+    /// Reclassifies a stop at the oldest archive whose first entry does not
+    /// chain from the start seed as [`PruneStopCause::StartBoundary`]; every
+    /// other stop is returned unchanged.
+    fn at_start(self) -> Self {
+        match *self.cause {
+            PruneStopCause::Chain(e @ WriterError::ChainBrokenAtOpen { entry_idx: 1, .. }) => {
+                Self::new(self.file, PruneStopCause::StartBoundary(e))
+            }
+            cause => Self::new(self.file, cause),
+        }
+    }
+}
+
+/// Why a prune stopped.
+#[derive(Debug)]
+enum PruneStopCause {
+    /// The archive this rotation created is missing from the sibling listing.
+    NotListed,
+    /// The file cannot be opened as a regular file.
+    Open(super::verify::VerifyError),
+    /// The file, or one of its lines, is larger than an honest writer produces.
+    OverBudget(ReadBudgetExceeded),
+    /// A read of the file failed.
+    Read(io::Error),
+    /// The file's entries do not chain from its predecessor's handoff through
+    /// to its own last entry, or a line is not an audit entry.
+    Chain(WriterError),
+    /// The file does not end with a rotation handoff naming it.
+    NoHandoff,
+    /// A keyed writer cannot verify the file's chain-root tag over its first
+    /// entry: the `.root_hmac` sidecar is missing, unreadable, or holds a tag
+    /// that does not verify under the writer's key.
+    RootTag(super::verify::VerifyError),
+    /// The just-rotated archive does not end on the handoff this writer
+    /// appended to it.
+    NotTheRotatedArchive,
+    /// The prune marker names neither boundary for the oldest archive.
+    MarkerBoundary,
+    /// The archive's removal failed.
+    Removal(io::Error),
+    /// The oldest archive does not chain from the start of the retained
+    /// history: the seed the prune marker records for it, or the zero seed
+    /// when no marker exists. Archives or the marker were removed outside the
+    /// prune.
+    StartBoundary(WriterError),
+}
+
+impl PruneStopCause {
+    /// Classifies an archive scan's error, keeping the read-budget, I/O and
+    /// parse or link cases apart.
+    fn from_scan_error(e: WriterError) -> Self {
+        match e {
+            WriterError::Io(io) => {
+                let exceeded = io
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<ReadBudgetExceeded>())
+                    .copied();
+                match exceeded {
+                    Some(exceeded) => Self::OverBudget(exceeded),
+                    None => Self::Read(io),
+                }
+            }
+            e => Self::Chain(e),
+        }
+    }
+}
+
+impl std::fmt::Display for PruneStopCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotListed => f.write_str("not in the sibling listing"),
+            Self::Open(e) => write!(f, "open: {e}"),
+            Self::OverBudget(e) => write!(f, "read budget: {e}"),
+            Self::Read(e) => write!(f, "read: {e}"),
+            Self::Chain(e) => write!(f, "chain: {e}"),
+            Self::NoHandoff => f.write_str("no rotation handoff naming the file"),
+            Self::RootTag(e) => write!(f, "chain-root tag: {e}"),
+            Self::NotTheRotatedArchive => {
+                f.write_str("the file does not end on the handoff this writer appended")
+            }
+            Self::MarkerBoundary => f.write_str(
+                "the prune marker names neither boundary for the oldest archive; see \
+                 docs/maintainers/audit-log-recovery.md section 11",
+            ),
+            Self::Removal(e) => write!(f, "removal: {e}"),
+            Self::StartBoundary(e) => write!(
+                f,
+                "chain: the oldest archive does not chain from the authenticated start \
+                 of the retained history ({e}); see \
+                 docs/maintainers/audit-log-recovery.md section 11"
+            ),
+        }
+    }
+}
+
+/// A read of a file the writer does not hold passed one of its limits.
+#[derive(Debug, Clone, Copy)]
+struct ReadBudgetExceeded {
+    /// `"line"` or `"file"`.
+    limit: &'static str,
+    /// The limit in bytes.
+    bytes: u64,
+}
+
+impl std::fmt::Display for ReadBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the {} exceeds {} bytes", self.limit, self.bytes)
+    }
+}
+
+impl std::error::Error for ReadBudgetExceeded {}
+
+/// Read limits for a scan of a file the writer does not hold.
+#[derive(Clone, Copy)]
+struct ScanBudget {
+    /// Longest line, terminator included.
+    line: u64,
+    /// Most bytes read from the file.
+    file: u64,
+}
+
+/// The read limits of every archive the prune scans.
+const PRUNE_BUDGET: ScanBudget = ScanBudget {
+    line: PRUNE_LINE_CAP,
+    file: PRUNE_FILE_CAP,
+};
+
+/// Validates `chain`, oldest first and ending at `rotated`, the archive this
+/// rotation created, and returns each archive's handoff hash in order.
+///
+/// Every archive is replayed in full: each entry chains from the entry before
+/// it, the first from the predecessor's handoff, and the last is a rotation
+/// handoff naming the archive. The oldest archive's first entry chains from
+/// `start_seed`, the start of the retained history the caller derives from the
+/// prune marker or the zero seed, so no link is taken from an archive's own
+/// file. The just-rotated archive's boundaries come from the writer's memory: its first entry must chain from `rotated.seed`, the
+/// predecessor's handoff must equal that seed, and the file must end on
+/// `rotated.handoff`. With `key`, every archive's first entry must also carry
+/// a chain-root tag that verifies under it, so each counted file starts where
+/// a keyed writer started one.
+///
+/// The links bind the entries into one sequence, and the tags bind where that
+/// sequence divides into files: a file split at an interior rotation handoff
+/// keeps valid links, but the part after the split starts on an entry no
+/// keyed writer signed. An unkeyed writer has only the links, so a sequence
+/// re-divided at such a handoff passes its proof.
+fn prove_prune_chain(
+    chain: &[PathBuf],
+    start_seed: &str,
+    rotated: &RotatedArchive<'_>,
+    key: Option<&[u8; 32]>,
+) -> Result<Vec<String>, PruneStop> {
+    let Some((newest, older)) = chain.split_last() else {
+        return Ok(Vec::new());
+    };
+    let mut handoffs: Vec<String> = Vec::with_capacity(chain.len());
+    for archive in older {
+        let handoff = match handoffs.last() {
+            Some(predecessor) => scan_archive(archive, predecessor, key)?,
+            None => scan_archive(archive, start_seed, key).map_err(PruneStop::at_start)?,
+        };
+        handoffs.push(handoff);
+    }
+    let predecessor = handoffs.last().map_or(start_seed, String::as_str);
+    if predecessor != rotated.seed {
+        let stop = PruneStop::new(
+            newest.clone(),
+            PruneStopCause::Chain(WriterError::ChainBrokenAtOpen {
+                entry_idx: 1,
+                expected_hex: predecessor.to_owned(),
+                got_hex: rotated.seed.clone(),
+            }),
+        );
+        return Err(if older.is_empty() {
+            stop.at_start()
+        } else {
+            stop
+        });
+    }
+    let handoff = scan_archive(newest, &rotated.seed, key)?;
+    if handoff != rotated.handoff {
+        return Err(PruneStop::new(
+            newest.clone(),
+            PruneStopCause::NotTheRotatedArchive,
+        ));
+    }
+    handoffs.push(handoff);
+    Ok(handoffs)
+}
+
+/// Replays one archive within [`PRUNE_BUDGET`] from `seed`, checks its
+/// chain-root tag under `key` when one is given, and returns its handoff hash.
+fn scan_archive(archive: &Path, seed: &str, key: Option<&[u8; 32]>) -> Result<String, PruneStop> {
+    let stop = |cause| PruneStop::new(archive.to_path_buf(), cause);
+    let file =
+        super::verify::open_regular_file(archive).map_err(|e| stop(PruneStopCause::Open(e)))?;
+    let len = file
+        .metadata()
+        .map_err(|e| stop(PruneStopCause::Open(super::verify::VerifyError::Io(e))))?
+        .len();
+    if len > PRUNE_BUDGET.file {
+        return Err(stop(PruneStopCause::OverBudget(ReadBudgetExceeded {
+            limit: "file",
+            bytes: PRUNE_BUDGET.file,
+        })));
+    }
+    let scan = scan_entry_chain(&file, 0, Some(seed), Some(PRUNE_BUDGET))
+        .map_err(|e| stop(PruneStopCause::from_scan_error(e)))?;
+    if scan.last_handoff.as_deref() != Some(basename_lossy_path(archive).as_str()) {
+        return Err(stop(PruneStopCause::NoHandoff));
+    }
+    if let (Some(key), Some(first_entry)) = (key, &scan.first_entry) {
+        let body = first_entry
+            .entry
+            .canonical_json_body()
+            .map_err(|e| stop(PruneStopCause::Chain(WriterError::Serialise(e))))?;
+        super::verify::verify_root_sidecar(archive, key, &body)
+            .map_err(|e| stop(PruneStopCause::RootTag(e)))?;
+    }
+    Ok(scan.last_hash)
 }
 
 /// Strips a trailing `\n`, and a `\r` before it, from a raw line.
@@ -3111,6 +4167,60 @@ pub(super) fn read_last_line_before(file: &File, end_offset: u64) -> io::Result<
         }
         scan_end = chunk_start;
     }
+}
+
+/// Reads the line whose `\n` is the byte just before `end_offset`, without
+/// that newline.
+///
+/// Returns `Ok(None)` when `end_offset` is zero or past the end of the file,
+/// when the byte before it is not a newline, or when the line, newline
+/// included, is longer than [`MAX_ROW_BYTES`], which no row the writer appends
+/// is. Reads backward in
+/// 4 KiB windows, as [`read_last_line_before`] does.
+fn read_line_ending_at(file: &File, end_offset: u64) -> io::Result<Option<Vec<u8>>> {
+    const SCAN_CHUNK: u64 = 4096;
+
+    let mut cursor = file;
+    if end_offset == 0 || cursor.metadata()?.len() < end_offset {
+        return Ok(None);
+    }
+    let line_end = end_offset - 1;
+    let mut terminator = [0u8; 1];
+    cursor.seek(SeekFrom::Start(line_end))?;
+    cursor.read_exact(&mut terminator)?;
+    if terminator[0] != b'\n' {
+        return Ok(None);
+    }
+
+    let mut line: Vec<u8> = Vec::new();
+    let mut scan_end = line_end;
+    while scan_end > 0 {
+        let chunk_size = std::cmp::min(SCAN_CHUNK, scan_end);
+        let chunk_start = scan_end - chunk_size;
+        cursor.seek(SeekFrom::Start(chunk_start))?;
+        let mut chunk = vec![
+            0u8;
+            usize::try_from(chunk_size)
+                .map_err(|_| io::Error::other("audit log chunk size overflow"))?
+        ];
+        cursor.read_exact(&mut chunk)?;
+        if let Some(idx) = chunk.iter().rposition(|&byte| byte == b'\n') {
+            chunk.drain(..=idx);
+            chunk.extend_from_slice(&line);
+            line = chunk;
+            break;
+        }
+        chunk.extend_from_slice(&line);
+        line = chunk;
+        if line.len() as u64 >= MAX_ROW_BYTES {
+            return Ok(None);
+        }
+        scan_end = chunk_start;
+    }
+    if line.len() as u64 >= MAX_ROW_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(line))
 }
 
 #[cfg(test)]
@@ -3437,6 +4547,25 @@ pub enum WriterError {
         /// `JSON that is not an audit entry`, or `truncated JSON`.
         reason: &'static str,
     },
+
+    /// The serialized row is longer than [`MAX_ROW_BYTES`].
+    ///
+    /// [`AuditWriter::write_entry`] and the outbox drain measure the row before
+    /// the append's checks, drain, or rotation, so the file, the chain, the
+    /// anchor, and the audit directory are unchanged. A row
+    /// [`AuditWriter::write_built`] builds exists only after the append's
+    /// rotation, by that method's contract, so a rotation the file was due for
+    /// may precede the refusal; the row itself is never written.
+    #[error(
+        "audit.row_too_large: the serialized row is {bytes} bytes, over the {cap}-byte \
+         cap; the row was not written"
+    )]
+    RowTooLarge {
+        /// Length of the serialized row, newline included.
+        bytes: u64,
+        /// The cap, [`MAX_ROW_BYTES`].
+        cap: u64,
+    },
 }
 
 /// Returns the condition an audit-writer acquisition failure describes, led by
@@ -3462,7 +4591,8 @@ pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
         WriterError::RotationBridgeUnusable { .. }
         | WriterError::IntegrityViolation(_)
         | WriterError::OutboxBusy
-        | WriterError::OutboxUnusable { .. } => Some(e.to_string()),
+        | WriterError::OutboxUnusable { .. }
+        | WriterError::RowTooLarge { .. } => Some(e.to_string()),
         WriterError::ChainBrokenAtOpen { entry_idx, .. } => Some(format!(
             "audit.chain_broken: the log's own hash chain is broken at entry {entry_idx}; \
              the file was modified outside the writer"
@@ -4204,7 +5334,7 @@ impl AuditWriterRegistry {
         // A concurrent thread may have won the race and inserted while we were
         // in Phase 2.  Check again; if a winner exists, discard the freshly-
         // opened writer (its Drop releases the advisory lock) and return the
-        // winner's handle — but only after validating path + key consistency.
+        // winner's handle, but only after validating path + key consistency.
         let mut map = registry.lock().map_err(|_| {
             WriterError::Io(io::Error::other(
                 "audit writer registry mutex poisoned; cannot open writer",
@@ -4239,7 +5369,7 @@ impl AuditWriterRegistry {
             }
         }
 
-        // We are the first (or the only) opener for this profile — insert.
+        // We are the first (or the only) opener for this profile: insert.
         map.insert(
             profile_name.to_owned(),
             RegistryEntry {
@@ -4295,10 +5425,7 @@ mod tests {
     use crate::audit_log::entry::NewToolInvocation;
     use crate::audit_log::schema::PolicyDecision;
     use crate::audit_log::test_helpers::rotated_archives_newest_first;
-    use std::{
-        collections::HashSet,
-        sync::{Arc, Barrier, Mutex},
-    };
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     fn make_entry(_prev_hash: &str) -> AuditEntry {
@@ -4322,6 +5449,1986 @@ mod tests {
 
     fn open_no_key(path: PathBuf) -> AuditWriter {
         AuditWriter::open(path, None).unwrap()
+    }
+
+    const PRUNE_TEST_KEY: [u8; 32] = [0x63; 32];
+
+    /// Hashes an archive's final entry, which must be a handoff naming it.
+    fn archive_handoff_hash(archive: &Path) -> Result<String, WriterError> {
+        read_archive_handoff_hash(archive)?.ok_or_else(|| WriterError::RotationBridgeUnusable {
+            archive_name: basename_lossy_path(archive),
+            reason: "the archive has no readable last entry",
+        })
+    }
+
+    fn rotate_pruning_fixture(writer: &mut AuditWriter) {
+        writer.write_entry(make_entry("")).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        let _threshold = super::super::rotation::test_seam::set_rotation_threshold(&writer.path, 1);
+        writer.write_entry(make_entry("")).unwrap();
+    }
+
+    fn pruning_fixture(path: &Path, keyed: bool, rotations: usize) -> AuditWriter {
+        let mut writer = if keyed {
+            AuditWriter::open_keyed_unanchored_for_test(
+                path.to_path_buf(),
+                Zeroizing::new(PRUNE_TEST_KEY),
+            )
+            .unwrap()
+        } else {
+            open_no_key(path.to_path_buf())
+        };
+        writer.write_entry(make_entry("")).unwrap();
+        for _ in 0..rotations {
+            rotate_pruning_fixture(&mut writer);
+        }
+        writer
+    }
+
+    #[test]
+    fn verify_passes_after_twelve_rotations() {
+        use super::super::verify::{VerifyWarning, collect_file_chain, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let _writer = pruning_fixture(&path, true, 12);
+        let chain = collect_file_chain(&path).unwrap();
+        let ok = verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        assert!(ok.hmac_verified);
+        assert_eq!(ok.files_walked, 11);
+        assert_eq!(
+            ok.warnings,
+            vec![VerifyWarning::PrunedPrefix {
+                first_file: basename_lossy_path(&chain[0]),
+                pruned_files: 2,
+            }]
+        );
+        assert_eq!(
+            serde_json::to_value(&ok.warnings[0]).unwrap()["kind"],
+            "pruned_prefix"
+        );
+        assert!(!is_rotated_sibling("audit.jsonl", "audit.jsonl.pruned"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(prune_marker_path(&path))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn verify_detects_an_interior_edit_after_pruning() {
+        use super::super::verify::{VerifyError, collect_file_chain, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let _writer = pruning_fixture(&path, true, 12);
+        let archive = collect_file_chain(&path).unwrap()[4].clone();
+        let content = fs::read_to_string(&archive).unwrap();
+        let mut lines: Vec<String> = content.lines().map(str::to_owned).collect();
+        let mut entry: AuditEntry = serde_json::from_str(&lines[1]).unwrap();
+        entry.request_id = "edited-interior-row".to_owned();
+        lines[1] = serde_json::to_string(&entry).unwrap();
+        fs::write(&archive, format!("{}\n", lines.join("\n"))).unwrap();
+        assert!(matches!(verify_log(&path, Some(&PRUNE_TEST_KEY)),
+            Err(VerifyError::ChainBroken { file, line: 3, .. })
+                if file == basename_lossy_path(&archive)));
+    }
+
+    #[test]
+    fn verify_refuses_an_archive_deleted_beyond_the_marker() {
+        use super::super::verify::{VerifyError, collect_file_chain, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, true, 12);
+        let chain = collect_file_chain(&path).unwrap();
+        fs::remove_file(&chain[0]).unwrap();
+        let marker = fs::read(prune_marker_path(&path)).unwrap();
+        assert!(matches!(verify_log(&path, Some(&PRUNE_TEST_KEY)),
+            Err(VerifyError::ChainBroken { file, line: 1, .. })
+                if file == basename_lossy_path(&chain[1])));
+        rotate_pruning_fixture(&mut writer);
+        rotate_pruning_fixture(&mut writer);
+        assert_eq!(
+            fs::read(prune_marker_path(&path)).unwrap(),
+            marker,
+            "pruning cannot adopt a boundary beyond the authenticated marker"
+        );
+        assert!(matches!(verify_log(&path, Some(&PRUNE_TEST_KEY)),
+            Err(VerifyError::ChainBroken { file, line: 1, .. })
+                if file == basename_lossy_path(&chain[1])));
+    }
+
+    #[test]
+    fn verify_refuses_a_forged_marker() {
+        use super::super::verify::{VerifyError, collect_file_chain, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let _writer = pruning_fixture(&path, true, 12);
+        let chain = collect_file_chain(&path).unwrap();
+        let seed = archive_handoff_hash(&chain[0]).unwrap();
+        fs::remove_file(&chain[0]).unwrap();
+        let marker_path = prune_marker_path(&path);
+        let mut marker = read_prune_marker(&path).unwrap().unwrap();
+        marker.data.oldest = PruneSeed {
+            file: basename_lossy_path(&chain[1]),
+            initial_prev_hash: seed,
+        };
+        for tag in [None, Some(ZERO_BLOCK_HASH.to_owned())] {
+            marker.tag = tag;
+            fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+            assert!(matches!(verify_log(&path, Some(&PRUNE_TEST_KEY)),
+                Err(VerifyError::HmacMismatch { file }) if file == "audit.jsonl.pruned"));
+        }
+    }
+
+    #[test]
+    fn a_crash_between_marker_and_removal_still_verifies() {
+        use super::super::verify::{VerifyWarning, collect_file_chain, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, true, 10);
+        let oldest = collect_file_chain(&path).unwrap()[0].clone();
+        writer.skip_prune_removal = true;
+        rotate_pruning_fixture(&mut writer);
+        assert!(oldest.exists(), "the deletion waits for the durable marker");
+        assert!(hmac_sidecar_path(&oldest).exists());
+        let marker = read_prune_marker(&path).unwrap().unwrap();
+        assert_eq!(
+            marker.data.previous.as_ref().unwrap().file,
+            basename_lossy_path(&oldest)
+        );
+        assert_eq!(marker.data.pruned_files, 1);
+        let ok = verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        assert!(ok.hmac_verified);
+        assert_eq!(ok.files_walked, 12);
+        assert!(
+            ok.warnings.is_empty(),
+            "the complete prefix is still present"
+        );
+        writer.skip_prune_removal = false;
+        let chain = collect_file_chain(&path).unwrap();
+        writer
+            .prune_rotated_files(&rotated_archive_from_file(&chain[chain.len() - 2]))
+            .unwrap();
+        assert!(!oldest.exists());
+        assert!(!hmac_sidecar_path(&oldest).exists());
+        assert_eq!(
+            read_prune_marker(&path).unwrap().unwrap().data.pruned_files,
+            1,
+            "retrying the recorded deletion counts it once"
+        );
+        assert_eq!(
+            verify_log(&path, Some(&PRUNE_TEST_KEY))
+                .unwrap()
+                .files_walked,
+            11
+        );
+        rotate_pruning_fixture(&mut writer);
+        let ok = verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        assert!(ok.hmac_verified);
+        assert_eq!(ok.files_walked, 11);
+        assert!(matches!(
+            &ok.warnings[..],
+            [VerifyWarning::PrunedPrefix {
+                pruned_files: 2,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn a_crash_at_a_later_prune_verifies_from_the_previous_seed() {
+        use super::super::verify::{VerifyWarning, collect_file_chain, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, true, 11);
+        assert_eq!(
+            read_prune_marker(&path).unwrap().unwrap().data.pruned_files,
+            1,
+            "the first prune has run"
+        );
+        let unremoved = collect_file_chain(&path).unwrap()[0].clone();
+        writer.skip_prune_removal = true;
+        rotate_pruning_fixture(&mut writer);
+        assert!(
+            unremoved.exists(),
+            "the deletion waits for the durable marker"
+        );
+        let marker = read_prune_marker(&path).unwrap().unwrap();
+        let previous = marker.data.previous.as_ref().unwrap();
+        assert_eq!(previous.file, basename_lossy_path(&unremoved));
+        assert_ne!(
+            previous.initial_prev_hash, ZERO_BLOCK_HASH,
+            "the unremoved file chains from the handoff of an archive already pruned"
+        );
+        assert_eq!(marker.data.pruned_files, 2);
+        let ok = verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        assert!(ok.hmac_verified);
+        // Eleven archives, the unremoved one included, plus the active file.
+        assert_eq!(ok.files_walked, 12);
+        assert_eq!(
+            ok.warnings,
+            vec![VerifyWarning::PrunedPrefix {
+                first_file: basename_lossy_path(&unremoved),
+                pruned_files: 2,
+            }]
+        );
+
+        writer.skip_prune_removal = false;
+        rotate_pruning_fixture(&mut writer);
+        assert!(!unremoved.exists());
+        let chain = collect_file_chain(&path).unwrap();
+        let ok = verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        assert!(ok.hmac_verified);
+        assert_eq!(ok.files_walked, 11);
+        assert_eq!(
+            ok.warnings,
+            vec![VerifyWarning::PrunedPrefix {
+                first_file: basename_lossy_path(&chain[0]),
+                pruned_files: 3,
+            }]
+        );
+    }
+
+    /// A keyed writer with an anchor store, rotated as [`pruning_fixture`]
+    /// rotates, so the tip-anchor checks run on every append.
+    fn anchored_pruning_fixture(
+        path: &Path,
+        rotations: usize,
+    ) -> (AuditWriter, Arc<InMemoryTipAnchorStore>) {
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let access = KeyedAuditAccess::new(
+            Zeroizing::new(PRUNE_TEST_KEY),
+            Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+        );
+        let mut writer = AuditWriter::open(path.to_path_buf(), Some(access)).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        for _ in 0..rotations {
+            rotate_pruning_fixture(&mut writer);
+        }
+        (writer, store)
+    }
+
+    /// Rotates once more and asserts that the prune failed without touching
+    /// the rotation: the new active file exists, the next append lands and the
+    /// anchor names it, no archive is removed, and the marker bytes are
+    /// unchanged.
+    fn assert_prune_failure_keeps_the_rotation(
+        writer: &mut AuditWriter,
+        store: &Arc<InMemoryTipAnchorStore>,
+        marker: Option<&[u8]>,
+    ) {
+        use super::super::verify::collect_file_chain;
+        let path = writer.path.clone();
+        let mut archives = collect_file_chain(&path).unwrap();
+        archives.pop();
+        rotate_pruning_fixture(writer);
+        assert!(path.exists(), "the rotation created the new active file");
+        writer.write_entry(make_entry("")).unwrap();
+        writer.require_anchor_current().unwrap();
+        assert_eq!(
+            stored_value(store),
+            TipAnchor::new(
+                writer.entry_count,
+                writer.last_hash.clone(),
+                writer.end_offset
+            )
+            .to_keyring_value(),
+            "the anchor names the append after the failed prune"
+        );
+        let mut after = collect_file_chain(&path).unwrap();
+        after.pop();
+        assert_eq!(after.len(), archives.len() + 1, "no archive was removed");
+        assert!(archives.iter().all(|archive| after.contains(archive)));
+        let on_disk = fs::read(prune_marker_path(&path)).ok();
+        assert_eq!(on_disk.as_deref(), marker, "the marker is unchanged");
+    }
+
+    #[test]
+    fn a_garbled_prune_marker_never_fails_the_rotation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let (mut writer, store) = anchored_pruning_fixture(&path, 11);
+        fs::write(prune_marker_path(&path), b"not JSON").unwrap();
+        assert_prune_failure_keeps_the_rotation(&mut writer, &store, Some(b"not JSON".as_slice()));
+    }
+
+    #[test]
+    fn a_forged_prune_marker_never_fails_the_rotation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let (mut writer, store) = anchored_pruning_fixture(&path, 11);
+        let mut marker = read_prune_marker(&path).unwrap().unwrap();
+        marker.tag = Some(ZERO_BLOCK_HASH.to_owned());
+        let forged = serde_json::to_vec(&marker).unwrap();
+        fs::write(prune_marker_path(&path), &forged).unwrap();
+        assert_prune_failure_keeps_the_rotation(&mut writer, &store, Some(forged.as_slice()));
+    }
+
+    #[test]
+    fn a_failed_prune_marker_write_never_fails_the_rotation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let (mut writer, store) = anchored_pruning_fixture(&path, 11);
+        let marker = fs::read(prune_marker_path(&path)).unwrap();
+        // A directory at the temp path makes the atomic marker write fail.
+        fs::create_dir(dir.path().join("audit.jsonl.pruned.tmp")).unwrap();
+        assert_prune_failure_keeps_the_rotation(&mut writer, &store, Some(marker.as_slice()));
+    }
+
+    /// The real archives, oldest first, without the active file.
+    fn real_archives(path: &Path) -> Vec<PathBuf> {
+        let mut archives = super::super::verify::collect_file_chain(path).unwrap();
+        archives.pop();
+        archives
+    }
+
+    /// Sibling names that sort right after `archive` and before any archive a
+    /// later millisecond creates.
+    fn sibling_names_after(archive: &Path, count: usize) -> Vec<PathBuf> {
+        let name = basename_lossy_path(archive);
+        let base = name.split_once('-').map_or(name.as_str(), |(base, _)| base);
+        (1..=count)
+            .map(|n| archive.with_file_name(format!("{base}-9999999{n}")))
+            .inspect(|file| {
+                assert!(is_rotated_sibling(
+                    "audit.jsonl",
+                    &basename_lossy_path(file)
+                ));
+            })
+            .collect()
+    }
+
+    /// Plants three sibling-named files right after `archive`, each holding one
+    /// rotation handoff naming itself and chained from the previous one, the
+    /// first from `archive`'s handoff. Every planted file is internally
+    /// consistent and the run bridges from `archive`. Returns the planted files
+    /// and the last planted handoff hash.
+    fn plant_handoff_run_after(archive: &Path) -> (Vec<PathBuf>, String) {
+        let planted = sibling_names_after(archive, 3);
+        let mut previous = archive_handoff_hash(archive).unwrap();
+        for file in &planted {
+            let mut handoff =
+                AuditEntry::new_rotation_handoff(basename_lossy_path(file), "planted");
+            handoff.previous_entry_hash = previous.clone();
+            previous = compute_entry_hash_streamed(&handoff, &previous).unwrap();
+            let mut line = serde_json::to_vec(&handoff).unwrap();
+            line.push(b'\n');
+            fs::write(file, line).unwrap();
+            assert_eq!(archive_handoff_hash(file).unwrap(), previous);
+        }
+        (planted, previous)
+    }
+
+    /// Lets the clock pass the newest archive's millisecond, so the next
+    /// archive is named from the clock rather than from a counter after the
+    /// names [`sibling_names_after`] produced.
+    fn wait_for_a_later_archive_name() {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    /// Replaces `file`'s first entry's `previous_entry_hash` in place. Hashes
+    /// share one length, so the file keeps its length.
+    fn edit_first_previous_hash(file: &Path, previous: &str) {
+        let content = fs::read_to_string(file).unwrap();
+        let first = content.lines().next().unwrap();
+        let entry: AuditEntry = serde_json::from_str(first).unwrap();
+        let edited = content.replacen(&entry.previous_entry_hash, previous, 1);
+        assert_eq!(edited.len(), content.len());
+        assert_ne!(edited, content);
+        fs::write(file, edited).unwrap();
+    }
+
+    /// Asserts that every real archive survived, nothing planted was removed,
+    /// and the prune wrote no marker.
+    fn assert_nothing_pruned(path: &Path, real: &[PathBuf], planted: &[PathBuf]) {
+        assert!(
+            real.iter().all(|archive| archive.exists()),
+            "no real archive was removed"
+        );
+        assert!(
+            planted
+                .iter()
+                .all(|file| fs::symlink_metadata(file).is_ok())
+        );
+        assert!(!prune_marker_path(path).exists(), "no marker was written");
+    }
+
+    /// The key a pruning fixture runs under, for a verify of its log.
+    fn fixture_key(keyed: bool) -> Option<&'static [u8; 32]> {
+        keyed.then_some(&PRUNE_TEST_KEY)
+    }
+
+    /// Planted runs are refused by the link proof alone, so each such case
+    /// runs unkeyed, where the links are the whole proof, and keyed.
+    #[test]
+    fn planted_siblings_never_raise_the_prune_excess() {
+        for keyed in [false, true] {
+            planted_siblings_never_raise_the_prune_excess_case(keyed);
+        }
+    }
+
+    fn planted_siblings_never_raise_the_prune_excess_case(keyed: bool) {
+        use super::super::verify::{collect_file_chain, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, keyed, 10);
+        let real = real_archives(&path);
+        let (planted, _) = plant_handoff_run_after(&real[real.len() - 1]);
+        wait_for_a_later_archive_name();
+        rotate_pruning_fixture(&mut writer);
+        assert_nothing_pruned(&path, &real, &planted);
+        let chain = collect_file_chain(&path).unwrap();
+        assert_eq!(
+            &chain[real.len()..real.len() + planted.len()],
+            &planted[..],
+            "the planted files sort between the real archives"
+        );
+        for file in &planted {
+            fs::remove_file(file).unwrap();
+        }
+        let ok = verify_log(&path, fixture_key(keyed)).unwrap();
+        assert_eq!(ok.hmac_verified, keyed);
+        assert_eq!(ok.files_walked, real.len() + 2);
+        assert!(ok.warnings.is_empty(), "no prefix was pruned");
+    }
+
+    /// An archive edited to bridge a planted run, the run itself consistent and
+    /// chained from the real predecessor, stops the prune at the edited file.
+    #[test]
+    fn an_edited_archive_never_bridges_a_planted_run() {
+        for keyed in [false, true] {
+            an_edited_archive_never_bridges_a_planted_run_case(keyed);
+        }
+    }
+
+    fn an_edited_archive_never_bridges_a_planted_run_case(keyed: bool) {
+        use super::super::verify::{collect_file_chain, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, keyed, 9);
+        wait_for_a_later_archive_name();
+        rotate_pruning_fixture(&mut writer);
+        let real = real_archives(&path);
+        assert_eq!(real.len(), 10);
+        let (planted, last_planted) = plant_handoff_run_after(&real[8]);
+        let edited = &real[9];
+        let original = fs::read(edited).unwrap();
+        edit_first_previous_hash(edited, &last_planted);
+        wait_for_a_later_archive_name();
+        rotate_pruning_fixture(&mut writer);
+        assert_nothing_pruned(&path, &real, &planted);
+        let chain = collect_file_chain(&path).unwrap();
+        assert_eq!(
+            &chain[9..12],
+            &planted[..],
+            "the planted run sorts before the edit"
+        );
+
+        fs::write(edited, original).unwrap();
+        for file in &planted {
+            fs::remove_file(file).unwrap();
+        }
+        let ok = verify_log(&path, fixture_key(keyed)).unwrap();
+        assert_eq!(ok.hmac_verified, keyed);
+        assert_eq!(ok.files_walked, real.len() + 2);
+        assert!(ok.warnings.is_empty(), "no prefix was pruned");
+    }
+
+    /// The active file edited before the rotating append to bridge a planted
+    /// run never lets the prune count that run.
+    #[test]
+    fn an_edited_active_file_never_bridges_a_planted_run() {
+        for keyed in [false, true] {
+            an_edited_active_file_never_bridges_a_planted_run_case(keyed);
+        }
+    }
+
+    fn an_edited_active_file_never_bridges_a_planted_run_case(keyed: bool) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, keyed, 10);
+        let real = real_archives(&path);
+        let (planted, last_planted) = plant_handoff_run_after(&real[real.len() - 1]);
+        writer.write_entry(make_entry("")).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        edit_first_previous_hash(&path, &last_planted);
+        wait_for_a_later_archive_name();
+        let _threshold = super::super::rotation::test_seam::set_rotation_threshold(&path, 1);
+        writer.write_entry(make_entry("")).unwrap();
+        assert_nothing_pruned(&path, &real, &planted);
+    }
+
+    /// A file swapped in under the just-rotated archive's name, internally
+    /// consistent and chained from a planted run, is not the archive this
+    /// writer rotated: the prune proves that archive from memory.
+    #[test]
+    fn a_file_swapped_in_after_the_rename_is_not_the_rotated_archive() {
+        for keyed in [false, true] {
+            a_file_swapped_in_after_the_rename_is_not_the_rotated_archive_case(keyed);
+        }
+    }
+
+    fn a_file_swapped_in_after_the_rename_is_not_the_rotated_archive_case(keyed: bool) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, keyed, 10);
+        let real = real_archives(&path);
+        let (planted, last_planted) = plant_handoff_run_after(&real[real.len() - 1]);
+        wait_for_a_later_archive_name();
+        writer.after_rotation_rename = Some(Box::new(move |archive: &Path| {
+            let mut row = make_entry("");
+            row.previous_entry_hash = last_planted.clone();
+            let row_hash = compute_entry_hash_streamed(&row, &last_planted).unwrap();
+            let mut handoff =
+                AuditEntry::new_rotation_handoff(basename_lossy_path(archive), "swapped");
+            handoff.previous_entry_hash = row_hash.clone();
+            let mut bytes = serde_json::to_vec(&row).unwrap();
+            bytes.push(b'\n');
+            bytes.extend(serde_json::to_vec(&handoff).unwrap());
+            bytes.push(b'\n');
+            fs::write(archive, bytes).unwrap();
+        }));
+        rotate_pruning_fixture(&mut writer);
+        assert_nothing_pruned(&path, &real, &planted);
+    }
+
+    /// Plants `make` at a sibling name between the newest archive and the next,
+    /// rotates on a thread, and asserts that the rotation returns within a few
+    /// seconds and prunes nothing.
+    fn assert_a_planted_sibling_stalls_the_prune(make: impl FnOnce(&Path, &Path)) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, true, 10);
+        let real = real_archives(&path);
+        let planted = sibling_names_after(&real[real.len() - 1], 1);
+        make(&planted[0], &real[real.len() - 1]);
+        wait_for_a_later_archive_name();
+        let (done, rotated) = std::sync::mpsc::channel();
+        let rotation = std::thread::spawn(move || {
+            rotate_pruning_fixture(&mut writer);
+            let _ = done.send(());
+            writer
+        });
+        match rotated.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(()) => drop(rotation.join().unwrap()),
+            // The thread dropped its sender without sending: it panicked.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match rotation.join() {
+                Err(panic) => std::panic::resume_unwind(panic),
+                Ok(_) => panic!("the rotation thread ended without reporting"),
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Releases a rotation blocked on a FIFO; never blocks itself.
+                #[cfg(unix)]
+                crate::audit_log::test_fifo::release_fifo(&planted[0]);
+                panic!("the rotation did not return while pruning a planted sibling");
+            }
+        }
+        assert_nothing_pruned(&path, &real, &planted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_sibling_never_blocks_the_rotation() {
+        assert_a_planted_sibling_stalls_the_prune(|fifo, _| {
+            crate::audit_log::test_fifo::make_fifo(fifo);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_sibling_stalls_the_prune() {
+        assert_a_planted_sibling_stalls_the_prune(|link, archive| {
+            std::os::unix::fs::symlink(archive, link).unwrap();
+        });
+    }
+
+    #[test]
+    fn a_directory_sibling_stalls_the_prune() {
+        assert_a_planted_sibling_stalls_the_prune(|directory, _| {
+            fs::create_dir(directory).unwrap();
+        });
+    }
+
+    /// The just-rotated archive's boundaries as its file states them, for a
+    /// prune run outside a rotation over an honest log.
+    fn rotated_archive_from_file(archive: &Path) -> RotatedArchive<'_> {
+        let content = fs::read_to_string(archive).unwrap();
+        let first: AuditEntry = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        RotatedArchive {
+            path: archive,
+            seed: first.previous_entry_hash,
+            handoff: archive_handoff_hash(archive).unwrap(),
+        }
+    }
+
+    #[test]
+    fn an_oversized_sibling_stops_the_prune_at_the_read_budget() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, true, 10);
+        let real = real_archives(&path);
+        let planted = sibling_names_after(&real[real.len() - 1], 1);
+        // One line past the line cap, sparse and without a newline.
+        fs::File::create(&planted[0])
+            .unwrap()
+            .set_len(PRUNE_LINE_CAP + 1)
+            .unwrap();
+        wait_for_a_later_archive_name();
+        rotate_pruning_fixture(&mut writer);
+        assert_nothing_pruned(&path, &real, &planted);
+
+        let mut chain = real_archives(&path);
+        let rotated = chain.pop().unwrap();
+        chain.push(rotated.clone());
+        let boundaries = rotated_archive_from_file(&rotated);
+        let stop = prove_prune_chain(&chain, ZERO_BLOCK_HASH, &boundaries, Some(&PRUNE_TEST_KEY))
+            .unwrap_err();
+        assert_eq!(stop.file, planted[0]);
+        assert!(
+            matches!(
+                *stop.cause,
+                PruneStopCause::OverBudget(ReadBudgetExceeded { limit: "line", .. })
+            ),
+            "{:?}",
+            stop.cause
+        );
+
+        // A file past the file cap stops before any byte of it is read.
+        fs::File::options()
+            .write(true)
+            .open(&planted[0])
+            .unwrap()
+            .set_len(PRUNE_FILE_CAP + 1)
+            .unwrap();
+        let stop = prove_prune_chain(&chain, ZERO_BLOCK_HASH, &boundaries, Some(&PRUNE_TEST_KEY))
+            .unwrap_err();
+        assert!(
+            matches!(
+                *stop.cause,
+                PruneStopCause::OverBudget(ReadBudgetExceeded { limit: "file", .. })
+            ),
+            "{:?}",
+            stop.cause
+        );
+    }
+
+    /// A line under the line budget but past what remains of the file budget
+    /// stops at the file budget: the read is bounded by both.
+    #[test]
+    fn a_budgeted_scan_stops_at_the_remaining_file_budget() {
+        let dir = TempDir::new().unwrap();
+        let long_line = dir.path().join("long-line");
+        fs::write(&long_line, vec![b'x'; 2000]).unwrap();
+        let file = File::open(&long_line).unwrap();
+        let budget = ScanBudget {
+            line: 1500,
+            file: 1000,
+        };
+        let Err(err) = scan_entry_chain(&file, 0, None, Some(budget)) else {
+            panic!("the scan must stop at a budget");
+        };
+        let cause = PruneStopCause::from_scan_error(err);
+        assert!(
+            matches!(
+                cause,
+                PruneStopCause::OverBudget(ReadBudgetExceeded {
+                    limit: "file",
+                    bytes: 1000
+                })
+            ),
+            "{cause:?}"
+        );
+    }
+
+    /// A copy of the archive the last prune deleted, planted back under its own
+    /// name, sorts oldest and is the one deleted; the real archives the honest
+    /// prune keeps all survive.
+    #[test]
+    fn a_planted_copy_of_a_pruned_archive_is_deleted_first() {
+        use super::super::verify::{VerifyWarning, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, true, 10);
+        let real = real_archives(&path);
+        let pruned_bytes = fs::read(&real[0]).unwrap();
+        let pruned_tag = fs::read(hmac_sidecar_path(&real[0])).unwrap();
+        rotate_pruning_fixture(&mut writer);
+        assert!(
+            !real[0].exists(),
+            "the first prune removes the oldest archive"
+        );
+        // The copy comes back with its own valid chain-root tag.
+        fs::write(&real[0], &pruned_bytes).unwrap();
+        fs::write(hmac_sidecar_path(&real[0]), &pruned_tag).unwrap();
+        rotate_pruning_fixture(&mut writer);
+        let kept = real_archives(&path);
+        assert!(!real[0].exists(), "the planted copy is deleted");
+        assert!(!real[1].exists(), "the honest prune removes its archive");
+        assert_eq!(kept.len(), 10);
+        assert_eq!(
+            &kept[..8],
+            &real[2..],
+            "every archive the honest prune keeps survives"
+        );
+        assert_eq!(
+            read_prune_marker(&path).unwrap().unwrap().data.pruned_files,
+            2,
+            "the copy retries the recorded deletion"
+        );
+        let ok = verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        assert!(ok.hmac_verified);
+        assert_eq!(ok.files_walked, 11);
+        assert_eq!(
+            ok.warnings,
+            vec![VerifyWarning::PrunedPrefix {
+                first_file: basename_lossy_path(&real[2]),
+                pruned_files: 2,
+            }]
+        );
+    }
+
+    /// Siblings planted under names that sort after every archive come before
+    /// the next archive, which is named after them. The prune stops at the
+    /// first of them with every archive kept; once they are removed, the next
+    /// prune proves the chain and the log verifies.
+    #[test]
+    fn siblings_planted_after_the_newest_archive_stop_the_prune_until_removed() {
+        use super::super::verify::{VerifyWarning, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, true, 10);
+        let real = real_archives(&path);
+        let planted: Vec<PathBuf> = (1..=3)
+            .map(|n| path.with_file_name(format!("audit.jsonl.20991231T23595999{n}")))
+            .collect();
+        for file in &planted {
+            fs::write(file, b"{\"planted\":true}\n").unwrap();
+        }
+        rotate_pruning_fixture(&mut writer);
+        let rotated = real_archives(&path).pop().unwrap();
+        assert_eq!(
+            basename_lossy_path(&rotated),
+            "audit.jsonl.20991231T235959993-000001",
+            "the new archive sorts after the planted siblings"
+        );
+        assert_nothing_pruned(&path, &real, &planted);
+
+        for file in &planted {
+            fs::remove_file(file).unwrap();
+        }
+        rotate_pruning_fixture(&mut writer);
+        assert!(!real[0].exists() && !real[1].exists(), "the prune resumed");
+        assert!(real[2..].iter().all(|archive| archive.exists()));
+        assert!(rotated.exists());
+        let ok = verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        assert!(ok.hmac_verified);
+        assert_eq!(ok.files_walked, 11);
+        assert_eq!(
+            ok.warnings,
+            vec![VerifyWarning::PrunedPrefix {
+                first_file: basename_lossy_path(&real[2]),
+                pruned_files: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_prune_stops_on_an_unusable_handoff() {
+        use super::super::verify::{VerifyError, collect_file_chain, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, true, 10);
+        let oldest = collect_file_chain(&path).unwrap()[0].clone();
+        let content = fs::read_to_string(&oldest).unwrap();
+        let mut lines: Vec<&str> = content.lines().collect();
+        lines.pop();
+        let edited = format!("{}\n", lines.join("\n"));
+        fs::write(&oldest, &edited).unwrap();
+        rotate_pruning_fixture(&mut writer);
+        assert_eq!(fs::read_to_string(&oldest).unwrap(), edited);
+        assert!(hmac_sidecar_path(&oldest).exists());
+        assert!(!prune_marker_path(&path).exists());
+        assert_eq!(collect_file_chain(&path).unwrap().len(), 12);
+        assert!(matches!(
+            verify_log(&path, Some(&PRUNE_TEST_KEY)),
+            Err(VerifyError::ChainBroken { .. } | VerifyError::RotationGap { .. })
+        ));
+    }
+
+    #[test]
+    fn resign_covers_the_prune_marker() {
+        use super::super::rotation::resign_chain_root_sidecars;
+        use super::super::verify::{VerifyError, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let writer = pruning_fixture(&path, true, 12);
+        drop(writer);
+        let new_key = [0x64; 32];
+        assert_eq!(resign_chain_root_sidecars(&path, &new_key).unwrap(), 12);
+        assert!(verify_log(&path, Some(&new_key)).unwrap().hmac_verified);
+        assert!(matches!(verify_log(&path, Some(&PRUNE_TEST_KEY)),
+            Err(VerifyError::HmacMismatch { file }) if file == "audit.jsonl.pruned"));
+    }
+
+    #[test]
+    fn an_unkeyed_writer_writes_an_untagged_marker() {
+        use super::super::verify::{VerifyWarning, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let _writer = pruning_fixture(&path, false, 12);
+        assert!(read_prune_marker(&path).unwrap().unwrap().tag.is_none());
+        let ok = verify_log(&path, None).unwrap();
+        assert!(!ok.hmac_verified);
+        assert_eq!(ok.files_walked, 11);
+        assert!(matches!(
+            &ok.warnings[..],
+            [VerifyWarning::PrunedPrefix {
+                pruned_files: 2,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn verify_refuses_a_malformed_prune_marker() {
+        use super::super::verify::{VerifyError, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let _writer = pruning_fixture(&path, true, 12);
+        let mut marker = read_prune_marker(&path).unwrap().unwrap();
+        marker.data.version = 2;
+        for bytes in [
+            b"not JSON".to_vec(),
+            vec![0xff],
+            serde_json::to_vec(&marker).unwrap(),
+        ] {
+            fs::write(prune_marker_path(&path), bytes).unwrap();
+            assert!(matches!(verify_log(&path, Some(&PRUNE_TEST_KEY)),
+                Err(VerifyError::ParseError { detail, .. }) if detail.contains("audit.jsonl.pruned")));
+        }
+    }
+
+    /// An archive holding a rotation handoff before its last entry links
+    /// across that handoff. Split there into a prefix under the handoff's name
+    /// with the archive's own tag and a suffix under the archive's name, the
+    /// sequence still links, but the suffix starts on an entry no keyed writer
+    /// signed, so a keyed prune counts neither part and deletes nothing.
+    ///
+    /// The writer completes a pending handoff's rotation before any further
+    /// row, so it never writes such an archive; the fixture builds one by
+    /// dropping the pending handoff and appending past it.
+    #[test]
+    fn an_archive_split_at_an_interior_handoff_never_raises_the_prune_excess() {
+        use super::super::verify::{collect_file_chain, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, true, 4);
+        wait_for_a_later_archive_name();
+        writer.write_rotation_handoff_for_test().unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let last: AuditEntry = serde_json::from_str(content.lines().last().unwrap()).unwrap();
+        let EventKind::AuditRotationHandoff {
+            next_file_name: interior_name,
+        } = last.event_kind
+        else {
+            panic!("the interrupted rotation ends on its handoff");
+        };
+        writer.pending_handoff = None;
+        for _ in 0..6 {
+            wait_for_a_later_archive_name();
+            rotate_pruning_fixture(&mut writer);
+        }
+        let real = real_archives(&path);
+        assert_eq!(real.len(), 10);
+        let split = real[4].clone();
+        let original = fs::read_to_string(&split).unwrap();
+        let lines: Vec<&str> = original.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.contains(interior_name.as_str()))
+            .unwrap();
+        assert!(
+            at + 1 < lines.len(),
+            "the handoff is interior to the archive"
+        );
+        let prefix = split.with_file_name(&interior_name);
+        fs::write(&prefix, format!("{}\n", lines[..=at].join("\n"))).unwrap();
+        fs::copy(hmac_sidecar_path(&split), hmac_sidecar_path(&prefix)).unwrap();
+        fs::write(&split, format!("{}\n", lines[at + 1..].join("\n"))).unwrap();
+        let chain = collect_file_chain(&path).unwrap();
+        assert_eq!(chain[4], prefix, "the prefix sorts right before the suffix");
+        assert_eq!(chain[5], split);
+
+        wait_for_a_later_archive_name();
+        rotate_pruning_fixture(&mut writer);
+        assert_nothing_pruned(&path, &real, std::slice::from_ref(&prefix));
+
+        fs::write(&split, &original).unwrap();
+        fs::remove_file(&prefix).unwrap();
+        fs::remove_file(hmac_sidecar_path(&prefix)).unwrap();
+        let ok = verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        assert!(ok.hmac_verified);
+        assert_eq!(ok.files_walked, real.len() + 2);
+        assert!(ok.warnings.is_empty(), "no prefix was pruned");
+    }
+
+    #[test]
+    fn an_archive_without_its_root_tag_stalls_a_keyed_prune() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, true, 10);
+        let real = real_archives(&path);
+        fs::remove_file(hmac_sidecar_path(&real[3])).unwrap();
+        rotate_pruning_fixture(&mut writer);
+        assert_nothing_pruned(&path, &real, &[]);
+
+        let mut chain = real_archives(&path);
+        let rotated = chain.pop().unwrap();
+        chain.push(rotated.clone());
+        let boundaries = rotated_archive_from_file(&rotated);
+        let stop = prove_prune_chain(&chain, ZERO_BLOCK_HASH, &boundaries, Some(&PRUNE_TEST_KEY))
+            .unwrap_err();
+        assert_eq!(stop.file, real[3]);
+        assert!(
+            matches!(
+                &*stop.cause,
+                PruneStopCause::RootTag(super::super::verify::VerifyError::HmacSidecarMissing { file })
+                    if *file == basename_lossy_path(&real[3])
+            ),
+            "{:?}",
+            stop.cause
+        );
+    }
+
+    /// Opens a keyed writer with an anchor store on `path`.
+    fn open_keyed_anchored(path: &Path, store: &Arc<InMemoryTipAnchorStore>) -> AuditWriter {
+        let access = KeyedAuditAccess::new(
+            Zeroizing::new(PRUNE_TEST_KEY),
+            Arc::clone(store) as Arc<dyn TipAnchorStore>,
+        );
+        AuditWriter::open(path.to_path_buf(), Some(access)).unwrap()
+    }
+
+    /// Fails the first entry's sidecar write on a fresh keyed log, so the file
+    /// holds a durable first entry and no chain-root tag.
+    fn first_entry_without_its_root_tag(path: &Path, store: &Arc<InMemoryTipAnchorStore>) {
+        let mut writer = open_keyed_anchored(path, store);
+        writer.set_fail_after_entry_before_sidecar(true);
+        writer.write_entry(make_entry("")).unwrap_err();
+        drop(writer);
+        assert!(!hmac_sidecar_path(path).exists());
+        assert!(!fs::read(path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_keyed_open_writes_a_missing_root_tag_before_any_rotation() {
+        use super::super::verify::verify_log;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        // The first entry of the file a rotation created lands without its tag;
+        // the anchor still names the archive's handoff.
+        let mut writer = open_keyed_anchored(&path, &store);
+        writer.write_entry(make_entry("")).unwrap();
+        writer.force_rotate_for_test().unwrap();
+        writer.set_fail_after_entry_before_sidecar(true);
+        writer.write_entry(make_entry("")).unwrap_err();
+        drop(writer);
+        assert!(!hmac_sidecar_path(&path).exists());
+
+        let mut writer = open_keyed_anchored(&path, &store);
+        assert!(
+            hmac_sidecar_path(&path).exists(),
+            "the open wrote the missing tag"
+        );
+        assert!(
+            verify_log(&path, Some(&PRUNE_TEST_KEY))
+                .unwrap()
+                .hmac_verified
+        );
+
+        rotate_pruning_fixture(&mut writer);
+        let archives = real_archives(&path);
+        assert_eq!(archives.len(), 2);
+        assert!(hmac_sidecar_path(&archives[1]).exists());
+        assert!(
+            verify_log(&path, Some(&PRUNE_TEST_KEY))
+                .unwrap()
+                .hmac_verified
+        );
+    }
+
+    /// An adopted file had no anchor to be proved against, so the open mints
+    /// no tag for it.
+    #[test]
+    fn an_adopted_file_gets_no_root_tag_at_open() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        first_entry_without_its_root_tag(&path, &store);
+        assert!(store.peek().is_none(), "the failed append anchored nothing");
+        let _writer = open_keyed_anchored(&path, &store);
+        assert!(store.peek().is_some(), "the open adopted the file");
+        assert!(!hmac_sidecar_path(&path).exists());
+    }
+
+    /// The active file holds handoffs P and Q, the anchor on Q. The writer
+    /// completes a pending handoff's rotation before it writes anything else,
+    /// so the fixture appends Q past P through the seam that writes a bare
+    /// handoff. The prefix through P moves to an archive under P's name with
+    /// the active file's tag, blank lines of equal length replace it, and the
+    /// active tag is removed: the tip and its offset still match.
+    /// The open proves the count from byte 0, refuses, and mints no tag.
+    #[test]
+    fn a_padded_split_of_the_active_file_refuses_and_gets_no_root_tag() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let (mut writer, store) = anchored_pruning_fixture(&path, 10);
+        writer.write_entry(make_entry("")).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        wait_for_a_later_archive_name();
+        writer.write_rotation_handoff_for_test().unwrap();
+        drop(writer);
+        let mut writer = open_keyed_anchored(&path, &store);
+        wait_for_a_later_archive_name();
+        writer.write_rotation_handoff_for_test().unwrap();
+        drop(writer);
+        let real = real_archives(&path);
+        assert_eq!(real.len(), 10);
+
+        let content = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let handoffs: Vec<(usize, String)> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(at, line)| {
+                match serde_json::from_str::<AuditEntry>(line).unwrap().event_kind {
+                    EventKind::AuditRotationHandoff { next_file_name } => {
+                        Some((at, next_file_name))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(handoffs.len(), 2);
+        let (at_p, p_name) = &handoffs[0];
+        let prefix = format!("{}\n", lines[..=*at_p].join("\n"));
+        let planted = path.with_file_name(p_name);
+        fs::write(&planted, &prefix).unwrap();
+        fs::copy(hmac_sidecar_path(&path), hmac_sidecar_path(&planted)).unwrap();
+        let padded = format!(
+            "{}{}\n",
+            "\n".repeat(prefix.len()),
+            lines[at_p + 1..].join("\n")
+        );
+        assert_eq!(padded.len(), content.len());
+        fs::write(&path, padded).unwrap();
+        fs::remove_file(hmac_sidecar_path(&path)).unwrap();
+
+        let access = KeyedAuditAccess::new(
+            Zeroizing::new(PRUNE_TEST_KEY),
+            Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+        );
+        let err = AuditWriter::open(path.clone(), Some(access)).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. } if *reason == LOG_COUNT_REASON
+            ),
+            "{err:?}"
+        );
+        assert!(!hmac_sidecar_path(&path).exists(), "no tag was minted");
+        assert_nothing_pruned(&path, &real, std::slice::from_ref(&planted));
+    }
+
+    /// A blank line before an otherwise intact anchored first entry is a byte
+    /// no honest writer writes, so the open mints no tag for that entry.
+    #[test]
+    fn a_leading_blank_line_leaves_a_missing_root_tag_unwritten() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let (line, hash) = serialised_entry_line(ZERO_BLOCK_HASH);
+        let mut content = b"\n".to_vec();
+        content.extend_from_slice(&line);
+        fs::write(&path, &content).unwrap();
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        store
+            .store_anchor(&TipAnchor::new(1, hash, content.len() as u64))
+            .unwrap();
+
+        let writer = open_keyed_anchored(&path, &store);
+        assert_eq!(writer.entry_count, 1, "the anchor check accepted the file");
+        assert!(!hmac_sidecar_path(&path).exists(), "no tag was minted");
+    }
+
+    /// Counts the handoffs in `file`.
+    fn handoff_count(file: &Path) -> usize {
+        fs::read_to_string(file)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                matches!(
+                    serde_json::from_str::<AuditEntry>(line).unwrap().event_kind,
+                    EventKind::AuditRotationHandoff { .. }
+                )
+            })
+            .count()
+    }
+
+    /// Three rotation attempts whose renames fail, two in one process and one
+    /// after a reopen, leave one handoff; the rotation that then succeeds
+    /// archives the file under that handoff's name within the prune's budget,
+    /// and the prunes prove it as the newest archive and as an older one.
+    #[test]
+    fn a_failed_rotation_rename_is_retried_under_its_one_handoff() {
+        use super::super::verify::verify_log;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let (mut writer, store) = anchored_pruning_fixture(&path, 10);
+        let real = real_archives(&path);
+        writer.write_entry(make_entry("")).unwrap();
+        wait_for_a_later_archive_name();
+        let _threshold = super::super::rotation::test_seam::set_rotation_threshold(&path, 1);
+        writer.set_rotation_renames_to_fail(2);
+        writer.write_entry(make_entry("")).unwrap_err();
+        writer.write_entry(make_entry("")).unwrap_err();
+        assert_eq!(handoff_count(&path), 1);
+        drop(writer);
+        let mut writer = open_keyed_anchored(&path, &store);
+        writer.set_rotation_renames_to_fail(1);
+        writer.write_entry(make_entry("")).unwrap_err();
+        assert_eq!(handoff_count(&path), 1, "every attempt reused the handoff");
+        let content = fs::read_to_string(&path).unwrap();
+        let last: AuditEntry = serde_json::from_str(content.lines().last().unwrap()).unwrap();
+        let EventKind::AuditRotationHandoff {
+            next_file_name: pending_name,
+        } = last.event_kind
+        else {
+            panic!("the file ends on its handoff");
+        };
+
+        writer.write_entry(make_entry("")).unwrap();
+        let archive = path.with_file_name(&pending_name);
+        assert!(archive.exists(), "the archive carries the pending name");
+        assert_eq!(handoff_count(&archive), 1);
+        assert!(fs::metadata(&archive).unwrap().len() <= PRUNE_FILE_CAP);
+        assert!(!real[0].exists(), "the prune proved the new archive");
+
+        wait_for_a_later_archive_name();
+        writer.write_entry(make_entry("")).unwrap();
+        assert!(
+            !real[1].exists(),
+            "the next prune proved it as an older one"
+        );
+        assert!(archive.exists());
+        drop(writer);
+        assert!(
+            verify_log(&path, Some(&PRUNE_TEST_KEY))
+                .unwrap()
+                .hmac_verified
+        );
+    }
+
+    /// What [`directory_snapshot`] records of one file.
+    #[derive(Debug, PartialEq, Eq)]
+    enum SnapshotFile {
+        /// The file's bytes.
+        Bytes(Vec<u8>),
+        /// The length of a lock file the live writer holds.
+        HeldLock(u64),
+    }
+
+    /// Every file in the directory of the log at `log` with its bytes, in name
+    /// order, except the lock sidecar and the drain lock the live writer
+    /// holds, which are recorded by their length.
+    ///
+    /// Windows refuses reads of a file locked with `LockFileEx` through any
+    /// other handle, so the held locks are compared by name and length.
+    fn directory_snapshot(log: &Path) -> Vec<(String, SnapshotFile)> {
+        let held_locks = [
+            lock_sidecar_path(log),
+            super::super::outbox::drain_lock_path(log),
+        ];
+        let mut files: Vec<(String, SnapshotFile)> = fs::read_dir(log.parent().unwrap())
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let state = if held_locks.contains(&path) {
+                    SnapshotFile::HeldLock(entry.metadata().unwrap().len())
+                } else {
+                    SnapshotFile::Bytes(fs::read(&path).unwrap())
+                };
+                (entry.file_name().to_string_lossy().into_owned(), state)
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files
+    }
+
+    /// With the active file at the rotation threshold and the retention cap
+    /// reached, an oversized row refuses before the rotation, its handoff, the
+    /// anchor move, or the prune.
+    #[test]
+    fn a_row_over_the_cap_at_the_rotation_threshold_changes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let (mut writer, store) = anchored_pruning_fixture(&path, 10);
+        writer.write_entry(make_entry("")).unwrap();
+        let _threshold = super::super::rotation::test_seam::set_rotation_threshold(&path, 1);
+        let before = directory_snapshot(&path);
+        let anchor = stored_value(&store);
+
+        let row = row_of_len(&writer, MAX_ROW_BYTES + 1);
+        let err = writer.write_entry(row).unwrap_err();
+        assert!(matches!(err, WriterError::RowTooLarge { .. }), "{err:?}");
+        assert_eq!(stored_value(&store), anchor, "the anchor is unchanged");
+        assert_eq!(
+            directory_snapshot(&path),
+            before,
+            "no file in the audit directory changed"
+        );
+    }
+
+    /// Serves an endless line of `x` and counts the bytes read from it.
+    struct EndlessLine {
+        served: u64,
+    }
+
+    impl io::Read for EndlessLine {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            buf.fill(b'x');
+            self.served += buf.len() as u64;
+            Ok(buf.len())
+        }
+    }
+
+    /// The file budget bounds the reads below the buffer: a source that never
+    /// ends is read for at most the budget and one byte, where a buffer above
+    /// the limit would read a whole buffer.
+    #[test]
+    fn a_budgeted_scan_reads_at_most_one_byte_past_the_file_budget() {
+        let mut source = EndlessLine { served: 0 };
+        let budget = ScanBudget {
+            line: MAX_ROW_BYTES,
+            file: 1000,
+        };
+        let result = scan_entry_reader(&mut source, 0, None, Some(budget));
+        assert_eq!(source.served, 1001, "bytes read from the source");
+        let Err(err) = result else {
+            panic!("the scan must stop at a budget");
+        };
+        assert!(matches!(
+            PruneStopCause::from_scan_error(err),
+            PruneStopCause::OverBudget(ReadBudgetExceeded { limit: "file", .. })
+        ));
+    }
+
+    /// Asserts that the prune proof of `path`'s archives, which no marker
+    /// covers, stops at `oldest` because it does not chain from the zero seed.
+    fn assert_start_boundary_stall(path: &Path, keyed: bool, oldest: &Path) {
+        let chain = real_archives(path);
+        assert_eq!(chain[0], oldest);
+        let boundaries = rotated_archive_from_file(chain.last().unwrap());
+        let stop = prove_prune_chain(&chain, ZERO_BLOCK_HASH, &boundaries, fixture_key(keyed))
+            .unwrap_err();
+        assert_eq!(stop.file, oldest);
+        assert!(
+            matches!(
+                &*stop.cause,
+                PruneStopCause::StartBoundary(WriterError::ChainBrokenAtOpen { entry_idx: 1, .. })
+            ),
+            "{:?}",
+            stop.cause
+        );
+    }
+
+    /// A log that was never pruned starts at the zero seed. Its oldest archive
+    /// deleted outside the prune leaves the next one starting on a handoff no
+    /// marker records, so the prune stalls with every archive kept and
+    /// verification fails.
+    #[test]
+    fn a_log_missing_its_oldest_archive_stalls_the_prune() {
+        for keyed in [false, true] {
+            a_log_missing_its_oldest_archive_stalls_the_prune_case(keyed);
+        }
+    }
+
+    fn a_log_missing_its_oldest_archive_stalls_the_prune_case(keyed: bool) {
+        use super::super::verify::verify_log;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, keyed, 10);
+        let real = real_archives(&path);
+        fs::remove_file(&real[0]).unwrap();
+        if keyed {
+            fs::remove_file(hmac_sidecar_path(&real[0])).unwrap();
+        }
+        rotate_pruning_fixture(&mut writer);
+        rotate_pruning_fixture(&mut writer);
+        assert_eq!(real_archives(&path).len(), 11, "the prune kept the excess");
+        assert_nothing_pruned(&path, &real[1..], &[]);
+        assert_start_boundary_stall(&path, keyed, &real[1]);
+        assert!(verify_log(&path, fixture_key(keyed)).is_err());
+    }
+
+    /// After a prune, the marker is what authenticates the start of the
+    /// retained history. With the marker deleted the oldest archive does not
+    /// chain from the zero seed, so the next prune stalls with every archive
+    /// kept and verification fails.
+    #[test]
+    fn a_log_missing_its_prune_marker_stalls_the_prune() {
+        for keyed in [false, true] {
+            a_log_missing_its_prune_marker_stalls_the_prune_case(keyed);
+        }
+    }
+
+    fn a_log_missing_its_prune_marker_stalls_the_prune_case(keyed: bool) {
+        use super::super::verify::verify_log;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, keyed, 11);
+        let real = real_archives(&path);
+        assert_eq!(real.len(), 10, "one honest prune ran");
+        fs::remove_file(prune_marker_path(&path)).unwrap();
+        rotate_pruning_fixture(&mut writer);
+        assert_eq!(real_archives(&path).len(), 11, "the prune kept the excess");
+        assert_nothing_pruned(&path, &real, &[]);
+        assert_start_boundary_stall(&path, keyed, &real[0]);
+        assert!(verify_log(&path, fixture_key(keyed)).is_err());
+    }
+
+    /// A carriage return before the anchored entry's newline moves that
+    /// entry's end one byte past the anchored offset, while a reader that
+    /// skips whitespace still finds the entry before it. With a chained entry
+    /// appended and the root tag removed, the open refuses and mints no tag.
+    #[test]
+    fn an_anchored_entry_ending_past_its_offset_refuses_and_gets_no_root_tag() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = open_keyed_anchored(&path, &store);
+        writer.write_entry(make_entry("")).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        drop(writer);
+        let anchor = store.peek().unwrap();
+        let mut content = fs::read(&path).unwrap();
+        assert_eq!(content.len() as u64, anchor.end_offset);
+        content.insert(content.len() - 1, b'\r');
+        let (line, _) = serialised_entry_line(&anchor.tip_hash);
+        content.extend_from_slice(&line);
+        fs::write(&path, &content).unwrap();
+        fs::remove_file(hmac_sidecar_path(&path)).unwrap();
+
+        let access = KeyedAuditAccess::new(
+            Zeroizing::new(PRUNE_TEST_KEY),
+            Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+        );
+        let Err(err) = AuditWriter::open(path.clone(), Some(access)) else {
+            panic!("the open accepted an anchored entry that ends past the anchored offset");
+        };
+        assert!(
+            matches!(
+                &err,
+                WriterError::TipAnchorMismatch { reason, .. }
+                    if *reason == LOG_ENTRY_END_REASON || *reason == LOG_COUNT_REASON
+            ),
+            "{err:?}"
+        );
+        assert!(!hmac_sidecar_path(&path).exists(), "no tag was minted");
+        assert_eq!(store.peek(), Some(anchor), "the anchor is unchanged");
+    }
+
+    /// The archive name the last entry of `file`, a rotation handoff, names.
+    fn last_handoff_name(file: &Path) -> String {
+        let content = fs::read_to_string(file).unwrap();
+        let last: AuditEntry = serde_json::from_str(content.lines().last().unwrap()).unwrap();
+        let EventKind::AuditRotationHandoff { next_file_name } = last.event_kind else {
+            panic!("the file ends on a rotation handoff");
+        };
+        next_file_name
+    }
+
+    /// A rotation handoff whose fsync failed after its bytes landed is the
+    /// file's last entry. The next acquisition reconciles the file and holds
+    /// that handoff as pending, so the next append renames the file under it
+    /// and the archive ends on its one handoff.
+    #[test]
+    fn a_handoff_whose_fsync_failed_is_completed_under_its_one_handoff() {
+        use super::super::verify::verify_log;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = open_keyed_anchored(&path, &store);
+        writer.write_entry(make_entry("")).unwrap();
+        let _threshold = super::super::rotation::test_seam::set_rotation_threshold(&path, 1);
+        writer.set_fail_sync_after_handoff_write(true);
+        writer.write_entry(make_entry("")).unwrap_err();
+        writer.set_fail_sync_after_handoff_write(false);
+        assert_eq!(handoff_count(&path), 1, "the handoff's bytes landed");
+        let pending_name = last_handoff_name(&path);
+        assert!(real_archives(&path).is_empty());
+
+        writer.verify_tip_anchor().unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        let archives = real_archives(&path);
+        assert_eq!(archives, vec![path.with_file_name(&pending_name)]);
+        assert_eq!(
+            handoff_count(&archives[0]),
+            1,
+            "the archive holds one handoff"
+        );
+        archive_handoff_hash(&archives[0]).unwrap();
+        assert_eq!(handoff_count(&path), 0);
+        verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+    }
+
+    /// A small unanchored file that ends on a rotation handoff is adopted by a
+    /// keyed open. The adoption row would be the first row after that handoff,
+    /// so the open completes the rotation under the handoff's name first and
+    /// the row starts the new file; the next rotation archives that file with
+    /// its own one handoff.
+    #[test]
+    fn an_adopted_file_ending_on_a_handoff_completes_its_rotation_first() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut unkeyed = open_no_key(path.clone());
+        unkeyed.write_entry(make_entry("")).unwrap();
+        let handoff = unkeyed.write_rotation_handoff_for_test().unwrap();
+        drop(unkeyed);
+        let pending_name = last_handoff_name(&path);
+
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = open_keyed_anchored(&path, &store);
+        let archives = real_archives(&path);
+        assert_eq!(archives, vec![path.with_file_name(&pending_name)]);
+        assert_eq!(archive_handoff_hash(&archives[0]).unwrap(), handoff);
+        assert_eq!(handoff_count(&archives[0]), 1);
+        let content = fs::read_to_string(&path).unwrap();
+        let first: AuditEntry = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            first.previous_entry_hash, handoff,
+            "the adoption row starts the new file"
+        );
+        assert!(matches!(
+            first.event_kind,
+            EventKind::AuditTipAnchored { .. }
+        ));
+
+        wait_for_a_later_archive_name();
+        writer.force_rotate_for_test().unwrap();
+        let archives = real_archives(&path);
+        assert_eq!(archives.len(), 2);
+        for archive in &archives {
+            assert_eq!(handoff_count(archive), 1);
+            archive_handoff_hash(archive).unwrap();
+        }
+    }
+
+    /// A correctly chained handoff naming an existing older archive, appended
+    /// to a threshold-sized active file, would rename the active file over
+    /// that archive. The reopen refuses and the archive stays as it was.
+    #[test]
+    fn a_pending_handoff_naming_an_existing_archive_refuses_at_open() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let writer = pruning_fixture(&path, true, 3);
+        let tip = writer.last_hash.clone();
+        drop(writer);
+        let real = real_archives(&path);
+        let target = real[0].clone();
+        let target_bytes = fs::read(&target).unwrap();
+        let target_tag = fs::read(hmac_sidecar_path(&target)).unwrap();
+
+        let mut handoff = AuditEntry::new_rotation_handoff(basename_lossy_path(&target), "planted");
+        handoff.previous_entry_hash = tip;
+        let mut line = serde_json::to_vec(&handoff).unwrap();
+        line.push(b'\n');
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&line)
+            .unwrap();
+        let _threshold = super::super::rotation::test_seam::set_rotation_threshold(&path, 1);
+
+        let Err(err) = AuditWriter::open_keyed_unanchored_for_test(
+            path.clone(),
+            Zeroizing::new(PRUNE_TEST_KEY),
+        ) else {
+            panic!("the open accepted a pending rename over an existing archive");
+        };
+        assert!(
+            matches!(
+                &err,
+                WriterError::RotationBridgeUnusable { archive_name, reason }
+                    if *archive_name == basename_lossy_path(&target)
+                        && *reason == ROTATION_TARGET_TAKEN_REASON
+            ),
+            "{err:?}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), target_bytes);
+        assert_eq!(fs::read(hmac_sidecar_path(&target)).unwrap(), target_tag);
+    }
+
+    /// A file planted under a pending handoff's archive name after a failed
+    /// rename is never replaced: the retried rotation refuses, and the planted
+    /// file and the active file keep their bytes.
+    #[test]
+    fn a_rotation_rename_never_replaces_an_existing_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, true, 2);
+        let _threshold = super::super::rotation::test_seam::set_rotation_threshold(&path, 1);
+        writer.set_rotation_renames_to_fail(1);
+        writer.write_entry(make_entry("")).unwrap_err();
+        let pending = path.with_file_name(last_handoff_name(&path));
+        fs::write(&pending, b"planted").unwrap();
+        let active = fs::read(&path).unwrap();
+
+        let err = writer.write_entry(make_entry("")).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WriterError::RotationBridgeUnusable { reason, .. }
+                    if *reason == ROTATION_TARGET_TAKEN_REASON
+            ),
+            "{err:?}"
+        );
+        assert_eq!(fs::read(&pending).unwrap(), b"planted");
+        assert_eq!(fs::read(&path).unwrap(), active);
+    }
+
+    /// An unkeyed writer whose rotation handoff failed its fsync after the
+    /// bytes landed rebuilds its state from the file on the next append: the
+    /// archive holds that one handoff, and the new file chains from it.
+    #[test]
+    fn an_unkeyed_handoff_whose_fsync_failed_is_completed_under_its_one_handoff() {
+        use super::super::verify::verify_log;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = open_no_key(path.clone());
+        writer.write_entry(make_entry("")).unwrap();
+        let _threshold = super::super::rotation::test_seam::set_rotation_threshold(&path, 1);
+        writer.set_fail_sync_after_handoff_write(true);
+        writer.write_entry(make_entry("")).unwrap_err();
+        writer.set_fail_sync_after_handoff_write(false);
+        assert_eq!(handoff_count(&path), 1, "the handoff's bytes landed");
+        let pending_name = last_handoff_name(&path);
+        assert!(real_archives(&path).is_empty());
+
+        writer.write_entry(make_entry("")).unwrap();
+        let archives = real_archives(&path);
+        assert_eq!(archives, vec![path.with_file_name(&pending_name)]);
+        assert_eq!(
+            handoff_count(&archives[0]),
+            1,
+            "the archive holds one handoff"
+        );
+        let handoff = archive_handoff_hash(&archives[0]).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let first: AuditEntry = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            first.previous_entry_hash, handoff,
+            "the new file chains from the handoff"
+        );
+        assert_eq!(handoff_count(&path), 0);
+        let ok = verify_log(&path, None).unwrap();
+        assert_eq!(ok.files_walked, 2);
+    }
+
+    /// A restart under a clock set back before the newest archive still names
+    /// the next archive after it: the archive is the chain's last, keyed
+    /// verification passes, and a later prune proves the chain and removes the
+    /// oldest archive.
+    #[test]
+    fn an_archive_named_under_a_clock_set_back_sorts_after_the_newest() {
+        use super::super::verify::verify_log;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        drop(pruning_fixture(&path, true, 9));
+        let before = real_archives(&path);
+        let mut writer = AuditWriter::open_keyed_unanchored_for_test(
+            path.clone(),
+            Zeroizing::new(PRUNE_TEST_KEY),
+        )
+        .unwrap();
+        writer.set_archive_clock_for_test("20000101T000000000");
+        assert!(basename_lossy_path(&before[8]).as_str() > "audit.jsonl.20000101T000000000");
+
+        rotate_pruning_fixture(&mut writer);
+        let after = real_archives(&path);
+        assert_eq!(after.len(), 10);
+        assert_eq!(&after[..9], &before[..], "the new archive sorts last");
+        assert_eq!(handoff_count(&after[9]), 1);
+        archive_handoff_hash(&after[9]).unwrap();
+        let ok = verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        assert!(ok.hmac_verified);
+        assert_eq!(ok.files_walked, 11);
+
+        rotate_pruning_fixture(&mut writer);
+        let pruned = real_archives(&path);
+        assert!(!before[0].exists(), "the prune proved the chain");
+        assert_eq!(pruned.len(), 10);
+        assert_eq!(&pruned[..9], &after[1..]);
+        assert!(prune_marker_path(&path).exists());
+        let ok = verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        assert!(ok.hmac_verified);
+        assert_eq!(ok.files_walked, 11);
+    }
+
+    /// Twelve rotations inside one timestamp name their archives in creation
+    /// order, past the point where the counter gains a digit, and the log
+    /// verifies after the prunes they cause.
+    #[test]
+    fn rotations_inside_one_timestamp_name_archives_in_creation_order() {
+        use super::super::verify::verify_log;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = AuditWriter::open_keyed_unanchored_for_test(
+            path.clone(),
+            Zeroizing::new(PRUNE_TEST_KEY),
+        )
+        .unwrap();
+        writer.set_archive_clock_for_test("20260101T120000500");
+        writer.write_entry(make_entry("")).unwrap();
+        let mut created = Vec::new();
+        for _ in 0..12 {
+            rotate_pruning_fixture(&mut writer);
+            created.push(real_archives(&path).pop().unwrap());
+        }
+        let mut sorted = created.clone();
+        sorted.sort();
+        assert_eq!(sorted, created, "names sort in creation order");
+        assert_eq!(
+            basename_lossy_path(&created[11]),
+            "audit.jsonl.20260101T120000500-000011"
+        );
+        assert_eq!(real_archives(&path), created[2..]);
+        let ok = verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        assert!(ok.hmac_verified);
+        assert_eq!(ok.files_walked, 11);
+    }
+
+    /// A zero-rooted keyed log beside a valid marker under the same key that
+    /// names other boundaries has no recorded start for its oldest archive.
+    /// Verification fails naming the marker boundary and that archive, the
+    /// prune stops with every archive kept, and with the marker moved aside
+    /// both pass from the zero seed.
+    #[test]
+    fn a_marker_naming_other_boundaries_stops_verify_and_the_prune_alike() {
+        use super::super::verify::{MARKER_NAMES_NO_BOUNDARY_REASON, VerifyError, verify_log};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, true, 10);
+        let real = real_archives(&path);
+        verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        let mut stale = PruneMarker {
+            data: PruneMarkerData {
+                version: 1,
+                oldest: PruneSeed {
+                    file: "audit.jsonl.20000101T000000000".to_owned(),
+                    initial_prev_hash: archive_handoff_hash(&real[0]).unwrap(),
+                },
+                previous: Some(PruneSeed {
+                    file: "audit.jsonl.19991231T235959999".to_owned(),
+                    initial_prev_hash: ZERO_BLOCK_HASH.to_owned(),
+                }),
+                pruned_files: 1,
+            },
+            tag: None,
+        };
+        stale.write(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        let marker = read_prune_marker(&path).unwrap().unwrap();
+        assert!(marker.verify_tag(&PRUNE_TEST_KEY), "the marker is valid");
+        let marker_bytes = fs::read(prune_marker_path(&path)).unwrap();
+
+        let err = verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                VerifyError::ChainBroken { line: 1, file, reason }
+                    if *file == basename_lossy_path(&real[0])
+                        && *reason == MARKER_NAMES_NO_BOUNDARY_REASON
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            oldest_retained_seed(Some(&marker), &basename_lossy_path(&real[0])),
+            Err(MarkerNamesNoBoundary),
+            "the prune reads the same start"
+        );
+        rotate_pruning_fixture(&mut writer);
+        assert_eq!(real_archives(&path).len(), 11, "the prune kept the excess");
+        assert!(real.iter().all(|archive| archive.exists()));
+        assert_eq!(fs::read(prune_marker_path(&path)).unwrap(), marker_bytes);
+
+        let aside = dir.path().join("stale.pruned");
+        fs::rename(prune_marker_path(&path), &aside).unwrap();
+        let ok = verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        assert!(ok.hmac_verified);
+        assert!(
+            ok.warnings.is_empty(),
+            "the log verifies from the zero seed"
+        );
+        rotate_pruning_fixture(&mut writer);
+        assert!(!real[0].exists() && !real[1].exists(), "the prune resumed");
+        assert_eq!(real_archives(&path).len(), 10);
+        let ok = verify_log(&path, Some(&PRUNE_TEST_KEY)).unwrap();
+        assert!(ok.hmac_verified);
+    }
+
+    /// Writes `content` to a fresh file in `dir` and opens it for reading.
+    fn file_holding(dir: &TempDir, content: &[u8]) -> File {
+        let path = dir.path().join("lines");
+        fs::write(&path, content).unwrap();
+        File::open(&path).unwrap()
+    }
+
+    /// `line` after a two-byte first line, with its newline, and the offset
+    /// just past that newline.
+    fn after_a_short_line(line: &[u8]) -> (Vec<u8>, u64) {
+        let mut content = b"a\n".to_vec();
+        content.extend_from_slice(line);
+        content.push(b'\n');
+        let end = content.len() as u64;
+        (content, end)
+    }
+
+    /// Lines whose start or end meets a 4 KiB read window, or that span two
+    /// windows, are read whole.
+    #[test]
+    fn the_boundary_reader_reads_lines_across_its_read_windows() {
+        let dir = TempDir::new().unwrap();
+        for len in [4095, 4096, 4097, 8192] {
+            let line = vec![b'x'; len];
+            let (content, end) = after_a_short_line(&line);
+            let file = file_holding(&dir, &content);
+            assert_eq!(
+                read_line_ending_at(&file, end).unwrap(),
+                Some(line),
+                "a line of {len} bytes"
+            );
+        }
+
+        let mut content = vec![b'x'; 4095];
+        content.extend_from_slice(b"\nnext\n");
+        let file = file_holding(&dir, &content);
+        assert_eq!(
+            read_line_ending_at(&file, 4096).unwrap(),
+            Some(vec![b'x'; 4095]),
+            "the file's first line, ending at the window edge"
+        );
+    }
+
+    /// A line of exactly [`MAX_ROW_BYTES`] with its newline is read; one byte
+    /// more is not.
+    #[test]
+    fn the_boundary_reader_reads_up_to_the_row_cap() {
+        let dir = TempDir::new().unwrap();
+        let cap = usize::try_from(MAX_ROW_BYTES).unwrap();
+        let line = vec![b'x'; cap - 1];
+        let (content, end) = after_a_short_line(&line);
+        let file = file_holding(&dir, &content);
+        assert_eq!(read_line_ending_at(&file, end).unwrap(), Some(line));
+
+        let (content, end) = after_a_short_line(&vec![b'x'; cap]);
+        let file = file_holding(&dir, &content);
+        assert_eq!(read_line_ending_at(&file, end).unwrap(), None);
+    }
+
+    /// An offset whose preceding byte is not a newline, an offset of zero,
+    /// and an offset past the end of the file name no line.
+    #[test]
+    fn the_boundary_reader_needs_a_newline_right_before_the_offset() {
+        let dir = TempDir::new().unwrap();
+        let content = b"first\nsecond\n";
+        let file = file_holding(&dir, content);
+        let len = content.len() as u64;
+        assert_eq!(
+            read_line_ending_at(&file, len).unwrap(),
+            Some(b"second".to_vec())
+        );
+        assert_eq!(
+            read_line_ending_at(&file, 6).unwrap(),
+            Some(b"first".to_vec())
+        );
+        for offset in [len - 1, 5, 7, 0, len + 1] {
+            assert_eq!(
+                read_line_ending_at(&file, offset).unwrap(),
+                None,
+                "offset {offset}"
+            );
+        }
+    }
+
+    /// Whitespace that opens or closes a line comes back with it, so the
+    /// caller can refuse a line the writer would not have written.
+    #[test]
+    fn the_boundary_reader_keeps_whitespace_around_the_line() {
+        let dir = TempDir::new().unwrap();
+        let (content, end) = after_a_short_line(b" \t{}\r");
+        let file = file_holding(&dir, &content);
+        assert_eq!(
+            read_line_ending_at(&file, end).unwrap(),
+            Some(b" \t{}\r".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_reanchor_writes_a_missing_root_tag_and_its_open_does_not() {
+        use super::super::verify::verify_log;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        first_entry_without_its_root_tag(&path, &store);
+
+        let mut writer = AuditWriter::open_for_reanchor(
+            path.clone(),
+            Some(Zeroizing::new(PRUNE_TEST_KEY)),
+            Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+        )
+        .unwrap();
+        assert!(
+            !hmac_sidecar_path(&path).exists(),
+            "opening for a re-anchor changes nothing"
+        );
+        writer.reanchor().unwrap();
+        assert!(hmac_sidecar_path(&path).exists(), "the re-anchor wrote it");
+        drop(writer);
+        assert!(
+            verify_log(&path, Some(&PRUNE_TEST_KEY))
+                .unwrap()
+                .hmac_verified
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_sidecar_never_redirects_the_tag_write() {
+        use super::super::verify::verify_log;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let elsewhere = dir.path().join("elsewhere");
+        fs::write(&elsewhere, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, hmac_sidecar_path(&path)).unwrap();
+        // Unanchored: an anchored open reads any sidecar entry as evidence of a
+        // prior anchor and refuses before the first append.
+        let mut writer = AuditWriter::open_keyed_unanchored_for_test(
+            path.clone(),
+            Zeroizing::new(PRUNE_TEST_KEY),
+        )
+        .unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        assert_eq!(fs::read(&elsewhere).unwrap(), b"untouched");
+        assert!(
+            fs::symlink_metadata(hmac_sidecar_path(&path))
+                .unwrap()
+                .is_file()
+        );
+        assert!(
+            verify_log(&path, Some(&PRUNE_TEST_KEY))
+                .unwrap()
+                .hmac_verified
+        );
+    }
+
+    /// Builds a row whose serialized line, newline included, is `len` bytes
+    /// once `writer` appends it.
+    fn row_of_len(writer: &AuditWriter, len: u64) -> AuditEntry {
+        let mut entry = make_entry("");
+        // No argument keys and the oversize flag already set: the append's
+        // truncation pass then leaves the row as it is.
+        entry.arg_keys.clear();
+        entry.truncated = true;
+        entry.chain_id = Some(String::new());
+        entry.previous_entry_hash = writer.last_entry_hash().to_owned();
+        let base = serde_json::to_vec(&entry).unwrap().len() as u64 + 1;
+        let pad = usize::try_from(len - base).unwrap();
+        entry.chain_id = Some("x".repeat(pad));
+        assert_eq!(serde_json::to_vec(&entry).unwrap().len() as u64 + 1, len);
+        entry
+    }
+
+    #[test]
+    fn a_row_over_the_cap_refuses_and_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = open_keyed_anchored(&path, &store);
+        writer.write_entry(make_entry("")).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let anchor = stored_value(&store);
+        let tip = writer.last_entry_hash().to_owned();
+
+        let row = row_of_len(&writer, MAX_ROW_BYTES + 1);
+        let err = writer.write_entry(row).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WriterError::RowTooLarge { bytes, cap: MAX_ROW_BYTES } if bytes == MAX_ROW_BYTES + 1
+            ),
+            "{err:?}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes, "the file is unchanged");
+        assert_eq!(stored_value(&store), anchor, "the anchor is unchanged");
+        assert_eq!(writer.last_entry_hash(), tip);
+
+        writer.write_entry(make_entry("")).unwrap();
+        writer.require_anchor_current().unwrap();
+    }
+
+    /// A row at the cap appends, and the archive it ends up in stays within
+    /// the prune's read budget.
+    #[test]
+    fn a_row_at_the_cap_appends_and_its_archive_prunes() {
+        use super::super::verify::verify_log;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut writer = pruning_fixture(&path, true, 0);
+        let row = row_of_len(&writer, MAX_ROW_BYTES);
+        let before = fs::metadata(&path).unwrap().len();
+        writer.write_entry(row).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), before + MAX_ROW_BYTES);
+        for _ in 0..10 {
+            rotate_pruning_fixture(&mut writer);
+        }
+        let oldest = real_archives(&path)[0].clone();
+        rotate_pruning_fixture(&mut writer);
+        assert!(!oldest.exists(), "the archive holding the row was pruned");
+        assert_eq!(real_archives(&path).len(), MAX_ROTATED_FILES);
+        assert!(
+            verify_log(&path, Some(&PRUNE_TEST_KEY))
+                .unwrap()
+                .hmac_verified
+        );
+    }
+
+    /// A valid marker padded past the read cap is refused as malformed without
+    /// being parsed, which stops the prune. Read whole, the padded marker would
+    /// parse and the prune would proceed.
+    #[test]
+    fn an_oversized_prune_marker_stops_the_prune() {
+        use super::super::verify::SIDECAR_READ_CAP;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let (mut writer, store) = anchored_pruning_fixture(&path, 11);
+        let mut padded = fs::read(prune_marker_path(&path)).unwrap();
+        padded.resize(usize::try_from(SIDECAR_READ_CAP).unwrap() + 1, b' ');
+        assert!(serde_json::from_slice::<PruneMarker>(&padded).is_ok());
+        fs::write(prune_marker_path(&path), &padded).unwrap();
+        assert_prune_failure_keeps_the_rotation(&mut writer, &store, Some(padded.as_slice()));
+        assert!(matches!(
+            read_prune_marker(&path),
+            Err(super::super::verify::VerifyError::ParseError { detail, .. })
+                if detail.contains("exceeds")
+        ));
     }
 
     #[test]
@@ -4937,65 +8044,72 @@ mod tests {
         ));
     }
 
+    /// The next archive suffix sorts strictly after the newest archive's and
+    /// is a rotated-sibling suffix, whether the clock moved past the newest
+    /// archive, stood still, or was set back, and whatever counter the newest
+    /// archive carries.
     #[test]
-    fn compact_timestamp_keeps_same_ms_calls_distinct() {
-        const CALLS: usize = 100;
-        const ATTEMPTS: usize = 10;
-
-        let mut observed_same_ms_prefix = false;
-        for _ in 0..ATTEMPTS {
-            let barrier = Arc::new(Barrier::new(CALLS + 1));
-            let timestamps = Arc::new(Mutex::new(Vec::with_capacity(CALLS)));
-            let handles: Vec<_> = (0..CALLS)
-                .map(|_| {
-                    let barrier = Arc::clone(&barrier);
-                    let timestamps = Arc::clone(&timestamps);
-                    std::thread::spawn(move || {
-                        barrier.wait();
-                        let timestamp = compact_timestamp();
-                        timestamps.lock().unwrap().push(timestamp);
-                    })
-                })
-                .collect();
-
-            barrier.wait();
-            for handle in handles {
-                handle.join().unwrap();
+    fn the_next_archive_suffix_sorts_after_the_newest() {
+        let now = "20260101T120000500";
+        let cases = [
+            (None, Some(now)),
+            (Some("20260101T120000499"), Some(now)),
+            (Some("20260101T115959"), Some(now)),
+            (Some(now), Some("20260101T120000500-000001")),
+            (
+                Some("20260101T130000000"),
+                Some("20260101T130000000-000001"),
+            ),
+            (
+                Some("20260101T130000000-000009"),
+                Some("20260101T130000000-000010"),
+            ),
+            (Some("20260101T130000"), Some("20260101T130000000")),
+            (
+                Some("20260101T130000000-9"),
+                Some("20260101T130000000-900000"),
+            ),
+            (
+                Some("20260101T130000000-10"),
+                Some("20260101T130000000-100000"),
+            ),
+            (
+                Some("20260101T130000000-1234567"),
+                Some("20260101T130000000-123457"),
+            ),
+            (Some("20260101T130000000-999999"), None),
+            (Some("20260101T130000000-99999993"), None),
+        ];
+        for (newest, expected) in cases {
+            let next = next_archive_suffix(now, newest);
+            assert_eq!(next.as_deref(), expected, "after {newest:?}");
+            let Some(next) = next else { continue };
+            if let Some(newest) = newest {
+                assert!(next.as_str() > newest, "{next} sorts after {newest}");
             }
-
-            let timestamps = timestamps.lock().unwrap().clone();
-            let distinct: HashSet<_> = timestamps.iter().cloned().collect();
-            assert_eq!(
-                distinct.len(),
-                CALLS,
-                "rotation timestamps must be unique: {timestamps:?}"
-            );
-
-            let has_same_ms_prefix = timestamps.iter().any(|timestamp| {
-                let prefix = timestamp
-                    .split_once('-')
-                    .map_or(timestamp.as_str(), |(prefix, _)| prefix);
-                timestamps
-                    .iter()
-                    .filter(|other| {
-                        other
-                            .split_once('-')
-                            .map_or(other.as_str(), |(other_prefix, _)| other_prefix)
-                            == prefix
-                    })
-                    .count()
-                    > 1
-            });
-            if has_same_ms_prefix {
-                observed_same_ms_prefix = true;
-                break;
-            }
+            assert!(is_rotated_sibling(
+                "audit.jsonl",
+                &format!("audit.jsonl.{next}")
+            ));
         }
+    }
 
-        assert!(
-            observed_same_ms_prefix,
-            "expected at least one shared millisecond prefix across {CALLS} calls"
-        );
+    /// Successive suffixes inside one millisecond sort in the order they were
+    /// taken, past the point where a counter gains a digit.
+    #[test]
+    fn same_millisecond_archive_suffixes_sort_in_creation_order() {
+        let now = "20260101T120000500";
+        let mut newest: Option<String> = None;
+        let mut taken = Vec::new();
+        for _ in 0..12 {
+            let next = next_archive_suffix(now, newest.as_deref()).unwrap();
+            taken.push(next.clone());
+            newest = Some(next);
+        }
+        let mut sorted = taken.clone();
+        sorted.sort();
+        assert_eq!(sorted, taken);
+        assert_eq!(taken[11], "20260101T120000500-000011");
     }
 
     /// Reject: only 1 digit after T — too short.
@@ -5092,7 +8206,13 @@ mod tests {
         for name in MULTIBYTE_AT_BYTE_8_NAMES {
             fs::write(dir.path().join(name), b"not an archive\n").unwrap();
         }
-        writer.prune_rotated_files().unwrap();
+        writer
+            .prune_rotated_files(&RotatedArchive {
+                path: &dir.path().join("audit.jsonl.20260101T000000000"),
+                seed: ZERO_BLOCK_HASH.to_owned(),
+                handoff: ZERO_BLOCK_HASH.to_owned(),
+            })
+            .unwrap();
         for name in MULTIBYTE_AT_BYTE_8_NAMES {
             assert!(dir.path().join(name).exists(), "{name} must be left alone");
         }
@@ -7992,18 +11112,7 @@ mod tests {
         let mut writer = open_anchored(&path, &store).unwrap();
         writer.write_entry(make_entry("")).unwrap();
 
-        // Pad the file past the rotation threshold through a second handle,
-        // APPENDING blank lines: the log carries no lock, every reader here
-        // tolerates blanks, and the entry the writer last wrote stays where it
-        // is, so the rotation this triggers is the writer's own rather than a
-        // rewrite of its tip.
-        {
-            let mut padding = OpenOptions::new().append(true).open(&path).unwrap();
-            padding
-                .write_all(&vec![b'\n'; ROTATION_THRESHOLD_BYTES as usize])
-                .unwrap();
-            padding.sync_data().unwrap();
-        }
+        let _threshold = super::super::rotation::test_seam::set_rotation_threshold(&path, 1);
         if let Ok(mut force_path) = FORCE_NEXT_ROTATION_CREATE_FAILURE_PATH.lock() {
             *force_path = Some(path.clone());
         }
@@ -8156,6 +11265,71 @@ mod tests {
         assert!(
             open_anchored(&path, &store).is_err(),
             "the refusal must outlive the writer that made it"
+        );
+    }
+
+    fn assert_append_after_foreign_bytes_refuses(bytes: &[u8]) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        let original = fs::read(&path).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+        let grown = fs::read(&path).unwrap();
+        assert_eq!(grown.len(), original.len() + bytes.len());
+        for _ in 0..2 {
+            let err = writer.write_entry(make_entry("")).unwrap_err();
+            assert!(matches!(err, WriterError::TipAnchorMismatch { reason, .. }
+                if reason == LOG_GREW_REASON));
+            assert_eq!(writer.log_diverged, Some(LOG_GREW_REASON));
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                grown,
+                "the refused row writes no bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn an_append_after_foreign_growth_refuses() {
+        let (line, _) = serialised_entry_line(ZERO_BLOCK_HASH);
+        assert_append_after_foreign_bytes_refuses(&line);
+    }
+
+    #[test]
+    fn an_append_after_a_foreign_torn_prefix_refuses() {
+        assert_append_after_foreign_bytes_refuses(b"{\"foreign\":");
+    }
+
+    /// A full `write_all` whose `sync_data` fails leaves a line the writer's
+    /// state does not account for; the next append refuses on the growth.
+    #[test]
+    fn an_append_after_a_failed_sync_refuses() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = open_anchored(&path, &store).unwrap();
+        writer.write_entry(make_entry("")).unwrap();
+        let before = fs::read(&path).unwrap();
+        writer.set_fail_sync_after_entry_write(true);
+        assert!(writer.write_entry(make_entry("")).is_err());
+        writer.set_fail_sync_after_entry_write(false);
+        let written = fs::read(&path).unwrap();
+        assert!(written.len() > before.len() && written.ends_with(b"\n"));
+        let err = writer.write_entry(make_entry("")).unwrap_err();
+        assert!(matches!(err, WriterError::TipAnchorMismatch { reason, .. }
+            if reason == LOG_GREW_REASON));
+        assert_eq!(writer.log_diverged, Some(LOG_GREW_REASON));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            written,
+            "the refused row writes no bytes"
         );
     }
 

@@ -155,6 +155,103 @@ Each log file gets a `<file>.root_hmac` sidecar holding an HMAC-SHA256 tag (`sha
 4. When `hmac_key` is supplied, each file's `.root_hmac` sidecar verifies on its first entry; a wrong tag is `HmacMismatch` and a missing sidecar is `HmacSidecarMissing` (with a key configured, a sidecar must exist for every file).
 5. When an anchor is supplied, the active file's tip is the anchored tip, or ahead of it; anything else is `TipAnchorMismatch`. The CLI supplies one only when `--profile` is given AND the positional path is the log that profile configures, since the anchor names a path; every other case reports `anchor.status = "not_checked"` with the reason and verifies the chain alone.
 
+Before the walk, the rule the prune applies too picks the first file's seed:
+the zero seed without `<log>.pruned`, and otherwise the seed the marker records
+for that file as its `oldest` or `previous` boundary. A marker that names
+neither fails with `audit.chain_broken`, reason
+`prune_marker_names_neither_boundary`, at line 1 of that file. With a key, a
+null or wrong tag refuses with `audit.hmac_mismatch`. A malformed marker
+refuses with `audit.parse_error`. Without a key the seed is unauthenticated. A
+nonzero seed adds `pruned_prefix`, naming the first file and the count of
+pruned archives. Later files chain from the walk's computed tip. A deletion
+beyond the marker or an interior edit still breaks verification.
+
+The writer prunes after the new active file exists, so a prune never fails the
+rotation. It deletes only archives of one fully validated chain that ends at
+the archive just rotated. Before any deletion it replays every archive from the
+oldest to that one. The oldest archive's first entry must chain from the seed
+the marker records for it, or from the zero seed when no marker exists, so the
+start of the retained history is authenticated the same way verification
+authenticates it. A log whose oldest archives or marker were removed outside
+the prune stalls every prune until the operator recovers it
+([audit-log recovery, section 11](audit-log-recovery.md#11-retained-history-without-an-authenticated-start)).
+Each archive must open as a regular file without following a symlink or waiting
+on a FIFO, and stay within a read budget: 1 MiB per line and the rotation
+threshold plus 2 MiB per archive. Every entry must chain from the one before
+it, each archive's first entry from its predecessor's handoff, and each archive
+must end on a handoff naming it. A keyed writer also requires each archive's
+first entry to carry a chain-root tag that verifies under its key. The links
+bind the entries into one sequence, and the tags bind where that sequence
+divides into files: an archive split at a handoff inside it still links, but
+the part after the split carries no valid tag and stops the prune. The writer
+writes no such archive, because a handoff is always the last entry of its file.
+An unkeyed writer checks the links only. The just-rotated archive is checked
+against the seed and handoff the writer holds in memory, never against what its
+file states. The writer names each archive so it sorts after every existing
+archive of the log: the current millisecond when that sorts after the newest
+archive, and otherwise the newest archive's timestamp with the next six-digit
+counter. The name order the prune, the open, and verification read is therefore
+the creation order, also across a clock set back. A sibling placed under a name
+that sorts after every archive precedes the next archive and stalls the prune
+until it is removed. A copy of an archive already pruned, planted back with its
+tag, carries that archive's own name, sorts oldest, and is deleted first or
+stops the prune at the marker. The writer syncs the marker before removing each
+archive and its sidecar. The prune trusts the proof it just made and does not
+recheck a file between the proof and its deletion; a concurrent writer of the
+audit directory is outside its guarantee. The `previous` seed lets verification
+walk an archive whose removal fails or is interrupted. Key rotation re-signs
+the marker as well as the root sidecars.
+
+The read budget holds every archive the writer produces. An append whose
+serialized row, newline included, exceeds 1 MiB refuses with
+`audit.row_too_large` and never writes the row. A supplied entry is measured
+before the append's checks, drain, or rotation, so the file, the chain, the
+anchor, and the audit directory stay unchanged. A row the append builds itself
+exists only after the rotation the file was due for, which can precede the
+refusal. Each archive holds one rotation handoff, its last entry. A rotation
+whose renames fail leaves its handoff pending. Every path that takes up a file
+ending on a handoff naming a rotated sibling holds it as pending: the open, an
+acquisition that replays bytes past the anchor, such as a handoff whose fsync
+failed, and `audit reanchor`. A writer without an anchor whose handoff write,
+flush, or fsync fails replays the file past its last entry before its next
+append, the same way. An anchored writer adopts it in the anchor check of its
+next acquisition; an append without that check refuses with
+`audit.tip_anchor_mismatch` and latches. The next append of any row, including
+the adoption row and the repair rows, first renames the file under that
+handoff's archive name and appends no second handoff, so no row follows a
+handoff and retries never grow an archive. A rename never replaces an existing
+file: a rotation whose archive name, or its sidecar's name, is taken refuses
+with `audit.rotation_bridge_unusable`, and so does an open whose active file
+ends on a handoff naming an existing file. A rotation that finds no name after
+the newest archive refuses with the same code and writes nothing. The check
+runs right before the renames; a concurrent writer of the audit directory is
+outside its guarantee.
+
+A keyed writer writes a file's chain-root tag after its first entry is durable
+and replaces the sidecar atomically through a temp file and a rename. A crash
+between the two leaves a file with entries and no tag. A keyed open writes the
+missing tag only after its anchor check proves the file is what the writer's
+lineage wrote: a replay from byte 0 yields exactly the anchored entry count,
+the last of those entries ends at the anchored offset, and its hash is the
+anchored tip. An anchored file that fails the proof refuses at open with
+`audit.tip_anchor_mismatch`. The tag binds where the file starts, so it is
+written only when the first entry starts at byte 0; the writer writes no blank
+lines or indentation. An open that adopts an unanchored file, or a keyed open
+without an anchor store, writes no tag. `audit reanchor` writes it after its
+anchor move, as the operator's acknowledgement of the file as it stands. Both
+run before any append can rotate the file. A file that an unkeyed writer both
+starts and rotates carries no tag and stalls a keyed prune until `profile
+rotate-audit-key` re-signs it.
+
+A planted, edited, split, unreadable, or oversized file in the counted range,
+from the oldest archive to the one just rotated, stalls pruning until it is
+removed, and so does an archive whose tag is missing or does not verify under
+a keyed writer's key. The prune also stops on a marker that does not
+parse, exceeds 16 KiB, does not authenticate under the writer's key, or names
+neither boundary, a failed marker write, or a failed removal. Every stop logs a
+warning naming the file and the cause, and keeps the excess archives. Past 21
+rotated files, open and verify refuse with `audit.too_many_rotated_files`.
+
 The `EventKind` match in the verifier is exhaustive with no wildcard arm, so adding an event variant forces a compile error until the verifier is updated.
 
 A backward timestamp jump larger than `BACKWARD_TS_WARN_THRESHOLD_MS` (60000 ms) is reported as a warning, not a failure, because NTP corrections can move wall-clock time backward.
@@ -166,7 +263,9 @@ the zero hash. The eleventh rotation deletes the oldest archive. The lookup
 runs outside the append's mutex. Two concurrent reconciliations of one hash can
 both find an owed row, and any concurrent in-process append can rotate the log
 between the file listing and the scan, renaming the matched file out of the
-walk. Writer-managed history holds at most eleven files of about 10 MiB each.
+walk. Writer-managed history holds at most eleven files of about 10 MiB each
+when pruning succeeds. A prune that stops leaves excess archives, for the
+causes listed above.
 Each lookup parses JSON and computes SHA-256 once per row visited, per settled
 row and in each gate pass that reconciles. When the settlement lookup cannot
 read the history, `tx status` and `stellar_transaction_status` log the error
@@ -240,7 +339,7 @@ That state is recognised rather than guessed. An anchor whose tip hash equals th
 
 **File identity.** Every read the anchor check makes except this one goes through the writer's single handle, which is the right source for the bytes it will append after. The file at the PATH is a different question. A `mv` over the log leaves the handle on the previous, now unnamed file, whose tail is exactly the anchored one. So every content comparison passes while the appends land where nothing can read them and the log an operator sees stays behind the anchor. The check therefore resolves the file at the path and compares its identity against the handle. Identity is device and inode on Unix, volume serial and file index on Windows, both through `same-file`. The check reads the length through the path rather than the handle. A mismatch, and a path holding no file at all, refuse under `audit.tip_anchor_mismatch`, and the refusal's detail names the log as replaced underneath the writer rather than as shorter than the anchor. The replacement is never adopted.
 
-**The append is checked too.** A caller acquires the writer, signs, submits, and appends afterward, so a check made only at acquisition leaves that whole span uncovered. Every append by an anchored writer therefore proves three things about the file at the path before it writes. First, it proves that it is the same file the handle holds. Second, it proves that it is no shorter than where this writer last appended. Third, it proves that the entry ending there is still the one this writer wrote. Those are the three shapes a divergence takes: a rename moves the identity; an in-place truncation moves the end; an in-place overwrite of the same length moves neither. Each refuses under `audit.tip_anchor_mismatch` with its own reason in the message. The cost is one identity comparison, one `stat`, and one entry read plus hash per row, with no keyring round trip.
+**The append is checked too.** A caller acquires the writer, signs, submits, and appends afterward, so acquisition alone leaves that span uncovered. Every anchored append checks four shapes of divergence: replacement, truncation, growth, and a same-length overwrite. It compares file identity, requires the length to equal the writer's last append or replay length, and hashes the entry at its cached tip offset. A replay includes tolerated trailing blank lines in that length; the anchor still names the last entry. Extra complete rows, torn prefixes, and bytes left after a failed sync all refuse before the next append. Each shape uses `audit.tip_anchor_mismatch` with its own reason. The cost is one identity comparison, one `stat`, and one entry read plus hash per row, with no keyring round trip. Open and keyed acquisition still accept an intact tail ahead of the anchor, because anchor writes are best-effort.
 
 A refused append is durable, not merely in-process. The action the row was going to prove has already committed. A refusal that lived only in the writer's memory would be erased by a restart. The file at the path (an attacker's byte-identical copy included) would satisfy the anchor again. The writer therefore anchors the row it was owed: entry count plus one, the hash that row would have carried, and the offset it would have ended at. Every file at that path is then short of the anchor by exactly that row. So every later open refuses until an operator runs `audit reanchor --acknowledge-rollback`. Its report shows one more anchored entry than the file holds. Its row records the superseded anchor permanently. An anchor exactly one entry ahead of a log whose own chain verifies is that signature. The anchor write is best-effort like every other. If the keyring rejects it, the refusal still stands for this writer and for every caller still holding it. The next refused append retries it. That refusal does not survive the process.
 
@@ -252,7 +351,7 @@ The registry evicts a writer that fails the check. The entry is kept as a tombst
 
 **Keyed opens always carry the anchor.** A keyed writer's rows are the ones `audit verify` covers and the ones worth removing, so a keyed open that did not advance the anchor would leave its rows unguarded. The registry's keyed entry point and the writer constructor both take a type that pairs the chain-root key with the anchor store and cannot be built without both, and one helper in the network crate produces the pair from the profile's audit keyring coordinate. The unkeyed entry point takes neither, and the anchored constructor the rotation verb uses takes the store as a required argument with the key optional, since a profile that has not minted a chain-root key yet still anchors. There is no way, at either level, to present a key without a handle.
 
-**Residual: the replacement between the append's check and its write syscall.** The append proves the three things above and then issues the write; a replacement landing between the two still lands the row in the file that was displaced. The window is those adjacent syscalls rather than the whole sign-and-submit span, and closing it entirely would need the write and the proof to be one operation, which no filesystem offers. Detection is unaffected: the append advances the anchor to describe the displaced file. So the next acquisition refuses and every one after it refuses the file at the path as shorter than the anchor, until `audit reanchor`. Nothing is laundered: a file at the path that satisfied the advanced anchor would have to contain the very row being removed.
+**Residual: the replacement between the append's check and its write syscall.** The append checks the four shapes above and then issues the write; a replacement landing between the two still lands the row in the file that was displaced. The window is those adjacent syscalls rather than the whole sign-and-submit span, and closing it entirely would need the write and the proof to be one operation, which no filesystem offers. Detection is unaffected: the append advances the anchor to describe the displaced file. So the next acquisition refuses and every one after it refuses the file at the path as shorter than the anchor, until `audit reanchor`. Nothing is laundered: a file at the path that satisfied the advanced anchor would have to contain the very row being removed.
 
 **Residual: the best-effort append window.** A row whose anchor write fails twice remains durable and unanchored until a successful retry or keyed acquisition. The latch lives only in memory. After process exit, rollback to the previous anchor silently loses that tail. A submission recorded through the pending row, the window-state reset, and an x402 payment never proceed while repair is owed. MPP's charge row and unkeyed writers remain outside this rule.
 

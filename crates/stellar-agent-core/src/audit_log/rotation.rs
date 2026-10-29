@@ -5,13 +5,38 @@
 //!
 //! # Rotation policy
 //!
-//! - **Threshold:** [`ROTATION_THRESHOLD_BYTES`] — 10 MiB.  When the active
+//! - **Threshold:** [`ROTATION_THRESHOLD_BYTES`], 10 MiB.  When the active
 //!   log file reaches or exceeds this size, [`super::writer::AuditWriter`]
 //!   writes an `AuditRotationHandoff` entry, renames the active file to an
 //!   archive with a compact timestamp suffix, and opens a fresh active file.
-//! - **Retention:** [`MAX_ROTATED_FILES`] — 10 archived copies.  When the
-//!   11th rotation occurs, the oldest archived file (and its `.root_hmac`
-//!   sidecar) is deleted.
+//! - **Retention:** [`MAX_ROTATED_FILES`], 10 archived copies. Each excess
+//!   archive is deleted with its `.root_hmac` sidecar after a durable
+//!   `<log>.pruned` marker records the successor's chain seed. The marker
+//!   retains the outgoing file's seed so an interrupted deletion still verifies.
+//!   The prune runs after the new active file exists and never fails the
+//!   rotation. It deletes only archives of one fully validated chain that
+//!   ends at the archive just rotated: every archive is a regular file within
+//!   the read budget, every entry chains from the one before it, the oldest
+//!   archive chains from the seed the marker records for it or, with no
+//!   marker, from the zero seed, each later archive chains from its
+//!   predecessor's handoff, under a keyed writer every
+//!   archive's first entry carries a chain-root tag that verifies under its
+//!   key, and the just-rotated archive matches the boundaries the writer holds
+//!   in memory. A planted, edited, split, unreadable, or oversized file in
+//!   that range therefore stalls pruning until it is removed; a sibling that
+//!   sorts after the newest archive is outside the chain, never counted, and
+//!   never deleted. The prune trusts the proof it just made, and a concurrent
+//!   writer of the audit directory is outside its guarantee. Each archive
+//!   holds one rotation handoff, its last entry: a retried rotation renames
+//!   under its pending handoff and appends no second one, and no rename
+//!   replaces an existing file. The prune also stops with a
+//!   warning and keeps the excess archives on a marker that does not parse,
+//!   does not authenticate, or names neither boundary, a failed marker write,
+//!   or a failed deletion.
+//!   Past `ROTATED_FILE_CHAIN_CAP` (21) rotated files, open and verify refuse
+//!   with `audit.too_many_rotated_files`.
+//!   A keyed writer authenticates the marker with HMAC-SHA256; an unkeyed
+//!   writer records a null tag. The marker counts pruned files.
 //!
 //! # Cross-file hash-chain bridge
 //!
@@ -42,10 +67,131 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
 
-use super::chain::sign_chain_root;
+use serde::{Deserialize, Serialize};
+
+use super::chain::{ZERO_BLOCK_HASH, sign_chain_root, verify_chain_root};
 use super::entry::AuditEntry;
-use super::verify::collect_file_chain;
-use super::writer::hmac_sidecar_path;
+use super::verify::{SIDECAR_READ_CAP, VerifyError, collect_file_chain, read_small_regular_file};
+use super::writer::{hmac_sidecar_path, prune_marker_path};
+
+/// A retained boundary and the hash its first entry chains from.
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct PruneSeed {
+    pub file: String,
+    pub initial_prev_hash: String,
+}
+
+/// Fixed field order for the authenticated prune-marker payload.
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct PruneMarkerData {
+    pub version: u32,
+    pub oldest: PruneSeed,
+    pub previous: Option<PruneSeed>,
+    pub pruned_files: u64,
+}
+
+/// The retention boundary, authenticated separately from each file's root.
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct PruneMarker {
+    #[serde(flatten)]
+    pub data: PruneMarkerData,
+    pub tag: Option<String>,
+}
+
+/// A prune marker that names neither of its boundaries as the oldest retained
+/// file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MarkerNamesNoBoundary;
+
+/// The hash the oldest retained file `oldest`, a basename, chains from: the one
+/// rule the prune and `verify_log` both read the start of the retained history
+/// by, so the two never disagree on it.
+///
+/// Without a marker nothing was pruned, and the oldest file is the chain's
+/// root, which chains from the zero seed. With one, the oldest file is a
+/// boundary the marker records, and its recorded seed is the answer. A marker
+/// that records no seed for the oldest file describes boundaries other than
+/// the history present, so no start is chosen: the prune stops, verify fails,
+/// and the operator decides (docs/maintainers/audit-log-recovery.md section
+/// 11).
+///
+/// # Errors
+///
+/// [`MarkerNamesNoBoundary`] when `marker` names neither boundary as `oldest`.
+pub(super) fn oldest_retained_seed<'marker>(
+    marker: Option<&'marker PruneMarker>,
+    oldest: &str,
+) -> Result<&'marker str, MarkerNamesNoBoundary> {
+    match marker {
+        None => Ok(ZERO_BLOCK_HASH),
+        Some(marker) => marker.seed_for(oldest).ok_or(MarkerNamesNoBoundary),
+    }
+}
+
+impl PruneMarker {
+    /// Returns the recorded seed of `file` when it is the marker's `oldest` or
+    /// `previous` boundary, and `None` for any other basename.
+    pub(super) fn seed_for(&self, file: &str) -> Option<&str> {
+        std::iter::once(&self.data.oldest)
+            .chain(self.data.previous.as_ref())
+            .find(|seed| seed.file == file)
+            .map(|seed| seed.initial_prev_hash.as_str())
+    }
+
+    fn signing_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let mut bytes = b"stellar-agent-audit-prune:v1".to_vec();
+        serde_json::to_writer(&mut bytes, &self.data)?;
+        Ok(bytes)
+    }
+
+    pub(super) fn verify_tag(&self, key: &[u8; 32]) -> bool {
+        match (&self.tag, self.signing_bytes()) {
+            (Some(tag), Ok(bytes)) => verify_chain_root(key, &bytes, tag).is_ok(),
+            _ => false,
+        }
+    }
+
+    pub(super) fn write(&mut self, log_path: &Path, key: Option<&[u8; 32]>) -> Result<(), String> {
+        self.tag = key
+            .map(|key| {
+                let bytes = self.signing_bytes().map_err(|e| e.to_string())?;
+                sign_chain_root(key, &bytes).map_err(|e| e.to_string())
+            })
+            .transpose()?;
+        let bytes = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        write_sidecar_atomic(&prune_marker_path(log_path), &bytes)
+    }
+}
+
+/// Reads the optional marker; size, syntax, and version failures name the
+/// sidecar.
+///
+/// The read stops past [`SIDECAR_READ_CAP`], and a longer file is refused as
+/// malformed before any of it is parsed.
+pub(super) fn read_prune_marker(log_path: &Path) -> Result<Option<PruneMarker>, VerifyError> {
+    let path = prune_marker_path(log_path);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let malformed = |detail: String| VerifyError::ParseError {
+        line: 1,
+        detail: format!("{name}: {detail}"),
+    };
+    let bytes = match read_small_regular_file(&path, SIDECAR_READ_CAP) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return Err(malformed(format!(
+                "the marker exceeds {SIDECAR_READ_CAP} bytes"
+            )));
+        }
+        Err(VerifyError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let marker: PruneMarker =
+        serde_json::from_slice(&bytes).map_err(|e| malformed(e.to_string()))?;
+    if marker.data.version != 1 {
+        return Err(malformed("unsupported prune marker version".to_owned()));
+    }
+    Ok(Some(marker))
+}
 
 /// Error re-signing an audit-log chain-root sidecar during audit-key rotation.
 ///
@@ -108,7 +254,8 @@ impl std::error::Error for SidecarResignError {}
 /// appended, so a row that happens to open a new file has that file's chain
 /// root brought onto the new key by the same pass.
 ///
-/// Returns the number of sidecars re-signed.
+/// The optional `<log>.pruned` marker is also re-signed under `new_key`.
+/// Returns the number of sidecars re-signed, including that marker.
 ///
 /// # Errors
 ///
@@ -144,12 +291,29 @@ pub fn resign_chain_root_sidecars(
             file: file_name.clone(),
             detail: format!("HMAC sign: {e}"),
         })?;
-        write_sidecar_atomic(&hmac_sidecar_path(&file), &tag).map_err(|detail| {
+        write_sidecar_atomic(&hmac_sidecar_path(&file), tag.as_bytes()).map_err(|detail| {
             SidecarResignError::File {
                 file: file_name.clone(),
                 detail,
             }
         })?;
+        resigned += 1;
+    }
+    let marker_name = prune_marker_path(log_path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    if let Some(mut marker) = read_prune_marker(log_path).map_err(|e| SidecarResignError::File {
+        file: marker_name.clone(),
+        detail: e.to_string(),
+    })? {
+        marker
+            .write(log_path, Some(new_key))
+            .map_err(|detail| SidecarResignError::File {
+                file: marker_name,
+                detail,
+            })?;
         resigned += 1;
     }
     Ok(resigned)
@@ -165,9 +329,14 @@ fn read_first_entry(file: &Path) -> Result<AuditEntry, String> {
     serde_json::from_str::<AuditEntry>(first_line).map_err(|e| format!("parse first entry: {e}"))
 }
 
-/// Atomically writes `tag` to the sidecar via a sibling temp file plus rename,
+/// Atomically writes `bytes` to the sidecar via a sibling temp file plus rename,
 /// mirroring the writer's `0o600` + `sync_data` durability discipline.
-fn write_sidecar_atomic(sidecar: &Path, tag: &str) -> Result<(), String> {
+///
+/// A stale entry at the temp path is unlinked, never followed, and the temp
+/// file is then created exclusively. A symlink planted there can therefore
+/// neither redirect the write nor survive to the rename; one recreated in
+/// between makes the exclusive create fail.
+pub(super) fn write_sidecar_atomic(sidecar: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut tmp = sidecar.to_path_buf();
     let name = tmp
         .file_name()
@@ -175,14 +344,18 @@ fn write_sidecar_atomic(sidecar: &Path, tag: &str) -> Result<(), String> {
         .ok_or_else(|| "sidecar path has no file name".to_owned())?
         .to_owned();
     tmp.set_file_name(format!("{name}.tmp"));
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("remove stale temp sidecar: {e}")),
+    }
     {
         #[cfg(unix)]
         let mut f = {
             use std::os::unix::fs::OpenOptionsExt as _;
             OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
                 .open(&tmp)
                 .map_err(|e| format!("open temp sidecar: {e}"))?
@@ -190,11 +363,10 @@ fn write_sidecar_atomic(sidecar: &Path, tag: &str) -> Result<(), String> {
         #[cfg(not(unix))]
         let mut f = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&tmp)
             .map_err(|e| format!("open temp sidecar: {e}"))?;
-        f.write_all(tag.as_bytes())
+        f.write_all(bytes)
             .map_err(|e| format!("write temp sidecar: {e}"))?;
         f.write_all(b"\n")
             .map_err(|e| format!("write temp sidecar newline: {e}"))?;
@@ -436,6 +608,42 @@ mod tests {
             reversed[reversed.len() - 1],
             suffixes[0],
             "last element after reverse must be the oldest (first chronological) suffix"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_temp_file_never_redirects_the_marker_write() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("victim");
+        fs::write(&target, b"outside the log directory").unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let marker_path = prune_marker_path(&path);
+        std::os::unix::fs::symlink(&target, dir.path().join("audit.jsonl.pruned.tmp")).unwrap();
+        let mut marker = PruneMarker {
+            data: PruneMarkerData {
+                version: 1,
+                oldest: PruneSeed {
+                    file: "audit.jsonl.20260101T000000000".to_owned(),
+                    initial_prev_hash: super::super::chain::ZERO_BLOCK_HASH.to_owned(),
+                },
+                previous: None,
+                pruned_files: 1,
+            },
+            tag: None,
+        };
+        marker.write(&path, None).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"outside the log directory");
+        assert!(
+            !fs::symlink_metadata(&marker_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            read_prune_marker(&path).unwrap().unwrap().data.pruned_files,
+            1
         );
     }
 }
