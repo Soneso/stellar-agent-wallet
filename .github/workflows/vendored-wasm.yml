@@ -9,8 +9,13 @@ name: vendored-wasm
 # The check job runs the tree check and the script's self-test on every event.
 # When a change can affect a rebuild, two macOS jobs provide the pinned
 # stellar-cli binaries, and the rebuild job rebuilds every manifest file and
-# compares it byte for byte. The vendored-wasm job reads every job result and
-# is the check to require; a job that if: skips reports success on its own.
+# compares it byte for byte. The vendored-wasm job reads every job result,
+# and on a tag it passes only after a rebuild. Tag runs happen inside the
+# release and build both stellar-cli binaries from source. The rebuild reads
+# the install roots from this run's artifacts. No job or step continues on an
+# error, and no step of the check, rebuild, or vendored-wasm job suppresses a
+# failure, so the release's signing, provenance, and publication jobs see
+# every failed check of this workflow.
 #
 # A newer push to a pull request cancels that pull request's older run. Every
 # main, tag, scheduled, and dispatched run has a concurrency group of its own.
@@ -18,11 +23,11 @@ name: vendored-wasm
 # of main, or the rebuild of a merged vendor change.
 
 on:
+  workflow_call:
   pull_request:
     branches: [main]
   push:
     branches: [main]
-    tags: ['v*']
   # Twice a week, so the stellar-cli cache entries stay inside the seven-day
   # eviction window.
   schedule:
@@ -82,8 +87,6 @@ jobs:
     if: needs.check.outputs.rebuild == 'true'
     runs-on: macos-26
     timeout-minutes: 120
-    outputs:
-      key: ${{ steps.key.outputs.key }}
     env:
       CLI_VERSION: 25.2.0
       CLI_COMMIT: 28484880988199233a7e8e87c97cb12dac323cb3
@@ -102,6 +105,7 @@ jobs:
         run: echo "key=stellar-cli-$CLI_VERSION-archive-$CLI_COMMIT-rustc-$HOST_RUSTC-$OS_NAME-$ARCH_NAME-r$RECIPE_REVISION" >>"$GITHUB_OUTPUT"
       - name: Restore the install root
         id: restore
+        if: github.ref_type != 'tag'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/stellar-cli-25
@@ -137,8 +141,18 @@ jobs:
             echo "the first --version line is '$first', not '$VERSION_LINE'" >&2
             exit 1
           fi
+      - name: Pack the install root
+        run: |
+          COPYFILE_DISABLE=1 /usr/bin/tar --create --format ustar --no-xattrs --no-acls --no-fflags \
+            --file "$RUNNER_TEMP/stellar-cli-25.tar" -C "$RUNNER_TEMP" stellar-cli-25
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vendored-wasm-stellar-cli-25
+          path: ${{ runner.temp }}/stellar-cli-25.tar
+          retention-days: 1
+          if-no-files-found: error
       - name: Save the install root
-        if: steps.restore.outputs.cache-hit != 'true'
+        if: github.ref_type != 'tag' && steps.restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/stellar-cli-25
@@ -150,8 +164,6 @@ jobs:
     if: needs.check.outputs.rebuild == 'true'
     runs-on: macos-26
     timeout-minutes: 120
-    outputs:
-      key: ${{ steps.key.outputs.key }}
     env:
       CLI_VERSION: 28.1.0
       CLI_COMMIT: c0f4d0da891bbf214c08b8c5035ae6db80e9a3bd
@@ -170,6 +182,7 @@ jobs:
         run: echo "key=stellar-cli-$CLI_VERSION-crates-io-$CLI_COMMIT-rustc-$HOST_RUSTC-$OS_NAME-$ARCH_NAME-r$RECIPE_REVISION" >>"$GITHUB_OUTPUT"
       - name: Restore the install root
         id: restore
+        if: github.ref_type != 'tag'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/stellar-cli-28
@@ -194,8 +207,18 @@ jobs:
             echo "the first --version line is '$first', not '$VERSION_LINE'" >&2
             exit 1
           fi
+      - name: Pack the install root
+        run: |
+          COPYFILE_DISABLE=1 /usr/bin/tar --create --format ustar --no-xattrs --no-acls --no-fflags \
+            --file "$RUNNER_TEMP/stellar-cli-28.tar" -C "$RUNNER_TEMP" stellar-cli-28
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vendored-wasm-stellar-cli-28
+          path: ${{ runner.temp }}/stellar-cli-28.tar
+          retention-days: 1
+          if-no-files-found: error
       - name: Save the install root
-        if: steps.restore.outputs.cache-hit != 'true'
+        if: github.ref_type != 'tag' && steps.restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/stellar-cli-28
@@ -222,18 +245,20 @@ jobs:
           while read -r toolchain target; do
             rustup toolchain install "$toolchain" --profile minimal --target "$target"
           done <"$RUNNER_TEMP/toolchains"
-      - name: Restore stellar-cli 25.2.0
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Download stellar-cli 25
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          path: ${{ runner.temp }}/stellar-cli-25
-          key: ${{ needs.stellar-cli-25.outputs.key }}
-          fail-on-cache-miss: true
-      - name: Restore stellar-cli 28.1.0
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+          name: vendored-wasm-stellar-cli-25
+          path: ${{ runner.temp }}/stellar-cli-artifacts
+      - name: Download stellar-cli 28
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          path: ${{ runner.temp }}/stellar-cli-28
-          key: ${{ needs.stellar-cli-28.outputs.key }}
-          fail-on-cache-miss: true
+          name: vendored-wasm-stellar-cli-28
+          path: ${{ runner.temp }}/stellar-cli-artifacts
+      - name: Unpack the install roots
+        run: |
+          /usr/bin/tar -xf "$RUNNER_TEMP/stellar-cli-artifacts/stellar-cli-25.tar" -C "$RUNNER_TEMP"
+          /usr/bin/tar -xf "$RUNNER_TEMP/stellar-cli-artifacts/stellar-cli-28.tar" -C "$RUNNER_TEMP"
       - name: Fetch the OpenZeppelin tags
         run: |
           set -euo pipefail
@@ -270,4 +295,5 @@ jobs:
           CLI25: ${{ needs.stellar-cli-25.result }}
           CLI28: ${{ needs.stellar-cli-28.result }}
           REBUILD_JOB: ${{ needs.rebuild.result }}
-        run: bash .github/scripts/rebuild-vendored-wasm.sh --gate "$CHECK" "$REBUILD" "$CLI25" "$CLI28" "$REBUILD_JOB"
+          REF_TYPE: ${{ github.ref_type }}
+        run: bash .github/scripts/rebuild-vendored-wasm.sh --gate "$CHECK" "$REBUILD" "$CLI25" "$CLI28" "$REBUILD_JOB" "$REF_TYPE"

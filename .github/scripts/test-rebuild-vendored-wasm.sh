@@ -1002,38 +1002,56 @@ gate() {
   OUT="$TMP/gate.out"
   STUBS="$NO_STUBS" CASE="$TMP" run_script -- --gate "$@"
 }
-gate success true success success success
+gate success true success success success branch
 expect_rc 0 "gate rebuild true"
-expect_out "check=success rebuild=true stellar-cli-25=success stellar-cli-28=success rebuild-job=success" "gate rebuild true"
-gate success false skipped skipped skipped
+expect_out "check=success rebuild=true stellar-cli-25=success stellar-cli-28=success rebuild-job=success ref-type=branch" "gate rebuild true"
+gate success false skipped skipped skipped branch
 expect_rc 0 "gate rebuild false"
-expect_out "check=success rebuild=false stellar-cli-25=skipped stellar-cli-28=skipped rebuild-job=skipped" "gate rebuild false"
+expect_out "check=success rebuild=false stellar-cli-25=skipped stellar-cli-28=skipped rebuild-job=skipped ref-type=branch" "gate rebuild false"
+gate success true success success success tag
+expect_rc 0 "gate tag rebuild true"
+expect_out "gate PASS: the vendored Wasm files were rebuilt and matched" "gate tag rebuild true"
+gate success false skipped skipped skipped ""
+expect_rc 0 "gate empty ref type rebuild false"
+expect_out "gate PASS: no rebuild was needed, and the tree check passed" "gate empty ref type rebuild false"
 gate_fails() {
   gate "$@"
-  expect_rc 1 "gate '$1' '$2' '$3' '$4' '$5'"
-  expect_out "gate FAIL" "gate '$1' '$2' '$3' '$4' '$5'"
+  expect_rc 1 "gate '$1' '$2' '$3' '$4' '$5' '$6'"
+  expect_out "gate FAIL" "gate '$1' '$2' '$3' '$4' '$5' '$6'"
 }
-for value in failure cancelled; do
-  gate_fails "$value" true success success success
-  gate_fails "$value" false skipped skipped skipped
-  gate_fails success true "$value" success success
-  gate_fails success true success "$value" success
-  gate_fails success true success success "$value"
-  gate_fails success false "$value" skipped skipped
-  gate_fails success false skipped "$value" skipped
-  gate_fails success false skipped skipped "$value"
+for ref_type in branch tag ""; do
+  for value in failure cancelled; do
+    gate_fails "$value" true success success success "$ref_type"
+    gate_fails "$value" false skipped skipped skipped "$ref_type"
+    gate_fails success true "$value" success success "$ref_type"
+    gate_fails success true success "$value" success "$ref_type"
+    gate_fails success true success success "$value" "$ref_type"
+    gate_fails success false "$value" skipped skipped "$ref_type"
+    gate_fails success false skipped "$value" skipped "$ref_type"
+    gate_fails success false skipped skipped "$value" "$ref_type"
+  done
+  gate_fails skipped true success success success "$ref_type"
+  gate_fails skipped false skipped skipped skipped "$ref_type"
+  gate_fails success true skipped success success "$ref_type"
+  gate_fails success true success skipped success "$ref_type"
+  gate_fails success true success success skipped "$ref_type"
+  gate_fails success false success skipped skipped "$ref_type"
+  gate_fails success false skipped success skipped "$ref_type"
+  gate_fails success false skipped skipped success "$ref_type"
+  gate_fails success "" skipped skipped skipped "$ref_type"
+  gate_fails success "" success success success "$ref_type"
 done
-gate_fails skipped true success success success
-gate_fails skipped false skipped skipped skipped
-gate_fails success true skipped success success
-gate_fails success true success skipped success
-gate_fails success true success success skipped
-gate_fails success false success skipped skipped
-gate_fails success false skipped success skipped
-gate_fails success false skipped skipped success
-gate_fails success "" skipped skipped skipped
-gate_fails success "" success success success
-pass "19 --gate passes only the two passing combinations; every failure, cancelled, or skipped input elsewhere and an empty rebuild fail"
+gate_fails success false skipped skipped skipped tag
+expect_out "gate FAIL: a tag run must rebuild the vendored Wasm files" "gate tag rebuild false"
+gate_fails success true success success success pull_request
+expect_out "gate FAIL: the ref type is 'pull_request', not branch, tag, or empty" "gate unknown ref type"
+gate success true success success success
+expect_rc 2 "gate with five arguments"
+expect_out "usage:" "gate with five arguments"
+gate success true success success success tag extra
+expect_rc 2 "gate with seven arguments"
+expect_out "usage:" "gate with seven arguments"
+pass "19 --gate passes only the two passing combinations, and on a tag only the rebuild; every failure, cancelled, or skipped input elsewhere, an empty rebuild, an unknown ref type, and a wrong argument count fail"
 
 # 20. --exec refuses before running the command, and runs a passing command in
 # its directory under the allowlist.

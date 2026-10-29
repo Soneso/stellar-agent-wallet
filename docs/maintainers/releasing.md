@@ -66,6 +66,7 @@ No job that holds a credential compiles code or runs dependency code.
 | Workflow | Job | Credential | Compiles code |
 |---|---|---|---|
 | `release.yml` | `preflight` | none | no |
+| `release.yml` | `vendored-wasm` | none | yes |
 | `release.yml` | `build` | none | yes |
 | `release.yml` | `sign-macos` | Apple secrets of `release-signing` | no |
 | `release.yml` | `verify-packaged` | none | no |
@@ -126,11 +127,51 @@ the rehearsal packages with the toolchain that `publish.yml` packages with.
 The feature jobs of `ci.yml` run unconditionally and run their defining
 commands.
 
+The `release-cache` rule refuses cache actions in the release and rehearsal.
+Both build cold from locked sources. The `release-toolchain` rule requires
+both builds to install `RELEASE_TOOLCHAIN` and pin `RUSTUP_TOOLCHAIN` before
+compilation, with the same value as `publish.yml`.
+
+The `release-wasm-gate` rule requires `hashes` and `publish` to depend on the
+local vendored Wasm workflow call, without conditions, inputs, or secrets, so
+signing, provenance, and publication wait for the rebuild. The called
+workflow declares `workflow_call`; every cache step starts its condition with
+`github.ref_type != 'tag'`. Its rebuild runs exactly when the tree check asks
+for one, reads both stellar-cli artifacts of its own run, uses no cache, and
+rebuilds and compares unconditionally. No job or step of it continues on an
+error, and no step of the tree check, the rebuild, or the gate suppresses a
+failure. The gate job runs on `always()`, needs the four other jobs, and runs
+the gate command with each job result and the run's ref type. On a tag the
+gate passes only after a rebuild.
+
+The `release-publish-sums` rule requires an unconditional checksum check before
+publication. The archives under `all-artifacts` must equal `SHA256SUMS` by
+name, count, and digest.
+
 The `sign-macos` job receives the unsigned binaries as a tar.
 `.github/scripts/validate-unsigned-archive.py` refuses the tar unless it holds
 exactly the two binaries as regular files, each a thin Mach-O executable for
 the target. The job then signs, notarizes, and packs the archive through the
 composite action in `.github/actions/macos-sign-notarize/`.
+
+The Windows build leg links libsodium from `libsodium-1.0.22-stable-msvc.zip`,
+and `.github/scripts/release/sodium.sh` pins its SHA-256 in
+`SODIUM_MSVC_SHA256`. Upstream replaces that stable archive in place when the
+stable branch moves, and the Windows build then fails at the sodium step. To
+update the pin, download the archive and its `.minisig` from the URL that
+`sodium.sh` uses, verify the signature with the key that
+`libsodium-sys-stable` embeds in its build script, and set
+`SODIUM_MSVC_SHA256` to the archive's digest. A `libsodium-sys-stable` update
+that changes the libsodium version changes the file names and the pin
+together.
+
+```sh
+base=https://download.libsodium.org/libsodium/releases
+curl --fail --location --remote-name "$base/libsodium-1.0.22-stable-msvc.zip"
+curl --fail --location --remote-name "$base/libsodium-1.0.22-stable-msvc.zip.minisig"
+minisign -Vm libsodium-1.0.22-stable-msvc.zip -P RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
+sha256sum libsodium-1.0.22-stable-msvc.zip
+```
 
 ## GitHub settings
 
@@ -172,10 +213,10 @@ jobs install that release and set `RUSTUP_TOOLCHAIN` to it. The publish job
 refuses any other `cargo` or `rustc` version, since the archive bytes can
 depend on the cargo version.
 
-To bump it, change the value in a pull request and merge it before the
-dispatch. `rustup check` and
-`https://static.rust-lang.org/dist/channel-rust-stable.toml` show the current
-stable release.
+To bump it, change `RELEASE_TOOLCHAIN` in `publish.yml`, `release.yml`, and
+`release-rehearsal.yml` in one pull request and merge it before the dispatch.
+`rustup check` and `https://static.rust-lang.org/dist/channel-rust-stable.toml`
+show the current stable release.
 
 ## Publish to crates.io
 
@@ -286,8 +327,8 @@ target as the release does and uploads each as the artifact
 notarized, and the run hashes, attests, and publishes nothing.
 
 The workflow holds no credential: its token reads the repository contents and
-nothing else. Its build cache has a key prefix of its own, so a release build
-never restores a cache that a rehearsal saved.
+nothing else. The release and rehearsal restore and save no cache, so both
+build cold from locked sources.
 
 GitHub runs a `workflow_dispatch` workflow only once its file exists on the
 default branch. From then on, `--ref` selects any branch that holds the file,
@@ -310,8 +351,11 @@ in `release-signing`, signs and notarizes the binaries with the version
 Release, publish and rehearsal expect `mainnet-write` to be off. The shared
 build script runs the environment guard immediately before the release recipe.
 Archive verification executes both packaged binaries and checks their embedded
-markers. Hashing depends on archive verification; publication depends on the
-provenance content check and the discipline check of its source commit.
+markers. Archive and host checks also refuse either test-override literal,
+`STELLAR_AGENT_HOME` or `STELLAR_AGENT_TEST_`. Hashing depends on archive
+verification and on the vendored Wasm rebuild of the tagged commit, so
+signing and provenance wait for that rebuild. Publication depends on the
+provenance content check, the source discipline check, and the rebuild.
 
 The publish verification job checks the binaries produced from unpacked crate
 sources, including their freshness. The install check runs only after a real

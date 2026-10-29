@@ -68,7 +68,7 @@ def before_sign_macos_tools(text):
     return (RELEASE, SIGN_MACOS_FIRST_STEP, text + SIGN_MACOS_FIRST_STEP, 1)
 
 
-REHEARSAL_TIMEOUT = "    timeout-minutes: 60\n"
+REHEARSAL_TIMEOUT = "    timeout-minutes: 120\n"
 REHEARSAL_JOB_PERMISSIONS = "    permissions:\n      contents: read\n    strategy:\n"
 REHEARSAL_VERSION_ECHO = '          echo "Rehearsing version: $VERSION"\n'
 REHEARSAL_ENV = '  EXPECTED_MAINNET_WRITE: "off"\n'
@@ -116,7 +116,9 @@ REHEARSAL_PIN_STEP = (
     "      - name: Pin the toolchain for every later step\n"
     '        run: echo "RUSTUP_TOOLCHAIN=$RELEASE_TOOLCHAIN" >> "$GITHUB_ENV"\n'
 )
-RELEASE_WORKFLOW_ENV = 'env:\n  EXPECTED_MAINNET_WRITE: "off"\n'
+RELEASE_WORKFLOW_ENV = ('env:\n  EXPECTED_MAINNET_WRITE: "off"\n'
+                        "  # The toolchain publish.yml packages with; every build leg compiles with it.\n"
+                        '  RELEASE_TOOLCHAIN: "1.99.0"\n')
 REHEARSAL_MARKER_RUN = ('        run: bash .github/scripts/check-packaged-markers.sh target '
                         'target/package-verification-start "$EXPECTED_MAINNET_WRITE"\n')
 # The defining command of each feature job of ci.yml, as its run: line.
@@ -319,9 +321,65 @@ def publish_job_only(old, new):
     return [(PUBLISH, old, HELD, 2), (PUBLISH, old, new, 1), (PUBLISH, HELD, old, 1)]
 
 
+WASM = ".github/workflows/vendored-wasm.yml"
+WASM_CALL = (
+    "  vendored-wasm:\n"
+    "    name: vendored-wasm\n"
+    "    needs: preflight\n"
+    "    permissions:\n"
+    "      contents: read\n"
+    "    uses: ./.github/workflows/vendored-wasm.yml\n"
+)
+CACHE_STEP = (
+    "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3\n"
+    "        with:\n"
+    "          key: ${{ matrix.target }}\n"
+)
+CACHE_RESTORE = "      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0\n"
+BUILD_PIN_STEP = (
+    "      - name: Pin the build toolchain\n"
+    "        shell: bash\n"
+    '        run: echo "RUSTUP_TOOLCHAIN=$RELEASE_TOOLCHAIN" >> "$GITHUB_ENV"\n'
+)
+SUMS_STEP = (
+    "      - name: Verify the publication archives\n"
+    '        run: bash .github/scripts/release/verify-sums.sh "$RUNNER_TEMP/release"\n'
+)
+TAG_GUARD = "        if: github.ref_type != 'tag'\n"
+SAVE_GUARD = "        if: github.ref_type != 'tag' && steps.restore.outputs.cache-hit != 'true'\n"
+BUILD_TOOLCHAIN = "          toolchain: ${{ env.RELEASE_TOOLCHAIN }}\n          targets: ${{ matrix.target }}\n"
+RELEASE_LAST_LINE = "            release-provenance/*.intoto.jsonl\n"
+BUILD_PYTHON = (
+    "      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0\n"
+    "        with:\n"
+    '          python-version: "3.13"\n'
+    "\n"
+    "      # On MSVC"
+)
+WASM_REBUILD_JOB = "  rebuild:\n    name: rebuild\n"
+WASM_REBUILD_IF = "    needs: [check, stellar-cli-25, stellar-cli-28]\n    if: needs.check.outputs.rebuild == 'true'\n"
+WASM_DOWNLOAD_25 = "          name: vendored-wasm-stellar-cli-25\n          path: ${{ runner.temp }}/stellar-cli-artifacts\n"
+WASM_COMPARE = '            --work "$RUNNER_TEMP/rebuild-work"\n'
+WASM_COMPARE_STEP = "      - name: Rebuild and compare\n"
+WASM_GATE_NEEDS = "    needs: [check, stellar-cli-25, stellar-cli-28, rebuild]\n"
+WASM_GATE_IF = WASM_GATE_NEEDS + "    if: always()\n"
+WASM_GATE_STEP = "      - name: Gate on every job result\n"
+WASM_GATE_RUN = ('        run: bash .github/scripts/rebuild-vendored-wasm.sh --gate "$CHECK" "$REBUILD" "$CLI25" "$CLI28" '
+                 '"$REBUILD_JOB" "$REF_TYPE"\n')
+WASM_DECIDE_RUN = '          echo "rebuild=$rebuild" >>"$GITHUB_OUTPUT"\n'
+
+
 # label, [(file, old, new, expected occurrences)];
 # the edited copy must pass.
 PASSING = [
+    ("wrapped tag cache guard passes", [
+        (WASM, TAG_GUARD, "        if: ${{ github.ref_type != 'tag' }}\n", 2)]),
+    ("wrapped Wasm rebuild and gate conditions pass", [
+        (WASM, WASM_REBUILD_IF,
+         "    needs: [check, stellar-cli-25, stellar-cli-28]\n    if: ${{ needs.check.outputs.rebuild == 'true' }}\n", 1),
+        (WASM, WASM_GATE_IF, WASM_GATE_NEEDS + "    if: ${{ always() }}\n", 1)]),
+    ("Wasm gate needs in another order pass", [
+        (WASM, WASM_GATE_NEEDS, "    needs: [rebuild, stellar-cli-28, stellar-cli-25, check]\n", 1)]),
     ("coverage job condition wrapped in ${{ }} passes", [
         (COVERAGE, COVERAGE_IF_LINE, COVERAGE_IF_WRAPPED_LINE, 1)]),
     ("coverage job condition with surrounding whitespace passes", [
@@ -347,6 +405,103 @@ PASSING = [
 # replaces only the first occurrence. A case that expects several lines gives
 # tuples of rules and fragments of the same length, in output order.
 CASES = [
+    ("release build cache", "release-cache", "uses Swatinem/rust-cache", [
+        (RELEASE, RELEASE_BUILD_STEP, CACHE_STEP + RELEASE_BUILD_STEP, 1)]),
+    ("rehearsal build cache", "release-cache", "uses Swatinem/rust-cache", [
+        (REHEARSAL, RELEASE_BUILD_STEP, CACHE_STEP + RELEASE_BUILD_STEP, 1)]),
+    ("release verification cache", "release-cache", "uses actions/cache/restore", [
+        (RELEASE, VERIFY_PACKAGED_STEP, CACHE_RESTORE + VERIFY_PACKAGED_STEP, 1)]),
+    ("mixed-case release cache action", "release-cache", "uses Swatinem/Rust-Cache", [
+        (RELEASE, RELEASE_BUILD_STEP, CACHE_STEP.replace("Swatinem/rust-cache", "Swatinem/Rust-Cache")
+         + RELEASE_BUILD_STEP, 1)]),
+    ("release setup action with a cache input", "release-cache",
+     "release.yml:build: release-cache: passes a cache input to actions/setup-python", [
+        (RELEASE, BUILD_PYTHON, BUILD_PYTHON.replace('"3.13"\n', '"3.13"\n          cache: pip\n'), 1)]),
+    ("rehearsal setup action with a cache input", "release-cache",
+     "release-rehearsal.yml:build: release-cache: passes a cache input to actions/setup-python", [
+        (REHEARSAL, '          python-version: "3.13"\n', '          python-version: "3.13"\n          cache: pip\n', 1)]),
+    ("signing without Wasm dependency", "release-wasm-gate", "hashes must need vendored-wasm", [
+        (RELEASE, "needs: [preflight, vendored-wasm, build, sign-macos, verify-packaged]",
+         "needs: [preflight, build, sign-macos, verify-packaged]", 1)], 1),
+    ("Wasm rebuild job continues on error", "release-wasm-gate",
+     "vendored-wasm.yml:rebuild: release-wasm-gate: rebuild continues on error", [
+        (WASM, WASM_REBUILD_JOB, WASM_REBUILD_JOB + "    continue-on-error: true\n", 1)], 1),
+    ("Wasm step continues on error", "release-wasm-gate",
+     "vendored-wasm.yml:stellar-cli-25: release-wasm-gate: stellar-cli-25 step 1 continues on error", [
+        (WASM, "        run: rustup toolchain install \"$HOST_RUSTC\" --profile minimal\n",
+         "        run: rustup toolchain install \"$HOST_RUSTC\" --profile minimal\n        continue-on-error: true\n", 2)], 1),
+    ("Wasm rebuild suppresses a failure", "release-wasm-gate",
+     "vendored-wasm.yml:rebuild: release-wasm-gate: rebuild step 8 suppresses failures", [
+        (WASM, WASM_COMPARE, WASM_COMPARE.replace('-work"\n', '-work" || true\n'), 1)], 1),
+    ("Wasm check turns off errexit", "release-wasm-gate",
+     "vendored-wasm.yml:check: release-wasm-gate: check step 4 suppresses failures", [
+        (WASM, WASM_DECIDE_RUN, WASM_DECIDE_RUN + "          set +e\n", 1)], 1),
+    ("Wasm gate suppresses a failure", ("release-wasm-gate", "release-wasm-gate"),
+     ("vendored-wasm.yml:vendored-wasm: release-wasm-gate: vendored-wasm step 2 suppresses failures",
+      "vendored-wasm.yml: release-wasm-gate: the gate step must run exactly"), [
+        (WASM, WASM_GATE_RUN, WASM_GATE_RUN.replace('"$REF_TYPE"\n', '"$REF_TYPE" || true\n'), 1)], 2),
+    ("Wasm gate job without always", "release-wasm-gate", "the vendored-wasm job must run on always()", [
+        (WASM, WASM_GATE_IF, WASM_GATE_NEEDS, 1)], 1),
+    ("Wasm gate job on success only", "release-wasm-gate", "the vendored-wasm job must run on always()", [
+        (WASM, WASM_GATE_IF, WASM_GATE_NEEDS + "    if: success()\n", 1)], 1),
+    ("Wasm gate job without the rebuild dependency", "release-wasm-gate",
+     "the vendored-wasm job must need exactly check, rebuild, stellar-cli-25, stellar-cli-28", [
+        (WASM, WASM_GATE_NEEDS, "    needs: [check, stellar-cli-25, stellar-cli-28]\n", 1)], 1),
+    ("Wasm gate job with an extra dependency", "release-wasm-gate",
+     "the vendored-wasm job must need exactly check, rebuild, stellar-cli-25, stellar-cli-28", [
+        (WASM, WASM_GATE_NEEDS, "    needs: [check, stellar-cli-25, stellar-cli-28, rebuild, rebuild]\n", 1)], 1),
+    ("conditional Wasm gate step", "release-wasm-gate", "the vendored-wasm job must run one gate step unconditionally", [
+        (WASM, WASM_GATE_STEP, WASM_GATE_STEP + "        if: github.ref_type == 'tag'\n", 1)], 1),
+    ("Wasm gate step without the ref type", "release-wasm-gate", "the gate step must run exactly", [
+        (WASM, WASM_GATE_RUN, WASM_GATE_RUN.replace(' "$REF_TYPE"', ""), 1)], 1),
+    ("Wasm gate step with a fixed job result", "release-wasm-gate", "the gate step must read each job result", [
+        (WASM, "          REBUILD_JOB: ${{ needs.rebuild.result }}\n", "          REBUILD_JOB: success\n", 1)], 1),
+    ("Wasm rebuild on always", "release-wasm-gate", "rebuild must run exactly on needs.check.outputs.rebuild == 'true'", [
+        (WASM, WASM_REBUILD_IF, "    needs: [check, stellar-cli-25, stellar-cli-28]\n    if: always()\n", 1)], 1),
+    ("conditional Wasm rebuild and compare", "release-wasm-gate", "rebuild must rebuild and compare unconditionally", [
+        (WASM, WASM_COMPARE_STEP, WASM_COMPARE_STEP + "        if: github.ref_type != 'tag'\n", 1)], 1),
+    ("Wasm download from another run", "release-wasm-gate", "rebuild downloads an artifact with run-id", [
+        (WASM, WASM_DOWNLOAD_25, WASM_DOWNLOAD_25 + "          run-id: 1\n", 1)], 1),
+    ("Wasm download with a token", "release-wasm-gate", "rebuild downloads an artifact with github-token", [
+        (WASM, WASM_DOWNLOAD_25, WASM_DOWNLOAD_25 + "          github-token: ${{ github.token }}\n", 1)], 1),
+    ("Wasm download from another repository", "release-wasm-gate", "rebuild downloads an artifact with repository", [
+        (WASM, WASM_DOWNLOAD_25, WASM_DOWNLOAD_25 + "          repository: other/repo\n", 1)], 1),
+    ("release without Wasm call", "release-wasm-gate", "must call the local workflow", [
+        (RELEASE, WASM_CALL, "", 1)]),
+    ("conditional Wasm call", "release-wasm-gate", "must call the local workflow", [
+        (RELEASE, WASM_CALL, WASM_CALL + "    if: false\n", 1)]),
+    ("Wasm call with inputs", "release-wasm-gate", "must call the local workflow", [
+        (RELEASE, WASM_CALL, WASM_CALL + "    with: {}\n", 1)]),
+    ("Wasm call with secrets", "release-wasm-gate", "must call the local workflow", [
+        (RELEASE, WASM_CALL, WASM_CALL + "    secrets: inherit\n", 1)]),
+    ("publication without Wasm dependency", "release-wasm-gate", "publish must need vendored-wasm", [
+        (RELEASE, "needs: [preflight, vendored-wasm, build, sign-macos, sign,", "needs: [preflight, build, sign-macos, sign,", 1)]),
+    ("Wasm workflow not callable", "release-wasm-gate", "workflow_call is absent", [
+        (WASM, "  workflow_call:\n", "", 1)]),
+    ("Wasm restore without tag guard", "release-wasm-gate", "cache guard must lead", [
+        (WASM, TAG_GUARD, "", 2)]),
+    ("Wasm save with trailing tag guard", "release-wasm-gate", "cache guard must lead", [
+        (WASM, SAVE_GUARD, "        if: steps.restore.outputs.cache-hit != 'true' && github.ref_type != 'tag'\n", 2)]),
+    ("Wasm rebuild cache", "release-wasm-gate", "rebuild uses a cache", [
+        (WASM, "      - name: Download stellar-cli 25\n", CACHE_RESTORE + "      - name: Download stellar-cli 25\n", 1)]),
+    ("Wasm rebuild missing artifact", "release-wasm-gate", "rebuild does not download vendored-wasm-stellar-cli-25", [
+        (WASM, "          name: vendored-wasm-stellar-cli-25\n          path: ${{ runner.temp }}/stellar-cli-artifacts",
+         "          name: another-artifact\n          path: ${{ runner.temp }}/stellar-cli-artifacts", 1)]),
+    ("release toolchain differs", "release-toolchain", "RELEASE_TOOLCHAIN differs from publish.yml", [
+        (RELEASE, '  RELEASE_TOOLCHAIN: "1.99.0"\n', '  RELEASE_TOOLCHAIN: "1.98.0"\n', 1)]),
+    ("release build on stable", "release-toolchain", "it installs another toolchain", [
+        (RELEASE, BUILD_TOOLCHAIN, BUILD_TOOLCHAIN.replace("${{ env.RELEASE_TOOLCHAIN }}", "stable"), 1)]),
+    ("release build without toolchain pin", "release-toolchain", "it does not pin RUSTUP_TOOLCHAIN", [
+        (RELEASE, BUILD_PIN_STEP, "", 1)]),
+    ("rehearsal build without toolchain pin", "release-toolchain", "it does not pin RUSTUP_TOOLCHAIN", [
+        (REHEARSAL, BUILD_PIN_STEP, "", 1)]),
+    ("publication without checksum check", "release-publish-sums", "publish must verify sums", [
+        (RELEASE, SUMS_STEP, "", 1)]),
+    ("conditional publication checksum check", "release-publish-sums", "publish must verify sums", [
+        (RELEASE, SUMS_STEP, SUMS_STEP + "        if: false\n", 1)]),
+    ("checksum check after publication", "release-publish-sums", "publish must verify sums", [
+        (RELEASE, SUMS_STEP, "", 1),
+        (RELEASE, RELEASE_LAST_LINE, RELEASE_LAST_LINE + SUMS_STEP, 1)]),
     ("labels workflow without top-level permissions", "workflow-permissions",
      'labels.yml: workflow-permissions: no top-level permissions', [
         (".github/workflows/labels.yml", "permissions: {}\n", "", 1)]),
@@ -471,14 +626,14 @@ CASES = [
         (PUBLISH, '"$RUNNER_TEMP/publish-target/package" "$VERSION"',
          '"$RUNNER_TEMP/publish-target/package" "${{ steps.tag.outputs.version }}"', 1)]),
     ("job output passed to an action in a credentialed job", "cred-with-needs",
-     'release.yml:publish step 8 (Create GitHub Release): cred-with-needs: passes needs output to with: tag_name', [
+     'release.yml:publish step 9 (Create GitHub Release): cred-with-needs: passes needs output to with: tag_name', [
         (RELEASE, "tag_name: v${{ steps.version.outputs.version }}",
          "tag_name: v${{ needs.preflight.outputs.version }}", 1)]),
     ("job output passed to a reusable workflow outside the allowlist", "cred-with-needs",
      'release.yml:attest: cred-with-needs: passes ${{ needs.hashes.outputs.subjects }} to the reusable workflow input base64-subjects', [
         (RELEASE, "  provenance:\n    name: provenance\n", "  attest:\n    name: provenance\n", 1),
-        (RELEASE, "needs: [preflight, build, sign-macos, sign, hashes, provenance, verify-provenance]",
-         "needs: [preflight, build, sign-macos, sign, hashes, attest, verify-provenance]", 1)]),
+        (RELEASE, "needs: [preflight, vendored-wasm, build, sign-macos, sign, hashes, provenance, verify-provenance]",
+         "needs: [preflight, vendored-wasm, build, sign-macos, sign, hashes, attest, verify-provenance]", 1)]),
     ("another job output passed to the provenance generator", "cred-with-needs",
      "release.yml:provenance: cred-with-needs: passes ${{ needs.build.result == 'success' }} to the reusable workflow input compile-generator", [
         (RELEASE, "      upload-assets: false\n",
@@ -817,7 +972,7 @@ CASES = [
     ("rehearsal job ID that reads the workflow token", "rehearsal-credentials",
      "release-rehearsal.yml:${{ github.token }}: rehearsal-credentials: "
      "an expression reads the workflow token: github.token", [
-        (REHEARSAL, "  build:\n", "  '${{ github.token }}':\n", 1)], 4),
+        (REHEARSAL, "  build:\n", "  '${{ github.token }}':\n", 1)], 5),
     ("rehearsal step env key with an unterminated expression", "rehearsal-credentials",
      "release-rehearsal.yml:build: rehearsal-credentials: unterminated expression", [
         (REHEARSAL, REHEARSAL_SODIUM_STEP,
@@ -889,7 +1044,8 @@ CASES = [
     ("build guard removed", "release-shared-scripts", "environment guard is not", [
         (BUILD_SCRIPT, ' --env-guard', ' --help', 1)]),
     ("packaged dependency removed", "release-packaged-gate", "hashes must need verify-packaged", [
-        (RELEASE, 'needs: [preflight, build, sign-macos, verify-packaged]', 'needs: [preflight, build, sign-macos]', 1)]),
+        (RELEASE, 'needs: [preflight, vendored-wasm, build, sign-macos, verify-packaged]',
+         'needs: [preflight, vendored-wasm, build, sign-macos]', 1)]),
     ("verify-packaged without sign-macos", "release-packaged-gate", "verify-packaged must need sign-macos", [
         (RELEASE, "    needs: [preflight, build, sign-macos]\n    runs-on: ${{ matrix.os }}\n",
          "    needs: [preflight, build]\n    runs-on: ${{ matrix.os }}\n", 1)]),
@@ -926,8 +1082,8 @@ CASES = [
     ("archive check ignored with exit 0", "release-check-unconditional", "verify-packaged suppresses failures", [
         (RELEASE, ARCHIVE_RUN, archive_block(" || exit 0"), 1)]),
     ("provenance dependency removed", "release-provenance-gate", "publish must need verify-provenance", [
-        (RELEASE, 'needs: [preflight, build, sign-macos, sign, hashes, provenance, verify-provenance]',
-         'needs: [preflight, build, sign-macos, sign, hashes, provenance]', 1)]),
+        (RELEASE, 'needs: [preflight, vendored-wasm, build, sign-macos, sign, hashes, provenance, verify-provenance]',
+         'needs: [preflight, vendored-wasm, build, sign-macos, sign, hashes, provenance]', 1)]),
     ("verify-provenance without provenance", "release-provenance-gate", "verify-provenance must need provenance", [
         (RELEASE, "needs: [preflight, provenance, hashes]", "needs: [preflight, hashes]", 1)]),
     ("provenance check behind a comment", "release-provenance-gate",
@@ -987,9 +1143,13 @@ CASES = [
     ("rehearsal toolchain differs", "release-toolchain", "RELEASE_TOOLCHAIN differs from publish.yml", [
         (REHEARSAL, '  RELEASE_TOOLCHAIN: "1.99.0"\n', '  RELEASE_TOOLCHAIN: "1.98.0"\n', 1)]),
     ("rehearsal crates on stable", "release-toolchain", "verify-crates does not package with RELEASE_TOOLCHAIN", [
-        (REHEARSAL, "          toolchain: ${{ env.RELEASE_TOOLCHAIN }}\n", "          toolchain: stable\n", 1)]),
+        (REHEARSAL, "          toolchain: ${{ env.RELEASE_TOOLCHAIN }}\n      # RUSTUP_TOOLCHAIN", "          toolchain: stable\n      # RUSTUP_TOOLCHAIN", 1)]),
     ("rehearsal crates without the toolchain pin", "release-toolchain", "it does not pin RUSTUP_TOOLCHAIN", [
         (REHEARSAL, REHEARSAL_PIN_STEP, "", 1)], 1),
+    ("release toolchain pinned after the build", "release-toolchain",
+     "build does not compile with RELEASE_TOOLCHAIN: RUSTUP_TOOLCHAIN is not pinned between the install and the build", [
+        (RELEASE, BUILD_PIN_STEP, "", 1),
+        (RELEASE, RELEASE_BUILD_STEP, RELEASE_BUILD_STEP + BUILD_PIN_STEP, 1)], 1),
     ("rehearsal toolchain pinned after packaging", "release-toolchain",
      "RUSTUP_TOOLCHAIN is not pinned between the install and the packaging", [
         (REHEARSAL, REHEARSAL_PIN_STEP, "", 1),
