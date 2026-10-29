@@ -719,17 +719,17 @@ Other common flags:
 
 ### The unlock window
 
-For the `--secret-env` path, the wallet loads the 32-byte signing seed into the
-unlock window: a short TTL-bounded period during which the seed stays in
-pinned, zeroize-on-drop memory (mlock). The TTL is the profile's `[wallet]
-unlock_ttl_seconds` (default 30 seconds). It must be in the range 1 to 600
-seconds. The wallet refuses a value of 0 or more than 600 when it builds the
-window, and never clamps it. The profile's `[wallet] mlock_required` governs
-what happens if the wallet cannot pin the seed in RAM: `true` (the default on
-Linux/macOS) fails the signing call closed. The window is active only for the
-duration of a single signing call. On every exit path, the wallet zeroizes the
-seed and releases the lock. The `--sign-with-ledger` path holds no seed in
-memory.
+The `--secret-env` path opens a wallet unlock window. Its clock permits seed
+access and transfer for `wallet.unlock_ttl_seconds`, default 30 seconds, in the
+range 1 to 600. The wallet refuses other values. The wallet copies the borrowed
+seed into an isolated home after the configured memory-lock attempt. The
+profile's `mlock_required = true` posture fails closed if locking fails.
+
+The seed stays in a zeroize-on-drop page, locked when the lock succeeds, until
+its wallet or signer drops it. Mainnet environment signers unlock once per
+signature and drop the seed afterward. Testnet environment signers keep it for
+the command, which can outlast the TTL. Drop zeroizes before unlocking and
+freeing. The `--sign-with-ledger` path holds no seed in process memory.
 
 ### Staged pipeline
 

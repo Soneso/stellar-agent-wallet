@@ -1,51 +1,34 @@
-//! Wallet lifecycle: unlock, TTL background timer, and RAII dispose.
+//! Wallet lifecycle: clock-checked seed access and RAII disposal.
 //!
-//! Provides [`Wallet`] — the short-in-memory-unlock window for signing seeds.
-//! A `Wallet` holds an `mlock`-protected [`LockedSeed`] for a bounded TTL
-//! (default 30 seconds; configurable per-profile).  When the TTL expires or
-//! when [`Wallet::dispose`] is called, the seed is immediately zeroized and
-//! the memory lock is released.
-//!
-//! # Lifecycle
+//! The unlock window bounds when a wallet hands out its seed or transfers it
+//! to a signer. Expiry refuses access. The seed stays in a zeroize-on-drop
+//! page, locked when the lock succeeds, until the wallet or the receiving
+//! signer drops it.
+//! Mainnet environment signers unlock once per signature and drop the seed
+//! afterward. Testnet environment signers hold it until the command drops them,
+//! which can outlast the unlock TTL.
 //!
 //! ```text
-//! Wallet::unlock(profile, Zeroizing::new(seed), ttl, mlock_required)
+//! Wallet::unlock(profile, &seed, ttl, mlock_required)
 //!   ↓
-//! LockedSeed::new  →  [mlock pinned RAM]
+//! zeroed home → lock → copy seed
 //!   ↓
-//! Wallet { locked_seed, ttl_task, cancel, … }
-//!   ↓                      ↓
-//! seed() borrows      TTL fires after ttl_seconds
-//!   ↓                      ↓
-//! dispose() / Drop   dispose() called by TTL task
-//!   ↓
-//! seed zeroed + munlock
+//! Wallet { locked_seed, expires_at_unix_ms, … }
+//!   ↓ clock check                    ↓ clock check
+//! seed() borrows                into_locked_seed() transfers ownership
+//!   ↓                                ↓
+//! Wallet::dispose / Drop         signer's Drop
+//!   ↓                                ↓
+//! zeroize → unlock → free        zeroize → unlock → free
 //! ```
 //!
-//! # Panic-safety
-//!
-//! [`Drop`] calls [`Wallet::dispose`], which in turn calls
-//! `LockedSeed::internal_dispose`.  Because `Drop` runs during
-//! panic-unwind, the seed bytes are zeroed even if the caller panics between
-//! `unlock` and the natural end of the scope.  See the
-//! `panic_unwind_zeroes_seed` test.
-//!
-//! # TTL background task
-//!
-//! `Wallet::unlock` spawns a `tokio::task::spawn` background task that sleeps
-//! for `ttl_seconds` and then sets the `disposed` flag.  The task checks a
-//! shared `AtomicBool` cancel flag on wake; if the flag is set (because
-//! `dispose()` was called before the TTL fired) the task exits cleanly without
-//! touching the wallet.  Callers that need to revoke the unlock window early
-//! call `dispose()` directly.
+//! Drop also zeroizes during panic unwind. Call [`Wallet::dispose`] to close
+//! access and release the seed before the wallet's scope ends.
 
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-
-use tokio::task::JoinHandle;
-use zeroize::Zeroizing;
 
 use crate::timefmt::{Clock, default_clock};
 
@@ -62,19 +45,17 @@ pub const DEFAULT_TTL_SECONDS: u32 = 30;
 
 /// Maximum permitted TTL (600 seconds = 10 minutes).
 ///
-/// Longer windows extend the period during which signing materials reside in
-/// memory.  Operators must use the profile field `wallet.unlock_ttl_seconds`
-/// to set a shorter value if the default is too long.
+/// The profile field `wallet.unlock_ttl_seconds` bounds seed access through
+/// the wallet. An owner that receives the seed controls its residency lifetime.
 pub const MAX_TTL_SECONDS: u32 = 600;
 
 // ── Wallet ────────────────────────────────────────────────────────────────────
 
 /// Short-in-memory-unlock window protecting a 32-byte signing seed.
 ///
-/// The wallet holds a [`LockedSeed`] for at most `ttl_seconds`.  After the
-/// TTL expires or [`dispose`](Wallet::dispose) is called, the seed is
-/// zeroized and the memory lock is released.  [`Drop`] calls `dispose()`
-/// unconditionally, so the seed is zeroed even on panic-unwind.
+/// The clock refuses seed access after `ttl_seconds`. The seed stays in its
+/// stable home until disposal or transfer to another owner. [`Drop`] calls
+/// [`Wallet::dispose`], including during panic unwind.
 ///
 /// # Construction
 ///
@@ -97,14 +78,14 @@ pub const MAX_TTL_SECONDS: u32 = 600;
 /// ```no_run
 /// use stellar_agent_core::wallet::{Wallet, MlockRequired};
 ///
-/// # async fn example() -> Result<(), stellar_agent_core::wallet::WalletLifecycleError> {
+/// # fn example() -> Result<(), stellar_agent_core::wallet::WalletLifecycleError> {
 /// let seed = zeroize::Zeroizing::new([0u8; 32]); // caller-obtained seed
 /// let mut wallet = Wallet::unlock(
 ///     "default".to_owned(),
-///     seed,
+///     &seed,
 ///     30,
 ///     MlockRequired::False,
-/// ).await?;
+/// )?;
 ///
 /// let bytes: &[u8; 32] = wallet.seed()?;
 /// // … use bytes to sign …
@@ -130,9 +111,8 @@ impl std::fmt::Debug for Wallet {
 
 /// Short-in-memory-unlock window protecting a 32-byte signing seed.
 ///
-/// Holds a [`LockedSeed`] for at most `ttl_seconds`.  After the TTL expires
-/// or [`Wallet::dispose`] is called the seed is zeroized and the memory lock
-/// is released.  [`Drop`] calls `dispose()` unconditionally (panic-safe).
+/// The clock bounds seed access to `ttl_seconds`. Disposal zeroizes the seed
+/// before releasing its lock. A transferred seed stays alive with its new owner.
 pub struct Wallet {
     /// Profile this wallet is locked to (for tracing + audit-log correlation).
     profile_name: String,
@@ -140,11 +120,7 @@ pub struct Wallet {
     locked_seed: Option<LockedSeed>,
     /// Unix epoch in milliseconds when the TTL expires.
     expires_at_unix_ms: u64,
-    /// Background TTL task handle.  Aborted (not awaited) on dispose.
-    ttl_task: Option<JoinHandle<()>>,
-    /// Shared cancel flag.  Set by `dispose()` so the TTL task exits cleanly.
-    cancel: Arc<AtomicBool>,
-    /// Set once the wallet has been disposed (TTL-expired or explicit dispose).
+    /// Set once the wallet is disposed or transfers its seed.
     disposed: AtomicBool,
     /// Wall-clock source for TTL checks.
     clock: Arc<dyn Clock>,
@@ -160,21 +136,18 @@ pub struct Wallet {
 impl Wallet {
     /// Open a short-in-memory-unlock window for `profile_name`.
     ///
-    /// The `seed` parameter must already be wrapped in [`Zeroizing`]. It is
-    /// moved into a [`LockedSeed`] immediately, so early-return paths and the
-    /// caller's relinquished copy are both covered by `Zeroizing` drop.
-    ///
-    /// A background `tokio::task::spawn` task is spawned that will call
-    /// `dispose` semantics (set `disposed = true`, abort the task reference)
-    /// after `ttl_seconds`.  The task respects a shared cancel flag so an
-    /// explicit `dispose()` before TTL expiry prevents any double-free.
+    /// The caller borrows its seed, preferably from a `Zeroizing` buffer.
+    /// The wallet copies it into a stable home after the configured lock attempt.
+    /// Clock checks refuse seed access and ownership transfer after `ttl_seconds`.
+    /// The seed zeroizes when its owner disposes or drops it.
     ///
     /// # Errors
     ///
     /// - [`WalletLifecycleError::TtlInvalid`] when `ttl_seconds == 0` or
     ///   `ttl_seconds > 600`.
     /// - [`WalletLifecycleError::MlockUnavailable`] when
-    ///   `mlock_required == MlockRequired::True` and the OS refuses the lock.
+    ///   `mlock_required == MlockRequired::True` and the OS refuses the lock
+    ///   or its page size exceeds the 64 KiB alignment of the seed's home.
     ///
     /// # Examples
     ///
@@ -184,16 +157,16 @@ impl Wallet {
     /// ```no_run
     /// use stellar_agent_core::wallet::{Wallet, MlockRequired};
     ///
-    /// # async fn run() -> Result<(), stellar_agent_core::wallet::WalletLifecycleError> {
+    /// # fn run() -> Result<(), stellar_agent_core::wallet::WalletLifecycleError> {
     /// let seed = zeroize::Zeroizing::new([0u8; 32]);
-    /// let mut w = Wallet::unlock("default".to_owned(), seed, 30, MlockRequired::False).await?;
+    /// let mut w = Wallet::unlock("default".to_owned(), &seed, 30, MlockRequired::False)?;
     /// w.dispose();
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn unlock(
+    pub fn unlock(
         profile_name: String,
-        seed: Zeroizing<[u8; 32]>,
+        seed: &[u8; 32],
         ttl_seconds: u32,
         mlock_required: MlockRequired,
     ) -> Result<Self, WalletLifecycleError> {
@@ -204,7 +177,6 @@ impl Wallet {
             mlock_required,
             default_clock(),
         )
-        .await
     }
 
     /// Open a short-in-memory-unlock window using an injected wall-clock source.
@@ -226,9 +198,9 @@ impl Wallet {
     ///
     /// Returns the same errors as [`Wallet::unlock`], including clock errors from
     /// the injected [`Clock`].
-    pub async fn unlock_with_clock(
+    pub fn unlock_with_clock(
         profile_name: String,
-        seed: Zeroizing<[u8; 32]>,
+        seed: &[u8; 32],
         ttl_seconds: u32,
         mlock_required: MlockRequired,
         clock: Arc<dyn Clock>,
@@ -255,45 +227,11 @@ impl Wallet {
         let now_ms = clock.now_unix_ms()?;
         let expires_at_unix_ms = now_ms.saturating_add(u64::from(ttl_seconds) * 1_000);
 
-        // ── Shared cancel + disposed flags ───────────────────────────────────
-        let cancel = Arc::new(AtomicBool::new(false));
-        let disposed = AtomicBool::new(false);
-
-        // ── TTL background task ──────────────────────────────────────────────
-        let cancel_task = cancel.clone();
-        let ttl_duration = std::time::Duration::from_secs(u64::from(ttl_seconds));
-        let profile_name_task = profile_name.clone();
-
-        let ttl_task = tokio::task::spawn(async move {
-            tokio::time::sleep(ttl_duration).await;
-            if cancel_task.load(Ordering::Acquire) {
-                // dispose() was called before TTL fired; task exits cleanly.
-                return;
-            }
-            // TTL has fired.  Log a trace event; the Wallet's disposed flag
-            // is set by reading it via the Wallet::seed() check path on the
-            // next call.  Because we cannot mutate the Wallet directly from
-            // this task (no shared reference), we communicate via the cancel
-            // flag being clear — callers observing the expired TTL see
-            // Disposed on the next seed() call when we check the clock.
-            //
-            // The task does NOT hold a reference to the Wallet; it only logs.
-            // The expires_at_unix_ms field in Wallet::seed() does the actual
-            // TTL enforcement on the hot path.
-            tracing::debug!(
-                profile = %profile_name_task,
-                ttl_seconds = ttl_seconds,
-                "wallet TTL expired; seed() will return Disposed on next call"
-            );
-        });
-
         Ok(Self {
             profile_name,
             locked_seed: Some(locked_seed),
             expires_at_unix_ms,
-            ttl_task: Some(ttl_task),
-            cancel,
-            disposed,
+            disposed: AtomicBool::new(false),
             clock,
             mlock_degradation,
         })
@@ -336,27 +274,37 @@ impl Wallet {
         }
     }
 
-    /// Synchronously dispose the wallet: abort the TTL task, zeroize the seed,
-    /// and release the memory lock.
+    /// Transfer the seed's stable home to another owner during the unlock window.
     ///
-    /// Idempotent — calling `dispose()` on an already-disposed wallet is a
-    /// no-op (returns without error).
+    /// The receiving owner controls the seed's lifetime, which can exceed the TTL.
     ///
-    /// [`Drop`] also calls dispose semantics, so explicit disposal is optional
-    /// but preferred for auditability.
+    /// # Errors
+    ///
+    /// Returns the same disposed, expiry, and clock errors as [`Wallet::seed`].
+    pub fn into_locked_seed(mut self) -> Result<LockedSeed, WalletLifecycleError> {
+        self.seed()?;
+        let seed = self
+            .locked_seed
+            .take()
+            .ok_or(WalletLifecycleError::Disposed)?;
+        self.disposed.store(true, Ordering::Release);
+        Ok(seed)
+    }
+
+    #[cfg(test)]
+    fn lock_target(&self) -> Option<usize> {
+        self.locked_seed.as_ref().and_then(LockedSeed::lock_target)
+    }
+
+    /// Zeroize the seed, release its memory lock, and close access.
+    ///
+    /// Repeated disposal is a no-op. [`Drop`] performs the same cleanup.
     pub fn dispose(&mut self) {
         if self.disposed.load(Ordering::Acquire) {
             return;
         }
         self.disposed.store(true, Ordering::Release);
-        // Signal the background task to exit cleanly.
-        self.cancel.store(true, Ordering::Release);
-        // Abort the TTL task handle (non-blocking; the task is at most sleeping).
-        if let Some(handle) = self.ttl_task.take() {
-            handle.abort();
-        }
-        // Drop the LockedSeed, which calls LockedSeed::internal_dispose():
-        // munlock first, then zeroize.
+        // LockedSeed zeroizes before unlocking and freeing its home.
         drop(self.locked_seed.take());
 
         tracing::debug!(
@@ -430,20 +378,20 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use zeroize::Zeroizing;
 
     const TEST_SEED: [u8; 32] = [0xABu8; 32];
 
     // ── Basic unlock + dispose ────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn unlock_and_dispose_idempotent() {
+    #[test]
+    fn unlock_and_dispose_idempotent() {
         let mut w = Wallet::unlock(
             "test-profile".to_owned(),
-            Zeroizing::new(TEST_SEED),
+            &Zeroizing::new(TEST_SEED),
             30,
             MlockRequired::False,
         )
-        .await
         .unwrap();
         assert!(!w.is_disposed());
         assert_eq!(w.seed().unwrap(), &TEST_SEED);
@@ -454,15 +402,14 @@ mod tests {
         assert!(w.is_disposed());
     }
 
-    #[tokio::test]
-    async fn seed_after_dispose_returns_disposed() {
+    #[test]
+    fn seed_after_dispose_returns_disposed() {
         let mut w = Wallet::unlock(
             "test-profile".to_owned(),
-            Zeroizing::new(TEST_SEED),
+            &Zeroizing::new(TEST_SEED),
             30,
             MlockRequired::False,
         )
-        .await
         .unwrap();
         w.dispose();
         assert!(matches!(w.seed(), Err(WalletLifecycleError::Disposed)));
@@ -470,20 +417,17 @@ mod tests {
 
     // ── TTL enforcement ───────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn ttl_expires_and_seed_returns_disposed() {
-        // Test the TTL-expiry path by forcing the expiry timestamp to a past
-        // value.  We cannot use tokio::time::advance (requires the `test-util`
-        // feature which is not enabled in the workspace) and we avoid sleeping
-        // 1 second in CI.  Instead we validate the path directly by
-        // manipulating the expiry field.
+    #[test]
+    fn ttl_expires_and_seed_returns_disposed() {
+        // The clock check in `seed()` compares the system clock against the
+        // expiry timestamp; moving that timestamp into the past exercises the
+        // expiry path without waiting.
         let mut w = Wallet::unlock(
             "test-profile".to_owned(),
-            Zeroizing::new(TEST_SEED),
-            30, // long TTL so it doesn't fire during the test
+            &Zeroizing::new(TEST_SEED),
+            30, // long TTL so the wallet is active until the timestamp moves
             MlockRequired::False,
         )
-        .await
         .unwrap();
         assert_eq!(w.seed().unwrap(), &TEST_SEED);
         assert!(!w.is_disposed());
@@ -496,15 +440,14 @@ mod tests {
 
     // ── TTL validation ────────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn ttl_zero_returns_error() {
+    #[test]
+    fn ttl_zero_returns_error() {
         let err = Wallet::unlock(
             "test-profile".to_owned(),
-            Zeroizing::new(TEST_SEED),
+            &Zeroizing::new(TEST_SEED),
             0,
             MlockRequired::False,
         )
-        .await
         .unwrap_err();
         assert!(
             matches!(err, WalletLifecycleError::TtlInvalid { ttl_seconds: 0, .. }),
@@ -512,15 +455,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn ttl_over_maximum_returns_error() {
+    #[test]
+    fn ttl_over_maximum_returns_error() {
         let err = Wallet::unlock(
             "test-profile".to_owned(),
-            Zeroizing::new(TEST_SEED),
+            &Zeroizing::new(TEST_SEED),
             MAX_TTL_SECONDS + 1,
             MlockRequired::False,
         )
-        .await
         .unwrap_err();
         assert!(
             matches!(
@@ -534,21 +476,20 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn ttl_at_maximum_is_accepted() {
+    #[test]
+    fn ttl_at_maximum_is_accepted() {
         let mut w = Wallet::unlock(
             "test-profile".to_owned(),
-            Zeroizing::new(TEST_SEED),
+            &Zeroizing::new(TEST_SEED),
             MAX_TTL_SECONDS,
             MlockRequired::False,
         )
-        .await
         .unwrap();
         w.dispose();
     }
 
-    #[tokio::test]
-    async fn wallet_lifecycle_propagates_clock_error_from_injected_failing_clock() {
+    #[test]
+    fn wallet_lifecycle_propagates_clock_error_from_injected_failing_clock() {
         let clock = Arc::new(crate::timefmt::MockClock::new(|| {
             Err(WalletLifecycleError::ClockError {
                 detail: "mock clock failed".to_owned(),
@@ -558,12 +499,11 @@ mod tests {
 
         let err = Wallet::unlock_with_clock(
             "test-profile".to_owned(),
-            Zeroizing::new(TEST_SEED),
+            &Zeroizing::new(TEST_SEED),
             30,
             MlockRequired::False,
             clock,
         )
-        .await
         .unwrap_err();
 
         assert!(
@@ -574,15 +514,14 @@ mod tests {
 
     // ── Profile name accessor ─────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn profile_name_accessor() {
+    #[test]
+    fn profile_name_accessor() {
         let mut w = Wallet::unlock(
             "my-profile".to_owned(),
-            Zeroizing::new(TEST_SEED),
+            &Zeroizing::new(TEST_SEED),
             30,
             MlockRequired::False,
         )
-        .await
         .unwrap();
         assert_eq!(w.profile_name(), "my-profile");
         w.dispose();
@@ -592,54 +531,34 @@ mod tests {
 
     #[test]
     fn panic_unwind_zeroes_seed() {
-        // Verify that Drop runs (and thus dispose fires) when a panic unwinds
-        // across the Wallet's scope.  We use a sentinel AtomicBool to confirm
-        // the dispose path executed.
-        //
-        // This test uses a synchronous tokio runtime inside catch_unwind to
-        // avoid the #[serial] requirement that comes with process-global state.
-
-        // Spin up a current-thread runtime so we can drive Wallet::unlock to
-        // completion inside catch_unwind.
+        super::super::mlock::ZEROIZED_BEFORE_UNLOCK.set(None);
         let result = std::panic::catch_unwind(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .unwrap();
-            rt.block_on(async {
-                let _wallet = Wallet::unlock(
-                    "panic-test".to_owned(),
-                    Zeroizing::new(TEST_SEED),
-                    30,
-                    MlockRequired::False,
-                )
-                .await
-                .unwrap();
-                // Inject a panic; Drop must run and dispose the wallet.
-                panic!("injected panic for dispose test");
-            })
+            let _wallet = Wallet::unlock(
+                "panic-test".to_owned(),
+                &Zeroizing::new(TEST_SEED),
+                30,
+                MlockRequired::False,
+            )
+            .unwrap();
+            panic!("injected panic for dispose test");
         });
-
-        assert!(
-            result.is_err(),
-            "catch_unwind should capture the injected panic"
+        assert!(result.is_err());
+        assert_eq!(
+            super::super::mlock::ZEROIZED_BEFORE_UNLOCK.get(),
+            Some(true)
         );
-        // If we reach here, Drop ran during unwind (it would have been called
-        // even if it only set the disposed flag; here we verify the panic was
-        // caught, which proves Rust's unwind mechanism ran Drop on the Wallet).
     }
 
     // ── Seed bytes after dispose ──────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn seed_is_inaccessible_after_dispose() {
+    #[test]
+    fn seed_is_inaccessible_after_dispose() {
         let mut w = Wallet::unlock(
             "dispose-test".to_owned(),
-            Zeroizing::new(TEST_SEED),
+            &Zeroizing::new(TEST_SEED),
             30,
             MlockRequired::False,
         )
-        .await
         .unwrap();
 
         // Confirm seed is readable before dispose.
@@ -656,16 +575,15 @@ mod tests {
 
     // ── Warn-mode mlock fallback ──────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn warn_mode_unlock_proceeds() {
+    #[test]
+    fn warn_mode_unlock_proceeds() {
         // Warn mode must always produce a valid Wallet, even on rlimit-0 envs.
         let mut w = Wallet::unlock(
             "warn-profile".to_owned(),
-            Zeroizing::new(TEST_SEED),
+            &Zeroizing::new(TEST_SEED),
             30,
             MlockRequired::Warn,
         )
-        .await
         .unwrap();
         assert_eq!(w.seed().unwrap(), &TEST_SEED);
         w.dispose();
@@ -673,19 +591,18 @@ mod tests {
 
     // ── expires_at_unix_ms accessor ───────────────────────────────────────────
 
-    #[tokio::test]
-    async fn expires_at_in_future() {
+    #[test]
+    fn expires_at_in_future() {
         let before_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
         let mut w = Wallet::unlock(
             "expiry-test".to_owned(),
-            Zeroizing::new(TEST_SEED),
+            &Zeroizing::new(TEST_SEED),
             30,
             MlockRequired::False,
         )
-        .await
         .unwrap();
         let after_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -706,8 +623,8 @@ mod tests {
 
     // ── Seed inaccessible after dispose (residue gate) ───────────────────────
 
-    #[tokio::test]
-    async fn seed_inaccessible_means_disposed_state_is_set() {
+    #[test]
+    fn seed_inaccessible_means_disposed_state_is_set() {
         // Verifies that after dispose, the wallet correctly reports Disposed
         // on every seed() call.  Direct heap-residue scanning requires unsafe
         // pointer reads (prohibited by #![forbid(unsafe_code)]).  The
@@ -716,11 +633,10 @@ mod tests {
         let seed: [u8; 32] = [0xCDu8; 32];
         let mut w = Wallet::unlock(
             "residue-test".to_owned(),
-            Zeroizing::new(seed),
+            &Zeroizing::new(seed),
             30,
             MlockRequired::False,
         )
-        .await
         .unwrap();
         // Before dispose: seed is accessible.
         assert_eq!(w.seed().unwrap(), &seed);
@@ -730,5 +646,97 @@ mod tests {
             matches!(w.seed(), Err(WalletLifecycleError::Disposed)),
             "seed must not be accessible after dispose (no-residue gate)"
         );
+    }
+
+    #[test]
+    fn no_task_is_spawned_by_unlock() {
+        let wallet = Wallet::unlock(
+            "test".to_owned(),
+            &Zeroizing::new(TEST_SEED),
+            30,
+            MlockRequired::False,
+        )
+        .unwrap();
+        assert_eq!(wallet.seed().unwrap(), &TEST_SEED);
+    }
+
+    #[test]
+    fn an_unlocked_wallet_reads_the_locked_home() {
+        fn returned(wallet: Wallet) -> Wallet {
+            wallet
+        }
+        let wallet = Wallet::unlock(
+            "test".to_owned(),
+            &Zeroizing::new(TEST_SEED),
+            30,
+            MlockRequired::Warn,
+        )
+        .unwrap();
+        let address = wallet.seed().unwrap().as_ptr() as usize;
+        assert_eq!(wallet.lock_target(), Some(address));
+        let mut values = Vec::new();
+        values.push(wallet);
+        assert_eq!(values[0].seed().unwrap().as_ptr() as usize, address);
+        assert_eq!(values[0].lock_target(), Some(address));
+        let boxed = Box::new(values.pop().unwrap());
+        assert_eq!(boxed.seed().unwrap().as_ptr() as usize, address);
+        assert_eq!(boxed.lock_target(), Some(address));
+        let wallet = returned(*boxed);
+        assert_eq!(wallet.seed().unwrap().as_ptr() as usize, address);
+        assert_eq!(wallet.lock_target(), Some(address));
+    }
+
+    #[test]
+    fn into_locked_seed_refuses_after_the_ttl() {
+        use std::sync::atomic::AtomicU64;
+        let now = Arc::new(AtomicU64::new(1000));
+        let clock_now = Arc::clone(&now);
+        let clock = Arc::new(crate::timefmt::MockClock::new(move || {
+            Ok(clock_now.load(Ordering::SeqCst))
+        }));
+        let wallet = Wallet::unlock_with_clock(
+            "test".to_owned(),
+            &Zeroizing::new(TEST_SEED),
+            1,
+            MlockRequired::False,
+            clock,
+        )
+        .unwrap();
+        now.store(2000, Ordering::SeqCst);
+        assert!(matches!(
+            wallet.into_locked_seed(),
+            Err(WalletLifecycleError::Disposed)
+        ));
+    }
+
+    #[test]
+    fn into_locked_seed_refuses_after_dispose() {
+        let mut wallet = Wallet::unlock(
+            "test".to_owned(),
+            &Zeroizing::new(TEST_SEED),
+            30,
+            MlockRequired::False,
+        )
+        .unwrap();
+        wallet.dispose();
+        assert!(matches!(
+            wallet.into_locked_seed(),
+            Err(WalletLifecycleError::Disposed)
+        ));
+    }
+
+    #[test]
+    fn into_locked_seed_returns_the_same_home() {
+        let wallet = Wallet::unlock(
+            "test".to_owned(),
+            &Zeroizing::new(TEST_SEED),
+            30,
+            MlockRequired::Warn,
+        )
+        .unwrap();
+        let address = wallet.seed().unwrap().as_ptr();
+        let locked = wallet.into_locked_seed().unwrap();
+        assert_eq!(locked.seed().as_ptr(), address);
+        assert_eq!(locked.seed(), &TEST_SEED);
     }
 }

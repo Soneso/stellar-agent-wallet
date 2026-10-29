@@ -216,6 +216,11 @@ pub(crate) fn prepare_mainnet_recorder<'a>(
 }
 
 impl<'a> PreparedMainnetRecorder<'a> {
+    /// The request identifier shared by this write's audit records.
+    pub(crate) fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
     /// Binds the prepared recorder to the minted `authorization`, whose
     /// window entries it records, with the witness and the confirmation's
     /// tombstone.

@@ -21,7 +21,7 @@ An AI agent calls wallet tools on its own initiative. The model does not assume 
   attempts keyed audit acquisition and tolerates an unavailable key or writer.
   A changed audit binding still refuses with `audit.log_binding_changed`.
   Synthesis applies when no profile is named and no `default.toml` exists.
-- **Key custody** keeps the signing seed out of the agent's reach: it lives in the platform keyring and is only briefly resident in pinned memory.
+- **Key custody** keeps the signing seed out of the agent's reach: it lives in the platform keyring, and a seed loaded for signing stays in a zeroize-on-drop page, locked when the lock succeeds, until its wallet or signer drops it.
 
 A fifth control addresses a different risk: which tool definitions the agent may load. **Toolsets** package third-party or untrusted tool definitions behind capability isolation: a toolset installs only after publisher-signature and hash verification, and a structural boundary keeps it from reaching a signing tool it was not granted. Where the four controls above constrain each action, toolsets constrain the surface an agent can act through. See [Toolsets](toolsets.md).
 
@@ -63,9 +63,10 @@ Keys are never stored in configuration. A profile is a per-environment TOML file
 
 When a CLI command signs with a seed read from a `--*-secret-env` variable, the 32-byte signing seed is loaded into a short Unlock window. Keyring signers, the Ledger, and the MCP server never enter it; a keyring signer loads its key for each signature into a zeroize-on-drop buffer without a memory lock. The window works as follows:
 
-- The seed is moved into a zeroize-on-drop buffer, and its backing page is pinned in physical RAM via `mlock` (Linux/macOS) or `VirtualLock` (Windows). Pinning the page keeps the seed out of swap.
-- The window is TTL-bounded. The default is 30 seconds; the configured value (profile `[wallet] unlock_ttl_seconds`) must be in the range 1 to 600 seconds, and a value of 0 or above 600 is refused when the window is constructed rather than clamped. A background timer fires at the TTL and marks the wallet disposed.
-- On every exit path, including normal return, error propagation, and panic-unwind, the seed is zeroized and the lock released.
+- The wallet allocates a zeroed, isolated home, attempts the configured memory lock, then copies the borrowed seed into it. A successful lock keeps the page out of swap.
+- The clock bounds wallet seed access and transfer to the unlock window. The default is 30 seconds; `wallet.unlock_ttl_seconds` accepts 1 to 600 seconds and refuses other values.
+- The seed stays in a zeroize-on-drop page, locked when the lock succeeds, until its wallet or signer drops it. Drop zeroizes before unlocking and freeing, including on errors and panic unwind.
+- Mainnet environment signers unlock once per signature and drop the seed afterward. Testnet environment signers keep it for the command, which can outlast the TTL.
 
 The `mlock_required` posture in `[wallet]` controls what happens when pinning fails. The value `true` (default on Linux/macOS) fails closed and aborts the unlock; `"warn"` (default on Windows) proceeds with unprotected memory and emits a warning; `false` proceeds silently, with the operator accepting the swap-disclosure risk. The posture is set in the profile file and is not overlayable. No path logs the seed.
 
@@ -331,7 +332,7 @@ states. See [Agent payments with MPP](agent-payments.md).
 | Profile | Per-environment TOML config (schema version 2) binding a CAIP-2 chain, RPC endpoint, keyring entry references, thresholds, and the active policy engine. Holds no keys; an endpoint URL can still embed a credential. |
 | CAIP-2 chain id | `stellar:testnet` or `stellar:mainnet`; drives passphrase resolution and the mainnet-write gate. |
 | Keyring entry reference | A `service` + `account` pair naming a platform-keyring secret; never the secret itself. |
-| Unlock window | The short, TTL-bounded period during which the signing seed is resident in pinned, zeroize-on-drop memory. See [Key custody and the unlock window](#key-custody-and-the-unlock-window). |
+| Unlock window | The clock-checked period when a wallet permits seed access or transfer. Seed residency lasts until its wallet or signer drops. |
 | Policy engine | Evaluates each tool/command to Allow, Deny, or RequireApproval. Noop and V1 are the two engines. |
 | Criterion | One typed check inside a V1 policy rule (per-tx cap, per-period cap, rate limit, counterparty allowlist, minimum-reserve, session-active, and others). |
 | Approval spine | The storage and cryptographic substrate recording out-of-band operator approvals: a per-profile pending-approval store plus an HMAC attestation minted at approve time. |

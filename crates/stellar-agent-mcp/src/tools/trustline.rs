@@ -74,7 +74,6 @@ use stellar_agent_stablecoin::{
     preview::{GateDecisionView, TrustlinePreview},
     resolve::{DenominationInput, ResolvedAsset, resolve_denomination},
 };
-use zeroize::Zeroizing;
 
 use crate::server::WalletServer;
 use crate::tools::common::{
@@ -297,7 +296,7 @@ impl WalletServer {
     /// the store) reads as no opt-in, so a clawback-enabled issuer refuses.
     fn verified_clawback_opt_in(&self, code: &str, issuer: &str, now_ms: u64) -> bool {
         let key = match crate::tools::common::load_attestation_key(self.security_profile()) {
-            Ok(key) => Zeroizing::new(key),
+            Ok(key) => key,
             Err(_) => {
                 tracing::debug!(
                     "attestation key load failed; treating clawback opt-in as absent (fail-closed)"

@@ -272,7 +272,7 @@ impl CredentialApi for HeadlessCredential {
         // Existence probe only, matching the platform-store pattern (see
         // apple-native-keyring-store's `Cred::get_credential`): every
         // specifier is also a wrapper here, so `None` hands `self` back.
-        self.get_secret()?;
+        drop(zeroize::Zeroizing::new(self.get_secret()?));
         Ok(None)
     }
 

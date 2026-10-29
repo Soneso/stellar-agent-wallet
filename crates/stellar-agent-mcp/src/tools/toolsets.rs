@@ -409,8 +409,7 @@ impl WalletServer {
         ),
         CallToolResult,
     > {
-        let key =
-            zeroize::Zeroizing::new(crate::tools::common::load_attestation_key(&self.profile)?);
+        let key = crate::tools::common::load_attestation_key(&self.profile)?;
         let binding = stellar_agent_core::approval::AttestationBinding::new(
             profile_name,
             self.context.chain_id.caip2_str(),

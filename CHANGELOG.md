@@ -181,6 +181,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bound_window_reset_reason` bounds the signed and recorded reason to 80 Unicode
   characters; `WINDOW_RESET_REASON_MAX` names the bound.
   `bound_recorded_str` exposes the general audit string bound.
+- `Wallet::unlock` and `Wallet::unlock_with_clock` take `&[u8; 32]` and run
+  synchronously. `signer_from_wallet` consumes the wallet. `LockedSeed::seed`
+  is public, and `Wallet::into_locked_seed` transfers its stable seed home.
 - MPP state adds a `default-generation-intent` keyring entry beside its committed
   counter; `intent_account` and `generation_intent_account` derive its account.
   `reset_for_profile` accepts the current time and returns `MppStateReset`.
@@ -644,6 +647,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- The wallet TTL background task. Clock checks bound seed access and transfer;
+  the wallet or signer owns the seed until disposal or drop.
+- `LockedSeed::is_disposed`. Disposal consumes the `LockedSeed`, so no disposed
+  value remains to query.
+
 - `StellarRpcClient::verify_network_passphrase`, replaced by
   `StellarRpcClient::endpoint_identity`.
 - `stellar_agent_core::audit_log::reader::value_action_settlement` and
@@ -744,6 +752,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A window-state reset on an installation with mainnet enabled requires the
   pinned owner's seed in every build. Its audit row records the owner's
   signature over the reset, including the store digest and generation pair.
+- Environment signing locks the seed's stable home before copying into it.
+  Signing reads that home; disposal zeroizes before unlocking and freeing it.
+  Mainnet environment signing records tolerated lock failures in the audit log.
 - Release and rehearsal builds restore and save no cache.
 - Release signing, provenance, and publication wait for the vendored Wasm
   rebuild of the tagged commit, and a tag run of the vendored Wasm workflow

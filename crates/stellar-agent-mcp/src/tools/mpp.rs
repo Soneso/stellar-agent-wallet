@@ -351,7 +351,7 @@ impl WalletServer {
         if let Err(error) = verify_pending_approval(
             &state,
             approval_store.as_ref(),
-            approval_key.as_ref(),
+            approval_key.as_deref(),
             &stellar_agent_core::approval::AttestationBinding::new(
                 &self.profile_name_for_approval(),
                 self.context.chain_id.caip2_str(),
@@ -405,7 +405,7 @@ impl WalletServer {
         let credential = commit_authorization(
             &state,
             approval_store.as_ref(),
-            approval_key.as_ref(),
+            approval_key.as_deref(),
             &stellar_agent_core::approval::AttestationBinding::new(
                 &self.profile_name_for_approval(),
                 self.context.chain_id.caip2_str(),

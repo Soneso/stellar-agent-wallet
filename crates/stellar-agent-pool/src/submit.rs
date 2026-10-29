@@ -217,7 +217,8 @@ where
     // derive_channel_signer and is dropped.
     #[cfg(feature = "test-hooks")]
     SEED_COPIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let seed_copy: Zeroizing<[u8; 64]> = Zeroizing::new(**seed);
+    let mut seed_copy = Zeroizing::new([0u8; 64]);
+    seed_copy.copy_from_slice(seed.as_ref());
     let signer = match derive_channel_signer(seed_copy, channel_index) {
         Ok(s) => s,
         Err(e) => {

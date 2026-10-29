@@ -50,7 +50,9 @@ use crate::commands::policy_engine::{MainnetEvaluation, MainnetPolicy, MainnetVe
 use crate::commands::submission_record::{error_envelope, prepare_mainnet_recorder};
 use crate::commands::value_audit::drain_consent_rows_before_signing;
 use crate::common::mainnet_confirm::{ConfirmDecision, MainnetWriteSummary, confirm_mainnet_write};
-use crate::common::signer_ceremony::{MainnetSignerChoice, mainnet_signer};
+use crate::common::signer_ceremony::{
+    MainnetSignerChoice, mainnet_signer, record_mlock_degradation,
+};
 
 /// The message of `network.mainnet_authorization_refused` when the signature
 /// was withheld.
@@ -432,6 +434,8 @@ pub(crate) async fn authorize_and_submit(
     )
     .map_err(|e| refused(PipelineStep::RecorderPreparation, &e, "", verb, None))?;
 
+    let audit_writer = std::sync::Arc::clone(readiness.writer());
+    let request_id = prepared.request_id().to_owned();
     let window_store = PersistedWindowStore::for_profile(name);
     let auth = resolve_tx_sign(TxSignRequest {
         context,
@@ -465,7 +469,7 @@ pub(crate) async fn authorize_and_submit(
     };
 
     let recorder = prepared.bind_authorized(&auth);
-    record_bound_recorder(&recorder);
+    record_bound_recorder(&recorder, &request_id);
 
     let signer = mainnet_signer(&choice, profile, &enrolled, source)
         .await
@@ -487,7 +491,7 @@ pub(crate) async fn authorize_and_submit(
     )
     .await
     .map_err(|e| {
-        refused(
+        let refusal = refused(
             PipelineStep::Attach {
                 handle_failed: signer.handle_failed(),
             },
@@ -495,7 +499,14 @@ pub(crate) async fn authorize_and_submit(
             "",
             verb,
             Some(&minted),
-        )
+        );
+        record_mlock_degradation(
+            &audit_writer,
+            signer.mlock_degradation().as_ref(),
+            name,
+            &request_id,
+        );
+        refusal
     })?;
 
     let result = submit_authorized_transaction_and_wait(
@@ -509,8 +520,15 @@ pub(crate) async fn authorize_and_submit(
         consumer,
         MainnetSubmitGrant::Tx(auth),
     )
-    .await
-    .map_err(|e| {
+    .await;
+    // Audit appends can rotate the segment, so record only after submit returns.
+    record_mlock_degradation(
+        &audit_writer,
+        signer.mlock_degradation().as_ref(),
+        name,
+        &request_id,
+    );
+    let result = result.map_err(|e| {
         refused(
             PipelineStep::Submit {
                 pre_send_entered: recorder.pre_send_entered(),
@@ -537,9 +555,14 @@ fn apply_test_routes(context: MainnetWriteContext) -> MainnetWriteContext {
 fn record_invalidation(_stage: InvalidationStage, _result: &Result<(), MainnetAuthorizationError>) {
 }
 
-/// Hands the bound recorder to the test seam; production does nothing.
+/// Hands the bound recorder and its request id to the test seam; production
+/// does nothing.
 #[cfg(not(test))]
-fn record_bound_recorder(_recorder: &crate::commands::submission_record::StageMarkedRecorder<'_>) {}
+fn record_bound_recorder(
+    _recorder: &crate::commands::submission_record::StageMarkedRecorder<'_>,
+    _request_id: &str,
+) {
+}
 
 #[cfg(test)]
 thread_local! {
@@ -551,6 +574,9 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     /// The `Debug` form of every recorder bound on this thread.
     static BOUND_RECORDERS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The request id of every recorder bound on this thread.
+    static BOUND_REQUEST_IDS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -593,6 +619,12 @@ pub(crate) fn bound_recorders_on_this_thread() -> Vec<String> {
     BOUND_RECORDERS.with(|recorded| recorded.borrow().clone())
 }
 
+/// The request ids of the recorders bound on this thread, oldest first.
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) fn bound_request_ids_on_this_thread() -> Vec<String> {
+    BOUND_REQUEST_IDS.with(|recorded| recorded.borrow().clone())
+}
+
 /// Returns `context` with the test route map of this thread, when a test set
 /// one.
 #[cfg(test)]
@@ -629,10 +661,15 @@ fn record_invalidation(stage: InvalidationStage, result: &Result<(), MainnetAuth
     INVALIDATIONS.with(|recorded| recorded.borrow_mut().push((label, result.clone())));
 }
 
-/// Appends the `Debug` form of the bound recorder to this thread's record.
+/// Appends the `Debug` form and the request id of the bound recorder to this
+/// thread's record.
 #[cfg(test)]
-fn record_bound_recorder(recorder: &crate::commands::submission_record::StageMarkedRecorder<'_>) {
+fn record_bound_recorder(
+    recorder: &crate::commands::submission_record::StageMarkedRecorder<'_>,
+    request_id: &str,
+) {
     BOUND_RECORDERS.with(|recorded| recorded.borrow_mut().push(format!("{recorder:?}")));
+    BOUND_REQUEST_IDS.with(|recorded| recorded.borrow_mut().push(request_id.to_owned()));
 }
 
 #[cfg(test)]

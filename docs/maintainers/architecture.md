@@ -128,7 +128,7 @@ The policy engine, approval spine, and audit log all live in `stellar-agent-core
 - `approval`: the per-profile `PendingApprovalStore` (TOML-backed, with an exclusive lifetime advisory lock that refuses a second opener), the HMAC-SHA256 attestation primitive, and the process-uid helper that binds an attestation to the OS user.
 - `audit_log`: the append-only hash-chained JSONL writer, the chain primitives, and `verify_log` for end-to-end chain verification.
 
-These primitives are synchronous and runtime-free; `core` uses Tokio only for the unlock-window TTL timer in `Wallet::unlock`. The security rationale for each is in [security-internals.md](security-internals.md).
+Wallet unlock and seed access are synchronous and runtime-free. The RPC budget helper uses Tokio to bound async stages. The security rationale for each is in [security-internals.md](security-internals.md).
 
 ### Approval error taxonomy
 

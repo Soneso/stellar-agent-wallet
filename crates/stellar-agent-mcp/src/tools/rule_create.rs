@@ -1440,11 +1440,10 @@ impl WalletServer {
                 }
             };
 
-            let attestation_key_bytes = match load_attestation_key(&self.profile) {
+            let attestation_key = match load_attestation_key(&self.profile) {
                 Ok(k) => k,
                 Err(result) => return Ok(result),
             };
-            let attestation_key = zeroize::Zeroizing::new(attestation_key_bytes);
 
             if let Err(e) = store.verify_rule_proposal_gate(
                 nonce_str,

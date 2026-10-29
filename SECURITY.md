@@ -102,11 +102,14 @@ properties:
   URL can embed a credential in its path or query on any network. Mainnet refuses only
   a username or password in the URL. Profile TOML is safe to back up only when no
   endpoint URL embeds a credential.
-- Unlock window with zeroize and mlock. When a CLI command signs with a seed read from a
-  `--*-secret-env` variable, the 32-byte seed is loaded into an unlock window. The window
-  is a short, TTL-bounded period (default 30s, hard cap 600s) during which the seed is
-  resident in pinned, zeroize-on-drop memory (`mlock`). On every drop path (normal
-  return, error propagation, or panic) the seed is zeroized and the lock released.
+- Unlock window with zeroize and mlock. CLI environment signing copies the
+  borrowed seed into an isolated home after the configured lock attempt.
+  The clock bounds wallet seed access and transfer, default 30 seconds, cap 600.
+  The seed stays in a zeroize-on-drop page, locked when the lock succeeds, until
+  its wallet or signer drops it. Drop zeroizes before unlocking and freeing,
+  including during unwind.
+  Mainnet environment signers unlock once per signature and drop the seed afterward.
+  Testnet environment signers keep it for the command, which can outlast the TTL.
   Keyring signers, the Ledger, and the MCP server never enter the window. A keyring
   signer loads its key for each signature into a zeroize-on-drop buffer without a
   memory lock.

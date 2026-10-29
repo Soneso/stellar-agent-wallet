@@ -27,7 +27,9 @@ fn seed_from_env(var_name: &str) -> Result<Zeroizing<[u8; 32]>, OwnerSeedError> 
     Ok(seed)
 }
 
-/// Runs an operation with a pinned seed and disposes the wallet on every path.
+/// Runs an operation with a pinned seed. The wallet borrows the source seed and
+/// owns its stable home through the operation; disposal zeroizes before
+/// unlocking, and the dalek key zeroizes on drop.
 pub(super) async fn with_owner_seed<T, E: From<OwnerSeedError>>(
     var_name: &str,
     wallet_label: &str,
@@ -36,8 +38,7 @@ pub(super) async fn with_owner_seed<T, E: From<OwnerSeedError>>(
     operation: impl AsyncFnOnce(&ed25519_dalek::SigningKey) -> Result<T, E>,
 ) -> Result<T, E> {
     let seed = seed_from_env(var_name)?;
-    let mut wallet = Wallet::unlock(wallet_label.to_owned(), seed, ttl_seconds, mlock_required)
-        .await
+    let mut wallet = Wallet::unlock(wallet_label.to_owned(), &seed, ttl_seconds, mlock_required)
         .map_err(|e| OwnerSeedError::Unlock(e.to_string()))?;
     let key = wallet
         .seed()
