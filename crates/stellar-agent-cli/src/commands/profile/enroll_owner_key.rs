@@ -923,6 +923,18 @@ mod tests {
                 "stellar-agent-nonce-operator",
                 "default",
             )
+            .primary_provider(
+                stellar_agent_core::profile::schema::PrimaryProviderRecord::new(
+                    "Primary operator",
+                    "rpc.example.invalid",
+                ),
+            )
+            .oracle_provider_url(url::Url::parse("https://oracle.example.invalid").unwrap())
+            .oracle_provider(stellar_agent_core::profile::schema::ProviderRecord::new(
+                "Oracle operator",
+                "oracle.example.invalid",
+                true,
+            ))
             .build();
             profile.wallet.mlock_required = stellar_agent_core::wallet::MlockRequired::Warn;
             let identity = stellar_agent_core::profile::schema::signer_identity_entry_ref(

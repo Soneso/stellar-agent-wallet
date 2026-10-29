@@ -26,6 +26,8 @@ mod fee_reserve_boundary;
 mod fresh_v1_ceremony;
 #[path = "cli/keyring_classification_discipline.rs"]
 mod keyring_classification_discipline;
+#[path = "cli/mainnet_oracle_required.rs"]
+mod mainnet_oracle_required;
 #[path = "cli/mpp_authorize_preview_parity.rs"]
 mod mpp_authorize_preview_parity;
 #[path = "cli/mpp_first_run_vs_unavailable_state.rs"]

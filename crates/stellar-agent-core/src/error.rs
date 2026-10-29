@@ -743,6 +743,23 @@ pub enum ValidationError {
         /// The mismatched binding, without secret material.
         binding: &'static str,
     },
+
+    /// A mainnet profile names no usable oracle endpoint.
+    ///
+    /// Mainnet enablement and every mainnet write require
+    /// `oracle_provider_url` with a matching `providers.oracle` record, so
+    /// an endpoint of another operator can confirm what the primary endpoint
+    /// reports. The profile loader checks the record itself: its host, its
+    /// operator, and its independence assertion.
+    ///
+    /// # Wire code
+    ///
+    /// `"profile.mainnet_oracle_required"`.
+    #[error("{}", gap.text())]
+    MainnetOracleRequired {
+        /// What the profile lacks.
+        gap: MainnetOracleGap,
+    },
     /// The amount was specified without explicit units (e.g. `"100"` instead
     /// of `"100 XLM"` or `"100.0000000"`).
     #[error("amount must specify units (e.g. '100 XLM' or '100.0000000')")]
@@ -1712,6 +1729,39 @@ pub enum ValidationError {
     },
 }
 
+/// What keeps a mainnet profile's oracle from being usable.
+///
+/// Carried by [`ValidationError::MainnetOracleRequired`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MainnetOracleGap {
+    /// The profile sets no `oracle_provider_url`.
+    UrlMissing,
+    /// The profile sets `oracle_provider_url` but holds no
+    /// `providers.oracle` record.
+    RecordMissing,
+}
+
+impl MainnetOracleGap {
+    /// The refusal text: what is missing and how to supply it.
+    #[must_use]
+    pub const fn text(self) -> &'static str {
+        match self {
+            Self::UrlMissing => {
+                "the mainnet profile sets no oracle_provider_url; mainnet enablement and \
+                 mainnet writes require an oracle endpoint run by another operator; set \
+                 oracle_provider_url and its providers.oracle record in the profile file"
+            }
+            Self::RecordMissing => {
+                "the mainnet profile sets oracle_provider_url without a providers.oracle \
+                 record; mainnet enablement and mainnet writes require the record; add \
+                 providers.oracle with the oracle's operator and host and \
+                 independent_of_primary = true to the profile file"
+            }
+        }
+    }
+}
+
 /// Where a classic per-operation fee came from.
 ///
 /// Carried by [`ValidationError::FeeAboveCap`] so its text names the remedy
@@ -1849,6 +1899,9 @@ impl ValidationError {
             Self::SecretEnvInvalid { .. } => "validation.secret_env_invalid",
             Self::SignerSourceRequired { .. } => "validation.signer_source_required",
             Self::MainnetEnablementInvalid { .. } => "profile.mainnet_enablement_invalid",
+            // Profile taxonomy code on a validation-class variant: see
+            // `ProfileNameMismatch` above for the same rationale.
+            Self::MainnetOracleRequired { .. } => "profile.mainnet_oracle_required",
             Self::MainnetFeeCapRequired => "validation.mainnet_fee_cap_required",
             // Fee taxonomy code on a validation-class variant: the code names
             // the subsystem (fees.*) while the category stays Validation.
@@ -3379,6 +3432,18 @@ mod tests {
                 "profile.mainnet_enablement_invalid",
             ),
             (
+                ValidationError::MainnetOracleRequired {
+                    gap: MainnetOracleGap::UrlMissing,
+                },
+                "profile.mainnet_oracle_required",
+            ),
+            (
+                ValidationError::MainnetOracleRequired {
+                    gap: MainnetOracleGap::RecordMissing,
+                },
+                "profile.mainnet_oracle_required",
+            ),
+            (
                 ValidationError::NetworkFlagMismatch {
                     flag: "testnet".into(),
                     profile: "mainnet".into(),
@@ -3717,6 +3782,9 @@ mod tests {
                 }
                 ValidationError::MainnetEnablementInvalid { binding } => {
                     ValidationError::MainnetEnablementInvalid { binding }
+                }
+                ValidationError::MainnetOracleRequired { gap } => {
+                    ValidationError::MainnetOracleRequired { gap: *gap }
                 }
                 ValidationError::AmountUnitsRequired => ValidationError::AmountUnitsRequired,
                 ValidationError::AmountPrecisionExceeded { amount } => {

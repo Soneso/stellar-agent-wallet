@@ -542,9 +542,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NetworkContext::oracle_client` and `MainnetWriteContext::oracle_client`
   build the oracle client a profile names, and `MainnetOracle::verify` returns
   that client once its endpoint reports the mainnet passphrase.
-- `profile enable-mainnet --check` reports `oracle_provider_url`, with the new
-  status `advisory` on a profile without an oracle. An advisory never fails the
-  check.
 - `tx receipt clear` on a mainnet profile with an oracle asks the oracle before
   it clears, and refuses with `submission.not_clearable` when the oracle does
   not report the mainnet passphrase, reports `SUCCESS` or `FAILED`, or cannot
@@ -835,6 +832,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file restored beside a truncated audit log agrees with it. Mainnet readiness
   and `profile enable-mainnet` therefore refuse the headless backends with
   `network.mainnet_keyring_backend_unsupported`.
+- Mainnet enablement and mainnet writes require an oracle:
+  `oracle_provider_url` with its `providers.oracle` record. Mainnet reads run
+  without it. `profile enable-mainnet` refuses a profile without one with the
+  new code `profile.mainnet_oracle_required` and writes no enablement state,
+  and `--check` reports its `oracle_provider_url` check as failed. Every
+  mainnet write, in the CLI and in the MCP server, refuses such a profile with
+  the same code before signing, so an existing enabled mainnet profile without
+  an oracle refuses writes until one is set.
+  `stellar_agent_core::mainnet::oracle::require_mainnet_oracle` decides the
+  requirement; `ValidationError::MainnetOracleRequired` carries the new
+  `MainnetOracleGap`.
 - `headless-dpapi` binds each entry to its keyring coordinate (service and
   account) as DPAPI optional entropy, so an entry moved to another coordinate
   fails to open. An entry sealed without entropy opens once through the call

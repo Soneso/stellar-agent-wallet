@@ -166,7 +166,7 @@ pub(crate) struct Spec {
     authorization_ttl_seconds: i64,
     primary: Option<ClassicRpc>,
     oracle: Option<ClassicRpc>,
-    oracle_named: bool,
+    oracle_removed: bool,
     testnet: bool,
     submit_timeout_seconds: Option<u64>,
 }
@@ -192,16 +192,18 @@ impl Spec {
             authorization_ttl_seconds: 60,
             primary: None,
             oracle: None,
-            oracle_named: true,
+            oracle_removed: false,
             testnet: false,
             submit_timeout_seconds: None,
         }
     }
 
-    /// Saves the mainnet profile without `oracle_provider_url` and without
-    /// an oracle provider record. The oracle endpoint is started and unused.
+    /// Removes `oracle_provider_url` and the oracle provider record from
+    /// the stored mainnet profile after the ceremony, as an operator who
+    /// drops the oracle of an enabled profile does. The oracle endpoint is
+    /// started and unused.
     pub(crate) fn without_oracle(mut self) -> Self {
-        self.oracle_named = false;
+        self.oracle_removed = true;
         self
     }
 
@@ -394,20 +396,16 @@ impl MainnetFixture {
         .primary_provider(PrimaryProviderRecord::new(
             "Fixture primary operator",
             PRIMARY_HOST,
-        ));
-        if spec.oracle_named {
-            builder = builder
-                .oracle_provider_url(url::Url::parse(&format!("https://{ORACLE_HOST}")).unwrap())
-                .oracle_provider(ProviderRecord::new(
-                    "Fixture oracle operator",
-                    ORACLE_HOST,
-                    true,
-                ));
-        }
-        builder = builder
-            .audit_log_path(home.path().join("audit.jsonl"))
-            .classic_max_fee_per_op_stroops(spec.profile_fee_cap)
-            .policy_engine(spec.engine);
+        ))
+        .oracle_provider_url(url::Url::parse(&format!("https://{ORACLE_HOST}")).unwrap())
+        .oracle_provider(ProviderRecord::new(
+            "Fixture oracle operator",
+            ORACLE_HOST,
+            true,
+        ))
+        .audit_log_path(home.path().join("audit.jsonl"))
+        .classic_max_fee_per_op_stroops(spec.profile_fee_cap)
+        .policy_engine(spec.engine);
         if spec.engine == PolicyEngineKind::Noop {
             builder = builder.with_noop_engine();
         }
@@ -419,6 +417,15 @@ impl MainnetFixture {
 
         if spec.engine == PolicyEngineKind::V1 {
             Self::ceremony(&spec, &agent, &owner).await;
+        }
+        if spec.oracle_removed {
+            let directory = default_profile_dir().unwrap();
+            let mut stored = loader::load_from_dir(name, &directory, None).unwrap();
+            stored.oracle_provider_url = None;
+            if let Some(providers) = stored.providers.as_mut() {
+                providers.oracle = None;
+            }
+            loader::save_to_dir(name, &stored, &directory).unwrap();
         }
         Self::assemble(
             name,

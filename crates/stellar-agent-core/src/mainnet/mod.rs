@@ -1,6 +1,6 @@
 //! Mainnet proof types that live in core: the verified signed policy, the
-//! verified enablement record, and the fact-digest layout every mainnet proof
-//! shares.
+//! verified enablement record, the fact-digest layout every mainnet proof
+//! shares, and the oracle requirement of a mainnet profile.
 //!
 //! The authorization types that compose these proofs, and the proofs that
 //! need the network crate (endpoint identity, enrolled signer, cross-check
@@ -13,6 +13,9 @@ pub mod enablement;
 
 /// The fact-digest layout and labels of the mainnet proofs.
 pub mod fact;
+
+/// The oracle a mainnet profile needs for enablement and writes.
+pub mod oracle;
 
 /// The verified signed policy of a mainnet profile and its mainnet section.
 pub mod verified_policy;

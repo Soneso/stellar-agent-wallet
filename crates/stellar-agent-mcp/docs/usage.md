@@ -34,7 +34,10 @@ Each commit forces confirmation before attestation validation.
 Feature-on startup loads the mainnet write context for a verified enabled
 profile. Failed enablement or policy checks abort startup. Admission refusals
 use `network.mainnet_write_forbidden` for unsupported tools or missing V1 engine,
-verified policy, enablement, enabled context, or profiles directory.
+verified policy, enablement, enabled context, or profiles directory. A stored
+profile without `oracle_provider_url` refuses at admission with
+`profile.mainnet_oracle_required`, before signing. The server reads the
+profile at startup, so it applies an oracle change from its next start.
 
 After `profile enable-mainnet` or `profile sign-policy`, restart the MCP server.
 Freshness compares current policy and enablement facts without advancing the pin.
