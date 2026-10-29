@@ -96,16 +96,18 @@ use stellar_agent_core::error::{InternalError, ValidationError, WalletError, Wal
 use stellar_agent_core::policy::PolicyError;
 use stellar_agent_core::policy::pin::PinState;
 use stellar_agent_core::policy::v1::signature::{WindowResetStatement, sign, window_reset_digest};
-use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::profile::owner_key::encode_owner_public_key;
 use stellar_agent_core::profile::schema::Profile;
+use stellar_agent_core::profile::{ResolvedProfileName, loader};
 use stellar_agent_network::keyring::init_platform_keyring_store;
 use stellar_agent_network::policy_state::{
     PersistedWindowStore, ResetError, ResetRecord, StateDefect, WindowStoreError,
 };
 use uuid::Uuid;
 
-use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
+use crate::common::profile_access::{
+    injected_profile_load, profile_access_envelope, reconcile_loaded_profile,
+};
 use crate::common::render;
 
 use crate::commands::value_audit::{
@@ -185,6 +187,15 @@ struct ResetWindowStateData {
 ///
 /// Never panics.
 pub async fn run(args: &ResetWindowStateArgs) -> i32 {
+    run_with_dependencies(args, injected_profile_load, init_platform_keyring_store).await
+}
+
+/// Runs the reset with profile loading and keyring initialization supplied.
+async fn run_with_dependencies(
+    args: &ResetWindowStateArgs,
+    load_profile: impl FnOnce(&str) -> Result<Profile, loader::ProfileLoadError>,
+    init_keyring: impl FnOnce() -> Result<(), WalletError>,
+) -> i32 {
     if args.reason.trim().is_empty() {
         render::render_json(&Envelope::<()>::err_raw(
             "validation.reason_empty",
@@ -193,9 +204,10 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
         return 1;
     }
 
-    let profile = match load_profile_reconciled(&ResolvedProfileName::from_flag(
-        args.profile_name(),
-    )) {
+    let profile = match reconcile_loaded_profile(
+        load_profile(args.profile_name()),
+        &ResolvedProfileName::from_flag(args.profile_name()),
+    ) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(profile = %args.profile_name(), error = %e, "profile access refused");
@@ -204,7 +216,14 @@ pub async fn run(args: &ResetWindowStateArgs) -> i32 {
         }
     };
 
-    if let Err(e) = init_platform_keyring_store() {
+    if let Err(e) = stellar_agent_core::profile::owner_key::refuse_installation_key_coordinate(
+        &profile.policy_window_state_key_id,
+        stellar_agent_network::policy_state::POLICY_STATE_KEY_FIELD,
+    ) {
+        render::render_json(&Envelope::err(&e));
+        return 1;
+    }
+    if let Err(e) = init_keyring() {
         render::render_json(&Envelope::err(&e));
         return 1;
     }
@@ -793,5 +812,24 @@ mod tests {
             "profile.reset_window_state_open_authorizations"
         );
         assert!(open.to_string().contains('2'), "{open}");
+    }
+
+    /// Window reset refuses installation coordinates before opening keys.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn installation_coordinate_refuses_without_writing() {
+        crate::common::installation_key_fixture::assert_installation_profile_refusal(
+            |profile| &mut profile.policy_window_state_key_id,
+            async |fixture, profile, name| {
+                let args = ResetWindowStateArgs {
+                    name: Some(name.to_owned()),
+                    profile: None,
+                    reason: "reset fixture".to_owned(),
+                    owner_secret_env: None,
+                };
+                run_with_dependencies(&args, |_| Ok(profile.clone()), || fixture.init()).await
+            },
+        )
+        .await;
     }
 }

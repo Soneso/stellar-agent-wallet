@@ -17,17 +17,27 @@
 //!   `route_to_matrix_tool` arm.
 //! - [`list_pinned_toolsets`] — enumerate installed toolsets + their declared actions.
 //!
+//! ## What a toolset bounds
+//!
+//! A toolset narrows what the dispatcher (`stellar_toolset_invoke`) routes: an
+//! action reaches a wallet tool only when the toolset's declared capabilities
+//! grant it. A toolset does not narrow the native tools the same MCP server
+//! registers; an agent connected to the server can call those directly. The
+//! `toolset` argument of an invocation is chosen by the caller, and the server
+//! binds no session to a toolset. The operator policy and the approvals bound
+//! native and routed calls alike.
+//!
 //! ## Security guarantees
 //!
-//! **Signing isolation is STRUCTURAL**: the ungated capability→tool matrix
-//! ([`matrix::grants_for_capability`]) contains no signing/key/policy tool
-//! regardless of any capability declaration. Even a toolset declaring every
-//! capability cannot reach a signing tool via the ungated path. This is the
-//! isolation boundary between the toolset guest code and the wallet's signing
-//! infrastructure.
+//! **Signing isolation of the dispatcher is STRUCTURAL**: the ungated
+//! capability→tool matrix ([`matrix::grants_for_capability`]) contains no
+//! signing/key/policy tool regardless of any capability declaration, and
+//! [`SIGNING_DENYLIST`] holds every destructive registry tool. Even a toolset
+//! declaring every capability cannot reach a signing tool through the ungated
+//! route.
 //!
-//! **Gated signing path**: `stellar_pay_commit` is reachable ONLY through
-//! `resolve_toolset_sign_payment_gated`, which requires BOTH:
+//! **Gated signing path**: `stellar_pay_commit` is reachable through the
+//! dispatcher ONLY via `resolve_toolset_sign_payment_gated`, which requires BOTH:
 //! 1. The four-part check (toolset declared `sign-payment`; the gated action
 //!    resolves; tool ∈ `allowed_tools`).
 //! 2. A current, matching first-invoke grant in the [`ToolsetGrantStore`].
@@ -35,6 +45,13 @@
 //! A `DispatchOutcome::Allow` from the policy engine is OVERRIDDEN to
 //! `RequireApproval` for all toolset-routed payments (unconditional per-action
 //! approval).
+//!
+//! **Authenticated install record**: both resolvers and the list read the
+//! capabilities from the install record, whose HMAC tag is verified under the
+//! installation's [`PinKey`] (a secret in the platform keyring). A record that
+//! does not verify refuses with [`ToolsetRuntimeError::PinUnverifiable`]. The
+//! record carries the `TOOLSET.md` digest, and both resolvers compare it with
+//! the file on disk before any routing.
 //!
 //! ## Primary consumers
 //!
@@ -49,6 +66,7 @@
 //!   grants via [`record_first_invoke_grant`]; the verification of those
 //!   grants on each action invocation is the consumer's responsibility.
 //! - Dynamic tool registration — explicitly out of scope.
+//! - Restricting the native tools of a server; the operator policy does that.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -71,7 +89,10 @@ use stellar_agent_core::approval::{
     default_toolset_grants_path, open_with_retry,
 };
 use stellar_agent_toolsets::{Capability, CapabilitySet, sanitise_display};
-use stellar_agent_toolsets_install::ToolsetPinRecord;
+pub use stellar_agent_toolsets_install::PinKey;
+use stellar_agent_toolsets_install::{
+    TOOLSETS_LOCK_FILE_NAME, ToolsetInstallError, ToolsetPinRecord,
+};
 use tracing::debug;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -113,9 +134,11 @@ pub struct ToolsetListEntry {
 /// [`ToolsetListEntry`] records.
 ///
 /// Walks `toolsets_root` for subdirectories, attempts to read the pin record
-/// from each, and skips entries whose pin files are absent (logged at debug)
-/// or malformed (logged at warn). This is intentionally resilient so a single
-/// corrupted install does not block listing all others.
+/// from each under `pin_key`, and skips entries whose pin files are absent
+/// (logged at debug), malformed or do not verify (logged at warn). This is
+/// intentionally resilient so a single corrupted install does not block
+/// listing all others. With `pin_key` `None` no record verifies, so the list
+/// is empty. The toolsets lock file is skipped by name and never opened.
 ///
 /// The returned list is sorted by toolset name for deterministic output.
 ///
@@ -124,6 +147,7 @@ pub struct ToolsetListEntry {
 /// - [`ToolsetRuntimeError::Io`] if `toolsets_root` itself cannot be read.
 pub fn list_pinned_toolsets(
     toolsets_root: &Path,
+    pin_key: Option<&PinKey>,
 ) -> Result<Vec<ToolsetListEntry>, ToolsetRuntimeError> {
     // If the toolsets_root does not exist yet, return an empty list rather than
     // an error — it's valid to have no toolsets installed.
@@ -145,6 +169,9 @@ pub fn list_pinned_toolsets(
             }
         };
 
+        if dir_entry.file_name() == TOOLSETS_LOCK_FILE_NAME {
+            continue;
+        }
         let path = dir_entry.path();
         if !path.is_dir() {
             continue;
@@ -155,10 +182,18 @@ pub fn list_pinned_toolsets(
             None => continue,
         };
 
-        let pin = match stellar_agent_toolsets_install::read_pin(&pkg_name, toolsets_root) {
+        let pin = match stellar_agent_toolsets_install::read_pin(&pkg_name, toolsets_root, pin_key)
+        {
             Ok(Some(p)) => p,
             Ok(None) => {
                 debug!(package = %pkg_name, "no pin record; skipping");
+                continue;
+            }
+            Err(ToolsetInstallError::PinRecordUnverifiable { .. }) => {
+                tracing::warn!(
+                    package = %pkg_name,
+                    "pin record does not verify; skipping (uninstall and install the toolset again)"
+                );
                 continue;
             }
             Err(e) => {
@@ -249,31 +284,33 @@ pub fn check_toolset_action(
 /// any character outside `[a-z0-9-]` are rejected immediately with
 /// [`ToolsetRuntimeError::ToolsetNotInstalled`] and produce NO filesystem read.
 ///
-/// Reads the pin ONCE from `toolsets_root` (TOCTOU avoidance) and uses the
-/// snapshot for the entire check. Returns `(tool_name, pin)` on success so the
-/// caller can use the pin record for further context.
+/// Reads the pin ONCE from `toolsets_root` (TOCTOU avoidance), verifies its
+/// tag under `pin_key`, and uses the snapshot for the entire check. Returns
+/// `(tool_name, pin)` on success so the caller can use the pin record for
+/// further context.
 ///
 /// ## Dispatch-time content re-verification
 ///
-/// If the pin's `toolset_md_shasum` field is `Some`, re-reads the on-disk
-/// `TOOLSET.md` and compares its SHA-256 against the recorded digest. A
-/// mismatch returns [`ToolsetRuntimeError::ContentDigestMismatch`] and refuses
-/// dispatch. Pins without this field skip the check — the capability-source
-/// invariant (capabilities from the pin, not re-parsed `TOOLSET.md`) ensures
-/// tampered manifests cannot escalate capabilities regardless.
+/// Re-reads the on-disk `TOOLSET.md` and compares its SHA-256 against the
+/// digest in the authenticated pin. A mismatch
+/// or an unreadable file returns [`ToolsetRuntimeError::ContentDigestMismatch`]
+/// and refuses dispatch.
 ///
 /// # Errors
 ///
-/// - [`ToolsetRuntimeError::ToolsetNotInstalled`] — `toolset_name` fails charset
+/// - [`ToolsetRuntimeError::ToolsetNotInstalled`]: `toolset_name` fails charset
 ///   validation (`[a-z0-9-]`), or no pin record exists for the name.
-/// - [`ToolsetRuntimeError::Io`] — I/O error reading the pin.
-/// - [`ToolsetRuntimeError::ContentDigestMismatch`] — on-disk `TOOLSET.md` hash
+/// - [`ToolsetRuntimeError::PinUnverifiable`]: a pin record exists but
+///   `pin_key` is `None` or the record does not verify under it.
+/// - [`ToolsetRuntimeError::Io`]: I/O error reading the pin, or a malformed pin.
+/// - [`ToolsetRuntimeError::ContentDigestMismatch`]: on-disk `TOOLSET.md` hash
 ///   differs from the install-time digest stored in the pin.
 /// - Any [`check_toolset_action`] error.
 pub fn resolve_toolset_and_check(
     toolset_name: &str,
     action: &str,
     toolsets_root: &Path,
+    pin_key: Option<&PinKey>,
 ) -> Result<(&'static str, ToolsetPinRecord), ToolsetRuntimeError> {
     // Validate toolset_name against [a-z0-9-] BEFORE any filesystem access.
     // Rejects `/`, `\`, `.`, `..`, and all other chars outside the charset.
@@ -285,43 +322,8 @@ pub fn resolve_toolset_and_check(
     })?;
 
     // Read the pin ONCE — snapshot for the entire check (TOCTOU avoidance).
-    // Map ToolsetInstallError to ToolsetRuntimeError::Io using a kind-level message
-    // to avoid leaking the toolsets_root path via full error Display.
-    let pin = stellar_agent_toolsets_install::read_pin(toolset_name, toolsets_root)
-        .map_err(|e| ToolsetRuntimeError::Io(install_error_kind_str(&e)))?
-        .ok_or_else(|| ToolsetRuntimeError::ToolsetNotInstalled {
-            name: sanitise_display(toolset_name, 64),
-        })?;
-
-    // ── Dispatch-time content re-verification ─────────────────────────────────
-    //
-    // If the pin carries a TOOLSET.md digest, re-read the on-disk TOOLSET.md,
-    // recompute SHA-256, and compare. Mismatch → refuse dispatch.
-    //
-    // Both digests are non-secret hex strings; plain string comparison is
-    // correct (no timing attack).
-    //
-    // On I/O error reading TOOLSET.md: refuse dispatch (fail-closed). The toolset
-    // is installed but the manifest is unreadable — something is wrong.
-    if let Some(ref expected_digest) = pin.toolset_md_shasum {
-        let toolset_md_path = toolsets_root.join(toolset_name).join("TOOLSET.md");
-        let toolset_md_bytes = std::fs::read(&toolset_md_path).map_err(|_| {
-            ToolsetRuntimeError::ContentDigestMismatch {
-                name: sanitise_display(toolset_name, 64),
-            }
-        })?;
-        let actual_digest = stellar_agent_toolsets_install::sha256_hex_of(&toolset_md_bytes);
-        if actual_digest != *expected_digest {
-            tracing::warn!(
-                toolset = %toolset_name,
-                "dispatch-time TOOLSET.md content digest mismatch; refusing dispatch"
-            );
-            return Err(ToolsetRuntimeError::ContentDigestMismatch {
-                name: sanitise_display(toolset_name, 64),
-            });
-        }
-        debug!(toolset = %toolset_name, "dispatch-time TOOLSET.md content digest verified");
-    }
+    let pin = read_verified_pin(toolset_name, toolsets_root, pin_key)?;
+    verify_manifest_digest(toolset_name, toolsets_root, &pin)?;
 
     let capabilities = &pin.capabilities;
     let allowed_tools = &pin.allowed_tools;
@@ -331,7 +333,69 @@ pub fn resolve_toolset_and_check(
     Ok((tool_name, pin))
 }
 
+/// Compares the on-disk `TOOLSET.md` of `toolset_name` with the digest the
+/// authenticated pin recorded at install time.
+///
+/// Both digests are non-secret hex strings; plain string comparison is
+/// correct. A file that cannot be read refuses (fail-closed): the toolset is
+/// installed but its manifest is gone or unreadable.
+///
+/// # Errors
+///
+/// - [`ToolsetRuntimeError::ContentDigestMismatch`]: the file cannot be read
+///   or its SHA-256 differs from `pin.toolset_md_shasum`.
+fn verify_manifest_digest(
+    toolset_name: &str,
+    toolsets_root: &Path,
+    pin: &ToolsetPinRecord,
+) -> Result<(), ToolsetRuntimeError> {
+    let toolset_md_path = toolsets_root.join(toolset_name).join("TOOLSET.md");
+    let toolset_md_bytes = std::fs::read(&toolset_md_path).map_err(|_| {
+        ToolsetRuntimeError::ContentDigestMismatch {
+            name: sanitise_display(toolset_name, 64),
+        }
+    })?;
+    let actual_digest = stellar_agent_toolsets_install::sha256_hex_of(&toolset_md_bytes);
+    if actual_digest != pin.toolset_md_shasum {
+        tracing::warn!(
+            toolset = %toolset_name,
+            "dispatch-time TOOLSET.md content digest mismatch; refusing dispatch"
+        );
+        return Err(ToolsetRuntimeError::ContentDigestMismatch {
+            name: sanitise_display(toolset_name, 64),
+        });
+    }
+    debug!(toolset = %toolset_name, "dispatch-time TOOLSET.md content digest verified");
+    Ok(())
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Reads and verifies the pin of an already name-validated `toolset_name`.
+///
+/// An absent record is [`ToolsetRuntimeError::ToolsetNotInstalled`]; a record
+/// that does not verify under `pin_key` (or any record when `pin_key` is
+/// `None`) is [`ToolsetRuntimeError::PinUnverifiable`]. Other read errors map
+/// to a kind-level [`ToolsetRuntimeError::Io`] so the toolsets path does not
+/// leak through the error.
+fn read_verified_pin(
+    toolset_name: &str,
+    toolsets_root: &Path,
+    pin_key: Option<&PinKey>,
+) -> Result<ToolsetPinRecord, ToolsetRuntimeError> {
+    match stellar_agent_toolsets_install::read_pin(toolset_name, toolsets_root, pin_key) {
+        Ok(Some(pin)) => Ok(pin),
+        Ok(None) => Err(ToolsetRuntimeError::ToolsetNotInstalled {
+            name: sanitise_display(toolset_name, 64),
+        }),
+        Err(ToolsetInstallError::PinRecordUnverifiable { .. }) => {
+            Err(ToolsetRuntimeError::PinUnverifiable {
+                name: sanitise_display(toolset_name, 64),
+            })
+        }
+        Err(e) => Err(ToolsetRuntimeError::Io(install_error_kind_str(&e))),
+    }
+}
 
 /// Intersective `allowed_tools` narrowing: an empty `allowed_tools` grants every
 /// matrix tool; a non-empty one restricts to its listed members.
@@ -421,6 +485,10 @@ pub struct GatedInvokeParams<'a> {
     pub now_unix_ms: u64,
     /// Platform-stable user identity (from `process_uid_for_attestation()`).
     pub process_uid: &'a str,
+    /// The installation's pin key, or `None` when none is available; with
+    /// `None` an installed toolset refuses with
+    /// [`ToolsetRuntimeError::PinUnverifiable`].
+    pub pin_key: Option<&'a PinKey>,
     /// Optional override for the approval store directory (test-only).
     #[cfg(feature = "test-helpers")]
     pub approval_dir_override: Option<std::path::PathBuf>,
@@ -436,6 +504,7 @@ impl std::fmt::Debug for GatedInvokeParams<'_> {
             .field("action", &self.action)
             .field("profile_name", &self.profile_name)
             .field("attestation_key", &"[REDACTED]")
+            .field("pin_key", &self.pin_key.map(|_| "[REDACTED]"))
             .finish_non_exhaustive()
     }
 }
@@ -494,13 +563,17 @@ pub enum GatedResolveOutcome {
 ///
 /// # Errors
 ///
-/// - [`ToolsetRuntimeError::ToolsetNotInstalled`] — toolset not installed or
+/// - [`ToolsetRuntimeError::ToolsetNotInstalled`]: toolset not installed or
 ///   name fails charset validation.
-/// - [`ToolsetRuntimeError::UnknownToolsetAction`] — action not in the gated matrix.
-/// - [`ToolsetRuntimeError::CapabilityNotDeclared`] — `sign-payment` not declared.
-/// - [`ToolsetRuntimeError::ToolNotAllowed`] — tool excluded by `allowed_tools`.
-/// - [`ToolsetRuntimeError::GrantStoreError`] — I/O error accessing the grant store.
-/// - [`ToolsetRuntimeError::Io`] — I/O error accessing the pending-approval store.
+/// - [`ToolsetRuntimeError::PinUnverifiable`]: the pin record does not verify
+///   under `params.pin_key`, or no key is available.
+/// - [`ToolsetRuntimeError::ContentDigestMismatch`]: the on-disk `TOOLSET.md`
+///   differs from the digest in the pin, or cannot be read.
+/// - [`ToolsetRuntimeError::UnknownToolsetAction`]: action not in the gated matrix.
+/// - [`ToolsetRuntimeError::CapabilityNotDeclared`]: `sign-payment` not declared.
+/// - [`ToolsetRuntimeError::ToolNotAllowed`]: tool excluded by `allowed_tools`.
+/// - [`ToolsetRuntimeError::GrantStoreError`]: I/O error accessing the grant store.
+/// - [`ToolsetRuntimeError::Io`]: I/O error accessing the pending-approval store.
 ///
 /// # Returns
 ///
@@ -521,12 +594,9 @@ pub fn resolve_toolset_sign_payment_gated(
         }
     })?;
 
-    // ── Step 0b: Read pin ONCE (TOCTOU avoidance) ─────────────────────────────
-    let pin = stellar_agent_toolsets_install::read_pin(toolset_name, params.toolsets_root)
-        .map_err(|e| ToolsetRuntimeError::Io(install_error_kind_str(&e)))?
-        .ok_or_else(|| ToolsetRuntimeError::ToolsetNotInstalled {
-            name: sanitise_display(toolset_name, 64),
-        })?;
+    // ── Step 0b: Read and verify pin ONCE (TOCTOU avoidance) ─────────────────
+    let pin = read_verified_pin(toolset_name, params.toolsets_root, params.pin_key)?;
+    verify_manifest_digest(toolset_name, params.toolsets_root, &pin)?;
 
     // ── Step 1: Gated four-part check ─────────────────────────────────────────
     //
@@ -849,17 +919,16 @@ pub use stellar_agent_toolsets_install::validate_package_name;
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Maps a [`stellar_agent_toolsets_install::ToolsetInstallError`] to a kind-level
+/// Maps a [`ToolsetInstallError`] to a kind-level
 /// I/O message string for use in [`ToolsetRuntimeError::Io`].
 ///
 /// Uses `io::ErrorKind` level granularity to avoid leaking `toolsets_root`
 /// through this conversion (a future path-annotating I/O error cannot reach
 /// `ToolsetRuntimeError::Io` via this function).
-fn install_error_kind_str(e: &stellar_agent_toolsets_install::ToolsetInstallError) -> String {
+fn install_error_kind_str(e: &ToolsetInstallError) -> String {
     // ToolsetInstallError already sanitises its Io variant internally, but we
     // want a fixed-class message not the full Display (which may embed detail).
     // For non-Io variants (PinRecordMalformed etc.) we use the variant name only.
-    use stellar_agent_toolsets_install::ToolsetInstallError;
     match e {
         ToolsetInstallError::Io { .. } => "io_error".to_owned(),
         ToolsetInstallError::PinRecordMalformed { .. } => "pin_record_malformed".to_owned(),
@@ -876,6 +945,13 @@ fn install_error_kind_str(e: &stellar_agent_toolsets_install::ToolsetInstallErro
 )]
 mod tests {
     use super::*;
+
+    /// The pin key every fixture record is tagged under.
+    fn test_pin_key() -> &'static PinKey {
+        static KEY: std::sync::LazyLock<PinKey> =
+            std::sync::LazyLock::new(|| PinKey::from_bytes(zeroize::Zeroizing::new([0x5a; 32])));
+        &KEY
+    }
 
     fn all_caps() -> CapabilitySet {
         // Build a full capability set by parsing the known tokens.
@@ -1062,14 +1138,17 @@ mod tests {
     #[test]
     fn list_pinned_toolsets_empty_dir() {
         let dir = tempfile::TempDir::new().unwrap();
-        let list = list_pinned_toolsets(dir.path()).unwrap();
+        let list = list_pinned_toolsets(dir.path(), Some(test_pin_key())).unwrap();
         assert!(list.is_empty());
     }
 
     #[test]
     fn list_pinned_toolsets_nonexistent_dir() {
-        let list =
-            list_pinned_toolsets(std::path::Path::new("/nonexistent/toolsets_root")).unwrap();
+        let list = list_pinned_toolsets(
+            std::path::Path::new("/nonexistent/toolsets_root"),
+            Some(test_pin_key()),
+        )
+        .unwrap();
         assert!(list.is_empty());
     }
 
@@ -1083,7 +1162,13 @@ mod tests {
     #[test]
     fn path_traversal_dotdot_slash_rejected() {
         let dir = tempfile::TempDir::new().unwrap();
-        let err = resolve_toolset_and_check("../foo", "stellar_balances", dir.path()).unwrap_err();
+        let err = resolve_toolset_and_check(
+            "../foo",
+            "stellar_balances",
+            dir.path(),
+            Some(test_pin_key()),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
             "expected ToolsetNotInstalled for '../foo', got: {err:?}"
@@ -1093,7 +1178,9 @@ mod tests {
     #[test]
     fn path_traversal_slash_in_name_rejected() {
         let dir = tempfile::TempDir::new().unwrap();
-        let err = resolve_toolset_and_check("a/b", "stellar_balances", dir.path()).unwrap_err();
+        let err =
+            resolve_toolset_and_check("a/b", "stellar_balances", dir.path(), Some(test_pin_key()))
+                .unwrap_err();
         assert!(
             matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
             "expected ToolsetNotInstalled for 'a/b', got: {err:?}"
@@ -1104,7 +1191,13 @@ mod tests {
     fn path_traversal_backslash_in_name_rejected() {
         let dir = tempfile::TempDir::new().unwrap();
         // "..\\foo" on any platform: backslash is not in [a-z0-9-], so rejected.
-        let err = resolve_toolset_and_check("..\\foo", "stellar_balances", dir.path()).unwrap_err();
+        let err = resolve_toolset_and_check(
+            "..\\foo",
+            "stellar_balances",
+            dir.path(),
+            Some(test_pin_key()),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
             "expected ToolsetNotInstalled for '..\\\\foo', got: {err:?}"
@@ -1114,7 +1207,9 @@ mod tests {
     #[test]
     fn path_traversal_dotdot_alone_rejected() {
         let dir = tempfile::TempDir::new().unwrap();
-        let err = resolve_toolset_and_check("..", "stellar_balances", dir.path()).unwrap_err();
+        let err =
+            resolve_toolset_and_check("..", "stellar_balances", dir.path(), Some(test_pin_key()))
+                .unwrap_err();
         assert!(
             matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
             "expected ToolsetNotInstalled for '..', got: {err:?}"
@@ -1124,7 +1219,9 @@ mod tests {
     #[test]
     fn path_traversal_dot_alone_rejected() {
         let dir = tempfile::TempDir::new().unwrap();
-        let err = resolve_toolset_and_check(".", "stellar_balances", dir.path()).unwrap_err();
+        let err =
+            resolve_toolset_and_check(".", "stellar_balances", dir.path(), Some(test_pin_key()))
+                .unwrap_err();
         assert!(
             matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
             "expected ToolsetNotInstalled for '.', got: {err:?}"
@@ -1134,8 +1231,13 @@ mod tests {
     #[test]
     fn path_traversal_uppercase_rejected() {
         let dir = tempfile::TempDir::new().unwrap();
-        let err =
-            resolve_toolset_and_check("MyToolset", "stellar_balances", dir.path()).unwrap_err();
+        let err = resolve_toolset_and_check(
+            "MyToolset",
+            "stellar_balances",
+            dir.path(),
+            Some(test_pin_key()),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
             "expected ToolsetNotInstalled for 'MyToolset', got: {err:?}"
@@ -1145,8 +1247,13 @@ mod tests {
     #[test]
     fn path_traversal_null_byte_rejected() {
         let dir = tempfile::TempDir::new().unwrap();
-        let err =
-            resolve_toolset_and_check("toolset\0name", "stellar_balances", dir.path()).unwrap_err();
+        let err = resolve_toolset_and_check(
+            "toolset\0name",
+            "stellar_balances",
+            dir.path(),
+            Some(test_pin_key()),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
             "expected ToolsetNotInstalled for null-byte name, got: {err:?}"
@@ -1155,13 +1262,13 @@ mod tests {
 
     // ── Dispatch-time TOOLSET.md content re-verification ───────────────────────
     //
-    // Three scenarios:
+    // Scenarios:
     //
-    //   (A) Pin has toolset_md_shasum; TOOLSET.md is unmodified → dispatch succeeds.
-    //   (B) Pin has toolset_md_shasum; TOOLSET.md is tampered  → ContentDigestMismatch.
-    //   (C) Pin has toolset_md_shasum = None (no digest stored) → check skipped.
+    //   (A) TOOLSET.md is unmodified → dispatch succeeds.
+    //   (B) TOOLSET.md is tampered   → ContentDigestMismatch.
+    //   (C) TOOLSET.md is missing    → ContentDigestMismatch.
     //
-    // Setup: write a minimal valid TOOLSET.md + a hand-crafted pin record into a
+    // Setup: write a minimal valid TOOLSET.md + a tagged pin record into a
     // tempdir.
 
     /// Writes a minimal valid `TOOLSET.md` to `<toolsets_root>/<pkg>/TOOLSET.md`.
@@ -1171,20 +1278,67 @@ mod tests {
         std::fs::write(toolset_dir.join("TOOLSET.md"), content).unwrap();
     }
 
-    /// Writes a pin record JSON to `<toolsets_root>/<pkg>/.stellar-agent-toolset-pin.json`.
-    fn write_pin_json(
+    /// Writes `pin` to `<toolsets_root>/<package>/` as a record tagged under
+    /// [`test_pin_key`].
+    fn write_pin(toolsets_root: &std::path::Path, pin: &ToolsetPinRecord) {
+        stellar_agent_toolsets_install::write_pin_for_test(pin, toolsets_root, test_pin_key())
+            .unwrap();
+    }
+
+    /// Writes a `TOOLSET.md` for `pkg` declaring `caps` and a tagged pin record
+    /// carrying its digest, as an install would.
+    fn write_toolset_fixture(
         toolsets_root: &std::path::Path,
         pkg: &str,
-        pin: &stellar_agent_toolsets_install::ToolsetPinRecord,
+        caps: &str,
+        allowed_tools: Vec<String>,
+        installed_at: &str,
+    ) -> ToolsetPinRecord {
+        let capability_lines: String = caps
+            .split_whitespace()
+            .map(|token| format!("  - {token}\n"))
+            .collect();
+        let content = format!(
+            "---\nname: {pkg}\ndescription: test toolset\nstellar-agent-capabilities:\n{capability_lines}---\n# {pkg}\n"
+        );
+        write_toolset_md(toolsets_root, pkg, &content);
+        let pin = ToolsetPinRecord::build_for_test(
+            pkg,
+            "1.0.0",
+            "d".repeat(64),
+            "GABC1234567890123456789012345678901234567890123456",
+            installed_at,
+            stellar_agent_toolsets::parse_capability_value_pub(caps).unwrap(),
+            allowed_tools,
+            stellar_agent_toolsets_install::sha256_hex_of(content.as_bytes()),
+        );
+        write_pin(toolsets_root, &pin);
+        pin
+    }
+
+    /// Applies `edit` to the stored JSON of `pkg`'s record without re-tagging it.
+    fn edit_stored_pin(
+        toolsets_root: &std::path::Path,
+        pkg: &str,
+        edit: impl FnOnce(&mut serde_json::Value),
     ) {
-        let json = serde_json::to_string_pretty(pin).unwrap();
-        std::fs::write(
-            toolsets_root
-                .join(pkg)
-                .join(".stellar-agent-toolset-pin.json"),
-            json,
-        )
-        .unwrap();
+        let path = toolsets_root
+            .join(pkg)
+            .join(".stellar-agent-toolset-pin.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        edit(&mut value);
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+    }
+
+    /// Adds `token` to the stored capability list of `pkg`'s record.
+    fn add_stored_capability(toolsets_root: &std::path::Path, pkg: &str, token: &str) {
+        edit_stored_pin(toolsets_root, pkg, |value| {
+            value["capabilities"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!(token));
+        });
     }
 
     /// Returns a minimal valid TOOLSET.md content string for package `pkg` with
@@ -1195,7 +1349,7 @@ mod tests {
         )
     }
 
-    // ── (A) Unmodified TOOLSET.md with toolset_md_shasum → dispatches ────────────
+    // ── (A) Unmodified TOOLSET.md → dispatches ──────────────────────────────────
 
     #[test]
     fn content_digest_match_allows_dispatch() {
@@ -1219,12 +1373,13 @@ mod tests {
             "2026-06-12T00:00:00Z",
             caps,
             vec![],
-            Some(expected_digest),
+            expected_digest,
         );
-        write_pin_json(toolsets_root, pkg, &pin);
+        write_pin(toolsets_root, &pin);
 
         // Dispatch must succeed — TOOLSET.md is unmodified.
-        let result = resolve_toolset_and_check(pkg, "stellar_balances", toolsets_root);
+        let result =
+            resolve_toolset_and_check(pkg, "stellar_balances", toolsets_root, Some(test_pin_key()));
         assert!(
             result.is_ok(),
             "dispatch must succeed when TOOLSET.md digest matches pin: {result:?}"
@@ -1233,7 +1388,7 @@ mod tests {
         assert_eq!(tool_name, "stellar_balances");
     }
 
-    // ── (B) Tampered TOOLSET.md with toolset_md_shasum → ContentDigestMismatch ──
+    // ── (B) Tampered TOOLSET.md → ContentDigestMismatch ─────────────────────────
 
     #[test]
     fn content_digest_mismatch_refuses_dispatch() {
@@ -1257,9 +1412,9 @@ mod tests {
             "2026-06-12T00:00:00Z",
             caps,
             vec![],
-            Some(original_digest),
+            original_digest,
         );
-        write_pin_json(toolsets_root, pkg, &pin);
+        write_pin(toolsets_root, &pin);
 
         // Tamper with TOOLSET.md (write attacker-controlled content).
         // The pin's toolset_md_shasum still refers to the original bytes.
@@ -1273,7 +1428,9 @@ mod tests {
         .unwrap();
 
         // Dispatch must fail with ContentDigestMismatch.
-        let err = resolve_toolset_and_check(pkg, "stellar_balances", toolsets_root).unwrap_err();
+        let err =
+            resolve_toolset_and_check(pkg, "stellar_balances", toolsets_root, Some(test_pin_key()))
+                .unwrap_err();
         assert!(
             matches!(err, ToolsetRuntimeError::ContentDigestMismatch { .. }),
             "expected ContentDigestMismatch for tampered TOOLSET.md, got: {err:?}"
@@ -1286,45 +1443,10 @@ mod tests {
         );
     }
 
-    // ── (C) Legacy pin (toolset_md_shasum = None) → check skipped ─────────────
+    // ── (C) Missing TOOLSET.md → ContentDigestMismatch ──────────────────────────
 
     #[test]
-    fn legacy_pin_without_toolset_md_shasum_skips_content_check() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let toolsets_root = dir.path();
-        let pkg = "my-toolset";
-
-        write_toolset_md(toolsets_root, pkg, &minimal_toolset_md(pkg));
-
-        // Pin has no toolset_md_shasum.
-        let caps = stellar_agent_toolsets::parse_capability_value_pub("read-balance").unwrap();
-        let pin = stellar_agent_toolsets_install::ToolsetPinRecord::build_for_test(
-            pkg,
-            "1.0.0",
-            "a".repeat(64),
-            "GABC1234567890123456789012345678901234567890123456",
-            "2026-06-12T00:00:00Z",
-            caps,
-            vec![],
-            None,
-        );
-        write_pin_json(toolsets_root, pkg, &pin);
-
-        // Dispatch must succeed even if TOOLSET.md was modified — pin has no
-        // digest to compare against, so the check is skipped. The
-        // capability-source invariant ensures capability escalation is still
-        // impossible via the on-disk TOOLSET.md.
-        let result = resolve_toolset_and_check(pkg, "stellar_balances", toolsets_root);
-        assert!(
-            result.is_ok(),
-            "pin without toolset_md_shasum must skip content check and dispatch: {result:?}"
-        );
-    }
-
-    // ── Missing TOOLSET.md when toolset_md_shasum is Some → ContentDigestMismatch
-
-    #[test]
-    fn missing_toolset_md_when_digest_expected_refuses_dispatch() {
+    fn ungated_resolver_refuses_a_missing_manifest() {
         let dir = tempfile::TempDir::new().unwrap();
         let toolsets_root = dir.path();
         let pkg = "my-toolset";
@@ -1341,16 +1463,149 @@ mod tests {
             "2026-06-12T00:00:00Z",
             caps,
             vec![],
-            Some("a".repeat(64)),
+            "a".repeat(64),
         );
-        write_pin_json(toolsets_root, pkg, &pin);
+        write_pin(toolsets_root, &pin);
 
-        // TOOLSET.md is missing — I/O error on read → fail-closed ContentDigestMismatch.
-        let err = resolve_toolset_and_check(pkg, "stellar_balances", toolsets_root).unwrap_err();
+        // TOOLSET.md is missing: the read fails, so dispatch fails closed with
+        // ContentDigestMismatch.
+        let err =
+            resolve_toolset_and_check(pkg, "stellar_balances", toolsets_root, Some(test_pin_key()))
+                .unwrap_err();
         assert!(
             matches!(err, ToolsetRuntimeError::ContentDigestMismatch { .. }),
-            "missing TOOLSET.md with digest in pin must refuse dispatch: {err:?}"
+            "missing TOOLSET.md must refuse dispatch: {err:?}"
         );
+    }
+
+    // ── Authenticated pin: ungated resolver ───────────────────────────────────
+
+    #[test]
+    fn ungated_resolver_refuses_an_edited_pin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let toolsets_root = dir.path();
+        write_toolset_fixture(
+            toolsets_root,
+            "read-toolset",
+            "read-balance",
+            vec![],
+            "2026-06-12T00:00:00Z",
+        );
+        let err = resolve_toolset_and_check(
+            "read-toolset",
+            "stellar_pay",
+            toolsets_root,
+            Some(test_pin_key()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolsetRuntimeError::CapabilityNotDeclared { .. }),
+            "{err:?}"
+        );
+
+        add_stored_capability(toolsets_root, "read-toolset", "propose-transaction");
+        let err = resolve_toolset_and_check(
+            "read-toolset",
+            "stellar_pay",
+            toolsets_root,
+            Some(test_pin_key()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolsetRuntimeError::PinUnverifiable { .. }),
+            "an edited capability must refuse, got: {err:?}"
+        );
+        assert!(err.to_string().contains("toolset.pin_unverifiable"));
+        assert!(err.to_string().contains("read-toolset"));
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    fn resolvers_without_a_key_report_unverifiable_and_not_installed() {
+        let fixture = GatedGrantFixture::new();
+        let toolsets_root = fixture.dir.path();
+        write_toolset_fixture(
+            toolsets_root,
+            "read-toolset",
+            "read-balance",
+            vec![],
+            "2026-06-12T00:00:00Z",
+        );
+
+        let err =
+            resolve_toolset_and_check("read-toolset", "stellar_balances", toolsets_root, None)
+                .unwrap_err();
+        assert!(
+            matches!(err, ToolsetRuntimeError::PinUnverifiable { .. }),
+            "{err:?}"
+        );
+        let err =
+            resolve_toolset_and_check("absent-toolset", "stellar_balances", toolsets_root, None)
+                .unwrap_err();
+        assert!(
+            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
+            "{err:?}"
+        );
+
+        let mut params = fixture.params();
+        params.pin_key = None;
+        let err = resolve_toolset_sign_payment_gated(&params).unwrap_err();
+        assert!(
+            matches!(err, ToolsetRuntimeError::PinUnverifiable { .. }),
+            "{err:?}"
+        );
+        params.toolset_name = "absent-toolset";
+        let err = resolve_toolset_sign_payment_gated(&params).unwrap_err();
+        assert!(
+            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn list_skips_a_pin_that_does_not_verify() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let toolsets_root = dir.path();
+        for pkg in ["alpha-toolset", "beta-toolset"] {
+            write_toolset_fixture(
+                toolsets_root,
+                pkg,
+                "read-balance",
+                vec![],
+                "2026-06-12T00:00:00Z",
+            );
+        }
+        add_stored_capability(toolsets_root, "beta-toolset", "propose-transaction");
+
+        let list = list_pinned_toolsets(toolsets_root, Some(test_pin_key())).unwrap();
+        let names: Vec<&str> = list.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha-toolset"]);
+        assert!(
+            list_pinned_toolsets(toolsets_root, None)
+                .unwrap()
+                .is_empty(),
+            "without a key no record verifies"
+        );
+    }
+
+    /// A held lock remains compatible with listing, including on Windows.
+    /// This is a regression guard: the regular file and invalid package name
+    /// also exclude the lock entry, so it does not isolate the name check.
+    #[test]
+    fn list_with_a_held_lock_is_a_compatibility_guard() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let toolsets_root = dir.path();
+        write_toolset_fixture(
+            toolsets_root,
+            "alpha-toolset",
+            "read-balance",
+            vec![],
+            "2026-06-12T00:00:00Z",
+        );
+        let _lock = stellar_agent_toolsets_install::lock_toolsets(toolsets_root).unwrap();
+        let list = list_pinned_toolsets(toolsets_root, Some(test_pin_key())).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "alpha-toolset");
     }
 
     // ── list_pinned_toolsets: directory with valid pin records ──────────────────
@@ -1373,12 +1628,12 @@ mod tests {
                 "2026-06-12T00:00:00Z",
                 caps,
                 vec![],
-                None,
+                "e".repeat(64),
             );
-            write_pin_json(toolsets_root, pkg, &pin);
+            write_pin(toolsets_root, &pin);
         }
 
-        let list = list_pinned_toolsets(toolsets_root).unwrap();
+        let list = list_pinned_toolsets(toolsets_root, Some(test_pin_key())).unwrap();
         assert_eq!(list.len(), 2, "should find both toolsets");
         // Sorted by name: alpha-toolset before beta-toolset.
         assert_eq!(list[0].name, "alpha-toolset");
@@ -1414,11 +1669,11 @@ mod tests {
             "2026-06-12T00:00:00Z",
             caps,
             vec![],
-            None,
+            "e".repeat(64),
         );
-        write_pin_json(toolsets_root, "good-toolset", &pin);
+        write_pin(toolsets_root, &pin);
 
-        let list = list_pinned_toolsets(toolsets_root).unwrap();
+        let list = list_pinned_toolsets(toolsets_root, Some(test_pin_key())).unwrap();
         assert_eq!(list.len(), 1, "orphan dir without pin must be skipped");
         assert_eq!(list[0].name, "good-toolset");
     }
@@ -1442,11 +1697,11 @@ mod tests {
             "2026-06-12T00:00:00Z",
             caps,
             vec!["stellar_balances".to_owned()],
-            None,
+            "e".repeat(64),
         );
-        write_pin_json(toolsets_root, pkg, &pin);
+        write_pin(toolsets_root, &pin);
 
-        let list = list_pinned_toolsets(toolsets_root).unwrap();
+        let list = list_pinned_toolsets(toolsets_root, Some(test_pin_key())).unwrap();
         assert_eq!(list.len(), 1);
         // Only stellar_balances should be in actions (the SuggestDestination tools
         // are not in allowed_tools so they must be filtered out).
@@ -1472,8 +1727,13 @@ mod tests {
     fn resolve_toolset_and_check_invalid_charset_rejected() {
         let dir = tempfile::TempDir::new().unwrap();
         // Name with space is outside [a-z0-9-]
-        let err =
-            resolve_toolset_and_check("bad name", "stellar_balances", dir.path()).unwrap_err();
+        let err = resolve_toolset_and_check(
+            "bad name",
+            "stellar_balances",
+            dir.path(),
+            Some(test_pin_key()),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
             "expected ToolsetNotInstalled, got: {err:?}"
@@ -1489,8 +1749,13 @@ mod tests {
     fn resolve_toolset_and_check_valid_name_toolset_not_installed() {
         let dir = tempfile::TempDir::new().unwrap();
         // "stellar-balances" is a valid [a-z0-9-] name but has no pin record.
-        let err =
-            resolve_toolset_and_check("valid-name", "stellar_balances", dir.path()).unwrap_err();
+        let err = resolve_toolset_and_check(
+            "valid-name",
+            "stellar_balances",
+            dir.path(),
+            Some(test_pin_key()),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
             "expected ToolsetNotInstalled for a valid name with no pin record, got: {err:?}"
@@ -1502,19 +1767,13 @@ mod tests {
     /// Builds and writes a pin with `sign-payment` capability.
     #[cfg(feature = "test-helpers")]
     fn write_sign_payment_pin(toolsets_root: &std::path::Path, pkg: &str) {
-        std::fs::create_dir_all(toolsets_root.join(pkg)).unwrap();
-        let caps = stellar_agent_toolsets::parse_capability_value_pub("sign-payment").unwrap();
-        let pin = stellar_agent_toolsets_install::ToolsetPinRecord::build_for_test(
+        write_toolset_fixture(
+            toolsets_root,
             pkg,
-            "1.0.0",
-            "d".repeat(64),
-            "GABC1234567890123456789012345678901234567890123456",
-            "1970-01-01T00:00:00Z",
-            caps,
+            "sign-payment",
             vec![],
-            None,
+            "1970-01-01T00:00:00Z",
         );
-        write_pin_json(toolsets_root, pkg, &pin);
     }
 
     #[cfg(feature = "test-helpers")]
@@ -1554,6 +1813,7 @@ mod tests {
                 authoritative_amount_stroops: 10,
                 now_unix_ms: Self::NOW_MS,
                 process_uid: "1000",
+                pin_key: Some(test_pin_key()),
                 approval_dir_override: Some(self.dir.path().join("approvals")),
                 grant_store_path_override: Some(self.dir.path().join("grants.toml")),
             }
@@ -1584,11 +1844,15 @@ mod tests {
         }
 
         fn set_install_time(&self, installed_at: &str) {
-            let mut pin = stellar_agent_toolsets_install::read_pin("pay-toolset", self.dir.path())
-                .unwrap()
-                .unwrap();
+            let mut pin = stellar_agent_toolsets_install::read_pin(
+                "pay-toolset",
+                self.dir.path(),
+                Some(test_pin_key()),
+            )
+            .unwrap()
+            .unwrap();
             pin.installed_at = installed_at.to_owned();
-            write_pin_json(self.dir.path(), "pay-toolset", &pin);
+            write_pin(self.dir.path(), &pin);
         }
 
         fn assert_first_invoke(&self) {
@@ -1601,6 +1865,56 @@ mod tests {
                 "{outcome:?}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    fn gated_resolver_refuses_an_edited_manifest() {
+        let fixture = GatedGrantFixture::new();
+        fixture.record_grant();
+        std::fs::write(
+            fixture.dir.path().join("pay-toolset").join("TOOLSET.md"),
+            "---\nname: pay-toolset\ndescription: edited\n---\n",
+        )
+        .unwrap();
+        let err = resolve_toolset_sign_payment_gated(&fixture.params()).unwrap_err();
+        assert!(
+            matches!(err, ToolsetRuntimeError::ContentDigestMismatch { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    fn gated_resolver_refuses_an_edited_pin() {
+        let fixture = GatedGrantFixture::new();
+        fixture.record_grant();
+        add_stored_capability(fixture.dir.path(), "pay-toolset", "read-balance");
+        let err = resolve_toolset_sign_payment_gated(&fixture.params()).unwrap_err();
+        assert!(
+            matches!(err, ToolsetRuntimeError::PinUnverifiable { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// A grant issued before the recorded install time is honored only when the
+    /// record says so; moving the stored install time earlier without the key
+    /// must not reopen it.
+    #[test]
+    #[cfg(feature = "test-helpers")]
+    fn gated_resolver_refuses_an_edited_install_time() {
+        let fixture = GatedGrantFixture::new();
+        fixture.record_grant();
+        fixture.set_install_time("2026-04-30T13:34:56Z");
+        fixture.assert_first_invoke();
+        edit_stored_pin(fixture.dir.path(), "pay-toolset", |value| {
+            value["installed_at"] = serde_json::json!("1970-01-01T00:00:00Z");
+        });
+        let err = resolve_toolset_sign_payment_gated(&fixture.params()).unwrap_err();
+        assert!(
+            matches!(err, ToolsetRuntimeError::PinUnverifiable { .. }),
+            "{err:?}"
+        );
     }
 
     /// The hand-written grant is issued now and expires after the default TTL,
@@ -1696,6 +2010,8 @@ attestation_version = 3
         let rendered = format!("{:?}", fixture.params());
         assert!(rendered.contains("[REDACTED]"));
         assert!(!rendered.contains(&format!("{:?}", GatedGrantFixture::KEY)));
+        assert!(!rendered.contains(&format!("{:?}", [0x5a_u8; 32])));
+        assert!(rendered.contains("pin_key"));
     }
 
     // ── Gated resolver: invalid toolset name → ToolsetNotInstalled ───────────────
@@ -1722,6 +2038,7 @@ attestation_version = 3
             authoritative_amount_stroops: 10_000_000,
             now_unix_ms: 1_000_000,
             process_uid: "uid-test",
+            pin_key: Some(test_pin_key()),
             approval_dir_override: Some(approval_dir.path().to_path_buf()),
             grant_store_path_override: Some(grant_dir.path().join("grants.json")),
         };
@@ -1757,6 +2074,7 @@ attestation_version = 3
             authoritative_amount_stroops: 10_000_000,
             now_unix_ms: 1_000_000,
             process_uid: "uid-test",
+            pin_key: Some(test_pin_key()),
             approval_dir_override: Some(approval_dir.path().to_path_buf()),
             grant_store_path_override: Some(grant_dir.path().join("grants.json")),
         };
@@ -1795,6 +2113,7 @@ attestation_version = 3
             authoritative_amount_stroops: 10_000_000,
             now_unix_ms: 1_000_000,
             process_uid: "uid-test",
+            pin_key: Some(test_pin_key()),
             approval_dir_override: Some(approval_dir.path().to_path_buf()),
             grant_store_path_override: Some(grant_dir.path().join("grants.json")),
         };
@@ -1816,19 +2135,13 @@ attestation_version = 3
         let grant_dir = tempfile::TempDir::new().unwrap();
 
         // Pin with read-balance only — no sign-payment.
-        let caps = stellar_agent_toolsets::parse_capability_value_pub("read-balance").unwrap();
-        let pin = stellar_agent_toolsets_install::ToolsetPinRecord::build_for_test(
+        write_toolset_fixture(
+            toolsets_dir.path(),
             "read-toolset",
-            "1.0.0",
-            "e".repeat(64),
-            "GABC1234567890123456789012345678901234567890123456",
-            "2026-06-12T00:00:00Z",
-            caps,
+            "read-balance",
             vec![],
-            None,
+            "2026-06-12T00:00:00Z",
         );
-        std::fs::create_dir_all(toolsets_dir.path().join("read-toolset")).unwrap();
-        write_pin_json(toolsets_dir.path(), "read-toolset", &pin);
 
         let params = GatedInvokeParams {
             toolset_name: "read-toolset",
@@ -1845,6 +2158,7 @@ attestation_version = 3
             authoritative_amount_stroops: 10_000_000,
             now_unix_ms: 1_000_000,
             process_uid: "uid-test",
+            pin_key: Some(test_pin_key()),
             approval_dir_override: Some(approval_dir.path().to_path_buf()),
             grant_store_path_override: Some(grant_dir.path().join("grants.json")),
         };
@@ -1866,19 +2180,13 @@ attestation_version = 3
         let grant_dir = tempfile::TempDir::new().unwrap();
 
         // sign-payment declared but allowed_tools excludes stellar_pay_commit.
-        let caps = stellar_agent_toolsets::parse_capability_value_pub("sign-payment").unwrap();
-        let pin = stellar_agent_toolsets_install::ToolsetPinRecord::build_for_test(
+        write_toolset_fixture(
+            toolsets_dir.path(),
             "narrow-pay-toolset",
-            "1.0.0",
-            "f".repeat(64),
-            "GABC1234567890123456789012345678901234567890123456",
-            "2026-06-12T00:00:00Z",
-            caps,
+            "sign-payment",
             vec!["some-other-tool".to_owned()],
-            None,
+            "2026-06-12T00:00:00Z",
         );
-        std::fs::create_dir_all(toolsets_dir.path().join("narrow-pay-toolset")).unwrap();
-        write_pin_json(toolsets_dir.path(), "narrow-pay-toolset", &pin);
 
         let params = GatedInvokeParams {
             toolset_name: "narrow-pay-toolset",
@@ -1895,6 +2203,7 @@ attestation_version = 3
             authoritative_amount_stroops: 10_000_000,
             now_unix_ms: 1_000_000,
             process_uid: "uid-test",
+            pin_key: Some(test_pin_key()),
             approval_dir_override: Some(approval_dir.path().to_path_buf()),
             grant_store_path_override: Some(grant_dir.path().join("grants.json")),
         };
@@ -1932,6 +2241,7 @@ attestation_version = 3
             authoritative_amount_stroops: 10_000_000,
             now_unix_ms: 1_000_000,
             process_uid: "uid-test",
+            pin_key: Some(test_pin_key()),
             approval_dir_override: Some(approval_dir.path().to_path_buf()),
             grant_store_path_override: Some(grant_dir.path().join("grants.json")),
         };
@@ -2009,6 +2319,7 @@ attestation_version = 3
             authoritative_amount_stroops: amount_stroops,
             now_unix_ms,
             process_uid: &uid,
+            pin_key: Some(test_pin_key()),
             approval_dir_override: Some(approval_dir.path().to_path_buf()),
             grant_store_path_override: Some(grant_path),
         };
@@ -2044,19 +2355,13 @@ attestation_version = 3
     use crate::matrix::{SIGN_RULE_CREATE_AMOUNT_SENTINEL, SIGN_RULE_CREATE_ASSET_SENTINEL};
 
     fn write_sign_rule_create_pin(toolsets_root: &std::path::Path, pkg: &str) {
-        std::fs::create_dir_all(toolsets_root.join(pkg)).unwrap();
-        let caps = stellar_agent_toolsets::parse_capability_value_pub("sign-rule-create").unwrap();
-        let pin = stellar_agent_toolsets_install::ToolsetPinRecord::build_for_test(
+        write_toolset_fixture(
+            toolsets_root,
             pkg,
-            "1.0.0",
-            "d".repeat(64),
-            "GABC1234567890123456789012345678901234567890123456",
-            "1970-01-01T00:00:00Z",
-            caps,
+            "sign-rule-create",
             vec![],
-            None,
+            "1970-01-01T00:00:00Z",
         );
-        write_pin_json(toolsets_root, pkg, &pin);
     }
 
     #[test]
@@ -2083,6 +2388,7 @@ attestation_version = 3
             authoritative_amount_stroops: SIGN_RULE_CREATE_AMOUNT_SENTINEL,
             now_unix_ms: 1_000_000,
             process_uid: "uid-test",
+            pin_key: Some(test_pin_key()),
             approval_dir_override: Some(approval_dir.path().to_path_buf()),
             grant_store_path_override: Some(grant_dir.path().join("grants.json")),
         };
@@ -2155,6 +2461,7 @@ attestation_version = 3
             authoritative_amount_stroops: SIGN_RULE_CREATE_AMOUNT_SENTINEL,
             now_unix_ms,
             process_uid: &uid,
+            pin_key: Some(test_pin_key()),
             approval_dir_override: Some(approval_dir.path().to_path_buf()),
             grant_store_path_override: Some(grant_path),
         };
@@ -2244,6 +2551,7 @@ attestation_version = 3
             authoritative_amount_stroops: 0,
             now_unix_ms,
             process_uid: &uid,
+            pin_key: Some(test_pin_key()),
             approval_dir_override: Some(approval_dir.path().to_path_buf()),
             grant_store_path_override: Some(grant_path),
         };
@@ -2284,6 +2592,7 @@ attestation_version = 3
             authoritative_amount_stroops: 0,
             now_unix_ms: 1_000_000,
             process_uid: "uid-test",
+            pin_key: Some(test_pin_key()),
             approval_dir_override: Some(approval_dir.path().to_path_buf()),
             grant_store_path_override: Some(grant_dir.path().join("grants.json")),
         };
@@ -2322,6 +2631,7 @@ attestation_version = 3
             authoritative_amount_stroops: -1,
             now_unix_ms: 1_000_000,
             process_uid: "uid-test",
+            pin_key: Some(test_pin_key()),
             approval_dir_override: Some(approval_dir.path().to_path_buf()),
             grant_store_path_override: Some(grant_dir.path().join("grants.json")),
         };
@@ -2372,6 +2682,7 @@ attestation_version = 3
             authoritative_amount_stroops: 10_000_000,
             now_unix_ms: 1_000_000,
             process_uid: supplied_uid,
+            pin_key: Some(test_pin_key()),
             approval_dir_override: Some(approval_dir.path().to_path_buf()),
             grant_store_path_override: Some(grant_dir.path().join("grants.json")),
         };
@@ -2464,6 +2775,7 @@ attestation_version = 3
             authoritative_amount_stroops: over_max_stroops,
             now_unix_ms,
             process_uid: &uid,
+            pin_key: Some(test_pin_key()),
             approval_dir_override: Some(approval_dir.path().to_path_buf()),
             grant_store_path_override: Some(grant_path),
         };

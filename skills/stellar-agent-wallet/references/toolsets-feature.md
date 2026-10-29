@@ -6,20 +6,28 @@ are reading right now.
 
 | | Knowledge skill (this package) | Wallet toolset (the feature) |
 |---|---|---|
-| Purpose | Teaches you how to use the wallet | Restricts what an agent may do |
+| Purpose | Teaches you how to use the wallet | Narrows what the toolset dispatcher routes |
 | Form | Documentation you read | A signed, installed package the wallet enforces |
 | Effect | Gives you context | Grants a narrow, wallet-enforced capability set |
 | Execution | You read and act on it | The wallet never executes its body; it is data |
 
-The feature exists to enforce least privilege. A wallet toolset grants an
-agent a narrow, declared capability set; the wallet treats the toolset as data
-(a manifest plus a capability declaration), never executes toolset-supplied code,
-and never lets a toolset reach a signing, key, or policy tool through its ungated
+A wallet toolset declares a narrow capability set that the toolset dispatcher
+(`stellar_toolset_invoke`) routes; the wallet treats the toolset as data (a
+manifest plus a capability declaration), never executes toolset-supplied code, and
+never routes a toolset to a signing, key, or policy tool through its ungated
 capabilities. The only signing tools a toolset reaches are `stellar_pay_commit`
 and `stellar_rule_create_commit`, through the gated `sign-payment` and
 `sign-rule-create` capabilities, each behind a first-invoke grant and a
-per-action approval. This FEATURE restricts what an agent may do. It is NOT a way to
-teach an agent.
+per-action approval.
+
+What a toolset does not do: it does not narrow the native tools the same MCP
+server registers, which an agent connected to the server can call directly. The
+`toolset` argument of an invocation is chosen by the caller, and the server binds
+no session to a toolset. The operator policy and the approvals bound native and
+routed calls alike. The install record a toolset's capabilities come from is
+authenticated by an HMAC under an installation key in the platform keyring and
+carries the `TOOLSET.md` digest that both resolver tiers check. This FEATURE
+narrows the dispatcher's routes. It is NOT a way to teach an agent.
 
 For the broader MCP tool surface used to invoke actions, see `./mcp-tools.md`
 (ships alongside this file).
@@ -112,11 +120,11 @@ A separate table for the two signing-adjacent capabilities:
 
 ### Signing denylist
 
-A signing denylist names every signing, key, and policy-mutation tool by literal
-string, including `stellar_pay_commit`, the SEP-43 and SEP-53 signing tools, the
-`*_commit` tools, the x402 tools, and the toolset dispatcher's own tools
-`stellar_toolset_list` / `stellar_toolset_invoke` (the last two prevent a toolset from
-re-invoking the dispatcher to escalate). The denylist and the ungated matrix are
+A signing denylist names tools by literal string under one rule: every registry
+tool annotated destructive, every tool that reaches a signer (the SEP-43 and SEP-53
+signing tools return a signature without submitting), and the toolset dispatcher's
+own tools `stellar_toolset_list` / `stellar_toolset_invoke` (so a toolset cannot
+re-invoke the dispatcher to escalate). The denylist and the ungated matrix are
 disjoint by literal name, so the gated tools are unreachable from the ungated
 resolver.
 
@@ -128,7 +136,8 @@ A toolset action passes only this check:
    `&'static str` registry tool name `T`. The resolved name is a compile-time
    constant; a toolset-supplied string can never become the routed tool name.
 2. `T` is in the grant set of some capability `C` (implied by step 1).
-3. `C` is in the toolset's declared capability set, read from the pin record.
+3. `C` is in the toolset's declared capability set, read from the authenticated
+   pin record.
 4. `T` is in the toolset's `allowed_tools`. `allowed_tools` can only subtract from
    a capability grant, never add to it; an empty list applies no narrowing.
 
@@ -175,11 +184,21 @@ Install pipeline:
    failure.
 7. Cross-check that the parsed `name` equals the package name.
 8. Run the attestation gate for key-touching toolsets.
-9. Atomically rename staging into place and write the pin record.
+9. Atomically rename staging into place and write the pin record, authenticated
+   under the installation's pin key.
+
+The install and the uninstall hold the toolsets directory lock (`.toolsets.lock`).
+The first install mints the pin key in the platform keyring.
 
 Verification proves origin and integrity, not content safety. The extractor and
 parser are safe on adversarial input on their own merits; signature verification
 is defence-in-depth layered before them.
+
+The publisher and auditor trust sets (`trust.txt`, `auditor-trust.txt`) default to
+plain operator-held files in the toolsets directory, read at install time only and
+not authenticated. A restored toolset directory with an earlier record of the same
+package verifies again after an uninstall: the record's tag binds its fields, not
+the install event, and the restored state is one the operator installed.
 
 ### The attestation gate
 
@@ -207,27 +226,34 @@ set: `--override-attestation` on a non-key-touching toolset reports `not-require
 ### The pin record and the capability-source invariant
 
 A successful install writes a pin record holding `package`, `version`, `shasum`,
-`publisher`, `installed_at`, the verified `capabilities`, `allowed_tools`, and a
-SHA-256 digest of the installed `TOOLSET.md`.
+`publisher`, `installed_at`, the verified `capabilities`, `allowed_tools`, and the
+mandatory SHA-256 digest of the installed `TOOLSET.md`. The record is
+`{"v":2, <fields>, "tag":"<64 hex>"}`, the tag an HMAC-SHA256 over every field under
+the installation's pin key. A record that does not verify (edited, written under
+another key, or written by an earlier build without a tag) grants nothing and
+refuses with `toolset.pin_unverifiable`; the operator uninstalls the toolset and
+installs it again.
 
-The capability-source invariant: the install gate, the attestation preimage, and
-every runtime capability decision read capabilities from the signature-verified
-pin record, never from a re-parse of the on-disk `TOOLSET.md`. A toolset installed
-with no declared capability whose on-disk `TOOLSET.md` is later edited to add
-`sign-payment` is still refused at the signing path, because the runtime reads
-the pin, not the file. As additional tamper-evidence, dispatch re-reads the
-on-disk `TOOLSET.md`, recomputes its digest, and refuses dispatch on a mismatch
-against the pinned digest.
+The capability-source invariant: the install gate and the attestation preimage
+read capabilities from the parse of the signature-verified package, and every
+runtime capability decision reads them from the authenticated pin record, never
+from a re-parse of the on-disk `TOOLSET.md`. A toolset installed with no declared
+capability whose on-disk `TOOLSET.md` is later edited to add `sign-payment` is
+still refused at the signing path, because the runtime reads the pin, not the
+file. As additional tamper-evidence, both resolver tiers re-read the on-disk
+`TOOLSET.md`, recompute its digest, and refuse dispatch with
+`toolset.content_digest_mismatch` on a mismatch or an unreadable file.
 
 ## First-invoke gate and per-action payment approval
 
-`stellar_pay_commit` is reachable only through the gated resolver, never the
-ungated path. The gated resolver enforces, in order:
+Through the dispatcher, `stellar_pay_commit` is reachable only through the gated
+resolver, never the ungated path. The gated resolver enforces, in order:
 
-1. The four-part check against the gated matrix: the toolset declares
+1. The install record verifies, and the on-disk `TOOLSET.md` matches its digest.
+2. The four-part check against the gated matrix: the toolset declares
    `sign-payment`, the action maps to the gated `stellar_pay_commit` constant,
    and the tool is within `allowed_tools`.
-2. The first-invoke gate: it looks for a current matching grant in the
+3. The first-invoke gate: it looks for a current matching grant in the
    per-profile grant store. Matching is computed from the authoritative
    destination, asset, and amount decoded from the transaction envelope, never
    from toolset-supplied arguments. A non-positive authoritative amount is refused
@@ -269,13 +295,19 @@ reports `name`, `description` (always empty; the pin record stores no
 description), `capabilities`, `allowed_tools`, `version`, and `actions` (the tool
 names reachable through the ungated matrix; gated tools such as
 `stellar_pay_commit` are not listed here because they are reachable only through
-the gated path). Read-only and non-destructive.
+the gated path). A toolset whose record does not verify is left out. Read-only and
+non-destructive.
 
 ```json
 {}
 ```
 
 ### `stellar_toolset_invoke`
+
+Annotated destructive (`destructiveHint = true`, `readOnlyHint = false`): its
+signing actions route to the signing commit tools. On a mainnet profile it is
+refused, because the default engine refuses a destructive tool and a mainnet policy
+rule cannot name it.
 
 | Field | Meaning |
 |---|---|
@@ -317,7 +349,8 @@ stroop integer string as `amount_in_stroops`. Asset is
 
 The subcommand group is `stellar-agent toolsets` (plural). All four subcommands are
 local and offline (no network calls, no chain signing) and print a JSON
-envelope. Each prints its success and error envelopes on stdout. Exit code is `0` on success, `1` on any error. The toolsets root defaults
+envelope. `install`, `list`, and `run` read the installation's pin key from the
+platform keyring; `install` mints it on the first install. Each prints its success and error envelopes on stdout. Exit code is `0` on success, `1` on any error. The toolsets root defaults
 to the OS-conventional toolsets directory; `--toolsets-dir <PATH>` overrides it on
 every subcommand.
 
@@ -357,7 +390,8 @@ The success envelope reports `package`, `version`, and `attestation`
 
 Enumerates installed toolsets and their declared actions as JSON. This is the
 canonical scriptable enumeration; it is read from pin records, not parsed from
-help text. Each entry reports `name`, `description` (always empty; the pin record
+help text. A record that does not verify is skipped with a warning; before the
+first install the list is empty. Each entry reports `name`, `description` (always empty; the pin record
 stores no description), `capabilities`, `allowed_tools`, `version`, and `actions`
 (the tool names reachable through the ungated matrix; gated tools such as
 `stellar_pay_commit` are not listed here).
@@ -390,15 +424,18 @@ stellar-agent toolsets run balance-reporter stellar_balances
 ```
 
 On enforcement failure the error envelope carries a `code` such as
-`toolset.not_installed`, `toolset.unknown_action`, `toolset.capability_not_declared`,
-or `toolset.tool_not_allowed`.
+`toolset.not_installed`, `toolset.pin_unverifiable`,
+`toolset.content_digest_mismatch`, `toolset.unknown_action`,
+`toolset.capability_not_declared`, or `toolset.tool_not_allowed`.
 
 ### `toolsets uninstall <PACKAGE>`
 
 Removes an installed toolset's directory and pin record. Refuses if the toolset is
-not installed. Uninstall reads the pin, re-validates the stored package name,
-reconstructs the directory path from that validated name (never from a stored
-path), refuses a symlinked leaf, and removes the directory and pin. Grants
+not installed. Uninstall reads no record: the toolset is installed when its pin
+file exists, and the directory removed is the one named by the validated
+requested package name (never a name or path read from the record). It refuses a
+symlinked leaf and removes the directory and pin, so a toolset whose record does
+not verify can be removed and installed again. Grants
 approved for the removed package do not apply to a later install, including a
 forced reinstall or an install after manual removal.
 
@@ -417,6 +454,8 @@ stellar-agent toolsets uninstall balance-reporter
 | Code | Cause |
 |---|---|
 | `toolset.not_installed` | Named toolset has no pin record. |
+| `toolset.pin_unverifiable` | The install record does not verify under the installation's pin key (edited, written under another key, or written by an earlier build), or no pin key exists. Uninstall the toolset and install it again. |
+| `toolset.content_digest_mismatch` | The on-disk `TOOLSET.md` differs from the digest in the install record, or cannot be read. Reinstall the toolset. |
 | `toolset.unknown_action` | Action does not resolve through the matrix (includes any signing tool named directly other than the two gated tools). |
 | `toolset.capability_not_declared` | Resolved tool's capability is not in the toolset's declared set. |
 | `toolset.tool_not_allowed` | Resolved tool is excluded by the toolset's `allowed_tools` narrowing. |

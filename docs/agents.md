@@ -200,8 +200,10 @@ A submission timeout has an unknown outcome. Reconcile it with
 
 ## Using installed toolsets
 
-A [toolset](toolsets.md) grants the agent a narrow, declared set of capabilities. Two
-tools drive them:
+A [toolset](toolsets.md) declares a narrow set of capabilities that the toolset
+dispatcher routes for the agent. It narrows only the dispatcher's routes, not the
+other tools of the server, and the `toolset` argument is yours to choose; the
+operator policy and approvals bound every call. Two tools drive them:
 
 - `stellar_toolset_list`: enumerate installed toolsets and their invocable actions.
 - `stellar_toolset_invoke`: run a named action, routed through capability
@@ -217,7 +219,10 @@ tools drive them:
 ```
 
 No signing, key, or policy tool is reachable through an ungated capability, so
-an `action` naming one returns `toolset.unknown_action`. Two signing-adjacent
+an `action` naming one returns `toolset.unknown_action`. A toolset whose install
+record does not verify returns `toolset.pin_unverifiable`; the operator
+uninstalls and installs it again. `stellar_toolset_invoke` is a destructive tool
+and is refused on a mainnet profile. Two signing-adjacent
 capabilities route through the gated path: `sign-payment` reaches
 `stellar_pay_commit`, and `sign-rule-create` reaches `stellar_rule_create_commit`
 (agent-proposed context rules). Each is guarded by a first-invoke gate. The

@@ -70,7 +70,6 @@ const SELF_PAYMENT_STROOPS: i64 = 10_000_000;
 const TOOLSET_NAME: &str = "gated-testnet-toolset";
 const CAPABILITY: &str = "sign-payment";
 const ASSET_XLM: &str = "XLM";
-const PIN_FILE_NAME: &str = ".stellar-agent-toolset-pin.json";
 
 // Syntactically valid 48-byte base64 nonce (HMAC will fail, which is expected
 // before attestation is verified).
@@ -151,23 +150,27 @@ fn build_test_server(
     server.set_approval_dir_for_test(approval_dir.to_path_buf());
     server.set_grant_store_path_for_test(grant_store_path.to_path_buf());
     server.set_toolsets_root_for_test(toolsets_root.to_path_buf());
+    server.set_toolset_pin_key_for_test(toolset_pin_key());
     server
 }
 
-fn write_toolset_pin(toolsets_root: &std::path::Path, toolset_name: &str, g_strkey: &str) {
-    let toolset_dir = toolsets_root.join(toolset_name);
-    std::fs::create_dir_all(&toolset_dir).expect("create toolset dir");
-    let pin_json = serde_json::json!({
-        "package": toolset_name,
-        "version": "1.0.0",
-        "shasum": "a".repeat(64),
-        "publisher": g_strkey,
-        "installed_at": "2026-06-02T00:00:00Z",
-        "capabilities": ["sign-payment"],
-        "allowed_tools": []
-    });
-    let pin_path = toolset_dir.join(PIN_FILE_NAME);
-    std::fs::write(&pin_path, serde_json::to_string_pretty(&pin_json).unwrap()).expect("write pin");
+/// The pin key the suite tags its install record under and hands the server.
+fn toolset_pin_key() -> stellar_agent_toolsets_runtime::PinKey {
+    stellar_agent_toolsets_runtime::PinKey::from_bytes(Zeroizing::new([0x5a; 32]))
+}
+
+/// Writes `toolset_name` declaring `sign-payment` as an install leaves it,
+/// with its record tagged under [`toolset_pin_key`].
+fn write_toolset_pin(toolsets_root: &std::path::Path, toolset_name: &str) {
+    stellar_agent_toolsets_install::write_toolset_for_test(
+        toolsets_root,
+        toolset_name,
+        &["sign-payment"],
+        &[],
+        "2026-06-02T00:00:00Z",
+        &toolset_pin_key(),
+    )
+    .expect("write toolset");
 }
 
 /// Builds a minimal payment XDR envelope for testing (no live RPC needed).
@@ -229,7 +232,7 @@ async fn gated_toolset_first_invoke_and_forced_per_action_testnet() {
     let grant_file = approval_dir.path().join("grants.toml");
     let toolsets_dir = TempDir::new().unwrap();
 
-    write_toolset_pin(toolsets_dir.path(), TOOLSET_NAME, &g_strkey);
+    write_toolset_pin(toolsets_dir.path(), TOOLSET_NAME);
 
     let server = build_test_server(
         &g_strkey,

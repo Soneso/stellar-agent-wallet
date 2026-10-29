@@ -92,6 +92,11 @@ where
     // A coordinate in the owner key namespace refuses before the keyring
     // opens, so the rotation never writes over an owner entry.
     let entry_ref = &profile.counterparty_cache_key_id;
+    if let Err(e) = owner_key::refuse_installation_key_coordinate(entry_ref, COUNTERPARTY_KEY_FIELD)
+    {
+        render::render_json(&Envelope::err(&e));
+        return 1;
+    }
     if let Err(e) = owner_key::refuse_owner_key_coordinate(entry_ref, COUNTERPARTY_KEY_FIELD) {
         render::render_json(&Envelope::err(&e));
         return 1;
@@ -194,5 +199,21 @@ mod tests {
         );
         assert_eq!(init_calls.get(), 0, "the refusal precedes the keyring");
         assert_eq!(code, 1);
+    }
+
+    /// Installation coordinates refuse on testnet before the keyring opens.
+    #[tokio::test]
+    #[serial]
+    async fn installation_coordinate_refuses_without_writing() {
+        crate::common::installation_key_fixture::assert_installation_profile_refusal(
+            |profile| &mut profile.counterparty_cache_key_id,
+            async |fixture, profile, name| {
+                let args = RotateHmacKeyArgs {
+                    profile: Some(name.to_owned()),
+                };
+                run_with_dependencies(&args, |_| Ok(profile.clone()), || fixture.init()).await
+            },
+        )
+        .await;
     }
 }

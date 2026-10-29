@@ -14,12 +14,24 @@
 //!
 //! ## Security posture
 //!
+//! - The toolset's capabilities are read from its install record, which is
+//!   authenticated by an HMAC under the installation's toolset pin key in the
+//!   platform keyring and carries the `TOOLSET.md` digest both resolver tiers
+//!   check. A record that does not verify refuses with
+//!   `toolset.pin_unverifiable`.
 //! - The four-part enforcement check runs BEFORE routing to a trusted tool.
 //! - After the four-part check passes, the trusted tool's normal handler
 //!   including `dispatch_gate` (operator-policy + chain + registry) runs.
 //!   The toolset gate is ADDITIVE, never substitutive.
-//! - No signing/key/policy tool is reachable via any capability grant
-//!   (structural isolation).
+//! - No signing/key/policy tool is reachable via an ungated capability grant;
+//!   the signing actions (sign-payment, sign-rule-create) route to the signing
+//!   commit tools only behind a first-invoke grant and a per-action approval.
+//! - `stellar_toolset_invoke` is annotated destructive, so on mainnet the
+//!   default policy engine refuses it.
+//! - A toolset narrows what this dispatcher routes. It does not restrict the
+//!   native tools the same server registers, the `toolset` argument is chosen
+//!   by the caller, and no session is bound to a toolset; the operator policy
+//!   and the approvals bound native and routed calls alike.
 
 use rmcp::{
     handler::server::wrapper::Parameters,
@@ -27,10 +39,11 @@ use rmcp::{
     schemars, serde, tool, tool_router,
 };
 use serde_json::json;
+use stellar_agent_core::profile::schema::KeyringEntryRef;
 use stellar_agent_mcp_macros::mcp_tool_router;
 use stellar_agent_toolsets_runtime::{
-    GatedInvokeParams, GatedResolveOutcome, list_pinned_toolsets, resolve_toolset_and_check,
-    resolve_toolset_sign_payment_gated,
+    GatedInvokeParams, GatedResolveOutcome, PinKey, list_pinned_toolsets,
+    resolve_toolset_and_check, resolve_toolset_sign_payment_gated,
 };
 
 use crate::server::WalletServer;
@@ -116,7 +129,9 @@ impl WalletServer {
     /// - `actions` — tool names the toolset may invoke (subject to enforcement).
     ///
     /// This is the canonical scriptable enumeration.  Uninstalling a toolset
-    /// removes it from this list without recompiling the binary.
+    /// removes it from this list without recompiling the binary.  A toolset
+    /// whose install record does not verify under the installation's pin key
+    /// is left out; without a pin key the list is empty.
     ///
     /// # Tool annotations
     ///
@@ -125,7 +140,8 @@ impl WalletServer {
     ///
     /// # Errors
     ///
-    /// Returns a tool-level error when the toolsets directory cannot be read.
+    /// Returns a tool-level error when the toolsets directory cannot be read,
+    /// or when the pin key cannot be read for a reason other than its absence.
     #[mcp_tool_item(
         name = "stellar_toolset_list",
         destructive_hint = false,
@@ -159,7 +175,8 @@ impl WalletServer {
                 rmcp::ErrorData::internal_error(format!("toolset.toolsets_dir_error: {e}"), None)
             })?;
 
-        let entries = list_pinned_toolsets(&toolsets_root).map_err(|e| {
+        let pin_key = self.toolset_pin_key()?;
+        let entries = list_pinned_toolsets(&toolsets_root, pin_key.as_ref()).map_err(|e| {
             rmcp::ErrorData::internal_error(format!("toolset.list_error: {e}"), None)
         })?;
 
@@ -180,52 +197,64 @@ impl WalletServer {
     /// four-part capability enforcement check:
     ///
     /// 1. Action resolves to a registry tool-name constant via the matrix.
-    /// 2. The resolving capability is in the toolset's declared `CapabilitySet`.
+    /// 2. The resolving capability is in the toolset's declared `CapabilitySet`,
+    ///    read from its authenticated install record.
     /// 3. The resolved tool is in the toolset's `allowed_tools` (intersective narrowing).
     /// 4. The routed tool's normal handler runs including `dispatch_gate`.
     ///
     /// The toolset gate is ADDITIVE: a toolset action allowed by its manifest but
-    /// denied by operator policy is refused by the operator-policy gate.
+    /// denied by operator policy is refused by the operator-policy gate.  A
+    /// toolset adds these gates to the routed calls; it does not restrict the
+    /// native tools this server also exposes, and the caller chooses the
+    /// `toolset` argument.
     ///
     /// # Signing isolation
     ///
-    /// No signing/key/policy tool is reachable via any capability grant.
-    /// The matrix contains no such tool regardless of declared capabilities
-    /// (structural isolation).
+    /// No signing/key/policy tool is reachable via an ungated capability grant:
+    /// the ungated matrix contains no such tool regardless of declared
+    /// capabilities.  The signing actions (sign-payment, sign-rule-create)
+    /// route to `stellar_pay_commit` and `stellar_rule_create_commit` only
+    /// through the gated resolver, behind a first-invoke grant and a
+    /// per-action approval.
     ///
     /// # Tool annotations
     ///
-    /// - `readOnlyHint = true` — the toolset gate itself is read-only; the routed
-    ///   tool determines the actual mutability (all matrix tools are read-only
-    ///   or build-only).
-    /// - `destructiveHint = false` — all matrix tools are non-destructive.
+    /// - `readOnlyHint = false`: the signing actions route to commit tools
+    ///   that sign and submit.
+    /// - `destructiveHint = true`: the dispatcher reaches destructive tools,
+    ///   so on mainnet the default policy engine refuses it and the mainnet
+    ///   read-only tool set does not list it.
     ///
     /// # Errors
     ///
     /// - `network.mainnet_write_forbidden`: a signing action (sign-payment or
     ///   rule-create) on a mainnet profile, answered as a business envelope
     ///   before any gate, approval, key access, or RPC request.
-    /// - `toolset.not_installed` — toolset is not installed.
-    /// - `toolset.unknown_action` — action not in the capability→tool matrix.
-    /// - `toolset.capability_not_declared` — granting capability not declared.
-    /// - `toolset.tool_not_allowed` — tool excluded by `allowed_tools` narrowing.
+    /// - `policy.engine_required` and the other dispatch-gate refusals: a non-signing
+    ///   action on a mainnet profile, refused by the dispatcher's policy gate.
+    /// - `toolset.pin_unverifiable`: the install record does not verify under
+    ///   the installation's pin key, or no pin key exists.
+    /// - `toolset.not_installed`: toolset is not installed.
+    /// - `toolset.unknown_action`: action not in the capability→tool matrix.
+    /// - `toolset.capability_not_declared`: granting capability not declared.
+    /// - `toolset.tool_not_allowed`: tool excluded by `allowed_tools` narrowing.
     /// - Plus any error from the routed tool (operator policy, chain mismatch, etc.).
     #[mcp_tool_item(
         name = "stellar_toolset_invoke",
-        destructive_hint = false,
-        read_only_hint = true,
+        destructive_hint = true,
+        read_only_hint = false,
         chain_id_required = false
     )]
     #[tool(
         name = "stellar_toolset_invoke",
-        description = "Invoke a named action of an installed toolset through the \
-                       four-part capability enforcement gate. \
-                       `toolset` is the package name; `action` is the registry tool name \
-                       (e.g. stellar_balances, stellar_pay). \
-                       Signing tools are never reachable regardless of declared capabilities. \
-                       The routed tool's normal operator-policy gate also runs (additive gate). \
-                       read_only_hint=true; destructive_hint=false.",
-        annotations(read_only_hint = true, destructive_hint = false)
+        description = "Invoke a named action of an installed toolset. `toolset` names the \
+                       package; `action` must be granted by the toolset's declared \
+                       capabilities, read from its authenticated install record. Signing \
+                       actions (sign-payment, sign-rule-create) route to the signing commit \
+                       tools behind a first-invoke grant and a per-action approval. A toolset \
+                       adds these gates; it does not restrict the native tools this server \
+                       also exposes.",
+        annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn stellar_toolset_invoke(
         &self,
@@ -236,11 +265,8 @@ impl WalletServer {
         let toolset_name = stellar_agent_toolsets::sanitise_display(&args.toolset, 64);
         let action = stellar_agent_toolsets::sanitise_display(&args.action, 128);
 
-        // Structural mainnet refusal for the signing actions (sign-payment and
-        // rule-create), keyed on the server's profile context. It precedes the
-        // toolset's own dispatch gate and the gated resolvers, so a mainnet
-        // profile queues neither a first-invoke approval nor a per-payment
-        // approval. Read-only actions stay allowed on mainnet.
+        // Signing actions refuse here; other actions reach the dispatcher's
+        // policy gate, which refuses them on mainnet.
         let is_signing_action = matrix::GATED_MATRIX_ENTRIES
             .iter()
             .any(|(_, tools)| tools.contains(&action.as_str()));
@@ -254,7 +280,9 @@ impl WalletServer {
         });
         // dispatch_gate with empty chain_id (chain_id_required = false for the
         // outer toolset_invoke tool — the routed tool handles its own chain_id check).
-        // Non-signing tool: RequireApproval produces no signing material; proceed.
+        // The dispatcher is destructive, so on mainnet the default engine refuses
+        // here. A RequireApproval outcome produces no signing material at this
+        // gate: the signing routes carry their own approvals; proceed.
         if let Err(e) = self
             .dispatch_gate("stellar_toolset_invoke", &args_value, "")
             .await
@@ -313,20 +341,28 @@ impl WalletServer {
         }
 
         // ── Four-part enforcement (ungated path) ──────────────────────────────
-        let (tool_name, _pin) = resolve_toolset_and_check(&toolset_name, &action, &toolsets_root)
-            .map_err(|e| match e {
-            ToolsetRuntimeError::ToolsetNotInstalled { .. } => {
-                rmcp::ErrorData::invalid_params(e.to_string(), None)
-            }
-            ToolsetRuntimeError::UnknownToolsetAction { .. }
-            | ToolsetRuntimeError::CapabilityNotDeclared { .. }
-            | ToolsetRuntimeError::ToolNotAllowed { .. } => {
-                rmcp::ErrorData::invalid_params(e.to_string(), None)
-            }
-            ToolsetRuntimeError::Io(_) => rmcp::ErrorData::internal_error(e.to_string(), None),
-            // Forward-compat: new #[non_exhaustive] variants fail closed.
-            _ => rmcp::ErrorData::internal_error(format!("toolset.enforcement_error: {e}"), None),
-        })?;
+        let pin_key = self.toolset_pin_key()?;
+        let (tool_name, _pin) =
+            resolve_toolset_and_check(&toolset_name, &action, &toolsets_root, pin_key.as_ref())
+                .map_err(|e| match e {
+                    ToolsetRuntimeError::ToolsetNotInstalled { .. }
+                    | ToolsetRuntimeError::PinUnverifiable { .. } => {
+                        rmcp::ErrorData::invalid_params(e.to_string(), None)
+                    }
+                    ToolsetRuntimeError::UnknownToolsetAction { .. }
+                    | ToolsetRuntimeError::CapabilityNotDeclared { .. }
+                    | ToolsetRuntimeError::ToolNotAllowed { .. } => {
+                        rmcp::ErrorData::invalid_params(e.to_string(), None)
+                    }
+                    ToolsetRuntimeError::Io(_) => {
+                        rmcp::ErrorData::internal_error(e.to_string(), None)
+                    }
+                    // Forward-compat: new #[non_exhaustive] variants fail closed.
+                    _ => rmcp::ErrorData::internal_error(
+                        format!("toolset.enforcement_error: {e}"),
+                        None,
+                    ),
+                })?;
 
         // ── Build merged args: chain_id + tool-specific args ──────────────────
         let chain_id = args.chain_id.as_deref().unwrap_or("");
@@ -386,6 +422,28 @@ impl WalletServer {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl WalletServer {
+    /// Reads the installation's toolset pin key for one toolset call.
+    ///
+    /// Read per call, so a key minted by an install after this server started
+    /// is used at once.  `Ok(None)` when no toolset was ever installed: every
+    /// resolver then reports an installed toolset as unverifiable.  A keyring
+    /// failure other than the key's absence is an internal error carrying the
+    /// keyring code, so a locked keyring never reads as an absent key.
+    fn toolset_pin_key(&self) -> Result<Option<PinKey>, rmcp::ErrorData> {
+        #[cfg(any(test, feature = "test-helpers"))]
+        if let Some(key) = &self.toolset_pin_key_override {
+            return Ok(Some(key.clone()));
+        }
+        stellar_agent_network::keyring::read_secret_32(&KeyringEntryRef::toolset_pin_key())
+            .map(|key| key.map(PinKey::from_bytes))
+            .map_err(|e| {
+                rmcp::ErrorData::internal_error(
+                    format!("{}: the toolset pin key cannot be read: {e}", e.code()),
+                    Some(json!({ "code": e.code() })),
+                )
+            })
+    }
+
     /// Loads the profile's attestation key and the binding its toolset grants
     /// are attested under, for the gated resolver's verified grant lookup.
     ///
@@ -548,6 +606,7 @@ impl WalletServer {
                 Ok(loaded) => loaded,
                 Err(result) => return Ok(result),
             };
+        let pin_key = self.toolset_pin_key()?;
 
         #[cfg(not(feature = "test-helpers"))]
         let gated_params = GatedInvokeParams {
@@ -562,6 +621,7 @@ impl WalletServer {
             authoritative_amount_stroops: amount_stroops,
             now_unix_ms,
             process_uid: &process_uid,
+            pin_key: pin_key.as_ref(),
         };
         #[cfg(feature = "test-helpers")]
         let gated_params = GatedInvokeParams {
@@ -576,6 +636,7 @@ impl WalletServer {
             authoritative_amount_stroops: amount_stroops,
             now_unix_ms,
             process_uid: &process_uid,
+            pin_key: pin_key.as_ref(),
             approval_dir_override: self.approval_dir_override.clone(),
             grant_store_path_override: self.grant_store_path_override.clone(),
         };
@@ -585,6 +646,7 @@ impl WalletServer {
                 // Hard errors (toolset not installed, capability not declared, etc.)
                 let err = match e {
                     ToolsetRuntimeError::ToolsetNotInstalled { .. }
+                    | ToolsetRuntimeError::PinUnverifiable { .. }
                     | ToolsetRuntimeError::UnknownToolsetAction { .. }
                     | ToolsetRuntimeError::CapabilityNotDeclared { .. }
                     | ToolsetRuntimeError::ToolNotAllowed { .. } => {
@@ -830,6 +892,7 @@ impl WalletServer {
                 Ok(loaded) => loaded,
                 Err(result) => return Ok(result),
             };
+        let pin_key = self.toolset_pin_key()?;
 
         #[cfg(not(feature = "test-helpers"))]
         let gated_params = GatedInvokeParams {
@@ -846,6 +909,7 @@ impl WalletServer {
                 stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_AMOUNT_SENTINEL,
             now_unix_ms,
             process_uid: &process_uid,
+            pin_key: pin_key.as_ref(),
         };
         #[cfg(feature = "test-helpers")]
         let gated_params = GatedInvokeParams {
@@ -862,6 +926,7 @@ impl WalletServer {
                 stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_AMOUNT_SENTINEL,
             now_unix_ms,
             process_uid: &process_uid,
+            pin_key: pin_key.as_ref(),
             approval_dir_override: self.approval_dir_override.clone(),
             grant_store_path_override: self.grant_store_path_override.clone(),
         };
@@ -870,6 +935,7 @@ impl WalletServer {
             Err(e) => {
                 let err = match e {
                     ToolsetRuntimeError::ToolsetNotInstalled { .. }
+                    | ToolsetRuntimeError::PinUnverifiable { .. }
                     | ToolsetRuntimeError::UnknownToolsetAction { .. }
                     | ToolsetRuntimeError::CapabilityNotDeclared { .. }
                     | ToolsetRuntimeError::ToolNotAllowed { .. } => {
@@ -1161,7 +1227,127 @@ impl TypeStrName for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "test-only fixture construction and assertions"
+    )]
+
+    use stellar_agent_core::profile::Profile;
+    use stellar_agent_toolsets_runtime::PinKey;
     use stellar_agent_toolsets_runtime::matrix::ALL_MATRIX_TOOL_NAMES;
+
+    use super::StellarToolsetInvokeArgs;
+    use crate::server::WalletServer;
+
+    /// Router metadata carries the annotations clients receive in `tools/list`.
+    #[test]
+    fn toolset_invoke_router_annotations_are_destructive() {
+        let tool = WalletServer::toolsets_tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "stellar_toolset_invoke")
+            .unwrap();
+        let annotations = tool.annotations.unwrap();
+        assert_eq!(annotations.destructive_hint, Some(true));
+        assert_eq!(annotations.read_only_hint, Some(false));
+    }
+
+    fn pin_key(byte: u8) -> PinKey {
+        PinKey::from_bytes(zeroize::Zeroizing::new([byte; 32]))
+    }
+
+    fn balances_invoke(toolset: &str) -> StellarToolsetInvokeArgs {
+        StellarToolsetInvokeArgs {
+            toolset: toolset.to_owned(),
+            action: "stellar_balances".to_owned(),
+            chain_id: None,
+            args: serde_json::json!({
+                "account_id": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+            }),
+        }
+    }
+
+    /// A record written under another key, and a record of the earlier
+    /// untagged format, both refuse with `toolset.pin_unverifiable` before
+    /// any routing.
+    #[tokio::test]
+    async fn toolset_invoke_refuses_an_unverifiable_pin() {
+        let toolsets = tempfile::TempDir::new().unwrap();
+        stellar_agent_toolsets_install::write_toolset_for_test(
+            toolsets.path(),
+            "balance-reporter",
+            &["read-balance"],
+            &[],
+            "2026-06-02T00:00:00Z",
+            &pin_key(0x5a),
+        )
+        .unwrap();
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.set_toolsets_root_for_test(toolsets.path().to_path_buf());
+        server.set_toolset_pin_key_for_test(pin_key(0x5b));
+
+        let err = server
+            .call_stellar_toolset_invoke(balances_invoke("balance-reporter"))
+            .await
+            .expect_err("a record under another key must refuse");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("toolset.pin_unverifiable"),
+            "{}",
+            err.message
+        );
+
+        std::fs::write(
+            toolsets
+                .path()
+                .join("balance-reporter")
+                .join(".stellar-agent-toolset-pin.json"),
+            r#"{"package":"balance-reporter","version":"1.0.0","shasum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","publisher":"GABC","installed_at":"2026-06-02T00:00:00Z","capabilities":["read-balance"],"allowed_tools":[]}"#,
+        )
+        .unwrap();
+        server.set_toolset_pin_key_for_test(pin_key(0x5a));
+        let err = server
+            .call_stellar_toolset_invoke(balances_invoke("balance-reporter"))
+            .await
+            .expect_err("an untagged record must refuse");
+        assert!(
+            err.message.contains("toolset.pin_unverifiable"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// On a mainnet profile without an operator policy, the dispatcher is
+    /// refused by its own policy gate for a read-only action, before the
+    /// resolver reads any record: the toolset here is not installed, and the
+    /// refusal is the policy code, not `toolset.not_installed`.
+    #[tokio::test]
+    async fn toolset_invoke_is_refused_on_mainnet_under_the_default_engine() {
+        let toolsets = tempfile::TempDir::new().unwrap();
+        let profile = Profile::builder_mainnet(
+            "https://rpc.example.invalid",
+            "svc",
+            "acct",
+            "n-svc",
+            "n-acct",
+        )
+        .with_noop_engine()
+        .build();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.set_toolsets_root_for_test(toolsets.path().to_path_buf());
+        server.set_toolset_pin_key_for_test(pin_key(0x5a));
+
+        let result = server
+            .call_stellar_toolset_invoke(balances_invoke("balance-reporter"))
+            .await
+            .expect("the policy refusal is a business envelope");
+        let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "policy.engine_required");
+    }
 
     /// Verify that ALL_MATRIX_TOOL_NAMES lists only names that have a routing arm
     /// in route_to_matrix_tool (i.e. no name exists in the matrix that is missing

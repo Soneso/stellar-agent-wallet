@@ -277,11 +277,12 @@ host sends the returned credential to the exact bound HTTP or MCP request. See
 ## 8. The wallet's toolsets feature
 
 Separately from this knowledge skill, the wallet has a built-in **toolsets**
-feature: a signed, installed package that grants an agent a narrow, wallet-enforced
-set of capabilities (least privilege). It is the opposite of this skill — it
-restricts what an agent may do rather than teaching it. Drive installed toolsets
-with `stellar_toolset_list` and `stellar_toolset_invoke`. See
-`references/toolsets-feature.md`.
+feature: a signed, installed package that declares a narrow set of capabilities
+the toolset dispatcher routes for an agent. It is the opposite of this skill: it
+narrows what the dispatcher routes rather than teaching. It does not restrict the
+other tools the server exposes; the operator policy and approvals bound every call.
+Drive installed toolsets with `stellar_toolset_list` and `stellar_toolset_invoke`
+(a destructive tool, refused on mainnet). See `references/toolsets-feature.md`.
 
 ## 9. Safety model
 
@@ -430,5 +431,5 @@ A submission timeout requires reconciliation, not a new payment attempt.
 is not a stable contract; the wire `code` is.
 
 **The toolsets feature is not this skill.** `stellar_toolset_list` /
-`stellar_toolset_invoke` drive the wallet's capability-restriction packages, a
-runtime permission mechanism — not downloadable knowledge like this skill.
+`stellar_toolset_invoke` drive the wallet's capability packages, which narrow what
+the toolset dispatcher routes; they are not downloadable knowledge like this skill.

@@ -137,9 +137,6 @@ const CAPABILITY: &str = "sign-payment";
 /// Native XLM sentinel for asset.
 const ASSET_XLM: &str = "XLM";
 
-/// The pin file name (mirrors toolsets-install constant).
-const PIN_FILE_NAME: &str = ".stellar-agent-toolset-pin.json";
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -185,41 +182,30 @@ fn payment_envelope_xdr(source: &str, dest: &str, amount_stroops: i64) -> String
     .expect("XDR encode must succeed")
 }
 
-/// Writes a minimal `ToolsetPinRecord` JSON for `toolset_name` with `sign-payment`
-/// capability to `toolsets_root`.
+/// Writes `toolset_name` as an install leaves it, declaring `capabilities`,
+/// with its record tagged under the suite's pin key.
 ///
 /// Bypasses `install_toolset` — no real package needed for unit-level tests.
-fn write_pin_with_sign_payment(toolsets_root: &std::path::Path, toolset_name: &str) {
-    let toolset_dir = toolsets_root.join(toolset_name);
-    std::fs::create_dir_all(&toolset_dir).expect("create toolset dir");
-    let pin_json = serde_json::json!({
-        "package": toolset_name,
-        "version": "1.0.0",
-        "shasum": "a".repeat(64),
-        "publisher": SOURCE_G,
-        "installed_at": "2026-06-02T00:00:00Z",
-        "capabilities": ["sign-payment"],
-        "allowed_tools": []
-    });
-    let pin_path = toolset_dir.join(PIN_FILE_NAME);
-    std::fs::write(&pin_path, serde_json::to_string_pretty(&pin_json).unwrap()).expect("write pin");
+fn write_toolset(toolsets_root: &std::path::Path, toolset_name: &str, capabilities: &[&str]) {
+    stellar_agent_toolsets_install::write_toolset_for_test(
+        toolsets_root,
+        toolset_name,
+        capabilities,
+        &[],
+        "2026-06-02T00:00:00Z",
+        &crate::common::toolset_pin_key(),
+    )
+    .expect("write toolset");
 }
 
-/// Writes a minimal `ToolsetPinRecord` without `sign-payment` capability.
+/// Writes `toolset_name` declaring `sign-payment`.
+fn write_pin_with_sign_payment(toolsets_root: &std::path::Path, toolset_name: &str) {
+    write_toolset(toolsets_root, toolset_name, &["sign-payment"]);
+}
+
+/// Writes `toolset_name` declaring `read-balance` only.
 fn write_pin_without_sign_payment(toolsets_root: &std::path::Path, toolset_name: &str) {
-    let toolset_dir = toolsets_root.join(toolset_name);
-    std::fs::create_dir_all(&toolset_dir).expect("create toolset dir");
-    let pin_json = serde_json::json!({
-        "package": toolset_name,
-        "version": "1.0.0",
-        "shasum": "b".repeat(64),
-        "publisher": SOURCE_G,
-        "installed_at": "2026-06-02T00:00:00Z",
-        "capabilities": ["read-balance"],
-        "allowed_tools": []
-    });
-    let pin_path = toolset_dir.join(PIN_FILE_NAME);
-    std::fs::write(&pin_path, serde_json::to_string_pretty(&pin_json).unwrap()).expect("write pin");
+    write_toolset(toolsets_root, toolset_name, &["read-balance"]);
 }
 
 /// Seeds the nonce key into the mock keyring (required for `WalletServer::new`).
@@ -288,6 +274,7 @@ fn allow_server_for(
     server.set_approval_dir_for_test(approval_dir.to_path_buf());
     server.set_grant_store_path_for_test(grant_store_path.to_path_buf());
     server.set_toolsets_root_for_test(toolsets_root.to_path_buf());
+    server.set_toolset_pin_key_for_test(crate::common::toolset_pin_key());
     server
 }
 
@@ -1391,25 +1378,13 @@ async fn adversarial_muxed_destination_reprompts() {
 // Tests 11 to 13: mainnet refusal ahead of the toolset gates
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Writes a minimal `ToolsetPinRecord` declaring `capabilities`.
+/// Writes `toolset_name` declaring `capabilities`.
 fn write_pin_with_capabilities(
     toolsets_root: &std::path::Path,
     toolset_name: &str,
     capabilities: &[&str],
 ) {
-    let toolset_dir = toolsets_root.join(toolset_name);
-    std::fs::create_dir_all(&toolset_dir).expect("create toolset dir");
-    let pin_json = serde_json::json!({
-        "package": toolset_name,
-        "version": "1.0.0",
-        "shasum": "c".repeat(64),
-        "publisher": SOURCE_G,
-        "installed_at": "2026-06-02T00:00:00Z",
-        "capabilities": capabilities,
-        "allowed_tools": []
-    });
-    let pin_path = toolset_dir.join(PIN_FILE_NAME);
-    std::fs::write(&pin_path, serde_json::to_string_pretty(&pin_json).unwrap()).expect("write pin");
+    write_toolset(toolsets_root, toolset_name, capabilities);
 }
 
 /// The policy engine a mainnet toolset case runs on.
@@ -1452,6 +1427,7 @@ fn build_mainnet_server(
     server.set_approval_dir_for_test(approval_dir.to_path_buf());
     server.set_grant_store_path_for_test(grant_store_path.to_path_buf());
     server.set_toolsets_root_for_test(toolsets_root.to_path_buf());
+    server.set_toolset_pin_key_for_test(crate::common::toolset_pin_key());
     server
 }
 
@@ -1635,10 +1611,11 @@ async fn mainnet_rule_create_case(engine: CaseEngine) {
     assert_no_requests(&rpc).await;
 }
 
-/// A read-only toolset action stays allowed on a mainnet context.
+/// A read-only toolset action on a mainnet profile is refused by the dispatcher's
+/// policy gate, and the routed tool sends no request.
 #[tokio::test]
 #[serial]
-async fn mainnet_read_only_toolset_action_still_succeeds() {
+async fn mainnet_read_only_toolset_action_is_refused_under_the_default_engine() {
     let _data_root = crate::common::isolated_data_root();
     let rpc = wiremock::MockServer::start().await;
     let toolsets_dir = TempDir::new().unwrap();
@@ -1668,11 +1645,11 @@ async fn mainnet_read_only_toolset_action_still_succeeds() {
     let result = server
         .call_stellar_toolset_invoke(args)
         .await
-        .expect("a read-only action on mainnet succeeds");
-    assert_ne!(
-        result.is_error,
-        Some(true),
-        "a read-only action on mainnet must not be refused: {result:?}"
+        .expect("the policy refusal is a business envelope");
+    let (code, _message, _text) = crate::common::assert_business_envelope(&result);
+    assert_eq!(
+        code, "policy.engine_required",
+        "the default engine refuses the destructive dispatcher on mainnet"
     );
     assert_no_requests(&rpc).await;
 }

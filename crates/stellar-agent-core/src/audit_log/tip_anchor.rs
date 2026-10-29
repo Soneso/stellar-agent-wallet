@@ -111,6 +111,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use super::binding::BindingHistory;
+use crate::profile::schema::KeyringEntryRef;
 
 /// Number of hex characters of the path digest carried in the anchor's keyring
 /// account name.
@@ -658,6 +659,58 @@ pub fn outbox_state_account_for_digest(base_account: &str, path_sha256: &[u8; 32
         "{}-outbox",
         tip_anchor_account_for_digest(base_account, path_sha256)
     )
+}
+
+pub(crate) const TIP_ANCHOR: &str = "audit_log_hash_chain_key_id (tip anchor)";
+pub(crate) const REANCHOR_COUNTER: &str = "audit_log_hash_chain_key_id (reanchor counter)";
+pub(crate) const OUTBOX_STATE: &str = "audit_log_hash_chain_key_id (outbox state)";
+
+/// The path-scoped keyring entries derived beside an audit chain key.
+///
+/// The writer's keyring store and profile scope checks share these coordinates.
+pub struct AuditKeyringEntries {
+    /// The authenticated log tip.
+    pub tip_anchor: KeyringEntryRef,
+    /// The monotonic count of acknowledged reanchors.
+    pub reanchor_counter: KeyringEntryRef,
+    /// The pending outbox commitment.
+    pub outbox_state: KeyringEntryRef,
+}
+
+impl AuditKeyringEntries {
+    /// Derives every companion entry from the audit key and log path digest.
+    #[must_use]
+    pub fn for_path_digest(audit_key: &KeyringEntryRef, path_sha256: &[u8; 32]) -> Self {
+        Self {
+            tip_anchor: KeyringEntryRef::new(
+                &audit_key.service,
+                tip_anchor_account_for_digest(&audit_key.account, path_sha256),
+            ),
+            reanchor_counter: KeyringEntryRef::new(
+                &audit_key.service,
+                reanchor_count_account_for_digest(&audit_key.account, path_sha256),
+            ),
+            outbox_state: KeyringEntryRef::new(
+                &audit_key.service,
+                outbox_state_account_for_digest(&audit_key.account, path_sha256),
+            ),
+        }
+    }
+
+    /// Enumerates every companion entry in profile scope order.
+    pub(crate) fn into_scope_entries(self) -> [(&'static str, KeyringEntryRef); 3] {
+        // Exhaustive destructuring requires each added coordinate to enter scope checks.
+        let Self {
+            tip_anchor,
+            reanchor_counter,
+            outbox_state,
+        } = self;
+        [
+            (TIP_ANCHOR, tip_anchor),
+            (REANCHOR_COUNTER, reanchor_counter),
+            (OUTBOX_STATE, outbox_state),
+        ]
+    }
 }
 
 // ── In-memory store for tests ────────────────────────────────────────────────

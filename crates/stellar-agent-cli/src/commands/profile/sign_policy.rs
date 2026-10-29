@@ -213,6 +213,13 @@ where
             return 1;
         }
     };
+    if let Err(e) = stellar_agent_core::profile::owner_key::refuse_installation_key_coordinate(
+        &profile.policy_window_state_key_id,
+        "policy_window_state_key_id",
+    ) {
+        render::render_json(&Envelope::<()>::err(&e));
+        return 1;
+    }
     if let Err(e) = init_keyring() {
         render::render_json(&Envelope::<()>::err(&e));
         return 1;
@@ -1482,6 +1489,7 @@ mod tests {
             "re-rendering must not duplicate the [signature] table"
         );
     }
+
     #[test]
     #[serial]
     fn sequence_assignment_uses_pin_and_body_without_writing_pin() {
@@ -1534,6 +1542,7 @@ mod tests {
             PinState::Present(pin) if pin.sequence() == 10
         ));
     }
+
     #[test]
     #[serial]
     fn sequence_missing_and_exhaustion_boundaries() {
@@ -1567,6 +1576,7 @@ mod tests {
             )
         );
     }
+
     #[test]
     #[serial]
     fn v1_warning_and_pin_rollback_warning() {
@@ -1609,6 +1619,7 @@ mod tests {
                 .any(|w| w.contains("policy.sequence_rollback"))
         );
     }
+
     #[test]
     #[serial]
     fn unsigned_and_minimum_validation_precede_signing() {
@@ -1658,6 +1669,7 @@ mod tests {
             );
         }
     }
+
     #[tokio::test]
     #[serial]
     async fn rendered_sequence_fields_and_mainnet_warning_follow_the_signed_body() {
@@ -1764,6 +1776,7 @@ mod tests {
             "{message}"
         );
     }
+
     #[tokio::test]
     #[serial]
     async fn previous_owner_seed_signs_a_loadable_rotation_without_secret_output() {
@@ -1938,5 +1951,23 @@ mod tests {
         .unwrap();
         assert_eq!(verified.owner(), new_public);
         assert_eq!(verified.sequence(), 2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn installation_coordinate_refuses_without_writing() {
+        crate::common::installation_key_fixture::assert_installation_profile_refusal(
+            |profile| &mut profile.policy_window_state_key_id,
+            async |fixture, profile, name| {
+                let args = SignPolicyArgs {
+                    profile: Some(name.to_owned()),
+                    secret_env: "UNUSED_PIN_SEED".to_owned(),
+                    previous_owner_secret_env: None,
+                    file: None,
+                };
+                run_with_dependencies(&args, |_| Ok(profile.clone()), || fixture.init()).await
+            },
+        )
+        .await;
     }
 }

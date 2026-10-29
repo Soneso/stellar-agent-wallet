@@ -717,12 +717,15 @@ async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
     )
     .await;
     let tools = tempfile::tempdir().unwrap();
-    let tool_dir = tools.path().join("payment-toolset");
-    std::fs::create_dir(&tool_dir).unwrap();
-    std::fs::write(tool_dir.join(".stellar-agent-toolset-pin.json"), json!({
-        "package": "payment-toolset", "version": "1.0.0", "shasum": "a".repeat(64),
-        "publisher": h.source, "installed_at": "2026-06-02T00:00:00Z", "capabilities": ["sign-payment"], "allowed_tools": []
-    }).to_string()).unwrap();
+    stellar_agent_toolsets_install::write_toolset_for_test(
+        tools.path(),
+        "payment-toolset",
+        &["sign-payment"],
+        &[],
+        "2026-06-02T00:00:00Z",
+        &crate::common::toolset_pin_key(),
+    )
+    .unwrap();
     let grant_path = tools.path().join("grants.toml");
     let now = now_unix_ms().unwrap();
     let grant = build_attested_grant(
@@ -744,6 +747,8 @@ async fn toolset_forced_approval_keeps_allow_effects_and_reservation() {
         .insert(grant)
         .unwrap();
     h.server.set_toolsets_root_for_test(tools.path().to_owned());
+    h.server
+        .set_toolset_pin_key_for_test(crate::common::toolset_pin_key());
     h.server.set_grant_store_path_for_test(grant_path);
     let sim = h.simulate_pay(AMOUNT).await;
     assert!(sim["data"]["approval"].is_null());
@@ -1046,12 +1051,15 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
     )
     .await;
     let tools = tempfile::tempdir().unwrap();
-    let tool_dir = tools.path().join("payment-toolset");
-    std::fs::create_dir(&tool_dir).unwrap();
-    std::fs::write(tool_dir.join(".stellar-agent-toolset-pin.json"), json!({
-        "package": "payment-toolset", "version": "1.0.0", "shasum": "a".repeat(64),
-        "publisher": h.source, "installed_at": "2026-06-02T00:00:00Z", "capabilities": ["sign-payment"], "allowed_tools": []
-    }).to_string()).unwrap();
+    stellar_agent_toolsets_install::write_toolset_for_test(
+        tools.path(),
+        "payment-toolset",
+        &["sign-payment"],
+        &[],
+        "2026-06-02T00:00:00Z",
+        &crate::common::toolset_pin_key(),
+    )
+    .unwrap();
     let grant_path = tools.path().join("grants.toml");
     let now = now_unix_ms().unwrap();
     let grant = build_attested_grant(
@@ -1073,6 +1081,8 @@ async fn rule_ttl_bounds_toolset_queued_approval_at_commit() {
         .insert(grant)
         .unwrap();
     h.server.set_toolsets_root_for_test(tools.path().to_owned());
+    h.server
+        .set_toolset_pin_key_for_test(crate::common::toolset_pin_key());
     h.server.set_grant_store_path_for_test(grant_path);
     let sim = h.simulate_pay(AMOUNT).await;
     let rule_nonce = sim["data"]["approval"]["approval_nonce"]

@@ -25,6 +25,8 @@ stellar-agent-toolsets = { path = "../stellar-agent-toolsets", features = ["test
 stellar-agent-core = { path = "../stellar-agent-core" }
 serde_json                 = { workspace = true }
 stellar-agent-toolsets-install = { path = "../stellar-agent-toolsets-install", features = ["test-helpers"] }
+# Builds the fixture pin key.
+zeroize                    = { workspace = true }
 
 [features]
 # Exposes test helpers for integration tests in sibling crates.

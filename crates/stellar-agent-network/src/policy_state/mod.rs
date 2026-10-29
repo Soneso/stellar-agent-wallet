@@ -347,6 +347,12 @@ pub enum WindowStoreError {
     )]
     KeyMatchesOwnerPublicKey,
 
+    /// The profile key coordinate names the reserved installation service.
+    #[error(
+        "`policy_window_state_key_id` names the reserved service `stellar-agent-toolsets` (validation.installation_key_coordinate)"
+    )]
+    InstallationKeyCoordinate,
+
     /// A window bucket cannot admit the reservation.
     ///
     /// Produced by [`PersistedWindowStore::record_pending`] when it re-applies

@@ -2353,9 +2353,10 @@ impl PersistedWindowStore {
         profile: &Profile,
     ) -> Result<(zeroize::Zeroizing<[u8; 32]>, MintOutcome), WindowStoreError> {
         let entry_ref = &profile.policy_window_state_key_id;
-        // An owner-namespace coordinate refuses here, so it never reaches the
-        // mint arm below.
+        // Reserved coordinates refuse before a keyring read or mint.
         refuse_owner_coordinate(profile)?;
+        owner_key::refuse_installation_key_coordinate(entry_ref, POLICY_STATE_KEY_FIELD)
+            .map_err(|_| WindowStoreError::InstallationKeyCoordinate)?;
         let loaded = crate::keyring::load_hmac_key_32(entry_ref);
         // Under the mainnet rules a key is minted only for a store with no
         // committed history: a file without its key, and a committed
@@ -2683,6 +2684,8 @@ fn body_digest(wire: &WireFile) -> Result<String, WindowStoreError> {
 
 /// The window lock serialises callers; one keyring write commits both fields.
 fn write_generation(entry_ref: &KeyringEntryRef, wire: &WireFile) -> Result<(), WindowStoreError> {
+    owner_key::refuse_installation_key_coordinate(entry_ref, POLICY_STATE_KEY_FIELD)
+        .map_err(|_| WindowStoreError::InstallationKeyCoordinate)?;
     let committed = GenerationCommitment {
         generation: wire.generation,
         body_sha256: body_digest(wire)?,
@@ -6137,5 +6140,47 @@ mod tests {
             .verify_with_key(&key, &fs::read(f.store.path()).unwrap())
             .unwrap_err();
         assert_eq!(defect_of(&error, false), Some(StateDefect::Malformed));
+    }
+
+    #[test]
+    #[serial]
+    fn lazy_mint_refuses_installation_coordinate() {
+        use base64::Engine as _;
+        let dir = TempDir::new().unwrap();
+        let mut profile = owner_profile(dir.path(), "installation-window");
+        profile.policy_window_state_key_id =
+            KeyringEntryRef::new("StElLaR-AgEnT-ToOlSeTs", "pin-key");
+        let store = PersistedWindowStore::at_path(dir.path().join("state"));
+        let existing = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x5a; 32]);
+        for initial in [None, Some(existing.as_str())] {
+            keyring_mock::install().unwrap();
+            if let Some(value) = initial {
+                put_raw(&profile.policy_window_state_key_id, value);
+            }
+            assert!(matches!(
+                store.load_or_mint_key(&profile),
+                Err(WindowStoreError::InstallationKeyCoordinate)
+            ));
+            assert_eq!(
+                get_raw(&profile.policy_window_state_key_id).as_deref(),
+                initial
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn generation_write_refuses_installation_coordinate() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut profile = owner_profile(dir.path(), "installation-generation");
+        profile.policy_window_state_key_id =
+            KeyringEntryRef::new("StElLaR-AgEnT-ToOlSeTs", "pin-key");
+        let entry_ref = generation_entry_ref(&profile);
+        assert!(matches!(
+            write_generation(&entry_ref, &WireFile::default()),
+            Err(WindowStoreError::InstallationKeyCoordinate)
+        ));
+        assert!(get_raw(&entry_ref).is_none());
     }
 }

@@ -14,6 +14,10 @@ categories = ["cryptography::cryptocurrencies", "cryptography"]
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
+# HMAC-SHA256 tag of the pin record under the installation's pin key.
+hmac = { workspace = true }
+# Wipes the pin key bytes on drop.
+zeroize = { workspace = true }
 subtle = { workspace = true }
 ed25519-dalek = { workspace = true }
 stellar-strkey = { workspace = true }
@@ -31,6 +35,7 @@ tar = { workspace = true }
 semver = { workspace = true }
 
 [dev-dependencies]
+stellar-agent-core = { workspace = true, features = ["test-helpers"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 tempfile = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -46,7 +51,8 @@ tar = { workspace = true }
 stellar-agent-toolsets = { path = "../stellar-agent-toolsets", features = ["test-helpers"] }
 
 [features]
-# Exposes `ToolsetPinRecord::build_for_test` for sibling-crate tests.
+# Exposes `ToolsetPinRecord::build_for_test` and `write_pin_for_test` for
+# sibling-crate tests.
 # Must NOT be enabled in production builds.
 # `read_pin` is part of the always-public API and is unaffected by this feature.
 test-helpers = []

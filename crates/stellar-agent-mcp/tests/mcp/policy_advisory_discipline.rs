@@ -38,6 +38,7 @@ fn mainnet_read_only_tools_match_registry_both_directions() {
     assert_eq!(registry, MAINNET_READ_ONLY_TOOLS.iter().copied().collect());
     assert!(!registry.contains("stellar_sep43_sign_message"));
     assert!(!registry.contains("stellar_sep53_sign_message"));
+    assert!(!registry.contains("stellar_toolset_invoke"));
 }
 
 #[test]

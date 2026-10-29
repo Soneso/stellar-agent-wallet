@@ -16,14 +16,19 @@
 //! The toolset gate is ADDITIVE: operator policy + chain gates of the routed
 //! tool also apply when wired through the MCP surface.
 //!
+//! The capabilities come from the install record, which must verify under the
+//! installation's toolset pin key; a record that does not verify refuses with
+//! `toolset.pin_unverifiable`.
+//!
 //! Note: this command performs the enforcement check and resolves the routed
 //! tool but does NOT execute it; use the MCP surface for execution.
 
 use clap::Args;
 use serde::Serialize;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::profile::schema::default_toolsets_dir;
-use stellar_agent_toolsets_runtime::resolve_toolset_and_check;
+use stellar_agent_core::profile::schema::{KeyringEntryRef, default_toolsets_dir};
+use stellar_agent_network::keyring::{init_platform_keyring_store, read_secret_32};
+use stellar_agent_toolsets_runtime::{PinKey, resolve_toolset_and_check};
 
 use crate::common::render::render_json;
 
@@ -80,8 +85,9 @@ struct RunResult {
 /// - `0` — enforcement passed (`{ ok: true, data: {...}, request_id }`).
 /// - `1` — enforcement failure or I/O error (`{ ok: false, error: { code,
 ///   message }, request_id }`), `code` one of the `toolset.*` enforcement
-///   codes shared with the MCP `stellar_toolset_invoke` tool, or
-///   `toolsets.dir_resolve_failed`.
+///   codes shared with the MCP `stellar_toolset_invoke` tool,
+///   `toolsets.dir_resolve_failed`, or a keyring error code when the pin key
+///   cannot be read.
 pub async fn run(args: &ToolsetRunArgs) -> i32 {
     let toolsets_root = if let Some(dir) = &args.toolsets_dir {
         dir.clone()
@@ -98,7 +104,19 @@ pub async fn run(args: &ToolsetRunArgs) -> i32 {
         }
     };
 
-    match resolve_toolset_and_check(&args.name, &args.action, &toolsets_root) {
+    if let Err(e) = init_platform_keyring_store() {
+        render_json(&Envelope::err(&e));
+        return 1;
+    }
+    let pin_key = match read_secret_32(&KeyringEntryRef::toolset_pin_key()) {
+        Ok(key) => key.map(PinKey::from_bytes),
+        Err(e) => {
+            render_json(&Envelope::err(&e));
+            return 1;
+        }
+    };
+
+    match resolve_toolset_and_check(&args.name, &args.action, &toolsets_root, pin_key.as_ref()) {
         Ok((tool_name, _pin)) => {
             let result = RunResult {
                 toolset: args.name.clone(),
@@ -118,6 +136,10 @@ pub async fn run(args: &ToolsetRunArgs) -> i32 {
                     "toolset.capability_not_declared"
                 }
                 ToolsetRuntimeError::ToolNotAllowed { .. } => "toolset.tool_not_allowed",
+                ToolsetRuntimeError::PinUnverifiable { .. } => "toolset.pin_unverifiable",
+                ToolsetRuntimeError::ContentDigestMismatch { .. } => {
+                    "toolset.content_digest_mismatch"
+                }
                 ToolsetRuntimeError::Io(_) => "toolset.io_error",
                 _ => "toolset.error",
             };

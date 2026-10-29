@@ -1153,7 +1153,7 @@ Install, list, run, and uninstall agent toolsets with cryptographic provenance v
 
 ### `toolsets install <PKG@VERSION> [flags]`
 
-Installs a toolset from a signed local `.tar.gz`. The publisher key must be in the configured publisher trust set. Toolsets that declare a key-touching capability (e.g. `sign-payment`) additionally require a valid auditor attestation unless `--override-attestation`.
+Installs a toolset from a signed local `.tar.gz`. The publisher key must be in the configured publisher trust set. Toolsets that declare a key-touching capability (e.g. `sign-payment`) additionally require a valid auditor attestation unless `--override-attestation`. The install holds the toolsets directory lock, reads the installation's pin key from the platform keyring (the first install mints it), and writes an install record authenticated under that key. The trust sets are plain operator-held files, read at install time only.
 
 | Flag / arg | Meaning |
 |---|---|
@@ -1170,7 +1170,7 @@ Installs a toolset from a signed local `.tar.gz`. The publisher key must be in t
 | `--allow-downgrade` | Allow installing an older version over a newer one (only with `--force`) |
 | `--toolsets-dir <PATH>` | Override toolsets root |
 
-On success `data` carries `package`, `version`, and `attestation` (`"attested"` / `"overridden"` / `"not-required"` — the actual gate decision, not an inference from flags). Refusals (attestation-required, auditor-untrusted — no partial install — or any other install failure) carry `error.code` `toolsets.install_failed`, with the distinguishing detail in `error.message`.
+On success `data` carries `package`, `version`, and `attestation` (`"attested"` / `"overridden"` / `"not-required"`: the actual gate decision, not an inference from flags). Refusals (attestation-required, auditor-untrusted with no partial install, or any other install failure) carry `error.code` `toolsets.install_failed`, with the distinguishing detail in `error.message`; a keyring failure carries its keyring code. `--force` over a record that does not verify also needs `--allow-downgrade`, because the recorded version cannot be trusted for the downgrade check; uninstalling first is the plain path.
 
 ```bash
 stellar-agent toolsets install my-toolset@1.0.0 --file ./my-toolset-1.0.0.tar.gz \
@@ -1179,7 +1179,7 @@ stellar-agent toolsets install my-toolset@1.0.0 --file ./my-toolset-1.0.0.tar.gz
 
 ### `toolsets list [--toolsets-dir PATH]`
 
-Read-only. The canonical scriptable enumeration of installed toolsets and their capability-derived action lists (not parsed from `--help`). Reports `data.toolsets`.
+Read-only. The canonical scriptable enumeration of installed toolsets and their capability-derived action lists (not parsed from `--help`). Reports `data.toolsets`. A toolset whose install record does not verify under the installation's pin key is skipped with a warning; before the first install the list is empty.
 
 ### `toolsets run <TOOLSET-NAME> <ACTION> [--toolsets-dir PATH]`
 
@@ -1188,7 +1188,7 @@ Runs the four-part capability enforcement check for an installed toolset action 
 - `<TOOLSET-NAME>` (positional, required) — installed toolset package name.
 - `<ACTION>` (positional, required) — must be an exact registry tool name the toolset's capabilities grant, e.g. `stellar_balances`.
 
-On success, exit `0` with `data` carrying `toolset`, `action`, `routed_to`, and a `note` clarifying that enforcement passed but the tool was not run. On failure, exit `1` with `error.code`: `toolset.not_installed`, `toolset.unknown_action`, `toolset.capability_not_declared`, `toolset.tool_not_allowed`, `toolset.io_error`, or `toolset.error`. The toolset gate is additive: the routed tool's operator policy and chain gates still apply at execution time.
+On success, exit `0` with `data` carrying `toolset`, `action`, `routed_to`, and a `note` clarifying that enforcement passed but the tool was not run. On failure, exit `1` with `error.code`: `toolset.not_installed`, `toolset.pin_unverifiable`, `toolset.content_digest_mismatch`, `toolset.unknown_action`, `toolset.capability_not_declared`, `toolset.tool_not_allowed`, `toolset.io_error`, or `toolset.error`. The toolset gate is additive: the routed tool's operator policy and chain gates still apply at execution time.
 
 ```bash
 stellar-agent toolsets run balance-reporter stellar_balances
@@ -1196,7 +1196,7 @@ stellar-agent toolsets run balance-reporter stellar_balances
 
 ### `toolsets uninstall <PACKAGE> [--toolsets-dir PATH]`
 
-Removes the toolset directory and pin record; refuses if not installed (`toolsets.uninstall_failed`). `<PACKAGE>` (positional, required) is the package name (`[a-z0-9-]`). On success `data` carries `package`.
+Removes the toolset directory and pin record; refuses if not installed (`toolsets.uninstall_failed`). It holds the toolsets directory lock and reads no install record, so it also removes a toolset whose record does not verify (`toolset.pin_unverifiable`), the first step of reinstalling it. `<PACKAGE>` (positional, required) is the package name (`[a-z0-9-]`). On success `data` carries `package`.
 
 ```bash
 stellar-agent toolsets uninstall my-toolset

@@ -834,6 +834,7 @@ pub struct OpenAuthorization {
 
 fn pin_refusal(error: PinError) -> WindowStoreError {
     match error {
+        PinError::InstallationKeyCoordinate => WindowStoreError::InstallationKeyCoordinate,
         PinError::Absent => refused(MainnetPrecondition::PolicyPinAbsent),
         PinError::Mismatch { .. } => refused(MainnetPrecondition::PolicyPinMismatch),
         PinError::Keyring { detail } => WindowStoreError::Keyring { detail },

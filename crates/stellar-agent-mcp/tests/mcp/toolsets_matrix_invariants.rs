@@ -11,6 +11,7 @@
 //! - Every SIGNING_DENYLIST name EXISTS in the static registry.
 //! - Every matrix tool has `destructive_hint == false`.
 //! - Matrix ∩ denylist = ∅ by literal name (confirmed vs registry).
+//! - Every registry tool with `destructive_hint == true` is in SIGNING_DENYLIST.
 
 #![allow(
     clippy::unwrap_used,
@@ -80,6 +81,24 @@ fn every_matrix_tool_has_destructive_hint_false() {
             "matrix tool '{tool}' (granting {cap:?}) has destructive_hint=true"
         );
     }
+}
+
+// ── Destructive registry tools are denied ───────────────────────────────────
+
+/// The converse of the matrix check above: a tool annotated destructive cannot
+/// join the registry without joining the denylist.
+#[test]
+fn every_destructive_registry_tool_is_in_the_denylist() {
+    let _ = std::hint::black_box(WalletServer::router_tool_names);
+    let denylist: HashSet<&str> = SIGNING_DENYLIST.iter().copied().collect();
+    let missing: Vec<&str> = inventory::iter::<McpToolRegistration>()
+        .filter(|r| r.destructive_hint && !denylist.contains(r.name))
+        .map(|r| r.name)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "destructive registry tools missing from SIGNING_DENYLIST: {missing:?}"
+    );
 }
 
 // ── Combined: matrix ∩ denylist = ∅ (registry-confirmed) ─────────────────────

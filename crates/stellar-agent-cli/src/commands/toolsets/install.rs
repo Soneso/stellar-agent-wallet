@@ -3,15 +3,26 @@
 //! Installs a toolset from a signed `.tar.gz` package file.  The attestation gate
 //! flags `--attestation-file`, `--auditor-trust-set`, and `--override-attestation`
 //! govern the auditor-attestation check for key-touching toolsets.
+//!
+//! The install runs under the toolsets directory lock and authenticates the
+//! install record under the installation's toolset pin key, which the first
+//! install mints in the platform keyring.  The publisher and auditor trust
+//! sets default to plain files in the toolsets directory; they are
+//! operator-held files read at install time only.
 
 use std::path::PathBuf;
 
 use clap::Args;
 use serde::Serialize;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::profile::schema::default_toolsets_dir;
+use stellar_agent_core::error::WalletError;
+use stellar_agent_core::profile::schema::{
+    KeyringEntryRef, canonical_data_root, default_toolsets_dir,
+};
+use stellar_agent_network::keyring::{init_platform_keyring_store, load_or_mint_secret_32};
 use stellar_agent_toolsets_install::{
-    InstallOptions, MAX_ATTESTATION_BYTES, ToolsetAttestation, install_toolset_from_path,
+    InstallOptions, MAX_ATTESTATION_BYTES, PinKey, TOOLSET_PIN_KEY_LOCK_FILE_NAME,
+    ToolsetAttestation, install_toolset_from_path, lock_installation_pin_key, lock_toolsets,
 };
 
 use crate::common::render::render_json;
@@ -124,18 +135,26 @@ struct InstallResult {
 /// - `1` on any error (`{ ok: false, error: { code, message }, request_id }`).
 ///   `code` is `"toolsets.install_failed"` for every refusal reason (parse,
 ///   attestation-gate, or install-library failure); the distinguishing detail
-///   is in `message`.
+///   is in `message`.  A keyring failure (store initialization, or reading or
+///   minting the toolset pin key) carries its own keyring error code.
 pub async fn run(args: &ToolsetInstallArgs) -> i32 {
+    if let Err(e) = init_platform_keyring_store() {
+        render_json(&Envelope::err(&e));
+        return 1;
+    }
     match run_inner(args) {
         Ok(result) => {
             render_json(&Envelope::ok(result));
             0
         }
         Err(e) => {
-            render_json(&Envelope::<()>::err_raw(
-                "toolsets.install_failed",
-                e.to_string(),
-            ));
+            match e.downcast_ref::<WalletError>() {
+                Some(wallet_error) => render_json(&Envelope::err(wallet_error)),
+                None => render_json(&Envelope::<()>::err_raw(
+                    "toolsets.install_failed",
+                    e.to_string(),
+                )),
+            }
             1
         }
     }
@@ -212,6 +231,17 @@ fn run_inner(args: &ToolsetInstallArgs) -> Result<InstallResult, Box<dyn std::er
         override_attestation: args.override_attestation,
     };
 
+    // Lock order: the toolsets-root lock first, then the installation pin-key
+    // lock. The latter serializes the read-or-mint across every toolsets root.
+    let lock = lock_toolsets(&toolsets_root)?;
+    let data_root = canonical_data_root()?;
+    std::fs::create_dir_all(&data_root)?;
+    let pin_key = {
+        let _mint_lock =
+            lock_installation_pin_key(&data_root.join(TOOLSET_PIN_KEY_LOCK_FILE_NAME))?;
+        PinKey::from_bytes(load_or_mint_secret_32(&KeyringEntryRef::toolset_pin_key())?)
+    };
+
     // Use install_toolset_from_path so the streaming cap (MAX_PACKAGE_BYTES) is
     // applied on the OS file handle BEFORE materialising the buffer — a
     // multi-GB or FIFO source cannot OOM the process.
@@ -227,6 +257,8 @@ fn run_inner(args: &ToolsetInstallArgs) -> Result<InstallResult, Box<dyn std::er
         attestation_owned.as_ref(),
         &auditor_trust_set_path,
         &opts,
+        &lock,
+        &pin_key,
     )?;
 
     Ok(InstallResult {
@@ -293,8 +325,11 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use sha2::{Digest, Sha256};
+    use stellar_agent_network::keyring::read_secret_32;
+    use stellar_agent_test_support::keyring_mock;
     use stellar_agent_toolsets::parse_capability_value_pub;
     use stellar_agent_toolsets_install::attestation::build_attestation_preimage;
+    use stellar_agent_toolsets_install::read_pin;
     use stellar_agent_toolsets_install::signature::build_preimage;
     use stellar_strkey::ed25519::PublicKey as StrPublicKey;
     use tempfile::TempDir;
@@ -414,7 +449,11 @@ mod tests {
     // field for four cases.
 
     #[test]
+    #[serial_test::serial]
     fn tfixture_key_touching_with_attestation_file_reports_attested() {
+        let home = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        keyring_mock::install().unwrap();
         // Key-touching + valid --attestation-file → "attested".
         let publisher_sk = SigningKey::from_bytes(&PUBLISHER_SEED);
         let publisher_pk = publisher_sk.verifying_key().to_bytes();
@@ -466,7 +505,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn tfixture_key_touching_no_attestation_returns_error() {
+        let home = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        keyring_mock::install().unwrap();
         // Key-touching + no attestation → AttestationRequired error.
         let publisher_sk = SigningKey::from_bytes(&PUBLISHER_SEED);
         let publisher_pk = publisher_sk.verifying_key().to_bytes();
@@ -511,7 +554,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn tfixture_key_touching_with_override_reports_overridden() {
+        let home = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        keyring_mock::install().unwrap();
         // Key-touching + --override-attestation → "overridden".
         let publisher_sk = SigningKey::from_bytes(&PUBLISHER_SEED);
         let publisher_pk = publisher_sk.verifying_key().to_bytes();
@@ -554,7 +601,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn tfixture_non_key_touching_with_override_flag_reports_not_required() {
+        let home = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        keyring_mock::install().unwrap();
         // Non-key-touching + --override-attestation → "not-required" (gate never fires).
         // The ACTUAL gate decision is returned from the lib, not inferred from flags.
         let publisher_sk = SigningKey::from_bytes(&PUBLISHER_SEED);
@@ -596,7 +647,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn tfixture_attestation_file_with_untrusted_auditor_refused() {
+        let home = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        keyring_mock::install().unwrap();
         // `--attestation-file` whose `auditor_pubkey` is NOT in the auditor
         // trust set → install refused with AuditorUntrusted; no partial install.
         let publisher_sk = SigningKey::from_bytes(&PUBLISHER_SEED);
@@ -661,6 +716,149 @@ mod tests {
         assert!(
             !toolsets_root.join("sign-toolset").exists(),
             "no partial install after AuditorUntrusted refusal"
+        );
+    }
+
+    /// Concurrent first installs in different roots hold the installation lock
+    /// during key reads, and both pins verify under the single stored key.
+    #[test]
+    #[serial_test::serial]
+    fn concurrent_installs_in_two_roots_share_one_minted_key() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let home = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let coordinate = KeyringEntryRef::toolset_pin_key();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let hook_reads = Arc::clone(&reads);
+        let lock_path = home.path().join(TOOLSET_PIN_KEY_LOCK_FILE_NAME);
+        keyring_mock::install_with_read_hooks(vec![keyring_mock::ReadHook::new(
+            &coordinate.service,
+            &coordinate.account,
+            Arc::new(move || {
+                if hook_reads.fetch_add(1, Ordering::SeqCst) < 2 {
+                    assert!(
+                        matches!(
+                            std::fs::OpenOptions::new()
+                                .write(true)
+                                .open(&lock_path)
+                                .unwrap()
+                                .try_lock(),
+                            Err(std::fs::TryLockError::WouldBlock)
+                        ),
+                        "the installation lock must cover each read-or-mint"
+                    );
+                }
+            }),
+        )])
+        .unwrap();
+
+        let publisher_sk = SigningKey::from_bytes(&PUBLISHER_SEED);
+        let publisher_pk = publisher_sk.verifying_key().to_bytes();
+        let tmp = TempDir::new().unwrap();
+        let mut installs = Vec::new();
+        let trust_path = write_publisher_trust(tmp.path(), publisher_pk);
+        let auditor_trust_path = tmp.path().join("auditor-trust.txt");
+
+        for package in ["alpha-toolset", "beta-toolset"] {
+            let toolsets_root = tmp.path().join(package);
+            let pkg_bytes = make_toolset_tar_gz(package, &toolset_md_no_caps(package));
+            let shasum = sha256_hex(&pkg_bytes);
+            let pkg_path = tmp.path().join(format!("{package}-1.0.0.tar.gz"));
+            std::fs::write(&pkg_path, &pkg_bytes).unwrap();
+            let args = ToolsetInstallArgs {
+                pkg_at_version: format!("{package}@1.0.0"),
+                file: pkg_path,
+                shasum: shasum.clone(),
+                signature: publisher_sig_hex(&publisher_sk, package, "1.0.0", &shasum),
+                publisher: StrPublicKey(publisher_pk).to_string().as_str().to_owned(),
+                trust_set: Some(trust_path.clone()),
+                toolsets_dir: Some(toolsets_root.clone()),
+                force: false,
+                allow_downgrade: false,
+                attestation_file: None,
+                auditor_trust_set: Some(auditor_trust_path.clone()),
+                override_attestation: false,
+            };
+            installs.push(args);
+        }
+
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = installs
+                .iter()
+                .map(|args| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        run_inner(args).expect("install must succeed");
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        let key = PinKey::from_bytes(
+            read_secret_32(&coordinate)
+                .unwrap()
+                .expect("the first install minted the key"),
+        );
+        for package in ["alpha-toolset", "beta-toolset"] {
+            let toolsets_root = tmp.path().join(package);
+            let pin = read_pin(package, &toolsets_root, Some(&key))
+                .unwrap()
+                .expect("the record verifies under the minted key");
+            assert_eq!(pin.package, package);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn held_pin_key_lock_reports_installation_lock() {
+        let home = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        keyring_mock::install().unwrap();
+        let publisher_sk = SigningKey::from_bytes(&PUBLISHER_SEED);
+        let publisher_pk = publisher_sk.verifying_key().to_bytes();
+
+        let tmp = TempDir::new().unwrap();
+        let toolsets_root = tmp.path().join("toolsets");
+        std::fs::create_dir_all(&toolsets_root).unwrap();
+
+        let pkg_bytes = make_toolset_tar_gz("read-toolset", &toolset_md_no_caps("read-toolset"));
+        let shasum = sha256_hex(&pkg_bytes);
+        let pkg_path = tmp.path().join("read-toolset-1.0.0.tar.gz");
+        std::fs::write(&pkg_path, &pkg_bytes).unwrap();
+
+        let trust_path = write_publisher_trust(tmp.path(), publisher_pk);
+        let auditor_trust_path = tmp.path().join("auditor-trust.txt");
+
+        let args = ToolsetInstallArgs {
+            pkg_at_version: "read-toolset@1.0.0".to_owned(),
+            file: pkg_path,
+            shasum: shasum.clone(),
+            signature: publisher_sig_hex(&publisher_sk, "read-toolset", "1.0.0", &shasum),
+            publisher: StrPublicKey(publisher_pk).to_string().as_str().to_owned(),
+            trust_set: Some(trust_path),
+            toolsets_dir: Some(toolsets_root),
+            force: false,
+            allow_downgrade: false,
+            attestation_file: None,
+            auditor_trust_set: Some(auditor_trust_path),
+            override_attestation: true,
+        };
+
+        let _held =
+            lock_installation_pin_key(&home.path().join(TOOLSET_PIN_KEY_LOCK_FILE_NAME)).unwrap();
+        let error = run_inner(&args).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "another toolset install holds the installation pin-key lock"
         );
     }
 }

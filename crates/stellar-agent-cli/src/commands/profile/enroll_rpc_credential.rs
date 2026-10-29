@@ -293,6 +293,16 @@ where
         .credential
         .cloned()
         .unwrap_or_else(|| KeyringEntryRef::default_rpc_credential(&name, role));
+    if let Err(e) = stellar_agent_core::profile::owner_key::refuse_installation_key_coordinate(
+        &entry,
+        match args.role {
+            RoleArg::Primary => "providers.primary.credential",
+            RoleArg::Secondary => "providers.secondary.credential",
+            RoleArg::Oracle => "providers.oracle.credential",
+        },
+    ) {
+        return render::write_envelope(out, &Envelope::<()>::err(&e), 1);
+    }
     let placement = match (record.placement, args.flag_placement()) {
         (Some(stored), Some(flag)) if *stored != flag => {
             return refuse(
@@ -903,5 +913,36 @@ mod tests {
             assert_eq!(profile_text(dir.path()), before);
             assert_eq!(stored(), None);
         }
+    }
+
+    /// Provider enrollment refuses installation coordinates before checking writes or opening keys.
+    #[test]
+    #[serial]
+    fn installation_coordinate_refuses_without_writing() {
+        use crate::common::installation_key_fixture::InstallationKeyFixture;
+        let fixture = InstallationKeyFixture::new("stellar-agent-toolsets");
+        let profile = Profile::builder_testnet_named(NAME, "s", "a", "n", "a")
+            .rpc_url("https://rpc.example")
+            .primary_provider(
+                PrimaryProviderRecord::new("Primary", "rpc.example")
+                    .with_credential(fixture.coordinate.clone(), header("X-Key")),
+            )
+            .build();
+        let mut output = Vec::new();
+        let code = run_with_dependencies(
+            &args(RoleArg::Primary, None),
+            |_| Ok(profile.clone()),
+            |_, _, _, _, _| panic!("refusal precedes the write check"),
+            |_, _, _, _| panic!("refusal precedes the profile patch"),
+            || fixture.init(),
+            ValueSource::Stdin(&mut Cursor::new(b"unused")),
+            &mut output,
+        );
+        fixture.assert_refused(code);
+        let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            output["error"]["code"],
+            "validation.installation_key_coordinate"
+        );
     }
 }

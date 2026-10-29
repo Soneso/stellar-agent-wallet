@@ -1,6 +1,13 @@
 //! `toolsets uninstall` subcommand.
 //!
 //! Uninstalls a previously-installed toolset by name.
+//!
+//! The uninstall runs under the toolsets directory lock and reads no install
+//! record: a toolset is installed when its record file exists, and the
+//! directory removed is the one named by the validated package name.  A
+//! record that does not verify can therefore be removed, which is the way to
+//! reinstall a toolset whose record is refused with
+//! `toolset.pin_unverifiable`.
 
 use std::path::PathBuf;
 
@@ -8,7 +15,7 @@ use clap::Args;
 use serde::Serialize;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::profile::schema::default_toolsets_dir;
-use stellar_agent_toolsets_install::uninstall_toolset;
+use stellar_agent_toolsets_install::{lock_toolsets, uninstall_toolset};
 
 use crate::common::render::render_json;
 
@@ -58,7 +65,9 @@ fn run_inner(args: &ToolsetUninstallArgs) -> Result<UninstallSuccess, (&'static 
         }
     };
 
-    uninstall_toolset(&args.package, &toolsets_root)
+    let lock =
+        lock_toolsets(&toolsets_root).map_err(|e| ("toolsets.uninstall_failed", e.to_string()))?;
+    uninstall_toolset(&args.package, &toolsets_root, &lock)
         .map_err(|e| ("toolsets.uninstall_failed", e.to_string()))?;
 
     Ok(UninstallSuccess {

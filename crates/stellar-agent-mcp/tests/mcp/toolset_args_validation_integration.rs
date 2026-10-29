@@ -101,9 +101,6 @@ const TOOLSET_SIGN_PAYMENT: &str = "payment-toolset";
 /// Malicious toolset name.
 const TOOLSET_MALICIOUS: &str = "malicious-toolset";
 
-/// The pin file name.
-const PIN_FILE_NAME: &str = ".stellar-agent-toolset-pin.json";
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -149,6 +146,7 @@ fn build_allow_server_with_overrides(
         crate::common::policy_mock::MockPolicyEngine::allow(),
     ));
     server.set_toolsets_root_for_test(toolsets_root.to_path_buf());
+    server.set_toolset_pin_key_for_test(crate::common::toolset_pin_key());
     if let Some(dir) = approval_dir {
         server.set_approval_dir_for_test(dir.to_path_buf());
     }
@@ -158,21 +156,18 @@ fn build_allow_server_with_overrides(
     server
 }
 
-/// Write a minimal `ToolsetPinRecord` JSON for `toolset_name` with `capabilities`.
+/// Writes `toolset_name` as an install leaves it, declaring `capabilities`,
+/// with its record tagged under the suite's pin key.
 fn write_pin(toolsets_root: &std::path::Path, toolset_name: &str, capabilities: &[&str]) {
-    let toolset_dir = toolsets_root.join(toolset_name);
-    std::fs::create_dir_all(&toolset_dir).expect("create toolset dir");
-    let pin_json = json!({
-        "package": toolset_name,
-        "version": "1.0.0",
-        "shasum": "a".repeat(64),
-        "publisher": SOURCE_G,
-        "installed_at": "2026-06-02T00:00:00Z",
-        "capabilities": capabilities,
-        "allowed_tools": []
-    });
-    let pin_path = toolset_dir.join(PIN_FILE_NAME);
-    std::fs::write(&pin_path, serde_json::to_string_pretty(&pin_json).unwrap()).expect("write pin");
+    stellar_agent_toolsets_install::write_toolset_for_test(
+        toolsets_root,
+        toolset_name,
+        capabilities,
+        &[],
+        "2026-06-02T00:00:00Z",
+        &crate::common::toolset_pin_key(),
+    )
+    .expect("write toolset");
 }
 
 /// Extract the error message string from `ErrorData`.

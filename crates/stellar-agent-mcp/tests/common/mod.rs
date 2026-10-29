@@ -6,6 +6,17 @@ use std::sync::{Arc, Mutex};
 use rmcp::model::CallToolResult;
 use stellar_agent_test_support::signed_envelope::{TESTNET_PASSPHRASE, get_network_result};
 
+/// The toolset pin key the toolset suites tag their install records under and
+/// hand the server through `set_toolset_pin_key_for_test`.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+#[must_use]
+pub fn toolset_pin_key() -> stellar_agent_toolsets_runtime::PinKey {
+    stellar_agent_toolsets_runtime::PinKey::from_bytes(zeroize::Zeroizing::new([0x5a; 32]))
+}
+
 /// Passphrase of a third Stellar network — neither testnet nor mainnet.
 ///
 /// An endpoint reporting it under a testnet profile is the plain

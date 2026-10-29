@@ -327,9 +327,9 @@ where
 
     let entry_ref = &profile.audit_log_hash_chain_key_id;
 
-    // ── Owner namespace: a coordinate in the owner key namespace refuses
-    // before the keyring opens, so the rotation never writes over an owner
-    // entry and the binding never records an owner coordinate.
+    // Installation and owner namespaces refuse before the keyring opens,
+    // so rotation preserves reserved entries and the binding excludes them.
+    owner_key::refuse_installation_key_coordinate(entry_ref, AUDIT_KEY_FIELD)?;
     owner_key::refuse_owner_key_coordinate(entry_ref, AUDIT_KEY_FIELD)?;
 
     // ── Setup B: initialise the platform keyring store.
@@ -1337,5 +1337,22 @@ mod tests {
             AuditWriter::open(profile.audit_log_path.clone(), Some(access))
                 .expect("the adopted log opens under the keyed path"),
         );
+    }
+
+    /// Installation coordinates refuse on testnet before the keyring opens.
+    #[tokio::test]
+    #[serial]
+    async fn installation_coordinate_refuses_without_writing() {
+        crate::common::installation_key_fixture::assert_installation_profile_refusal(
+            |profile| &mut profile.audit_log_hash_chain_key_id,
+            async |fixture, profile, name| {
+                let args = RotateAuditKeyArgs {
+                    name: Some(name.to_owned()),
+                    profile: None,
+                };
+                run_with_dependencies(&args, |_| Ok(profile.clone()), || fixture.init()).await
+            },
+        )
+        .await;
     }
 }

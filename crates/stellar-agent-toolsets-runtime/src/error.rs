@@ -22,6 +22,7 @@ use thiserror::Error;
 /// | [`ToolsetRuntimeError::ToolsetNotInstalled`] | pre-check | Toolset name has no pin record. |
 /// | [`ToolsetRuntimeError::Io`] | pre-check | I/O error reading the pin. |
 /// | [`ToolsetRuntimeError::ContentDigestMismatch`] | pre-check | On-disk `TOOLSET.md` hash differs from install-time digest. |
+/// | [`ToolsetRuntimeError::PinUnverifiable`] | pre-check | The install record does not verify under the installation's pin key. |
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ToolsetRuntimeError {
@@ -89,9 +90,9 @@ pub enum ToolsetRuntimeError {
     /// Pre-check: the on-disk `TOOLSET.md` SHA-256 digest does not match the
     /// digest recorded in the pin at install time.
     ///
-    /// Fires when the pin's `toolset_md_shasum` field is `Some` and the current
-    /// file's hash differs. This indicates post-install modification of the
-    /// manifest file.
+    /// Fires when the current file's hash differs from the pin's
+    /// `toolset_md_shasum`, or when the file cannot be read. This indicates
+    /// post-install modification or removal of the manifest file.
     ///
     /// ## Recovery
     ///
@@ -113,6 +114,27 @@ pub enum ToolsetRuntimeError {
          (dispatch-time content digest check failed; reinstall the toolset to resolve)"
     )]
     ContentDigestMismatch {
+        /// Sanitised toolset package name.
+        name: String,
+    },
+
+    /// Pre-check: the install record exists but does not verify.
+    ///
+    /// Fires when no pin key is available, when the record was written in an
+    /// earlier format without an authentication tag, or when its tag does not
+    /// verify under the installation's pin key (the record was edited or
+    /// written under another key). Nothing the record states is trusted.
+    ///
+    /// ## Recovery
+    ///
+    /// Uninstall the toolset (uninstall reads no record) and install it again
+    /// from the signed package, which re-verifies the publisher signature and
+    /// the attestation.
+    #[error(
+        "toolset.pin_unverifiable: the install record of '{name}' does not verify; \
+         uninstall the toolset and install it again"
+    )]
+    PinUnverifiable {
         /// Sanitised toolset package name.
         name: String,
     },
@@ -203,6 +225,9 @@ mod tests {
             ToolsetRuntimeError::ContentDigestMismatch {
                 name: "test-toolset".to_owned(),
             },
+            ToolsetRuntimeError::PinUnverifiable {
+                name: "test-toolset".to_owned(),
+            },
             ToolsetRuntimeError::FirstInvokeApprovalRequired {
                 approval_nonce: "AbCdEfGhIjKlMnOpQrStUv".to_owned(),
                 toolset_name: "test-toolset".to_owned(),
@@ -260,6 +285,15 @@ mod tests {
         assert!(
             e.to_string().contains("my-distinct-toolset"),
             "toolset name must appear in message"
+        );
+
+        let e = ToolsetRuntimeError::PinUnverifiable {
+            name: "my-distinct-toolset".to_owned(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "toolset.pin_unverifiable: the install record of 'my-distinct-toolset' does not \
+             verify; uninstall the toolset and install it again"
         );
 
         let e = ToolsetRuntimeError::FirstInvokeApprovalRequired {

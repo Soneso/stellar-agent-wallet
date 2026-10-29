@@ -125,6 +125,7 @@ pub enum CounterpartyKindParseError {
 /// | [`CounterpartyError::HomeDomainInvalid`] | `counterparty.home_domain_invalid` |
 /// | [`CounterpartyError::KeyringUnavailable`] | `counterparty.keyring_unavailable` |
 /// | [`CounterpartyError::KeyMatchesOwnerPublicKey`] | `validation.key_matches_owner_public_key` |
+/// | [`CounterpartyError::InstallationKeyCoordinate`] | `validation.installation_key_coordinate` |
 /// | [`CounterpartyError::Io`] | `counterparty.io` |
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -198,6 +199,12 @@ pub enum CounterpartyError {
         "the key for `counterparty_cache_key` is an owner public key or sits in the owner key namespace"
     )]
     KeyMatchesOwnerPublicKey,
+
+    /// The profile key coordinate names the reserved installation service.
+    #[error(
+        "`counterparty_cache_key_id` names the reserved service `stellar-agent-toolsets` (validation.installation_key_coordinate)"
+    )]
+    InstallationKeyCoordinate,
 
     /// Underlying I/O failure during cache read or write.
     #[error("counterparty cache I/O failed: {kind}")]

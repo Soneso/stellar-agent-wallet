@@ -368,12 +368,16 @@ where
             None => Err(unavailable("there is no pool initialization to resume")),
         };
     }
-    init_keyring()?;
-    let audit = crate::commands::value_audit::require_value_audit_writer(&profile, name)?;
     let master = profile
         .pool_master_key_id
         .clone()
         .unwrap_or_else(|| KeyringEntryRef::default_pool_master_key(name));
+    stellar_agent_core::profile::owner_key::refuse_installation_key_coordinate(
+        &master,
+        "pool_master_key_id",
+    )?;
+    init_keyring()?;
+    let audit = crate::commands::value_audit::require_value_audit_writer(&profile, name)?;
     let fee_per_op = profile
         .classic_fee_per_op_stroops
         .unwrap_or(stellar_agent_core::DEFAULT_CLASSIC_FEE_STROOPS);
@@ -1719,5 +1723,28 @@ mod tests {
         async fn present_channels_complete_without_cap_or_witness() {
             exercise(Case::Present).await;
         }
+    }
+
+    /// Pool initialization refuses an installation coordinate before opening keys.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn installation_coordinate_refuses_without_writing() {
+        use crate::common::installation_key_fixture::InstallationKeyFixture;
+        let fixture = InstallationKeyFixture::new("stellar-agent-toolsets");
+        let name = "pin-coordinate-refusal";
+        let mut profile = Profile::builder_testnet_named(name, "s", "a", "n", "a").build();
+        profile.pool_master_key_id = Some(fixture.coordinate.clone());
+        loader::save_to_dir(name, &profile, &fixture.home().join("profiles")).unwrap();
+        let args = PoolInitArgs {
+            size: Some(2),
+            profile: Some(name.to_owned()),
+            force: true,
+            resume: false,
+            timeout_seconds: 5,
+            output: OutputFormat::Json,
+        };
+        let error = execute(&args, || fixture.init()).await.unwrap_err();
+        assert_eq!(error.code(), "validation.installation_key_coordinate");
+        fixture.assert_refused(1);
     }
 }
