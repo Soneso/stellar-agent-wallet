@@ -2399,6 +2399,20 @@ pub fn generation_account(account: &str) -> String {
     format!("{account}-generation")
 }
 
+/// Returns the account of the MPP generation intent counter beside the HMAC
+/// entry `account`.
+#[must_use]
+pub fn generation_intent_account(account: &str) -> String {
+    intent_account(&generation_account(account))
+}
+
+/// Derives the intent counter account beside the committed counter account
+/// `generation_account`.
+#[must_use]
+pub fn intent_account(generation_account: &str) -> String {
+    format!("{generation_account}-intent")
+}
+
 /// The keyring account suffix of the policy pin beside the window-state key.
 const POLICY_PIN_SUFFIX: &str = "-policy-pin";
 

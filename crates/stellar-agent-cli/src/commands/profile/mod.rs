@@ -164,7 +164,11 @@ pub enum ProfileSubcommand {
     /// `bundle_per_period_cap`, `bundle_rate_limit`) fail closed until reset.
     /// Discards accumulated history for the profile; the reset is audited.
     ResetWindowState(reset_window_state::ResetWindowStateArgs),
-    /// Discard MPP replay history with an explicit acknowledgement and an audit row.
+    /// Recover MPP state with an explicit acknowledgement and an audit row.
+    ///
+    /// Carries the records of the snapshot that authenticates and closes
+    /// charges not yet committed; discards the replay history only when no
+    /// snapshot authenticates.
     ResetMppState(reset_mpp_state::ResetMppStateArgs),
 }
 

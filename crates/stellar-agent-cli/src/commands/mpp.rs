@@ -1014,7 +1014,7 @@ fn render_wallet_error(error: &WalletError) -> i32 {
     1
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     stellar_agent_core::timefmt::now_unix_ms()
         .map(|ms| i64::try_from(ms / 1_000).unwrap_or(i64::MAX))
         .unwrap_or(i64::MAX)

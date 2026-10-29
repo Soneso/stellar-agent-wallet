@@ -1,9 +1,9 @@
-//! Audited, operator-acknowledged reset of a profile's MPP replay history.
+//! Audited MPP recovery that carries authenticated replay history.
 
 use clap::{ArgGroup, Args};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::profile::ResolvedProfileName;
-use stellar_agent_mpp::MppAuthorizationStore;
+use stellar_agent_mpp::{MppAuthorizationStore, MppStateReset};
 
 use crate::common::{
     profile_access::{load_profile_reconciled, profile_access_envelope},
@@ -23,11 +23,11 @@ pub(crate) struct ResetMppStateArgs {
     /// Operator reason recorded in the audit row.
     #[arg(long, value_name = "REASON")]
     pub(crate) reason: String,
-    /// Acknowledges discarding the profile's MPP replay history.
+    /// Acknowledges closing unclaimed charges and discarding unauthenticated history.
     #[arg(
         long,
         required = true,
-        help = "Discard replay markers for every prepared, authorized, indeterminate and settled charge; a charge settled before the reset is no longer recognized as settled."
+        help = "Keep the records of the MPP snapshot on disk when it authenticates and close charges not yet committed. A state file rolled back before the reset loses the records written after that snapshot; the result reports a carry the generation counter proves stale. When no snapshot authenticates, every replay marker is discarded, and a charge settled before the reset loses its settled status."
     )]
     pub(crate) acknowledge: bool,
 }
@@ -74,12 +74,17 @@ pub(crate) fn run(args: &ResetMppStateArgs) -> i32 {
         &profile,
         stellar_agent_core::audit_log::BindingCheck::Enforce,
         &args.reason,
+        crate::commands::mpp::now_unix(),
     ) {
-        Ok(discarded_generation) => {
+        Ok(outcome) => {
             render::render_json(&Envelope::ok(serde_json::json!({
                 "profile": profile_name,
                 "reset": true,
-                "discarded_generation": discarded_generation,
+                "discarded_generation": outcome.discarded_generation,
+                "carried_records": outcome.carried_records,
+                "carried_generation": outcome.carried_generation,
+                "stale_carry": outcome.stale_carry,
+                "warnings": stale_carry_warning(&outcome).into_iter().collect::<Vec<_>>(),
                 "reason": args.reason,
             })));
             0
@@ -89,4 +94,17 @@ pub(crate) fn run(args: &ResetMppStateArgs) -> i32 {
             1
         }
     }
+}
+
+/// The one-line warning for a carried snapshot the committed counter proves
+/// stale.
+fn stale_carry_warning(outcome: &MppStateReset) -> Option<String> {
+    if !outcome.stale_carry {
+        return None;
+    }
+    let carried = outcome.carried_generation?;
+    let committed = outcome.discarded_generation?;
+    Some(format!(
+        "carried MPP snapshot generation {carried} is older than committed generation {committed}; records written after it are lost"
+    ))
 }

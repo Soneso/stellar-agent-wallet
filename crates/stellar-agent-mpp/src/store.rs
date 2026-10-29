@@ -1,4 +1,4 @@
-//! Locked, HMAC-authenticated MPP persistence with a keyring generation anchor.
+//! Locked, HMAC-authenticated MPP persistence with committed and intent counters.
 
 use std::{
     collections::HashSet,
@@ -13,14 +13,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::{
     audit_log::{AuditEntry, AuditWriterRegistry, BindingCheck},
+    error::{ValidationError, WalletError},
     profile::owner_key::{self, OwnerKeyContext},
-    profile::schema::{KeyringEntryRef, Profile, canonical_data_root},
+    profile::schema::{KeyringEntryRef, Profile, canonical_data_root, intent_account},
 };
 use subtle::ConstantTimeEq as _;
 use zeroize::Zeroizing;
 
 use crate::{
     error::{MppError, MppErrorCode},
+    limits::MAX_CHALLENGE_LIFETIME_SECS,
     receipt::PaymentReceipt,
     state::{AuthorizationRecord, AuthorizationStatus, HostObservation, LedgerOutcome},
 };
@@ -40,7 +42,31 @@ struct WireStore {
     version: u32,
     #[serde(default)]
     generation: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pruned_through: i64,
     records: Vec<AuthorizationRecord>,
+}
+
+const fn is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
+/// Outcome of an audited MPP state reset.
+#[derive(Debug)]
+pub struct MppStateReset {
+    /// Parseable committed generation observed before the reset.
+    pub discarded_generation: Option<u64>,
+    /// Number of authenticated authorization records retained by the reset.
+    pub carried_records: usize,
+    /// Generation of the authenticated snapshot the reset carries, or `None`
+    /// when no snapshot authenticates and the reset discards the history.
+    pub carried_generation: Option<u64>,
+    /// Whether the committed counter proves the carried snapshot older than
+    /// the last committed one. No write leaves the file more than one
+    /// generation below the committed counter, so a larger gap shows that the
+    /// file was rolled back and the records written after that snapshot are
+    /// lost.
+    pub stale_carry: bool,
 }
 
 struct StoreLock {
@@ -52,6 +78,7 @@ pub struct MppAuthorizationStore {
     path: PathBuf,
     key: Zeroizing<[u8; 32]>,
     generation_entry: KeyringEntryRef,
+    generation_intent_entry: KeyringEntryRef,
     state_key_entry: Option<KeyringEntryRef>,
     /// The owner coordinates every reload of the state key is compared with.
     owner: Option<OwnerKeyContext>,
@@ -72,12 +99,14 @@ impl MppAuthorizationStore {
     ///
     /// The caller must provision the entry to `0` only for a new store and retain
     /// it across handles and process restarts. Its contents belong in the keyring,
-    /// outside the filesystem containing the state snapshots.
+    /// outside the filesystem containing the state snapshots. The intent counter
+    /// shares its service and appends `-intent` to its account; retain both entries.
     #[must_use]
     pub fn at_path(path: PathBuf, key: [u8; 32], generation_entry: KeyringEntryRef) -> Self {
         Self {
             path,
             key: Zeroizing::new(key),
+            generation_intent_entry: generation_intent_entry_ref(&generation_entry),
             generation_entry,
             state_key_entry: None,
             owner: None,
@@ -269,8 +298,8 @@ impl MppAuthorizationStore {
             return Err(anchor_error());
         }
         let mut wire = self.read_authenticated()?;
-        // Every version 2 snapshot is published after its counter, so one with
-        // an absent counter proves the anchor was removed and is not adopted.
+        // Every store holds its counter before its first version 2 snapshot.
+        // An absent counter on that format proves anchor removal.
         if wire.version != 1 {
             return Err(anchor_error());
         }
@@ -282,49 +311,120 @@ impl MppAuthorizationStore {
         self.write_atomic(&wire, None)
     }
 
-    /// Discards MPP replay history after an operator acknowledgement at the
-    /// caller. The reset request is audited under the store lock before mutation.
-    /// A fresh HMAC key prevents snapshots from the discarded history matching
-    /// generations reused by a clean store.
+    /// Resets MPP state after the caller's operator acknowledgement.
+    ///
+    /// Under the store lock the reset reads the state file before it changes
+    /// anything. A file that authenticates under the retained state key is
+    /// carried: its records survive with unclaimed charges closed as expired,
+    /// and it is published above both counters under the same key. The reset
+    /// discards the history only when no snapshot can authenticate: the state
+    /// key is missing, malformed or equal to an owner public key, the file is
+    /// missing, or the file fails its HMAC, parse or validation checks. It
+    /// then rotates the key and publishes an empty snapshot. The carried
+    /// snapshot is the one on disk, so a state file rolled back before the
+    /// reset loses the records written after it;
+    /// [`MppStateReset::stale_carry`] reports a rollback the committed counter
+    /// proves. A stale carry and a discard both raise the pruned-expiry
+    /// watermark to the challenge lifetime cap past `now_unix`, so a challenge
+    /// whose marker is lost is refused while it can still be live. The audit
+    /// row precedes every mutation.
     ///
     /// # Errors
     ///
-    /// Refuses on lock, audit, keyring access, or filesystem errors. A failed
-    /// reset can be retried with the same explicit acknowledgement. `binding`
-    /// is the audit binding check of the reset row's writer.
+    /// Refuses on lock or audit errors, and on every keyring access or I/O
+    /// error while reading the state, without changing anything; a transient
+    /// error never discards history. A failure after the audit row can be
+    /// retried with the same explicit acknowledgement. `binding` is the audit
+    /// binding check of the reset row's writer.
     pub fn reset_for_profile(
         profile_name: &str,
         profile: &Profile,
         binding: BindingCheck,
         reason: &str,
-    ) -> Result<Option<u64>, MppError> {
+        now_unix: i64,
+    ) -> Result<MppStateReset, MppError> {
         let placeholder = Self::for_profile(profile_name, [0; 32])?;
         let key_ref = KeyringEntryRef::default_mpp_state_key(profile_name);
-        Self::reset_at(placeholder.path, &key_ref, |generation| {
-            emit_state_audit(
-                profile,
-                profile_name,
-                binding,
-                AuditEntry::new_mpp_state_reset(
+        Self::reset_at(
+            placeholder.path,
+            &key_ref,
+            profile_name,
+            now_unix,
+            |outcome| {
+                emit_state_audit(
+                    profile,
                     profile_name,
-                    generation,
-                    reason,
-                    uuid::Uuid::new_v4().to_string(),
-                ),
-            )
-        })
+                    binding,
+                    AuditEntry::new_mpp_state_reset(
+                        profile_name,
+                        outcome.discarded_generation,
+                        outcome.carried_generation,
+                        outcome.stale_carry,
+                        reason,
+                        uuid::Uuid::new_v4().to_string(),
+                    ),
+                )
+            },
+        )
     }
 
     fn reset_at(
         path: PathBuf,
         key_ref: &KeyringEntryRef,
-        audit: impl FnOnce(Option<u64>) -> Result<(), MppError>,
-    ) -> Result<Option<u64>, MppError> {
-        let store = Self::at_path(path, [0; 32], generation_entry_ref(key_ref));
+        profile_name: &str,
+        now_unix: i64,
+        audit: impl FnOnce(&MppStateReset) -> Result<(), MppError>,
+    ) -> Result<MppStateReset, MppError> {
+        refuse_owner_coordinate(key_ref)?;
+        let mut store = Self::at_path(path, [0; 32], generation_entry_ref(key_ref));
         let _lock = store.acquire_lock()?;
         let discarded =
             load_generation_value(&store.generation_entry)?.and_then(|value| value.parse().ok());
-        audit(discarded)?;
+        let carried = store.read_for_reset(key_ref, profile_name)?;
+        let outcome = MppStateReset {
+            discarded_generation: discarded,
+            carried_records: carried.as_ref().map_or(0, |wire| wire.records.len()),
+            carried_generation: carried.as_ref().map(|wire| wire.generation),
+            stale_carry: carried.as_ref().is_some_and(|wire| {
+                discarded.is_some_and(|counter| wire.generation.saturating_add(1) < counter)
+            }),
+        };
+        audit(&outcome)?;
+        // A record the reset cannot carry belongs to a challenge prepared
+        // before the reset, and its effective expiry lies at most the
+        // challenge lifetime cap past its preparation.
+        let lost_marker_horizon = now_unix.saturating_add(MAX_CHALLENGE_LIFETIME_SECS);
+        if let Some(mut wire) = carried {
+            if outcome.stale_carry {
+                wire.pruned_through = wire.pruned_through.max(lost_marker_horizon);
+            }
+            for record in &mut wire.records {
+                if is_unclaimed(record) {
+                    record.transition(
+                        AuthorizationStatus::ExpiredUnresolved,
+                        now_unix.max(record.updated_at()),
+                    )?;
+                }
+            }
+            let raw_intent = load_generation_value(&store.generation_intent_entry)?;
+            let intent = raw_intent
+                .as_ref()
+                .and_then(|value| value.parse::<u64>().ok());
+            let floor = discarded
+                .unwrap_or(0)
+                .max(intent.unwrap_or(0))
+                .max(wire.generation);
+            wire.version = STORE_VERSION;
+            wire.generation = floor.checked_add(1).ok_or_else(state_error)?;
+            write_generation(&store.generation_entry, floor)?;
+            // A malformed intent has no generation to preserve. The committed
+            // floor protects the authenticated history while it is repaired.
+            if raw_intent.is_some() && intent.is_none() {
+                write_intent(&store.generation_intent_entry, floor)?;
+            }
+            store.write_atomic(&wire, Some(floor))?;
+            return Ok(outcome);
+        }
         stellar_agent_network::keyring::rotate_keyring_secret_32(
             &key_ref.service,
             &key_ref.account,
@@ -340,10 +440,70 @@ impl MppAuthorizationStore {
             .and_then(|parent| parent.sync_all())
             .map_err(|_error| state_error())?;
         write_generation(&store.generation_entry, 0)?;
-        Ok(discarded)
+        match keyring_core::Entry::new(
+            &store.generation_intent_entry.service,
+            &store.generation_intent_entry.account,
+        )
+        .and_then(|entry| entry.delete_credential())
+        {
+            Ok(()) | Err(keyring_core::Error::NoEntry) => {}
+            Err(_) => return Err(state_error()),
+        }
+        // The empty snapshot carries the watermark under the fresh key. A
+        // failure before it publishes leaves a valid empty store that a
+        // repeated reset discards again.
+        store.key = stellar_agent_network::keyring::load_hmac_key_32(key_ref)
+            .map_err(|_error| state_error())?;
+        let empty = WireStore {
+            version: STORE_VERSION,
+            generation: 1,
+            pruned_through: lost_marker_horizon,
+            records: Vec::new(),
+        };
+        store.write_atomic(&empty, Some(0))?;
+        Ok(outcome)
     }
 
-    /// Inserts a newly prepared record or returns the existing identical record.
+    /// Reads the snapshot a reset can carry under the retained state key.
+    ///
+    /// `Ok(None)` means no snapshot can authenticate: the key is missing,
+    /// not UTF-8, not a 32-byte key or equal to an owner public key, or the
+    /// file is missing, a symlink, oversized, or fails its HMAC, parse or
+    /// record checks. Every keyring access error and every I/O error refuses,
+    /// as does a path that is not a regular file, which the reset could not
+    /// replace. The file is read before the key, so such a path refuses even
+    /// when the key is missing.
+    fn read_for_reset(
+        &mut self,
+        key_ref: &KeyringEntryRef,
+        profile_name: &str,
+    ) -> Result<Option<WireStore>, MppError> {
+        let bytes = self.read_snapshot_bytes()?;
+        let entry = keyring_core::Entry::new(&key_ref.service, &key_ref.account)
+            .map_err(|_error| state_error())?;
+        match entry.get_password().map(Zeroizing::new) {
+            Ok(_) => {}
+            Err(keyring_core::Error::NoEntry | keyring_core::Error::BadEncoding(_)) => {
+                return Ok(None);
+            }
+            Err(_error) => return Err(state_error()),
+        }
+        let key = match stellar_agent_network::keyring::load_hmac_key_32(key_ref) {
+            Ok(key) => key,
+            Err(WalletError::Internal(_)) => return Ok(None),
+            Err(_error) => return Err(state_error()),
+        };
+        if owner_public_key_matches(&key[..], &OwnerKeyContext::for_profile_name(profile_name))? {
+            return Ok(None);
+        }
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        self.key = key;
+        Ok(self.verify_snapshot(&bytes).ok())
+    }
+
+    /// Inserts a prepared record or returns a live, unclaimed match for its challenge.
     ///
     /// # Errors
     ///
@@ -354,19 +514,16 @@ impl MppAuthorizationStore {
         now_unix: i64,
     ) -> Result<AuthorizationRecord, MppError> {
         self.mutate(|wire| {
-            if let Some(existing) = wire
-                .records
-                .iter()
-                .find(|existing| existing.fingerprint() == record.fingerprint())
-            {
-                if matches!(
-                    existing.status(),
-                    AuthorizationStatus::Prepared
-                        | AuthorizationStatus::ApprovalPending
-                        | AuthorizationStatus::Ready
-                ) && existing.expires_at() >= now_unix
-                {
+            if let Some(existing) = find_prepare_match(wire, &record, now_unix)? {
+                if is_live_unclaimed(existing, now_unix) {
                     return Ok(existing.clone());
+                }
+                // A match that expired before it was claimed was never signed.
+                if is_unclaimed(existing) {
+                    return Err(MppError::new(
+                        MppErrorCode::ChallengeExpired,
+                        "challenge expired before its prepared authorization was committed",
+                    ));
                 }
                 return Err(replay_error());
             }
@@ -384,6 +541,23 @@ impl MppAuthorizationStore {
             wire.records.push(record.clone());
             Ok(record)
         })
+    }
+
+    /// Finds the preferred record for a challenge, including consumed records.
+    /// Live unclaimed records take precedence; otherwise the newest match wins.
+    ///
+    /// # Errors
+    ///
+    /// Returns `mpp.challenge_expired` at or below the pruned-expiry watermark.
+    /// Fails closed on lock, integrity, parse, or I/O errors.
+    pub fn find_for_prepare(
+        &self,
+        record: &AuthorizationRecord,
+        now_unix: i64,
+    ) -> Result<Option<AuthorizationRecord>, MppError> {
+        let _lock = self.acquire_lock()?;
+        let wire = self.read_verified()?;
+        Ok(find_prepare_match(&wire, record, now_unix)?.cloned())
     }
 
     /// Loads one fully verified record.
@@ -707,9 +881,13 @@ impl MppAuthorizationStore {
             }
             let before = wire.records.len();
             wire.records.retain(|record| {
-                record.status() == AuthorizationStatus::Indeterminate
+                let keep = record.status() == AuthorizationStatus::Indeterminate
                     || !record.status().is_terminal()
-                    || record.expires_at().saturating_add(TERMINAL_RETENTION_SECS) >= now_unix
+                    || record.expires_at().saturating_add(TERMINAL_RETENTION_SECS) >= now_unix;
+                if !keep {
+                    wire.pruned_through = wire.pruned_through.max(record.expires_at());
+                }
+                keep
             });
             Ok(before.saturating_sub(wire.records.len()))
         })
@@ -767,7 +945,11 @@ impl MppAuthorizationStore {
         let mut wire = self.read_verified()?;
         let generation = wire.generation;
         let result = update(&mut wire)?;
-        wire.generation = generation.checked_add(1).ok_or_else(state_error)?;
+        let intent = load_intent(&self.generation_intent_entry)?.unwrap_or(0);
+        wire.generation = generation
+            .max(intent)
+            .checked_add(1)
+            .ok_or_else(state_error)?;
         self.write_atomic(&wire, Some(generation))?;
         Ok(result)
     }
@@ -854,6 +1036,7 @@ impl MppAuthorizationStore {
                 Some(0) => Ok(WireStore {
                     version: STORE_VERSION,
                     generation: 0,
+                    pruned_through: 0,
                     records: Vec::new(),
                 }),
                 Some(_) => Err(rollback_error()),
@@ -861,7 +1044,14 @@ impl MppAuthorizationStore {
             };
         }
         let wire = self.read_authenticated()?;
-        let generation = load_generation(&self.generation_entry)?.ok_or_else(anchor_error)?;
+        let mut generation = load_generation(&self.generation_entry)?.ok_or_else(anchor_error)?;
+        // A version 1 file has generation zero and never exceeds the counter.
+        if wire.generation > generation
+            && load_intent(&self.generation_intent_entry)? == Some(wire.generation)
+        {
+            write_generation(&self.generation_entry, wire.generation)?;
+            generation = wire.generation;
+        }
         if wire.version != STORE_VERSION || wire.generation != generation || generation == 0 {
             return Err(rollback_error());
         }
@@ -869,14 +1059,36 @@ impl MppAuthorizationStore {
     }
 
     fn read_authenticated(&self) -> Result<WireStore, MppError> {
-        reject_symlink(&self.path)?;
-        let metadata = fs::metadata(&self.path).map_err(|_error| state_error())?;
-        if !metadata.is_file()
-            || usize::try_from(metadata.len()).unwrap_or(usize::MAX) > MAX_STORE_BYTES
-        {
+        let bytes = self.read_snapshot_bytes()?.ok_or_else(state_error)?;
+        self.verify_snapshot(&bytes)
+    }
+
+    /// Reads the state file's bytes. `Ok(None)` means the path holds nothing
+    /// a snapshot can come from: it is absent, a symlink, or larger than any
+    /// snapshot. A path that exists but is not a regular file, and every
+    /// metadata or read failure, refuses.
+    fn read_snapshot_bytes(&self) -> Result<Option<Vec<u8>>, MppError> {
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_error) => return Err(state_error()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(None);
+        }
+        if !metadata.is_file() {
             return Err(state_error());
         }
-        let bytes = fs::read(&self.path).map_err(|_error| state_error())?;
+        if usize::try_from(metadata.len()).unwrap_or(usize::MAX) > MAX_STORE_BYTES {
+            return Ok(None);
+        }
+        fs::read(&self.path)
+            .map(Some)
+            .map_err(|_error| state_error())
+    }
+
+    /// Checks the HMAC, the format and every record of snapshot `bytes`.
+    fn verify_snapshot(&self, bytes: &[u8]) -> Result<WireStore, MppError> {
         if bytes.len() < HMAC_TAG_BYTES {
             return Err(state_error());
         }
@@ -932,10 +1144,17 @@ impl MppAuthorizationStore {
         if load_generation(&self.generation_entry)? != expected_generation {
             return Err(concurrent_update_error());
         }
-        // Advance before publishing any authenticated snapshot, including a temp
-        // file. An interrupted write leaves a gap that refuses; its generation
-        // can never be reused for a different snapshot.
-        write_generation(&self.generation_entry, wire.generation)?;
+        let intent = load_intent(&self.generation_intent_entry)?;
+        if expected_generation.is_none() && intent.is_some() {
+            return Err(anchor_error());
+        }
+        if intent.is_some_and(|intent| intent >= wire.generation) {
+            return Err(concurrent_update_error());
+        }
+        // Burn the generation before writing authenticated bytes. Publish and
+        // sync the snapshot before committing its counter. A read completes an
+        // interrupted commit only when the snapshot equals the burned intent.
+        write_intent(&self.generation_intent_entry, wire.generation)?;
         let mut temporary =
             tempfile::NamedTempFile::new_in(parent).map_err(|_error| state_error())?;
         temporary.write_all(&tag).map_err(|_error| state_error())?;
@@ -953,6 +1172,18 @@ impl MppAuthorizationStore {
                 .and_then(|directory| directory.sync_all())
                 .map_err(|_error| state_error())?;
         }
+        // A second writer admitted by a replaced lock file can commit while
+        // this snapshot is written. The commit proceeds only while both
+        // counters still hold this write's values, so a counter that moved is
+        // left to the writer that moved it and this write asks for a retry.
+        #[cfg(test)]
+        tests::before_commit(&self.generation_entry, &self.generation_intent_entry);
+        if load_generation(&self.generation_entry)? != expected_generation
+            || load_intent(&self.generation_intent_entry)? != Some(wire.generation)
+        {
+            return Err(concurrent_update_error());
+        }
+        write_generation(&self.generation_entry, wire.generation)?;
         Ok(())
     }
 }
@@ -987,6 +1218,70 @@ fn emit_state_audit(
 /// The counter shares the state key's service and uses a distinct account.
 fn generation_entry_ref(key: &KeyringEntryRef) -> KeyringEntryRef {
     KeyringEntryRef::new(key.service.clone(), format!("{}-generation", key.account))
+}
+
+/// The intent counter shares the committed counter's service.
+fn generation_intent_entry_ref(generation: &KeyringEntryRef) -> KeyringEntryRef {
+    KeyringEntryRef::new(
+        generation.service.clone(),
+        intent_account(&generation.account),
+    )
+}
+
+fn load_intent(entry_ref: &KeyringEntryRef) -> Result<Option<u64>, MppError> {
+    load_generation(entry_ref)
+}
+
+fn write_intent(entry_ref: &KeyringEntryRef, generation: u64) -> Result<(), MppError> {
+    #[cfg(test)]
+    tests::before_intent_write(entry_ref);
+    keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+        .and_then(|entry| entry.set_password(&generation.to_string()))
+        .map_err(|_error| state_error())
+}
+
+fn is_unclaimed(record: &AuthorizationRecord) -> bool {
+    matches!(
+        record.status(),
+        AuthorizationStatus::Prepared
+            | AuthorizationStatus::ApprovalPending
+            | AuthorizationStatus::Ready
+    )
+}
+
+/// An unclaimed record whose challenge has not expired at `now_unix`; a
+/// repeated prepare reuses it.
+fn is_live_unclaimed(record: &AuthorizationRecord, now_unix: i64) -> bool {
+    is_unclaimed(record) && record.expires_at() >= now_unix
+}
+
+fn find_prepare_match<'a>(
+    wire: &'a WireStore,
+    record: &AuthorizationRecord,
+    now_unix: i64,
+) -> Result<Option<&'a AuthorizationRecord>, MppError> {
+    let identity = record.challenge_identity()?;
+    let mut selected: Option<&AuthorizationRecord> = None;
+    let rank = |candidate: &AuthorizationRecord| {
+        (
+            is_live_unclaimed(candidate, now_unix),
+            candidate.created_at(),
+        )
+    };
+    for existing in &wire.records {
+        if existing.challenge_identity()? == identity
+            && selected.is_none_or(|selected| rank(existing) > rank(selected))
+        {
+            selected = Some(existing);
+        }
+    }
+    if selected.is_none() && record.expires_at() <= wire.pruned_through {
+        return Err(MppError::new(
+            MppErrorCode::ChallengeExpired,
+            "challenge expires no later than an authorization this store has pruned; check the host clock",
+        ));
+    }
+    Ok(selected)
 }
 
 fn load_generation(entry_ref: &KeyringEntryRef) -> Result<Option<u64>, MppError> {
@@ -1055,15 +1350,27 @@ fn refuse_owner_coordinate(entry_ref: &KeyringEntryRef) -> Result<(), MppError> 
 /// Refuses a loaded state key equal to the profile's owner public key. An
 /// owner entry that cannot be read refuses as unavailable state.
 fn refuse_owner_public_key(key: &[u8], owner: &OwnerKeyContext) -> Result<(), MppError> {
-    owner_key::refuse_owner_public_key(key, owner, MPP_STATE_KEY_FIELD).map_err(|error| {
-        tracing::warn!(code = %error.code(), "mpp state key refused");
-        match error {
-            stellar_agent_core::error::WalletError::Validation(
-                stellar_agent_core::error::ValidationError::KeyMatchesOwnerPublicKey { .. },
-            ) => owner_key_error(),
-            _ => state_error(),
+    if owner_public_key_matches(key, owner)? {
+        return Err(owner_key_error());
+    }
+    Ok(())
+}
+
+/// Reports whether `key` equals an owner public key of the profile. An owner
+/// entry that cannot be read refuses as unavailable state.
+fn owner_public_key_matches(key: &[u8], owner: &OwnerKeyContext) -> Result<bool, MppError> {
+    match owner_key::refuse_owner_public_key(key, owner, MPP_STATE_KEY_FIELD) {
+        Ok(()) => Ok(false),
+        Err(error) => {
+            tracing::warn!(code = %error.code(), "mpp state key refused");
+            match error {
+                WalletError::Validation(ValidationError::KeyMatchesOwnerPublicKey { .. }) => {
+                    Ok(true)
+                }
+                _ => Err(state_error()),
+            }
         }
-    })
+    }
 }
 
 const fn rollback_error() -> MppError {
@@ -1222,7 +1529,7 @@ pub(crate) mod tests {
     )]
 
     use super::*;
-    use crate::sponsored::tests::prepared_fixture;
+    use crate::sponsored::tests::{prepared_fixture, prepared_fixture_for_resource};
     use crate::{ReceiptInput, parse_receipt};
     use serde_json::Value;
     use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
@@ -1231,15 +1538,21 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     thread_local! {
+        static FAIL_NEXT_INTENT_WRITE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
         static FAIL_NEXT_GENERATION_WRITE: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        static MOVE_COUNTER_BEFORE_COMMIT: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
+        static MOVE_INTENT_BEFORE_COMMIT: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
     }
 
-    /// A publish reads the counter immediately before advancing it, and the
-    /// mock keyring fails only the next operation on a credential, so no
-    /// injection placed before the call can reach the write. When armed, this
-    /// injects the keyring failure between that read and the write; the
-    /// refusal it produces is the production one.
+    /// A commit reads both counters immediately before it writes the
+    /// committed one, and the mock keyring fails only the next operation on a
+    /// credential, so no injection placed before the publish can reach the
+    /// write. When armed, this injects the keyring failure between that read
+    /// and the write; the refusal it produces is the production one.
     pub(super) fn before_generation_write(entry_ref: &KeyringEntryRef) {
         if FAIL_NEXT_GENERATION_WRITE.with(std::cell::Cell::take) {
             stellar_agent_test_support::keyring_mock::inject_no_logon_session(
@@ -1247,6 +1560,32 @@ pub(crate) mod tests {
                 &entry_ref.account,
             )
             .expect("inject the generation write failure");
+        }
+    }
+
+    /// When armed, moves the committed counter or the intent after the
+    /// snapshot is published and before the commit re-reads them, as a second
+    /// writer admitted by a replaced lock file would.
+    pub(super) fn before_commit(generation: &KeyringEntryRef, intent: &KeyringEntryRef) {
+        for (cell, entry_ref) in [
+            (&MOVE_COUNTER_BEFORE_COMMIT, generation),
+            (&MOVE_INTENT_BEFORE_COMMIT, intent),
+        ] {
+            if let Some(value) = cell.with(std::cell::Cell::take) {
+                put_raw(entry_ref, &value.to_string());
+            }
+        }
+    }
+
+    /// The intent write is the first keyring write of a publish; when armed,
+    /// this fails it the way [`before_generation_write`] fails the commit.
+    pub(super) fn before_intent_write(entry_ref: &KeyringEntryRef) {
+        if FAIL_NEXT_INTENT_WRITE.with(std::cell::Cell::take) {
+            stellar_agent_test_support::keyring_mock::inject_no_logon_session(
+                &entry_ref.service,
+                &entry_ref.account,
+            )
+            .expect("inject the intent write failure");
         }
     }
 
@@ -1682,6 +2021,8 @@ pub(crate) mod tests {
         let id = first.authorization_id().to_owned();
         store.insert_prepared(first, now).expect("test value");
         let old = fs::read(&path).expect("test value");
+        let (prepared, _, _) =
+            prepared_fixture_for_resource(now, "https://merchant.example/second").await;
         let second = AuthorizationRecord::new("second", TESTNET_PASSPHRASE, &prepared, now)
             .expect("test value");
         store.insert_prepared(second, now).expect("test value");
@@ -1722,6 +2063,8 @@ pub(crate) mod tests {
         let first_id = first.authorization_id().to_owned();
         store.insert_prepared(first, now).expect("first write");
         let other = test_store(path.clone(), [7; 32]);
+        let (prepared, _, _) =
+            prepared_fixture_for_resource(now, "https://merchant.example/winner").await;
         let winner = AuthorizationRecord::new("winner", TESTNET_PASSPHRASE, &prepared, now)
             .expect("winning record");
         let winner_id = winner.authorization_id().to_owned();
@@ -1761,19 +2104,20 @@ pub(crate) mod tests {
         );
     }
 
-    /// An anchor failure cannot publish a new authenticated snapshot.
+    /// An intent failure cannot publish a new authenticated snapshot.
     #[test]
     #[serial_test::serial]
-    fn anti_rollback_anchor_write_failure_leaves_no_snapshot() {
+    fn an_intent_write_failure_publishes_nothing() {
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
         let directory = TempDir::new().expect("test value");
         let path = directory.path().join("state");
         let store = test_store(path.clone(), [7; 32]);
         store.ensure_parent().expect("test value");
-        FAIL_NEXT_GENERATION_WRITE.with(|fail| fail.set(true));
+        FAIL_NEXT_INTENT_WRITE.with(|fail| fail.set(true));
         let wire = WireStore {
             version: STORE_VERSION,
             generation: 1,
+            pruned_through: 0,
             records: Vec::new(),
         };
         assert_eq!(
@@ -1784,8 +2128,8 @@ pub(crate) mod tests {
             STATE_CODE
         );
         assert!(
-            !FAIL_NEXT_GENERATION_WRITE.with(std::cell::Cell::get),
-            "the refusal comes from the generation write"
+            !FAIL_NEXT_INTENT_WRITE.with(std::cell::Cell::get),
+            "the refusal comes from the intent write"
         );
         assert!(!path.exists());
         assert_eq!(
@@ -1794,33 +2138,429 @@ pub(crate) mod tests {
         );
     }
 
-    /// A failed filesystem commit consumes its generation before any snapshot
-    /// is published, so an abandoned temporary file cannot reuse a generation.
     #[test]
     #[serial_test::serial]
-    fn anti_rollback_failed_file_commit_retains_the_advanced_anchor() {
+    fn a_failed_publish_keeps_the_store_readable() {
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
-        let directory = TempDir::new().expect("test value");
-        let path = directory.path().join("state");
-        let store = test_store(path.clone(), [7; 32]);
-        store
-            .mutate(|_wire| {
-                fs::create_dir(&path).expect("test value");
-                Ok(())
-            })
-            .expect_err("a directory blocks the atomic file replacement");
+        let directory = TempDir::new().expect("tempdir");
+        let store = test_store(directory.path().join("state"), [7; 32]);
+        fail_publish(&store);
         assert_eq!(
-            load_generation(&store.generation_entry).expect("test value"),
+            load_generation(&store.generation_entry).expect("counter"),
+            Some(0)
+        );
+        assert_eq!(
+            load_intent(&store.generation_intent_entry).expect("intent"),
             Some(1)
         );
-        fs::remove_dir(&path).expect("test value");
+        assert_eq!(
+            store.load(UNKNOWN_ID).expect_err("empty store").code(),
+            "mpp.authorization_not_found"
+        );
+    }
+
+    fn fail_publish(store: &MppAuthorizationStore) {
+        store
+            .mutate(|_| {
+                fs::create_dir(&store.path).expect("block publish");
+                Ok(())
+            })
+            .expect_err("a directory blocks the atomic replacement");
+        fs::remove_dir(&store.path).expect("remove blocker");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_publish_burns_its_generation() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let store = test_store(directory.path().join("state"), [7; 32]);
+        fail_publish(&store);
+        let now = 1_700_000_000;
+        let (prepared, _, _) = prepared_fixture(now).await;
+        let record =
+            AuthorizationRecord::new("burn", TESTNET_PASSPHRASE, &prepared, now).expect("record");
+        store
+            .insert_prepared(record, now)
+            .expect("publish next generation");
+        assert_eq!(store.read_authenticated().expect("snapshot").generation, 2);
+        assert_eq!(
+            load_generation(&store.generation_entry).expect("counter"),
+            Some(2)
+        );
+        assert_eq!(
+            load_intent(&store.generation_intent_entry).expect("intent"),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_interrupted_commit_is_completed_by_the_next_read() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let store = test_store(directory.path().join("state"), [7; 32]);
+        let now = 1_700_000_000;
+        let (prepared, _, _) = prepared_fixture(now).await;
+        let record =
+            AuthorizationRecord::new("commit", TESTNET_PASSPHRASE, &prepared, now).expect("record");
+        let id = record.authorization_id().to_owned();
+        FAIL_NEXT_GENERATION_WRITE.with(|fail| fail.set(true));
+        assert_eq!(
+            store
+                .insert_prepared(record, now)
+                .expect_err("interrupted commit")
+                .code(),
+            STATE_CODE
+        );
+        let wire = store.read_authenticated().expect("published snapshot");
+        assert_eq!(wire.generation, 1);
+        assert_eq!(wire.records[0].authorization_id(), id);
+        assert_eq!(
+            load_generation(&store.generation_entry).expect("counter"),
+            Some(0)
+        );
+        assert_eq!(
+            load_intent(&store.generation_intent_entry).expect("intent"),
+            Some(1)
+        );
+        assert_eq!(
+            store.load(&id).expect("complete commit").authorization_id(),
+            id
+        );
+        assert_eq!(
+            load_generation(&store.generation_entry).expect("counter"),
+            Some(1)
+        );
+        let (prepared, _, _) =
+            prepared_fixture_for_resource(now, "https://merchant.example/next").await;
+        let record =
+            AuthorizationRecord::new("commit", TESTNET_PASSPHRASE, &prepared, now).expect("record");
+        store.insert_prepared(record, now).expect("next publish");
+        assert_eq!(store.read_authenticated().expect("snapshot").generation, 2);
+        assert_eq!(
+            load_generation(&store.generation_entry).expect("counter"),
+            Some(2)
+        );
+        assert_eq!(
+            load_intent(&store.generation_intent_entry).expect("intent"),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_snapshot_ahead_of_its_intent_refuses() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let store = test_store(directory.path().join("state"), [7; 32]);
+        let now = 1_700_000_000;
+        let (prepared, _, _) = prepared_fixture(now).await;
+        let record =
+            AuthorizationRecord::new("ahead", TESTNET_PASSPHRASE, &prepared, now).expect("record");
+        let id = record.authorization_id().to_owned();
+        store.insert_prepared(record.clone(), now).expect("publish");
+        let mut wire = store.read_authenticated().expect("snapshot");
+        wire.generation = 2;
+        let body = serde_json::to_vec(&wire).expect("body");
+        let tag = compute_tag(&store.key, &body).expect("tag");
+        fs::write(&store.path, [tag.as_slice(), body.as_slice()].concat()).expect("ahead snapshot");
+        for error in [
+            store.load(&id).expect_err("load refuses"),
+            store
+                .find_for_prepare(&record, now)
+                .expect_err("prepare lookup refuses"),
+            store.prune(now).expect_err("mutation refuses"),
+        ] {
+            assert!(error.message().contains("rolled back"));
+        }
+        assert_eq!(
+            load_generation(&store.generation_entry).expect("counter"),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_same_challenge_later_is_a_replay() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let store = test_store(directory.path().join("state"), [7; 32]);
+        let now = 1_700_000_000;
+        let (prepared, _, _) = prepared_fixture(now).await;
+        let first =
+            AuthorizationRecord::new("replay", TESTNET_PASSPHRASE, &prepared, now).expect("first");
+        let id = first.authorization_id();
+        store.insert_prepared(first.clone(), now).expect("insert");
+        store.mark_ready(id, now).expect("ready");
+        store.claim_ready(id, now).expect("claim");
+        store.mark_policy_accounted(id).expect("account");
+        store
+            .mark_delivery_pending(id, [3; 32], now)
+            .expect("delivery");
+        store.mark_authorized(id, now).expect("authorized");
+        let (prepared, _, _) = prepared_fixture(now + 10).await;
+        let later = AuthorizationRecord::new("replay", TESTNET_PASSPHRASE, &prepared, now + 10)
+            .expect("later");
+        assert_ne!(first.fingerprint(), later.fingerprint());
+        assert_eq!(
+            store
+                .insert_prepared(later, now + 10)
+                .expect_err("replay")
+                .code(),
+            "mpp.authorization_replayed"
+        );
+        assert_eq!(store.read_verified().expect("store").records.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_same_challenge_while_prepared_returns_the_first_record() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let store = test_store(directory.path().join("state"), [7; 32]);
+        let now = 1_700_000_000;
+        let (prepared, _, _) = prepared_fixture(now).await;
+        let first =
+            AuthorizationRecord::new("replay", TESTNET_PASSPHRASE, &prepared, now).expect("first");
+        store.insert_prepared(first.clone(), now).expect("insert");
+        let (prepared, _, _) = prepared_fixture(now + 10).await;
+        let later = AuthorizationRecord::new("replay", TESTNET_PASSPHRASE, &prepared, now + 10)
+            .expect("later");
+        assert_ne!(first.fingerprint(), later.fingerprint());
+        assert_eq!(
+            store
+                .insert_prepared(later, now + 10)
+                .expect("reuse")
+                .authorization_id(),
+            first.authorization_id()
+        );
+        assert_eq!(store.read_verified().expect("store").records.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_matches_prefer_live_unclaimed_then_the_newest_record() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let store = test_store(directory.path().join("state"), [7; 32]);
+        let now = 1_700_000_000;
+        let mut records = Vec::new();
+        for offset in [0, 10, 20] {
+            let (prepared, _, _) = prepared_fixture(now + offset).await;
+            let mut record =
+                AuthorizationRecord::new("legacy", TESTNET_PASSPHRASE, &prepared, now + offset)
+                    .expect("record");
+            if offset != 10 {
+                record
+                    .transition(AuthorizationStatus::ExpiredUnresolved, now + offset)
+                    .expect("closed");
+            }
+            records.push(record);
+        }
+        store
+            .mutate(|wire| {
+                wire.records = records.clone();
+                Ok(())
+            })
+            .expect("legacy snapshot");
+        let preferred = store
+            .find_for_prepare(&records[2], now + 20)
+            .expect("matching records")
+            .expect("live match");
+        assert_eq!(preferred.authorization_id(), records[1].authorization_id());
+        assert_eq!(
+            store
+                .insert_prepared(records[2].clone(), now + 20)
+                .expect("reuse live match")
+                .authorization_id(),
+            records[1].authorization_id()
+        );
+        let latest = store
+            .find_for_prepare(&records[0], now + 400)
+            .expect("matching records")
+            .expect("newest match");
+        assert_eq!(latest.authorization_id(), records[2].authorization_id());
+        assert_eq!(
+            store
+                .insert_prepared(records[0].clone(), now + 400)
+                .expect_err("all consumed or expired")
+                .code(),
+            "mpp.authorization_replayed"
+        );
+        assert_eq!(
+            store
+                .read_verified()
+                .expect("legacy records remain valid")
+                .records
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_different_resource_is_a_different_challenge() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let store = test_store(directory.path().join("state"), [7; 32]);
+        let now = 1_700_000_000;
+        for resource in [
+            "https://merchant.example/first",
+            "https://merchant.example/second",
+        ] {
+            let (prepared, _, _) = prepared_fixture_for_resource(now, resource).await;
+            let record = AuthorizationRecord::new("resources", TESTNET_PASSPHRASE, &prepared, now)
+                .expect("record");
+            let id = record.authorization_id().to_owned();
+            assert_eq!(
+                store
+                    .insert_prepared(record, now)
+                    .expect("insert")
+                    .authorization_id(),
+                id
+            );
+        }
+        assert_eq!(store.read_verified().expect("store").records.len(), 2);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_pruned_challenge_is_refused_under_a_regressed_clock() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("state");
+        let store = test_store(path.clone(), [7; 32]);
+        let now = 1_700_000_000;
+        let (prepared, _, _) = prepared_fixture(now).await;
+        let record =
+            AuthorizationRecord::new("clock", TESTNET_PASSPHRASE, &prepared, now).expect("record");
+        store.insert_prepared(record.clone(), now).expect("insert");
+        assert_eq!(
+            store
+                .prune(now + 301 + TERMINAL_RETENTION_SECS)
+                .expect("prune"),
+            1
+        );
+        let reopened = test_store(path, [7; 32]);
+        for error in [
+            reopened
+                .find_for_prepare(&record, now)
+                .expect_err("prepare lookup refuses"),
+            reopened
+                .insert_prepared(record, now)
+                .expect_err("insert refuses"),
+        ] {
+            assert_eq!(error.code(), "mpp.challenge_expired");
+            assert_eq!(
+                error.message(),
+                "challenge expires no later than an authorization this store has pruned; check the host clock"
+            );
+        }
+        assert!(reopened.read_verified().expect("store").records.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_clock_advanced_only_for_the_prune_blocks_nothing_later() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let store = test_store(directory.path().join("state"), [7; 32]);
+        let now = 1_700_000_000;
+        let (prepared, _, _) = prepared_fixture(now).await;
+        let record =
+            AuthorizationRecord::new("clock", TESTNET_PASSPHRASE, &prepared, now).expect("record");
+        store.insert_prepared(record, now).expect("insert");
+        assert_eq!(store.prune(now + 400 * 24 * 60 * 60).expect("prune"), 1);
+        let (prepared, _, _) =
+            prepared_fixture_for_resource(now + 1_000, "https://merchant.example/new").await;
+        let record = AuthorizationRecord::new("clock", TESTNET_PASSPHRASE, &prepared, now + 1_000)
+            .expect("record");
         assert!(
             store
-                .load(UNKNOWN_ID)
-                .expect_err("refusal")
-                .message()
-                .contains("rolled back")
+                .find_for_prepare(&record, now + 1_000)
+                .expect("new challenge")
+                .is_none()
         );
+        store
+            .insert_prepared(record, now + 1_000)
+            .expect("insert after correction");
+        assert_eq!(store.read_verified().expect("store").records.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_store_with_nothing_pruned_has_no_watermark_field() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let store = test_store(directory.path().join("state"), [7; 32]);
+        let now = 1_700_000_000;
+        let (prepared, _, _) = prepared_fixture(now).await;
+        let record = AuthorizationRecord::new("watermark", TESTNET_PASSPHRASE, &prepared, now)
+            .expect("record");
+        store.insert_prepared(record, now).expect("insert");
+        assert_eq!(store.prune(now + 1).expect("prune"), 0);
+        let bytes = fs::read(&store.path).expect("snapshot");
+        let body: Value = serde_json::from_slice(&bytes[HMAC_TAG_BYTES..]).expect("body");
+        assert!(body.get("pruned_through").is_none());
+    }
+
+    /// A prepared record whose challenge expired before it was claimed was
+    /// never signed: a repeated prepare of that challenge is an expired
+    /// challenge, not a replay, and stores nothing new.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_expired_unclaimed_match_is_an_expired_challenge() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        let directory = TempDir::new().expect("tempdir");
+        let store = test_store(directory.path().join("state"), [7; 32]);
+        let now = 1_700_000_000;
+        let (prepared, _, _) = prepared_fixture(now).await;
+        let first =
+            AuthorizationRecord::new("expired", TESTNET_PASSPHRASE, &prepared, now).expect("first");
+        store.insert_prepared(first.clone(), now).expect("insert");
+        let later_at = first.expires_at() + 1;
+        let (prepared, _, _) = prepared_fixture(later_at).await;
+        let later = AuthorizationRecord::new("expired", TESTNET_PASSPHRASE, &prepared, later_at)
+            .expect("later");
+        let error = store
+            .insert_prepared(later, later_at)
+            .expect_err("expired match");
+        assert_eq!(error.code(), "mpp.challenge_expired");
+        assert_eq!(
+            error.message(),
+            "challenge expired before its prepared authorization was committed"
+        );
+        let wire = store.read_verified().expect("store");
+        assert_eq!(wire.records.len(), 1);
+        assert_eq!(wire.records[0].status(), AuthorizationStatus::Prepared);
+    }
+
+    /// A committed counter or an intent that moves after the snapshot is
+    /// published refuses the commit and leaves the moved value in place.
+    #[test]
+    #[serial_test::serial]
+    fn a_counter_moved_before_the_commit_refuses_it() {
+        stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
+        for moved_counter in [true, false] {
+            let directory = TempDir::new().expect("tempdir");
+            let store = test_store(directory.path().join("state"), [7; 32]);
+            if moved_counter {
+                MOVE_COUNTER_BEFORE_COMMIT.with(|cell| cell.set(Some(5)));
+            } else {
+                MOVE_INTENT_BEFORE_COMMIT.with(|cell| cell.set(Some(9)));
+            }
+            let error = store.prune(0).expect_err("moved counter");
+            assert_eq!(error.message(), concurrent_update_error().message());
+            assert_eq!(
+                load_generation(&store.generation_entry).expect("counter"),
+                Some(if moved_counter { 5 } else { 0 })
+            );
+            assert_eq!(
+                load_intent(&store.generation_intent_entry).expect("intent"),
+                Some(if moved_counter { 1 } else { 9 })
+            );
+        }
     }
 
     /// A missing, malformed, or inaccessible anchor never reads as empty state.
@@ -1902,6 +2642,7 @@ pub(crate) mod tests {
                 &WireStore {
                     version: STORE_VERSION,
                     generation: u64::MAX,
+                    pruned_through: 0,
                     records: Vec::new(),
                 },
                 Some(0),
@@ -2099,6 +2840,7 @@ pub(crate) mod tests {
         let wire = WireStore {
             version: STORE_VERSION,
             generation: 1,
+            pruned_through: 0,
             records: Vec::new(),
         };
         store.ensure_parent().expect("parent");
@@ -2122,6 +2864,7 @@ pub(crate) mod tests {
                 &WireStore {
                     version: STORE_VERSION,
                     generation: 1,
+                    pruned_through: 0,
                     records: Vec::new(),
                 },
                 Some(0),
@@ -2264,6 +3007,7 @@ pub(crate) mod tests {
                 &WireStore {
                     version: STORE_VERSION,
                     generation: 1,
+                    pruned_through: 0,
                     records: vec![record.clone(), record],
                 },
                 Some(0),
@@ -2314,12 +3058,14 @@ pub(crate) mod tests {
         let directory = TempDir::new().expect("tempdir");
         let store = test_store(directory.path().join("state"), [7; 32]);
         let now = 1_700_000_000;
-        let (prepared, _signer, _rpc) = prepared_fixture(now).await;
-        let make_record = |profile: &str| {
+        let make_record = async |profile: &str| {
+            let (prepared, _, _) =
+                prepared_fixture_for_resource(now, &format!("https://merchant.example/{profile}"))
+                    .await;
             AuthorizationRecord::new(profile, TESTNET_PASSPHRASE, &prepared, now).expect("record")
         };
-        let insert_ready = |profile: &str| {
-            let record = make_record(profile);
+        let insert_ready = async |profile: &str| {
+            let record = make_record(profile).await;
             let id = record.authorization_id().to_owned();
             store.insert_prepared(record, now).expect("insert");
             store.mark_ready(&id, now + 1).expect("ready");
@@ -2350,7 +3096,7 @@ pub(crate) mod tests {
             );
         }
 
-        let pending = make_record("pending");
+        let pending = make_record("pending").await;
         let pending_id = pending.authorization_id().to_owned();
         assert_eq!(
             store
@@ -2452,21 +3198,21 @@ pub(crate) mod tests {
             "mpp.receipt_conflict"
         );
 
-        let failed = insert_ready("failed");
+        let failed = insert_ready("failed").await;
         store
             .claim_ready(&failed, now + 2)
             .expect("claim failed path");
         store
             .mark_failed(&failed, now + 3)
             .expect("pre-sign failure");
-        let indeterminate = insert_ready("indeterminate");
+        let indeterminate = insert_ready("indeterminate").await;
         store
             .claim_ready(&indeterminate, now + 2)
             .expect("claim indeterminate path");
         store
             .mark_indeterminate(&indeterminate, now + 3)
             .expect("indeterminate");
-        let withheld = insert_ready("withheld");
+        let withheld = insert_ready("withheld").await;
         store
             .claim_ready(&withheld, now + 2)
             .expect("claim withheld");
@@ -2477,7 +3223,7 @@ pub(crate) mod tests {
             .mark_authorized_withheld(&withheld, now + 4)
             .expect("withheld");
 
-        let ledger_failed = insert_ready("ledger-failed");
+        let ledger_failed = insert_ready("ledger-failed").await;
         authorize(&ledger_failed);
         assert_eq!(
             store
@@ -2497,7 +3243,7 @@ pub(crate) mod tests {
             )
             .expect("ledger failure");
 
-        let expiring = insert_ready("expiring");
+        let expiring = insert_ready("expiring").await;
         assert_eq!(
             store
                 .claim_ready(&expiring, now + 271)
@@ -2513,6 +3259,20 @@ pub(crate) mod tests {
             generation_entry_ref(&key).account,
             stellar_agent_core::profile::schema::generation_account(&key.account)
         );
+    }
+
+    /// The intent coordinate the store writes is the one the key scope
+    /// reserves for the profile's MPP state key.
+    #[test]
+    fn intent_account_matches_the_reserved_profile_coordinate() {
+        let key = KeyringEntryRef::default_mpp_state_key("sample");
+        let intent = generation_intent_entry_ref(&generation_entry_ref(&key));
+        assert_eq!(intent.service, key.service);
+        assert_eq!(
+            intent.account,
+            stellar_agent_core::profile::schema::generation_intent_account(&key.account)
+        );
+        assert_eq!(intent.account, "default-generation-intent");
     }
 }
 
