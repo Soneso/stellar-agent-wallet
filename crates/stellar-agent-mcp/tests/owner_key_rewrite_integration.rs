@@ -37,6 +37,7 @@ fn owner(name: &str) -> Option<String> {
 /// profile B's. A profile with no owner entry is skipped and the build goes
 /// on to its own policy check.
 #[test]
+#[serial_test::serial]
 fn an_engine_build_for_one_profile_rewrites_another_profiles_older_form_entry() {
     let home = tempfile::tempdir().unwrap();
     let _home = StellarAgentHomeGuard::new(home.path());

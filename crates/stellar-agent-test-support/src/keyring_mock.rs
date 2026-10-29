@@ -13,20 +13,21 @@
 //! # When to call
 //!
 //! Call [`install`] at the start of each unit test that creates a
-//! `keyring_core::Entry`.  Because `set_default_store` is process-global,
-//! tests that share a process must not race on it — use `#[serial]` from
-//! the `serial_test` crate when multiple tests in the same binary touch the
-//! keyring.  Each call to [`install`] replaces any previously registered
-//! store (including a prior mock) with a fresh in-memory store, so test
-//! isolation is maintained per-call.
+//! `keyring_core::Entry`.  `set_default_store` is process-global: each call
+//! to [`install`] or [`install_with_read_hooks`] replaces the process-global
+//! store and discards every credential already seeded in this process.  A
+//! test that installs or reads the mock keyring store therefore holds the
+//! same `serial_test` key as every other test in its binary that touches the
+//! store or the process environment (`STELLAR_AGENT_HOME`).
 //!
 //! # Per-test call vs process-wide setup
 //!
 //! A per-test call (rather than a `#[ctor]` hook or `Once`-guarded global) is
 //! the recommended pattern here for two reasons:
 //!
-//! 1. **Isolation**: each test gets a fresh, empty store.  Credentials written
-//!    by one test do not bleed into another.
+//! 1. **Isolation**: each test that holds its binary's serial key gets a
+//!    fresh, empty store.  Credentials written by one test do not bleed into
+//!    another.
 //! 2. **Explicit contract**: the test function body makes the mock dependency
 //!    visible at the call site.  A hidden process-wide hook would silently affect
 //!    tests that never call [`install`], making debugging harder when a test
@@ -47,9 +48,11 @@ use std::sync::Arc;
 /// mock store is not persisted; credentials exist only for the lifetime of the
 /// `Arc<CredentialStore>` held internally by `keyring_core`'s global state.
 ///
-/// Safe to call multiple times.  Each call replaces the previously registered
-/// store (including a prior mock from an earlier test run) with a fresh,
-/// empty in-memory store, ensuring test isolation.
+/// Each call replaces the process-global store and discards every credential
+/// already seeded in this process, so a test that installs or reads the mock
+/// keyring store holds the same `serial_test` key as every other test in its
+/// binary that touches the store or the process environment
+/// (`STELLAR_AGENT_HOME`).
 ///
 /// # Errors
 ///
@@ -123,6 +126,12 @@ impl std::fmt::Debug for ReadHook {
 /// Writes, deletes, and reads at every other coordinate behave exactly as the
 /// plain mock store. A hook runs on every read at its coordinate, including
 /// the reads a test performs itself.
+///
+/// Each call replaces the process-global store and discards every credential
+/// already seeded in this process, so a test that installs or reads the mock
+/// keyring store holds the same `serial_test` key as every other test in its
+/// binary that touches the store or the process environment
+/// (`STELLAR_AGENT_HOME`).
 ///
 /// # Errors
 ///

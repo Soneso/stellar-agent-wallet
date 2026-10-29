@@ -1792,6 +1792,7 @@ mod tests {
 
     /// The testnet payment's authorized row records the policy's `Allow`.
     #[test]
+    #[serial_test::serial(keyring)]
     fn testnet_authorized_row_records_the_allow_decision() {
         stellar_agent_test_support::keyring_mock::install().ok();
         let server = make_require_approval_server();

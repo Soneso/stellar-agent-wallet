@@ -26,6 +26,7 @@ testnet-integration = [
     "dep:rand_core",
     "dep:reqwest",
     "dep:rmcp",
+    "dep:serial_test",
     "dep:serde_json",
     "dep:sha2",
     "dep:soroban-spec-tools",
@@ -92,6 +93,8 @@ url = { workspace = true, optional = true }
 stellar-agent-mcp = { workspace = true, optional = true, features = ["test-helpers"] }
 keyring-core = { workspace = true, optional = true }
 rmcp = { workspace = true, optional = true }
+# Serializes the suite's use of the process-global mock keyring store.
+serial_test = { workspace = true, optional = true }
 # CAP-85 external-reference suite: the SEP-48 spec fetch, the DeFi sign-time
 # pin gate, the DeFindex vault pin gate, and the offline parse of the vendored
 # verifier specs the live fetch is compared against.

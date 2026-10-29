@@ -1438,7 +1438,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn classic_sends_oracle_credential() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let server = oracle(network()).await;
@@ -1457,7 +1457,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[serial_test::serial(keyring)]
+    #[serial_test::serial]
     async fn classic_missing_oracle_credential_reports_keyring_not_found() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let server = oracle(network()).await;

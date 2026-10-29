@@ -373,6 +373,7 @@ fn audit_rows(home: &std::path::Path, profile: &str) -> Vec<serde_json::Value> {
 /// A timed-out payment is recorded, reported with its hash, and settled by
 /// `tx status` once the chain has it.
 #[tokio::test]
+#[serial_test::serial]
 async fn pay_timeout_is_recorded_and_tx_status_reconciles_it() {
     stellar_agent_network::init_platform_keyring_store()
         .expect("platform keyring store must initialise on this host");
