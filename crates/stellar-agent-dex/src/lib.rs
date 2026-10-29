@@ -77,7 +77,10 @@
 //! `.auth_rule_ids(&[ContextRuleId::new(0)])` — identical to the Blend adapter.
 //! The router calls `to.require_auth()` in `soroswap-core contracts/router/src/lib.rs`,
 //! and the SAC `transfer(from=wallet)` is a covered sub-invocation.
-//! No custom smart-account auth machinery is needed.
+//! No custom smart-account auth machinery is needed. The adapter declares
+//! transfers of the input token from the wallet, totaling at most `amount_in`,
+//! as the only sub-invocations it authorizes, so the wallet refuses any other
+//! simulated tree before signing.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

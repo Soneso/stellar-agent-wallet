@@ -337,6 +337,12 @@ pub enum SmartAccountSubcommand {
     /// Mainnet is structurally refused. Empty function name, malformed
     /// `--arg` XDR, and an unresolvable Ed25519 verifier all refuse
     /// client-side before any RPC call or key-material access.
+    ///
+    /// The smart account authorizes the named call alone. A target whose
+    /// call needs further authorization from the smart account (for example
+    /// a contract that moves the account's tokens on its behalf) simulates
+    /// sub-invocations under the call and is refused before signing with
+    /// `simulation.divergence.auth_contexts`.
     Execute(Box<execute::ExecuteArgs>),
 }
 

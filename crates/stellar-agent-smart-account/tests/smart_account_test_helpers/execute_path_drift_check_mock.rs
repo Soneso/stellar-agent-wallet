@@ -67,7 +67,8 @@ use stellar_agent_smart_account::managers::signers::{
 };
 use stellar_agent_smart_account::signers::THRESHOLD_POLICY_WASM_HASHES;
 use stellar_agent_smart_account::submit::{
-    MigratingRule, PinCheck, SubmitInvokeArgs, SubmitInvokeResult, submit_signed_invoke,
+    DeclaredSubInvocations, MigratingRule, PinCheck, SubmitInvokeArgs, SubmitInvokeResult,
+    submit_signed_invoke,
 };
 use stellar_agent_smart_account::verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAuditStatus};
 use stellar_agent_test_support::signed_envelope::{
@@ -1596,11 +1597,21 @@ impl Harness {
             rule_ids.iter().copied().map(ContextRuleId::new).collect();
         let smart_account = strkey(&smart_account());
         let uri = self.primary.uri();
+        // The submission declares the subtree the mock reports for
+        // `function`, so `pair` signs its two-context tree.
+        let declared_calls: Vec<InvokeContractArgs> = sub_invocations(function)
+            .iter()
+            .map(|sub| match &sub.function {
+                SorobanAuthorizedFunction::ContractFn(call) => call.clone(),
+                other => panic!("the mock reports contract calls only: {other:?}"),
+            })
+            .collect();
         submit_signed_invoke(
             SubmitInvokeArgs::builder()
                 .target_contract(&smart_account)
                 .auth_rule_ids(&rule_ids)
                 .host_function(invocation(function))
+                .sub_invocations(DeclaredSubInvocations::Calls(&declared_calls))
                 .signer(&signer)
                 .primary_rpc_url(&uri)
                 .network_passphrase(PASSPHRASE)

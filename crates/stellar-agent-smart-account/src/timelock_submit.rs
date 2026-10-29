@@ -20,9 +20,12 @@
 //! This module provides [`submit_timelock_invoke_with_g_key_auth`], which:
 //! 1. Builds a source-account transaction for the `InvokeHostFunction`.
 //! 2. Simulates (empty auth) to discover the required auth entries + `latest_ledger`.
-//! 3. For each returned `SorobanCredentials::Address` entry whose address is the
-//!    signer's G-key, computes the canonical `HashIdPreimageSorobanAuthorization`
-//!    preimage and signs it via `Signer::sign_soroban_address_auth_payload`.
+//! 3. Checks every returned `SorobanCredentials::Address` entry before signing
+//!    any: its address is the signer's G-key, and its root invocation is the
+//!    timelock call the wallet built, with no sub-invocations. Only then does it
+//!    compute, per entry, the canonical `HashIdPreimageSorobanAuthorization`
+//!    preimage over that call and sign it via
+//!    `Signer::sign_soroban_address_auth_payload`.
 //! 4. Re-simulates with signed auth entries to obtain the accurate Soroban
 //!    resource footprint (which includes storage reads triggered by the G-key
 //!    `require_auth` validation path).
@@ -36,8 +39,14 @@
 //! `  network_id: Hash(sha256(network_passphrase)),`
 //! `  nonce: <from simulate SorobanCredentials>,`
 //! `  signature_expiration_ledger: latest_ledger + AUTH_VALIDITY_LEDGERS,`
-//! `  invocation: <from simulate SorobanCredentials root_invocation>,`
+//! `  invocation: <the wallet's own timelock call, no sub-invocations>,`
 //! `}`
+//!
+//! The G-key signature is a classic-account Address authorization: no
+//! context rule narrows it, and it is not bound to a transaction. The wallet
+//! therefore signs only the invocation it built itself; a simulated root on
+//! another contract, with another function or arguments, or with
+//! sub-invocations is refused before the preimage is computed.
 //! Canonical source: `stellar_xdr::HashIdPreimageSorobanAuthorization`
 //! (mirroring the preimage used in `managers/auth_entry.rs::compute_signature_payload`
 //! and `managers/auth_entry.rs::build_and_sign_delegated_g_key_entry`).
@@ -63,16 +72,19 @@ use stellar_rpc_client::Client;
 use stellar_xdr::{
     AccountId, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, HostFunction,
     InvokeHostFunctionOp, Limits, Operation, OperationBody, PublicKey as XdrPublicKey, ScAddress,
-    ScVal, SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanCredentials, Uint256, VecM,
-    WriteXdr,
+    ScVal, SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
+    SorobanAuthorizedInvocation, SorobanCredentials, Uint256, VecM, WriteXdr,
 };
 
 use crate::SaError;
 use crate::managers::rules::{
-    AUTH_VALIDITY_LEDGERS, BASE_FEE_STROOPS, augment_with_oz_error_name, parse_min_resource_fee,
-    validate_latest_ledger,
+    AUTH_VALIDITY_LEDGERS, BASE_FEE_STROOPS, augment_with_oz_error_name, fingerprint_invocation,
+    parse_min_resource_fee, validate_latest_ledger,
 };
-use crate::submit::refuse_mainnet_sa;
+use crate::submit::{
+    DeclaredSubInvocations, attribute_signed_tree_refusal, check_declared_sub_invocations,
+    check_simulated_root, refuse_mainnet_sa,
+};
 
 // ── Public result type ────────────────────────────────────────────────────────
 
@@ -122,6 +134,17 @@ pub(crate) struct TimelockSubmitArgs<'a> {
 
 // ── Main submit function ──────────────────────────────────────────────────────
 
+/// A simulated authorization entry after the check pass of step 4.
+enum CheckedEntry {
+    /// An entry this path does not sign (source-account credentials, or a
+    /// credential variant the OZ timelock does not use), passed through as is.
+    PassThrough(Box<SorobanAuthorizationEntry>),
+    /// An Address entry for the signer's G-key whose root is the wallet's own
+    /// call; the sign pass signs the wallet's invocation with these
+    /// credentials.
+    SignerKey(SorobanAddressCredentials),
+}
+
 /// Submits a timelock `InvokeHostFunction` with direct G-key authorization.
 ///
 /// The OZ `TimelockController` is not a smart-account; its entrypoints call
@@ -135,8 +158,10 @@ pub(crate) struct TimelockSubmitArgs<'a> {
 /// 1. Fetch signer G-key and source account sequence.
 /// 2. Build `InvokeHostFunction` tx (empty auth) for simulation.
 /// 3. Simulate on primary RPC; extract `latest_ledger` + auth entry template.
-/// 4. For each `SorobanCredentials::Address` entry whose address matches the
-///    signer G-key, compute the auth preimage and sign it.
+/// 4. Check every `SorobanCredentials::Address` entry: its address is the
+///    signer G-key, and its root invocation equals the host function with no
+///    sub-invocations. Only after every entry passes, compute the auth
+///    preimage over the wallet's own invocation for each and sign it.
 /// 5. Re-simulate with signed auth entries to get the full storage footprint.
 /// 6. Build final envelope: inject signed auth entries + soroban_data.
 /// 7. Attach source-account signature.
@@ -149,6 +174,15 @@ pub(crate) struct TimelockSubmitArgs<'a> {
 ///   signer's public key is read and before any request.
 /// - [`SaError::AuthEntryConstructionFailed`] — pubkey fetch, XDR encoding,
 ///   simulate, or signing failure.
+/// - [`SaError::SimulationDivergence`] with sub-code `AuthContexts` (wire code
+///   `simulation.divergence.auth_contexts`): an entry for the signer's G-key
+///   whose root invocation differs from the host function or carries
+///   sub-invocations; refused before any entry is signed. The public
+///   [`crate::timelock::schedule_upgrade`], [`crate::timelock::execute`], and
+///   [`crate::timelock::cancel`] map it, like every other error here except
+///   [`SaError::MainnetWriteForbidden`] (and, for `execute`,
+///   [`SaError::SubmissionUnresolved`]), to their typed variant below, with the
+///   refusal text in the reason.
 /// - [`SaError::DeploymentFailed`] — re-simulate error or envelope construction.
 /// - [`SaError::TimelockScheduleFailed`] / `CancelFailed` / `ExecuteFailed`
 ///   — NOT emitted here; the caller maps `SaError` to the typed variant.
@@ -326,8 +360,18 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
     // Signature shape: `ScVal::Vec([ScVal::Map([{public_key, signature}])])`
     // (same encoding as `auth_entry.rs::build_and_sign_delegated_g_key_entry`;
     // js-stellar-base auth.js:171-184 canonical reference).
-    let mut signed_entries: Vec<SorobanAuthorizationEntry> = Vec::with_capacity(auth_entries.len());
-
+    //
+    // The invocation signed is the wallet's own timelock call, never the one
+    // the simulation returned: an entry whose root differs from it is refused
+    // below before any preimage is computed.
+    let wallet_root = SorobanAuthorizedInvocation {
+        function: SorobanAuthorizedFunction::ContractFn(invoke.clone()),
+        sub_invocations: VecM::default(),
+    };
+    //
+    // Every entry is checked before any is signed: a response whose first
+    // entry is honest and whose second is not produces no signature at all.
+    let mut checked_entries: Vec<CheckedEntry> = Vec::with_capacity(auth_entries.len());
     for entry in auth_entries {
         let creds = match &entry.credentials {
             SorobanCredentials::Address(c) => c.clone(),
@@ -338,7 +382,7 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
                 // source-account envelope signature covers them.
                 // AddressV2 / AddressWithDelegates are credential variants not
                 // used by the OZ TimelockController; pass through unchanged.
-                signed_entries.push(entry);
+                checked_entries.push(CheckedEntry::PassThrough(Box::new(entry)));
                 continue;
             }
         };
@@ -361,14 +405,43 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
             ));
         }
 
-        // Compute the auth preimage over the simulate-returned `invocation`.
+        // The OZ timelock calls the role's `require_auth()` in its own
+        // `schedule` / `execute` / `cancel` frame, so the honest root is the
+        // host function itself, with nothing under it. Any other root is an
+        // authorization the wallet did not build.
+        check_simulated_root(&entry.root_invocation.function, &invoke)
+            .and_then(|()| {
+                check_declared_sub_invocations(
+                    &entry.root_invocation.sub_invocations,
+                    &DeclaredSubInvocations::None,
+                    &creds.address,
+                )
+            })
+            .map_err(|err| {
+                attribute_signed_tree_refusal(err, args.op_label, &fingerprint_invocation(&entry))
+            })?;
+        checked_entries.push(CheckedEntry::SignerKey(creds));
+    }
+
+    let mut signed_entries: Vec<SorobanAuthorizationEntry> =
+        Vec::with_capacity(checked_entries.len());
+    for checked in checked_entries {
+        let creds = match checked {
+            CheckedEntry::PassThrough(entry) => {
+                signed_entries.push(*entry);
+                continue;
+            }
+            CheckedEntry::SignerKey(creds) => creds,
+        };
+
+        // Compute the auth preimage over the wallet's own invocation.
         // `signature_expiration_ledger` is set to `latest_ledger + AUTH_VALIDITY_LEDGERS`
-        // (overrides the `0` placeholder the RPC returns; mirrors submit.rs:716-718).
+        // (overrides the `0` placeholder the RPC returns).
         let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
             network_id: Hash(network_id),
             nonce: creds.nonce,
             signature_expiration_ledger,
-            invocation: entry.root_invocation.clone(),
+            invocation: wallet_root.clone(),
         });
         let preimage_xdr = preimage.to_xdr(Limits::none()).map_err(|e| {
             auth_err(
@@ -404,7 +477,7 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
                 signature_expiration_ledger,
                 signature: signature_scval,
             }),
-            root_invocation: entry.root_invocation,
+            root_invocation: wallet_root.clone(),
         });
     }
 
@@ -612,6 +685,7 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test-only")]
+    #![allow(clippy::panic, reason = "test-only")]
 
     use stellar_xdr::{BytesM, ContractId, Hash, InvokeContractArgs, ScAddress, ScSymbol};
 
@@ -715,5 +789,354 @@ mod tests {
         );
         assert_eq!(key_accesses, 0);
         assert_eq!(requests, 0);
+    }
+
+    // ── The signed invocation is the timelock call itself ────────────────────
+
+    mod signed_root {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        use serde_json::{Value, json};
+        use sha2::{Digest, Sha256};
+        use stellar_agent_network::signing::test_doubles::CountingSigner;
+        use stellar_agent_test_support::signed_envelope::{
+            account_id_for_seed, get_network_result, ledger_entries_result_for,
+            public_key_for_seed, send_transaction_hash_hex,
+        };
+        use stellar_xdr::{
+            AccountId, ContractId, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization,
+            HostFunction, Int128Parts, InvokeContractArgs, Limits, OperationBody,
+            PublicKey as XdrPublicKey, ReadXdr, ScAddress, ScSymbol, ScVal,
+            SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
+            SorobanAuthorizedInvocation, SorobanCredentials, SorobanTransactionData,
+            TransactionEnvelope, Uint256, VecM, WriteXdr,
+        };
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
+
+        use super::super::{TimelockSubmitArgs, submit_timelock_invoke_with_g_key_auth};
+        use crate::SaError;
+        use crate::error::SimulationDivergenceSubCode;
+
+        const SEED: [u8; 32] = [0x51; 32];
+
+        /// The operator's classic account, the role the timelock checks.
+        fn operator() -> ScAddress {
+            ScAddress::Account(AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256(
+                public_key_for_seed(SEED),
+            ))))
+        }
+
+        fn contract(byte: u8) -> ScAddress {
+            ScAddress::Contract(ContractId(Hash([byte; 32])))
+        }
+
+        fn call(target: ScAddress, function: &str, args: Vec<ScVal>) -> InvokeContractArgs {
+            InvokeContractArgs {
+                contract_address: target,
+                function_name: ScSymbol::try_from(function).unwrap(),
+                args: args.try_into().unwrap(),
+            }
+        }
+
+        /// `timelock.schedule(operator, delay)`.
+        fn schedule() -> InvokeContractArgs {
+            call(
+                contract(0x52),
+                "schedule",
+                vec![ScVal::Address(operator()), ScVal::U32(10)],
+            )
+        }
+
+        /// The native token's `transfer(operator, attacker, balance)`.
+        fn drain() -> InvokeContractArgs {
+            call(
+                contract(0x53),
+                "transfer",
+                vec![
+                    ScVal::Address(operator()),
+                    ScVal::Address(contract(0xAA)),
+                    ScVal::I128(Int128Parts {
+                        hi: 0,
+                        lo: 1_000_000_000,
+                    }),
+                ],
+            )
+        }
+
+        fn leaf(call: InvokeContractArgs) -> SorobanAuthorizedInvocation {
+            SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(call),
+                sub_invocations: VecM::default(),
+            }
+        }
+
+        /// The nonce of the first entry the simulation hands out; each
+        /// further entry takes the next one.
+        const NONCE: i64 = 9;
+
+        type TreesFn =
+            dyn Fn(&InvokeContractArgs) -> Vec<SorobanAuthorizedInvocation> + Send + Sync;
+
+        /// Answers the first simulation with one entry for the operator's key
+        /// per root `trees` builds from the request, echoes the signed
+        /// entries on the re-simulation and records them.
+        struct Rpc {
+            trees: Arc<TreesFn>,
+            simulations: Arc<AtomicUsize>,
+            resimulated: Arc<Mutex<Vec<SorobanAuthorizationEntry>>>,
+        }
+
+        impl Respond for Rpc {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let passphrase = stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
+                let result = match body["method"].as_str().unwrap() {
+                    "getNetwork" => get_network_result(passphrase),
+                    "getLatestLedger" => {
+                        json!({"id": "ab".repeat(32), "sequence": 1000, "protocolVersion": 27})
+                    }
+                    "getLedgerEntries" => {
+                        ledger_entries_result_for(&[account_id_for_seed(SEED).as_str()])
+                    }
+                    "simulateTransaction" => {
+                        self.simulations.fetch_add(1, Ordering::SeqCst);
+                        let TransactionEnvelope::Tx(tx) = TransactionEnvelope::from_xdr_base64(
+                            body["params"]["transaction"].as_str().unwrap(),
+                            Limits::none(),
+                        )
+                        .unwrap() else {
+                            panic!("v1 envelope")
+                        };
+                        let OperationBody::InvokeHostFunction(op) = &tx.tx.operations[0].body
+                        else {
+                            panic!("invoke operation")
+                        };
+                        let HostFunction::InvokeContract(invoke) = &op.host_function else {
+                            panic!("contract function")
+                        };
+                        let auth = if op.auth.is_empty() {
+                            (self.trees)(invoke)
+                                .into_iter()
+                                .zip(NONCE..)
+                                .map(|(root_invocation, nonce)| SorobanAuthorizationEntry {
+                                    credentials: SorobanCredentials::Address(
+                                        SorobanAddressCredentials {
+                                            address: operator(),
+                                            nonce,
+                                            signature_expiration_ledger: 0,
+                                            signature: ScVal::Void,
+                                        },
+                                    ),
+                                    root_invocation,
+                                })
+                                .collect()
+                        } else {
+                            self.resimulated
+                                .lock()
+                                .unwrap()
+                                .extend(op.auth.iter().cloned());
+                            op.auth.to_vec()
+                        };
+                        json!({
+                            "latestLedger": 1000,
+                            "minResourceFee": "1000",
+                            "transactionData": SorobanTransactionData::default()
+                                .to_xdr_base64(Limits::none())
+                                .unwrap(),
+                            "results": [{
+                                "auth": auth
+                                    .iter()
+                                    .map(|entry| entry.to_xdr_base64(Limits::none()).unwrap())
+                                    .collect::<Vec<_>>(),
+                                "xdr": ScVal::Void.to_xdr_base64(Limits::none()).unwrap(),
+                            }],
+                        })
+                    }
+                    "sendTransaction" => {
+                        json!({"status": "PENDING", "hash": send_transaction_hash_hex(&body, passphrase), "latestLedger": 1000, "latestLedgerCloseTime": "1234567890"})
+                    }
+                    "getTransaction" => {
+                        json!({"status": "SUCCESS", "ledger": 1001, "latestLedger": 1001, "oldestLedger": 1})
+                    }
+                    other => panic!("unexpected RPC method: {other}"),
+                };
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": body["id"], "result": result}))
+            }
+        }
+
+        struct Outcome {
+            result: Result<super::super::TimelockSubmitResult, SaError>,
+            signs: usize,
+            simulations: usize,
+            resimulated: Vec<SorobanAuthorizationEntry>,
+        }
+
+        impl Outcome {
+            /// Asserts the refusal before any signing primitive and any
+            /// second simulation, and returns its reason.
+            fn refused_before_signing(&self) -> String {
+                assert_eq!(self.signs, 0, "nothing is signed: {:?}", self.result);
+                assert_eq!(self.simulations, 1, "no re-simulation: {:?}", self.result);
+                match &self.result {
+                    Err(SaError::SimulationDivergence {
+                        sub_code: SimulationDivergenceSubCode::AuthContexts,
+                        redacted_reason,
+                    }) => redacted_reason.clone(),
+                    other => panic!("expected the auth-contexts divergence, got {other:?}"),
+                }
+            }
+        }
+
+        /// Submits `schedule()` against a simulation that hands out one entry
+        /// whose root `tree` builds.
+        async fn submit(
+            tree: impl Fn(&InvokeContractArgs) -> SorobanAuthorizedInvocation + Send + Sync + 'static,
+        ) -> Outcome {
+            submit_entries(move |invoke| vec![tree(invoke)]).await
+        }
+
+        /// Submits `schedule()` against a simulation that hands out one entry
+        /// per root `trees` builds.
+        async fn submit_entries(
+            trees: impl Fn(&InvokeContractArgs) -> Vec<SorobanAuthorizedInvocation>
+            + Send
+            + Sync
+            + 'static,
+        ) -> Outcome {
+            let server = MockServer::start().await;
+            let simulations = Arc::new(AtomicUsize::new(0));
+            let resimulated = Arc::new(Mutex::new(Vec::new()));
+            Mock::given(method("POST"))
+                .respond_with(Rpc {
+                    trees: Arc::new(trees),
+                    simulations: Arc::clone(&simulations),
+                    resimulated: Arc::clone(&resimulated),
+                })
+                .mount(&server)
+                .await;
+            let signer = CountingSigner::new(SEED);
+            let result = submit_timelock_invoke_with_g_key_auth(TimelockSubmitArgs {
+                host_function: HostFunction::InvokeContract(schedule()),
+                signer: &signer,
+                primary_rpc_url: &server.uri(),
+                network_passphrase: stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+                timeout: std::time::Duration::from_secs(5),
+                op_label: "schedule",
+                submission_recorder: None,
+            })
+            .await;
+            let resimulated = resimulated.lock().unwrap().clone();
+            Outcome {
+                result,
+                signs: signer.sign_calls(),
+                simulations: simulations.load(Ordering::SeqCst),
+                resimulated,
+            }
+        }
+
+        #[tokio::test]
+        async fn a_timelock_root_on_another_contract_is_refused_before_signing() {
+            let outcome = submit(|_| leaf(drain())).await;
+            let reason = outcome.refused_before_signing();
+            assert!(reason.contains("in its contract"), "{reason}");
+        }
+
+        #[tokio::test]
+        async fn a_timelock_root_with_a_sub_invocation_is_refused() {
+            let outcome = submit(|invoke| SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(invoke.clone()),
+                sub_invocations: vec![leaf(drain())].try_into().unwrap(),
+            })
+            .await;
+            let reason = outcome.refused_before_signing();
+            assert!(reason.contains("1 undeclared sub-invocations"), "{reason}");
+        }
+
+        #[tokio::test]
+        async fn a_timelock_root_with_other_arguments_is_refused() {
+            let outcome = submit(|invoke| {
+                let mut root = invoke.clone();
+                root.args = vec![ScVal::Address(operator()), ScVal::U32(0)]
+                    .try_into()
+                    .unwrap();
+                leaf(root)
+            })
+            .await;
+            let reason = outcome.refused_before_signing();
+            assert!(reason.contains("in argument 1"), "{reason}");
+        }
+
+        /// Every entry is checked before any is signed, so an honest first
+        /// entry is not signed when the second is refused.
+        #[tokio::test]
+        async fn an_honest_first_entry_is_not_signed_when_a_second_is_refused() {
+            let outcome = submit_entries(|invoke| vec![leaf(invoke.clone()), leaf(drain())]).await;
+            let reason = outcome.refused_before_signing();
+            assert!(reason.contains("in its contract"), "{reason}");
+        }
+
+        #[tokio::test]
+        async fn the_timelock_signs_its_own_call() {
+            let outcome = submit(|invoke| leaf(invoke.clone())).await;
+            assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+            assert_eq!(
+                outcome.signs, 2,
+                "one authorization signature and one envelope signature"
+            );
+            assert_eq!(outcome.simulations, 2, "the signed entry is re-simulated");
+            let [signed] = outcome.resimulated.as_slice() else {
+                panic!("one signed entry: {:?}", outcome.resimulated)
+            };
+            assert_eq!(signed.root_invocation, leaf(schedule()));
+            let SorobanCredentials::Address(creds) = &signed.credentials else {
+                panic!("address credentials")
+            };
+            assert_eq!(creds.address, operator());
+            assert_eq!(creds.nonce, NONCE);
+            let expiration = 1000 + super::super::AUTH_VALIDITY_LEDGERS;
+            assert_eq!(creds.signature_expiration_ledger, expiration);
+
+            // The signature verifies under the operator's key over the
+            // preimage of the timelock call, the simulated nonce and the
+            // expiration, built here from those values alone.
+            let preimage =
+                HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+                    network_id: Hash(
+                        Sha256::digest(
+                            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE.as_bytes(),
+                        )
+                        .into(),
+                    ),
+                    nonce: NONCE,
+                    signature_expiration_ledger: expiration,
+                    invocation: leaf(schedule()),
+                });
+            let payload: [u8; 32] = Sha256::digest(preimage.to_xdr(Limits::none()).unwrap()).into();
+            let ScVal::Vec(Some(signatures)) = &creds.signature else {
+                panic!("a signature vector: {:?}", creds.signature)
+            };
+            let [ScVal::Map(Some(fields))] = signatures.as_slice() else {
+                panic!("one signature map: {signatures:?}")
+            };
+            let field = |name: &str| -> Vec<u8> {
+                let entry = fields
+                    .iter()
+                    .find(|entry| entry.key == ScVal::Symbol(ScSymbol::try_from(name).unwrap()))
+                    .unwrap_or_else(|| panic!("the {name} field"));
+                let ScVal::Bytes(bytes) = &entry.val else {
+                    panic!("{name} is bytes")
+                };
+                bytes.to_vec()
+            };
+            assert_eq!(field("public_key"), public_key_for_seed(SEED).to_vec());
+            let signature = ed25519_dalek::Signature::from_slice(&field("signature"))
+                .unwrap_or_else(|err| panic!("a 64-byte signature: {err}"));
+            ed25519_dalek::VerifyingKey::from_bytes(&public_key_for_seed(SEED))
+                .unwrap()
+                .verify_strict(&payload, &signature)
+                .unwrap_or_else(|err| panic!("the signature covers the expected preimage: {err}"));
+        }
     }
 }

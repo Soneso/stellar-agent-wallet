@@ -1059,6 +1059,20 @@ Callers MUST produce `context_rule_ids_xdr` via `encode_context_rule_ids`, which
 
 Signing the digest rather than the raw `signature_payload` closes the rule-id downgrade attack by a malicious transaction sponsor. Because the rule ids are inside the hashed preimage, swapping them changes the digest and invalidates the signature. A signer that signs the raw payload, or that builds a non-canonical `context_rule_ids_xdr`, produces a signature the contract rejects during `__check_auth`. The failure is on-chain at submission, not at off-chain digest computation. The silent off-chain success that breaks on submit is exactly what this primitive exists to prevent. The function logs only input byte-lengths and the one-way output digest at debug level; the raw payload and rule-id XDR are never logged.
 
+### Signed invocation tree
+
+The digest covers the invocation tree inside `signature_payload`. Address credentials are not bound to a transaction, so whoever holds a signed entry can submit it in a transaction of its own until the signature expiration ledger. The rule ids do not narrow the tree either: under an OpenZeppelin `Default` rule, such as the bootstrap rule 0 the DeFi adapters sign under, `__check_auth` accepts any context. The tree the wallet signs therefore comes from the wallet, not from the RPC.
+
+`submit_signed_invoke` (`crates/stellar-agent-smart-account/src/submit.rs`) requires the simulated root invocation of the wallet's entry to equal the caller's host function in contract, function name, and every argument. The sub-invocations under it must match the caller's `DeclaredSubInvocations`:
+
+- `None`, the default: no sub-invocations. A wallet entrypoint authorizes its own frame, and the contracts it calls are authorized through invoker-contract auth without adding a node to the wallet's tree.
+- `TokenTransfers`: each sub-invocation is a `transfer(from, to, amount)` on a declared token, `from` is the wallet, the recipient matches when the declaration sets one, and the amounts counted against each declared entry sum to at most its bound. The Soroswap adapter declares the input token with an open recipient (the router picks the pair) and the trade's input amount. A DeFindex deposit declares each vault asset with the vault as recipient and its desired amount.
+- `Calls`: the sub-invocations equal declared calls in declared order, each used at most once. The multicall submit declares its bundle entries.
+
+Every accepted sub-invocation is a leaf. The wallet then signs its own root with the accepted subtree. Any other tree refuses with `simulation.divergence.auth_contexts` before a signing primitive runs; the message names the differing part or the index of the refused sub-invocation and the reason, never a value. The divergence check of the auth-entry builder then compares one fingerprint per node of the simulated tree (`node:` plus the SHA-256 of the node's function XDR and its child count) with one per node of the signed tree, as a second check behind those two.
+
+The timelock path signs `schedule`, `execute`, and `cancel` with the operator's classic key. That Address authorization has no context rule at all, so the path signs only the timelock call it built, with no sub-invocations. `submit_timelock_invoke_with_g_key_auth` (`crates/stellar-agent-smart-account/src/timelock_submit.rs`) checks every Address entry of the simulation before it signs any: each must name the operator's key and have the call as its root with no sub-invocations. A root that differs or carries sub-invocations returns the same `simulation.divergence.auth_contexts` refusal, and no entry is signed. The public `schedule_upgrade`, `execute`, and `cancel` operations map that refusal, like every other submission failure except the mainnet refusal (and, for `execute`, an unresolved submission), to `sa.timelock_schedule_failed`, `sa.timelock_execute_failed`, and `sa.timelock_cancel_failed`; the refusal text is kept in the reason.
+
 ## Redaction discipline
 
 Audit and policy wire output never carry secrets or raw argument maps:

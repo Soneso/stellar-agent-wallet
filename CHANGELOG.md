@@ -618,6 +618,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry. `MainnetPrecondition` gains `EntryNonce` (`entry_nonce`) and
   `EntryExpiration` (`entry_expiration`), both reported as
   `network.mainnet_authorization_refused`.
+- `stellar_agent_smart_account::submit::SubmitInvokeArgs` adds
+  `sub_invocations`, a `DeclaredSubInvocations`: `None` (the default),
+  `TokenTransfers` of `DeclaredTransfer` values (token, optional recipient,
+  amount bound), or `Calls`. It names the sub-invocations a submission
+  authorizes under its host function.
+- The quorum path of `submit_signed_invoke` refuses a simulated tree that
+  carries sub-invocations at stage `quorum_external_contract_guard`, as it
+  refuses a host function on a contract other than the wallet.
 
 ### Removed
 
@@ -974,6 +982,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and signature expiration ledger and signs one preimage. A preimage under
   another nonce or another expiration ledger refuses before key access, and a
   second signature needs a second authorization.
+- Smart-account submissions sign the host function the wallet built as the
+  root of the authorized invocation tree, with only the sub-invocations the
+  caller declared under it. A simulated root on another contract, with
+  another function or other arguments, or a simulated subtree outside the
+  declaration refuses with `simulation.divergence.auth_contexts` before
+  anything is signed. A Soroswap swap accepts transfers of the input token
+  from the wallet totaling at most the input amount, a DeFindex deposit, per
+  vault asset, transfers from the wallet to the vault totaling at most that
+  asset's desired amount, and a multicall bundle its own calls in bundle
+  order. A DeFindex withdraw,
+  `smart-account execute`, and the rule and signer verbs accept no
+  sub-invocations.
+- Timelock `schedule`, `execute`, and `cancel` sign only the timelock call
+  itself with the operator's key. No entry is signed unless every
+  authorization entry of the simulation names that key and has the call as
+  its root with no sub-invocations; otherwise the verb fails with
+  `sa.timelock_schedule_failed`, `sa.timelock_execute_failed`, or
+  `sa.timelock_cancel_failed` before anything is signed.
+- The pre-signing divergence check of smart-account auth entries compares one
+  fingerprint per node of the simulated invocation tree with one per node of
+  the signed tree.
 
 ## [0.1.0-alpha.12] - 2026-10-15
 

@@ -32,6 +32,16 @@
 //! happen before `submit` is called.  The REFUSALS (upgradable, pin, counts)
 //! are enforced here in submit — not delegated to the dispatch site.
 //!
+//! # Signed invocation tree
+//!
+//! The wallet signs the vault call this adapter built as the root of its
+//! authorization, never a root the simulation returns. A deposit declares, per
+//! vault asset, `transfer(from = wallet, to = vault, amount)` calls totaling at
+//! most that asset's `amounts_desired` entry; a withdraw declares no
+//! sub-invocations, since its asset transfers are the vault's to authorize.
+//! A simulated tree outside the declaration is refused before signing with
+//! `simulation.divergence.auth_contexts`.
+//!
 //! # Witness consumption
 //!
 //! [`DefindexVaultAdapter::submit`] consumes the [`SubmitWitness`] by logging,
@@ -50,9 +60,12 @@ use async_trait::async_trait;
 use stellar_agent_core::ContextRuleId;
 use stellar_agent_defi::adapter::{DefiAdapter, DefiAdapterCtx, DefiAdapterError, DefiPreview};
 use stellar_agent_defi::dispatch::SubmitWitness;
-use stellar_agent_smart_account::submit::{SubmitInvokeArgs, submit_signed_invoke};
+use stellar_agent_defi::scval::contract_strkey_to_sc_address;
+use stellar_agent_smart_account::submit::{
+    DeclaredSubInvocations, DeclaredTransfer, SubmitInvokeArgs, submit_signed_invoke,
+};
 
-use crate::abi::{VaultDepositArgs, VaultWithdrawArgs};
+use crate::abi::{VaultDepositArgs, VaultWithdrawArgs, WalletAssetStrategySet};
 use crate::scval::{args_to_vecm, encode_vault_deposit_args, encode_vault_withdraw_args};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -362,6 +375,15 @@ impl DefindexVaultAdapter {
             build_invoke_contract_args(&vault_sc_addr, DEFINDEX_DEPOSIT_FN, deposit_scvals)?;
         let host_function = stellar_xdr::HostFunction::InvokeContract(invoke_args);
 
+        // ── Declared sub-invocations ─────────────────────────────────────────
+        // Any simulated subtree other than the deposit's transfers of the vault
+        // assets to the vault is refused before signing.
+        let declared_transfers = declared_deposit_transfers(
+            &deposit_args.vault_address,
+            &vault_assets,
+            &deposit_args.amounts_desired,
+        )?;
+
         let secondary_rpc_url = ctx
             .secondary_rpc
             .map(stellar_agent_network::StellarRpcClient::url);
@@ -386,6 +408,7 @@ impl DefindexVaultAdapter {
                 // stays `None`); any other rule would be refused without one.
                 .auth_rule_ids(&[ContextRuleId::new(0)])
                 .host_function(host_function)
+                .sub_invocations(DeclaredSubInvocations::TokenTransfers(&declared_transfers))
                 .signer(signer)
                 .primary_rpc_url(ctx.primary_rpc.url())
                 .maybe_secondary_rpc_url(secondary_rpc_url)
@@ -557,6 +580,10 @@ impl DefindexVaultAdapter {
                 // stays `None`); any other rule would be refused without one.
                 .auth_rule_ids(&[ContextRuleId::new(0)])
                 .host_function(host_function)
+                // The withdraw's asset transfers move from the vault to the
+                // wallet and are the vault's to authorize: the wallet signs
+                // the `withdraw` call alone, with no sub-invocations.
+                .sub_invocations(DeclaredSubInvocations::None)
                 .signer(signer)
                 .primary_rpc_url(ctx.primary_rpc.url())
                 .maybe_secondary_rpc_url(secondary_rpc_url)
@@ -645,6 +672,53 @@ fn extract_submit_ctx<'a>(
         .timeout
         .unwrap_or_else(|| std::time::Duration::from_secs(DEFAULT_SUBMIT_TIMEOUT_SECS));
     Ok((signer, network_passphrase, chain_id, timeout))
+}
+
+/// The sub-invocations a deposit authorizes under the vault call.
+///
+/// The vault's `deposit` calls `from.require_auth()` and moves each deposited
+/// asset with `transfer(from = wallet, to = vault, amount)`. The wallet
+/// authorizes, per vault asset, such transfers to the vault totaling at most
+/// the asset's `amounts_desired` entry.
+///
+/// # Errors
+///
+/// [`DefiAdapterError::InvalidArguments`] when `vault_assets` and
+/// `amounts_desired` differ in length, or an address is not a C-strkey.
+fn declared_deposit_transfers(
+    vault_address: &str,
+    vault_assets: &[WalletAssetStrategySet],
+    amounts_desired: &[i128],
+) -> Result<Vec<DeclaredTransfer>, DefiAdapterError> {
+    if vault_assets.len() != amounts_desired.len() {
+        return Err(DefiAdapterError::InvalidArguments {
+            reason: format!(
+                "{} desired amounts for {} vault assets",
+                amounts_desired.len(),
+                vault_assets.len()
+            ),
+        });
+    }
+    let vault = contract_strkey_to_sc_address(vault_address).map_err(|e| {
+        DefiAdapterError::InvalidArguments {
+            reason: format!("invalid vault_address: {e}"),
+        }
+    })?;
+    vault_assets
+        .iter()
+        .zip(amounts_desired)
+        .map(|(asset, amount)| {
+            Ok(DeclaredTransfer {
+                token: contract_strkey_to_sc_address(&asset.address).map_err(|e| {
+                    DefiAdapterError::InvalidArguments {
+                        reason: format!("invalid vault asset address: {e}"),
+                    }
+                })?,
+                to: Some(vault.clone()),
+                max_amount: *amount,
+            })
+        })
+        .collect()
 }
 
 fn build_invoke_contract_args(
@@ -737,6 +811,37 @@ mod tests {
     use crate::abi::{VaultDepositArgs, VaultWithdrawArgs};
     use stellar_agent_defi::pins::DefiContractPin;
     use stellar_agent_network::StellarRpcClient;
+
+    /// A deposit declares one transfer per vault asset, to the vault, bounded
+    /// by the asset's desired amount, in vault-asset order.
+    #[test]
+    fn a_deposit_declares_one_bounded_transfer_per_vault_asset_to_the_vault() {
+        let vault = "CCLV4H7WTLJQ7ATLHBBQV2WW3OINF3FOY5XZ7VPHZO7NH3D2ZS4GFSF6";
+        let assets = [
+            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+            "CB3TLW74NBIOT3BUWOZ3TUM6RFDF6A4GVIRUQRQZABG5KPOUL4JJOV2F",
+        ]
+        .map(|address| WalletAssetStrategySet {
+            address: address.to_owned(),
+            strategies: Vec::new(),
+        });
+        let declared = declared_deposit_transfers(vault, &assets, &[70, 0]).unwrap();
+        let vault_address = contract_strkey_to_sc_address(vault).unwrap();
+        assert_eq!(declared.len(), 2);
+        for (entry, (asset, amount)) in declared.iter().zip(assets.iter().zip([70, 0])) {
+            assert_eq!(
+                entry.token,
+                contract_strkey_to_sc_address(&asset.address).unwrap()
+            );
+            assert_eq!(entry.to.as_ref(), Some(&vault_address));
+            assert_eq!(entry.max_amount, amount);
+        }
+
+        assert!(matches!(
+            declared_deposit_transfers(vault, &assets, &[70]),
+            Err(DefiAdapterError::InvalidArguments { .. })
+        ));
+    }
 
     /// A refusal the spending window decided reaches the adapter surface as a
     /// policy denial, not as a network failure that moved nothing.

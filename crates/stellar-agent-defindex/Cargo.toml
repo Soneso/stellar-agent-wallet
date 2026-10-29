@@ -41,6 +41,8 @@ tokio                 = { workspace = true, features = ["rt", "time"] }
 
 [dev-dependencies]
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
+# CountingSigner for the adapter submit tests.
+stellar-agent-network       = { workspace = true, features = ["test-helpers"] }
 serde_json                  = { workspace = true }
 tokio                       = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 zeroize                     = { workspace = true }
