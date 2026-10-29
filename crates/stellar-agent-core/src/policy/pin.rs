@@ -248,6 +248,27 @@ pub fn read(lock: &WindowStoreLock, scope: &PinScope<'_>) -> Result<PinState, Pi
     }
 }
 
+/// Whether the pin entry of the window-state key `window_key` exists, read
+/// without the window-state lock and without parsing the value: a presence
+/// probe for callers that select or diagnose a store before they read its
+/// pin under the lock. A malformed value counts as present.
+///
+/// # Errors
+///
+/// [`PinError::Keyring`] when the entry cannot be opened or read; only
+/// `NoEntry` means absence.
+pub fn entry_present(window_key: &KeyringEntryRef) -> Result<bool, PinError> {
+    let entry_ref = policy_pin_entry_ref(window_key);
+    match open(&entry_ref)?.get_password() {
+        Ok(_) => Ok(true),
+        Err(keyring_core::Error::NoEntry) => Ok(false),
+        Err(e) => Err(PinError::Keyring {
+            detail: map_keyring_operation_error(&e, KeyringOperation::Read, &entry_ref.service)
+                .to_string(),
+        }),
+    }
+}
+
 /// Writes `pin` as the pin of `scope` under `lock`, replacing any value.
 ///
 /// # Errors

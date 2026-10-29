@@ -66,6 +66,15 @@ pub enum KeyScopeKind {
         /// Rendered overridden account.
         account: String,
     },
+    /// A mainnet profile's window-state key is not the profile's default
+    /// entry. The policy pin and the mainnet enablement nonce derive from this
+    /// coordinate, so another entry selects another pin and nonce.
+    WindowStateKeyOverride {
+        /// Rendered configured entry.
+        coordinate: Coordinate,
+        /// Rendered default entry for the profile name.
+        expected: Coordinate,
+    },
     /// Two roles within the profile share an entry.
     SelfCollision {
         /// First role in enumeration order.
@@ -111,6 +120,7 @@ impl KeyScopeKind {
         match self {
             Self::OutOfScope { .. } => "out_of_scope",
             Self::OwnerAccountOverride { .. } => "owner_account_override",
+            Self::WindowStateKeyOverride { .. } => "window_state_key_override",
             Self::SelfCollision { .. } => "self_collision",
             Self::SharedWithSibling { .. } => "shared_with_sibling",
             Self::MainnetSignerIdentity { .. } => "mainnet_signer_identity",
@@ -147,6 +157,15 @@ impl KeyScopeFinding {
                 "profile '{name}': policy_owner_key_id names account '{account}'; the owner \
                  key is read from account 'default'. Set the account to 'default' in the \
                  profile file"
+            ),
+            KeyScopeKind::WindowStateKeyOverride {
+                coordinate,
+                expected,
+            } => format!(
+                "profile '{name}': policy_window_state_key_id names keyring entry \
+                 '{coordinate}'; a mainnet profile keeps its policy pin and enablement nonce \
+                 beside its default entry '{expected}'. Set policy_window_state_key_id to that \
+                 entry in the profile file"
             ),
             KeyScopeKind::SelfCollision {
                 field,
@@ -456,6 +475,15 @@ fn scope_findings_in_dir(
             account: render_part(&profile.policy_owner_key_id.account),
         }));
     }
+    // An explicit reference in the file does not exempt this field: the pin
+    // and the enablement nonce of a mainnet profile stay at its default entry.
+    let window_default = KeyringEntryRef::default_policy_window_state_key(name);
+    if profile.chain_id == Caip2::Mainnet && profile.policy_window_state_key_id != window_default {
+        findings.push(finding(KeyScopeKind::WindowStateKeyOverride {
+            coordinate: (&profile.policy_window_state_key_id).into(),
+            expected: (&window_default).into(),
+        }));
+    }
     if let Some(document) = &document {
         for ((field, entry), canonical) in WALLET_KEY_REFERENCE_FIELDS
             .iter()
@@ -668,7 +696,8 @@ pub fn enforce_message_signing_scope_in_dir(
             | KeyScopeKind::SiblingUnreadable { .. }
             | KeyScopeKind::SelectedDocumentUnreadable
             | KeyScopeKind::ProfilesDirUnreadable => true,
-            KeyScopeKind::OwnerAccountOverride { .. } => false,
+            KeyScopeKind::OwnerAccountOverride { .. }
+            | KeyScopeKind::WindowStateKeyOverride { .. } => false,
         };
         if refuses {
             return Err(KeyScopeConflict {
@@ -887,6 +916,79 @@ mod tests {
         let err = enforce_key_scope(&a, "alice").unwrap_err();
         assert_eq!(err.kind, "owner_account_override");
         shared(&f.findings("alice", &a), OWNER_CANONICAL);
+    }
+
+    /// A mainnet window-state key other than the profile's default entry
+    /// refuses even when the profile file names it explicitly, for another
+    /// account under the default service and for another service.
+    #[test]
+    #[serial_test::serial]
+    fn mainnet_window_state_key_override_refuses_an_explicit_reference() {
+        let f = Fixture::new();
+        let default = KeyringEntryRef::default_policy_window_state_key("alice");
+        for moved in [
+            KeyringEntryRef::new(&default.service, "moved"),
+            KeyringEntryRef::new("stellar-agent-policy-window-elsewhere", "default"),
+        ] {
+            let mut a = profile("alice");
+            a.policy_window_state_key_id = moved.clone();
+            f.save("alice", &a);
+            let loaded = load_from_dir("alice", &f.dir, None).unwrap();
+            assert_eq!(loaded.policy_window_state_key_id, moved);
+            let refusal = enforce_key_scope(&loaded, "alice").unwrap_err();
+            assert_eq!(refusal.kind, "window_state_key_override");
+            assert_eq!(
+                ValidationError::from(refusal.clone()).code(),
+                "profile.key_scope_conflict"
+            );
+            assert!(
+                refusal.detail.contains(&format!(
+                    "names keyring entry '{}/{}'",
+                    moved.service, moved.account
+                )),
+                "{refusal}"
+            );
+            assert!(
+                refusal
+                    .detail
+                    .contains("default entry 'stellar-agent-policy-window-alice/default'"),
+                "{refusal}"
+            );
+        }
+        let a = profile("alice");
+        f.save("alice", &a);
+        assert!(enforce_key_scope(&a, "alice").is_ok());
+    }
+
+    /// A testnet profile keeps loading with a window-state key of its own
+    /// choice: the finding applies to mainnet only.
+    #[test]
+    #[serial_test::serial]
+    fn testnet_window_state_key_override_still_loads() {
+        let f = Fixture::new();
+        let signer = KeyringEntryRef::default_signer("alice");
+        let nonce = KeyringEntryRef::default_nonce("alice");
+        let mut a = Profile::builder_testnet_named(
+            "alice",
+            &signer.service,
+            &signer.account,
+            &nonce.service,
+            &nonce.account,
+        )
+        .build();
+        a.policy_window_state_key_id =
+            KeyringEntryRef::new("stellar-agent-policy-window-alice", "moved");
+        f.save("alice", &a);
+        let loaded = load_from_dir("alice", &f.dir, None).unwrap();
+        assert_eq!(loaded.chain_id, Caip2::Testnet);
+        assert!(
+            f.findings("alice", &loaded).is_empty(),
+            "{:?}",
+            f.findings("alice", &loaded)
+        );
+        let (result, output) = capture_enforce(&loaded, "alice");
+        result.unwrap();
+        assert!(!output.contains("policy_window_state_key_id"), "{output}");
     }
 
     #[test]
@@ -1549,6 +1651,30 @@ mod tests {
                 "missing {kind}: {findings:?}"
             );
         }
+        enforce_message_signing_scope_in_dir(&f.dir, &selected, "message").unwrap();
+    }
+
+    /// A moved window-state key concerns the policy pin and the enablement
+    /// nonce, not the signing key: alone it leaves message signing allowed,
+    /// while the profile load refuses the mainnet profile.
+    #[test]
+    #[serial_test::serial]
+    fn message_scope_allows_a_window_state_key_override() {
+        let f = Fixture::new();
+        let mut selected = profile("message");
+        selected.policy_window_state_key_id =
+            KeyringEntryRef::new("stellar-agent-policy-window-message", "moved");
+        f.save("message", &selected);
+        let kinds: Vec<_> = f
+            .findings("message", &selected)
+            .iter()
+            .map(|finding| finding.kind.as_str())
+            .collect();
+        assert_eq!(kinds, ["window_state_key_override"]);
+        assert_eq!(
+            enforce_key_scope(&selected, "message").unwrap_err().kind,
+            "window_state_key_override"
+        );
         enforce_message_signing_scope_in_dir(&f.dir, &selected, "message").unwrap();
     }
 }

@@ -62,6 +62,10 @@ Provider credentials may share with other provider credentials, but cannot share
 with wallet or derived entries. Two fields in one profile cannot name one entry,
 and the owner account must be `default`. Explicit wallet references must be set
 in the file; an out-of-scope overlay is a conflict.
+A mainnet profile's `policy_window_state_key_id` must name its default entry,
+`stellar-agent-policy-window-<name>` with account `default`, even when the file
+sets it explicitly. The policy pin and the mainnet enablement nonce sit beside
+that entry, so another entry would start from an empty pin and nonce.
 
 A copied profile file, including a backup in that directory, counts as a sibling.
 If this profile names a sibling's entry, give this profile its own entry.
@@ -636,6 +640,38 @@ a refresh rewrites them. `counterparty refresh <domain>` rewrites the entry
 for that domain. `counterparty warm-up` refreshes only the `HOME_DOMAIN`
 entries of the policy allowlist.
 
+### Rotate the policy owner
+
+For an enabled mainnet profile, prepare the new policy with both owner seeds.
+Use this order whenever a policy pin exists, including on testnet:
+
+```bash
+stellar-agent profile sign-policy --profile operator --secret-env NEW_OWNER_SEED --previous-owner-secret-env PREVIOUS_OWNER_SEED
+stellar-agent profile enroll-owner-key --profile operator --secret-env NEW_OWNER_SEED --force
+```
+
+Supply each variable through the secret-entry procedure and unset both afterward.
+If signing uses `--file`, install that file at `policies/operator.toml` before
+running enrollment. The previous seed must match the pinned owner, or the
+enrolled owner when no pin exists.
+Enrollment checks the installed policy whenever an enablement nonce or a
+policy pin exists at the profile's window-state entry, or an enablement nonce
+exists at its default entry, whatever chain the profile file names. A pin
+alone at the default entry of a testnet profile that names another entry
+does not block enrollment; the next load there refuses a new owner without a
+statement.
+The `[owner_rotation]` table names `previous_owner` and `new_owner` as G-strkeys
+and carries a hex `sig` from the previous owner.
+It binds the scope, sequence, and every rule; the new owner's signature covers
+that table too. The next verified load advances the pin to the new owner.
+A later load of the same policy succeeds without another rotation.
+
+Enrolling the pinned owner's own key needs no statement, so
+`enroll-owner-key --force` with that seed restores a lost or overwritten owner
+entry. The pinned owner's seed is the only authority for an owner change: if it
+is lost on a profile with a policy pin, on mainnet or testnet, no wallet command
+rotates the owner. Keep that seed until the new owner's policy has loaded.
+
 ### Rotate each key
 
 Each command generates fresh key material from the OS CSPRNG and stores it in the
@@ -785,6 +821,24 @@ schema with `sign_policy.canonicalization_failed`, and a body the engine would
 refuse with `sign_policy.policy_body_invalid`.
 
 ### Mainnet policy body
+
+The first enablement requires a signed v2 policy and pins its sequence, digest,
+and owner before storing the nonce. A v1 or unsigned policy is refused and
+nothing is written. Prepare this policy without `[mainnet]`, sign it, run
+`enable-mainnet`, then complete and sign the bound policy.
+An installation with a stored enablement nonce refuses an absent pin with
+`policy.pin_absent`: every mainnet write and both forms of `enable-mainnet`
+refuse, and no wallet command establishes that pin. Nonce rotation and
+window-state reset preserve an existing pin. To recover, remove the keyring
+entry with service `stellar-agent-policy-window-<name>` and account
+`default-mainnet-enablement` with the platform keyring tool, run
+`profile enable-mainnet --profile <name>`, which pins the installed signed
+policy and stores a new nonce, and sign the rebound policy at a higher
+sequence. That enablement trusts the installed signed policy and its owner,
+as the first enablement of a new installation does.
+A new owner at a higher sequence requires a valid previous-owner statement.
+An absent statement refuses with `policy.owner_rotation_required`; an invalid
+one refuses with `policy.owner_rotation_invalid`.
 
 Engine `v1`, policy-body version 2, and profile-schema version 2 are separate.
 The enabled-policy minimum applies to feature-on mainnet profiles with a

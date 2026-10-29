@@ -497,7 +497,10 @@ impl MainnetFixture {
             .await,
         );
 
-        let mut document = format!("version = 1\nscope = \"profile:{name}\"\n");
+        let mut document = format!(
+            "version = {}\nscope = \"profile:{name}\"\n",
+            if spec.enable { 2 } else { 1 }
+        );
         for rule in &spec.rules {
             document.push('\n');
             document.push_str(rule);
@@ -506,6 +509,7 @@ impl MainnetFixture {
         std::fs::create_dir_all(policy_path.parent().unwrap()).unwrap();
         std::fs::write(&policy_path, document).unwrap();
         let sign = sign_policy::SignPolicyArgs {
+            previous_owner_secret_env: None,
             profile: profile.clone(),
             secret_env: OWNER_VAR.to_owned(),
             file: None,

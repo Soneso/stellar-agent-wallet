@@ -143,6 +143,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `KeyScopeKind` gains `MainnetSignerIdentity`. The enum is exhaustive, so
   downstream exhaustive matches must add the arm.
+- `profile sign-policy --previous-owner-secret-env` builds an owner rotation
+  statement before the new owner signs. The previous seed must match the owner
+  the policy pin names, or the enrolled owner when no pin exists. Install the
+  policy before enrolling the new key.
+- `profile enable-mainnet` refuses a v1 or unsigned policy at first enablement:
+  sign a v2 policy first. The ceremony pins that policy before it stores the
+  nonce. `--rotate` keeps a present pin. An installation that holds a nonce
+  but no pin is refused with `policy.pin_absent`, with and without `--rotate`,
+  and nothing is written.
+- `profile enroll-owner-key` writes the owner the policy pin names without a
+  rotation statement, so a lost owner entry of an enabled mainnet profile can
+  be restored. Any other key needs the installed rotation policy whenever an
+  enablement nonce or a policy pin exists at the profile's window-state entry,
+  or an enablement nonce exists at its default entry, whatever chain the
+  profile file names.
+- A mainnet profile whose `policy_window_state_key_id` names an entry other
+  than `stellar-agent-policy-window-<profile>` / `default` is refused with
+  `profile.key_scope_conflict`, also when the profile file names that entry.
 - The opt-in stale-if-error fallback returns expired entries only on transient
   fetch failures and only within one TTL past expiry, and never an entry whose
   fetch time lies more than five minutes in the future. It never writes them back.
@@ -581,6 +599,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sep7.invalid_param_value`. Verification independently refuses trailing
   parameters, so the verified payload covers every URI parameter the preview
   shows.
+- The owner of an enabled mainnet profile changes only with a statement
+  signed by the previous owner. A verified load refuses a new owner without
+  that statement, an installation with an enablement nonce refuses an absent
+  policy pin, and owner enrollment checks the installed rotation policy before
+  it replaces the public key, also when the profile file names testnet or
+  another window-state entry. No wallet command establishes the pin of an
+  installation with a nonce. The pin and the nonce stay at the profile's
+  default window-state entry, which a mainnet profile cannot move.
 - An expired binding does not satisfy the `HOME_DOMAIN` kind of a
   `counterparty_allowlist` criterion or `home_domain_resolved`:
   `counterparty list` and the policy snapshot skip cache entries past their TTL.

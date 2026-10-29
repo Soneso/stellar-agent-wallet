@@ -99,7 +99,8 @@ unset WALLET_SK
 ```
 
 `profile.key_scope_conflict` reports shared, self-colliding or out-of-scope
-keyring entries, a non-default owner account, or an unreadable comparison input.
+keyring entries, a non-default owner account, a mainnet window-state entry other
+than the profile's default, or an unreadable comparison input.
 It refuses mainnet reconciliation and warns on testnet. An unreadable sibling
 only warns. See [profile key scoping](../profiles.md#file-location-and-selection)
 for the two recovery paths. `profile show` remains available for diagnosis.

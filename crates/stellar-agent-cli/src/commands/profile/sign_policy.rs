@@ -41,6 +41,16 @@
 //! produce a file the engine rejects, so signing refuses on a mismatch and
 //! points the operator at `enroll-owner-key`.
 //!
+//! # Owner rotation
+//!
+//! With `--previous-owner-secret-env`, the seed in `--secret-env` is the new
+//! owner's. The previous seed must derive to the owner the installation's
+//! policy pin names, or to the enrolled owner when no pin exists, because a
+//! verified load checks the statement against the pin. That seed signs the
+//! `[owner_rotation]` statement for the new owner, and the new seed then
+//! signs the policy including the table. Both seeds go through the same
+//! mlock-protected ceremony.
+//!
 //! # Secret handling
 //!
 //! The owner seed is held only in `Zeroizing` wrappers and the
@@ -110,6 +120,12 @@ pub(crate) struct SignPolicyArgs {
     #[arg(long, value_name = "VAR")]
     pub(crate) secret_env: String,
 
+    /// Name of the environment variable that holds the previous owner's
+    /// `S...` strkey. Signs an `[owner_rotation]` statement that hands the
+    /// policy to the owner in `--secret-env`.
+    #[arg(long, value_name = "VAR")]
+    pub(crate) previous_owner_secret_env: Option<String>,
+
     /// Path to the policy file to sign.
     ///
     /// Defaults to the engine's expected location
@@ -127,7 +143,7 @@ struct SignPolicyData {
     profile: String,
     /// Always `true` on success.
     signed: bool,
-    /// The G-strkey of the owner key that signed (equals the enrolled owner).
+    /// The G-strkey of the owner key that signs the policy.
     owner_address: String,
     /// Absolute path of the signed policy file.
     policy_path: String,
@@ -274,9 +290,6 @@ where
         }
     };
     let raw = prepared.raw;
-    let canon = prepared.canonical;
-    let d = digest(&canon);
-    let digest_hex = to_hex(&d);
 
     // ── Sign the digest inside an mlock-protected window ──────────────────────
     // The policy signature is a raw ed25519 signature over the BLAKE3 digest — a
@@ -285,16 +298,29 @@ where
     // `Wallet::unlock` (matching `enroll-owner-key`'s mlock ceremony posture:
     // `Wallet::unlock` emits the same `tracing::warn!` on degradation) and the
     // dalek key is built from the pinned bytes only for this one signature.
-    let (derived_pubkey, sig) = match sign_digest_with_owner_seed(
+    let (raw, derived_pubkey, sig, d) = match sign_policy_with_owner_seeds(
         &args.secret_env,
         profile.wallet.mlock_required,
         profile.wallet.unlock_ttl_seconds,
         &enrolled_pubkey,
-        &d,
+        &raw,
+        args.previous_owner_secret_env
+            .as_deref()
+            .map(|var_name| PreviousOwner {
+                var_name,
+                expected: prepared.pinned_owner.unwrap_or(enrolled_pubkey),
+            }),
     )
     .await
     {
         Ok(pair) => pair,
+        Err(OwnerSignError::Policy(error)) => {
+            render::render_json(&Envelope::<()>::err_raw(
+                error.wire_code(),
+                error.to_string(),
+            ));
+            return 1;
+        }
         Err(OwnerSignError::Env(msg)) => {
             render::render_json(&Envelope::<()>::err_raw(
                 "sign_policy.invalid_owner_seed",
@@ -328,11 +354,37 @@ where
             ));
             return 1;
         }
+        Err(OwnerSignError::PreviousMismatch { derived, expected }) => {
+            let derived_address = stellar_strkey::ed25519::PublicKey(derived)
+                .to_string()
+                .to_string();
+            let expected_address = stellar_strkey::ed25519::PublicKey(expected)
+                .to_string()
+                .to_string();
+            let source = if prepared.pinned_owner.is_some() {
+                "the owner the installation's policy pin names"
+            } else {
+                "the enrolled owner, as no policy pin exists"
+            };
+            render::render_json(&Envelope::<()>::err_raw(
+                "sign_policy.owner_key_mismatch",
+                format!(
+                    "the seed in '{}' derives to owner key {derived_address}, but the previous \
+                     owner of this rotation is {expected_address}, {source}. Supply that \
+                     owner's seed. No file was written.",
+                    args.previous_owner_secret_env
+                        .as_deref()
+                        .unwrap_or_default()
+                ),
+            ));
+            return 1;
+        }
     };
     let owner_address = stellar_strkey::ed25519::PublicKey(derived_pubkey)
         .to_string()
         .to_string();
     let sig_hex = to_hex(&sig);
+    let digest_hex = to_hex(&d);
 
     // ── Render + atomically write the `[signature]` table ─────────────────────
     let (rendered, replaced, previous_owner_id) =
@@ -378,7 +430,8 @@ where
 /// sequence and canonical bytes.
 struct PreparedPolicy {
     raw: String,
-    canonical: Vec<u8>,
+    /// The owner the installation's pin names, when a pin exists.
+    pinned_owner: Option<[u8; 32]>,
     sequence: Option<i64>,
     previous_sequence: Option<i64>,
     warnings: Vec<String>,
@@ -466,7 +519,7 @@ fn prepare_policy(
 
     let pin = match read_pin_without_creating(window_path, profile) {
         Ok(PinState::Absent) => None,
-        Ok(PinState::Present(pin)) => Some(pin.sequence()),
+        Ok(PinState::Present(pin)) => Some(pin),
         Err(e) => {
             return Err((
                 e.wire_code(),
@@ -477,9 +530,13 @@ fn prepare_policy(
             ));
         }
     };
+    let pinned_owner = pin
+        .as_ref()
+        .map(stellar_agent_core::policy::pin::Pin::owner);
+    let pin = pin.map(|pin| pin.sequence());
     let mut result = PreparedPolicy {
         raw: raw.to_owned(),
-        canonical: Vec::new(),
+        pinned_owner,
         sequence: None,
         previous_sequence: None,
         warnings: Vec::new(),
@@ -518,7 +575,7 @@ fn prepare_policy(
                 .push("The next load refuses this v1 body with policy.sequence_rollback.".into());
         }
     }
-    result.canonical = canonical_bytes(&result.raw).map_err(not_canonical)?;
+    canonical_bytes(&result.raw).map_err(not_canonical)?;
     validate_unsigned_policy(&result.raw, name).map_err(|e| body_invalid(&e))?;
     if mainnet_minimum::required(&body, profile) {
         mainnet_minimum::validate(&body, profile, name).map_err(|e| {
@@ -625,8 +682,10 @@ fn read_owner_pubkey(coord: &KeyringEntryRef) -> Result<[u8; 32], String> {
     })
 }
 
-/// Failure modes of [`sign_digest_with_owner_seed`].
+/// Failure modes of the owner signing ceremony.
 enum OwnerSignError {
+    /// The policy cannot be canonicalized.
+    Policy(stellar_agent_core::policy::PolicyError),
     /// The env var is unset or does not hold a valid `S...` strkey.
     Env(String),
     /// `Wallet::unlock` (mlock pinning) or seed access failed.
@@ -635,6 +694,14 @@ enum OwnerSignError {
     Mismatch {
         /// The public key the supplied seed derives to.
         derived: [u8; 32],
+    },
+    /// The previous seed derives to `derived`, which is not the previous
+    /// owner the statement must name.
+    PreviousMismatch {
+        /// The public key the previous seed derives to.
+        derived: [u8; 32],
+        /// The pin's owner, or the enrolled owner when no pin exists.
+        expected: [u8; 32],
     },
 }
 
@@ -654,22 +721,14 @@ fn seed_from_env(var_name: &str) -> Result<Zeroizing<[u8; 32]>, String> {
     Ok(seed)
 }
 
-/// Signs `digest_bytes` with the owner seed from `var_name` inside an
-/// mlock-protected window, refusing when the seed does not derive to
-/// `enrolled_pubkey`.
-///
-/// The seed is pinned in RAM via `Wallet::unlock` for the derive-and-sign
-/// window, matching `enroll-owner-key`'s posture: the same `mlock_required` /
-/// `unlock_ttl_seconds` profile controls apply, and `Wallet::unlock` emits the
-/// `wallet.mlock_failed` `tracing::warn!` on degradation. The wallet is
-/// disposed (munlock + zeroize) before returning on every path.
-async fn sign_digest_with_owner_seed(
+/// Runs an operation while the seed is held by the wallet's mlock ceremony.
+/// The wallet is disposed on every path; the dalek key zeroizes on drop.
+async fn with_owner_seed<T>(
     var_name: &str,
     mlock_required: MlockRequired,
     ttl_seconds: u32,
-    enrolled_pubkey: &[u8; 32],
-    digest_bytes: &[u8; 32],
-) -> Result<([u8; 32], [u8; 64]), OwnerSignError> {
+    operation: impl AsyncFnOnce(&ed25519_dalek::SigningKey) -> Result<T, OwnerSignError>,
+) -> Result<T, OwnerSignError> {
     let seed = seed_from_env(var_name).map_err(OwnerSignError::Env)?;
     let mut wallet = Wallet::unlock(
         "profile-sign-policy".to_owned(),
@@ -679,30 +738,88 @@ async fn sign_digest_with_owner_seed(
     )
     .await
     .map_err(|e| OwnerSignError::Unlock(e.to_string()))?;
-
-    let outcome = derive_and_sign(&wallet, enrolled_pubkey, digest_bytes);
+    let key = wallet
+        .seed()
+        .map(ed25519_dalek::SigningKey::from_bytes)
+        .map_err(|e| OwnerSignError::Unlock(e.to_string()));
+    let result = match key {
+        Ok(key) => operation(&key).await,
+        Err(error) => Err(error),
+    };
     wallet.dispose();
-    outcome
+    result
 }
 
-/// Builds the dalek key from the pinned seed, cross-checks the derived public
-/// key against `enrolled_pubkey`, and signs `digest_bytes`.
+/// The previous owner a rotation statement must name.
+#[derive(Clone, Copy)]
+struct PreviousOwner<'a> {
+    /// Environment variable holding the previous owner's seed.
+    var_name: &'a str,
+    /// The pin's owner, or the enrolled owner when no pin exists.
+    expected: [u8; 32],
+}
+
+/// Signs a policy with the seed in `var_name`.
 ///
-/// The dalek `SigningKey` lives only for this call and zeroizes on drop.
-fn derive_and_sign(
-    wallet: &Wallet,
+/// Without `previous`, that seed must derive to `enrolled_pubkey`. With it,
+/// the previous seed must derive to `previous.expected`; it signs the
+/// `[owner_rotation]` statement for the new owner first, and the new seed
+/// then signs the policy including that table. Both seeds run through
+/// [`with_owner_seed`].
+async fn sign_policy_with_owner_seeds(
+    var_name: &str,
+    mlock_required: MlockRequired,
+    ttl_seconds: u32,
     enrolled_pubkey: &[u8; 32],
-    digest_bytes: &[u8; 32],
-) -> Result<([u8; 32], [u8; 64]), OwnerSignError> {
-    let seed_ref = wallet
-        .seed()
-        .map_err(|e| OwnerSignError::Unlock(e.to_string()))?;
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(seed_ref);
-    let derived = signing_key.verifying_key().to_bytes();
-    if &derived != enrolled_pubkey {
-        return Err(OwnerSignError::Mismatch { derived });
-    }
-    Ok((derived, sign(digest_bytes, &signing_key)))
+    raw: &str,
+    previous: Option<PreviousOwner<'_>>,
+) -> Result<(String, [u8; 32], [u8; 64], [u8; 32]), OwnerSignError> {
+    with_owner_seed(var_name, mlock_required, ttl_seconds, async |key| {
+        let derived = key.verifying_key().to_bytes();
+        let mut raw = raw.to_owned();
+        match previous {
+            Some(previous) => {
+                let table = with_owner_seed(
+                    previous.var_name,
+                    mlock_required,
+                    ttl_seconds,
+                    async |previous_key| {
+                        let previous_owner = previous_key.verifying_key().to_bytes();
+                        if previous_owner != previous.expected {
+                            return Err(OwnerSignError::PreviousMismatch {
+                                derived: previous_owner,
+                                expected: previous.expected,
+                            });
+                        }
+                        stellar_agent_core::policy::v1::signature::build_owner_rotation(
+                            &raw,
+                            previous_key,
+                            &derived,
+                        )
+                        .map_err(OwnerSignError::Policy)
+                    },
+                )
+                .await?;
+                let mut doc = raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
+                    OwnerSignError::Policy(
+                        stellar_agent_core::policy::PolicyError::PolicyFileParseFailed {
+                            detail: e.to_string(),
+                        },
+                    )
+                })?;
+                doc["owner_rotation"] = toml_edit::Item::Table(table);
+                raw = doc.to_string();
+            }
+            None if derived != *enrolled_pubkey => {
+                return Err(OwnerSignError::Mismatch { derived });
+            }
+            None => {}
+        }
+        let canonical = canonical_bytes(&raw).map_err(OwnerSignError::Policy)?;
+        let digest = digest(&canonical);
+        Ok((raw, derived, sign(&digest, key), digest))
+    })
+    .await
 }
 
 /// Atomically writes `contents` to `path`: writes a temp file in the same
@@ -861,6 +978,7 @@ mod tests {
         SignPolicyArgs {
             profile: Some(PROFILE_NAME.to_owned()),
             secret_env: var.to_owned(),
+            previous_owner_secret_env: None,
             file: Some(file.to_path_buf()),
         }
     }
@@ -1238,6 +1356,7 @@ mod tests {
         let args = SignPolicyArgs {
             profile: Some("__nonexistent_sign_policy__".to_owned()),
             secret_env: "__UNSET_SIGN_POLICY_VAR__".to_owned(),
+            previous_owner_secret_env: None,
             file: None,
         };
         let code = run(&args).await;
@@ -1567,5 +1686,180 @@ mod tests {
             message.starts_with(&framing) && message.ends_with("). No file was written."),
             "{message}"
         );
+    }
+    #[tokio::test]
+    #[serial]
+    async fn previous_owner_seed_signs_a_loadable_rotation_without_secret_output() {
+        use stellar_agent_core::policy::{
+            pin::{self, Pin, PinScope},
+            state_lock::WindowStoreLock,
+            v1::{
+                PolicyStateStore,
+                verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+            },
+        };
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let (previous_secret, previous_public, _) = seed_material([41; 32]);
+        let (new_secret, new_public, _) = seed_material([42; 32]);
+        enroll_owner_pubkey(PROFILE_NAME, &previous_public);
+        let previous_var = unique_var("PREVIOUS");
+        let new_var = unique_var("NEW");
+        let _previous = EnvGuard::set(previous_var.clone(), &previous_secret);
+        let _new = EnvGuard::set(new_var.clone(), &new_secret);
+        let profile = profile_for(PROFILE_NAME);
+        let window =
+            stellar_agent_core::profile::schema::default_policy_window_state_path_for(PROFILE_NAME);
+        std::fs::create_dir_all(window.parent().unwrap()).unwrap();
+        let lock =
+            WindowStoreLock::acquire_for(&window, &profile.policy_window_state_key_id).unwrap();
+        pin::write(
+            &lock,
+            &PinScope::for_profile(&window, &profile),
+            &Pin::new(1, [0; 32], previous_public).unwrap(),
+        )
+        .unwrap();
+        drop(lock);
+        let path = dir.path().join("policy.toml");
+        let body = policy_body(PROFILE_NAME).replace("version = 1", "version = 2\nsequence = 1");
+        std::fs::write(&path, &body).unwrap();
+        let mut arguments = args(&path, &new_var);
+        arguments.previous_owner_secret_env = Some(previous_var);
+        render::take_rendered_for_test();
+        assert_eq!(
+            run_with_dependencies(&arguments, |_| Ok(profile.clone()), || Ok(())).await,
+            0
+        );
+        let output = render::take_rendered_for_test();
+        let text = serde_json::to_string(&output).unwrap();
+        assert!(!text.contains(&previous_secret));
+        assert!(!text.contains(&new_secret));
+        let signed = std::fs::read_to_string(&path).unwrap();
+        assert!(!signed.contains(&previous_secret));
+        assert!(!signed.contains(&new_secret));
+        assert!(signed.contains("[owner_rotation]"));
+        let verified = load_verified_policy(
+            &PolicyLoad {
+                path: &path,
+                profile: &profile,
+                profile_name: PROFILE_NAME,
+                owner_pubkey: &new_public,
+                owner_source: OwnerKeySource::Keyring,
+                window_path: &window,
+            },
+            PolicyStateStore::new(),
+            PinMode::Advance,
+        )
+        .unwrap();
+        assert_eq!(verified.sequence(), 2);
+        assert_eq!(verified.owner(), new_public);
+        let coord = KeyringEntryRef::default_owner_key(PROFILE_NAME);
+        assert_eq!(read_owner_pubkey(&coord).unwrap(), previous_public);
+
+        // A previous seed that is not the pinned owner's leaves the file intact.
+        let (other_secret, _, _) = seed_material([40; 32]);
+        let other_var = unique_var("OTHER");
+        let _other = EnvGuard::set(other_var.clone(), &other_secret);
+        arguments.previous_owner_secret_env = Some(other_var);
+        render::take_rendered_for_test();
+        assert_eq!(
+            run_with_dependencies(&arguments, |_| Ok(profile.clone()), || Ok(())).await,
+            1
+        );
+        let output = render::take_rendered_for_test();
+        assert_eq!(output[0]["error"]["code"], "sign_policy.owner_key_mismatch");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), signed);
+        let text = serde_json::to_string(&output).unwrap();
+        assert!(!text.contains(&previous_secret));
+        assert!(!text.contains(&new_secret));
+        assert!(!text.contains(&other_secret));
+    }
+
+    /// The statement must name the pin's owner, so the previous seed is
+    /// checked against the pin when one exists, also after the enrolled
+    /// owner entry was replaced.
+    #[tokio::test]
+    #[serial]
+    async fn previous_owner_seed_must_match_the_pinned_owner() {
+        use stellar_agent_core::policy::{
+            pin::{self, Pin, PinScope},
+            state_lock::WindowStoreLock,
+            v1::{
+                PolicyStateStore,
+                verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+            },
+        };
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let (pinned_secret, pinned_public, _) = seed_material([43; 32]);
+        let (enrolled_secret, enrolled_public, _) = seed_material([44; 32]);
+        let (new_secret, new_public, _) = seed_material([45; 32]);
+        enroll_owner_pubkey(PROFILE_NAME, &enrolled_public);
+        let pinned_var = unique_var("PINNED");
+        let enrolled_var = unique_var("ENROLLED");
+        let new_var = unique_var("NEW_OWNER");
+        let _pinned = EnvGuard::set(pinned_var.clone(), &pinned_secret);
+        let _enrolled = EnvGuard::set(enrolled_var.clone(), &enrolled_secret);
+        let _new = EnvGuard::set(new_var.clone(), &new_secret);
+        let profile = profile_for(PROFILE_NAME);
+        let window =
+            stellar_agent_core::profile::schema::default_policy_window_state_path_for(PROFILE_NAME);
+        std::fs::create_dir_all(window.parent().unwrap()).unwrap();
+        let lock =
+            WindowStoreLock::acquire_for(&window, &profile.policy_window_state_key_id).unwrap();
+        pin::write(
+            &lock,
+            &PinScope::for_profile(&window, &profile),
+            &Pin::new(1, [0; 32], pinned_public).unwrap(),
+        )
+        .unwrap();
+        drop(lock);
+        let path = dir.path().join("policy.toml");
+        let body = policy_body(PROFILE_NAME).replace("version = 1", "version = 2\nsequence = 1");
+        std::fs::write(&path, &body).unwrap();
+        let mut arguments = args(&path, &new_var);
+        arguments.previous_owner_secret_env = Some(enrolled_var);
+        render::take_rendered_for_test();
+        assert_eq!(
+            run_with_dependencies(&arguments, |_| Ok(profile.clone()), || Ok(())).await,
+            1
+        );
+        let output = render::take_rendered_for_test();
+        assert_eq!(output[0]["error"]["code"], "sign_policy.owner_key_mismatch");
+        let message = output[0]["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(
+                &stellar_strkey::ed25519::PublicKey(pinned_public)
+                    .to_string()
+                    .to_string()
+            ),
+            "{message}"
+        );
+        assert!(message.contains("policy pin"), "{message}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+
+        arguments.previous_owner_secret_env = Some(pinned_var);
+        render::take_rendered_for_test();
+        assert_eq!(
+            run_with_dependencies(&arguments, |_| Ok(profile.clone()), || Ok(())).await,
+            0
+        );
+        let verified = load_verified_policy(
+            &PolicyLoad {
+                path: &path,
+                profile: &profile,
+                profile_name: PROFILE_NAME,
+                owner_pubkey: &new_public,
+                owner_source: OwnerKeySource::Keyring,
+                window_path: &window,
+            },
+            PolicyStateStore::new(),
+            PinMode::Advance,
+        )
+        .unwrap();
+        assert_eq!(verified.owner(), new_public);
+        assert_eq!(verified.sequence(), 2);
     }
 }

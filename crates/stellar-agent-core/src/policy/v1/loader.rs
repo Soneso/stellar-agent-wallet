@@ -483,7 +483,13 @@ pub(crate) fn read_policy_file(path: &Path) -> Result<String, PolicyError> {
     })
 }
 
-pub(crate) fn load_signed_policy_text(
+/// Verifies and parses one in-memory policy using the file loader's checks.
+///
+/// Callers can apply further authorization checks to these same bytes.
+///
+/// # Errors
+/// Returns the signature, scope, and schema errors of [`load_signed_policy`].
+pub fn load_signed_policy_text(
     raw: &str,
     profile_name: &str,
     owner_pubkey: &[u8; 32],
@@ -602,7 +608,8 @@ struct PolicyBody {
 }
 
 /// Parses `version`, `scope` (refusing a scope that names a profile other
-/// than `profile_name`), and the rules of `doc`.
+/// than `profile_name`), a present `[owner_rotation]` table, and the rules of
+/// `doc`.
 ///
 /// The one body parser of the signed and the unsigned path, so both refuse
 /// the same bodies.
@@ -611,6 +618,7 @@ fn parse_policy_body(doc: &DocumentMut, profile_name: &str) -> Result<PolicyBody
     if version == 2 {
         super::verified::sequence(doc)?;
     }
+    super::signature::parse_owner_rotation(doc)?;
     let scope = extract_scope(doc)?;
     reject_scope_profile_mismatch(&scope, profile_name)?;
     let rules = extract_rules(doc)?;
@@ -3310,7 +3318,7 @@ decision = "deny"
         assert_parse_failure(
             load_signed_body_after(&body, |signed| signed),
             "unknown key `default_decision`; the policy file accepts version, scope, rules, \
-             signature",
+             signature, owner_rotation",
         );
     }
 

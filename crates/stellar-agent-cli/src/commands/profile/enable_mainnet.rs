@@ -1,12 +1,21 @@
 //! Audited installation binding for a named mainnet profile.
 //!
+//! Before it stores a nonce, the ceremony keeps a present policy pin and
+//! otherwise pins the installed policy, which must be a signed v2 policy.
+//! An installation that already holds a nonce but no pin is refused with
+//! `policy.pin_absent`, with and without `--rotate`, before anything is
+//! written: no wallet command establishes the pin of an enabled installation.
+//!
 //! Refusals use `profile.enable_mainnet_profile_flag_required`,
 //! `profile.enable_mainnet_default_refused`, `profile.enable_mainnet_not_mainnet`,
-//! `profile.enable_mainnet_precondition`, and `profile.enable_mainnet_nonce_exists`,
-//! and strict audit errors retain their own codes. A process on a headless
-//! keyring backend is refused with `network.mainnet_keyring_backend_unsupported`
-//! in both modes, before any keyring entry is read. `--check` reports every
-//! check as `passed`, `failed`, or `not_evaluated` and writes nothing.
+//! `profile.enable_mainnet_precondition`, `profile.enable_mainnet_nonce_exists`,
+//! and `policy.pin_absent`. The pin step returns the `policy.*` code of its
+//! verified load, such as `policy.owner_signature_invalid`,
+//! `policy.sequence_rollback`, or `policy.state_lock_busy`, and strict audit
+//! errors retain their own codes. A process on a headless keyring backend is
+//! refused with `network.mainnet_keyring_backend_unsupported` in both modes,
+//! before any keyring entry is read. `--check` reports every check as
+//! `passed`, `failed`, or `not_evaluated` and writes nothing.
 
 use super::sign_policy::atomic_write_string;
 use crate::{
@@ -24,7 +33,9 @@ use stellar_agent_core::{
         schema::{EventKind, PolicyDecision},
     },
     envelope::Envelope,
-    mainnet::enablement::{normalize_endpoint_host, read_enablement_nonce, verify_enablement},
+    mainnet::enablement::{
+        has_enablement_nonce, normalize_endpoint_host, read_enablement_nonce, verify_enablement,
+    },
     policy::{
         PolicyError,
         pin::PinState,
@@ -189,7 +200,7 @@ fn exit_code(result: &Result<serde_json::Value, Failure>) -> i32 {
     reason = "the command binds disk paths, an injectable strict audit emitter, and an \
               injectable policy writer"
 )]
-fn execute(
+pub(super) fn execute(
     args: &EnableMainnetArgs,
     name: &str,
     profile: &Profile,
@@ -333,14 +344,10 @@ fn execute(
     let coordinate = mainnet_enablement_entry_ref(&profile.policy_window_state_key_id);
     let entry = keyring_core::Entry::new(&coordinate.service, &coordinate.account)
         .map_err(|_| precondition("nonce"))?;
-    let exists = match entry.get_password() {
-        Ok(nonce) => {
-            let _nonce = zeroize::Zeroizing::new(nonce);
-            true
-        }
-        Err(keyring_core::Error::NoEntry) => false,
-        Err(_) => return Err(precondition("nonce unreadable")),
-    };
+    let exists = has_enablement_nonce(profile).map_err(|_| precondition("nonce unreadable"))?;
+    if exists {
+        refuse_absent_pin(name, profile, window_path, &coordinate)?;
+    }
     if exists && !args.rotate {
         return Err((
             "profile.enable_mainnet_nonce_exists",
@@ -358,6 +365,7 @@ fn execute(
     let nonce = zeroize::Zeroizing::new(stellar_agent_core::hex::encode(random.as_ref()));
     let digest = stellar_agent_core::hex::encode(&sha2::Sha256::digest(nonce.as_bytes()));
     let rewritten = rewrite_policy(&body, name, &host, &digest, args.rotate)?;
+    ensure_policy_pin(name, profile, policy_path, window_path)?;
     let mut audit = AuditEntry::new_tool_invocation(NewToolInvocation::new(
         "mainnet_enablement_minted",
         "stellar:mainnet",
@@ -401,6 +409,96 @@ fn execute(
     }))
 }
 
+/// Refuses an installation that holds an enablement nonce at `nonce` but no
+/// readable pin, before anything is written. The pin is read without
+/// creating the lock file or its directory. When the lock file is missing
+/// but the pin entry exists, the refusal names the lock file, which a
+/// command that builds the V1 policy engine recreates; only a missing pin
+/// entry prescribes removing the nonce.
+///
+/// # Errors
+/// `policy.pin_absent` naming the missing lock file or the nonce entry to
+/// remove, or the code of the lock or pin read failure.
+fn refuse_absent_pin(
+    name: &str,
+    profile: &Profile,
+    window_path: &Path,
+    nonce: &KeyringEntryRef,
+) -> Result<(), Failure> {
+    use stellar_agent_core::policy::{pin, v1::verified::read_pin_without_creating};
+    let state = read_pin_without_creating(window_path, profile)
+        .map_err(|e| (e.wire_code(), e.to_string()))?;
+    if let PinState::Present(_) = state {
+        return Ok(());
+    }
+    let pin_entry = pin::entry_present(&profile.policy_window_state_key_id).map_err(|e| {
+        let e = PolicyError::from(e);
+        (e.wire_code(), e.to_string())
+    })?;
+    if pin_entry {
+        return Err((
+            PolicyError::PinAbsent.wire_code(),
+            format!(
+                "the policy-state lock file of profile '{name}' is missing, so its policy pin \
+                 cannot be read; a command that builds the V1 policy engine recreates the lock \
+                 file, and this command can run after it; nothing was written"
+            ),
+        ));
+    }
+    Err((
+        PolicyError::PinAbsent.wire_code(),
+        format!(
+            "the installation holds a mainnet enablement nonce but no policy pin, and no wallet \
+             command establishes the pin of an enabled installation; remove the keyring entry \
+             with service '{}' and account '{}' with the platform keyring tool, rerun \
+             `stellar-agent profile enable-mainnet --profile {name}`, and sign the rebound \
+             policy; nothing was written",
+            nonce.service, nonce.account
+        ),
+    ))
+}
+
+/// Preserves an existing pin, or establishes one from the installed signed
+/// v2 policy before a nonce is written. The caller has refused an
+/// installation that holds a nonce but no pin, and the verified load refuses
+/// that state again under the lock.
+fn ensure_policy_pin(
+    name: &str,
+    profile: &Profile,
+    policy_path: &Path,
+    window_path: &Path,
+) -> Result<(), Failure> {
+    use stellar_agent_core::policy::v1::verified::{
+        PinMode, load_verified_policy, read_pin_without_creating,
+    };
+    let error = |e: PolicyError| (e.wire_code(), e.to_string());
+    if let PinState::Present(_) = read_pin_without_creating(window_path, profile).map_err(error)? {
+        return Ok(());
+    }
+    if let Some(parent) = window_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| precondition(format!("policy state directory: {e}")))?;
+    }
+    let owner = read_owner_key(&KeyringEntryRef::default_owner_key(name)).map_err(precondition)?;
+    let verified = load_verified_policy(
+        &PolicyLoad {
+            path: policy_path,
+            profile,
+            profile_name: name,
+            owner_pubkey: &owner,
+            owner_source: OwnerKeySource::Keyring,
+            window_path,
+        },
+        PolicyStateStore::new(),
+        PinMode::Advance,
+    )
+    .map_err(error)?;
+    if verified.sequence() == 0 {
+        return Err(precondition("sign a v2 policy before enabling mainnet"));
+    }
+    Ok(())
+}
+
 /// The checks a compare-only inspection yields: the verified policy, the pin
 /// it compared against, the installation binding, and every minimum
 /// requirement on the verified document, in [`mainnet_minimum::REQUIREMENTS`]
@@ -441,6 +539,9 @@ fn inspection_checks(
                     error @ (PolicyError::StateLockBusy
                     | PolicyError::StateLockIo { .. }
                     | PolicyError::PinUnusable { .. }
+                    | PolicyError::PinAbsent
+                    | PolicyError::OwnerRotationRequired
+                    | PolicyError::OwnerRotationInvalid
                     | PolicyError::SequenceRollback
                     | PolicyError::SequenceFork),
                 ),
@@ -610,11 +711,10 @@ mod tests {
             );
             let mut body = FULL.parse::<toml_edit::DocumentMut>().unwrap();
             body.remove("mainnet");
-            body.remove("sequence");
-            body["version"] = toml_edit::value(1);
+            body["sequence"] = toml_edit::value(1);
             std::fs::write(dir.path().join("policy.toml"), body.to_string()).unwrap();
             let window = dir.path().join("state.window");
-            Self {
+            let fixture = Self {
                 dir,
                 profile,
                 args: EnableMainnetArgs {
@@ -624,7 +724,9 @@ mod tests {
                 },
                 owner,
                 window,
-            }
+            };
+            fixture.sign(&body.to_string());
+            fixture
         }
         fn path(&self) -> std::path::PathBuf {
             self.dir.path().join("policy.toml")
@@ -667,8 +769,11 @@ mod tests {
             )
         }
         fn sign(&self, raw: &str) {
+            let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+            doc.remove("signature");
+            let raw = doc.to_string();
             let canonical =
-                stellar_agent_core::policy::v1::canonical::canonical_bytes(raw).unwrap();
+                stellar_agent_core::policy::v1::canonical::canonical_bytes(&raw).unwrap();
             let digest = stellar_agent_core::policy::v1::signature::digest(&canonical);
             let signature = stellar_agent_core::policy::v1::signature::sign(&digest, &self.owner);
             std::fs::write(
@@ -789,13 +894,42 @@ mod tests {
 
     #[test]
     #[serial]
-    fn ceremony_rewrites_v1_and_can_be_signed_and_loaded() {
+    fn ceremony_pins_the_verified_policy_before_enablement() {
         let fixture = Fixture::new();
-        let output = fixture.run().unwrap();
+        let initial = load_verified_policy(
+            &PolicyLoad {
+                path: &fixture.path(),
+                profile: &fixture.profile,
+                profile_name: "operator",
+                owner_pubkey: &fixture.owner.verifying_key().to_bytes(),
+                owner_source: OwnerKeySource::Keyring,
+                window_path: &fixture.window,
+            },
+            PolicyStateStore::new(),
+            PinMode::CompareOnly,
+        )
+        .unwrap();
+        let output = fixture
+            .run_with(
+                |entry| {
+                    assert_eq!(
+                        fixture.pin(),
+                        PinState::Present(
+                            Pin::new(initial.sequence(), initial.digest(), initial.owner())
+                                .unwrap()
+                        )
+                    );
+                    assert!(get(&fixture.nonce_ref()).is_none());
+                    fixture.append_audit(&entry);
+                    Ok(())
+                },
+                atomic_write_string,
+            )
+            .unwrap();
         let raw = std::fs::read_to_string(fixture.path()).unwrap();
         let doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
         assert_eq!(doc["version"].as_integer(), Some(2));
-        assert!(doc.get("sequence").is_none());
+        assert_eq!(doc["sequence"].as_integer(), Some(1));
         assert_eq!(doc["mainnet"]["profile"].as_str(), Some("operator"));
         assert_eq!(output["policy_needs_signature"], true);
         assert_eq!(output["rotated"], false);
@@ -818,7 +952,7 @@ mod tests {
             next.contains("build with mainnet-write enabled"),
             !cfg!(feature = "mainnet-write")
         );
-        fixture.sign_rewritten_and_verify(1);
+        fixture.sign_rewritten_and_verify(2);
     }
     #[test]
     #[serial]
@@ -830,6 +964,14 @@ mod tests {
         for present in [false, true] {
             if present {
                 fixture.put_pin(1);
+            } else {
+                let coord = stellar_agent_core::profile::schema::policy_pin_entry_ref(
+                    &fixture.profile.policy_window_state_key_id,
+                );
+                keyring_core::Entry::new(&coord.service, &coord.account)
+                    .unwrap()
+                    .delete_credential()
+                    .unwrap();
             }
             let file = std::fs::read(fixture.path()).unwrap();
             let nonce = get(&fixture.nonce_ref());
@@ -837,15 +979,18 @@ mod tests {
             let audit = std::fs::read(fixture.dir.path().join("audit.jsonl")).unwrap();
             let listing = fixture.listing();
             let output = fixture.run().unwrap();
-            assert_eq!(output["valid"], true, "{output}");
+            assert_eq!(output["valid"], present, "{output}");
             let expected_pin = if present {
                 "sequence 1"
             } else {
-                "absent (first use)"
+                "policy.pin_absent"
             };
             assert_eq!(
                 check_of(&output, "pin"),
-                ("passed".to_owned(), Some(expected_pin.to_owned()))
+                (
+                    if present { "passed" } else { "failed" }.to_owned(),
+                    Some(expected_pin.to_owned())
+                )
             );
             assert_eq!(std::fs::read(fixture.path()).unwrap(), file);
             assert_eq!(get(&fixture.nonce_ref()), nonce);
@@ -859,16 +1004,15 @@ mod tests {
     }
     #[test]
     #[serial]
-    fn check_on_a_fresh_install_reports_pin_absent_and_creates_nothing() {
+    fn check_before_enablement_reports_a_first_use_pin_and_creates_nothing() {
         for window in ["absent/state.window", "state.window"] {
             let mut fixture = Fixture::new();
             fixture.window = fixture.dir.path().join(window);
-            fixture.run().unwrap();
-            fixture.signed_body(7);
+            fixture.sign(FULL);
             fixture.args.check = true;
             let listing = fixture.listing();
             let output = fixture.run().unwrap();
-            assert_eq!(output["valid"], true, "{window}: {output}");
+            assert_eq!(output["valid"], false, "{window}: {output}");
             assert_eq!(
                 check_of(&output, "verified_policy"),
                 ("passed".to_owned(), None),
@@ -879,8 +1023,244 @@ mod tests {
                 ("passed".to_owned(), Some("absent (first use)".to_owned())),
                 "{window}"
             );
+            // No nonce is stored yet, so the installation binding is the one
+            // failed check.
+            let failed: Vec<_> = output["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|check| check["status"] == "failed")
+                .map(|check| check["item"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(failed, ["enablement"], "{window}: {output}");
+            assert_eq!(
+                check_of(&output, "enablement").1.as_deref(),
+                Some("profile.mainnet_enablement_invalid: nonce"),
+                "{window}"
+            );
             assert_eq!(fixture.listing(), listing, "{window}");
         }
+    }
+    #[test]
+    #[serial]
+    fn first_enablement_refuses_a_v1_or_unsigned_policy_and_writes_nothing() {
+        for (body, code) in [
+            ("v1", "profile.enable_mainnet_precondition"),
+            ("unsigned", "policy.policy_file_parse_failed"),
+        ] {
+            let fixture = Fixture::new();
+            let mut doc = std::fs::read_to_string(fixture.path())
+                .unwrap()
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            if body == "v1" {
+                doc.remove("sequence");
+                doc["version"] = toml_edit::value(1);
+                fixture.sign(&doc.to_string());
+            } else {
+                doc.remove("signature");
+                std::fs::write(fixture.path(), doc.to_string()).unwrap();
+            }
+            let file = std::fs::read(fixture.path()).unwrap();
+            let (refused, detail) = fixture.run().unwrap_err();
+            assert_eq!(refused, code, "{body}: {detail}");
+            if body == "v1" {
+                assert_eq!(detail, "sign a v2 policy before enabling mainnet");
+            }
+            assert_eq!(get(&fixture.nonce_ref()), None, "{body}");
+            assert!(!fixture.dir.path().join("audit.jsonl").exists(), "{body}");
+            assert_eq!(fixture.pin(), PinState::Absent, "{body}");
+            assert_eq!(std::fs::read(fixture.path()).unwrap(), file, "{body}");
+        }
+    }
+    #[test]
+    #[serial]
+    fn rotate_leaves_an_existing_pin_unchanged() {
+        let mut fixture = Fixture::new();
+        fixture.run().unwrap();
+        let pinned = fixture.pin();
+        assert!(matches!(&pinned, PinState::Present(pin) if pin.sequence() == 1));
+        // The rewritten policy is not signed yet; the rotation keeps the pin
+        // and loads nothing.
+        fixture.args.rotate = true;
+        fixture.run().unwrap();
+        assert_eq!(fixture.pin(), pinned);
+        fixture.sign_rewritten_and_verify(2);
+        let advanced = fixture.pin();
+        fixture.run().unwrap();
+        assert_eq!(fixture.pin(), advanced);
+        fixture.sign_rewritten_and_verify(3);
+    }
+    /// An installation that holds a nonce but no pin refuses both forms of
+    /// the ceremony with `policy.pin_absent`, whether the pin entry alone or
+    /// also the lock file is missing, and writes no nonce, pin, audit row,
+    /// policy, or file.
+    #[test]
+    #[serial]
+    fn an_enabled_installation_without_a_pin_refuses_both_forms_and_writes_nothing() {
+        use stellar_agent_core::policy::state_lock::window_lock_path;
+        for missing in ["pin", "pin_and_lock"] {
+            let mut fixture = Fixture::new();
+            fixture.run().unwrap();
+            fixture.sign_rewritten_and_verify(2);
+            let pin = stellar_agent_core::profile::schema::policy_pin_entry_ref(
+                &fixture.profile.policy_window_state_key_id,
+            );
+            keyring_core::Entry::new(&pin.service, &pin.account)
+                .unwrap()
+                .delete_credential()
+                .unwrap();
+            if missing == "pin_and_lock" {
+                std::fs::remove_file(window_lock_path(&fixture.window)).unwrap();
+            }
+            let nonce = get(&fixture.nonce_ref()).unwrap();
+            let policy = std::fs::read(fixture.path()).unwrap();
+            let audit = std::fs::read(fixture.dir.path().join("audit.jsonl")).unwrap();
+            let listing = fixture.listing();
+            for rotate in [false, true] {
+                fixture.args.rotate = rotate;
+                let (code, detail) = fixture.run().unwrap_err();
+                assert_eq!(code, "policy.pin_absent", "{missing}, {rotate}: {detail}");
+                assert!(
+                    detail.contains(&fixture.nonce_ref().account),
+                    "{missing}, {rotate}: {detail}"
+                );
+                assert_eq!(get(&fixture.nonce_ref()), Some(nonce.clone()));
+                assert_eq!(fixture.pin(), PinState::Absent);
+                assert_eq!(std::fs::read(fixture.path()).unwrap(), policy);
+                assert_eq!(
+                    std::fs::read(fixture.dir.path().join("audit.jsonl")).unwrap(),
+                    audit
+                );
+                assert_eq!(fixture.listing(), listing, "{missing}, {rotate}");
+            }
+        }
+    }
+    /// A missing lock file beside a present pin entry refuses both forms with
+    /// `policy.pin_absent` and a message that names the lock file and does
+    /// not prescribe removing the nonce, and writes nothing. A verified load
+    /// in `PinMode::Advance` then recreates the lock and keeps the pin and the
+    /// nonce.
+    #[test]
+    #[serial]
+    fn a_missing_lock_file_refuses_both_forms_without_prescribing_nonce_removal() {
+        use stellar_agent_core::policy::state_lock::window_lock_path;
+        let mut fixture = Fixture::new();
+        fixture.run().unwrap();
+        fixture.sign_rewritten_and_verify(2);
+        let pinned = fixture.pin();
+        let pin = stellar_agent_core::profile::schema::policy_pin_entry_ref(
+            &fixture.profile.policy_window_state_key_id,
+        );
+        let stored_pin = get(&pin).unwrap();
+        std::fs::remove_file(window_lock_path(&fixture.window)).unwrap();
+        let nonce = get(&fixture.nonce_ref()).unwrap();
+        let policy = std::fs::read(fixture.path()).unwrap();
+        let audit = std::fs::read(fixture.dir.path().join("audit.jsonl")).unwrap();
+        let listing = fixture.listing();
+        for rotate in [false, true] {
+            fixture.args.rotate = rotate;
+            let (code, detail) = fixture.run().unwrap_err();
+            assert_eq!(code, "policy.pin_absent", "{rotate}: {detail}");
+            assert!(
+                detail.contains("policy-state lock file of profile 'operator' is missing"),
+                "{rotate}: {detail}"
+            );
+            assert!(
+                !detail.contains(&fixture.nonce_ref().account),
+                "{rotate}: {detail}"
+            );
+            assert_eq!(get(&fixture.nonce_ref()), Some(nonce.clone()));
+            assert_eq!(get(&pin), Some(stored_pin.clone()));
+            assert_eq!(std::fs::read(fixture.path()).unwrap(), policy);
+            assert_eq!(
+                std::fs::read(fixture.dir.path().join("audit.jsonl")).unwrap(),
+                audit
+            );
+            assert_eq!(fixture.listing(), listing, "{rotate}");
+        }
+        load_verified_policy(
+            &PolicyLoad {
+                path: &fixture.path(),
+                profile: &fixture.profile,
+                profile_name: "operator",
+                owner_pubkey: &fixture.owner.verifying_key().to_bytes(),
+                owner_source: OwnerKeySource::Keyring,
+                window_path: &fixture.window,
+            },
+            PolicyStateStore::new(),
+            PinMode::Advance,
+        )
+        .unwrap();
+        assert!(window_lock_path(&fixture.window).exists());
+        assert_eq!(fixture.pin(), pinned);
+        assert_eq!(get(&fixture.nonce_ref()), Some(nonce));
+    }
+    /// The documented recovery: with the nonce entry removed, the first
+    /// enablement pins the installed signed policy and stores a new nonce.
+    /// Neither the policy bound to the replaced nonce nor the unsigned
+    /// rewrite authorizes a mainnet write until the owner signs the rebound
+    /// policy at a higher sequence.
+    #[test]
+    #[serial]
+    fn removing_the_nonce_entry_lets_the_first_enablement_pin_the_installed_policy() {
+        let fixture = Fixture::new();
+        fixture.run().unwrap();
+        fixture.sign_rewritten_and_verify(2);
+        let pinned = fixture.pin();
+        let bound_to_old_nonce = std::fs::read_to_string(fixture.path()).unwrap();
+        let old_nonce = get(&fixture.nonce_ref()).unwrap();
+        for coordinate in [
+            stellar_agent_core::profile::schema::policy_pin_entry_ref(
+                &fixture.profile.policy_window_state_key_id,
+            ),
+            fixture.nonce_ref(),
+        ] {
+            keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+                .unwrap()
+                .delete_credential()
+                .unwrap();
+        }
+        let load = |fixture: &Fixture| {
+            load_verified_policy(
+                &PolicyLoad {
+                    path: &fixture.path(),
+                    profile: &fixture.profile,
+                    profile_name: "operator",
+                    owner_pubkey: &fixture.owner.verifying_key().to_bytes(),
+                    owner_source: OwnerKeySource::Keyring,
+                    window_path: &fixture.window,
+                },
+                PolicyStateStore::new(),
+                PinMode::CompareOnly,
+            )
+        };
+        let output = fixture.run().unwrap();
+        assert_eq!(output["rotated"], false);
+        assert_eq!(fixture.pin(), pinned);
+        assert_ne!(get(&fixture.nonce_ref()).unwrap(), old_nonce);
+        let rebound = std::fs::read_to_string(fixture.path()).unwrap();
+        assert_eq!(
+            load(&fixture).err().unwrap().wire_code(),
+            "policy.owner_signature_invalid"
+        );
+        std::fs::write(fixture.path(), &bound_to_old_nonce).unwrap();
+        let verified = load(&fixture).unwrap();
+        assert_eq!(
+            verify_enablement(
+                &verified,
+                "operator",
+                ProfileNameSource::Flag,
+                &fixture.profile,
+                &fixture.dir.path().join("profiles"),
+                &read_enablement_nonce,
+            )
+            .unwrap_err()
+            .code(),
+            "profile.mainnet_enablement_invalid"
+        );
+        std::fs::write(fixture.path(), rebound).unwrap();
+        fixture.sign_rewritten_and_verify(3);
     }
     #[test]
     #[serial]
@@ -892,8 +1272,14 @@ mod tests {
         let older = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(fixture.owner.verifying_key().to_bytes());
         put(&owner, &older);
-        let raw = std::fs::read_to_string(fixture.path()).unwrap();
-        fixture.sign(&raw);
+        let mut doc = std::fs::read_to_string(fixture.path())
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        doc.remove("signature");
+        doc.remove("sequence");
+        doc["version"] = toml_edit::value(1);
+        fixture.sign(&doc.to_string());
         let output = fixture.run().unwrap();
         let items: Vec<_> = output["checks"]
             .as_array()
@@ -957,6 +1343,12 @@ mod tests {
     #[serial]
     fn check_without_a_verified_policy_evaluates_no_requirement() {
         let mut fixture = Fixture::new();
+        let mut doc = std::fs::read_to_string(fixture.path())
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        doc.remove("signature");
+        std::fs::write(fixture.path(), doc.to_string()).unwrap();
         fixture.args.check = true;
         let output = fixture.run().unwrap();
         assert_eq!(output["valid"], false);
@@ -1136,7 +1528,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let rotated: Vec<_> = rows.iter().map(|row| row["rotated"].as_bool()).collect();
         assert_eq!(rotated, vec![Some(false), Some(true)], "{audit}");
-        fixture.sign_rewritten_and_verify(1);
+        fixture.sign_rewritten_and_verify(2);
     }
     #[test]
     #[serial]

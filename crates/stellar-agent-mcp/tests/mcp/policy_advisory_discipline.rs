@@ -218,6 +218,7 @@ fn selected_startup_verifies_the_installation_binding() {
         ),
     )
     .unwrap();
+    drop(build_server(profile.clone(), BindingCheck::Enforce).unwrap());
     let coordinate = mainnet_enablement_entry_ref(&profile.policy_window_state_key_id);
     let entry = keyring_core::Entry::new(&coordinate.service, &coordinate.account).unwrap();
     entry.set_password(nonce).unwrap();

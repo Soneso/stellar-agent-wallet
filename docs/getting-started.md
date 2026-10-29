@@ -480,6 +480,11 @@ Create a dedicated mainnet profile with its HTTPS endpoint stored in the file.
 Initialize the audit, nonce, attestation, and policy-owner keys, then enroll the
 signer with `profile enroll-signer --secret-env`.
 
+Write a v2 policy body for the profile, with `version = 2` and without a
+`[mainnet]` table, and sign it with `profile sign-policy`. The enablement
+ceremony refuses a v1 or unsigned policy, because it pins the signed policy
+before it stores the installation nonce.
+
 Run `profile enable-mainnet --profile <NAME>` to bind this installation.
 Complete the [v2 policy body](profiles.md#mainnet-policy-body), including rules
 for each prepare and commit name. Run `profile sign-policy`, then
@@ -790,8 +795,8 @@ instead names the missing prerequisite.
 
 Report an authorization refusal to the operator. The operator reads the failed
 check in the `precondition` field of the warn-level log entry
-`mainnet authorization refused`. For missing enablement, run
-`profile enable-mainnet`, complete the policy, then run `profile sign-policy`.
+`mainnet authorization refused`. For missing enablement, sign a v2 policy,
+run `profile enable-mainnet`, complete the policy, then run `profile sign-policy`.
 Then restart the MCP server. CLI entry checks can refuse missing engine,
 verified policy, or enablement before the resolver runs.
 

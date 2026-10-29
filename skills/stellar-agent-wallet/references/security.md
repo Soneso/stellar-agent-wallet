@@ -23,6 +23,10 @@ Provider credentials may share with other provider credentials, but cannot share
 with wallet or derived entries. Two fields in one profile cannot name one entry,
 and the owner account must be `default`. Explicit wallet references must be set
 in the file; an out-of-scope overlay is a conflict.
+A mainnet profile's `policy_window_state_key_id` must name its default entry,
+`stellar-agent-policy-window-<name>` with account `default`, even when the file
+sets it explicitly. The policy pin and the mainnet enablement nonce sit beside
+that entry, so another entry would start from an empty pin and nonce.
 
 A copied profile file, including a backup in that directory, counts as a sibling.
 If this profile names a sibling's entry, give this profile its own entry.
@@ -408,3 +412,10 @@ Unauthorized mainnet signing, payload release, or submission is also in scope. O
 of scope: defects in your own keyring backend, OS, RPC endpoint, or anchor; and
 any issue that requires already holding the wallet's keyring secrets, since custody
 of those secrets is the security boundary.
+
+For code running as the same OS user, the owner of an enabled mainnet profile
+changes only with a statement signed by the previous owner. The policy pin and
+the enablement nonce that carry this continuity sit at the profile's default
+window-state entry, and a mainnet profile that names another entry is refused.
+Raw deletion of the pin, enablement, and owner entry outside the wallet rests
+on the platform keyring.

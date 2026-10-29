@@ -83,6 +83,13 @@ Out of scope: defects in your own keyring backend, operating system, RPC endpoin
 anchor; and issues that require already holding the wallet's keyring secrets (the seed,
 nonce key, or HMAC keys), since custody of those secrets is the security boundary.
 
+For code running as the same OS user, the owner of an enabled mainnet profile
+changes only with a statement signed by the previous owner. The policy pin and
+the enablement nonce that carry this continuity sit at the profile's default
+window-state entry, and a mainnet profile that names another entry is refused.
+Raw deletion of the pin, enablement, and owner entry outside the wallet rests
+on the platform keyring.
+
 ## Security model summary
 
 For the full design see [docs/concepts.md](docs/concepts.md) and
