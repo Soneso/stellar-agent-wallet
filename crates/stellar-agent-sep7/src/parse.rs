@@ -153,6 +153,8 @@ pub enum Sep7Request {
 /// # Untrusted-input hardening
 ///
 /// - Duplicate parameters are rejected (not last-value-wins).
+/// - `signature` must be the last parameter, with its name spelled literally.
+///   A trailing empty pair after `signature` is rejected.
 /// - The `xdr` parameter is fully decoded to confirm it is a valid
 ///   `TransactionEnvelope` before the preview is assembled.
 /// - `msg` exceeding 300 characters is rejected.
@@ -218,12 +220,20 @@ pub fn parse_sep7_uri(uri: &str) -> Result<Sep7Request, Sep7Error> {
 /// URL-decodes both keys and values using percent-decoding.
 fn parse_query_params(query: &str) -> Result<std::collections::HashMap<String, String>, Sep7Error> {
     let mut map = std::collections::HashMap::new();
+    let mut signature_seen = false;
 
     if query.is_empty() {
         return Ok(map);
     }
 
     for pair in query.split('&') {
+        // The signed payload ends where the signature pair begins, so no pair may follow it.
+        if signature_seen {
+            return Err(Sep7Error::InvalidParamValue {
+                param: "signature",
+                detail: "signature must be the last parameter".to_owned(),
+            });
+        }
         if pair.is_empty() {
             continue;
         }
@@ -235,6 +245,16 @@ fn parse_query_params(query: &str) -> Result<std::collections::HashMap<String, S
         let key = percent_decode(k).map_err(|_| Sep7Error::MalformedUri {
             detail: "query parameter key contains invalid percent-encoding".to_owned(),
         })?;
+        if key == "signature" {
+            // The payload cut matches the raw text `&signature=`, so the name must be literal.
+            if k != "signature" {
+                return Err(Sep7Error::InvalidParamValue {
+                    param: "signature",
+                    detail: "the signature parameter name must not be percent-encoded".to_owned(),
+                });
+            }
+            signature_seen = true;
+        }
         let value = percent_decode(v).map_err(|_| Sep7Error::MalformedUri {
             detail: "query parameter value contains invalid percent-encoding".to_owned(),
         })?;
@@ -837,10 +857,9 @@ fn sanitize_operation(op: &str) -> String {
 /// Strips the `&signature=<urlencoded-value>` suffix from a URI string to
 /// produce the payload URI for signature verification.
 ///
-/// The SEP-7 spec requires `signature` to be the LAST parameter.  Strips
-/// from `&signature=` (or `?signature=` when it is the first/only param) to
-/// the end of the string.  This matches the approach used by the Flutter and
-/// Python Stellar SDKs.
+/// The parser refuses a URI whose `signature` is not the last parameter.
+/// This helper strips from `&signature=` (or `?signature=` when it is the
+/// first parameter) to the end of the string.
 pub fn strip_signature_param(uri: &str) -> &str {
     // Prefer removing the `&signature=` form (signature is not the first param).
     if let Some(idx) = uri.find("&signature=") {
@@ -853,6 +872,34 @@ pub fn strip_signature_param(uri: &str) -> &str {
     uri
 }
 
+/// Returns the signed URI prefix, requiring a literal signature pair to be last.
+///
+/// The query starts at the first `?`, as in the parser, so a signature pair is
+/// a literal `&signature=` after that `?` or a `signature=` directly at it.
+/// A URI without such a pair returns whole, and its verification fails on the
+/// signature itself.
+///
+/// # Errors
+///
+/// Returns [`Sep7Error::SignatureVerificationFailed`] if a pair follows the signature.
+pub(crate) fn signed_prefix(uri: &str) -> Result<&str, Sep7Error> {
+    let Some(query_start) = uri.find('?') else {
+        return Ok(uri);
+    };
+    let query = &uri[query_start..];
+    let cut = match query.find("&signature=") {
+        Some(idx) => query_start + idx,
+        None if query.starts_with("?signature=") => query_start,
+        None => return Ok(uri),
+    };
+    if uri[cut + 1..].contains('&') {
+        return Err(Sep7Error::SignatureVerificationFailed {
+            detail: "signature must be the last parameter".to_owned(),
+        });
+    }
+    Ok(&uri[..cut])
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -863,6 +910,145 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn signature_followed_by_a_parameter_is_refused() {
+        let uri = "web+stellar:pay?\
+            destination=GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO\
+            &origin_domain=example.com&signature=SIG&amount=5000";
+        assert_signature_position_refused(uri);
+    }
+
+    #[test]
+    fn signature_first_followed_by_parameters_is_refused() {
+        let uri = "web+stellar:pay?signature=SIG\
+            &destination=GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO";
+        assert_signature_position_refused(uri);
+    }
+
+    #[test]
+    fn signature_followed_by_an_empty_pair_is_refused() {
+        let uri = "web+stellar:pay?\
+            destination=GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO\
+            &signature=SIG&";
+        assert_signature_position_refused(uri);
+    }
+
+    /// A percent-encoded minimal `TransactionEnvelope` for `tx` URIs.
+    fn signature_test_tx_xdr() -> String {
+        use stellar_xdr::{
+            Memo, MuxedAccount, Preconditions, SequenceNumber, Transaction, TransactionExt,
+            TransactionV1Envelope, Uint256,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([0u8; 32])),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![].try_into().unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: vec![].try_into().unwrap(),
+        });
+        envelope
+            .to_xdr_base64(Limits::none())
+            .unwrap()
+            .replace('+', "%2B")
+            .replace('/', "%2F")
+            .replace('=', "%3D")
+    }
+
+    #[test]
+    fn tx_signature_followed_by_a_parameter_is_refused() {
+        let xdr = signature_test_tx_xdr();
+        let uri = format!("web+stellar:tx?xdr={xdr}&signature=SIG&msg=hello");
+        assert_signature_position_refused(&uri);
+    }
+
+    #[test]
+    fn chain_signature_followed_by_a_parameter_is_refused() {
+        let xdr = signature_test_tx_xdr();
+        // The decoded chain value is
+        // `web+stellar:pay?destination=G...&signature=S&msg=x`.
+        let chain = "web%2Bstellar%3Apay%3Fdestination%3D\
+            GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO\
+            %26signature%3DS%26msg%3Dx";
+        let uri = format!("web+stellar:tx?xdr={xdr}&chain={chain}");
+        assert_signature_position_refused(&uri);
+    }
+
+    fn assert_signature_position_refused(uri: &str) {
+        let err = parse_sep7_uri(uri).unwrap_err();
+        assert!(
+            matches!(err, Sep7Error::InvalidParamValue { param: "signature", ref detail }
+                if detail == "signature must be the last parameter"),
+            "unexpected refusal: {err:?}"
+        );
+    }
+
+    #[test]
+    fn percent_encoded_signature_name_is_refused() {
+        let uri = "web+stellar:pay?\
+            destination=GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO\
+            &%73ignature=SIG";
+        let err = parse_sep7_uri(uri).unwrap_err();
+        assert!(
+            matches!(err, Sep7Error::InvalidParamValue { param: "signature", ref detail }
+                if detail == "the signature parameter name must not be percent-encoded"),
+            "unexpected refusal: {err:?}"
+        );
+    }
+
+    #[test]
+    fn signed_prefix_refuses_trailing_text() {
+        for uri in [
+            "web+stellar:pay?destination=G&signature=SIG&amount=5000",
+            "web+stellar:pay?signature=SIG&destination=G",
+            "web+stellar:pay?destination=G&signature=SIG&",
+        ] {
+            let err = signed_prefix(uri).unwrap_err();
+            assert!(
+                matches!(err, Sep7Error::SignatureVerificationFailed { ref detail }
+                    if detail == "signature must be the last parameter"),
+                "unexpected refusal: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_prefix_returns_the_unsigned_prefix() {
+        for (uri, prefix) in [
+            (
+                "web+stellar:pay?destination=G&signature=SIG",
+                "web+stellar:pay?destination=G",
+            ),
+            ("web+stellar:pay?signature=SIG", "web+stellar:pay"),
+            (
+                "web+stellar:pay?destination=G",
+                "web+stellar:pay?destination=G",
+            ),
+        ] {
+            assert_eq!(signed_prefix(uri).unwrap(), prefix);
+        }
+    }
+
+    #[test]
+    fn signed_prefix_ignores_a_signature_pattern_outside_the_query_start() {
+        // A `?signature=` inside a value and an `&signature=` before the first
+        // `?` are no signature pair, so the URI returns whole.
+        for uri in [
+            "web+stellar:pay?destination=G&msg=hi?signature=X",
+            "web+stellar:pay&signature=X?destination=G",
+        ] {
+            assert_eq!(signed_prefix(uri).unwrap(), uri);
+        }
+        assert_eq!(
+            signed_prefix("web+stellar:pay?signature=X").unwrap(),
+            "web+stellar:pay"
+        );
+    }
 
     #[test]
     fn parses_minimal_pay_uri() {

@@ -341,6 +341,31 @@ mod tests {
         assert_eq!(code, "sep7.malformed_uri");
     }
 
+    #[tokio::test]
+    async fn appended_parameter_after_signature_is_business_error() {
+        let server = make_server();
+        let args = Sep7ParseUriArgs {
+            chain_id: "stellar:testnet".to_owned(),
+            // `127.0.0.1` fails origin_domain validation, so this test never reaches the network.
+            uri: "web+stellar:pay?destination=\
+                  GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO\
+                  &origin_domain=127.0.0.1&signature=SIG&amount=5000"
+                .to_owned(),
+            verify_origin: true,
+        };
+        let result = server
+            .invoke_stellar_sep7_parse_uri(args)
+            .await
+            .expect("signature ordering must surface as a business-error envelope");
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "sep7.invalid_param_value");
+        assert_eq!(
+            message,
+            "invalid 'signature': signature must be the last parameter"
+        );
+        assert!(!text.contains("origin_verified"));
+    }
+
     /// An unsupported operation in the URI path is `sep7.unknown_operation`,
     /// not a JSON-RPC protocol error.
     #[tokio::test]

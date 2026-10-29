@@ -23,6 +23,7 @@ The scope table defines mainnet admission for each build configuration. Public S
 - **Refusals and constraints:**
   - Never signs a URI, never auto-POSTs to a `callback` endpoint, never auto-submits.
   - Origin-domain signature verification always fetches a fresh `stellar.toml`; it is never cached.
+  - A URI with any parameter after `signature`, a trailing `&` included, or with a percent-encoded `signature` name, refuses with `sep7.invalid_param_value`; the verified payload therefore covers every parameter the preview shows.
   - Stateless with no replay protection: SEP-7 signatures carry no nonce or timestamp, so idempotency is the operator/host's responsibility.
 
 ### SEP-10: Stellar Web Authentication

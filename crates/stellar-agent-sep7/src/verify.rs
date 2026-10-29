@@ -42,7 +42,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use stellar_agent_network::counterparty::{fetch::fetch_stellar_toml, parser::parse_minimal_sep1};
 
 use crate::error::Sep7Error;
-use crate::parse::strip_signature_param;
+use crate::parse::{signed_prefix, strip_signature_param};
 
 /// SEP-7 signature verification verdict.
 ///
@@ -92,9 +92,9 @@ impl SignatureStatus {
 /// stellar.toml body.
 ///
 /// Single source of truth for the post-fetch verification logic:
-/// TOML parse → `URI_REQUEST_SIGNING_KEY` extraction → signature
-/// base64-decode (URL-safe no-pad first, then standard) → payload build
-/// → `VerifyingKey::verify`.
+/// signature-position check → TOML parse → `URI_REQUEST_SIGNING_KEY`
+/// extraction → payload build → signature base64-decode (URL-safe no-pad
+/// first, then standard) → `VerifyingKey::verify`.
 ///
 /// [`verify_origin_signature`] calls this after its fresh fetch.  The
 /// `test-helpers` re-export allows tests to inject a stellar.toml body
@@ -113,6 +113,7 @@ impl SignatureStatus {
 ///
 /// Returns [`Sep7Error`] on TOML parse failure, missing/invalid
 /// `URI_REQUEST_SIGNING_KEY`, or non-base64 / wrong-length signature bytes.
+/// A parameter after `signature` yields [`Sep7Error::SignatureVerificationFailed`].
 ///
 /// # Panics
 ///
@@ -132,6 +133,10 @@ pub fn verify_against_toml_body(
         None => return Ok(SignatureStatus::MissingRequired),
         Some(s) => s,
     };
+
+    // Text after the signature pair is outside the signed payload; refuse it
+    // before any TOML work.
+    let signed = signed_prefix(uri)?;
 
     // Parse the TOML body to extract URI_REQUEST_SIGNING_KEY.
     let minimal = parse_minimal_sep1(toml_body).map_err(|e| {
@@ -167,7 +172,7 @@ pub fn verify_against_toml_body(
     })?;
 
     // Build the signature payload.
-    let payload = build_signature_payload(uri);
+    let payload = payload_for(signed);
 
     // Decode the base64 signature.
     // Try URL-safe no-pad first, then standard base64.  All callers go through
@@ -218,6 +223,7 @@ pub fn verify_against_toml_body(
 ///
 /// Returns [`Sep7Error`] on fetch failures, key-not-in-toml, or when the
 /// signature cannot be decoded at all.
+/// A parameter after `signature` yields [`Sep7Error::SignatureVerificationFailed`].
 ///
 /// # Panics
 ///
@@ -238,6 +244,10 @@ pub async fn verify_origin_signature(
     if signature_b64.is_none() {
         return Ok(SignatureStatus::MissingRequired);
     }
+
+    // A URI with text after the signature pair cannot verify, so it refuses
+    // before the network fetch.
+    signed_prefix(uri)?;
 
     // Fetch fresh stellar.toml — NOT the cache.
     // Anti-phishing freshness per sep-0007.md.
@@ -276,12 +286,13 @@ pub async fn verify_origin_signature(
 /// - Python stellar-sdk `stellar_uri.py`:
 ///   `b"\0"*35 + b"\4" + b"stellar.sep.7 - URI Scheme" + data.encode()`.
 pub fn build_signature_payload(uri: &str) -> Vec<u8> {
-    // Strip &signature=... before building payload.
-    let uri_without_sig = strip_signature_param(uri);
+    payload_for(strip_signature_param(uri))
+}
 
+fn payload_for(prefix: &str) -> Vec<u8> {
     const PREFIX: &[u8] = b"stellar.sep.7 - URI Scheme";
     // Total prefix: 35 zero bytes + 0x04 + "stellar.sep.7 - URI Scheme" = 62 bytes.
-    let mut payload = Vec::with_capacity(36 + PREFIX.len() + uri_without_sig.len());
+    let mut payload = Vec::with_capacity(36 + PREFIX.len() + prefix.len());
     // 35 zero bytes.
     payload.extend_from_slice(&[0u8; 35]);
     // Byte 36: type discriminant 0x04.
@@ -289,7 +300,7 @@ pub fn build_signature_payload(uri: &str) -> Vec<u8> {
     // The prefix string.
     payload.extend_from_slice(PREFIX);
     // The URI bytes (without signature param).
-    payload.extend_from_slice(uri_without_sig.as_bytes());
+    payload.extend_from_slice(prefix.as_bytes());
     payload
 }
 
@@ -432,7 +443,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn toml_body_parameter_after_signature_refuses_before_toml_parse() {
+        // The malformed body would yield TomlFetchFailed if it were parsed first.
+        let uri = "web+stellar:pay?\
+            destination=GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO\
+            &origin_domain=example.com&signature=SIG&amount=5000";
+        let err = verify_against_toml_body(uri, "example.com", Some("SIG"), "= not valid toml =")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Sep7Error::SignatureVerificationFailed { ref detail }
+                    if detail == "signature must be the last parameter"
+            ),
+            "a parameter after the signature must refuse before the TOML parse, got: {err:?}"
+        );
+    }
+
     // ── verify_origin_signature early returns (no network) ───────────────────
+
+    #[tokio::test]
+    async fn origin_signature_parameter_after_signature_refuses_before_fetch() {
+        // `fetch_stellar_toml` refuses this domain (an underscore fails LDH
+        // validation) with TomlFetchFailed before any I/O, so the test makes no
+        // request; SignatureVerificationFailed shows the position check runs first.
+        let uri = "web+stellar:pay?\
+            destination=GCALNQQBXAPZ2WIRSDDBMSTAKCUH5SG6U76YBFLQLIXJTF7FE5AX7AOO\
+            &origin_domain=no_fetch.example&signature=SIG&amount=5000";
+        let err = verify_origin_signature(uri, Some("no_fetch.example"), Some("SIG"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Sep7Error::SignatureVerificationFailed { ref detail }
+                    if detail == "signature must be the last parameter"
+            ),
+            "a parameter after the signature must refuse before the fetch, got: {err:?}"
+        );
+    }
 
     #[tokio::test]
     async fn origin_signature_none_domain_returns_absent() {
