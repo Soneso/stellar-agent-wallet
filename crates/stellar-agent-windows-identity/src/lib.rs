@@ -11,11 +11,10 @@
 //!   replayed by another user on the same machine.
 //! - `create_owner_only_directory` creates a directory whose protected DACL
 //!   grants access to the current user only, inherited by everything created
-//!   inside it; `path_dacl_sddl` reads a path's DACL back as SDDL, and
-//!   `admits_only_current_user` checks that a path's DACL grants nothing to
-//!   anyone else. The CLI writes its private browser redirect file into such
-//!   a directory. All three are Windows-only and have no stub on other
-//!   targets.
+//!   inside it, and `admits_only_current_user` checks that a path's DACL
+//!   grants nothing to anyone else. The CLI writes its private browser
+//!   redirect file into such a directory. Both are Windows-only and have no
+//!   stub on other targets.
 //! - [`dpapi_protect`] / [`dpapi_unprotect`] wrap DPAPI CurrentUser-scope
 //!   protect/unprotect, and [`dpapi_protect_with_entropy`] /
 //!   [`dpapi_unprotect_with_entropy`] add DPAPI's optional entropy, consumed
@@ -51,9 +50,13 @@ pub enum WindowsIdentityError {
     /// The returned SID string was not valid UTF-16.
     #[error("SID string was not valid UTF-16")]
     InvalidUtf16,
-    /// A returned security-descriptor string was not valid UTF-16.
-    #[error("security descriptor string was not valid UTF-16")]
-    SddlNotUtf16,
+    /// A Win32 API returned a SID that is not valid or does not fit in the
+    /// data it returned.
+    #[error("{api} returned an invalid SID")]
+    InvalidSid {
+        /// The Win32 API label.
+        api: &'static str,
+    },
     /// A path passed to a Win32 API contains a NUL character.
     #[error("path contains a NUL character")]
     PathContainsNul,
@@ -110,68 +113,25 @@ pub fn create_owner_only_directory(path: &std::path::Path) -> Result<(), Windows
     windows::create_owner_only_directory(path)
 }
 
-/// Returns the DACL of `path` in SDDL form, for example
-/// `D:P(A;OICI;FA;;;S-1-5-21-...)`.
-///
-/// # Errors
-///
-/// Returns [`WindowsIdentityError`] if the security information cannot be
-/// read or converted, or if `path` contains a NUL.
-#[cfg(target_os = "windows")]
-pub fn path_dacl_sddl(path: &std::path::Path) -> Result<String, WindowsIdentityError> {
-    windows::path_dacl_sddl(path)
-}
-
 /// Returns `true` iff the DACL of `path` holds only access-allowed ACEs for
 /// the current process user, at least one of them, and, when
 /// `require_protected` is set, is protected from inheritance.
 ///
+/// Trustees are compared as binary SIDs with `EqualSid`, so the result does
+/// not depend on how a SID renders as text. A NULL or absent DACL, which
+/// grants everyone full access, and an empty DACL, which grants nothing, are
+/// refused, as is a DACL holding any ACE type other than access-allowed.
+///
 /// # Errors
 ///
-/// Returns [`WindowsIdentityError`] if the SID lookup or the DACL read fails.
+/// Returns [`WindowsIdentityError`] if the SID lookup or the DACL read fails,
+/// or if `path` contains a NUL.
 #[cfg(target_os = "windows")]
 pub fn admits_only_current_user(
     path: &std::path::Path,
     require_protected: bool,
 ) -> Result<bool, WindowsIdentityError> {
-    let sid = current_user_sid_string()?;
-    let sddl = path_dacl_sddl(path)?;
-    Ok(dacl_sddl_admits_only(&sddl, &sid, require_protected))
-}
-
-/// Decides [`admits_only_current_user`] on an SDDL DACL string.
-///
-/// The string has the form `D:<flags>(<ace>)(<ace>)...`; each ACE is
-/// `type;flags;rights;object;inherit-object;sid`. Every ACE must be an allow
-/// ACE (`A`) whose trustee is exactly `sid`, and there must be at least one.
-/// An empty DACL (`D:` with no ACE) grants nothing to anyone and is refused
-/// too, as is a NULL DACL (`D:NO_ACCESS_CONTROL`), which grants everything.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn dacl_sddl_admits_only(sddl: &str, sid: &str, require_protected: bool) -> bool {
-    let Some(body) = sddl.strip_prefix("D:") else {
-        return false;
-    };
-    let split = body.find('(').unwrap_or(body.len());
-    let (flags, mut aces) = body.split_at(split);
-    if flags.contains("NO_ACCESS_CONTROL") || (require_protected && !flags.contains('P')) {
-        return false;
-    }
-    let mut count = 0usize;
-    while !aces.is_empty() {
-        let Some(rest) = aces.strip_prefix('(') else {
-            return false;
-        };
-        let Some(end) = rest.find(')') else {
-            return false;
-        };
-        let fields: Vec<&str> = rest[..end].split(';').collect();
-        if fields.len() != 6 || fields[0] != "A" || fields[5] != sid {
-            return false;
-        }
-        count += 1;
-        aces = &rest[end + 1..];
-    }
-    count > 0
+    windows::admits_only_current_user(path, require_protected)
 }
 
 /// Errors returned by the DPAPI protect/unprotect wrappers.
@@ -326,15 +286,17 @@ mod windows {
         CloseHandle, ERROR_SUCCESS, GetLastError, HANDLE, LocalFree,
     };
     use windows_sys::Win32::Security::Authorization::{
-        ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-        SDDL_REVISION_1, SE_FILE_OBJECT,
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetTokenInformation,
+        IsValidSid, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
         TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use super::WindowsIdentityError;
@@ -366,23 +328,17 @@ mod windows {
         Ok(wide)
     }
 
-    pub(super) fn create_owner_only_directory(path: &Path) -> Result<(), WindowsIdentityError> {
-        let sid = current_user_sid_string()?;
-        // A protected DACL (`P`) with one ACE: allow (`A`) full file access
-        // (`FA`) to the current user, inherited by files (`OI`) and
-        // subdirectories (`CI`) created inside.
-        let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;{sid})")
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+    /// Converts `sddl` into a self-relative security descriptor.
+    fn security_descriptor_from_sddl(sddl: &str) -> Result<LocalAllocation, WindowsIdentityError> {
+        let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
         let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
-        // SAFETY: `sddl` is a NUL-terminated UTF-16 string live for the call;
+        // SAFETY: `wide` is a NUL-terminated UTF-16 string live for the call;
         // `descriptor` is a valid out-pointer and the size out-pointer may be
         // null. On success the descriptor is a LocalAlloc allocation, owned
         // below by `LocalAllocation`.
         let converted = unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
+                wide.as_ptr(),
                 SDDL_REVISION_1,
                 &mut descriptor,
                 null_mut(),
@@ -398,7 +354,15 @@ mod windows {
                 api: "ConvertStringSecurityDescriptorToSecurityDescriptorW",
             });
         }
-        let descriptor = LocalAllocation(descriptor);
+        Ok(LocalAllocation(descriptor))
+    }
+
+    pub(super) fn create_owner_only_directory(path: &Path) -> Result<(), WindowsIdentityError> {
+        let sid = current_user_sid_string()?;
+        // A protected DACL (`P`) with one ACE: allow (`A`) full file access
+        // (`FA`) to the current user, inherited by files (`OI`) and
+        // subdirectories (`CI`) created inside.
+        let descriptor = security_descriptor_from_sddl(&format!("D:P(A;OICI;FA;;;{sid})"))?;
 
         let wide = wide_path(path)?;
         let attributes = SECURITY_ATTRIBUTES {
@@ -415,7 +379,8 @@ mod windows {
         Ok(())
     }
 
-    pub(super) fn path_dacl_sddl(path: &Path) -> Result<String, WindowsIdentityError> {
+    /// Reads the DACL part of the security descriptor of `path`.
+    fn path_security_descriptor(path: &Path) -> Result<LocalAllocation, WindowsIdentityError> {
         let wide = wide_path(path)?;
         let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
         // SAFETY: `wide` is a NUL-terminated UTF-16 path live for the call.
@@ -445,39 +410,303 @@ mod windows {
                 api: "GetNamedSecurityInfoW",
             });
         }
-        let descriptor = LocalAllocation(descriptor);
+        Ok(LocalAllocation(descriptor))
+    }
 
-        let mut sddl: *mut u16 = null_mut();
-        // SAFETY: `descriptor.0` is the live descriptor returned above and
-        // `sddl` is a valid out-pointer; the length out-pointer may be null.
-        // On success the string is a LocalAlloc allocation, owned below.
-        let converted = unsafe {
-            ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                descriptor.0,
-                SDDL_REVISION_1,
-                DACL_SECURITY_INFORMATION,
-                &mut sddl,
-                null_mut(),
-            )
-        };
-        if converted == 0 {
-            return Err(last_error(
-                "ConvertSecurityDescriptorToStringSecurityDescriptorW",
-            ));
+    pub(super) fn admits_only_current_user(
+        path: &Path,
+        require_protected: bool,
+    ) -> Result<bool, WindowsIdentityError> {
+        let user = current_user_sid()?;
+        let descriptor = path_security_descriptor(path)?;
+        // SAFETY: `descriptor.0` is the descriptor `GetNamedSecurityInfoW`
+        // returned, live until `descriptor` drops after the call.
+        unsafe { descriptor_admits_only(descriptor.0, &user, require_protected) }
+    }
+
+    /// Decides whether the DACL of `descriptor` admits `user` and nobody
+    /// else; see [`Dacl::admits_only`].
+    ///
+    /// # Safety
+    ///
+    /// `descriptor` must point to a valid security descriptor that stays live
+    /// for the call.
+    unsafe fn descriptor_admits_only(
+        descriptor: PSECURITY_DESCRIPTOR,
+        user: &Sid,
+        require_protected: bool,
+    ) -> Result<bool, WindowsIdentityError> {
+        // SAFETY: forwarded from this function's contract.
+        let dacl = unsafe { read_dacl(descriptor) }?;
+        Ok(dacl.admits_only(user, require_protected))
+    }
+
+    /// The smallest SID: revision, sub-authority count and the six-byte
+    /// identifier authority, without a sub-authority.
+    const MIN_SID_LEN: usize = 8;
+
+    /// A SID copied into an owned buffer.
+    ///
+    /// [`Sid::copy_from`] is the only constructor and validates the SID, so
+    /// the buffer always starts with a valid SID. The buffer is `u32`-backed
+    /// because the SID's sub-authorities are DWORDs.
+    pub(super) struct Sid(Vec<u32>);
+
+    impl Sid {
+        /// Copies the SID at `sid`, or returns `None` when the bytes there are
+        /// not a valid SID that fits in `available` bytes.
+        ///
+        /// # Safety
+        ///
+        /// `sid` must be non-null and point to `available` readable bytes.
+        unsafe fn copy_from(sid: PSID, available: usize) -> Option<Self> {
+            if available < MIN_SID_LEN {
+                return None;
+            }
+            // SAFETY: `sid` points to at least `MIN_SID_LEN` readable bytes,
+            // the fixed header that `IsValidSid` checks.
+            if unsafe { IsValidSid(sid) } == 0 {
+                return None;
+            }
+            // SAFETY: `sid` is a valid SID (checked above), the precondition
+            // of `GetLengthSid`.
+            let len = usize::try_from(unsafe { GetLengthSid(sid) }).ok()?;
+            if len > available {
+                return None;
+            }
+            let mut words = vec![0_u32; len.div_ceil(size_of::<u32>())];
+            // SAFETY: `sid` has `len <= available` readable bytes and `words`
+            // holds at least `len` writable bytes in a separate allocation.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    sid.cast::<u8>().cast_const(),
+                    words.as_mut_ptr().cast::<u8>(),
+                    len,
+                );
+            }
+            Some(Self(words))
         }
-        if sddl.is_null() {
-            return Err(WindowsIdentityError::NullPointer {
-                api: "ConvertSecurityDescriptorToStringSecurityDescriptorW",
+
+        fn as_psid(&self) -> PSID {
+            self.0.as_ptr().cast_mut().cast::<c_void>()
+        }
+
+        /// Returns `true` iff `self` and `other` are the same SID, as
+        /// `EqualSid` decides.
+        pub(super) fn equals(&self, other: &Self) -> bool {
+            // SAFETY: both buffers hold a valid SID (the `Sid` invariant) and
+            // live for the call; `EqualSid` only reads them.
+            unsafe { EqualSid(self.as_psid(), other.as_psid()) != 0 }
+        }
+
+        /// Parses a SID string such as `S-1-5-18`.
+        #[cfg(test)]
+        pub(super) fn parse(text: &str) -> Result<Self, WindowsIdentityError> {
+            let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut sid: PSID = null_mut();
+            // SAFETY: `wide` is a NUL-terminated UTF-16 string live for the
+            // call and `sid` is a valid out-pointer. On success the SID is a
+            // LocalAlloc allocation, owned below by `LocalAllocation`.
+            let converted = unsafe {
+                windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW(
+                    wide.as_ptr(),
+                    &mut sid,
+                )
+            };
+            if converted == 0 {
+                return Err(last_error("ConvertStringSidToSidW"));
+            }
+            if sid.is_null() {
+                return Err(WindowsIdentityError::NullPointer {
+                    api: "ConvertStringSidToSidW",
+                });
+            }
+            let allocation = LocalAllocation(sid);
+            // SAFETY: the conversion produced a valid SID, the precondition of
+            // `GetLengthSid`, in an allocation of that length.
+            let len = usize::try_from(unsafe { GetLengthSid(sid) }).unwrap_or(0);
+            // SAFETY: `sid` is non-null and its allocation holds `len` bytes.
+            let copied = unsafe { Self::copy_from(sid, len) };
+            drop(allocation);
+            copied.ok_or(WindowsIdentityError::InvalidSid {
+                api: "ConvertStringSidToSidW",
+            })
+        }
+    }
+
+    /// A DACL as the access check judges it.
+    pub(super) struct Dacl {
+        /// The descriptor's `SE_DACL_PROTECTED` control bit: the DACL
+        /// inherits no ACE from the parent.
+        pub(super) protected: bool,
+        /// The ACEs in order; `None` for a NULL or absent DACL, which grants
+        /// everyone full access.
+        pub(super) entries: Option<Vec<AceEntry>>,
+    }
+
+    /// One ACE of a [`Dacl`].
+    pub(super) struct AceEntry {
+        /// The ACE type, for example `ACCESS_ALLOWED_ACE_TYPE`.
+        pub(super) ace_type: u8,
+        /// The inheritance flags, for example `OBJECT_INHERIT_ACE` or
+        /// `INHERITED_ACE`.
+        #[cfg_attr(not(test), allow(dead_code, reason = "read by the DACL shape tests"))]
+        pub(super) flags: u8,
+        /// The access mask of an access-allowed ACE; zero for other types.
+        #[cfg_attr(not(test), allow(dead_code, reason = "read by the DACL shape tests"))]
+        pub(super) mask: u32,
+        /// The trustee of an access-allowed ACE; `None` for other types and
+        /// for an ACE whose trustee is not a valid SID.
+        pub(super) trustee: Option<Sid>,
+    }
+
+    impl Dacl {
+        /// Returns `true` iff the DACL holds at least one ACE, every ACE is
+        /// an access-allowed ACE whose trustee is `user`, and, when
+        /// `require_protected` is set, the DACL is protected.
+        ///
+        /// A NULL or absent DACL grants everyone full access and an empty
+        /// DACL grants nothing; both are refused.
+        pub(super) fn admits_only(&self, user: &Sid, require_protected: bool) -> bool {
+            if require_protected && !self.protected {
+                return false;
+            }
+            let Some(entries) = &self.entries else {
+                return false;
+            };
+            !entries.is_empty()
+                && entries.iter().all(|entry| {
+                    u32::from(entry.ace_type) == ACCESS_ALLOWED_ACE_TYPE
+                        && entry
+                            .trustee
+                            .as_ref()
+                            .is_some_and(|trustee| trustee.equals(user))
+                })
+        }
+    }
+
+    /// Reads the DACL of `descriptor` together with its protected bit.
+    ///
+    /// # Safety
+    ///
+    /// `descriptor` must point to a valid security descriptor that stays live
+    /// for the call.
+    unsafe fn read_dacl(descriptor: PSECURITY_DESCRIPTOR) -> Result<Dacl, WindowsIdentityError> {
+        let mut control = 0_u16;
+        let mut revision = 0_u32;
+        // SAFETY: `descriptor` is valid (caller contract) and both
+        // out-pointers are valid for writes.
+        let read = unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+        if read == 0 {
+            return Err(last_error("GetSecurityDescriptorControl"));
+        }
+        let protected = control & SE_DACL_PROTECTED != 0;
+
+        let mut present = 0;
+        let mut acl: *mut ACL = null_mut();
+        let mut defaulted = 0;
+        // SAFETY: `descriptor` is valid (caller contract) and the three
+        // out-pointers are valid for writes. On success `acl` is null or
+        // points to the ACL inside `descriptor`.
+        let read = unsafe {
+            GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted)
+        };
+        if read == 0 {
+            return Err(last_error("GetSecurityDescriptorDacl"));
+        }
+        if present == 0 || acl.is_null() {
+            return Ok(Dacl {
+                protected,
+                entries: None,
             });
         }
-        let allocation = LocalAllocation(sddl.cast::<c_void>());
-        // SAFETY: `sddl` is non-null (checked above) and points to the
-        // NUL-terminated UTF-16 string the conversion produced, live until
-        // `allocation` drops at the end of this function.
-        let decoded = unsafe { wide_null_terminated_to_string(sddl) }
-            .map_err(|_| WindowsIdentityError::SddlNotUtf16);
-        drop(allocation);
-        decoded
+
+        // SAFETY: `acl` is non-null and points to the ACL header inside the
+        // live descriptor.
+        let count = unsafe { acl.read_unaligned() }.AceCount;
+        let mut entries = Vec::with_capacity(usize::from(count));
+        for index in 0..u32::from(count) {
+            let mut ace: *mut c_void = null_mut();
+            // SAFETY: `acl` is the live ACL, `index` is below its ACE count,
+            // and `ace` is a valid out-pointer. On success `ace` points to
+            // the ACE inside the ACL.
+            if unsafe { GetAce(acl, index, &mut ace) } == 0 {
+                return Err(last_error("GetAce"));
+            }
+            if ace.is_null() {
+                return Err(WindowsIdentityError::NullPointer { api: "GetAce" });
+            }
+            // SAFETY: `ace` points to an ACE, which starts with an
+            // `ACE_HEADER`.
+            let header = unsafe { ace.cast::<ACE_HEADER>().read_unaligned() };
+            let (mask, trustee) = if u32::from(header.AceType) == ACCESS_ALLOWED_ACE_TYPE {
+                // SAFETY: `ace` points to an access-allowed ACE whose header
+                // gives its size in bytes.
+                unsafe { allowed_ace_body(ace, header.AceSize) }
+            } else {
+                (0, None)
+            };
+            entries.push(AceEntry {
+                ace_type: header.AceType,
+                flags: header.AceFlags,
+                mask,
+                trustee,
+            });
+        }
+        Ok(Dacl {
+            protected,
+            entries: Some(entries),
+        })
+    }
+
+    /// The access mask and trustee of the access-allowed ACE at `ace`. The
+    /// trustee is `None` when the ACE is too short for a valid SID.
+    ///
+    /// # Safety
+    ///
+    /// `ace` must point to an access-allowed ACE of `size` readable bytes.
+    unsafe fn allowed_ace_body(ace: *const c_void, size: u16) -> (u32, Option<Sid>) {
+        let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+        let Some(available) = usize::from(size).checked_sub(sid_offset) else {
+            return (0, None);
+        };
+        let base = ace.cast::<u8>();
+        // SAFETY: the ACE holds at least `sid_offset` bytes (checked above),
+        // and the mask lies before the SID.
+        let mask = unsafe {
+            base.add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, Mask))
+                .cast::<u32>()
+                .read_unaligned()
+        };
+        // SAFETY: the trustee starts `sid_offset` bytes into the ACE and the
+        // `available` bytes after it lie within the ACE.
+        let trustee = unsafe { Sid::copy_from(base.add(sid_offset).cast_mut().cast(), available) };
+        (mask, trustee)
+    }
+
+    /// Reads the DACL of `path`.
+    #[cfg(test)]
+    pub(super) fn path_dacl(path: &Path) -> Result<Dacl, WindowsIdentityError> {
+        let descriptor = path_security_descriptor(path)?;
+        // SAFETY: `descriptor.0` is the descriptor `GetNamedSecurityInfoW`
+        // returned, live until `descriptor` drops after the call.
+        unsafe { read_dacl(descriptor.0) }
+    }
+
+    /// Decides the DACL that `sddl` describes against the SID that `sid`
+    /// spells, through the same check [`admits_only_current_user`] applies to
+    /// a path.
+    #[cfg(test)]
+    pub(super) fn sddl_admits_only(
+        sddl: &str,
+        sid: &str,
+        require_protected: bool,
+    ) -> Result<bool, WindowsIdentityError> {
+        let descriptor = security_descriptor_from_sddl(sddl)?;
+        let user = Sid::parse(sid)?;
+        // SAFETY: `descriptor.0` is the converted descriptor, live until
+        // `descriptor` drops after the call.
+        unsafe { descriptor_admits_only(descriptor.0, &user, require_protected) }
     }
 
     struct TokenHandle(HANDLE);
@@ -495,7 +724,8 @@ mod windows {
         }
     }
 
-    pub(super) fn current_user_sid_string() -> Result<String, WindowsIdentityError> {
+    /// Reads the current process token's user SID.
+    pub(super) fn current_user_sid() -> Result<Sid, WindowsIdentityError> {
         let mut token: HANDLE = null_mut();
         // SAFETY: `GetCurrentProcess` returns the current pseudo-handle and
         // `token` is a valid out-pointer for `OpenProcessToken`.
@@ -557,12 +787,29 @@ mod windows {
                 api: "GetTokenInformation(TokenUser).Sid",
             });
         }
+        // The SID is stored in the buffer after the `TOKEN_USER` header; the
+        // bytes from it to the end of the written data bound its length.
+        let available = sid
+            .addr()
+            .checked_sub(buffer.as_ptr().addr())
+            .and_then(|offset| (needed_len as usize).checked_sub(offset))
+            .ok_or(WindowsIdentityError::InvalidSid {
+                api: "GetTokenInformation(TokenUser)",
+            })?;
+        // SAFETY: `sid` is non-null and points into `buffer`, which holds the
+        // `available` bytes after it and stays live for the call.
+        unsafe { Sid::copy_from(sid, available) }.ok_or(WindowsIdentityError::InvalidSid {
+            api: "GetTokenInformation(TokenUser)",
+        })
+    }
 
+    pub(super) fn current_user_sid_string() -> Result<String, WindowsIdentityError> {
+        let sid = current_user_sid()?;
         let mut sid_string_ptr: *mut u16 = null_mut();
-        // SAFETY: `sid` points into the live TOKEN_USER buffer and
+        // SAFETY: `sid` holds a valid SID live for the call and
         // `sid_string_ptr` is a valid out-pointer. Win32 allocates the returned
         // string with LocalAlloc; this function frees it with LocalFree.
-        let converted = unsafe { ConvertSidToStringSidW(sid, &mut sid_string_ptr) };
+        let converted = unsafe { ConvertSidToStringSidW(sid.as_psid(), &mut sid_string_ptr) };
         if converted == 0 {
             return Err(last_error("ConvertSidToStringSidW"));
         }
@@ -832,8 +1079,11 @@ mod tests {
             "Windows SID lookup is only available on Windows"
         );
         assert_eq!(
-            WindowsIdentityError::SddlNotUtf16.to_string(),
-            "security descriptor string was not valid UTF-16"
+            WindowsIdentityError::InvalidSid {
+                api: "GetTokenInformation(TokenUser)",
+            }
+            .to_string(),
+            "GetTokenInformation(TokenUser) returned an invalid SID"
         );
         assert_eq!(
             WindowsIdentityError::PathContainsNul.to_string(),
@@ -841,47 +1091,78 @@ mod tests {
         );
     }
 
+    /// The access check compares binary SIDs: an ACE written with an SDDL
+    /// alias matches the SID the alias stands for, and every DACL that grants
+    /// anything to another trustee, grants nothing, or is not protected when
+    /// protection is required, is refused.
     #[test]
-    fn dacl_sddl_admits_only_the_named_user() {
-        let sid = "S-1-5-21-1-2-3-1001";
-        assert!(dacl_sddl_admits_only(
-            "D:P(A;OICI;FA;;;S-1-5-21-1-2-3-1001)",
-            sid,
-            true
-        ));
-        assert!(dacl_sddl_admits_only(
-            "D:AI(A;ID;FA;;;S-1-5-21-1-2-3-1001)",
-            sid,
-            false
-        ));
-        assert!(dacl_sddl_admits_only(
-            "D:PAI(A;OICI;FA;;;S-1-5-21-1-2-3-1001)(A;ID;0x1200a9;;;S-1-5-21-1-2-3-1001)",
-            sid,
-            true
-        ));
-        for refused in [
-            "D:AI(A;ID;FA;;;S-1-5-21-1-2-3-1001)",
-            "D:P(A;OICI;FA;;;S-1-5-21-1-2-3-1001)(A;OICI;FA;;;SY)",
-            "D:P(A;OICI;FA;;;S-1-5-21-1-2-3-1001)(A;OICI;FR;;;WD)",
-            "D:P(D;OICI;FA;;;S-1-5-21-1-2-3-1001)",
-            "D:P(A;OICI;FA;;;S-1-5-21-1-2-3-10010)",
-            "D:P",
-            "D:NO_ACCESS_CONTROL",
-            "D:P(A;OICI;FA;;;S-1-5-21-1-2-3-1001",
-            "O:S-1-5-21-1-2-3-1001D:P(A;OICI;FA;;;S-1-5-21-1-2-3-1001)",
-            "",
+    #[cfg(target_os = "windows")]
+    fn dacl_check_compares_binary_sids() {
+        const SYSTEM: &str = "S-1-5-18";
+        const ADMINISTRATORS: &str = "S-1-5-32-544";
+        const USER: &str = "S-1-5-21-1-2-3-1001";
+
+        for (sddl, sid, require_protected) in [
+            ("D:P(A;OICI;FA;;;SY)", SYSTEM, true),
+            ("D:P(A;OICI;FA;;;BA)", ADMINISTRATORS, true),
+            ("D:P(A;OICI;FA;;;S-1-5-18)", SYSTEM, true),
+            ("D:P(A;OICI;FA;;;S-1-5-21-1-2-3-1001)", USER, true),
+            (
+                "D:PAI(A;OICI;FA;;;SY)(A;ID;0x1200a9;;;S-1-5-18)",
+                SYSTEM,
+                true,
+            ),
+            ("D:(A;OICI;FA;;;SY)", SYSTEM, false),
+            ("D:AI(A;ID;FA;;;SY)", SYSTEM, false),
         ] {
-            assert!(!dacl_sddl_admits_only(refused, sid, true), "{refused}");
+            let decided = windows::sddl_admits_only(sddl, sid, require_protected);
+            assert!(
+                matches!(decided, Ok(true)),
+                "{sddl} must admit {sid}: {decided:?}"
+            );
+        }
+
+        for (sddl, sid, require_protected) in [
+            // The only trustee is a different SID.
+            ("D:P(A;OICI;FA;;;SY)", ADMINISTRATORS, true),
+            ("D:P(A;OICI;FA;;;S-1-5-21-1-2-3-10010)", USER, true),
+            // A second ACE grants another trustee.
+            ("D:P(A;OICI;FA;;;SY)(A;OICI;FR;;;WD)", SYSTEM, true),
+            ("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", SYSTEM, true),
+            // A deny ACE, alone or beside the user's allow ACE.
+            ("D:P(D;OICI;FA;;;SY)", SYSTEM, true),
+            ("D:P(D;OICI;FA;;;WD)(A;OICI;FA;;;SY)", SYSTEM, true),
+            // Protection is required but the DACL is not protected.
+            ("D:(A;OICI;FA;;;SY)", SYSTEM, true),
+            ("D:AI(A;ID;FA;;;SY)", SYSTEM, true),
+            // An empty DACL grants nothing.
+            ("D:P", SYSTEM, true),
+            ("D:P", SYSTEM, false),
+            // A NULL DACL and an absent DACL grant everyone full access.
+            ("D:NO_ACCESS_CONTROL", SYSTEM, false),
+            ("O:SY", SYSTEM, false),
+        ] {
+            let decided = windows::sddl_admits_only(sddl, sid, require_protected);
+            assert!(
+                matches!(decided, Ok(false)),
+                "{sddl} must not admit {sid} (require_protected {require_protected}): {decided:?}"
+            );
         }
     }
 
-    /// The directory carries exactly one protected, inheritable ACE for the
-    /// current user, a file created inside inherits exactly that ACE, and an
-    /// existing path is refused.
+    /// The directory carries exactly one protected, inheritable allow ACE for
+    /// the current user, a file created inside inherits exactly that ACE,
+    /// and an existing path is refused.
     #[test]
     #[cfg(target_os = "windows")]
     fn owner_only_directory_admits_only_the_current_user() {
-        let sid = current_user_sid_string().expect("Windows SID must be available");
+        use windows_sys::Win32::Security::{
+            CONTAINER_INHERIT_ACE, INHERITED_ACE, OBJECT_INHERIT_ACE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+        use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+
+        let user = windows::current_user_sid().expect("Windows SID must be available");
         let parent = std::env::temp_dir().join(format!(
             "stellar-agent-owner-only-test-{}",
             std::process::id()
@@ -891,20 +1172,28 @@ mod tests {
         let dir = parent.join("private");
 
         create_owner_only_directory(&dir).expect("CreateDirectoryW must succeed");
-        // SDDL `D:<flags>(ace)(ace)...`: split the control flags from the ACEs.
-        let split = |sddl: String| {
-            let body = sddl.strip_prefix("D:").expect("a DACL string").to_owned();
-            let at = body.find('(').unwrap_or(body.len());
-            (body[..at].to_owned(), body[at..].to_owned())
+        let single_user_ace = |path: &std::path::Path, flags: u32| {
+            let dacl = windows::path_dacl(path).expect("a readable DACL");
+            let entries = dacl.entries.expect("a DACL is present");
+            assert_eq!(entries.len(), 1, "exactly one ACE on {}", path.display());
+            let ace = &entries[0];
+            assert_eq!(u32::from(ace.ace_type), ACCESS_ALLOWED_ACE_TYPE);
+            assert_eq!(u32::from(ace.flags), flags);
+            assert_eq!(ace.mask, FILE_ALL_ACCESS);
+            assert!(
+                ace.trustee.as_ref().is_some_and(|t| t.equals(&user)),
+                "the ACE trustee must be the current user"
+            );
+            dacl.protected
         };
-        let (flags, aces) = split(path_dacl_sddl(&dir).expect("directory DACL"));
-        assert!(flags.contains('P'), "the DACL must be protected: {flags}");
-        assert_eq!(aces, format!("(A;OICI;FA;;;{sid})"));
+        assert!(
+            single_user_ace(&dir, OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE),
+            "the directory DACL must be protected"
+        );
 
         let file = dir.join("redirect.html");
         std::fs::write(&file, b"x").expect("file inside the directory");
-        let (_flags, aces) = split(path_dacl_sddl(&file).expect("file DACL"));
-        assert_eq!(aces, format!("(A;ID;FA;;;{sid})"));
+        single_user_ace(&file, INHERITED_ACE);
         assert!(admits_only_current_user(&dir, true).expect("directory DACL"));
         assert!(admits_only_current_user(&file, false).expect("file DACL"));
         assert!(!admits_only_current_user(&parent, true).expect("parent DACL"));
