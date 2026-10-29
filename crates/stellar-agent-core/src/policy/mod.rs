@@ -1112,6 +1112,15 @@ pub enum PolicyError {
     /// Equal sequences name different bodies or owners.
     #[error("policy.sequence_fork")]
     SequenceFork,
+    /// An enabled installation has no policy pin.
+    #[error("policy.pin_absent")]
+    PinAbsent,
+    /// A new owner has no statement from the pinned owner.
+    #[error("policy.owner_rotation_required")]
+    OwnerRotationRequired,
+    /// The rotation statement does not authorize this owner and body.
+    #[error("policy.owner_rotation_invalid")]
+    OwnerRotationInvalid,
     /// The window-state lock remained held through the retry window.
     #[error("policy.state_lock_busy")]
     StateLockBusy,
@@ -1289,6 +1298,9 @@ impl PolicyError {
         match self {
             Self::MainnetTableOnTestnet => "policy.mainnet_table_on_testnet",
             Self::SequenceRollback => "policy.sequence_rollback",
+            Self::PinAbsent => "policy.pin_absent",
+            Self::OwnerRotationRequired => "policy.owner_rotation_required",
+            Self::OwnerRotationInvalid => "policy.owner_rotation_invalid",
             Self::SequenceFork => "policy.sequence_fork",
             Self::StateLockBusy => "policy.state_lock_busy",
             Self::StateLockIo { .. } => "policy.state_lock_io",
@@ -1846,6 +1858,9 @@ mod tests {
             match e {
                 PolicyError::MainnetTableOnTestnet => {}
                 PolicyError::SequenceRollback => {}
+                PolicyError::PinAbsent => {}
+                PolicyError::OwnerRotationRequired => {}
+                PolicyError::OwnerRotationInvalid => {}
                 PolicyError::SequenceFork => {}
                 PolicyError::StateLockBusy => {}
                 PolicyError::StateLockIo { .. } => {}
@@ -1865,6 +1880,9 @@ mod tests {
         vec![
             PolicyError::MainnetTableOnTestnet,
             PolicyError::SequenceRollback,
+            PolicyError::PinAbsent,
+            PolicyError::OwnerRotationRequired,
+            PolicyError::OwnerRotationInvalid,
             PolicyError::SequenceFork,
             PolicyError::StateLockBusy,
             PolicyError::StateLockIo {
@@ -1905,6 +1923,9 @@ mod tests {
         match err {
             PolicyError::MainnetTableOnTestnet => "policy.mainnet_table_on_testnet",
             PolicyError::SequenceRollback => "policy.sequence_rollback",
+            PolicyError::PinAbsent => "policy.pin_absent",
+            PolicyError::OwnerRotationRequired => "policy.owner_rotation_required",
+            PolicyError::OwnerRotationInvalid => "policy.owner_rotation_invalid",
             PolicyError::SequenceFork => "policy.sequence_fork",
             PolicyError::StateLockBusy => "policy.state_lock_busy",
             PolicyError::StateLockIo { .. } => "policy.state_lock_io",

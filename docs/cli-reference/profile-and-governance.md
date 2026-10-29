@@ -256,7 +256,7 @@ Enrolls the policy-file owner PUBLIC key into the profile's `policy_owner_key_id
 - `--secret-env <VAR>` (required) — name of the environment variable holding the owner `S...` strkey. The flag takes the variable name, never the secret.
 - `--profile <NAME>`: profile whose owner coordinate is written (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
 - `--expected-address <G_STRKEY>` — refuse unless the seed derives to this address.
-- `--force` — replace an already-enrolled owner key (refused without it when one exists; replacing invalidates every policy file signed by the previous owner key).
+- `--force`: replace an enrolled owner key. When an enablement nonce or a policy pin exists at the profile's window-state entry, or an enablement nonce exists at its default entry (`stellar-agent-policy-window-<NAME>` / `default`), whatever chain the profile file names, a key other than the pinned owner requires an installed policy signed by that key with a valid statement from the pinned owner. Enrolling the pinned owner's key needs no statement and restores a lost owner entry.
 
 The owner coordinate's `account` is the literal `"default"` (the value the engine reads); the stored value is the public key's G-strkey. A G-strkey decodes as URL-safe base64 to 42 bytes, so no 32-byte symmetric-key loader accepts it. Every owner reader also accepts the older form, URL-safe base64 of the 32 key bytes. The V1 engine build rewrites an older-form entry as its G-strkey, best effort, and the first build in a process also rewrites every other profile's older-form owner entry in the profile directory. This command rewrites them too. Under `headless-dpapi` an older-form owner entry can be moved to another coordinate until it is rewritten, so run one V1 verb or this command after upgrading. On success the data object reports the derived `owner_address`, the `keyring_service`/`keyring_account` written, and `replaced`. The prior key's stored value is never decoded or reported. A prior entry at this coordinate may have held an owner seed in the older encoding, so rendering it could print a private key. `replaced: true` conveys that a prior entry existed.
 
@@ -269,7 +269,13 @@ Exits `1` on refusal:
 - `validation.profile_not_found`: the profile does not exist.
 - `enroll_owner_key.expected_address_mismatch`: `--expected-address` does not match.
 - `enroll_owner_key.entry_exists`: an owner key exists without `--force`.
+- `enroll_owner_key.rotation_statement_required`: the installed policy lacks a valid previous-owner statement or a signature from the key being enrolled. The message names the cause (`policy.owner_rotation_required`, `policy.owner_rotation_invalid`, or `policy.owner_signature_invalid`).
+- `policy.pin_absent`: the installation holds a mainnet enablement nonce or a policy pin, but its policy-state lock file or its pin is missing. The message names which one. A command that builds the V1 policy engine recreates a missing lock file. For a missing pin, follow the recovery under [`profile enable-mainnet`](#profile-enable-mainnet).
+- `profile.mainnet_enablement_invalid`: the enablement nonce cannot be read.
+- `policy.state_lock_busy`, `policy.state_lock_io`, `policy.pin_unusable`, and the verified-load codes such as `policy.sequence_rollback` or `policy.policy_file_load_failed` keep their own codes.
 - A keyring error: the platform keyring is unavailable.
+
+Each refusal writes no owner entry.
 
 ### `profile sign-policy`
 
@@ -287,10 +293,11 @@ unset WALLET_OWNER_SK
 Signs a v1 or v2 policy file so the engine accepts it. The engine loads `<state_dir>/policies/<profile>.toml`, recomputes the canonical form (the `[signature]` table excluded), and verifies the signature against the enrolled owner public key. This command produces that `[signature]` table: it computes the same canonical BLAKE3 digest the loader computes, signs it with the owner seed, and writes `owner_id` (the owner G-strkey) and `sig` (hex) back into the file. State-changing (writes the policy file), no network. The owner seed is read from a named environment variable and held only in zeroizing memory; it is never printed, logged, or written to disk.
 
 - `--secret-env <VAR>` (required) — name of the environment variable holding the owner `S...` strkey.
+- `--previous-owner-secret-env <VAR>`: authorize rotation with the previous seed through the same mlock-protected ceremony. `--secret-env` supplies the new owner seed. The previous seed must match the pinned owner, or the enrolled owner when no pin exists.
 - `--profile <NAME>`: profile whose policy file is signed (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
 - `--file <PATH>` — sign a policy file at a non-default path (default `<state_dir>/policies/<profile>.toml`, the only location the engine loads).
 
-Before writing, the seed's derived public key is cross-checked against the enrolled owner key; a seed that does not match is refused (`sign_policy.owner_key_mismatch`) so a file the engine would reject is never produced. Before signing, the command also checks the body as the engine loads it, with the `scope` compared against the profile, and refuses a body the engine would reject. A refusal leaves the file unchanged. Signing does not require a valid previous signature: re-signing a file with a stale or malformed `[signature]` table replaces that table in place, dropping any extra key in it, and reports `replaced: true` with the previous `owner_id`. On success the data object reports the `owner_address`, the `policy_path`, the `digest` (hex), and the `signature` (hex):
+Without the rotation flag, the seed's derived public key is cross-checked against the enrolled owner key; a seed that does not match is refused (`sign_policy.owner_key_mismatch`) so a file the engine would reject is never produced. Before signing, the command also checks the body as the engine loads it, with the `scope` compared against the profile, and refuses a body the engine would reject. A refusal leaves the file unchanged. Signing does not require a valid previous signature: re-signing a file with a stale or malformed `[signature]` table replaces that table in place, dropping any extra key in it, and reports `replaced: true` with the previous `owner_id`. On success the data object reports the `owner_address`, the `policy_path`, the `digest` (hex), and the `signature` (hex):
 
 ```json
 {"ok":true,"data":{"profile":"default","signed":true,"owner_address":"G...","policy_path":".../policies/default.toml","digest":"<hex>","signature":"<hex>","replaced":false},"request_id":"..."}
@@ -300,7 +307,7 @@ Exits `1` on refusal:
 
 - `validation.profile_not_found`: the profile does not exist.
 - `sign_policy.owner_key_unavailable`: no owner key is enrolled; run `enroll-owner-key` first.
-- `sign_policy.owner_key_mismatch`: the seed does not match the enrolled owner key.
+- `sign_policy.owner_key_mismatch`: the seed does not match the enrolled owner key, or the previous seed does not match the pinned owner (the enrolled owner when no pin exists).
 - `sign_policy.policy_file_unreadable`: the policy file is missing.
 - `sign_policy.canonicalization_failed`: the policy file is malformed, or its
   body holds a key outside the policy schema. The message names the key and
@@ -326,8 +333,10 @@ advances it.
 
 A v1 policy on mainnet produces a warning that writes require v2 with
 `[mainnet]`. If a pin exists, signing v1 also warns that its next load refuses
-with `policy.sequence_rollback`. Rotate the owner with `enroll-owner-key
---force`, then run `sign-policy`.
+with `policy.sequence_rollback`.
+
+To change the owner of a profile with a policy pin, follow
+[Rotate the policy owner](../profiles.md#rotate-the-policy-owner).
 
 Additional refusals:
 
@@ -337,6 +346,13 @@ Additional refusals:
 - `policy.state_lock_busy`: another writer holds the lock through three attempts.
 - `policy.state_lock_io`: the lock file cannot be opened; the detail gives the I/O kind.
 - `policy.pin_unusable`: the installation's policy pin cannot be read or is malformed.
+
+Signing does not check owner continuity. The verified load that follows
+refuses a signed policy with `policy.pin_absent` when the installation holds
+an enablement nonce but no pin, with `policy.owner_rotation_required` when a
+higher sequence changes the pinned owner without a rotation statement, and
+with `policy.owner_rotation_invalid` when the statement names other keys or
+its signature does not verify for this body.
 
 After signing an enabled mainnet policy, restart the MCP server. A stale
 startup binding refuses with `network.mainnet_write_forbidden` and
@@ -356,10 +372,18 @@ chain and RPC URL, engine v1, an enrolled owner key and signer identity, and
 no key-scope findings. A process on a headless keyring backend
 (`STELLAR_AGENT_KEYRING_BACKEND` set to `headless-env` or `headless-dpapi`)
 is refused in every mode with `network.mainnet_keyring_backend_unsupported`
-before any keyring entry is read: mainnet needs the platform keyring. It records `mainnet_enablement_minted` through the
+before any keyring entry is read: mainnet needs the platform keyring.
+Before the first nonce is written, a signed v2 policy
+establishes the pin with its verified sequence, digest, and owner.
+Create and sign that policy before running the ceremony; it may omit `[mainnet]`.
+A v1 policy refuses with `profile.enable_mainnet_precondition` and
+`sign a v2 policy before enabling mainnet`; an unsigned policy refuses with
+`policy.policy_file_parse_failed`. Neither writes a nonce, pin, or audit row.
+An existing pin stays in place, including during nonce rotation.
+The ceremony records `mainnet_enablement_minted` through the
 strict audit writer, stores an installation nonce, then atomically rewrites
 the policy with the profile, normalized endpoint host, and nonce digest.
-A v1 body becomes v2. The operator supplies the fee cap, optional authorization
+The operator supplies the fee cap, optional authorization
 TTL, and thresholds, then signs the policy as the output's `next` list directs.
 
 See [the policy schema and minimum](../profiles.md#mainnet-policy-body) for
@@ -378,6 +402,22 @@ first run does. This recovers a run that stored the nonce but could not
 rewrite the policy. In a build without `mainnet-write`, the `next` list adds
 that writes require such a build.
 
+An installation that holds a nonce but no pin refuses every mainnet write,
+and the ceremony refuses it with `policy.pin_absent`, with and without
+`--rotate`, before writing anything: no wallet command establishes the pin of
+an enabled installation. To recover, remove the keyring entry with service
+`stellar-agent-policy-window-<NAME>` and account `default-mainnet-enablement`
+with the platform keyring tool, such as Keychain Access on macOS, Seahorse on
+Linux, or Credential Manager on Windows. Then run
+`profile enable-mainnet --profile <NAME>`: it pins the installed signed
+policy and stores a new nonce. Sign the rebound policy at a higher sequence;
+mainnet writes stay refused until then. That enablement trusts the installed
+signed policy and its owner, as the first enablement of a new installation
+does, so review the installed policy and the enrolled owner key first.
+When only the policy-state lock file is missing and the pin entry exists,
+the refusal names the lock file instead: a command that builds the V1 policy
+engine, such as starting the MCP server, recreates it, and the nonce stays.
+
 `--check` reports every check with the status `passed`, `failed`, or
 `not_evaluated` and a detail, and exits `1` when any check failed. The checks
 are the preconditions, `verified_policy`, `pin`, `enablement`, and every
@@ -388,9 +428,12 @@ restrictions and `enablement` are `not_evaluated`. The `enablement` check
 fails with `profile.mainnet_enablement_invalid` and the name of the binding
 that does not match, such as `on_disk_host` or `nonce_digest`. The `pin`
 check passes with the pinned sequence, or with `absent (first use)` when no
-pin or window-state lock file exists. It fails when the pin cannot be read or
+pin or window-state lock file exists and no enablement nonce exists.
+An enablement nonce with no pin refuses with `policy.pin_absent`.
+It fails when the pin cannot be read or
 the comparison refuses, with `policy.sequence_rollback`,
-`policy.sequence_fork`, or the lock or pin error in its detail.
+`policy.sequence_fork`, `policy.owner_rotation_required`,
+`policy.owner_rotation_invalid`, or the lock or pin error in its detail.
 `--check` creates and changes nothing: no window-state directory or lock
 file, and no policy, owner key, nonce, pin, or audit row.
 
@@ -401,6 +444,7 @@ Exits `1` on refusal:
 - `profile.enable_mainnet_not_mainnet`: the selected chain is testnet.
 - `profile.enable_mainnet_precondition`: a named precondition or effect failed.
 - `profile.enable_mainnet_nonce_exists`: rerun with `--rotate` to replace the nonce.
+- `policy.pin_absent`: the installation holds a nonce but no pin; see the recovery above.
 - Strict audit errors retain their own codes.
 
 ### Key-rotation subcommands

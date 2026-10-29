@@ -138,6 +138,17 @@ fn enabled_mainnet_verifies_and_bad_binding_refuses() {
     let nonce = "installation-nonce";
     let nonce_hash = stellar_agent_core::hex::encode(&sha2::Sha256::digest(nonce.as_bytes()));
     let pk = write_policy(&FULL.replace(&"0".repeat(64), &nonce_hash));
+    // `profile enable-mainnet` pins the verified policy before it stores the
+    // nonce: a load without a selection advances the absent pin.
+    build_policy_engine(
+        &profile,
+        None,
+        "operator",
+        None,
+        pk,
+        OwnerKeySource::Keyring,
+    )
+    .unwrap();
     let coordinate = mainnet_enablement_entry_ref(&profile.policy_window_state_key_id);
     let entry = keyring_core::Entry::new(&coordinate.service, &coordinate.account).unwrap();
     entry.set_password(nonce).unwrap();
@@ -174,6 +185,59 @@ fn enabled_mainnet_verifies_and_bad_binding_refuses() {
     )
     .unwrap();
     assert!(legacy.enablement.is_none());
+}
+/// An installation that holds an enablement nonce but no pin: the engine
+/// refuses with `policy.pin_absent`, with and without a selection, and writes
+/// no pin.
+#[test]
+#[serial]
+fn a_stored_nonce_without_a_pin_refuses_and_writes_no_pin() {
+    use sha2::Digest as _;
+    use stellar_agent_core::policy::{
+        PolicyError, pin::PinState, v1::verified::read_pin_without_creating,
+    };
+    use stellar_agent_network::policy_engine::PolicyEngineBuildError;
+    keyring_mock::install().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let _home = StellarAgentHomeGuard::new(dir.path());
+    let profile = profile(true);
+    let profile_dir = default_profile_dir().unwrap();
+    loader::save_to_dir("operator", &profile, &profile_dir).unwrap();
+    let nonce = "installation-nonce";
+    let nonce_hash = stellar_agent_core::hex::encode(&sha2::Sha256::digest(nonce.as_bytes()));
+    let pk = write_policy(&FULL.replace(&"0".repeat(64), &nonce_hash));
+    let coordinate = mainnet_enablement_entry_ref(&profile.policy_window_state_key_id);
+    keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+        .unwrap()
+        .set_password(nonce)
+        .unwrap();
+    let window =
+        stellar_agent_core::profile::schema::default_policy_window_state_path_for("operator");
+    for selection in [None, Some(flag_selection(&profile_dir))] {
+        let selected = selection.is_some();
+        let error = build_policy_engine(
+            &profile,
+            selection,
+            "operator",
+            None,
+            pk,
+            OwnerKeySource::Keyring,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(
+                error,
+                PolicyEngineBuildError::Policy(PolicyError::PinAbsent)
+            ),
+            "{selected}: {error}"
+        );
+        assert_eq!(
+            read_pin_without_creating(&window, &profile).unwrap(),
+            PinState::Absent,
+            "{selected}"
+        );
+    }
 }
 #[test]
 fn signed_fee_cap_precedence() {

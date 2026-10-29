@@ -1809,7 +1809,23 @@ fn higher_sequence_owner_rotation_is_accepted() {
     load(dir.path(), FULL, &profile, &key, PinMode::Advance).unwrap();
     let rotated = SigningKey::from_bytes(&[12; 32]);
     let newer = FULL.replace("sequence = 7", "sequence = 8");
-    let verified = load(dir.path(), &newer, &profile, &rotated, PinMode::Advance).unwrap();
+    let mut doc = newer.parse::<DocumentMut>().unwrap();
+    doc["owner_rotation"] = toml_edit::Item::Table(
+        stellar_agent_core::policy::v1::signature::build_owner_rotation(
+            &newer,
+            &key,
+            &rotated.verifying_key().to_bytes(),
+        )
+        .unwrap(),
+    );
+    let verified = load(
+        dir.path(),
+        &doc.to_string(),
+        &profile,
+        &rotated,
+        PinMode::Advance,
+    )
+    .unwrap();
     assert_eq!(verified.sequence(), 8);
     assert_eq!(verified.owner(), rotated.verifying_key().to_bytes());
     assert!(matches!(

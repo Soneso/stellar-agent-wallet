@@ -17,7 +17,7 @@ use crate::policy::PolicyError;
 
 /// Top-level keys of a policy file. `signature` is the envelope, which the
 /// canonical form excludes.
-const ROOT_KEYS: &[&str] = &["version", "scope", "rules", "signature"];
+const ROOT_KEYS: &[&str] = &["version", "scope", "rules", "signature", "owner_rotation"];
 
 /// Keys of the signed mainnet installation binding, in canonical order.
 pub(crate) const MAINNET_KEYS: &[&str] = &[
@@ -28,6 +28,9 @@ pub(crate) const MAINNET_KEYS: &[&str] = &[
     "authorization_ttl_seconds",
     "cross_check_thresholds",
 ];
+
+/// Keys of the previous owner's rotation statement, in canonical order.
+pub(crate) const OWNER_ROTATION_KEYS: &[&str] = &["previous_owner", "new_owner", "sig"];
 
 /// Keys of the `[signature]` envelope.
 const SIGNATURE_KEYS: &[&str] = &["owner_id", "sig"];
@@ -97,7 +100,7 @@ pub(crate) fn criterion_keys(kind: &str) -> Option<&'static [&'static str]> {
 ///    version 2 document also accepts `sequence` and `mainnet`.
 /// 2. The `[mainnet]` table, then its `cross_check_thresholds` table, whose
 ///    keys must be `native` or a pinned asset identity.
-/// 3. The `[signature]` table.
+/// 3. The `[signature]` and `[owner_rotation]` tables.
 /// 4. Each rule of a `[[rules]]` array or an inline `rules = [...]` array in
 ///    order, with its `match` table and its criteria. Each criterion is checked
 ///    against the key set of its `kind`.
@@ -150,6 +153,7 @@ pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
             "mainnet",
             "rules",
             "signature",
+            "owner_rotation",
         ][..]
     } else {
         ROOT_KEYS
@@ -183,6 +187,15 @@ pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
             SIGNATURE_KEYS,
             Some("signature"),
             "the signature table",
+        )?;
+    }
+
+    if let Some(rotation) = doc.get("owner_rotation").and_then(Item::as_table_like) {
+        reject_unknown_keys(
+            rotation,
+            OWNER_ROTATION_KEYS,
+            Some("owner_rotation"),
+            "the owner rotation table",
         )?;
     }
 
@@ -306,6 +319,31 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// An unknown key inside `[owner_rotation]` is refused with its location,
+    /// in either version.
+    #[test]
+    fn unknown_owner_rotation_key_is_refused() {
+        for head in [
+            "version = 1\nscope = \"profile:alice\"\n",
+            "version = 2\nscope = \"profile:alice\"\nsequence = 1\n",
+        ] {
+            let doc = DocumentMut::from_str(&format!(
+                "{head}[owner_rotation]\nprevious_owner = \"G\"\nnew_owner = \"G\"\n\
+                 sig = \"00\"\nextra = 1\n"
+            ))
+            .unwrap();
+            let err = validate_policy_keys(&doc).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    PolicyError::PolicyFileParseFailed { ref detail }
+                        if detail.starts_with("owner_rotation: unknown key `extra`;")
+                ),
+                "{head}: {err:?}"
+            );
+        }
     }
 
     /// A container of another shape is left to the loader's diagnostics: a

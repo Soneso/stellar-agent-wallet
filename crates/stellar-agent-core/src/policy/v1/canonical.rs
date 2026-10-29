@@ -9,7 +9,8 @@
 //! 1. The `[signature]` table is **excluded** from the output.
 //! 2. Included keys: `version` (top-level integer), `scope` (top-level string),
 //!    `[[rules]]` array (in original declaration order). Version 2 also signs
-//!    `sequence` and the optional mainnet binding before the rules.
+//!    `sequence` and the optional mainnet binding before the rules. A present
+//!    `owner_rotation` table is signed in either version.
 //! 3. Field order within each rule is fixed: `match`, `criteria`, `decision`,
 //!    then `reason`, `ttl_secs` and `allow_opaque_signing`. The last three are
 //!    emitted only when the rule carries them, so the canonical bytes of a rule
@@ -55,9 +56,10 @@ use crate::policy::PolicyError;
 /// The canonical form is the pre-image for the owner signature:
 /// `blake3(canonical_bytes(policy_toml))`.
 ///
-/// The `[signature]` table is excluded. Version 1 signs `version`, `scope`,
-/// and `[[rules]]` in declaration order. Version 2 also signs `sequence` and
-/// `[mainnet]`, and sorts keys in match and criterion tables.  Each rule
+/// The `[signature]` table is excluded and a present `[owner_rotation]`
+/// table is included. Version 1 signs `version`, `scope`, and `[[rules]]` in
+/// declaration order. Version 2 also signs `sequence` and `[mainnet]`, and
+/// sorts keys in match and criterion tables.  Each rule
 /// carries `match`, `criteria` and `decision`, then whichever of `reason`,
 /// `ttl_secs` and `allow_opaque_signing` it holds, in that order.  All
 /// comments are stripped and whitespace is normalised.
@@ -95,6 +97,23 @@ pub fn canonical_bytes(toml_text: &str) -> Result<Vec<u8>, PolicyError> {
 
     let output = build_canonical_document(&doc)?;
     Ok(output.into_bytes())
+}
+
+/// Canonical bytes bound by the previous owner's rotation statement.
+///
+/// Both `[signature]` and `[owner_rotation]` are excluded. Every other
+/// canonical field, including scope, sequence, and rules, remains signed.
+///
+/// # Errors
+/// Returns the same parsing errors as [`canonical_bytes`].
+pub fn owner_rotation_bytes(toml_text: &str) -> Result<Vec<u8>, PolicyError> {
+    let mut doc =
+        DocumentMut::from_str(toml_text).map_err(|e| PolicyError::PolicyFileParseFailed {
+            detail: e.to_string(),
+        })?;
+    doc.remove("signature");
+    doc.remove("owner_rotation");
+    Ok(build_canonical_document(&doc)?.into_bytes())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -175,6 +194,22 @@ fn build_canonical_document(doc: &DocumentMut) -> Result<String, PolicyError> {
             }
             out.insert("mainnet", Item::Table(table));
         }
+    }
+
+    if let Some(rotation) = doc.get("owner_rotation") {
+        let rotation =
+            rotation
+                .as_table_like()
+                .ok_or_else(|| PolicyError::PolicyFileParseFailed {
+                    detail: "`owner_rotation` must be a table".into(),
+                })?;
+        let mut table = Table::new();
+        for key in super::schema::OWNER_ROTATION_KEYS {
+            if let Some(item) = rotation.get(key) {
+                table.insert(key, Item::Value(canonical_scalar(item)?));
+            }
+        }
+        out.insert("owner_rotation", Item::Table(table));
     }
 
     // ── [[rules]] ─────────────────────────────────────────────────────────────
@@ -499,6 +534,26 @@ mod tests {
             ),
             "a non-table mainnet value must be refused, got {err:?}"
         );
+    }
+
+    /// An `owner_rotation` value that is not a table is refused in either
+    /// version, never left out of the signed bytes.
+    #[test]
+    fn canonical_bytes_rejects_non_table_owner_rotation() {
+        for toml in [
+            "version = 1\nscope = \"profile:default\"\nowner_rotation = 5\n",
+            "version = 2\nscope = \"profile:default\"\nsequence = 1\nowner_rotation = \"G\"\n",
+        ] {
+            let err = canonical_bytes(toml).unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    PolicyError::PolicyFileParseFailed { detail }
+                        if detail == "`owner_rotation` must be a table"
+                ),
+                "a non-table owner_rotation value must be refused, got {err:?}"
+            );
+        }
     }
 
     // ── canonical_bytes_strips_signature_table ────────────────────────────────

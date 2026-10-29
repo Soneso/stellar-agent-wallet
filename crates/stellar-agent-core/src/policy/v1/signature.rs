@@ -8,6 +8,10 @@
 //! 3. [`crate::policy::v1::signature::verify`] — verifies an ed25519 signature over the digest using the
 //!    owner public key.
 //!
+//! Owner rotation uses [`build_owner_rotation`](crate::policy::v1::signature::build_owner_rotation)
+//! and [`verify_owner_rotation`](crate::policy::v1::signature::verify_owner_rotation).
+//! The previous owner signs a separate domain that binds both keys and the body.
+//!
 //! ## Dependencies
 //!
 //! - `ed25519-dalek` is used for signature production and verification.  No
@@ -175,6 +179,158 @@ pub fn sign(digest: &[u8; 32], signing_key: &SigningKey) -> [u8; 64] {
     // `verify_strict` on the read side — no domain separation or pre-hashing
     // is applied here because none is applied there.
     signing_key.sign(digest).to_bytes()
+}
+
+/// Builds the digest authorized by the previous owner.
+///
+/// The message is `stellar-agent-owner-rotation-v1`, followed by the previous
+/// and new public keys, then BLAKE3 of the canonical body without either
+/// signature table. Each key and digest occupies exactly 32 bytes.
+///
+/// # Errors
+/// Refuses a body that cannot be canonicalized.
+pub fn owner_rotation_digest(
+    raw: &str,
+    previous_owner: &[u8; 32],
+    new_owner: &[u8; 32],
+) -> Result<[u8; 32], PolicyError> {
+    let body = super::canonical::owner_rotation_bytes(raw)?;
+    let mut message = b"stellar-agent-owner-rotation-v1".to_vec();
+    message.extend_from_slice(previous_owner);
+    message.extend_from_slice(new_owner);
+    message.extend_from_slice(&digest(&body));
+    Ok(digest(&message))
+}
+
+/// Builds an `[owner_rotation]` table signed by the previous owner.
+///
+/// The new owner's policy signature must cover the returned table too.
+///
+/// # Errors
+/// Refuses a body that cannot be canonicalized.
+pub fn build_owner_rotation(
+    raw: &str,
+    previous_key: &SigningKey,
+    new_owner: &[u8; 32],
+) -> Result<toml_edit::Table, PolicyError> {
+    let previous_owner = previous_key.verifying_key().to_bytes();
+    let digest = owner_rotation_digest(raw, &previous_owner, new_owner)?;
+    let mut table = toml_edit::Table::new();
+    table["previous_owner"] = toml_edit::value(
+        stellar_strkey::ed25519::PublicKey(previous_owner)
+            .to_string()
+            .to_string(),
+    );
+    table["new_owner"] = toml_edit::value(
+        stellar_strkey::ed25519::PublicKey(*new_owner)
+            .to_string()
+            .to_string(),
+    );
+    table["sig"] = toml_edit::value(crate::hex::encode(&previous_key.sign(&digest).to_bytes()));
+    Ok(table)
+}
+
+/// The fields of a well-formed `[owner_rotation]` table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerRotation {
+    /// The owner the statement hands the policy over from.
+    pub previous_owner: [u8; 32],
+    /// The owner the statement authorizes.
+    pub new_owner: [u8; 32],
+    /// The previous owner's signature over [`owner_rotation_digest`].
+    pub sig: [u8; 64],
+}
+
+/// Parses the `[owner_rotation]` table of `doc`; `None` when it is absent.
+///
+/// The table holds exactly `previous_owner` and `new_owner`, each a G-strkey
+/// string, and `sig`, a string of 128 hex characters.
+///
+/// # Errors
+/// Returns [`PolicyError::PolicyFileParseFailed`] naming the defect: a value
+/// that is not a table, a missing or unknown key, a value that is not a
+/// string, a key that is not a G-strkey, or a `sig` that is not 64 bytes of
+/// hex.
+pub fn parse_owner_rotation(
+    doc: &toml_edit::DocumentMut,
+) -> Result<Option<OwnerRotation>, PolicyError> {
+    let malformed = |detail: String| PolicyError::PolicyFileParseFailed { detail };
+    let Some(item) = doc.get("owner_rotation") else {
+        return Ok(None);
+    };
+    let table = item
+        .as_table_like()
+        .ok_or_else(|| malformed("`owner_rotation` must be a table".into()))?;
+    let keys = super::schema::OWNER_ROTATION_KEYS;
+    if let Some((key, _)) = table.iter().find(|(key, _)| !keys.contains(key)) {
+        return Err(malformed(format!(
+            "owner_rotation: unknown key `{}`; the owner rotation table accepts {}",
+            key.escape_debug(),
+            keys.join(", ")
+        )));
+    }
+    let text = |key: &str| {
+        table
+            .get(key)
+            .ok_or_else(|| malformed(format!("`[owner_rotation].{key}` is missing")))?
+            .as_str()
+            .ok_or_else(|| malformed(format!("`[owner_rotation].{key}` must be a string")))
+    };
+    let owner = |key: &str| {
+        stellar_strkey::ed25519::PublicKey::from_string(text(key)?)
+            .map(|key| key.0)
+            .map_err(|_| malformed(format!("`[owner_rotation].{key}` must be a G-strkey")))
+    };
+    let previous_owner = owner("previous_owner")?;
+    let new_owner = owner("new_owner")?;
+    let sig = decode_signature_hex(text("sig")?)
+        .ok_or_else(|| malformed("`[owner_rotation].sig` must be 128 hex characters".into()))?;
+    Ok(Some(OwnerRotation {
+        previous_owner,
+        new_owner,
+        sig,
+    }))
+}
+
+/// Decodes exactly 64 bytes of hex digits, either case. Signs, whitespace and
+/// non-ASCII text are refused.
+fn decode_signature_hex(hex: &str) -> Option<[u8; 64]> {
+    if hex.len() != 128 || !hex.is_ascii() {
+        return None;
+    }
+    let (first, second) = hex.split_at(64);
+    let mut out = [0_u8; 64];
+    out[..32].copy_from_slice(&crate::hex::decode_hex32(first).ok()?);
+    out[32..].copy_from_slice(&crate::hex::decode_hex32(second).ok()?);
+    Some(out)
+}
+
+/// Verifies a rotation statement against the pinned and verifying owners.
+///
+/// # Errors
+/// Returns `OwnerRotationRequired` for an absent statement,
+/// `PolicyFileParseFailed` for a malformed table, and `OwnerRotationInvalid`
+/// for a statement that names other owners or whose signature does not
+/// authorize this policy body.
+pub fn verify_owner_rotation(
+    raw: &str,
+    previous_owner: &[u8; 32],
+    new_owner: &[u8; 32],
+) -> Result<(), PolicyError> {
+    let invalid = || PolicyError::OwnerRotationInvalid;
+    let doc =
+        raw.parse::<toml_edit::DocumentMut>()
+            .map_err(|e| PolicyError::PolicyFileParseFailed {
+                detail: e.to_string(),
+            })?;
+    let rotation = parse_owner_rotation(&doc)?.ok_or(PolicyError::OwnerRotationRequired)?;
+    if rotation.previous_owner != *previous_owner || rotation.new_owner != *new_owner {
+        return Err(invalid());
+    }
+    let digest = owner_rotation_digest(raw, previous_owner, new_owner)?;
+    let key = VerifyingKey::from_bytes(previous_owner).map_err(|_| invalid())?;
+    key.verify_strict(&digest, &Signature::from_bytes(&rotation.sig))
+        .map_err(|_| invalid())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -355,5 +511,114 @@ mod tests {
             matches!(err, PolicyError::OwnerSignatureInvalid { .. }),
             "a signature must not verify under a different owner key, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn rotation_statement_binds_the_domain_keys_and_body_and_is_signed_by_new_owner() {
+        let old = SigningKey::from_bytes(&[51; 32]);
+        let new = SigningKey::from_bytes(&[52; 32]);
+        let raw = "version = 2\nscope = \"profile:operator\"\nsequence = 2\n";
+        let old_public = old.verifying_key().to_bytes();
+        let new_public = new.verifying_key().to_bytes();
+        let table = build_owner_rotation(raw, &old, &new_public).unwrap();
+        let sig = decode_signature_hex(table["sig"].as_str().unwrap()).unwrap();
+        let mut message = b"stellar-agent-owner-rotation-v1".to_vec();
+        message.extend(old_public);
+        message.extend(new_public);
+        message.extend(digest(
+            &super::super::canonical::canonical_bytes(raw).unwrap(),
+        ));
+        old.verifying_key()
+            .verify_strict(&digest(&message), &Signature::from_bytes(&sig))
+            .unwrap();
+        let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+        doc["owner_rotation"] = toml_edit::Item::Table(table);
+        assert_eq!(
+            owner_rotation_digest(&doc.to_string(), &old_public, &new_public).unwrap(),
+            digest(&message)
+        );
+        let outer = digest(&super::super::canonical::canonical_bytes(&doc.to_string()).unwrap());
+        let outer_sig = sign(&outer, &new);
+        doc["owner_rotation"]["sig"] = toml_edit::value("00".repeat(64));
+        let changed = digest(&super::super::canonical::canonical_bytes(&doc.to_string()).unwrap());
+        assert!(verify(&changed, &outer_sig, &new_public, "operator").is_err());
+    }
+
+    /// Parsing refuses each malformed shape of the table and accepts the
+    /// well-formed one.
+    #[test]
+    fn owner_rotation_parse_refuses_each_malformed_shape() {
+        let old = SigningKey::from_bytes(&[51; 32]);
+        let new = SigningKey::from_bytes(&[52; 32]);
+        let raw = "version = 2\nscope = \"profile:operator\"\nsequence = 2\n";
+        let table = build_owner_rotation(raw, &old, &new.verifying_key().to_bytes()).unwrap();
+        let mut valid = raw.parse::<toml_edit::DocumentMut>().unwrap();
+        valid["owner_rotation"] = toml_edit::Item::Table(table);
+        let parsed = parse_owner_rotation(&valid).unwrap().unwrap();
+        assert_eq!(parsed.previous_owner, old.verifying_key().to_bytes());
+        assert_eq!(parsed.new_owner, new.verifying_key().to_bytes());
+        assert_eq!(
+            parse_owner_rotation(&raw.parse::<toml_edit::DocumentMut>().unwrap()).unwrap(),
+            None
+        );
+        let upper = valid["owner_rotation"]["sig"]
+            .as_str()
+            .unwrap()
+            .to_ascii_uppercase();
+        let mut doc = valid.clone();
+        doc["owner_rotation"]["sig"] = toml_edit::value(upper);
+        assert_eq!(parse_owner_rotation(&doc).unwrap().unwrap(), parsed);
+        for (defect, expected) in [
+            ("non_table", "`owner_rotation` must be a table"),
+            ("missing", "`[owner_rotation].sig` is missing"),
+            ("unknown", "owner_rotation: unknown key `extra`"),
+            (
+                "non_string",
+                "`[owner_rotation].new_owner` must be a string",
+            ),
+            (
+                "strkey",
+                "`[owner_rotation].previous_owner` must be a G-strkey",
+            ),
+            (
+                "sig_hex",
+                "`[owner_rotation].sig` must be 128 hex characters",
+            ),
+            (
+                "sig_sign",
+                "`[owner_rotation].sig` must be 128 hex characters",
+            ),
+            (
+                "sig_non_ascii",
+                "`[owner_rotation].sig` must be 128 hex characters",
+            ),
+            (
+                "sig_length",
+                "`[owner_rotation].sig` must be 128 hex characters",
+            ),
+        ] {
+            let mut doc = valid.clone();
+            match defect {
+                "non_table" => doc["owner_rotation"] = toml_edit::value("statement"),
+                "missing" => {
+                    doc["owner_rotation"].as_table_mut().unwrap().remove("sig");
+                }
+                "unknown" => doc["owner_rotation"]["extra"] = toml_edit::value("x"),
+                "non_string" => doc["owner_rotation"]["new_owner"] = toml_edit::value(5),
+                "strkey" => doc["owner_rotation"]["previous_owner"] = toml_edit::value("GABC"),
+                "sig_hex" => doc["owner_rotation"]["sig"] = toml_edit::value("zz".repeat(64)),
+                "sig_sign" => doc["owner_rotation"]["sig"] = toml_edit::value("+f".repeat(64)),
+                "sig_non_ascii" => {
+                    doc["owner_rotation"]["sig"] =
+                        toml_edit::value(format!("{0}\u{e9}{0}", "0".repeat(63)));
+                }
+                _ => doc["owner_rotation"]["sig"] = toml_edit::value("00".repeat(63)),
+            }
+            let error = parse_owner_rotation(&doc).unwrap_err();
+            assert!(
+                matches!(&error, PolicyError::PolicyFileParseFailed { detail } if detail.starts_with(expected)),
+                "{defect}: {error:?}"
+            );
+        }
     }
 }

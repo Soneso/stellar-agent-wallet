@@ -279,6 +279,30 @@ pub fn read_enablement_nonce(
         .map_err(|_| crate::error::ValidationError::MainnetEnablementInvalid { binding: "nonce" })
 }
 
+/// Reports whether the installation holds a mainnet enablement nonce.
+///
+/// Continuity checks use presence because an edited policy can invalidate the
+/// binding without removing the installation's obligation to keep its pin.
+///
+/// # Errors
+/// Refuses an unreadable keyring entry; only `NoEntry` means absence.
+pub fn has_enablement_nonce(
+    profile: &crate::profile::schema::Profile,
+) -> Result<bool, crate::error::ValidationError> {
+    let coordinate =
+        crate::profile::schema::mainnet_enablement_entry_ref(&profile.policy_window_state_key_id);
+    let result = keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+        .and_then(|entry| entry.get_password());
+    match result {
+        Ok(nonce) => {
+            let _nonce = zeroize::Zeroizing::new(nonce);
+            Ok(true)
+        }
+        Err(keyring_core::Error::NoEntry) => Ok(false),
+        Err(_) => Err(crate::error::ValidationError::MainnetEnablementInvalid { binding: "nonce" }),
+    }
+}
+
 /// Verifies the installation bindings of a cryptographically verified policy.
 ///
 /// # Errors
@@ -337,6 +361,7 @@ pub fn verify_enablement(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, reason = "test fixtures fail loudly")]
     use super::*;
 
     /// The getters return what the verifier recorded and the fact digest
@@ -394,5 +419,40 @@ mod tests {
             crate::hex::encode(&record.fact_digest()),
             "9b345afa62260aae121d165979de774d333b022df227e8e043bec5871484cf46"
         );
+    }
+
+    /// Only an absent entry reads as no enablement; a read failure refuses.
+    #[test]
+    #[serial_test::serial]
+    fn the_nonce_presence_probe_fails_closed() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let profile = crate::profile::schema::Profile::builder_mainnet_named(
+            "operator",
+            "https://rpc.example.invalid",
+            "s",
+            "a",
+            "n",
+            "a",
+        )
+        .build();
+        let coordinate = crate::profile::schema::mainnet_enablement_entry_ref(
+            &profile.policy_window_state_key_id,
+        );
+        assert!(!has_enablement_nonce(&profile).unwrap());
+        stellar_agent_test_support::keyring_mock::inject_error(
+            &coordinate.service,
+            &coordinate.account,
+            keyring_core::Error::BadStoreFormat("injected read failure".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            has_enablement_nonce(&profile).unwrap_err().code(),
+            "profile.mainnet_enablement_invalid"
+        );
+        keyring_core::Entry::new(&coordinate.service, &coordinate.account)
+            .unwrap()
+            .set_password("installation-nonce")
+            .unwrap();
+        assert!(has_enablement_nonce(&profile).unwrap());
     }
 }

@@ -4880,10 +4880,6 @@ pub(crate) mod tests {
                     )
                     .unwrap();
                 }
-                put(
-                    &mainnet_enablement_entry_ref(&profile.policy_window_state_key_id),
-                    "installation-nonce",
-                );
                 loader::save_to_dir("operator", &profile, &default_profile_dir().unwrap()).unwrap();
                 let raw = include_str!("../../../stellar-agent-core/tests/fixtures/policy-v2.toml")
                     .replace(
@@ -4914,6 +4910,17 @@ pub(crate) mod tests {
                     rule.replace("stellar_pay", "stellar_pay_commit")
                 ));
                 Self::write_policy(&raw);
+                drop(
+                    crate::transport::build_server(
+                        profile.clone(),
+                        stellar_agent_core::audit_log::BindingCheck::Enforce,
+                    )
+                    .unwrap(),
+                );
+                put(
+                    &mainnet_enablement_entry_ref(&profile.policy_window_state_key_id),
+                    "installation-nonce",
+                );
                 let server = stellar_agent_mcp_transport_build(profile);
                 Self {
                     server,
@@ -5158,7 +5165,7 @@ pub(crate) mod tests {
 
         #[test]
         #[serial_test::serial(keyring)]
-        fn compare_only_reverification_creates_no_missing_lock() {
+        fn compare_only_reverification_refuses_a_missing_lock_without_creating_it() {
             let f = Fixture::new(|raw| raw);
             let guard = f
                 .server
@@ -5169,7 +5176,33 @@ pub(crate) mod tests {
             if lock.exists() {
                 std::fs::remove_file(&lock).unwrap();
             }
-            assert!(f.server.verify_mainnet_freshness(&guard).is_ok());
+            let result = f.server.verify_mainnet_freshness(&guard).unwrap_err();
+            let (_, code, message) = error_envelope_parts(&result);
+            assert_eq!(code, "network.mainnet_write_forbidden");
+            assert!(message.contains("restart the server"), "{message}");
+            // The compare-only load behind that refusal reads no pin on an
+            // installation that holds a nonce.
+            use stellar_agent_core::policy::v1::{
+                PolicyStateStore,
+                verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
+            };
+            let refusal = load_verified_policy(
+                &PolicyLoad {
+                    path: &default_policy_dir().unwrap().join("operator.toml"),
+                    profile: &f.server.profile,
+                    profile_name: "operator",
+                    owner_pubkey: &ed25519_dalek::SigningKey::from_bytes(&[11; 32])
+                        .verifying_key()
+                        .to_bytes(),
+                    owner_source: OwnerKeySource::Keyring,
+                    window_path: &f.server.window_path,
+                },
+                PolicyStateStore::new(),
+                PinMode::CompareOnly,
+            )
+            .err()
+            .unwrap();
+            assert_eq!(refusal.wire_code(), "policy.pin_absent");
             assert!(!lock.exists());
         }
 

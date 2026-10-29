@@ -502,12 +502,6 @@ impl ResolverFixture {
         }
         loader::save_to_dir("operator", &profile, &dir.path().join("profiles")).unwrap();
         let nonce = "installation-nonce";
-        put(
-            &stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
-                &profile.policy_window_state_key_id,
-            ),
-            nonce,
-        );
         let digest = stellar_agent_core::hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(
             nonce.as_bytes(),
         ));
@@ -547,6 +541,12 @@ impl ResolverFixture {
             PinMode::Advance,
         )
         .unwrap();
+        put(
+            &stellar_agent_core::profile::schema::mainnet_enablement_entry_ref(
+                &profile.policy_window_state_key_id,
+            ),
+            nonce,
+        );
         let enablement = stellar_agent_core::mainnet::enablement::verify_enablement(
             &policy,
             "operator",
