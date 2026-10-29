@@ -1118,7 +1118,7 @@ async fn mpp_commit_drains_a_queued_consent_row_before_the_signed_resimulation()
         &AttestationBinding::new(NAME, "stellar:testnet"),
         Surface::Cli,
         ConsentAudit::Outbox(&outbox),
-        None,
+        &stellar_agent_core::approval::AttestedApprover::Local,
         |_, _| Err("no grant".to_owned()),
     )
     .expect("approve");
@@ -1386,7 +1386,13 @@ async fn split_mpp_approval_prepare_records_commit_request() {
                 <= data["authorization"]["expires_at_unix"].as_u64().unwrap() * 1_000
         );
         if attempt == 1 {
-            store.record_attestation(approval_id, [0; 32]).unwrap();
+            store
+                .record_attestation(
+                    approval_id,
+                    [0; 32],
+                    stellar_agent_core::approval::AttestedApprover::Local,
+                )
+                .unwrap();
         } else if attempt == 2 {
             let outbox = AuditOutbox::for_log(&fixture.profile.audit_log_path);
             attest_and_persist(
@@ -1396,7 +1402,7 @@ async fn split_mpp_approval_prepare_records_commit_request() {
                 &AttestationBinding::new(NAME, "stellar:testnet"),
                 Surface::Cli,
                 ConsentAudit::Outbox(&outbox),
-                None,
+                &stellar_agent_core::approval::AttestedApprover::Local,
                 |_, _| Err("no grant".into()),
             )
             .unwrap();

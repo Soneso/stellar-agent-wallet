@@ -53,9 +53,11 @@
 //!   caller-supplied `attestation_blob` under the layout the record stores,
 //!   then collapses any error to `policy.approval_required`.
 //! - **Mainnet proof**: [`witness::verify_approval`](crate::approval::witness::verify_approval)
-//! loads the record and the
-//!   key itself and accepts only a version 3 attestation, which covers the
-//!   record's kind and lifetime.
+//!   loads the record and the key itself and accepts only a version 4
+//!   attestation, which covers the record's kind, its lifetime and its
+//!   approver; for a remote approver it then reads the current
+//!   [`RemoteApprovalAuthority`](crate::approval::remote_authorization::RemoteApprovalAuthority)
+//!   again.
 //! - **Bridge POST handler**: calls
 //!   [`PendingApprovalStore::record_passkey_assertion`] after verifying the
 //!   WebAuthn assertion from the browser ceremony.
@@ -70,6 +72,7 @@ pub mod fixtures;
 pub mod mpp;
 pub mod operator_credentials;
 pub mod registration_input;
+pub mod remote_authorization;
 pub mod retry;
 pub mod rule_proposal;
 pub mod store;
@@ -86,9 +89,10 @@ pub use attest::{
 };
 pub use attestation::AttestationBinding;
 pub use attestation::{
-    ATTESTATION_VERSION, ATTESTATION_VERSION_V2, AttestationScope, AttestedLifetime,
-    RULE_PROPOSAL_DOMAIN_TAG, TOOLSET_GATE_DOMAIN_TAG, TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG,
-    compute_attestation, compute_rule_proposal_digest, compute_toolset_gate_digest,
+    ATTESTATION_VERSION, ATTESTATION_VERSION_V2, AttestationScope, AttestedApprover,
+    AttestedLifetime, PENDING_ATTESTATION_VERSION, RULE_PROPOSAL_DOMAIN_TAG,
+    TOOLSET_GATE_DOMAIN_TAG, TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG, compute_attestation,
+    compute_attestation_v4, compute_rule_proposal_digest, compute_toolset_gate_digest,
     compute_trustline_clawback_opt_in_digest, envelope_sha256, verify_attestation,
     verify_toolset_gate_attestation,
 };
@@ -99,6 +103,7 @@ pub use operator_credentials::{
     default_operator_approval_credentials_path,
 };
 pub use registration_input::RegistrationInput;
+pub use remote_authorization::{RemoteApprovalAuthority, RemoteApprovalAuthorization};
 pub use retry::{DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry};
 pub use rule_proposal::{
     CONTEXT_RULE_PROPOSAL_SNAPSHOT_VERSION, ContextRuleProposalSnapshot,

@@ -1777,7 +1777,7 @@ mod tests {
             use stellar_agent_core::approval::witness::{
                 ApprovalExpectation, ApprovedKind, verify_approval,
             };
-            use stellar_agent_core::approval::{AttestationBinding, compute_attestation};
+            use stellar_agent_core::approval::{AttestationBinding, compute_attestation_v4};
             use stellar_agent_core::mainnet::fact::{
                 FACT_LABEL_ENABLEMENT, FACT_LABEL_POLICY, FactDigest,
             };
@@ -1892,17 +1892,24 @@ mod tests {
             let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
             crate::keyring::write_keyring_string(&profile.attestation_key_id, &encoded).unwrap();
             let subject = approval_subject_classic(&envelope_text);
-            let blob = compute_attestation(
+            let blob = compute_attestation_v4(
                 &key,
                 &AttestationBinding::new(&name, "stellar:mainnet"),
                 &nonce,
                 &subject,
                 "1000",
                 &approval_record.attested_lifetime(),
+                &stellar_agent_core::approval::AttestedApprover::Local,
             );
             let mut pending = PendingApprovalStore::open(dir.path().join("pending.toml")).unwrap();
             pending.insert(approval_record, now).unwrap();
-            pending.record_attestation(&nonce, blob).unwrap();
+            pending
+                .record_attestation(
+                    &nonce,
+                    blob,
+                    stellar_agent_core::approval::AttestedApprover::Local,
+                )
+                .unwrap();
             let approval = verify_approval(
                 &pending,
                 &profile,

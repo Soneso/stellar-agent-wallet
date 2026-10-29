@@ -27,16 +27,34 @@
 //! atomically via a temp-file-then-rename. No private-key bytes are ever
 //! stored — only the public metadata produced by a WebAuthn registration
 //! ceremony.
+//!
+//! # Write serialization
+//!
+//! Every mutation ([`OperatorApprovalCredentialStore::enroll`],
+//! [`OperatorApprovalCredentialStore::update_sign_count`] and
+//! [`OperatorApprovalCredentialStore::remove`]) holds an exclusive advisory
+//! lock on the sidecar `<profile>.toml.lock` file from before it loads the
+//! registry until after the replacement file is renamed into place. The
+//! sidecar is never deleted and never replaced, so every writer locks the
+//! same inode; the TOML file itself is replaced on each write and is never
+//! the lock target. Two concurrent writers therefore always see each other's
+//! successful writes: an enrollment is never lost, a removal is never
+//! undone, and a stored sign counter never decreases. A writer that cannot
+//! take the lock within a short bounded retry refuses with
+//! [`ApprovalError::WriterLocked`] and changes nothing. Reads take no lock:
+//! the rename makes every observed file a complete earlier or later version.
 
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
 use super::error::{ApprovalError, toml_error_position};
+use super::store::{LockHandle, lock_path};
 use crate::redact_first5_last5;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -52,6 +70,15 @@ const CREDENTIAL_ID_MAX_BYTES: usize = 64;
 /// Length of an uncompressed SEC1 P-256 public key in bytes:
 /// `0x04 || X (32 bytes) || Y (32 bytes)`.
 const PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN: usize = 65;
+
+/// Attempts at taking the write lock before a mutation refuses with
+/// [`ApprovalError::WriterLocked`].
+const WRITE_LOCK_ATTEMPTS: u32 = 5;
+
+/// Pause between two attempts at taking the write lock. With
+/// [`WRITE_LOCK_ATTEMPTS`] a contended mutation waits at most 80 ms before it
+/// refuses; every critical section is one small TOML load, edit and rename.
+const WRITE_LOCK_BACKOFF: Duration = Duration::from_millis(20);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OperatorApprovalCredential
@@ -112,14 +139,14 @@ pub struct OperatorApprovalCredential {
     ///
     /// # Registration-time seeding is advisory, never authorization-bearing
     ///
-    /// A caller may seed this field at enrollment time with a counter value
-    /// read client-side from the registration ceremony (e.g. the interactive
-    /// loopback enrollment server extracts it from
-    /// `AuthenticatorAttestationResponse.getAuthenticatorData()`). That value
-    /// is client-supplied and, unlike an assertion-time counter, is never
-    /// checked against a signature — nothing stops a caller from reporting
-    /// any number here. This is acceptable because the field feeds only the
-    /// clone-detection regression check in
+    /// A caller may seed this field at enrollment time with the counter of
+    /// the registration ceremony. The interactive loopback enrollment server
+    /// parses it from the authenticator data of the registration response it
+    /// verified; argument import takes the operator's `--sign-count`. Either
+    /// value comes from the client and, unlike an assertion-time counter, is
+    /// never checked against a signature: nothing stops a caller from
+    /// reporting any number here. This is acceptable because the field feeds
+    /// only the clone-detection regression check in
     /// [`OperatorApprovalCredentialStore::update_sign_count`]: lying about
     /// the seed weakens that one credential's own clone-detection baseline
     /// and nothing else. Authorization is decided solely by the profile's
@@ -260,9 +287,9 @@ impl std::fmt::Debug for OperatorApprovalCredentialStore {
 impl OperatorApprovalCredentialStore {
     /// Opens (without yet reading) the store at `path`.
     ///
-    /// Does not touch the filesystem: the file is created lazily on first
-    /// [`Self::enroll`] or [`Self::update_sign_count`] call. Reads return an
-    /// empty registry when the file does not yet exist.
+    /// Does not touch the filesystem: the file and its sidecar lock file are
+    /// created lazily by the first mutation. Reads return an empty registry
+    /// when the file does not yet exist.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
         Self { path }
@@ -294,15 +321,14 @@ impl OperatorApprovalCredentialStore {
         })
     }
 
-    /// Atomically persists the registry via temp-file + rename.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApprovalError::Io`] on I/O failure or [`ApprovalError::Toml`]
-    /// on serialisation failure.
-    fn persist(&self, file: &OperatorCredentialStoreFile) -> Result<(), ApprovalError> {
-        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+    /// The directory that holds the registry file and its sidecar lock.
+    fn parent_dir(&self) -> &Path {
+        self.path.parent().unwrap_or_else(|| Path::new("."))
+    }
 
+    /// Creates the registry directory (mode `0o700` on Unix) if it is absent.
+    fn ensure_parent_dir(&self) -> Result<(), ApprovalError> {
+        let parent = self.parent_dir();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt as _;
@@ -316,6 +342,20 @@ impl OperatorApprovalCredentialStore {
         {
             fs::create_dir_all(parent).map_err(ApprovalError::from_io)?;
         }
+        Ok(())
+    }
+
+    /// Atomically persists the registry via temp-file + rename.
+    ///
+    /// Called only with the store's write lock held: by
+    /// [`Self::with_write_lock`] and by [`Self::remove`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApprovalError::Io`] on I/O failure or [`ApprovalError::Toml`]
+    /// on serialisation failure.
+    fn persist(&self, file: &OperatorCredentialStoreFile) -> Result<(), ApprovalError> {
+        let parent = self.parent_dir();
 
         let toml_str = toml::to_string_pretty(file).map_err(|e| ApprovalError::Toml {
             detail: format!("operator_credentials: serialise error: {e}"),
@@ -339,6 +379,63 @@ impl OperatorApprovalCredentialStore {
             .map_err(|e| ApprovalError::from_io(e.error))?;
 
         Ok(())
+    }
+
+    /// Takes the store's write lock, retrying a held lock a bounded number of
+    /// times.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApprovalError::WriterLocked`] when every attempt finds the lock
+    ///   held by another writer.
+    /// - [`ApprovalError::Io`] when the directory or the lock file cannot be
+    ///   created or locked.
+    fn acquire_write_lock(&self) -> Result<OperatorCredentialWriteLock, ApprovalError> {
+        self.ensure_parent_dir()?;
+        let lock_file = lock_path(&self.path);
+        let mut attempt = 0_u32;
+        loop {
+            attempt += 1;
+            match LockHandle::acquire(&lock_file) {
+                Ok(handle) => return Ok(OperatorCredentialWriteLock { _handle: handle }),
+                Err(ApprovalError::WriterLocked) if attempt < WRITE_LOCK_ATTEMPTS => {
+                    #[cfg(test)]
+                    test_hooks::fire(&self.path, test_hooks::Point::Busy);
+                    std::thread::sleep(WRITE_LOCK_BACKOFF);
+                }
+                Err(other) => return Err(other),
+            }
+        }
+    }
+
+    /// Runs one mutation of the registry under the store's write lock.
+    ///
+    /// The lock is taken before the registry is loaded and released after
+    /// the replacement file is renamed into place, so `update` always sees
+    /// the latest successful write and no other writer can replace the file
+    /// between the load and the rename. Nothing is written when `update`
+    /// returns an error. No WebAuthn verification, terminal input, network
+    /// operation or `.await` happens inside the critical section.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApprovalError::WriterLocked`] when the lock stays held by another
+    ///   writer; nothing is loaded or written.
+    /// - The error `update` returns; nothing is written.
+    /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on load or persist
+    ///   failure.
+    fn with_write_lock<T>(
+        &self,
+        update: impl FnOnce(&mut OperatorCredentialStoreFile) -> Result<T, ApprovalError>,
+    ) -> Result<T, ApprovalError> {
+        let lock = self.acquire_write_lock()?;
+        let mut file = self.load()?;
+        let value = update(&mut file)?;
+        #[cfg(test)]
+        test_hooks::fire(&self.path, test_hooks::Point::Locked);
+        self.persist(&file)?;
+        drop(lock);
+        Ok(value)
     }
 
     /// Returns all enrolled operator-approval credentials.
@@ -376,13 +473,24 @@ impl OperatorApprovalCredentialStore {
     /// path cannot silently grant approval authority; the profile TOML edit
     /// is the operator-controlled authorization act.
     ///
+    /// Runs under the store's write lock (see the module docs), so a
+    /// concurrent enrollment or counter update never drops this record.
+    ///
+    /// The label is shown to the operator, so no label that holds a control
+    /// character ([`char::is_control`]: C0, DEL, C1) is ever stored, whatever
+    /// path supplies it. Loading a store does not check labels.
+    ///
     /// # Errors
     ///
     /// - [`ApprovalError::Invalid`] if `credential.credential_id_b64url` or
-    ///   `credential.public_key_sec1_b64` fails format validation.
+    ///   `credential.public_key_sec1_b64` fails format validation, or if
+    ///   `credential.label` holds a control character. The check runs before
+    ///   the write lock is taken; nothing is created or written.
     /// - [`ApprovalError::DuplicateCredentialId`] if a credential with the
-    ///   same `credential_id_b64url` is already enrolled. Remove it first
-    ///   (via a future explicit removal path) to re-enroll under the same ID.
+    ///   same `credential_id_b64url` is already enrolled. [`Self::remove`] it
+    ///   first to re-enroll under the same ID.
+    /// - [`ApprovalError::WriterLocked`] if another writer holds the store's
+    ///   write lock; nothing is written.
     /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on persistence
     ///   failure.
     pub fn enroll(&self, credential: OperatorApprovalCredential) -> Result<(), ApprovalError> {
@@ -390,19 +498,25 @@ impl OperatorApprovalCredentialStore {
             &credential.credential_id_b64url,
             &credential.public_key_sec1_b64,
         )?;
-
-        let mut file = self.load()?;
-        if file
-            .credentials
-            .iter()
-            .any(|c| c.credential_id_b64url == credential.credential_id_b64url)
-        {
-            return Err(ApprovalError::duplicate_credential_id(
-                &credential.credential_id_b64url,
-            ));
+        if credential.label.chars().any(char::is_control) {
+            return Err(ApprovalError::Invalid {
+                reason: "the label holds a control character".to_owned(),
+            });
         }
-        file.credentials.push(credential);
-        self.persist(&file)
+
+        self.with_write_lock(|file| {
+            if file
+                .credentials
+                .iter()
+                .any(|c| c.credential_id_b64url == credential.credential_id_b64url)
+            {
+                return Err(ApprovalError::duplicate_credential_id(
+                    &credential.credential_id_b64url,
+                ));
+            }
+            file.credentials.push(credential);
+            Ok(())
+        })
     }
 
     /// Updates the stored sign counter for `credential_id_b64url` after a
@@ -420,12 +534,18 @@ impl OperatorApprovalCredentialStore {
     /// regression check — the authenticator does not report counters at
     /// all, which is valid under WebAuthn Level 2.
     ///
+    /// The check runs against the counter loaded under the store's write
+    /// lock, so of two concurrent successful updates the later one always
+    /// carries the higher counter.
+    ///
     /// # Errors
     ///
     /// - [`ApprovalError::NotFound`] if no credential with
     ///   `credential_id_b64url` is enrolled.
     /// - [`ApprovalError::SignCounterRegression`] if the regression check
     ///   above fails. The stored counter is NOT updated in this case.
+    /// - [`ApprovalError::WriterLocked`] if another writer holds the store's
+    ///   write lock; nothing is written.
     /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on persistence
     ///   failure.
     pub fn update_sign_count(
@@ -433,40 +553,93 @@ impl OperatorApprovalCredentialStore {
         credential_id_b64url: &str,
         presented_counter: u32,
     ) -> Result<(), ApprovalError> {
-        let mut file = self.load()?;
-        let record = file
-            .credentials
-            .iter_mut()
-            .find(|c| c.credential_id_b64url == credential_id_b64url)
-            .ok_or(ApprovalError::NotFound)?;
+        self.with_write_lock(|file| {
+            let record = file
+                .credentials
+                .iter_mut()
+                .find(|c| c.credential_id_b64url == credential_id_b64url)
+                .ok_or(ApprovalError::NotFound)?;
 
-        if let Some(stored) = record.sign_count
-            && (stored != 0 || presented_counter != 0)
-            && presented_counter <= stored
-        {
-            return Err(ApprovalError::sign_counter_regression(
-                credential_id_b64url,
-                presented_counter,
-                stored,
-            ));
-        }
+            if let Some(stored) = record.sign_count
+                && (stored != 0 || presented_counter != 0)
+                && presented_counter <= stored
+            {
+                return Err(ApprovalError::sign_counter_regression(
+                    credential_id_b64url,
+                    presented_counter,
+                    stored,
+                ));
+            }
 
-        record.sign_count = Some(presented_counter);
-        self.persist(&file)
+            record.sign_count = Some(presented_counter);
+            Ok(())
+        })
     }
+
+    /// Removes the enrolled credential `credential_id_b64url`.
+    ///
+    /// Returns `true` when a record was removed and `false` when none was
+    /// enrolled under that ID, in which case nothing is written. Runs under
+    /// the store's write lock, so a concurrent counter update or enrollment
+    /// cannot write the removed record back.
+    ///
+    /// Removal deletes the enrollment only. The profile's
+    /// `RemoteApprovalConfig::allowed_credentials` list is a separate file
+    /// this method never edits; an allowlisted ID with no enrolled record
+    /// authorizes nothing.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApprovalError::WriterLocked`] if another writer holds the store's
+    ///   write lock; nothing is written.
+    /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on load or
+    ///   persistence failure.
+    pub fn remove(&self, credential_id_b64url: &str) -> Result<bool, ApprovalError> {
+        let lock = self.acquire_write_lock()?;
+        let mut file = self.load()?;
+        let before = file.credentials.len();
+        file.credentials
+            .retain(|c| c.credential_id_b64url != credential_id_b64url);
+        if file.credentials.len() == before {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        test_hooks::fire(&self.path, test_hooks::Point::Locked);
+        self.persist(&file)?;
+        drop(lock);
+        Ok(true)
+    }
+}
+
+/// The store's held write lock: an exclusive advisory lock on the sidecar
+/// `<profile>.toml.lock` file, released when this value drops.
+struct OperatorCredentialWriteLock {
+    _handle: LockHandle,
 }
 
 /// Returns the default path for a profile's operator-approval credential
 /// store: `<dir>/<profile>.toml` under
 /// [`crate::profile::schema::default_operator_approval_credentials_dir`].
 ///
+/// The returned path always names a file directly inside that directory:
+/// `profile_name` must pass
+/// [`crate::profile::name::validate_path_component_ascii_safe`], so an
+/// absolute path, a separator or a `..` component never reaches the join.
+///
 /// # Errors
 ///
-/// Returns [`ApprovalError::Io`] if the OS-conventional state directory
-/// cannot be resolved.
+/// - [`ApprovalError::Invalid`] if `profile_name` is not a safe path
+///   component; nothing is resolved.
+/// - [`ApprovalError::Io`] if the OS-conventional state directory cannot be
+///   resolved.
 pub fn default_operator_approval_credentials_path(
     profile_name: &str,
 ) -> Result<PathBuf, ApprovalError> {
+    crate::profile::name::validate_path_component_ascii_safe(profile_name).map_err(|reason| {
+        ApprovalError::Invalid {
+            reason: format!("invalid profile name: {reason}"),
+        }
+    })?;
     let dir = crate::profile::schema::default_operator_approval_credentials_dir().map_err(|e| {
         ApprovalError::from_io_detail(
             std::io::ErrorKind::Other,
@@ -474,6 +647,61 @@ pub fn default_operator_approval_credentials_path(
         )
     })?;
     Ok(dir.join(format!("{profile_name}.toml")))
+}
+
+/// Pause points inside the write path, so a test can interleave two writers
+/// deterministically.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    /// Where a writer calls its hook.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Point {
+        /// The writer holds the write lock and has applied its change; the
+        /// replacement file is not yet renamed into place.
+        Locked,
+        /// An attempt at the write lock found it held; the writer is about to
+        /// wait and retry.
+        Busy,
+    }
+
+    type Hook = Arc<dyn Fn(Point) + Send + Sync>;
+
+    fn hooks() -> &'static Mutex<HashMap<PathBuf, Hook>> {
+        static HOOKS: std::sync::OnceLock<Mutex<HashMap<PathBuf, Hook>>> =
+            std::sync::OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Installs `hook` for the store at `path`, replacing any earlier one.
+    pub(crate) fn install(path: &Path, hook: impl Fn(Point) + Send + Sync + 'static) {
+        hooks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_path_buf(), Arc::new(hook));
+    }
+
+    /// Removes the hook for the store at `path`.
+    pub(crate) fn clear(path: &Path) {
+        hooks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(path);
+    }
+
+    pub(super) fn fire(path: &Path, point: Point) {
+        let hook = hooks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(path)
+            .cloned();
+        if let Some(hook) = hook {
+            hook(point);
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -734,6 +962,319 @@ mod tests {
         assert_eq!(
             mode, 0o600,
             "registry file must be mode 0o600, got {mode:o}"
+        );
+    }
+
+    // ── Write serialization ─────────────────────────────────────────────────
+
+    /// How long an interleaving step may take before the test fails instead
+    /// of hanging.
+    const STEP: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Runs two writers against the store at `path` in a fixed order: `first`
+    /// runs until it holds the write lock with its change applied and pauses;
+    /// `second` then runs until it finds the lock held and pauses; `first`
+    /// finishes; `second` finishes. A `second` that never meets the held lock
+    /// finishes before `first` resumes. Returns both results.
+    fn interleave<A, B>(
+        path: &Path,
+        first: impl FnOnce() -> A + Send + 'static,
+        second: impl FnOnce() -> B + Send + 'static,
+    ) -> (A, B)
+    where
+        A: Send + 'static,
+        B: Send + 'static,
+    {
+        use std::sync::mpsc;
+        let (locked_tx, locked_rx) = mpsc::channel::<()>();
+        let (release_first_tx, release_first_rx) = mpsc::channel::<()>();
+        let (busy_tx, busy_rx) = mpsc::channel::<()>();
+        let (release_second_tx, release_second_rx) = mpsc::channel::<()>();
+        let release_first_rx = std::sync::Mutex::new(Some(release_first_rx));
+        let release_second_rx = std::sync::Mutex::new(Some(release_second_rx));
+        test_hooks::install(path, move |point| {
+            let name = std::thread::current().name().map(str::to_owned);
+            match (name.as_deref(), point) {
+                (Some("first-writer"), test_hooks::Point::Locked) => {
+                    if let Some(rx) = release_first_rx.lock().unwrap().take() {
+                        locked_tx.send(()).unwrap();
+                        rx.recv_timeout(STEP).unwrap();
+                    }
+                }
+                (Some("second-writer"), test_hooks::Point::Busy) => {
+                    if let Some(rx) = release_second_rx.lock().unwrap().take() {
+                        busy_tx.send(()).unwrap();
+                        rx.recv_timeout(STEP).unwrap();
+                    }
+                }
+                _ => {}
+            }
+        });
+
+        let first = std::thread::Builder::new()
+            .name("first-writer".to_owned())
+            .spawn(first)
+            .unwrap();
+        locked_rx
+            .recv_timeout(STEP)
+            .expect("the first writer reaches its critical section");
+        let second = std::thread::Builder::new()
+            .name("second-writer".to_owned())
+            .spawn(second)
+            .unwrap();
+        let deadline = std::time::Instant::now() + STEP;
+        let met_lock = loop {
+            if busy_rx.try_recv().is_ok() {
+                break true;
+            }
+            if second.is_finished() {
+                break false;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the second writer neither met the lock nor finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        release_first_tx.send(()).unwrap();
+        let first_result = first.join().unwrap();
+        if met_lock {
+            release_second_tx.send(()).unwrap();
+        }
+        let second_result = second.join().unwrap();
+        test_hooks::clear(path);
+        (first_result, second_result)
+    }
+
+    /// Two enrollments that overlap in time both survive: the second writer
+    /// meets the held lock, waits, and then loads the first writer's record.
+    #[test]
+    fn concurrent_enrollments_preserve_both_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let first_store = OperatorApprovalCredentialStore::new(path.clone());
+        let second_store = OperatorApprovalCredentialStore::new(path.clone());
+        let (first, second) = interleave(
+            &path,
+            move || first_store.enroll(make_credential(21, "first")),
+            move || second_store.enroll(make_credential(22, "second")),
+        );
+        first.unwrap();
+        second.unwrap();
+        let ids: Vec<String> = OperatorApprovalCredentialStore::new(path)
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.credential_id_b64url)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![valid_credential_id_b64(21), valid_credential_id_b64(22)]
+        );
+    }
+
+    /// Of two overlapping counter updates, a lower counter that loses the
+    /// race to a higher one is refused and the higher one stays stored; in
+    /// the other order both succeed and the higher one is stored last.
+    #[test]
+    fn concurrent_counter_updates_never_regress() {
+        for (first_counter, second_counter) in [(10_u32, 5_u32), (5, 10)] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("default.toml");
+            let cred = make_credential(23, "laptop");
+            let id = cred.credential_id_b64url.clone();
+            OperatorApprovalCredentialStore::new(path.clone())
+                .enroll(cred)
+                .unwrap();
+            let first_store = OperatorApprovalCredentialStore::new(path.clone());
+            let second_store = OperatorApprovalCredentialStore::new(path.clone());
+            let (first_id, second_id) = (id.clone(), id.clone());
+            let (first, second) = interleave(
+                &path,
+                move || first_store.update_sign_count(&first_id, first_counter),
+                move || second_store.update_sign_count(&second_id, second_counter),
+            );
+            first.unwrap();
+            if second_counter < first_counter {
+                assert!(
+                    matches!(second, Err(ApprovalError::SignCounterRegression { .. })),
+                    "{second:?}"
+                );
+            } else {
+                second.unwrap();
+            }
+            let stored = OperatorApprovalCredentialStore::new(path)
+                .find_by_credential_id(&id)
+                .unwrap()
+                .unwrap()
+                .sign_count;
+            assert_eq!(stored, Some(first_counter.max(second_counter)));
+        }
+    }
+
+    /// A removal that overlaps a paused counter update or enrollment stays
+    /// removed: the paused writer cannot write the removed record back, and
+    /// a later counter update finds nothing.
+    #[test]
+    fn removal_cannot_be_undone_by_stale_writer() {
+        for paused_enrollment in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("default.toml");
+            let cred = make_credential(24, "laptop");
+            let id = cred.credential_id_b64url.clone();
+            OperatorApprovalCredentialStore::new(path.clone())
+                .enroll(cred)
+                .unwrap();
+            let first_store = OperatorApprovalCredentialStore::new(path.clone());
+            let second_store = OperatorApprovalCredentialStore::new(path.clone());
+            let (first_id, second_id) = (id.clone(), id.clone());
+            let (first, removed) = interleave(
+                &path,
+                move || {
+                    if paused_enrollment {
+                        first_store.enroll(make_credential(25, "phone"))
+                    } else {
+                        first_store.update_sign_count(&first_id, 7)
+                    }
+                },
+                move || second_store.remove(&second_id),
+            );
+            first.unwrap();
+            assert!(removed.unwrap(), "the removal found the record");
+            let store = OperatorApprovalCredentialStore::new(path);
+            assert!(store.find_by_credential_id(&id).unwrap().is_none());
+            assert!(matches!(
+                store.update_sign_count(&id, 8),
+                Err(ApprovalError::NotFound)
+            ));
+            assert_eq!(
+                store.list().unwrap().len(),
+                usize::from(paused_enrollment),
+                "the paused enrollment survives the removal"
+            );
+        }
+    }
+
+    /// Removal reports whether a record was removed, leaves other records,
+    /// and a second removal reports `false` without writing.
+    #[test]
+    fn remove_is_idempotent_and_leaves_other_records() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let store = OperatorApprovalCredentialStore::new(path.clone());
+        let keep = make_credential(26, "keep");
+        let gone = make_credential(27, "gone");
+        store.enroll(keep.clone()).unwrap();
+        store.enroll(gone.clone()).unwrap();
+
+        assert!(store.remove(&gone.credential_id_b64url).unwrap());
+        assert_eq!(store.list().unwrap(), vec![keep.clone()]);
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(!store.remove(&gone.credential_id_b64url).unwrap());
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert_eq!(store.list().unwrap(), vec![keep]);
+        assert!(!store.remove("never-enrolled").unwrap());
+    }
+
+    /// A writer that cannot take the lock refuses with `WriterLocked` and
+    /// changes nothing; the sidecar lock file stays in place between writes.
+    #[test]
+    fn held_lock_refuses_every_mutation_without_writing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let store = OperatorApprovalCredentialStore::new(path.clone());
+        let cred = make_credential(28, "laptop");
+        let id = cred.credential_id_b64url.clone();
+        store.enroll(cred).unwrap();
+        let sidecar = dir.path().join("default.toml.lock");
+        assert!(sidecar.exists(), "the sidecar lock file persists");
+        let before = fs::read(&path).unwrap();
+
+        let held = LockHandle::acquire(&sidecar).unwrap();
+        assert!(matches!(
+            store.enroll(make_credential(29, "other")),
+            Err(ApprovalError::WriterLocked)
+        ));
+        assert!(matches!(
+            store.update_sign_count(&id, 3),
+            Err(ApprovalError::WriterLocked)
+        ));
+        assert!(matches!(
+            store.remove(&id),
+            Err(ApprovalError::WriterLocked)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        drop(held);
+
+        assert!(store.remove(&id).unwrap());
+        assert!(sidecar.exists(), "release never deletes the sidecar");
+    }
+
+    /// A label with a control character anywhere refuses before the write
+    /// lock: an absent store stays absent with no lock sidecar, and an
+    /// existing store keeps its bytes.
+    #[test]
+    fn enroll_refuses_a_label_with_a_control_character() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("labels.toml");
+        let sidecar = dir.path().join("labels.toml.lock");
+        let store = OperatorApprovalCredentialStore::new(path.clone());
+        for label in [
+            "lap\u{1b}[2Ktop",
+            "laptop\r",
+            "\u{85}laptop",
+            "\tlaptop",
+            "lap\u{7f}",
+        ] {
+            assert!(
+                matches!(
+                    store.enroll(make_credential(40, label)),
+                    Err(ApprovalError::Invalid { .. })
+                ),
+                "{label:?}"
+            );
+        }
+        assert!(!path.exists());
+        assert!(!sidecar.exists(), "refused before the write lock");
+
+        store.enroll(make_credential(41, "laptop")).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(matches!(
+            store.enroll(make_credential(42, "phone\u{9b}2J")),
+            Err(ApprovalError::Invalid { .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(store.list().unwrap(), vec![make_credential(41, "laptop")]);
+    }
+
+    /// The default store path never leaves the credential directory: a
+    /// profile name that is not a safe path component refuses, and a safe
+    /// one names a file directly inside the directory.
+    #[test]
+    fn default_path_refuses_a_profile_name_that_escapes_the_directory() {
+        for name in [
+            "../escape",
+            "/tmp/escape",
+            "nested/escape",
+            "..",
+            "",
+            "a\\b",
+        ] {
+            assert!(
+                matches!(
+                    default_operator_approval_credentials_path(name),
+                    Err(ApprovalError::Invalid { .. })
+                ),
+                "{name:?}"
+            );
+        }
+        let path = default_operator_approval_credentials_path("laptop").unwrap();
+        assert_eq!(path.file_name().unwrap(), "laptop.toml");
+        assert!(
+            path.parent()
+                .unwrap()
+                .ends_with("operator-approval-credentials"),
+            "{path:?}"
         );
     }
 }

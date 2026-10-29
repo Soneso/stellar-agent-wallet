@@ -6,6 +6,7 @@
 //! | `GET`  | `/enroll` | [`enroll_page_get`] | session cookie |
 //! | `GET`  | `/static/operator-enroll.js` | [`operator_enroll_js_get`] | session cookie |
 //! | `GET`  | `/static/session-bootstrap.js` | [`session_bootstrap_js_get`] | none |
+//! | `POST` | `/enroll/challenge` | [`enroll_challenge_post`] | session + CSRF + proof |
 //! | `POST` | `/enroll/credential` | [`enroll_credential_post`] | session + CSRF + proof |
 //!
 //! The Host / Origin / security-header / body-limit / trace layers are
@@ -15,18 +16,13 @@
 //! successful bootstrap response is the only response that carries the
 //! session proof.
 //!
-//! # Server-side attestation verification is intentionally omitted
+//! # Registration is verified, then staged
 //!
-//! `enroll_credential_post` never inspects an attestation statement (the
-//! ceremony requests `attestation: "none"` client-side — see
-//! `crate::operator_enroll::web::OPERATOR_ENROLL_JS`). Enrolling a
-//! credential here authorizes nothing by itself: the profile's
-//! `[remote_approval] allowed_credentials` allowlist is the sole
-//! authorization gate, consulted only later, at assertion time. Verifying an
-//! attestation statement would add complexity (a CBOR/COSE parser, a trust
-//! anchor set) in exchange for a guarantee this surface has no use for —
-//! knowing the authenticator's make and model does not change whether its
-//! credential id ends up on the allowlist.
+//! `enroll_credential_post` verifies the posted registration response
+//! against the challenge `enroll_challenge_post` issued (see
+//! `super::registration`) and hands the verified credential to the CLI. It
+//! never writes the credential store: the CLI persists the credential only
+//! after the operator types the page's confirmation code at the terminal.
 //!
 //! # Error responses are distinguishable, not collapsed
 //!
@@ -34,15 +30,16 @@
 //! which collapse every failure mode to a generic code because they defend
 //! against an adversary probing a network-reachable, multi-approval
 //! surface — this server is loopback-only, single-operator, and single-use
-//! for exactly one enrollment. There is no adversarial actor for whom
-//! distinguishing "wrong label" from "duplicate credential" from "CSRF
-//! mismatch" would be useful information; surfacing the specific reason is
-//! strictly better for the operator driving the ceremony.
+//! for exactly one enrollment. Its routes answer only the session that
+//! exchanged the bootstrap token, so distinguishing "wrong label" from
+//! "duplicate credential" from "CSRF mismatch" informs only the operator
+//! driving the ceremony.
 
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
+    Router,
+    body::Bytes,
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
@@ -50,52 +47,29 @@ use axum::{
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde::Deserialize;
 use serde_json::json;
-
-use stellar_agent_core::approval::error::ApprovalError;
-use stellar_agent_core::approval::operator_credentials::OperatorApprovalCredential;
 
 use crate::auth::{
     CSRF_HEADER_NAME, SessionState, compute_csrf, require_session_proof, verify_csrf,
 };
 use crate::templates::render_session_bootstrap_page;
 
-use super::OperatorEnrollState;
+use super::confirmation::StagedEnrollment;
+use super::registration::{
+    COSE_ALG_ES256, CREDENTIAL_ID_MAX_BYTES, CREDENTIAL_ID_MIN_BYTES, EnrollCredentialRequest,
+    OperatorRegistrationError, PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN, REGISTRATION_RP_ID,
+    RegistrationChallenge, VerifiedOperatorRegistration, normalized_label,
+    verify_operator_registration,
+};
 use super::templates::render_enroll_page;
 use super::web;
+use super::{Ceremony, OperatorEnrollState};
 
 /// The single logical action this server's per-session CSRF binds to. Unlike
 /// the approval-inbox server (one CSRF value per pending-approval nonce),
 /// this server has exactly one state-changing action, so a fixed nonce is
 /// sufficient.
 const ENROLL_NONCE: &str = "operator-enroll";
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Wire-format bounds
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Minimum credential ID length in raw bytes.
-///
-/// Mirrors `CREDENTIAL_ID_MIN_BYTES` in
-/// `stellar_agent_core::approval::operator_credentials` (CTAP2 §4.2 /
-/// WebAuthn-2 §5.4.7). Duplicated at this wire boundary only so a bounds
-/// violation gets its own distinguishing error code before the store's own
-/// (redundant, defense-in-depth) validation runs.
-const CREDENTIAL_ID_MIN_BYTES: usize = 16;
-
-/// Maximum credential ID length in raw bytes. See
-/// [`CREDENTIAL_ID_MIN_BYTES`].
-const CREDENTIAL_ID_MAX_BYTES: usize = 64;
-
-/// Length of an uncompressed SEC1 P-256 public key in bytes. Mirrors
-/// `PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN` in
-/// `stellar_agent_core::approval::operator_credentials`.
-const PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN: usize = 65;
-
-/// Maximum accepted label length in bytes, matching the page's
-/// `maxlength="64"` input attribute.
-const MAX_LABEL_BYTES: usize = 64;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Router
@@ -112,6 +86,7 @@ pub(super) fn build_router() -> Router<Arc<OperatorEnrollState>> {
             "/static/session-bootstrap.js",
             get(session_bootstrap_js_get),
         )
+        .route("/enroll/challenge", post(enroll_challenge_post))
         .route("/enroll/credential", post(enroll_credential_post))
 }
 
@@ -256,72 +231,138 @@ async fn operator_enroll_js_get(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /enroll/credential
+// Shared POST helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Wire payload for `POST /enroll/credential`.
-///
-/// `Debug` is deliberately not derived: the payload carries a credential id
-/// and a public key, and this crate's tracing layer must never be able to
-/// echo either — matching the wire-type convention documented at
-/// `stellar_agent_webauthn_bridge::wire`.
-#[derive(Deserialize)]
-struct EnrollCredentialRequest {
-    /// Base64url (no padding) WebAuthn credential id.
-    credential_id_b64url: String,
-    /// Base64url (no padding) uncompressed SEC1 P-256 public key.
-    public_key_sec1_b64: String,
-    /// Operator-chosen label, read from the page's label input.
-    label: String,
-    /// Best-effort sign-count seed extracted client-side. See
-    /// `OperatorApprovalCredential::sign_count` for the advisory-trust and
-    /// best-effort-seeding rationale. Typed `u32` so any wire value outside
-    /// that range is rejected by the JSON extractor before this handler
-    /// runs.
-    sign_count: u32,
-}
 
 /// A `403 Forbidden` `csrf_invalid` JSON body.
 fn csrf_invalid() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        [(header::CONTENT_TYPE, "application/json")],
-        json!({"error": "csrf_invalid"}).to_string(),
-    )
-        .into_response()
+    json_response(StatusCode::FORBIDDEN, &json!({"error": "csrf_invalid"}))
 }
 
 /// A `400 Bad Request` JSON body carrying `code` as the distinguishing
 /// error string.
 fn bad_request(code: &'static str) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        [(header::CONTENT_TYPE, "application/json")],
-        json!({"error": code}).to_string(),
-    )
-        .into_response()
+    json_response(StatusCode::BAD_REQUEST, &json!({"error": code}))
 }
 
 /// A `409 Conflict` JSON body carrying `code` as the distinguishing error
 /// string.
 fn conflict(code: &'static str) -> Response {
-    (
-        StatusCode::CONFLICT,
-        [(header::CONTENT_TYPE, "application/json")],
-        json!({"error": code}).to_string(),
-    )
-        .into_response()
+    json_response(StatusCode::CONFLICT, &json!({"error": code}))
 }
 
 /// A `500 Internal Server Error` generic JSON body.
 fn internal_error() -> Response {
-    (
+    json_response(
         StatusCode::INTERNAL_SERVER_ERROR,
+        &json!({"error": "enroll_failed"}),
+    )
+}
+
+fn json_response(status: StatusCode, body: &serde_json::Value) -> Response {
+    (
+        status,
         [(header::CONTENT_TYPE, "application/json")],
-        json!({"error": "enroll_failed"}).to_string(),
+        body.to_string(),
     )
         .into_response()
 }
+
+/// Locks the ceremony state, recovering a poisoned guard: every mutation
+/// under it is a whole-value replacement, so a panic mid-section cannot
+/// leave it half-written.
+fn lock_ceremony(state: &OperatorEnrollState) -> std::sync::MutexGuard<'_, Ceremony> {
+    match state.ceremony.lock() {
+        Ok(g) => g,
+        Err(poison) => poison.into_inner(),
+    }
+}
+
+/// The auth boundary of both POST routes, in order: the session cookie
+/// (`404` on failure), the CSRF header bound to [`ENROLL_NONCE`] (`403`
+/// `csrf_invalid`), and the session proof (`403` `session_proof_invalid`).
+/// A request that passes all three records session activity, and the
+/// session clock's reading is returned for the handler's checks.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err variant is the ready-to-return axum Response for the auth-boundary rejection"
+)]
+fn authorize_post(
+    state: &OperatorEnrollState,
+    headers: &HeaderMap,
+) -> Result<std::time::Instant, Response> {
+    let session = require_session(state, headers)?;
+    let Some(submitted_hex) = headers.get(CSRF_HEADER_NAME).and_then(|v| v.to_str().ok()) else {
+        return Err(csrf_invalid());
+    };
+    if !verify_csrf(&session.csrf_key, ENROLL_NONCE, submitted_hex) {
+        return Err(csrf_invalid());
+    }
+    require_session_proof(&session, headers)?;
+    let mut auth = match state.auth.lock() {
+        Ok(g) => g,
+        Err(poison) => poison.into_inner(),
+    };
+    let now = auth.now();
+    if !auth.record_activity(&session.session_id, now) {
+        return Err(not_found());
+    }
+    Ok(now)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /enroll/challenge
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `POST /enroll/challenge`: the ceremony's registration challenge and the
+/// options the page registers with.
+///
+/// Passes [`authorize_post`] first. Returns the outstanding challenge while
+/// it is unexpired, so a concurrent or repeated request never replaces it,
+/// and issues a fresh one otherwise. Once a registration was accepted the
+/// ceremony is over: `409` `already_completed`. The body never carries the
+/// session proof.
+async fn enroll_challenge_post(
+    State(state): State<Arc<OperatorEnrollState>>,
+    headers: HeaderMap,
+    // The page posts `{}`. The body carries nothing the route uses, and is
+    // read so the connection never closes with request bytes unread.
+    _body: Bytes,
+) -> Response {
+    let now = match authorize_post(&state, &headers) {
+        Ok(now) => now,
+        Err(resp) => return resp,
+    };
+    let mut ceremony = lock_ceremony(&state);
+    if ceremony.completion.is_none() {
+        return conflict("already_completed");
+    }
+    if ceremony
+        .challenge
+        .as_ref()
+        .is_none_or(|challenge| challenge.is_expired(now))
+    {
+        ceremony.challenge = Some(RegistrationChallenge::generate(now));
+    }
+    let Some(challenge) = ceremony.challenge.as_ref() else {
+        return internal_error();
+    };
+    let body = json!({
+        "challenge": challenge.to_b64url(),
+        "rp_id": REGISTRATION_RP_ID,
+        "alg": COSE_ALG_ES256,
+        "user_verification": "required",
+        "resident_key": "required",
+        "attestation": "none",
+        "timeout_ms": u64::try_from(challenge.remaining(now).as_millis()).unwrap_or(u64::MAX),
+    });
+    drop(ceremony);
+    json_response(StatusCode::OK, &body)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /enroll/credential
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// `true` iff `b64url` decodes to a base64url credential id within
 /// [`CREDENTIAL_ID_MIN_BYTES`]..=[`CREDENTIAL_ID_MAX_BYTES`] raw bytes.
@@ -339,124 +380,130 @@ fn public_key_shape_is_valid(b64: &str) -> bool {
         .is_ok_and(|b| b.len() == PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN && b.first() == Some(&0x04))
 }
 
-/// `POST /enroll/credential` — validate, persist, and (on the first success)
-/// fire the single-use completion signal.
+/// Verifies `payload` against the ceremony's outstanding challenge and
+/// returns the verified registration with the challenge it answers.
 ///
-/// # Session and CSRF
+/// # Errors
 ///
-/// Requires the session cookie established by the `/bootstrap/{token}`
-/// exchange — checked first, so an unauthenticated caller learns nothing
-/// beyond a bare `404`. The `X-Stellar-Approval-CSRF` header must then carry
-/// `hex(HMAC-SHA256(session_csrf_key, "operator-enroll"))`, the same value
-/// embedded in the `/enroll` page's data island, recomputed server-side and
-/// compared in constant time via [`crate::auth::verify_csrf`]; a failure is
-/// `403` `csrf_invalid`. Last, the `X-Session-Proof` header must carry the
-/// session proof the bootstrap page stored; a failure is `403`
-/// `session_proof_invalid`. A request that passes all three records session
-/// activity before anything is validated or persisted.
+/// - [`OperatorRegistrationError::AlreadyCompleted`] once a registration was
+///   accepted.
+/// - [`OperatorRegistrationError::Invalid`] when no challenge is outstanding
+///   or verification fails; the challenge stays.
+/// - [`OperatorRegistrationError::Expired`] when the challenge expired; it
+///   is dropped, so the next `POST /enroll/challenge` issues a fresh one.
+fn verify_against_ceremony(
+    ceremony: &mut Ceremony,
+    payload: &EnrollCredentialRequest,
+    expected_origin: &str,
+    now: std::time::Instant,
+) -> Result<(VerifiedOperatorRegistration, [u8; 32]), OperatorRegistrationError> {
+    if ceremony.completion.is_none() {
+        return Err(OperatorRegistrationError::AlreadyCompleted);
+    }
+    let challenge = ceremony
+        .challenge
+        .as_ref()
+        .ok_or(OperatorRegistrationError::Invalid)?;
+    match verify_operator_registration(payload, challenge, expected_origin, now) {
+        Ok(verified) => Ok((verified, *challenge.bytes())),
+        Err(OperatorRegistrationError::Expired) => {
+            ceremony.challenge = None;
+            Err(OperatorRegistrationError::Expired)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// `POST /enroll/credential`: verify the registration response, stage the
+/// credential, and hand it to the CLI for terminal confirmation.
+///
+/// # Checks, in order
+///
+/// 1. [`authorize_post`]: session, CSRF, proof, then activity. The body is
+///    parsed only after it, so an unauthenticated request learns nothing
+///    from its body's shape.
+/// 2. A body that is not exactly the [`EnrollCredentialRequest`] fields
+///    answers `400` `registration_invalid`; shape checks answer
+///    `credential_id_invalid`, `public_key_invalid` and `label_invalid`
+///    (`400`). A label is invalid when it holds a control character
+///    anywhere, or when, trimmed, it is empty or longer than 64 bytes (see
+///    [`normalized_label`]).
+/// 3. Under the ceremony lock: a ceremony that already accepted a
+///    registration answers `409` `already_completed`; one with no
+///    outstanding challenge answers `400` `registration_invalid`.
+/// 4. [`verify_operator_registration`]: an expired challenge answers `400`
+///    `registration_expired` and is dropped, so the page asks for a fresh
+///    one; any other failure answers `400` `registration_invalid` and keeps
+///    the challenge.
+/// 5. A credential ID the store already holds answers `409`
+///    `duplicate_credential_id`. The read takes no store lock, and
+///    [`super::ConfirmedOperatorEnrollment::persist`] refuses a duplicate
+///    again under the store's write lock.
 ///
 /// # Single-use enforcement
 ///
-/// The completion latch (`state.completion`, a
-/// `std::sync::Mutex<Option<oneshot::Sender<()>>>`) is checked and, on
-/// success, consumed while the mutex guard is held across the synchronous
-/// `store.enroll` call — never across an `.await` point. This makes the
-/// check-is-still-available / persist / consume sequence atomic with
-/// respect to any concurrent POST: a second successful-shape request either
-/// sees the sender already gone (refused before it can persist anything) or
-/// loses the race and is the one that persists — never both. A
-/// `DuplicateCredentialId` or other store failure does NOT consume the
-/// latch, so the operator can correct and retry within the same server
-/// session.
+/// A response that passes every check consumes the challenge and the
+/// completion latch in the same critical section, so of two concurrent
+/// valid posts exactly one is staged and the other sees
+/// `already_completed`. A refusal at steps 1 to 5 consumes neither, except
+/// that an expired challenge is dropped (step 4). When the CLI has stopped
+/// waiting, the challenge and the latch are already consumed and the post
+/// answers `409` `already_completed`. The answer is `200`
+/// `{"status":"awaiting_confirmation"}`; the store is untouched.
 async fn enroll_credential_post(
     State(state): State<Arc<OperatorEnrollState>>,
     headers: HeaderMap,
-    Json(payload): Json<EnrollCredentialRequest>,
+    body: Bytes,
 ) -> Response {
-    // ── Session, then CSRF, then proof ──────────────────────────────────────
-    let session = match require_session(&state, &headers) {
-        Ok(s) => s,
+    let now = match authorize_post(&state, &headers) {
+        Ok(now) => now,
         Err(resp) => return resp,
     };
-    let Some(submitted_hex) = headers.get(CSRF_HEADER_NAME).and_then(|v| v.to_str().ok()) else {
-        return csrf_invalid();
+    let Ok(payload) = serde_json::from_slice::<EnrollCredentialRequest>(&body) else {
+        return bad_request("registration_invalid");
     };
-    if !verify_csrf(&session.csrf_key, ENROLL_NONCE, submitted_hex) {
-        return csrf_invalid();
-    }
-    if let Err(resp) = require_session_proof(&session, &headers) {
-        return resp;
-    }
-    {
-        let mut auth = match state.auth.lock() {
-            Ok(g) => g,
-            Err(poison) => poison.into_inner(),
-        };
-        let now = auth.now();
-        if !auth.record_activity(&session.session_id, now) {
-            return not_found();
-        }
-    }
 
-    // ── Shape validation (before touching the store or the latch) ──────────
-    // Decoded only to validate shape; the store re-decodes the original
-    // base64 strings itself (`validate_credential_invariants` stays the
-    // single source of truth for the persisted invariant).
     if !credential_id_shape_is_valid(&payload.credential_id_b64url) {
         return bad_request("credential_id_invalid");
     }
     if !public_key_shape_is_valid(&payload.public_key_sec1_b64) {
         return bad_request("public_key_invalid");
     }
-    let label = payload.label.trim();
-    if label.is_empty() || label.len() > MAX_LABEL_BYTES {
+    if normalized_label(&payload.label).is_none() {
         return bad_request("label_invalid");
     }
 
-    let registered_at_unix_ms = match stellar_agent_core::timefmt::now_unix_ms() {
-        Ok(n) => n,
-        Err(_) => return internal_error(),
+    let mut ceremony = lock_ceremony(&state);
+    let (verified, challenge) =
+        match verify_against_ceremony(&mut ceremony, &payload, &state.expected_origin, now) {
+            Ok(verified) => verified,
+            Err(OperatorRegistrationError::AlreadyCompleted) => {
+                return conflict("already_completed");
+            }
+            Err(OperatorRegistrationError::Expired) => return bad_request("registration_expired"),
+            Err(OperatorRegistrationError::Invalid) => return bad_request("registration_invalid"),
+        };
+    match state
+        .store
+        .find_by_credential_id(verified.credential_id_b64url())
+    {
+        Ok(None) => {}
+        Ok(Some(_)) => return conflict("duplicate_credential_id"),
+        Err(error) => {
+            tracing::warn!(error = %error, "operator enroll: credential store read failed");
+            return internal_error();
+        }
+    }
+    let staged = StagedEnrollment::new(verified, &challenge);
+    ceremony.challenge = None;
+    let Some(completion) = ceremony.completion.take() else {
+        return conflict("already_completed");
     };
-
-    let credential = OperatorApprovalCredential {
-        credential_id_b64url: payload.credential_id_b64url,
-        public_key_sec1_b64: payload.public_key_sec1_b64,
-        rp_id: "localhost".to_owned(),
-        label: label.to_owned(),
-        registered_at_unix_ms,
-        sign_count: Some(payload.sign_count),
-    };
-
-    // ── Single-use claim + persist, atomic under one lock ──────────────────
-    let mut guard = match state.completion.lock() {
-        Ok(g) => g,
-        Err(poison) => poison.into_inner(),
-    };
-    if guard.is_none() {
-        drop(guard);
+    drop(ceremony);
+    if completion.send(staged).is_err() {
+        // The handle stopped waiting: the ceremony window closed before this
+        // registration arrived.
         return conflict("already_completed");
     }
-
-    match state.store.enroll(credential) {
-        Ok(()) => {
-            if let Some(tx) = guard.take() {
-                let _ = tx.send(());
-            }
-            drop(guard);
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/json")],
-                json!({"status": "enrolled"}).to_string(),
-            )
-                .into_response()
-        }
-        Err(ApprovalError::DuplicateCredentialId { .. }) => {
-            drop(guard);
-            conflict("duplicate_credential_id")
-        }
-        Err(_) => {
-            drop(guard);
-            internal_error()
-        }
-    }
+    json_response(StatusCode::OK, &json!({"status": "awaiting_confirmation"}))
 }

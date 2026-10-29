@@ -1,15 +1,30 @@
-//! Terminal requirements for interactive mainnet consent.
+//! Terminal requirements for interactive operator prompts: mainnet consent
+//! and the operator-enrollment confirmation code.
 
 use std::io::IsTerminal as _;
 use stellar_agent_core::error::{ValidationError, WalletError};
 
 pub(crate) fn require_tty_for_mainnet() -> Result<(), WalletError> {
+    let (stdin, stderr) = terminal_streams();
+    require_streams(stdin, stderr)
+}
+
+/// Whether stdin and stderr are both terminals, the condition every
+/// interactive operator prompt needs.
+pub(crate) fn stdin_and_stderr_are_terminals() -> bool {
+    let (stdin, stderr) = terminal_streams();
+    stdin && stderr
+}
+
+/// Whether stdin and stderr are terminals, as the process sees them or as a
+/// test reports them.
+fn terminal_streams() -> (bool, bool) {
     #[cfg(test)]
-    if let Some((stdin, stderr)) = tests::TEST_TTY.get() {
+    if let Some(streams) = tests::TEST_TTY.get() {
         tests::TEST_TTY_CHECKS.set(tests::TEST_TTY_CHECKS.get() + 1);
-        return require_streams(stdin, stderr);
+        return streams;
     }
-    require_streams(
+    (
         std::io::stdin().is_terminal(),
         std::io::stderr().is_terminal(),
     )
@@ -39,10 +54,8 @@ pub(crate) mod tests {
     }
 
     /// Restores the previous terminal state when dropped.
-    #[cfg(feature = "mainnet-write")]
     pub(crate) struct TestTty(Option<(bool, bool)>);
 
-    #[cfg(feature = "mainnet-write")]
     impl Drop for TestTty {
         fn drop(&mut self) {
             TEST_TTY.set(self.0);
@@ -51,7 +64,6 @@ pub(crate) mod tests {
 
     /// Reports `stdin` and `stderr` as the terminal state until the guard
     /// drops.
-    #[cfg(feature = "mainnet-write")]
     pub(crate) fn test_tty(stdin: bool, stderr: bool) -> TestTty {
         TestTty(TEST_TTY.replace(Some((stdin, stderr))))
     }

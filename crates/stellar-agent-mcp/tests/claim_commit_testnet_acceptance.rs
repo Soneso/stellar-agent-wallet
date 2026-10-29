@@ -63,7 +63,7 @@ use serial_test::serial;
 use stellar_agent_claimable::entry::fetch_claimable_balance_entry;
 use stellar_agent_claimable::id::BalanceId;
 use stellar_agent_core::approval::{
-    compute_attestation, envelope_sha256, process_uid_for_attestation,
+    compute_attestation_v4, envelope_sha256, process_uid_for_attestation,
 };
 use stellar_agent_core::policy::v1::{
     AccountIdentityView, AccountReservesView, CounterpartyCacheView, Sep10SessionView,
@@ -410,7 +410,7 @@ async fn t1_claim_two_phase_happy_path() {
     .get(&approval_nonce)
     .expect("the approval request is persisted")
     .clone();
-    let blob = compute_attestation(
+    let blob = compute_attestation_v4(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new(
             &server.profile_name_for_approval(),
@@ -420,8 +420,24 @@ async fn t1_claim_two_phase_happy_path() {
         &sha,
         &uid,
         &stored.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
+    // `approve` records the blob with its approver; the commit gate verifies
+    // the presented blob against that record. The store drops at the end of
+    // the statement, so the commit gate can open it.
+    stellar_agent_core::approval::PendingApprovalStore::open(
+        stellar_agent_core::profile::schema::default_approval_dir()
+            .expect("approval dir")
+            .join(format!("{}.toml", server.profile_name_for_approval())),
+    )
+    .expect("open approval store")
+    .record_attestation(
+        &approval_nonce,
+        blob,
+        stellar_agent_core::approval::AttestedApprover::Local,
+    )
+    .expect("record the local approval");
 
     // ── 3. Commit: gate verifies the attestation, signs, and submits on-chain ──
     let commit = server

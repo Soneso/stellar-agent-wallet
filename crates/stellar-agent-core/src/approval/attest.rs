@@ -40,7 +40,9 @@ use crate::timefmt;
 
 use crate::envelope_decode::{ClassicSummary, ClassicTransactionKind, classic_summary};
 
-use super::attestation::{compute_attestation, compute_trustline_clawback_opt_in_digest};
+use super::attestation::{
+    AttestedApprover, compute_attestation_v4, compute_trustline_clawback_opt_in_digest,
+};
 use super::error::ApprovalError;
 use super::store::{ApprovalKind, PendingApproval, PendingApprovalStore};
 use super::subject::approval_subject_classic;
@@ -419,14 +421,22 @@ impl ConsentAudit<'_> {
 ///    same pending entry the caller validated, with the code the store would
 ///    give for the same condition. One clock read serves this check and the
 ///    store's own expiry check.
-/// 2. Write the consent row through `audit`: `ApprovalAttested`, or
-///    `ApprovalAttestedRemote` with the operator's redacted credential
-///    pseudonym when `operator_credential_id_b64url` is `Some`. The row is
-///    fatal: when the sink refuses, nothing is persisted and the sink's error
-///    is returned.
-/// 3. Persist the attestation, the grant, or the consent. A persist failure
+/// 2. Write the consent row through `audit`: `ApprovalAttested` for a
+///    [`AttestedApprover::Local`] approver, or `ApprovalAttestedRemote` with
+///    the operator's redacted credential pseudonym for a
+///    [`AttestedApprover::Remote`] one. The row is fatal: when the sink
+///    refuses, nothing is persisted and the sink's error is returned.
+/// 3. Persist the attestation, the grant, or the consent. A pending-record
+///    attestation is the version 4 HMAC over the record and `approver`,
+///    stored together with `approver` in one replacement. A persist failure
 ///    after the row returns that failure, and the row then records a consent
 ///    that did not take effect.
+///
+/// `approver` is the identity the approving surface verified, never a value
+/// read from request input: [`Surface::ServeRemote`] requires a
+/// [`AttestedApprover::Remote`] approver and every other surface requires
+/// [`AttestedApprover::Local`]; any other pairing refuses with
+/// `approval.user_mismatch` before anything is written.
 ///
 /// # Errors
 ///
@@ -440,6 +450,8 @@ impl ConsentAudit<'_> {
 ///   (`approval.entry_inconsistent`).
 ///   `ApprovalKind::Rejected` and `ApprovalKind::Consumed` are tombstones and
 ///   can never be attested.
+/// - A surface and approver that do not belong together, or a remote
+///   approver whose credential ID is malformed (`approval.user_mismatch`).
 /// - An entry that changed since validation: `approval.not_found`,
 ///   `approval.expired`, `approval.already_attested`, `approval.rejected`,
 ///   `approval.consumed`, or `approval.wrong_kind`.
@@ -460,9 +472,10 @@ pub fn attest_and_persist(
     binding: &super::AttestationBinding<'_>,
     surface: Surface,
     mut audit: ConsentAudit<'_>,
-    operator_credential_id_b64url: Option<&str>,
+    approver: &AttestedApprover,
     persist_toolset_grant: impl FnOnce(&ToolsetGrantRequest<'_>, &[u8; 32]) -> Result<(), String>,
 ) -> Result<Option<String>, WalletError> {
+    let operator_credential_id_b64url = approver_matches_surface(surface, approver)?;
     let (key_arr, now_ms) = prepare_attestation(store, entry, key_bytes, binding)?;
     let profile = binding.profile_name;
 
@@ -502,7 +515,7 @@ pub fn attest_and_persist(
                 binding,
                 &mut audit,
                 surface,
-                operator_credential_id_b64url,
+                approver,
                 now_ms,
                 &crate::hex::encode(&subject),
                 "X402Payment",
@@ -520,7 +533,7 @@ pub fn attest_and_persist(
             binding,
             &mut audit,
             surface,
-            operator_credential_id_b64url,
+            approver,
             now_ms,
             envelope_sha256_hex,
             "PaymentSimulated",
@@ -536,7 +549,7 @@ pub fn attest_and_persist(
             binding,
             &mut audit,
             surface,
-            operator_credential_id_b64url,
+            approver,
             now_ms,
             envelope_sha256_hex,
             "TrustlineSimulated",
@@ -552,7 +565,7 @@ pub fn attest_and_persist(
             binding,
             &mut audit,
             surface,
-            operator_credential_id_b64url,
+            approver,
             now_ms,
             envelope_sha256_hex,
             "ClaimSimulated",
@@ -637,13 +650,14 @@ pub fn attest_and_persist(
             // clears only when `verify_attested_trustline_clawback_opt_in`
             // recomputes the digest and verifies this blob against the keyring key.
             let digest = compute_trustline_clawback_opt_in_digest(network, code, issuer);
-            let attestation_blob = compute_attestation(
+            let attestation_blob = compute_attestation_v4(
                 key_arr,
                 binding,
                 &entry.approval_nonce,
                 &digest,
                 &entry.process_uid,
                 &entry.attested_lifetime(),
+                approver,
             );
             emit_attested_audit(
                 &mut audit,
@@ -659,6 +673,7 @@ pub fn attest_and_persist(
                 .record_trustline_clawback_opt_in_attestation_at(
                     &entry.approval_nonce,
                     attestation_blob,
+                    approver.clone(),
                     now_ms,
                 )
                 .map_err(|e| record_error(&e))?;
@@ -674,13 +689,14 @@ pub fn attest_and_persist(
             // with PaymentSimulated/ClaimSimulated: the blob binds
             // `proposal_sha256`, the nonce, and the process UID, and is
             // surfaced to `stellar_rule_create_commit`.
-            let attestation_blob = compute_attestation(
+            let attestation_blob = compute_attestation_v4(
                 key_arr,
                 binding,
                 &entry.approval_nonce,
                 proposal_sha256,
                 &entry.process_uid,
                 &entry.attested_lifetime(),
+                approver,
             );
             let proposal_sha256_hex = proposal_sha256
                 .iter()
@@ -700,6 +716,7 @@ pub fn attest_and_persist(
                 .record_rule_proposal_attestation_at(
                     &entry.approval_nonce,
                     attestation_blob,
+                    approver.clone(),
                     now_ms,
                 )
                 .map_err(|e| record_error(&e))?;
@@ -711,13 +728,14 @@ pub fn attest_and_persist(
             ..
         } => {
             super::mpp::verify_mpp_entry_terms(&entry.kind)?;
-            let attestation_blob = compute_attestation(
+            let attestation_blob = compute_attestation_v4(
                 key_arr,
                 binding,
                 &entry.approval_nonce,
                 &super::mpp::approval_subject(authorization_fingerprint, prepared_artifact_hash),
                 &entry.process_uid,
                 &entry.attested_lifetime(),
+                approver,
             );
             emit_attested_audit(
                 &mut audit,
@@ -734,7 +752,13 @@ pub fn attest_and_persist(
                 surface,
                 operator_credential_id_b64url,
             )?;
-            record_attestation_on_store(store, &entry.approval_nonce, attestation_blob, now_ms)?;
+            record_attestation_on_store(
+                store,
+                &entry.approval_nonce,
+                attestation_blob,
+                approver,
+                now_ms,
+            )?;
             Some(URL_SAFE_NO_PAD.encode(attestation_blob))
         }
         ApprovalKind::Rejected { .. } => {
@@ -772,6 +796,39 @@ fn consumed_error() -> WalletError {
                  submission and cannot be attested"
             .to_owned(),
     })
+}
+
+/// Checks that `approver` is the approver `surface` verifies and returns the
+/// credential ID the consent row attributes the approval to.
+///
+/// The remote listener is the only surface that authenticates an operator
+/// credential, so [`Surface::ServeRemote`] requires a well-formed
+/// [`AttestedApprover::Remote`] and every other surface requires
+/// [`AttestedApprover::Local`].
+fn approver_matches_surface(
+    surface: Surface,
+    approver: &AttestedApprover,
+) -> Result<Option<&str>, WalletError> {
+    let mismatch = |detail: &str| {
+        WalletError::Approval(ApprovalFailure::UserMismatch {
+            detail: detail.to_owned(),
+        })
+    };
+    match (surface, approver) {
+        (
+            Surface::ServeRemote,
+            AttestedApprover::Remote {
+                credential_id_b64url,
+            },
+        ) if approver.is_well_formed() => Ok(Some(credential_id_b64url.as_str())),
+        (Surface::ServeRemote, _) => Err(mismatch(
+            "a remote approval requires a verified operator credential",
+        )),
+        (_, AttestedApprover::Local) => Ok(None),
+        (_, _) => Err(mismatch(
+            "only the remote-approval listener attests for an operator credential",
+        )),
+    }
 }
 
 /// Runs the checks every attestation runs before it matches the entry's kind.
@@ -892,7 +949,7 @@ pub fn attest_mainnet_confirmation(
         binding,
         &mut audit,
         Surface::CliMainnetConfirm,
-        None,
+        &AttestedApprover::Local,
         now_ms,
         digest,
         entry.kind.kind_name(),
@@ -941,23 +998,25 @@ fn attest_envelope_and_persist(
     binding: &super::AttestationBinding<'_>,
     audit: &mut ConsentAudit<'_>,
     surface: Surface,
-    operator_credential_id_b64url: Option<&str>,
+    approver: &AttestedApprover,
     now_ms: u64,
     envelope_sha256_hex: &str,
     kind_name: &str,
     gated_tool: &str,
 ) -> Result<Option<String>, WalletError> {
+    let operator_credential_id_b64url = approver_matches_surface(surface, approver)?;
     if let Some(consistency) = classic_entry_summary(&entry.kind) {
         consistency?;
     }
     let presented_sha256 = decode_sha256_hex(envelope_sha256_hex)?;
-    let attestation_blob = compute_attestation(
+    let attestation_blob = compute_attestation_v4(
         key,
         binding,
         &entry.approval_nonce,
         &presented_sha256,
         &entry.process_uid,
         &entry.attested_lifetime(),
+        approver,
     );
     emit_attested_audit(
         audit,
@@ -969,19 +1028,27 @@ fn attest_envelope_and_persist(
         surface,
         operator_credential_id_b64url,
     )?;
-    record_attestation_on_store(store, &entry.approval_nonce, attestation_blob, now_ms)?;
+    record_attestation_on_store(
+        store,
+        &entry.approval_nonce,
+        attestation_blob,
+        approver,
+        now_ms,
+    )?;
     Ok(Some(URL_SAFE_NO_PAD.encode(attestation_blob)))
 }
 
-/// Helper: records an HMAC attestation blob on the store entry.
+/// Helper: records an HMAC attestation blob and its approver on the store
+/// entry.
 fn record_attestation_on_store(
     store: &mut PendingApprovalStore,
     approval_nonce: &str,
     attestation_blob: [u8; 32],
+    approver: &AttestedApprover,
     now_ms: u64,
 ) -> Result<(), WalletError> {
     store
-        .record_attestation_at(approval_nonce, attestation_blob, now_ms)
+        .record_attestation_at(approval_nonce, attestation_blob, approver.clone(), now_ms)
         .map_err(|e| record_error(&e))
 }
 
@@ -1136,7 +1203,7 @@ mod tests {
             &binding(),
             Surface::Cli,
             ConsentAudit::Writer(&mut writer),
-            None,
+            &AttestedApprover::Local,
             |_, _| {
                 grant_persisted = true;
                 Ok(())
@@ -1167,10 +1234,15 @@ mod tests {
         store.insert(entry.clone(), now_ms)?;
         std::fs::remove_file(&store_path)?;
         std::fs::create_dir(&store_path)?;
-        let err =
-            record_attestation_on_store(&mut store, &entry.approval_nonce, [0x42; 32], now_ms)
-                .err()
-                .ok_or("persisting over a directory must refuse")?;
+        let err = record_attestation_on_store(
+            &mut store,
+            &entry.approval_nonce,
+            [0x42; 32],
+            &AttestedApprover::Local,
+            now_ms,
+        )
+        .err()
+        .ok_or("persisting over a directory must refuse")?;
         assert_eq!(err.code(), "approval.record_failed");
         assert!(store_path.is_dir());
         Ok(())
@@ -1558,7 +1630,7 @@ mod tests {
             &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            None,
+            &AttestedApprover::Local,
             |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
         )
         .unwrap();
@@ -1569,13 +1641,14 @@ mod tests {
         assert_eq!(surfaced_blob, *blob_b64);
 
         let sha256_bytes = decode_sha256_hex(&envelope_sha256_hex).unwrap();
-        let expected = compute_attestation(
+        let expected = compute_attestation_v4(
             &raw_key,
             &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
             &nonce,
             &sha256_bytes,
             &process_uid,
             &final_entry.attested_lifetime(),
+            &AttestedApprover::Local,
         );
         let persisted_bytes: [u8; 32] = URL_SAFE_NO_PAD
             .decode(blob_b64)
@@ -1610,7 +1683,7 @@ mod tests {
             &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            None,
+            &AttestedApprover::Local,
             |_req, _key| Err("must not be called".to_owned()),
         )
         .unwrap_err();
@@ -1650,7 +1723,7 @@ mod tests {
             &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            None,
+            &AttestedApprover::Local,
             |req, _key| {
                 assert_eq!(req.toolset_name, "my-toolset");
                 assert_eq!(req.capability, "sign-payment");
@@ -1700,7 +1773,7 @@ mod tests {
             &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            None,
+            &AttestedApprover::Local,
             |_req, _key| Err("grant store unavailable".to_owned()),
         )
         .unwrap_err();
@@ -1777,7 +1850,7 @@ mod tests {
             &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            None,
+            &AttestedApprover::Local,
             |_req, _key| Err("must not be called for RuleProposalSimulated".to_owned()),
         )
         .unwrap();
@@ -1788,13 +1861,14 @@ mod tests {
         let blob_b64 = final_entry.attestation_blob_b64.as_ref().unwrap();
         assert_eq!(surfaced_blob, *blob_b64);
 
-        let expected = compute_attestation(
+        let expected = compute_attestation_v4(
             &raw_key,
             &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
             &nonce,
             &proposal_sha256,
             &process_uid,
             &final_entry.attested_lifetime(),
+            &AttestedApprover::Local,
         );
         let persisted_bytes: [u8; 32] = URL_SAFE_NO_PAD
             .decode(blob_b64)
@@ -1829,7 +1903,7 @@ mod tests {
             &crate::approval::AttestationBinding::new("default", "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            None,
+            &AttestedApprover::Local,
             |_req, _key| Err("must not be called".to_owned()),
         )
         .unwrap_err();
@@ -1852,7 +1926,7 @@ mod tests {
             &crate::approval::AttestationBinding::new("a", "stellar:mainnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            None,
+            &AttestedApprover::Local,
             |_, _| Ok(()),
         )
         .unwrap_err();
@@ -1906,7 +1980,7 @@ mod tests {
                 &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
                 Surface::Cli,
                 ConsentAudit::Writer(&mut audit_writer),
-                None,
+                &AttestedApprover::Local,
                 |_, _| Ok(()),
             )
             .unwrap_err();
@@ -2043,7 +2117,7 @@ mod tests {
                 &binding(),
                 Surface::Cli,
                 ConsentAudit::Writer(&mut writer),
-                None,
+                &AttestedApprover::Local,
                 |_, _| {
                     grant_persisted = true;
                     Ok(())
@@ -2082,7 +2156,7 @@ mod tests {
                 &binding(),
                 Surface::Cli,
                 ConsentAudit::Outbox(&outbox),
-                None,
+                &AttestedApprover::Local,
                 |_, _| {
                     grant_persisted = true;
                     Ok(())
@@ -2133,7 +2207,7 @@ mod tests {
                 &binding(),
                 Surface::Cli,
                 ConsentAudit::Writer(&mut writer),
-                None,
+                &AttestedApprover::Local,
                 |_, _| {
                     row_before_grant = Some(
                         std::fs::read_to_string(&audit_path)
@@ -2176,13 +2250,18 @@ mod tests {
                         .record_trustline_clawback_opt_in_attestation(
                             &entry.approval_nonce,
                             [0x01; 32],
+                            AttestedApprover::Local,
                         )
                         .unwrap();
                     "approval.already_attested"
                 }
                 "RuleProposalSimulated" => {
                     store
-                        .record_rule_proposal_attestation(&entry.approval_nonce, [0x01; 32])
+                        .record_rule_proposal_attestation(
+                            &entry.approval_nonce,
+                            [0x01; 32],
+                            AttestedApprover::Local,
+                        )
                         .unwrap();
                     "approval.already_attested"
                 }
@@ -2192,7 +2271,11 @@ mod tests {
                 }
                 _ => {
                     store
-                        .record_attestation(&entry.approval_nonce, [0x01; 32])
+                        .record_attestation(
+                            &entry.approval_nonce,
+                            [0x01; 32],
+                            AttestedApprover::Local,
+                        )
                         .unwrap();
                     "approval.already_attested"
                 }
@@ -2206,7 +2289,7 @@ mod tests {
                 &binding(),
                 Surface::Cli,
                 ConsentAudit::Writer(&mut writer),
-                None,
+                &AttestedApprover::Local,
                 |_, _| {
                     grant_persisted = true;
                     Ok(())
@@ -2236,7 +2319,7 @@ mod tests {
             &binding(),
             Surface::Cli,
             ConsentAudit::Writer(&mut writer),
-            None,
+            &AttestedApprover::Local,
             |_, _| {
                 grant_persisted = true;
                 Ok(())
@@ -2331,7 +2414,7 @@ mod tests {
             .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
             .unwrap();
         store
-            .record_attestation(&entry.approval_nonce, [0x01; 32])
+            .record_attestation(&entry.approval_nonce, [0x01; 32], AttestedApprover::Local)
             .unwrap();
         store
             .consume(
@@ -2347,7 +2430,13 @@ mod tests {
 
     #[test]
     fn trustline_attest_persist_reload_returns_verifiable_blob() {
-        for operator in [None, Some("trustline-operator-credential")] {
+        for operator in [None, Some("dHJ1c3RsaW5lLW9wZXJhdG9y")] {
+            let approver = match operator {
+                Some(id) => AttestedApprover::Remote {
+                    credential_id_b64url: id.to_owned(),
+                },
+                None => AttestedApprover::Local,
+            };
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("trustline.toml");
             let mut store = PendingApprovalStore::open(path.clone()).unwrap();
@@ -2369,21 +2458,17 @@ mod tests {
                     Surface::Cli
                 },
                 ConsentAudit::Writer(&mut writer),
-                operator,
+                &approver,
                 |_, _| panic!("trustlines do not mint grants"),
             )
             .unwrap()
             .unwrap();
             drop(store);
             let reopened = PendingApprovalStore::open(path).unwrap();
-            assert_eq!(
-                reopened
-                    .get(&entry.approval_nonce)
-                    .unwrap()
-                    .attestation_blob_b64
-                    .as_ref(),
-                Some(&blob)
-            );
+            let persisted = reopened.get(&entry.approval_nonce).unwrap();
+            assert_eq!(persisted.attestation_blob_b64.as_ref(), Some(&blob));
+            assert_eq!(persisted.attestation_version, 4);
+            assert!(persisted.attested_approver.as_ref() == Some(&approver));
             let bytes: [u8; 32] = URL_SAFE_NO_PAD.decode(&blob).unwrap().try_into().unwrap();
             let ApprovalKind::TrustlineSimulated {
                 envelope_xdr_b64, ..
@@ -2398,7 +2483,7 @@ mod tests {
                 &entry.approval_nonce,
                 &expected_digest,
                 &entry.process_uid,
-                &entry.attestation_scope().unwrap(),
+                &persisted.attestation_scope().unwrap(),
                 &bytes
             ));
             let log = std::fs::read_to_string(dir.path().join("audit/audit.jsonl")).unwrap();
@@ -2584,7 +2669,7 @@ mod tests {
             &binding(),
             surface,
             ConsentAudit::Writer(writer),
-            None,
+            &AttestedApprover::Local,
             |_, _| panic!("no grant"),
         )
         .map(|_| ())
@@ -3046,7 +3131,7 @@ mod tests {
                 &binding(),
                 Surface::Cli,
                 ConsentAudit::Writer(&mut test_audit_writer(&dir)),
-                None,
+                &AttestedApprover::Local,
                 |_, _| panic!("no grant"),
             )
             .unwrap()
@@ -3055,13 +3140,14 @@ mod tests {
             let stored = store.get(&entry.approval_nonce).unwrap();
             assert_eq!(
                 blob,
-                compute_attestation(
+                compute_attestation_v4(
                     &[0x42; 32],
                     &binding(),
                     &entry.approval_nonce,
                     &subject,
                     &entry.process_uid,
                     &stored.attested_lifetime(),
+                    &AttestedApprover::Local,
                 ),
                 "{kind}"
             );
@@ -3095,7 +3181,7 @@ mod tests {
             &crate::approval::AttestationBinding::new("a", "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            None,
+            &AttestedApprover::Local,
             |_, _| Ok(()),
         )
         .unwrap_err();

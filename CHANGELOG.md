@@ -12,6 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `stellar_agent_core::approval::GrantQuery` describes the invocation and
   installation cutoff for a verified toolset grant lookup.
   `timefmt::parse_rfc3339_utc` parses second-precision UTC install timestamps.
+- `approve operator remove --credential-id <B64URL> [--profile <NAME>]`
+  removes an enrolled operator credential and prints `{"removed": true}` or,
+  for an id that is not enrolled, `{"removed": false}`. It never edits the
+  profile. `OperatorApprovalCredentialStore::remove` backs it.
+- `stellar_agent_core::approval` exposes `AttestedApprover`,
+  `compute_attestation_v4`, `PENDING_ATTESTATION_VERSION`, and
+  `RemoteApprovalAuthority`, which reads a profile's `[remote_approval]`
+  authorization and its operator-credential store at each check.
+  `ApprovalFailure` gains `OperatorCredentialRevoked`
+  (`approval.operator_credential_revoked`) and
+  `RemoteAuthorizationUnavailable` (`approval.remote_authorization_unavailable`).
+- `stellar_agent_approval_ui::operator_enroll` exposes
+  `PendingOperatorEnrollment`, `ConfirmedOperatorEnrollment`,
+  `OperatorEnrollmentConfirmationError`, and
+  `OperatorEnrollHandle::await_completion_until`. The `test-helpers` feature
+  exposes `operator_enroll::test_support`, a software authenticator and HTTP
+  client for enrollment tests.
 - `stellar_agent_core::profile::key_scope` exposes
   `enforce_message_signing_scope` and `enforce_message_signing_scope_in_dir`,
   which refuse an unsafe message-signing identity on every chain before key
@@ -155,6 +172,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ToolsetGrantStore::find_matching` takes a `GrantQuery`, the attestation key,
   and the profile/chain binding. `GatedInvokeParams` gains `attestation_key`
   and `attestation_binding`; its debug output redacts the key.
+- Interactive operator enrollment requires the browser's confirmation code at
+  the terminal. `approve operator enroll --interactive` needs a terminal on
+  stdin and stderr. The page requests a single-use registration challenge from
+  the server (`POST /enroll/challenge`) and posts the authenticator's
+  `clientDataJSON` and `attestationObject`, which the server verifies against
+  that challenge. The server stages the verified credential and writes
+  nothing; the command enrolls it only after the operator types the 16-digit
+  code the page shows before the timeout, which covers the browser ceremony
+  and the confirmation. `OperatorEnrollHandle::await_completion` returns the
+  `PendingOperatorEnrollment`; `PendingOperatorEnrollment::confirm` and
+  `ConfirmedOperatorEnrollment::persist` enroll it.
+- Pending approvals created before version 4 require fresh consent. Every
+  pending-approval commit requires attestation version 4, which also
+  authenticates the approver: the local operator or the remote operator
+  credential. `PendingApprovalStore::record_attestation` and
+  `attest_and_persist` take an `AttestedApprover` in place of the optional
+  credential id. Toolset grants keep their versions.
+- `RemoteServeConfig::new` takes a `RemoteApprovalAuthority` in place of the
+  allowlist and the operator-credential store path, and the remote listener
+  reads `allowed_credentials` and the store at every login, request, and
+  decision, so a running listener honors an edited list without a restart.
+  `RemoteServeStartError` gains `UnknownChain`.
 - `KeyScopeKind` gains `MainnetSignerIdentity`. The enum is exhaustive, so
   downstream exhaustive matches must add the arm.
 - `profile sign-policy --previous-owner-secret-env` builds an owner rotation
@@ -663,6 +702,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discards history, or carries a snapshot the generation counter proves rolled
   back, raises the watermark to five minutes past the reset, so a challenge
   whose record it lost is refused while it can still be live.
+- Operator registration validates a server-issued challenge, the exact
+  origin, the relying-party hash, user presence and verification, and the
+  posted credential id and key against the authenticator's response.
+  Credential-store writes are serialized under a lock file, so concurrent
+  enrollments and sign-count updates never lose an entry or lower a counter.
+  Remote logins and decisions, and mainnet pending-approval commits, enforce
+  the current credential authorization: removing a credential from
+  `allowed_credentials` or removing its enrollment revokes its sessions and
+  its uncommitted mainnet approvals. `approve operator enroll` and
+  `approve operator remove` refuse a profile name that is not a safe file
+  name with `validation.config_invalid`.
+- No operator credential label that holds a control character is accepted
+  or stored: the operator-enrollment server refuses it with `label_invalid`
+  wherever the control stands, and `OperatorApprovalCredentialStore::enroll`,
+  and with it `approve operator enroll` argument import, refuses it as
+  invalid. The terminal confirmation prompt shows the label with every
+  control or format character as a visible escape.
 - `stellar_rule_create_commit` spends its approval before the install starts.
   A retry with the same approval and attestation, directly or through
   `stellar_toolset_invoke`, returns `policy.approval_consumed` whether the

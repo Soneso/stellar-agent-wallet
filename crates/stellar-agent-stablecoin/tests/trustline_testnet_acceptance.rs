@@ -17,7 +17,7 @@
 //!   Friendbot-fund a fresh ephemeral ISSUER G-account, set
 //!   `AUTH_REVOCABLE | AUTH_CLAWBACK_ENABLED` on-chain, assert live flags,
 //!   run the gate (no opt-in → `RefuseWithWarning`), record + HMAC-attest the
-//!   opt-in via `new_trustline_clawback_opt_in_pending` + `compute_attestation`
+//!   opt-in via `new_trustline_clawback_opt_in_pending` + `compute_attestation_v4`
 //!   + `record_trustline_clawback_opt_in_attestation`, verify with
 //!     `verify_attested_trustline_clawback_opt_in` (HMAC key required; presence-
 //!     only `has_attested_trustline_clawback_opt_in` is insufficient), submit
@@ -55,7 +55,7 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use stellar_agent_core::approval::{
-    DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, compute_attestation,
+    DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, compute_attestation_v4,
     compute_trustline_clawback_opt_in_digest, process_uid_for_attestation,
 };
 use stellar_agent_network::{
@@ -328,7 +328,7 @@ async fn happy_path_usdc_trustline() {
 /// 5. Record the opt-in through the real store write path:
 ///    `new_trustline_clawback_opt_in_pending` (network=`"stellar:testnet"`)
 ///    → `store.insert` → `compute_trustline_clawback_opt_in_digest` +
-///    `compute_attestation` → `record_trustline_clawback_opt_in_attestation`.
+///    `compute_attestation_v4` → `record_trustline_clawback_opt_in_attestation`.
 /// 6. Re-run the gate with `store.verify_attested_trustline_clawback_opt_in`
 ///    (HMAC key required — the test key is `[0x42; 32]`, the same key used to
 ///    compute the blob in step 5; a wrong key would return false) → assert
@@ -564,17 +564,22 @@ async fn clawback_gate_opt_in_round_trip() {
         &resolved.code,
         &resolved.issuer,
     );
-    let attestation_blob = compute_attestation(
+    let attestation_blob = compute_attestation_v4(
         &test_hmac_key,
         &stellar_agent_core::approval::AttestationBinding::new("default", "stellar:testnet"),
         &approval_nonce,
         &digest,
         &uid,
         &attested.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
 
     store
-        .record_trustline_clawback_opt_in_attestation(&approval_nonce, attestation_blob)
+        .record_trustline_clawback_opt_in_attestation(
+            &approval_nonce,
+            attestation_blob,
+            stellar_agent_core::approval::AttestedApprover::Local,
+        )
         .expect("record_trustline_clawback_opt_in_attestation must succeed");
 
     // Now the HMAC-verified lookup must return true.  This is the production-

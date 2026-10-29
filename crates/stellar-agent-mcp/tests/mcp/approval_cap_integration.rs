@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use serial_test::serial;
 use stellar_agent_core::approval::{
     PendingApprovalStore, TOOLSET_GRANT_DEFAULT_TTL_MS, ToolsetGrantStore,
-    attestation::{compute_attestation, envelope_sha256},
+    attestation::{compute_attestation_v4, envelope_sha256},
     build_attested_grant, process_uid_for_attestation,
 };
 use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, StateKey};
@@ -347,7 +347,7 @@ decision = "allow"
         )
         .unwrap();
         let stored = store.get(nonce).unwrap().clone();
-        let blob = compute_attestation(
+        let blob = compute_attestation_v4(
             &ATTESTATION_KEY,
             &stellar_agent_core::approval::AttestationBinding::new(
                 &self.name,
@@ -357,8 +357,15 @@ decision = "allow"
             &envelope_sha256(envelope.as_bytes()),
             &process_uid_for_attestation().unwrap(),
             &stored.attested_lifetime(),
+            &stellar_agent_core::approval::AttestedApprover::Local,
         );
-        store.record_attestation(nonce, blob).unwrap();
+        store
+            .record_attestation(
+                nonce,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
+            .unwrap();
         (
             nonce.to_owned(),
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob),
@@ -1559,16 +1566,18 @@ async fn split_approval_round_trip(pair: ClassicPair) {
         let mut entry = store.get(nonce).unwrap().clone();
         entry.approval_nonce = "E".repeat(22);
         entry.expires_at_unix_ms = entry.created_at_unix_ms;
-        let blob = compute_attestation(
+        let blob = compute_attestation_v4(
             &ATTESTATION_KEY,
             &stellar_agent_core::approval::AttestationBinding::new(&h.name, "stellar:testnet"),
             &entry.approval_nonce,
             &envelope_sha256(data["envelope_xdr"].as_str().unwrap().as_bytes()),
             &process_uid_for_attestation().unwrap(),
             &entry.attested_lifetime(),
+            &stellar_agent_core::approval::AttestedApprover::Local,
         );
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
         entry.attestation_blob_b64 = Some(encoded.clone());
+        entry.attested_approver = Some(stellar_agent_core::approval::AttestedApprover::Local);
         let approval = (entry.approval_nonce.clone(), encoded);
         store.insert(entry, now_unix_ms().unwrap()).unwrap();
         approval

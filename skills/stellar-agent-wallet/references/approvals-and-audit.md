@@ -65,9 +65,14 @@ envelope signature. Reads retain their selection and key-scope checks.
 
 ### Classic mainnet confirmation
 
-Version 3 attestations authenticate approval kind, creation time, and expiry.
-Mainnet proof verification requires `attestation_version = 3`.
-`approval.attestation_invalid` covers missing version 3 coverage or a mismatched
+Pending-approval attestations use version 4: approval kind, creation time,
+expiry, and the approver (the local operator or the remote operator credential
+the listener verified). Every pending-approval commit requires
+`attestation_version = 4`; an approval recorded under version 2 or 3 needs
+fresh consent. For a remote approver, mainnet proof verification reads the
+profile's `allowed_credentials` list and the operator-credential store again
+and refuses a credential that is missing from either.
+`approval.attestation_invalid` covers missing version 4 coverage or a mismatched
 subject. MCP reports failed approval proofs as `policy.approval_required`.
 
 Direct CLI confirmation requires terminal stdin and stderr. It renders and
@@ -287,6 +292,8 @@ The 37-byte tag has no length prefix or NUL terminator; the digest is 32 bytes w
 The tag separates this HMAC from every other use of the key.
 The profile name and CAIP-2 chain id make a blob unverifiable under another profile or chain.
 A layout change bumps the tag; blobs under the previous tag do not verify.
+Pending approvals use version 4 of this input, under the tag `stellar-agent-approval-attestation:v4`: the fields above, then the approval's kind, creation time and expiry, then the approver.
+Every commit requires version 4, so an approval recorded under an earlier layout needs fresh consent.
 
 The length prefixes prevent boundary-collision attacks. The `envelope_sha256`
 slot binds the tag to the exact transaction envelope that will be signed. The
@@ -368,7 +375,10 @@ with it. Three surfaces exist for the operator side of that handshake:
   reject additionally requires a fresh passkey assertion bound to the exact
   entry.
 
-None of this changes what the agent does or what an attestation proves. See
+None of this changes what the agent does. The attestation also records which
+surface approved: the local operator, or the remote operator credential. When
+the operator revokes that credential before the commit, a mainnet commit
+returns `policy.approval_required`, and the action needs fresh consent. See
 "The attestation" above. Setup for remote approval (the profile's
 `[remote_approval]` block, enrolling a passkey via `approve operator enroll`,
 the trust model, DNS requirements) is out of scope here; see

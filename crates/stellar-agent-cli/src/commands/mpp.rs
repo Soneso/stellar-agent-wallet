@@ -1848,7 +1848,7 @@ mod tests {
             &AttestationBinding::new(NAME, "stellar:testnet"),
             Surface::Cli,
             ConsentAudit::Outbox(&outbox),
-            None,
+            &stellar_agent_core::approval::AttestedApprover::Local,
             |_, _| Err("no grant".to_owned()),
         )
         .expect("approve");

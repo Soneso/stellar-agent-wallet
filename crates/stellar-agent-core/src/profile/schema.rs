@@ -1249,6 +1249,13 @@ pub struct RemoteApprovalConfig {
     ///
     /// Defaults to an empty list when omitted — fail-closed: no credential
     /// is authorized until the operator explicitly lists one.
+    ///
+    /// The running listener and the mainnet commit read this list from the
+    /// stored profile at every login, decision and commit
+    /// ([`crate::approval::remote_authorization::RemoteApprovalAuthority`]),
+    /// so removing an id revokes the credential at once, including the
+    /// uncommitted approvals it made. The revocation procedure removes the id
+    /// here first, then the enrollment with `approve operator remove`.
     #[serde(default)]
     pub allowed_credentials: Vec<String>,
 }

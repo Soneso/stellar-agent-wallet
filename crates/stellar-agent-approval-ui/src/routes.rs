@@ -531,6 +531,9 @@ fn outcome_to_response(outcome: Outcome) -> Response {
                 "message": crate::templates::INCONSISTENT_MESSAGE,
             }),
         ),
+        // The loopback inbox decides as the local operator, which needs no
+        // remote authorization; the arm keeps the mapping total.
+        Outcome::Unauthorized => (StatusCode::FORBIDDEN, json!({ "status": "unauthorized" })),
         Outcome::Busy => (
             StatusCode::SERVICE_UNAVAILABLE,
             json!({ "status": "busy", "retriable": true }),

@@ -467,7 +467,7 @@ the `--confirm-remote-exposure` flag at start time.
 | `enabled` | bool | no | `false` | Must be `true`, together with `--confirm-remote-exposure`, for `--remote` to take effect. |
 | `bind` | string | yes (if block present) | none | Socket address to bind, validated before any TLS provisioning or bind attempt. |
 | `rp_id` | string | yes (if block present) | none | WebAuthn Relying Party ID, a DNS hostname; an IP literal is refused. |
-| `allowed_credentials` | array of strings | no | `[]` | Base64url WebAuthn credential IDs authorized to approve or reject. |
+| `allowed_credentials` | array of strings | no | `[]` | Base64url WebAuthn credential IDs authorized to approve or reject. The running listener reads it at every login and decision; removing an id revokes that credential at once, including its uncommitted mainnet approvals. Remove the id here first, then the enrollment with `approve operator remove`. |
 
 ### `[served_pages]` block
 

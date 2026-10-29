@@ -20,6 +20,18 @@
 //! loopback approval-inbox server's auth-boundary discipline: absent /
 //! malformed / mismatched session collapses to a bare `404`.
 //!
+//! # Authorization is read again at every check
+//!
+//! A login reads the profile's current authorization (see [`authorize`])
+//! before it verifies the assertion and again immediately before it creates
+//! the session. Every authenticated request reads it in
+//! [`require_session`]; a session whose credential the current files do
+//! not admit is dropped and answered like no session. A decision also
+//! passes the decision seam's own checks after the attestation key loads.
+//! A refused login or decision answers `400` `webauthn_assertion_invalid`,
+//! the same as a bad assertion, so no response tells an unknown, removed or
+//! unlisted credential apart.
+//!
 //! `/static/login.js` is deliberately ungated: it runs the passkey login
 //! ceremony, which IS the authentication step, so no session can exist yet
 //! for it to run behind. `/enroll` and `/static/enroll.js` are pre-auth for
@@ -133,6 +145,11 @@ fn store_unavailable() -> Response {
 /// like no session at all: the same `404` response, and the stale session is
 /// dropped from `state.session` so the next login starts clean rather than
 /// leaving a dead entry around indefinitely.
+///
+/// The session's credential must also be authorized now (see
+/// [`authorize`]): a session whose credential the profile's current list or
+/// the operator-credential store does not admit, or whose authorization
+/// cannot be read, is dropped and answered with the same `404`.
 #[allow(
     clippy::result_large_err,
     reason = "the Err variant is the ready-to-return Response for the auth-boundary rejection"
@@ -141,24 +158,58 @@ fn require_session(
     state: &RemoteServeState,
     headers: &HeaderMap,
 ) -> Result<SessionState, Response> {
-    let mut guard = match state.session.lock() {
-        Ok(g) => g,
-        Err(poison) => poison.into_inner(),
+    let session = {
+        let mut guard = match state.session.lock() {
+            Ok(g) => g,
+            Err(poison) => poison.into_inner(),
+        };
+
+        let expired = guard.as_ref().is_some_and(SessionState::is_expired);
+        if expired {
+            *guard = None;
+        }
+
+        let session = guard.as_ref().ok_or_else(not_found)?;
+
+        let cookie = session_cookie_value(headers).ok_or_else(not_found)?;
+        let submitted = crate::session::OpaqueToken::from_hex(&cookie).ok_or_else(not_found)?;
+        if !session.session_id.ct_eq(&submitted) {
+            return Err(not_found());
+        }
+        session.clone()
     };
 
-    let expired = guard.as_ref().is_some_and(SessionState::is_expired);
-    if expired {
-        *guard = None;
+    if !authorize(state, &session.credential_id_b64url) {
+        let mut guard = match state.session.lock() {
+            Ok(g) => g,
+            Err(poison) => poison.into_inner(),
+        };
+        if guard
+            .as_ref()
+            .is_some_and(|live| live.session_id.ct_eq(&session.session_id))
+        {
+            *guard = None;
+        }
+        return Err(not_found());
     }
+    Ok(session)
+}
 
-    let session = guard.as_ref().ok_or_else(not_found)?;
-
-    let cookie = session_cookie_value(headers).ok_or_else(not_found)?;
-    let submitted = crate::session::OpaqueToken::from_hex(&cookie).ok_or_else(not_found)?;
-    if session.session_id.ct_eq(&submitted) {
-        Ok(session.clone())
-    } else {
-        Err(not_found())
+/// Whether the served profile's current authorization admits
+/// `credential_id_b64url`: its `allowed_credentials` list names it, the
+/// operator-credential store holds it, remote approval is enabled, and the
+/// profile's chain and relying-party ID are the listener's. Reads both
+/// files now; a read failure refuses.
+fn authorize(state: &RemoteServeState, credential_id_b64url: &str) -> bool {
+    match state
+        .authority
+        .require_credential(credential_id_b64url, state.chain, Some(&state.rp_id))
+    {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(code = %error.code(), "remote approval: credential not authorized");
+            false
+        }
     }
 }
 
@@ -295,12 +346,12 @@ async fn login_challenge_post(State(state): State<RemoteServeState>) -> Response
 /// `POST /login/assertion` — verifies a login assertion and establishes a
 /// session.
 ///
-/// Tries the presented credential id against BOTH the profile's
-/// `allowed_credentials` allowlist and the operator-credential store's
-/// enrolled public key; a credential that is enrolled but not allowlisted
-/// (or vice versa) is refused identically to an unknown credential — see
-/// the module-level error-indistinguishability note in
-/// `crate::verify`.
+/// Reads the profile's current authorization for the presented credential
+/// id before verifying (see [`authorize`]) and again immediately before
+/// creating the session, so a credential removed during the verification is
+/// refused; a credential that is enrolled but not allowlisted (or vice
+/// versa) is refused identically to an unknown credential; see the
+/// module-level error-indistinguishability note in `crate::verify`.
 async fn login_assertion_post(
     State(state): State<RemoteServeState>,
     body: axum::body::Bytes,
@@ -310,11 +361,7 @@ async fn login_assertion_post(
     };
 
     let credential_id = request.assertion.id.clone();
-    if !state
-        .allowed_credentials
-        .iter()
-        .any(|c| c == &credential_id)
-    {
+    if !authorize(&state, &credential_id) {
         return assertion_invalid();
     }
 
@@ -376,6 +423,11 @@ async fn login_assertion_post(
         return assertion_invalid();
     }
 
+    #[cfg(test)]
+    login_hook::fire();
+    if !authorize(&state, &credential_id) {
+        return assertion_invalid();
+    }
     let session = SessionState::generate(credential_id);
     let cookie_value = session.session_id.to_hex();
     {
@@ -391,6 +443,30 @@ async fn login_assertion_post(
         resp.headers_mut().insert(header::SET_COOKIE, hv);
     }
     resp
+}
+
+#[cfg(test)]
+pub(crate) mod login_hook {
+    //! Runs a test action after a login assertion verified and its counter
+    //! was recorded, right before the final authorization read, standing in
+    //! for an operator who revokes the credential during the verification.
+
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Installs `action` for the next verified login on this thread.
+    pub(crate) fn install(action: impl FnOnce() + 'static) {
+        HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(action)));
+    }
+
+    pub(super) fn fire() {
+        if let Some(action) = HOOK.with(|hook| hook.borrow_mut().take()) {
+            action();
+        }
+    }
 }
 
 /// Extracts the WebAuthn `challenge` field from raw `clientDataJSON` bytes
@@ -776,7 +852,9 @@ async fn action_decision_post(
 
     let requester = RequestIdentity::Remote {
         identity,
-        allowed_credentials: state.allowed_credentials.as_ref().clone(),
+        authority: std::sync::Arc::clone(&state.authority),
+        chain: state.chain,
+        rp_id: state.rp_id.to_string(),
     };
 
     // `request.decision` was already validated to be exactly "approve" or
@@ -832,6 +910,10 @@ fn outcome_to_response(outcome: stellar_agent_approval_ui::Outcome) -> Response 
             StatusCode::SERVICE_UNAVAILABLE,
             json!({"status": "unavailable", "retriable": false}),
         ),
+        // A credential the current authorization does not admit answers
+        // like an invalid assertion, so the response does not tell a
+        // removed credential from a bad signature.
+        Outcome::Unauthorized => return assertion_invalid(),
         _ => (
             StatusCode::SERVICE_UNAVAILABLE,
             json!({"status": "unavailable", "retriable": false}),
@@ -889,9 +971,76 @@ mod tests {
     const ORIGIN: &str = "https://wallet.test.internal:8443";
 
     struct Fixture {
-        _dir: TempDir,
+        dir: TempDir,
         state: RemoteServeState,
         authenticator: SoftwareAuthenticator,
+    }
+
+    impl Fixture {
+        fn profile_dir(&self) -> std::path::PathBuf {
+            self.dir.path().join("profiles")
+        }
+
+        /// Rewrites the served profile with remote approval enabled for
+        /// exactly `ids`, the way an operator edits `allowed_credentials`
+        /// while the listener runs.
+        fn allow(&self, ids: &[String]) {
+            write_profile(&self.profile_dir(), ids);
+        }
+
+        fn audit_rows(&self, kind: &str) -> usize {
+            std::fs::read_to_string(self.dir.path().join("audit.log"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.contains(&format!(r#""kind":"{kind}""#)))
+                .count()
+        }
+
+        /// Enrolls a second operator credential and returns its
+        /// authenticator.
+        fn enroll_second(&self) -> SoftwareAuthenticator {
+            let second =
+                SoftwareAuthenticator::new([0x12u8; 32], URL_SAFE_NO_PAD.encode([0x43u8; 16]));
+            OperatorApprovalCredentialStore::new(
+                self.state.authority.credentials_path().to_path_buf(),
+            )
+            .enroll(OperatorApprovalCredential {
+                credential_id_b64url: second.credential_id_b64url().to_owned(),
+                public_key_sec1_b64: second.pubkey_uncompressed_b64(),
+                rp_id: RP_ID.to_owned(),
+                label: "second-device".to_owned(),
+                registered_at_unix_ms: 1_750_000_000_000,
+                sign_count: None,
+            })
+            .unwrap();
+            second
+        }
+    }
+
+    /// The served profile's name.
+    const PROFILE: &str = "remote-test";
+
+    fn served_profile() -> stellar_agent_core::profile::schema::Profile {
+        stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "default", "nonce", "default",
+        )
+        .build()
+    }
+
+    /// Writes the served profile to `profile_dir` with remote approval
+    /// enabled for exactly `ids`.
+    fn write_profile(profile_dir: &std::path::Path, ids: &[String]) {
+        let mut profile = served_profile();
+        profile.remote_approval = Some(
+            serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "bind": "127.0.0.1:8443",
+                "rp_id": RP_ID,
+                "allowed_credentials": ids,
+            }))
+            .unwrap(),
+        );
+        stellar_agent_core::profile::loader::save_to_dir(PROFILE, &profile, profile_dir).unwrap();
     }
 
     fn seed_attestation_key(service: &str) -> [u8; 32] {
@@ -930,14 +1079,10 @@ mod tests {
         let audit_writer = Arc::new(std::sync::Mutex::new(
             AuditWriter::open(audit_path, None).expect("open audit writer"),
         ));
+        let profile_dir = dir.path().join("profiles");
+        write_profile(&profile_dir, std::slice::from_ref(&credential_id));
         let ctx = DecisionContext::new(
-            stellar_agent_core::approval::ApprovalContext::from_profile(
-                "remote-test",
-                &stellar_agent_core::profile::schema::Profile::builder_testnet(
-                    "svc", "default", "nonce", "default",
-                )
-                .build(),
-            ),
+            stellar_agent_core::approval::ApprovalContext::from_profile(PROFILE, &served_profile()),
             store_path,
             KeyringEntryRef::new(svc, "default"),
             stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile_name("ui-test"),
@@ -948,7 +1093,15 @@ mod tests {
         let state = RemoteServeState {
             rp_id: RP_ID.into(),
             expected_origin: ORIGIN.into(),
-            allowed_credentials: Arc::new(vec![credential_id.clone()]),
+            authority: Arc::new(
+                stellar_agent_core::approval::RemoteApprovalAuthority::from_paths(
+                    PROFILE.to_owned(),
+                    profile_dir,
+                    operator_credentials_path.clone(),
+                )
+                .unwrap(),
+            ),
+            chain: stellar_agent_core::profile::caip2::Caip2::Testnet,
             ctx: Arc::new(ctx),
             operator_credentials: Arc::new(OperatorApprovalCredentialStore::new(
                 operator_credentials_path,
@@ -961,7 +1114,7 @@ mod tests {
         };
 
         Fixture {
-            _dir: dir,
+            dir,
             state,
             authenticator,
         }
@@ -1327,13 +1480,10 @@ mod tests {
             assert_eq!(body["status"], "attested");
             let attestation_b64 = body["attestation"].as_str().expect("attestation string");
 
-            // Byte-identical-to-loopback check: independently recompute the
-            // HMAC attestation from the entry's own stored fields and the
-            // fixed test attestation key, and assert it matches exactly what
-            // the remote ceremony surfaced. The preimage is unchanged by
-            // remote approval — it binds the nonce, envelope SHA-256, and
-            // the entry's stored `process_uid`, never the operator's
-            // passkey identity.
+            // Independently recompute the version 4 HMAC attestation from
+            // the entry's own stored fields, the fixed test attestation key,
+            // and the credential that logged in, and assert it matches
+            // exactly what the remote ceremony surfaced and recorded.
             let store = PendingApprovalStore::open(fx.state.ctx.store_path.clone()).unwrap();
             let entry = store.get(&nonce).unwrap().clone();
             drop(store);
@@ -1346,13 +1496,19 @@ mod tests {
             };
             let envelope_sha256 =
                 stellar_agent_core::approval::decode_sha256_hex(&envelope_sha256_hex).unwrap();
-            let expected = stellar_agent_core::approval::compute_attestation(
+            let approver = stellar_agent_core::approval::AttestedApprover::Remote {
+                credential_id_b64url: fx.authenticator.credential_id_b64url().to_owned(),
+            };
+            assert!(entry.attested_approver.as_ref() == Some(&approver));
+            assert_eq!(entry.attestation_version, 4);
+            let expected = stellar_agent_core::approval::compute_attestation_v4(
                 &[0xABu8; 32],
                 &fx.state.ctx.context.binding(),
                 &nonce,
                 &envelope_sha256,
                 &entry.process_uid,
                 &entry.attested_lifetime(),
+                &approver,
             );
             let actual: [u8; 32] = URL_SAFE_NO_PAD
                 .decode(attestation_b64)
@@ -1361,8 +1517,9 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 actual, expected,
-                "remote-approval attestation must be byte-identical to the loopback HMAC preimage"
+                "the remote attestation authenticates the approving credential"
             );
+            assert_eq!(fx.audit_rows("approval_attested_remote"), 1);
         });
     }
 
@@ -1857,6 +2014,366 @@ mod tests {
                 resp.status(),
                 StatusCode::BAD_REQUEST,
                 "a credential absent from allowed_credentials must be refused at login"
+            );
+        });
+    }
+
+    /// Attempts a fresh, valid login with `auth` and returns the status.
+    async fn try_login(
+        router: &Router<RemoteServeState>,
+        state: &RemoteServeState,
+        auth: &SoftwareAuthenticator,
+        sign_count: u32,
+    ) -> StatusCode {
+        let resp = router
+            .clone()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login/challenge")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        let challenge: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(body["challenge"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let assertion = auth.sign_valid(&challenge, RP_ID, ORIGIN, sign_count);
+        let resp = router
+            .clone()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login/assertion")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(decision_body_login(&assertion)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        if status != StatusCode::OK {
+            assert_eq!(
+                body_json(resp).await,
+                serde_json::json!({"error": "webauthn_assertion_invalid"})
+            );
+        }
+        status
+    }
+
+    /// Editing only the profile's allowlist, with the listener state and the
+    /// enrollment untouched, refuses the next valid login of the removed
+    /// credential; restoring the entry admits it again.
+    #[test]
+    #[serial]
+    fn revoked_credential_cannot_login_without_restart() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("revoked-login");
+            let router = build_router();
+            let id = fx.authenticator.credential_id_b64url().to_owned();
+            assert_eq!(
+                try_login(&router, &fx.state, &fx.authenticator, 1).await,
+                StatusCode::OK
+            );
+
+            fx.allow(&[]);
+            assert_eq!(
+                try_login(&router, &fx.state, &fx.authenticator, 2).await,
+                StatusCode::BAD_REQUEST
+            );
+            assert!(
+                fx.state
+                    .operator_credentials
+                    .find_by_credential_id(&id)
+                    .unwrap()
+                    .is_some(),
+                "the enrollment is untouched"
+            );
+
+            fx.allow(std::slice::from_ref(&id));
+            assert_eq!(
+                try_login(&router, &fx.state, &fx.authenticator, 3).await,
+                StatusCode::OK
+            );
+
+            assert!(
+                OperatorApprovalCredentialStore::new(
+                    fx.state.authority.credentials_path().to_path_buf()
+                )
+                .remove(&id)
+                .unwrap()
+            );
+            assert_eq!(
+                try_login(&router, &fx.state, &fx.authenticator, 4).await,
+                StatusCode::BAD_REQUEST
+            );
+        });
+    }
+
+    /// Re-enrolls the fixture's credential after a test removed it.
+    fn reenroll(fx: &Fixture) {
+        OperatorApprovalCredentialStore::new(fx.state.authority.credentials_path().to_path_buf())
+            .enroll(OperatorApprovalCredential {
+                credential_id_b64url: fx.authenticator.credential_id_b64url().to_owned(),
+                public_key_sec1_b64: fx.authenticator.pubkey_uncompressed_b64(),
+                rp_id: RP_ID.to_owned(),
+                label: "test-device".to_owned(),
+                registered_at_unix_ms: 1_750_000_000_000,
+                sign_count: None,
+            })
+            .unwrap();
+    }
+
+    /// Revokes the fixture's credential the way `revoke` names: by emptying
+    /// the profile's allowlist or by removing its enrollment.
+    fn revoke_fixture_credential(
+        profile_dir: &std::path::Path,
+        credentials_path: &std::path::Path,
+        id: &str,
+        revoke: &str,
+    ) {
+        if revoke == "allowlist" {
+            write_profile(profile_dir, &[]);
+        } else {
+            assert!(
+                OperatorApprovalCredentialStore::new(credentials_path.to_path_buf())
+                    .remove(id)
+                    .unwrap()
+            );
+        }
+    }
+
+    /// The credential is revoked after the login's first authorization read
+    /// and its verification, before the session is created: the verified
+    /// login refuses and no session exists. Once authorization is restored,
+    /// the next login succeeds.
+    #[test]
+    #[serial]
+    fn revocation_during_login_verification_refuses() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            for revoke in ["allowlist", "enrollment"] {
+                let fx = fixture(&format!("login-verify-{revoke}"));
+                let router = build_router();
+                let id = fx.authenticator.credential_id_b64url().to_owned();
+                let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+                let hook_fired = std::rc::Rc::clone(&fired);
+                let profile_dir = fx.profile_dir();
+                let credentials_path = fx.state.authority.credentials_path().to_path_buf();
+                let revoked_id = id.clone();
+                login_hook::install(move || {
+                    hook_fired.set(true);
+                    revoke_fixture_credential(&profile_dir, &credentials_path, &revoked_id, revoke);
+                });
+                assert_eq!(
+                    try_login(&router, &fx.state, &fx.authenticator, 1).await,
+                    StatusCode::BAD_REQUEST,
+                    "{revoke}"
+                );
+                assert!(fired.get(), "{revoke}");
+                assert!(fx.state.session.lock().unwrap().is_none(), "{revoke}");
+
+                if revoke == "allowlist" {
+                    fx.allow(std::slice::from_ref(&id));
+                } else {
+                    reenroll(&fx);
+                }
+                assert_eq!(
+                    try_login(&router, &fx.state, &fx.authenticator, 2).await,
+                    StatusCode::OK,
+                    "{revoke}"
+                );
+            }
+        });
+    }
+
+    /// The status of a `GET` of `uri` with the session `cookie`.
+    async fn get_status(
+        router: &Router<RemoteServeState>,
+        state: &RemoteServeState,
+        cookie: &str,
+        uri: &str,
+    ) -> StatusCode {
+        router
+            .clone()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// A live session whose credential is revoked serves no further GET.
+    /// With no decision in between, each authenticated GET route answers
+    /// `404` on the next request and drops the session.
+    #[test]
+    #[serial]
+    fn revoked_session_serves_no_authenticated_get() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            for revoke in ["allowlist", "enrollment"] {
+                for route in [
+                    "/inbox",
+                    "/pending.json",
+                    "/approval/{nonce}",
+                    "/static/app.js",
+                    "/static/app-shared.js",
+                ] {
+                    let tag = route.replace(['/', '{', '}', '.'], "-");
+                    let fx = fixture(&format!("revoked-get-{revoke}{tag}"));
+                    let nonce = insert_payment_entry(&fx.state.ctx.store_path);
+                    let router = build_router();
+                    let cookie = login(&router, &fx.state, &fx.authenticator).await;
+                    let uri = route.replace("{nonce}", &nonce);
+                    assert_eq!(
+                        get_status(&router, &fx.state, &cookie, &uri).await,
+                        StatusCode::OK,
+                        "{revoke} {uri}"
+                    );
+
+                    revoke_fixture_credential(
+                        &fx.profile_dir(),
+                        fx.state.authority.credentials_path(),
+                        fx.authenticator.credential_id_b64url(),
+                        revoke,
+                    );
+                    assert_eq!(
+                        get_status(&router, &fx.state, &cookie, &uri).await,
+                        StatusCode::NOT_FOUND,
+                        "{revoke} {uri}"
+                    );
+                    assert!(fx.state.session.lock().unwrap().is_none(), "{revoke} {uri}");
+                }
+            }
+        });
+    }
+
+    /// Removing one credential from the list leaves a still-listed one
+    /// logging in.
+    #[test]
+    #[serial]
+    fn unaffected_credential_survives_allowlist_edit() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fx = fixture("unaffected-login");
+            let router = build_router();
+            let second = fx.enroll_second();
+            let first_id = fx.authenticator.credential_id_b64url().to_owned();
+            let second_id = second.credential_id_b64url().to_owned();
+            fx.allow(&[first_id, second_id.clone()]);
+            assert_eq!(
+                try_login(&router, &fx.state, &second, 1).await,
+                StatusCode::OK
+            );
+            fx.allow(std::slice::from_ref(&second_id));
+            assert_eq!(
+                try_login(&router, &fx.state, &fx.authenticator, 1).await,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                try_login(&router, &fx.state, &second, 2).await,
+                StatusCode::OK
+            );
+        });
+    }
+
+    /// A logged-in session whose credential is removed from the allowlist
+    /// after it minted the action challenge cannot approve or reject with a
+    /// valid assertion: nothing is attested or rejected, no decision row is
+    /// written, and the session stops being served.
+    #[test]
+    #[serial]
+    fn revoked_session_cannot_approve_or_reject() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            for (decision, revoke) in [
+                ("approve", "allowlist"),
+                ("reject", "allowlist"),
+                ("approve", "enrollment"),
+            ] {
+                let fx = fixture(&format!("revoked-session-{decision}-{revoke}"));
+                let nonce = insert_payment_entry(&fx.state.ctx.store_path);
+                let router = build_router();
+                let cookie = login(&router, &fx.state, &fx.authenticator).await;
+                let csrf = get_csrf(&router, &fx.state, &cookie, &nonce).await;
+                let challenge =
+                    mint_action_challenge(&router, &fx.state, &cookie, &csrf, &nonce).await;
+                let assertion = fx.authenticator.sign_valid(&challenge, RP_ID, ORIGIN, 2);
+
+                if revoke == "allowlist" {
+                    fx.allow(&[]);
+                } else {
+                    assert!(
+                        OperatorApprovalCredentialStore::new(
+                            fx.state.authority.credentials_path().to_path_buf()
+                        )
+                        .remove(fx.authenticator.credential_id_b64url())
+                        .unwrap()
+                    );
+                }
+
+                let resp = router
+                    .clone()
+                    .with_state(fx.state.clone())
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(format!("/approval/{nonce}/decision"))
+                            .header(header::COOKIE, &cookie)
+                            .header(CSRF_HEADER_NAME, &csrf)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(decision_body(decision, &assertion)))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{decision} {revoke}");
+                assert_entry_untouched(&fx.state.ctx.store_path, &nonce);
+                assert_eq!(fx.audit_rows("approval_attested_remote"), 0);
+                assert_eq!(fx.audit_rows("approval_rejected_remote"), 0);
+
+                let resp = router
+                    .clone()
+                    .with_state(fx.state.clone())
+                    .oneshot(
+                        Request::builder()
+                            .uri("/pending.json")
+                            .header(header::COOKIE, &cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+                assert!(fx.state.session.lock().unwrap().is_none());
+            }
+        });
+    }
+
+    /// The decision seam's own authorization refusal answers like an invalid
+    /// assertion.
+    #[test]
+    fn unauthorized_outcome_answers_as_an_invalid_assertion() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let resp = outcome_to_response(stellar_agent_approval_ui::Outcome::Unauthorized);
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                body_json(resp).await,
+                serde_json::json!({"error": "webauthn_assertion_invalid"})
             );
         });
     }

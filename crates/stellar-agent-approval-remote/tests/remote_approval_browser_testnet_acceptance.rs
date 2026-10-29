@@ -363,9 +363,8 @@ async fn launch_chromium() -> (Browser, chromiumoxide::Handler, TempDir) {
 /// Takes the full allowlist (rather than a single id) because this suite
 /// starts the listener TWICE: once with an empty allowlist for the
 /// enrollment ceremony (which needs none), and again with the
-/// just-enrolled credential id once it is known — mirroring how
-/// `allowed_credentials` is read once at real listener startup and requires
-/// a restart to pick up a newly enrolled credential.
+/// just-enrolled credential id once it is known. Each start writes the
+/// served profile with that list, which the listener reads at every check.
 async fn start_remote_serve_for_profile(
     server: &WalletServer,
     profile: &Profile,
@@ -394,15 +393,30 @@ async fn start_remote_serve_for_profile(
     let tls = provision_or_load("remote-approval-browser-testnet-acceptance", TEST_RP_ID)
         .expect("TLS cert must provision");
 
-    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let config = RemoteServeConfig::new(
-        bind_addr,
-        TEST_RP_ID,
-        allowed_credentials,
-        ctx,
-        operator_credentials_path,
-        tls,
+    // The listener reads its allowlist from the profile file at every
+    // check, so the served profile is written with `allowed_credentials`.
+    let profile_dir = approval_dir.path().join("profiles");
+    let mut served = profile.clone();
+    served.remote_approval = Some(
+        serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "bind": "127.0.0.1:0",
+            "rp_id": TEST_RP_ID,
+            "allowed_credentials": allowed_credentials,
+        }))
+        .expect("remote approval config"),
     );
+    stellar_agent_core::profile::loader::save_to_dir(&profile_name, &served, &profile_dir)
+        .expect("write the served profile");
+    let authority = stellar_agent_core::approval::RemoteApprovalAuthority::from_paths(
+        profile_name.clone(),
+        profile_dir,
+        operator_credentials_path,
+    )
+    .expect("remote approval authority");
+
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let config = RemoteServeConfig::new(bind_addr, TEST_RP_ID, authority, ctx, tls);
     start_remote_serve(config)
         .await
         .expect("start_remote_serve must succeed")

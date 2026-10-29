@@ -23,7 +23,7 @@ use serial_test::serial;
 use stellar_agent_core::DEFAULT_CLASSIC_FEE_STROOPS;
 use stellar_agent_core::approval::{
     ApprovalKind, ConsumedOutcome, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore,
-    attestation::{compute_attestation, envelope_sha256},
+    attestation::{compute_attestation_v4, envelope_sha256},
     process_uid_for_attestation,
 };
 use stellar_agent_core::policy::v1::{
@@ -295,20 +295,25 @@ async fn exercise_approval_consumption(fail_once: bool) {
     )
     .expect("pending approval");
     let approval_nonce = entry.approval_nonce.clone();
-    let blob = compute_attestation(
+    let blob = compute_attestation_v4(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new("acct-consumed", "stellar:testnet"),
         &approval_nonce,
         &envelope_sha256(envelope_xdr.as_bytes()),
         &process_uid,
         &entry.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     let attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
     {
         let mut store = PendingApprovalStore::open(store_path.clone()).expect("approval store");
         store.insert(entry, now_unix_ms).expect("insert");
         store
-            .record_attestation(&approval_nonce, blob)
+            .record_attestation(
+                &approval_nonce,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
             .expect("record attestation");
     }
 
@@ -551,20 +556,25 @@ async fn a_refused_commit_leaves_its_approval_untouched() {
     )
     .expect("pending approval");
     let approval_nonce = entry.approval_nonce.clone();
-    let blob = compute_attestation(
+    let blob = compute_attestation_v4(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new("acct-rejected", "stellar:testnet"),
         &approval_nonce,
         &envelope_sha256(envelope_xdr.as_bytes()),
         &process_uid,
         &entry.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     let attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
     {
         let mut store = PendingApprovalStore::open(store_path.clone()).expect("approval store");
         store.insert(entry, now_unix_ms).expect("insert");
         store
-            .record_attestation(&approval_nonce, blob)
+            .record_attestation(
+                &approval_nonce,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
             .expect("record attestation");
     }
 
@@ -709,13 +719,14 @@ async fn pay_commit_logs_a_queued_consent_row_before_the_signer_loads() {
     )
     .expect("pending approval");
     let approval_nonce = entry.approval_nonce.clone();
-    let blob = compute_attestation(
+    let blob = compute_attestation_v4(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new(ACCOUNT, "stellar:testnet"),
         &approval_nonce,
         &envelope_sha256(envelope_xdr.as_bytes()),
         &process_uid,
         &entry.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     let attestation_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
 
@@ -752,7 +763,11 @@ async fn pay_commit_logs_a_queued_consent_row_before_the_signer_loads() {
             )
             .expect("insert");
         store
-            .record_attestation(&approval_nonce, blob)
+            .record_attestation(
+                &approval_nonce,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
             .expect("record attestation");
     }
 

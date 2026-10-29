@@ -847,28 +847,37 @@ async fn valid_attestation_passes_gate() {
     )
     .expect("new_payment_pending");
     let approval_nonce_id = entry.approval_nonce.clone();
-    let attested = entry.clone();
-    {
-        let store_path = temp.path().join("acct.toml");
-        let mut store = PendingApprovalStore::open(store_path).expect("open store");
-        let now_ms = stellar_agent_core::timefmt::now_unix_ms().expect("now");
-        store.insert(entry, now_ms).expect("insert live entry");
-        // Store dropped here: file lock released so the server can open it.
-    }
 
     // Compute the VALID attestation blob exactly as `stellar-agent approve`
-    // surfaces it: HMAC over (nonce, envelope SHA-256, process uid) keyed by the
-    // attestation key, URL-safe base64 no-pad.
+    // surfaces it: HMAC over (nonce, envelope SHA-256, process uid, lifetime,
+    // approver) keyed by the attestation key, URL-safe base64 no-pad.
     let sha = stellar_agent_core::approval::envelope_sha256(envelope_xdr.as_bytes());
-    let blob = stellar_agent_core::approval::compute_attestation(
+    let blob = stellar_agent_core::approval::compute_attestation_v4(
         &attestation_key,
         &stellar_agent_core::approval::AttestationBinding::new("acct", "stellar:testnet"),
         &approval_nonce_id,
         &sha,
         &uid,
-        &attested.attested_lifetime(),
+        &entry.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     let blob_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob);
+    {
+        // `stellar-agent approve` records the blob with its approver; the
+        // commit gate verifies against that record.
+        let store_path = temp.path().join("acct.toml");
+        let mut store = PendingApprovalStore::open(store_path).expect("open store");
+        let now_ms = stellar_agent_core::timefmt::now_unix_ms().expect("now");
+        store.insert(entry, now_ms).expect("insert live entry");
+        store
+            .record_attestation(
+                &approval_nonce_id,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
+            .expect("record the local approval");
+        // Store dropped here: file lock released so the server can open it.
+    }
 
     let result = server
         .call_stellar_pay_commit(StellarPayCommitArgs {
@@ -968,21 +977,30 @@ async fn an_attestation_under_the_owner_public_key_returns_the_uniform_error() {
     )
     .expect("new_payment_pending");
     let approval_nonce_id = entry.approval_nonce.clone();
-    let attested = entry.clone();
-    {
-        let mut store =
-            PendingApprovalStore::open(temp.path().join("acct.toml")).expect("open store");
-        let now_ms = stellar_agent_core::timefmt::now_unix_ms().expect("now");
-        store.insert(entry, now_ms).expect("insert live entry");
-    }
-    let blob = stellar_agent_core::approval::compute_attestation(
+    let blob = stellar_agent_core::approval::compute_attestation_v4(
         &owner_key,
         &stellar_agent_core::approval::AttestationBinding::new("acct", "stellar:testnet"),
         &approval_nonce_id,
         &stellar_agent_core::approval::envelope_sha256(envelope_xdr.as_bytes()),
         &uid,
-        &attested.attested_lifetime(),
+        &entry.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
+    {
+        // The record carries the blob and approver `stellar-agent approve`
+        // writes, so the refusal comes from the key check alone.
+        let mut store =
+            PendingApprovalStore::open(temp.path().join("acct.toml")).expect("open store");
+        let now_ms = stellar_agent_core::timefmt::now_unix_ms().expect("now");
+        store.insert(entry, now_ms).expect("insert live entry");
+        store
+            .record_attestation(
+                &approval_nonce_id,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
+            .expect("record the local approval");
+    }
 
     let logs = CaptureWriter::new();
     let subscriber = capture_subscriber(logs.clone());

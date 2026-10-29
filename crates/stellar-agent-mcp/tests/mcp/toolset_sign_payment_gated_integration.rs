@@ -301,7 +301,7 @@ async fn assert_approved_submission_audit(
     key: &[u8; 32],
 ) {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use stellar_agent_core::approval::attestation::{compute_attestation, envelope_sha256};
+    use stellar_agent_core::approval::attestation::{compute_attestation_v4, envelope_sha256};
     use stellar_agent_test_support::xdr_fixtures::{
         account_entry_xdr_with_seq, account_ledger_key_xdr,
     };
@@ -399,7 +399,7 @@ async fn assert_approved_submission_audit(
         assert_eq!(pending.len(), 1);
         let nonce = pending[0].approval_nonce.clone();
         let stored = store.get(&nonce).unwrap().clone();
-        let blob = compute_attestation(
+        let blob = compute_attestation_v4(
             key,
             &stellar_agent_core::approval::AttestationBinding::new(
                 name,
@@ -409,8 +409,15 @@ async fn assert_approved_submission_audit(
             &envelope_sha256(data["envelope_xdr"].as_str().unwrap().as_bytes()),
             &process_uid_for_attestation().unwrap(),
             &stored.attested_lifetime(),
+            &stellar_agent_core::approval::AttestedApprover::Local,
         );
-        store.record_attestation(&nonce, blob).unwrap();
+        store
+            .record_attestation(
+                &nonce,
+                blob,
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
+            .unwrap();
         (nonce, URL_SAFE_NO_PAD.encode(blob))
     };
     payload["approval_nonce"] = serde_json::json!(approval_nonce);
@@ -1743,7 +1750,7 @@ async fn rule_create_pending_proposal_without_grant_queues_first_invoke_approval
 async fn rule_create_pending_proposal_with_grant_reaches_signer_load() {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use stellar_agent_core::approval::{
-        AttestationBinding, attestation::compute_attestation, store::ApprovalKind,
+        AttestationBinding, attestation::compute_attestation_v4, store::ApprovalKind,
     };
 
     let _data_root = crate::common::isolated_data_root();
@@ -1777,17 +1784,22 @@ async fn rule_create_pending_proposal_with_grant_reaches_signer_load() {
         .get(&approval_nonce)
         .expect("stored proposal")
         .clone();
-    let blob = compute_attestation(
+    let blob = compute_attestation_v4(
         &key,
         &AttestationBinding::new(&server.profile_name_for_approval(), "stellar:testnet"),
         &approval_nonce,
         &digest,
         &process_uid_for_attestation().expect("process uid"),
         &stored.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     PendingApprovalStore::open(store_path.clone())
         .expect("open approval store")
-        .record_rule_proposal_attestation(&approval_nonce, blob)
+        .record_rule_proposal_attestation(
+            &approval_nonce,
+            blob,
+            stellar_agent_core::approval::AttestedApprover::Local,
+        )
         .expect("record proposal attestation");
     insert_valid_grant(
         &grant_file,
@@ -1843,7 +1855,7 @@ async fn rule_create_pending_proposal_with_grant_reaches_signer_load() {
 async fn rule_create_retry_after_a_failed_install_is_refused_as_consumed() {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use stellar_agent_core::approval::{
-        AttestationBinding, attestation::compute_attestation, store::ApprovalKind,
+        AttestationBinding, attestation::compute_attestation_v4, store::ApprovalKind,
     };
     use stellar_agent_network::Signer as _;
 
@@ -1895,17 +1907,22 @@ async fn rule_create_retry_after_a_failed_install_is_refused_as_consumed() {
         .get(&approval_nonce)
         .expect("stored proposal")
         .clone();
-    let blob = compute_attestation(
+    let blob = compute_attestation_v4(
         &key,
         &AttestationBinding::new(&server.profile_name_for_approval(), "stellar:testnet"),
         &approval_nonce,
         &digest,
         &process_uid_for_attestation().expect("process uid"),
         &stored.attested_lifetime(),
+        &stellar_agent_core::approval::AttestedApprover::Local,
     );
     PendingApprovalStore::open(store_path.clone())
         .expect("open approval store")
-        .record_rule_proposal_attestation(&approval_nonce, blob)
+        .record_rule_proposal_attestation(
+            &approval_nonce,
+            blob,
+            stellar_agent_core::approval::AttestedApprover::Local,
+        )
         .expect("record proposal attestation");
     insert_valid_grant(
         &grant_file,

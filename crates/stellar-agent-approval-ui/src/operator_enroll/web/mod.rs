@@ -2,8 +2,11 @@
 //!
 //! Holds the wallet-authored, same-origin `operator-enroll.js` served at
 //! `GET /static/operator-enroll.js`. Vanilla JS, no build step, no external
-//! dependency — it reads the server-rendered data island, runs the WebAuthn
-//! registration ceremony, and POSTs the result to `POST /enroll/credential`.
+//! dependency. It reads the server-rendered data island, requests the
+//! server's challenge at `POST /enroll/challenge`, runs the WebAuthn
+//! registration ceremony over it, POSTs the response to
+//! `POST /enroll/credential`, and shows the confirmation code of the
+//! credential it created.
 
 /// Wallet-authored operator-enrollment browser glue served at
 /// `GET /static/operator-enroll.js`.
@@ -26,12 +29,17 @@ mod tests {
         std::str::from_utf8(OPERATOR_ENROLL_JS).expect("operator-enroll.js must be valid UTF-8");
     }
 
+    /// The ceremony registers with the options the server's challenge
+    /// response names, and never generates a challenge itself.
     #[test]
-    fn operator_enroll_js_runs_create_with_none_attestation() {
+    fn operator_enroll_js_registers_over_the_server_challenge() {
         let body = std::str::from_utf8(OPERATOR_ENROLL_JS).unwrap();
         assert!(body.contains("navigator.credentials"));
         assert!(body.contains(".create("));
-        assert!(body.contains(r#"attestation: "none""#));
+        assert!(body.contains("/enroll/challenge"));
+        assert!(body.contains("challenge: ceremony.challenge"));
+        assert!(body.contains("attestation: options.attestation"));
+        assert!(!body.contains("getRandomValues(new Uint8Array(32))"));
     }
 
     #[test]
@@ -40,6 +48,26 @@ mod tests {
         assert!(body.contains("enroll-data"));
         assert!(body.contains("/enroll/credential"));
         assert!(body.contains("x-stellar-approval-csrf"));
+    }
+
+    /// The posted body carries the authenticator's own response and no
+    /// client-chosen counter.
+    #[test]
+    fn operator_enroll_js_posts_the_authenticator_response_and_no_counter() {
+        let body = std::str::from_utf8(OPERATOR_ENROLL_JS).unwrap();
+        assert!(body.contains("client_data_json: b64urlFromBytes(response.clientDataJSON)"));
+        assert!(body.contains("attestation_object: b64urlFromBytes(response.attestationObject)"));
+        assert!(!body.contains("sign_count"));
+        assert!(!body.contains("getAuthenticatorData"));
+    }
+
+    /// The code domain is the one the server derives the expected code
+    /// under.
+    #[test]
+    fn operator_enroll_js_derives_the_code_under_the_server_domain() {
+        let body = std::str::from_utf8(OPERATOR_ENROLL_JS).unwrap();
+        assert!(body.contains(r#""stellar-agent-operator-enrollment-confirmation:v1""#));
+        assert!(body.contains(r#"crypto.subtle.digest("SHA-256""#));
     }
 
     /// The ceremony reads the proof from the key the bootstrap page stores it
@@ -55,24 +83,5 @@ mod tests {
             "\"{}\": proof",
             crate::auth::SESSION_PROOF_HEADER_NAME
         )));
-    }
-
-    #[test]
-    fn operator_enroll_js_extracts_sign_count_via_get_authenticator_data() {
-        let body = std::str::from_utf8(OPERATOR_ENROLL_JS).unwrap();
-        assert!(body.contains("getAuthenticatorData"));
-    }
-
-    #[test]
-    fn operator_enroll_js_never_reads_attestation_object_bytes_directly() {
-        // The counter extraction goes only through `getAuthenticatorData()`;
-        // the file must never touch `response.attestationObject` (doing so
-        // would require a CBOR decoder this ceremony deliberately omits —
-        // the comment above `extractSignCount` documents that omission,
-        // which is why this check targets the property access, not the
-        // word "CBOR" itself).
-        let body = std::str::from_utf8(OPERATOR_ENROLL_JS).unwrap();
-        assert!(!body.contains("response.attestationObject"));
-        assert!(!body.contains("credential.response.attestationObject"));
     }
 }

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { webcrypto } from "node:crypto";
 import vm from "node:vm";
 import renderers from "./app_shared.js";
 
@@ -93,6 +94,10 @@ test("memo types remain distinct through JSON and DOM rendering", () => {
 
 // ── Session proof: the bootstrap page, the inbox, and the enrollment page ──
 //
+// The enrollment cases share the confirmation-code vector of the Rust test
+// `confirmation_code_vectors_match_browser`: challenge 0x00..0x1f, credential
+// ID sixteen 0xa5 bytes, key 0x04 followed by 0x01..0x40.
+//
 // Each browser script runs in a fresh VM context with a minimal DOM, a
 // recorded sessionStorage, a recorded fetch, and a manual clock, so the tests
 // observe exactly what the script stores, requests, and navigates to.
@@ -100,6 +105,59 @@ test("memo types remain distinct through JSON and DOM rendering", () => {
 const INBOX_PROOF_KEY = "stellar-agent-approval-session-proof";
 const ENROLL_PROOF_KEY = "stellar-agent-operator-enroll-session-proof";
 const PROOF = "ab".repeat(32);
+
+const VECTOR_CHALLENGE = Uint8Array.from({ length: 32 }, (_, i) => i);
+const VECTOR_ID = new Uint8Array(16).fill(0xa5);
+const VECTOR_KEY = Uint8Array.from({ length: 65 }, (_, i) => (i === 0 ? 4 : i));
+const VECTOR_CODE = "305b-4244-62ef-fd53";
+const CLIENT_DATA = new TextEncoder().encode('{"type":"webauthn.create"}');
+const ATTESTATION_OBJECT = Uint8Array.from([0xa3, 0x01, 0x02]);
+
+function b64url(bytes) {
+  return Buffer.from(bytes).toString("base64url");
+}
+
+// The credential a ceremony creates: `id` and `key` default to the vector.
+function makeCredential({ id = VECTOR_ID, key = VECTOR_KEY } = {}) {
+  const spki = new Uint8Array(26 + key.length);
+  spki.fill(0x30, 0, 26);
+  spki.set(key, 26);
+  return {
+    rawId: id.slice().buffer,
+    response: {
+      getPublicKey: () => spki.buffer,
+      clientDataJSON: CLIENT_DATA.slice().buffer,
+      attestationObject: ATTESTATION_OBJECT.slice().buffer,
+    },
+  };
+}
+
+function defaultCredential() {
+  return makeCredential();
+}
+
+function jsonReply(status, body) {
+  return Promise.resolve({ ok: status >= 200 && status < 300, status, json: () => Promise.resolve(body) });
+}
+
+// A server that issues `challenge` and answers the credential POST with
+// `credentialStatus` and `credentialBody`.
+function server({ challenge = VECTOR_CHALLENGE, credentialStatus = 200, credentialBody = { status: "awaiting_confirmation" } } = {}) {
+  return (url) => {
+    if (url === "/enroll/challenge") {
+      return jsonReply(200, {
+        challenge: b64url(challenge),
+        rp_id: "localhost",
+        alg: -7,
+        user_verification: "required",
+        resident_key: "required",
+        attestation: "none",
+        timeout_ms: 300000,
+      });
+    }
+    return jsonReply(credentialStatus, credentialBody);
+  };
+}
 
 function source(relative) {
   return readFileSync(new URL(relative, import.meta.url), "utf8");
@@ -131,7 +189,15 @@ function fakeElement(name) {
   };
 }
 
-function browser({ islands = {}, elements = [], storage = {}, storageThrows = false, readBackDiffers = false } = {}) {
+function browser({
+  islands = {},
+  elements = [],
+  storage = {},
+  storageThrows = false,
+  readBackDiffers = false,
+  reply = () => new Promise(() => {}),
+  credential = defaultCredential,
+} = {}) {
   const byId = {};
   for (const [id, value] of Object.entries(islands)) {
     byId[id] = fakeElement(id);
@@ -192,21 +258,13 @@ function browser({ islands = {}, elements = [], storage = {}, storageThrows = fa
       credentials: {
         create(options) {
           credentialCalls.push(options);
-          const spki = new Uint8Array(91).fill(7);
-          const authData = new Uint8Array(37);
-          authData[36] = 5;
-          return Promise.resolve({
-            rawId: new Uint8Array(16).fill(1).buffer,
-            response: {
-              getPublicKey: () => spki.buffer,
-              getAuthenticatorData: () => authData.buffer,
-            },
-          });
+          return Promise.resolve(credential());
         },
       },
     },
-    crypto: { getRandomValues: (array) => array.fill(3) },
+    crypto: { getRandomValues: (array) => array.fill(3), subtle: webcrypto.subtle },
     btoa,
+    atob,
     console,
     Date: FakeDate,
     setInterval(callback, ms) {
@@ -215,7 +273,7 @@ function browser({ islands = {}, elements = [], storage = {}, storageThrows = fa
     },
     fetch(url, init) {
       fetches.push({ url, init: init || {} });
-      return new Promise(() => {});
+      return reply(url, init || {});
     },
   };
   vm.createContext(context);
@@ -238,9 +296,17 @@ function browser({ islands = {}, elements = [], storage = {}, storageThrows = fa
   };
 }
 
-async function settle() {
-  for (let i = 0; i < 10; i++) {
+async function until(predicate, what) {
+  const deadline = performance.now() + 5000;
+  let turns = 0;
+  while (!predicate()) {
+    if (performance.now() >= deadline) {
+      throw new Error(`Timed out waiting for ${what}`);
+    }
     await new Promise((resolve) => setImmediate(resolve));
+    if (++turns % 10 === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
   }
 }
 
@@ -374,33 +440,116 @@ test("a page without a proof sends no activity", () => {
   assert.equal(page.fetches.length, 0);
 });
 
-function enrollPage(storage) {
+function enrollPage(storage, options = {}) {
   const page = browser({
     islands: { "enroll-data": { csrfToken: "e".repeat(64), rpId: "localhost" } },
-    elements: ["label-input", "enroll-btn", "status"],
+    elements: ["label-input", "enroll-btn", "status", "confirmation-code"],
     storage,
+    ...options,
   });
   page.byId["label-input"].value = "laptop";
   page.run("../operator_enroll/web/operator-enroll.js");
   return page;
 }
 
-test("enrollment posts the credential with the session proof", async () => {
-  const page = enrollPage({ [ENROLL_PROOF_KEY]: PROOF });
+test("enrollment registers over the server challenge and posts the authenticator response", async () => {
+  const page = enrollPage({ [ENROLL_PROOF_KEY]: PROOF }, { reply: server() });
   page.byId["enroll-btn"].listeners.click[0]();
-  await settle();
+  await until(() => page.byId["confirmation-code"].textContent !== "", "the enrollment confirmation code");
+  assert.equal(page.fetches.length, 2);
+  const [challenge, posted] = page.fetches;
+  assert.equal(challenge.url, "/enroll/challenge");
+  assert.equal(challenge.init.method, "POST");
+  assert.equal(challenge.init.headers["x-session-proof"], PROOF);
+  assert.equal(challenge.init.headers["x-stellar-approval-csrf"], "e".repeat(64));
+
   assert.equal(page.credentialCalls.length, 1);
+  const options = page.credentialCalls[0].publicKey;
+  assert.deepEqual(Array.from(options.challenge), Array.from(VECTOR_CHALLENGE));
+  assert.equal(options.rp.id, "localhost");
+  assert.deepEqual(JSON.parse(JSON.stringify(options.pubKeyCredParams)), [{ type: "public-key", alg: -7 }]);
+  assert.equal(options.attestation, "none");
+  assert.equal(options.authenticatorSelection.userVerification, "required");
+  assert.equal(options.authenticatorSelection.residentKey, "required");
+
+  assert.equal(posted.url, "/enroll/credential");
+  assert.equal(posted.init.headers["x-session-proof"], PROOF);
+  assert.equal(posted.init.headers["x-stellar-approval-csrf"], "e".repeat(64));
+  assert.deepEqual(JSON.parse(posted.init.body), {
+    credential_id_b64url: b64url(VECTOR_ID),
+    public_key_sec1_b64: b64url(VECTOR_KEY),
+    label: "laptop",
+    client_data_json: b64url(CLIENT_DATA),
+    attestation_object: b64url(ATTESTATION_OBJECT),
+  });
+
+  assert.equal(page.byId["confirmation-code"].textContent, VECTOR_CODE);
+  assert.equal(page.byId["confirmation-code"].hidden, false);
+  assert.match(page.byId.status.textContent, /Awaiting confirmation/);
+  assert.match(page.byId.status.textContent, new RegExp(VECTOR_CODE));
+  assert.match(page.byId.status.textContent, /at the terminal/);
+  assert.doesNotMatch(page.byId.status.textContent, /Enrolled/);
+});
+
+for (const [name, setup, code] of [
+  ["challenge", { challenge: Uint8Array.from(VECTOR_CHALLENGE, (b, i) => (i === 0 ? b ^ 1 : b)) }, "641f-fb30-29a4-176c"],
+  ["credential ID", { id: Uint8Array.from(VECTOR_ID, (b, i) => (i === 0 ? b ^ 1 : b)) }, "852e-a601-133f-7a16"],
+  ["key", { key: Uint8Array.from(VECTOR_KEY, (b, i) => (i === 64 ? b ^ 1 : b)) }, "edb8-5c46-9d41-ab10"],
+  ["credential ID length", { id: new Uint8Array(32).fill(0xa5) }, "b449-2171-5701-0e67"],
+]) {
+  test(`the confirmation code changes with the ${name}, as the Rust vectors do`, async () => {
+    const page = enrollPage(
+      { [ENROLL_PROOF_KEY]: PROOF },
+      {
+        reply: server({ challenge: setup.challenge }),
+        credential: () => makeCredential({ id: setup.id, key: setup.key }),
+      }
+    );
+    page.byId["enroll-btn"].listeners.click[0]();
+    await until(() => page.byId["confirmation-code"].textContent !== "", `the confirmation code for ${name}`);
+    assert.equal(page.byId["confirmation-code"].textContent, code);
+  });
+}
+
+test("the page shows the code of its own ceremony, never one the server names", async () => {
+  const page = enrollPage(
+    { [ENROLL_PROOF_KEY]: PROOF },
+    { reply: server({ credentialBody: { status: "awaiting_confirmation", code: "0000-0000-0000-0000" } }) }
+  );
+  page.byId["enroll-btn"].listeners.click[0]();
+  await until(() => page.byId["confirmation-code"].textContent !== "", "the ceremony's own confirmation code");
+  assert.equal(page.byId["confirmation-code"].textContent, VECTOR_CODE);
+});
+
+test("a refused registration shows the server's error and no code", async () => {
+  const page = enrollPage(
+    { [ENROLL_PROOF_KEY]: PROOF },
+    { reply: server({ credentialStatus: 400, credentialBody: { error: "registration_invalid" } }) }
+  );
+  page.byId["enroll-btn"].listeners.click[0]();
+  await until(() => page.byId.status.textContent === "Enrollment failed: registration_invalid", "the registration refusal");
+  assert.equal(page.fetches.length, 2);
+  assert.equal(page.byId.status.textContent, "Enrollment failed: registration_invalid");
+  assert.equal(page.byId["confirmation-code"].textContent, "");
+  assert.equal(page.byId["confirmation-code"].hidden, true);
+});
+
+test("a refused challenge request creates no passkey", async () => {
+  const page = enrollPage(
+    { [ENROLL_PROOF_KEY]: PROOF },
+    { reply: () => jsonReply(409, { error: "already_completed" }) }
+  );
+  page.byId["enroll-btn"].listeners.click[0]();
+  await until(() => page.byId.status.textContent === "Enrollment failed: already_completed", "the challenge refusal");
   assert.equal(page.fetches.length, 1);
-  const { url, init } = page.fetches[0];
-  assert.equal(url, "/enroll/credential");
-  assert.equal(init.headers["x-session-proof"], PROOF);
-  assert.equal(init.headers["x-stellar-approval-csrf"], "e".repeat(64));
+  assert.equal(page.credentialCalls.length, 0);
+  assert.equal(page.byId.status.textContent, "Enrollment failed: already_completed");
 });
 
 test("enrollment without a stored proof creates no passkey and sends nothing", async () => {
   const page = enrollPage({ [INBOX_PROOF_KEY]: PROOF });
   page.byId["enroll-btn"].listeners.click[0]();
-  await settle();
+  await until(() => /no wallet session/.test(page.byId.status.textContent), "the missing session proof status");
   assert.equal(page.credentialCalls.length, 0);
   assert.equal(page.fetches.length, 0);
   assert.match(page.byId.status.textContent, /no wallet session/);

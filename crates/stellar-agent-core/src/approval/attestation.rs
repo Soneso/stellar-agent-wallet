@@ -33,7 +33,29 @@
 //! carry no `attestation_version` and read as version 2;
 //! [`verify_attestation`] verifies each record under the layout its stored
 //! version names, so an approval attested under version 2 still verifies on
-//! the paths that accept it. A mainnet proof requires version 3.
+//! the paths that accept it. A pending approval requires version 4 (below).
+//!
+//! # Version 4: pending approvals name their approver
+//!
+//! A pending approval's attestation also authenticates who approved it.
+//! [`compute_attestation_v4`] produces the version 3 fields under the tag
+//! `stellar-agent-approval-attestation:v4`, followed by the approver:
+//!
+//! ```text
+//! (the version 3 fields, in the version 3 order)
+//! mac.update([approver_tag])              0x00 local, 0x01 remote
+//! mac.update(u32_be(len(credential_id)))  mac.update(credential_id)   (remote only)
+//! ```
+//!
+//! `credential_id` is the canonical base64url form of the operator credential
+//! the remote listener verified. Changing the recorded approver, turning a
+//! remote approval into a local one, or deleting the approver makes the blob
+//! fail verification. Every pending-approval consumer requires version 4
+//! ([`PENDING_ATTESTATION_VERSION`]): a pending record stored under version 2
+//! or 3 does not say whether a local operator or a remote credential
+//! approved it, so it verifies nothing and the action needs fresh consent.
+//! Toolset grants are versioned on their own and keep using
+//! [`compute_attestation`] and [`AttestationScope::from_version`].
 //!
 //! Lengths count UTF-8 bytes, encoded as big-endian u32 with saturation.
 //! The tags and the 32-byte digest have no prefix or NUL terminator.
@@ -98,6 +120,79 @@ const ATTESTATION_TAG_V2: &[u8] = b"stellar-agent-approval-attestation:v2";
 /// HMAC domain tag of version 3.
 const ATTESTATION_TAG_V3: &[u8] = b"stellar-agent-approval-attestation:v3";
 
+/// The attestation layout every pending approval is recorded and verified
+/// under: version 3's fields plus the authenticated approver.
+pub const PENDING_ATTESTATION_VERSION: u32 = 4;
+
+/// HMAC domain tag of version 4.
+const ATTESTATION_TAG_V4: &[u8] = b"stellar-agent-approval-attestation:v4";
+
+/// The approver byte of a local approval in the version 4 layout.
+const APPROVER_TAG_LOCAL: u8 = 0x00;
+
+/// The approver byte of a remote approval in the version 4 layout.
+const APPROVER_TAG_REMOTE: u8 = 0x01;
+
+/// Who approved a pending approval, as its version 4 attestation
+/// authenticates it.
+///
+/// Derived from the verified identity of the surface that approved, never
+/// from request input: a loopback or CLI surface records [`Self::Local`], and
+/// the remote listener records [`Self::Remote`] with the credential ID its
+/// WebAuthn verification matched.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AttestedApprover {
+    /// The wallet host's own operator, through the CLI or the loopback inbox.
+    Local,
+    /// An operator credential authenticated by the remote-approval listener.
+    Remote {
+        /// The canonical base64url credential ID the listener verified.
+        credential_id_b64url: String,
+    },
+}
+
+impl AttestedApprover {
+    /// Whether the approver is well formed: a remote approver names a
+    /// non-empty, canonical base64url credential ID.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        match self {
+            Self::Local => true,
+            Self::Remote {
+                credential_id_b64url,
+            } => is_canonical_b64url(credential_id_b64url),
+        }
+    }
+}
+
+impl std::fmt::Debug for AttestedApprover {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local => f.write_str("Local"),
+            Self::Remote {
+                credential_id_b64url,
+            } => f
+                .debug_struct("Remote")
+                .field(
+                    "credential_id_b64url",
+                    &crate::redact_first5_last5(credential_id_b64url),
+                )
+                .finish(),
+        }
+    }
+}
+
+/// Whether `value` is non-empty unpadded base64url that re-encodes to itself.
+fn is_canonical_b64url(value: &str) -> bool {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    !value.is_empty()
+        && URL_SAFE_NO_PAD
+            .decode(value)
+            .is_ok_and(|bytes| URL_SAFE_NO_PAD.encode(bytes) == value)
+}
+
 /// The approval facts a version 3 attestation covers beyond version 2's.
 ///
 /// Every value comes from the approval record the operator approves:
@@ -134,15 +229,42 @@ pub enum AttestationScope<'a> {
     V2,
     /// Version 3: the record's kind and lifetime.
     V3(AttestedLifetime<'a>),
+    /// Version 4: the record's kind and lifetime and its authenticated
+    /// approver. The only layout a pending approval verifies under.
+    V4(AttestedLifetime<'a>, &'a AttestedApprover),
 }
 
 impl<'a> AttestationScope<'a> {
-    /// Selects the stored version's layout; unsupported versions verify nothing.
+    /// Selects a toolset grant's stored layout; unsupported versions verify
+    /// nothing.
+    ///
+    /// Version 4 is a pending-approval layout and needs the approver, so this
+    /// selector never returns it; a pending record selects its layout with
+    /// [`Self::pending`].
     #[must_use]
     pub fn from_version(version: u32, lifetime: AttestedLifetime<'a>) -> Option<Self> {
         match version {
             ATTESTATION_VERSION_V2 => Some(Self::V2),
             ATTESTATION_VERSION => Some(Self::V3(lifetime)),
+            _ => None,
+        }
+    }
+
+    /// Selects a pending approval's layout: version 4 with a well-formed
+    /// approver, and nothing else.
+    ///
+    /// A pending record under version 2 or 3, or without an approver, or
+    /// with a malformed one, verifies nothing.
+    #[must_use]
+    pub fn pending(
+        version: u32,
+        lifetime: AttestedLifetime<'a>,
+        approver: Option<&'a AttestedApprover>,
+    ) -> Option<Self> {
+        match (version, approver) {
+            (PENDING_ATTESTATION_VERSION, Some(approver)) if approver.is_well_formed() => {
+                Some(Self::V4(lifetime, approver))
+            }
             _ => None,
         }
     }
@@ -153,6 +275,7 @@ impl<'a> AttestationScope<'a> {
         match self {
             Self::V2 => ATTESTATION_VERSION_V2,
             Self::V3(_) => ATTESTATION_VERSION,
+            Self::V4(..) => PENDING_ATTESTATION_VERSION,
         }
     }
 }
@@ -612,9 +735,68 @@ pub fn compute_attestation(
     )
 }
 
-/// Computes the blob of `scope`'s layout. [`compute_attestation`] is the only
-/// producer and always computes version 3; verification recomputes version 2
-/// for records stored under it.
+/// Computes the HMAC-SHA256 attestation blob of a pending approval, version 4.
+///
+/// Takes [`compute_attestation`]'s arguments plus the approver the approving
+/// surface verified, and authenticates all of them:
+///
+/// ```text
+/// mac.update(b"stellar-agent-approval-attestation:v4")
+/// (profile_name, chain_id, approval_nonce, envelope_sha256, process_uid,
+///  kind, created_at_unix_ms, expires_at_unix_ms, as version 3 lays them out)
+/// mac.update([0x00])                                  local approver
+/// mac.update([0x01])                                  remote approver,
+/// mac.update(u32_be(len(credential_id)))              followed by its
+/// mac.update(credential_id)                           credential ID
+/// ```
+///
+/// Same key discipline as [`compute_attestation`].
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::approval::attestation::{
+///     AttestationScope, AttestedApprover, AttestedLifetime, compute_attestation_v4,
+///     verify_attestation,
+/// };
+///
+/// let key = [0x42u8; 32];
+/// let binding = stellar_agent_core::approval::AttestationBinding::new("default",
+/// "stellar:testnet");
+/// let lifetime = AttestedLifetime::new("PaymentSimulated", 0, 60_000);
+/// let approver = AttestedApprover::Local;
+/// let blob = compute_attestation_v4(&key, &binding, "n", &[1u8; 32], "1000", &lifetime,
+/// &approver);
+/// assert!(verify_attestation(&key, &binding, "n", &[1u8; 32], "1000",
+/// &AttestationScope::V4(lifetime, &approver), &blob));
+/// // The same blob does not verify as a version 3 attestation.
+/// assert!(!verify_attestation(&key, &binding, "n", &[1u8; 32], "1000",
+/// &AttestationScope::V3(lifetime), &blob));
+/// ```
+#[must_use]
+pub fn compute_attestation_v4(
+    key: &[u8; 32],
+    binding: &AttestationBinding<'_>,
+    approval_nonce: &str,
+    envelope_sha256: &[u8; 32],
+    process_uid: &str,
+    lifetime: &AttestedLifetime<'_>,
+    approver: &AttestedApprover,
+) -> [u8; 32] {
+    compute_with_scope(
+        key,
+        binding,
+        approval_nonce,
+        envelope_sha256,
+        process_uid,
+        &AttestationScope::V4(*lifetime, approver),
+    )
+}
+
+/// Computes the blob of `scope`'s layout. [`compute_attestation`] produces
+/// version 3 for toolset grants and [`compute_attestation_v4`] produces
+/// version 4 for pending approvals; verification recomputes version 2 for
+/// grants stored under it.
 fn compute_with_scope(
     key: &[u8; 32],
     binding: &AttestationBinding<'_>,
@@ -641,6 +823,7 @@ fn compute_with_scope(
     mac.update(match scope {
         AttestationScope::V2 => ATTESTATION_TAG_V2,
         AttestationScope::V3(_) => ATTESTATION_TAG_V3,
+        AttestationScope::V4(..) => ATTESTATION_TAG_V4,
     });
     length_prefixed(&mut mac, binding.profile_name.as_bytes());
     length_prefixed(&mut mac, binding.chain_id.as_bytes());
@@ -648,10 +831,21 @@ fn compute_with_scope(
     // envelope_sha256 is always 32 bytes (fixed-length); no length prefix needed.
     mac.update(envelope_sha256);
     length_prefixed(&mut mac, process_uid.as_bytes());
-    if let AttestationScope::V3(lifetime) = scope {
+    if let AttestationScope::V3(lifetime) | AttestationScope::V4(lifetime, _) = scope {
         length_prefixed(&mut mac, lifetime.kind.as_bytes());
         mac.update(&lifetime.created_at_unix_ms.to_be_bytes());
         mac.update(&lifetime.expires_at_unix_ms.to_be_bytes());
+    }
+    if let AttestationScope::V4(_, approver) = scope {
+        match approver {
+            AttestedApprover::Local => mac.update(&[APPROVER_TAG_LOCAL]),
+            AttestedApprover::Remote {
+                credential_id_b64url,
+            } => {
+                mac.update(&[APPROVER_TAG_REMOTE]);
+                length_prefixed(&mut mac, credential_id_b64url.as_bytes());
+            }
+        }
     }
 
     let mut out = [0u8; 32];
@@ -1479,5 +1673,147 @@ mod tests {
             "1000",
             &blob
         ));
+    }
+
+    /// The version 4 layout recomputed independently from the documented
+    /// bytes, for a local and a remote approver.
+    #[test]
+    fn version_4_layout_matches_independent_hmac() {
+        let binding = AttestationBinding::new("default", "stellar:testnet");
+        let remote = AttestedApprover::Remote {
+            credential_id_b64url: "AAECAw".to_owned(),
+        };
+        for approver in [AttestedApprover::Local, remote] {
+            let mut mac = HmacSha256::new_from_slice(&[0x42; 32]).unwrap();
+            mac.update(b"stellar-agent-approval-attestation:v4");
+            for field in [&b"default"[..], b"stellar:testnet", b"nonce"] {
+                mac.update(&u32::try_from(field.len()).unwrap().to_be_bytes());
+                mac.update(field);
+            }
+            mac.update(&[1; 32]);
+            mac.update(&4_u32.to_be_bytes());
+            mac.update(b"1000");
+            mac.update(&u32::try_from(LIFETIME.kind.len()).unwrap().to_be_bytes());
+            mac.update(LIFETIME.kind.as_bytes());
+            mac.update(&LIFETIME.created_at_unix_ms.to_be_bytes());
+            mac.update(&LIFETIME.expires_at_unix_ms.to_be_bytes());
+            match &approver {
+                AttestedApprover::Local => mac.update(&[0x00]),
+                AttestedApprover::Remote {
+                    credential_id_b64url,
+                } => {
+                    mac.update(&[0x01]);
+                    mac.update(&6_u32.to_be_bytes());
+                    mac.update(credential_id_b64url.as_bytes());
+                }
+            }
+            let expected: [u8; 32] = mac.finalize().into_bytes().into();
+            assert_eq!(
+                compute_attestation_v4(
+                    &[0x42; 32],
+                    &binding,
+                    "nonce",
+                    &[1; 32],
+                    "1000",
+                    &LIFETIME,
+                    &approver
+                ),
+                expected
+            );
+        }
+    }
+
+    /// A version 4 blob verifies only for the approver it names: another
+    /// credential ID, the local operator in place of a remote credential,
+    /// and a record without its approver each refuse.
+    #[test]
+    fn remote_attestation_authenticates_approver() {
+        let binding = AttestationBinding::new("default", "stellar:mainnet");
+        let remote = |id: &str| AttestedApprover::Remote {
+            credential_id_b64url: id.to_owned(),
+        };
+        let approver = remote("AAECAw");
+        let blob = compute_attestation_v4(
+            &[0x42; 32],
+            &binding,
+            "nonce",
+            &[1; 32],
+            "1000",
+            &LIFETIME,
+            &approver,
+        );
+        let verifies = |scope: Option<AttestationScope<'_>>| {
+            scope.is_some_and(|scope| {
+                verify_attestation(
+                    &[0x42; 32],
+                    &binding,
+                    "nonce",
+                    &[1; 32],
+                    "1000",
+                    &scope,
+                    &blob,
+                )
+            })
+        };
+        assert!(verifies(AttestationScope::pending(
+            4,
+            LIFETIME,
+            Some(&approver)
+        )));
+        let other = remote("AAECBA");
+        assert!(!verifies(AttestationScope::pending(
+            4,
+            LIFETIME,
+            Some(&other)
+        )));
+        assert!(!verifies(AttestationScope::pending(
+            4,
+            LIFETIME,
+            Some(&AttestedApprover::Local)
+        )));
+        assert!(AttestationScope::pending(4, LIFETIME, None).is_none());
+        assert!(!verifies(Some(AttestationScope::V3(LIFETIME))));
+        assert!(!verifies(Some(AttestationScope::V2)));
+
+        let local = compute_attestation_v4(
+            &[0x42; 32],
+            &binding,
+            "nonce",
+            &[1; 32],
+            "1000",
+            &LIFETIME,
+            &AttestedApprover::Local,
+        );
+        assert_ne!(local, blob);
+    }
+
+    /// Only version 4 with a well-formed approver selects a pending layout.
+    #[test]
+    fn pending_layout_is_version_4_with_a_well_formed_approver() {
+        let local = AttestedApprover::Local;
+        for version in [0, 1, ATTESTATION_VERSION_V2, ATTESTATION_VERSION, 5] {
+            assert!(AttestationScope::pending(version, LIFETIME, Some(&local)).is_none());
+        }
+        assert_eq!(
+            AttestationScope::pending(4, LIFETIME, Some(&local))
+                .unwrap()
+                .version(),
+            PENDING_ATTESTATION_VERSION
+        );
+        for id in ["", "AAECAw==", "AAECA+", "AAECAx", "A"] {
+            let malformed = AttestedApprover::Remote {
+                credential_id_b64url: id.to_owned(),
+            };
+            assert!(!malformed.is_well_formed(), "{id}");
+            assert!(AttestationScope::pending(4, LIFETIME, Some(&malformed)).is_none());
+        }
+        let debug = format!(
+            "{:?}",
+            AttestedApprover::Remote {
+                credential_id_b64url: "BwcHBwcHBwcHBwcHBwcHBw".to_owned()
+            }
+        );
+        assert!(!debug.contains("BwcHBwcHBwcHBwcHBwcHBw"), "{debug}");
+        assert!(AttestationScope::from_version(4, LIFETIME).is_none());
     }
 }

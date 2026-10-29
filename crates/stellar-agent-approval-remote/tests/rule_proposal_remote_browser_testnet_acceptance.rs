@@ -512,15 +512,30 @@ async fn start_remote_serve_for_profile(
     )
     .expect("TLS cert must provision");
 
-    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let config = RemoteServeConfig::new(
-        bind_addr,
-        TEST_RP_ID,
-        allowed_credentials,
-        ctx,
-        operator_credentials_path,
-        tls,
+    // The listener reads its allowlist from the profile file at every
+    // check, so the served profile is written with `allowed_credentials`.
+    let profile_dir = approval_dir.path().join("profiles");
+    let mut served = profile.clone();
+    served.remote_approval = Some(
+        serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "bind": "127.0.0.1:0",
+            "rp_id": TEST_RP_ID,
+            "allowed_credentials": allowed_credentials,
+        }))
+        .expect("remote approval config"),
     );
+    stellar_agent_core::profile::loader::save_to_dir(&profile_name, &served, &profile_dir)
+        .expect("write the served profile");
+    let authority = stellar_agent_core::approval::RemoteApprovalAuthority::from_paths(
+        profile_name.clone(),
+        profile_dir,
+        operator_credentials_path,
+    )
+    .expect("remote approval authority");
+
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let config = RemoteServeConfig::new(bind_addr, TEST_RP_ID, authority, ctx, tls);
     start_remote_serve(config)
         .await
         .expect("start_remote_serve must succeed")
@@ -1494,7 +1509,7 @@ async fn toolset_gated_first_invoke_entry_is_consumed() {
         ),
         stellar_agent_core::approval::Surface::Cli,
         stellar_agent_core::approval::ConsentAudit::Writer(&mut consent_writer),
-        None,
+        &stellar_agent_core::approval::AttestedApprover::Local,
         |req, key| {
             stellar_agent_toolsets_runtime::record_first_invoke_grant(
                 &profile_name,

@@ -372,7 +372,7 @@ fn approve_with_consent_row(
                 &context.binding(),
                 Surface::Cli,
                 ConsentAudit::Writer(&mut guard),
-                None,
+                &stellar_agent_core::approval::AttestedApprover::Local,
                 persist_grant,
             )?;
             Ok((attestation, ConsentRowOutcome::Written))
@@ -385,7 +385,7 @@ fn approve_with_consent_row(
                 &context.binding(),
                 Surface::Cli,
                 ConsentAudit::Outbox(&outbox),
-                None,
+                &stellar_agent_core::approval::AttestedApprover::Local,
                 persist_grant,
             )?;
             Ok((attestation, ConsentRowOutcome::Queued))
@@ -1099,7 +1099,8 @@ mod tests {
     use serial_test::serial;
     use stellar_agent_core::approval::{
         ApprovalError, ApprovalKind, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore,
-        attestation::compute_attestation, decode_sha256_hex, fixtures, process_uid_for_attestation,
+        attestation::compute_attestation_v4, decode_sha256_hex, fixtures,
+        process_uid_for_attestation,
     };
     use stellar_agent_core::error::AuthError;
     use stellar_agent_core::profile::schema::KeyringEntryRef;
@@ -1347,10 +1348,22 @@ mod tests {
         store
             .insert(entry, timefmt::now_unix_ms().expect("clock"))
             .unwrap();
-        store.record_attestation(&nonce, [0x42u8; 32]).unwrap();
+        store
+            .record_attestation(
+                &nonce,
+                [0x42u8; 32],
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
+            .unwrap();
 
         // Second record_attestation must fail with AlreadyAttested.
-        let err = store.record_attestation(&nonce, [0x42u8; 32]).unwrap_err();
+        let err = store
+            .record_attestation(
+                &nonce,
+                [0x42u8; 32],
+                stellar_agent_core::approval::AttestedApprover::Local,
+            )
+            .unwrap_err();
         assert!(matches!(err, ApprovalError::AlreadyAttested));
     }
 
@@ -1442,7 +1455,7 @@ mod tests {
             &context.binding(),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            None,
+            &stellar_agent_core::approval::AttestedApprover::Local,
             |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
         )
         .unwrap();
@@ -1472,13 +1485,14 @@ mod tests {
             .expect("envelope_sha256_hex must be valid hex")
             .try_into()
             .expect("SHA-256 must be exactly 32 bytes");
-        let expected = compute_attestation(
+        let expected = compute_attestation_v4(
             &raw_key,
             &context.binding(),
             &nonce,
             &sha256_bytes,
             &process_uid,
             &entry2.attested_lifetime(),
+            &stellar_agent_core::approval::AttestedApprover::Local,
         );
 
         assert_eq!(

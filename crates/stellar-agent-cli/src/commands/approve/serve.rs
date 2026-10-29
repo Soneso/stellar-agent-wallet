@@ -352,10 +352,12 @@ async fn run_remote(
         }
     };
 
-    let operator_credentials_path =
-        match stellar_agent_core::approval::default_operator_approval_credentials_path(profile_name)
-        {
-            Ok(p) => p,
+    // The listener reads the profile's allowlist and the operator-credential
+    // store from these locations at every check; the `[remote_approval]`
+    // block loaded above only configures the bind address and RP ID.
+    let authority =
+        match stellar_agent_core::approval::RemoteApprovalAuthority::for_profile(profile_name) {
+            Ok(authority) => authority,
             Err(e) => {
                 let err = WalletError::Internal(InternalError::UnexpectedState {
                     detail: format!("approve.remote_operator_store_unavailable: {e}"),
@@ -369,9 +371,8 @@ async fn run_remote(
     let config = stellar_agent_approval_remote::RemoteServeConfig::new(
         bind_addr,
         remote_config.rp_id.clone(),
-        remote_config.allowed_credentials.clone(),
+        authority,
         context,
-        operator_credentials_path,
         tls,
     )
     .with_page_identity(page_identity);

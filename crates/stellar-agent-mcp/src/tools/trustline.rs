@@ -1520,7 +1520,7 @@ mod tests {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
         use stellar_agent_core::approval::{
             AttestationBinding,
-            attestation::{compute_attestation, compute_trustline_clawback_opt_in_digest},
+            attestation::{compute_attestation_v4, compute_trustline_clawback_opt_in_digest},
             store::PendingApprovalStore,
         };
         use stellar_agent_core::profile::schema::Profile;
@@ -1560,16 +1560,21 @@ mod tests {
         let expiry = entry.expires_at_unix_ms;
         let nonce = entry.approval_nonce.clone();
         let digest = compute_trustline_clawback_opt_in_digest("stellar:testnet", "USDC", issuer);
-        let blob = compute_attestation(
+        let blob = compute_attestation_v4(
             &key,
             &AttestationBinding::new(&name, "stellar:testnet"),
             &nonce,
             &digest,
             &entry.process_uid,
             &entry.attested_lifetime(),
+            &stellar_agent_core::approval::AttestedApprover::Local,
         );
         store.insert(entry, now)?;
-        store.record_trustline_clawback_opt_in_attestation(&nonce, blob)?;
+        store.record_trustline_clawback_opt_in_attestation(
+            &nonce,
+            blob,
+            stellar_agent_core::approval::AttestedApprover::Local,
+        )?;
         drop(store);
         assert!(server.verified_clawback_opt_in("USDC", issuer, now));
         assert!(!server.verified_clawback_opt_in("USDC", issuer, expiry + 1));

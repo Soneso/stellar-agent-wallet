@@ -1,5 +1,5 @@
 //! `stellar-agent approve operator` — operator-approval credential
-//! enrollment.
+//! enrollment and removal.
 //!
 //! Manages the dedicated operator-approval credential store
 //! (`stellar_agent_core::approval::operator_credentials`) that authenticates
@@ -17,12 +17,15 @@
 //! HTTP origin can only claim `"localhost"` as an effective domain, so which
 //! mode applies depends on where the remote-approval listener is bound:
 //!
-//! - `--interactive`: for a loopback or SSH-tunnelled listener. Starts a
-//!   one-shot local server (`stellar_agent_approval_ui::operator_enroll`),
-//!   prints its enrollment URL, opens it through a private redirect file
-//!   unless `--no-open` is passed (the launcher never receives the URL
-//!   itself), and persists the result automatically once the ceremony
-//!   completes. Always produces a `rp_id: "localhost"` credential.
+//! - `--interactive`: for a loopback or SSH-tunnelled listener. Needs a
+//!   terminal on stdin and stderr. Starts a one-shot local server
+//!   (`stellar_agent_approval_ui::operator_enroll`), prints its enrollment
+//!   URL, and opens it through a private redirect file unless `--no-open` is
+//!   passed (the launcher never receives the URL itself). The server verifies
+//!   the registration over its own challenge and stages it; the page then
+//!   shows a confirmation code, and the command persists the credential only
+//!   after the operator types that code at the terminal before the timeout.
+//!   Always produces a `rp_id: "localhost"` credential.
 //! - `--credential-id` / `--public-key` / `--rp-id` / `--label` (all four
 //!   together): for a domain-configured remote listener. Imports the id and
 //!   public key produced by a WebAuthn ceremony run elsewhere — normally the
@@ -34,16 +37,32 @@
 //! Either way, enrollment alone grants nothing — the profile's
 //! `[remote_approval] allowed_credentials` list is the separate,
 //! operator-controlled authorization step.
+//!
+//! # Removal
+//!
+//! `remove --credential-id <B64URL>` deletes the enrollment record under the
+//! credential store's write lock and reports whether one was removed. It
+//! never edits the profile. Revoking a credential means removing its ID from
+//! `allowed_credentials` and then removing its enrollment: a running
+//! listener refuses it as soon as either is gone, and its uncommitted
+//! approvals refuse at mainnet commit.
+//!
+//! # Profile name
+//!
+//! Both subcommands resolve the profile from `--profile`, then
+//! `STELLAR_AGENT_PROFILE`, then `"default"`, and refuse a name that is not
+//! a safe path component with `validation.config_invalid` before any
+//! filesystem work: the name becomes the credential store's file name.
 
-use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{ArgGroup, Args, Subcommand};
 
 use stellar_agent_approval_ui::operator_enroll::{
-    OperatorEnrollAwaitError, OperatorEnrollHandle, start_operator_enroll_server,
+    ConfirmedOperatorEnrollment, OperatorEnrollAwaitError, OperatorEnrollHandle,
+    OperatorEnrollmentConfirmationError, PendingOperatorEnrollment, start_operator_enroll_server,
 };
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::approval::operator_credentials::{
@@ -51,17 +70,18 @@ use stellar_agent_core::approval::operator_credentials::{
     default_operator_approval_credentials_path,
 };
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::error::{InternalError, WalletError};
+use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::timefmt;
 use stellar_agent_loopback_http::brand::PageIdentity;
 
 use crate::common::private_open;
 use crate::common::profile_access::load_profile_reconciled;
-use crate::common::render::render_json;
-use crate::common::resolve_profile_name;
+use crate::common::render::{escape_for_terminal, render_json};
 use crate::common::served_pages::page_identity_for;
+use crate::common::tty::stdin_and_stderr_are_terminals;
 use crate::common::{display_available, interrupted};
+use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
 /// Reminder attached to every successful enrollment, in both modes:
 /// enrollment writes to the credential store only — it never touches the
@@ -90,6 +110,30 @@ pub enum OperatorSubcommand {
     /// by itself — add its id to the profile's
     /// `[remote_approval] allowed_credentials` list separately.
     Enroll(EnrollArgs),
+    /// Remove an enrolled operator-approval credential.
+    ///
+    /// Deletes the credential's enrollment record and prints whether one was
+    /// removed; removing an absent credential succeeds with `false`. Does
+    /// not edit the profile: remove the id from
+    /// `[remote_approval] allowed_credentials` first, then the enrollment.
+    Remove(RemoveArgs),
+}
+
+/// Arguments for `stellar-agent approve operator remove`.
+#[derive(Debug, Args)]
+#[non_exhaustive]
+pub struct RemoveArgs {
+    /// Profile name (default: `"default"` or `STELLAR_AGENT_PROFILE` env var).
+    #[arg(long = "profile", value_name = "NAME")]
+    pub profile: Option<String>,
+
+    /// Base64url WebAuthn credential id of the enrollment to remove.
+    #[arg(
+        long = "credential-id",
+        value_name = "B64URL",
+        allow_hyphen_values = true
+    )]
+    pub credential_id_b64url: String,
 }
 
 /// Arguments for `stellar-agent approve operator enroll`.
@@ -114,7 +158,9 @@ pub struct EnrollArgs {
 
     /// Start the interactive loopback enrollment ceremony: a one-shot local
     /// server serves a registration page, your authenticator creates the
-    /// credential in place, and it is persisted automatically. Produces a
+    /// credential over the server's challenge, and the page shows a
+    /// confirmation code. The credential is persisted only after you type
+    /// that code here, before the timeout. Needs a terminal. Produces a
     /// credential bound to `rp_id: "localhost"` — correct for a local or
     /// SSH-tunnelled remote-approval listener. Mutually exclusive with the
     /// argument-import flags below.
@@ -127,7 +173,8 @@ pub struct EnrollArgs {
     #[arg(long = "no-open")]
     pub no_open: bool,
 
-    /// Interactive-ceremony timeout in seconds. Interactive mode only.
+    /// Interactive-ceremony timeout in seconds, covering both the browser
+    /// registration and the terminal confirmation. Interactive mode only.
     #[arg(long = "timeout-seconds", value_name = "SECS", default_value_t = 300)]
     pub timeout_seconds: u64,
 
@@ -176,8 +223,8 @@ pub struct EnrollArgs {
 
     /// Best-effort WebAuthn signature counter to seed at enrollment, read
     /// from the registration ceremony (the remote `/enroll` page displays
-    /// it). Import mode only — interactive mode extracts this
-    /// automatically, client-side. Advisory only: it seeds the
+    /// it). Import mode only; interactive mode reads it from the verified
+    /// authenticator data. Advisory only: it seeds the
     /// clone-detection baseline and never affects authorization; see
     /// `OperatorApprovalCredential::sign_count`.
     #[arg(
@@ -198,17 +245,44 @@ pub struct EnrollArgs {
 pub async fn dispatch(args: OperatorArgs) -> i32 {
     match args.subcommand {
         OperatorSubcommand::Enroll(enroll_args) => run_enroll(enroll_args).await,
+        OperatorSubcommand::Remove(remove_args) => run_remove(&remove_args),
     }
 }
 
 async fn run_enroll(args: EnrollArgs) -> i32 {
-    let resolved = resolve_profile_name(args.profile.as_deref());
+    let resolved = match resolve_store_profile(args.profile.as_deref()) {
+        Ok(resolved) => resolved,
+        Err(code) => return code,
+    };
     let profile_name = resolved.name.clone();
     if args.interactive {
         run_enroll_interactive(resolved, args).await
     } else {
         run_enroll_args(profile_name, args).await
     }
+}
+
+/// Resolves the profile whose operator-credential store a subcommand uses.
+///
+/// The name becomes the store's file name, so a name that is not a safe
+/// path component (an absolute path, a separator, a `..` component) is
+/// refused here, before any filesystem work, whether it came from
+/// `--profile` or from `STELLAR_AGENT_PROFILE`.
+///
+/// # Errors
+///
+/// Renders `validation.config_invalid` and returns exit code `1`.
+fn resolve_store_profile(flag: Option<&str>) -> Result<ResolvedProfileName, i32> {
+    let resolved = resolve_profile_name(flag);
+    if let Err(reason) = validate_path_component_ascii_safe(&resolved.name) {
+        let err = WalletError::Validation(ValidationError::ConfigInvalid {
+            component: "profile",
+            reason: format!("invalid profile name '{}': {reason}", resolved.name),
+        });
+        render_json(&Envelope::<()>::err(&err));
+        return Err(1);
+    }
+    Ok(resolved)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -316,6 +390,17 @@ struct EnrollResult {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn run_enroll_interactive(resolved: ResolvedProfileName, args: EnrollArgs) -> i32 {
+    // The confirmation code is typed at this terminal; without one the
+    // ceremony could never be confirmed, so nothing starts.
+    if !stdin_and_stderr_are_terminals() {
+        render_json(&Envelope::<()>::err_raw(
+            "approve.operator_enroll_tty_required",
+            "interactive enrollment needs a terminal on stdin and stderr to type the \
+             confirmation code the enrollment page shows",
+        ));
+        return 1;
+    }
+
     let profile_name = resolved.name.clone();
     let store_path = match default_operator_approval_credentials_path(&profile_name) {
         Ok(p) => p,
@@ -327,21 +412,7 @@ async fn run_enroll_interactive(resolved: ResolvedProfileName, args: EnrollArgs)
             return 1;
         }
     };
-
-    // Snapshot the store's credential ids before the ceremony starts, so the
-    // credential the ceremony persists can be identified afterward without
-    // widening the completion signal's payload type.
     let store = OperatorApprovalCredentialStore::new(store_path.clone());
-    let before_ids: HashSet<String> = match store.list() {
-        Ok(list) => list.into_iter().map(|c| c.credential_id_b64url).collect(),
-        Err(e) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("approve.operator_store_unavailable: {e}"),
-            });
-            render_json(&Envelope::<()>::err(&err));
-            return 1;
-        }
-    };
 
     // A protected refusal or a name mismatch blocks the ceremony.
     // Any other load failure yields the neutral identity.
@@ -383,51 +454,85 @@ async fn run_enroll_interactive(resolved: ResolvedProfileName, args: EnrollArgs)
         private_open::browser_opener,
         Duration::from_secs(args.timeout_seconds),
         tokio::signal::ctrl_c(),
+        read_code_from_terminal,
     )
     .await;
-    report_ceremony_end(end, &store, &before_ids)
+    report_enrollment_end(end, &store)
 }
 
-/// How the interactive ceremony's wait ended.
+/// How the browser phase of the ceremony ended.
 #[derive(Debug)]
 enum CeremonyEnd {
-    /// The ceremony completed, timed out, or its server failed.
-    Finished(Result<(), OperatorEnrollAwaitError>),
+    /// The server staged a verified registration, or the wait timed out or
+    /// its server failed.
+    Finished(Result<PendingOperatorEnrollment, OperatorEnrollAwaitError>),
     /// The operator interrupted the wait (Ctrl-C).
     Interrupted,
 }
 
-/// Runs the started enrollment server until the ceremony ends or
-/// `interrupt` resolves.
+/// How the whole interactive enrollment ended.
+#[derive(Debug)]
+enum EnrollmentEnd {
+    /// The operator typed the page's code before the deadline.
+    Confirmed(ConfirmedOperatorEnrollment),
+    /// No verified registration arrived before the deadline.
+    TimedOut,
+    /// The enrollment server failed before a registration arrived.
+    Failed(OperatorEnrollAwaitError),
+    /// The operator interrupted the browser phase.
+    Interrupted,
+    /// The typed code was malformed or not the page's.
+    Mismatch,
+    /// The deadline passed at the prompt.
+    Expired,
+    /// The prompt ended without a code: end of input, a read failure, or
+    /// Ctrl-C.
+    Canceled,
+}
+
+/// Runs the started enrollment server until the ceremony ends, then asks for
+/// the confirmation code.
 ///
 /// When `open_browser` is set, opens the enrollment URL through a private
-/// redirect file first; `opener` receives only the file's URL. The file stays
-/// while the ceremony runs. Every end, an interrupt included, then stops the
-/// server and removes the file and its directory. When the open fails, the
-/// URL printed at startup is the handoff.
-async fn enroll_until_done(
+/// redirect file first; `opener` receives only the file's URL. One deadline,
+/// `timeout` after the open returns, bounds both the wait for a verified
+/// registration and the prompt. The server stops and the redirect file and
+/// its directory are removed as soon as the browser phase ends, an interrupt
+/// included; when the open fails, the URL printed at startup is the handoff.
+///
+/// `interrupt` is watched across both phases. `read_code` reads the typed
+/// line, `Ok(None)` at end of input; it runs only once a registration is
+/// staged, and its future is dropped at the deadline or an interrupt, so a
+/// line it reads after that confirms nothing.
+async fn enroll_until_done<Code>(
     mut handle: OperatorEnrollHandle,
     url: &str,
     open_browser: bool,
     opener: impl FnOnce(&str) -> io::Result<()>,
     timeout: Duration,
     interrupt: impl Future<Output = io::Result<()>>,
-) -> CeremonyEnd {
+    read_code: impl FnOnce() -> Code,
+) -> EnrollmentEnd
+where
+    Code: Future<Output = io::Result<Option<String>>>,
+{
     let browser_handoff = if open_browser {
         private_open::open_or_point_to_handoff(url, opener, "the enrollment URL printed above")
     } else {
         None
     };
+    let deadline = Instant::now() + timeout;
+    let interrupt = interrupted(interrupt);
+    tokio::pin!(interrupt);
 
-    let end = tokio::select! {
-        result = handle.await_completion(timeout) => CeremonyEnd::Finished(result),
-        () = interrupted(interrupt) => CeremonyEnd::Interrupted,
+    let ceremony = tokio::select! {
+        result = handle.await_completion_until(deadline) => CeremonyEnd::Finished(result),
+        () = &mut interrupt => CeremonyEnd::Interrupted,
     };
 
     if let Err(e) = handle.shutdown().await {
-        // Non-fatal: the ceremony has already completed, timed out, errored
-        // or been interrupted; shutdown failing here does not change the
-        // outcome.
+        // Non-fatal: the browser phase has already ended; shutdown failing
+        // here does not change the outcome, and the server can write nothing.
         tracing::debug!(
             error = %e,
             "approve operator enroll --interactive: shutdown did not complete cleanly"
@@ -441,33 +546,145 @@ async fn enroll_until_done(
             "approve operator enroll --interactive: redirect file cleanup failed"
         );
     }
-    end
+
+    let pending = match ceremony {
+        CeremonyEnd::Finished(Ok(pending)) => pending,
+        CeremonyEnd::Finished(Err(OperatorEnrollAwaitError::Timeout)) => {
+            return EnrollmentEnd::TimedOut;
+        }
+        CeremonyEnd::Finished(Err(error)) => return EnrollmentEnd::Failed(error),
+        CeremonyEnd::Interrupted => return EnrollmentEnd::Interrupted,
+    };
+
+    print_confirmation_prompt(pending.label());
+    let typed = tokio::select! {
+        typed = tokio::time::timeout_at(tokio::time::Instant::from_std(pending.deadline()), read_code()) => typed,
+        () = &mut interrupt => return EnrollmentEnd::Canceled,
+    };
+    let line = match typed {
+        Ok(Ok(Some(line))) => line,
+        Ok(Ok(None)) => return EnrollmentEnd::Canceled,
+        Ok(Err(error)) => {
+            tracing::debug!(
+                error.kind = ?error.kind(),
+                "approve operator enroll --interactive: reading the confirmation code failed"
+            );
+            return EnrollmentEnd::Canceled;
+        }
+        Err(_elapsed) => return EnrollmentEnd::Expired,
+    };
+    match pending.confirm(&line, Instant::now()) {
+        Ok(confirmed) => EnrollmentEnd::Confirmed(confirmed),
+        Err(OperatorEnrollmentConfirmationError::Mismatch) => EnrollmentEnd::Mismatch,
+        Err(OperatorEnrollmentConfirmationError::Expired) => EnrollmentEnd::Expired,
+    }
 }
 
-/// Renders the envelope for how the ceremony ended and returns the exit code:
-/// `0` for a persisted credential, `1` otherwise.
-fn report_ceremony_end(
-    end: CeremonyEnd,
-    store: &OperatorApprovalCredentialStore,
-    before_ids: &HashSet<String>,
-) -> i32 {
-    let detail = match end {
-        CeremonyEnd::Finished(Ok(())) => return report_interactive_success(store, before_ids),
-        CeremonyEnd::Finished(Err(OperatorEnrollAwaitError::Timeout)) => {
-            "approve.operator_enroll_interactive_timeout: no enrollment completed within the \
-             timeout"
-                .to_owned()
+/// Reads one line from the process's stdin on a detached thread.
+///
+/// A blocking read cannot be cancelled, so the thread is not joined: when
+/// the caller stops waiting, the line it may read later goes nowhere.
+fn read_code_from_terminal() -> impl Future<Output = io::Result<Option<String>>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("operator-enroll-code".to_owned())
+        .spawn(move || {
+            let mut line = String::new();
+            let result = match io::stdin().read_line(&mut line) {
+                Ok(0) => Ok(None),
+                Ok(_) => Ok(Some(line)),
+                Err(error) => Err(error),
+            };
+            let _ = sender.send(result);
+        });
+    async move {
+        spawned?;
+        receiver
+            .await
+            .map_err(|_| io::Error::other("the terminal reader stopped"))?
+    }
+}
+
+/// Renders the envelope for how the enrollment ended and returns the exit
+/// code: `0` for a persisted credential, `1` otherwise. Only a confirmed
+/// enrollment writes the store.
+fn report_enrollment_end(end: EnrollmentEnd, store: &OperatorApprovalCredentialStore) -> i32 {
+    let (code, message) = match end {
+        EnrollmentEnd::Confirmed(confirmed) => return persist_confirmed(confirmed, store),
+        EnrollmentEnd::TimedOut => (
+            "approve.operator_enroll_interactive_timeout",
+            "no enrollment completed within the timeout",
+        ),
+        EnrollmentEnd::Failed(e) => {
+            let err = WalletError::Internal(InternalError::UnexpectedState {
+                detail: format!("approve.operator_enroll_interactive_failed: {e}"),
+            });
+            render_json(&Envelope::<()>::err(&err));
+            return 1;
         }
-        CeremonyEnd::Finished(Err(e)) => {
-            format!("approve.operator_enroll_interactive_failed: {e}")
-        }
-        CeremonyEnd::Interrupted => "approve.operator_enroll_interactive_interrupted: the \
-                                     ceremony was interrupted before an enrollment completed"
-            .to_owned(),
+        EnrollmentEnd::Interrupted => (
+            "approve.operator_enroll_interactive_interrupted",
+            "the ceremony was interrupted before an enrollment completed",
+        ),
+        EnrollmentEnd::Mismatch => (
+            "approve.operator_enroll_confirmation_mismatch",
+            "the code typed is not the one the enrollment page shows; nothing was enrolled",
+        ),
+        EnrollmentEnd::Expired => (
+            "approve.operator_enroll_confirmation_expired",
+            "the timeout passed before the confirmation code was typed; nothing was enrolled",
+        ),
+        EnrollmentEnd::Canceled => (
+            "approve.operator_enroll_confirmation_canceled",
+            "no confirmation code was typed; nothing was enrolled",
+        ),
     };
-    let err = WalletError::Internal(InternalError::UnexpectedState { detail });
-    render_json(&Envelope::<()>::err(&err));
+    render_json(&Envelope::<()>::err_raw(code, message));
     1
+}
+
+/// Persists the confirmed credential and renders the success envelope from
+/// the record written.
+fn persist_confirmed(
+    confirmed: ConfirmedOperatorEnrollment,
+    store: &OperatorApprovalCredentialStore,
+) -> i32 {
+    match confirmed.persist(store) {
+        Ok(cred) => {
+            render_json(&Envelope::ok(InteractiveEnrollResult {
+                status: "enrolled",
+                credential_id_preview: credential_id_preview(&cred.credential_id_b64url),
+                label: cred.label,
+                rp_id: cred.rp_id,
+                sign_count: cred.sign_count,
+                note: ALLOWLIST_NOTE.to_owned(),
+            }));
+            0
+        }
+        Err(ApprovalError::WriterLocked) => {
+            render_json(&Envelope::<()>::err_raw(
+                "approval.writer_locked",
+                "another process is writing the operator-credential store; nothing was enrolled",
+            ));
+            1
+        }
+        Err(ApprovalError::DuplicateCredentialId { .. }) => {
+            let err = WalletError::Internal(InternalError::UnexpectedState {
+                detail: "approve.operator_credential_already_enrolled: a credential with this id \
+                         is already enrolled for this profile"
+                    .to_owned(),
+            });
+            render_json(&Envelope::<()>::err(&err));
+            1
+        }
+        Err(e) => {
+            let err = WalletError::Internal(InternalError::UnexpectedState {
+                detail: format!("approve.operator_enroll_failed: {e}"),
+            });
+            render_json(&Envelope::<()>::err(&err));
+            1
+        }
+    }
 }
 
 /// Prints the interactive-ceremony startup guidance to stderr, keeping
@@ -484,57 +701,27 @@ fn print_interactive_startup(url: &str) {
     );
 }
 
-/// Diffs the store's credential ids against the pre-ceremony snapshot to
-/// find the credential the ceremony just persisted, and renders the
-/// success envelope.
-///
-/// # Errors
-///
-/// Returns exit code `1` (with an error envelope) if the store cannot be
-/// read back, or if completion fired but no new credential is found — the
-/// latter is unreachable given the server's single-use completion latch, and
-/// is treated as a failure rather than reported as a success so a violated
-/// invariant can never surface as a fabricated `enrolled` result.
-fn report_interactive_success(
-    store: &OperatorApprovalCredentialStore,
-    before_ids: &HashSet<String>,
-) -> i32 {
-    let after = match store.list() {
-        Ok(l) => l,
-        Err(e) => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("approve.operator_store_unavailable: {e}"),
-            });
-            render_json(&Envelope::<()>::err(&err));
-            return 1;
-        }
-    };
+/// Asks for the code the page shows, on stderr.
+#[allow(
+    clippy::print_stderr,
+    reason = "CLI binary intentional prompt; stdout stays JSON-only"
+)]
+fn print_confirmation_prompt(label: &str) {
+    eprint!("{}", confirmation_prompt(label));
+}
 
-    match after
-        .into_iter()
-        .find(|c| !before_ids.contains(&c.credential_id_b64url))
-    {
-        Some(cred) => {
-            render_json(&Envelope::ok(InteractiveEnrollResult {
-                status: "enrolled",
-                credential_id_preview: credential_id_preview(&cred.credential_id_b64url),
-                label: cred.label,
-                rp_id: cred.rp_id,
-                sign_count: cred.sign_count,
-                note: ALLOWLIST_NOTE.to_owned(),
-            }));
-            0
-        }
-        None => {
-            let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: "approve.operator_enroll_interactive_no_new_credential: the ceremony \
-                         reported completion but no new credential is present in the store"
-                    .to_owned(),
-            });
-            render_json(&Envelope::<()>::err(&err));
-            1
-        }
-    }
+/// The confirmation prompt for a staged credential labelled `label`.
+///
+/// The label comes from the browser, so it is shown through
+/// [`escape_for_terminal`]: a control or format character appears as a
+/// visible escape and cannot move the cursor, erase the prompt or reach the
+/// terminal's clipboard. The expected code is never part of the prompt.
+fn confirmation_prompt(label: &str) -> String {
+    format!(
+        "stellar-agent: a passkey labelled \"{}\" was registered.\n  \
+         Type the confirmation code the enrollment page shows, then press Enter: ",
+        escape_for_terminal(label)
+    )
 }
 
 /// Returns the first 8 characters of `id` (or the whole string if shorter)
@@ -558,6 +745,61 @@ struct InteractiveEnrollResult {
     note: String,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Removal
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// JSON success payload for `approve operator remove`. Carries no credential
+/// id.
+#[derive(Debug, serde::Serialize)]
+struct RemoveResult {
+    removed: bool,
+}
+
+fn run_remove(args: &RemoveArgs) -> i32 {
+    let profile_name = match resolve_store_profile(args.profile.as_deref()) {
+        Ok(resolved) => resolved.name,
+        Err(code) => return code,
+    };
+    match default_operator_approval_credentials_path(&profile_name) {
+        Ok(path) => remove_from(
+            &OperatorApprovalCredentialStore::new(path),
+            &args.credential_id_b64url,
+        ),
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                "approve.operator_remove_failed",
+                format!("the operator-credential store is unavailable: {e}"),
+            ));
+            1
+        }
+    }
+}
+
+/// Removes `credential_id_b64url` from `store` and renders the result.
+fn remove_from(store: &OperatorApprovalCredentialStore, credential_id_b64url: &str) -> i32 {
+    match store.remove(credential_id_b64url) {
+        Ok(removed) => {
+            render_json(&Envelope::ok(RemoveResult { removed }));
+            0
+        }
+        Err(ApprovalError::WriterLocked) => {
+            render_json(&Envelope::<()>::err_raw(
+                "approval.writer_locked",
+                "another process is writing the operator-credential store; nothing was removed",
+            ));
+            1
+        }
+        Err(e) => {
+            render_json(&Envelope::<()>::err_raw(
+                "approve.operator_remove_failed",
+                format!("the operator-credential store could not be updated: {e}"),
+            ));
+            1
+        }
+    }
+}
+
 impl OperatorArgs {
     /// The profile name this invocation operates on, as the selected subcommand
     /// resolves it.
@@ -570,6 +812,7 @@ impl OperatorArgs {
     pub(crate) fn profile_flag(&self) -> Option<&str> {
         match &self.subcommand {
             OperatorSubcommand::Enroll(a) => a.profile.as_deref(),
+            OperatorSubcommand::Remove(a) => a.profile.as_deref(),
         }
     }
 }
@@ -652,31 +895,29 @@ mod tests {
                 probe.opener(Ok(())),
                 ceremony,
                 probe.interrupt(),
+                never_typed,
             ),
         )
         .await
         .expect("the interrupt ends the enrollment wait");
-        assert!(matches!(end, CeremonyEnd::Interrupted), "{end:?}");
+        assert!(matches!(end, EnrollmentEnd::Interrupted), "{end:?}");
         probe.assert_private_handoff(&url, &token);
         assert!(
             std::net::TcpStream::connect(addr).is_err(),
             "the server stopped"
         );
         crate::common::render::take_rendered_for_test();
-        assert_eq!(report_ceremony_end(end, &store, &HashSet::new()), 1);
+        assert_eq!(report_enrollment_end(end, &store), 1);
         let rendered = crate::common::render::take_rendered_for_test();
         assert_eq!(rendered.len(), 1, "{rendered:?}");
         assert_eq!(rendered[0]["ok"], false, "{rendered:?}");
         assert_eq!(
-            rendered[0]["error"]["code"], "internal.unexpected_state",
+            rendered[0]["error"]["code"], "approve.operator_enroll_interactive_interrupted",
             "{rendered:?}"
         );
-        let message = rendered[0]["error"]["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains(
-                "approve.operator_enroll_interactive_interrupted: the ceremony was \
-                 interrupted before an enrollment completed"
-            ),
+        assert_eq!(
+            rendered[0]["error"]["message"],
+            "the ceremony was interrupted before an enrollment completed",
             "{rendered:?}"
         );
 
@@ -691,11 +932,12 @@ mod tests {
                 probe.opener(Err(io::Error::other("no browser"))),
                 ceremony,
                 probe.interrupt(),
+                never_typed,
             ),
         )
         .await
         .expect("the interrupt ends the enrollment wait");
-        assert!(matches!(end, CeremonyEnd::Interrupted), "{end:?}");
+        assert!(matches!(end, EnrollmentEnd::Interrupted), "{end:?}");
         probe.assert_failed_open_left_nothing(&token);
 
         let (handle, url, _token) = start_test_enrollment(&dir).await;
@@ -709,12 +951,610 @@ mod tests {
                 probe.opener(Ok(())),
                 ceremony,
                 probe.interrupt(),
+                never_typed,
             ),
         )
         .await
         .expect("the interrupt ends the enrollment wait");
-        assert!(matches!(end, CeremonyEnd::Interrupted), "{end:?}");
+        assert!(matches!(end, EnrollmentEnd::Interrupted), "{end:?}");
         assert!(probe.launched().is_empty());
+    }
+
+    /// A code reader the test never answers.
+    fn never_typed() -> impl Future<Output = io::Result<Option<String>>> {
+        std::future::pending()
+    }
+
+    /// What the operator does at the prompt in one interactive case.
+    enum Typing {
+        /// Types the page's code, in upper case with spaces for separators.
+        PageCode,
+        /// Types a well-formed code that is not the page's.
+        OtherCode,
+        /// Types something that is not a code.
+        Garbage,
+        /// Closes stdin.
+        EndOfInput,
+        /// The terminal read fails.
+        ReadError,
+        /// Presses Ctrl-C at the prompt, once the ceremony has asked for the
+        /// code.
+        Interrupt,
+        /// Types nothing until the deadline passes.
+        Nothing,
+    }
+
+    /// Runs one interactive ceremony against a real enrollment server: a
+    /// software authenticator registers over the server's challenge through
+    /// the page's HTTP calls, then `typing` happens at the prompt. A typed
+    /// value waits in a channel until the ceremony reads it; Ctrl-C is sent
+    /// only after the ceremony has called the code reader, so it lands at
+    /// the prompt and not in the browser phase. Returns the end, the store,
+    /// and the registrar.
+    async fn interactive_case(
+        dir: &tempfile::TempDir,
+        typing: Typing,
+        timeout: Duration,
+    ) -> (
+        EnrollmentEnd,
+        OperatorApprovalCredentialStore,
+        stellar_agent_approval_ui::operator_enroll::test_support::SoftwareRegistrar,
+    ) {
+        use stellar_agent_approval_ui::operator_enroll::test_support::{
+            EnrollmentClient, SoftwareRegistrar,
+        };
+        let store = OperatorApprovalCredentialStore::new(dir.path().join("enroll-test.toml"));
+        let (handle, url, token) = start_test_enrollment(dir).await;
+        let addr = handle.local_addr();
+        let registrar = SoftwareRegistrar::new([0x21; 32], vec![0x5a; 20]);
+        let (typed_tx, typed_rx) = tokio::sync::oneshot::channel::<io::Result<Option<String>>>();
+        let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel::<()>();
+        let interrupt = async move {
+            if interrupt_rx.await.is_ok() {
+                Ok(())
+            } else {
+                std::future::pending().await
+            }
+        };
+        let (prompt_tx, prompt_rx) = tokio::sync::oneshot::channel::<()>();
+        // The ceremony calls the reader once it shows the prompt; the call
+        // tells the driver the prompt is up. A dropped typing sender means
+        // the operator types nothing.
+        let read_code = move || {
+            let _ = prompt_tx.send(());
+            async move {
+                match typed_rx.await {
+                    Ok(typed) => typed,
+                    Err(_) => std::future::pending().await,
+                }
+            }
+        };
+        let driver = {
+            let store = OperatorApprovalCredentialStore::new(dir.path().join("enroll-test.toml"));
+            let registrar = &registrar;
+            async move {
+                let client = EnrollmentClient::connect(addr, &token).await.unwrap();
+                let (reply, code) = client.register(registrar, "laptop").await.unwrap();
+                assert_eq!(reply.status, 200, "{reply:?}");
+                assert_eq!(reply.json()["status"], "awaiting_confirmation");
+                assert!(store.list().unwrap().is_empty(), "staged, not stored");
+                let typed = match typing {
+                    Typing::PageCode => Some(Ok(Some(code.to_uppercase().replace('-', " ")))),
+                    Typing::OtherCode => {
+                        let mut other = code.into_bytes();
+                        other[0] = if other[0] == b'0' { b'1' } else { b'0' };
+                        Some(Ok(Some(String::from_utf8(other).unwrap())))
+                    }
+                    Typing::Garbage => Some(Ok(Some("yes".to_owned()))),
+                    Typing::EndOfInput => Some(Ok(None)),
+                    Typing::ReadError => Some(Err(io::Error::other("terminal gone"))),
+                    Typing::Interrupt => {
+                        prompt_rx.await.expect("the ceremony reaches the prompt");
+                        interrupt_tx.send(()).unwrap();
+                        None
+                    }
+                    Typing::Nothing => None,
+                };
+                if let Some(typed) = typed {
+                    let _ = typed_tx.send(typed);
+                }
+            }
+        };
+        let ceremony = enroll_until_done(
+            handle,
+            &url,
+            false,
+            |_| Ok(()),
+            timeout,
+            interrupt,
+            read_code,
+        );
+        let (end, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(ceremony, driver)
+        })
+        .await
+        .expect("the ceremony ends");
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "the server stopped before the prompt"
+        );
+        (end, store, registrar)
+    }
+
+    /// Only the page's code, typed before the deadline, persists the exact
+    /// candidate, once. A different or malformed code, end of input, a
+    /// read failure, Ctrl-C at the prompt, and the deadline each write
+    /// nothing and exit `1` with their own code.
+    #[tokio::test(flavor = "current_thread")]
+    async fn interactive_enrollment_requires_matching_terminal_code() {
+        for (typing, expected) in [
+            (
+                Typing::OtherCode,
+                "approve.operator_enroll_confirmation_mismatch",
+            ),
+            (
+                Typing::Garbage,
+                "approve.operator_enroll_confirmation_mismatch",
+            ),
+            (
+                Typing::EndOfInput,
+                "approve.operator_enroll_confirmation_canceled",
+            ),
+            (
+                Typing::ReadError,
+                "approve.operator_enroll_confirmation_canceled",
+            ),
+            (
+                Typing::Interrupt,
+                "approve.operator_enroll_confirmation_canceled",
+            ),
+            (
+                Typing::Nothing,
+                "approve.operator_enroll_confirmation_expired",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let timeout = if matches!(typing, Typing::Nothing) {
+                Duration::from_secs(3)
+            } else {
+                Duration::from_secs(30)
+            };
+            let (end, store, _) = interactive_case(&dir, typing, timeout).await;
+            crate::common::render::take_rendered_for_test();
+            assert_eq!(report_enrollment_end(end, &store), 1, "{expected}");
+            let rendered = crate::common::render::take_rendered_for_test();
+            assert_eq!(rendered.len(), 1, "{rendered:?}");
+            assert_eq!(rendered[0]["error"]["code"], expected, "{rendered:?}");
+            assert!(store.list().unwrap().is_empty(), "{expected}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (end, store, registrar) =
+            interactive_case(&dir, Typing::PageCode, Duration::from_secs(30)).await;
+        assert!(matches!(end, EnrollmentEnd::Confirmed(_)), "{end:?}");
+        crate::common::render::take_rendered_for_test();
+        assert_eq!(report_enrollment_end(end, &store), 0);
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered[0]["ok"], true, "{rendered:?}");
+        assert_eq!(rendered[0]["data"]["status"], "enrolled");
+        assert_eq!(rendered[0]["data"]["rp_id"], "localhost");
+        assert_eq!(rendered[0]["data"]["label"], "laptop");
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].credential_id_b64url,
+            registrar.credential_id_b64url()
+        );
+        assert_eq!(
+            listed[0].public_key_sec1_b64,
+            base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                registrar.public_key_sec1()
+            )
+        );
+        assert_eq!(listed[0].rp_id, "localhost");
+        assert_eq!(listed[0].label, "laptop");
+        assert_eq!(listed[0].sign_count, Some(0));
+        assert!(
+            !rendered[0]
+                .to_string()
+                .contains(&registrar.credential_id_b64url()),
+            "the summary carries only a preview of the id"
+        );
+    }
+
+    /// Without a terminal on stdin and stderr the command refuses before it
+    /// resolves a store or starts a server.
+    #[tokio::test(flavor = "current_thread")]
+    async fn interactive_enrollment_requires_a_terminal() {
+        for streams in [(false, true), (true, false), (false, false)] {
+            let _tty = crate::common::tty::tests::test_tty(streams.0, streams.1);
+            // A one-second timeout keeps a ceremony that wrongly starts short.
+            let args = Wrap::try_parse_from([
+                "prog",
+                "--interactive",
+                "--no-open",
+                "--timeout-seconds",
+                "1",
+            ])
+            .unwrap()
+            .args;
+            crate::common::render::take_rendered_for_test();
+            let resolved = resolve_profile_name(Some("enroll-tty-test"));
+            assert_eq!(run_enroll_interactive(resolved, args).await, 1);
+            let rendered = crate::common::render::take_rendered_for_test();
+            assert_eq!(rendered.len(), 1, "{rendered:?}");
+            assert_eq!(
+                rendered[0]["error"]["code"], "approve.operator_enroll_tty_required",
+                "{streams:?}"
+            );
+        }
+    }
+
+    #[derive(Debug, Parser)]
+    struct WrapRemove {
+        #[command(flatten)]
+        args: RemoveArgs,
+    }
+
+    /// `remove` parses its exact flags, removes only from the named store,
+    /// reports `false` for an absent id, and writes nothing while another
+    /// writer holds the store's lock.
+    #[test]
+    fn operator_remove_is_idempotent_and_profile_scoped() {
+        let parsed = WrapRemove::try_parse_from([
+            "prog",
+            "--credential-id",
+            "-AbCdEfGhIjKlMnOpQrStU",
+            "--profile",
+            "laptop",
+        ])
+        .unwrap();
+        assert_eq!(parsed.args.credential_id_b64url, "-AbCdEfGhIjKlMnOpQrStU");
+        assert_eq!(parsed.args.profile.as_deref(), Some("laptop"));
+        assert!(WrapRemove::try_parse_from(["prog"]).is_err());
+        assert!(WrapRemove::try_parse_from(["prog", "--credential-id", "A", "--force"]).is_err());
+        let operator = OperatorArgs {
+            subcommand: OperatorSubcommand::Remove(parsed.args),
+        };
+        assert_eq!(operator.profile_flag(), Some("laptop"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let credential = |seed: u8| OperatorApprovalCredential {
+            credential_id_b64url: base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                [seed; 16],
+            ),
+            public_key_sec1_b64: base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                {
+                    let mut key = [seed; 65];
+                    key[0] = 0x04;
+                    key
+                },
+            ),
+            rp_id: "localhost".to_owned(),
+            label: "laptop".to_owned(),
+            registered_at_unix_ms: 1,
+            sign_count: None,
+        };
+        let first = OperatorApprovalCredentialStore::new(dir.path().join("first.toml"));
+        let second = OperatorApprovalCredentialStore::new(dir.path().join("second.toml"));
+        first.enroll(credential(1)).unwrap();
+        first.enroll(credential(2)).unwrap();
+        second.enroll(credential(1)).unwrap();
+        let id = credential(1).credential_id_b64url;
+
+        crate::common::render::take_rendered_for_test();
+        assert_eq!(remove_from(&first, &id), 0);
+        assert_eq!(remove_from(&first, &id), 0);
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered[0]["data"], serde_json::json!({"removed": true}));
+        assert_eq!(rendered[1]["data"], serde_json::json!({"removed": false}));
+        assert!(!rendered[0].to_string().contains(&id));
+        assert_eq!(first.list().unwrap(), vec![credential(2)]);
+        assert_eq!(
+            second.list().unwrap(),
+            vec![credential(1)],
+            "another profile is untouched"
+        );
+
+        let before = std::fs::read(dir.path().join("second.toml")).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.path().join("second.toml.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        assert_eq!(remove_from(&second, &id), 1);
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered[0]["error"]["code"], "approval.writer_locked");
+        assert_eq!(
+            std::fs::read(dir.path().join("second.toml")).unwrap(),
+            before
+        );
+        drop(lock);
+        assert_eq!(remove_from(&second, &id), 0);
+        assert!(second.list().unwrap().is_empty());
+    }
+
+    /// A credential record for the `run_remove` tests.
+    fn remove_test_credential(seed: u8) -> OperatorApprovalCredential {
+        let mut key = [seed; 65];
+        key[0] = 0x04;
+        OperatorApprovalCredential {
+            credential_id_b64url: base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                [seed; 16],
+            ),
+            public_key_sec1_b64: base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                key,
+            ),
+            rp_id: "localhost".to_owned(),
+            label: "laptop".to_owned(),
+            registered_at_unix_ms: 1,
+            sign_count: None,
+        }
+    }
+
+    /// Every file under `root` with its bytes, by path relative to `root`.
+    fn tree_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let bytes = std::fs::read(&path).unwrap();
+                    found.push((path.strip_prefix(root).unwrap().to_path_buf(), bytes));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// Sets `STELLAR_AGENT_PROFILE`; the caller holds a
+    /// `ProfileEnvVarGuard`, which restores the variable, and is `#[serial]`.
+    #[allow(
+        unsafe_code,
+        reason = "test-only process environment mutation; serialised by #[serial]"
+    )]
+    fn set_profile_env(name: &str) {
+        // SAFETY: serialised by #[serial]; the caller's guard restores the
+        // variable when it drops.
+        unsafe {
+            std::env::set_var("STELLAR_AGENT_PROFILE", name);
+        }
+    }
+
+    /// A profile name that is not a safe path component refuses with
+    /// `validation.config_invalid`, by flag and by `STELLAR_AGENT_PROFILE`,
+    /// and nothing anywhere is created, changed or removed: not the store
+    /// the name points at outside the credential directory, not its lock
+    /// sidecar, not the credential directory itself.
+    #[test]
+    #[serial_test::serial]
+    fn operator_remove_refuses_an_unsafe_profile_name() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let outside = home.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let victim = OperatorApprovalCredentialStore::new(outside.join("victim.toml"));
+        victim.enroll(remove_test_credential(1)).unwrap();
+        let id = remove_test_credential(1).credential_id_b64url;
+        let before = tree_snapshot(home.path());
+
+        let absolute = outside.join("victim").to_str().unwrap().to_owned();
+        let names = [
+            "../outside/victim".to_owned(),
+            absolute,
+            "nested/victim".to_owned(),
+            "..".to_owned(),
+        ];
+        for name in &names {
+            for by_env in [false, true] {
+                let args = if by_env {
+                    set_profile_env(name);
+                    RemoveArgs {
+                        profile: None,
+                        credential_id_b64url: id.clone(),
+                    }
+                } else {
+                    RemoveArgs {
+                        profile: Some(name.clone()),
+                        credential_id_b64url: id.clone(),
+                    }
+                };
+                crate::common::render::take_rendered_for_test();
+                assert_eq!(run_remove(&args), 1, "{name} by_env={by_env}");
+                let rendered = crate::common::render::take_rendered_for_test();
+                assert_eq!(rendered.len(), 1, "{rendered:?}");
+                assert_eq!(
+                    rendered[0]["error"]["code"], "validation.config_invalid",
+                    "{name} by_env={by_env}: {rendered:?}"
+                );
+            }
+        }
+        assert_eq!(tree_snapshot(home.path()), before, "nothing was touched");
+        assert!(!home.path().join("operator-approval-credentials").exists());
+        assert_eq!(victim.list().unwrap(), vec![remove_test_credential(1)]);
+    }
+
+    /// `enroll` applies the same profile-name rule as `remove`, by flag and
+    /// by `STELLAR_AGENT_PROFILE`, in both modes, and creates nothing.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn operator_enroll_refuses_an_unsafe_profile_name() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let credential = remove_test_credential(3);
+        for by_env in [false, true] {
+            for interactive in [false, true] {
+                let mut argv = vec!["prog".to_owned()];
+                if by_env {
+                    set_profile_env("../escape");
+                } else {
+                    argv.extend(["--profile".to_owned(), "../escape".to_owned()]);
+                }
+                if interactive {
+                    argv.extend(["--interactive".to_owned(), "--no-open".to_owned()]);
+                } else {
+                    argv.extend([
+                        "--credential-id".to_owned(),
+                        credential.credential_id_b64url.clone(),
+                        "--public-key".to_owned(),
+                        credential.public_key_sec1_b64.clone(),
+                        "--rp-id".to_owned(),
+                        "localhost".to_owned(),
+                        "--label".to_owned(),
+                        "laptop".to_owned(),
+                    ]);
+                }
+                let args = Wrap::try_parse_from(argv).unwrap().args;
+                crate::common::render::take_rendered_for_test();
+                assert_eq!(run_enroll(args).await, 1);
+                let rendered = crate::common::render::take_rendered_for_test();
+                assert_eq!(rendered.len(), 1, "{rendered:?}");
+                assert_eq!(
+                    rendered[0]["error"]["code"], "validation.config_invalid",
+                    "by_env={by_env} interactive={interactive}: {rendered:?}"
+                );
+            }
+        }
+        assert!(tree_snapshot(home.path()).is_empty(), "nothing was created");
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+    }
+
+    /// Argument import refuses a label that holds a control character
+    /// through the store's own check and creates no store file.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn operator_import_refuses_a_label_with_a_control_character() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let credential = remove_test_credential(4);
+        let args = Wrap::try_parse_from([
+            "prog",
+            "--profile",
+            "import-label",
+            "--credential-id",
+            &credential.credential_id_b64url,
+            "--public-key",
+            &credential.public_key_sec1_b64,
+            "--rp-id",
+            "localhost",
+            "--label",
+            "lap\u{1b}[2Ktop",
+        ])
+        .unwrap()
+        .args;
+        crate::common::render::take_rendered_for_test();
+        assert_eq!(run_enroll(args).await, 1);
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert_eq!(
+            rendered[0]["error"]["code"], "internal.unexpected_state",
+            "{rendered:?}"
+        );
+        assert!(
+            rendered[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("approve.operator_credential_invalid"),
+            "{rendered:?}"
+        );
+        assert!(
+            !default_operator_approval_credentials_path("import-label")
+                .unwrap()
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read_dir(home.path()).unwrap().count(),
+            0,
+            "nothing was created"
+        );
+    }
+
+    /// `run_remove` edits the store of the profile it resolves: `--profile`
+    /// first, then `STELLAR_AGENT_PROFILE`, and the flag wins over the
+    /// variable. The stores of the other profiles keep their record.
+    #[test]
+    #[serial_test::serial]
+    fn operator_remove_selects_the_resolved_profile_store() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
+        let store = |name: &str| {
+            OperatorApprovalCredentialStore::new(
+                default_operator_approval_credentials_path(name).unwrap(),
+            )
+        };
+        assert!(
+            store("alpha")
+                .path()
+                .starts_with(home.path().join("operator-approval-credentials"))
+        );
+        for name in ["alpha", "beta", "default"] {
+            store(name).enroll(remove_test_credential(1)).unwrap();
+        }
+        let id = remove_test_credential(1).credential_id_b64url;
+        let holds = |name: &str| !store(name).list().unwrap().is_empty();
+
+        let remove = |profile: Option<&str>| {
+            crate::common::render::take_rendered_for_test();
+            let code = run_remove(&RemoveArgs {
+                profile: profile.map(str::to_owned),
+                credential_id_b64url: id.clone(),
+            });
+            let rendered = crate::common::render::take_rendered_for_test();
+            (code, rendered[0]["data"]["removed"].clone())
+        };
+
+        assert_eq!(remove(Some("alpha")), (0, serde_json::json!(true)));
+        assert!(!holds("alpha"));
+        assert!(holds("beta") && holds("default"));
+
+        set_profile_env("beta");
+        assert_eq!(remove(None), (0, serde_json::json!(true)));
+        assert!(!holds("beta"));
+        assert!(holds("default"));
+
+        assert_eq!(remove(Some("default")), (0, serde_json::json!(true)));
+        assert!(!holds("default"));
+    }
+
+    /// A browser-supplied label reaches the terminal only escaped: ANSI and
+    /// OSC sequences, carriage return, bell and C1 controls appear as
+    /// visible escapes, and the prompt holds no control character other than
+    /// its own line break.
+    #[test]
+    fn confirmation_prompt_escapes_a_hostile_label() {
+        let hostile = "laptop\u{1b}[2K\u{1b}[1A\rok\u{07}\u{1b}]52;c;ZXZpbA==\u{07}\u{9b}2J";
+        let prompt = confirmation_prompt(hostile);
+        assert_eq!(
+            prompt,
+            "stellar-agent: a passkey labelled \
+             \"laptop\\u{1b}[2K\\u{1b}[1A\\rok\\u{7}\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{9b}2J\" \
+             was registered.\n  Type the confirmation code the enrollment page shows, then \
+             press Enter: "
+        );
+        assert!(
+            prompt.chars().all(|c| c == '\n' || !c.is_control()),
+            "{prompt:?}"
+        );
+        assert_eq!(
+            confirmation_prompt("laptop"),
+            "stellar-agent: a passkey labelled \"laptop\" was registered.\n  Type the \
+             confirmation code the enrollment page shows, then press Enter: "
+        );
     }
 
     #[derive(Debug, Parser)]
