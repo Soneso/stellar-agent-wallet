@@ -156,6 +156,12 @@ pub enum PinError {
         /// `sequence` or `digest`.
         field: &'static str,
     },
+    /// The profile key coordinate names the reserved installation service.
+    #[error(
+        "`policy_window_state_key_id` names the reserved service `stellar-agent-toolsets` (validation.installation_key_coordinate)"
+    )]
+    InstallationKeyCoordinate,
+
     /// The keyring entry could not be read or written.
     #[error("the policy pin keyring entry could not be used: {detail}")]
     Keyring {
@@ -275,7 +281,13 @@ pub fn entry_present(window_key: &KeyringEntryRef) -> Result<bool, PinError> {
 ///
 /// - [`PinError::WrongGuard`] when `lock` does not guard `scope`.
 /// - [`PinError::Keyring`] when the entry cannot be written.
+/// - [`PinError::InstallationKeyCoordinate`] for the reserved installation service.
 pub fn write(lock: &WindowStoreLock, scope: &PinScope<'_>, pin: &Pin) -> Result<(), PinError> {
+    crate::profile::owner_key::refuse_installation_key_coordinate(
+        scope.window_key,
+        "policy_window_state_key_id",
+    )
+    .map_err(|_| PinError::InstallationKeyCoordinate)?;
     check_guard(lock, scope)?;
     let value = render(pin)?;
     let entry_ref = scope.pin_entry_ref();
@@ -478,5 +490,22 @@ mod tests {
             WindowStoreLock::acquire_for(&window, &key),
             Err(crate::policy::state_lock::StateLockError::WriterLocked)
         ));
+    }
+
+    #[test]
+    #[serial]
+    fn write_refuses_installation_coordinate() {
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let window = dir.path().join("pin.window");
+        let key = KeyringEntryRef::new("StElLaR-AgEnT-ToOlSeTs", "pin-key");
+        let scope = PinScope::new(&window, &key);
+        let lock = WindowStoreLock::acquire_for(&window, &key).unwrap();
+        let pin = Pin::new(1, [1; 32], [2; 32]).unwrap();
+        assert_eq!(
+            write(&lock, &scope, &pin),
+            Err(PinError::InstallationKeyCoordinate)
+        );
+        assert!(get(&scope.pin_entry_ref()).is_none());
     }
 }

@@ -539,7 +539,8 @@ four-part capability gate. Two signing tools are reachable, only through gated
 capabilities: `stellar_pay_commit` (`sign-payment`) and
 `stellar_rule_create_commit` (`sign-rule-create`). Each needs a first-invoke
 grant plus its per-action approval. No other signing tool is reachable through
-a toolset. The routed tool's own policy gate still applies.
+a toolset. The routed tool's own policy gate still applies. The dispatcher is a
+destructive tool and is refused on a mainnet profile.
 
 | Code | Meaning | Agent action |
 |---|---|---|
@@ -548,6 +549,8 @@ a toolset. The routed tool's own policy gate still applies.
 | `toolset.capability_not_declared` | The toolset's manifest does not declare the capability needed to grant this action. | The toolset cannot perform this action. Report to the operator; do not retry. |
 | `toolset.tool_not_allowed` | The resolved tool is excluded by the toolset's `allowed_tools` narrowing. | The toolset is configured not to use that tool. Report to the operator. |
 | `toolset.not_installed` | The named toolset is not installed. | Verify the toolset name with `stellar_toolset_list`; install via the operator if missing. |
+| `toolset.pin_unverifiable` | The toolset's install record does not verify under the installation's pin key: it was edited, written under another key, or written by an earlier build without an authentication tag. Nothing it states is trusted. | Not agent-recoverable. Ask the operator to uninstall the toolset and install it again from its signed package. |
+| `toolset.content_digest_mismatch` | The toolset's `TOOLSET.md` on disk differs from the digest in its install record, or cannot be read. | Not agent-recoverable. Report to the operator, who reinstalls the toolset. |
 | `toolset.gated_missing_envelope` | A toolset sign-payment route was called without `args.envelope_xdr`. | Run `stellar_pay` (simulate) first and pass its `envelope_xdr` into the gated invoke. |
 | `toolset.args_not_object` | `args` was not a JSON object. | Pass `args` as a JSON object. |
 | `toolset.args_validation` / `toolset.args_deserialise` / `toolset.gated_args_deserialise` | The toolset arguments failed validation or deserialization. | Fix the argument shape to match the routed tool's schema and retry. |

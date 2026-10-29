@@ -179,6 +179,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `stellar_agent_network::mainnet::authorization::MainnetSignedSorobanIntent`
   is the Soroban intent authorization whose one signature was produced, and
   `MainnetSorobanIntentAuthorization::into_signed` converts one into it.
+- `stellar_agent_toolsets_install` exposes `PinKey`, the installation's
+  toolset pin key, and `ToolsetsLock` with `lock_toolsets` and
+  `TOOLSETS_LOCK_FILE_NAME`, the toolsets directory lock. `ToolsetInstallError`
+  gains `PinRecordUnverifiable` and `Busy`. Under `test-helpers`,
+  `write_pin_for_test` and `write_toolset_for_test` write tagged records.
+- `stellar_agent_toolsets_runtime` re-exports `PinKey`.
+  `ToolsetRuntimeError` gains `PinUnverifiable`
+  (`toolset.pin_unverifiable`).
+- `stellar_agent_network::keyring` exposes `read_secret_32`, which reports an
+  absent entry as `None`, and `load_or_mint_secret_32`, which mints a 32-byte
+  secret only when the entry is absent.
+- `KeyringEntryRef::toolset_pin_key`, `TOOLSET_PIN_KEY_SERVICE` and
+  `TOOLSET_PIN_KEY_ACCOUNT` name the toolset pin key's keyring entry. The
+  key-scope finding `KeyScopeKind::InstallationEntry` (`installation_entry`)
+  reports a profile role naming an entry under that service.
 
 ### Changed
 
@@ -218,6 +233,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ToolsetGrantStore::find_matching` takes a `GrantQuery`, the attestation key,
   and the profile/chain binding. `GatedInvokeParams` gains `attestation_key`
   and `attestation_binding`; its debug output redacts the key.
+- `read_pin` takes an `Option<&PinKey>`. `install_toolset` and
+  `install_toolset_from_path` take a `&ToolsetsLock` and a `&PinKey`, and
+  `uninstall_toolset` takes a `&ToolsetsLock`; each refuses a lock taken on
+  another toolsets directory. `ToolsetPinRecord::toolset_md_shasum` is a
+  `String`, and the record derives `Serialize` only; `read_pin` is the one
+  way to read it.
+  `list_pinned_toolsets` and `resolve_toolset_and_check` take an
+  `Option<&PinKey>`, and `GatedInvokeParams` gains `pin_key`.
+- `SIGNING_DENYLIST` adds `stellar_trustline_commit`,
+  `stellar_mpp_charge_commit`, `stellar_dex_trade`,
+  `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw` and
+  `stellar_friendbot`, and drops the read-only `stellar_x402_parse_receipt`.
+  It holds every destructive registry tool, every tool that reaches a signer,
+  and the dispatcher's own tools.
+- `toolsets install`, `toolsets list` and `toolsets run` read the toolset pin
+  key from the platform keyring, and `toolsets install` mints it on the first
+  install. `toolsets install` and `toolsets uninstall` hold the toolsets
+  directory lock. `toolsets uninstall` reads no install record and removes the
+  directory of the requested package name. `toolsets run` reports
+  `toolset.pin_unverifiable` and `toolset.content_digest_mismatch`.
 - Interactive operator enrollment requires the browser's confirmation code at
   the terminal. `approve operator enroll --interactive` needs a terminal on
   stdin and stderr. The page requests a single-use registration challenge from
@@ -1101,6 +1136,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The pre-signing divergence check of smart-account auth entries compares one
   fingerprint per node of the simulated invocation tree with one per node of
   the signed tree.
+- Toolset install records are authenticated by an HMAC-SHA256 under an
+  installation key in the platform keyring and carry a mandatory `TOOLSET.md`
+  digest, which both the ungated and the gated resolver check. A record that is
+  edited, written under another key, or stored under another package's name
+  grants nothing. A record written by an earlier build does not verify, so every
+  installed toolset is refused with `toolset.pin_unverifiable` until it is
+  uninstalled and installed again.
+- `stellar_toolset_invoke` is annotated destructive and leaves the mainnet
+  read-only tool set, so it is refused on mainnet.
+- The toolset documentation states that a toolset narrows only what the
+  dispatcher routes, not the native tools the server registers; the caller
+  chooses the `toolset` argument, and the operator policy and approvals bound
+  native and routed calls alike.
 
 ## [0.1.0-alpha.12] - 2026-10-15
 

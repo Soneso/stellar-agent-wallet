@@ -163,6 +163,17 @@ fn read_owner_key(coordinate: &KeyringEntryRef) -> Result<[u8; 32], String> {
 
 /// Runs the ceremony or its read-only inspection and renders a JSON envelope.
 pub(crate) fn run(args: &EnableMainnetArgs) -> i32 {
+    run_with_keyring(
+        args,
+        stellar_agent_network::keyring::init_platform_keyring_store,
+    )
+}
+
+/// Runs enablement with keyring initialization supplied.
+fn run_with_keyring(
+    args: &EnableMainnetArgs,
+    init_keyring: impl FnOnce() -> Result<(), stellar_agent_core::error::WalletError>,
+) -> i32 {
     let result = (|| {
         let name = args.profile.as_deref().ok_or_else(|| {
             (
@@ -184,8 +195,12 @@ pub(crate) fn run(args: &EnableMainnetArgs) -> i32 {
         let policy_path = default_policy_dir()
             .map_err(|e| precondition(e.to_string()))?
             .join(format!("{name}.toml"));
-        stellar_agent_network::keyring::init_platform_keyring_store()
-            .map_err(|e| precondition(e.to_string()))?;
+        stellar_agent_core::profile::owner_key::refuse_installation_key_coordinate(
+            &profile.policy_window_state_key_id,
+            "policy_window_state_key_id",
+        )
+        .map_err(|e| (e.code(), e.to_string()))?;
+        init_keyring().map_err(|e| precondition(e.to_string()))?;
         execute(
             args,
             name,
@@ -1990,5 +2005,23 @@ mod tests {
         .unwrap();
         let unchanged = raw.split_once("scope").unwrap().1;
         assert!(rewritten.contains(&format!("scope{unchanged}")));
+    }
+
+    /// Enablement refuses a reserved window-key service before opening keys.
+    #[test]
+    #[serial_test::serial]
+    fn installation_coordinate_refuses_without_writing() {
+        use crate::common::installation_key_fixture::InstallationKeyFixture;
+        let fixture = InstallationKeyFixture::new("stellar-agent-toolsets");
+        let name = "pin-coordinate-refusal";
+        let mut profile = Profile::builder_testnet_named(name, "s", "a", "n", "a").build();
+        profile.policy_window_state_key_id = fixture.coordinate.clone();
+        loader::save_to_dir(name, &profile, &fixture.home().join("profiles")).unwrap();
+        let args = EnableMainnetArgs {
+            profile: Some(name.to_owned()),
+            check: false,
+            rotate: true,
+        };
+        fixture.assert_rendered_refusal(run_with_keyring(&args, || fixture.init()));
     }
 }

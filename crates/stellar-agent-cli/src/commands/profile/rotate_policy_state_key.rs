@@ -69,13 +69,15 @@ use serde::Serialize;
 use stellar_agent_core::audit_log::KeyPurpose;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::WalletError;
-use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::profile::owner_key;
+use stellar_agent_core::profile::{Profile, ResolvedProfileName, loader};
 use stellar_agent_network::keyring::{init_platform_keyring_store, load_hmac_key_32};
 use stellar_agent_network::policy_state::{POLICY_STATE_KEY_FIELD, PersistedWindowStore};
 use uuid::Uuid;
 
-use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
+use crate::common::profile_access::{
+    injected_profile_load, profile_access_envelope, reconcile_loaded_profile,
+};
 use crate::common::render;
 
 use super::audit_emit::emit_keyring_key_written;
@@ -141,11 +143,21 @@ struct RotatePolicyStateKeyData {
 ///
 /// Never panics.
 pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
+    run_with_dependencies(args, injected_profile_load, init_platform_keyring_store).await
+}
+
+/// Runs the rotation with profile loading and keyring initialization supplied.
+async fn run_with_dependencies(
+    args: &RotatePolicyStateKeyArgs,
+    load_profile: impl FnOnce(&str) -> Result<Profile, loader::ProfileLoadError>,
+    init_keyring: impl FnOnce() -> Result<(), WalletError>,
+) -> i32 {
     // ── Step 0: load the profile FIRST so a nonexistent profile never
     // reaches the keyring init.
-    let profile = match load_profile_reconciled(&ResolvedProfileName::from_flag(
-        args.profile_name(),
-    )) {
+    let profile = match reconcile_loaded_profile(
+        load_profile(args.profile_name()),
+        &ResolvedProfileName::from_flag(args.profile_name()),
+    ) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(profile = %args.profile_name(), error = %e, "profile access refused");
@@ -154,7 +166,15 @@ pub async fn run(args: &RotatePolicyStateKeyArgs) -> i32 {
         }
     };
 
-    if let Err(e) = init_platform_keyring_store() {
+    if let Err(e) = owner_key::refuse_installation_key_coordinate(
+        &profile.policy_window_state_key_id,
+        POLICY_STATE_KEY_FIELD,
+    ) {
+        render::render_json(&Envelope::err(&e));
+        return 1;
+    }
+
+    if let Err(e) = init_keyring() {
         render::render_json(&Envelope::err(&e));
         return 1;
     }
@@ -451,5 +471,22 @@ mod tests {
             .get_password()
             .unwrap_err();
         assert!(matches!(pending, keyring_core::Error::PlatformFailure(_)));
+    }
+
+    /// Installation coordinates refuse on testnet before the keyring opens.
+    #[tokio::test]
+    #[serial]
+    async fn installation_coordinate_refuses_without_writing() {
+        crate::common::installation_key_fixture::assert_installation_profile_refusal(
+            |profile| &mut profile.policy_window_state_key_id,
+            async |fixture, profile, name| {
+                let args = RotatePolicyStateKeyArgs {
+                    name: Some(name.to_owned()),
+                    profile: None,
+                };
+                run_with_dependencies(&args, |_| Ok(profile.clone()), || fixture.init()).await
+            },
+        )
+        .await;
     }
 }

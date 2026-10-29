@@ -4,14 +4,14 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::audit_log::tip_anchor::{reanchor_count_account, tip_anchor_account};
+use crate::audit_log::tip_anchor::{AuditKeyringEntries, log_path_sha256};
 use crate::error::ValidationError;
 use crate::observability::redact_path_in_message;
 
 use super::caip2::Caip2;
 use super::loader::{guard_name_for_load, list_profiles_in_dir};
 use super::schema::{
-    KeyringEntryRef, Profile, ProviderRole, WALLET_KEY_REFERENCE_FIELDS,
+    KeyringEntryRef, Profile, ProviderRole, TOOLSET_PIN_KEY_SERVICE, WALLET_KEY_REFERENCE_FIELDS,
     default_audit_log_path_for, default_profile_dir, generation_account, generation_intent_account,
     keyring_entry_alias, mainnet_enablement_entry_ref, policy_pin_entry_ref,
     signer_identity_entry_ref,
@@ -76,6 +76,15 @@ pub enum KeyScopeKind {
         /// Rendered default entry for the profile name.
         expected: Coordinate,
     },
+    /// A profile role names an installation-wide entry: a coordinate under
+    /// the toolset pin key's service. A key operation on that role (a
+    /// `rotate-*-key`, a reset) would replace the installation's pin key.
+    InstallationEntry {
+        /// Profile role.
+        field: &'static str,
+        /// Rendered reference.
+        coordinate: Coordinate,
+    },
     /// Two roles within the profile share an entry.
     SelfCollision {
         /// First role in enumeration order.
@@ -122,6 +131,7 @@ impl KeyScopeKind {
             Self::OutOfScope { .. } => "out_of_scope",
             Self::OwnerAccountOverride { .. } => "owner_account_override",
             Self::WindowStateKeyOverride { .. } => "window_state_key_override",
+            Self::InstallationEntry { .. } => "installation_entry",
             Self::SelfCollision { .. } => "self_collision",
             Self::SharedWithSibling { .. } => "shared_with_sibling",
             Self::MainnetSignerIdentity { .. } => "mainnet_signer_identity",
@@ -167,6 +177,11 @@ impl KeyScopeFinding {
                  '{coordinate}'; a mainnet profile keeps its policy pin and enablement nonce \
                  beside its default entry '{expected}'. Set policy_window_state_key_id to that \
                  entry in the profile file"
+            ),
+            KeyScopeKind::InstallationEntry { field, coordinate } => format!(
+                "profile '{name}': {field} names keyring entry '{coordinate}', which belongs \
+                 to the installation's toolset pin key; give this profile an entry of its own \
+                 in its profile file"
             ),
             KeyScopeKind::SelfCollision {
                 field,
@@ -257,9 +272,6 @@ const WINDOW_GENERATION: &str = "policy_window_state_key_id (generation)";
 const WINDOW_POLICY_PIN: &str = "policy_window_state_key_id (policy pin)";
 const WINDOW_ENABLEMENT: &str = "policy_window_state_key_id (mainnet enablement)";
 const SIGNER_IDENTITY: &str = "mcp_signer_default (enrolled identity)";
-const TIP_ANCHOR: &str = "audit_log_hash_chain_key_id (tip anchor)";
-const OUTBOX_STATE: &str = "audit_log_hash_chain_key_id (outbox state)";
-const REANCHOR_COUNTER: &str = "audit_log_hash_chain_key_id (reanchor counter)";
 const AUDIT_BINDING: &str = "audit binding (derived)";
 const MPP_STATE: &str = "mpp state (derived)";
 const MPP_GENERATION: &str = "mpp state (generation)";
@@ -371,27 +383,9 @@ fn effective_coordinates(
         .cloned()
         .unwrap_or_else(|| default_audit_log_path_for(name));
     let audit = entries[AUDIT_FIELD].1.clone();
-    entries.push((
-        TIP_ANCHOR,
-        KeyringEntryRef {
-            service: audit.service.clone(),
-            account: tip_anchor_account(&audit.account, &path),
-        },
-    ));
-    entries.push((
-        REANCHOR_COUNTER,
-        KeyringEntryRef {
-            service: audit.service.clone(),
-            account: reanchor_count_account(&audit.account, &path),
-        },
-    ));
-    entries.push((
-        OUTBOX_STATE,
-        KeyringEntryRef::new(
-            &audit.service,
-            crate::audit_log::outbox_state_account(&audit.account, &path),
-        ),
-    ));
+    entries.extend(
+        AuditKeyringEntries::for_path_digest(&audit, &log_path_sha256(&path)).into_scope_entries(),
+    );
     entries.push((AUDIT_BINDING, KeyringEntryRef::default_audit_binding(name)));
     let mpp = KeyringEntryRef::default_mpp_state_key(name);
     entries.push((MPP_STATE, mpp.clone()));
@@ -517,6 +511,16 @@ fn scope_findings_in_dir(
         }
     }
     let selected = effective_coordinates(name, document.as_ref(), Some(profile));
+    // Every keyring store compares services without regard to case, and the
+    // joined `account.service` alias of the pin key splits only one way.
+    for (field, entry) in &selected {
+        if entry.service.eq_ignore_ascii_case(TOOLSET_PIN_KEY_SERVICE) {
+            findings.push(finding(KeyScopeKind::InstallationEntry {
+                field,
+                coordinate: entry.into(),
+            }));
+        }
+    }
     for (i, (field, entry)) in selected.iter().enumerate() {
         for (other_field, other) in selected.iter().skip(i + 1) {
             let owner_pair = *field == WALLET_KEY_REFERENCE_FIELDS[OWNER_FIELD]
@@ -702,6 +706,7 @@ pub fn enforce_message_signing_scope_in_dir(
     for finding in scope_findings_in_dir(profile, name, profiles_dir, true) {
         let refuses = match &finding.kind {
             KeyScopeKind::OutOfScope { field, .. }
+            | KeyScopeKind::InstallationEntry { field, .. }
             | KeyScopeKind::SharedWithSibling { field, .. } => signer_field(field),
             KeyScopeKind::SelfCollision {
                 field, other_field, ..
@@ -733,6 +738,9 @@ mod tests {
         reason = "test assertions"
     )]
     use super::*;
+    use crate::audit_log::tip_anchor::{
+        OUTBOX_STATE, REANCHOR_COUNTER, TIP_ANCHOR, reanchor_count_account, tip_anchor_account,
+    };
     use crate::envelope::Envelope;
     use crate::error::WalletError;
     use crate::profile::loader::{load_from_dir, save_to_dir};
@@ -915,6 +923,66 @@ mod tests {
         f.save("alice", &a);
         let err = enforce_key_scope(&a, "alice").unwrap_err();
         assert_eq!(err.kind, "self_collision");
+    }
+
+    /// A profile document naming the toolset pin key as its audit key is a
+    /// finding for the field and the three entries derived beside it.
+    /// On mainnet it refuses, and a signer under that service refuses message
+    /// signing on every chain.
+    #[test]
+    #[serial_test::serial]
+    fn a_profile_naming_the_toolset_pin_key_is_a_finding() {
+        let f = Fixture::new();
+        let mut a = profile("alice");
+        a.audit_log_hash_chain_key_id = KeyringEntryRef::toolset_pin_key();
+        f.save("alice", &a);
+        let fields: Vec<&str> = f
+            .findings("alice", &a)
+            .iter()
+            .filter_map(|finding| match &finding.kind {
+                KeyScopeKind::InstallationEntry { field, coordinate } => {
+                    assert_eq!(coordinate.service, "stellar-agent-toolsets");
+                    Some(*field)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                "audit_log_hash_chain_key_id",
+                TIP_ANCHOR,
+                REANCHOR_COUNTER,
+                OUTBOX_STATE,
+            ]
+        );
+        let err = enforce_key_scope(&a, "alice").unwrap_err();
+        assert_eq!(err.kind, "installation_entry");
+        assert!(
+            err.detail
+                .contains("belongs to the installation's toolset pin key"),
+            "{}",
+            err.detail
+        );
+
+        a.audit_log_hash_chain_key_id = KeyringEntryRef::new("Stellar-Agent-Toolsets", "other");
+        f.save("alice", &a);
+        assert!(
+            f.findings("alice", &a)
+                .iter()
+                .any(|finding| matches!(finding.kind, KeyScopeKind::InstallationEntry { .. })),
+            "the service compares without regard to case"
+        );
+
+        let mut selected = message_profile("message");
+        selected.mcp_signer_default.service = TOOLSET_PIN_KEY_SERVICE.to_owned();
+        f.save("message", &selected);
+        assert_eq!(
+            enforce_message_signing_scope_in_dir(&f.dir, &selected, "message")
+                .unwrap_err()
+                .kind,
+            "installation_entry"
+        );
     }
 
     #[test]

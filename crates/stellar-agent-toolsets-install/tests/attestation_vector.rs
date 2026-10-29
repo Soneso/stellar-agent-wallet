@@ -34,9 +34,16 @@ use stellar_agent_toolsets_install::attestation::{
     verify_attestation_signature,
 };
 use stellar_agent_toolsets_install::signature::{DOMAIN_TAG, build_preimage};
-use stellar_agent_toolsets_install::{InstallOptions, ToolsetInstallError, install_toolset};
+use stellar_agent_toolsets_install::{
+    InstallOptions, PinKey, ToolsetInstallError, install_toolset, lock_toolsets, read_pin,
+};
 use stellar_strkey::ed25519::PublicKey as StrPublicKey;
 use tempfile::TempDir;
+
+/// The pin key every install in this suite writes its record under.
+fn test_pin_key() -> PinKey {
+    PinKey::from_bytes(zeroize::Zeroizing::new([0x5a; 32]))
+}
 
 // ── JSON vector loading helper ────────────────────────────────────────────────
 
@@ -495,6 +502,8 @@ fn key_touching_no_attestation_required() {
         None, // no attestation
         &auditor_trust_path,
         &InstallOptions::default(),
+        &lock_toolsets(&toolsets_root).unwrap(),
+        &test_pin_key(),
     )
     .unwrap_err();
 
@@ -551,6 +560,8 @@ fn valid_attestation_trusted_auditor_succeeds() {
         Some(&att),
         &auditor_trust_path,
         &InstallOptions::default(),
+        &lock_toolsets(&toolsets_root).unwrap(),
+        &test_pin_key(),
     )
     .expect("valid attestation from trusted auditor must succeed");
 
@@ -601,6 +612,8 @@ fn override_attestation_succeeds_with_warn() {
         None, // no attestation — override bypasses the gate
         &auditor_trust_path,
         &opts,
+        &lock_toolsets(&toolsets_root).unwrap(),
+        &test_pin_key(),
     )
     .expect("override_attestation must succeed even with no attestation");
 
@@ -662,6 +675,8 @@ fn untrusted_auditor_refused() {
         Some(&att),
         &auditor_trust_path,
         &InstallOptions::default(),
+        &lock_toolsets(&toolsets_root).unwrap(),
+        &test_pin_key(),
     )
     .unwrap_err();
 
@@ -713,6 +728,8 @@ fn attestation_package_mismatch_refused() {
         Some(&att),
         &auditor_trust_path,
         &InstallOptions::default(),
+        &lock_toolsets(&toolsets_root).unwrap(),
+        &test_pin_key(),
     )
     .unwrap_err();
 
@@ -765,6 +782,8 @@ fn attestation_version_mismatch_refused() {
         Some(&att),
         &auditor_trust_path,
         &InstallOptions::default(),
+        &lock_toolsets(&toolsets_root).unwrap(),
+        &test_pin_key(),
     )
     .unwrap_err();
 
@@ -818,6 +837,8 @@ fn attestation_shasum_mismatch_refused() {
         Some(&att),
         &auditor_trust_path,
         &InstallOptions::default(),
+        &lock_toolsets(&toolsets_root).unwrap(),
+        &test_pin_key(),
     )
     .unwrap_err();
 
@@ -873,6 +894,8 @@ fn attestation_capabilities_mismatch_refused() {
         Some(&att),
         &auditor_trust_path,
         &InstallOptions::default(),
+        &lock_toolsets(&toolsets_root).unwrap(),
+        &test_pin_key(),
     )
     .unwrap_err();
 
@@ -924,6 +947,8 @@ fn non_key_touching_no_attestation_needed() {
         None,
         &auditor_trust_path,
         &InstallOptions::default(),
+        &lock_toolsets(&toolsets_root).unwrap(),
+        &test_pin_key(),
     )
     .expect("non-key-touching toolset must install without attestation");
 }
@@ -998,6 +1023,8 @@ fn membership_and_verify_use_same_key_bytes() {
         Some(&att),
         &auditor_trust_path,
         &InstallOptions::default(),
+        &lock_toolsets(&toolsets_root).unwrap(),
+        &test_pin_key(),
     )
     .unwrap_err();
 
@@ -1060,6 +1087,8 @@ fn identity_confusion_attested_for_wrong_name_refused() {
         Some(&att),
         &auditor_trust_path,
         &InstallOptions::default(),
+        &lock_toolsets(&toolsets_root).unwrap(),
+        &test_pin_key(),
     )
     .unwrap_err();
 
@@ -1130,15 +1159,15 @@ fn override_still_persists_sign_payment_in_pin() {
         None,
         &auditor_trust_path,
         &opts,
+        &lock_toolsets(&toolsets_root).unwrap(),
+        &test_pin_key(),
     )
     .expect("override install must succeed");
 
     // Read the pin and verify sign-payment is persisted (inert) in the pin.
-    let pin_path = toolsets_root
-        .join("sign-toolset")
-        .join(".stellar-agent-toolset-pin.json");
-    let pin: stellar_agent_toolsets_install::ToolsetPinRecord =
-        serde_json::from_str(&std::fs::read_to_string(&pin_path).unwrap()).unwrap();
+    let pin = read_pin("sign-toolset", &toolsets_root, Some(&test_pin_key()))
+        .unwrap()
+        .expect("the record must verify under the install key");
 
     assert!(
         pin.capabilities
@@ -1191,15 +1220,15 @@ fn sec_on_disk_tamper_pin_is_source_of_truth() {
         None,
         &auditor_trust_path,
         &InstallOptions::default(),
+        &lock_toolsets(&toolsets_root).unwrap(),
+        &test_pin_key(),
     )
     .expect("non-key-touching install must succeed");
 
     // Read the pin — must have NO capabilities (empty set).
-    let pin_path = toolsets_root
-        .join("read-toolset")
-        .join(".stellar-agent-toolset-pin.json");
-    let pin_before: stellar_agent_toolsets_install::ToolsetPinRecord =
-        serde_json::from_str(&std::fs::read_to_string(&pin_path).unwrap()).unwrap();
+    let pin_before = read_pin("read-toolset", &toolsets_root, Some(&test_pin_key()))
+        .unwrap()
+        .expect("the record must verify under the install key");
     assert!(
         pin_before.capabilities.is_empty(),
         "pin must have empty capabilities after non-key-touching install; got: {:?}",
@@ -1217,8 +1246,9 @@ fn sec_on_disk_tamper_pin_is_source_of_truth() {
     // Read the pin again — must STILL have no capabilities.
     // The pin was written from the signature-verified parse; the disk tamper
     // changes the file but NOT the pin.
-    let pin_after: stellar_agent_toolsets_install::ToolsetPinRecord =
-        serde_json::from_str(&std::fs::read_to_string(&pin_path).unwrap()).unwrap();
+    let pin_after = read_pin("read-toolset", &toolsets_root, Some(&test_pin_key()))
+        .unwrap()
+        .expect("the record must verify under the install key");
     assert!(
         pin_after.capabilities.is_empty(),
         "pin must still have empty capabilities after on-disk tamper of TOOLSET.md; \

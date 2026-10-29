@@ -19,7 +19,6 @@ pub const MAINNET_READ_ONLY_TOOLS: &[&str] = &[
     "stellar_sep6_deposit_info",
     "stellar_sep7_parse_uri",
     "stellar_toolset_list",
-    "stellar_toolset_invoke",
     "stellar_mpp_authorization_status",
     "stellar_x402_parse_receipt",
     "stellar_transaction_status",

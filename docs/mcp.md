@@ -20,6 +20,9 @@ for build configuration, admitted operations, and exclusions. Per tool on
   feature-enabled build admits the four classic commits and both x402 payment
   tools after setup. With the feature off, these tools refuse mainnet at entry
   with the same code.
+- `stellar_toolset_invoke` is annotated destructive, so its own policy gate
+  refuses its other actions on mainnet: the default engine refuses a
+  destructive tool, and a mainnet policy rule cannot name it.
 
 `stellar-agent-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
 server that exposes the Stellar Agent Wallet to an MCP client. It speaks
@@ -966,12 +969,19 @@ configured RPC sees signed authorization during mandatory re-simulation. See
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_toolset_list` | Enumerate installed toolsets and their invocable actions. | Read-only. No `chain_id`. |
-| `stellar_toolset_invoke` | Invoke a named action of an installed toolset, routed to a registered tool through capability enforcement. | Dispatcher. The toolset signs nothing directly; the routed tool's own policy gate still applies. Optional `chain_id`, forwarded to the routed tool. |
+| `stellar_toolset_invoke` | Invoke a named action of an installed toolset, routed to a registered tool through capability enforcement. | Dispatcher. Destructive; refused on mainnet. The toolset signs nothing directly; the dispatcher's and the routed tool's policy gates apply. Optional `chain_id`, forwarded to the routed tool. |
 
-The toolsets dispatcher enforces a toolset's declared capabilities and never reaches
-a signing tool directly regardless of those declarations. The routed tool runs
-under its normal gate, so the first-invoke gate and per-action approval still
-fire as described in [Toolsets](./toolsets.md).
+The toolsets dispatcher enforces a toolset's declared capabilities, read from its
+install record, which is authenticated by an HMAC under an installation key in the
+platform keyring and carries the `TOOLSET.md` digest both resolvers check. Its
+ungated routes never reach a signing tool regardless of those declarations; the
+signing actions route to the commit tools only behind the first-invoke gate and
+the per-action approval described in [Toolsets](./toolsets.md). A toolset narrows
+what this dispatcher routes. It does not narrow the native tools this server
+registers, the caller chooses the `toolset` argument, and the server binds no
+session to a toolset; the operator policy and the approvals bound native and
+routed calls alike. A record that does not verify refuses with
+`toolset.pin_unverifiable`.
 
 ## Output and exit behavior
 

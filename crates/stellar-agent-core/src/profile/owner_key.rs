@@ -104,6 +104,30 @@ pub fn refuse_owner_key_coordinate(
     Ok(())
 }
 
+/// Refuses a profile field in the installation's toolset pin-key namespace.
+///
+/// Callers check this before opening the keyring, on every chain.
+/// The service comparison follows the case-insensitive key-scope classifier.
+///
+/// # Errors
+///
+/// Returns [`ValidationError::InstallationKeyCoordinate`] naming `field` and
+/// the reserved service.
+pub fn refuse_installation_key_coordinate(
+    entry_ref: &KeyringEntryRef,
+    field: &'static str,
+) -> Result<(), WalletError> {
+    if entry_ref
+        .service
+        .eq_ignore_ascii_case(super::schema::TOOLSET_PIN_KEY_SERVICE)
+    {
+        return Err(WalletError::Validation(
+            ValidationError::InstallationKeyCoordinate { field },
+        ));
+    }
+    Ok(())
+}
+
 /// The owner coordinates a symmetric-key loader compares a loaded key with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerKeyContext {
@@ -354,5 +378,31 @@ mod tests {
         .unwrap_err();
         assert_ne!(err.code(), "validation.key_matches_owner_public_key");
         assert_eq!(err.category(), crate::error::ErrorCategory::Auth);
+    }
+
+    /// The installation namespace is case-insensitive and covers every account.
+    #[test]
+    fn installation_coordinate_refusal_names_the_field_and_reserved_key() {
+        for service in ["stellar-agent-toolsets", "StElLaR-AgEnT-ToOlSeTs"] {
+            for account in ["pin-key", "another-account"] {
+                let error = refuse_installation_key_coordinate(
+                    &KeyringEntryRef::new(service, account),
+                    "attestation_key_id",
+                )
+                .unwrap_err();
+                assert_eq!(error.code(), "validation.installation_key_coordinate");
+                assert!(error.to_string().contains("attestation_key_id"));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("reserved service `stellar-agent-toolsets`")
+                );
+            }
+        }
+        refuse_installation_key_coordinate(
+            &KeyringEntryRef::default_owner_key("test"),
+            "policy_owner_key_id",
+        )
+        .unwrap();
     }
 }

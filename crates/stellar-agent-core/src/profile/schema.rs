@@ -117,6 +117,19 @@ pub struct KeyringEntryRef {
 /// Account value used before signer enrollment.
 pub const SIGNER_PLACEHOLDER_ACCOUNT: &str = "default";
 
+/// Keyring service of the installation's toolset pin key.
+///
+/// Every profile coordinate is `stellar-agent-<kind>-<profile>` with a
+/// non-empty profile name, so this service lies outside every profile's
+/// default coordinate space.
+pub const TOOLSET_PIN_KEY_SERVICE: &str = "stellar-agent-toolsets";
+
+/// Keyring account of the installation's toolset pin key.
+pub const TOOLSET_PIN_KEY_ACCOUNT: &str = "pin-key";
+
+/// File name of the installation pin-key lock in [`canonical_data_root`].
+pub const TOOLSET_PIN_KEY_LOCK_FILE_NAME: &str = ".toolset-pin-key.lock";
+
 impl KeyringEntryRef {
     /// Returns whether this reference still names the enrollment placeholder.
     #[must_use]
@@ -371,6 +384,30 @@ impl KeyringEntryRef {
             format!("stellar-agent-auditbinding-{profile_name}"),
             "default",
         )
+    }
+
+    /// Constructs the keyring entry reference of the installation's toolset
+    /// pin key.
+    ///
+    /// Entry name: [`TOOLSET_PIN_KEY_SERVICE`] / [`TOOLSET_PIN_KEY_ACCOUNT`].
+    /// The toolsets directory and its commands carry no profile, so the key
+    /// is one per installation. It holds the 32-byte HMAC key that
+    /// authenticates every toolset install record; the first toolset install
+    /// mints it. A profile document naming this coordinate as one of its own
+    /// keys is a key-scope finding.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::profile::schema::KeyringEntryRef;
+    ///
+    /// let r = KeyringEntryRef::toolset_pin_key();
+    /// assert_eq!(r.service, "stellar-agent-toolsets");
+    /// assert_eq!(r.account, "pin-key");
+    /// ```
+    #[must_use]
+    pub fn toolset_pin_key() -> Self {
+        Self::new(TOOLSET_PIN_KEY_SERVICE, TOOLSET_PIN_KEY_ACCOUNT)
     }
 
     /// Constructs the default keyring entry reference of an RPC provider

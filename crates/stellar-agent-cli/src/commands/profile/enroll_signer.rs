@@ -300,9 +300,6 @@ where
             return render::write_envelope(out, &profile_access_envelope(&e, &profile_name), 1);
         }
     };
-    if let Err(e) = init_keyring() {
-        return render::write_envelope(out, &Envelope::<()>::err(&e), 1);
-    }
 
     // ── Raw on-disk signer reference ───────────────────────────────────────────
     // Classification (placeholder vs pinned) and the pin itself operate on
@@ -329,6 +326,16 @@ where
             return render::write_envelope(out, &Envelope::<()>::err(&err), 1);
         }
     };
+
+    if let Err(e) = stellar_agent_core::profile::owner_key::refuse_installation_key_coordinate(
+        &signer_ref,
+        "mcp_signer_default",
+    ) {
+        return render::write_envelope(out, &Envelope::<()>::err(&e), 1);
+    }
+    if let Err(e) = init_keyring() {
+        return render::write_envelope(out, &Envelope::<()>::err(&e), 1);
+    }
 
     if args.repair_identity {
         return repair_identity(
@@ -1939,5 +1946,36 @@ mod tests {
         assert!(log.contains("signer_identity_enrolled"), "{log}");
         assert!(log.contains("enrolled-identity"));
         assert!(!log.contains(&seed));
+    }
+
+    /// Both signer enrollment forms refuse a raw installation coordinate.
+    #[tokio::test]
+    #[serial]
+    async fn installation_coordinate_refuses_without_writing() {
+        use crate::common::installation_key_fixture::InstallationKeyFixture;
+        for repair in [false, true] {
+            let fixture = InstallationKeyFixture::new("stellar-agent-toolsets");
+            let profile = profile_with_signer_account("default");
+            let mut args = args("UNUSED_PIN_SEED", None, true);
+            args.repair_identity = repair;
+            let mut output = Vec::new();
+            let code = run_with_dependencies(
+                &args,
+                |_| Ok(profile.clone()),
+                |_| Ok(fixture.coordinate.clone()),
+                pin_signer_must_not_be_called,
+                || fixture.init(),
+                |_| Err(std::env::VarError::NotPresent),
+                write_keyring_string,
+                &mut output,
+            )
+            .await;
+            fixture.assert_refused(code);
+            let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(
+                output["error"]["code"],
+                "validation.installation_key_coordinate"
+            );
+        }
     }
 }

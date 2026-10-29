@@ -841,6 +841,11 @@ fn load_or_mint_hmac_key(
     // `CounterpartyError::KeyringUnavailable`.
     let service = &key_ref.service;
     refuse_owner_coordinate(key_ref)?;
+    stellar_agent_core::profile::owner_key::refuse_installation_key_coordinate(
+        key_ref,
+        "counterparty_cache_key_id",
+    )
+    .map_err(|_| CounterpartyError::InstallationKeyCoordinate)?;
     let entry = KeyringEntry::new(service, &key_ref.account).map_err(|e| {
         CounterpartyError::KeyringUnavailable {
             detail: format!("keyring entry open failed: {e}"),
@@ -1989,6 +1994,7 @@ mod tests {
         let matches = decoded.as_ref() == key;
         assert!(matches, "base64 round-trip produced unexpected bytes");
     }
+
     #[test]
     #[serial_test::serial]
     fn explicit_reference_reads_the_rotated_key() {
@@ -2263,5 +2269,24 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn lazy_mint_refuses_installation_coordinate() {
+        let coordinate = KeyringEntryRef::new("StElLaR-AgEnT-ToOlSeTs", "pin-key");
+        let existing = base64_encode_key(&[0x5a; HMAC_KEY_LEN]);
+        for initial in [None, Some(existing.as_str())] {
+            stellar_agent_test_support::keyring_mock::install().unwrap();
+            let entry = KeyringEntry::new(&coordinate.service, &coordinate.account).unwrap();
+            if let Some(value) = initial {
+                entry.set_password(value).unwrap();
+            }
+            assert!(matches!(
+                load_or_mint_hmac_key("installation-cache", &coordinate),
+                Err(CounterpartyError::InstallationKeyCoordinate)
+            ));
+            assert_eq!(entry.get_password().ok().as_deref(), initial);
+        }
     }
 }

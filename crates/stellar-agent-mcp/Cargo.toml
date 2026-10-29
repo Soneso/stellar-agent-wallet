@@ -164,6 +164,9 @@ async-trait = { workspace = true }
 [dev-dependencies]
 toml_edit = { workspace = true }
 stellar-agent-toolsets-runtime = { path = "../stellar-agent-toolsets-runtime", features = ["test-helpers"] }
+# write_toolset_for_test writes the tagged install records the toolset suites
+# read through the server.
+stellar-agent-toolsets-install = { path = "../stellar-agent-toolsets-install", features = ["test-helpers"] }
 # Path-only self-reference: enables this crate's own test features for its tests
 # and is stripped from the published manifest like every internal dev-dependency.
 stellar-agent-mcp = { path = ".", features = ["test-helpers"] }

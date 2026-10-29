@@ -71,9 +71,10 @@ In plain terms, an agent connected to the wallet can:
 
 Two guardrail features frame all of it:
 
-- **Toolsets** let you hand a specific agent a restricted subset of
-  capabilities (for example "read balances and propose payments, nothing
-  else"), cryptographically signed and isolated from the signing tools.
+- **Toolsets** are signed packages that declare a narrow set of capabilities
+  (for example "read balances and propose payments") and narrow what the
+  toolset dispatcher routes for an agent. They do not restrict the other tools
+  the MCP server exposes; your operator policy and approvals do that.
 - **The approval inbox** is where held actions wait for you. Run it as a
   terminal command (`stellar-agent approve list`) or as a small local web
   page (`stellar-agent approve serve`) that updates live, notifies you when

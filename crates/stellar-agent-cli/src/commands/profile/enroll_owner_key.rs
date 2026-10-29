@@ -1697,4 +1697,25 @@ mod tests {
             derived_g
         );
     }
+
+    /// Profile-name reconciliation refuses an installation owner coordinate before keyring initialization.
+    #[tokio::test]
+    #[serial]
+    async fn installation_coordinate_refuses_without_writing() {
+        use crate::common::installation_key_fixture::InstallationKeyFixture;
+        let fixture = InstallationKeyFixture::new("stellar-agent-toolsets");
+        let name = "pin-coordinate-refusal";
+        let mut profile = profile_for(name);
+        profile.policy_owner_key_id = fixture.coordinate.clone();
+        let code = run_with_dependencies(
+            &args(name, "UNUSED_PIN_SEED", None, true),
+            |_| Ok(profile.clone()),
+            || fixture.init(),
+        )
+        .await;
+        fixture.assert_refused(code);
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0]["error"]["code"], "profile.name_mismatch");
+    }
 }

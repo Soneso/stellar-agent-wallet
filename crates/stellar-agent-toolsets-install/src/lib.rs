@@ -5,27 +5,33 @@
 //!
 //! Installs and uninstalls toolsets with cryptographic provenance:
 //!
-//! 1. **Hash verification** — SHA-256 of the package bytes is compared to the
+//! 1. **Hash verification**: SHA-256 of the package bytes is compared to the
 //!    signed `shasum` (constant-time).
-//! 2. **Publisher signature + trust set** — ed25519 `verify_strict` over a
+//! 2. **Publisher signature + trust set**: ed25519 `verify_strict` over a
 //!    canonical domain-separated, length-prefixed preimage; signer must be in
 //!    the local trust set.
-//! 3. **Safe extraction** — iterate tar entries with type-first checks, lexical
+//! 3. **Safe extraction**: iterate tar entries with type-first checks, lexical
 //!    containment, no-follow writes, ASCII-only entry-name gate, and size
 //!    bounds; NEVER `tar::Archive::unpack`.
-//! 4. **Parse + validate** — calls `stellar-agent-toolsets::parse_toolset`
+//! 4. **Parse + validate**: calls `stellar-agent-toolsets::parse_toolset`
 //!    on the extracted directory.
-//! 5. **Attestation gate** — if the toolset declares a key-touching capability
+//! 5. **Attestation gate**: if the toolset declares a key-touching capability
 //!    (e.g. `sign-payment`), verifies an auditor `ToolsetAttestation` signed by a
 //!    key in `auditor-trust.txt` over `(package, version, shasum, capabilities)`.
 //!    The gate fires AFTER the identity cross-check and BEFORE the atomic
 //!    rename, so it can never be confused by an unverified identity.  A named
 //!    override (`override_attestation: true`) logs a structured warn and
 //!    proceeds.
-//! 6. **Pin record** — atomic write of `(package, version, shasum, publisher,
-//!    installed_at, capabilities, allowed_tools)` after successful extraction.
-//! 7. **Uninstall** — reconstructs the directory path from the validated pin
-//!    package name; no-follow removal.
+//! 6. **Pin record**: atomic write of `(package, version, shasum, publisher,
+//!    installed_at, capabilities, allowed_tools, toolset_md_shasum)` after
+//!    successful extraction, authenticated by an HMAC tag under the
+//!    installation's [`PinKey`].
+//! 7. **Uninstall**: removes the directory named by the validated requested
+//!    package name; no-follow removal.  It reads no record, so a record that
+//!    does not verify can still be removed.
+//!
+//! Install and uninstall run under the toolsets directory lock
+//! ([`lock_toolsets`]).
 //!
 //! ## What this crate does NOT do
 //!
@@ -46,14 +52,31 @@
 //!
 //! ## Capability-source invariant
 //!
-//! **INVARIANT:** the install-time capability gate, the attestation preimage
-//! binding, and the runtime capability grant ALL read capabilities from the
-//! **signature-verified pin record**, which is written from the parse of the
-//! signature-verified bytes.  NONE of them re-parse the post-install on-disk
-//! `TOOLSET.md`.  This closes the capability-omission/post-install-tamper bypass:
-//! a toolset installed with no declared capability whose on-disk `TOOLSET.md` is
-//! later edited to add `sign-payment` is still refused at the signing path,
-//! because the runtime grant reads the pin, not the file.
+//! **INVARIANT:** the install-time capability gate and the attestation
+//! preimage binding read capabilities from the parse of the signature-verified
+//! bytes, and the runtime capability grant reads them from the **authenticated
+//! pin record** written from that parse.  NONE of them re-parse the
+//! post-install on-disk `TOOLSET.md`.  A toolset installed with no declared
+//! capability whose on-disk `TOOLSET.md` is later edited to add `sign-payment`
+//! is still refused at the signing path, because the runtime grant reads the
+//! pin, not the file.
+//!
+//! The pin record is plain JSON in the toolsets directory, so its contents are
+//! trusted only through its tag: an HMAC-SHA256 under the installation's
+//! [`PinKey`], a 32-byte secret in the platform keyring that the first install
+//! mints.  A record edited after the install, written under another key, or
+//! written without a tag does not verify and grants nothing.  The record also
+//! carries the `TOOLSET.md` digest, which both runtime tiers check at every
+//! dispatch.
+//!
+//! An earlier record of the same package that verified under the same key
+//! still verifies when its directory is restored after an uninstall: the tag
+//! binds the record's fields, not the install event.  Such a record is one
+//! the operator installed, with its publisher signature and attestation, and
+//! restoring it needs a write to the toolsets directory.
+//!
+//! The publisher and auditor trust sets (`trust.txt`, `auditor-trust.txt`)
+//! are plain operator-held files, read at install time only.
 //!
 //! ## Sibling crates
 //!
@@ -75,6 +98,7 @@ pub mod attestation;
 pub mod error;
 pub(crate) mod extract;
 pub(crate) mod hash;
+pub(crate) mod lock;
 pub(crate) mod pin;
 /// Low-level signature primitives.
 ///
@@ -85,7 +109,13 @@ pub mod signature;
 pub use attestation::{ATTESTATION_DOMAIN_TAG, ToolsetAttestation, load_auditor_trust_set};
 pub use error::ToolsetInstallError;
 pub use hash::sha256_hex_of;
-pub use pin::{ToolsetPinRecord, read_pin};
+pub use lock::{
+    InstallationPinKeyLock, TOOLSET_PIN_KEY_LOCK_FILE_NAME, TOOLSETS_LOCK_FILE_NAME, ToolsetsLock,
+    lock_installation_pin_key, lock_toolsets,
+};
+pub use pin::{PinKey, ToolsetPinRecord, read_pin};
+#[cfg(any(test, feature = "test-helpers"))]
+pub use pin::{write_pin_for_test, write_toolset_for_test};
 pub use signature::{DOMAIN_TAG, load_trust_set, parse_trust_set_content};
 pub use stellar_agent_toolsets::CapabilitySet;
 
@@ -216,9 +246,11 @@ pub const MAX_VERSION_LEN: usize = 64;
 pub struct InstallOptions {
     /// If `true`, reinstall even if the toolset is already installed.
     ///
-    /// The existing installation is uninstalled first (through the pin record),
-    /// then the new version is installed.  A version downgrade is still refused
-    /// unless `allow_downgrade` is also `true`.
+    /// The existing installation is uninstalled first, then the new version is
+    /// installed.  A version downgrade is still refused unless
+    /// `allow_downgrade` is also `true`.  An existing record that does not
+    /// verify carries no version to compare, so it is replaced only when
+    /// `allow_downgrade` is also `true`.
     pub force: bool,
 
     /// If `true`, allow installing a version older than the installed one.
@@ -262,7 +294,8 @@ pub struct InstallOptions {
 /// 3. Check publisher trust set membership.
 /// 4. Read package + recompute SHA-256 hash.
 /// 5. Verify publisher ed25519 signature over the canonical preimage.
-/// 6. Check already-installed per `options`.
+/// 6. Check already-installed per `options` (the existing record is read
+///    under `pin_key`).
 /// 7. Safe-extract from the verified buffer to a staging directory.
 /// 8. Parse + validate `TOOLSET.md`; rollback staging on failure.
 /// 9. Identity cross-check: extracted `TOOLSET.md` `name` == `package`.
@@ -271,7 +304,11 @@ pub struct InstallOptions {
 ///    supplied `attestation` (or bypass if `override_attestation` is set).
 ///    Rollback staging on any refusal; NO pin is written on refusal.
 /// 10. Atomic rename staging → final.
-/// 11. Atomic pin write (capabilities persisted from signature-verified parse).
+/// 11. Atomic pin write (capabilities persisted from signature-verified parse),
+///     tagged under `pin_key`.
+///
+/// The caller holds `lock`, the [`ToolsetsLock`] of `toolsets_root`, for the
+/// whole call.
 ///
 /// ## Attestation gate placement
 ///
@@ -301,17 +338,31 @@ pub struct InstallOptions {
 ///
 /// # Errors
 ///
-/// Returns a [`ToolsetInstallError`] variant for any failure in the above steps.
+/// Returns a [`ToolsetInstallError`] variant for any failure in the above steps,
+/// among them:
+///
+/// - [`ToolsetInstallError::ToolsetsRootInvalid`]: `lock` was taken on another
+///   toolsets directory.
+/// - [`ToolsetInstallError::AlreadyInstalled`]: the toolset is installed
+///   (its record verifying or not) and `force` is not set.
+/// - [`ToolsetInstallError::PinRecordUnverifiable`]: `force` is set without
+///   `allow_downgrade` and the existing record does not verify.
+/// - [`ToolsetInstallError::Io`]: among others, the extracted `TOOLSET.md`
+///   cannot be read for its digest.
 ///
 /// # Examples
 ///
 /// ```rust,ignore
 /// // The byte values below are illustrative placeholders.
 /// // A real call requires a genuine signed package, a correct SHA-256
-/// // shasum, a valid ed25519 signature, and a trusted publisher key.
+/// // shasum, a valid ed25519 signature, a trusted publisher key, and the
+/// // installation's pin key from the keyring.
 /// use std::path::Path;
-/// use stellar_agent_toolsets_install::{InstallOptions, install_toolset};
+/// use stellar_agent_toolsets_install::{InstallOptions, PinKey, install_toolset, lock_toolsets};
 ///
+/// let toolsets_root = Path::new("/path/to/toolsets");
+/// let lock = lock_toolsets(toolsets_root).unwrap();
+/// let pin_key = PinKey::from_bytes(zeroize::Zeroizing::new([0u8; 32]));
 /// let package_bytes = std::fs::read("my-toolset-1.0.0.tar.gz").unwrap();
 /// let outcome = install_toolset(
 ///     "my-toolset",
@@ -320,11 +371,13 @@ pub struct InstallOptions {
 ///     "a64hexchars...",  // 64-char lowercase hex SHA-256 of package_bytes
 ///     &[0u8; 64],        // ed25519 signature bytes (placeholder)
 ///     &[0u8; 32],        // publisher public key bytes (placeholder)
-///     Path::new("/path/to/toolsets"),
+///     toolsets_root,
 ///     Path::new("/path/to/trust.txt"),
 ///     None,
 ///     Path::new("/path/to/auditor-trust.txt"),
 ///     &InstallOptions::default(),
+///     &lock,
+///     &pin_key,
 /// ).unwrap();
 /// // outcome is AttestationOutcome::Attested, Overridden, or NotRequired
 /// // depending on the toolset's declared capabilities and install options.
@@ -342,7 +395,11 @@ pub fn install_toolset(
     attestation: Option<&ToolsetAttestation>,
     auditor_trust_set_path: &Path,
     options: &InstallOptions,
+    lock: &ToolsetsLock,
+    pin_key: &PinKey,
 ) -> Result<AttestationOutcome, ToolsetInstallError> {
+    lock.check_root(toolsets_root)?;
+
     // ── Step 1: Validate inputs ───────────────────────────────────────────────
     validate_package_name(package)
         .map_err(|detail| ToolsetInstallError::InvalidPackageName { detail })?;
@@ -398,22 +455,46 @@ pub fn install_toolset(
     // Create toolsets_root if it doesn't exist yet.
     std::fs::create_dir_all(toolsets_root).map_err(ToolsetInstallError::from_io)?;
 
-    if let Some(existing_pin) = pin::read_pin(package, toolsets_root)? {
-        if !options.force {
-            return Err(ToolsetInstallError::AlreadyInstalled {
-                package: package.to_owned(),
-                installed_version: existing_pin.version.clone(),
-            });
-        }
+    match pin::read_pin(package, toolsets_root, Some(pin_key)) {
+        Ok(None) => {}
+        Ok(Some(existing_pin)) => {
+            if !options.force {
+                return Err(ToolsetInstallError::AlreadyInstalled {
+                    package: package.to_owned(),
+                    installed_version: existing_pin.version.clone(),
+                });
+            }
 
-        // --force: check for downgrade.
-        if !options.allow_downgrade {
-            check_not_downgrade(version, &existing_pin.version, &parsed_version)?;
-        }
+            // --force: check for downgrade.
+            if !options.allow_downgrade {
+                check_not_downgrade(version, &existing_pin.version, &parsed_version)?;
+            }
 
-        // Uninstall existing version first (through pin).
-        debug!(package, existing_version = %existing_pin.version, "force-reinstalling: removing existing install");
-        uninstall_inner(package, toolsets_root)?;
+            debug!(package, existing_version = %existing_pin.version, "force-reinstalling: removing existing install");
+            uninstall_inner(package, toolsets_root)?;
+        }
+        Err(ToolsetInstallError::PinRecordUnverifiable { .. }) => {
+            if !options.force {
+                return Err(ToolsetInstallError::AlreadyInstalled {
+                    package: package.to_owned(),
+                    installed_version: "(version unverified)".to_owned(),
+                });
+            }
+            // The recorded version cannot be trusted, so the downgrade check
+            // has nothing to compare against: only an explicit
+            // --allow-downgrade replaces the installation.
+            if !options.allow_downgrade {
+                return Err(ToolsetInstallError::PinRecordUnverifiable {
+                    package: package.to_owned(),
+                });
+            }
+            warn!(
+                package,
+                "force-reinstalling over an install record that does not verify"
+            );
+            uninstall_inner(package, toolsets_root)?;
+        }
+        Err(e) => return Err(e),
     }
 
     // ── Step 7: Safe extraction ───────────────────────────────────────────────
@@ -439,27 +520,22 @@ pub fn install_toolset(
     // Step 10 (atomic rename to final), so the bytes are from the
     // signature-verified package.
     //
-    // On I/O failure: log a warn and proceed without the digest (None).
-    // The capability-source invariant (capabilities from pin, not re-parsed
-    // TOOLSET.md) ensures safety; the digest check is additive tamper-evidence.
-    let toolset_md_shasum: Option<String> = {
+    // The digest is mandatory in every record: a read failure refuses the
+    // install and rolls back the staging directory.
+    let toolset_md_shasum: String = {
         let toolset_md_path = staging_pkg_dir.join("TOOLSET.md");
         match std::fs::read(&toolset_md_path) {
             Ok(bytes) => {
-                let digest = hash::sha256_hex_of(&bytes);
                 debug!(
                     package,
                     "computed TOOLSET.md content digest for dispatch-time re-verification"
                 );
-                Some(digest)
+                hash::sha256_hex_of(&bytes)
             }
             Err(e) => {
-                warn!(
-                    package,
-                    error = %e,
-                    "failed to read TOOLSET.md for content digest; pin will skip dispatch-time re-verification"
-                );
-                None
+                warn!(package, error = %e, "failed to read TOOLSET.md for its content digest; rolling back staging");
+                let _ = std::fs::remove_dir_all(staging.path());
+                return Err(ToolsetInstallError::from_io(e));
             }
         }
     };
@@ -642,7 +718,7 @@ pub fn install_toolset(
         toolset_md_shasum,
     };
 
-    if let Err(e) = pin::write_pin_atomic(&pin_record, toolsets_root) {
+    if let Err(e) = pin::write_pin_atomic(&pin_record, toolsets_root, pin_key) {
         // Pin write failed: roll back the moved dir.
         warn!(package, error = %e, "pin write failed; rolling back installed dir");
         let _ = std::fs::remove_dir_all(&final_dir);
@@ -666,7 +742,7 @@ pub fn install_toolset(
 /// On success, delegates to [`install_toolset`] with the verified buffer.
 /// The `attestation` and `auditor_trust_set_path` parameters are threaded
 /// through to the gate in [`install_toolset`] — the gate cannot be bypassed by
-/// using this entry point.
+/// using this entry point.  `lock` and `pin_key` are passed through as well.
 ///
 /// # Errors
 ///
@@ -686,6 +762,8 @@ pub fn install_toolset_from_path(
     attestation: Option<&ToolsetAttestation>,
     auditor_trust_set_path: &Path,
     options: &InstallOptions,
+    lock: &ToolsetsLock,
+    pin_key: &PinKey,
 ) -> Result<AttestationOutcome, ToolsetInstallError> {
     // Open the file and apply the streaming cap BEFORE reading.
     // Do NOT call metadata().len() — the source is untrusted.
@@ -714,67 +792,73 @@ pub fn install_toolset_from_path(
         attestation,
         auditor_trust_set_path,
         options,
+        lock,
+        pin_key,
     )
 }
 
 /// Uninstalls a previously-installed toolset.
 ///
-/// 1. Reads the pin record for `package`.
-/// 2. Validates the stored package name.
-/// 3. Reconstructs the directory path as `<toolsets_root>/<package>` (NEVER
-///    trusts a stored path).
-/// 4. Verifies the reconstructed path via `symlink_metadata` (no-follow).
-/// 5. Removes the directory and pin record.
+/// 1. Validates `package` against the `[a-z0-9-]` rule.
+/// 2. Treats the toolset as installed when its pin file exists; the record's
+///    contents are not read, so a record that does not verify can be removed.
+/// 3. Builds the directory path as `<toolsets_root>/<package>` from the
+///    validated requested name (NEVER from a stored value).
+/// 4. Verifies the path via `symlink_metadata` (no-follow).
+/// 5. Removes the directory, pin record included.
 ///
-/// Returns [`ToolsetInstallError::NotInstalled`] if no pin record exists.
+/// The caller holds `lock`, the [`ToolsetsLock`] of `toolsets_root`.
 ///
 /// # Errors
 ///
-/// - [`ToolsetInstallError::NotInstalled`] — toolset is not installed.
-/// - [`ToolsetInstallError::PinRecordMalformed`] — pin record is invalid.
-/// - [`ToolsetInstallError::Io`] — I/O error during removal.
+/// - [`ToolsetInstallError::InvalidPackageName`]: `package` fails validation.
+/// - [`ToolsetInstallError::ToolsetsRootInvalid`]: `lock` was taken on another
+///   toolsets directory.
+/// - [`ToolsetInstallError::NotInstalled`]: no pin file exists for `package`.
+/// - [`ToolsetInstallError::PinRecordMalformed`]: the toolset directory is a
+///   symlink or escapes the toolsets root.
+/// - [`ToolsetInstallError::Io`]: I/O error during removal.
 ///
 /// # Examples
 ///
 /// ```rust,ignore
 /// use std::path::Path;
-/// use stellar_agent_toolsets_install::uninstall_toolset;
+/// use stellar_agent_toolsets_install::{lock_toolsets, uninstall_toolset};
 ///
-/// uninstall_toolset("my-toolset", Path::new("/path/to/toolsets")).unwrap();
+/// let toolsets_root = Path::new("/path/to/toolsets");
+/// let lock = lock_toolsets(toolsets_root).unwrap();
+/// uninstall_toolset("my-toolset", toolsets_root, &lock).unwrap();
 /// ```
-pub fn uninstall_toolset(package: &str, toolsets_root: &Path) -> Result<(), ToolsetInstallError> {
+pub fn uninstall_toolset(
+    package: &str,
+    toolsets_root: &Path,
+    lock: &ToolsetsLock,
+) -> Result<(), ToolsetInstallError> {
     validate_package_name(package)
         .map_err(|detail| ToolsetInstallError::InvalidPackageName { detail })?;
+    lock.check_root(toolsets_root)?;
     uninstall_inner(package, toolsets_root)
 }
 
 /// Inner uninstall (called by both the public API and force-reinstall).
+///
+/// `package` is validated by the caller.  The pin file's presence is the
+/// installed signal; its contents are never read here.
 fn uninstall_inner(package: &str, toolsets_root: &Path) -> Result<(), ToolsetInstallError> {
-    // Read the pin record.
-    let pin = pin::read_pin(package, toolsets_root)?;
-    let pin = match pin {
-        Some(p) => p,
-        None => {
+    let toolset_dir = toolsets_root.join(package);
+    let pin_path = toolset_dir.join(pin::PIN_FILE_NAME);
+
+    match std::fs::symlink_metadata(&pin_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(ToolsetInstallError::NotInstalled {
                 package: package.to_owned(),
             });
         }
-    };
-
-    // Validate the stored name.
-    if let Err(reason) = validate_package_name(&pin.package) {
-        return Err(ToolsetInstallError::PinRecordMalformed {
-            detail: format!(
-                "stored package name '{}' is invalid: {reason}",
-                stellar_agent_toolsets::sanitise_display(&pin.package, 64)
-            ),
-        });
+        Err(e) => return Err(ToolsetInstallError::from_io(e)),
     }
 
-    // Reconstruct the path from the VALIDATED name (never trust a stored path).
-    let toolset_dir = toolsets_root.join(&pin.package);
-
-    // Lexical containment check: ensure the reconstructed path is inside toolsets_root.
+    // Lexical containment check: ensure the path is inside toolsets_root.
     check_path_within_root(&toolset_dir, toolsets_root)?;
 
     // No-follow check on the toolset directory leaf.
@@ -792,12 +876,6 @@ fn uninstall_inner(package: &str, toolsets_root: &Path) -> Result<(), ToolsetIns
         }
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Dir doesn't exist but pin exists; remove the orphan pin.
-            warn!(
-                package,
-                "toolset dir not found but pin exists; removing orphan pin"
-            );
-            pin::remove_pin(package, toolsets_root)?;
             return Err(ToolsetInstallError::NotInstalled {
                 package: package.to_owned(),
             });
@@ -805,16 +883,11 @@ fn uninstall_inner(package: &str, toolsets_root: &Path) -> Result<(), ToolsetIns
         Err(e) => return Err(ToolsetInstallError::from_io(e)),
     }
 
-    // Re-check immediately before removal (TOCTOU residual mitigation).
-    // Rely on std's remove_dir_all symlink-hardening (Rust ≥ 1.0 on all
-    // supported platforms refuses to descend into a symlink during recursive
-    // removal on Unix; Windows uses FILE_FLAG_OPEN_REPARSE_POINT).
-    // Note: the TOCTOU window between stat and removal is residual-MINOR and
-    // bounded by the name-reconstruction (we never act on a stored path).
+    // Rely on std's remove_dir_all symlink-hardening: it does not descend into
+    // a symlink during recursive removal on Unix, and Windows opens reparse
+    // points without following them. The window between the check above and
+    // the removal is bounded by the path being built from the validated name.
     std::fs::remove_dir_all(&toolset_dir).map_err(ToolsetInstallError::from_io)?;
-
-    // Remove the pin record (best-effort; the toolset dir is already gone).
-    pin::remove_pin(package, toolsets_root)?;
 
     info!(package, "toolset uninstalled successfully");
     Ok(())
@@ -907,8 +980,7 @@ fn check_not_downgrade(
 /// Checks that `path` is lexically contained within `root`.
 fn check_path_within_root(path: &Path, root: &Path) -> Result<(), ToolsetInstallError> {
     // Use starts_with on the PathBuf components for a clean lexical check.
-    // This is safe because the path was reconstructed from a validated package
-    // name — no `..` can appear.
+    // The path is built from a validated package name, so no `..` can appear.
     if !path.starts_with(root) {
         return Err(ToolsetInstallError::PinRecordMalformed {
             detail: "reconstructed toolset path escapes toolsets root".to_owned(),
@@ -946,6 +1018,85 @@ mod tests {
 
     use super::*;
 
+    /// The pin key every test install writes and reads its records under.
+    fn test_pin_key() -> PinKey {
+        PinKey::from_bytes(zeroize::Zeroizing::new([0x5a; 32]))
+    }
+
+    /// Runs [`install_toolset`] under a freshly taken lock of `toolsets_root`
+    /// and [`test_pin_key`].
+    #[allow(clippy::too_many_arguments)]
+    fn install_locked(
+        package: &str,
+        version: &str,
+        package_bytes: &[u8],
+        signed_shasum: &str,
+        signature_bytes: &[u8; 64],
+        publisher_pubkey_bytes: &[u8; 32],
+        toolsets_root: &Path,
+        trust_set_path: &Path,
+        attestation: Option<&ToolsetAttestation>,
+        auditor_trust_set_path: &Path,
+        options: &InstallOptions,
+    ) -> Result<AttestationOutcome, ToolsetInstallError> {
+        let lock = lock_toolsets(toolsets_root)?;
+        install_toolset(
+            package,
+            version,
+            package_bytes,
+            signed_shasum,
+            signature_bytes,
+            publisher_pubkey_bytes,
+            toolsets_root,
+            trust_set_path,
+            attestation,
+            auditor_trust_set_path,
+            options,
+            &lock,
+            &test_pin_key(),
+        )
+    }
+
+    /// Runs [`install_toolset_from_path`] under a freshly taken lock of
+    /// `toolsets_root` and [`test_pin_key`].
+    #[allow(clippy::too_many_arguments)]
+    fn install_from_path_locked(
+        package: &str,
+        version: &str,
+        package_path: &Path,
+        signed_shasum: &str,
+        signature_bytes: &[u8; 64],
+        publisher_pubkey_bytes: &[u8; 32],
+        toolsets_root: &Path,
+        trust_set_path: &Path,
+        attestation: Option<&ToolsetAttestation>,
+        auditor_trust_set_path: &Path,
+        options: &InstallOptions,
+    ) -> Result<AttestationOutcome, ToolsetInstallError> {
+        let lock = lock_toolsets(toolsets_root)?;
+        install_toolset_from_path(
+            package,
+            version,
+            package_path,
+            signed_shasum,
+            signature_bytes,
+            publisher_pubkey_bytes,
+            toolsets_root,
+            trust_set_path,
+            attestation,
+            auditor_trust_set_path,
+            options,
+            &lock,
+            &test_pin_key(),
+        )
+    }
+
+    /// Runs [`uninstall_toolset`] under a freshly taken lock of `toolsets_root`.
+    fn uninstall_locked(package: &str, toolsets_root: &Path) -> Result<(), ToolsetInstallError> {
+        let lock = lock_toolsets(toolsets_root)?;
+        uninstall_toolset(package, toolsets_root, &lock)
+    }
+
     // ── AttestationOutcome::as_str ────────────────────────────────────────────
 
     #[test]
@@ -977,7 +1128,7 @@ mod tests {
         let pubkey = [0u8; 32];
         let opts = InstallOptions::default();
 
-        let err = install_toolset(
+        let err = install_locked(
             "my-toolset",
             "1.0.0",
             &[0u8; 32],
@@ -1010,7 +1161,7 @@ mod tests {
         let pubkey = [0u8; 32];
         let opts = InstallOptions::default();
 
-        let err = install_toolset(
+        let err = install_locked(
             "my-toolset",
             "1.0.0",
             &[0u8; 32],
@@ -1044,7 +1195,7 @@ mod tests {
         let pubkey = [0u8; 32];
         let opts = InstallOptions::default();
 
-        let err = install_toolset(
+        let err = install_locked(
             "my-toolset",
             "1.0.0",
             &[0u8; 32],
@@ -1154,7 +1305,7 @@ mod tests {
         let trust_path = write_publisher_trust(dir.path(), pk);
         let auditor_trust_path = write_empty_auditor_trust(dir.path());
 
-        let err = install_toolset(
+        let err = install_locked(
             "my-toolset",
             "1.0.0",
             &package_bytes,
@@ -1192,7 +1343,7 @@ mod tests {
         let auditor_trust_path = write_empty_auditor_trust(dir.path());
 
         // First install.
-        install_toolset(
+        install_locked(
             "my-toolset",
             "1.0.0",
             &package_bytes,
@@ -1208,7 +1359,7 @@ mod tests {
         .unwrap();
 
         // Second install without force.
-        let err = install_toolset(
+        let err = install_locked(
             "my-toolset",
             "1.0.0",
             &package_bytes,
@@ -1245,7 +1396,7 @@ mod tests {
         let auditor_trust_path = write_empty_auditor_trust(dir.path());
 
         // First install.
-        install_toolset(
+        install_locked(
             "my-toolset",
             "1.0.0",
             &package_bytes,
@@ -1266,7 +1417,7 @@ mod tests {
             allow_downgrade: false,
             override_attestation: false,
         };
-        install_toolset(
+        install_locked(
             "my-toolset",
             "1.0.0",
             &package_bytes,
@@ -1332,7 +1483,7 @@ mod tests {
             .unwrap();
         }
 
-        let err = install_toolset(
+        let err = install_locked(
             "my-toolset",
             "1.0.0",
             &package_bytes,
@@ -1390,7 +1541,7 @@ mod tests {
         // Auditor trust file does NOT exist → TrustSetEmpty.
         let nonexistent_trust = dir.path().join("no-auditor-trust.txt");
 
-        let err = install_toolset(
+        let err = install_locked(
             "my-toolset",
             "1.0.0",
             &package_bytes,
@@ -1458,7 +1609,7 @@ mod tests {
             signature: att_sig,
         };
 
-        let outcome = install_toolset(
+        let outcome = install_locked(
             "my-toolset",
             "1.0.0",
             &pkg,
@@ -1489,7 +1640,7 @@ mod tests {
         let auditor_trust_path = write_empty_auditor_trust(dir.path());
         let nonexistent = dir.path().join("nonexistent.tar.gz");
 
-        let err = install_toolset_from_path(
+        let err = install_from_path_locked(
             "my-toolset",
             "1.0.0",
             &nonexistent,
@@ -1533,7 +1684,7 @@ mod tests {
         let auditor_trust_path = dir.path().join("auditor-trust.txt");
         std::fs::write(&auditor_trust_path, b"").unwrap();
 
-        let err = install_toolset_from_path(
+        let err = install_from_path_locked(
             "my-toolset",
             "1.0.0",
             &big_path,
@@ -1575,7 +1726,7 @@ mod tests {
         let wrong_shasum = "a".repeat(64);
         let dummy_sig = [0u8; 64];
 
-        let err = install_toolset_from_path(
+        let err = install_from_path_locked(
             "my-toolset",
             "1.0.0",
             &pkg_path,
@@ -1630,7 +1781,7 @@ mod tests {
         let toolsets_root = dir.path().join("toolsets");
         std::fs::create_dir_all(&toolsets_root).unwrap();
 
-        let err = uninstall_toolset("my-toolset", &toolsets_root).unwrap_err();
+        let err = uninstall_locked("my-toolset", &toolsets_root).unwrap_err();
         assert!(
             matches!(err, ToolsetInstallError::NotInstalled { .. }),
             "expected NotInstalled, got: {err:?}"
@@ -1640,37 +1791,262 @@ mod tests {
     #[test]
     fn uninstall_toolset_invalid_package_name_rejected() {
         let dir = TempDir::new().unwrap();
-        let err = uninstall_toolset("../evil", dir.path()).unwrap_err();
+        let err = uninstall_locked("../evil", dir.path()).unwrap_err();
         assert!(
             matches!(err, ToolsetInstallError::InvalidPackageName { .. }),
             "expected InvalidPackageName for traversal name, got: {err:?}"
         );
     }
 
+    /// Installs `package` 1.0.0 (no capabilities) into `toolsets_root` with
+    /// trust files written under `dir`.
+    fn install_plain(dir: &Path, toolsets_root: &Path, package: &str, options: &InstallOptions) {
+        let (bytes, sig, pk, shasum, _sk) =
+            build_signed_package(package, "1.0.0", &toolset_md_no_caps(package));
+        let trust_path = write_publisher_trust(dir, pk);
+        let auditor_trust_path = write_empty_auditor_trust(dir);
+        install_locked(
+            package,
+            "1.0.0",
+            &bytes,
+            &shasum,
+            &sig,
+            &pk,
+            toolsets_root,
+            &trust_path,
+            None,
+            &auditor_trust_path,
+            options,
+        )
+        .unwrap();
+    }
+
+    /// Records each file's bytes and each directory's name, skipping the lock
+    /// file by name before opening any file.
+    fn snapshot(dir: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                if name == TOOLSETS_LOCK_FILE_NAME {
+                    return None;
+                }
+                let bytes = entry
+                    .file_type()
+                    .unwrap()
+                    .is_file()
+                    .then(|| std::fs::read(entry.path()).unwrap());
+                Some((name.to_string_lossy().into_owned(), bytes))
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
     #[test]
-    fn uninstall_toolset_pin_with_invalid_stored_name_returns_malformed() {
-        // Write a pin JSON where the stored "package" field fails validate_package_name.
-        // Covers the stored-package-name validation branch in uninstall_inner.
-        use pin::PIN_FILE_NAME;
+    fn install_writes_a_record_that_verifies() {
+        let dir = TempDir::new().unwrap();
+        let toolsets_root = dir.path().join("toolsets");
+        let content = toolset_md_with_sign_payment("my-toolset");
+        let (bytes, sig, pk, shasum, _sk) = build_signed_package("my-toolset", "1.0.0", &content);
+        let trust_path = write_publisher_trust(dir.path(), pk);
+        let auditor_trust_path = write_empty_auditor_trust(dir.path());
+        install_locked(
+            "my-toolset",
+            "1.0.0",
+            &bytes,
+            &shasum,
+            &sig,
+            &pk,
+            &toolsets_root,
+            &trust_path,
+            None,
+            &auditor_trust_path,
+            &InstallOptions {
+                override_attestation: true,
+                ..InstallOptions::default()
+            },
+        )
+        .unwrap();
+
+        let pin = read_pin("my-toolset", &toolsets_root, Some(&test_pin_key()))
+            .unwrap()
+            .expect("the install must write a record");
+        assert!(
+            pin.capabilities
+                .contains(stellar_agent_toolsets::Capability::SignPayment)
+        );
+        assert_eq!(
+            pin.toolset_md_shasum,
+            hash::sha256_hex_of(content.as_bytes())
+        );
+        assert_eq!(pin.toolset_md_shasum.len(), 64);
+        let other_key = PinKey::from_bytes(zeroize::Zeroizing::new([0x5b; 32]));
+        assert!(matches!(
+            read_pin("my-toolset", &toolsets_root, Some(&other_key)),
+            Err(ToolsetInstallError::PinRecordUnverifiable { .. })
+        ));
+    }
+
+    #[test]
+    fn a_forced_install_over_an_unverifiable_pin_needs_allow_downgrade() {
         let dir = TempDir::new().unwrap();
         let toolsets_root = dir.path().join("toolsets");
         let pkg_dir = toolsets_root.join("my-toolset");
         std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("TOOLSET.md"), "earlier manifest").unwrap();
+        // A record of the earlier format: no version, no tag.
+        std::fs::write(
+            pkg_dir.join(pin::PIN_FILE_NAME),
+            r#"{"package":"my-toolset","version":"9.0.0","shasum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","publisher":"GABC","installed_at":"2026-06-01T00:00:00Z","capabilities":["sign-payment"],"allowed_tools":[]}"#,
+        )
+        .unwrap();
+        let before_root = snapshot(&toolsets_root);
+        let before_pkg = snapshot(&pkg_dir);
 
-        // Write a pin where the stored package name contains an illegal character.
-        let bad_pin = r#"{
-            "package": "INVALID_NAME",
-            "version": "1.0.0",
-            "shasum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "publisher": "GABC...XYZ",
-            "installed_at": "2026-06-01T00:00:00Z"
-        }"#;
-        std::fs::write(pkg_dir.join(PIN_FILE_NAME), bad_pin).unwrap();
+        let (bytes, sig, pk, shasum, _sk) =
+            build_signed_package("my-toolset", "1.0.0", &toolset_md_no_caps("my-toolset"));
+        let trust_path = write_publisher_trust(dir.path(), pk);
+        let auditor_trust_path = write_empty_auditor_trust(dir.path());
+        let install = |options: &InstallOptions| {
+            install_locked(
+                "my-toolset",
+                "1.0.0",
+                &bytes,
+                &shasum,
+                &sig,
+                &pk,
+                &toolsets_root,
+                &trust_path,
+                None,
+                &auditor_trust_path,
+                options,
+            )
+        };
 
-        let err = uninstall_toolset("my-toolset", &toolsets_root).unwrap_err();
+        let err = install(&InstallOptions::default()).unwrap_err();
         assert!(
-            matches!(err, ToolsetInstallError::PinRecordMalformed { .. }),
-            "expected PinRecordMalformed for invalid stored name, got: {err:?}"
+            matches!(err, ToolsetInstallError::AlreadyInstalled { .. }),
+            "without --force an unverifiable record still counts as installed, got: {err:?}"
+        );
+
+        let err = install(&InstallOptions {
+            force: true,
+            ..InstallOptions::default()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolsetInstallError::PinRecordUnverifiable { .. }),
+            "--force alone must refuse an unverifiable record, got: {err:?}"
+        );
+        assert_eq!(snapshot(&toolsets_root), before_root);
+        assert_eq!(snapshot(&pkg_dir), before_pkg);
+
+        install(&InstallOptions {
+            force: true,
+            allow_downgrade: true,
+            ..InstallOptions::default()
+        })
+        .unwrap();
+        let pin = read_pin("my-toolset", &toolsets_root, Some(&test_pin_key()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pin.version, "1.0.0");
+        assert!(pin.capabilities.is_empty());
+    }
+
+    #[test]
+    fn uninstall_removes_only_the_requested_directory() {
+        let dir = TempDir::new().unwrap();
+        let toolsets_root = dir.path().join("toolsets");
+        install_plain(
+            dir.path(),
+            &toolsets_root,
+            "alpha",
+            &InstallOptions::default(),
+        );
+        install_plain(
+            dir.path(),
+            &toolsets_root,
+            "beta",
+            &InstallOptions::default(),
+        );
+
+        // beta's record is edited to name alpha.
+        let beta_pin = toolsets_root.join("beta").join(pin::PIN_FILE_NAME);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&beta_pin).unwrap()).unwrap();
+        value["package"] = serde_json::json!("alpha");
+        std::fs::write(&beta_pin, serde_json::to_string(&value).unwrap()).unwrap();
+
+        uninstall_locked("beta", &toolsets_root).unwrap();
+        assert!(
+            !toolsets_root.join("beta").exists(),
+            "beta/ must be removed"
+        );
+        assert!(
+            toolsets_root.join("alpha").join("TOOLSET.md").is_file(),
+            "alpha/ must stay intact"
+        );
+        read_pin("alpha", &toolsets_root, Some(&test_pin_key()))
+            .unwrap()
+            .expect("alpha's record must still verify");
+    }
+
+    #[test]
+    fn uninstall_removes_a_toolset_whose_pin_does_not_verify() {
+        let dir = TempDir::new().unwrap();
+        let toolsets_root = dir.path().join("toolsets");
+        let pkg_dir = toolsets_root.join("my-toolset");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("TOOLSET.md"), "manifest").unwrap();
+        std::fs::write(
+            pkg_dir.join(pin::PIN_FILE_NAME),
+            r#"{"package":"INVALID_NAME","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        uninstall_locked("my-toolset", &toolsets_root).unwrap();
+        assert!(!pkg_dir.exists(), "the toolset directory must be removed");
+    }
+
+    #[test]
+    fn install_refuses_a_lock_of_another_root() {
+        let dir = TempDir::new().unwrap();
+        let toolsets_root = dir.path().join("toolsets");
+        let other_lock = lock_toolsets(&dir.path().join("other")).unwrap();
+        let (bytes, sig, pk, shasum, _sk) =
+            build_signed_package("my-toolset", "1.0.0", &toolset_md_no_caps("my-toolset"));
+        let trust_path = write_publisher_trust(dir.path(), pk);
+        let auditor_trust_path = write_empty_auditor_trust(dir.path());
+
+        let err = install_toolset(
+            "my-toolset",
+            "1.0.0",
+            &bytes,
+            &shasum,
+            &sig,
+            &pk,
+            &toolsets_root,
+            &trust_path,
+            None,
+            &auditor_trust_path,
+            &InstallOptions::default(),
+            &other_lock,
+            &test_pin_key(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolsetInstallError::ToolsetsRootInvalid { .. }),
+            "got: {err:?}"
+        );
+        assert!(!toolsets_root.join("my-toolset").exists());
+
+        let err = uninstall_toolset("my-toolset", &toolsets_root, &other_lock).unwrap_err();
+        assert!(
+            matches!(err, ToolsetInstallError::ToolsetsRootInvalid { .. }),
+            "got: {err:?}"
         );
     }
 
@@ -1701,20 +2077,19 @@ mod tests {
             installed_at: "2026-06-01T00:00:00Z".to_owned(),
             capabilities: stellar_agent_toolsets::CapabilitySet::empty(),
             allowed_tools: vec![],
-            toolset_md_shasum: None,
+            toolset_md_shasum: "c".repeat(64),
         };
         // Write pin via the symlink so read_pin can find it.
-        let pin_path = pkg_dir.join(PIN_FILE_NAME);
-        let pin_json = serde_json::to_string_pretty(&record).unwrap();
-        std::fs::write(&pin_path, pin_json.as_bytes()).unwrap();
+        pin::write_pin_atomic(&record, &toolsets_root, &test_pin_key()).unwrap();
+        assert!(pkg_dir.join(PIN_FILE_NAME).is_file());
         // Verify read_pin finds the pin through the symlink.
-        let loaded = pin::read_pin("my-toolset", &toolsets_root)
+        let loaded = pin::read_pin("my-toolset", &toolsets_root, Some(&test_pin_key()))
             .unwrap()
             .unwrap();
         assert_eq!(loaded.package, "my-toolset");
 
         // Now uninstall — should fail because the toolset directory IS a symlink.
-        let err = uninstall_toolset("my-toolset", &toolsets_root).unwrap_err();
+        let err = uninstall_locked("my-toolset", &toolsets_root).unwrap_err();
         assert!(
             matches!(err, ToolsetInstallError::PinRecordMalformed { .. }),
             "expected PinRecordMalformed for symlink toolset dir, got: {err:?}"

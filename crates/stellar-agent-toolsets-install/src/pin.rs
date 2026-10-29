@@ -3,7 +3,24 @@
 //! Each installed toolset has a corresponding pin record stored at
 //! `<toolsets_root>/<package>/.stellar-agent-toolset-pin.json`.  The record
 //! stores the **package name** (not a deletable path) plus the version,
-//! shasum, publisher public key (G-strkey), and install timestamp.
+//! shasum, publisher public key (G-strkey), install timestamp, the capability
+//! grant, the `allowed_tools` narrowing, and the `TOOLSET.md` digest.
+//!
+//! ## Authentication
+//!
+//! The record is authenticated by an HMAC-SHA256 tag under the installation's
+//! [`PinKey`], a 32-byte secret held in the platform keyring.  The stored JSON
+//! is `{"v":2, <record fields>, "tag":"<64 lowercase hex>"}`.  The tag covers
+//! the domain label `stellar-agent-toolset-pin:v2` followed by every record
+//! field in declaration order: each string is prefixed by its byte length as
+//! a big-endian `u32`, and each list by its element count as a big-endian
+//! `u32` (capabilities as their display tokens in set order, `allowed_tools`
+//! in stored order).
+//!
+//! [`read_pin`] returns a record only when its tag verifies under the key, it
+//! names the package it is stored under, and it carries a `TOOLSET.md` digest.
+//! A record without a tag, under another key, or with any field edited after
+//! the install is [`ToolsetInstallError::PinRecordUnverifiable`].
 //!
 //! ## Atomic write (temp+rename, same-FS)
 //!
@@ -16,40 +33,77 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use stellar_agent_toolsets::CapabilitySet;
+use zeroize::Zeroizing;
 
 use crate::{ToolsetInstallError, validate_package_name};
 
 /// File name for the pin record inside the toolset package directory.
 pub(crate) const PIN_FILE_NAME: &str = ".stellar-agent-toolset-pin.json";
 
+/// The record format version the tag authenticates.
+const PIN_RECORD_VERSION: u32 = 2;
+
+/// Domain label that starts every tag preimage.
+const PIN_TAG_DOMAIN: &[u8] = b"stellar-agent-toolset-pin:v2";
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// The installation key that authenticates every toolset pin record.
+///
+/// One 32-byte secret per installation, held in the platform keyring.  The
+/// toolsets directory is shared by every profile, so the key is too.  The
+/// bytes are wiped on drop and never printed: `Debug` renders a fixed
+/// placeholder.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_toolsets_install::PinKey;
+/// use zeroize::Zeroizing;
+///
+/// let key = PinKey::from_bytes(Zeroizing::new([7u8; 32]));
+/// assert_eq!(format!("{key:?}"), "PinKey([REDACTED])");
+/// ```
+#[derive(Clone)]
+pub struct PinKey(Zeroizing<[u8; 32]>);
+
+impl PinKey {
+    /// Wraps the 32 key bytes read from the keyring.
+    #[must_use]
+    pub fn from_bytes(bytes: Zeroizing<[u8; 32]>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Debug for PinKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PinKey([REDACTED])")
+    }
+}
+
 /// Pinned install record for a toolset.
 ///
-/// Stored as `<toolsets_root>/<package>/.stellar-agent-toolset-pin.json`.
+/// Stored as `<toolsets_root>/<package>/.stellar-agent-toolset-pin.json`
+/// under an HMAC tag (see the module documentation).  A record is only ever
+/// obtained through [`read_pin`], which verifies the tag, so every field of a
+/// returned record is the value the install wrote.
 ///
 /// ## Capability fields
 ///
 /// `capabilities` and `allowed_tools` are persisted at install time from the
 /// signature-verified `TOOLSET.md` parse output.  Dispatch reads these fields
 /// from the pin rather than re-parsing on-disk `TOOLSET.md` (TOCTOU avoidance).
-///
-/// ### Legacy pin behaviour
-///
-/// Both fields use `#[serde(default)]`: a pin record written before this
-/// extension will deserialise with `capabilities = CapabilitySet::empty()`
-/// and `allowed_tools = vec![]`.  An empty capabilities set means the runtime
-/// grants no capability, so every key-touching action is refused (fail-closed)
-/// until the toolset is reinstalled with a current binary.
-///
-/// See also: `tests::legacy_pin_without_capabilities_fails_closed`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct ToolsetPinRecord {
     /// Package name (`[a-z0-9-]`).
     ///
-    /// This is the VALIDATED name, not a stored path — uninstall
-    /// reconstructs the path from this name.
+    /// This is the VALIDATED name, not a stored path. [`read_pin`] refuses a
+    /// record whose name differs from the name it is stored under.
     pub package: String,
 
     /// Installed version (SemVer string).
@@ -65,24 +119,16 @@ pub struct ToolsetPinRecord {
     pub publisher: String,
 
     /// ISO-8601 install timestamp (UTC).
+    ///
+    /// The first-invoke gate honors only grants issued after this time, so
+    /// the tag covers it like every other field.
     pub installed_at: String,
 
     /// Capabilities declared by the toolset manifest, persisted at install time.
     ///
-    /// Sourced from the signature-verified `TOOLSET.md` parse.
-    /// Default: [`CapabilitySet::empty()`] — a legacy pin with no `capabilities`
-    /// field deserialises to an empty set, which **refuses every action** until
-    /// reinstall (fail-closed).
-    ///
-    /// ## Integrity provenance
-    ///
-    /// The capabilities INHERIT install-time provenance (parsed from the
-    /// shasum-verified, publisher-signed package) but, once COPIED into the
-    /// locally-written unsigned pin JSON, are thereafter protected only by the
-    /// toolsets-dir trust boundary — NOT by the shasum (no over-claim).
-    /// The signing isolation (no toolset can EVER reach a signing/key tool) is
-    /// STRUCTURAL and tamper-proof regardless of pin contents.
-    #[serde(default)]
+    /// Sourced from the signature-verified `TOOLSET.md` parse.  The tag binds
+    /// them to the installation key, so a capability added to the stored JSON
+    /// makes the record unverifiable rather than granted.
     pub capabilities: CapabilitySet,
 
     /// Intersective `allowed_tools` from the toolset manifest, persisted at install time.
@@ -90,39 +136,24 @@ pub struct ToolsetPinRecord {
     /// When non-empty, narrows the capability grant: only tools present in
     /// BOTH the capability matrix AND this list are reachable.  An empty list
     /// means no narrowing (the full capability grant applies).
-    ///
-    /// Default: `vec![]` — legacy pins with no `allowed_tools` field
-    /// deserialise to an empty list (no narrowing).
-    #[serde(default)]
     pub allowed_tools: Vec<String>,
 
     /// SHA-256 hex digest (64 lowercase hex chars) of the `TOOLSET.md` bytes as
     /// extracted at install time.
     ///
-    /// At every dispatch, the toolsets runtime re-reads the on-disk `TOOLSET.md`,
-    /// recomputes SHA-256, and compares against this field.  A mismatch refuses
-    /// the dispatch.
-    ///
-    /// ## Legacy behaviour
-    ///
-    /// `#[serde(default)]` → `None` for pins written before this field was added.
-    /// Legacy pins skip the re-verification step at dispatch (no `toolset_md_shasum`
-    /// to compare against).  This is intentionally OPEN for legacy pins — the
-    /// capability-source invariant (runtime reads capabilities from the pin, not
-    /// from the on-disk `TOOLSET.md`) ensures that a tampered `TOOLSET.md` cannot
-    /// escalate capabilities even without the digest check.  Reinstalling with a
-    /// current binary populates the field and activates the check.
+    /// Mandatory: every record carries it, and both runtime resolvers re-read
+    /// the on-disk `TOOLSET.md` at every dispatch, recompute SHA-256, and refuse
+    /// the dispatch on a mismatch or an unreadable file.
     ///
     /// ## Security scope
     ///
-    /// The `TOOLSET.md` digest covers post-install tamper detection of the toolset's
+    /// The digest covers post-install tamper detection of the toolset's
     /// human-readable manifest.  It does NOT re-verify the full package hash
-    /// (`pin.shasum` is SHA-256 of the original `.tar.gz` tarball, which is not
-    /// retained post-extraction).  The capability-escalation attack path is
-    /// already closed by reading capabilities from the pin rather than re-parsing
-    /// the on-disk file; this check adds tamper-evidence for the manifest text.
-    #[serde(default)]
-    pub toolset_md_shasum: Option<String>,
+    /// (`shasum` is SHA-256 of the original `.tar.gz` tarball, which is not
+    /// retained post-extraction).  Capabilities are read from this record,
+    /// never from the on-disk file, so an edited manifest grants nothing; the
+    /// digest makes the edit visible and refuses dispatch.
+    pub toolset_md_shasum: String,
 }
 
 impl ToolsetPinRecord {
@@ -159,7 +190,7 @@ impl ToolsetPinRecord {
     ///     "2026-06-12T00:00:00Z",
     ///     CapabilitySet::empty(),
     ///     vec![],
-    ///     None,
+    ///     "b".repeat(64),
     /// );
     /// ```
     #[cfg(any(test, feature = "test-helpers"))]
@@ -173,7 +204,7 @@ impl ToolsetPinRecord {
         installed_at: impl Into<String>,
         capabilities: stellar_agent_toolsets::CapabilitySet,
         allowed_tools: Vec<String>,
-        toolset_md_shasum: Option<String>,
+        toolset_md_shasum: impl Into<String>,
     ) -> Self {
         Self {
             package: package.into(),
@@ -183,15 +214,116 @@ impl ToolsetPinRecord {
             installed_at: installed_at.into(),
             capabilities,
             allowed_tools,
-            toolset_md_shasum,
+            toolset_md_shasum: toolset_md_shasum.into(),
         }
     }
 }
 
-/// Writes a pin record atomically (temp+rename, same filesystem).
+/// The stored form of a pin record: the version, the record, and its tag.
+#[derive(Serialize)]
+struct StoredPinOut<'a> {
+    v: u32,
+    #[serde(flatten)]
+    record: &'a ToolsetPinRecord,
+    tag: String,
+}
+
+/// The parse target of a stored pin record.
+///
+/// Every field is optional or defaulted so that a record of an earlier format
+/// parses and is then refused as unverifiable, while an unknown field is a
+/// malformed record.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StoredPin {
+    v: Option<u32>,
+    package: String,
+    version: String,
+    shasum: String,
+    publisher: String,
+    installed_at: String,
+    capabilities: CapabilitySet,
+    allowed_tools: Vec<String>,
+    toolset_md_shasum: Option<String>,
+    tag: Option<String>,
+}
+
+/// Feeds `bytes` to `mac` behind its length as a big-endian `u32`.
+///
+/// Returns `None` when the length does not fit a `u32`; no record field the
+/// install writes comes near that bound.
+fn put_bytes(mac: &mut HmacSha256, bytes: &[u8]) -> Option<()> {
+    let len = u32::try_from(bytes.len()).ok()?;
+    mac.update(&len.to_be_bytes());
+    mac.update(bytes);
+    Some(())
+}
+
+/// Feeds a list's element count to `mac` as a big-endian `u32`.
+fn put_count(mac: &mut HmacSha256, count: usize) -> Option<()> {
+    let count = u32::try_from(count).ok()?;
+    mac.update(&count.to_be_bytes());
+    Some(())
+}
+
+/// The HMAC over the tag preimage of `record` under `key`, ready to finalize
+/// or to verify a tag.
+///
+/// Returns `None` when a field length or a list count does not fit a `u32`.
+fn tag_mac(record: &ToolsetPinRecord, key: &PinKey) -> Option<HmacSha256> {
+    let mut mac = HmacSha256::new_from_slice(key.0.as_ref()).ok()?;
+    mac.update(PIN_TAG_DOMAIN);
+    put_bytes(&mut mac, record.package.as_bytes())?;
+    put_bytes(&mut mac, record.version.as_bytes())?;
+    put_bytes(&mut mac, record.shasum.as_bytes())?;
+    put_bytes(&mut mac, record.publisher.as_bytes())?;
+    put_bytes(&mut mac, record.installed_at.as_bytes())?;
+    put_count(&mut mac, record.capabilities.len())?;
+    for capability in record.capabilities.iter() {
+        put_bytes(&mut mac, capability.to_string().as_bytes())?;
+    }
+    put_count(&mut mac, record.allowed_tools.len())?;
+    for tool in &record.allowed_tools {
+        put_bytes(&mut mac, tool.as_bytes())?;
+    }
+    put_bytes(&mut mac, record.toolset_md_shasum.as_bytes())?;
+    Some(mac)
+}
+
+/// Whether `s` is exactly 64 lowercase hex characters.
+fn is_lower_hex_64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Serialises `record` in its stored form, tagged under `key`.
+///
+/// # Errors
+///
+/// - [`ToolsetInstallError::Io`]: a field is too long to encode, or the JSON
+///   serialisation fails.
+fn encode_pin(record: &ToolsetPinRecord, key: &PinKey) -> Result<String, ToolsetInstallError> {
+    let tag = tag_mac(record, key)
+        .ok_or_else(|| {
+            ToolsetInstallError::from_io(std::io::Error::other(
+                "pin record field exceeds the encodable length",
+            ))
+        })?
+        .finalize()
+        .into_bytes();
+    let stored = StoredPinOut {
+        v: PIN_RECORD_VERSION,
+        record,
+        tag: hex::encode(tag),
+    };
+    serde_json::to_string_pretty(&stored)
+        .map_err(|e| ToolsetInstallError::from_io(std::io::Error::other(e.to_string())))
+}
+
+/// Writes a pin record atomically (temp+rename, same filesystem), tagged
+/// under `key`.
 ///
 /// Steps:
-/// 1. Serialise `record` to JSON.
+/// 1. Serialise `record` with its version and tag to JSON.
 /// 2. Write to a temp file inside `toolsets_root` (same FS → rename is atomic).
 /// 3. Rename temp → `record.pin_path(toolsets_root)`.
 ///
@@ -203,9 +335,9 @@ impl ToolsetPinRecord {
 pub(crate) fn write_pin_atomic(
     record: &ToolsetPinRecord,
     toolsets_root: &Path,
+    key: &PinKey,
 ) -> Result<(), ToolsetInstallError> {
-    let json = serde_json::to_string_pretty(record)
-        .map_err(|e| ToolsetInstallError::from_io(std::io::Error::other(e.to_string())))?;
+    let json = encode_pin(record, key)?;
 
     let target_path = record.pin_path(toolsets_root);
 
@@ -229,7 +361,79 @@ pub(crate) fn write_pin_atomic(
     Ok(())
 }
 
-/// Reads and parses the pin record for `package` from `toolsets_root`.
+/// Writes `record` as an installed toolset's pin record, tagged under `key`,
+/// creating `<toolsets_root>/<package>/` first.
+///
+/// Test fixtures use it to set up an installed toolset without the install
+/// pipeline.  Only available under `#[cfg(any(test, feature = "test-helpers"))]`.
+///
+/// # Errors
+///
+/// - [`ToolsetInstallError::Io`]: the directory or the record cannot be written.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn write_pin_for_test(
+    record: &ToolsetPinRecord,
+    toolsets_root: &Path,
+    key: &PinKey,
+) -> Result<(), ToolsetInstallError> {
+    std::fs::create_dir_all(toolsets_root.join(&record.package))
+        .map_err(ToolsetInstallError::from_io)?;
+    write_pin_atomic(record, toolsets_root, key)
+}
+
+/// Writes an installed toolset as an install leaves it: a `TOOLSET.md` for
+/// `package` declaring `capabilities`, and a version `1.0.0` record of
+/// `package` declaring the same capabilities and `allowed_tools`, carrying the
+/// manifest's digest and tagged under `key`.  Returns the record.
+///
+/// `capabilities` are display tokens such as `"sign-payment"`; a token the
+/// capability set does not know is dropped, as the record parse drops it.
+/// Only available under `#[cfg(any(test, feature = "test-helpers"))]`.
+///
+/// # Errors
+///
+/// - [`ToolsetInstallError::Io`]: the directory, the manifest or the record
+///   cannot be written.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn write_toolset_for_test(
+    toolsets_root: &Path,
+    package: &str,
+    capabilities: &[&str],
+    allowed_tools: &[&str],
+    installed_at: &str,
+    key: &PinKey,
+) -> Result<ToolsetPinRecord, ToolsetInstallError> {
+    let manifest = format!(
+        "---\nname: {package}\ndescription: test toolset.\nmetadata:\n  \
+         stellar-agent-capabilities: {}\n---\n\nBody.\n",
+        capabilities.join(" ")
+    );
+    let toolset_dir = toolsets_root.join(package);
+    std::fs::create_dir_all(&toolset_dir).map_err(ToolsetInstallError::from_io)?;
+    std::fs::write(toolset_dir.join("TOOLSET.md"), &manifest)
+        .map_err(ToolsetInstallError::from_io)?;
+    let capability_set: CapabilitySet = serde_json::from_value(serde_json::json!(capabilities))
+        .map_err(|e| ToolsetInstallError::Io {
+            detail: format!("capability tokens: {e}"),
+        })?;
+    let record = ToolsetPinRecord::build_for_test(
+        package,
+        "1.0.0",
+        "0".repeat(64),
+        "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+        installed_at,
+        capability_set,
+        allowed_tools
+            .iter()
+            .map(|tool| (*tool).to_owned())
+            .collect(),
+        crate::hash::sha256_hex_of(manifest.as_bytes()),
+    );
+    write_pin_atomic(&record, toolsets_root, key)?;
+    Ok(record)
+}
+
+/// Reads and verifies the pin record for `package` from `toolsets_root`.
 ///
 /// Validates `package` against the `[a-z0-9-]` charset BEFORE constructing
 /// any filesystem path: a `package` value containing `/`, `\`, `.`, `..`, or
@@ -238,17 +442,25 @@ pub(crate) fn write_pin_atomic(
 /// join.
 ///
 /// Returns `None` if the pin file does not exist (toolset not installed).
+/// Otherwise the record is returned only when its tag verifies under `key`,
+/// it names `package`, and its `TOOLSET.md` digest is 64 lowercase hex
+/// characters.  The tag is compared in constant time.
 ///
 /// # Errors
 ///
-/// - [`ToolsetInstallError::InvalidPackageName`] — `package` fails the
+/// - [`ToolsetInstallError::InvalidPackageName`]: `package` fails the
 ///   `[a-z0-9-]` charset validation.
-/// - [`ToolsetInstallError::PinRecordMalformed`] — pin file exists but cannot
-///   be parsed or contains an invalid package name.
-/// - [`ToolsetInstallError::Io`] — unexpected I/O error (not NotFound).
+/// - [`ToolsetInstallError::PinRecordMalformed`]: the pin file exists but is
+///   not a pin record, names another package, or carries a digest that is not
+///   64 lowercase hex characters.
+/// - [`ToolsetInstallError::PinRecordUnverifiable`]: `key` is `None`, the
+///   record is not version 2, its tag or digest is missing, or its tag does
+///   not verify under `key`.
+/// - [`ToolsetInstallError::Io`]: unexpected I/O error (not NotFound).
 pub fn read_pin(
     package: &str,
     toolsets_root: &Path,
+    key: Option<&PinKey>,
 ) -> Result<Option<ToolsetPinRecord>, ToolsetInstallError> {
     // Validate before ANY path join.
     validate_package_name(package)
@@ -262,38 +474,59 @@ pub fn read_pin(
         Err(e) => return Err(ToolsetInstallError::from_io(e)),
     };
 
-    let record: ToolsetPinRecord =
+    let stored: StoredPin =
         serde_json::from_str(&content).map_err(|_| ToolsetInstallError::PinRecordMalformed {
-            detail: format!("pin record for '{package}' is not valid JSON"),
+            detail: format!("pin record for '{package}' is not a valid pin record"),
         })?;
 
-    // Validate the stored package name.
-    if let Err(reason) = validate_package_name(&record.package) {
+    let unverifiable = || ToolsetInstallError::PinRecordUnverifiable {
+        package: package.to_owned(),
+    };
+    let key = key.ok_or_else(unverifiable)?;
+    if stored.v != Some(PIN_RECORD_VERSION) {
+        return Err(unverifiable());
+    }
+    let (Some(tag_hex), Some(toolset_md_shasum)) = (stored.tag, stored.toolset_md_shasum) else {
+        return Err(unverifiable());
+    };
+    if !is_lower_hex_64(&tag_hex) {
+        return Err(unverifiable());
+    }
+    let tag = hex::decode(&tag_hex).map_err(|_| unverifiable())?;
+
+    let record = ToolsetPinRecord {
+        package: stored.package,
+        version: stored.version,
+        shasum: stored.shasum,
+        publisher: stored.publisher,
+        installed_at: stored.installed_at,
+        capabilities: stored.capabilities,
+        allowed_tools: stored.allowed_tools,
+        toolset_md_shasum,
+    };
+
+    let mac = tag_mac(&record, key).ok_or_else(unverifiable)?;
+    mac.verify_slice(&tag).map_err(|_| unverifiable())?;
+
+    if record.package != package {
         return Err(ToolsetInstallError::PinRecordMalformed {
             detail: format!(
-                "pin record package name '{}' is invalid: {reason}",
+                "pin record names package '{}', stored under '{package}'",
                 stellar_agent_toolsets::sanitise_display(&record.package, 64),
             ),
         });
     }
 
-    Ok(Some(record))
-}
-
-/// Removes the pin record for `package` from `toolsets_root`.
-///
-/// Returns `Ok(())` if the file was removed successfully or did not exist.
-///
-/// # Errors
-///
-/// - [`ToolsetInstallError::Io`] — unexpected removal error.
-pub(crate) fn remove_pin(package: &str, toolsets_root: &Path) -> Result<(), ToolsetInstallError> {
-    let pin_path = toolsets_root.join(package).join(PIN_FILE_NAME);
-    match std::fs::remove_file(&pin_path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(ToolsetInstallError::from_io(e)),
+    if !is_lower_hex_64(&record.toolset_md_shasum) {
+        return Err(ToolsetInstallError::PinRecordMalformed {
+            detail: format!(
+                "pin record for '{package}' carries a TOOLSET.md digest that is not \
+                 64 lowercase hex characters"
+            ),
+        });
     }
+
+    Ok(Some(record))
 }
 
 #[cfg(test)]
@@ -308,6 +541,10 @@ mod tests {
 
     use super::*;
 
+    fn key(byte: u8) -> PinKey {
+        PinKey::from_bytes(Zeroizing::new([byte; 32]))
+    }
+
     fn test_record() -> ToolsetPinRecord {
         ToolsetPinRecord {
             package: "my-toolset".to_owned(),
@@ -317,30 +554,55 @@ mod tests {
             installed_at: "2026-06-01T00:00:00Z".to_owned(),
             capabilities: stellar_agent_toolsets::CapabilitySet::empty(),
             allowed_tools: vec![],
-            toolset_md_shasum: None,
+            toolset_md_shasum: "c".repeat(64),
         }
     }
 
+    fn tag_hex(record: &ToolsetPinRecord, key: &PinKey) -> String {
+        hex::encode(tag_mac(record, key).unwrap().finalize().into_bytes())
+    }
+
+    /// Reads the stored JSON of `package`, applies `edit`, and writes it back.
+    fn edit_stored(toolsets_root: &Path, package: &str, edit: impl FnOnce(&mut serde_json::Value)) {
+        let path = toolsets_root.join(package).join(PIN_FILE_NAME);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        edit(&mut value);
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+    }
+
+    fn assert_unverifiable(result: Result<Option<ToolsetPinRecord>, ToolsetInstallError>) {
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ToolsetInstallError::PinRecordUnverifiable { .. }),
+            "expected PinRecordUnverifiable, got: {err:?}"
+        );
+    }
+
     #[test]
-    fn write_and_read_pin_roundtrip() {
+    fn a_tagged_pin_round_trips() {
         let dir = TempDir::new().unwrap();
-        let toolsets_root = dir.path();
-
-        // Create the package directory (normally done by extraction).
-        let pkg_dir = toolsets_root.join("my-toolset");
-        std::fs::create_dir_all(&pkg_dir).unwrap();
-
         let record = test_record();
-        write_pin_atomic(&record, toolsets_root).unwrap();
+        write_pin_for_test(&record, dir.path(), &key(1)).unwrap();
 
-        let loaded = read_pin("my-toolset", toolsets_root).unwrap().unwrap();
+        let loaded = read_pin("my-toolset", dir.path(), Some(&key(1)))
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded, record);
+
+        let stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(record.pin_path(dir.path())).unwrap())
+                .unwrap();
+        assert_eq!(stored["v"], 2);
+        assert_eq!(stored["tag"], tag_hex(&record, &key(1)));
     }
 
     #[test]
     fn missing_pin_returns_none() {
         let dir = TempDir::new().unwrap();
-        let result = read_pin("nonexistent", dir.path()).unwrap();
+        let result = read_pin("nonexistent", dir.path(), Some(&key(1))).unwrap();
+        assert!(result.is_none());
+        let result = read_pin("nonexistent", dir.path(), None).unwrap();
         assert!(result.is_none());
     }
 
@@ -353,52 +615,244 @@ mod tests {
         let pin_path = pkg_dir.join(PIN_FILE_NAME);
         std::fs::write(&pin_path, b"not json").unwrap();
 
-        let err = read_pin("bad-toolset", toolsets_root).unwrap_err();
+        let err = read_pin("bad-toolset", toolsets_root, Some(&key(1))).unwrap_err();
         assert!(
             matches!(err, ToolsetInstallError::PinRecordMalformed { .. }),
             "expected PinRecordMalformed, got: {err:?}"
         );
     }
 
+    /// The expected tag comes from an independent calculation of the documented preimage.
+    /// The test covers eight record fields plus the allowed-tool order.
     #[test]
-    fn remove_pin_nonexistent_is_ok() {
-        let dir = TempDir::new().unwrap();
-        remove_pin("nonexistent", dir.path()).unwrap();
+    fn the_tag_covers_every_field() {
+        let base = ToolsetPinRecord {
+            package: "vector-toolset".to_owned(),
+            version: "1.2.3".to_owned(),
+            shasum: "a".repeat(64),
+            publisher: "GABC".to_owned(),
+            installed_at: "2026-06-01T00:00:00Z".to_owned(),
+            capabilities: stellar_agent_toolsets::parse_capability_value_pub(
+                "sign-payment read-balance",
+            )
+            .unwrap(),
+            allowed_tools: vec![
+                "stellar_pay_commit".to_owned(),
+                "stellar_balances".to_owned(),
+            ],
+            toolset_md_shasum: "b".repeat(64),
+        };
+        let vector_key = key(0x42);
+        let expected = "8fa792e3db0e65cdff5cf0e95dbc437014fca6a597b9621b40fe4b72e9ce3fd4";
+        assert_eq!(tag_hex(&base, &vector_key), expected);
+
+        fn prefixed(preimage: &mut Vec<u8>, bytes: &[u8]) {
+            preimage.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_be_bytes());
+            preimage.extend_from_slice(bytes);
+        }
+        let mut preimage = PIN_TAG_DOMAIN.to_vec();
+        prefixed(&mut preimage, b"vector-toolset");
+        prefixed(&mut preimage, b"1.2.3");
+        prefixed(&mut preimage, "a".repeat(64).as_bytes());
+        prefixed(&mut preimage, b"GABC");
+        prefixed(&mut preimage, b"2026-06-01T00:00:00Z");
+        preimage.extend_from_slice(&2u32.to_be_bytes());
+        prefixed(&mut preimage, b"read-balance");
+        prefixed(&mut preimage, b"sign-payment");
+        preimage.extend_from_slice(&2u32.to_be_bytes());
+        prefixed(&mut preimage, b"stellar_pay_commit");
+        prefixed(&mut preimage, b"stellar_balances");
+        prefixed(&mut preimage, "b".repeat(64).as_bytes());
+        let mut mac = HmacSha256::new_from_slice(&[0x42; 32]).unwrap();
+        mac.update(&preimage);
+        assert_eq!(hex::encode(mac.finalize().into_bytes()), expected);
+
+        let mut variants: Vec<(&str, ToolsetPinRecord)> = Vec::new();
+        let mut v = base.clone();
+        v.package = "vector-toolsets".to_owned();
+        variants.push(("package", v));
+        let mut v = base.clone();
+        v.version = "1.2.4".to_owned();
+        variants.push(("version", v));
+        let mut v = base.clone();
+        v.shasum = "d".repeat(64);
+        variants.push(("shasum", v));
+        let mut v = base.clone();
+        v.publisher = "GABD".to_owned();
+        variants.push(("publisher", v));
+        let mut v = base.clone();
+        v.installed_at = "2026-05-01T00:00:00Z".to_owned();
+        variants.push(("installed_at", v));
+        let mut v = base.clone();
+        v.capabilities =
+            stellar_agent_toolsets::parse_capability_value_pub("read-balance").unwrap();
+        variants.push(("capabilities", v));
+        let mut v = base.clone();
+        v.allowed_tools = vec!["stellar_pay_commit".to_owned()];
+        variants.push(("allowed_tools", v));
+        let mut v = base.clone();
+        v.allowed_tools.reverse();
+        variants.push(("allowed_tools order", v));
+        let mut v = base.clone();
+        v.toolset_md_shasum = "e".repeat(64);
+        variants.push(("toolset_md_shasum", v));
+        assert_eq!(variants.len(), 9);
+        for (field, variant) in &variants {
+            assert_ne!(
+                tag_hex(variant, &vector_key),
+                expected,
+                "a record differing only in {field} must carry a different tag"
+            );
+        }
+        assert_ne!(
+            tag_hex(&base, &key(0x43)),
+            expected,
+            "the tag depends on the key"
+        );
     }
 
-    // A pin record written before the `capabilities` / `allowed_tools` fields
-    // were added MUST deserialise with `capabilities = CapabilitySet::empty()`
-    // and `allowed_tools = vec![]` — producing fail-closed behaviour at dispatch
-    // time (every action refused until reinstall).
     #[test]
-    fn legacy_pin_without_capabilities_fails_closed() {
+    fn an_edited_capability_fails_verification() {
         let dir = TempDir::new().unwrap();
-        let toolsets_root = dir.path();
-        let pkg_dir = toolsets_root.join("legacy-toolset");
-        std::fs::create_dir_all(&pkg_dir).unwrap();
-        let pin_path = pkg_dir.join(PIN_FILE_NAME);
+        let mut record = test_record();
+        record.capabilities =
+            stellar_agent_toolsets::parse_capability_value_pub("read-balance").unwrap();
+        write_pin_for_test(&record, dir.path(), &key(1)).unwrap();
+        edit_stored(dir.path(), "my-toolset", |value| {
+            value["capabilities"] = serde_json::json!(["read-balance", "sign-payment"]);
+        });
 
-        // Write a legacy pin (no capabilities / allowed_tools fields).
-        let legacy_json = r#"{
+        assert_unverifiable(read_pin("my-toolset", dir.path(), Some(&key(1))));
+    }
+
+    #[test]
+    fn a_pin_without_a_tag_is_unverifiable() {
+        let dir = TempDir::new().unwrap();
+        let pkg_dir = dir.path().join("legacy-toolset");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let without_digest = r#"{
             "package": "legacy-toolset",
             "version": "1.0.0",
             "shasum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "publisher": "GABC...XYZ",
-            "installed_at": "2026-06-01T00:00:00Z"
+            "installed_at": "2026-06-01T00:00:00Z",
+            "capabilities": ["sign-payment"],
+            "allowed_tools": []
         }"#;
-        std::fs::write(&pin_path, legacy_json).unwrap();
+        let with_digest = r#"{
+            "package": "legacy-toolset",
+            "version": "1.0.0",
+            "shasum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "publisher": "GABC...XYZ",
+            "installed_at": "2026-06-01T00:00:00Z",
+            "capabilities": ["sign-payment"],
+            "allowed_tools": [],
+            "toolset_md_shasum": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        }"#;
+        for json in [without_digest, with_digest] {
+            std::fs::write(pkg_dir.join(PIN_FILE_NAME), json).unwrap();
+            assert_unverifiable(read_pin("legacy-toolset", dir.path(), Some(&key(1))));
+        }
+    }
 
-        let pin = read_pin("legacy-toolset", toolsets_root).unwrap().unwrap();
+    #[test]
+    fn a_pin_of_another_format_version_is_unverifiable() {
+        let dir = TempDir::new().unwrap();
+        write_pin_for_test(&test_record(), dir.path(), &key(1)).unwrap();
+        edit_stored(dir.path(), "my-toolset", |value| {
+            value["v"] = serde_json::json!(3);
+        });
+        assert_unverifiable(read_pin("my-toolset", dir.path(), Some(&key(1))));
+    }
 
-        // capabilities must default to empty (fail-closed).
+    #[test]
+    fn a_pin_without_a_digest_is_unverifiable() {
+        let dir = TempDir::new().unwrap();
+        write_pin_for_test(&test_record(), dir.path(), &key(1)).unwrap();
+        edit_stored(dir.path(), "my-toolset", |value| {
+            value.as_object_mut().unwrap().remove("toolset_md_shasum");
+        });
+        assert_unverifiable(read_pin("my-toolset", dir.path(), Some(&key(1))));
+    }
+
+    #[test]
+    fn a_pin_under_another_key_is_unverifiable() {
+        let dir = TempDir::new().unwrap();
+        write_pin_for_test(&test_record(), dir.path(), &key(1)).unwrap();
+        assert_unverifiable(read_pin("my-toolset", dir.path(), Some(&key(2))));
+        assert_unverifiable(read_pin("my-toolset", dir.path(), None));
+    }
+
+    #[test]
+    fn a_pin_copied_under_another_name_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let mut alpha = test_record();
+        alpha.package = "alpha".to_owned();
+        write_pin_for_test(&alpha, dir.path(), &key(1)).unwrap();
+        std::fs::create_dir_all(dir.path().join("beta")).unwrap();
+        std::fs::copy(
+            alpha.pin_path(dir.path()),
+            dir.path().join("beta").join(PIN_FILE_NAME),
+        )
+        .unwrap();
+
+        let err = read_pin("beta", dir.path(), Some(&key(1))).unwrap_err();
         assert!(
-            pin.capabilities.is_empty(),
-            "legacy pin must deserialise with empty capabilities (fail-closed)"
+            matches!(
+                &err,
+                ToolsetInstallError::PinRecordMalformed { detail }
+                    if detail.contains("'alpha'") && detail.contains("'beta'")
+            ),
+            "the refusal must be PinRecordMalformed naming both packages, got: {err:?}"
         );
-        // allowed_tools must default to empty.
+    }
+
+    #[test]
+    fn a_tagged_pin_naming_an_invalid_package_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let pkg_dir = dir.path().join("good-name");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let mut record = test_record();
+        record.package = "BADNAME!@#".to_owned();
+        std::fs::write(
+            pkg_dir.join(PIN_FILE_NAME),
+            encode_pin(&record, &key(1)).unwrap(),
+        )
+        .unwrap();
+
+        let err = read_pin("good-name", dir.path(), Some(&key(1))).unwrap_err();
         assert!(
-            pin.allowed_tools.is_empty(),
-            "legacy pin must deserialise with empty allowed_tools"
+            matches!(err, ToolsetInstallError::PinRecordMalformed { .. }),
+            "expected PinRecordMalformed for a stored name other than the requested one, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_pin_with_a_malformed_digest_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let mut record = test_record();
+        record.toolset_md_shasum = "C".repeat(64);
+        write_pin_for_test(&record, dir.path(), &key(1)).unwrap();
+
+        let err = read_pin("my-toolset", dir.path(), Some(&key(1))).unwrap_err();
+        assert!(
+            matches!(err, ToolsetInstallError::PinRecordMalformed { .. }),
+            "expected PinRecordMalformed for an uppercase digest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_is_refused() {
+        let dir = TempDir::new().unwrap();
+        write_pin_for_test(&test_record(), dir.path(), &key(1)).unwrap();
+        edit_stored(dir.path(), "my-toolset", |value| {
+            value["extra"] = serde_json::json!("x");
+        });
+
+        let err = read_pin("my-toolset", dir.path(), Some(&key(1))).unwrap_err();
+        assert!(
+            matches!(err, ToolsetInstallError::PinRecordMalformed { .. }),
+            "expected PinRecordMalformed for an unknown field, got: {err:?}"
         );
     }
 
@@ -407,7 +861,7 @@ mod tests {
     #[test]
     fn read_pin_dotdot_slash_rejected() {
         let dir = TempDir::new().unwrap();
-        let err = read_pin("../foo", dir.path()).unwrap_err();
+        let err = read_pin("../foo", dir.path(), Some(&key(1))).unwrap_err();
         assert!(
             matches!(err, ToolsetInstallError::InvalidPackageName { .. }),
             "expected InvalidPackageName for '../foo', got: {err:?}"
@@ -417,7 +871,7 @@ mod tests {
     #[test]
     fn read_pin_slash_in_name_rejected() {
         let dir = TempDir::new().unwrap();
-        let err = read_pin("a/b", dir.path()).unwrap_err();
+        let err = read_pin("a/b", dir.path(), Some(&key(1))).unwrap_err();
         assert!(
             matches!(err, ToolsetInstallError::InvalidPackageName { .. }),
             "expected InvalidPackageName for 'a/b', got: {err:?}"
@@ -427,11 +881,18 @@ mod tests {
     #[test]
     fn read_pin_backslash_in_name_rejected() {
         let dir = TempDir::new().unwrap();
-        let err = read_pin("..\\foo", dir.path()).unwrap_err();
+        let err = read_pin("..\\foo", dir.path(), Some(&key(1))).unwrap_err();
         assert!(
             matches!(err, ToolsetInstallError::InvalidPackageName { .. }),
             "expected InvalidPackageName for '..\\\\foo', got: {err:?}"
         );
+    }
+
+    #[test]
+    fn pin_key_debug_prints_no_key_bytes() {
+        let rendered = format!("{:?}", key(0xab));
+        assert_eq!(rendered, "PinKey([REDACTED])");
+        assert!(!rendered.contains("171"), "{rendered}");
     }
 
     // `build_for_test` is only compiled in test mode; exercise all arguments.
@@ -448,7 +909,7 @@ mod tests {
             "2026-06-22T00:00:00Z",
             caps.clone(),
             vec!["stellar_pay".to_owned()],
-            Some("dead".repeat(16)),
+            "dead".repeat(16),
         );
 
         assert_eq!(record.package, "test-toolset");
@@ -458,42 +919,13 @@ mod tests {
         assert_eq!(record.installed_at, "2026-06-22T00:00:00Z");
         assert_eq!(record.capabilities, caps);
         assert_eq!(record.allowed_tools, vec!["stellar_pay"]);
-        assert_eq!(record.toolset_md_shasum, Some("dead".repeat(16)));
-    }
-
-    // Pin records where the stored `package` name fails validate_package_name
-    // must be detected during read_pin and returned as PinRecordMalformed.
-    #[test]
-    fn read_pin_rejects_invalid_stored_package_name_in_json() {
-        let dir = TempDir::new().unwrap();
-        let toolsets_root = dir.path();
-        // Create a package directory with a valid name.
-        let pkg_dir = toolsets_root.join("good-name");
-        std::fs::create_dir_all(&pkg_dir).unwrap();
-
-        // Write a pin JSON where the inner `package` field has an invalid value.
-        let invalid_pin_json = r#"{
-            "package": "BADNAME!@#",
-            "version": "1.0.0",
-            "shasum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "publisher": "GABC...XYZ",
-            "installed_at": "2026-06-01T00:00:00Z"
-        }"#;
-        std::fs::write(pkg_dir.join(PIN_FILE_NAME), invalid_pin_json).unwrap();
-
-        let err = read_pin("good-name", toolsets_root).unwrap_err();
-        assert!(
-            matches!(err, crate::ToolsetInstallError::PinRecordMalformed { .. }),
-            "expected PinRecordMalformed for invalid stored name, got: {err:?}"
-        );
+        assert_eq!(record.toolset_md_shasum, "dead".repeat(16));
     }
 
     #[test]
     fn pin_with_capabilities_roundtrip() {
         let dir = TempDir::new().unwrap();
         let toolsets_root = dir.path();
-        let pkg_dir = toolsets_root.join("rich-toolset");
-        std::fs::create_dir_all(&pkg_dir).unwrap();
 
         // Build a pin with capabilities.
         let caps =
@@ -507,11 +939,13 @@ mod tests {
             installed_at: "2026-06-01T12:00:00Z".to_owned(),
             capabilities: caps,
             allowed_tools: vec!["stellar_balances".to_owned(), "stellar_pay".to_owned()],
-            toolset_md_shasum: None,
+            toolset_md_shasum: "c".repeat(64),
         };
 
-        write_pin_atomic(&record, toolsets_root).unwrap();
-        let loaded = read_pin("rich-toolset", toolsets_root).unwrap().unwrap();
+        write_pin_for_test(&record, toolsets_root, &key(3)).unwrap();
+        let loaded = read_pin("rich-toolset", toolsets_root, Some(&key(3)))
+            .unwrap()
+            .unwrap();
 
         assert!(
             loaded

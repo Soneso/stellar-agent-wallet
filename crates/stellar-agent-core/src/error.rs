@@ -1600,6 +1600,19 @@ pub enum ValidationError {
         field: &'static str,
     },
 
+    /// A profile key operation targets the reserved installation namespace.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.installation_key_coordinate"`.
+    #[error(
+        "`{field}` names the reserved service `stellar-agent-toolsets`. Point `{field}` at its own profile keyring coordinate"
+    )]
+    InstallationKeyCoordinate {
+        /// The profile field whose coordinate is refused.
+        field: &'static str,
+    },
+
     /// A signing verb was asked to read a secret from a named environment
     /// variable, but that variable is not set in this process's environment.
     ///
@@ -1963,6 +1976,7 @@ impl ValidationError {
             // Audit taxonomy code on a validation-class variant: see
             // `AuditLogNotFound` above for the same rationale.
             Self::AuditLogBindingChanged { .. } => "audit.log_binding_changed",
+            Self::InstallationKeyCoordinate { .. } => "validation.installation_key_coordinate",
             Self::KeyMatchesOwnerPublicKey { .. } => "validation.key_matches_owner_public_key",
             Self::SecretEnvNotSet { .. } => "validation.secret_env_not_set",
             Self::SecretEnvInvalid { .. } => "validation.secret_env_invalid",
@@ -3804,6 +3818,12 @@ mod tests {
                 "validation.acknowledgement_required",
             ),
             (
+                ValidationError::InstallationKeyCoordinate {
+                    field: "attestation_key_id",
+                },
+                "validation.installation_key_coordinate",
+            ),
+            (
                 ValidationError::KeyMatchesOwnerPublicKey {
                     field: "attestation_key_id",
                 },
@@ -4100,6 +4120,9 @@ mod tests {
                         profile: profile.clone(),
                         missing,
                     }
+                }
+                ValidationError::InstallationKeyCoordinate { field } => {
+                    ValidationError::InstallationKeyCoordinate { field }
                 }
                 ValidationError::KeyMatchesOwnerPublicKey { field } => {
                     ValidationError::KeyMatchesOwnerPublicKey { field }

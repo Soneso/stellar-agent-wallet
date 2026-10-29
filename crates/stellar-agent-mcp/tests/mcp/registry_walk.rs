@@ -1032,19 +1032,19 @@ fn stellar_toolset_list_annotations_correct() {
     );
 }
 
-/// Verifies `stellar_toolset_invoke` annotations: read-only, not destructive,
+/// Verifies `stellar_toolset_invoke` annotations: destructive, not read-only,
 /// chain_id not required at the outer gate level.
 #[test]
-fn stellar_toolset_invoke_annotations_correct() {
+fn stellar_toolset_invoke_is_annotated_destructive() {
     let reg = find_registration("stellar_toolset_invoke")
         .expect("stellar_toolset_invoke McpToolRegistration not found");
     assert!(
-        !reg.destructive_hint,
-        "stellar_toolset_invoke: destructive_hint must be false (all routable matrix tools are non-destructive)"
+        reg.destructive_hint,
+        "stellar_toolset_invoke: destructive_hint must be true (its signing actions route to the signing commit tools)"
     );
     assert!(
-        reg.read_only_hint,
-        "stellar_toolset_invoke: read_only_hint must be true (outer gate; routed tool determines actual mutability)"
+        !reg.read_only_hint,
+        "stellar_toolset_invoke: read_only_hint must be false (its signing actions route to the signing commit tools)"
     );
     assert!(
         !reg.chain_id_required,

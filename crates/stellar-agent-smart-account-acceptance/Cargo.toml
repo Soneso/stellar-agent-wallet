@@ -38,6 +38,7 @@ testnet-integration = [
     "dep:stellar-agent-sep48",
     "dep:stellar-agent-smart-account",
     "dep:stellar-agent-test-support",
+    "dep:stellar-agent-toolsets-install",
     "dep:stellar-agent-webauthn-bridge",
     "dep:stellar-baselib",
     "dep:stellar-rpc-client",
@@ -93,6 +94,9 @@ url = { workspace = true, optional = true }
 stellar-agent-mcp = { workspace = true, optional = true, features = ["test-helpers"] }
 keyring-core = { workspace = true, optional = true }
 rmcp = { workspace = true, optional = true }
+# Writes the read-rules toolset the MCP dispatch leg invokes, as an install
+# leaves it: the manifest and its record tagged under the suite's pin key.
+stellar-agent-toolsets-install = { workspace = true, optional = true, features = ["test-helpers"] }
 # Serializes the suite's use of the process-global mock keyring store.
 serial_test = { workspace = true, optional = true }
 # CAP-85 external-reference suite: the SEP-48 spec fetch, the DeFi sign-time

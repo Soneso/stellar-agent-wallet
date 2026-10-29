@@ -102,8 +102,7 @@ use stellar_agent_core::profile::owner_key;
 use stellar_agent_core::{
     audit_log::binding::{AuditBinding, BindingCheck, BindingHistory, RecordedBinding},
     audit_log::tip_anchor::{
-        KeyedAuditAccess, TipAnchor, TipAnchorStore, TipAnchorStoreError,
-        reanchor_count_account_for_digest, tip_anchor_account_for_digest,
+        AuditKeyringEntries, KeyedAuditAccess, TipAnchor, TipAnchorStore, TipAnchorStoreError,
     },
     error::{AuthError, InternalError, NetworkError, ValidationError, WalletError},
     observability::redact_strkey_first5_last5,
@@ -378,6 +377,7 @@ pub fn read_rpc_credential(entry: &KeyringEntryRef) -> Result<Zeroizing<String>,
 ///
 /// # Errors
 ///
+/// - [`ValidationError::InstallationKeyCoordinate`] for the reserved service.
 /// - [`NetworkError::RpcCredentialInvalid`] when the value breaks the value
 ///   rules; nothing is written.
 /// - The keyring codes of a failed write.
@@ -385,6 +385,7 @@ pub fn write_rpc_credential(
     entry: &KeyringEntryRef,
     value: &Zeroizing<String>,
 ) -> Result<(), WalletError> {
+    owner_key::refuse_installation_key_coordinate(entry, "rpc_credential")?;
     let label = rpc_credential_label(entry);
     check_rpc_credential_value(value).map_err(|reason| {
         WalletError::Network(NetworkError::RpcCredentialInvalid {
@@ -469,16 +470,18 @@ fn install_platform_store(
 ///
 /// # Errors
 ///
+/// Returns [`ValidationError::InstallationKeyCoordinate`] for the reserved service.
 /// Returns [`WalletError`] when the keyring entry cannot be opened or updated.
 /// Operator-visible errors are mapped through the same secret-safe keyring
 /// error discipline as signing-key lookups.
 pub fn rotate_keyring_secret_32(service: &str, entry_name: &str) -> Result<(), WalletError> {
+    let entry_ref = KeyringEntryRef::new(service, entry_name);
+    owner_key::refuse_installation_key_coordinate(&entry_ref, "keyring_coordinate")?;
     let mut raw = Zeroizing::new([0u8; 32]);
     OsRng.fill_bytes(raw.as_mut());
 
     let encoded: Zeroizing<String> = Zeroizing::new(URL_SAFE_NO_PAD.encode(raw.as_ref()));
 
-    let entry_ref = KeyringEntryRef::new(service, entry_name);
     let entry = open_entry(&entry_ref)?;
     entry
         .set_password(&encoded)
@@ -518,7 +521,71 @@ pub fn load_hmac_key_32(entry_ref: &KeyringEntryRef) -> Result<Zeroizing<[u8; 32
     let secret_b64 = Zeroizing::new(entry.get_password().map_err(|e| {
         map_keyring_operation_error(&e, KeyringOperation::Read, &entry_ref.service)
     })?);
+    decode_secret_32(&secret_b64)
+}
 
+/// Reads a 32-byte secret stored in the [`rotate_keyring_secret_32`] form,
+/// reporting a never-written entry as `Ok(None)`.
+///
+/// The absent-tolerant counterpart of [`load_hmac_key_32`] for an
+/// installation-wide secret that a later operation mints, such as the toolset
+/// pin key: a reader without the secret refuses what the secret would
+/// authenticate, rather than failing on the keyring read.
+///
+/// # Errors
+///
+/// - [`WalletError`] when the keyring entry cannot be opened or read for any
+///   reason other than its absence, mapped through the secret-safe keyring
+///   error discipline.
+/// - [`WalletError::Internal`] if the stored value is not valid base64 or does
+///   not decode to exactly 32 bytes.
+pub fn read_secret_32(
+    entry_ref: &KeyringEntryRef,
+) -> Result<Option<Zeroizing<[u8; 32]>>, WalletError> {
+    let entry = open_entry(entry_ref)?;
+    match entry.get_password() {
+        Ok(value) => decode_secret_32(&Zeroizing::new(value)).map(Some),
+        Err(keyring_core::Error::NoEntry) => Ok(None),
+        Err(e) => Err(map_keyring_operation_error(
+            &e,
+            KeyringOperation::Read,
+            &entry_ref.service,
+        )),
+    }
+}
+
+/// Returns the 32-byte secret at `entry_ref`, minting and storing a fresh one
+/// only when the entry has never been written.
+///
+/// The minted secret is 32 bytes from the operating system's CSPRNG, stored
+/// in the [`rotate_keyring_secret_32`] form. Any read failure other than the
+/// entry's absence refuses and mints nothing, so a locked or unavailable
+/// keyring never replaces an existing secret. The read and the mint are not
+/// atomic against another process. Toolset installation serializes them with
+/// the installation pin-key lock in [`stellar_agent_core::profile::schema::canonical_data_root`],
+/// named by [`stellar_agent_core::profile::schema::TOOLSET_PIN_KEY_LOCK_FILE_NAME`].
+///
+/// # Errors
+///
+/// - Any error of [`read_secret_32`].
+/// - [`WalletError`] when the minted secret cannot be written.
+pub fn load_or_mint_secret_32(
+    entry_ref: &KeyringEntryRef,
+) -> Result<Zeroizing<[u8; 32]>, WalletError> {
+    if let Some(secret) = read_secret_32(entry_ref)? {
+        return Ok(secret);
+    }
+    let mut raw = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(raw.as_mut());
+    let encoded: Zeroizing<String> = Zeroizing::new(URL_SAFE_NO_PAD.encode(raw.as_ref()));
+    open_entry(entry_ref)?.set_password(&encoded).map_err(|e| {
+        map_keyring_operation_error(&e, KeyringOperation::Write, &entry_ref.service)
+    })?;
+    Ok(raw)
+}
+
+/// Decodes a `URL_SAFE_NO_PAD` secret and checks its 32-byte length.
+fn decode_secret_32(secret_b64: &str) -> Result<Zeroizing<[u8; 32]>, WalletError> {
     let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(secret_b64.as_bytes()).map_err(|e| {
         // Upstream Display strings are not forwarded to typed errors; debug only.
         tracing::debug!(error = %e, "chain-root HMAC key base64 decode failed");
@@ -563,10 +630,12 @@ pub fn load_hmac_key_32(entry_ref: &KeyringEntryRef) -> Result<Zeroizing<[u8; 32
 ///
 /// # Errors
 ///
+/// Returns [`ValidationError::InstallationKeyCoordinate`] for the reserved service.
 /// Returns [`WalletError`] when the keyring entry cannot be opened or written,
 /// mapped through the same secret-safe keyring error discipline as signing-key
 /// lookups.
 pub fn write_keyring_string(entry_ref: &KeyringEntryRef, value: &str) -> Result<(), WalletError> {
+    owner_key::refuse_installation_key_coordinate(entry_ref, "keyring_coordinate")?;
     let entry = open_entry(entry_ref)?;
     entry
         .set_password(value)
@@ -793,15 +862,12 @@ impl KeyringAuditBindingStore {
 
 /// The platform-keyring implementation of the audit log's tip anchor.
 ///
-/// Holds the two keyring coordinates the anchor for one log PATH occupies: the
-/// anchor value itself, and the monotonic counter of operator-acknowledged
-/// re-anchors beside it. Both are derived from the profile's audit-key
-/// coordinate plus the lexically normalized log path, so a repointed
-/// `audit_log_path` has coordinates of its own and never carries the old
-/// file's tip onto a new file. The audit binding refuses the repointed path
-/// until the operator acknowledges it.
+/// Holds the anchor, reanchor counter, and outbox commitment for one log path.
+/// All derive from the profile's audit-key coordinate and the lexically
+/// normalized log path. A repointed `audit_log_path` has coordinates of its own.
+/// The audit binding refuses the repointed path until the operator acknowledges it.
 ///
-/// Neither value is secret: the anchor is a count, a public chain hash, and a
+/// These values are public: the anchor is a count, a public chain hash, and a
 /// byte offset. The anchor, the re-anchor counter, and the audit binding live
 /// in the keyring, outside the log file. Anyone who can restore the keyring's
 /// own storage together with the log can restore an older state. With a
@@ -834,22 +900,15 @@ impl KeyringTipAnchorStore {
     /// an [`AuditBinding`] records it.
     #[must_use]
     pub fn for_path_digest(audit_key_ref: &KeyringEntryRef, path_sha256: &[u8; 32]) -> Self {
+        let AuditKeyringEntries {
+            tip_anchor,
+            reanchor_counter,
+            outbox_state,
+        } = AuditKeyringEntries::for_path_digest(audit_key_ref, path_sha256);
         Self {
-            anchor_ref: KeyringEntryRef::new(
-                audit_key_ref.service.clone(),
-                tip_anchor_account_for_digest(&audit_key_ref.account, path_sha256),
-            ),
-            outbox_ref: KeyringEntryRef::new(
-                audit_key_ref.service.clone(),
-                stellar_agent_core::audit_log::outbox_state_account_for_digest(
-                    &audit_key_ref.account,
-                    path_sha256,
-                ),
-            ),
-            counter_ref: KeyringEntryRef::new(
-                audit_key_ref.service.clone(),
-                reanchor_count_account_for_digest(&audit_key_ref.account, path_sha256),
-            ),
+            anchor_ref: tip_anchor,
+            counter_ref: reanchor_counter,
+            outbox_ref: outbox_state,
         }
     }
 
@@ -2251,6 +2310,69 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn load_or_mint_mints_once_and_refuses_other_errors() {
+        keyring_mock::install().expect("mock store");
+        let entry_ref = KeyringEntryRef::new("stellar-agent-network-mint-test", "pin-key");
+
+        let minted = load_or_mint_secret_32(&entry_ref).expect("first call mints");
+        let stored = read_secret_32(&entry_ref)
+            .expect("read ok")
+            .expect("the minted secret is stored");
+        assert!(*minted == *stored, "the stored secret is the minted one");
+        let again = load_or_mint_secret_32(&entry_ref).expect("second call reads");
+        assert!(*minted == *again, "a second call returns the same secret");
+
+        let absent = KeyringEntryRef::new("stellar-agent-network-mint-test", "locked");
+        keyring_mock::inject_error(
+            &absent.service,
+            &absent.account,
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other("locked"))),
+        )
+        .unwrap();
+        let err = load_or_mint_secret_32(&absent).unwrap_err();
+        assert_ne!(err.category(), ErrorCategory::Internal, "{err:?}");
+        let entry = KeyringEntry::new(&absent.service, &absent.account).unwrap();
+        assert!(
+            matches!(entry.get_password(), Err(keyring_core::Error::NoEntry)),
+            "a refused read must mint nothing"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn read_secret_32_reports_absence_as_none() {
+        keyring_mock::install().expect("mock store");
+        let entry_ref = KeyringEntryRef::new("stellar-agent-network-read-secret", "pin-key");
+        assert!(read_secret_32(&entry_ref).expect("absence is ok").is_none());
+
+        rotate_keyring_secret_32(&entry_ref.service, &entry_ref.account).expect("rotation ok");
+        let read = read_secret_32(&entry_ref)
+            .expect("read ok")
+            .expect("present");
+        let loaded = load_hmac_key_32(&entry_ref).expect("load ok");
+        assert!(*read == *loaded, "both readers decode the same secret");
+
+        KeyringEntry::new(&entry_ref.service, &entry_ref.account)
+            .unwrap()
+            .set_password(&URL_SAFE_NO_PAD.encode([0u8; 16]))
+            .unwrap();
+        let err = read_secret_32(&entry_ref).unwrap_err();
+        assert_eq!(err.category(), ErrorCategory::Internal);
+
+        keyring_mock::inject_error(
+            &entry_ref.service,
+            &entry_ref.account,
+            keyring_core::Error::PlatformFailure(Box::new(std::io::Error::other("locked"))),
+        )
+        .unwrap();
+        assert!(
+            read_secret_32(&entry_ref).is_err(),
+            "a read failure is not absence"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn load_hmac_key_32_rejects_non_32_byte_secret() {
         keyring_mock::install().expect("mock store");
         let entry_ref = KeyringEntryRef::new("stellar-agent-network-load-hmac-bad-len", "default");
@@ -3383,5 +3505,47 @@ mod tests {
                 "327807a06a5d845937759fdf5b37e4cda3e5645414d24386163c4705836da4d9"
             );
         }
+    }
+
+    fn assert_installation_write_refused(
+        write: impl Fn(&KeyringEntryRef) -> Result<(), WalletError>,
+    ) {
+        for service in ["stellar-agent-toolsets", "StElLaR-AgEnT-ToOlSeTs"] {
+            for account in ["pin-key", "another-account"] {
+                for initial in [None, Some("untouched")] {
+                    keyring_mock::install().unwrap();
+                    let coordinate = KeyringEntryRef::new(service, account);
+                    let entry = keyring_core::Entry::new(service, account).unwrap();
+                    if let Some(value) = initial {
+                        entry.set_password(value).unwrap();
+                    }
+                    let error = write(&coordinate).unwrap_err();
+                    assert_eq!(error.code(), "validation.installation_key_coordinate");
+                    assert_eq!(entry.get_password().ok().as_deref(), initial);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rotate_keyring_secret_32_refuses_installation_service() {
+        assert_installation_write_refused(|entry| {
+            rotate_keyring_secret_32(&entry.service, &entry.account)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_keyring_string_refuses_installation_service() {
+        assert_installation_write_refused(|entry| write_keyring_string(entry, "replacement"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_rpc_credential_refuses_installation_service() {
+        assert_installation_write_refused(|entry| {
+            write_rpc_credential(entry, &Zeroizing::new("replacement".to_owned()))
+        });
     }
 }

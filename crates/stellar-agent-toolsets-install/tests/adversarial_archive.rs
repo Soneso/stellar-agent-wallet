@@ -25,7 +25,8 @@ use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 use stellar_agent_toolsets_install::signature::build_preimage;
 use stellar_agent_toolsets_install::{
-    InstallOptions, ToolsetInstallError, install_toolset, uninstall_toolset,
+    InstallOptions, PinKey, ToolsetInstallError, install_toolset, lock_toolsets, read_pin,
+    uninstall_toolset,
 };
 use stellar_strkey::ed25519::PublicKey as StrPublicKey;
 use tempfile::TempDir;
@@ -149,6 +150,20 @@ fn make_trust_setup() -> (SigningKey, [u8; 32], std::path::PathBuf, TempDir) {
     (sk, pk, trust_path, tmp)
 }
 
+/// The pin key every install in this suite writes its record under.
+fn test_pin_key() -> PinKey {
+    PinKey::from_bytes(zeroize::Zeroizing::new([0x5a; 32]))
+}
+
+/// Runs [`uninstall_toolset`] under a freshly taken lock of `toolsets_root`.
+fn uninstall_locked(
+    package: &str,
+    toolsets_root: &std::path::Path,
+) -> Result<(), ToolsetInstallError> {
+    let lock = lock_toolsets(toolsets_root)?;
+    uninstall_toolset(package, toolsets_root, &lock)
+}
+
 /// Calls [`install_toolset`] for tests that do NOT declare key-touching
 /// capabilities.  Passes `None` for attestation and a non-existent auditor
 /// trust path (the gate does not fire for non-key-touching toolsets, so the
@@ -169,6 +184,7 @@ fn install_no_attestation(
     options: &InstallOptions,
 ) -> Result<(), ToolsetInstallError> {
     let auditor_trust_path = trust_path.with_file_name("auditor-trust.txt");
+    let lock = lock_toolsets(toolsets_root)?;
     install_toolset(
         package,
         version,
@@ -181,6 +197,8 @@ fn install_no_attestation(
         None,
         &auditor_trust_path,
         options,
+        &lock,
+        &test_pin_key(),
     )
     .map(|_outcome| ())
 }
@@ -213,6 +231,7 @@ fn install_expecting_err(
     // capability), so the attestation gate does not fire.  The auditor trust
     // path is kept adjacent to the publisher trust file but will not be read.
     let auditor_trust_path = trust_path.with_file_name("auditor-trust.txt");
+    let lock = lock_toolsets(toolsets_root).unwrap();
     install_toolset(
         package,
         version,
@@ -225,6 +244,8 @@ fn install_expecting_err(
         None,
         &auditor_trust_path,
         &opts,
+        &lock,
+        &test_pin_key(),
     )
     .unwrap_err()
 }
@@ -876,7 +897,7 @@ fn uninstall_removes_dir_and_pin() {
             .exists()
     );
 
-    uninstall_toolset("my-toolset", &toolsets_root).unwrap();
+    uninstall_locked("my-toolset", &toolsets_root).unwrap();
 
     assert!(!toolsets_root.join("my-toolset").exists());
 }
@@ -889,7 +910,7 @@ fn uninstall_absent_returns_not_installed() {
     let toolsets_root = tmp.path().join("toolsets");
     std::fs::create_dir_all(&toolsets_root).unwrap();
 
-    let err = uninstall_toolset("my-toolset", &toolsets_root).unwrap_err();
+    let err = uninstall_locked("my-toolset", &toolsets_root).unwrap_err();
     assert!(
         matches!(err, ToolsetInstallError::NotInstalled { .. }),
         "expected NotInstalled, got: {err:?}"
@@ -962,15 +983,16 @@ fn valid_install_end_to_end() {
         "pin record must be written after install"
     );
 
-    let pin: stellar_agent_toolsets_install::ToolsetPinRecord =
-        serde_json::from_str(&std::fs::read_to_string(&pin_path).unwrap()).unwrap();
+    let pin = read_pin("my-toolset", &toolsets_root, Some(&test_pin_key()))
+        .unwrap()
+        .expect("the record must verify under the install key");
     assert_eq!(pin.package, "my-toolset");
     assert_eq!(pin.version, "1.0.0");
     assert_eq!(pin.shasum, shasum);
 
     // The pin must record the SHA-256 of the extracted TOOLSET.md so the dispatch
     // path can detect later manifest tampering.  Assert it is present and equals
-    // the digest of the bytes actually on disk (not None, not a stale value).
+    // the digest of the bytes actually on disk.
     let on_disk_toolset_md =
         std::fs::read(toolsets_root.join("my-toolset").join("TOOLSET.md")).unwrap();
     let expected_toolset_md_shasum = {
@@ -979,8 +1001,7 @@ fn valid_install_end_to_end() {
         hex::encode(h.finalize())
     };
     assert_eq!(
-        pin.toolset_md_shasum,
-        Some(expected_toolset_md_shasum),
+        pin.toolset_md_shasum, expected_toolset_md_shasum,
         "pin must record the SHA-256 of the extracted TOOLSET.md for tamper detection"
     );
 }
@@ -1182,37 +1203,40 @@ fn char_device_entry_rejected() {
 #[cfg(unix)]
 #[test]
 fn uninstall_with_symlink_toolset_dir_refuses() {
-    use stellar_agent_toolsets_install::uninstall_toolset;
-
-    let tmp = TempDir::new().unwrap();
+    let (sk, pk, trust_path, tmp) = make_trust_setup();
     let toolsets_root = tmp.path().join("toolsets");
     std::fs::create_dir_all(&toolsets_root).unwrap();
 
-    // Create a legitimate directory somewhere else.
+    let toolset_md = minimal_toolset_md("my-toolset");
+    let pkg_bytes = make_valid_tar_gz("my-toolset", &toolset_md);
+    let (sig, shasum) = sign_package("my-toolset", "1.0.0", &pkg_bytes, &sk);
+    install_no_attestation(
+        "my-toolset",
+        "1.0.0",
+        &pkg_bytes,
+        &shasum,
+        &sig,
+        &pk,
+        &toolsets_root,
+        &trust_path,
+        &InstallOptions::default(),
+    )
+    .unwrap();
+
+    // Move the installed directory, record included, elsewhere and place a
+    // symlink at toolsets_root/my-toolset pointing at it.
     let real_dir = tmp.path().join("real-toolset-dir");
-    std::fs::create_dir_all(&real_dir).unwrap();
-
-    // Place a symlink at toolsets_root/my-toolset → real-toolset-dir.
     let symlink_path = toolsets_root.join("my-toolset");
+    std::fs::rename(&symlink_path, &real_dir).unwrap();
     std::os::unix::fs::symlink(&real_dir, &symlink_path).unwrap();
-
-    // Write a pin record (directly, bypassing the install flow).
-    // ToolsetPinRecord is #[non_exhaustive]; construct via JSON serialisation.
-    let pkg_dir = toolsets_root.join("my-toolset");
-    // The pin path is inside the symlink destination, but we write via the link.
-    std::fs::create_dir_all(&pkg_dir).unwrap(); // creates inside real_dir via symlink
-    let pin_json = serde_json::json!({
-        "package": "my-toolset",
-        "version": "1.0.0",
-        "shasum": "a".repeat(64),
-        "publisher": "GABCDEFG...",
-        "installed_at": "2026-06-01T00:00:00Z"
-    });
-    let pin_path = pkg_dir.join(".stellar-agent-toolset-pin.json");
-    std::fs::write(&pin_path, serde_json::to_string(&pin_json).unwrap()).unwrap();
+    assert!(
+        symlink_path
+            .join(".stellar-agent-toolset-pin.json")
+            .is_file()
+    );
 
     // Uninstall must refuse (symlink leaf on toolset dir).
-    let err = uninstall_toolset("my-toolset", &toolsets_root).unwrap_err();
+    let err = uninstall_locked("my-toolset", &toolsets_root).unwrap_err();
     assert!(
         matches!(err, ToolsetInstallError::PinRecordMalformed { .. }),
         "expected PinRecordMalformed for symlink toolset dir, got: {err:?}"
@@ -1220,4 +1244,5 @@ fn uninstall_with_symlink_toolset_dir_refuses() {
 
     // The real directory must still exist (no deletion through symlink).
     assert!(real_dir.exists(), "real dir must not have been removed");
+    assert!(real_dir.join("TOOLSET.md").is_file());
 }

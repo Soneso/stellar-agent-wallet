@@ -4872,6 +4872,7 @@ dependencies = [
  "stellar-agent-stablecoin",
  "stellar-agent-test-support",
  "stellar-agent-toolsets",
+ "stellar-agent-toolsets-install",
  "stellar-agent-toolsets-runtime",
  "stellar-agent-x402",
  "stellar-agent-x402-identity",
@@ -5241,6 +5242,7 @@ dependencies = [
  "stellar-agent-sep48",
  "stellar-agent-smart-account",
  "stellar-agent-test-support",
+ "stellar-agent-toolsets-install",
  "stellar-agent-webauthn-bridge",
  "stellar-baselib",
  "stellar-rpc-client",
@@ -5328,6 +5330,7 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "hex",
+ "hmac 0.13.0",
  "rand_core 0.6.4",
  "semver",
  "serde",
@@ -5342,6 +5345,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -5357,6 +5361,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

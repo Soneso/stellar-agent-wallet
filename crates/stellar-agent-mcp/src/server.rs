@@ -674,6 +674,17 @@ pub struct WalletServer {
     #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) toolsets_root_override: Option<std::path::PathBuf>,
 
+    /// Test-only toolset pin key.
+    ///
+    /// `None` reads the installation's pin key from the platform keyring at
+    /// every toolset call, as production does.  Set via
+    /// [`WalletServer::set_toolset_pin_key_for_test`] so integration tests
+    /// verify the records they write without a keyring entry.
+    ///
+    /// Gated on `test-helpers` feature or `#[cfg(test)]`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) toolset_pin_key_override: Option<stellar_agent_toolsets_runtime::PinKey>,
+
     /// Test-only stand-in for the SEP-10 counterparty-identity gate of
     /// `stellar_x402_authenticated_payment`: the JWT, the subject, and the
     /// declared accounts of the session the gate would return.
@@ -897,6 +908,8 @@ impl WalletServer {
             grant_store_path_override: None,
             #[cfg(any(test, feature = "test-helpers"))]
             toolsets_root_override: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            toolset_pin_key_override: None,
             #[cfg(any(test, feature = "test-helpers"))]
             x402_identity_session_override: None,
             #[cfg(all(feature = "mainnet-write", any(test, feature = "test-helpers")))]
@@ -1238,6 +1251,15 @@ impl WalletServer {
     pub fn set_toolsets_root_for_test(&mut self, path: std::path::PathBuf) {
         self.toolsets_root_override = Some(path);
     }
+
+    /// Sets the toolset pin key the toolset tools verify install records
+    /// under, in place of the key in the platform keyring.
+    ///
+    /// Gated on `test-helpers` feature or `#[cfg(test)]`.
+    #[doc(hidden)]
+    pub fn set_toolset_pin_key_for_test(&mut self, key: stellar_agent_toolsets_runtime::PinKey) {
+        self.toolset_pin_key_override = Some(key);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1365,7 +1387,7 @@ impl ServerHandler for WalletServer {
              stellar_toolset_list (enumerate installed toolsets and their invocable \
              actions, read-only); \
              stellar_toolset_invoke (invoke a named action of an installed toolset, \
-             routed to a trusted tool through capability enforcement); \
+             routed to a trusted tool through capability enforcement, destructive); \
              stellar_rules_list (enumerate active context rules on a smart account: \
              rule_id, name, context_type_label, valid_until, signer_count, \
              policy_count, baseline (none, v1, v2, unreadable, or unknown), \

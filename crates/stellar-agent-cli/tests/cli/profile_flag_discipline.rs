@@ -665,7 +665,7 @@ fn matching_brace(bytes: &[u8], open_idx: usize) -> Option<usize> {
 #[test]
 fn from_flag_is_confined_to_explicit_argument_boundaries() {
     let allowed = [
-        ("commands/profile/enable_mainnet.rs", "run"),
+        ("commands/profile/enable_mainnet.rs", "run_with_keyring"),
         (
             "commands/profile/rotate_nonce_key.rs",
             "run_with_dependencies",
@@ -679,8 +679,14 @@ fn from_flag_is_confined_to_explicit_argument_boundaries() {
             "commands/profile/rotate_counterparty_key.rs",
             "run_with_dependencies",
         ),
-        ("commands/profile/rotate_policy_state_key.rs", "run"),
-        ("commands/profile/reset_window_state.rs", "run"),
+        (
+            "commands/profile/rotate_policy_state_key.rs",
+            "run_with_dependencies",
+        ),
+        (
+            "commands/profile/reset_window_state.rs",
+            "run_with_dependencies",
+        ),
         ("commands/profile/reset_mpp_state.rs", "run"),
         ("commands/fees/stats.rs", "resolve_rpc_url"),
         ("commands/mpp.rs", "prune"),

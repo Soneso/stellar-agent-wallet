@@ -36,9 +36,16 @@
 //!    proof that no gated tool is reachable via the ungated path). Asserted by
 //!    `gated_matrix_entries_subset_of_signing_denylist`.
 //!
-//! Inventory-based checks (invariants 2, 3, 4, 8 above) require the full MCP
-//! tool inventory at link time and therefore live in the MCP server's
-//! integration suite once that crate is added.
+//! ### Denylist completeness
+//!
+//! 10. Every registry tool with `destructive_hint == true` is in
+//!     `SIGNING_DENYLIST` (the converse of invariant 4: a destructive tool
+//!     cannot be added to the registry without being denied to the ungated
+//!     tier). Asserted by `every_destructive_registry_tool_is_in_the_denylist`.
+//!
+//! Inventory-based checks (invariants 2, 3, 4, 8 and 10 above) require the
+//! full MCP tool inventory at link time and therefore live in the MCP server's
+//! integration suite.
 //!
 //! **Adding a new tool to the ungated matrix requires:**
 //! - Confirming it is NOT a signing/key/policy-mutation tool.
@@ -259,21 +266,29 @@ pub fn gated_grants_for_capability(cap: Capability) -> Option<&'static [&'static
 /// Explicit by-name denylist of signing, key-derivation, policy-mutation, and
 /// reflexive-escalation tools.
 ///
-/// These tools MUST NOT appear in any grant set. Their presence is a
-/// compile-time invariant verified by the `matrix_and_denylist_are_disjoint`
-/// test.
+/// These tools MUST NOT appear in any grant set. Their absence from every
+/// grant set is verified by the `matrix_and_denylist_are_disjoint` test.
 ///
-/// The denylist also includes the generic dispatcher's own tools
-/// (`stellar_toolset_list`, `stellar_toolset_invoke`) to prevent reflexive
-/// escalation — a toolset must not be able to invoke the toolset dispatcher itself.
+/// ## Rule
+///
+/// The denylist holds:
+/// - every registry tool annotated `destructive_hint = true`;
+/// - every tool that reaches a signer, destructive or not (the SEP-43 and
+///   SEP-53 bare-sign tools return a signature without submitting);
+/// - the generic dispatcher's own tools (`stellar_toolset_list`,
+///   `stellar_toolset_invoke`), so a toolset cannot invoke the dispatcher
+///   itself.
+///
+/// The MCP server's `every_destructive_registry_tool_is_in_the_denylist` test
+/// checks the first part against the live registry.
 ///
 /// ## Maintenance rule
 ///
-/// When adding a new signing/key/policy MCP tool:
+/// When adding a new destructive or signing MCP tool:
 /// 1. Add it to this list.
 /// 2. Verify it is NOT in any grant array above.
-/// 3. Run `cargo test -p stellar-agent-toolsets-runtime` to confirm the invariant
-///    tests pass.
+/// 3. Run `cargo test -p stellar-agent-toolsets-runtime` and the MCP server's
+///    `toolsets_matrix_invariants` suite to confirm the invariant tests pass.
 pub const SIGNING_DENYLIST: &[&str] = &[
     // SEP-43 signing tools
     "stellar_sep43_sign_transaction",
@@ -286,11 +301,19 @@ pub const SIGNING_DENYLIST: &[&str] = &[
     "stellar_pay_commit",
     "stellar_create_account_commit",
     "stellar_claim_commit",
+    "stellar_trustline_commit",
     // Agent-proposed context-rule commit (sign+submit) tool
     "stellar_rule_create_commit",
-    // x402 tools (default-exclude: confirm at impl whether each reaches a signer)
+    // MPP charge commit (signs a payment credential)
+    "stellar_mpp_charge_commit",
+    // DeFi tools (each signs and submits a transaction)
+    "stellar_dex_trade",
+    "stellar_defindex_vault_deposit",
+    "stellar_defindex_vault_withdraw",
+    // Testnet account funding (destructive network write)
+    "stellar_friendbot",
+    // x402 payment tools (each builds and signs a payment)
     "stellar_x402_create_payment",
-    "stellar_x402_parse_receipt",
     "stellar_x402_authenticated_payment",
     // Generic toolset dispatcher tools (no reflexive escalation)
     "stellar_toolset_list",

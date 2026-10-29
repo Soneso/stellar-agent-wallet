@@ -96,8 +96,8 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 | `stellar-agent-sep53` | SEP-53 prefixed message sign and verify over ed25519. |
 | `stellar-agent-anchor` | Privacy-first anchor client: SEP-6 `/info` discovery and SEP-24 interactive-URL hand-off with same-domain SSRF bind; never opens or follows the URL. |
 | `stellar-agent-toolsets` | `TOOLSET.md` format parse, capability-manifest validation, and the pre-canonicalisation argument-validation guard; format and parse substrate only. |
-| `stellar-agent-toolsets-install` | Toolset install and uninstall with hash verification, ed25519 publisher signature and trust set, safe tar extraction, attestation gate, and atomic pin record. |
-| `stellar-agent-toolsets-runtime` | Capability-to-tool matrix, gated resolver, signing denylist, and the enforcement forming the toolset isolation boundary. |
+| `stellar-agent-toolsets-install` | Toolset install and uninstall with hash verification, ed25519 publisher signature and trust set, safe tar extraction, attestation gate, toolsets directory lock, and an atomic pin record authenticated by an HMAC under the installation's pin key. |
+| `stellar-agent-toolsets-runtime` | Capability-to-tool matrix, gated resolver, signing denylist, pin and manifest-digest verification, and the enforcement bounding what the toolset dispatcher routes (not the server's native tools). |
 | `stellar-agent-defi` | DeFi-adapter substrate: contract-pin framework, the typed-preview trait, and the dispatch-verb seam (`lend`/`trade`/`vault`/`bridge`); ships no live verb. |
 | `stellar-agent-defindex` | DeFindex vault adapter: typed deposit and withdraw with mandatory `min_out`, role disclosure, upgradable-flag refusal gate; drives the `vault` verb. |
 | `stellar-agent-dex` | Soroswap router-direct swap adapter with absolute `amount_out_min`, pre-sign slippage re-verify, token canonicalisation, bounded deadline, venue allowlist and router pin; drives `trade`/`quote`. |

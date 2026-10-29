@@ -9,7 +9,7 @@ use stellar_agent_toolsets_install::ToolsetInstallError;
 ///
 /// This constant MUST be updated whenever a variant is added or removed.
 /// The test below asserts this constant matches the actual variant count.
-const EXPECTED_VARIANT_COUNT: usize = 30;
+const EXPECTED_VARIANT_COUNT: usize = 32;
 
 /// Exercises every variant by constructing it and asserting the Display output
 /// does not panic.  This also acts as a compile-time coverage check — if a
@@ -82,6 +82,10 @@ fn all_variants_covered_and_display_non_panicking() {
         ToolsetInstallError::PinRecordMalformed {
             detail: "invalid name".to_owned(),
         },
+        ToolsetInstallError::PinRecordUnverifiable {
+            package: "my-toolset".to_owned(),
+        },
+        ToolsetInstallError::Busy,
         ToolsetInstallError::ToolsetsRootInvalid {
             detail: "toolsets root is a symlink".to_owned(),
         },

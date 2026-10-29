@@ -54,7 +54,10 @@ use stellar_agent_toolsets::ToolsetFormatError;
 /// | `AlreadyInstalled` | Toolset is already installed and `--force` was not supplied. |
 /// | `VersionDowngrade` | `--force` reinstall would downgrade the version; requires `--allow-downgrade`. |
 /// | `NotInstalled` | Uninstall requested for a toolset that is not installed. |
-/// | `PinRecordMalformed` | Stored pin record is invalid (bad name, escaping path, or symlink target) during uninstall. |
+/// | `PinRecordMalformed` | Stored pin record does not parse, names another package, or carries a malformed digest; or the uninstall path escapes the root or is a symlink. |
+/// | `PinRecordUnverifiable` | Stored pin record carries no valid tag under the installation's pin key. |
+/// | `PinKeyBusy` | Another install holds the installation pin-key lock. |
+/// | `Busy` | Another process holds the toolsets directory lock. |
 /// | `ToolsetsRootInvalid` | The toolsets root directory itself is a symlink leaf (install-time check). |
 /// | `AttestationRequired` | Toolset declares a key-touching capability but no attestation was supplied and `override_attestation` is `false`. |
 /// | `AttestationInvalid` | Attestation signature fails `verify_strict`, or `auditor_pubkey` is not a valid ed25519 point. |
@@ -296,15 +299,47 @@ pub enum ToolsetInstallError {
 
     /// The stored pin record is invalid.
     ///
-    /// Triggered during uninstall when the pin record's `package` name fails
-    /// validation or the reconstructed path escapes the toolsets root or resolves
-    /// to a symlink.  NOT used for install-time toolsets-root checks; see
+    /// Triggered when the pin file is not a pin record (not JSON, or a field
+    /// this build does not know), when a verified record names a package other
+    /// than the one it is stored under, or when its `TOOLSET.md` digest is not
+    /// 64 lowercase hex characters; and during uninstall when the toolset
+    /// directory path escapes the toolsets root or is a symlink.  NOT used for
+    /// install-time toolsets-root checks; see
     /// [`ToolsetInstallError::ToolsetsRootInvalid`] for those.
     #[error("pin record malformed: {detail}")]
     PinRecordMalformed {
         /// Sanitised description of the malformed field.
         detail: String,
     },
+
+    /// The stored pin record does not verify under the installation's pin key.
+    ///
+    /// The record has no tag, is of another format version, lacks its
+    /// `TOOLSET.md` digest, was written under another key, was edited after
+    /// the install, or no pin key is available.  Its contents are not
+    /// trusted, so the toolset is refused until it is uninstalled and
+    /// installed again.
+    #[error(
+        "pin record unverifiable: the install record of '{package}' does not verify; \
+         uninstall the toolset and install it again"
+    )]
+    PinRecordUnverifiable {
+        /// Package name (validated `[a-z0-9-]`).
+        package: String,
+    },
+
+    /// Another process holds the toolsets directory lock.
+    ///
+    /// Install and uninstall take the lock for their whole run; the lock
+    /// stayed held through every retry.
+    #[error(
+        "toolsets directory busy: another install or uninstall holds its lock; retry when it finishes"
+    )]
+    Busy,
+
+    /// Another install holds the installation pin-key lock through every retry.
+    #[error("another toolset install holds the installation pin-key lock")]
+    PinKeyBusy,
 
     /// The toolsets root directory is invalid at install time.
     ///

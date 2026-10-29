@@ -588,25 +588,23 @@ fn result_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
     serde_json::from_str(text).expect("tool result text must be valid JSON")
 }
 
-/// Writes a toolset pin file declaring only the `read-rules` capability.
-fn write_read_rules_toolset_pin(toolsets_root: &Path, toolset_name: &str, publisher_g: &str) {
-    let toolset_dir = toolsets_root.join(toolset_name);
-    std::fs::create_dir_all(&toolset_dir).expect("create toolset dir");
-    let pin_json = serde_json::json!({
-        "package": toolset_name,
-        "version": "1.0.0",
-        "shasum": "a".repeat(64),
-        "publisher": publisher_g,
-        "installed_at": "2026-07-05T00:00:00Z",
-        "capabilities": ["read-rules"],
-        "allowed_tools": []
-    });
-    let pin_path = toolset_dir.join(".stellar-agent-toolset-pin.json");
-    std::fs::write(
-        &pin_path,
-        serde_json::to_string_pretty(&pin_json).expect("serialise pin"),
+/// The pin key the suite tags its toolset record under and hands the server.
+fn toolset_pin_key() -> stellar_agent_toolsets_install::PinKey {
+    stellar_agent_toolsets_install::PinKey::from_bytes(Zeroizing::new([0x5a; 32]))
+}
+
+/// Writes a toolset declaring only the `read-rules` capability, as an install
+/// leaves it, with its record tagged under [`toolset_pin_key`].
+fn write_read_rules_toolset_pin(toolsets_root: &Path, toolset_name: &str) {
+    stellar_agent_toolsets_install::write_toolset_for_test(
+        toolsets_root,
+        toolset_name,
+        &["read-rules"],
+        &[],
+        "2026-07-05T00:00:00Z",
+        &toolset_pin_key(),
     )
-    .expect("write pin");
+    .expect("write toolset");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1013,6 +1011,7 @@ async fn policy_observability_full_flow_testnet_acceptance() {
     let mut server = WalletServer::new(mcp_profile).expect("WalletServer::new");
     server.set_approval_dir_for_test(approval_dir.path().to_path_buf());
     server.set_toolsets_root_for_test(toolsets_dir.path().to_path_buf());
+    server.set_toolset_pin_key_for_test(toolset_pin_key());
 
     let get_result = server
         .call_stellar_rules_get(StellarRulesGetArgs {
@@ -1105,7 +1104,7 @@ async fn policy_observability_full_flow_testnet_acceptance() {
 
     // Toolset-grant assertion: a toolset declaring ONLY read-rules resolves
     // and dispatches stellar_rules_get end-to-end through check_toolset_action.
-    write_read_rules_toolset_pin(toolsets_dir.path(), "policy-obs-read-rules", &operator_g);
+    write_read_rules_toolset_pin(toolsets_dir.path(), "policy-obs-read-rules");
     let toolset_invoke_result = server
         .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
             toolset: "policy-obs-read-rules".to_owned(),
