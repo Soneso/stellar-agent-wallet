@@ -28,21 +28,19 @@
 //! `AuditWriter::rotate` is safe against a concurrent second writer: no other
 //! process can ever hold the writer role while the current one is rotating.
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::Path;
 
 use super::writer::WriterError;
+use crate::file_lock::HeldFileLock;
 
 /// An exclusive OFD/handle advisory lock over an audit-log writer's sidecar
 /// lock file.
 ///
-/// Acquired via [`AuditWriterLock::acquire`]; held until dropped. The
-/// underlying lock file is kept open — the kernel/OS releases the advisory
-/// lock when the file descriptor/handle closes (i.e. when [`AuditWriterLock`]
-/// drops).
+/// Acquired via [`AuditWriterLock::acquire`]; explicitly unlocked when the guard drops.
 pub struct AuditWriterLock {
-    /// The open lock file. Closing it (on drop) releases the lock.
-    _file: File,
+    /// The guard explicitly releases the lock on drop.
+    _file: HeldFileLock,
 }
 
 impl std::fmt::Debug for AuditWriterLock {
@@ -87,7 +85,7 @@ impl AuditWriterLock {
         // Acquire the lock BEFORE any content check — a pre-lock check is a
         // TOCTOU race (see CacheLock::acquire / WindowStoreLock::acquire for
         // the identical rationale).
-        file.try_lock().map_err(|e| match e {
+        let file = HeldFileLock::try_lock(file).map_err(|e| match e {
             std::fs::TryLockError::WouldBlock => WriterError::FileLocked,
             std::fs::TryLockError::Error(io_err) => WriterError::Io(io_err),
         })?;
@@ -106,6 +104,26 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_audit_writer_unlocks_with_a_duplicate_descriptor_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.lock");
+        let guard = AuditWriterLock::acquire(&path).unwrap();
+        let duplicate = guard._file.try_clone_file().unwrap();
+        assert!(matches!(
+            AuditWriterLock::acquire(&path),
+            Err(WriterError::FileLocked)
+        ));
+        drop(guard);
+        let _next = AuditWriterLock::acquire(&path).unwrap();
+        drop(duplicate);
+        assert!(matches!(
+            AuditWriterLock::acquire(&path),
+            Err(WriterError::FileLocked)
+        ));
+    }
 
     #[test]
     fn acquire_creates_lock_file() {

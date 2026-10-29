@@ -3,7 +3,7 @@
 use std::{
     collections::HashSet,
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::Write as _,
     path::{Path, PathBuf},
 };
@@ -14,6 +14,7 @@ use sha2::{Digest as _, Sha256};
 use stellar_agent_core::{
     audit_log::{AuditEntry, AuditWriterRegistry, BindingCheck},
     error::{ValidationError, WalletError},
+    file_lock::HeldFileLock,
     profile::owner_key::{self, OwnerKeyContext},
     profile::schema::{KeyringEntryRef, Profile, canonical_data_root, intent_account},
 };
@@ -70,7 +71,8 @@ pub struct MppStateReset {
 }
 
 struct StoreLock {
-    _file: File,
+    /// The guard explicitly releases the lock on drop.
+    _file: HeldFileLock,
 }
 
 /// Per-profile durable MPP authorization store.
@@ -238,8 +240,8 @@ impl MppAuthorizationStore {
         })
     }
 
-    /// Tests inject a temporary path so isolated unit runs cannot reach the
-    /// operator's data root when core's home override is compiled out.
+    /// Tests inject a temporary path so unit runs never reach the operator's
+    /// data root.
     fn open_for_read_audited_at(
         path: PathBuf,
         entry_ref: &KeyringEntryRef,
@@ -436,7 +438,7 @@ impl MppAuthorizationStore {
             Err(_) => return Err(state_error()),
         }
         #[cfg(unix)]
-        File::open(store.path.parent().ok_or_else(state_error)?)
+        fs::File::open(store.path.parent().ok_or_else(state_error)?)
             .and_then(|parent| parent.sync_all())
             .map_err(|_error| state_error())?;
         write_generation(&store.generation_entry, 0)?;
@@ -1013,7 +1015,7 @@ impl MppAuthorizationStore {
             .truncate(false)
             .open(path)
             .map_err(|_error| state_error())?;
-        file.try_lock().map_err(|_error| state_error())?;
+        let file = HeldFileLock::try_lock(file).map_err(|_error| state_error())?;
         Ok(StoreLock { _file: file })
     }
 
@@ -1168,7 +1170,7 @@ impl MppAuthorizationStore {
             .map_err(|_error| state_error())?;
         #[cfg(unix)]
         if let Some(parent) = self.path.parent() {
-            File::open(parent)
+            fs::File::open(parent)
                 .and_then(|directory| directory.sync_all())
                 .map_err(|_error| state_error())?;
         }
@@ -1513,14 +1515,9 @@ const fn replay_error() -> MppError {
 ///
 /// # Why the quadrant tests drive the seam
 ///
-/// They call [`MppAuthorizationStore::open_for_read_at`] with a `TempDir`
-/// path rather than [`MppAuthorizationStore::open_for_read`]. Under
-/// `cargo test -p stellar-agent-mpp --lib store::tests::` — which is exactly
-/// how the `windows-storage` CI job runs them — `stellar-agent-core` is built
-/// as a plain dependency, so `canonical_data_root`'s `STELLAR_AGENT_HOME`
-/// override is compiled out and the public entry point would read and write
-/// the operator's real data root. No feature unification in that invocation
-/// changes it.
+/// The quadrant tests call [`MppAuthorizationStore::open_for_read_at`] with
+/// explicit `TempDir` paths. Their storage fixtures stay isolated from process
+/// environment settings and the host data root.
 #[cfg(test)]
 pub(crate) mod tests {
     #![allow(
@@ -2884,6 +2881,24 @@ pub(crate) mod tests {
         store.ensure_parent().expect("parent");
         fs::write(path, [0_u8; HMAC_TAG_BYTES - 1]).expect("truncated file");
         assert!(store.read_verified().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_store_unlocks_with_a_duplicate_descriptor_alive() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = MppAuthorizationStore::at_path(
+            dir.path().join("state"),
+            [7; 32],
+            KeyringEntryRef::new("mpp-lock-test", "generation"),
+        );
+        let guard = store.acquire_lock().expect("store lock");
+        let duplicate = guard._file.try_clone_file().expect("duplicate descriptor");
+        assert!(store.acquire_lock().is_err());
+        drop(guard);
+        let _next = store.acquire_lock().expect("store lock");
+        drop(duplicate);
+        assert!(store.acquire_lock().is_err());
     }
 
     #[test]

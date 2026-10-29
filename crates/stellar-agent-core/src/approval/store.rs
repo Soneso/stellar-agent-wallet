@@ -112,6 +112,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::file_lock::HeldFileLock;
+
 use super::assertion_input::{AssertionInput, validate_signature_compact};
 use super::attestation::AttestedApprover;
 use super::error::ApprovalError;
@@ -6000,10 +6002,10 @@ impl PendingApprovalStore {
 /// Holds an exclusive advisory lock on the sidecar `.lock` file.
 ///
 /// Lock is acquired via [`std::fs::File::try_lock`] (stable Rust 1.89).
-/// Released when the `LockHandle` is dropped (file descriptor closed).
+/// Explicitly unlocked when the `LockHandle` drops.
 pub(super) struct LockHandle {
-    /// Holding this `File` keeps the advisory exclusive lock active.
-    _file: File,
+    /// The guard explicitly releases the lock on drop.
+    _file: HeldFileLock,
 }
 
 impl LockHandle {
@@ -6017,8 +6019,8 @@ impl LockHandle {
     /// - [`ApprovalError::Io`] on open or lock failure.
     pub(super) fn acquire(lock_path: &Path) -> Result<Self, ApprovalError> {
         let file = open_or_create_0600(lock_path).map_err(ApprovalError::from_io)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
+        match HeldFileLock::try_lock(file) {
+            Ok(file) => Ok(Self { _file: file }),
             Err(std::fs::TryLockError::WouldBlock) => Err(ApprovalError::WriterLocked),
             Err(std::fs::TryLockError::Error(e)) => Err(ApprovalError::from_io(e)),
         }
@@ -6450,6 +6452,26 @@ mod tests {
     }
 
     // ── flock second opener ──────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_store_unlocks_with_a_duplicate_descriptor_alive() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let store = PendingApprovalStore::open(path.clone()).unwrap();
+        let duplicate = store._lock._file.try_clone_file().unwrap();
+        assert!(matches!(
+            PendingApprovalStore::open(path.clone()),
+            Err(ApprovalError::WriterLocked)
+        ));
+        drop(store);
+        let _next = PendingApprovalStore::open(path.clone()).unwrap();
+        drop(duplicate);
+        assert!(matches!(
+            PendingApprovalStore::open(path),
+            Err(ApprovalError::WriterLocked)
+        ));
+    }
 
     #[test]
     fn second_opener_returns_writer_locked() {

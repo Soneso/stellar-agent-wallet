@@ -12,11 +12,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::Args;
 use keyring_core::Entry as KeyringEntry;
 use rand_core::{OsRng, RngCore};
-use std::{
-    fs::{File, OpenOptions},
-    sync::Mutex,
-    time::Duration,
-};
+use std::{fs::OpenOptions, path::Path, sync::Mutex, time::Duration};
 use stellar_agent_core::audit_log::{entry::AuditEntry, reader::AuditReader};
 use stellar_agent_core::cross_check::CrossCheckValue;
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
@@ -24,6 +20,7 @@ use stellar_agent_core::error::FeeSource;
 use stellar_agent_core::error::{
     AuthError, InternalError, NetworkError, SubmissionError, WalletError,
 };
+use stellar_agent_core::file_lock::HeldFileLock;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::profile::schema::{
     KeyringEntryRef, PoolChannelRecord, PoolConfig, PoolInitSubmission, PoolInitialization, Profile,
@@ -136,9 +133,14 @@ fn persist(
         .map_err(|error| unavailable(format!("pool recovery state could not be saved: {error}")))
 }
 
-/// Serialises seed replacement, recovery and completion across processes.
-fn lifecycle_lock(name: &str) -> Result<File, WalletError> {
+/// Serializes seed replacement, recovery and completion across processes.
+fn lifecycle_lock(name: &str) -> Result<HeldFileLock, WalletError> {
     let dir = loader::default_profile_dir().map_err(|error| unavailable(error.to_string()))?;
+    lifecycle_lock_in_dir(name, &dir)
+}
+
+/// Takes the `<name>.pool-init.lock` file lock in `dir` for [`lifecycle_lock`] and the tests.
+fn lifecycle_lock_in_dir(name: &str, dir: &Path) -> Result<HeldFileLock, WalletError> {
     let mut options = OpenOptions::new();
     options.create(true).write(true).truncate(false);
     #[cfg(unix)]
@@ -149,9 +151,7 @@ fn lifecycle_lock(name: &str) -> Result<File, WalletError> {
     let file = options
         .open(dir.join(format!("{name}.pool-init.lock")))
         .map_err(|error| unavailable(error.to_string()))?;
-    file.try_lock()
-        .map_err(|_| unavailable("another pool initialization is running"))?;
-    Ok(file)
+    HeldFileLock::try_lock(file).map_err(|_| unavailable("another pool initialization is running"))
 }
 
 fn fresh_seed() -> Zeroizing<[u8; 64]> {
@@ -849,6 +849,31 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use stellar_agent_core::profile::schema::Profile;
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_lifecycle_lock_unlocks_with_a_duplicate_descriptor_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = lifecycle_lock_in_dir("pool-lock-test", dir.path()).unwrap();
+        let duplicate = guard.try_clone_file().unwrap();
+        assert_contended(dir.path());
+        drop(guard);
+        let _next = lifecycle_lock_in_dir("pool-lock-test", dir.path()).unwrap();
+        drop(duplicate);
+        assert_contended(dir.path());
+    }
+
+    #[cfg(unix)]
+    fn assert_contended(dir: &Path) {
+        let error = lifecycle_lock_in_dir("pool-lock-test", dir)
+            .expect_err("a held lifecycle lock excludes a second opener");
+        assert!(
+            error
+                .to_string()
+                .contains("another pool initialization is running"),
+            "{error}"
+        );
+    }
 
     /// RAII env-var guard; `#[serial]` on every test using it prevents
     /// concurrent env access.

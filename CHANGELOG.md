@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with its `AuditEntry::new_audit_outbox_loss_acknowledged` constructor, and
   `VerifyWarning` gains `OutboxLossAcknowledged`.
 
+- `stellar_agent_core::file_lock::HeldFileLock`, the guard every file-backed store lock holds: it takes the lock with `try_lock` and unlocks when it drops.
 - `stellar_agent_core::approval::GrantQuery` describes the invocation and
   installation cutoff for a verified toolset grant lookup.
   `timefmt::parse_rfc3339_utc` parses second-precision UTC install timestamps.
@@ -685,6 +686,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A file-backed store lock (approval, audit writer, window state, receipt, counterparty cache, MPP, pool initialization, headless keyring) is released when its guard drops, also while a process spawned by another thread still holds a copy of the descriptor. The next opener of the same store succeeds at once instead of reading the store as locked by another writer.
 - Interrupted MPP writes leave the committed store readable or complete on the
   next read. State reset keeps authenticated records and closes unclaimed
   charges, and a keyring or file access error refuses it without changing
