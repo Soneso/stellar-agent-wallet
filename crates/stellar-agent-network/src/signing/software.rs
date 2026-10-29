@@ -10,7 +10,10 @@ use stellar_agent_core::error::{AuthError, WalletError};
 use stellar_agent_core::wallet::LockedSeed;
 use zeroize::Zeroizing;
 
-use crate::signing::{Signer, WebAuthnAssertion};
+use crate::signing::{
+    MessagePayload, Signer, SmartAccountAuthDigest, SorobanAuthPayload, TxSigningPayload,
+    WebAuthnAssertion,
+};
 
 /// A zeroize-on-drop wrapper around a 32-byte ed25519 secret seed.
 ///
@@ -25,8 +28,7 @@ use crate::signing::{Signer, WebAuthnAssertion};
 /// The inner bytes are never accessible except through
 /// `expose_secret_for_signing` (a `pub(crate)` method), which is explicitly
 /// named to signal the narrow use case. It is called by
-/// `SoftwareSigningKey::sign_tx_payload` and `SoftwareSigningKey::public_key`
-/// only.
+/// `SoftwareSigningKey::sign_raw` and `SoftwareSigningKey::public_key` only.
 ///
 /// This type deliberately does not implement `Debug`, `Display`, `Clone`, or
 /// `Serialize` — the type system prevents the inner bytes from leaking through
@@ -44,6 +46,14 @@ use crate::signing::{Signer, WebAuthnAssertion};
 /// ```
 ///
 /// The private seed home keeps construction behind the named constructors.
+///
+/// The raw signing primitive is crate-private:
+///
+/// ```compile_fail,E0624
+/// use stellar_agent_network::SoftwareSigningKey;
+/// let key = SoftwareSigningKey::new_from_bytes([7; 32]);
+/// let _ = key.sign_raw(&[0; 32]);
+/// ```
 pub struct SoftwareSigningKey(SeedHome);
 
 enum SeedHome {
@@ -108,13 +118,27 @@ impl SoftwareSigningKey {
 
     /// Exposes the raw 32-byte secret key seed for the signing implementation.
     ///
-    /// `pub(crate)` — called by `SoftwareSigningKey::sign_tx_payload` and
+    /// `pub(crate)`: called by `SoftwareSigningKey::sign_raw` and
     /// `SoftwareSigningKey::public_key` only.
     pub(crate) fn expose_secret_for_signing(&self) -> &[u8; 32] {
         match &self.0 {
             SeedHome::Boxed(seed) => seed.expose_secret(),
             SeedHome::Locked(seed) => seed.seed(),
         }
+    }
+
+    /// Signs 32 bytes with the ed25519 secret seed: the primitive under every
+    /// typed signing method.
+    ///
+    /// Reads the seed in place from its home, boxed or locked, and builds the
+    /// dalek signing key from it; the dalek key zeroizes when it drops at the
+    /// end of the call. Crate-private: outside this crate a signature is made
+    /// only over a typed payload.
+    pub(crate) fn sign_raw(&self, bytes: &[u8; 32]) -> [u8; 64] {
+        use ed25519_dalek::{Signer as DalekSigner, SigningKey};
+
+        let signing_key = SigningKey::from_bytes(self.expose_secret_for_signing());
+        signing_key.sign(bytes).to_bytes()
     }
 }
 
@@ -135,73 +159,53 @@ const _: fn() = || {
 
 #[async_trait]
 impl Signer for SoftwareSigningKey {
-    /// Signs a 32-byte transaction hash payload using the ed25519 secret seed.
-    ///
-    /// Constructs an `ed25519_dalek::SigningKey` from the secret seed, signs
-    /// the payload, and returns the 64-byte signature.  The dalek signing key
-    /// is zeroed by its own `Drop` impl before this function returns.
+    /// Signs a SEP-23 transaction payload with the ed25519 secret seed.
     ///
     /// # Errors
     ///
-    /// This implementation does not return errors under normal use.  The seed
-    /// is always 32 bytes (enforced by type), so dalek construction cannot
-    /// fail.  The error type is `WalletError` for trait uniformity.
-    async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
-        use ed25519_dalek::{Signer as DalekSigner, SigningKey};
-
-        let seed = self.expose_secret_for_signing();
-        let signing_key = SigningKey::from_bytes(seed);
-        let signature = signing_key.sign(payload);
-        Ok(signature.to_bytes())
+    /// `network.mainnet_authorization_refused` when the mainnet binding
+    /// names another signer key.
+    async fn sign_tx_payload(&self, payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
+        payload.check_mainnet_binding(self).await?;
+        Ok(self.sign_raw(payload.as_bytes()))
     }
 
-    /// Signs a 32-byte smart-account auth-digest using the ed25519 secret seed.
-    ///
-    /// Cryptographically identical to [`SoftwareSigningKey::sign_tx_payload`];
-    /// the split is a call-site-discipline guard: smart-account auth-entry
-    /// assembly invokes this method, classic transaction signing invokes
-    /// `sign_tx_payload`. The implementations are separated rather than chained
-    /// so that each call site is auditable at the trait-dispatch level —
-    /// `sign_auth_digest` and `sign_tx_payload` resolve to distinct vtable
-    /// entries.
+    /// Signs a smart-account auth digest with the ed25519 secret seed.
     ///
     /// # Errors
     ///
     /// This implementation does not return errors under normal use; the seed
     /// is always 32 bytes (enforced by type), so dalek construction cannot fail.
     /// The error type is `WalletError` for trait uniformity.
-    async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
-        use ed25519_dalek::{Signer as DalekSigner, SigningKey};
-
-        let seed = self.expose_secret_for_signing();
-        let signing_key = SigningKey::from_bytes(seed);
-        let signature = signing_key.sign(digest);
-        Ok(signature.to_bytes())
+    async fn sign_auth_digest(
+        &self,
+        digest: &SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
+        Ok(self.sign_raw(digest.as_bytes()))
     }
 
-    /// Signs a 32-byte Soroban address-credentials auth-entry signature_payload
-    /// using the ed25519 secret seed.
-    ///
-    /// Cryptographically identical to [`SoftwareSigningKey::sign_tx_payload`]
-    /// and [`SoftwareSigningKey::sign_auth_digest`]; the split is a call-site
-    /// discipline guard. Used exclusively by the smart-account manager flow
-    /// when constructing the secondary "Delegated G-key" auth entry that OZ
-    /// smart accounts require alongside the smart-account entry.
+    /// Signs a Soroban address-credentials auth-entry payload with the
+    /// ed25519 secret seed.
     ///
     /// # Errors
     ///
-    /// Same as [`SoftwareSigningKey::sign_tx_payload`]: this implementation
-    /// does not return errors under normal use.
+    /// `network.mainnet_authorization_refused` when the mainnet binding
+    /// names another signer key.
     async fn sign_soroban_address_auth_payload(
         &self,
-        payload: &[u8; 32],
+        payload: &SorobanAuthPayload,
     ) -> Result<[u8; 64], WalletError> {
-        use ed25519_dalek::{Signer as DalekSigner, SigningKey};
+        payload.check_mainnet_binding(self).await?;
+        Ok(self.sign_raw(payload.as_bytes()))
+    }
 
-        let seed = self.expose_secret_for_signing();
-        let signing_key = SigningKey::from_bytes(seed);
-        let signature = signing_key.sign(payload);
-        Ok(signature.to_bytes())
+    /// Signs a SEP-53 message digest with the ed25519 secret seed.
+    ///
+    /// # Errors
+    ///
+    /// This implementation does not return errors under normal use.
+    async fn sign_message(&self, payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
+        Ok(self.sign_raw(payload.as_bytes()))
     }
 
     /// Software ed25519 signers cannot produce WebAuthn assertions; passkey
@@ -218,7 +222,7 @@ impl Signer for SoftwareSigningKey {
     ///   always, on every call.
     async fn sign_webauthn_assertion(
         &self,
-        _auth_digest: &[u8; 32],
+        _auth_digest: &SmartAccountAuthDigest,
         _credential_id: &[u8],
     ) -> Result<WebAuthnAssertion, WalletError> {
         Err(WalletError::Auth(AuthError::SignerKindMismatch {
@@ -257,6 +261,46 @@ impl Signer for SoftwareSigningKey {
 mod tests {
     use super::*;
     use zeroize::Zeroizing;
+
+    #[tokio::test]
+    async fn soroban_mainnet_binding_refuses_another_key() {
+        let key = SoftwareSigningKey::new_from_bytes([7; 32]);
+        let own_key = key.public_key().await.unwrap().0;
+        let bytes = [0x3c; 32];
+        let wrong = SorobanAuthPayload::bound_for_test(bytes, [0; 32]);
+        let error = key
+            .sign_soroban_address_auth_payload(&wrong)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "network.mainnet_authorization_refused");
+        for payload in [
+            SorobanAuthPayload::from_bytes_for_test(bytes),
+            SorobanAuthPayload::bound_for_test(bytes, own_key),
+        ] {
+            let signature = key
+                .sign_soroban_address_auth_payload(&payload)
+                .await
+                .unwrap();
+            assert_eq!(signature, key.sign_raw(&bytes));
+        }
+    }
+
+    #[tokio::test]
+    async fn transaction_mainnet_binding_refuses_another_key() {
+        let key = SoftwareSigningKey::new_from_bytes([7; 32]);
+        let own_key = key.public_key().await.unwrap().0;
+        let bytes = [0x3c; 32];
+        let wrong = TxSigningPayload::bound_for_test(bytes, [0; 32]);
+        let error = key.sign_tx_payload(&wrong).await.unwrap_err();
+        assert_eq!(error.code(), "network.mainnet_authorization_refused");
+        for payload in [
+            TxSigningPayload::from_bytes_for_test(bytes),
+            TxSigningPayload::bound_for_test(bytes, own_key),
+        ] {
+            let signature = key.sign_tx_payload(&payload).await.unwrap();
+            assert_eq!(signature, key.sign_raw(&bytes));
+        }
+    }
 
     #[test]
     fn new_from_bytes_roundtrip() {
@@ -325,7 +369,7 @@ mod tests {
     #[tokio::test]
     async fn sign_tx_payload_produces_64_bytes() {
         let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
-        let payload = [0xDE_u8; 32];
+        let payload = TxSigningPayload::from_bytes_for_test([0xDE_u8; 32]);
         let sig = key.sign_tx_payload(&payload).await.unwrap();
         assert_eq!(sig.len(), 64);
     }
@@ -341,30 +385,60 @@ mod tests {
     #[tokio::test]
     async fn sign_auth_digest_produces_64_bytes() {
         let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
-        let digest = [0xAD_u8; 32];
+        let digest = SmartAccountAuthDigest::from_bytes_for_test([0xAD_u8; 32]);
         let sig = key.sign_auth_digest(&digest).await.unwrap();
         assert_eq!(sig.len(), 64);
     }
 
-    /// Documents the cryptographic-identity property between the two signing
-    /// methods. Both `sign_tx_payload` and `sign_auth_digest` reach the same
-    /// underlying ed25519 primitive (identical 32-byte → 64-byte mapping per
-    /// the same secret seed), so identical 32-byte inputs MUST produce
-    /// identical 64-byte signatures. The discipline that distinguishes them
-    /// lives at the call site: smart-account auth-entry assembly invokes
-    /// `sign_auth_digest`, classic-transaction signing invokes
-    /// `sign_tx_payload`. Cross-substitution of these methods is a build-time
-    /// invariant enforced in the repository gate rules.
+    /// Every typed method signs its payload's bytes with the one ed25519
+    /// primitive: identical bytes under one seed produce identical
+    /// signatures, whichever domain type carries them. The types, not the
+    /// bytes, keep the domains apart.
     #[tokio::test]
     async fn sign_methods_are_cryptographically_identical_for_same_input() {
         let key = SoftwareSigningKey::new_from_bytes([42u8; 32]);
         let bytes = [0xC0_u8; 32];
-        let sig_tx = key.sign_tx_payload(&bytes).await.unwrap();
-        let sig_auth = key.sign_auth_digest(&bytes).await.unwrap();
+        let raw = key.sign_raw(&bytes);
         assert_eq!(
-            sig_tx, sig_auth,
-            "ed25519 is deterministic — identical 32-byte inputs must produce identical signatures regardless of trait method invoked"
+            key.sign_tx_payload(&TxSigningPayload::from_bytes_for_test(bytes))
+                .await
+                .unwrap(),
+            raw
         );
+        assert_eq!(
+            key.sign_auth_digest(&SmartAccountAuthDigest::from_bytes_for_test(bytes))
+                .await
+                .unwrap(),
+            raw
+        );
+        assert_eq!(
+            key.sign_soroban_address_auth_payload(&SorobanAuthPayload::from_bytes_for_test(bytes))
+                .await
+                .unwrap(),
+            raw
+        );
+    }
+
+    /// A message signature verifies against the SEP-53 digest of the message
+    /// under the key's public key.
+    #[tokio::test]
+    async fn sign_message_verifies_against_the_sep53_digest() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        use sha2::{Digest as _, Sha256};
+
+        let key = SoftwareSigningKey::new_from_bytes([5u8; 32]);
+        let message = b"sign me";
+        let sig_bytes = key
+            .sign_message(&MessagePayload::sep53(message))
+            .await
+            .unwrap();
+
+        let mut preimage = b"Stellar Signed Message:\n".to_vec();
+        preimage.extend_from_slice(message);
+        let digest: [u8; 32] = Sha256::digest(&preimage).into();
+        let vk = VerifyingKey::from_bytes(&key.public_key().await.unwrap().0).unwrap();
+        vk.verify(&digest, &Signature::from_bytes(&sig_bytes))
+            .expect("the message signature verifies against the SEP-53 digest");
     }
 
     #[tokio::test]
@@ -374,7 +448,10 @@ mod tests {
         let seed = [3u8; 32];
         let key = SoftwareSigningKey::new_from_bytes(seed);
         let digest = [0xAD_u8; 32];
-        let sig_bytes = key.sign_auth_digest(&digest).await.unwrap();
+        let sig_bytes = key
+            .sign_auth_digest(&SmartAccountAuthDigest::from_bytes_for_test(digest))
+            .await
+            .unwrap();
 
         let pk_strkey = key.public_key().await.unwrap();
         let vk = VerifyingKey::from_bytes(&pk_strkey.0).unwrap();
@@ -394,7 +471,7 @@ mod tests {
         use stellar_agent_core::error::AuthError;
 
         let key = SoftwareSigningKey::new_from_bytes([1u8; 32]);
-        let auth_digest = [0xAB_u8; 32];
+        let auth_digest = SmartAccountAuthDigest::from_bytes_for_test([0xAB_u8; 32]);
         let credential_id = b"test-credential-id";
 
         let err = key
@@ -422,7 +499,10 @@ mod tests {
         let seed = [3u8; 32];
         let key = SoftwareSigningKey::new_from_bytes(seed);
         let payload = [0xBE_u8; 32];
-        let sig_bytes = key.sign_tx_payload(&payload).await.unwrap();
+        let sig_bytes = key
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test(payload))
+            .await
+            .unwrap();
 
         let pk_strkey = key.public_key().await.unwrap();
         let vk = VerifyingKey::from_bytes(&pk_strkey.0).unwrap();

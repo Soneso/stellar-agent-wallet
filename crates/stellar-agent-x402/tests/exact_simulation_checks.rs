@@ -500,27 +500,44 @@ impl CountingSigner {
 
 #[async_trait]
 impl Signer for CountingSigner {
-    async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_tx_payload(
+        &self,
+        payload: &stellar_agent_network::signing::TxSigningPayload,
+    ) -> Result<[u8; 64], WalletError> {
         self.other_signing_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.sign_tx_payload(payload).await
     }
 
-    async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_auth_digest(
+        &self,
+        digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
         self.other_signing_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.sign_auth_digest(digest).await
     }
 
     async fn sign_soroban_address_auth_payload(
         &self,
-        payload: &[u8; 32],
+        payload: &stellar_agent_network::signing::SorobanAuthPayload,
     ) -> Result<[u8; 64], WalletError> {
-        self.address_auth_digests.lock().unwrap().push(*payload);
+        self.address_auth_digests
+            .lock()
+            .unwrap()
+            .push(*payload.as_bytes());
         self.inner.sign_soroban_address_auth_payload(payload).await
+    }
+
+    async fn sign_message(
+        &self,
+        payload: &stellar_agent_network::signing::MessagePayload,
+    ) -> Result<[u8; 64], WalletError> {
+        self.other_signing_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.sign_message(payload).await
     }
 
     async fn sign_webauthn_assertion(
         &self,
-        auth_digest: &[u8; 32],
+        auth_digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
         credential_id: &[u8],
     ) -> Result<WebAuthnAssertion, WalletError> {
         self.other_signing_calls.fetch_add(1, Ordering::SeqCst);

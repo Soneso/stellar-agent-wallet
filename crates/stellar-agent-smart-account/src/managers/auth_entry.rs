@@ -6,10 +6,11 @@
 //! `Signer::sign_auth_digest` sibling primitive.
 
 use sha2::{Digest as _, Sha256};
+use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 use stellar_agent_core::smart_account::auth_digest::compute_auth_digest;
 use stellar_agent_core::smart_account::rule_id::{ContextRuleId, encode_context_rule_ids};
-use stellar_agent_network::signing::Signer;
+use stellar_agent_network::signing::{Signer, SmartAccountAuthDigest, SorobanAuthPayload};
 use stellar_agent_network::{StellarRpcClient, fetch_account};
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::TransactionBehavior;
@@ -194,6 +195,43 @@ impl PartialSorobanAuthorizationEntry {
         }
         Ok(())
     }
+
+    /// Validates the entry with [`Self::validate`] and returns the digest a
+    /// signer signs for it, built through
+    /// [`SmartAccountAuthDigest::new`] from the entry's own facts: the type 9
+    /// preimage of `network_id`, `nonce`, `signature_expiration_ledger` and
+    /// `root_invocation`, bound to `context_rule_ids`. Its bytes equal
+    /// `auth_digest`, which validation has just recomputed.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::validate`], and
+    /// [`SaError::AuthEntryConstructionFailed`] at stage `"context_rule_ids"`
+    /// or `"signature_payload"` when the typed digest cannot be built.
+    pub(crate) fn signing_digest(&self) -> Result<SmartAccountAuthDigest, SaError> {
+        self.validate()?;
+        let preimage = soroban_authorization_preimage(
+            self.network_id,
+            self.nonce,
+            self.signature_expiration_ledger,
+            self.root_invocation.clone(),
+        );
+        let rule_ids_xdr = encode_context_rule_ids(&self.context_rule_ids).map_err(|e| {
+            SaError::AuthEntryConstructionFailed {
+                stage: "context_rule_ids",
+                redacted_reason: format!("context_rule_ids XDR encode failed before signing: {e}"),
+            }
+        })?;
+        SmartAccountAuthDigest::new(&preimage, &rule_ids_xdr).map_err(|e| match e {
+            WalletError::Network(NetworkError::MainnetWriteForbidden) => {
+                SaError::MainnetWriteForbidden
+            }
+            other => SaError::AuthEntryConstructionFailed {
+                stage: "signature_payload",
+                redacted_reason: format!("auth digest construction failed before signing: {other}"),
+            },
+        })
+    }
 }
 
 /// SHA-256 of a network passphrase: the network ID a Soroban authorization
@@ -203,7 +241,8 @@ pub(crate) fn network_id_of(network_passphrase: &str) -> [u8; 32] {
 }
 
 /// Refuses a passphrase that names mainnet, or whose network ID differs from
-/// the network ID `partial` commits to, and validates `partial`.
+/// the network ID `partial` commits to, validates `partial`, and returns the
+/// digest a signer signs for it.
 ///
 /// The boundary for every signing function that takes a partial together
 /// with a passphrase: the passphrase drives the delegated G-key entries, the
@@ -212,17 +251,17 @@ pub(crate) fn network_id_of(network_passphrase: &str) -> [u8; 32] {
 fn check_partial_against_passphrase(
     partial: &PartialSorobanAuthorizationEntry,
     network_passphrase: &str,
-) -> Result<(), SaError> {
+) -> Result<SmartAccountAuthDigest, SaError> {
     if network_passphrase == MAINNET_PASSPHRASE {
         return Err(SaError::MainnetWriteForbidden);
     }
-    partial.validate()?;
+    let digest = partial.signing_digest()?;
     if network_id_of(network_passphrase) != partial.network_id {
         return Err(SaError::AuthEntryBindingMismatch {
             field: "network_id",
         });
     }
-    Ok(())
+    Ok(digest)
 }
 
 /// Builds pre-signature state for a smart-account-targeted invocation.
@@ -423,18 +462,31 @@ fn root_contract_invocation(
     })
 }
 
+/// The envelope type 9 preimage a smart-account auth entry is signed over:
+/// `network_id`, the entry's `nonce` and `signature_expiration_ledger`, and
+/// its root `invocation`.
+pub(crate) fn soroban_authorization_preimage(
+    network_id: [u8; 32],
+    nonce: i64,
+    signature_expiration_ledger: u32,
+    invocation: SorobanAuthorizedInvocation,
+) -> HashIdPreimage {
+    HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+        network_id: Hash(network_id),
+        nonce,
+        signature_expiration_ledger,
+        invocation,
+    })
+}
+
 fn compute_signature_payload(
     network_id: [u8; 32],
     nonce: i64,
     signature_expiration_ledger: u32,
     invocation: SorobanAuthorizedInvocation,
 ) -> Result<[u8; 32], SaError> {
-    let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
-        network_id: Hash(network_id),
-        nonce,
-        signature_expiration_ledger,
-        invocation,
-    });
+    let preimage =
+        soroban_authorization_preimage(network_id, nonce, signature_expiration_ledger, invocation);
     let preimage_xdr =
         preimage
             .to_xdr(Limits::none())
@@ -509,7 +561,7 @@ pub async fn complete_authorization_entry(
     partial: PartialSorobanAuthorizationEntry,
     signer: &(dyn Signer + Send + Sync),
 ) -> Result<SorobanAuthorizationEntry, SaError> {
-    partial.validate()?;
+    let digest = partial.signing_digest()?;
 
     let pubkey = signer
         .public_key()
@@ -519,13 +571,12 @@ pub async fn complete_authorization_entry(
             redacted_reason: format!("signer public_key fetch failed before signing: {e}"),
         })?;
 
-    let signature_bytes = signer
-        .sign_auth_digest(&partial.auth_digest)
-        .await
-        .map_err(|e| SaError::AuthEntryConstructionFailed {
+    let signature_bytes = signer.sign_auth_digest(&digest).await.map_err(|e| {
+        SaError::AuthEntryConstructionFailed {
             stage: "auth_payload",
             redacted_reason: format!("auth-digest signing failed: {e}"),
-        })?;
+        }
+    })?;
 
     let auth_payload =
         build_auth_payload_scval(pubkey.0, &signature_bytes, &partial.context_rule_ids)?;
@@ -807,7 +858,7 @@ pub async fn complete_authorization_entry_multi_signer(
     partial: PartialSorobanAuthorizationEntry,
     signers: &[&(dyn Signer + Send + Sync)],
 ) -> Result<SorobanAuthorizationEntry, SaError> {
-    partial.validate()?;
+    let digest = partial.signing_digest()?;
 
     if signers.is_empty() {
         return Err(SaError::AuthEntryConstructionFailed {
@@ -832,13 +883,12 @@ pub async fn complete_authorization_entry_multi_signer(
                     redacted_reason: format!("signer public_key fetch failed: {e}"),
                 })?;
 
-        let signature_bytes = signer
-            .sign_auth_digest(&partial.auth_digest)
-            .await
-            .map_err(|e| SaError::AuthEntryConstructionFailed {
+        let signature_bytes = signer.sign_auth_digest(&digest).await.map_err(|e| {
+            SaError::AuthEntryConstructionFailed {
                 stage: "auth_payload",
                 redacted_reason: format!("auth-digest signing failed: {e}"),
-            })?;
+            }
+        })?;
 
         descriptors.push(AuthPayloadSigner::Delegated {
             pubkey: pubkey.0,
@@ -970,7 +1020,7 @@ pub(crate) async fn collect_mixed_signer_entries(
     signature_expiration_ledger: u32,
     network_passphrase: &str,
 ) -> Result<Vec<SorobanAuthorizationEntry>, SaError> {
-    check_partial_against_passphrase(&partial, network_passphrase)?;
+    let digest = check_partial_against_passphrase(&partial, network_passphrase)?;
 
     if signers.is_empty() {
         return Err(SaError::AuthEntryConstructionFailed {
@@ -979,7 +1029,7 @@ pub(crate) async fn collect_mixed_signer_entries(
         });
     }
 
-    let auth_digest: [u8; 32] = partial.auth_digest;
+    let auth_digest: [u8; 32] = *digest.as_bytes();
     let smart_account = partial.smart_account.clone();
 
     // Build the AuthPayload descriptors: sign the shared auth_digest with each
@@ -995,14 +1045,12 @@ pub(crate) async fn collect_mixed_signer_entries(
                     stage: "auth_payload",
                     redacted_reason: format!("signer public_key fetch failed: {e}"),
                 })?;
-        let signature_bytes = entry
-            .signer
-            .sign_auth_digest(&auth_digest)
-            .await
-            .map_err(|e| SaError::AuthEntryConstructionFailed {
+        let signature_bytes = entry.signer.sign_auth_digest(&digest).await.map_err(|e| {
+            SaError::AuthEntryConstructionFailed {
                 stage: "auth_payload",
                 redacted_reason: format!("auth-digest signing failed: {e}"),
-            })?;
+            }
+        })?;
 
         let descriptor = match &entry.kind {
             MixedSignerKind::Delegated => AuthPayloadSigner::Delegated {
@@ -1192,7 +1240,7 @@ pub(crate) async fn build_and_sign_delegated_g_key_entry(
     use stellar_xdr::{
         AccountId, BytesM, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, PublicKey,
         ScBytes, SorobanAddressCredentials, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
-        SorobanCredentials, Uint256, WriteXdr,
+        SorobanCredentials, Uint256,
     };
 
     if network_passphrase == MAINNET_PASSPHRASE {
@@ -1271,16 +1319,10 @@ pub(crate) async fn build_and_sign_delegated_g_key_entry(
         signature_expiration_ledger,
         invocation: invocation.clone(),
     });
-    let preimage_xdr = preimage.to_xdr(Limits::none()).map_err(|e| {
-        auth_payload_err(format!(
-            "delegated entry: signature_payload XDR encode: {e:?}"
-        ))
-    })?;
-    let signature_payload: [u8; 32] = Sha256::digest(preimage_xdr).into();
+    let signature_payload = SorobanAuthPayload::from_preimage(&preimage)
+        .map_err(|e| auth_payload_err(format!("delegated entry: signature_payload: {e}")))?;
 
-    // Sign with the dedicated Soroban-address-auth primitive. Distinct
-    // call-site from `sign_tx_payload` and `sign_auth_digest` per the
-    // Signer trait's call-site discipline.
+    // Sign with the Soroban-address-auth primitive.
     let signature_bytes = signer
         .sign_soroban_address_auth_payload(&signature_payload)
         .await
@@ -3016,6 +3058,43 @@ mod tests {
     #[test]
     fn validate_accepts_a_testnet_partial_from_the_builder_derivation() {
         partial_on(TESTNET_PASSPHRASE).validate().unwrap();
+    }
+
+    /// The typed digest a signer receives for a validated partial equals the
+    /// partial's `auth_digest`, and equals `SmartAccountAuthDigest::new` over
+    /// the partial's own preimage and rule ids.
+    #[test]
+    fn signing_digest_equals_the_validated_auth_digest() {
+        let partial = partial_on(TESTNET_PASSPHRASE);
+        let digest = partial.signing_digest().unwrap();
+        assert_eq!(*digest.as_bytes(), partial.auth_digest);
+
+        let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+            network_id: Hash(partial.network_id),
+            nonce: partial.nonce,
+            signature_expiration_ledger: partial.signature_expiration_ledger,
+            invocation: partial.root_invocation.clone(),
+        });
+        let rule_ids_xdr = encode_context_rule_ids(&partial.context_rule_ids).unwrap();
+        assert_eq!(
+            SmartAccountAuthDigest::new(&preimage, &rule_ids_xdr).unwrap(),
+            digest
+        );
+    }
+
+    /// No typed digest exists for a mainnet partial or a tampered one.
+    #[test]
+    fn signing_digest_refuses_a_mainnet_or_tampered_partial() {
+        assert!(matches!(
+            partial_on(MAINNET_PASSPHRASE).signing_digest(),
+            Err(SaError::MainnetWriteForbidden)
+        ));
+        assert!(matches!(
+            tampered_testnet_partial().signing_digest(),
+            Err(SaError::AuthEntryBindingMismatch {
+                field: "auth_digest"
+            })
+        ));
     }
 
     #[test]

@@ -113,7 +113,7 @@ mod tests {
         .unwrap();
 
         let signer = signer_from_wallet(wallet).expect("active wallet must produce signer");
-        let payload = [0xABu8; 32];
+        let payload = crate::signing::TxSigningPayload::from_bytes_for_test([0xABu8; 32]);
         let sig = signer
             .sign_tx_payload(&payload)
             .await
@@ -270,10 +270,15 @@ mod tests {
             locked.public_key().await.unwrap(),
             boxed.public_key().await.unwrap()
         );
-        let payload = [0xA7; 32];
+        let payload = crate::signing::TxSigningPayload::from_bytes_for_test([0xA7; 32]);
         assert_eq!(
             locked.sign_tx_payload(&payload).await.unwrap(),
             boxed.sign_tx_payload(&payload).await.unwrap()
+        );
+        let message = crate::signing::MessagePayload::sep53(b"locked home");
+        assert_eq!(
+            locked.sign_message(&message).await.unwrap(),
+            boxed.sign_message(&message).await.unwrap()
         );
     }
 }

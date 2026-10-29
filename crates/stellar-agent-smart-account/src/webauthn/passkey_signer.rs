@@ -8,7 +8,8 @@
 //!
 //! Symmetrically, `PasskeySignHandle` returns `AuthError::SignerKindMismatch`
 //! for `sign_tx_payload`, `sign_auth_digest`, `sign_soroban_address_auth_payload`,
-//! and `public_key` — it is a passkey-only signer with no ed25519 surface.
+//! `sign_message`, and `public_key`: it is a passkey-only signer with no
+//! ed25519 surface.
 //!
 //! # Architecture
 //!
@@ -39,7 +40,10 @@
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use stellar_agent_core::error::{AuthError, WalletError};
-use stellar_agent_network::signing::{Signer, WebAuthnAssertion};
+use stellar_agent_network::signing::{
+    MessagePayload, Signer, SmartAccountAuthDigest, SorobanAuthPayload, TxSigningPayload,
+    WebAuthnAssertion,
+};
 use stellar_strkey::ed25519::PublicKey;
 
 use crate::SaError;
@@ -161,7 +165,7 @@ impl PasskeyCredentialRecord {
 ///
 /// Conversely, `PasskeySignHandle` returns `AuthError::SignerKindMismatch`
 /// for all ed25519-only methods: `sign_tx_payload`, `sign_auth_digest`,
-/// `sign_soroban_address_auth_payload`, and `public_key`.
+/// `sign_soroban_address_auth_payload`, `sign_message`, and `public_key`.
 ///
 /// # Construction
 ///
@@ -291,7 +295,7 @@ impl Signer for PasskeySignHandle {
     /// # Errors
     ///
     /// Always returns `Err(WalletError::Auth(AuthError::SignerKindMismatch))`.
-    async fn sign_tx_payload(&self, _payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_tx_payload(&self, _payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
         Err(WalletError::Auth(AuthError::SignerKindMismatch {
             signer_kind: "passkey",
             requested_primitive: "sign_tx_payload",
@@ -308,7 +312,10 @@ impl Signer for PasskeySignHandle {
     /// # Errors
     ///
     /// Always returns `Err(WalletError::Auth(AuthError::SignerKindMismatch))`.
-    async fn sign_auth_digest(&self, _digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_auth_digest(
+        &self,
+        _digest: &SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
         Err(WalletError::Auth(AuthError::SignerKindMismatch {
             signer_kind: "passkey",
             requested_primitive: "sign_auth_digest",
@@ -327,11 +334,28 @@ impl Signer for PasskeySignHandle {
     /// Always returns `Err(WalletError::Auth(AuthError::SignerKindMismatch))`.
     async fn sign_soroban_address_auth_payload(
         &self,
-        _payload: &[u8; 32],
+        _payload: &SorobanAuthPayload,
     ) -> Result<[u8; 64], WalletError> {
         Err(WalletError::Auth(AuthError::SignerKindMismatch {
             signer_kind: "passkey",
             requested_primitive: "sign_soroban_address_auth_payload",
+        }))
+    }
+
+    /// Not implemented for passkey signers.
+    ///
+    /// Returns [`AuthError::SignerKindMismatch`] with
+    /// `signer_kind = "passkey"`, `requested_primitive = "sign_message"`.
+    /// A SEP-53 message signature is an ed25519 signature; passkey signers
+    /// produce WebAuthn assertions only.
+    ///
+    /// # Errors
+    ///
+    /// Always returns `Err(WalletError::Auth(AuthError::SignerKindMismatch))`.
+    async fn sign_message(&self, _payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
+        Err(WalletError::Auth(AuthError::SignerKindMismatch {
+            signer_kind: "passkey",
+            requested_primitive: "sign_message",
         }))
     }
 
@@ -378,7 +402,7 @@ impl Signer for PasskeySignHandle {
     ///
     async fn sign_webauthn_assertion(
         &self,
-        auth_digest: &[u8; 32],
+        auth_digest: &SmartAccountAuthDigest,
         credential_id: &[u8],
     ) -> Result<WebAuthnAssertion, WalletError> {
         // Step 1: Validate credential_id matches the bound credential and assertion.
@@ -421,7 +445,7 @@ impl Signer for PasskeySignHandle {
         // hash, UV bit unset, challenge mismatch, invalid signature) without
         // burning a testnet/mainnet round-trip.
         pre_verify_assertion(
-            auth_digest,
+            auth_digest.as_bytes(),
             &self.credential.public_key_uncompressed,
             &self.assertion.authenticator_data,
             &self.assertion.client_data_json,
@@ -476,7 +500,11 @@ mod tests {
     // ── Test fixtures ─────────────────────────────────────────────────────────
 
     const TEST_CREDENTIAL_ID: &[u8] = &[0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
-    const TEST_AUTH_DIGEST: [u8; 32] = [0x01u8; 32];
+
+    /// The auth digest every assertion fixture in this module is made over.
+    fn test_auth_digest() -> SmartAccountAuthDigest {
+        crate::test_payloads::auth_digest(0x01)
+    }
     const TEST_RP_ID: &str = "test.stellar.agent.wallet";
 
     /// Minimal 37-byte authenticatorData (rpIdHash[32] || flags[1] || signCount[4]).
@@ -495,14 +523,14 @@ mod tests {
     }
 
     /// A valid `clientDataJSON` for `sign_webauthn_assertion` with challenge =
-    /// base64url(TEST_AUTH_DIGEST).
+    /// base64url of [`test_auth_digest`].
     ///
     /// The challenge field must be base64url-no-pad of the auth_digest bytes per
     /// `pre_verifier.rs` step 2.
     fn test_client_data_json() -> Vec<u8> {
         use base64::Engine as _;
         let challenge_b64 =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(TEST_AUTH_DIGEST);
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(test_auth_digest().as_bytes());
         let json = format!(
             r#"{{"type":"webauthn.get","challenge":"{challenge_b64}","origin":"https://test.stellar.agent.wallet"}}"#
         );
@@ -510,7 +538,7 @@ mod tests {
     }
 
     /// Build a valid P-256 test signing key, credential record, and a matching
-    /// real DER signature for `TEST_AUTH_DIGEST` signed over the webauthn
+    /// real DER signature for [`test_auth_digest`] signed over the webauthn
     /// message (`authenticator_data || sha256(client_data_json)`).
     ///
     /// Returns `(credential_record, signing_key, der_signature)`.
@@ -586,7 +614,7 @@ mod tests {
         let handle = PasskeySignHandle::new(credential, assertion);
 
         let result = handle
-            .sign_webauthn_assertion(&TEST_AUTH_DIGEST, TEST_CREDENTIAL_ID)
+            .sign_webauthn_assertion(&test_auth_digest(), TEST_CREDENTIAL_ID)
             .await;
 
         let assertion = result.expect("happy-path must succeed");
@@ -611,7 +639,7 @@ mod tests {
 
         let wrong_id = &[0xFF, 0xFF, 0xFF, 0xFF];
         let err = handle
-            .sign_webauthn_assertion(&TEST_AUTH_DIGEST, wrong_id)
+            .sign_webauthn_assertion(&test_auth_digest(), wrong_id)
             .await
             .expect_err("credential_id mismatch must return error");
 
@@ -651,7 +679,7 @@ mod tests {
         let handle = PasskeySignHandle::new(credential, mismatched_assertion);
 
         let err = handle
-            .sign_webauthn_assertion(&TEST_AUTH_DIGEST, TEST_CREDENTIAL_ID)
+            .sign_webauthn_assertion(&test_auth_digest(), TEST_CREDENTIAL_ID)
             .await
             .expect_err("assertion credential_id mismatch must return error");
 
@@ -676,7 +704,7 @@ mod tests {
     async fn passkey_sign_handle_pre_verify_failure_propagates() {
         let (credential, _signing_key, der_signature) = test_signing_setup();
 
-        // Bad client_data_json: challenge is all zeros (not base64url(TEST_AUTH_DIGEST)).
+        // Bad client_data_json: challenge is all zeros (not the base64url test auth digest).
         let bad_client_data = br#"{"type":"webauthn.get","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","origin":"https://test.stellar.agent.wallet"}"#.to_vec();
 
         let assertion = AssertionInput::new(
@@ -693,7 +721,7 @@ mod tests {
         let handle = PasskeySignHandle::new(credential, assertion);
 
         let err = handle
-            .sign_webauthn_assertion(&TEST_AUTH_DIGEST, TEST_CREDENTIAL_ID)
+            .sign_webauthn_assertion(&test_auth_digest(), TEST_CREDENTIAL_ID)
             .await
             .expect_err("bad challenge must cause pre-verify failure");
 
@@ -714,7 +742,7 @@ mod tests {
         let handle = PasskeySignHandle::new(credential, assertion);
 
         let err = handle
-            .sign_tx_payload(&[0u8; 32])
+            .sign_tx_payload(&crate::test_payloads::tx_payload(0))
             .await
             .expect_err("sign_tx_payload must refuse");
 
@@ -738,7 +766,7 @@ mod tests {
         let handle = PasskeySignHandle::new(credential, assertion);
 
         let err = handle
-            .sign_auth_digest(&[0u8; 32])
+            .sign_auth_digest(&crate::test_payloads::auth_digest(0))
             .await
             .expect_err("sign_auth_digest must refuse");
 
@@ -762,7 +790,7 @@ mod tests {
         let handle = PasskeySignHandle::new(credential, assertion);
 
         let err = handle
-            .sign_soroban_address_auth_payload(&[0u8; 32])
+            .sign_soroban_address_auth_payload(&crate::test_payloads::soroban_payload(0))
             .await
             .expect_err("sign_soroban_address_auth_payload must refuse");
 
@@ -775,6 +803,30 @@ mod tests {
                 })
             ),
             "expected SignerKindMismatch(passkey, sign_soroban_address_auth_payload), got: {err:?}",
+        );
+    }
+
+    /// Verify that `sign_message` returns `SignerKindMismatch` for passkey signers.
+    #[tokio::test]
+    async fn passkey_sign_handle_refuses_sign_message() {
+        let (credential, _signing_key, der_signature) = test_signing_setup();
+        let assertion = test_assertion_input(&der_signature);
+        let handle = PasskeySignHandle::new(credential, assertion);
+
+        let err = handle
+            .sign_message(&MessagePayload::sep53(b"passkey message"))
+            .await
+            .expect_err("sign_message must refuse");
+
+        assert!(
+            matches!(
+                err,
+                WalletError::Auth(AuthError::SignerKindMismatch {
+                    signer_kind: "passkey",
+                    requested_primitive: "sign_message",
+                })
+            ),
+            "expected SignerKindMismatch(passkey, sign_message), got: {err:?}",
         );
     }
 

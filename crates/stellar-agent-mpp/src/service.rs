@@ -1561,28 +1561,35 @@ mod tests {
     impl Signer for SignCallFails {
         async fn sign_tx_payload(
             &self,
-            _payload: &[u8; 32],
+            _payload: &stellar_agent_network::signing::TxSigningPayload,
         ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
             Err(sign_refused())
         }
 
         async fn sign_auth_digest(
             &self,
-            _digest: &[u8; 32],
+            _digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
         ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
             Err(sign_refused())
         }
 
         async fn sign_soroban_address_auth_payload(
             &self,
-            _payload: &[u8; 32],
+            _payload: &stellar_agent_network::signing::SorobanAuthPayload,
+        ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
+            Err(sign_refused())
+        }
+
+        async fn sign_message(
+            &self,
+            _payload: &stellar_agent_network::signing::MessagePayload,
         ) -> Result<[u8; 64], stellar_agent_core::error::WalletError> {
             Err(sign_refused())
         }
 
         async fn sign_webauthn_assertion(
             &self,
-            _auth_digest: &[u8; 32],
+            _auth_digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
             _credential_id: &[u8],
         ) -> Result<
             stellar_agent_network::signing::WebAuthnAssertion,

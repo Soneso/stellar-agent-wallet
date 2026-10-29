@@ -76,7 +76,7 @@ async fn sign_auth_digest_happy_path_and_verify() {
         .await
         .expect("handle construction must succeed");
 
-    let digest = [0xA1u8; 32];
+    let digest = crate::payload_fixtures::auth_digest(0xA1);
     let sig_bytes = handle
         .sign_auth_digest(&digest)
         .await
@@ -88,7 +88,7 @@ async fn sign_auth_digest_happy_path_and_verify() {
     let pk = handle.public_key();
     let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk.0).expect("valid verifying key");
     let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    vk.verify(&digest, &sig)
+    vk.verify(digest.as_bytes(), &sig)
         .expect("auth-digest signature must verify");
 }
 
@@ -113,7 +113,7 @@ async fn sign_auth_digest_after_entry_deletion_returns_keyring_not_found() {
         keyring_core::Entry::new(&entry_ref.service, &entry_ref.account).expect("mock entry");
     entry.delete_credential().expect("delete must succeed");
 
-    let digest = [0xB2u8; 32];
+    let digest = crate::payload_fixtures::auth_digest(0xB2);
     let err = handle.sign_auth_digest(&digest).await.unwrap_err();
     assert_eq!(err.category(), ErrorCategory::Auth);
     assert_eq!(err.code(), "auth.keyring_not_found");
@@ -137,7 +137,7 @@ async fn sign_soroban_address_auth_payload_happy_path_and_verify() {
         .await
         .expect("handle construction must succeed");
 
-    let payload = [0xC3u8; 32];
+    let payload = crate::payload_fixtures::soroban_payload(0xC3);
     let sig_bytes = handle
         .sign_soroban_address_auth_payload(&payload)
         .await
@@ -148,7 +148,7 @@ async fn sign_soroban_address_auth_payload_happy_path_and_verify() {
     let pk = handle.public_key();
     let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk.0).expect("valid verifying key");
     let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    vk.verify(&payload, &sig)
+    vk.verify(payload.as_bytes(), &sig)
         .expect("soroban-auth-payload signature must verify");
 }
 
@@ -175,7 +175,7 @@ async fn sign_soroban_address_auth_payload_host_swap_detected() {
         .set_password(&sstrkey_for_seed(swapped_seed))
         .expect("swap");
 
-    let payload = [0xD4u8; 32];
+    let payload = crate::payload_fixtures::soroban_payload(0xD4);
     let err = handle
         .sign_soroban_address_auth_payload(&payload)
         .await
@@ -203,7 +203,7 @@ async fn signer_trait_sign_tx_payload() {
 
     // Exercise via trait (dyn Signer).
     let signer: &dyn Signer = &handle;
-    let payload = [0x01u8; 32];
+    let payload = crate::payload_fixtures::tx_payload(0x01);
     let sig = signer.sign_tx_payload(&payload).await.expect("must sign");
     assert_eq!(sig.len(), 64);
 }
@@ -224,7 +224,7 @@ async fn signer_trait_sign_auth_digest() {
         .expect("handle construction");
 
     let signer: &dyn Signer = &handle;
-    let digest = [0x02u8; 32];
+    let digest = crate::payload_fixtures::auth_digest(0x02);
     let sig = signer.sign_auth_digest(&digest).await.expect("must sign");
     assert_eq!(sig.len(), 64);
 }
@@ -245,7 +245,7 @@ async fn signer_trait_sign_soroban_address_auth_payload() {
         .expect("handle construction");
 
     let signer: &dyn Signer = &handle;
-    let payload = [0x03u8; 32];
+    let payload = crate::payload_fixtures::soroban_payload(0x03);
     let sig = signer
         .sign_soroban_address_auth_payload(&payload)
         .await
@@ -317,7 +317,10 @@ async fn no_storage_access_maps_to_keyring_platform_error() {
     )));
 
     // sign_tx_payload re-loads the secret; the armed error fires.
-    let err = handle.sign_tx_payload(&[0u8; 32]).await.unwrap_err();
+    let err = handle
+        .sign_tx_payload(&crate::payload_fixtures::tx_payload(0))
+        .await
+        .unwrap_err();
     assert_eq!(err.category(), ErrorCategory::Auth);
     assert_eq!(
         err.code(),
@@ -355,7 +358,10 @@ async fn bad_encoding_maps_to_keyring_platform_error_via_mock() {
 
     // sign_tx_payload re-loads the secret; the armed error fires.
     // The classified cause describes malformed encoding without rendering bytes.
-    let err = handle.sign_tx_payload(&[0u8; 32]).await.unwrap_err();
+    let err = handle
+        .sign_tx_payload(&crate::payload_fixtures::tx_payload(0))
+        .await
+        .unwrap_err();
     assert_eq!(err.category(), ErrorCategory::Auth);
     assert_eq!(
         err.code(),
@@ -506,7 +512,10 @@ async fn sign_tx_payload_platform_error_is_logged_as_keyring_platform_error() {
     let _guard = tracing::dispatcher::set_default(&dispatch);
     tracing::callsite::rebuild_interest_cache();
 
-    let err = handle.sign_tx_payload(&[0u8; 32]).await.unwrap_err();
+    let err = handle
+        .sign_tx_payload(&crate::payload_fixtures::tx_payload(0))
+        .await
+        .unwrap_err();
     drop(_guard);
 
     assert_eq!(err.code(), "auth.keyring_platform_error");

@@ -41,7 +41,10 @@ use stellar_agent_core::profile::schema::{
     default_approval_dir, default_policy_dir, default_profile_dir,
 };
 use stellar_agent_network::policy_state::{OpenAuthorization, PersistedWindowStore};
-use stellar_agent_network::{Signer, WebAuthnAssertion};
+use stellar_agent_network::{
+    MessagePayload, Signer, SmartAccountAuthDigest, SorobanAuthPayload, TxSigningPayload,
+    WebAuthnAssertion,
+};
 use stellar_agent_test_support::{ProfileEnvVarGuard, StellarAgentHomeGuard};
 use wiremock::MockServer;
 
@@ -819,27 +822,34 @@ struct LedgerDouble {
 
 #[async_trait::async_trait]
 impl Signer for LedgerDouble {
-    async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_tx_payload(&self, payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
         self.calls.lock().unwrap().push("sign_tx_payload");
         (self.before_sign)()?;
         use ed25519_dalek::Signer as _;
-        Ok(self.key.sign(payload).to_bytes())
+        Ok(self.key.sign(payload.as_bytes()).to_bytes())
     }
 
-    async fn sign_auth_digest(&self, _digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_auth_digest(
+        &self,
+        _digest: &SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
         panic!("the classic verbs sign no auth digest")
     }
 
     async fn sign_soroban_address_auth_payload(
         &self,
-        _payload: &[u8; 32],
+        _payload: &SorobanAuthPayload,
     ) -> Result<[u8; 64], WalletError> {
         panic!("the classic verbs sign no Soroban payload")
     }
 
+    async fn sign_message(&self, _payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
+        panic!("the classic verbs sign no message")
+    }
+
     async fn sign_webauthn_assertion(
         &self,
-        _auth_digest: &[u8; 32],
+        _auth_digest: &SmartAccountAuthDigest,
         _credential_id: &[u8],
     ) -> Result<WebAuthnAssertion, WalletError> {
         panic!("the classic verbs sign no WebAuthn assertion")

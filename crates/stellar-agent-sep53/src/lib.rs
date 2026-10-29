@@ -56,10 +56,9 @@ pub mod error;
 
 pub use error::Sep53Error;
 
-use sha2::{Digest, Sha256};
 use stellar_agent_core::error::MAINNET_SIGNING_REFUSAL_DETAIL;
 use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
-use stellar_agent_network::signing::Signer;
+use stellar_agent_network::signing::{MessagePayload, Signer};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -74,10 +73,11 @@ use stellar_agent_network::signing::Signer;
 /// Cited from `sep-0053.md`.
 /// The trailing byte is `\n` = `0x0a`.
 ///
-/// This constant is the single source of truth for the SEP-53 prefix inside
-/// this crate. All code paths use [`PREFIX`] rather than an inline literal to
-/// prevent byte-drift.
-pub const PREFIX: &[u8] = b"Stellar Signed Message:\n";
+/// The prefix is defined once, as
+/// [`stellar_agent_network::signing::payload::SEP53_MESSAGE_PREFIX`], which
+/// [`stellar_agent_network::signing::MessagePayload::sep53`] hashes; this
+/// constant names the same bytes.
+pub const PREFIX: &[u8] = stellar_agent_network::signing::payload::SEP53_MESSAGE_PREFIX;
 
 /// Maximum message length in bytes accepted by [`sign_message`] and
 /// [`verify_message`] (DoS guard).
@@ -95,19 +95,17 @@ pub const MAX_MESSAGE_BYTES: usize = 65_536;
 /// Preimage = `PREFIX ‖ message_bytes`.
 /// Returns `SHA-256(preimage)` as a 32-byte array.
 ///
-/// Per `sep-0053.md` ("single-round SHA256"). This is the single source of the
-/// SEP-53 digest scheme; callers in other crates (e.g. the SEP-43 `signMessage`
-/// path) reuse it so the two SEPs cannot diverge.
+/// Per `sep-0053.md` ("single-round SHA256"). The bytes of
+/// [`MessagePayload::sep53`], which holds the one implementation of the
+/// digest; [`sign_message`] signs that payload and [`verify_message`]
+/// verifies against these bytes.
 ///
 /// # Panics
 ///
 /// Never panics.
 #[must_use]
 pub fn message_digest(message: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(PREFIX);
-    hasher.update(message);
-    hasher.finalize().into()
+    *MessagePayload::sep53(message).as_bytes()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -116,9 +114,9 @@ pub fn message_digest(message: &[u8]) -> [u8; 32] {
 
 /// Signs `message` using the SEP-53 prefixed scheme.
 ///
-/// Constructs the preimage `"Stellar Signed Message:\n" ‖ message`, computes
-/// `SHA-256(preimage)`, and calls `Signer::sign_tx_payload(&digest)` to
-/// produce a 64-byte ed25519 signature.
+/// Builds the SEP-53 payload [`MessagePayload::sep53`], the digest
+/// `SHA-256("Stellar Signed Message:\n" ‖ message)`, and calls
+/// `Signer::sign_message` on it to produce a 64-byte ed25519 signature.
 ///
 /// The caller is responsible for any base64 or hex encoding of the returned
 /// signature bytes for wire transport.
@@ -193,20 +191,10 @@ pub async fn sign_message(
         });
     }
 
-    // Build the SEP-53 digest: SHA-256("Stellar Signed Message:\n" ‖ message).
-    // Cited: sep-0053.md (single-round SHA256).
-    let digest = message_digest(message);
-
-    // sign_tx_payload is the correct primitive: it performs raw ed25519 over
-    // a 32-byte payload. The payload here is the SEP-53 prefixed digest, NOT
-    // a SEP-23 transaction payload. This is sanctioned use of sign_tx_payload
-    // the Signer trait does not expose a separate
-    // domain-isolated "sign_message" entry point; the 32-byte ed25519 primitive
-    // is identical but the payload domain is the SEP-53 prefixed digest.
-    // See `stellar_agent_network::signing::Signer::sign_tx_payload` rustdoc for
-    // the sanctioned-call-site list where this caller is registered.
+    // The SEP-53 digest, SHA-256("Stellar Signed Message:\n" ‖ message)
+    // (sep-0053.md, single-round SHA256), signed in the message domain.
     signer
-        .sign_tx_payload(&digest)
+        .sign_message(&MessagePayload::sep53(message))
         .await
         .map_err(|e| Sep53Error::SigningFailed {
             reason: format!("{e}"),
@@ -459,6 +447,26 @@ mod tests {
 
         verify_message(&msg_bytes, &sig_arr, &pk)
             .expect("spec test vector signature must verify (sep-0053.md test case 3 binary)");
+    }
+
+    /// `sign_message` signs the message payload in the message domain: its
+    /// signature is the signer's `sign_message` over `MessagePayload::sep53`.
+    #[test]
+    fn sign_message_signs_the_message_payload() {
+        let key = SoftwareSigningKey::new_from_bytes([9u8; 32]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let message = b"domain check";
+            assert_eq!(
+                sign_message(message, &key, TESTNET).await.unwrap(),
+                key.sign_message(&MessagePayload::sep53(message))
+                    .await
+                    .unwrap()
+            );
+        });
     }
 
     // ── sign→verify round-trips with ephemeral keypair ────────────────────

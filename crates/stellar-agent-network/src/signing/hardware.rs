@@ -22,12 +22,13 @@
 //!
 //! # Timeout
 //!
-//! `HardwareSigningKey::sign_tx_payload` wraps the `LedgerSigner::sign_blob`
-//! call in `tokio::time::timeout`.  The default timeout is 60 seconds;
-//! rationale: Ledger UX requires the user to physically review and confirm
-//! a transaction on-device.  60 seconds is generous but bounded; it prevents
-//! an indefinite block when the user walks away or the device is unresponsive
-//! without returning a transport error.  On elapsed, the function returns
+//! Every signing method of `HardwareSigningKey` wraps the
+//! `LedgerSigner::sign_blob` call in `tokio::time::timeout`.  The default
+//! timeout is 60 seconds; rationale: Ledger UX requires the user to
+//! physically review and confirm a transaction on-device.  60 seconds is
+//! generous but bounded; it prevents an indefinite block when the user walks
+//! away or the device is unresponsive without returning a transport error.
+//! On elapsed, the function returns
 //! `WalletError::WalletState(WalletStateError::HardwareTimeout)`.
 //!
 //! # Ledger Stellar app protocol version
@@ -56,7 +57,10 @@ use stellar_ledger::{Blob, Exchange, LedgerSigner};
 use tokio::time::timeout;
 use tracing::warn;
 
-use crate::signing::{Signer, WebAuthnAssertion};
+use crate::signing::{
+    MessagePayload, Signer, SmartAccountAuthDigest, SorobanAuthPayload, TxSigningPayload,
+    WebAuthnAssertion,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal type-erased transport trait
@@ -180,6 +184,15 @@ pub const TARGETED_LEDGER_STELLAR_APP_VERSION: (u8, u8, u8) = (5, 0, 3);
 /// let key = HardwareSigningKey::native()?;
 /// # Ok(()) }
 /// ```
+///
+/// The raw hash-signing primitive is crate-private:
+///
+/// ```compile_fail,E0624
+/// use stellar_agent_network::HardwareSigningKey;
+/// async fn raw(key: &HardwareSigningKey) {
+///     let _ = key.sign_hash(&[0; 32], "message").await;
+/// }
+/// ```
 #[non_exhaustive]
 pub struct HardwareSigningKey {
     device: Box<dyn SignerDevice>,
@@ -279,10 +292,16 @@ impl HardwareSigningKey {
     }
 }
 
-#[async_trait]
-impl Signer for HardwareSigningKey {
-    /// Signs a 32-byte transaction hash by sending it to the Ledger device
-    /// and returning the 64-byte ed25519 signature.
+impl HardwareSigningKey {
+    /// Sends 32 bytes to the Ledger device's hash-signing command
+    /// (SIGN_TX_HASH, 0x08) and returns the 64-byte ed25519 signature: the
+    /// primitive under every typed signing method.
+    ///
+    /// The device cannot tell the domains apart; all of them arrive as 32 raw
+    /// bytes through the same blind-signing command, so the payload type on
+    /// the host side is what selects the domain. `domain` names it in the
+    /// timeout log and the length error. Crate-private: outside this crate a
+    /// signature is made only over a typed payload.
     ///
     /// The call is wrapped in `tokio::time::timeout`; if the device does not
     /// respond within the configured duration (default 60 seconds),
@@ -290,22 +309,26 @@ impl Signer for HardwareSigningKey {
     ///
     /// # Errors
     ///
-    /// - `WalletError::Auth(HardwareUserRefused)` — user rejected on device.
-    /// - `WalletError::WalletState(HardwareNotFound)` — device not connected.
-    /// - `WalletError::WalletState(HardwareWrongApp)` — Stellar app not open.
-    /// - `WalletError::WalletState(HardwareTimeout)` — device did not respond.
-    /// - `WalletError::WalletState(HardwareBlindSigningDisabled)` — blind
+    /// - `WalletError::Auth(HardwareUserRefused)`: user rejected on device.
+    /// - `WalletError::WalletState(HardwareNotFound)`: device not connected.
+    /// - `WalletError::WalletState(HardwareWrongApp)`: Stellar app not open.
+    /// - `WalletError::WalletState(HardwareTimeout)`: device did not respond.
+    /// - `WalletError::WalletState(HardwareBlindSigningDisabled)`: blind
     ///   signing is disabled in the Stellar app settings.
-    /// - `WalletError::Protocol(XdrCodecFailed)` — XDR encoding failure.
-    /// - `WalletError::Internal(UnexpectedState)` — BIP-32 path error or
-    ///   APDU decode failure.
-    async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
-        let sign_future = self.device.device_sign_blob(self.hd_path, payload);
+    /// - `WalletError::Protocol(XdrCodecFailed)`: XDR encoding failure.
+    /// - `WalletError::Internal(UnexpectedState)`: BIP-32 path error,
+    ///   APDU decode failure, or a signature that is not 64 bytes.
+    pub(crate) async fn sign_hash(
+        &self,
+        hash: &[u8; 32],
+        domain: &'static str,
+    ) -> Result<[u8; 64], WalletError> {
+        let sign_future = self.device.device_sign_blob(self.hd_path, hash);
         let result = timeout(self.timeout_duration, sign_future)
             .await
             .map_err(|_elapsed| {
                 warn!(
-                    "hardware signer timed out after {:?}",
+                    "hardware {domain} signer timed out after {:?}",
                     self.timeout_duration
                 );
                 WalletError::WalletState(WalletStateError::HardwareTimeout)
@@ -316,85 +339,65 @@ impl Signer for HardwareSigningKey {
         result.try_into().map_err(|v: Vec<u8>| {
             WalletError::Internal(InternalError::UnexpectedState {
                 detail: format!(
-                    "Ledger returned {} bytes for signature; expected 64",
+                    "Ledger returned {} bytes for {domain} signature; expected 64",
                     v.len()
                 ),
             })
         })
     }
+}
 
-    /// Signs a 32-byte smart-account auth-digest by sending it to the Ledger
-    /// device and returning the 64-byte ed25519 signature.
-    ///
-    /// The device cannot distinguish a transaction-hash payload from an
-    /// auth-digest payload — both are 32 raw bytes routed through the
-    /// SIGN_TX_HASH (0x08) blind-signing APDU. The semantic split between
-    /// `sign_tx_payload` and `sign_auth_digest` is enforced on the host side
-    /// (caller selects the trait method matching the payload class). For the
-    /// device's perspective, this is the same blind-sign call.
+#[async_trait]
+impl Signer for HardwareSigningKey {
+    /// Signs a SEP-23 transaction payload on the Ledger device.
     ///
     /// # Errors
     ///
-    /// Same variants as [`HardwareSigningKey::sign_tx_payload`].
-    async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
-        let sign_future = self.device.device_sign_blob(self.hd_path, digest);
-        let result = timeout(self.timeout_duration, sign_future)
-            .await
-            .map_err(|_elapsed| {
-                warn!(
-                    "hardware auth-digest signer timed out after {:?}",
-                    self.timeout_duration
-                );
-                WalletError::WalletState(WalletStateError::HardwareTimeout)
-            })?
-            .map_err(map_ledger_error)?;
-
-        result.try_into().map_err(|v: Vec<u8>| {
-            WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!(
-                    "Ledger returned {} bytes for auth-digest signature; expected 64",
-                    v.len()
-                ),
-            })
-        })
+    /// The errors of the device's hash-signing command: user refusal, device
+    /// not found, wrong app, timeout, blind signing disabled, or an
+    /// unexpected response. A mainnet binding to another key returns
+    /// `network.mainnet_authorization_refused`.
+    async fn sign_tx_payload(&self, payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
+        payload.check_mainnet_binding(self).await?;
+        self.sign_hash(payload.as_bytes(), "transaction").await
     }
 
-    /// Signs a 32-byte Soroban address-credentials auth-entry signature_payload
-    /// via the Ledger SIGN_TX_HASH (0x08) blind-signing APDU.
-    ///
-    /// The device cannot distinguish a transaction-hash payload from an
-    /// auth-digest payload from a Soroban auth-entry signature_payload —
-    /// all three are 32 raw bytes routed through the same blind-signing APDU.
-    /// The semantic split is enforced on the host side (caller selects the
-    /// trait method matching the payload class).
+    /// Signs a smart-account auth digest on the Ledger device.
     ///
     /// # Errors
     ///
     /// Same variants as [`HardwareSigningKey::sign_tx_payload`].
+    async fn sign_auth_digest(
+        &self,
+        digest: &SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
+        self.sign_hash(digest.as_bytes(), "auth-digest").await
+    }
+
+    /// Signs a Soroban address-credentials auth-entry payload on the Ledger
+    /// device.
+    ///
+    /// # Errors
+    ///
+    /// Same variants as [`HardwareSigningKey::sign_tx_payload`], plus
+    /// `network.mainnet_authorization_refused` for a binding to another key.
     async fn sign_soroban_address_auth_payload(
         &self,
-        payload: &[u8; 32],
+        payload: &SorobanAuthPayload,
     ) -> Result<[u8; 64], WalletError> {
-        let sign_future = self.device.device_sign_blob(self.hd_path, payload);
-        let result = timeout(self.timeout_duration, sign_future)
+        payload.check_mainnet_binding(self).await?;
+        self.sign_hash(payload.as_bytes(), "soroban-auth-payload")
             .await
-            .map_err(|_elapsed| {
-                warn!(
-                    "hardware soroban-auth-payload signer timed out after {:?}",
-                    self.timeout_duration
-                );
-                WalletError::WalletState(WalletStateError::HardwareTimeout)
-            })?
-            .map_err(map_ledger_error)?;
+    }
 
-        result.try_into().map_err(|v: Vec<u8>| {
-            WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!(
-                    "Ledger returned {} bytes for soroban-auth-payload signature; expected 64",
-                    v.len()
-                ),
-            })
-        })
+    /// Signs a SEP-53 message digest on the Ledger device, through the same
+    /// hash-signing command.
+    ///
+    /// # Errors
+    ///
+    /// Same variants as [`HardwareSigningKey::sign_tx_payload`].
+    async fn sign_message(&self, payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
+        self.sign_hash(payload.as_bytes(), "message").await
     }
 
     /// Hardware ed25519 signers (Ledger) cannot produce WebAuthn assertions;
@@ -411,7 +414,7 @@ impl Signer for HardwareSigningKey {
     ///   always, on every call.
     async fn sign_webauthn_assertion(
         &self,
-        _auth_digest: &[u8; 32],
+        _auth_digest: &SmartAccountAuthDigest,
         _credential_id: &[u8],
     ) -> Result<WebAuthnAssertion, WalletError> {
         Err(WalletError::Auth(AuthError::SignerKindMismatch {
@@ -571,7 +574,7 @@ pub(crate) fn map_ledger_error(err: stellar_ledger::Error) -> WalletError {
 mod tests {
     use std::collections::VecDeque;
     use std::ops::Deref;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use ledger_apdu::{APDUAnswer, APDUCommand};
@@ -599,6 +602,7 @@ mod tests {
     struct MockExchange {
         /// Queue of pre-scripted raw answer bytes (data + retcode).
         answers: Mutex<VecDeque<Vec<u8>>>,
+        commands: Arc<Mutex<Vec<APDUCommand<Vec<u8>>>>>,
     }
 
     impl MockExchange {
@@ -606,6 +610,7 @@ mod tests {
         fn empty() -> Self {
             Self {
                 answers: Mutex::new(VecDeque::new()),
+                commands: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -657,11 +662,18 @@ mod tests {
 
         async fn exchange<I>(
             &self,
-            _command: &APDUCommand<I>,
+            command: &APDUCommand<I>,
         ) -> Result<APDUAnswer<Self::AnswerType>, Self::Error>
         where
             I: Deref<Target = [u8]> + Send + Sync,
         {
+            self.commands.lock().unwrap().push(APDUCommand {
+                cla: command.cla,
+                ins: command.ins,
+                p1: command.p1,
+                p2: command.p2,
+                data: command.data.to_vec(),
+            });
             let mut queue = self
                 .answers
                 .lock()
@@ -828,7 +840,10 @@ mod tests {
         let sig_bytes = vec![0xABu8; 64];
         let key = key_with_mock(MockExchange::with_success(sig_bytes));
         let payload = [0u8; 32];
-        let sig = key.sign_tx_payload(&payload).await.unwrap();
+        let sig = key
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test(payload))
+            .await
+            .unwrap();
         assert_eq!(sig, [0xABu8; 64]);
     }
 
@@ -837,7 +852,10 @@ mod tests {
     async fn mock_user_refused() {
         let key = key_with_mock(MockExchange::with_retcode(0x6985));
         let payload = [0u8; 32];
-        let err = key.sign_tx_payload(&payload).await.unwrap_err();
+        let err = key
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test(payload))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "auth.hardware_user_refused");
     }
 
@@ -846,7 +864,10 @@ mod tests {
     async fn mock_stellar_app_not_open() {
         let key = key_with_mock(MockExchange::with_retcode(0x6511));
         let payload = [0u8; 32];
-        let err = key.sign_tx_payload(&payload).await.unwrap_err();
+        let err = key
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test(payload))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "wallet_state.hardware_wrong_app");
     }
 
@@ -855,7 +876,10 @@ mod tests {
     async fn mock_blind_signing_disabled() {
         let key = key_with_mock(MockExchange::with_retcode(0x6C66));
         let payload = [0u8; 32];
-        let err = key.sign_tx_payload(&payload).await.unwrap_err();
+        let err = key
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test(payload))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "wallet_state.hardware_blind_signing_disabled");
     }
 
@@ -864,7 +888,10 @@ mod tests {
     async fn mock_device_locked() {
         let key = key_with_mock(MockExchange::with_retcode(0x5515));
         let payload = [0u8; 32];
-        let err = key.sign_tx_payload(&payload).await.unwrap_err();
+        let err = key
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test(payload))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "wallet_state.hardware_not_found");
     }
 
@@ -873,7 +900,10 @@ mod tests {
     async fn mock_connection_error() {
         let key = key_with_mock(MockExchange::empty());
         let payload = [0u8; 32];
-        let err = key.sign_tx_payload(&payload).await.unwrap_err();
+        let err = key
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test(payload))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "wallet_state.hardware_not_found");
     }
 
@@ -882,7 +912,10 @@ mod tests {
     async fn mock_unknown_apdu_retcode() {
         let key = key_with_mock(MockExchange::with_retcode(0xDEAD));
         let payload = [0u8; 32];
-        let err = key.sign_tx_payload(&payload).await.unwrap_err();
+        let err = key
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test(payload))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "wallet_state.hardware_not_found");
     }
 
@@ -922,7 +955,10 @@ mod tests {
         let key = HardwareSigningKey::new(StallingExchange).with_timeout(Duration::from_millis(5));
 
         let payload = [0u8; 32];
-        let err = key.sign_tx_payload(&payload).await.unwrap_err();
+        let err = key
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test(payload))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "wallet_state.hardware_timeout");
     }
 
@@ -974,7 +1010,10 @@ mod tests {
         let credential_id = b"test-credential-id";
 
         let err = key
-            .sign_webauthn_assertion(&auth_digest, credential_id)
+            .sign_webauthn_assertion(
+                &SmartAccountAuthDigest::from_bytes_for_test(auth_digest),
+                credential_id,
+            )
             .await
             .unwrap_err();
 
@@ -1001,7 +1040,10 @@ mod tests {
         let sig_bytes = vec![0xCDu8; 64];
         let key = key_with_mock(MockExchange::with_success(sig_bytes));
         let digest = [0x01u8; 32];
-        let sig = key.sign_auth_digest(&digest).await.unwrap();
+        let sig = key
+            .sign_auth_digest(&SmartAccountAuthDigest::from_bytes_for_test(digest))
+            .await
+            .unwrap();
         assert_eq!(sig, [0xCDu8; 64]);
     }
 
@@ -1010,7 +1052,10 @@ mod tests {
     async fn mock_sign_auth_digest_user_refused() {
         let key = key_with_mock(MockExchange::with_retcode(0x6985));
         let digest = [0x02u8; 32];
-        let err = key.sign_auth_digest(&digest).await.unwrap_err();
+        let err = key
+            .sign_auth_digest(&SmartAccountAuthDigest::from_bytes_for_test(digest))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "auth.hardware_user_refused");
     }
 
@@ -1038,7 +1083,10 @@ mod tests {
 
         let key = HardwareSigningKey::new(StallingExchange2).with_timeout(Duration::from_millis(5));
         let digest = [0x03u8; 32];
-        let err = key.sign_auth_digest(&digest).await.unwrap_err();
+        let err = key
+            .sign_auth_digest(&SmartAccountAuthDigest::from_bytes_for_test(digest))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "wallet_state.hardware_timeout");
     }
 
@@ -1053,10 +1101,130 @@ mod tests {
         let key = key_with_mock(MockExchange::with_success(sig_bytes));
         let payload = [0x04u8; 32];
         let sig = key
-            .sign_soroban_address_auth_payload(&payload)
+            .sign_soroban_address_auth_payload(&SorobanAuthPayload::from_bytes_for_test(payload))
             .await
             .unwrap();
         assert_eq!(sig, [0xEFu8; 64]);
+    }
+
+    #[tokio::test]
+    async fn soroban_mainnet_binding_refuses_another_key() {
+        let own_key = [7; 32];
+        let mock = MockExchange::with_success(own_key.to_vec());
+        let commands = Arc::clone(&mock.commands);
+        let key = key_with_mock(mock);
+        let bytes = [0x3c; 32];
+        let wrong = SorobanAuthPayload::bound_for_test(bytes, [0; 32]);
+        let error = key
+            .sign_soroban_address_auth_payload(&wrong)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "network.mainnet_authorization_refused");
+        assert!(
+            commands
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|command| command.ins != 0x08)
+        );
+        for (payload, answers) in [
+            (
+                SorobanAuthPayload::from_bytes_for_test(bytes),
+                vec![vec![0x5a; 64]],
+            ),
+            (
+                SorobanAuthPayload::bound_for_test(bytes, own_key),
+                vec![own_key.to_vec(), vec![0x5a; 64]],
+            ),
+        ] {
+            let mock = MockExchange::empty();
+            for mut answer in answers {
+                answer.extend_from_slice(&[0x90, 0x00]);
+                mock.answers.lock().unwrap().push_back(answer);
+            }
+            let key = key_with_mock(mock);
+            assert_eq!(
+                key.sign_soroban_address_auth_payload(&payload)
+                    .await
+                    .unwrap(),
+                [0x5a; 64]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transaction_mainnet_binding_refuses_another_key() {
+        let own_key = [7; 32];
+        let mock = MockExchange::with_success(own_key.to_vec());
+        let commands = Arc::clone(&mock.commands);
+        let key = key_with_mock(mock);
+        let bytes = [0x3c; 32];
+        let wrong = TxSigningPayload::bound_for_test(bytes, [0; 32]);
+        let error = key.sign_tx_payload(&wrong).await.unwrap_err();
+        assert_eq!(error.code(), "network.mainnet_authorization_refused");
+        assert!(
+            commands
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|command| command.ins != 0x08)
+        );
+        for (payload, answers) in [
+            (
+                TxSigningPayload::from_bytes_for_test(bytes),
+                vec![vec![0x5a; 64]],
+            ),
+            (
+                TxSigningPayload::bound_for_test(bytes, own_key),
+                vec![own_key.to_vec(), vec![0x5a; 64]],
+            ),
+        ] {
+            let mock = MockExchange::empty();
+            for mut answer in answers {
+                answer.extend_from_slice(&[0x90, 0x00]);
+                mock.answers.lock().unwrap().push_back(answer);
+            }
+            let key = key_with_mock(mock);
+            assert_eq!(key.sign_tx_payload(&payload).await.unwrap(), [0x5a; 64]);
+        }
+    }
+
+    /// `sign_message` goes through the device's hash-signing command and
+    /// returns its 64-byte signature; a short response is refused as for the
+    /// other domains.
+    #[tokio::test]
+    async fn mock_sign_message_signs_through_the_hash_command() {
+        let mock = MockExchange::with_success(vec![0x5Au8; 64]);
+        let commands = Arc::clone(&mock.commands);
+        let key = key_with_mock(mock);
+        let sig = key
+            .sign_message(&MessagePayload::sep53(b"hardware message"))
+            .await
+            .unwrap();
+        assert_eq!(sig, [0x5Au8; 64]);
+        {
+            use sha2::{Digest as _, Sha256};
+
+            let commands = commands.lock().unwrap();
+            assert_eq!(commands.len(), 1);
+            let command = &commands[0];
+            assert_eq!(command.ins, 0x08);
+            let expected_digest = Sha256::digest(b"Stellar Signed Message:\nhardware message");
+            let mut expected_data = vec![3];
+            expected_data.extend_from_slice(&0x8000_002cu32.to_be_bytes());
+            expected_data.extend_from_slice(&0x8000_0094u32.to_be_bytes());
+            expected_data.extend_from_slice(&0x8000_0000u32.to_be_bytes());
+            expected_data.extend_from_slice(&expected_digest);
+            assert_eq!(command.data, expected_data);
+        }
+
+        let key = key_with_mock(MockExchange::with_success(vec![0x5Au8; 12]));
+        let err = key
+            .sign_message(&MessagePayload::sep53(b"hardware message"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "internal.unexpected_state");
+        assert!(err.message().contains("12"), "{}", err.message());
     }
 
     /// `sign_soroban_address_auth_payload` propagates blind-signing-disabled on retcode 0x6C66.
@@ -1065,7 +1233,7 @@ mod tests {
         let key = key_with_mock(MockExchange::with_retcode(0x6C66));
         let payload = [0x05u8; 32];
         let err = key
-            .sign_soroban_address_auth_payload(&payload)
+            .sign_soroban_address_auth_payload(&SorobanAuthPayload::from_bytes_for_test(payload))
             .await
             .unwrap_err();
         assert_eq!(err.code(), "wallet_state.hardware_blind_signing_disabled");
@@ -1096,7 +1264,7 @@ mod tests {
         let key = HardwareSigningKey::new(StallingExchange3).with_timeout(Duration::from_millis(5));
         let payload = [0x06u8; 32];
         let err = key
-            .sign_soroban_address_auth_payload(&payload)
+            .sign_soroban_address_auth_payload(&SorobanAuthPayload::from_bytes_for_test(payload))
             .await
             .unwrap_err();
         assert_eq!(err.code(), "wallet_state.hardware_timeout");
@@ -1184,7 +1352,10 @@ mod tests {
         let short_sig = vec![0xFFu8; 32];
         let key = key_with_mock(MockExchange::with_success(short_sig));
         let payload = [0u8; 32];
-        let err = key.sign_tx_payload(&payload).await.unwrap_err();
+        let err = key
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test(payload))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "internal.unexpected_state");
         assert_eq!(err.category(), ErrorCategory::Internal);
         // The error message must name the actual byte count.
@@ -1201,7 +1372,10 @@ mod tests {
         let short_sig = vec![0xFFu8; 16];
         let key = key_with_mock(MockExchange::with_success(short_sig));
         let digest = [0u8; 32];
-        let err = key.sign_auth_digest(&digest).await.unwrap_err();
+        let err = key
+            .sign_auth_digest(&SmartAccountAuthDigest::from_bytes_for_test(digest))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "internal.unexpected_state");
         assert!(
             err.message().contains("16"),
@@ -1217,7 +1391,7 @@ mod tests {
         let key = key_with_mock(MockExchange::with_success(short_sig));
         let payload = [0u8; 32];
         let err = key
-            .sign_soroban_address_auth_payload(&payload)
+            .sign_soroban_address_auth_payload(&SorobanAuthPayload::from_bytes_for_test(payload))
             .await
             .unwrap_err();
         assert_eq!(err.code(), "internal.unexpected_state");
@@ -1244,7 +1418,10 @@ mod tests {
         let sig_bytes = vec![0x12u8; 64];
         let key = key_with_mock(MockExchange::with_success(sig_bytes)).with_account_index(3);
         let payload = [0u8; 32];
-        let sig = key.sign_tx_payload(&payload).await.unwrap();
+        let sig = key
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test(payload))
+            .await
+            .unwrap();
         assert_eq!(sig.len(), 64);
     }
 
@@ -1309,7 +1486,7 @@ mod tests {
         let key = HardwareSigningKey::native().expect("Ledger must be connected");
         let payload = [0xAB_u8; 32];
         let sig_bytes = key
-            .sign_tx_payload(&payload)
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test(payload))
             .await
             .expect("signing must succeed");
         let pk = key

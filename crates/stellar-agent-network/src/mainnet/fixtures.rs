@@ -36,8 +36,8 @@ use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope};
 
 use super::audit_readiness::AuditReadiness;
 use super::authorization::{
-    ApprovalBinding, EndpointBinding, Header, MainnetTxSignAuthorization, PolicyBinding,
-    SignerBinding, TxSignInner,
+    ApprovalBinding, EndpointBinding, Header, MainnetSorobanIntentAuthorization,
+    MainnetTxSignAuthorization, PolicyBinding, SignerBinding, SorobanIntentInner, TxSignInner,
 };
 use super::clock::{TestClockGuard, set_now_ms_for_test};
 use super::digest::{BindingFacts, approval_subject_classic};
@@ -151,6 +151,51 @@ pub(crate) fn tx_authorization(
         header,
         binding,
         entries: vec![],
+    })
+}
+
+/// A Soroban intent authorization for `X402Create` over `invocation` on
+/// mainnet, binding `nonce` and `signature_expiration_ledger`, with the
+/// fixture's agent signer and an audit proof of `writer`, valid at `now` for
+/// [`TTL_MS`].
+pub(crate) fn soroban_authorization(
+    writer: &AuditWriterHandle,
+    invocation: &stellar_xdr::SorobanAuthorizedInvocation,
+    nonce: i64,
+    signature_expiration_ledger: u32,
+    now: u64,
+) -> MainnetSorobanIntentAuthorization {
+    use sha2::{Digest as _, Sha256};
+
+    let facts = VerifiedTipFacts {
+        segment_start_hash: [0; 32],
+        entry_count: 0,
+        tip_hash: [0; 32],
+        log_path_sha256: [5; 32],
+        anchor_covers_tip: true,
+    };
+    let mut header = header("fixture", None, writer, facts, now);
+    header.domain = AuthorizationDomain::Soroban;
+    header.consumer = MainnetConsumer::X402Create;
+    let mainnet: [u8; 32] = Sha256::digest(MAINNET_PASSPHRASE.as_bytes()).into();
+    let intent_digest = super::digest::soroban_intent_digest(&mainnet, invocation).unwrap();
+    MainnetSorobanIntentAuthorization::for_crate_tests(SorobanIntentInner {
+        entries: vec![],
+        facts: BindingFacts {
+            endpoint: None,
+            signer: [0; 32],
+            policy: [0; 32],
+            enablement: [0; 32],
+            witness: None,
+            reservation: None,
+            approval: [0; 32],
+            audit: [0; 32],
+        },
+        authorization_ttl_ms: TTL_MS,
+        header,
+        binding: DomainBinding::Soroban { intent_digest },
+        nonce,
+        signature_expiration_ledger,
     })
 }
 

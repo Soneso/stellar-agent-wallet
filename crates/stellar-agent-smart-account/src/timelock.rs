@@ -3424,27 +3424,33 @@ mod tests {
     impl Signer for PanickingSigner {
         async fn sign_tx_payload(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::TxSigningPayload,
         ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
             panic!("a refused mainnet timelock call must not reach sign_tx_payload")
         }
         async fn sign_auth_digest(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::SmartAccountAuthDigest,
         ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
             panic!("a refused mainnet timelock call must not reach sign_auth_digest")
         }
         async fn sign_soroban_address_auth_payload(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::SorobanAuthPayload,
         ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
             panic!(
                 "a refused mainnet timelock call must not reach sign_soroban_address_auth_payload"
             )
         }
+        async fn sign_message(
+            &self,
+            _: &stellar_agent_network::signing::MessagePayload,
+        ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+            panic!("a refused mainnet timelock call must not reach sign_message")
+        }
         async fn sign_webauthn_assertion(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::SmartAccountAuthDigest,
             _: &[u8],
         ) -> Result<stellar_agent_network::WebAuthnAssertion, stellar_agent_core::WalletError>
         {

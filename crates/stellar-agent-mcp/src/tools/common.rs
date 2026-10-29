@@ -8680,7 +8680,7 @@ pub(crate) mod tests {
         impl stellar_agent_network::signing::Signer for CountingSigner<'_> {
             async fn sign_tx_payload(
                 &self,
-                payload: &[u8; 32],
+                payload: &stellar_agent_network::signing::TxSigningPayload,
             ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
                 self.count();
                 self.inner.sign_tx_payload(payload).await
@@ -8688,7 +8688,7 @@ pub(crate) mod tests {
 
             async fn sign_auth_digest(
                 &self,
-                digest: &[u8; 32],
+                digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
             ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
                 self.count();
                 self.inner.sign_auth_digest(digest).await
@@ -8696,15 +8696,23 @@ pub(crate) mod tests {
 
             async fn sign_soroban_address_auth_payload(
                 &self,
-                payload: &[u8; 32],
+                payload: &stellar_agent_network::signing::SorobanAuthPayload,
             ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
                 self.count();
                 self.inner.sign_soroban_address_auth_payload(payload).await
             }
 
+            async fn sign_message(
+                &self,
+                payload: &stellar_agent_network::signing::MessagePayload,
+            ) -> Result<[u8; 64], stellar_agent_core::WalletError> {
+                self.count();
+                self.inner.sign_message(payload).await
+            }
+
             async fn sign_webauthn_assertion(
                 &self,
-                auth_digest: &[u8; 32],
+                auth_digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
                 credential_id: &[u8],
             ) -> Result<
                 stellar_agent_network::signing::WebAuthnAssertion,
@@ -8733,12 +8741,43 @@ pub(crate) mod tests {
             refusals: Vec<(String, String)>,
         }
 
+        /// The preimage a signing of the signing-boundary tests signs.
+        #[derive(Clone, Copy, Default)]
+        enum SignedPreimage {
+            /// The type 9 preimage, which carries no address.
+            #[default]
+            Unbound,
+            /// A type 10 preimage bound to the payer's account.
+            BoundToPayer,
+            /// A type 10 preimage bound to this key's account.
+            BoundTo([u8; 32]),
+        }
+
+        /// How a signing of the signing-boundary tests departs from the
+        /// payment's own preimage and signer.
+        #[derive(Clone, Copy, Default)]
+        struct Departure {
+            preimage: SignedPreimage,
+            /// Name this key as the expected signer in place of the payer.
+            expected_signer: Option<[u8; 32]>,
+        }
+
         /// Resolves the fixture payment's intent for the entry fields
         /// `bound`, then signs, through `sign_soroban_auth_entry_authorized`
         /// with a counting signer, the preimage of the payment's root
         /// invocation under the entry fields `signed`. Both pairs are a
         /// nonce and a signature expiration ledger.
         async fn sign_under_intent(bound: (i64, u32), signed: (i64, u32)) -> IntentSigning {
+            sign_departing(bound, signed, Departure::default()).await
+        }
+
+        /// [`sign_under_intent`] with the preimage type, its bound address,
+        /// and the expected signer of `departure`.
+        async fn sign_departing(
+            bound: (i64, u32),
+            signed: (i64, u32),
+            departure: Departure,
+        ) -> IntentSigning {
             use stellar_agent_soroban_auth::{AuthCredentialsVersion, build_auth_preimage};
             use stellar_xdr::{Limits, WriteXdr as _};
             let rpc = wiremock::MockServer::start().await;
@@ -8748,18 +8787,25 @@ pub(crate) mod tests {
             let authorization = approved.resolve(bound.0, bound.1).await;
             let payer =
                 stellar_strkey::ed25519::PublicKey::from_string(f.envelope.source()).unwrap();
+            let (version, bound_key) = match departure.preimage {
+                SignedPreimage::Unbound => (AuthCredentialsVersion::V1, payer.0),
+                SignedPreimage::BoundToPayer => (AuthCredentialsVersion::V2, payer.0),
+                SignedPreimage::BoundTo(key) => (AuthCredentialsVersion::V2, key),
+            };
             let preimage = build_auth_preimage(
-                AuthCredentialsVersion::V1,
+                version,
                 approved.network_id,
                 signed.0,
                 signed.1,
                 &stellar_xdr::ScAddress::Account(stellar_xdr::AccountId(
-                    stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(payer.0)),
+                    stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(bound_key)),
                 )),
                 approved.root.clone(),
             )
             .to_xdr_base64(Limits::none())
             .unwrap();
+            let expected_signer =
+                stellar_strkey::ed25519::PublicKey(departure.expected_signer.unwrap_or(payer.0));
             let signer = CountingSigner {
                 inner: &approved.handle,
                 calls: std::sync::atomic::AtomicUsize::new(0),
@@ -8769,7 +8815,7 @@ pub(crate) mod tests {
             let result = stellar_agent_sep43::signing::sign_soroban_auth_entry_authorized(
                 &preimage,
                 &signer,
-                &payer,
+                &expected_signer,
                 stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE,
                 None,
                 stellar_agent_network::mainnet::MainnetConsumer::X402Create,
@@ -8865,6 +8911,71 @@ pub(crate) mod tests {
         async fn the_authorized_signer_refuses_another_expiration_ledger() {
             let signing = sign_under_intent(BOUND_ENTRY, (BOUND_ENTRY.0, BOUND_ENTRY.1 + 1)).await;
             assert_refused_before_the_signer(&signing, "entry_expiration");
+        }
+
+        /// The authorized signer signs a type 10 preimage bound to the
+        /// payer's own account.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn the_authorized_signer_signs_an_entry_bound_to_the_payer() {
+            let signing = sign_departing(
+                BOUND_ENTRY,
+                BOUND_ENTRY,
+                Departure {
+                    preimage: SignedPreimage::BoundToPayer,
+                    expected_signer: None,
+                },
+            )
+            .await;
+            signing
+                .result
+                .as_ref()
+                .unwrap_or_else(|error| panic!("the payer-bound entry signs: {error:?}"));
+            assert_eq!(signing.signer_calls, 2, "the key report and the signature");
+        }
+
+        /// A type 10 preimage bound to another account refuses with
+        /// `sep43.invalid_address` before the signer is called or the seed
+        /// read, and before the expected signer is compared: a mismatch of
+        /// both still reports the address.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn the_authorized_signer_refuses_an_entry_bound_to_another_address() {
+            for expected_signer in [None, Some([0x77; 32])] {
+                let signing = sign_departing(
+                    BOUND_ENTRY,
+                    BOUND_ENTRY,
+                    Departure {
+                        preimage: SignedPreimage::BoundTo([0x77; 32]),
+                        expected_signer,
+                    },
+                )
+                .await;
+                match &signing.result {
+                    Err(error) => assert_eq!(error.wire_code(), "sep43.invalid_address"),
+                    Ok(_) => panic!("an entry bound to another address signed"),
+                }
+                assert!(signing.refusals.is_empty(), "{:?}", signing.refusals);
+                assert_eq!(signing.signer_calls, 0);
+                assert_eq!(signing.seed_reads, 0);
+            }
+        }
+
+        /// An expected signer other than the authorization's refuses before
+        /// the signer is called.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn the_authorized_signer_refuses_another_expected_signer() {
+            let signing = sign_departing(
+                BOUND_ENTRY,
+                BOUND_ENTRY,
+                Departure {
+                    preimage: SignedPreimage::Unbound,
+                    expected_signer: Some([0x77; 32]),
+                },
+            )
+            .await;
+            assert_refused_before_the_signer(&signing, "signer_key_mismatch");
         }
 
         #[tokio::test]

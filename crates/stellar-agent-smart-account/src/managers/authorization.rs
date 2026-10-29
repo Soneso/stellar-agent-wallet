@@ -981,11 +981,17 @@ mod tests {
 
     #[async_trait]
     impl Signer for StubSigner {
-        async fn sign_tx_payload(&self, _: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        async fn sign_tx_payload(
+            &self,
+            _: &stellar_agent_network::signing::TxSigningPayload,
+        ) -> Result<[u8; 64], WalletError> {
             unimplemented!("stub")
         }
 
-        async fn sign_auth_digest(&self, _: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        async fn sign_auth_digest(
+            &self,
+            _: &stellar_agent_network::signing::SmartAccountAuthDigest,
+        ) -> Result<[u8; 64], WalletError> {
             // Return a deterministic fake 64-byte signature; sufficient for
             // offline unit tests that only exercise the quorum logic path.
             Ok([self.pubkey_bytes[0]; 64])
@@ -993,14 +999,21 @@ mod tests {
 
         async fn sign_soroban_address_auth_payload(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::SorobanAuthPayload,
         ) -> Result<[u8; 64], WalletError> {
             Ok([self.pubkey_bytes[0]; 64])
         }
 
+        async fn sign_message(
+            &self,
+            _: &stellar_agent_network::signing::MessagePayload,
+        ) -> Result<[u8; 64], WalletError> {
+            unimplemented!("stub")
+        }
+
         async fn sign_webauthn_assertion(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::SmartAccountAuthDigest,
             _: &[u8],
         ) -> Result<WebAuthnAssertion, WalletError> {
             unimplemented!("stub")

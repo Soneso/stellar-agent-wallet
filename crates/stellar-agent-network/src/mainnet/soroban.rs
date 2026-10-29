@@ -82,7 +82,6 @@ mod tests {
 
     use sha2::{Digest as _, Sha256};
     use stellar_agent_core::audit_log::AuditWriter;
-    use stellar_agent_core::audit_log::writer::VerifiedTipFacts;
     use stellar_agent_soroban_auth::{AuthCredentialsVersion, build_auth_preimage};
     use stellar_xdr::{
         ContractId, ContractIdPreimage, ContractIdPreimageFromAddress, Hash,
@@ -92,10 +91,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::mainnet::AuthorizationDomain;
-    use crate::mainnet::authorization::SorobanIntentInner;
     use crate::mainnet::fixtures::{self, TTL_MS};
-    use crate::policy_state::DomainBinding;
 
     const NOW: u64 = 1_800_000_000_000;
     /// The nonce every authorization in this module binds.
@@ -178,38 +174,13 @@ mod tests {
             let writer = Arc::new(Mutex::new(
                 AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap(),
             ));
-            let facts = VerifiedTipFacts {
-                segment_start_hash: [0; 32],
-                entry_count: 0,
-                tip_hash: [0; 32],
-                log_path_sha256: [5; 32],
-                anchor_covers_tip: true,
-            };
-            let mut header = fixtures::header("fixture", None, &writer, facts, NOW);
-            header.domain = AuthorizationDomain::Soroban;
-            header.consumer = MainnetConsumer::X402Create;
-            let intent_digest =
-                soroban_intent_digest(&network_id(MAINNET_PASSPHRASE), &approved_invocation())
-                    .unwrap();
-            let authorization =
-                MainnetSorobanIntentAuthorization::for_crate_tests(SorobanIntentInner {
-                    entries: vec![],
-                    facts: super::super::digest::BindingFacts {
-                        endpoint: None,
-                        signer: [0; 32],
-                        policy: [0; 32],
-                        enablement: [0; 32],
-                        witness: None,
-                        reservation: None,
-                        approval: [0; 32],
-                        audit: [0; 32],
-                    },
-                    authorization_ttl_ms: TTL_MS,
-                    header,
-                    binding: DomainBinding::Soroban { intent_digest },
-                    nonce: NONCE,
-                    signature_expiration_ledger: EXPIRATION_LEDGER,
-                });
+            let authorization = fixtures::soroban_authorization(
+                &writer,
+                &approved_invocation(),
+                NONCE,
+                EXPIRATION_LEDGER,
+                NOW,
+            );
             Self {
                 _dir: dir,
                 authorization,

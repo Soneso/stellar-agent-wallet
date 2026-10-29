@@ -60,7 +60,9 @@ Keep the following properties of the current alpha in mind when assessing impact
   Policy evaluation alone grants no signing authority. Signing, submission, and
   x402 payload release independently check sealed authorization.
   The wallet's own signing paths sign mainnet payloads only under mainnet
-  authorization. Library signing primitives do not enforce this requirement.
+  authorization. The library signers enforce it too: every `Signer`, the
+  public keyring handle included, signs a mainnet transaction or Soroban
+  authorization payload only under a mainnet authorization.
   Code running as the same OS user with access to a keyring entry can read its
   seed directly. The keyring entry is the custody boundary.
   The endpoint's network binds each envelope signature.
