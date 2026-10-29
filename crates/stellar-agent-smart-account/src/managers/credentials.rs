@@ -74,7 +74,7 @@ use uuid::Uuid;
 
 use crate::webauthn::passkey_signer::{PasskeyCredentialRecord, PasskeySignHandle};
 use stellar_agent_core::smart_account::rule_id::ContextRuleId;
-use stellar_agent_network::signing::Signer as _;
+use stellar_agent_network::signing::{Signer as _, SmartAccountAuthDigest};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -1543,7 +1543,7 @@ impl CredentialsManager {
     ///    Early-exit paths (those that return before `poll_signing`) emit with
     ///    `credential_id_b64url = ""` and `rp_id = ""` because those fields are
     ///    only available after `show()` succeeds; `auth_digest_hex` is always
-    ///    derived from `partial.auth_digest`.
+    ///    derived from the digest of `partial`.
     ///
     /// # Parameters
     ///
@@ -1646,7 +1646,7 @@ impl CredentialsManager {
     ) -> Result<SignWithPasskeyOutcome, CredentialsError> {
         // The entry checks precede the ceremony and its audit machinery: a
         // refused entry starts nothing, so it leaves no PasskeyAssertion row.
-        partial.validate().map_err(|e| match e {
+        let digest = partial.signing_digest().map_err(|e| match e {
             crate::SaError::MainnetWriteForbidden => CredentialsError::MainnetWriteForbidden,
             other => CredentialsError::AuthEntryInvalid {
                 source: Box::new(other),
@@ -1658,7 +1658,6 @@ impl CredentialsManager {
         let smart_account =
             crate::managers::rules::xdr_scaddress_to_strkey_or_sentinel(&partial.smart_account);
         let smart_account = smart_account.as_str();
-        let auth_digest = &partial.auth_digest;
         let rule_ids: Vec<u32> = partial
             .context_rule_ids
             .iter()
@@ -1678,7 +1677,7 @@ impl CredentialsManager {
         // the `AuditEntry::new_passkey_assertion` constructor accepts — the `""`
         // sentinel is the documented convention for non-success paths where the
         // field is unavailable.
-        let auth_digest_hex = encode_auth_digest_hex(auth_digest);
+        let auth_digest_hex = encode_auth_digest_hex(digest.as_bytes());
         let signed_at_unix_ms = unix_now_ms();
 
         // Writer-sharing details live in the function rustdoc above; keep the
@@ -1698,7 +1697,7 @@ impl CredentialsManager {
             self.sign_with_passkey_rule_inner(
                 credential_name,
                 smart_account,
-                auth_digest,
+                &digest,
                 rule_ids,
                 // Clone preserves signers_manager for emit_signing_audit below
                 // Arc clone is O(1).
@@ -1809,7 +1808,7 @@ impl CredentialsManager {
         &self,
         credential_name: &str,
         smart_account: &str,
-        auth_digest: &[u8; 32],
+        auth_digest: &SmartAccountAuthDigest,
         rule_ids: Vec<u32>,
         signers_manager: Arc<SignersManager>,
         bridge_local_addr: SocketAddr,
@@ -2153,7 +2152,7 @@ impl CredentialsManager {
         // RP-ID in the approval page JS; bridge handlers read rp_id from the entry
         // rather than using a hardcoded "localhost" placeholder.
         let entry = match PendingApproval::new_passkey_pending(
-            *auth_digest,
+            *auth_digest.as_bytes(),
             credential_id_bytes.clone(),
             smart_account_redacted,
             rule_ids,
@@ -2246,7 +2245,7 @@ impl CredentialsManager {
     async fn poll_signing(
         &self,
         nonce: &str,
-        auth_digest: &[u8; 32],
+        auth_digest: &SmartAccountAuthDigest,
         credential_record: PasskeyCredentialRecord,
         credential_id_bytes: &[u8],
         metadata: &CredentialMetadata,
@@ -2297,7 +2296,7 @@ impl CredentialsManager {
     async fn check_store_for_assertion(
         &self,
         nonce: &str,
-        auth_digest: &[u8; 32],
+        auth_digest: &SmartAccountAuthDigest,
         credential_record: PasskeyCredentialRecord,
         credential_id_bytes: &[u8],
         metadata: &CredentialMetadata,

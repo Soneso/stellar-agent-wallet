@@ -103,7 +103,7 @@ pub enum Sep53Error {
 
     /// The signing operation failed.
     ///
-    /// Returned when [`super::sign_message`] calls `Signer::sign_tx_payload`
+    /// Returned when [`super::sign_message`] calls `Signer::sign_message`
     /// and the signer returns an error (hardware timeout, keyring unavailable,
     /// etc.).
     ///

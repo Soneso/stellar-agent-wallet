@@ -2593,21 +2593,33 @@ mod tests {
 
     #[async_trait::async_trait]
     impl stellar_agent_network::signing::Signer for StubSigner {
-        async fn sign_tx_payload(&self, _: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        async fn sign_tx_payload(
+            &self,
+            _: &stellar_agent_network::signing::TxSigningPayload,
+        ) -> Result<[u8; 64], WalletError> {
             unimplemented!("stub — not called by check_required tests")
         }
-        async fn sign_auth_digest(&self, _: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        async fn sign_auth_digest(
+            &self,
+            _: &stellar_agent_network::signing::SmartAccountAuthDigest,
+        ) -> Result<[u8; 64], WalletError> {
             unimplemented!("stub — not called by check_required tests")
         }
         async fn sign_soroban_address_auth_payload(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::SorobanAuthPayload,
         ) -> Result<[u8; 64], WalletError> {
             unimplemented!("stub — not called by check_required tests")
         }
+        async fn sign_message(
+            &self,
+            _: &stellar_agent_network::signing::MessagePayload,
+        ) -> Result<[u8; 64], WalletError> {
+            unimplemented!("stub: not called by check_required tests")
+        }
         async fn sign_webauthn_assertion(
             &self,
-            _: &[u8; 32],
+            _: &stellar_agent_network::signing::SmartAccountAuthDigest,
             _: &[u8],
         ) -> Result<WebAuthnAssertion, WalletError> {
             unimplemented!("stub — not called by check_required tests")

@@ -5148,7 +5148,6 @@ version = "0.1.0-alpha.12"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
- "sha2 0.11.0",
  "stellar-agent-core",
  "stellar-agent-network",
  "stellar-agent-test-support",

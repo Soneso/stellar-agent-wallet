@@ -1055,7 +1055,10 @@ struct FailingSigner {
 
 #[async_trait]
 impl Signer for FailingSigner {
-    async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_tx_payload(
+        &self,
+        payload: &stellar_agent_network::signing::TxSigningPayload,
+    ) -> Result<[u8; 64], WalletError> {
         let call = self.sign_calls.fetch_add(1, Ordering::AcqRel) + 1;
         if call == self.fail_on_sign_call {
             return Err(WalletError::Auth(AuthError::HardwareUserRefused));
@@ -1063,7 +1066,10 @@ impl Signer for FailingSigner {
         self.signing_key.sign_tx_payload(payload).await
     }
 
-    async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_auth_digest(
+        &self,
+        digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
         // FailingSigner is used by deploy-c tests which exercise
         // sign_tx_payload only; auth-digest signing is unreachable here.
         // Provide a faithful pass-through to keep the trait satisfied.
@@ -1072,7 +1078,7 @@ impl Signer for FailingSigner {
 
     async fn sign_soroban_address_auth_payload(
         &self,
-        payload: &[u8; 32],
+        payload: &stellar_agent_network::signing::SorobanAuthPayload,
     ) -> Result<[u8; 64], WalletError> {
         // FailingSigner is used by deploy-c tests which exercise
         // sign_tx_payload only; Soroban address-auth signing is unreachable
@@ -1082,9 +1088,19 @@ impl Signer for FailingSigner {
             .await
     }
 
+    async fn sign_message(
+        &self,
+        payload: &stellar_agent_network::signing::MessagePayload,
+    ) -> Result<[u8; 64], WalletError> {
+        // FailingSigner is used by deploy-c tests which exercise
+        // sign_tx_payload only; message signing is unreachable here.
+        // Pass-through preserves the trait.
+        self.signing_key.sign_message(payload).await
+    }
+
     async fn sign_webauthn_assertion(
         &self,
-        _auth_digest: &[u8; 32],
+        _auth_digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
         _credential_id: &[u8],
     ) -> Result<stellar_agent_network::WebAuthnAssertion, WalletError> {
         // FailingSigner is used by deploy-c tests which exercise

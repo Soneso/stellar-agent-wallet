@@ -123,7 +123,11 @@ pub use sequence_floor::{
 };
 pub use signing::source::{signer_from_env, signer_from_ledger};
 pub use signing::wallet::signer_from_wallet;
-pub use signing::{HardwareSigningKey, Signer, SigningKey, SoftwareSigningKey, WebAuthnAssertion};
+pub use signing::{
+    AuthorizedPayloadError, HardwareSigningKey, MainnetSorobanAuthPayload, MessagePayload, Signer,
+    SigningKey, SmartAccountAuthDigest, SoftwareSigningKey, SorobanAuthPayload, TxSigningPayload,
+    WebAuthnAssertion,
+};
 pub use simulation_audit::{
     AuthEntryFingerprint, fingerprint_soroban_auth_entries, verify_auth_entries_unchanged,
 };

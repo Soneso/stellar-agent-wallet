@@ -180,9 +180,11 @@ unspent pending approval. Reusing it can produce
 `network.mainnet_authorization_refused` without a tombstone.
 
 The wallet's own signing paths sign mainnet payloads only under mainnet
-authorization. Library signing primitives do not enforce this requirement.
-Code running as the same OS user with access to a keyring entry can read its
-seed directly. The keyring entry is the custody boundary.
+authorization. The library signers enforce it too: every `Signer`, the public
+keyring handle included, signs a mainnet transaction or Soroban authorization
+payload only under a mainnet authorization. Code running as the same OS user
+with access to a keyring entry can read its seed directly. The keyring entry
+is the custody boundary.
 Ordinary submission refuses the declared mainnet passphrase or known mainnet
 host before RPC. Authorized entry points check sealed authority independently.
 Durable consumption precedes sending.

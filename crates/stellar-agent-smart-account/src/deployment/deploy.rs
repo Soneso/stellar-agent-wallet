@@ -1467,24 +1467,37 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Signer for RecordingSigner {
-        async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        async fn sign_tx_payload(
+            &self,
+            payload: &stellar_agent_network::signing::TxSigningPayload,
+        ) -> Result<[u8; 64], WalletError> {
             self.record("sign_tx_payload");
             self.key.sign_tx_payload(payload).await
         }
-        async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        async fn sign_auth_digest(
+            &self,
+            digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
+        ) -> Result<[u8; 64], WalletError> {
             self.record("sign_auth_digest");
             self.key.sign_auth_digest(digest).await
         }
         async fn sign_soroban_address_auth_payload(
             &self,
-            payload: &[u8; 32],
+            payload: &stellar_agent_network::signing::SorobanAuthPayload,
         ) -> Result<[u8; 64], WalletError> {
             self.record("sign_soroban_address_auth_payload");
             self.key.sign_soroban_address_auth_payload(payload).await
         }
+        async fn sign_message(
+            &self,
+            payload: &stellar_agent_network::signing::MessagePayload,
+        ) -> Result<[u8; 64], WalletError> {
+            self.record("sign_message");
+            self.key.sign_message(payload).await
+        }
         async fn sign_webauthn_assertion(
             &self,
-            auth_digest: &[u8; 32],
+            auth_digest: &stellar_agent_network::signing::SmartAccountAuthDigest,
             credential_id: &[u8],
         ) -> Result<stellar_agent_network::WebAuthnAssertion, WalletError> {
             self.record("sign_webauthn_assertion");

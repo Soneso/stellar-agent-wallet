@@ -62,8 +62,8 @@
 
 use sha2::{Digest as _, Sha256};
 use stellar_agent_network::{
-    StellarRpcClient, fetch_account, signing::Signer, signing::envelope_signing::attach_signature,
-    submit_transaction_and_wait,
+    StellarRpcClient, fetch_account, signing::Signer, signing::SorobanAuthPayload,
+    signing::envelope_signing::attach_signature, submit_transaction_and_wait,
 };
 use stellar_baselib::account::{Account as BaselibAccount, AccountBehavior};
 use stellar_baselib::transaction::TransactionBehavior;
@@ -443,16 +443,14 @@ pub(crate) async fn submit_timelock_invoke_with_g_key_auth(
             signature_expiration_ledger,
             invocation: wallet_root.clone(),
         });
-        let preimage_xdr = preimage.to_xdr(Limits::none()).map_err(|e| {
+        let signature_payload = SorobanAuthPayload::from_preimage(&preimage).map_err(|e| {
             auth_err(
                 "auth_payload",
-                format!("{}: auth preimage XDR encode failed: {e:?}", args.op_label),
+                format!("{}: auth preimage payload refused: {e}", args.op_label),
             )
         })?;
-        let signature_payload: [u8; 32] = Sha256::digest(&preimage_xdr).into();
 
-        // Sign with the Soroban-address-auth primitive (distinct call-site from
-        // `sign_tx_payload` per the Signer trait's call-site discipline).
+        // Sign with the Soroban-address-auth primitive.
         let signature_bytes = args
             .signer
             .sign_soroban_address_auth_payload(&signature_payload)

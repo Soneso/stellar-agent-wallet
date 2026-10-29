@@ -9,7 +9,7 @@
 //!   `SorobanAuthorization` or type 10 `SorobanAuthorizationWithAddress`),
 //!   returning a base64 raw signature.
 //! - [`sign_message_bytes`]: SEP-53 message signing for `signMessage`, an
-//!   ed25519 signature via `sign_tx_payload` over
+//!   ed25519 signature via `sign_message` over
 //!   `SHA256("Stellar Signed Message:\n" ‖ message)`.
 //!
 //! # Canonical byte-layout references
@@ -21,8 +21,9 @@
 //!   preimage layout `{ network_id, nonce, signature_expiration_ledger,
 //!   invocation }`; `HashIdPreimageSorobanAuthorizationWithAddress` (envelope
 //!   type 10, CAP-71): `{ network_id, nonce, signature_expiration_ledger,
-//!   address, invocation }`. The received preimage bytes are SHA-256-hashed to
-//!   produce the auth-entry signing payload.
+//!   address, invocation }`. The SHA-256 of the preimage's XDR is the
+//!   auth-entry signing payload; XDR decoding accepts only the canonical
+//!   encoding, so it is the hash of the received bytes.
 //!
 //! # Call-site discipline
 //!
@@ -30,14 +31,14 @@
 //!   `stellar_agent_network::signing::envelope_signing::attach_signature`:
 //!   the single SEP-23 signing call site.
 //! - [`sign_soroban_auth_entry`] invokes
-//!   `Signer::sign_soroban_address_auth_payload` over the SHA-256 of the
-//!   supplied preimage bytes: the auth-entry signing primitive. It refuses a
-//!   mainnet preimage; `sign_soroban_auth_entry_authorized`, which exists only
-//!   in builds with the `mainnet-write` feature, signs one under a Soroban
-//!   intent authorization.
-//! - [`sign_message_bytes`] computes the SEP-53 message digest then invokes
-//!   `Signer::sign_tx_payload` (the payload domain is the SEP-53 message digest,
-//!   not a SEP-23 transaction, but the ed25519 primitive is identical).
+//!   `Signer::sign_soroban_address_auth_payload` over the
+//!   `SorobanAuthPayload` of the supplied preimage: the auth-entry signing
+//!   primitive. It refuses a mainnet preimage;
+//!   `sign_soroban_auth_entry_authorized`, which exists only in builds with
+//!   the `mainnet-write` feature, signs one under a Soroban intent
+//!   authorization through `SorobanAuthPayload::authorized`.
+//! - [`sign_message_bytes`] invokes `Signer::sign_message` over the SEP-53
+//!   `MessagePayload` of the message.
 //!
 //! # No HTTP/HTTPS client surface
 //!
@@ -54,12 +55,12 @@ use stellar_agent_network::mainnet::authorization::{
     MainnetSignedSorobanIntent, MainnetSorobanIntentAuthorization,
 };
 #[cfg(feature = "mainnet-write")]
-use stellar_agent_network::mainnet::soroban::check_preimage_against_authorization;
-#[cfg(feature = "mainnet-write")]
 use stellar_agent_network::mainnet::{
-    MainnetAuthorizationError, MainnetConsumer, MainnetPrecondition, SignerRole,
+    MainnetAuthorizationError, MainnetConsumer, MainnetPrecondition,
 };
-use stellar_agent_network::signing::Signer;
+#[cfg(feature = "mainnet-write")]
+use stellar_agent_network::signing::AuthorizedPayloadError;
+use stellar_agent_network::signing::{MessagePayload, Signer, SorobanAuthPayload};
 use stellar_agent_soroban_auth::preimage_parts;
 use stellar_xdr::{AccountId, HashIdPreimage, PublicKey, ReadXdr, ScAddress, Uint256};
 
@@ -196,10 +197,12 @@ pub async fn sign_soroban_auth_entry(
         return Err(mainnet_signing_forbidden());
     }
     check_bound_address(&received.preimage, &expected_signer.0)?;
+    let payload =
+        SorobanAuthPayload::from_preimage(&received.preimage).map_err(wallet_error_to_sep43)?;
 
-    // Sign SHA-256 of the received bytes with the auth-entry signing primitive.
+    // Sign the preimage's payload with the auth-entry signing primitive.
     let sig_bytes = signer
-        .sign_soroban_address_auth_payload(&received.payload)
+        .sign_soroban_address_auth_payload(&payload)
         .await
         .map_err(wallet_error_to_sep43)?;
 
@@ -221,17 +224,17 @@ pub async fn sign_soroban_auth_entry(
 /// input and preimage checks, in this order:
 ///
 /// 1. The checks 1 to 4 of [`sign_soroban_auth_entry`].
-/// 2. A type 10 preimage must be bound to the authorization's signer.
-/// 3. `expected_signer` must be the authorization's signer.
-/// 4. The preimage must be the one `authorization` covers, for `consumer`, on
-///    the mainnet clock: the chain, the consuming verb, the expiry, the
-///    intent digest of the preimage's invocation, and the entry's nonce and
-///    signature expiration ledger, through
-///    [`check_preimage_against_authorization`].
-/// 5. The signer's reported public key must be the authorization's agent
-///    signer. This is the only step that calls the signer before it signs.
-/// 6. The signature must verify under that key over `SHA256(preimage_bytes)`
-///    before it is returned.
+/// 2. `SorobanAuthPayload::authorized`, which takes the authorization: a
+///    type 10 preimage must be bound to the authorization's signer;
+///    `expected_signer` must be the authorization's signer; and the preimage
+///    must be the one `authorization` covers, for `consumer`, on the mainnet
+///    clock: the chain, the consuming verb, the expiry, the intent digest of
+///    the preimage's invocation, and the entry's nonce and signature
+///    expiration ledger.
+/// 3. `MainnetSorobanAuthPayload::sign`: the signer's reported public key
+///    must be the authorization's agent signer, which is the only call on the
+///    signer before it signs, and the signature must verify under that key
+///    over the payload before it is returned.
 ///
 /// Exists only in builds with the `mainnet-write` feature.
 ///
@@ -261,7 +264,6 @@ pub async fn sign_soroban_auth_entry_authorized(
     authorization: MainnetSorobanIntentAuthorization,
 ) -> Result<(String, MainnetSignedSorobanIntent), Sep43Error> {
     const PATH: &str = "sign_soroban_auth_entry_authorized";
-    let refuse = |error: MainnetAuthorizationError| wallet_error_to_sep43(error.report(PATH));
 
     let received = decode_preimage(
         preimage_xdr,
@@ -269,40 +271,26 @@ pub async fn sign_soroban_auth_entry_authorized(
         network_passphrase_override,
     )?;
     let bound_key = authorization.signer_public_key();
-    check_bound_address(&received.preimage, &bound_key)?;
-    if expected_signer.0 != bound_key {
-        return Err(refuse(MainnetAuthorizationError::Refused(
-            MainnetPrecondition::SignerKeyMismatch,
-        )));
-    }
-    let now_ms = stellar_agent_network::mainnet::clock::now_ms().map_err(wallet_error_to_sep43)?;
-    check_preimage_against_authorization(
-        &authorization,
-        consumer,
+    let payload = SorobanAuthPayload::authorized(
         &received.preimage,
-        &received.network_id,
-        now_ms,
+        consumer,
+        &expected_signer.0,
+        authorization,
     )
-    .map_err(refuse)?;
-
-    let public_key = signer.public_key().await.map_err(wallet_error_to_sep43)?;
-    authorization
-        .check_signer(&public_key.0, SignerRole::AgentSigner)
-        .map_err(refuse)?;
-
-    let sig_bytes = signer
-        .sign_soroban_address_auth_payload(&received.payload)
+    .map_err(|error| match error {
+        AuthorizedPayloadError::Refused(MainnetAuthorizationError::Refused(
+            MainnetPrecondition::PreimageAddress,
+        )) => invalid_address(&bound_key),
+        other => wallet_error_to_sep43(other.report(PATH)),
+    })?;
+    let (sig_bytes, signed) = payload
+        .sign(signer)
         .await
-        .map_err(wallet_error_to_sep43)?;
-    if !signature_verifies(&public_key.0, &received.payload, &sig_bytes) {
-        return Err(refuse(MainnetAuthorizationError::Refused(
-            MainnetPrecondition::SignatureInvalid,
-        )));
-    }
+        .map_err(|error| wallet_error_to_sep43(error.report(PATH)))?;
 
     Ok((
         base64::engine::general_purpose::STANDARD.encode(sig_bytes),
-        authorization.into_signed(),
+        signed,
     ))
 }
 
@@ -312,8 +300,6 @@ struct ReceivedPreimage {
     preimage: HashIdPreimage,
     /// Its `network_id`, equal to the expected network's.
     network_id: [u8; 32],
-    /// `SHA-256` of the received bytes: the payload the signature covers.
-    payload: [u8; 32],
 }
 
 /// Runs the passphrase-override, decode, preimage-type, and network-id
@@ -368,7 +354,6 @@ fn decode_preimage(
     }
 
     Ok(ReceivedPreimage {
-        payload: Sha256::digest(&preimage_bytes).into(),
         preimage,
         network_id,
     })
@@ -385,15 +370,21 @@ fn check_bound_address(preimage: &HashIdPreimage, key: &[u8; 32]) -> Result<(), 
     if *bound_address == signer_address {
         return Ok(());
     }
+    Err(invalid_address(key))
+}
+
+/// The refusal of a type 10 preimage bound to another address than the
+/// account of `key`.
+fn invalid_address(key: &[u8; 32]) -> Sep43Error {
     let expected = stellar_strkey::ed25519::PublicKey(*key).to_string();
-    Err(Sep43Error::InvalidAddress {
+    Sep43Error::InvalidAddress {
         detail: format!(
             "authorization preimage is bound to another address (expected the signing \
              key {})",
             redact_strkey_first5_last5(expected.as_str())
         ),
         expected_type: "G-strkey matching the signing key",
-    })
+    }
 }
 
 /// `SHA-256` of the mainnet passphrase: the mainnet network id.
@@ -424,20 +415,11 @@ fn mainnet_signing_forbidden() -> Sep43Error {
     }
 }
 
-/// Whether `signature` is a valid ed25519 signature by `key` over `payload`.
-#[cfg(feature = "mainnet-write")]
-fn signature_verifies(key: &[u8; 32], payload: &[u8; 32], signature: &[u8; 64]) -> bool {
-    ed25519_dalek::VerifyingKey::from_bytes(key).is_ok_and(|key| {
-        key.verify_strict(payload, &ed25519_dalek::Signature::from_bytes(signature))
-            .is_ok()
-    })
-}
-
 /// Signs an arbitrary message byte slice for SEP-43 `signMessage`.
 ///
-/// Computes the SEP-53 message digest `SHA256("Stellar Signed Message:\n" ‖
-/// message_bytes)` and calls `Signer::sign_tx_payload` on the resulting 32-byte
-/// digest. The prefix is the domain separator that makes the signature
+/// Builds the SEP-53 message payload `SHA256("Stellar Signed Message:\n" ‖
+/// message_bytes)` and calls `Signer::sign_message` on it. The prefix is the
+/// domain separator that makes the signature
 /// verifiable by any SEP-53 verifier (including
 /// [`stellar_agent_sep53::verify_message`]) and matches the message-signing
 /// scheme used by reference SEP-43 wallets.
@@ -489,15 +471,11 @@ pub async fn sign_message_bytes(
         });
     }
 
-    // Reuse the sep53 crate's single SEP-53 digest implementation
-    // (SHA-256("Stellar Signed Message:\n" ‖ message)) so the two SEPs cannot
-    // diverge; the signature is verifiable by any SEP-53 verifier.
-    let digest = stellar_agent_sep53::message_digest(message_bytes);
-
-    // sign_tx_payload is the raw 32-byte ed25519 primitive; the payload domain
-    // here is the SEP-53 message digest, not a SEP-23 transaction payload.
+    // The one SEP-53 digest implementation, SHA-256("Stellar Signed
+    // Message:\n" ‖ message), signed in the message domain; any SEP-53
+    // verifier accepts the signature.
     let sig_bytes = signer
-        .sign_tx_payload(&digest)
+        .sign_message(&MessagePayload::sep53(message_bytes))
         .await
         .map_err(wallet_error_to_sep43)?;
 

@@ -53,7 +53,8 @@ use stellar_agent_network::keyring::{EnrolledSigner, lazy_signer_from_keyring};
 use stellar_agent_network::signing::hardware::HardwareSigningKey;
 use stellar_agent_network::signing::wallet::signer_from_wallet;
 use stellar_agent_network::{
-    KeyringSignHandle, Signer, SoftwareSigningKey, WebAuthnAssertion, signer_from_ledger,
+    KeyringSignHandle, MessagePayload, Signer, SmartAccountAuthDigest, SoftwareSigningKey,
+    SorobanAuthPayload, TxSigningPayload, WebAuthnAssertion, signer_from_ledger,
 };
 use stellar_agent_smart_account::deployment::DeployerKeypair;
 use zeroize::Zeroizing;
@@ -523,7 +524,7 @@ impl<'a> DeferredEnvSigner<'a> {
 
 #[async_trait::async_trait]
 impl Signer for DeferredEnvSigner<'_> {
-    async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_tx_payload(&self, payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
         let SignerCeremonyOutcome {
             signer,
             mlock_degradation,
@@ -554,20 +555,29 @@ impl Signer for DeferredEnvSigner<'_> {
         signer.sign_tx_payload(payload).await
     }
 
-    async fn sign_auth_digest(&self, _digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_auth_digest(
+        &self,
+        _digest: &SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
         Err(Self::refused("sign_auth_digest"))
     }
 
     async fn sign_soroban_address_auth_payload(
         &self,
-        _payload: &[u8; 32],
+        _payload: &SorobanAuthPayload,
     ) -> Result<[u8; 64], WalletError> {
         Err(Self::refused("sign_soroban_address_auth_payload"))
     }
 
+    /// The environment ceremony signs transactions only; a message is
+    /// refused before any seed is read.
+    async fn sign_message(&self, _payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
+        Err(Self::refused("sign_message"))
+    }
+
     async fn sign_webauthn_assertion(
         &self,
-        _auth_digest: &[u8; 32],
+        _auth_digest: &SmartAccountAuthDigest,
         _credential_id: &[u8],
     ) -> Result<WebAuthnAssertion, WalletError> {
         Err(Self::refused("sign_webauthn_assertion"))
@@ -599,24 +609,31 @@ impl KeyringHandleSigner {
 
 #[async_trait::async_trait]
 impl Signer for KeyringHandleSigner {
-    async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_tx_payload(&self, payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
         self.observe(Signer::sign_tx_payload(&self.handle, payload).await)
     }
 
-    async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_auth_digest(
+        &self,
+        digest: &SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
         self.observe(Signer::sign_auth_digest(&self.handle, digest).await)
     }
 
     async fn sign_soroban_address_auth_payload(
         &self,
-        payload: &[u8; 32],
+        payload: &SorobanAuthPayload,
     ) -> Result<[u8; 64], WalletError> {
         self.observe(Signer::sign_soroban_address_auth_payload(&self.handle, payload).await)
     }
 
+    async fn sign_message(&self, payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
+        self.observe(Signer::sign_message(&self.handle, payload).await)
+    }
+
     async fn sign_webauthn_assertion(
         &self,
-        auth_digest: &[u8; 32],
+        auth_digest: &SmartAccountAuthDigest,
         credential_id: &[u8],
     ) -> Result<WebAuthnAssertion, WalletError> {
         self.observe(
@@ -760,6 +777,120 @@ mod tests {
 
     use super::*;
 
+    /// The CLI wrapper preserves the binding when a callback forwards a mainnet payload.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn keyring_handle_signer_refuses_another_mainnet_key() {
+        use crate::common::mainnet_write_fixture::{AGENT_SEED, DESTINATION, Spec};
+        use clap::Parser;
+
+        struct ForwardingSigner {
+            target: KeyringHandleSigner,
+        }
+
+        #[async_trait::async_trait]
+        impl Signer for ForwardingSigner {
+            async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
+                SoftwareSigningKey::new_from_bytes(AGENT_SEED)
+                    .public_key()
+                    .await
+            }
+
+            async fn sign_tx_payload(
+                &self,
+                payload: &TxSigningPayload,
+            ) -> Result<[u8; 64], WalletError> {
+                let error = self.target.sign_tx_payload(payload).await.unwrap_err();
+                assert_eq!(error.code(), "network.mainnet_authorization_refused");
+                Err(error)
+            }
+
+            async fn sign_auth_digest(
+                &self,
+                _: &SmartAccountAuthDigest,
+            ) -> Result<[u8; 64], WalletError> {
+                panic!("unexpected smart-account signing")
+            }
+
+            async fn sign_soroban_address_auth_payload(
+                &self,
+                _: &SorobanAuthPayload,
+            ) -> Result<[u8; 64], WalletError> {
+                panic!("unexpected Soroban signing")
+            }
+
+            async fn sign_message(&self, _: &MessagePayload) -> Result<[u8; 64], WalletError> {
+                panic!("unexpected message signing")
+            }
+
+            async fn sign_webauthn_assertion(
+                &self,
+                _: &SmartAccountAuthDigest,
+                _: &[u8],
+            ) -> Result<WebAuthnAssertion, WalletError> {
+                panic!("unexpected WebAuthn signing")
+            }
+        }
+
+        #[derive(Parser)]
+        struct PayCommand {
+            #[command(flatten)]
+            args: crate::commands::pay::PayArgs,
+        }
+
+        let fixture = Spec::new("keyring-payload-binding").build().await;
+        let seed = [0x3b; 32];
+        let public = SoftwareSigningKey::new_from_bytes(seed)
+            .public_key()
+            .await
+            .unwrap();
+        let entry = stellar_agent_core::profile::schema::KeyringEntryRef::new(
+            "stellar-agent-cli-payload-binding",
+            "default",
+        );
+        keyring_core::Entry::new(&entry.service, &entry.account)
+            .unwrap()
+            .set_password(
+                &stellar_strkey::ed25519::PrivateKey(seed)
+                    .as_unredacted()
+                    .to_string(),
+            )
+            .unwrap();
+        let failed = Arc::new(AtomicBool::new(false));
+        let target = KeyringHandleSigner {
+            handle: lazy_signer_from_keyring(&entry, &public.to_string()).unwrap(),
+            failed: Arc::clone(&failed),
+        };
+        assert!(target.sign_tx_payload(&tx_payload(7)).await.is_ok());
+        assert!(!failed.load(Ordering::SeqCst));
+        let record = Arc::clone(&failed);
+        let _factory = set_ledger_signer_factory(std::rc::Rc::new(move |_, _| {
+            Ok(Box::new(ForwardingSigner {
+                target: KeyringHandleSigner {
+                    handle: lazy_signer_from_keyring(&entry, &public.to_string())?,
+                    failed: Arc::clone(&record),
+                },
+            }))
+        }));
+        let command = PayCommand::parse_from([
+            "pay",
+            DESTINATION,
+            "1 XLM",
+            "--profile",
+            fixture.name,
+            "--source",
+            &fixture.agent.g,
+            "--sign-with-ledger",
+        ]);
+        assert_eq!(crate::commands::pay::run(&command.args).await, 1);
+        assert!(
+            failed.load(Ordering::SeqCst),
+            "the wrapper refuses the bound payload"
+        );
+        assert!(fixture.sent_envelopes().await.is_empty());
+    }
+
     fn test_profile() -> Profile {
         let mut profile = Profile::builder_testnet_named("ceremony", "s", "a", "n", "a").build();
         profile.wallet.mlock_required = MlockRequired::Warn;
@@ -768,6 +899,56 @@ mod tests {
 
     fn unique_var(tag: &str) -> String {
         format!("SIGNER_CEREMONY_TEST_{tag}_{}", std::process::id())
+    }
+
+    /// The SEP-23 payload of an empty testnet transaction at `sequence`.
+    #[cfg(feature = "mainnet-write")]
+    fn tx_payload(sequence: i64) -> TxSigningPayload {
+        use stellar_xdr::{
+            Memo, MuxedAccount, Preconditions, SequenceNumber, Transaction, TransactionEnvelope,
+            TransactionExt, TransactionV1Envelope, Uint256, VecM,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([0x11; 32])),
+                fee: 100,
+                seq_num: SequenceNumber(sequence),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: VecM::default(),
+                ext: TransactionExt::V0,
+            },
+            signatures: VecM::default(),
+        });
+        TxSigningPayload::for_envelope(
+            &envelope,
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+        )
+        .unwrap()
+    }
+
+    /// The environment signer refuses a message before it reads its
+    /// variable: the refusal names the message primitive, not a missing
+    /// variable.
+    #[tokio::test]
+    async fn deferred_env_signer_refuses_a_message_before_the_ceremony() {
+        let profile = test_profile();
+        let deferred =
+            DeferredEnvSigner::new(unique_var("MESSAGE_UNSET"), "test", &profile, [0x42; 32]);
+        let err = deferred
+            .sign_message(&MessagePayload::sep53(b"not a transaction"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WalletError::Auth(AuthError::SignerKindMismatch {
+                    signer_kind: "env-seed",
+                    requested_primitive: "sign_message",
+                })
+            ),
+            "{err:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -994,7 +1175,11 @@ mod tests {
                 mlock_degradation: Some(degradation),
             };
             assert!(signer.mlock_degradation().is_none());
-            signer.signer().sign_tx_payload(&[7; 32]).await.unwrap();
+            signer
+                .signer()
+                .sign_tx_payload(&tx_payload(7))
+                .await
+                .unwrap();
             let observed = signer.mlock_degradation();
             assert_eq!(observed.is_some(), degraded);
             if let Some(observed) = observed {
@@ -1032,8 +1217,16 @@ mod tests {
             handle_failure: None,
             mlock_degradation: Some(degradation),
         };
-        signer.signer().sign_tx_payload(&[7; 32]).await.unwrap();
-        signer.signer().sign_tx_payload(&[8; 32]).await.unwrap();
+        signer
+            .signer()
+            .sign_tx_payload(&tx_payload(7))
+            .await
+            .unwrap();
+        signer
+            .signer()
+            .sign_tx_payload(&tx_payload(8))
+            .await
+            .unwrap();
         assert_eq!(calls.get(), 2, "each signature runs its own ceremony");
         let observed = signer
             .mlock_degradation()
@@ -1173,24 +1366,34 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Signer for CountingKeyFetchSigner {
-        async fn sign_tx_payload(&self, _payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        async fn sign_tx_payload(
+            &self,
+            _payload: &TxSigningPayload,
+        ) -> Result<[u8; 64], WalletError> {
             Err(counting_signer_error())
         }
 
-        async fn sign_auth_digest(&self, _digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+        async fn sign_auth_digest(
+            &self,
+            _digest: &SmartAccountAuthDigest,
+        ) -> Result<[u8; 64], WalletError> {
             Err(counting_signer_error())
         }
 
         async fn sign_soroban_address_auth_payload(
             &self,
-            _payload: &[u8; 32],
+            _payload: &SorobanAuthPayload,
         ) -> Result<[u8; 64], WalletError> {
+            Err(counting_signer_error())
+        }
+
+        async fn sign_message(&self, _payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
             Err(counting_signer_error())
         }
 
         async fn sign_webauthn_assertion(
             &self,
-            _auth_digest: &[u8; 32],
+            _auth_digest: &SmartAccountAuthDigest,
             _credential_id: &[u8],
         ) -> Result<WebAuthnAssertion, WalletError> {
             Err(counting_signer_error())

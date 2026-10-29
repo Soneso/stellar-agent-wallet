@@ -7,9 +7,9 @@
 //!
 //! # Signing discipline
 //!
-//! The helper decodes the base64 envelope, constructs the SEP-23
-//! `TransactionSignaturePayload`, SHA-256 hashes it, calls
-//! `signer.sign_tx_payload` exactly once, attaches the resulting
+//! The helper decodes the base64 envelope, builds its SEP-23 payload with
+//! [`TxSigningPayload::for_envelope`], calls `signer.sign_tx_payload` exactly
+//! once, attaches the resulting
 //! `DecoratedSignature`, and re-encodes the signed envelope as base64.
 //! Signing is fully off-chain.
 //!
@@ -23,20 +23,18 @@
 //! which checks a transaction authorization before it touches the signer and
 //! verifies the signature before it attaches it.
 
-use sha2::{Digest, Sha256};
 use stellar_agent_core::error::{NetworkError, ProtocolError, WalletError};
 use stellar_agent_core::profile::caip2::Caip2;
 use stellar_xdr::{
-    DecoratedSignature, Hash, Limits, ReadXdr, Signature, SignatureHint, TransactionEnvelope,
-    TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction, WriteXdr,
+    DecoratedSignature, Limits, ReadXdr, Signature, SignatureHint, TransactionEnvelope, WriteXdr,
 };
 
 use crate::mainnet::authorization::MainnetTxSignAuthorization;
 use crate::mainnet::digest::approval_subject_classic;
 use crate::mainnet::refusal::{AuthorizedPathError, require};
 use crate::mainnet::{MainnetConsumer, MainnetPrecondition, SignerRole};
-use crate::signing::Signer;
 use crate::signing::verify_binding::signature_verifies;
+use crate::signing::{Signer, TxSigningPayload};
 use crate::submit::{MAINNET_PASSPHRASE, replay_identity};
 
 /// Decodes a base64 `TransactionEnvelope`, attaches an ed25519 signature
@@ -83,7 +81,7 @@ pub async fn attach_signature(
         return Err(WalletError::Network(NetworkError::MainnetWriteForbidden));
     }
     let envelope = decode_envelope(unsigned_envelope_xdr)?;
-    let payload = signature_payload(&envelope, network_passphrase)?;
+    let payload = TxSigningPayload::for_envelope(&envelope, network_passphrase)?;
 
     // Invoke the signer exactly once, then read the key for the hint.
     let sig_bytes = signer.sign_tx_payload(&payload).await?;
@@ -166,8 +164,7 @@ pub(crate) async fn authorized_signature(
     authorization.check_not_expired(crate::mainnet::clock::now_ms()?)?;
 
     authorization.check_unsigned_envelope(&approval_subject_classic(unsigned_envelope_xdr))?;
-    let payload = signature_payload(&envelope, network_passphrase)?;
-    authorization.check_tx_hash(&payload)?;
+    let payload = TxSigningPayload::authorized(&envelope, authorization)?;
     let (source, sequence) = replay_identity(&envelope)?;
     authorization.check_source_sequence(&source, sequence)?;
 
@@ -175,7 +172,7 @@ pub(crate) async fn authorized_signature(
     authorization.check_signer(&public_key.0, SignerRole::AgentSigner)?;
     let sig_bytes = signer.sign_tx_payload(&payload).await?;
     require(
-        signature_verifies(&public_key.0, &payload, &sig_bytes),
+        signature_verifies(&public_key.0, payload.as_bytes(), &sig_bytes),
         MainnetPrecondition::SignatureInvalid,
     )?;
     Ok(append_signature(envelope, &public_key.0, &sig_bytes)?)
@@ -194,45 +191,6 @@ fn decode_envelope(envelope_xdr: &str) -> Result<TransactionEnvelope, WalletErro
             detail: format!("failed to decode TransactionEnvelope: {e}"),
         })
     })
-}
-
-/// The SEP-23 signing payload of `envelope` under `network_passphrase`: the
-/// SHA-256 of its `TransactionSignaturePayload`, which is also the
-/// transaction hash.
-fn signature_payload(
-    envelope: &TransactionEnvelope,
-    network_passphrase: &str,
-) -> Result<[u8; 32], WalletError> {
-    // SEP-23 covers V1 `Tx` and `TxFeeBump` envelopes. The tagged transaction
-    // selects the matching payload variant; legacy V0 envelopes are rejected.
-    let network_id_hash = Hash(Sha256::digest(network_passphrase.as_bytes()).into());
-    let tagged_tx = match envelope {
-        TransactionEnvelope::Tx(v1) => {
-            TransactionSignaturePayloadTaggedTransaction::Tx(v1.tx.clone())
-        }
-        TransactionEnvelope::TxFeeBump(fb) => {
-            TransactionSignaturePayloadTaggedTransaction::TxFeeBump(fb.tx.clone())
-        }
-        TransactionEnvelope::TxV0(_) => {
-            return Err(WalletError::Protocol(ProtocolError::XdrCodecFailed {
-                detail: "legacy V0 transaction envelopes are not supported; \
-                         use a V1 Tx or TxFeeBump envelope"
-                    .to_owned(),
-            }));
-        }
-    };
-
-    let sig_payload = TransactionSignaturePayload {
-        network_id: network_id_hash,
-        tagged_transaction: tagged_tx,
-    };
-
-    let payload_bytes = sig_payload.to_xdr(Limits::none()).map_err(|e| {
-        WalletError::Protocol(ProtocolError::XdrCodecFailed {
-            detail: format!("TransactionSignaturePayload XDR encode failed: {e}"),
-        })
-    })?;
-    Ok(Sha256::digest(&payload_bytes).into())
 }
 
 /// Appends the signature by `public_key` to the envelope's signature list and

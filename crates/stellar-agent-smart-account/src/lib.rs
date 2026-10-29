@@ -53,6 +53,9 @@ pub mod submit;
 // module so the builders never reach the public rustdoc of a release build.
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;
+// Typed signing payloads for the signer tests.
+#[cfg(test)]
+mod test_payloads;
 pub mod timelock;
 pub(crate) mod timelock_submit;
 pub mod verifier_allowlist;

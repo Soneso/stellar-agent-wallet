@@ -197,6 +197,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Breaking (`stellar-agent-network` API): every ed25519 method of `Signer`
+  takes a typed payload from `signing::payload`, and `Signer::sign_message` is
+  required. Implementations sign `payload.as_bytes()`; callers build payloads:
+  - `sign_tx_payload` takes `&TxSigningPayload`, from
+    `TxSigningPayload::for_envelope` or `TxSigningPayload::for_tagged`.
+  - `sign_soroban_address_auth_payload` takes `&SorobanAuthPayload`, from
+    `SorobanAuthPayload::from_preimage`.
+  - `sign_auth_digest` and `sign_webauthn_assertion` take
+    `&SmartAccountAuthDigest`, from `SmartAccountAuthDigest::new`.
+  - `sign_message` takes `&MessagePayload`, from `MessagePayload::sep53`.
+  The inherent signing methods of `KeyringSignHandle` take the same types, and
+  `KeyringSignHandle::sign_message` is added. A mainnet Soroban payload comes
+  from `SorobanAuthPayload::authorized`, which consumes the intent
+  authorization; `MainnetSorobanAuthPayload::sign` signs it once.
+  `MainnetPrecondition::PreimageAddress` names a type 10 preimage bound to
+  another address than the authorization's signer. The SEP-43 and SEP-53
+  signing functions keep their signatures.
 - `decode_owner_public_key` returns `Result<[u8; 32], OwnerKeyDecodeError>`.
   `OwnerKeyForm`, `OwnerEntryRewrite`, `rewrite_older_form_owner_entry`,
   `rewrite_owner_value_if_older`, `log_owner_entry_rewrite`,
@@ -800,6 +817,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- The keyring, software, and hardware signers refuse a mainnet payload bound to another signer key; the mainnet Soroban signing call rechecks freshness.
+
 - Owner readers refuse entries in the older base64 form and keep them unchanged.
   An installation that runs `profile rotate-owner-key` on v0.1.0-alpha.1 or
   v0.1.0-alpha.2 holds that command's generated owner seed at the owner coordinate.
@@ -904,7 +923,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retain that overlay. Both message tools require an audit writer before key
   loading and record a redacted `opaque_payload_signed` row after signing.
 - The signing documentation identifies wallet authorization checks and the
-  keyring custody boundary. Public library signing primitives accept raw digests.
+  keyring custody boundary.
+- Signing primitives refuse a mainnet payload without an authorization. The
+  public constructors of transaction, Soroban, and smart-account payloads
+  refuse mainnet. A mainnet Soroban payload exists only by consuming its intent
+  authorization, carries no public bytes, and signs once after its signer key
+  check. Message and transaction payloads are separate types, so a message
+  digest is never signed as a transaction hash.
 - SEP-7 parsing refuses parameters after `signature`, including a trailing
   empty pair, and percent-encoded signature parameter names with
   `sep7.invalid_param_value`. Verification independently refuses trailing

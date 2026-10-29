@@ -10,7 +10,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use stellar_agent_core::error::WalletError;
 
-use super::{Signer, SoftwareSigningKey, WebAuthnAssertion};
+use super::{
+    MessagePayload, Signer, SmartAccountAuthDigest, SoftwareSigningKey, SorobanAuthPayload,
+    TxSigningPayload, WebAuthnAssertion,
+};
 
 /// Wraps a software key and counts each call of each [`Signer`] method.
 /// Clones share their key and counters.
@@ -83,24 +86,31 @@ impl CountingSigner {
 
 #[async_trait]
 impl Signer for CountingSigner {
-    async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_tx_payload(&self, payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
         self.finish(self.key.sign_tx_payload(payload).await)
     }
 
-    async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_auth_digest(
+        &self,
+        digest: &SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
         self.finish(self.key.sign_auth_digest(digest).await)
     }
 
     async fn sign_soroban_address_auth_payload(
         &self,
-        payload: &[u8; 32],
+        payload: &SorobanAuthPayload,
     ) -> Result<[u8; 64], WalletError> {
         self.finish(self.key.sign_soroban_address_auth_payload(payload).await)
     }
 
+    async fn sign_message(&self, payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
+        self.finish(self.key.sign_message(payload).await)
+    }
+
     async fn sign_webauthn_assertion(
         &self,
-        auth_digest: &[u8; 32],
+        auth_digest: &SmartAccountAuthDigest,
         credential_id: &[u8],
     ) -> Result<WebAuthnAssertion, WalletError> {
         self.signs.fetch_add(1, Ordering::SeqCst);

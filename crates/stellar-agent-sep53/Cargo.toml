@@ -14,16 +14,14 @@ categories = ["cryptography::cryptocurrencies", "cryptography"]
 name = "stellar_agent_sep53"
 
 [dependencies]
-# SHA-256 for the SEP-53 prefixed-message preimage.
-sha2 = { workspace = true }
 # Stellar strkey encode/decode for G-key validation and the signer public key.
 stellar-strkey = { workspace = true }
 # Ed25519 VerifyingKey + Signature for message verification.
 ed25519-dalek = { workspace = true }
 # Typed error derives.
 thiserror = { workspace = true }
-# The signing primitive: SEP-53 builds the prefix + message preimage, SHA-256
-# digests it, then calls Signer::sign_tx_payload on the digest.
+# The signing primitive and the SEP-53 message payload: MessagePayload::sep53
+# digests the prefix + message preimage, and Signer::sign_message signs it.
 stellar-agent-network = { workspace = true }
 # The mainnet passphrase and the mainnet signing refusal detail, from their
 # single definition, for the refusal of mainnet message signing.

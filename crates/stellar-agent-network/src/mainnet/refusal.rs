@@ -153,6 +153,9 @@ pub enum MainnetPrecondition {
     /// The authorization entry's signature expiration ledger differs from
     /// the bound one.
     EntryExpiration,
+    /// A type 10 Soroban preimage is bound to another address than the
+    /// account of the authorization's signer.
+    PreimageAddress,
     /// The parent intent record differs or does not qualify.
     IntentRecordMismatch,
     /// The final envelope digest differs.
@@ -292,6 +295,7 @@ impl MainnetPrecondition {
             Self::IntentDigest => "intent_digest",
             Self::EntryNonce => "entry_nonce",
             Self::EntryExpiration => "entry_expiration",
+            Self::PreimageAddress => "preimage_address",
             Self::IntentRecordMismatch => "intent_record_mismatch",
             Self::FinalEnvelope => "final_envelope",
             Self::RootInvocation => "root_invocation",
@@ -516,6 +520,7 @@ mod tests {
             P::IntentDigest,
             P::EntryNonce,
             P::EntryExpiration,
+            P::PreimageAddress,
             P::IntentRecordMismatch,
             P::FinalEnvelope,
             P::RootInvocation,
@@ -617,6 +622,7 @@ mod tests {
                 | P::IntentDigest
                 | P::EntryNonce
                 | P::EntryExpiration
+                | P::PreimageAddress
                 | P::IntentRecordMismatch
                 | P::FinalEnvelope
                 | P::RootInvocation
@@ -727,6 +733,7 @@ mod tests {
             "intent_digest",
             "entry_nonce",
             "entry_expiration",
+            "preimage_address",
             "intent_record_mismatch",
             "final_envelope",
             "root_invocation",

@@ -42,7 +42,8 @@ thiserror = { workspace = true }
 # Async trait object support for ModuleAdapter async methods.
 async-trait = { workspace = true }
 
-# SHA-256 for the SEP-53 signMessage digest.
+# SHA-256 of the network passphrase: the network id a signAuthEntry preimage
+# must carry.
 sha2 = { workspace = true }
 
 # Profile types: network passphrase, mcp_signer_default, chain_id.
@@ -55,19 +56,18 @@ stellar-agent-xdr-limits = { workspace = true }
 # the signAuthEntry preimage checks.
 stellar-agent-soroban-auth = { workspace = true }
 
-# Signer trait: sign_tx_payload + sign_soroban_address_auth_payload.
+# Signer trait and the typed signing payloads: TxSigningPayload through
+# attach_signature, SorobanAuthPayload for signAuthEntry, MessagePayload for
+# signMessage.
 stellar-agent-network = { workspace = true }
 
 # SEP-53 message-signing scheme — shared PREFIX and MAX_MESSAGE_BYTES constants
 # so signMessage produces interoperable signatures.
 stellar-agent-sep53 = { workspace = true }
 
-# Verification of the signature the authorized signAuthEntry path returns,
-# under the authorization's signer key, and independent verification of
-# produced signatures in tests.
-ed25519-dalek = { workspace = true }
-
 [dev-dependencies]
+# Independent verification of produced signatures in tests.
+ed25519-dalek = { workspace = true }
 stellar-agent-network = { workspace = true, features = ["test-helpers"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

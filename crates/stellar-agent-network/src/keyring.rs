@@ -111,7 +111,10 @@ use stellar_agent_core::{
 use zeroize::Zeroizing;
 
 use crate::signing::source::{SecretStrkeySource, signer_from_s_strkey};
-use crate::signing::{Signer, WebAuthnAssertion, software::SoftwareSigningKey};
+use crate::signing::{
+    MessagePayload, Signer, SmartAccountAuthDigest, SorobanAuthPayload, TxSigningPayload,
+    WebAuthnAssertion, software::SoftwareSigningKey,
+};
 
 #[allow(deprecated)]
 pub use stellar_agent_core::keyring_errors::classify_keyring_error;
@@ -1099,7 +1102,11 @@ impl KeyringSignHandle {
         &self.entry_ref
     }
 
-    /// Signs a 32-byte transaction hash payload.
+    /// Signs a SEP-23 transaction payload.
+    ///
+    /// A mainnet payload exists only under a mainnet transaction
+    /// authorization, so the handle signs a mainnet transaction only when its
+    /// caller holds one; see [`crate::signing::payload`].
     ///
     /// RE-LOADS the secret from the keyring on every call.  The secret exists
     /// only within this function's stack frame and is zeroised before the
@@ -1149,6 +1156,8 @@ impl KeyringSignHandle {
     ///   public key derived from the freshly-loaded seed does not match the
     ///   cached public key from handle construction (host-swap defence).
     ///
+    /// - `network.mainnet_authorization_refused` for a mainnet binding to another key.
+    ///
     /// # Panics
     ///
     /// Never panics (all `unwrap`-free; panic-injection in tests uses a
@@ -1163,13 +1172,21 @@ impl KeyringSignHandle {
     /// # async fn example() -> Result<(), stellar_agent_core::WalletError> {
     /// # stellar_agent_test_support::keyring_mock::install().ok();
     /// let entry_ref = KeyringEntryRef::new("stellar-agent-signer-test", "test");
+    /// # fn envelope() -> stellar_xdr::TransactionEnvelope { unimplemented!() }
+    /// use stellar_agent_network::signing::TxSigningPayload;
+    ///
     /// let handle = signer_from_keyring(&entry_ref, "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY").await?;
-    /// let sig = handle.sign_tx_payload(&[0u8; 32]).await?;
+    /// let payload = TxSigningPayload::for_envelope(&envelope(), "Test SDF Network ; September 2015")?;
+    /// let sig = handle.sign_tx_payload(&payload).await?;
     /// assert_eq!(sig.len(), 64);
     /// # Ok(()) }
     /// ```
-    pub async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
-        let result = self.sign_tx_payload_inner(payload).await;
+    pub async fn sign_tx_payload(
+        &self,
+        payload: &TxSigningPayload,
+    ) -> Result<[u8; 64], WalletError> {
+        payload.check_mainnet_binding(self).await?;
+        let result = self.sign_bytes(payload.as_bytes()).await;
         let service = redact_keyring_coord(&self.entry_ref.service);
         let public_key = redact_strkey_first5_last5(self.public_key().to_string().as_ref());
         match &result {
@@ -1195,7 +1212,9 @@ impl KeyringSignHandle {
         result
     }
 
-    async fn sign_tx_payload_inner(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    /// Loads the seed and signs `payload` with it: the one keyring signing
+    /// path under every typed method.
+    async fn sign_bytes(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
         // Step 1: load the secret from the keyring into a Zeroizing<String>.
         // The String's heap allocation is zeroed when `s_strkey` drops.
         // The `KeyringEntry` is constructed fresh on every call (per-call
@@ -1218,63 +1237,51 @@ impl KeyringSignHandle {
         .await
     }
 
-    /// Signs a 32-byte smart-account auth-digest using the keyring-stored seed.
+    /// Signs a smart-account auth digest using the keyring-stored seed.
     ///
-    /// Cryptographically identical to [`KeyringSignHandle::sign_tx_payload`]
-    /// (same zeroise sequence, host-swap pubkey-verification, and ed25519
-    /// primitive). The split is a call-site-discipline guard: smart-account
-    /// auth-entry assembly invokes `sign_auth_digest`, classic transaction
-    /// signing invokes `sign_tx_payload`.
+    /// The same zeroise sequence, host-swap public-key verification, and
+    /// ed25519 primitive as [`KeyringSignHandle::sign_tx_payload`].
     ///
     /// # Errors
     ///
     /// Same variants as [`KeyringSignHandle::sign_tx_payload`].
-    pub async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
-        // Same zeroisation + host-swap check as sign_tx_payload. The two methods
-        // diverge only at the call site (which payload class is being signed).
-        let entry = open_entry(&self.entry_ref)?;
-        let s_strkey: Zeroizing<String> = Zeroizing::new(entry.get_password().map_err(|e| {
-            map_keyring_operation_error(&e, KeyringOperation::Read, &self.entry_ref.service)
-        })?);
-
-        sign_payload_verifying_pubkey(
-            s_strkey,
-            digest,
-            &self.cached_pubkey_bytes,
-            &self.entry_ref.service,
-        )
-        .await
+    pub async fn sign_auth_digest(
+        &self,
+        digest: &SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
+        self.sign_bytes(digest.as_bytes()).await
     }
 
-    /// Signs a 32-byte Soroban address-credentials auth-entry signature_payload
-    /// using the keyring-stored seed.
+    /// Signs a Soroban address-credentials auth-entry payload using the
+    /// keyring-stored seed.
     ///
-    /// Cryptographically identical to [`KeyringSignHandle::sign_tx_payload`]
-    /// and [`KeyringSignHandle::sign_auth_digest`] (same zeroise sequence,
-    /// host-swap pubkey-verification, and ed25519 primitive). Used exclusively
-    /// for the secondary "Delegated G-key" auth entry that OZ smart accounts
-    /// require. See [`Signer::sign_soroban_address_auth_payload`] for the
-    /// call-site-discipline rationale.
+    /// The same zeroise sequence, host-swap public-key verification, and
+    /// ed25519 primitive as [`KeyringSignHandle::sign_tx_payload`]. A mainnet
+    /// payload exists only under a mainnet Soroban intent authorization. See
+    /// [`Signer::sign_soroban_address_auth_payload`] for the call sites.
+    ///
+    /// # Errors
+    ///
+    /// Same variants as [`KeyringSignHandle::sign_tx_payload`], plus
+    /// `network.mainnet_authorization_refused` for a binding to another key.
+    pub async fn sign_soroban_address_auth_payload(
+        &self,
+        payload: &SorobanAuthPayload,
+    ) -> Result<[u8; 64], WalletError> {
+        payload.check_mainnet_binding(self).await?;
+        self.sign_bytes(payload.as_bytes()).await
+    }
+
+    /// Signs a SEP-53 message digest using the keyring-stored seed.
+    ///
+    /// The same zeroise sequence, host-swap public-key verification, and
+    /// ed25519 primitive as [`KeyringSignHandle::sign_tx_payload`].
     ///
     /// # Errors
     ///
     /// Same variants as [`KeyringSignHandle::sign_tx_payload`].
-    pub async fn sign_soroban_address_auth_payload(
-        &self,
-        payload: &[u8; 32],
-    ) -> Result<[u8; 64], WalletError> {
-        let entry = open_entry(&self.entry_ref)?;
-        let s_strkey: Zeroizing<String> = Zeroizing::new(entry.get_password().map_err(|e| {
-            map_keyring_operation_error(&e, KeyringOperation::Read, &self.entry_ref.service)
-        })?);
-
-        sign_payload_verifying_pubkey(
-            s_strkey,
-            payload,
-            &self.cached_pubkey_bytes,
-            &self.entry_ref.service,
-        )
-        .await
+    pub async fn sign_message(&self, payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
+        self.sign_bytes(payload.as_bytes()).await
     }
 }
 
@@ -1285,27 +1292,33 @@ impl KeyringSignHandle {
 /// Allows `KeyringSignHandle` to be used at the single SEP-23 signing call site
 /// (`attach_signature`) which takes `&dyn Signer`.
 ///
-/// `sign_tx_payload` delegates to `sign_payload_verifying_pubkey` (the same
-/// code that `KeyringSignHandle::sign_tx_payload` calls), so the full
-/// zeroisation sequence and host-swap defence apply.
+/// Each signing method delegates to the inherent method of the same name, so
+/// the full zeroisation sequence and host-swap defence apply.
 ///
 /// `public_key` returns the cached public key without a keyring lookup,
 /// matching the Signer contract (fast, no I/O).
 #[async_trait]
 impl Signer for KeyringSignHandle {
-    async fn sign_tx_payload(&self, payload: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_tx_payload(&self, payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
         KeyringSignHandle::sign_tx_payload(self, payload).await
     }
 
-    async fn sign_auth_digest(&self, digest: &[u8; 32]) -> Result<[u8; 64], WalletError> {
+    async fn sign_auth_digest(
+        &self,
+        digest: &SmartAccountAuthDigest,
+    ) -> Result<[u8; 64], WalletError> {
         KeyringSignHandle::sign_auth_digest(self, digest).await
     }
 
     async fn sign_soroban_address_auth_payload(
         &self,
-        payload: &[u8; 32],
+        payload: &SorobanAuthPayload,
     ) -> Result<[u8; 64], WalletError> {
         KeyringSignHandle::sign_soroban_address_auth_payload(self, payload).await
+    }
+
+    async fn sign_message(&self, payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
+        KeyringSignHandle::sign_message(self, payload).await
     }
 
     /// Keyring-stored ed25519 seeds cannot produce WebAuthn assertions;
@@ -1322,7 +1335,7 @@ impl Signer for KeyringSignHandle {
     ///   always, on every call.
     async fn sign_webauthn_assertion(
         &self,
-        _auth_digest: &[u8; 32],
+        _auth_digest: &SmartAccountAuthDigest,
         _credential_id: &[u8],
     ) -> Result<WebAuthnAssertion, WalletError> {
         Err(WalletError::Auth(AuthError::SignerKindMismatch {
@@ -1791,8 +1804,8 @@ fn wallet_error_kind(err: &WalletError) -> &'static str {
 ///
 /// Owns steps 2-6 of the zeroisation sequence from the module-level doc,
 /// with an added host-swap check before constructing the per-call signer.
-/// Called from `KeyringSignHandle::sign_tx_payload` ONLY — that caller
-/// owns step 1 (loading the secret into `Zeroizing<String>`).
+/// Called from `KeyringSignHandle::sign_bytes` ONLY; that caller owns step 1
+/// (loading the secret into `Zeroizing<String>`).
 ///
 /// All `Zeroizing<T>` wrappers fire their `Drop` on every exit path including
 /// panic.
@@ -1862,7 +1875,7 @@ async fn sign_payload_verifying_pubkey(
     let signer = SoftwareSigningKey::new_from_zeroizing(seed_bytes);
 
     // Step 7: sign; `signer` drops at end of scope.
-    let sig = signer.sign_tx_payload(payload).await?;
+    let sig = signer.sign_raw(payload);
     // `signer` drops here; SecretBox::drop zeroes the heap allocation.
     Ok(sig)
 }
@@ -2419,6 +2432,122 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn soroban_mainnet_binding_refuses_another_key() {
+        keyring_mock::install().expect("mock store");
+        let seed = [0xBC; 32];
+        let entry_ref = KeyringEntryRef::new("stellar-agent-keyring-soroban-binding", "default");
+        store_sstrkey(&entry_ref, &sstrkey_for_seed(seed));
+        let handle = signer_from_keyring(&entry_ref, &gstrkey_for_seed(seed))
+            .await
+            .unwrap();
+        let bytes = [0x3c; 32];
+        let wrong = SorobanAuthPayload::bound_for_test(bytes, [0; 32]);
+        let inert = stellar_agent_test_support::inert_dispatcher();
+        let writer = CaptureWriter::new();
+        let dispatch = tracing::Dispatch::new(json_capture_subscriber(writer.clone()));
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
+        let error = handle
+            .sign_soroban_address_auth_payload(&wrong)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "network.mainnet_authorization_refused");
+        drop(guard);
+        drop(inert);
+        assert!(writer.captured_str().contains("signer_key_mismatch"));
+        let key = SoftwareSigningKey::new_from_bytes(seed);
+        for payload in [
+            SorobanAuthPayload::from_bytes_for_test(bytes),
+            SorobanAuthPayload::bound_for_test(bytes, handle.public_key().0),
+        ] {
+            let signature = handle
+                .sign_soroban_address_auth_payload(&payload)
+                .await
+                .unwrap();
+            assert_eq!(signature, key.sign_raw(&bytes));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transaction_mainnet_binding_refuses_another_key() {
+        keyring_mock::install().expect("mock store");
+        let seed = [0xBC; 32];
+        let entry_ref =
+            KeyringEntryRef::new("stellar-agent-keyring-transaction-binding", "default");
+        store_sstrkey(&entry_ref, &sstrkey_for_seed(seed));
+        let handle = signer_from_keyring(&entry_ref, &gstrkey_for_seed(seed))
+            .await
+            .unwrap();
+        let bytes = [0x3c; 32];
+        let wrong = TxSigningPayload::bound_for_test(bytes, [0; 32]);
+        let inert = stellar_agent_test_support::inert_dispatcher();
+        let writer = CaptureWriter::new();
+        let dispatch = tracing::Dispatch::new(json_capture_subscriber(writer.clone()));
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
+        let error = handle.sign_tx_payload(&wrong).await.unwrap_err();
+        assert_eq!(error.code(), "network.mainnet_authorization_refused");
+        drop(guard);
+        drop(inert);
+        assert!(writer.captured_str().contains("signer_key_mismatch"));
+        let key = SoftwareSigningKey::new_from_bytes(seed);
+        for payload in [
+            TxSigningPayload::from_bytes_for_test(bytes),
+            TxSigningPayload::bound_for_test(bytes, handle.public_key().0),
+        ] {
+            let signature = handle.sign_tx_payload(&payload).await.unwrap();
+            assert_eq!(signature, key.sign_raw(&bytes));
+        }
+    }
+
+    /// Every typed method of the handle signs its payload's bytes with the
+    /// stored key, both as inherent methods and through the trait, and the
+    /// message signature verifies against the SEP-53 digest.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn every_typed_method_signs_with_the_stored_key() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        keyring_mock::install().expect("mock store");
+        let seed = [0xBC_u8; 32];
+        let entry_ref = KeyringEntryRef::new("stellar-agent-keyring-typed-methods", "default");
+        let expected_g = gstrkey_for_seed(seed);
+        store_sstrkey(&entry_ref, &sstrkey_for_seed(seed));
+        let handle = signer_from_keyring(&entry_ref, &expected_g).await.unwrap();
+        let key = SoftwareSigningKey::new_from_bytes(seed);
+        let bytes = [0x3C_u8; 32];
+
+        let tx = TxSigningPayload::from_bytes_for_test(bytes);
+        let digest = SmartAccountAuthDigest::from_bytes_for_test(bytes);
+        let soroban = SorobanAuthPayload::from_bytes_for_test(bytes);
+        let message = MessagePayload::sep53(b"keyring message");
+        assert_eq!(
+            handle.sign_tx_payload(&tx).await.unwrap(),
+            key.sign_raw(&bytes)
+        );
+        assert_eq!(
+            handle.sign_auth_digest(&digest).await.unwrap(),
+            key.sign_raw(&bytes)
+        );
+        assert_eq!(
+            handle
+                .sign_soroban_address_auth_payload(&soroban)
+                .await
+                .unwrap(),
+            key.sign_raw(&bytes)
+        );
+        let inherent = handle.sign_message(&message).await.unwrap();
+        let through_trait = Signer::sign_message(&handle, &message).await.unwrap();
+        assert_eq!(inherent, through_trait);
+        VerifyingKey::from_bytes(&handle.public_key().0)
+            .unwrap()
+            .verify(message.as_bytes(), &Signature::from_bytes(&inherent))
+            .expect("the message signature verifies against the SEP-53 digest");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn sign_tx_payload_emits_success_event() {
         keyring_mock::install().expect("mock store");
         let seed = [0xBB_u8; 32];
@@ -2433,7 +2562,10 @@ mod tests {
         let _guard = tracing::dispatcher::set_default(&dispatch);
         tracing::callsite::rebuild_interest_cache();
 
-        let sig = handle.sign_tx_payload(&[0x01_u8; 32]).await.unwrap();
+        let sig = handle
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test([0x01_u8; 32]))
+            .await
+            .unwrap();
         drop(_guard);
 
         assert_eq!(sig.len(), 64);
@@ -2469,7 +2601,10 @@ mod tests {
         let _guard = tracing::dispatcher::set_default(&dispatch);
         tracing::callsite::rebuild_interest_cache();
 
-        let err = handle.sign_tx_payload(&[0x02_u8; 32]).await.unwrap_err();
+        let err = handle
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test([0x02_u8; 32]))
+            .await
+            .unwrap_err();
         drop(_guard);
 
         assert_eq!(err.code(), "auth.signer_key_mismatch");
@@ -2513,7 +2648,7 @@ mod tests {
             entry_ref: KeyringEntryRef::new("test-service", "test-account"),
             cached_pubkey_bytes: [0u8; 32],
         };
-        let auth_digest = [0xAB_u8; 32];
+        let auth_digest = SmartAccountAuthDigest::from_bytes_for_test([0xAB_u8; 32]);
         let credential_id = b"test-credential-id";
 
         let err = (<KeyringSignHandle as Signer>::sign_webauthn_assertion(
@@ -2568,7 +2703,7 @@ mod tests {
         assert_eq!(handle.public_key().to_string(), expected_g.as_str());
 
         let error = handle
-            .sign_tx_payload(&[0x11; 32])
+            .sign_tx_payload(&TxSigningPayload::from_bytes_for_test([0x11; 32]))
             .await
             .expect_err("first signature call must open the missing keyring");
         assert_eq!(error.code(), "auth.keyring_platform_error");

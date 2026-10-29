@@ -36,19 +36,18 @@
 //! Source: stellar-core `FeeBumpTransactionFrame::commonValid` +
 //! CAP-0015 §"Validity of FeeBumpTransactions".
 
-use sha2::{Digest, Sha256};
 use stellar_agent_core::error::{
     NetworkError, ProtocolError, SubmissionError, ValidationError, WalletError,
 };
 use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
 use stellar_xdr::{
     DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
-    FeeBumpTransactionInnerTx, Hash, Limits, MuxedAccount, ReadXdr, Signature, SignatureHint,
-    TransactionEnvelope, TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction,
-    TransactionV1Envelope, Uint256, WriteXdr,
+    FeeBumpTransactionInnerTx, Limits, MuxedAccount, ReadXdr, Signature, SignatureHint,
+    TransactionEnvelope, TransactionSignaturePayloadTaggedTransaction, TransactionV1Envelope,
+    Uint256, WriteXdr,
 };
 
-use crate::signing::Signer;
+use crate::signing::{Signer, TxSigningPayload};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CAP-15 constants
@@ -448,36 +447,26 @@ pub async fn build_and_sign_fee_bump(
 
     let fee_bump_tx = build_fee_bump_tx(fee_source_muxed, outer_fee_stroops, v1_inner);
 
-    // Build the SEP-23 TxFeeBump signature payload.
-    //
-    // Preimage: SHA-256(network_id || TransactionSignaturePayload {
-    //     tagged_transaction: TxFeeBump(fee_bump_tx)
-    // })
-    //
-    // This is the EnvelopeType::TxFeeBump variant of TransactionSignaturePayload,
-    // using a dedicated signing site for the outer fee-bump payload
-    // (distinct from the EnvelopeType::Tx variant used for inner transactions).
-    let network_id_hash = Hash(Sha256::digest(network_passphrase.as_bytes()).into());
-    let sig_payload = TransactionSignaturePayload {
-        network_id: network_id_hash,
-        tagged_transaction: TransactionSignaturePayloadTaggedTransaction::TxFeeBump(
-            // Clone is required: fee_bump_tx is also moved into the outer
-            // FeeBumpTransactionEnvelope below; the payload construction
-            // must happen before the move.
-            fee_bump_tx.clone(),
-        ),
-    };
-    let payload_bytes =
-        sig_payload
-            .to_xdr(Limits::none())
-            .map_err(|e| FeeBumpError::EnvelopeEncodeFailed {
-                detail: format!("TransactionSignaturePayload TxFeeBump XDR encode failed: {e}"),
-            })?;
+    // The SEP-23 TxFeeBump payload, `SHA-256(network_id ||
+    // TransactionSignaturePayload { tagged_transaction: TxFeeBump(..) })`:
+    // the outer fee-bump domain, distinct from the inner transaction's `Tx`
+    // payload. Built before `fee_bump_tx` moves into the outer envelope.
+    let payload = TxSigningPayload::for_tagged(
+        &TransactionSignaturePayloadTaggedTransaction::TxFeeBump(fee_bump_tx.clone()),
+        network_passphrase,
+    )
+    .map_err(|e| match e {
+        WalletError::Network(NetworkError::MainnetWriteForbidden) => {
+            FeeBumpError::MainnetSigningForbidden
+        }
+        other => FeeBumpError::EnvelopeEncodeFailed {
+            detail: format!("TxFeeBump signature payload: {other}"),
+        },
+    })?;
 
-    // SHA-256 the payload and sign exactly once.
-    let tx_hash: [u8; 32] = Sha256::digest(&payload_bytes).into();
+    // Sign exactly once.
     let sig_bytes = fee_payer_signer
-        .sign_tx_payload(&tx_hash)
+        .sign_tx_payload(&payload)
         .await
         .map_err(FeeBumpError::SigningFailed)?;
 
