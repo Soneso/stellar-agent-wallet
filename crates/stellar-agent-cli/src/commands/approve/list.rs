@@ -338,6 +338,15 @@ fn render_summary_line(view: &PendingApprovalView) -> String {
         } if original_kind_name == "X402Payment" => format!(
             "spent ({original_kind_name}), final-envelope digest {tx_hash_redacted}, outcome {outcome}"
         ),
+        // A rule-proposal tombstone holds the proposal digest the operator
+        // attested, written before the install sends anything.
+        ApprovalSummaryView::Consumed {
+            original_kind_name,
+            tx_hash_redacted,
+            outcome,
+        } if original_kind_name == "RuleProposalSimulated" => format!(
+            "spent ({original_kind_name}), proposal digest {tx_hash_redacted}, outcome {outcome}"
+        ),
         ApprovalSummaryView::Consumed {
             original_kind_name,
             tx_hash_redacted,
@@ -773,6 +782,40 @@ mod tests {
         assert_eq!(
             render_summary_line(&view),
             format!("spent (X402Payment), final-envelope digest {redacted}, outcome confirmed")
+        );
+    }
+
+    /// A consumed rule-proposal approval names its value as the proposal
+    /// digest.
+    #[test]
+    fn consumed_rule_proposal_names_its_value_as_the_proposal_digest() {
+        use stellar_agent_core::approval::{
+            ContextRuleProposalSnapshot, RuleProposalContextType, RuleProposalSigner,
+        };
+        let entry = PendingApproval::new_rule_proposal_pending(
+            "CDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD".to_owned(),
+            "Test SDF Network ; September 2015".to_owned(),
+            "stellar:testnet".to_owned(),
+            ContextRuleProposalSnapshot::new(
+                RuleProposalContextType::Default,
+                "rule".to_owned(),
+                None,
+                vec![RuleProposalSigner::delegated(SOURCE_G.to_owned(), true)],
+                vec![],
+                vec![0],
+                false,
+                false,
+            ),
+            [0x11; 32],
+            "rule".to_owned(),
+            uid(),
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let (view, redacted) = consumed_view(entry);
+        assert_eq!(
+            render_summary_line(&view),
+            format!("spent (RuleProposalSimulated), proposal digest {redacted}, outcome confirmed")
         );
     }
 

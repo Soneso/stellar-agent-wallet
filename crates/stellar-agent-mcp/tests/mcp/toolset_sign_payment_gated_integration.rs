@@ -47,6 +47,10 @@
 //!     `toolset.first_invoke_approval_required` and queues the approval beside the proposal.
 //! 15. **rule_create_pending_proposal_with_grant_reaches_signer_load**: a matching
 //!     grant and valid proposal attestation reach the signer load.
+//! 16. **rule_create_retry_after_a_failed_install_is_refused_as_consumed**: an
+//!     install that fails after the commit spent the approval leaves it spent,
+//!     and a retry through the toolset answers `policy.approval_consumed`
+//!     without contacting the RPC endpoint.
 //!
 //! # `#[serial]` requirement
 //!
@@ -1638,4 +1642,138 @@ async fn rule_create_pending_proposal_with_grant_reaches_signer_load() {
         "the proposal retains its attestation"
     );
     assert_no_requests(&rpc).await;
+}
+
+/// An install that fails after the commit spent the approval leaves it spent.
+/// A retry of the same toolset invocation answers `policy.approval_consumed`
+/// with the rule-proposal message, before the gated resolver and the commit,
+/// and contacts the RPC endpoint no further. The endpoint closes every
+/// connection, so the first install fails once it reaches the network.
+#[tokio::test]
+#[serial]
+async fn rule_create_retry_after_a_failed_install_is_refused_as_consumed() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use stellar_agent_core::approval::{
+        AttestationBinding, attestation::compute_attestation, store::ApprovalKind,
+    };
+    use stellar_agent_network::Signer as _;
+
+    let _data_root = crate::common::isolated_data_root();
+    let rpc = stellar_agent_test_support::ConnectionCounter::start().expect("loopback listener");
+    let key = setup_mock_keyring();
+    let toolsets_dir = TempDir::new().unwrap();
+    let approval_dir = TempDir::new().unwrap();
+    let grant_dir = TempDir::new().unwrap();
+    let grant_file = grant_dir.path().join("grants.toml");
+
+    write_pin_with_capabilities(toolsets_dir.path(), TOOLSET_NAME, &["sign-rule-create"]);
+    let mut profile = testnet_profile();
+    profile.rpc_url = rpc.https_uri();
+    crate::common::install_test_audit_key(&mut profile);
+    seed_attestation_key(&profile, &key);
+    // The signer is seeded from a deterministic test seed, so the commit
+    // passes the signer load and reaches the install.
+    let seed = [0x5b_u8; 32];
+    let signer_g = stellar_agent_network::signing::SoftwareSigningKey::new_from_bytes(seed)
+        .public_key()
+        .await
+        .expect("public key")
+        .to_string()
+        .to_string();
+    profile.mcp_signer_default.account.clone_from(&signer_g);
+    keyring_core::Entry::new(&profile.mcp_signer_default.service, &signer_g)
+        .expect("signer entry")
+        .set_password(
+            &stellar_strkey::ed25519::PrivateKey(seed)
+                .as_unredacted()
+                .to_string(),
+        )
+        .expect("seed signer");
+    let server = allow_server_for(
+        profile,
+        approval_dir.path(),
+        &grant_file,
+        toolsets_dir.path(),
+    );
+
+    let store_path = approval_dir
+        .path()
+        .join(format!("{TEST_PROFILE_NAME}.toml"));
+    let (approval_nonce, digest) =
+        insert_rule_proposal(&store_path, TESTNET_PASSPHRASE, "stellar:testnet");
+    let stored = PendingApprovalStore::open(store_path.clone())
+        .expect("open approval store")
+        .get(&approval_nonce)
+        .expect("stored proposal")
+        .clone();
+    let blob = compute_attestation(
+        &key,
+        &AttestationBinding::new(&server.profile_name_for_approval(), "stellar:testnet"),
+        &approval_nonce,
+        &digest,
+        &process_uid_for_attestation().expect("process uid"),
+        &stored.attested_lifetime(),
+    );
+    PendingApprovalStore::open(store_path.clone())
+        .expect("open approval store")
+        .record_rule_proposal_attestation(&approval_nonce, blob)
+        .expect("record proposal attestation");
+    insert_valid_grant(
+        &grant_file,
+        TOOLSET_NAME,
+        "sign-rule-create",
+        SMART_ACCOUNT,
+        SIGN_RULE_CREATE_ASSET_SENTINEL,
+        0,
+        SIGN_RULE_CREATE_AMOUNT_SENTINEL,
+        &key,
+    );
+
+    let args = || StellarToolsetInvokeArgs {
+        toolset: TOOLSET_NAME.to_owned(),
+        action: "stellar_rule_create_commit".to_owned(),
+        chain_id: Some("stellar:testnet".to_owned()),
+        args: serde_json::json!({
+            "approval_nonce": approval_nonce,
+            "approval_attestation": URL_SAFE_NO_PAD.encode(blob),
+            "chain_id": "stellar:testnet"
+        }),
+    };
+    let first = server
+        .call_stellar_toolset_invoke(args())
+        .await
+        .expect("the failed install returns a business envelope");
+    let (code, message, _text) = crate::common::assert_business_envelope(&first);
+    assert!(
+        code.starts_with("sa."),
+        "the commit must pass the gate and fail in the install: {code}: {message}"
+    );
+    let contacts = rpc.accepted().expect("connection count");
+    assert!(contacts > 0, "the install reached the RPC endpoint");
+    assert!(matches!(
+        &PendingApprovalStore::open(store_path.clone())
+            .expect("open approval store")
+            .get(&approval_nonce)
+            .expect("spent proposal")
+            .kind,
+        ApprovalKind::Consumed { original_kind_name, .. }
+            if original_kind_name == "RuleProposalSimulated"
+    ));
+
+    let retry = server
+        .call_stellar_toolset_invoke(args())
+        .await
+        .expect("the spent approval returns a business envelope");
+    let (code, message, _text) = crate::common::assert_business_envelope(&retry);
+    assert_eq!(code, "policy.approval_consumed");
+    assert_eq!(
+        message,
+        "this rule-proposal approval is already spent; list the account's rules before \
+         proposing the rule again"
+    );
+    assert_eq!(
+        rpc.accepted().expect("connection count"),
+        contacts,
+        "the refused retry must not reach the RPC endpoint"
+    );
 }

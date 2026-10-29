@@ -302,16 +302,18 @@ pub enum ApprovalSummaryView {
     },
 
     /// [`ApprovalKind::Consumed`] tombstone — carries no summary data, only
-    /// the kind name of the entry that was consumed, the transaction it was
-    /// spent on, and what is known about that transaction.
+    /// the kind name of the entry that was consumed, the value it was spent
+    /// on, and what is known about the outcome.
     Consumed {
         /// `kind_name()` of the entry before it was consumed.
         original_kind_name: String,
-        /// First-8-last-8 redaction of the transaction hash the approval was
-        /// spent on.
+        /// First-8-last-8 redaction of the value the approval was spent on:
+        /// the transaction hash for a submission, the final-envelope digest
+        /// of an x402 payment, or the proposal digest of a rule proposal.
         tx_hash_redacted: String,
         /// `confirmed` when the transaction reached a ledger, `unknown` while
-        /// its outcome is still to be reconciled.
+        /// its outcome is still to be reconciled. A rule proposal is spent
+        /// before its install starts, so its outcome stays `unknown`.
         outcome: String,
     },
 }

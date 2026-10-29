@@ -781,16 +781,19 @@ pub enum ApprovalKind {
     /// schedule as any other entry. A `Consumed` entry can never be attested.
     ///
     /// Summary data from the original entry does not survive: only the kind
-    /// name it replaced, the transaction it was spent on, and whether that
-    /// transaction was confirmed.
+    /// name it replaced, the value it was spent on, and what is known about
+    /// the outcome.
     Consumed {
         /// `kind_name()` of the entry before it was consumed (e.g.
         /// `"PaymentSimulated"`).
         original_kind_name: String,
-        /// The transaction hash the approval was spent on, 64 lowercase hex
-        /// characters. A public identifier.
+        /// The value the approval was spent on, 64 lowercase hex characters.
+        /// A submission records its transaction hash. Other kinds record a
+        /// kind-specific digest: an x402 payment its final-envelope digest,
+        /// a rule proposal the proposal digest the operator attested.
         tx_hash: String,
-        /// Whether that transaction was confirmed on-chain.
+        /// Whether the transaction was confirmed on-chain. A rule proposal is
+        /// spent before its install starts, so its outcome stays `unknown`.
         outcome: ConsumedOutcome,
     },
 }
@@ -5301,9 +5304,12 @@ impl PendingApprovalStore {
     ///
     /// Called where a commit spends the approval, on both the confirmed and
     /// the unknown-outcome arms. The tombstone carries only the consumed
-    /// entry's `kind_name()`, the transaction hash it was spent on, and
-    /// whether that transaction was confirmed; the entry's summary data
-    /// (destination, amount, asset, and so on) does not survive.
+    /// entry's `kind_name()`, the value it was spent on, and what is known
+    /// about the outcome; the entry's summary data (destination, amount,
+    /// asset, and so on) does not survive. The value is the transaction hash
+    /// for a submission and a kind-specific digest otherwise: the
+    /// final-envelope digest of an x402 payment, or the proposal digest of a
+    /// rule proposal, whose outcome stays `unknown`.
     ///
     /// The entry keeps its `attestation_blob_b64` and its original
     /// `created_at_unix_ms` / `expires_at_unix_ms`, so it is swept by the
