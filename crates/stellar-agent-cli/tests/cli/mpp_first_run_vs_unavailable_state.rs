@@ -671,8 +671,9 @@ fn mpp_reset_requires_acknowledgement_and_audits_recovery() {
     assert!(reset.json()["data"]["carried_generation"].is_null());
     assert_eq!(reset.json()["data"]["stale_carry"], false);
     assert_eq!(reset.json()["data"]["warnings"], serde_json::json!([]));
-    // The discard publishes an empty snapshot that carries the watermark.
-    assert_eq!(anchor.get_password().expect("counter"), "1");
+    // The discard publishes an empty snapshot that carries the watermark one
+    // generation above the retained committed counter.
+    assert_eq!(anchor.get_password().expect("counter"), "6");
     assert!(state_path(home.path()).is_file());
     let clean = run_cli(home.path(), &status_args(), None);
     assert_eq!(clean.code_field(), NOT_FOUND_CODE);

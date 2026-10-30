@@ -917,6 +917,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- MPP checks the held state lock identity before publication, before each
+  state-key rotation, and before and after counter writes. Guarded counter
+  comparisons refuse stale writers and equal reservations and retain generation
+  high-water marks across state-key rotation. Outside the documented Unix race
+  limit in [MPP persistence](docs/maintainers/mpp.md#durable-state), a losing
+  writer never overwrites or invalidates the winner's snapshot and counters.
+  Inside it, a stale writer can overwrite a newer counter or snapshot, or
+  replace the state key so that the winner's snapshot stops authenticating; a
+  discarding reset recovers the store.
+  A discarding reset keeps every valid counter, publishes above both counters,
+  and proceeds under an absent or malformed counter.
+  Reset refuses to carry an authenticated state file beside an absent or
+  malformed committed counter or a malformed intent, and names the discarding
+  reset. An adoption interrupted at intent one resumes on open. A publication
+  under an absent committed counter completes when the intent names its snapshot.
+  A discard interrupted before publication needs another reset. After publication
+  under a malformed committed counter, recovery requires moving the state file
+  out and resetting. The same recovery applies to an adoption interrupted again
+  at generation two before publication.
+
 - Signer and rule commands refuse a revoked or retired verifier at install,
   and every signing path refuses it under a rule pinned to that hash.
   No override flag admits either status. Raw wallet self-calls can reach

@@ -216,12 +216,14 @@ every store state, including a profile with no MPP state, so the answer never
 reveals whether a profile has one.
 
 Verified version 1 MPP history, which carries no generation, is adopted once on
-open, with an audit row naming the profile and generation. A version 2 file
-without its keyring counter, an invalid file, or a keyring access failure
-refuses. After adoption, deletion and stale snapshots are detected against the
-trusted counter. A profile whose state key exists with neither a counter nor a
-state file holds no replay history; it refuses with a missing anchor, and a
-reset recovers it without discarding any record.
+open, with an audit row naming the profile and generation. An invalid file or a
+keyring access failure refuses. After adoption, deletion and stale snapshots
+are detected against the trusted counter. An adoption interrupted at intent
+one resumes at generation two. A publication under an absent committed counter
+completes on open only when its intent names the authenticated snapshot.
+A profile whose state key exists with neither a counter nor a state file
+refuses with a missing anchor, and a discarding reset recovers it. Reset never
+infers a counter from a state file.
 
 With the headless keyring backend the committed and intent counters are kept
 in a file on the same host. Anyone who can replace both that keyring file and
@@ -254,12 +256,29 @@ are refused while they can still be live: for five minutes after the reset, a
 challenge expiring within that window returns `mpp.challenge_expired`.
 
 When no snapshot authenticates, reset discards every replay marker, rotates the
-state key, and starts an empty store with the same five-minute refusal window.
+state key, and starts an empty store above both trusted generation counters,
+with the same five-minute refusal window.
 A charge settled before that reset loses its settled status. A keyring or file
 access error refuses the reset and changes nothing; retry once the error
-clears. Reset requires a usable audit log and its key; it is never automatic.
-Interrupted writes keep the committed snapshot readable or complete on the next
-read when the published snapshot matches the intent counter.
+clears. A state file that authenticates while the committed counter is missing
+or malformed, or the intent counter is malformed, cannot be carried: the reset
+refuses and names the discarding reset. Move the state file out of the MPP
+state directory under the data root and run the reset again; it then discards
+every replay marker as above.
+Reset requires a usable audit log and its key; it is never automatic.
+Ordinary writes keep the committed snapshot readable before publication, or
+complete on read when the published snapshot matches the intent counter.
+Discarding resets and resumed adoptions have these recovery cases:
+
+- A discard interrupted after key rotation and before publication leaves no
+  snapshot that authenticates under the new key. Opening refuses; rerun the
+  reset to discard.
+- A discard under a malformed committed counter interrupted after publication
+  refuses on open with the anchor error. Reset refuses the carry. Move the
+  state file out of the MPP state directory and rerun the reset to discard.
+- An adoption at generation two interrupted before publication refuses on
+  open, because its intent cannot be told apart from anchor removal. Move the
+  state file out of the MPP state directory and run the reset to discard.
 
 Repeated prepare matches the exact challenge, payer, and request context,
 independently of preparation time. Prune retains the largest expiry it removes
