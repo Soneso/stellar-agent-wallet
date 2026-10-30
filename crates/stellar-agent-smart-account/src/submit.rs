@@ -273,6 +273,118 @@ pub struct PinCheck<'a> {
     pub migrating_rule: Option<MigratingRule>,
 }
 
+/// Proof that the manager ran the pinned-hash drift check, with its verifier
+/// status gate, for these rules.
+///
+/// Obtain it through [`SignersManager::check_signing_rules`]. Signing consumes
+/// the proof and checks its account, network and rule set against the entry.
+/// Rule 0 and a rule without a pin record pass unchecked: neither has a pin
+/// to compare the live verifier with, so neither is status-checked.
+///
+/// The proof has no public constructor:
+///
+/// ```compile_fail
+/// use stellar_agent_smart_account::submit::CheckedSigningRules;
+/// let proof = CheckedSigningRules::new();
+/// ```
+///
+/// and cannot be cloned:
+///
+/// ```compile_fail
+/// use stellar_agent_smart_account::submit::CheckedSigningRules;
+/// fn f(p: &CheckedSigningRules) -> CheckedSigningRules { p.clone() }
+/// ```
+#[derive(Debug)]
+pub struct CheckedSigningRules {
+    smart_account: ScAddress,
+    network_id: [u8; 32],
+    rule_ids: Vec<u32>,
+}
+
+impl CheckedSigningRules {
+    pub(crate) fn check_binding(
+        &self,
+        smart_account: &ScAddress,
+        network_id: [u8; 32],
+        rule_ids: &[ContextRuleId],
+    ) -> Result<(), SaError> {
+        if self.smart_account != *smart_account
+            || self.network_id != network_id
+            || self.rule_ids != distinct_rule_ids(rule_ids)
+        {
+            return Err(SaError::AuthEntryBindingMismatch {
+                field: "checked_signing_rules",
+            });
+        }
+        Ok(())
+    }
+
+    // A quorum uses the same checked rule set for each group's shared entry.
+    pub(crate) fn into_groups(self, count: usize) -> Vec<Self> {
+        (0..count)
+            .map(|_| Self {
+                smart_account: self.smart_account.clone(),
+                network_id: self.network_id,
+                rule_ids: self.rule_ids.clone(),
+            })
+            .collect()
+    }
+}
+
+/// The distinct rule ids of `rules`, in ascending order: the form the
+/// pinned-hash drift check runs over and a [`CheckedSigningRules`] binds.
+fn distinct_rule_ids(rules: &[ContextRuleId]) -> Vec<u32> {
+    let mut ids: Vec<u32> = rules.iter().map(ContextRuleId::as_u32).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+#[cfg(test)]
+pub(crate) fn checked_rules_for_test(
+    partial: &PartialSorobanAuthorizationEntry,
+) -> CheckedSigningRules {
+    checked_context_for_test(
+        &partial.smart_account,
+        partial.network_id,
+        &partial.context_rule_ids,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn checked_context_for_test(
+    smart_account: &ScAddress,
+    network_id: [u8; 32],
+    rules: &[ContextRuleId],
+) -> CheckedSigningRules {
+    CheckedSigningRules {
+        smart_account: smart_account.clone(),
+        network_id,
+        rule_ids: distinct_rule_ids(rules),
+    }
+}
+
+/// Checks the manager's rules and produces their consumed signing proof.
+pub(crate) async fn check_signing_rules(
+    manager: &SignersManager,
+    smart_account: &ScAddress,
+    rules: &[ContextRuleId],
+    request_id: &str,
+    budget: PreSubmitBudget,
+) -> Result<CheckedSigningRules, SaError> {
+    run_pin_check(
+        &PinCheck {
+            signers_manager: manager,
+            request_id,
+            migrating_rule: None,
+        },
+        &distinct_rule_ids(rules),
+        smart_account,
+        budget,
+    )
+    .await
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MigratingRule
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1025,7 +1137,7 @@ pub async fn submit_signed_invoke(
     // acquired here are held through the simulation and the signing and
     // released immediately before the send; a held-lock context's locks
     // belong to its holder.
-    let owned_rule_locks = match &args.pin_check {
+    let (owned_rule_locks, checked_rules) = match &args.pin_check {
         Some(pin_check) => {
             run_rule_checks(
                 pin_check,
@@ -1037,7 +1149,14 @@ pub async fn submit_signed_invoke(
             )
             .await?
         }
-        None => Vec::new(),
+        None => (
+            Vec::new(),
+            CheckedSigningRules {
+                smart_account: auth_scaddr.clone(),
+                network_id: Sha256::digest(args.network_passphrase.as_bytes()).into(),
+                rule_ids: vec![0],
+            },
+        ),
     };
 
     let source_view = bound_pre_submit_stage(
@@ -1398,6 +1517,7 @@ pub async fn submit_signed_invoke(
             });
         }
         collect_quorum_signatures(
+            checked_rules,
             authz,
             args.signers,
             auth_scaddr.clone(),
@@ -1467,6 +1587,7 @@ pub async fn submit_signed_invoke(
                 },
             }];
             crate::managers::auth_entry::collect_mixed_signer_entries(
+                checked_rules,
                 partial,
                 &mixed_signers,
                 signature_expiration_ledger,
@@ -1477,7 +1598,8 @@ pub async fn submit_signed_invoke(
             // Delegated arm (unchanged): sign the auth-digest, then build the
             // secondary G-key sub-auth entry `__check_auth` requires for
             // `Signer::Delegated(addr)`.
-            let signed_entry = complete_authorization_entry(partial.clone(), args.signer).await?;
+            let signed_entry =
+                complete_authorization_entry(checked_rules, partial.clone(), args.signer).await?;
 
             let delegated_entry: SorobanAuthorizationEntry = build_and_sign_delegated_g_key_entry(
                 &auth_scaddr,
@@ -2079,7 +2201,8 @@ fn validate_submit_invoke_args(args: &SubmitInvokeArgs<'_>) -> Result<(), SaErro
 /// 3. The pinned-hash drift check ([`run_pin_check`]).
 /// 4. The signer-set comparison of each rule read in step 2.
 ///
-/// Returns the locks step 1 acquired, empty for a held-lock context.
+/// Returns the locks step 1 acquires, empty for a held-lock context,
+/// and the signing proof from the pin and status checks.
 ///
 /// # Errors
 ///
@@ -2097,16 +2220,15 @@ async fn run_rule_checks(
     smart_account: &ScAddress,
     source_account_strkey: &str,
     budget: PreSubmitBudget,
-) -> Result<Vec<RuleLockGuard>, SaError> {
+) -> Result<(Vec<RuleLockGuard>, CheckedSigningRules), SaError> {
     let manager = pin_check.signers_manager;
     let smart_account_strkey = scaddress_to_strkey(smart_account)?;
-    let mut rule_ids: Vec<u32> = auth_rule_ids
+    let signing_ids = distinct_rule_ids(auth_rule_ids);
+    let rule_ids: Vec<u32> = signing_ids
         .iter()
-        .map(ContextRuleId::as_u32)
+        .copied()
         .filter(|rule_id| *rule_id != 0)
         .collect();
-    rule_ids.sort_unstable();
-    rule_ids.dedup();
 
     // Step 1: the locks.
     let owned = match rule_locks {
@@ -2160,7 +2282,7 @@ async fn run_rule_checks(
     }
 
     // Step 3: the pinned-hash drift check.
-    run_pin_check(pin_check, &rule_ids, smart_account, budget).await?;
+    let checked = run_pin_check(pin_check, &signing_ids, smart_account, budget).await?;
 
     // Step 4: the signer-set comparisons.
     for (rule_id, baseline) in baselines {
@@ -2178,18 +2300,21 @@ async fn run_rule_checks(
         .await??;
     }
 
-    Ok(owned)
+    Ok((owned, checked))
 }
 
 /// Runs the pinned-hash drift check of each rule in `rule_ids`, the distinct
-/// non-zero auth rules in ascending order, each bounded by `budget` as stage
-/// `"pin_check"`; see [`PinCheck`] for the outcomes.
+/// auth rules in ascending order, each bounded by `budget` as stage
+/// `"pin_check"`; see [`PinCheck`] for the outcomes. Rule 0 is skipped, and
+/// the returned proof binds every rule of `rule_ids`, rule 0 included.
 ///
 /// # Errors
 ///
 /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
 ///   [`SaError::PinnedPolicyAbsent`] / [`SaError::PinnedVerifierAbsent`]
 ///   unchanged from the check.
+/// - [`SaError::VerifierWasmRevoked`] / [`SaError::VerifierWasmRetired`]
+///   unchanged from the status gate, with no drift row.
 /// - [`SaError::PinCheckUnavailable`] for every other failure, including the
 ///   budget elapsing.
 /// - [`SaError::ScAddressEncodingFailed`] when the smart account has no
@@ -2199,10 +2324,13 @@ async fn run_pin_check(
     rule_ids: &[u32],
     smart_account: &ScAddress,
     budget: PreSubmitBudget,
-) -> Result<(), SaError> {
+) -> Result<CheckedSigningRules, SaError> {
     let smart_account_redacted = redact_strkey_first5_last5(&scaddress_to_strkey(smart_account)?);
     let mut cache = HashMap::new();
     for &rule_id in rule_ids {
+        if rule_id == 0 {
+            continue;
+        }
         let outcome = bound_pre_submit_stage(
             budget,
             "pin_check",
@@ -2223,7 +2351,9 @@ async fn run_pin_check(
                 refusal @ (SaError::VerifierHashDrift { .. }
                 | SaError::PolicyHashDrift { .. }
                 | SaError::PinnedPolicyAbsent { .. }
-                | SaError::PinnedVerifierAbsent { .. }),
+                | SaError::PinnedVerifierAbsent { .. }
+                | SaError::VerifierWasmRevoked { .. }
+                | SaError::VerifierWasmRetired { .. }),
             )) => {
                 return Err(refusal);
             }
@@ -2244,7 +2374,11 @@ async fn run_pin_check(
             request_id: pin_check.request_id.to_owned(),
         });
     }
-    Ok(())
+    Ok(CheckedSigningRules {
+        smart_account: smart_account.clone(),
+        network_id: pin_check.signers_manager.signing_network_id(),
+        rule_ids: rule_ids.to_vec(),
+    })
 }
 
 /// Checks one rule: fetches its verifier and policy addresses, compares
@@ -2283,6 +2417,7 @@ async fn check_rule_pins(
                 smart_account_redacted,
                 pin_check.request_id,
                 cache,
+                crate::managers::verifiers::VerifierStatusGate::Refuse,
             )
             .await?;
             budget.check("auth_payload")?;
@@ -3057,6 +3192,7 @@ mod tests {
         }];
 
         let entries = collect_mixed_signer_entries(
+            crate::submit::checked_rules_for_test(&partial),
             partial,
             &mixed_signers,
             simulation.signature_expiration_ledger,

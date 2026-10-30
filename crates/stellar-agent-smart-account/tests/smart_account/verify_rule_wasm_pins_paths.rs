@@ -434,3 +434,106 @@ async fn verify_pins_mixed_drift_and_unavailable_preserves_both_statuses_and_cod
         assert_eq!(report["unavailable_wire_code"], "sa.deployment_failed");
     }
 }
+
+#[cfg(feature = "test-helpers")]
+#[tokio::test]
+#[serial]
+#[allow(clippy::unwrap_used, reason = "test fixture construction")]
+async fn verify_pins_reports_a_revoked_pinned_verifier_as_matching() {
+    let verifier = stellar_strkey::Contract([0x41; 32]).to_string();
+    let vector = |items: Vec<ScVal>| ScVal::Vec(Some(ScVec(items.try_into().unwrap())));
+    let field = |key: &str, val| ScMapEntry {
+        key: ScVal::Symbol(key.try_into().unwrap()),
+        val,
+    };
+    let rule = ScVal::Map(Some(ScMap(
+        vec![
+            field("id", ScVal::U32(7)),
+            field("policies", vector(vec![])),
+            field("policy_ids", vector(vec![])),
+            field("signer_ids", vector(vec![ScVal::U32(0)])),
+            field(
+                "signers",
+                vector(vec![
+                    build_external_signer_scval(
+                        parse_c_strkey_to_smart_account(&verifier).unwrap(),
+                        &[0x11; 32],
+                    )
+                    .unwrap(),
+                ]),
+            ),
+        ]
+        .try_into()
+        .unwrap(),
+    )));
+    let (audit, audit_log_path, _dir) = tmp_audit_writer();
+    audit
+        .lock()
+        .unwrap()
+        .write_entry(AuditEntry::new_sa_context_rule_created(
+            redact_strkey_first5_last5(ACCOUNT),
+            7,
+            "default",
+            1,
+            0,
+            None,
+            CHAIN_ID,
+            "revoked-report",
+            vec!["eeeeeeeeeeeeeeee".to_owned()],
+            vec![],
+            false,
+            false,
+            vec![],
+            vec![],
+        ))
+        .unwrap();
+    let available: serde_json::Value = serde_json::from_str(
+        &contract_instance_ledger_entries_json(&verifier, [0xee; 32]),
+    )
+    .unwrap();
+    let unavailable: serde_json::Value =
+        serde_json::from_str(&contract_instance_ledger_entries_json(
+            &stellar_strkey::Contract([0x42; 32]).to_string(),
+            [0xcd; 32],
+        ))
+        .unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(MixedPinsResponder {
+            rule,
+            available: available["result"].clone(),
+            unavailable_key: LedgerKey::from_xdr_base64(
+                unavailable["result"]["entries"][0]["key"].as_str().unwrap(),
+                Limits::none(),
+            )
+            .unwrap(),
+        })
+        .mount(&server)
+        .await;
+    let signers = Arc::new(manager_one_url(
+        &server.uri(),
+        Arc::clone(&audit),
+        audit_log_path,
+    ));
+    let manager = ContextRuleManager::new(
+        ContextRuleManagerConfig::new(
+            server.uri(),
+            NETWORK_PASSPHRASE.to_owned(),
+            Duration::from_secs(5),
+            CHAIN_ID.to_owned(),
+        )
+        .with_signers_manager(signers)
+        .with_audit_writer(audit),
+    )
+    .unwrap();
+    let report = manager
+        .verify_rule_wasm_pins(
+            parse_c_strkey_to_smart_account(ACCOUNT).unwrap(),
+            7,
+            None,
+            "revoked-report",
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.verifier_pin_status, PinStatus::Match);
+}

@@ -29,6 +29,7 @@
 //! an empty auth-entry set that would pass through to on-chain submission as a
 //! no-auth transaction.
 
+use crate::submit::CheckedSigningRules;
 use serde::{Deserialize, Serialize};
 use stellar_agent_network::signing::Signer;
 use stellar_xdr::{ScAddress, ScSymbol, ScVal, SorobanAuthorizationEntry};
@@ -457,6 +458,7 @@ impl QuorumError {
               splitting would require a context struct (deferred to a future ergonomics pass)"
 )]
 pub async fn collect_quorum_signatures(
+    checked_rules: CheckedSigningRules,
     authz: &AuthorizationInfo,
     signers: &[&(dyn Signer + Send + Sync)],
     auth_scaddr: ScAddress,
@@ -479,6 +481,13 @@ pub async fn collect_quorum_signatures(
         return Err(QuorumError::EmptyAuthorizationInfo);
     }
 
+    checked_rules
+        .check_binding(&auth_scaddr, simulation.network_id, &auth_rule_ids)
+        .map_err(|error| QuorumError::SignatureProductionFailed {
+            detail: error.to_string(),
+        })?;
+    let checked_rules = checked_rules.into_groups(authz.groups.len());
+
     // Resolve each signer's public key once upfront to avoid repeated async
     // calls and to enable deterministic sorting within groups.
     let mut resolved: Vec<([u8; 32], &(dyn Signer + Send + Sync))> =
@@ -496,6 +505,7 @@ pub async fn collect_quorum_signatures(
     match authz.combinator {
         Combinator::And => {
             collect_and(
+                checked_rules,
                 authz,
                 &resolved,
                 auth_scaddr,
@@ -511,6 +521,7 @@ pub async fn collect_quorum_signatures(
         }
         Combinator::Or => {
             collect_or(
+                checked_rules,
                 authz,
                 &resolved,
                 auth_scaddr,
@@ -537,6 +548,7 @@ pub async fn collect_quorum_signatures(
     reason = "mirrors collect_quorum_signatures parameter set"
 )]
 async fn collect_and(
+    checked_rules: Vec<CheckedSigningRules>,
     authz: &AuthorizationInfo,
     resolved: &[([u8; 32], &(dyn Signer + Send + Sync))],
     auth_scaddr: ScAddress,
@@ -551,8 +563,9 @@ async fn collect_and(
     let mut all_entries: Vec<SorobanAuthorizationEntry> = Vec::new();
     let mut unsatisfied: Vec<String> = Vec::new();
 
-    for group in &authz.groups {
+    for (group, checked) in authz.groups.iter().zip(checked_rules) {
         match collect_group_entries(
+            checked,
             group,
             resolved,
             auth_scaddr.clone(),
@@ -589,6 +602,7 @@ async fn collect_and(
     reason = "mirrors collect_quorum_signatures parameter set"
 )]
 async fn collect_or(
+    checked_rules: Vec<CheckedSigningRules>,
     authz: &AuthorizationInfo,
     resolved: &[([u8; 32], &(dyn Signer + Send + Sync))],
     auth_scaddr: ScAddress,
@@ -602,8 +616,9 @@ async fn collect_or(
 ) -> Result<Vec<SorobanAuthorizationEntry>, QuorumError> {
     let group_names: Vec<String> = authz.groups.iter().map(|g| g.name.clone()).collect();
 
-    for group in &authz.groups {
+    for (group, checked) in authz.groups.iter().zip(checked_rules) {
         match collect_group_entries(
+            checked,
             group,
             resolved,
             auth_scaddr.clone(),
@@ -643,6 +658,7 @@ async fn collect_or(
     reason = "mirrors collect_quorum_signatures parameter set"
 )]
 async fn collect_group_entries(
+    checked_rules: CheckedSigningRules,
     group: &SignerGroup,
     resolved: &[([u8; 32], &(dyn Signer + Send + Sync))],
     auth_scaddr: ScAddress,
@@ -729,11 +745,12 @@ async fn collect_group_entries(
     // authenticated entries.
     // Producing separate entries per signer would have the host process only ONE
     // entry for the smart-account C-address.
-    let smart_account_entry = complete_authorization_entry_multi_signer(partial, &signer_refs)
-        .await
-        .map_err(|e: SaError| QuorumError::SignatureProductionFailed {
-            detail: format!("{e}"),
-        })?;
+    let smart_account_entry =
+        complete_authorization_entry_multi_signer(checked_rules, partial, &signer_refs)
+            .await
+            .map_err(|e: SaError| QuorumError::SignatureProductionFailed {
+                detail: format!("{e}"),
+            })?;
 
     // Build one delegated G-key sub-auth entry PER signer (required by __check_auth).
     //
@@ -1080,6 +1097,11 @@ mod tests {
         };
 
         let result = collect_quorum_signatures(
+            crate::submit::checked_context_for_test(
+                &auth_scaddr,
+                simulation.network_id,
+                &simulation.context.context_rule_ids,
+            ),
             &authz,
             &signers,
             auth_scaddr,
@@ -1157,6 +1179,11 @@ mod tests {
         };
 
         let result = collect_quorum_signatures(
+            crate::submit::checked_context_for_test(
+                &auth_scaddr,
+                simulation.network_id,
+                &simulation.context.context_rule_ids,
+            ),
             &authz,
             &signers,
             auth_scaddr,
@@ -1238,6 +1265,11 @@ mod tests {
         };
 
         let result = collect_quorum_signatures(
+            crate::submit::checked_context_for_test(
+                &auth_scaddr,
+                simulation.network_id,
+                &simulation.context.context_rule_ids,
+            ),
             &authz,
             &signers,
             auth_scaddr,
@@ -1318,6 +1350,11 @@ mod tests {
 
         // We expect success (g1 satisfied by s1).
         let result = collect_quorum_signatures(
+            crate::submit::checked_context_for_test(
+                &auth_scaddr,
+                simulation.network_id,
+                &simulation.context.context_rule_ids,
+            ),
             &authz,
             &signers,
             auth_scaddr,
@@ -1382,6 +1419,11 @@ mod tests {
         let envelope = matching_envelope_context(&simulation);
 
         let result = collect_quorum_signatures(
+            crate::submit::checked_context_for_test(
+                &ScAddress::Contract(ContractId(Hash([0x31; 32]))),
+                simulation.network_id,
+                &simulation.context.context_rule_ids,
+            ),
             &authz,
             &[&signer],
             ScAddress::Contract(ContractId(Hash([0x31; 32]))),
@@ -1453,5 +1495,51 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(key_accesses, 0);
+    }
+    #[tokio::test]
+    async fn quorum_collection_refuses_a_different_checked_rule() {
+        use crate::managers::auth_entry::test_helpers::{
+            baseline_authorization_simulation, matching_envelope_context,
+        };
+        use stellar_agent_network::signing::test_doubles::CountingSigner;
+        use stellar_xdr::{ContractId, Hash};
+        let address = ScAddress::Contract(ContractId(Hash([0x31; 32])));
+        let rule = ContextRuleId::new(1);
+        let simulation = baseline_authorization_simulation(
+            "Test SDF Network ; September 2015",
+            "stellar:testnet",
+            vec![rule],
+        );
+        let envelope = matching_envelope_context(&simulation);
+        let checked = crate::submit::checked_context_for_test(
+            &address,
+            simulation.network_id,
+            &[ContextRuleId::new(0)],
+        );
+        let signer = CountingSigner::new([0x46; 32]);
+        let authz = AuthorizationInfo::new(
+            vec![SignerGroup::new("one".to_owned(), vec![[0x46; 32]], 1).unwrap()],
+            Combinator::And,
+        );
+        let error = collect_quorum_signatures(
+            checked,
+            &authz,
+            &[&signer],
+            address,
+            "execute".try_into().unwrap(),
+            vec![],
+            vec![rule],
+            &simulation,
+            &envelope,
+            "Test SDF Network ; September 2015",
+            9999,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, QuorumError::SignatureProductionFailed { ref detail } if detail.contains("checked_signing_rules")),
+            "{error:?}"
+        );
+        assert_eq!(signer.key_accesses(), 0);
     }
 }

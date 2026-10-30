@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Multicall accepts exact `{"scval": "<base64 XDR ScVal>"}` argument objects.
+  `stellar_agent_core::policy::v1::bundle::decompose_bundle_calls` values typed
+  wallet transfers. `OpaqueReason::UnvaluedBundleCall` identifies other calls.
+  `CredentialsError::VerifierStatusRefused` identifies passkey status refusals.
+- `SignersManager::check_signing_rules` produces `CheckedSigningRules`, a consumed
+  proof required by public smart-account signing APIs, including quorum signing.
+
 - `audit acknowledge-outbox-loss --profile <NAME> --reason <TEXT>` records
   queued consent loss and revokes the profile's decided approvals and toolset
   grants. Verification reports each record with an `outbox_loss_acknowledged`
@@ -215,6 +222,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports a profile role naming an entry under that service.
 
 ### Changed
+
+- Breaking (`stellar-agent-smart-account` API): `complete_authorization_entry`,
+  `complete_authorization_entry_multi_signer`, `sign_with_ed25519_rule` and
+  `collect_quorum_signatures` take a `CheckedSigningRules` as their first
+  argument. `SignersManager::check_signing_rules` produces it; the value binds
+  the smart account, the network and the rule IDs, and each entry point
+  refuses a partial entry outside that binding before any key access.
+- `VerifierWasmRevoked` and `VerifierWasmRetired` carry `rule_id: Option<u32>`.
+  Unsizable multicall calls use audit code `multicall.unsizable_value_effect`.
+- `smart-account signers add` and `signers batch-add` observe every new
+  verifier before submission, also on a rule without a pin record. On such a
+  rule the add can refuse with `sa.verifier_wasm_revoked`,
+  `sa.verifier_wasm_retired`, `sa.contract_instance_unsupported`,
+  `network.rpc_divergence` or `sa.deployment_failed`, and the pin record stays
+  absent.
 
 - Breaking (`stellar-agent-network` API): every ed25519 method of `Signer`
   takes a typed payload from `signing::payload`, and `Signer::sign_message` is
@@ -762,6 +784,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 - `ValidationError` loses the unused `ConfirmTtyRequired`, `ConfirmProfileNameMismatch` and `ConfirmInputUnavailable` variants and their `confirm.*` codes.
+- The JSON bundle decomposer `decompose_bundle` and `parse_i128_arg`.
 
 - The wallet TTL background task. Clock checks bound seed access and transfer;
   the wallet or signer owns the seed until disposal or drop.
@@ -857,6 +880,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stellar:pubnet` is not a valid `chain_id`.
 
 ### Security
+
+- Signer and rule commands refuse a revoked or retired verifier at install,
+  and every signing path refuses it under a rule pinned to that hash.
+  No override flag admits either status. Raw wallet self-calls can reach
+  admin entrypoints without manager install probes; signing still checks pins.
+- Multicall values the encoded calls the transaction carries. A transfer from
+  the smart account counts against value criteria and bundle caps. Other calls
+  are unsizable under per-call value criteria unless `allow_opaque_signing` applies.
+  Bundle caps keep their generic-call refusal. `minimum_reserve` requires an
+  account view and fails closed in bundle evaluation.
 
 - The keyring, software, and hardware signers refuse a mainnet payload bound to another signer key; the mainnet Soroban signing call rechecks freshness.
 

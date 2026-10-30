@@ -393,6 +393,9 @@ impl PendingOverride {
 ///
 /// # Errors
 ///
+/// - [`SaError::VerifierWasmRevoked`] and [`SaError::VerifierWasmRetired`]:
+///   the verifier status refuses the operation; no flag overrides it.
+///
 /// - [`SaError::VerifierMutable`]: verifier has a non-zero admin key or an
 ///   external-reference executable and `accept_mutable_verifier` is `false`.
 /// - [`SaError::PolicyMutable`]: the same for a policy.
@@ -522,6 +525,9 @@ pub(crate) struct AddedContractPin {
 /// as a pending override; nothing is written to the audit log.
 ///
 /// # Errors
+///
+/// - [`SaError::VerifierWasmRevoked`] and [`SaError::VerifierWasmRetired`]:
+///   the verifier status refuses the operation; no flag overrides it.
 ///
 /// The refusals of [`pin_referenced_contracts`] for one contract of `kind`.
 #[allow(
@@ -774,6 +780,15 @@ async fn pin_contract(
             request_id,
         )
         .await?;
+
+    if kind == PinnedKind::Verifier && observation.allowlisted {
+        crate::verifier_allowlist::refuse_revoked_or_retired_verifier(
+            &observation.effective_hash,
+            rule_id,
+            smart_account_redacted,
+            request_id,
+        )?;
+    }
 
     let mut pending_overrides = Vec::new();
     let mut unknown_override = false;
@@ -1200,6 +1215,15 @@ async fn observe_with_cache(
     Ok(observed)
 }
 
+/// Selects status enforcement for a pin comparison.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum VerifierStatusGate {
+    /// Enforces status before a signature.
+    Refuse,
+    /// Compares pins for the on-demand report.
+    Skip,
+}
+
 /// Verify a rule's pinned verifier against the live on-chain contract at
 /// signing time.
 ///
@@ -1207,9 +1231,9 @@ async fn observe_with_cache(
 /// `SaContextRulePinsUpdated` row for `rule_id`), fetches the live executable
 /// via
 /// [`fetch_observed_executable`][crate::managers::signers::fetch_observed_executable]
-/// (two-RPC, no allowlist enforcement; drift detection compares against the
-/// pin only; allowlist enforcement belongs at install time), and compares
-/// kind, reference and hash as described on `compare_against_pin`.
+/// through both endpoints, and compares kind, reference and hash as described
+/// on `compare_against_pin`. When the pin matches, `VerifierStatusGate::Refuse`
+/// checks for revoked or retired status. `Skip` serves the pin report.
 ///
 /// The per-call `wasm_hash_cache` prevents redundant two-RPC fetches when
 /// multiple operations within one signing call reference the same verifier
@@ -1232,6 +1256,9 @@ async fn observe_with_cache(
 /// - `Ok(())` — no drift detected; signing may proceed.
 ///
 /// # Errors
+///
+/// - [`SaError::VerifierWasmRevoked`] and [`SaError::VerifierWasmRetired`]:
+///   the verifier status refuses the operation; no flag overrides it.
 ///
 /// - [`SaError::NetworkRpcDivergence`] — RPCs disagree before drift check.
 /// - [`SaError::VerifierHashDrift`]: the live executable differs from the pin
@@ -1257,6 +1284,7 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
     smart_account_redacted: &str,
     request_id: &str,
     wasm_hash_cache: &mut HashMap<Vec<u8>, ObservedExecutable>,
+    status_gate: VerifierStatusGate,
 ) -> Result<(), SaError> {
     let verifier_strkey = xdr_scaddress_to_strkey_or_sentinel(&verifier_addr);
     let verifier_redacted = redact_strkey_first5_last5(&verifier_strkey);
@@ -1340,6 +1368,16 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
             observed_executable = %comparison.observed_executable,
             "verify_pinned_verifier_against_chain: executable matches pin (no drift)"
         );
+        if status_gate == VerifierStatusGate::Refuse
+            && let Some(hash) = observed.effective_hash()
+        {
+            crate::verifier_allowlist::refuse_revoked_or_retired_verifier(
+                &hash,
+                Some(rule_id),
+                smart_account_redacted,
+                request_id,
+            )?;
+        }
         return Ok(());
     }
 
@@ -4116,6 +4154,7 @@ pub mod test_helpers {
             smart_account_redacted,
             request_id,
             wasm_hash_cache,
+            super::VerifierStatusGate::Refuse,
         )
         .await
     }

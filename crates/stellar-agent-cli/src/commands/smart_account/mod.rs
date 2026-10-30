@@ -94,7 +94,7 @@ pub enum SmartAccountSubcommand {
     ///
     /// - `<target>` is the C-strkey of the contract to invoke.
     /// - `<fn>` is the function name on that contract.
-    /// - `<json-args>` is a JSON array of Soroban XDR-encoded arguments.
+    /// - `<json-args>` contains integers, strings, null, or `{"scval": "<base64 XDR ScVal>"}` elements.
     ///
     /// The bundle is submitted via `submit_multicall_bundle` using the registered
     /// multicall router for the target network. The router address is resolved from

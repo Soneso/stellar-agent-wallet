@@ -510,7 +510,7 @@ async fn q2_insufficient_signers_fails_before_rpc() {
 
     let auth_scaddr = ScAddress::Contract(ContractId(Hash([0u8; 32])));
     let function_name = ScSymbol::try_from("test_fn").expect("ScSymbol must encode");
-    let rule_id = ContextRuleId::new(1);
+    let rule_id = ContextRuleId::new(0);
 
     // Use test_helpers builders to construct the non_exhaustive simulation and
     // envelope types without struct literals; #[non_exhaustive] types cannot be
@@ -520,7 +520,13 @@ async fn q2_insufficient_signers_fails_before_rpc() {
     let simulation = baseline_authorization_simulation(TESTNET_PASSPHRASE, CHAIN_ID, vec![rule_id]);
     let envelope = matching_envelope_context(&simulation);
 
+    let (_, manager, _dir) = fresh_rule_manager();
+    let checked = manager
+        .check_signing_rules(&auth_scaddr, &[rule_id], "quorum-capacity")
+        .await
+        .unwrap();
     let result = collect_quorum_signatures(
+        checked,
         &authz,
         &signers,
         auth_scaddr,

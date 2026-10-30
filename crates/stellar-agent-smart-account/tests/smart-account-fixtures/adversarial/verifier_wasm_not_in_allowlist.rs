@@ -138,3 +138,80 @@ fn verifier_wasm_not_in_allowlist_wire_code_is_consistent() {
         "VerifierWasmNotInAllowlist wire_code must be 'sa.verifier_wasm_not_in_allowlist'"
     );
 }
+
+#[cfg(feature = "test-helpers")]
+#[tokio::test]
+async fn a_revoked_verifier_is_refused_with_both_overrides() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(JsonRpcResultResponder(
+            build_ledger_entries_contract_instance(&verifier_addr(), [0xee; 32]),
+        ))
+        .mount(&server)
+        .await;
+    let (audit, path, _dir) = tmp_audit_writer();
+    let manager = manager_one_url(&server.uri(), audit, path);
+    let definition = ContextRuleDefinition::new(
+        RuleContext::Default,
+        "revoked".to_owned(),
+        None,
+        vec![ContextRuleSignerInput::External {
+            verifier: verifier_addr(),
+            pubkey_data: vec![0x11; 32],
+        }],
+        vec![],
+    );
+    let error = pin_referenced_contracts(
+        &manager,
+        smart_account_addr(),
+        ZERO_CONTRACT_REDACTED,
+        &definition,
+        None,
+        SOURCE_G,
+        true,
+        true,
+        "revoked-install".to_owned(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, SaError::VerifierWasmRevoked { rule_id: None, .. }),
+        "{error:?}"
+    );
+    assert_eq!(error.wire_code(), "sa.verifier_wasm_revoked");
+    assert!(!error.to_string().contains("for rule"));
+}
+
+#[cfg(feature = "test-helpers")]
+#[tokio::test]
+async fn identify_verifier_refuses_a_revoked_verifier() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(JsonRpcResultResponder(
+            build_ledger_entries_contract_instance(&verifier_addr(), [0xee; 32]),
+        ))
+        .mount(&server)
+        .await;
+    let (audit, path, _dir) = tmp_audit_writer();
+    let manager = manager_one_url(&server.uri(), audit, path);
+    let error = manager
+        .identify_verifier(
+            smart_account_addr(),
+            verifier_addr(),
+            7,
+            SOURCE_G,
+            "revoked-identify".to_owned(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SaError::VerifierWasmRevoked {
+                rule_id: Some(7),
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}

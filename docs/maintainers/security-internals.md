@@ -941,6 +941,8 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | `sep10_session_active` | Active SEP-10 session for the account |
 | `sep45_session_active` | Active SEP-45 session for the contract |
 
+The bundle gate decomposes the encoded declared calls. Only a typed transfer from the wallet has a sized value effect. Every other call is opaque to matched per-call value criteria.
+
 Multicall bundles also carry a hard floor independent of policy: `evaluate_bundle` denies any bundle with more than 50 inners (`DEFAULT_INNER_INVOCATION_COUNT_CAP`) before rule resolution. Policy authors may configure a lower cap but cannot raise it above the floor.
 
 The allowlist, single-call caps, bundle caps, and period accounting share
@@ -1257,9 +1259,11 @@ The digest covers the invocation tree inside `signature_payload`. Address creden
 
 - `None`, the default: no sub-invocations. A wallet entrypoint authorizes its own frame, and the contracts it calls are authorized through invoker-contract auth without adding a node to the wallet's tree.
 - `TokenTransfers`: each sub-invocation is a `transfer(from, to, amount)` on a declared token, `from` is the wallet, the recipient matches when the declaration sets one, and the amounts counted against each declared entry sum to at most its bound. The Soroswap adapter declares the input token with an open recipient (the router picks the pair) and the trade's input amount. A DeFindex deposit declares each vault asset with the vault as recipient and its desired amount.
-- `Calls`: the sub-invocations equal declared calls in declared order, each used at most once. The multicall submit declares its bundle entries.
+- `Calls`: the sub-invocations equal declared calls in declared order, each used at most once. The multicall submit declares its encoded bundle calls and decomposes those same calls for valuation. The signed leaves form an ordered subset of the declaration.
 
 Every accepted sub-invocation is a leaf. The wallet then signs its own root with the accepted subtree. Any other tree refuses with `simulation.divergence.auth_contexts` before a signing primitive runs; the message names the differing part or the index of the refused sub-invocation and the reason, never a value. The divergence check of the auth-entry builder then compares one fingerprint per node of the simulated tree (`node:` plus the SHA-256 of the node's function XDR and its child count) with one per node of the signed tree, as a second check behind those two.
+
+Public smart-account signing entry points consume `CheckedSigningRules`, obtained through `SignersManager::check_signing_rules`. The proof binds the account, network and rule set after the verifier pin and status checks. Quorum collection passes that checked set to every group completion. `rules verify-pins` compares hashes without enforcing status.
 
 The timelock path signs `schedule`, `execute`, and `cancel` with the operator's classic key. That Address authorization has no context rule at all, so the path signs only the timelock call it built, with no sub-invocations. `submit_timelock_invoke_with_g_key_auth` (`crates/stellar-agent-smart-account/src/timelock_submit.rs`) checks every Address entry of the simulation before it signs any: each must name the operator's key and have the call as its root with no sub-invocations. A root that differs or carries sub-invocations returns the same `simulation.divergence.auth_contexts` refusal, and no entry is signed. The public `schedule_upgrade`, `execute`, and `cancel` operations map that refusal, like every other submission failure except the mainnet refusal (and, for `execute`, an unresolved submission), to `sa.timelock_schedule_failed`, `sa.timelock_execute_failed`, and `sa.timelock_cancel_failed`; the refusal text is kept in the reason.
 

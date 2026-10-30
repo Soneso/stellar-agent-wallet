@@ -60,6 +60,23 @@ fn contract(byte: u8) -> String {
     stellar_strkey::Contract([byte; 32]).to_string().to_string()
 }
 
+/// The `{"scval": ...}` multicall argument of the address `strkey`, a G- or
+/// C-strkey, encoded as a standard-base64 `ScVal::Address`.
+fn scval_address(strkey: &str) -> Value {
+    let address = match stellar_strkey::Strkey::from_string(strkey).unwrap() {
+        stellar_strkey::Strkey::PublicKeyEd25519(key) => {
+            ScAddress::Account(stellar_xdr::AccountId(
+                stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(key.0)),
+            ))
+        }
+        stellar_strkey::Strkey::Contract(contract) => {
+            ScAddress::Contract(ContractId(Hash(contract.0)))
+        }
+        _ => panic!("not an address strkey"),
+    };
+    json!({"scval": ScVal::Address(address).to_xdr_base64(Limits::none()).unwrap()})
+}
+
 /// Runs once inside the mock RPC, on the first simulation.
 type SimulateHook = Box<dyn FnOnce() + Send>;
 
@@ -73,6 +90,7 @@ struct Rpc {
     /// Whether the unsigned `exec` simulation authorizes one sub-invocation
     /// per inner call beneath the router's root invocation.
     exec_subtree: bool,
+    extra_transfer: bool,
     /// The envelopes this endpoint saw, in order.
     seen: Arc<Mutex<SeenEnvelopes>>,
 }
@@ -165,7 +183,11 @@ impl Respond for Rpc {
                 let value = match function.as_str() {
                     "get_operation_ledger" => ScVal::U32(500),
                     "hash_operation" => ScVal::Bytes(vec![0x46; 32].try_into().unwrap()),
-                    "exec" => ScVal::Vec(Some(vec![ScVal::Void, ScVal::Void].try_into().unwrap())),
+                    "exec" => ScVal::Vec(Some(
+                        vec![ScVal::Void; exec_subtree(invoke).len()]
+                            .try_into()
+                            .unwrap(),
+                    )),
                     _ => ScVal::Void,
                 };
                 let mut result = rpc_helpers::build_simulate_response(
@@ -180,7 +202,35 @@ impl Respond for Rpc {
                     op.auth.to_vec()
                 } else if function == "exec" {
                     let sub_invocations = if self.exec_subtree {
-                        exec_subtree(invoke).try_into().unwrap()
+                        let mut calls = exec_subtree(invoke);
+                        if self.extra_transfer {
+                            calls.push(SorobanAuthorizedInvocation {
+                                function: SorobanAuthorizedFunction::ContractFn(
+                                    InvokeContractArgs {
+                                        contract_address: ScAddress::Contract(ContractId(Hash(
+                                            [0x50; 32],
+                                        ))),
+                                        function_name: "transfer".try_into().unwrap(),
+                                        args: vec![
+                                            ScVal::Address(ScAddress::Contract(ContractId(Hash(
+                                                [0x44; 32],
+                                            )))),
+                                            ScVal::Address(ScAddress::Contract(ContractId(Hash(
+                                                [0x51; 32],
+                                            )))),
+                                            ScVal::I128(stellar_xdr::Int128Parts {
+                                                hi: 0,
+                                                lo: 1000,
+                                            }),
+                                        ]
+                                        .try_into()
+                                        .unwrap(),
+                                    },
+                                ),
+                                sub_invocations: VecM::default(),
+                            });
+                        }
+                        calls.try_into().unwrap()
                     } else {
                         VecM::default()
                     };
@@ -313,15 +363,36 @@ impl Fixture {
         Arc::new(engine)
     }
 
+    fn per_call_engine(&self, cap: i128, allow_opaque_signing: bool) -> Arc<PolicyEngineV1> {
+        use stellar_agent_core::policy::v1::criteria::per_tx_cap::PerTxCapCriterion;
+        Arc::new(PolicyEngineV1::new(
+            PolicyDocument {
+                version: 1,
+                scope: ScopeId::AllProfiles,
+                signature: None,
+                rules: vec![PolicyRule {
+                    r#match: RuleMatch {
+                        tool: "wallet_multicall".to_owned(),
+                        chain: "stellar:testnet".to_owned(),
+                    },
+                    criteria: vec![Box::new(PerTxCapCriterion::new(contract(0x47), cap))],
+                    decision: Decision::Allow,
+                    allow_opaque_signing,
+                }],
+            },
+            PROFILE.to_owned(),
+        ))
+    }
+
     fn bundle(&self) -> Vec<MulticallInvocation> {
         (0..2)
             .map(|_| MulticallInvocation {
                 target_contract: contract(0x47),
                 fn_name: "transfer".to_owned(),
                 args_json: json!([
-                    account_id_for_seed(SEED),
-                    account_id_for_seed([0x48; 32]),
-                    "30"
+                    scval_address(&contract(0x44)),
+                    scval_address(&account_id_for_seed([0x48; 32])),
+                    30
                 ]),
             })
             .collect()
@@ -432,6 +503,7 @@ async fn rpc_with_hook(
             sent_hash: Arc::clone(&sent_hash),
             before_simulate: Arc::new(Mutex::new(before_simulate)),
             exec_subtree: false,
+            extra_transfer: false,
             seen: Arc::default(),
         })
         .mount(&server)
@@ -442,6 +514,12 @@ async fn rpc_with_hook(
 /// A confirming endpoint whose `exec` simulation authorizes a sub-invocation
 /// per inner call, with the envelopes it received.
 async fn rpc_with_exec_subtree() -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<SeenEnvelopes>>) {
+    rpc_with_tree(false).await
+}
+
+async fn rpc_with_tree(
+    extra_transfer: bool,
+) -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<SeenEnvelopes>>) {
     let server = MockServer::start().await;
     let sends = Arc::new(AtomicUsize::new(0));
     let seen = Arc::new(Mutex::new(SeenEnvelopes::default()));
@@ -452,6 +530,7 @@ async fn rpc_with_exec_subtree() -> (MockServer, Arc<AtomicUsize>, Arc<Mutex<See
             sent_hash: Arc::default(),
             before_simulate: Arc::default(),
             exec_subtree: true,
+            extra_transfer,
             seen: Arc::clone(&seen),
         })
         .mount(&server)
@@ -703,7 +782,7 @@ async fn profile_chain_multicall_cap_precedes_wildcard_and_persists_accounting()
     let (server, sends, _) = rpc("SUCCESS").await;
     let mut over_cap = fixture.bundle();
     for invocation in &mut over_cap {
-        invocation.args_json[2] = json!("60");
+        invocation.args_json[2] = json!(60);
     }
     let error = fixture
         .multicall_with_policy(
@@ -894,4 +973,164 @@ async fn multicall_chain_mismatch_precedes_empty_bundle_validation()
         .ok_or("chain mismatch must refuse")?;
     assert_multicall_chain_mismatch(&error);
     Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn a_bundle_of_string_transfers_is_not_valued() {
+    let fixture = Fixture::new();
+    let (server, sends, _) = rpc("SUCCESS").await;
+    let mut bundle = fixture.bundle();
+    for invocation in &mut bundle {
+        invocation.args_json = json!([
+            account_id_for_seed(SEED),
+            account_id_for_seed([0x48; 32]),
+            "30"
+        ]);
+    }
+    let error = fixture
+        .multicall_with_policy(&server.uri(), bundle, fixture.engine())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SaError::MulticallFailed {
+                phase: "policy_gate",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        fixture.rows("sa_multicall_bundle_denied")[0]["deny_wire_code"],
+        "multicall.bundle_contains_generic_kind"
+    );
+    assert_eq!(fixture.total(), (0, 0));
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_wallet_transfer_over_the_per_call_cap_is_refused() {
+    let fixture = Fixture::new();
+    let (server, sends, _) = rpc("SUCCESS").await;
+    let error = fixture
+        .multicall_with_policy(
+            &server.uri(),
+            fixture.bundle(),
+            fixture.per_call_engine(20, false),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SaError::MulticallFailed {
+                phase: "policy_gate",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    let rows = fixture.rows("sa_multicall_bundle_denied");
+    assert_eq!(rows[0]["deny_wire_code"], "multicall.per_tx_cap_exceeded");
+    assert_eq!(rows[0]["denied_inner_index"], 0);
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
+}
+
+fn with_unvalued_call(mut bundle: Vec<MulticallInvocation>) -> Vec<MulticallInvocation> {
+    bundle.push(MulticallInvocation {
+        target_contract: contract(0x49),
+        fn_name: "approve".to_owned(),
+        args_json: json!([]),
+    });
+    bundle
+}
+
+#[tokio::test]
+#[serial]
+async fn a_per_call_value_rule_refuses_an_unvalued_call() {
+    let fixture = Fixture::new();
+    let (server, sends, _) = rpc("SUCCESS").await;
+    let error = fixture
+        .multicall_with_policy(
+            &server.uri(),
+            with_unvalued_call(fixture.bundle()),
+            fixture.per_call_engine(100, false),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SaError::MulticallFailed {
+                phase: "policy_gate",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    let rows = fixture.rows("sa_multicall_bundle_denied");
+    assert_eq!(
+        rows[0]["deny_wire_code"],
+        "multicall.unsizable_value_effect"
+    );
+    assert_eq!(rows[0]["denied_inner_index"], 2);
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn allow_opaque_signing_admits_an_unvalued_call() {
+    let fixture = Fixture::new();
+    let (server, sends, _) = rpc("SUCCESS").await;
+    fixture
+        .multicall_with_policy(
+            &server.uri(),
+            with_unvalued_call(fixture.bundle()),
+            fixture.per_call_engine(100, true),
+        )
+        .await
+        .unwrap();
+    let rows = fixture.rows("value_action_pending");
+    let legs = rows[0]["legs"].as_array().unwrap();
+    assert_eq!(legs.len(), 2);
+    for leg in legs {
+        assert_eq!(leg["amount"], "30");
+        assert_eq!(leg["asset"], contract(0x47));
+    }
+    assert_eq!(sends.load(Ordering::SeqCst), 1);
+}
+
+/// A simulated `exec` subtree that carries a transfer after the declared
+/// calls is refused by the declared sub-invocation check before anything is
+/// signed: the bundle reports the divergence at phase `sign` and writes the
+/// denied row naming it.
+#[tokio::test]
+#[serial]
+async fn a_simulated_transfer_outside_the_bundle_is_refused() {
+    let fixture = Fixture::new();
+    let (server, sends, seen) = rpc_with_tree(true).await;
+    let error = fixture.multicall(&server.uri()).await.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            SaError::MulticallFailed {
+                phase: "sign",
+                redacted_reason,
+                post_submit_kind: None,
+            } if redacted_reason == "submit error: simulation.divergence.auth_contexts"
+        ),
+        "{error:?}"
+    );
+    let rows = fixture.rows("sa_multicall_bundle_denied");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["deny_wire_code"],
+        "multicall.simulation.divergence.auth_contexts"
+    );
+    assert_eq!(rows[0]["refusal_phase"], "sign");
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
+    assert!(seen.lock().unwrap().signed_simulations.is_empty());
 }

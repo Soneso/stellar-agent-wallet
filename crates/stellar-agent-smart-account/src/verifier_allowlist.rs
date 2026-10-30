@@ -180,8 +180,8 @@ pub struct VerifierAllowlistEntry {
     /// hash from this typed field.
     pub wasm_hash: [u8; 32],
 
-    /// Audit status. Drives both install-time gates AND the startup-advisory
-    /// check in `run_startup_advisory`.
+    /// Audit status. Drives install gates, signing-time pin checks, migration
+    /// preflight and the startup advisory.
     pub audit_status: VerifierAuditStatus,
 }
 
@@ -345,12 +345,114 @@ pub const VERIFIER_ALLOWLIST: &[VerifierAllowlistEntry] = &[
     },
 ];
 
+/// Refuses a disclosed verifier status independently of allowlist membership.
+pub(crate) fn verifier_status_refusal(
+    allowlist: &[VerifierAllowlistEntry],
+    hash: &[u8; 32],
+    rule_id: Option<u32>,
+    smart_account_redacted: &str,
+    request_id: &str,
+) -> Result<(), crate::SaError> {
+    use stellar_agent_core::observability::RedactedStrkey;
+    let Some(entry) = allowlist.iter().find(|entry| entry.wasm_hash == *hash) else {
+        return Ok(());
+    };
+    match &entry.audit_status {
+        VerifierAuditStatus::Revoked { reason, .. } => Err(crate::SaError::VerifierWasmRevoked {
+            rule_id,
+            smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
+            verifier_hash_first8: stellar_agent_core::hex::wasm_hash_first8_hex(hash),
+            revoked_reason: (*reason).to_owned(),
+            request_id: request_id.to_owned(),
+        }),
+        VerifierAuditStatus::Retired { .. } => Err(crate::SaError::VerifierWasmRetired {
+            rule_id,
+            smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
+            verifier_hash_first8: stellar_agent_core::hex::wasm_hash_first8_hex(hash),
+            request_id: request_id.to_owned(),
+        }),
+        VerifierAuditStatus::Audited { .. }
+        | VerifierAuditStatus::Provisional { .. }
+        | VerifierAuditStatus::Unaudited => Ok(()),
+    }
+}
+
+/// Applies the verifier status gate using the compiled allowlist.
+pub(crate) fn refuse_revoked_or_retired_verifier(
+    hash: &[u8; 32],
+    rule_id: Option<u32>,
+    smart_account_redacted: &str,
+    request_id: &str,
+) -> Result<(), crate::SaError> {
+    verifier_status_refusal(
+        VERIFIER_ALLOWLIST,
+        hash,
+        rule_id,
+        smart_account_redacted,
+        request_id,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test-only")]
     #![allow(clippy::expect_used, reason = "test-only")]
 
     use super::*;
+
+    #[test]
+    fn verifier_status_refusal_refuses_revoked_and_retired_only() {
+        let statuses = [
+            VerifierAuditStatus::Audited {
+                auditor: "a",
+                audited_at: "b",
+            },
+            VerifierAuditStatus::Provisional {
+                attested_by: "a",
+                attested_at: "b",
+            },
+            VerifierAuditStatus::Unaudited,
+            VerifierAuditStatus::Revoked {
+                revoked_at: "a",
+                reason: "disclosed problem",
+            },
+            VerifierAuditStatus::Retired {
+                revoked_at: "a",
+                retired_at: "b",
+            },
+        ];
+        let entries: Vec<_> = statuses
+            .into_iter()
+            .enumerate()
+            .map(|(i, status)| {
+                VerifierAllowlistEntry::new_for_test([u8::try_from(i).unwrap(); 32], status)
+            })
+            .collect();
+        for tag in [0, 1, 2, 5] {
+            assert!(
+                verifier_status_refusal(&entries, &[tag; 32], Some(4), "CAAAA...AAAAA", "status")
+                    .is_ok()
+            );
+        }
+        let revoked =
+            verifier_status_refusal(&entries, &[3; 32], Some(4), "CAAAA...AAAAA", "status")
+                .unwrap_err();
+        assert!(
+            matches!(revoked, crate::SaError::VerifierWasmRevoked { rule_id: Some(4), ref revoked_reason, .. } if revoked_reason == "disclosed problem")
+        );
+        assert!(matches!(
+            verifier_status_refusal(&entries, &[4; 32], None, "CAAAA...AAAAA", "status"),
+            Err(crate::SaError::VerifierWasmRetired { rule_id: None, .. })
+        ));
+        let mut repeated = entries.clone();
+        repeated.insert(
+            0,
+            VerifierAllowlistEntry::new_for_test([3; 32], VerifierAuditStatus::Unaudited),
+        );
+        assert!(
+            verifier_status_refusal(&repeated, &[3; 32], None, "CAAAA...AAAAA", "status").is_ok()
+        );
+    }
 
     #[test]
     fn verifier_allowlist_closed_set_audit_status_count() {
