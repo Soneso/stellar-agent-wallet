@@ -19,8 +19,8 @@ Facts that apply to every crate:
   description say what that does and does not mean.
 - The unpublished `stellar-agent-smart-account-acceptance` member holds live
   acceptance suites only. It has no tier and no row in the Crates table.
-- The mainnet column describes the scope of feature-enabled builds. Released
-  binaries have the feature off. See
+- The mainnet column describes the scope of feature-enabled builds, which
+  include the released binaries. See
   [Mainnet configurations and scope](../getting-started.md#mainnet-configurations-and-scope).
 - The `stellar-agent` and `stellar-agent-mcp` binaries bundle every surface
   during alpha. Cargo feature groups (`payments`, `smart-account`,

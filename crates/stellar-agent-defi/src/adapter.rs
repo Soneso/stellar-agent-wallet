@@ -550,7 +550,7 @@ pub enum DefiAdapterError {
     /// Distinct from [`Self::Network`]: the refusal is structural, not a
     /// failure. The surface reports `network.mainnet_write_forbidden`, the one
     /// code every mainnet refusal carries.
-    #[error("mainnet writes are structurally refused in this alpha")]
+    #[error("this mainnet write is structurally refused")]
     MainnetWriteForbidden,
 }
 

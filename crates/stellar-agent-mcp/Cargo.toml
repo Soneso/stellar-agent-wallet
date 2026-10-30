@@ -169,7 +169,8 @@ stellar-agent-toolsets-runtime = { path = "../stellar-agent-toolsets-runtime", f
 stellar-agent-toolsets-install = { path = "../stellar-agent-toolsets-install", features = ["test-helpers"] }
 # Path-only self-reference: enables this crate's own test features for its tests
 # and is stripped from the published manifest like every internal dev-dependency.
-stellar-agent-mcp = { path = ".", features = ["test-helpers"] }
+# Its default stays off here, so a --no-default-features run stays off.
+stellar-agent-mcp = { path = ".", default-features = false, features = ["test-helpers"] }
 stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 # test-hooks counts StellarRpcClient constructions, so the tool tests can show
 # which clients a prepare or commit call builds.
@@ -228,8 +229,11 @@ stellar-xdr                = { workspace = true }
 stellar-baselib            = { workspace = true }
 
 [features]
-# Enables mainnet-write in core, network, sep43, x402 and x402-identity;
-# --version reports its state. Disabled by default.
+# On by default, so release, cargo install and source builds carry it, and
+# --version reports its state. --no-default-features builds without it.
+# A dependent of the library sets default-features = false to leave it off.
+default = ["mainnet-write"]
+# Enables mainnet-write in core, network, sep43, x402 and x402-identity.
 mainnet-write = [
     "stellar-agent-core/mainnet-write",
     "stellar-agent-network/mainnet-write",
@@ -249,7 +253,7 @@ test-helpers = ["stellar-agent-network/test-hooks",
 ]
 # Gate end-to-end testnet acceptance tests that require a live Friendbot + RPC.
 # These tests are NOT run under default `cargo test`; invoke with:
-#   cargo test -p stellar-agent-mcp --features testnet-acceptance \
+#   cargo test -p stellar-agent-mcp --no-default-features --features testnet-acceptance \
 #     --test sep43_sign_and_submit_transaction_testnet_acceptance
 # This feature is CI/dev-only and MUST NOT be enabled in any release-artefact
 # feature set.

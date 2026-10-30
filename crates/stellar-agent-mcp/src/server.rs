@@ -1278,11 +1278,13 @@ impl ServerHandler for WalletServer {
              stellar_create_account (simulate step: build CreateAccount envelope \
              and mint nonce, returns envelope_xdr+nonce+expires_at_unix_ms); \
              stellar_create_account_commit (commit step: verify nonce, re-check \
-             envelope, sign via keyring, submit — testnet-only, destructive); \
+             envelope, sign via keyring, submit; destructive, and on mainnet \
+             only under the configured mainnet authorization); \
              stellar_pay (simulate step: build Payment envelope for native or \
              non-native assets, runs SEP-29 memo-required check, mints nonce); \
              stellar_pay_commit (commit step: verify nonce, re-check envelope, \
-             sign via keyring, submit — testnet-only, destructive); \
+             sign via keyring, submit; destructive, and on mainnet only under \
+             the configured mainnet authorization); \
              stellar_sep43_get_address (SEP-43 getAddress: returns the active \
              wallet address, read-only); \
              stellar_sep43_get_network (SEP-43 getNetwork: returns active network \

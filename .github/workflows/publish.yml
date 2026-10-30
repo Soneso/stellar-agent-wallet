@@ -45,7 +45,7 @@ permissions:
   contents: read
 
 env:
-  EXPECTED_MAINNET_WRITE: "off"
+  EXPECTED_MAINNET_WRITE: "on"
   # The exact toolchain both jobs package with. The publish job refuses any
   # other cargo or rustc version.
   RELEASE_TOOLCHAIN: "1.99.0"

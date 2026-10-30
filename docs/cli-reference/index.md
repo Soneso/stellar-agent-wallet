@@ -31,7 +31,7 @@ The wallet is a public alpha; prebuilt binaries are published on the GitHub rele
 
 ## Global conventions
 
-The top-level command accepts `-h`/`--help` and `-V`/`--version`. The second line of `--version` and `-V` output, `STELLAR_AGENT_BUILD_MAINNET_WRITE=off` or `=on`, reports the build state of the default-off `mainnet-write` Cargo feature. Network selection, the profile, RPC URLs, and the signer source are declared per subcommand. The recurring flags below have the same meaning everywhere they appear; the per-group pages reference this section rather than restating them.
+The top-level command accepts `-h`/`--help` and `-V`/`--version`. The second line of `--version` and `-V` output, `STELLAR_AGENT_BUILD_MAINNET_WRITE=off` or `=on`, reports the build state of the `mainnet-write` Cargo feature, which the binary packages enable by default. Network selection, the profile, RPC URLs, and the signer source are declared per subcommand. The recurring flags below have the same meaning everywhere they appear; the per-group pages reference this section rather than restating them.
 
 ### Profile
 
@@ -121,7 +121,7 @@ fi
 
 ## Mainnet write behavior
 
-Released binaries have `mainnet-write` disabled. Enabled builds admit full-mode
+Released binaries have `mainnet-write` on and admit full-mode
 `pay`, `claim`, sponsored `accounts create`, and `trustline` after installation
 setup and consent for each action. Build-only, sign-only, submit-only,
 Friendbot creation, generated-account creation, and relayer paths remain excluded.

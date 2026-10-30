@@ -73,8 +73,9 @@ rustup component add llvm-tools-preview
 
 ## Building
 
-The default-off `mainnet-write` Cargo feature controls authorization
-representation, enabled-policy checks, and build reporting.
+The `mainnet-write` Cargo feature controls authorization representation,
+enabled-policy checks, and build reporting. `stellar-agent-cli` and
+`stellar-agent-mcp` enable it by default; the library crates leave it off.
 `stellar-agent` and `stellar-agent-mcp` report its state as
 `STELLAR_AGENT_BUILD_MAINNET_WRITE=off` or `=on` on the second line of
 `--version` and `-V` output.
@@ -84,6 +85,9 @@ Build the whole workspace:
 ```bash
 cargo build
 ```
+
+`cargo build` builds both binaries with `mainnet-write` on;
+`cargo build --no-default-features` builds them with it off.
 
 For maintainer release validation:
 
@@ -306,8 +310,9 @@ Cargo builds the required dependency closures. A dependent names an owner by
 `[dev-dependencies]`, or a target-specific dependency table.
 
 Clippy and rustdoc use the same `-p` list as tests, with every declared feature
-except `default` and `mainnet-write`. Feature-on rows add `mainnet-write` only
-when a selected package declares it.
+except `default` and `mainnet-write`. Clippy, rustdoc, and tests pass
+`--no-default-features`. Feature-on rows keep the default features and add
+`mainnet-write` only when a selected package declares it.
 Tests use the offline features that at least one selected package declares:
 `test-helpers`, `test-hooks`, `test-loopback`, and `verifier-registry`, in that
 order.
@@ -460,7 +465,7 @@ Run `cargo fmt --all` to format Rust sources.
 ```bash
 # operator-enroll-browser-acceptance covers browser acceptance tests of the approval pages.
 FEATURES_EXCEPT_MAINNET_WRITE=deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
-cargo clippy --workspace --all-targets --features "$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings
 cargo clippy --workspace --all-targets --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings
 ```
 
@@ -472,7 +477,7 @@ restriction lints `unwrap_used`, `expect_used`, `panic`, `print_stdout`,
 #### Rustdoc
 
 ```bash
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features "$FEATURES_EXCEPT_MAINNET_WRITE"
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE"
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE"
 ```
 
@@ -481,7 +486,7 @@ Rustdoc warnings are denied.
 #### Test
 
 ```bash
-cargo test --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry
+cargo test --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry
 cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry
 cargo check -p stellar-agent-network --features mainnet-write
 ```
@@ -492,7 +497,7 @@ its separate workflow and feature selections; see [Test tiers](#test-tiers).
 #### Coverage
 
 ```bash
-cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json
+cargo llvm-cov --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json
 python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off
 cargo llvm-cov --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-on.json
 python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on
@@ -636,12 +641,12 @@ testnet RPC and Friendbot. These tests are not run under default `cargo test`; e
 is enabled per crate. For example:
 
 ```bash
-cargo test -p stellar-agent-mcp --features testnet-acceptance \
+cargo test -p stellar-agent-mcp --no-default-features --features testnet-acceptance \
   --test sep43_sign_and_submit_transaction_testnet_acceptance
 ```
 
 ```bash
-cargo test -p stellar-agent-network --features testnet-acceptance
+cargo test -p stellar-agent-network --no-default-features --features testnet-acceptance
 ```
 
 The `testnet-acceptance` feature is dev- and CI-only and must not be enabled in any
@@ -660,7 +665,9 @@ of them.
 
 These tests require network reachability to testnet RPC and Friendbot. Testnet is
 the default network; Friendbot funding is testnet-only. Live acceptance runs
-with `mainnet-write` off. These tests establish no live-mainnet acceptance.
+with `mainnet-write` off: the runner passes `--no-default-features` to every
+suite, and none of its selections enables the feature. These tests establish
+no live-mainnet acceptance.
 
 The MPP acceptance target also requires Node.js and pnpm for the pinned released
 `@stellar/mpp` server harness. Its package and lock files must contain the exact
@@ -1091,14 +1098,19 @@ bash .github/scripts/release/check-host.sh
 The checker reads metadata and Cargo trees with `--locked --offline`. Each
 error message names the rule that failed:
 
-- D1: the `mainnet-write` declarations the checker pins hold, and no other
-  feature, no `default`, and no normal dependency declaration reaches
-  `mainnet-write`.
+- D1: the `mainnet-write` declarations and the `default = ["mainnet-write"]`
+  of `stellar-agent-cli` and `stellar-agent-mcp` that the checker pins hold,
+  and no other feature, no other `default`, and no normal dependency
+  declaration reaches `mainnet-write`.
 - D2: no dev or build dependency declaration requests a feature that reaches
-  `mainnet-write`.
+  `mainnet-write`. A declaration that keeps a binary package's default
+  reaches it, so each one, the MCP self dev-dependency included, sets
+  `default-features = false`.
 - D3: every cargo and cross call of the workflows and of the scripts they name
   matches the reviewed inventory in the checker, and each resolved graph has
-  `mainnet-write` in the state its record relies on. The scanner reads
+  `mainnet-write` in the state its record relies on. A record relies on the
+  feature when its feature list names `mainnet-write`, or when it keeps the
+  default features and selects the workspace or a binary package. The scanner reads
   spaces and tabs as the only blanks, and a physical line ends at a line
   feed. It reads a heredoc only when its delimiter, after `<<` and at most
   one space, is an identifier, an ASCII letter or underscore followed by
@@ -1161,11 +1173,12 @@ error message names the rule that failed:
   write that reaches the file without spelling `GITHUB_ENV`, through another
   variable or a path found at run time, is outside the scan.
 - D8: no workflow, named script, or this guide enables every feature.
-- D9: only the CI feature-on jobs and the coverage job activate
-  `mainnet-write`.
+- D9: only the CI feature-on jobs and the coverage job name `mainnet-write`
+  in a feature list; release-shaped builds activate it through the binary
+  defaults.
 - D10: the feature list of `ci.yml` and the list in this guide equal the
   declared features except `default` and `mainnet-write`.
-- D11: the release, publish, and rehearsal workflows expect the marker off.
+- D11: the release, publish, and rehearsal workflows expect the marker on.
 - D12: the marker literal appears in `crates/` only in the two cfg arms of the
   core crate.
 - D13: every declared feature belongs to exactly one of the product and test
@@ -1175,12 +1188,14 @@ error message names the rule that failed:
 
 Release builds refuse compiler overrides and cargo configuration files
 through the checker's `--env-guard` mode, which `build.sh` runs on its own
-checkout. `check-binary-marker.sh <binary> off` checks the second version
+checkout. `check-binary-marker.sh <binary> <on|off>` checks the second version
 line, the embedded expected marker, and the absence of the opposite marker
 and test-override literals.
 
 `check-host.sh` builds the release binaries for the host target through
-`build.sh` and checks both markers; the preflight row `release-shape` runs it.
+`build.sh` and checks both markers, then builds each binary package alone with
+`cargo build --locked -p` and checks that marker too; the preflight row
+`release-shape` runs it.
 It installs nothing, and it stops in these cases:
 
 - On Linux without libudev, it prints the install command and exits 2. The
@@ -1195,5 +1210,6 @@ It installs nothing, and it stops in these cases:
 The release rehearsal checks both binaries from every packed archive on a
 native runner, including Rosetta for the Intel macOS archive. Its crate job
 packages with the publish toolchain and checks fresh package-verification
-outputs. The live acceptance tier runs with `mainnet-write` off: none of the
-acceptance runner's selections enables it.
+outputs. Live acceptance runs with `mainnet-write` off: the runner passes
+`--no-default-features` to every suite, and none of its selections enables the
+feature.

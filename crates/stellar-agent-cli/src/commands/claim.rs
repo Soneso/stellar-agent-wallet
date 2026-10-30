@@ -460,8 +460,9 @@ where
     render_claim_outcome(out, args.output, outcome)
 }
 
-/// Resolves the profile and the network context, refuses mainnet, and runs
-/// the selected stage.
+/// Resolves the profile and the network context, refuses the staged modes on
+/// mainnet, and runs the selected stage; full mode on mainnet runs the
+/// authorized mainnet pipeline.
 async fn claim_outcome<LoadProfile, InitKeyring>(
     args: &ClaimArgs,
     load_profile: LoadProfile,
@@ -484,8 +485,9 @@ where
     claim_outcome_loaded(args, &resolved, &profile, origin, init_keyring).await
 }
 
-/// Runs the command on a loaded profile: the network context, the structural
-/// mainnet refusal, and the stage dispatch.
+/// Runs the command on a loaded profile: the network context, the refusal of
+/// the staged modes on mainnet, the authorized mainnet dispatch of full mode,
+/// and the stage dispatch.
 async fn claim_outcome_loaded<InitKeyring>(
     args: &ClaimArgs,
     resolved: &ResolvedProfileName,

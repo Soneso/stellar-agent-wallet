@@ -286,9 +286,9 @@ Drive installed toolsets with `stellar_toolset_list` and `stellar_toolset_invoke
 
 ## 9. Safety model
 
-- Released binaries have `mainnet-write` disabled. A feature-enabled build
-  admits the four classic full-mode CLI operations and classic MCP commits
-  after operator setup and approval for each action. See
+- Released binaries have `mainnet-write` on and admit the four classic
+  full-mode CLI operations and classic MCP commits after operator setup and
+  approval for each action. See
   [profiles and keys](references/profiles-and-keys.md#mainnet-policy-body) and
   [classic MCP authorization](references/mcp-tools.md#classic-mainnet-authorization).
   Mainnet reads retain selection, key-scope, and policy requirements.

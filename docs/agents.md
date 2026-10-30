@@ -168,7 +168,7 @@ and never as a transient error to retry blindly.
 
 ## Mainnet actions and refusal recovery
 
-Released binaries have `mainnet-write` disabled. A feature-enabled server admits
+Released binaries have `mainnet-write` on. The server admits
 `stellar_pay_commit`, `stellar_claim_commit`, `stellar_create_account_commit`,
 and `stellar_trustline_commit` after operator setup. Every action needs approval,
 even under an Allow rule. Both prepare and commit names need policy rules.

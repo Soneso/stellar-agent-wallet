@@ -238,7 +238,8 @@ Notes:
   Arguments other than `--profile`, `--help`, and `--version` are refused.
 - The second line of `--version` and `-V` output,
   `STELLAR_AGENT_BUILD_MAINNET_WRITE=off` or `=on`, reports the build state of
-  the default-off `mainnet-write` Cargo feature.
+  the `mainnet-write` Cargo feature, which the binary packages enable by
+  default.
 - The exact location and schema of the configuration file depend on the MCP
   client. Consult that client's documentation for where to place the stanza.
 

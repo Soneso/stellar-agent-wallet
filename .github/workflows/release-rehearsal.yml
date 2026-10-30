@@ -32,8 +32,8 @@ permissions:
   contents: read
 
 env:
-  # The expected mainnet-write state is off.
-  EXPECTED_MAINNET_WRITE: "off"
+  # The expected mainnet-write state is on.
+  EXPECTED_MAINNET_WRITE: "on"
   # The toolchain publish.yml packages with.
   RELEASE_TOOLCHAIN: "1.99.0"
 

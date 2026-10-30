@@ -41,7 +41,7 @@ permissions:
   contents: read
 
 env:
-  EXPECTED_MAINNET_WRITE: "off"
+  EXPECTED_MAINNET_WRITE: "on"
   # The toolchain publish.yml packages with; every build leg compiles with it.
   RELEASE_TOOLCHAIN: "1.99.0"
 
