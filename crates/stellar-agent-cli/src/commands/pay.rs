@@ -5521,7 +5521,7 @@ mod tests {
         use std::sync::Arc;
 
         use serde_json::{Value, json};
-        use stellar_agent_core::error::{AuthError, WalletStateError};
+        use stellar_agent_core::error::{ApprovalFailure, AuthError, WalletStateError};
         use stellar_agent_core::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
         use stellar_agent_network::mainnet::{MainnetAuthorizationError, MainnetPrecondition};
         use stellar_agent_test_support::WarningCapture;
@@ -5532,6 +5532,7 @@ mod tests {
             account_entry_xdr_with_seq, account_ledger_key_xdr,
         };
 
+        use crate::common::mainnet_presence::driver;
         use crate::common::mainnet_write::{
             bound_recorders_on_this_thread, bound_request_ids_on_this_thread,
             invalidations_on_this_thread,
@@ -5904,7 +5905,7 @@ mod tests {
             assert!(fixture.oracle_methods().await.is_empty());
             assert_eq!(signer_resolutions_on_this_thread(), resolutions);
             assert_eq!(env_signatures_on_this_thread(), signatures);
-            fixture.assert_terminal_untouched();
+            fixture.assert_no_consent_ceremony();
         }
 
         /// Engine kind: a Noop profile refuses at the engine check, naming the
@@ -5991,7 +5992,7 @@ mod tests {
 
             assert_refused_before_confirmation(&fixture, &run, "auth.enrolled_signer_unpinned")
                 .await;
-            fixture.assert_terminal_untouched();
+            fixture.assert_no_consent_ceremony();
         }
 
         /// Enrollment: a `--source` other than the enrolled key refuses with
@@ -6019,7 +6020,7 @@ mod tests {
                 "{}",
                 run.message()
             );
-            fixture.assert_terminal_untouched();
+            fixture.assert_no_consent_ceremony();
         }
 
         /// Enrollment: the Ledger choice with an unenrolled key names the
@@ -6059,70 +6060,102 @@ mod tests {
                 .await;
         }
 
-        /// Asserts a confirmation refusal with `code`: no record, the
-        /// testnet signing helpers never ran, nothing sent.
+        /// Asserts a confirmation refusal with `code`: one ceremony started,
+        /// no consent row, no pending entry left, no record, nothing sent.
         async fn assert_confirmation_refused(fixture: &MainnetFixture, run: &Run, code: &str) {
             assert_eq!(run.code, 1, "{}", run.envelope);
             assert_eq!(run.code(), code, "{}", run.envelope);
+            assert_eq!(fixture.ceremonies().len(), 1, "the ceremony started");
+            assert!(fixture.audit_rows("approval_attested").is_empty());
+            assert!(
+                fixture.pending_entries().is_empty(),
+                "the parked entry is gone"
+            );
             assert!(records(fixture).is_empty(), "no authorization record");
             assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
         }
 
-        /// Confirmation: without a terminal the confirmation refuses.
+        /// Confirmation: a ceremony without a usable browser refuses with
+        /// the browser code; the terminal is never consulted, so a missing
+        /// terminal changes nothing.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn the_confirmation_requires_a_terminal() {
-            let mut fixture = Spec::new("mainnet-pay-confirm-tty").build().await;
+        async fn the_confirmation_refuses_a_missing_browser() {
+            let mut fixture = Spec::new("mainnet-pay-confirm-browser").build().await;
             fixture.terminal(false, false);
+            fixture.present_with(|_| {
+                Err(WalletError::Approval(
+                    ApprovalFailure::PresenceBrowserRequired,
+                ))
+            });
             let before = signer_resolutions_on_this_thread();
 
             let run = run(&fixture, &memo_args(&fixture)).await;
 
-            assert_confirmation_refused(&fixture, &run, "confirm.tty_required").await;
+            assert_confirmation_refused(&fixture, &run, "approval.presence_browser_required").await;
             assert_eq!(signer_resolutions_on_this_thread(), before);
-            assert!(fixture.prompts().is_empty());
+            assert_eq!(fixture.terminal_checks(), 0);
+            assert_eq!(fixture.summaries().len(), 1, "the summary is shown");
         }
 
-        /// Confirmation: a typed name other than the profile's refuses.
+        /// Confirmation: an assertion over another challenge refuses as
+        /// invalid.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn the_confirmation_refuses_another_name() {
-            let mut fixture = Spec::new("mainnet-pay-confirm-name").build().await;
-            fixture.answer_with(|_| Ok(Some("another-profile".to_owned())));
+        async fn the_confirmation_refuses_an_assertion_over_another_challenge() {
+            let mut fixture = Spec::new("mainnet-pay-confirm-challenge").build().await;
+            fixture.present_with(driver::over_another_challenge(driver::fixture_credential()));
             let before = signer_resolutions_on_this_thread();
 
             let run = run(&fixture, &memo_args(&fixture)).await;
 
-            assert_confirmation_refused(&fixture, &run, "confirm.profile_name_mismatch").await;
-            assert_eq!(signer_resolutions_on_this_thread(), before);
-        }
-
-        /// Confirmation: end of input refuses as unavailable input.
-        #[tokio::test(flavor = "current_thread")]
-        #[serial_test::serial]
-        async fn the_confirmation_refuses_end_of_input() {
-            let mut fixture = Spec::new("mainnet-pay-confirm-eof").build().await;
-            fixture.answer_with(|_| Ok(None));
-            let before = signer_resolutions_on_this_thread();
-
-            let run = run(&fixture, &memo_args(&fixture)).await;
-
-            assert_confirmation_refused(&fixture, &run, "confirm.input_unavailable").await;
+            assert_confirmation_refused(&fixture, &run, "approval.presence_invalid").await;
             assert_eq!(signer_resolutions_on_this_thread(), before);
         }
 
-        /// Confirmation: a read error refuses as unavailable input.
+        /// Confirmation: a canceled ceremony refuses as canceled.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn the_confirmation_refuses_a_read_error() {
-            let mut fixture = Spec::new("mainnet-pay-confirm-read").build().await;
-            fixture.answer_with(|_| Err(std::io::Error::other("terminal gone")));
+        async fn the_confirmation_refuses_a_canceled_ceremony() {
+            let mut fixture = Spec::new("mainnet-pay-confirm-cancel").build().await;
+            fixture.present_with(|_| Err(WalletError::Approval(ApprovalFailure::PresenceCanceled)));
             let before = signer_resolutions_on_this_thread();
 
             let run = run(&fixture, &memo_args(&fixture)).await;
 
-            assert_confirmation_refused(&fixture, &run, "confirm.input_unavailable").await;
+            assert_confirmation_refused(&fixture, &run, "approval.presence_canceled").await;
             assert_eq!(signer_resolutions_on_this_thread(), before);
+        }
+
+        /// Confirmation: an assertion without user verification, and one of
+        /// a credential the signed policy does not list, refuse as invalid.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn the_confirmation_refuses_an_unverified_or_unpinned_assertion() {
+            use stellar_agent_test_support::webauthn::{
+                FLAG_UP, FLAG_UV, TestAuthenticator, fixture_authenticator,
+            };
+            for (index, (authenticator, flags)) in [
+                (fixture_authenticator(), FLAG_UP),
+                (
+                    TestAuthenticator::from_seed([0x33; 32], vec![0x44; 16]),
+                    FLAG_UP | FLAG_UV,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let name: &'static str =
+                    ["mainnet-pay-confirm-uv", "mainnet-pay-confirm-pin"][index];
+                let mut fixture = Spec::new(name).build().await;
+                fixture.present_with(driver::credential(authenticator, flags));
+                let before = signer_resolutions_on_this_thread();
+
+                let run = run(&fixture, &memo_args(&fixture)).await;
+
+                assert_confirmation_refused(&fixture, &run, "approval.presence_invalid").await;
+                assert_eq!(signer_resolutions_on_this_thread(), before);
+            }
         }
 
         /// Confirmation: an unwritable approval directory refuses with the
@@ -6201,21 +6234,12 @@ mod tests {
                 .rules(vec![pay_rule("require_approval", "")])
                 .build()
                 .await;
-            let store_paths = Rc::new(std::cell::RefCell::new(Vec::new()));
-            let observed = Rc::clone(&store_paths);
-            let mut fixture = fixture;
-            let name = fixture.name.to_owned();
-            let store = fixture.approval_store_path();
-            fixture.answer_with(move |_| {
-                observed.borrow_mut().push(store.clone());
-                Ok(Some(name.clone()))
-            });
 
             let run = run(&fixture, &memo_args(&fixture)).await;
 
             assert_eq!(run.code, 0, "{}", run.envelope);
             assert_eq!(
-                store_paths.borrow().len(),
+                fixture.ceremonies().len(),
                 1,
                 "the run reached the confirmation"
             );
@@ -6245,10 +6269,10 @@ mod tests {
                 now() + CLOCK_LEAD_MS,
             ));
             let advance = Rc::clone(&clock);
-            let name = fixture.name.to_owned();
-            fixture.answer_with(move |_| {
+            let mut answer = driver::fixture_credential();
+            fixture.present_with(move |ceremony| {
                 // The operator answers one second past the readiness lifetime
-                // of a proof made when the prompt appeared.
+                // of a proof made when the ceremony started.
                 let prompted_at = stellar_agent_network::mainnet::clock::now_ms().unwrap();
                 advance.set(
                     prompted_at
@@ -6256,7 +6280,7 @@ mod tests {
                             + 1)
                             * 1000,
                 );
-                Ok(Some(name.clone()))
+                answer(ceremony)
             });
 
             let run = run(&fixture, &memo_args(&fixture)).await;
@@ -6435,14 +6459,14 @@ mod tests {
         #[serial_test::serial]
         async fn an_unset_seed_variable_is_not_read_before_the_confirmation() {
             let mut fixture = Spec::new("mainnet-pay-seed-order").build().await;
-            fixture.terminal(false, false);
+            fixture.present_with(|_| Err(WalletError::Approval(ApprovalFailure::PresenceCanceled)));
             let mut args = memo_args(&fixture);
             args.secret_env = Some("STELLAR_AGENT_MAINNET_FIXTURE_UNSET_SK".to_owned());
             let before = signer_resolutions_on_this_thread();
 
             let run = run(&fixture, &args).await;
 
-            assert_eq!(run.code(), "confirm.tty_required", "{}", run.envelope);
+            assert_eq!(run.code(), "approval.presence_canceled", "{}", run.envelope);
             assert_eq!(signer_resolutions_on_this_thread(), before);
         }
 

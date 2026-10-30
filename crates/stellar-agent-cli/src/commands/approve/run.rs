@@ -58,9 +58,19 @@
 //! - `1` — denied, expired, not found, user mismatch, or I/O error.
 //!
 //! This is the `approve --id <nonce> --profile <name>` CLI path of the wallet-owned approval spine.
+//!
+//! # Mainnet
+//!
+//! On a mainnet profile `--yes` is refused, no y/n prompt runs, and terminal
+//! input is never consent. The summary is rendered for orientation, the
+//! pending store is released, and the command awaits a verified WebAuthn
+//! assertion from an approval credential in the owner-signed policy through
+//! [`acquire_mainnet_presence`]. It then reopens the store, reads the current
+//! policy again, and records a version 5 consent; the success envelope names
+//! the ceremony in `presence` and carries its consent request ID.
 
 use std::io::{BufRead as _, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use clap::Args;
@@ -69,11 +79,13 @@ use serde::Serialize;
 use stellar_agent_core::amount::StellarAmount;
 use stellar_agent_core::approval::view::format_trustline_limit;
 use stellar_agent_core::approval::{
-    ApprovalKind, ApproverIdentity, ConsentAudit, ContextRuleProposalSnapshot,
-    DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, PendingApproval, PendingApprovalStore,
+    ApprovalContext, ApprovalKind, ApproverIdentity, AttestedApprover, ConsentAudit,
+    ConsentAuthorization, ContextRuleProposalSnapshot, DEFAULT_RETRY_ATTEMPTS,
+    DEFAULT_RETRY_BACKOFF, MainnetApprovalAuthority, PendingApproval, PendingApprovalStore,
     RuleProposalContextType, RuleProposalSignerKind, Surface, ToolsetGrantRequest,
     attest_and_persist, classic_entry_summary, load_and_validate_entry, load_attestation_key,
-    open_with_retry, process_uid_for_attestation, try_decode_spending_limit_params,
+    mainnet_consent_subject, open_with_retry, process_uid_for_attestation,
+    try_decode_spending_limit_params,
 };
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::envelope_decode::ClassicOperation;
@@ -83,6 +95,7 @@ use stellar_agent_core::timefmt;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
 use crate::common::consent::{ConsentSink, acquire_consent_sink};
+use crate::common::mainnet_presence::acquire_mainnet_presence;
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::{render, resolve_profile_name};
 
@@ -118,7 +131,8 @@ pub struct RunArgs {
     /// there is a visible record (stdout stays reserved for the JSON envelope),
     /// but no human confirmation is required.
     /// This mode is intended for integration tests and CI pipelines operating
-    /// in a controlled, trusted environment.
+    /// in a controlled, trusted environment. It is refused on a mainnet
+    /// profile.
     #[arg(long = "yes")]
     pub yes: bool,
 }
@@ -150,6 +164,22 @@ struct ApproveRunData {
     /// in the audit outbox for the draining writer of a running MCP server or
     /// approval inbox.
     audit: ConsentRowOutcome,
+    /// The presence ceremony of a mainnet consent; absent on testnet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence: Option<PresenceData>,
+}
+
+/// The `presence` field of a mainnet success envelope.
+#[derive(Debug, Serialize)]
+struct PresenceData {
+    /// Always `"webauthn_uv"`: a WebAuthn assertion with user presence and
+    /// user verification.
+    method: &'static str,
+    /// The fingerprint of the approval credential that signed.
+    credential_fingerprint: String,
+    /// The consent request ID, also the envelope's `request_id` and the
+    /// consent row's.
+    request_id: String,
 }
 
 /// Runs `stellar-agent approve --id <nonce> --profile <name>`.
@@ -194,7 +224,7 @@ pub async fn run(args: RunArgs) -> i32 {
         }
     };
 
-    // ── 3a. The mainnet rule: no --yes, and a terminal for the y/n prompt ───
+    // ── 3a. The mainnet rule: no --yes ──────────────────────────────────────
     // Before the store opens, so a refused approval leaves it untouched.
     if let Err(envelope) = mainnet_approve_rule(&profile, args.yes) {
         render::render_json(&envelope);
@@ -245,6 +275,32 @@ pub async fn run(args: RunArgs) -> i32 {
             return 1;
         }
     };
+
+    // ── 5a. Mainnet: presence-gated consent, no prompt ───────────────────────
+    if profile.chain_id.is_mainnet() {
+        return match approve_mainnet(store, &store_path, &entry, &context, &profile).await {
+            Ok(approved) => {
+                let request_id = approved.presence.request_id.clone();
+                render::render_json(&Envelope::ok_with_request_id(
+                    ApproveRunData {
+                        approval_nonce: nonce,
+                        attested: true,
+                        process_uid: our_uid,
+                        expires_at_unix_ms: entry.expires_at_unix_ms,
+                        approval_attestation: approved.attestation,
+                        audit: approved.audit,
+                        presence: Some(approved.presence),
+                    },
+                    request_id,
+                ));
+                0
+            }
+            Err(e) => {
+                render::render_json(&Envelope::<()>::err(&e));
+                1
+            }
+        };
+    }
 
     // ── 6. Render wallet-controlled summary and read y/n ─────────────────────
     match prompt_approval(&entry, &context, args.yes) {
@@ -304,8 +360,80 @@ pub async fn run(args: RunArgs) -> i32 {
         expires_at_unix_ms: entry.expires_at_unix_ms,
         approval_attestation,
         audit,
+        presence: None,
     }));
     0
+}
+
+/// A recorded mainnet consent.
+struct MainnetApproved {
+    attestation: Option<String>,
+    audit: ConsentRowOutcome,
+    presence: PresenceData,
+}
+
+/// Records the mainnet consent of `entry`.
+///
+/// The summary is rendered and the entry checked as on testnet, the kind
+/// must have a mainnet consent path, and the pending store is released
+/// before the presence wait. After it the store is reopened, the current
+/// policy is read again without advancing its pin, and the version 5 consent
+/// is recorded; the attester rechecks the entry, the policy and the
+/// ceremony's deadlines under the store lock.
+///
+/// # Errors
+///
+/// `approval.wrong_kind` for a kind without a mainnet consent path, the
+/// presence refusals of [`acquire_mainnet_presence`], and the policy, key,
+/// sink and attester refusals.
+async fn approve_mainnet(
+    store: PendingApprovalStore,
+    store_path: &Path,
+    entry: &PendingApproval,
+    context: &ApprovalContext,
+    profile: &Profile,
+) -> Result<MainnetApproved, WalletError> {
+    render_summary(entry, context);
+    stellar_agent_core::approval::mpp::verify_mpp_entry_terms(&entry.kind)?;
+    if let Some(Err(error)) = classic_entry_summary(&entry.kind) {
+        return Err(error);
+    }
+    mainnet_consent_subject(entry, &context.binding())?;
+    let authority = MainnetApprovalAuthority::for_profile(&context.profile_name)?;
+    drop(store);
+    init_platform_keyring_store()?;
+    let presence = acquire_mainnet_presence(entry, context, &authority, store_path).await?;
+    let data = PresenceData {
+        method: "webauthn_uv",
+        credential_fingerprint: presence.credential_fingerprint().to_owned(),
+        request_id: presence.request_id().to_owned(),
+    };
+    let mut store = open_with_retry(store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
+        .map_err(|e| super::common::approval_store_open_error(&e))?;
+    let policy = authority.load_current_compare_only()?.into_policy();
+    let key = load_attestation_key(
+        &profile.attestation_key_id,
+        &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
+            &context.profile_name,
+            profile,
+        ),
+    )?;
+    let (attestation, audit) = record_consent(
+        &mut store,
+        entry,
+        &key,
+        context,
+        profile,
+        ConsentAuthorization::Mainnet {
+            presence,
+            policy: &policy,
+        },
+    )?;
+    Ok(MainnetApproved {
+        attestation,
+        audit,
+        presence: data,
+    })
 }
 
 /// Where `approve --id` wrote its consent row, reported as the success
@@ -321,19 +449,44 @@ enum ConsentRowOutcome {
     Queued,
 }
 
-/// Writes the consent row and persists the approval, in that order.
+/// Writes the consent row and persists the testnet approval of the local
+/// operator, in that order.
+///
+/// # Errors
+///
+/// As [`record_consent`].
+fn approve_with_consent_row(
+    store: &mut PendingApprovalStore,
+    entry: &PendingApproval,
+    key_bytes: &[u8],
+    context: &ApprovalContext,
+    profile: &Profile,
+) -> Result<(Option<String>, ConsentRowOutcome), WalletError> {
+    record_consent(
+        store,
+        entry,
+        key_bytes,
+        context,
+        profile,
+        ConsentAuthorization::Standard(&AttestedApprover::Local),
+    )
+}
+
+/// Writes the consent row and persists the approval `authorization` admits,
+/// in that order.
 ///
 /// # Errors
 ///
 /// The acquisition refusal of [`acquire_consent_sink`], a poisoned writer
 /// mutex, or any error of `attest_and_persist`. Nothing is persisted when the
 /// row is refused.
-fn approve_with_consent_row(
+fn record_consent(
     store: &mut PendingApprovalStore,
     entry: &PendingApproval,
     key_bytes: &[u8],
-    context: &stellar_agent_core::approval::ApprovalContext,
+    context: &ApprovalContext,
     profile: &Profile,
+    authorization: ConsentAuthorization<'_>,
 ) -> Result<(Option<String>, ConsentRowOutcome), WalletError> {
     let profile_name = context.profile_name.as_str();
     let persist_grant = |req: &ToolsetGrantRequest<'_>, key: &[u8; 32]| {
@@ -354,9 +507,11 @@ fn approve_with_consent_row(
         .map(|_grant| ())
         .map_err(|e| e.to_string())
     };
-    match acquire_consent_sink(profile, profile_name)? {
+    let sink = acquire_consent_sink(profile, profile_name)?;
+    let mut guard;
+    let (audit, outcome) = match &sink {
         ConsentSink::Writer(writer) => {
-            let mut guard = writer.lock().map_err(|_| {
+            guard = writer.lock().map_err(|_| {
                 tracing::error!(
                     event_kind = "approval_attested",
                     "approve: audit writer mutex poisoned; refusing the approval"
@@ -365,61 +520,47 @@ fn approve_with_consent_row(
                     profile: profile_name.to_owned(),
                 })
             })?;
-            let attestation = attest_and_persist(
-                store,
-                entry,
-                key_bytes,
-                &context.binding(),
-                Surface::Cli,
-                ConsentAudit::Writer(&mut guard),
-                &stellar_agent_core::approval::AttestedApprover::Local,
-                persist_grant,
-            )?;
-            Ok((attestation, ConsentRowOutcome::Written))
+            (ConsentAudit::Writer(&mut guard), ConsentRowOutcome::Written)
         }
-        ConsentSink::Outbox(outbox) => {
-            let attestation = attest_and_persist(
-                store,
-                entry,
-                key_bytes,
-                &context.binding(),
-                Surface::Cli,
-                ConsentAudit::Outbox(&outbox),
-                &stellar_agent_core::approval::AttestedApprover::Local,
-                persist_grant,
-            )?;
-            Ok((attestation, ConsentRowOutcome::Queued))
-        }
-    }
+        ConsentSink::Outbox(outbox) => (ConsentAudit::Outbox(outbox), ConsentRowOutcome::Queued),
+    };
+    let attestation = attest_and_persist(
+        store,
+        entry,
+        key_bytes,
+        &context.binding(),
+        Surface::Cli,
+        audit,
+        authorization,
+        persist_grant,
+    )?;
+    Ok((attestation, outcome))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Refuses an approval of a pending entry on a mainnet profile that the
-/// operator cannot answer at a terminal.
-///
-/// `--yes` is refused first, then a missing terminal on stdin or stderr. A
-/// testnet profile passes without a terminal check, `--yes` included.
+/// Refuses `--yes` on a mainnet profile, where only a verified passkey
+/// assertion is consent. A testnet profile passes, `--yes` included.
 ///
 /// # Errors
 ///
-/// `approve.yes_refused_on_mainnet` for `--yes` on a mainnet profile, and
-/// `confirm.tty_required` on a mainnet profile without a terminal.
+/// `approve.yes_refused_on_mainnet` for `--yes` on a mainnet profile.
 fn mainnet_approve_rule(profile: &Profile, yes: bool) -> Result<(), Envelope<()>> {
-    if !profile.chain_id.is_mainnet() {
-        return Ok(());
-    }
-    if yes {
+    if profile.chain_id.is_mainnet() && yes {
         return Err(Envelope::<()>::err_raw(
             "approve.yes_refused_on_mainnet",
-            "approve --yes is refused on a mainnet profile; run approve on a terminal and \
-             answer the prompt",
+            YES_REFUSED_ON_MAINNET,
         ));
     }
-    crate::common::tty::require_tty_for_mainnet().map_err(|e| Envelope::<()>::err(&e))
+    Ok(())
 }
+
+/// The message of `approve.yes_refused_on_mainnet`.
+const YES_REFUSED_ON_MAINNET: &str = "approve --yes is refused on a mainnet profile; mainnet \
+                                      consent requires a verified passkey assertion from an \
+                                      approval credential in the owner-signed policy.";
 
 /// Builds the store path for `<profile>` as `<approval_dir>/<profile>.toml`.
 fn build_store_path(profile_name: &str) -> Result<PathBuf, WalletError> {
@@ -1394,13 +1535,14 @@ mod tests {
         );
     }
 
+    /// On mainnet the local operator's approval records nothing, whatever
+    /// the key: consent there needs a verified passkey assertion.
     #[test]
     #[serial]
-    fn run_yes_with_valid_pending_records_attestation_store_level() {
+    fn store_level_local_approval_is_refused_on_mainnet() {
         keyring_mock::install().unwrap();
-        let svc = "stellar-agent-attestation-run-test-valid";
-        let raw_key = seed_key_32(svc, "default");
-
+        let svc = "stellar-agent-attestation-run-test-mainnet";
+        seed_key_32(svc, "default");
         let profile = stellar_agent_core::profile::schema::Profile::builder_mainnet_named(
             "mainnet-store",
             "https://mainnet-store.example",
@@ -1412,6 +1554,57 @@ mod tests {
         .build();
         let context =
             stellar_agent_core::approval::ApprovalContext::from_profile("mainnet-store", &profile);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("__stellar_agent_approve_test_mainnet.toml");
+        let mut store = PendingApprovalStore::open(path).unwrap();
+        let entry = make_entry(DEFAULT_TTL_MS);
+        store
+            .insert(entry.clone(), timefmt::now_unix_ms().expect("clock"))
+            .unwrap();
+        let key = load_attestation_key(
+            &KeyringEntryRef::new(svc, "default"),
+            &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile_name("run-test"),
+        )
+        .unwrap();
+        let log = dir.path().join("audit").join("audit.jsonl");
+        let mut audit_writer = AuditWriter::open(log.clone(), None).unwrap();
+        let error = stellar_agent_core::approval::attest_and_persist(
+            &mut store,
+            &entry,
+            &key,
+            &context.binding(),
+            Surface::Cli,
+            ConsentAudit::Writer(&mut audit_writer),
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
+            |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "approval.presence_required");
+        assert_nothing_persisted(&store, &entry.approval_nonce);
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("approval_attested")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn run_yes_with_valid_pending_records_attestation_store_level() {
+        keyring_mock::install().unwrap();
+        let svc = "stellar-agent-attestation-run-test-valid";
+        let raw_key = seed_key_32(svc, "default");
+
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+            "testnet-store",
+            "svc",
+            "default",
+            "nonce",
+            "default",
+        )
+        .build();
+        let context =
+            stellar_agent_core::approval::ApprovalContext::from_profile("testnet-store", &profile);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("__stellar_agent_approve_test_valid.toml");
         let mut store = PendingApprovalStore::open(path.clone()).unwrap();
@@ -1455,7 +1648,7 @@ mod tests {
             &context.binding(),
             Surface::Cli,
             ConsentAudit::Writer(&mut audit_writer),
-            &stellar_agent_core::approval::AttestedApprover::Local,
+            ConsentAuthorization::Standard(&AttestedApprover::Local),
             |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
         )
         .unwrap();
@@ -2137,8 +2330,14 @@ mod tests {
                 expires_at_unix_ms: 1,
                 approval_attestation: None,
                 audit: outcome,
+                presence: None,
             };
-            assert_eq!(serde_json::to_value(&data).unwrap()["audit"], wire);
+            let value = serde_json::to_value(&data).unwrap();
+            assert_eq!(value["audit"], wire);
+            assert!(
+                value.get("presence").is_none(),
+                "testnet data has no presence"
+            );
         }
     }
 
@@ -2740,7 +2939,8 @@ mod tests {
 
     /// The outcome of the mainnet rule for a mainnet profile when `mainnet`
     /// is true and a testnet one otherwise, with `--yes` as given and stdin
-    /// and stderr reported as `terminal`.
+    /// and stderr reported as `terminal`; asserts the rule checked no
+    /// terminal.
     fn approve_rule(mainnet: bool, yes: bool, terminal: (bool, bool)) -> Result<(), String> {
         let profile = if mainnet {
             Profile::builder_mainnet_named(
@@ -2756,36 +2956,42 @@ mod tests {
             Profile::builder_testnet_named("operator", "s", "a", "n", "b").build()
         };
         let previous = crate::common::tty::tests::TEST_TTY.replace(Some(terminal));
+        let checks = crate::common::tty::tests::TEST_TTY_CHECKS.get();
         let outcome = mainnet_approve_rule(&profile, yes);
+        assert_eq!(crate::common::tty::tests::TEST_TTY_CHECKS.get(), checks);
         crate::common::tty::tests::TEST_TTY.set(previous);
-        outcome.map_err(|envelope| envelope.error.unwrap().code)
+        outcome.map_err(|envelope| {
+            let error = envelope.error.unwrap();
+            assert_eq!(error.message, YES_REFUSED_ON_MAINNET);
+            error.code
+        })
     }
 
-    /// Mainnet with `--yes` refuses whatever the terminal.
+    /// Mainnet with `--yes` refuses whatever the terminal, naming the
+    /// passkey assertion that consent requires.
     #[test]
     fn mainnet_refuses_yes_on_a_terminal() {
-        assert_eq!(
-            approve_rule(true, true, (true, true)),
-            Err("approve.yes_refused_on_mainnet".to_owned())
-        );
-    }
-
-    /// Mainnet without `--yes` requires stdin and stderr to be terminals.
-    #[test]
-    fn mainnet_without_yes_requires_a_terminal() {
-        for terminal in [(false, true), (true, false), (false, false)] {
+        for terminal in [(true, true), (false, false)] {
             assert_eq!(
-                approve_rule(true, false, terminal),
-                Err("confirm.tty_required".to_owned()),
+                approve_rule(true, true, terminal),
+                Err("approve.yes_refused_on_mainnet".to_owned()),
                 "{terminal:?}"
             );
         }
+        assert_eq!(
+            YES_REFUSED_ON_MAINNET,
+            "approve --yes is refused on a mainnet profile; mainnet consent requires a verified \
+             passkey assertion from an approval credential in the owner-signed policy."
+        );
     }
 
-    /// Mainnet without `--yes` on a terminal proceeds to the prompt.
+    /// Mainnet without `--yes` passes the rule without a terminal check:
+    /// terminal input is no mainnet consent, so a terminal is not required.
     #[test]
-    fn mainnet_without_yes_on_a_terminal_proceeds() {
-        assert_eq!(approve_rule(true, false, (true, true)), Ok(()));
+    fn mainnet_without_yes_checks_no_terminal() {
+        for terminal in [(false, true), (true, false), (false, false), (true, true)] {
+            assert_eq!(approve_rule(true, false, terminal), Ok(()), "{terminal:?}");
+        }
     }
 
     /// Testnet keeps `--yes` and checks no terminal.
@@ -2793,15 +2999,6 @@ mod tests {
     fn testnet_keeps_yes_without_a_terminal() {
         assert_eq!(approve_rule(false, true, (false, false)), Ok(()));
         assert_eq!(approve_rule(false, false, (false, false)), Ok(()));
-    }
-
-    /// Mainnet checks `--yes` before the terminal.
-    #[test]
-    fn mainnet_checks_yes_before_the_terminal() {
-        assert_eq!(
-            approve_rule(true, true, (false, false)),
-            Err("approve.yes_refused_on_mainnet".to_owned())
-        );
     }
     fn assert_edited_mpp_inconsistent(edit_amount: bool) {
         let mut entry = fixtures::mpp_pending();

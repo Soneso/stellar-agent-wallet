@@ -72,6 +72,9 @@ pub enum MainnetPrecondition {
     ApprovalExpired,
     /// The approval lifetime exceeds the governing rule.
     ApprovalTtlExceedsRule,
+    /// The approval was consented under another owner-signed policy than
+    /// the one this authorization is minted under.
+    ApprovalPolicyMismatch,
     /// The audit lease names another profile.
     AuditProfileMismatch,
     /// The audit readiness proof is stale.
@@ -255,6 +258,7 @@ impl MainnetPrecondition {
             Self::ApprovalKindMismatch => "approval_kind_mismatch",
             Self::ApprovalExpired => "approval_expired",
             Self::ApprovalTtlExceedsRule => "approval_ttl_exceeds_rule",
+            Self::ApprovalPolicyMismatch => "approval_policy_mismatch",
             Self::AuditProfileMismatch => "audit_profile_mismatch",
             Self::AuditStale => "audit_stale",
             Self::SignerCoordinateMismatch => "signer_coordinate_mismatch",
@@ -481,6 +485,7 @@ mod tests {
             P::ApprovalKindMismatch,
             P::ApprovalExpired,
             P::ApprovalTtlExceedsRule,
+            P::ApprovalPolicyMismatch,
             P::AuditProfileMismatch,
             P::AuditStale,
             P::SignerCoordinateMismatch,
@@ -583,6 +588,7 @@ mod tests {
                 | P::ApprovalKindMismatch
                 | P::ApprovalExpired
                 | P::ApprovalTtlExceedsRule
+                | P::ApprovalPolicyMismatch
                 | P::AuditProfileMismatch
                 | P::AuditStale
                 | P::SignerCoordinateMismatch
@@ -694,6 +700,7 @@ mod tests {
             "approval_kind_mismatch",
             "approval_expired",
             "approval_ttl_exceeds_rule",
+            "approval_policy_mismatch",
             "audit_profile_mismatch",
             "audit_stale",
             "signer_coordinate_mismatch",

@@ -52,12 +52,15 @@
 //! - **MCP `_commit` verifier**: calls [`verify_attestation`] with the
 //!   caller-supplied `attestation_blob` under the layout the record stores,
 //!   then collapses any error to `policy.approval_required`.
+//! - **Mainnet consent**: [`presence`](crate::approval::presence) issues a WebAuthn challenge for a
+//!   pending entry and verifies the assertion against the credential keys of
+//!   the owner-signed mainnet policy; the attester records a version 5
+//!   attestation bound to the retained receipt.
 //! - **Mainnet proof**: [`witness::verify_approval`](crate::approval::witness::verify_approval)
-//!   loads the record and the key itself and accepts only a version 4
-//!   attestation, which covers the record's kind, its lifetime and its
-//!   approver; for a remote approver it then reads the current
-//!   [`RemoteApprovalAuthority`](crate::approval::remote_authorization::RemoteApprovalAuthority)
-//!   again.
+//!   loads the record and the key itself, accepts only a version 5
+//!   attestation with a mainnet passkey approver, reads the current signed
+//!   policy through [`presence_policy`](crate::approval::presence_policy), and verifies the stored assertion
+//!   again under it.
 //! - **Bridge POST handler**: calls
 //!   [`PendingApprovalStore::record_passkey_assertion`] after verifying the
 //!   WebAuthn assertion from the browser ceremony.
@@ -69,8 +72,12 @@ mod context;
 pub mod error;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod fixtures;
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod mainnet_fixtures;
 pub mod mpp;
 pub mod operator_credentials;
+pub mod presence;
+pub mod presence_policy;
 pub mod registration_input;
 pub mod remote_authorization;
 pub mod retry;
@@ -80,19 +87,22 @@ pub mod subject;
 pub mod toolset_grant;
 pub mod user_id;
 pub mod view;
+pub mod webauthn;
 pub mod witness;
 
 pub use assertion_input::AssertionInput;
 pub use attest::{
-    ConsentAudit, Surface, ToolsetGrantRequest, attest_and_persist, attest_mainnet_confirmation,
-    classic_entry_summary, decode_sha256_hex, load_and_validate_entry, load_attestation_key,
+    ConsentAudit, ConsentAuthorization, Surface, ToolsetGrantRequest, attest_and_persist,
+    attest_mainnet_confirmation, classic_entry_summary, decode_sha256_hex, load_and_validate_entry,
+    load_attestation_key,
 };
 pub use attestation::AttestationBinding;
 pub use attestation::{
     ATTESTATION_VERSION, ATTESTATION_VERSION_V2, AttestationScope, AttestedApprover,
-    AttestedLifetime, PENDING_ATTESTATION_VERSION, RULE_PROPOSAL_DOMAIN_TAG,
-    TOOLSET_GATE_DOMAIN_TAG, TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG, compute_attestation,
-    compute_attestation_v4, compute_rule_proposal_digest, compute_toolset_gate_digest,
+    AttestedLifetime, MAINNET_ATTESTATION_VERSION, PENDING_ATTESTATION_VERSION,
+    RULE_PROPOSAL_DOMAIN_TAG, TOOLSET_GATE_DOMAIN_TAG, TRUSTLINE_CLAWBACK_OPT_IN_DOMAIN_TAG,
+    compute_attestation, compute_attestation_v4, compute_attestation_v5,
+    compute_rule_proposal_digest, compute_toolset_gate_digest,
     compute_trustline_clawback_opt_in_digest, envelope_sha256, verify_attestation,
     verify_toolset_gate_attestation,
 };
@@ -102,6 +112,13 @@ pub use operator_credentials::{
     OperatorApprovalCredential, OperatorApprovalCredentialStore,
     default_operator_approval_credentials_path,
 };
+pub use presence::{
+    ApprovalCredentialError, MAINNET_APPROVAL_RP_ID, MainnetApprovalCredential,
+    MainnetAssertionWire, MainnetPresenceOptions, MainnetPresenceReceipt, PendingMainnetPresence,
+    VerifiedMainnetPresence, issue_mainnet_presence, mainnet_consent_subject,
+    mainnet_consent_view_digest, mainnet_presence_origin, verify_mainnet_presence,
+};
+pub use presence_policy::{CurrentMainnetApprovalPolicy, MainnetApprovalAuthority};
 pub use registration_input::RegistrationInput;
 pub use remote_authorization::{RemoteApprovalAuthority, RemoteApprovalAuthorization};
 pub use retry::{DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry};

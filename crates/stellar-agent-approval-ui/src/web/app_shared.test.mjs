@@ -1,9 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { webcrypto } from "node:crypto";
-import vm from "node:vm";
 import renderers from "./app_shared.js";
+import { b64url, browser, jsonReply, until } from "./browser_harness.mjs";
 
 for (const [limit, rendered] of [
   [null, "unlimited"],
@@ -113,10 +112,6 @@ const VECTOR_CODE = "305b-4244-62ef-fd53";
 const CLIENT_DATA = new TextEncoder().encode('{"type":"webauthn.create"}');
 const ATTESTATION_OBJECT = Uint8Array.from([0xa3, 0x01, 0x02]);
 
-function b64url(bytes) {
-  return Buffer.from(bytes).toString("base64url");
-}
-
 // The credential a ceremony creates: `id` and `key` default to the vector.
 function makeCredential({ id = VECTOR_ID, key = VECTOR_KEY } = {}) {
   const spki = new Uint8Array(26 + key.length);
@@ -136,10 +131,6 @@ function defaultCredential() {
   return makeCredential();
 }
 
-function jsonReply(status, body) {
-  return Promise.resolve({ ok: status >= 200 && status < 300, status, json: () => Promise.resolve(body) });
-}
-
 // A server that issues `challenge` and answers the credential POST with
 // `credentialStatus` and `credentialBody`.
 function server({ challenge = VECTOR_CHALLENGE, credentialStatus = 200, credentialBody = { status: "awaiting_confirmation" } } = {}) {
@@ -157,157 +148,6 @@ function server({ challenge = VECTOR_CHALLENGE, credentialStatus = 200, credenti
     }
     return jsonReply(credentialStatus, credentialBody);
   };
-}
-
-function source(relative) {
-  return readFileSync(new URL(relative, import.meta.url), "utf8");
-}
-
-function fakeElement(name) {
-  return {
-    name,
-    textContent: "",
-    className: "",
-    hidden: false,
-    value: "",
-    children: [],
-    attributes: {},
-    listeners: {},
-    appendChild(child) {
-      this.children.push(child);
-      return child;
-    },
-    setAttribute(key, value) {
-      this.attributes[key] = String(value);
-    },
-    getAttribute(key) {
-      return key in this.attributes ? this.attributes[key] : null;
-    },
-    addEventListener(type, listener) {
-      (this.listeners[type] ||= []).push(listener);
-    },
-  };
-}
-
-function browser({
-  islands = {},
-  elements = [],
-  storage = {},
-  storageThrows = false,
-  readBackDiffers = false,
-  reply = () => new Promise(() => {}),
-  credential = defaultCredential,
-} = {}) {
-  const byId = {};
-  for (const [id, value] of Object.entries(islands)) {
-    byId[id] = fakeElement(id);
-    byId[id].textContent = typeof value === "string" ? value : JSON.stringify(value);
-  }
-  for (const id of elements) {
-    byId[id] ||= fakeElement(id);
-  }
-  const stored = new Map(Object.entries(storage));
-  const log = [];
-  const fetches = [];
-  const intervals = [];
-  const documentListeners = {};
-  const clock = { now: 1_000_000 };
-  const sessionStorage = {
-    getItem(key) {
-      if (storageThrows) throw new Error("storage denied");
-      return stored.has(key) ? stored.get(key) : null;
-    },
-    setItem(key, value) {
-      if (storageThrows) throw new Error("storage denied");
-      log.push(["setItem", key]);
-      stored.set(key, readBackDiffers ? "other" : String(value));
-    },
-  };
-  class FakeDate extends Date {
-    static now() {
-      return clock.now;
-    }
-  }
-  const document = {
-    documentElement: fakeElement("html"),
-    getElementById(id) {
-      return byId[id] || null;
-    },
-    createElement(tag) {
-      return fakeElement(tag);
-    },
-    createTextNode(text) {
-      return { textContent: text, children: [] };
-    },
-    addEventListener(type, listener) {
-      (documentListeners[type] ||= []).push(listener);
-    },
-  };
-  const credentialCalls = [];
-  const context = {
-    document,
-    window: {
-      sessionStorage,
-      location: {
-        replace(url) {
-          log.push(["replace", url]);
-        },
-      },
-    },
-    navigator: {
-      credentials: {
-        create(options) {
-          credentialCalls.push(options);
-          return Promise.resolve(credential());
-        },
-      },
-    },
-    crypto: { getRandomValues: (array) => array.fill(3), subtle: webcrypto.subtle },
-    btoa,
-    atob,
-    console,
-    Date: FakeDate,
-    setInterval(callback, ms) {
-      intervals.push({ callback, ms });
-      return intervals.length;
-    },
-    fetch(url, init) {
-      fetches.push({ url, init: init || {} });
-      return reply(url, init || {});
-    },
-  };
-  vm.createContext(context);
-  return {
-    byId,
-    stored,
-    log,
-    fetches,
-    intervals,
-    clock,
-    credentialCalls,
-    run(file) {
-      vm.runInContext(source(file), context, { filename: file });
-    },
-    dispatch(type, isTrusted) {
-      for (const listener of documentListeners[type] || []) {
-        listener({ type, isTrusted });
-      }
-    },
-  };
-}
-
-async function until(predicate, what) {
-  const deadline = performance.now() + 5000;
-  let turns = 0;
-  while (!predicate()) {
-    if (performance.now() >= deadline) {
-      throw new Error(`Timed out waiting for ${what}`);
-    }
-    await new Promise((resolve) => setImmediate(resolve));
-    if (++turns % 10 === 0) {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    }
-  }
 }
 
 test("bootstrap script stores the proof, clears it from the page, then navigates", () => {
@@ -443,8 +283,10 @@ test("a page without a proof sends no activity", () => {
 function enrollPage(storage, options = {}) {
   const page = browser({
     islands: { "enroll-data": { csrfToken: "e".repeat(64), rpId: "localhost" } },
+    attributes: { "enroll-data": { "data-purpose": "remote-operator" } },
     elements: ["label-input", "enroll-btn", "status", "confirmation-code"],
     storage,
+    credential: defaultCredential,
     ...options,
   });
   page.byId["label-input"].value = "laptop";
@@ -554,3 +396,16 @@ test("enrollment without a stored proof creates no passkey and sends nothing", a
   assert.equal(page.fetches.length, 0);
   assert.match(page.byId.status.textContent, /no wallet session/);
 });
+
+for (const [name, attributes] of [
+  ["no purpose", {}],
+  ["an unknown purpose", { "enroll-data": { "data-purpose": "remote-mainnet" } }],
+]) {
+  test(`a page with ${name} creates no passkey and sends nothing`, async () => {
+    const page = enrollPage({ [ENROLL_PROOF_KEY]: PROOF }, { attributes, reply: server() });
+    page.byId["enroll-btn"].listeners.click[0]();
+    await until(() => /no enrollment purpose/.test(page.byId.status.textContent), "the purpose refusal");
+    assert.equal(page.credentialCalls.length, 0);
+    assert.equal(page.fetches.length, 0);
+  });
+}

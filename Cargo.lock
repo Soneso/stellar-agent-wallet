@@ -4706,6 +4706,7 @@ dependencies = [
  "inventory",
  "keyring-core",
  "libc",
+ "p256",
  "proptest",
  "rand_core 0.6.4",
  "region",
@@ -5290,9 +5291,11 @@ name = "stellar-agent-test-support"
 version = "0.1.0-alpha.12"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "ed25519-dalek",
  "keyring-core",
  "memchr",
+ "p256",
  "rand_core 0.6.4",
  "regex-lite",
  "reqwest 0.12.28",

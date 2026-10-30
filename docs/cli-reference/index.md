@@ -123,7 +123,7 @@ fi
 
 Released binaries have `mainnet-write` disabled. Enabled builds admit full-mode
 `pay`, `claim`, sponsored `accounts create`, and `trustline` after installation
-setup and confirmation for each action. Build-only, sign-only, submit-only,
+setup and consent for each action. Build-only, sign-only, submit-only,
 Friendbot creation, generated-account creation, and relayer paths remain excluded.
 
 Select an explicit nondefault mainnet profile with matching stored configuration.
@@ -131,18 +131,35 @@ Enroll signer and owner identities, enable the installation, and sign a v2 polic
 Valid pin and audit state, required witnesses, and per-action authorization remain
 necessary. [The policy guide](../profiles.md#mainnet-policy-body) lists the fields.
 
-Direct confirmation requires terminal stdin and stderr. The wallet renders and
-flushes the summary, then compares the typed profile name after removing only
-the line ending. A terminal refusal uses `confirm.tty_required`; a different
-name uses `confirm.profile_name_mismatch`. Input, output, or flush failure uses
-`confirm.input_unavailable`. CLI approval failures retain their `approval.*` codes.
-An Allow rule gives confirmation 600 seconds; RequireApproval supplies its lifetime.
-Authorization defaults to 120 seconds and cannot outlive approval.
+Mainnet consent requires a fresh WebAuthn assertion, with user presence and
+user verification, from an approval credential listed in the owner-signed
+policy ([approval credentials](../profiles.md#approval-credentials)). Terminal input, a
+pseudo-terminal, `--yes`, and the local process identity supply no mainnet
+consent. This release connects no presence ceremony to the consent surfaces,
+so every mainnet consent refuses with `approval.presence_required` and
+`Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy.`
+No approval is recorded:
 
-CLI `approve` uses a separate y/n prompt. In either build, mainnet `--yes`
-refuses before terminal checks or store access with `approve.yes_refused_on_mainnet`:
-`approve --yes is refused on a mainnet profile; run approve on a terminal and answer the prompt`.
-Classic UI and remote attestations retain their supported approval behavior.
+- Direct confirmation of `pay`, `claim`, sponsored `accounts create`, and
+  `trustline` renders the summary on stderr, then refuses before any approval,
+  signature, or submission. It reads no terminal input.
+- `approve --id <NONCE>` on a mainnet profile renders the summary, then
+  refuses. It needs no terminal. In either build, `--yes` refuses first, before
+  store access, with `approve.yes_refused_on_mainnet`:
+  `approve --yes is refused on a mainnet profile; mainnet consent requires a verified passkey assertion from an approval credential in the owner-signed policy.`
+- Approve in the local `approve serve` inbox answers HTTP 403 with
+  `approval.presence_required`; the remote listener answers
+  `approval.mainnet_remote_unsupported`. Reject works on both.
+- An MCP mainnet commit accepts only a version 5 approval with its verified
+  presence receipt. Any other approval, a version 4 approval recorded by an
+  earlier release included, refuses with `policy.approval_required`.
+
+Mainnet writes therefore remain unavailable in this release.
+[`approve credential enroll`](profile-and-governance.md#approve-credential-enroll), policy signing, reads, and
+simulation work as documented, and testnet approvals keep version 4 on every
+surface. An Allow rule gives a consent 600 seconds; RequireApproval supplies
+its lifetime. Authorization defaults to 120 seconds and cannot outlive
+approval.
 
 `network.mainnet_write_forbidden` means the build, operation, or selected context
 has no admitted path. Missing CLI engine, verified policy, or enablement is an

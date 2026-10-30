@@ -542,6 +542,10 @@ fn outcome_to_response(outcome: Outcome) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             json!({ "status": "unavailable", "retriable": false }),
         ),
+        Outcome::PresenceRefused { code, message } => (
+            StatusCode::FORBIDDEN,
+            json!({ "status": "presence_refused", "code": code, "error": message }),
+        ),
     };
     (
         status,

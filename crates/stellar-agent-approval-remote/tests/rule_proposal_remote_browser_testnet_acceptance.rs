@@ -1509,7 +1509,9 @@ async fn toolset_gated_first_invoke_entry_is_consumed() {
         ),
         stellar_agent_core::approval::Surface::Cli,
         stellar_agent_core::approval::ConsentAudit::Writer(&mut consent_writer),
-        &stellar_agent_core::approval::AttestedApprover::Local,
+        stellar_agent_core::approval::ConsentAuthorization::Standard(
+            &stellar_agent_core::approval::AttestedApprover::Local,
+        ),
         |req, key| {
             stellar_agent_toolsets_runtime::record_first_invoke_grant(
                 &profile_name,

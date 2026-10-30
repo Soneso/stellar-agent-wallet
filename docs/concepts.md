@@ -181,7 +181,7 @@ simulate and approve again to create a trustline approval.
 
 ### What `approve` does
 
-`stellar-agent approve --id <nonce> --profile <name>` loads the store and renders a wallet-controlled summary of the pending action. A payment, claim, or trustline summary is decoded from the envelope whose digest the attestation binds, and an entry whose stored digest is not that envelope's digest is refused with `approval.entry_inconsistent`. Every value renders control characters as visible escapes, so a hostile entry cannot inject terminal-rendering content into that summary. The operator confirms at the terminal, and the command then computes and records the attestation. Recording is one-shot: a nonce that is expired, of the wrong kind, or already attested is rejected.
+`stellar-agent approve --id <nonce> --profile <name>` loads the store and renders a wallet-controlled summary of the pending action. A payment, claim, or trustline summary is decoded from the envelope whose digest the attestation binds, and an entry whose stored digest is not that envelope's digest is refused with `approval.entry_inconsistent`. Every value renders control characters as visible escapes, so a hostile entry cannot inject terminal-rendering content into that summary. On testnet the operator confirms at the terminal, and the command then computes and records the attestation. On mainnet a consent needs a verified passkey assertion from an approval credential in the owner-signed policy instead, which this release refuses with `approval.presence_required`. Recording is one-shot: a nonce that is expired, of the wrong kind, or already attested is rejected.
 
 ### The attestation
 
@@ -202,13 +202,20 @@ The tag separates this HMAC from every other use of the key.
 The profile name and CAIP-2 chain id make a blob unverifiable under another profile or chain.
 A layout change bumps the tag; blobs under the previous tag do not verify.
 Pending approvals use version 4 of this input, under the tag `stellar-agent-approval-attestation:v4`: the fields above, then the approval's kind, creation time and expiry, then the approver, which is the local operator or the operator credential the remote-approval listener verified.
-Every commit requires version 4, so an approval recorded under an earlier layout needs fresh consent.
+Every testnet commit requires version 4, so an approval recorded under an earlier layout needs fresh consent.
+Mainnet consent uses version 5, under the tag `stellar-agent-approval-attestation:v5`: the version 4 fields with a mainnet passkey approver, which names the approval credential's ID, followed by the SHA-256 digest of the stored presence receipt.
+The receipt holds a consent request ID, the random challenge input, the policy sequence, digest, and owner, the expected origin, the issue, expiry, and verification times, and the raw WebAuthn assertion.
+The consent request ID names one ceremony; the approval nonce names the pending action.
+The commit witness verifies the receipt again: it recomputes the challenge from the stored record and binding, checks the raw assertion under the credential key of the current signed policy, and requires that policy to be the one the receipt names.
+A version 4 blob never verifies as version 5, so a local or remote approval cannot stand for a mainnet consent.
+The authenticator's signature counter is recorded and not enforced: fresh single-use challenges provide replay protection, and the wallet does not detect cloned credentials.
+This release connects no presence ceremony, so it records no version 5 approval and refuses every mainnet consent.
 
 The length prefixes on the variable fields prevent boundary-collision attacks (two different nonce/uid pairs cannot collide into the same input). The `envelope_sha256` slot binds the attestation to the exact transaction envelope that will be signed. The `process_uid` (numeric OS uid on Unix) gives cross-account-on-host non-replay: a tag minted by one local user cannot be replayed by another.
 
 The MCP commit-path verifier recomputes the tag and compares it in constant time. It collapses the distinct internal outcomes (`Expired`, `NotFound`, `AlreadyAttested`) into the single wire code `policy.approval_required`, so a caller cannot probe which state a nonce is in; the distinction is kept only in internal debug tracing.
 
-The attestation proves that **the keyring holder ran `approve`**, not that a human clicked "yes" in some agent-controlled UI. The agent's own UI is not a trust input; the wallet-controlled `approve` step is.
+On testnet the attestation proves that **the keyring holder ran `approve`**, not that a human clicked "yes" in some agent-controlled UI. A mainnet attestation also binds a user-verified passkey assertion over the exact consent, so the HMAC key alone records no mainnet consent. The agent's own UI is not a trust input; the wallet-controlled `approve` step is.
 
 What an attacker who can write to the store file can and cannot do: deleting a pending entry forces re-approval, which is a denial-of-service nuisance, not a bypass. The attacker cannot forge an attestation, because the HMAC key is in the keyring, not in the file. Rotating the attestation key invalidates all outstanding pending approvals.
 

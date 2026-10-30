@@ -25,6 +25,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VerifyWarning` gains `OutboxLossAcknowledged`.
 
 - `stellar_agent_core::file_lock::HeldFileLock`, the guard every file-backed store lock holds: it takes the lock with `try_lock` and unlocks when it drops.
+- Approval credential enrollment exports a WebAuthn credential ID and P-256
+  public key for the owner-signed mainnet policy.
+  `stellar-agent approve credential enroll --profile <NAME> [--label <LABEL>]
+  [--timeout-seconds <SECS>]` runs a local browser ceremony, confirms the
+  credential by a typed code, and prints the credential's
+  `mainnet.approval_credentials` entry; it writes nothing.
+- `stellar_agent_core::approval` exposes `MainnetApprovalCredential`,
+  `MainnetApprovalAuthority`, `issue_mainnet_presence`,
+  `verify_mainnet_presence`, `MainnetPresenceReceipt`, `ConsentAuthorization`,
+  `compute_attestation_v5` and `MAINNET_ATTESTATION_VERSION`. `ApprovalFailure`
+  gains the `approval.presence_*` refusals and `MainnetRemoteUnsupported`
+  (`approval.mainnet_remote_unsupported`). `ApprovalWitness` reports the
+  receipt and policy digests it binds, and the mainnet authorization refusal
+  gains the precondition `approval_policy_mismatch`.
+- `stellar_agent_approval_ui::operator_enroll` exposes `EnrollmentPurpose` and
+  `start_mainnet_approval_enroll`; `OperatorEnrollmentConfirmationError` gains
+  `WrongPurpose` and `CredentialInvalid`, and `Outcome` gains
+  `PresenceRefused`. `stellar_agent_test_support::webauthn` provides a
+  deterministic WebAuthn test authenticator under `test-helpers`.
 - `stellar_agent_core::approval::GrantQuery` describes the invocation and
   installation cutoff for a verified toolset grant lookup.
   `timefmt::parse_rfc3339_utc` parses second-precision UTC install timestamps.
@@ -214,6 +233,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MainnetPrecondition::PreimageAddress` names a type 10 preimage bound to
   another address than the authorization's signer. The SEP-43 and SEP-53
   signing functions keep their signatures.
+- A mainnet policy body requires approval_credentials with at least one
+  credential. Owners enroll a credential, review its policy entry, and sign
+  the updated body at a higher sequence.
+- Mainnet approval receipts use attestation version 5 and retain the verified
+  WebAuthn assertion. Testnet approvals retain version 4.
+- The core approval APIs accept sealed mainnet presence authorization and the
+  current verified policy. MainnetBody includes approval credentials,
+  AttestedApprover includes MainnetPasskey, and AttestationScope::pending
+  accepts a presence receipt.
+- The smart-account WebAuthn verification and normalization APIs forward to
+  shared core implementations.
+- Upgrading: a mainnet approval recorded under version 4 needs a fresh
+  consent. An existing mainnet policy needs the `approval_credentials` field
+  and a new signature before the MCP server or `approve serve` starts on it,
+  including for read-only mainnet use. Signing a policy invalidates every
+  outstanding mainnet approval receipt bound to the previous one. Restart
+  every wallet process after the upgrade: a process from an earlier release
+  cannot load a pending-approval store that holds a mainnet passkey approval.
+  This release still refuses every mainnet consent, so mainnet writes stay
+  unavailable.
 - `decode_owner_public_key` returns `Result<[u8; 32], OwnerKeyDecodeError>`.
   `OwnerKeyForm`, `OwnerEntryRewrite`, `rewrite_older_form_owner_entry`,
   `rewrite_owner_value_if_older`, `log_owner_entry_rewrite`,
@@ -722,6 +761,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- `ValidationError` loses the unused `ConfirmTtyRequired`, `ConfirmProfileNameMismatch` and `ConfirmInputUnavailable` variants and their `confirm.*` codes.
+
 - The wallet TTL background task. Clock checks bound seed access and transfer;
   the wallet or signer owns the seed until disposal or drop.
 - `LockedSeed::is_disposed`. Disposal consumes the `LockedSeed`, so no disposed
@@ -819,6 +860,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The keyring, software, and hardware signers refuse a mainnet payload bound to another signer key; the mainnet Soroban signing call rechecks freshness.
 
+- Mainnet consent refuses terminal-only and local-HMAC approvals. Mainnet
+  writes remain unavailable until the local presence ceremony is connected.
 - Owner readers refuse entries in the older base64 form and keep them unchanged.
   An installation that runs `profile rotate-owner-key` on v0.1.0-alpha.1 or
   v0.1.0-alpha.2 holds that command's generated owner seed at the owner coordinate.

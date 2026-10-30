@@ -78,7 +78,7 @@ unset WALLET_SK
 
 Released binaries have `mainnet-write` disabled. Enabled builds admit full-mode
 `pay`, `claim`, sponsored `accounts create`, and `trustline` after installation
-setup and confirmation for each action. Build-only, sign-only, submit-only,
+setup and consent for each action. Build-only, sign-only, submit-only,
 Friendbot creation, generated-account creation, and relayer paths remain excluded.
 
 Select an explicit nondefault mainnet profile with matching stored configuration.
@@ -86,18 +86,35 @@ Enroll signer and owner identities, enable the installation, and sign a v2 polic
 Valid pin and audit state, required witnesses, and per-action authorization remain
 necessary. [The policy guide](profiles-and-keys.md#mainnet-policy-body) lists the fields.
 
-Direct confirmation requires terminal stdin and stderr. The wallet renders and
-flushes the summary, then compares the typed profile name after removing only
-the line ending. A terminal refusal uses `confirm.tty_required`; a different
-name uses `confirm.profile_name_mismatch`. Input, output, or flush failure uses
-`confirm.input_unavailable`. CLI approval failures retain their `approval.*` codes.
-An Allow rule gives confirmation 600 seconds; RequireApproval supplies its lifetime.
-Authorization defaults to 120 seconds and cannot outlive approval.
+Mainnet consent requires a fresh WebAuthn assertion, with user presence and
+user verification, from an approval credential listed in the owner-signed
+policy ([approval credentials](profiles-and-keys.md#approval-credentials)). Terminal input, a
+pseudo-terminal, `--yes`, and the local process identity supply no mainnet
+consent. This release connects no presence ceremony to the consent surfaces,
+so every mainnet consent refuses with `approval.presence_required` and
+`Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy.`
+No approval is recorded:
 
-CLI `approve` uses a separate y/n prompt. In either build, mainnet `--yes`
-refuses before terminal checks or store access with `approve.yes_refused_on_mainnet`:
-`approve --yes is refused on a mainnet profile; run approve on a terminal and answer the prompt`.
-Classic UI and remote attestations retain their supported approval behavior.
+- Direct confirmation of `pay`, `claim`, sponsored `accounts create`, and
+  `trustline` renders the summary on stderr, then refuses before any approval,
+  signature, or submission. It reads no terminal input.
+- `approve --id <NONCE>` on a mainnet profile renders the summary, then
+  refuses. It needs no terminal. In either build, `--yes` refuses first, before
+  store access, with `approve.yes_refused_on_mainnet`:
+  `approve --yes is refused on a mainnet profile; mainnet consent requires a verified passkey assertion from an approval credential in the owner-signed policy.`
+- Approve in the local `approve serve` inbox answers HTTP 403 with
+  `approval.presence_required`; the remote listener answers
+  `approval.mainnet_remote_unsupported`. Reject works on both.
+- An MCP mainnet commit accepts only a version 5 approval with its verified
+  presence receipt. Any other approval, a version 4 approval recorded by an
+  earlier release included, refuses with `policy.approval_required`.
+
+Mainnet writes therefore remain unavailable in this release.
+[`approve credential enroll`](#approve-credential-enroll), policy signing, reads, and
+simulation work as documented, and testnet approvals keep version 4 on every
+surface. An Allow rule gives a consent 600 seconds; RequireApproval supplies
+its lifetime. Authorization defaults to 120 seconds and cannot outlive
+approval.
 
 `network.mainnet_write_forbidden` means the build, operation, or selected context
 has no admitted path. Missing CLI engine, verified policy, or enablement is an
@@ -874,7 +891,7 @@ Closed set of `error.code` values across the group: the verb-specific codes in t
 
 ## approve
 
-The operator-side half of the approval spine. When a signing-adjacent action needs out-of-band approval, the agent surface records a pending approval and returns an approval nonce. The wallet owner runs `approve --id <NONCE> --profile <name>` in a separate trusted context to inspect a wallet-controlled summary and consent. The summary is rendered from stored fields, not from anything the agent supplied. Approval is bound to the local user (recorded process uid must match at approve time). Uses the `{ok, data, request_id}` envelope.
+The operator-side half of the approval spine. When a signing-adjacent action needs out-of-band approval, the agent surface records a pending approval and returns an approval nonce. The wallet owner runs `approve --id <NONCE> --profile <name>` in a separate trusted context to inspect a wallet-controlled summary and consent. A payment, claim, or trustline summary is decoded from the authoritative envelope the approval attests, not from anything the agent supplied. Approval is bound to the local user (recorded process uid must match at approve time). Uses the `{ok, data, request_id}` envelope.
 
 ### `approve --id <NONCE> --profile <name>`
 
@@ -884,9 +901,9 @@ State-changing (records an HMAC attestation, or for a toolset first-invoke gate 
 |---|---|
 | `--id <NONCE>` (required in this form) | Approval nonce from the agent surface's simulate response |
 | `--profile <NAME>` | Profile whose attestation key + pending-approval store to use (resolves `--profile` → env → `default`) |
-| `--yes` | Non-interactive auto-approve; the summary is still printed |
+| `--yes` | Non-interactive auto-approve on a testnet profile; the summary is still printed. A mainnet profile refuses it before store access with `approve.yes_refused_on_mainnet` |
 
-Interactively prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. Exits `1` when the nonce is unknown, expired, already attested, created by a different local user, denied, or on I/O error. For payment-style approvals the response returns `approval_attestation` (the HMAC blob the agent must pass as the `approval_attestation` argument to the matching `*_commit` tool); omitted for kinds whose gate reads recorded consent directly (toolset first-invoke grants, trustline clawback opt-ins).
+On a mainnet profile the command prints the summary, then refuses with `approval.presence_required` and records nothing; it reads no terminal input. On a testnet profile it interactively prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. Exits `1` when the nonce is unknown, expired, already attested, created by a different local user, denied, or on I/O error. For payment-style approvals the response returns `approval_attestation` (the HMAC blob the agent must pass as the `approval_attestation` argument to the matching `*_commit` tool); omitted for kinds whose gate reads recorded consent directly (toolset first-invoke grants, trustline clawback opt-ins).
 
 The `approval_attested` row is written before the approval is persisted. `audit` is `"written"`, or `"queued"` when a running MCP server or `approve serve` inbox holds the audit writer. That process appends the queued row to the log before any process loads a signing key for the approved action. The command exits `1` and persists nothing beside a process that does not drain the outbox (`audit.writer_locked`) and on any other audit failure. After upgrading, restart a running MCP server and `approve serve`: `approve --id` refuses beside an older one.
 
@@ -952,7 +969,7 @@ Binds a TLS-protected, passkey-authenticated remote-approval surface instead of 
 | `--remote` | Bind the remote surface instead of the loopback inbox |
 | `--confirm-remote-exposure` | Required explicit consent, separate from the profile's `enabled` flag |
 
-Every approve or reject on this surface requires a fresh WebAuthn passkey assertion bound to the exact pending entry, in addition to the session login. See `docs/remote-approval.md` in the wallet repository for the full setup guide (the `[remote_approval]` profile block, DNS/hosts-file requirements for `rp_id`, and the login/approve walkthrough).
+Every approve or reject on this surface requires a fresh WebAuthn passkey assertion bound to the exact pending entry, in addition to the session login. The remote surface approves testnet requests only: an approve of a mainnet request answers HTTP 403 with `approval.mainnet_remote_unsupported`. See `docs/remote-approval.md` in the wallet repository for the full setup guide (the `[remote_approval]` profile block, DNS/hosts-file requirements for `rp_id`, and the login/approve walkthrough).
 
 ```bash
 stellar-agent approve serve --remote --confirm-remote-exposure --profile default
@@ -1003,7 +1020,27 @@ Removes an enrolled operator credential from the profile's operator-credential s
 stellar-agent approve operator remove --credential-id <B64URL> --profile default
 ```
 
-To revoke a credential, remove its id from `[remote_approval] allowed_credentials` first, then remove the enrollment. Either step alone revokes it: the running listener reads both at every login and decision, and a mainnet commit refuses the uncommitted approvals that credential made.
+To revoke a credential, remove its id from `[remote_approval] allowed_credentials` first, then remove the enrollment. Either step alone revokes it: the running listener reads both at every login and decision. Operator credentials approve remote testnet requests only and do not change the mainnet approval credentials of the signed policy.
+
+### `approve credential enroll`
+
+Enrolls a WebAuthn approval credential for the owner-signed mainnet policy and prints its `mainnet.approval_credentials` entry. Writes nothing: the credential approves mainnet consent only after the owner adds the entry and signs the policy with `profile sign-policy` (see [Approval credentials](profiles-and-keys.md#approval-credentials)). Needs a terminal on stdin and stderr and a local browser; the profile must be a persisted mainnet profile, enabled or not. The page at `http://localhost:<port>` creates a passkey with relying-party ID `localhost`, user presence and user verification, and shows a 16-hex-digit code; type it at the terminal before the deadline. The bearer URL is never printed.
+
+| Flag | Meaning |
+|---|---|
+| `--profile <NAME>` | Required. The persisted mainnet profile |
+| `--label <LABEL>` | Page label pre-fill; absent from the output |
+| `--timeout-seconds <SECS>` | Deadline for registration and code, 1 to 600 (default 300) |
+
+```bash
+stellar-agent approve credential enroll --profile operator --label laptop
+```
+
+```json
+{"ok":true,"data":{"profile":"operator","rp_id":"localhost","credential_id_b64url":"<id>","public_key_sec1_b64url":"<key>","credential_fingerprint":"sha256:<hex>","policy_entry_toml":"{ credential_id_b64url = \"<id>\", public_key_sec1_b64url = \"<key>\" }"},"request_id":"..."}
+```
+
+Refusals (exit `1`, nothing exported): `approve.credential_enroll_tty_required`, `approve.credential_enroll_profile_required`, `approval.presence_browser_required` (no display or the browser did not open), `approve.credential_enroll_confirmation_mismatch`, `approve.credential_enroll_expired`, `approve.credential_enroll_canceled`, `approve.credential_enroll_unavailable`. This is an operator command: an agent never enrolls a credential or approves its own request. To revoke an approval credential, remove its policy entry and sign the policy at a higher sequence.
 
 ---
 

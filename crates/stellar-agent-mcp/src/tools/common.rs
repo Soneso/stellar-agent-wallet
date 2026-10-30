@@ -2300,9 +2300,27 @@ pub(crate) async fn verify_attestation_subject_gate(
     // An unreadable receipt still refuses before any approval can admit a send.
     receipt_hold.map_err(|_| approval_required_indistinguishable(&profile_name))?;
 
-    if server.mainnet_context.is_some() {
+    // A mainnet approval verifies only through the mainnet witness, so the
+    // version 4 HMAC below never admits a mainnet commit, also on a server
+    // without mainnet admission state.
+    if server.mainnet_context.is_some() || server.context.chain_id.is_mainnet() {
         // Preserve the key-loader's indistinguishable rendering and operator diagnostics.
         let _key = load_attestation_key(server.security_profile())?;
+        // The key load may wait on a keyring prompt: the startup policy must
+        // still verify as the current one before the witness, which loads the
+        // current policy again and requires it to be this one.
+        let Some(policy) = server.current_mainnet_policy() else {
+            tracing::debug!(
+                tool = tool_name,
+                code = if server.mainnet_context.is_some() {
+                    "policy.changed_before_proof"
+                } else {
+                    "mainnet.admission_absent"
+                },
+                "approval proof refused"
+            );
+            return Err(approval_required_indistinguishable(&profile_name));
+        };
         return stellar_agent_core::approval::witness::verify_approval(
             &store,
             server.security_profile(),
@@ -2310,6 +2328,7 @@ pub(crate) async fn verify_attestation_subject_gate(
             approval_nonce_str,
             &attestation_bytes,
             &expected,
+            policy,
             now_ms_attest,
         )
         .map(Some)
@@ -3832,13 +3851,15 @@ pub(crate) mod tests {
     // ── Cross-check: a core-minted attestation verifies through this gate ─────
     //
     // The CLI and this test use the shared core attester,
-    // `stellar_agent_core::approval::attest_and_persist`. Its blob verifies
-    // through `verify_attestation_gate`, so the CLI and the MCP commit
-    // boundary agree on the attestation format.
+    // `stellar_agent_core::approval::attest_and_persist`. Its testnet blob
+    // verifies through `verify_attestation_gate`, so the CLI and the MCP
+    // commit boundary agree on the version 4 format. The mainnet counterpart,
+    // a presence-backed version 5 consent, is
+    // `mainnet::mainnet_gate_returns_a_real_classic_witness_and_checks_subject`.
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(keyring)]
-    async fn core_minted_attestation_verifies_through_verify_attestation_gate() {
+    async fn core_minted_testnet_attestation_verifies_through_verify_attestation_gate() {
         use base64::Engine as _;
         use stellar_agent_core::approval::{
             DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, Surface, attest_and_persist,
@@ -3849,8 +3870,7 @@ pub(crate) mod tests {
         // Unique service/account names (not shared with any other test in this
         // file) so this test cannot race on the process-global mock keyring
         // store against a test using a different `serial_test` group.
-        let profile = Profile::builder_mainnet(
-            "https://mainnet-gate.example",
+        let profile = Profile::builder_testnet(
             "cross-check-svc",
             "cross-check-acct",
             "cross-check-n-svc",
@@ -3920,11 +3940,13 @@ pub(crate) mod tests {
             &attestation_key,
             &stellar_agent_core::approval::AttestationBinding::new(
                 &server.profile_name_for_approval(),
-                "stellar:mainnet",
+                "stellar:testnet",
             ),
             Surface::Cli,
             stellar_agent_core::approval::ConsentAudit::Writer(&mut consent_writer),
-            &stellar_agent_core::approval::AttestedApprover::Local,
+            stellar_agent_core::approval::ConsentAuthorization::Standard(
+                &stellar_agent_core::approval::AttestedApprover::Local,
+            ),
             |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
         )
         .unwrap()
@@ -3975,8 +3997,7 @@ pub(crate) mod tests {
         // Unique service/account names (not shared with any other test in this
         // file) so this test cannot race on the process-global mock keyring
         // store against a test using a different `serial_test` group.
-        let profile = Profile::builder_mainnet(
-            "https://mainnet-gate.example",
+        let profile = Profile::builder_testnet(
             "cross-check-svc",
             "cross-check-acct",
             "cross-check-n-svc",
@@ -4046,11 +4067,13 @@ pub(crate) mod tests {
             &attestation_key,
             &stellar_agent_core::approval::AttestationBinding::new(
                 &server.profile_name_for_approval(),
-                "stellar:mainnet",
+                "stellar:testnet",
             ),
             Surface::Cli,
             stellar_agent_core::approval::ConsentAudit::Writer(&mut consent_writer),
-            &stellar_agent_core::approval::AttestedApprover::Local,
+            stellar_agent_core::approval::ConsentAuthorization::Standard(
+                &stellar_agent_core::approval::AttestedApprover::Local,
+            ),
             |_req, _key| Err("must not be called for PaymentSimulated".to_owned()),
         )
         .unwrap()
@@ -4081,8 +4104,8 @@ pub(crate) mod tests {
                 .is_some()
         );
         for (profile_name, chain_id) in [
-            ("other-profile", "stellar:mainnet"),
-            ("cross-check-acct", "stellar:testnet"),
+            ("other-profile", "stellar:testnet"),
+            ("cross-check-acct", "stellar:mainnet"),
         ] {
             let wrong_blob = stellar_agent_core::approval::compute_attestation_v4(
                 &attestation_key,
@@ -4119,8 +4142,11 @@ pub(crate) mod tests {
                 capture.captured_str()
             );
         }
+        // On mainnet the genuine testnet blob is refused before any HMAC: a
+        // mainnet approval verifies only through the mainnet witness, which
+        // this server, without mainnet admission state, cannot reach.
         std::sync::Arc::make_mut(&mut server.profile).chain_id =
-            stellar_agent_core::profile::caip2::Caip2::Testnet;
+            stellar_agent_core::profile::caip2::Caip2::Mainnet;
         server.context = stellar_agent_network::NetworkContext::from_profile(&server.profile);
         capture.clear();
         let result = verify_attestation_gate(
@@ -4139,12 +4165,14 @@ pub(crate) mod tests {
         let (_, expected_message, _) =
             assert_business_envelope(&approval_required_indistinguishable("cross-check-acct"));
         assert_eq!(message, expected_message);
+        let log = capture.captured_str();
         assert!(
-            capture
-                .captured_str()
-                .contains("HMAC attestation verification failed"),
-            "mainnet blob under testnet must reach HMAC verification: {}",
-            capture.captured_str()
+            log.contains("mainnet.admission_absent"),
+            "a mainnet server without admission state refuses before the HMAC: {log}"
+        );
+        assert!(
+            !log.contains("HMAC attestation verification failed"),
+            "a testnet blob on mainnet must not reach the version 4 HMAC: {log}"
         );
     }
 
@@ -5008,17 +5036,30 @@ pub(crate) mod tests {
                 self.attest_bound(entry, "operator", "stellar:mainnet")
             }
 
-            /// Attests `entry` as the operator does, bound to `profile` and
-            /// `chain`, and returns the attestation.
+            /// Attests `entry` as the operator does and returns the
+            /// attestation the agent presents for `profile` and `chain`.
+            ///
+            /// On mainnet the consent is the production one: a challenge
+            /// issued under the current owner-signed policy, an assertion of
+            /// the test-support fixture credential over it, the core verifier
+            /// and the mainnet attester, for the operator's binding. For
+            /// another profile the returned blob is the version 5 HMAC of
+            /// the same record under that profile's binding, which no gate of
+            /// this profile accepts. A testnet binding records the standard
+            /// version 4 consent of the local operator.
             pub(crate) fn attest_bound(
                 &self,
                 entry: &stellar_agent_core::approval::PendingApproval,
                 profile_name: &str,
                 chain: &str,
             ) -> String {
+                use base64::Engine as _;
                 use stellar_agent_core::approval::{
-                    AttestationBinding, ConsentAudit, Surface, attest_and_persist,
-                    load_attestation_key,
+                    AttestationBinding, ConsentAudit, ConsentAuthorization, Surface,
+                    attest_and_persist, attestation::AttestationScope, compute_attestation_v5,
+                    issue_mainnet_presence, load_attestation_key, mainnet_consent_subject,
+                    mainnet_fixtures::MainnetConsentFixture, presence::MAINNET_CHAIN_ID,
+                    verify_mainnet_presence,
                 };
                 let profile = self.server.security_profile();
                 let mut store = stellar_agent_core::approval::PendingApprovalStore::open(
@@ -5043,23 +5084,89 @@ pub(crate) mod tests {
                     ),
                 )
                 .unwrap();
+                if chain != MAINNET_CHAIN_ID {
+                    attest_and_persist(
+                        &mut store,
+                        entry,
+                        &key,
+                        &AttestationBinding::new(profile_name, chain),
+                        Surface::Cli,
+                        ConsentAudit::Writer(&mut readiness.writer().lock().unwrap()),
+                        ConsentAuthorization::Standard(
+                            &stellar_agent_core::approval::AttestedApprover::Local,
+                        ),
+                        |_, _| Err("unexpected grant".to_owned()),
+                    )
+                    .unwrap();
+                    return store
+                        .get(&entry.approval_nonce)
+                        .unwrap()
+                        .attestation_blob_b64
+                        .clone()
+                        .unwrap();
+                }
+                let binding = AttestationBinding::new("operator", chain);
+                let policy =
+                    stellar_agent_core::approval::MainnetApprovalAuthority::for_profile("operator")
+                        .unwrap()
+                        .load_current()
+                        .unwrap()
+                        .into_policy();
+                let pending = issue_mainnet_presence(
+                    entry,
+                    &binding,
+                    &policy,
+                    &MainnetConsentFixture::origin(),
+                    stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+                let assertion = MainnetConsentFixture::sign(
+                    &stellar_agent_test_support::webauthn::fixture_authenticator(),
+                    &pending,
+                );
+                let presence = verify_mainnet_presence(
+                    pending,
+                    MainnetConsentFixture::input(&assertion),
+                    stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                    std::time::Instant::now(),
+                )
+                .unwrap();
                 attest_and_persist(
                     &mut store,
                     entry,
                     &key,
-                    &AttestationBinding::new(profile_name, chain),
+                    &binding,
                     Surface::Cli,
                     ConsentAudit::Writer(&mut readiness.writer().lock().unwrap()),
-                    &stellar_agent_core::approval::AttestedApprover::Local,
+                    ConsentAuthorization::Mainnet {
+                        presence,
+                        policy: &policy,
+                    },
                     |_, _| Err("unexpected grant".to_owned()),
                 )
                 .unwrap();
-                store
-                    .get(&entry.approval_nonce)
-                    .unwrap()
-                    .attestation_blob_b64
-                    .clone()
-                    .unwrap()
+                let stored = store.get(&entry.approval_nonce).unwrap();
+                if profile_name == "operator" {
+                    return stored.attestation_blob_b64.clone().unwrap();
+                }
+                let other = AttestationBinding::new(profile_name, chain);
+                let Some(AttestationScope::V5(lifetime, approver, receipt)) =
+                    stored.attestation_scope()
+                else {
+                    unreachable!("a mainnet consent records a version 5 scope")
+                };
+                let blob = compute_attestation_v5(
+                    &<[u8; 32]>::try_from(key.as_slice()).unwrap(),
+                    &other,
+                    &stored.approval_nonce,
+                    &mainnet_consent_subject(stored, &other).unwrap(),
+                    &stored.process_uid,
+                    &lifetime,
+                    approver,
+                    receipt,
+                );
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob)
             }
         }
 
@@ -5844,7 +5951,7 @@ pub(crate) mod tests {
             .cloned()
         }
 
-        fn is_consumed(entry: &stellar_agent_core::approval::PendingApproval) -> bool {
+        pub(crate) fn is_consumed(entry: &stellar_agent_core::approval::PendingApproval) -> bool {
             matches!(
                 entry.kind,
                 stellar_agent_core::approval::ApprovalKind::Consumed { .. }
@@ -6289,7 +6396,8 @@ pub(crate) mod tests {
         }
 
         impl Tool {
-            const ALL: [Self; 4] = [Self::Pay, Self::Claim, Self::CreateAccount, Self::Trustline];
+            pub(crate) const ALL: [Self; 4] =
+                [Self::Pay, Self::Claim, Self::CreateAccount, Self::Trustline];
 
             fn commit_name(self) -> &'static str {
                 match self {
@@ -6492,7 +6600,7 @@ pub(crate) mod tests {
             }
 
             /// A second preparation of the same action on the same fixture.
-            async fn prepare_again(
+            pub(crate) async fn prepare_again(
                 &self,
             ) -> (
                 serde_json::Value,
@@ -6520,8 +6628,30 @@ pub(crate) mod tests {
                 self.tool.commit(&self.f.server, args).await
             }
 
-            fn seed_reads(&self) -> u32 {
+            pub(crate) fn seed_reads(&self) -> u32 {
                 self.f.seed_reads.load(Ordering::SeqCst)
+            }
+
+            /// Starts a new server on the current files and keyring, routed to
+            /// the run's own primary and oracle servers, in place of the
+            /// running one, as a restart of the wallet process does.
+            ///
+            /// # Errors
+            ///
+            /// The startup refusal of the new server; the running one stays.
+            pub(crate) fn restart(
+                &mut self,
+            ) -> Result<(), stellar_agent_core::policy::BuildRegistryError> {
+                self.f.server = WalletServer::new_with_selection_and_routes_for_test(
+                    (*self.f.server.profile).clone(),
+                    ProfileNameSource::Flag,
+                    &default_profile_dir().unwrap(),
+                    &[
+                        ("rpc.example.invalid", self._primary.uri().as_str()),
+                        ("oracle.example.invalid", self._oracle.uri().as_str()),
+                    ],
+                )?;
+                Ok(())
             }
 
             /// A commit of the approved transaction changed by `change`, with
@@ -6557,7 +6687,7 @@ pub(crate) mod tests {
             /// The run's commit arguments for `xdr` carrying the approval
             /// `approval_nonce` with its attestation `blob`, and a protocol
             /// nonce minted for `xdr` now.
-            fn commit_args_for(
+            pub(crate) fn commit_args_for(
                 &self,
                 xdr: &str,
                 approval_nonce: &str,
@@ -6590,7 +6720,7 @@ pub(crate) mod tests {
 
         /// A pending approval of the kind `tool` commits, for the envelope
         /// `xdr`, with a lifetime of `ttl_ms`.
-        fn approval_for(
+        pub(crate) fn approval_for(
             tool: Tool,
             f: &Fixture,
             xdr: &str,
@@ -6672,7 +6802,7 @@ pub(crate) mod tests {
 
         /// Asserts that no submission entered its pre-send recording: no
         /// receipt and no pending audit row.
-        fn assert_no_pre_send_entry(run: &ClassicRun) {
+        pub(crate) fn assert_no_pre_send_entry(run: &ClassicRun) {
             let tool = run.tool;
             assert!(receipts().is_empty(), "{tool:?}");
             assert!(
@@ -6812,25 +6942,11 @@ pub(crate) mod tests {
             accept(Tool::Trustline).await;
         }
 
-        /// The operator credential the remote-approval listener verified.
-        const REMOTE_CREDENTIAL: &str = "XFxcXFxcXFxcXFxcXFxcXA";
-        /// A second enrolled and allowed operator credential.
-        const OTHER_CREDENTIAL: &str = "YWFhYWFhYWFhYWFhYWFhYQ";
-
-        /// What changes on disk after the listener has persisted a remote
-        /// approval and released its audit writer.
-        #[derive(Clone, Copy, Debug)]
-        enum AfterListenerShutdown {
-            /// The other credential loses its allowlist entry and enrollment.
-            RevokeOther,
-            /// The approving credential loses its allowlist entry.
-            UnlistApprover,
-            /// The approving credential loses its enrollment.
-            UnenrollApprover,
-        }
+        /// The operator credential the remote-approval listener verifies.
+        pub(crate) const REMOTE_CREDENTIAL: &str = "XFxcXFxcXFxcXFxcXFxcXA";
 
         /// A `[remote_approval]` block that allows `ids`.
-        fn remote_approval(
+        pub(crate) fn remote_approval(
             ids: &[&str],
         ) -> stellar_agent_core::profile::schema::RemoteApprovalConfig {
             serde_json::from_value(serde_json::json!({
@@ -6842,64 +6958,13 @@ pub(crate) mod tests {
             .unwrap()
         }
 
-        /// Prepares a mainnet payment, has the remote-approval listener
-        /// approve it for [`REMOTE_CREDENTIAL`] through its own audit writer,
-        /// shows that a commit refuses while that writer is held, releases
-        /// it the way the listener's exit does, applies `after` to the files
-        /// on disk, and commits on the same server state.
-        ///
-        /// Returns the run, the remote approval and the final commit result.
-        async fn remote_commit_after_listener_shutdown(
-            after: AfterListenerShutdown,
-        ) -> (
-            ClassicRun,
-            stellar_agent_core::approval::PendingApproval,
-            serde_json::Value,
-        ) {
-            use stellar_agent_core::approval::{
-                AttestationBinding, AttestedApprover, ConsentAudit, OperatorApprovalCredential,
-                OperatorApprovalCredentialStore, PendingApprovalStore, Surface, attest_and_persist,
-                default_operator_approval_credentials_path, load_attestation_key,
-            };
-            let run = ClassicRun::with(
-                Tool::Pay,
-                |raw| raw,
-                |profile| {
-                    profile.remote_approval =
-                        Some(remote_approval(&[REMOTE_CREDENTIAL, OTHER_CREDENTIAL]));
-                },
-                |_| {},
-            )
-            .await;
-            let credentials = OperatorApprovalCredentialStore::new(
-                default_operator_approval_credentials_path("operator").unwrap(),
-            );
-            for (id, byte) in [(REMOTE_CREDENTIAL, 7u8), (OTHER_CREDENTIAL, 8u8)] {
-                let mut key = vec![0x04u8; 65];
-                key[1] = byte;
-                credentials
-                    .enroll(OperatorApprovalCredential {
-                        credential_id_b64url: id.to_owned(),
-                        public_key_sec1_b64: base64::Engine::encode(
-                            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-                            key,
-                        ),
-                        rp_id: "wallet.example.invalid".to_owned(),
-                        label: "device".to_owned(),
-                        registered_at_unix_ms: 1,
-                        sign_count: None,
-                    })
-                    .unwrap();
-            }
-
-            // The listener is another process: its audit writer is its own,
-            // opened on the profile's log with the profile's keyring anchor,
-            // and it holds the log's lock until the listener exits.
-            let xdr = run.args["envelope_xdr"].as_str().unwrap().to_owned();
-            let entry = approval_for(Tool::Pay, &run.f, &xdr, 600_000);
+        /// Opens the remote-approval listener's audit writer as the listener
+        /// process does: its own writer on the profile's log with the
+        /// profile's keyring anchor, holding the log's lock until it drops.
+        fn listener_writer(run: &ClassicRun) -> stellar_agent_core::audit_log::writer::AuditWriter {
             stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test("operator");
             let profile = run.f.server.security_profile();
-            let mut listener_writer = stellar_agent_core::audit_log::writer::AuditWriter::open(
+            stellar_agent_core::audit_log::writer::AuditWriter::open(
                 profile.audit_log_path.clone(),
                 Some(
                     stellar_agent_network::keyring::keyed_audit_access(
@@ -6910,44 +6975,112 @@ pub(crate) mod tests {
                     .unwrap(),
                 ),
             )
-            .unwrap();
-            let blob = {
-                let mut store = PendingApprovalStore::open(
-                    run.f
-                        .server
-                        .resolve_approval_dir()
-                        .unwrap()
-                        .join("operator.toml"),
-                )
-                .unwrap();
-                store
-                    .insert(
-                        entry.clone(),
-                        stellar_agent_core::timefmt::now_unix_ms().unwrap(),
-                    )
-                    .unwrap();
-                let key = load_attestation_key(
-                    &profile.attestation_key_id,
-                    &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
-                        "operator", profile,
-                    ),
-                )
-                .unwrap();
-                attest_and_persist(
-                    &mut store,
-                    &entry,
-                    &key,
-                    &AttestationBinding::new("operator", "stellar:mainnet"),
-                    Surface::ServeRemote,
-                    ConsentAudit::Writer(&mut listener_writer),
-                    &AttestedApprover::Remote {
-                        credential_id_b64url: REMOTE_CREDENTIAL.to_owned(),
-                    },
-                    |_, _| Err("unexpected grant".to_owned()),
-                )
-                .unwrap()
-                .unwrap()
+            .unwrap()
+        }
+
+        /// The remote-approval listener records no mainnet consent: for an
+        /// allowed and enrolled credential its standard remote attestation
+        /// refuses with `approval.presence_required`, leaves the entry
+        /// unattested and writes no audit row.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn a_remote_listener_records_no_mainnet_consent() {
+            use base64::Engine as _;
+            use stellar_agent_core::approval::{
+                AttestationBinding, AttestedApprover, ConsentAudit, ConsentAuthorization,
+                OperatorApprovalCredential, OperatorApprovalCredentialStore, PendingApprovalStore,
+                Surface, attest_and_persist, default_operator_approval_credentials_path,
+                load_attestation_key,
             };
+            let run = ClassicRun::with(
+                Tool::Pay,
+                |raw| raw,
+                |profile| {
+                    profile.remote_approval = Some(remote_approval(&[REMOTE_CREDENTIAL]));
+                },
+                |_| {},
+            )
+            .await;
+            let mut key_bytes = vec![0x04u8; 65];
+            key_bytes[1] = 7;
+            OperatorApprovalCredentialStore::new(
+                default_operator_approval_credentials_path("operator").unwrap(),
+            )
+            .enroll(OperatorApprovalCredential {
+                credential_id_b64url: REMOTE_CREDENTIAL.to_owned(),
+                public_key_sec1_b64: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(&key_bytes),
+                rp_id: "wallet.example.invalid".to_owned(),
+                label: "device".to_owned(),
+                registered_at_unix_ms: 1,
+                sign_count: None,
+            })
+            .unwrap();
+
+            let xdr = run.args["envelope_xdr"].as_str().unwrap().to_owned();
+            let entry = approval_for(Tool::Pay, &run.f, &xdr, 600_000);
+            let approver = AttestedApprover::Remote {
+                credential_id_b64url: REMOTE_CREDENTIAL.to_owned(),
+            };
+            let binding = AttestationBinding::new("operator", "stellar:mainnet");
+            let profile = run.f.server.security_profile();
+            let log_before = std::fs::read_to_string(&profile.audit_log_path).unwrap_or_default();
+            let mut listener_writer = listener_writer(&run);
+            let mut store = PendingApprovalStore::open(
+                run.f
+                    .server
+                    .resolve_approval_dir()
+                    .unwrap()
+                    .join("operator.toml"),
+            )
+            .unwrap();
+            store
+                .insert(
+                    entry.clone(),
+                    stellar_agent_core::timefmt::now_unix_ms().unwrap(),
+                )
+                .unwrap();
+            let key = load_attestation_key(
+                &profile.attestation_key_id,
+                &stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
+                    "operator", profile,
+                ),
+            )
+            .unwrap();
+            let refused = attest_and_persist(
+                &mut store,
+                &entry,
+                &key,
+                &binding,
+                Surface::ServeRemote,
+                ConsentAudit::Writer(&mut listener_writer),
+                ConsentAuthorization::Standard(&approver),
+                |_, _| Err("unexpected grant".to_owned()),
+            )
+            .unwrap_err();
+            assert_eq!(refused.code(), "approval.presence_required");
+            let stored = store.get(&entry.approval_nonce).unwrap();
+            assert!(stored.attestation_blob_b64.is_none());
+            assert!(stored.mainnet_presence.is_none());
+            drop(listener_writer);
+            assert_eq!(
+                std::fs::read_to_string(&profile.audit_log_path).unwrap_or_default(),
+                log_before,
+                "a refused remote consent writes no audit row"
+            );
+        }
+
+        /// A commit of a genuine mainnet consent refuses while another
+        /// process holds the profile's audit writer, spends nothing, and
+        /// commits on the same server state once that writer drops.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn a_held_listener_writer_refuses_a_mainnet_commit_until_it_drops() {
+            let run = ClassicRun::with(Tool::Pay, |raw| raw, |_| {}, |_| {}).await;
+            let xdr = run.args["envelope_xdr"].as_str().unwrap().to_owned();
+            let entry = approval_for(Tool::Pay, &run.f, &xdr, 600_000);
+            let blob = run.f.attest(&entry);
+            let listener_writer = listener_writer(&run);
 
             let held = run
                 .commit_with(run.commit_args_for(&xdr, &entry.approval_nonce, &blob))
@@ -6971,57 +7104,14 @@ pub(crate) mod tests {
             ));
             drop(listener_writer);
 
-            let mut stored = (*run.f.server.profile).clone();
-            match after {
-                AfterListenerShutdown::RevokeOther => {
-                    stored.remote_approval = Some(remote_approval(&[REMOTE_CREDENTIAL]));
-                    assert!(credentials.remove(OTHER_CREDENTIAL).unwrap());
-                }
-                AfterListenerShutdown::UnlistApprover => {
-                    stored.remote_approval = Some(remote_approval(&[OTHER_CREDENTIAL]));
-                }
-                AfterListenerShutdown::UnenrollApprover => {
-                    assert!(credentials.remove(REMOTE_CREDENTIAL).unwrap());
-                }
-            }
-            loader::save_to_dir("operator", &stored, &default_profile_dir().unwrap()).unwrap();
-
             let result = run
                 .commit_with(run.commit_args_for(&xdr, &entry.approval_nonce, &blob))
                 .await;
-            (run, entry, result)
-        }
-
-        #[tokio::test]
-        #[serial_test::serial(keyring)]
-        async fn persisted_remote_approval_refuses_after_listener_shutdown() {
-            let (run, entry, result) =
-                remote_commit_after_listener_shutdown(AfterListenerShutdown::RevokeOther).await;
-            assert_eq!(result["ok"], true, "the still-authorized control: {result}");
+            assert_eq!(result["ok"], true, "{result}");
             assert_eq!(run.control.count("sendTransaction"), 1);
             assert!(is_consumed(
                 &stored_approval(&run.f, &entry.approval_nonce).unwrap()
             ));
-
-            for after in [
-                AfterListenerShutdown::UnlistApprover,
-                AfterListenerShutdown::UnenrollApprover,
-            ] {
-                let (run, entry, result) = remote_commit_after_listener_shutdown(after).await;
-                assert_eq!(result["ok"], false, "{after:?}: {result}");
-                assert_eq!(
-                    result["error"]["code"], "policy.approval_required",
-                    "{after:?}: {result}"
-                );
-                assert!(authorizations(&run.f).is_empty(), "{after:?}");
-                assert_eq!(run.seed_reads(), 0, "{after:?}");
-                assert_eq!(run.control.count("sendTransaction"), 0, "{after:?}");
-                assert_no_pre_send_entry(&run);
-                assert!(
-                    !is_consumed(&stored_approval(&run.f, &entry.approval_nonce).unwrap()),
-                    "{after:?}: the approval stays unspent"
-                );
-            }
         }
 
         /// Asserts the restart refusal with no action request, no seed read
@@ -8112,7 +8202,7 @@ pub(crate) mod tests {
             }
 
             /// Runs the preparation call and attests its pending approval.
-            async fn approve(f: &Fixture, control: &RpcControl) -> (String, String) {
+            pub(crate) async fn approve(f: &Fixture, control: &RpcControl) -> (String, String) {
                 let prepared = wire(
                     &f.server
                         .call_stellar_x402_create_payment(x402_args(f, None))
@@ -8154,14 +8244,14 @@ pub(crate) mod tests {
                 )
             }
 
-            fn simulations(&self) -> usize {
+            pub(crate) fn simulations(&self) -> usize {
                 self.control.count("simulateTransaction")
             }
         }
 
         /// Asserts an x402 refusal before the intent was minted: no
         /// authorization, no seed read, no payload, and no payment request.
-        fn assert_x402_refused_before_intent(
+        pub(crate) fn assert_x402_refused_before_intent(
             run: &X402Run,
             result: &serde_json::Value,
             code: &str,

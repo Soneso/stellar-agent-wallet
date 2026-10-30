@@ -281,11 +281,18 @@ or `trustline.policy_engine_unavailable`.
 | `profile.reset_window_state_newer_version` | This build cannot reset an unsupported newer state format. |
 | `policy.window_state_unverifiable` | Enabled-mainnet state cannot be verified. Follow the operator recovery procedure. |
 | `profile.reset_window_state_open_authorizations` | Effective open authorizations prevent reset. |
-| `confirm.tty_required` | Direct mainnet confirmation requires terminal stdin and stderr. |
-| `confirm.profile_name_mismatch` | The entered line must equal the selected profile name. |
-| `confirm.input_unavailable` | Input, render, or flush failure prevents confirmation. |
-| `approve.yes_refused_on_mainnet` | On mainnet, `--yes` refuses before terminal or store checks in either build. CLI `approve` uses a y/n prompt. |
+| `approval.presence_required` | Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy. This release records no mainnet consent; report it to the operator. |
+| `approval.presence_policy_unavailable` | The current owner-signed mainnet policy cannot be verified, lists no approval credential, or changed since the consent was recorded. |
+| `approval.mainnet_remote_unsupported` | The remote approval listener does not approve mainnet requests. |
+| `approve.yes_refused_on_mainnet` | On mainnet, `--yes` refuses before store access in either build. |
 | `accounts.create.generate_refused_on_mainnet` | Mainnet creation requires a destination public key. Generated-key creation is a testnet convenience. |
+| `approval.presence_invalid` | The passkey assertion fails verification; start a fresh consent. |
+| `approval.presence_changed` | The pending request or policy differs from the displayed consent; reload it. |
+| `approval.presence_expired` | The presence deadline expires; start a fresh consent. |
+| `approval.presence_consumed` | The challenge is consumed; start a fresh consent. |
+| `approval.presence_unavailable` | The presence ceremony cannot complete; check the local browser and authenticator. |
+| `approval.presence_canceled` | The presence ceremony is canceled; no approval is recorded. |
+| `approval.presence_browser_required` | The ceremony requires a local browser; no approval is recorded. |
 
 ### Policy denial codes
 

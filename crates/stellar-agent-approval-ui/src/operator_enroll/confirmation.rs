@@ -6,16 +6,21 @@
 //! the confirmation code the enrollment page displays.
 //! [`PendingOperatorEnrollment::confirm`] compares it, once, with the code of
 //! the staged credential; only the [`ConfirmedOperatorEnrollment`] it returns
-//! can [`ConfirmedOperatorEnrollment::persist`] the credential.
+//! can [`ConfirmedOperatorEnrollment::persist`] an operator credential or
+//! [`ConfirmedOperatorEnrollment::into_mainnet_policy_credential`] export a
+//! mainnet approval credential, each for its own
+//! [`super::EnrollmentPurpose`] only.
 //!
 //! # The confirmation code
 //!
-//! [`operator_enrollment_confirmation_code`] is the first 16 hexadecimal
-//! characters of SHA-256 over the domain
-//! `stellar-agent-operator-enrollment-confirmation:v1`, the 32-byte
-//! challenge, the credential ID's length as a big-endian `u32` followed by
-//! the ID, and the 65-byte SEC1 public key, shown as four groups of four
-//! separated by `-`. The page computes it from the credential its own
+//! The code is the first 16 hexadecimal characters of SHA-256 over the
+//! purpose's domain, the 32-byte challenge, the credential ID's length as a
+//! big-endian `u32` followed by the ID, and the 65-byte SEC1 public key,
+//! shown as four groups of four separated by `-`. The domain is
+//! `stellar-agent-operator-enrollment-confirmation:v1` for an operator
+//! credential and `stellar-agent-mainnet-approval-enrollment-confirmation:v1`
+//! for a mainnet approval credential, so a code of one purpose never
+//! confirms the other. The page computes it from the credential its own
 //! ceremony created, so a code typed at the terminal matches only when the
 //! staged credential is that one.
 
@@ -26,32 +31,59 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 
+use stellar_agent_core::approval::MainnetApprovalCredential;
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::approval::operator_credentials::{
     OperatorApprovalCredential, OperatorApprovalCredentialStore,
 };
 
+use super::EnrollmentPurpose;
 use super::registration::{
     PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN, REGISTRATION_RP_ID, VerifiedOperatorRegistration,
 };
 
-/// Domain separator of the confirmation-code digest.
-const CONFIRMATION_CODE_DOMAIN: &[u8] = b"stellar-agent-operator-enrollment-confirmation:v1";
+/// Domain separator of an operator credential's confirmation code.
+pub(super) const OPERATOR_CODE_DOMAIN: &[u8] = b"stellar-agent-operator-enrollment-confirmation:v1";
+
+/// Domain separator of a mainnet approval credential's confirmation code.
+pub(super) const MAINNET_APPROVAL_CODE_DOMAIN: &[u8] =
+    b"stellar-agent-mainnet-approval-enrollment-confirmation:v1";
+
+/// The message of a confirmed enrollment used for the other purpose.
+const WRONG_PURPOSE_MESSAGE: &str = "The enrollment purpose does not match the requested export.";
 
 /// Number of hexadecimal characters in a confirmation code.
 const CONFIRMATION_CODE_HEX_LEN: usize = 16;
 
-/// The confirmation code of a credential registered over `challenge`, in
-/// the display form `xxxx-xxxx-xxxx-xxxx` (lowercase hexadecimal) the page
-/// shows. The server itself compares only the digits, so this form exists
-/// for the tests and the test support that play the page's part.
-#[cfg(any(test, feature = "test-helpers"))]
+/// The operator credential's confirmation code of a credential registered
+/// over `challenge`; see [`enrollment_confirmation_code`].
+#[cfg(test)]
 pub(crate) fn operator_enrollment_confirmation_code(
     challenge: &[u8; 32],
     credential_id: &[u8],
     public_key_sec1: &[u8; PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN],
 ) -> String {
-    let digits = code_digits(challenge, credential_id, public_key_sec1);
+    enrollment_confirmation_code(
+        EnrollmentPurpose::RemoteOperator,
+        challenge,
+        credential_id,
+        public_key_sec1,
+    )
+}
+
+/// The `purpose` confirmation code of a credential registered over
+/// `challenge`, in the display form `xxxx-xxxx-xxxx-xxxx` (lowercase
+/// hexadecimal) the page shows. The server itself compares only the digits,
+/// so this form exists for the tests and the test support that play the
+/// page's part.
+#[cfg(any(test, feature = "test-helpers"))]
+pub(crate) fn enrollment_confirmation_code(
+    purpose: EnrollmentPurpose,
+    challenge: &[u8; 32],
+    credential_id: &[u8],
+    public_key_sec1: &[u8; PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN],
+) -> String {
+    let digits = code_digits(purpose, challenge, credential_id, public_key_sec1);
     let mut display = String::with_capacity(CONFIRMATION_CODE_HEX_LEN + 3);
     for (index, digit) in digits.iter().enumerate() {
         if index > 0 && index % 4 == 0 {
@@ -62,14 +94,15 @@ pub(crate) fn operator_enrollment_confirmation_code(
     display
 }
 
-/// The code's 16 lowercase hexadecimal digits as ASCII bytes.
+/// The `purpose` code's 16 lowercase hexadecimal digits as ASCII bytes.
 fn code_digits(
+    purpose: EnrollmentPurpose,
     challenge: &[u8; 32],
     credential_id: &[u8],
     public_key_sec1: &[u8; PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN],
 ) -> [u8; CONFIRMATION_CODE_HEX_LEN] {
     let mut hasher = Sha256::new();
-    hasher.update(CONFIRMATION_CODE_DOMAIN);
+    hasher.update(purpose.code_domain());
     hasher.update(challenge);
     let id_len = u32::try_from(credential_id.len()).unwrap_or(u32::MAX);
     hasher.update(id_len.to_be_bytes());
@@ -105,12 +138,19 @@ fn normalize_submitted_code(submitted: &str) -> Option<[u8; CONFIRMATION_CODE_HE
 pub(crate) struct StagedEnrollment {
     registration: VerifiedOperatorRegistration,
     expected_code: [u8; CONFIRMATION_CODE_HEX_LEN],
+    purpose: EnrollmentPurpose,
 }
 
 impl StagedEnrollment {
-    /// Stages `registration`, accepted for `challenge`.
-    pub(crate) fn new(registration: VerifiedOperatorRegistration, challenge: &[u8; 32]) -> Self {
+    /// Stages `registration`, accepted for `challenge` by a `purpose`
+    /// ceremony.
+    pub(crate) fn new(
+        registration: VerifiedOperatorRegistration,
+        challenge: &[u8; 32],
+        purpose: EnrollmentPurpose,
+    ) -> Self {
         let expected_code = code_digits(
+            purpose,
             challenge,
             registration.credential_id(),
             registration.public_key_sec1(),
@@ -118,6 +158,7 @@ impl StagedEnrollment {
         Self {
             registration,
             expected_code,
+            purpose,
         }
     }
 
@@ -155,6 +196,12 @@ impl PendingOperatorEnrollment {
         self.staged.registration.label()
     }
 
+    /// What the ceremony enrolled the credential for.
+    #[must_use]
+    pub fn purpose(&self) -> EnrollmentPurpose {
+        self.staged.purpose
+    }
+
     /// Compares `submitted_code` with the code of the staged credential, at
     /// `now`.
     ///
@@ -184,6 +231,7 @@ impl PendingOperatorEnrollment {
         }
         Ok(ConfirmedOperatorEnrollment {
             registration: self.staged.registration,
+            purpose: self.staged.purpose,
         })
     }
 }
@@ -195,18 +243,45 @@ impl std::fmt::Debug for PendingOperatorEnrollment {
     }
 }
 
-/// A credential the operator confirmed at the terminal, ready to persist.
+/// A credential the operator confirmed at the terminal, ready to persist or
+/// export for its purpose.
 pub struct ConfirmedOperatorEnrollment {
     registration: VerifiedOperatorRegistration,
+    purpose: EnrollmentPurpose,
 }
 
 impl ConfirmedOperatorEnrollment {
+    /// The mainnet approval credential of a
+    /// [`EnrollmentPurpose::MainnetApproval`] ceremony, for the owner to add
+    /// to `mainnet.approval_credentials` and sign. Nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// - [`OperatorEnrollmentConfirmationError::WrongPurpose`] for an
+    ///   operator credential ceremony.
+    /// - [`OperatorEnrollmentConfirmationError::CredentialInvalid`] when the
+    ///   verified registration has no policy form.
+    pub fn into_mainnet_policy_credential(
+        self,
+    ) -> Result<MainnetApprovalCredential, OperatorEnrollmentConfirmationError> {
+        if self.purpose != EnrollmentPurpose::MainnetApproval {
+            return Err(OperatorEnrollmentConfirmationError::WrongPurpose);
+        }
+        MainnetApprovalCredential::from_encoded(
+            self.registration.credential_id_b64url(),
+            &URL_SAFE_NO_PAD.encode(self.registration.public_key_sec1()),
+        )
+        .map_err(|_| OperatorEnrollmentConfirmationError::CredentialInvalid)
+    }
+
     /// Enrolls the confirmed credential into `store`, bound to
     /// `rp_id: "localhost"`, and returns the record written.
     ///
     /// # Errors
     ///
-    /// The errors of [`OperatorApprovalCredentialStore::enroll`], including
+    /// [`ApprovalError::Invalid`] for a mainnet approval credential
+    /// ceremony, whose credential is exported and never stored here. The
+    /// errors of [`OperatorApprovalCredentialStore::enroll`], including
     /// [`ApprovalError::DuplicateCredentialId`] when the ID was enrolled
     /// since the server staged it, and [`ApprovalError::WriterLocked`] under
     /// contention; an [`ApprovalError::Io`] when the system clock reads
@@ -215,6 +290,11 @@ impl ConfirmedOperatorEnrollment {
         self,
         store: &OperatorApprovalCredentialStore,
     ) -> Result<OperatorApprovalCredential, ApprovalError> {
+        if self.purpose != EnrollmentPurpose::RemoteOperator {
+            return Err(ApprovalError::Invalid {
+                reason: WRONG_PURPOSE_MESSAGE.to_owned(),
+            });
+        }
         let registered_at_unix_ms =
             stellar_agent_core::timefmt::now_unix_ms().map_err(|e| ApprovalError::Io {
                 kind: std::io::ErrorKind::Other,
@@ -250,6 +330,13 @@ pub enum OperatorEnrollmentConfirmationError {
     /// The ceremony deadline passed before the code was confirmed.
     #[error("the enrollment ceremony expired before the code was confirmed")]
     Expired,
+    /// The confirmed enrollment was requested for another purpose than the
+    /// ceremony enrolled it for.
+    #[error("The enrollment purpose does not match the requested export.")]
+    WrongPurpose,
+    /// The verified registration has no mainnet policy form.
+    #[error("The enrolled credential is not a valid mainnet approval credential.")]
+    CredentialInvalid,
 }
 
 #[cfg(test)]
@@ -314,6 +401,32 @@ mod tests {
         );
     }
 
+    /// The mainnet approval vectors the browser test in
+    /// `app_shared.test.mjs` shares: the same inputs under the mainnet
+    /// domain give other codes than the operator domain.
+    #[test]
+    fn mainnet_confirmation_code_vectors_match_browser() {
+        let (challenge, id, key) = vector();
+        let code = |challenge: &[u8; 32], id: &[u8], key: &[u8; 65]| {
+            enrollment_confirmation_code(EnrollmentPurpose::MainnetApproval, challenge, id, key)
+        };
+        assert_eq!(code(&challenge, &id, &key), "415b-db8a-ac00-4222");
+        assert_ne!(
+            code(&challenge, &id, &key),
+            operator_enrollment_confirmation_code(&challenge, &id, &key)
+        );
+        let mut other_challenge = challenge;
+        other_challenge[0] ^= 1;
+        assert_eq!(code(&other_challenge, &id, &key), "67f8-9765-fe91-7daf");
+        let mut other_id = id.clone();
+        other_id[0] ^= 1;
+        assert_eq!(code(&challenge, &other_id, &key), "b965-512c-4df9-c87d");
+        let mut other_key = key;
+        other_key[64] ^= 1;
+        assert_eq!(code(&challenge, &id, &other_key), "504b-3195-bc18-cf46");
+        assert_eq!(code(&challenge, &[0xa5; 32], &key), "1c3b-c8a8-faf5-58cb");
+    }
+
     #[test]
     fn submitted_codes_normalize_case_and_separators_only() {
         let expected = *b"305b424462effd53";
@@ -345,6 +458,13 @@ mod tests {
     }
 
     fn pending(deadline: Instant) -> (PendingOperatorEnrollment, String, SoftwareRegistrar) {
+        pending_for(EnrollmentPurpose::RemoteOperator, deadline)
+    }
+
+    fn pending_for(
+        purpose: EnrollmentPurpose,
+        deadline: Instant,
+    ) -> (PendingOperatorEnrollment, String, SoftwareRegistrar) {
         let registrar = SoftwareRegistrar::new([0x11; 32], vec![0xa5; 16]);
         let challenge =
             RegistrationChallenge::from_parts([0x42; 32], Instant::now() + Duration::from_secs(60));
@@ -359,12 +479,13 @@ mod tests {
             Instant::now(),
         )
         .unwrap();
-        let code = operator_enrollment_confirmation_code(
+        let code = enrollment_confirmation_code(
+            purpose,
             challenge.bytes(),
             verified.credential_id(),
             verified.public_key_sec1(),
         );
-        let staged = StagedEnrollment::new(verified, challenge.bytes());
+        let staged = StagedEnrollment::new(verified, challenge.bytes(), purpose);
         (staged.with_deadline(deadline), code, registrar)
     }
 
@@ -422,5 +543,62 @@ mod tests {
             Err(ApprovalError::DuplicateCredentialId { .. })
         ));
         assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    /// A code of one purpose never confirms a ceremony of the other; a
+    /// confirmed mainnet approval credential is exported and never
+    /// persisted, and a confirmed operator credential is never exported.
+    #[test]
+    fn export_and_persist_follow_the_purpose() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OperatorApprovalCredentialStore::new(dir.path().join("operator.toml"));
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(30);
+
+        let (remote, remote_code, _) = pending_for(EnrollmentPurpose::RemoteOperator, deadline);
+        let (mainnet, mainnet_code, _) = pending_for(EnrollmentPurpose::MainnetApproval, deadline);
+        assert_ne!(remote_code, mainnet_code);
+        assert_eq!(
+            mainnet.confirm(&remote_code, now).unwrap_err(),
+            OperatorEnrollmentConfirmationError::Mismatch
+        );
+        assert_eq!(
+            remote.confirm(&mainnet_code, now).unwrap_err(),
+            OperatorEnrollmentConfirmationError::Mismatch
+        );
+
+        let (remote, code, _) = pending_for(EnrollmentPurpose::RemoteOperator, deadline);
+        assert_eq!(remote.purpose(), EnrollmentPurpose::RemoteOperator);
+        assert_eq!(
+            remote
+                .confirm(&code, now)
+                .unwrap()
+                .into_mainnet_policy_credential()
+                .unwrap_err(),
+            OperatorEnrollmentConfirmationError::WrongPurpose
+        );
+        assert_eq!(
+            OperatorEnrollmentConfirmationError::WrongPurpose.to_string(),
+            "The enrollment purpose does not match the requested export."
+        );
+
+        let (mainnet, code, registrar) = pending_for(EnrollmentPurpose::MainnetApproval, deadline);
+        assert_eq!(mainnet.purpose(), EnrollmentPurpose::MainnetApproval);
+        let confirmed = mainnet.confirm(&code, now).unwrap();
+        let ApprovalError::Invalid { reason } = confirmed.persist(&store).unwrap_err() else {
+            panic!("a mainnet approval credential is never stored");
+        };
+        assert_eq!(reason, WRONG_PURPOSE_MESSAGE);
+        assert!(store.list().unwrap().is_empty());
+
+        let (mainnet, code, _) = pending_for(EnrollmentPurpose::MainnetApproval, deadline);
+        let exported = mainnet
+            .confirm(&code, now)
+            .unwrap()
+            .into_mainnet_policy_credential()
+            .unwrap();
+        assert_eq!(exported.credential_id(), registrar.credential_id());
+        assert_eq!(exported.public_key_sec1(), &registrar.public_key_sec1());
+        assert!(store.list().unwrap().is_empty());
     }
 }

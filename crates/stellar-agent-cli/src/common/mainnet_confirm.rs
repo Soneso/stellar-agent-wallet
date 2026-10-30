@@ -1,20 +1,33 @@
-//! Typed-profile consent for one decoded mainnet transaction.
+//! Presence-gated consent for one decoded mainnet transaction.
+//!
+//! [`confirm_mainnet_write`] renders the authoritative summary of the
+//! envelope, parks its pending entry, releases the pending store and awaits
+//! the verified WebAuthn presence of an approval credential in the
+//! owner-signed policy. It then reopens the store and records the version 5
+//! consent; the core attester checks the parked snapshot, the current policy
+//! and both challenge deadlines again under the store lock. No terminal input
+//! is consent.
 
 use super::consent::{ConsentSink, acquire_consent_sink};
+use super::mainnet_presence::acquire_mainnet_presence;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use std::io::{BufRead, Write};
+use std::io::Write;
+use std::path::Path;
 use stellar_agent_core::{
     approval::{
-        AttestationBinding, ConsentAudit, PendingApproval, PendingApprovalStore,
+        ApprovalContext, AttestationBinding, ConsentAudit, DEFAULT_RETRY_ATTEMPTS,
+        DEFAULT_RETRY_BACKOFF, MainnetApprovalAuthority, PendingApproval, PendingApprovalStore,
+        VerifiedMainnetPresence,
         attest::{attest_mainnet_confirmation, record_error},
         error::ApprovalError,
-        load_attestation_key, process_uid_for_attestation,
+        load_attestation_key, open_with_retry, process_uid_for_attestation,
         store::MAINNET_CONFIRMATION_TTL_SECONDS,
         subject::approval_subject_classic,
         witness::{ApprovalExpectation, ApprovalWitness, ApprovedKind, verify_approval},
     },
     envelope_decode::decode_authoritative_args,
     error::{ApprovalFailure, ProtocolError, ValidationError, WalletError},
+    mainnet::verified_policy::VerifiedPolicy,
     policy::v1::value::{ValueClass, derive_value_class},
     profile::owner_key::OwnerKeyContext,
 };
@@ -36,6 +49,10 @@ impl ConfirmDecision {
         }
     }
 }
+
+/// The last line of the rendered summary: what records consent to it.
+const CONSENT_LINE: &str = "Consent requires a passkey assertion from an approval credential in the \
+                            owner-signed policy.";
 
 pub(crate) struct MainnetWriteSummary {
     envelope: String,
@@ -189,7 +206,7 @@ impl MainnetWriteSummary {
         writeln!(output, "Memo: {}", esc(&self.memo))?;
         writeln!(
             output,
-            "Fee: {} stroops\nFee cap: {} stroops per operation\nType the profile name to confirm:",
+            "Fee: {} stroops\nFee cap: {} stroops per operation\n{CONSENT_LINE}",
             self.fee, self.fee_cap
         )
     }
@@ -254,117 +271,194 @@ impl MainnetWriteSummary {
     }
 }
 
-fn read_name(input: &mut impl BufRead, expected: &str) -> Result<(), WalletError> {
-    let mut line = String::new();
-    if input
-        .read_line(&mut line)
-        .map_err(|_| WalletError::from(ValidationError::ConfirmInputUnavailable))?
-        == 0
-    {
-        return Err(ValidationError::ConfirmInputUnavailable.into());
-    }
-    let line = line.strip_suffix('\n').unwrap_or(&line);
-    let line = line.strip_suffix('\r').unwrap_or(line);
-    if line != expected {
-        return Err(ValidationError::ConfirmProfileNameMismatch.into());
-    }
-    Ok(())
-}
-
-/// Shows the operator the summary of the mainnet write on stderr, reads the
-/// profile name from stdin, and persists the attested confirmation.
+/// Records the operator's presence-gated consent to the mainnet write that
+/// `summary` decodes, and returns its witness under `policy`.
+///
+/// The summary goes to stderr for orientation. The pending entry is parked in
+/// the store at `store_path` and the store is released before the presence
+/// wait, so other handles can use it meanwhile. A refusal after the entry was
+/// parked removes it while it is still the unattested record parked here.
 ///
 /// # Errors
 ///
-/// `confirm.tty_required` without a terminal on stdin and stderr,
-/// `confirm.input_unavailable` when the summary cannot be written or the
-/// name cannot be read, `confirm.profile_name_mismatch` for another name, and
-/// the summary's, the attestation's and the store's refusals.
-pub(crate) fn confirm_mainnet_write(
+/// `approval.presence_unavailable` when the summary cannot be shown; the
+/// summary's, the attestation key's and the consent sink's refusals before
+/// anything is parked; the presence refusals of [`acquire_mainnet_presence`];
+/// and the attester's, the store's and the witness's refusals.
+pub(crate) async fn confirm_mainnet_write(
     summary: &MainnetWriteSummary,
     decision: ConfirmDecision,
     context: &MainnetWriteContext,
-    pending: &mut PendingApprovalStore,
+    policy: &VerifiedPolicy,
+    store_path: &Path,
 ) -> Result<ApprovalWitness, WalletError> {
-    confirm_on_terminal(summary, decision, context, pending)
+    let profile = context.profile();
+    let name = context.profile_name();
+    let authority = MainnetApprovalAuthority::for_profile(name)?;
+    let mut rendered = Vec::new();
+    summary
+        .render(context, &mut rendered)
+        .map_err(|_| WalletError::Approval(ApprovalFailure::PresenceUnavailable))?;
+    show_summary(&rendered)?;
+    let uid = process_uid_for_attestation().map_err(store_error)?;
+    let entry = summary.pending(uid, decision.ttl_ms())?;
+    // The key and the sink are checked before the entry is parked, so a
+    // profile that cannot record consent parks nothing; both are acquired
+    // again after the wait.
+    load_attestation_key(
+        &profile.attestation_key_id,
+        &OwnerKeyContext::for_profile(name, profile),
+    )?;
+    drop(acquire_consent_sink(profile, name)?);
+    {
+        let mut store = open_store(store_path)?;
+        store
+            .insert(entry.clone(), entry.created_at_unix_ms)
+            .map_err(store_error)?;
+    }
+    let approval_context = ApprovalContext::from_profile(name, profile);
+    let result =
+        match acquire_mainnet_presence(&entry, &approval_context, &authority, store_path).await {
+            Ok(presence) => {
+                persist_confirmation(summary, context, policy, store_path, &entry, presence)
+            }
+            Err(error) => Err(error),
+        };
+    if result.is_err() {
+        discard_parked(store_path, &entry);
+    }
+    result
 }
 
-fn confirm_with_io(
-    summary: &MainnetWriteSummary,
-    decision: ConfirmDecision,
-    context: &MainnetWriteContext,
-    pending: &mut PendingApprovalStore,
-    input: &mut impl BufRead,
-    output: &mut impl Write,
-) -> Result<ApprovalWitness, WalletError> {
-    super::tty::require_tty_for_mainnet()?;
-    summary
-        .render(context, output)
-        .and_then(|()| output.flush())
-        .map_err(|_| WalletError::from(ValidationError::ConfirmInputUnavailable))?;
-    read_name(input, context.profile_name())?;
-    persist_confirmation(summary, decision, context, pending)
+/// Writes the rendered summary to stderr.
+#[cfg(not(test))]
+fn show_summary(rendered: &[u8]) -> Result<(), WalletError> {
+    let mut stderr = std::io::stderr();
+    stderr
+        .write_all(rendered)
+        .and_then(|()| stderr.flush())
+        .map_err(|_| WalletError::Approval(ApprovalFailure::PresenceUnavailable))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The summaries the confirmation showed on this thread, oldest first.
+    static SHOWN_SUMMARIES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Records the rendered summary on this thread in place of stderr.
+#[cfg(test)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the signature of the stderr implementation"
+)]
+fn show_summary(rendered: &[u8]) -> Result<(), WalletError> {
+    SHOWN_SUMMARIES.with(|shown| {
+        shown
+            .borrow_mut()
+            .push(String::from_utf8_lossy(rendered).into_owned());
+    });
+    Ok(())
+}
+
+/// The summaries the confirmation showed on this thread, oldest first.
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) fn shown_summaries() -> Vec<String> {
+    SHOWN_SUMMARIES.with(|shown| shown.borrow().clone())
+}
+
+/// Forgets the summaries shown on this thread.
+#[cfg(all(test, feature = "mainnet-write"))]
+pub(crate) fn clear_shown_summaries() {
+    SHOWN_SUMMARIES.with(|shown| shown.borrow_mut().clear());
+}
+
+fn open_store(store_path: &Path) -> Result<PendingApprovalStore, WalletError> {
+    open_with_retry(store_path, DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF)
+        .map_err(|error| crate::commands::approve::approval_store_open_error(&error))
+}
+
+/// Removes the entry this confirmation parked while the store still holds it
+/// unattested with the parked lifetime; a record another handle attested or
+/// replaced stays.
+fn discard_parked(store_path: &Path, entry: &PendingApproval) {
+    let Ok(mut store) = open_store(store_path) else {
+        return;
+    };
+    let parked = store.get(&entry.approval_nonce).is_some_and(|stored| {
+        stored.attestation_blob_b64.is_none()
+            && stored.created_at_unix_ms == entry.created_at_unix_ms
+            && stored.expires_at_unix_ms == entry.expires_at_unix_ms
+    });
+    if parked && let Err(error) = store.remove(&entry.approval_nonce) {
+        tracing::debug!(code = %record_error(&error).code(), "parked mainnet entry not removed");
+    }
 }
 
 fn persist_confirmation(
     summary: &MainnetWriteSummary,
-    decision: ConfirmDecision,
     context: &MainnetWriteContext,
-    pending: &mut PendingApprovalStore,
+    policy: &VerifiedPolicy,
+    store_path: &Path,
+    entry: &PendingApproval,
+    presence: VerifiedMainnetPresence,
 ) -> Result<ApprovalWitness, WalletError> {
     let profile = context.profile();
-    let uid = process_uid_for_attestation().map_err(store_error)?;
-    let entry = summary.pending(uid, decision.ttl_ms())?;
+    let name = context.profile_name();
+    let mut pending = open_store(store_path)?;
     let key = load_attestation_key(
         &profile.attestation_key_id,
-        &OwnerKeyContext::for_profile(context.profile_name(), profile),
+        &OwnerKeyContext::for_profile(name, profile),
     )?;
-    let sink = acquire_consent_sink(profile, context.profile_name())?;
-    pending
-        .insert(entry.clone(), entry.created_at_unix_ms)
-        .map_err(store_error)?;
-    let binding = AttestationBinding::new(context.profile_name(), context.chain().caip2_str());
+    let sink = acquire_consent_sink(profile, name)?;
+    let binding = AttestationBinding::new(name, context.chain().caip2_str());
     match sink {
         ConsentSink::Writer(writer) => {
             let mut guard = writer.lock().map_err(|_| {
                 WalletError::from(ValidationError::AuditWriterOpenFailed {
-                    profile: context.profile_name().to_owned(),
+                    profile: name.to_owned(),
                 })
             })?;
             attest_mainnet_confirmation(
-                pending,
-                &entry,
+                &mut pending,
+                entry,
                 &key,
                 &binding,
                 ConsentAudit::Writer(&mut guard),
                 summary.policy_tool,
+                policy,
+                presence,
             )?;
         }
         ConsentSink::Outbox(outbox) => attest_mainnet_confirmation(
-            pending,
-            &entry,
+            &mut pending,
+            entry,
             &key,
             &binding,
             ConsentAudit::Outbox(&outbox),
             summary.policy_tool,
+            policy,
+            presence,
         )?,
     }
-    let attestation = persisted_attestation(pending, &entry.approval_nonce)?;
+    let attestation = persisted_attestation(&pending, &entry.approval_nonce)?;
     let now = stellar_agent_core::timefmt::now_unix_ms().map_err(|error| {
         WalletError::Approval(ApprovalFailure::ClockError {
             detail: error.to_string(),
         })
     })?;
     verify_approval(
-        pending,
+        &pending,
         profile,
-        context.profile_name(),
+        name,
         &entry.approval_nonce,
         &attestation,
         &ApprovalExpectation {
             kind: summary.kind,
             subject: approval_subject_classic(&summary.envelope),
         },
+        policy,
         now,
     )
 }
@@ -387,187 +481,14 @@ fn persisted_attestation(
         .map_err(|_| attestation_invalid("the persisted attestation has the wrong length"))
 }
 
-/// Runs the confirmation on the process's stdin and stderr.
-#[cfg(not(test))]
-fn confirm_on_terminal(
-    summary: &MainnetWriteSummary,
-    decision: ConfirmDecision,
-    context: &MainnetWriteContext,
-    pending: &mut PendingApprovalStore,
-) -> Result<ApprovalWitness, WalletError> {
-    confirm_with_io(
-        summary,
-        decision,
-        context,
-        pending,
-        &mut std::io::stdin().lock(),
-        &mut std::io::stderr().lock(),
-    )
-}
-
-/// The input a test answers the confirmation with: called with the rendered
-/// prompt while the input is pending, it returns the typed line, `None` for
-/// end of input, or a read error.
-#[cfg(test)]
-pub(crate) type ConfirmationInput = Box<dyn FnMut(&str) -> std::io::Result<Option<String>>>;
-
-#[cfg(test)]
-thread_local! {
-    /// The confirmation input a test set on this thread.
-    static CONFIRMATION_INPUT: std::cell::RefCell<Option<ConfirmationInput>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Clears the confirmation input of this thread when dropped.
-#[cfg(all(test, feature = "mainnet-write"))]
-pub(crate) struct ConfirmationInputGuard(());
-
-#[cfg(all(test, feature = "mainnet-write"))]
-impl Drop for ConfirmationInputGuard {
-    fn drop(&mut self) {
-        CONFIRMATION_INPUT.with(|slot| slot.borrow_mut().take());
-    }
-}
-
-/// Answers every confirmation on this thread through `input` until the guard
-/// drops.
-#[cfg(all(test, feature = "mainnet-write"))]
-pub(crate) fn set_confirmation_input(input: ConfirmationInput) -> ConfirmationInputGuard {
-    CONFIRMATION_INPUT.with(|slot| *slot.borrow_mut() = Some(input));
-    ConfirmationInputGuard(())
-}
-
-/// Runs the confirmation through the test's input when one is set, and on
-/// stdin and stderr otherwise.
-///
-/// The prompt the confirmation writes is captured, and the input is asked for
-/// the line when the confirmation first reads, so the callback sees exactly
-/// what the operator would see before typing.
-#[cfg(test)]
-fn confirm_on_terminal(
-    summary: &MainnetWriteSummary,
-    decision: ConfirmDecision,
-    context: &MainnetWriteContext,
-    pending: &mut PendingApprovalStore,
-) -> Result<ApprovalWitness, WalletError> {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    struct Prompt(Rc<RefCell<Vec<u8>>>);
-    impl Write for Prompt {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.borrow_mut().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    struct Answer {
-        prompt: Rc<RefCell<Vec<u8>>>,
-        input: ConfirmationInput,
-        line: Option<std::io::Cursor<Vec<u8>>>,
-    }
-    impl std::io::Read for Answer {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let available = self.fill_buf()?;
-            let n = available.len().min(buf.len());
-            buf[..n].copy_from_slice(&available[..n]);
-            self.consume(n);
-            Ok(n)
-        }
-    }
-    impl BufRead for Answer {
-        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-            if self.line.is_none() {
-                let prompt = String::from_utf8_lossy(&self.prompt.borrow()).into_owned();
-                let bytes = match (self.input)(&prompt)? {
-                    Some(line) => format!("{line}\n").into_bytes(),
-                    None => Vec::new(),
-                };
-                self.line = Some(std::io::Cursor::new(bytes));
-            }
-            self.line.as_mut().map_or(Ok(&[][..]), BufRead::fill_buf)
-        }
-        fn consume(&mut self, amount: usize) {
-            if let Some(line) = self.line.as_mut() {
-                line.consume(amount);
-            }
-        }
-    }
-
-    let Some(input) = CONFIRMATION_INPUT.with(|slot| slot.borrow_mut().take()) else {
-        return confirm_with_io(
-            summary,
-            decision,
-            context,
-            pending,
-            &mut std::io::stdin().lock(),
-            &mut std::io::stderr().lock(),
-        );
-    };
-    let prompt = Rc::new(RefCell::new(Vec::new()));
-    let mut answer = Answer {
-        prompt: Rc::clone(&prompt),
-        input,
-        line: None,
-    };
-    let result = confirm_with_io(
-        summary,
-        decision,
-        context,
-        pending,
-        &mut answer,
-        &mut Prompt(prompt),
-    );
-    CONFIRMATION_INPUT.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(answer.input);
-        }
-    });
-    result
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
     use super::*;
-    #[test]
-    fn confirm_refuses_wrong_name() {
-        assert_eq!(
-            read_name(&mut &b"other\n"[..], "selected")
-                .unwrap_err()
-                .code(),
-            "confirm.profile_name_mismatch"
-        );
-    }
-    #[test]
-    fn confirm_refuses_end_of_input() {
-        assert_eq!(
-            read_name(&mut &b""[..], "selected").unwrap_err().code(),
-            "confirm.input_unavailable"
-        );
-    }
-    #[test]
-    fn confirm_refuses_read_error() {
-        struct Broken;
-        impl std::io::Read for Broken {
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("unavailable"))
-            }
-        }
-        impl BufRead for Broken {
-            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-                Err(std::io::Error::other("unavailable"))
-            }
-            fn consume(&mut self, _: usize) {}
-        }
-        assert_eq!(
-            read_name(&mut Broken, "selected").unwrap_err().code(),
-            "confirm.input_unavailable"
-        );
-    }
+    #[cfg(feature = "mainnet-write")]
+    use crate::common::mainnet_presence::driver;
+    #[cfg(feature = "mainnet-write")]
+    use stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture;
     #[test]
     fn confirm_ttl_follows_decision() {
         assert_eq!(ConfirmDecision::Allow.ttl_ms(), 600_000);
@@ -748,6 +669,8 @@ mod tests {
             assert!(output.contains("stellar:mainnet"));
             assert!(output.contains(&summary.string("source")));
             assert!(output.contains("Fee: 100 stroops"));
+            assert!(output.ends_with(&format!("{CONSENT_LINE}\n")), "{output}");
+            assert!(!output.contains("Type the profile name"), "{output}");
         }
     }
 
@@ -824,19 +747,18 @@ mod tests {
     }
 
     #[cfg(feature = "mainnet-write")]
-    fn confirmation_fixture(name: &str) -> (tempfile::TempDir, MainnetWriteContext, String) {
+    fn confirmation_fixture(name: &str) -> (MainnetConsentFixture, MainnetWriteContext, String) {
         confirmation_fixture_with(name, |_| {})
     }
-    /// A stored mainnet profile, edited by `edit` before it is saved, and the
-    /// write context built from it.
+    /// An enabled mainnet profile whose owner-signed policy admits the
+    /// test-support fixture credential, edited by `edit` before it is saved,
+    /// and the write context built from it.
     #[cfg(feature = "mainnet-write")]
     fn confirmation_fixture_with(
         name: &str,
         edit: impl FnOnce(&mut stellar_agent_core::profile::schema::Profile),
-    ) -> (tempfile::TempDir, MainnetWriteContext, String) {
-        use stellar_agent_core::profile::{loader, name::ResolvedProfileName, schema::Profile};
-        stellar_agent_test_support::keyring_mock::install().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+    ) -> (MainnetConsentFixture, MainnetWriteContext, String) {
+        use stellar_agent_core::profile::name::ResolvedProfileName;
         // The served source account is at sequence 1, so its next
         // transaction carries sequence 2.
         let envelope = stellar_agent_test_support::SignedTestEnvelope::builder([8; 32])
@@ -844,61 +766,71 @@ mod tests {
             .sequence(2)
             .amount_stroops(17)
             .build();
-        let mut profile = Profile::builder_mainnet_named(
-            name,
-            "https://rpc.example.invalid",
-            &format!("stellar-agent-signer-{name}"),
-            envelope.source(),
-            &format!("stellar-agent-nonce-{name}"),
-            "default",
+        let source = envelope.source().to_owned();
+        let fixture = MainnetConsentFixture::with_profile(name, |profile| {
+            profile.mcp_signer_default.account = source;
+            edit(profile);
+        });
+        let chain_key = &fixture.profile().audit_log_hash_chain_key_id;
+        stellar_agent_network::keyring::rotate_keyring_secret_32(
+            &chain_key.service,
+            &chain_key.account,
         )
-        .build();
-        profile.audit_log_path = dir.path().join("audit.jsonl");
-        edit(&mut profile);
-        for entry in [
-            &profile.attestation_key_id,
-            &profile.audit_log_hash_chain_key_id,
-        ] {
-            stellar_agent_network::keyring::rotate_keyring_secret_32(
-                &entry.service,
-                &entry.account,
-            )
-            .unwrap();
-        }
-        loader::save_to_dir(name, &profile, &dir.path().join("profiles")).unwrap();
+        .unwrap();
         let context = stellar_agent_network::NetworkContext::mainnet_write(
-            &profile,
+            fixture.profile(),
             &ResolvedProfileName::from_flag(name),
-            &dir.path().join("profiles"),
+            &fixture.home().join("profiles"),
             stellar_agent_network::MainnetEndpointFlags::default(),
         )
         .unwrap();
-        (dir, context, envelope.envelope_xdr().to_owned())
+        (fixture, context, envelope.envelope_xdr().to_owned())
     }
+
+    /// Runs the confirmation of a payment summary of `envelope` under the
+    /// fixture's current policy.
     #[cfg(feature = "mainnet-write")]
-    #[test]
+    async fn confirm(
+        fixture: &MainnetConsentFixture,
+        context: &MainnetWriteContext,
+        summary: &MainnetWriteSummary,
+    ) -> Result<ApprovalWitness, WalletError> {
+        confirm_mainnet_write(
+            summary,
+            ConfirmDecision::Allow,
+            context,
+            &fixture.current_policy(),
+            &fixture.store_path(),
+        )
+        .await
+    }
+
+    /// The pending store of the fixture profile.
+    #[cfg(feature = "mainnet-write")]
+    fn pending_store(fixture: &MainnetConsentFixture) -> PendingApprovalStore {
+        PendingApprovalStore::open(fixture.store_path()).unwrap()
+    }
+
+    /// A verified assertion of the policy's credential records one version 5
+    /// consent with its receipt and one consent row naming the mainnet
+    /// confirmation and the pay tool.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
     #[serial_test::serial]
-    fn confirm_accepts() {
-        let (dir, context, envelope) = confirmation_fixture("confirm-accepts");
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
-        let _tty = super::super::tty::tests::test_tty(true, true);
+    async fn confirm_accepts() {
+        let (fixture, context, envelope) = confirmation_fixture("confirm-accepts");
+        let _presence = driver::install(driver::fixture_credential());
         let summary =
             MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500).unwrap();
-        let mut pending = PendingApprovalStore::open(dir.path().join("pending.toml")).unwrap();
-        let witness = confirm_with_io(
-            &summary,
-            ConfirmDecision::Allow,
-            &context,
-            &mut pending,
-            &mut format!("{}\n", context.profile_name()).as_bytes(),
-            &mut Vec::new(),
-        )
-        .unwrap();
+        let witness = confirm(&fixture, &context, &summary).await.unwrap();
         assert_eq!(witness.subject(), approval_subject_classic(&envelope));
         assert_eq!(witness.expires_at_ms() - witness.created_at_ms(), 600_000);
+        assert_eq!(driver::ceremonies().len(), 1);
+        let pending = pending_store(&fixture);
         assert_eq!(pending.len(), 1);
         let entry = pending.get(witness.nonce()).unwrap();
         assert!(entry.attestation_blob_b64.is_some());
+        assert!(entry.mainnet_presence.is_some());
         let rows: Vec<serde_json::Value> =
             std::fs::read_to_string(&context.profile().audit_log_path)
                 .unwrap()
@@ -911,16 +843,16 @@ mod tests {
         assert_eq!(rows[0]["gated_tool"], "stellar_pay");
     }
     #[cfg(feature = "mainnet-write")]
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn confirm_accepts_claim_with_unknown_value() {
+    async fn confirm_accepts_claim_with_unknown_value() {
         use stellar_xdr::{
             ClaimClaimableBalanceOp, ClaimableBalanceId, Hash, Limits, Operation, OperationBody,
             WriteXdr as _,
         };
-        let (dir, context, envelope) = confirmation_fixture("confirm-claim");
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
-        let _tty = super::super::tty::tests::test_tty(true, true);
+        let (fixture, context, envelope) = confirmation_fixture("confirm-claim");
+        let _presence = driver::install(driver::fixture_credential());
+        clear_shown_summaries();
         let TransactionEnvelope::Tx(mut tx) =
             TransactionEnvelope::from_xdr_base64(&envelope, Limits::none()).unwrap()
         else {
@@ -939,18 +871,9 @@ mod tests {
             .unwrap();
         let summary =
             MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliClaim, 500).unwrap();
-        let mut pending = PendingApprovalStore::open(dir.path().join("pending.toml")).unwrap();
-        let mut output = Vec::new();
-        let witness = confirm_with_io(
-            &summary,
-            ConfirmDecision::Allow,
-            &context,
-            &mut pending,
-            &mut format!("{}\n", context.profile_name()).as_bytes(),
-            &mut output,
-        )
-        .unwrap();
+        let witness = confirm(&fixture, &context, &summary).await.unwrap();
         assert_eq!(witness.kind(), ApprovedKind::Claim);
+        let pending = pending_store(&fixture);
         let stellar_agent_core::approval::ApprovalKind::ClaimSimulated {
             summary_asset,
             summary_amount_stroops,
@@ -969,9 +892,10 @@ mod tests {
         assert_eq!(source, &summary.string("source"));
         assert_eq!(*simulated_fee_stroops, summary.fee);
         assert_eq!(*simulated_seq_num, summary.sequence);
-        let rendered = String::from_utf8(output).unwrap();
+        let shown = shown_summaries();
+        assert_eq!(shown.len(), 1);
         assert_eq!(
-            rendered
+            shown[0]
                 .matches("not known to the wallet before the claim")
                 .count(),
             2
@@ -981,12 +905,11 @@ mod tests {
         assert!(audit.contains("cli-mainnet-confirm"));
     }
     #[cfg(all(feature = "mainnet-write", feature = "test-helpers"))]
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn failed_consent_leaves_no_attestation() {
-        let (dir, context, envelope) = confirmation_fixture("confirm-failure");
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
-        let _tty = super::super::tty::tests::test_tty(true, true);
+    async fn failed_consent_leaves_no_attestation() {
+        let (fixture, context, envelope) = confirmation_fixture("confirm-failure");
+        let _presence = driver::install(driver::fixture_credential());
         let _server =
             stellar_agent_core::audit_log::writer::AuditWriterRegistry::get_or_open_keyed(
                 "confirm-server",
@@ -1009,34 +932,23 @@ mod tests {
         stellar_agent_core::audit_log::outbox::test_seam::arm_partial_write(outbox.path(), 5);
         let summary =
             MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500).unwrap();
-        let mut pending = PendingApprovalStore::open(dir.path().join("pending.toml")).unwrap();
-        let result = confirm_with_io(
-            &summary,
-            ConfirmDecision::Allow,
-            &context,
-            &mut pending,
-            &mut format!("{}\n", context.profile_name()).as_bytes(),
-            &mut Vec::new(),
-        );
+        let result = confirm(&fixture, &context, &summary).await;
         stellar_agent_core::audit_log::outbox::test_seam::disarm(outbox.path());
         assert_eq!(result.unwrap_err().code(), "audit.chain_key_unavailable");
-        let text = std::fs::read_to_string(dir.path().join("pending.toml")).unwrap();
+        assert_eq!(driver::ceremonies().len(), 1);
+        let text = std::fs::read_to_string(fixture.store_path()).unwrap();
         assert!(!text.contains("attestation_blob_b64"));
+        assert_eq!(pending_store(&fixture).len(), 0, "the parked entry is gone");
     }
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
     #[serial_test::serial]
     async fn confirmed_claim_witness_resolves() {
         use sha2::Digest as _;
+        use stellar_agent_core::approval::mainnet_fixtures::ENABLEMENT_NONCE;
         use stellar_agent_core::cross_check::{CrossCheckValue, ThresholdSet};
         use stellar_agent_core::{
             mainnet::enablement::verify_enablement,
-            policy::v1::{
-                canonical,
-                criteria::state_store::PolicyStateStore,
-                signature,
-                verified::{OwnerKeySource, PinMode, PolicyLoad, load_verified_policy},
-            },
             profile::{
                 name::ProfileNameSource, schema::signer_identity_entry_ref,
                 signer_identity::SignerIdentityRecord,
@@ -1058,7 +970,7 @@ mod tests {
             EchoIdResponder, SignedTestEnvelope, signed_envelope::get_network_result,
         };
         use stellar_xdr::*;
-        let (dir, context, encoded) =
+        let (fixture, context, encoded) =
             confirmation_fixture_with("confirm-claim-resolve", |profile| {
                 use stellar_agent_core::profile::schema::{PrimaryProviderRecord, ProviderRecord};
                 let providers = profile.providers.get_or_insert_with(Default::default);
@@ -1072,8 +984,7 @@ mod tests {
                 profile.oracle_provider_url =
                     Some("https://oracle.example.invalid".parse().unwrap());
             });
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
-        let _tty = super::super::tty::tests::test_tty(true, true);
+        let _presence = driver::install(driver::fixture_credential());
         let TransactionEnvelope::Tx(mut tx) =
             TransactionEnvelope::from_xdr_base64(&encoded, Limits::none()).unwrap()
         else {
@@ -1092,45 +1003,11 @@ mod tests {
             .unwrap();
         let summary =
             MainnetWriteSummary::from_envelope(&encoded, MainnetConsumer::CliClaim, 500).unwrap();
-        let mut pending = PendingApprovalStore::open(dir.path().join("pending.toml")).unwrap();
-        let approval = confirm_with_io(
-            &summary,
-            ConfirmDecision::Allow,
-            &context,
-            &mut pending,
-            &mut format!("{}\n", context.profile_name()).as_bytes(),
-            &mut Vec::new(),
-        )
-        .unwrap();
-        drop(pending);
-        let profile = context.profile();
-        let name = context.profile_name();
-        let owner = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
-        keyring_core::Entry::new(
-            &profile.policy_owner_key_id.service,
-            &profile.policy_owner_key_id.account,
-        )
-        .unwrap()
-        .set_password(
-            &stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()).to_string(),
-        )
-        .unwrap();
-        keyring::rotate_keyring_secret_32(
-            &profile.policy_window_state_key_id.service,
-            &profile.policy_window_state_key_id.account,
-        )
-        .unwrap();
-        let public = ed25519_dalek::SigningKey::from_bytes(&[8; 32])
-            .verifying_key()
-            .to_bytes();
-        let identity = signer_identity_entry_ref(&profile.mcp_signer_default);
-        keyring_core::Entry::new(&identity.service, &identity.account)
-            .unwrap()
-            .set_password(&SignerIdentityRecord::agent(public).render())
-            .unwrap();
-        let source = SignedTestEnvelope::builder([8; 32]).unsigned().build();
-        let nonce = "installation-nonce";
-        let nonce_digest = stellar_agent_core::hex::encode(&sha2::Sha256::digest(nonce.as_bytes()));
+        let profile = context.profile().clone();
+        let name = context.profile_name().to_owned();
+        let name = name.as_str();
+        let nonce_digest =
+            stellar_agent_core::hex::encode(&sha2::Sha256::digest(ENABLEMENT_NONCE.as_bytes()));
         let raw = include_str!("../../../stellar-agent-core/tests/fixtures/policy-v2.toml")
             .replace("operator", name)
             .replace("stellar_pay", "stellar_claim")
@@ -1141,48 +1018,44 @@ mod tests {
             .replace(&"0".repeat(64), &nonce_digest)
             .replace("decision = \"require_approval\"", "decision = \"allow\"")
             .replace("ttl_secs = 3600", "")
-            .replace("reason = \"review\"", "");
-        let signed = signature::sign(
-            &signature::digest(&canonical::canonical_bytes(&raw).unwrap()),
-            &owner,
-        );
-        let path = dir.path().join("policy.toml");
-        std::fs::write(
-            &path,
-            format!(
-                "{raw}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
-                stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()),
-                stellar_agent_core::hex::encode(&signed)
-            ),
+            .replace("reason = \"review\"", "")
+            .replace(
+                "sequence = 7",
+                &format!("sequence = {}", fixture.sequence() + 1),
+            );
+        fixture.write_signed(&raw);
+        let policy = fixture.current_policy();
+        let approval = confirm_mainnet_write(
+            &summary,
+            ConfirmDecision::Allow,
+            &context,
+            &policy,
+            &fixture.store_path(),
         )
+        .await
         .unwrap();
-        let window_path = dir.path().join("state.window");
-        let policy = load_verified_policy(
-            &PolicyLoad {
-                path: &path,
-                profile,
-                profile_name: name,
-                owner_pubkey: &owner.verifying_key().to_bytes(),
-                owner_source: OwnerKeySource::Keyring,
-                window_path: &window_path,
-            },
-            PolicyStateStore::new(),
-            PinMode::Advance,
-        )
-        .unwrap();
+        let public = ed25519_dalek::SigningKey::from_bytes(&[8; 32])
+            .verifying_key()
+            .to_bytes();
+        let identity = signer_identity_entry_ref(&profile.mcp_signer_default);
+        keyring_core::Entry::new(&identity.service, &identity.account)
+            .unwrap()
+            .set_password(&SignerIdentityRecord::agent(public).render())
+            .unwrap();
+        let source = SignedTestEnvelope::builder([8; 32]).unsigned().build();
         let enablement = verify_enablement(
             &policy,
             name,
             ProfileNameSource::Flag,
-            profile,
-            &dir.path().join("profiles"),
-            &|_| Ok(nonce.to_owned()),
+            &profile,
+            &fixture.home().join("profiles"),
+            &|_| Ok(ENABLEMENT_NONCE.to_owned()),
         )
         .unwrap();
         let signer = keyring::enrolled_signer(
             name,
-            &dir.path().join("profiles"),
-            profile,
+            &fixture.home().join("profiles"),
+            &profile,
             keyring::EnrolledRole::Agent,
             &public,
         )
@@ -1241,7 +1114,7 @@ mod tests {
         };
         assert_eq!(witness.authority(), "https://oracle.example.invalid");
         assert!(!oracle.received_requests().await.unwrap().is_empty());
-        let store = PersistedWindowStore::at_path(window_path);
+        let store = PersistedWindowStore::for_profile(name);
         let request = |witness| TxSignRequest {
             context: &context,
             consumer: MainnetConsumer::CliClaim,
@@ -1291,70 +1164,164 @@ mod tests {
             .count()
     }
 
-    /// Drives the confirmation with `streams` as the terminal state of
-    /// stdin and stderr and `typed` as the operator's line, and returns the
-    /// refusal code after asserting that nothing was recorded.
+    /// Drives the confirmation with `presence` as the browser side, or the
+    /// release adapter when it is `None`, and returns the refusal code after
+    /// asserting that nothing was recorded and the parked entry is gone.
     #[cfg(feature = "mainnet-write")]
-    fn refused_confirmation(name: &str, streams: (bool, bool), typed: &str) -> String {
-        let (dir, context, envelope) = confirmation_fixture(name);
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
-        let _tty = super::super::tty::tests::test_tty(streams.0, streams.1);
+    async fn refused_confirmation(name: &str, presence: Option<driver::Driver>) -> String {
+        let (fixture, context, envelope) = confirmation_fixture(name);
+        let _presence = presence.map(driver::install);
         let summary =
             MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500).unwrap();
-        let mut pending = PendingApprovalStore::open(dir.path().join("pending.toml")).unwrap();
-        let mut output = Vec::new();
-        let code = confirm_with_io(
-            &summary,
-            ConfirmDecision::Allow,
-            &context,
-            &mut pending,
-            &mut typed.as_bytes(),
-            &mut output,
-        )
-        .unwrap_err()
-        .code()
-        .to_owned();
-        assert_eq!(pending.len(), 0);
+        let code = confirm(&fixture, &context, &summary)
+            .await
+            .unwrap_err()
+            .code()
+            .to_owned();
+        assert_eq!(pending_store(&fixture).len(), 0);
         assert_eq!(consent_rows(&context), 0);
-        let stored = std::fs::read_to_string(dir.path().join("pending.toml")).unwrap_or_default();
+        let stored = std::fs::read_to_string(fixture.store_path()).unwrap_or_default();
         assert!(!stored.contains("attestation_blob_b64"), "{stored}");
         code
     }
 
+    /// Without a ceremony the release adapter refuses, and terminal input is
+    /// never read: a reported terminal and a reported absence of one both
+    /// end in `approval.presence_required`.
     #[cfg(feature = "mainnet-write")]
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn confirm_refuses_a_stream_that_is_not_a_terminal() {
-        for (index, streams) in [(false, true), (true, false)].into_iter().enumerate() {
+    async fn confirm_without_a_ceremony_records_nothing() {
+        for (index, streams) in [(true, true), (false, false)].into_iter().enumerate() {
+            let _tty = super::super::tty::tests::test_tty(streams.0, streams.1);
+            let checks = super::super::tty::tests::TEST_TTY_CHECKS.get();
             assert_eq!(
-                refused_confirmation(
-                    &format!("confirm-tty-{index}"),
-                    streams,
-                    &format!("confirm-tty-{index}\n"),
-                ),
-                "confirm.tty_required",
+                refused_confirmation(&format!("confirm-closed-{index}"), None).await,
+                "approval.presence_required",
                 "{streams:?}"
+            );
+            assert_eq!(super::super::tty::tests::TEST_TTY_CHECKS.get(), checks);
+        }
+    }
+
+    /// A missing browser, a canceled ceremony, an assertion over another
+    /// challenge, one without user verification and one of a credential
+    /// the signed policy does not list all refuse with nothing recorded.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn confirm_refuses_a_failed_or_invalid_presence() {
+        use stellar_agent_test_support::webauthn::{
+            FLAG_UP, FLAG_UV, TestAuthenticator, fixture_authenticator,
+        };
+        let refusing = |failure: fn() -> ApprovalFailure| -> driver::Driver {
+            Box::new(move |_| Err(WalletError::Approval(failure())))
+        };
+        let cases: Vec<(driver::Driver, &str)> = vec![
+            (
+                refusing(|| ApprovalFailure::PresenceBrowserRequired),
+                "approval.presence_browser_required",
+            ),
+            (
+                refusing(|| ApprovalFailure::PresenceCanceled),
+                "approval.presence_canceled",
+            ),
+            (
+                driver::over_another_challenge(driver::fixture_credential()),
+                "approval.presence_invalid",
+            ),
+            (
+                driver::credential(fixture_authenticator(), FLAG_UP),
+                "approval.presence_invalid",
+            ),
+            (
+                driver::credential(
+                    TestAuthenticator::from_seed([0x33; 32], vec![0x44; 16]),
+                    FLAG_UP | FLAG_UV,
+                ),
+                "approval.presence_invalid",
+            ),
+        ];
+        for (index, (presence, expected)) in cases.into_iter().enumerate() {
+            assert_eq!(
+                refused_confirmation(&format!("confirm-refused-{index}"), Some(presence)).await,
+                expected,
+                "case {index}"
             );
         }
     }
 
+    /// The store is released during the ceremony: another handle opens it,
+    /// sees the parked unattested entry, and the confirmation still
+    /// completes afterwards.
     #[cfg(feature = "mainnet-write")]
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn confirm_refuses_a_wrong_profile_name() {
-        assert_eq!(
-            refused_confirmation("confirm-name", (true, true), "confirm-other\n"),
-            "confirm.profile_name_mismatch"
-        );
+    async fn confirm_releases_the_store_during_the_ceremony() {
+        let (fixture, context, envelope) = confirmation_fixture("confirm-released");
+        let store_path = fixture.store_path();
+        let seen = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = std::rc::Rc::clone(&seen);
+        let mut answer = driver::fixture_credential();
+        let _presence = driver::install(Box::new(move |ceremony| {
+            let other = PendingApprovalStore::open(store_path.clone()).unwrap();
+            let parked = other.get(&ceremony.nonce).unwrap();
+            assert!(parked.attestation_blob_b64.is_none());
+            observed.set(true);
+            drop(other);
+            answer(ceremony)
+        }));
+        let summary =
+            MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500).unwrap();
+        confirm(&fixture, &context, &summary).await.unwrap();
+        assert!(seen.get(), "the ceremony ran with the store released");
+        assert_eq!(consent_rows(&context), 1);
+    }
+
+    /// A policy signed at a higher sequence during the ceremony refuses the
+    /// consent, although the same credential signed: the challenge bound
+    /// the earlier policy.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn confirm_refuses_a_policy_changed_during_the_ceremony() {
+        let (fixture, context, envelope) = confirmation_fixture("confirm-policy-changed");
+        let policy = fixture.current_policy();
+        let policy_path = fixture.policy_path();
+        let original = std::fs::read_to_string(&policy_path).unwrap();
+        fixture.write_signed(&fixture.policy_body(
+            fixture.sequence() + 1,
+            &[&stellar_agent_test_support::webauthn::fixture_authenticator()],
+        ));
+        let higher = std::fs::read_to_string(&policy_path).unwrap();
+        std::fs::write(&policy_path, &original).unwrap();
+        let mut answer = driver::fixture_credential();
+        let _presence = driver::install(Box::new(move |ceremony| {
+            std::fs::write(&policy_path, &higher).unwrap();
+            answer(ceremony)
+        }));
+        let summary =
+            MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500).unwrap();
+        let error = confirm_mainnet_write(
+            &summary,
+            ConfirmDecision::Allow,
+            &context,
+            &policy,
+            &fixture.store_path(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), "approval.presence_policy_unavailable");
+        assert_eq!(consent_rows(&context), 0);
+        assert_eq!(pending_store(&fixture).len(), 0);
     }
 
     #[cfg(feature = "mainnet-write")]
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn confirm_without_the_attestation_key_records_nothing() {
-        let (dir, context, envelope) = confirmation_fixture("confirm-no-key");
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
-        let _tty = super::super::tty::tests::test_tty(true, true);
+    async fn confirm_without_the_attestation_key_records_nothing() {
+        let (fixture, context, envelope) = confirmation_fixture("confirm-no-key");
+        let _presence = driver::install(driver::fixture_credential());
         let key = &context.profile().attestation_key_id;
         keyring_core::Entry::new(&key.service, &key.account)
             .unwrap()
@@ -1362,27 +1329,18 @@ mod tests {
             .unwrap();
         let summary =
             MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500).unwrap();
-        let mut pending = PendingApprovalStore::open(dir.path().join("pending.toml")).unwrap();
-        confirm_with_io(
-            &summary,
-            ConfirmDecision::Allow,
-            &context,
-            &mut pending,
-            &mut format!("{}\n", context.profile_name()).as_bytes(),
-            &mut Vec::new(),
-        )
-        .unwrap_err();
-        assert_eq!(pending.len(), 0);
+        confirm(&fixture, &context, &summary).await.unwrap_err();
+        assert!(driver::ceremonies().is_empty(), "no ceremony starts");
+        assert_eq!(pending_store(&fixture).len(), 0);
         assert_eq!(consent_rows(&context), 0);
     }
 
     #[cfg(feature = "mainnet-write")]
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn confirm_without_a_consent_sink_records_nothing() {
-        let (dir, context, envelope) = confirmation_fixture("confirm-no-sink");
-        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
-        let _tty = super::super::tty::tests::test_tty(true, true);
+    async fn confirm_without_a_consent_sink_records_nothing() {
+        let (fixture, context, envelope) = confirmation_fixture("confirm-no-sink");
+        let _presence = driver::install(driver::fixture_credential());
         let chain_key = &context.profile().audit_log_hash_chain_key_id;
         keyring_core::Entry::new(&chain_key.service, &chain_key.account)
             .unwrap()
@@ -1390,20 +1348,12 @@ mod tests {
             .unwrap();
         let summary =
             MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500).unwrap();
-        let mut pending = PendingApprovalStore::open(dir.path().join("pending.toml")).unwrap();
-        let error = confirm_with_io(
-            &summary,
-            ConfirmDecision::Allow,
-            &context,
-            &mut pending,
-            &mut format!("{}\n", context.profile_name()).as_bytes(),
-            &mut Vec::new(),
-        )
-        .unwrap_err();
+        let error = confirm(&fixture, &context, &summary).await.unwrap_err();
         assert_eq!(error.code(), "audit.chain_key_unavailable");
-        assert_eq!(pending.len(), 0);
+        assert!(driver::ceremonies().is_empty(), "no ceremony starts");
+        assert_eq!(pending_store(&fixture).len(), 0);
         assert_eq!(consent_rows(&context), 0);
-        let stored = std::fs::read_to_string(dir.path().join("pending.toml")).unwrap_or_default();
+        let stored = std::fs::read_to_string(fixture.store_path()).unwrap_or_default();
         assert!(!stored.contains("attestation_blob_b64"), "{stored}");
     }
 

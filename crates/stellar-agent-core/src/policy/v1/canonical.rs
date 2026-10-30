@@ -22,8 +22,14 @@
 //!    policy schema before it verifies the signature (see
 //!    [`crate::policy::v1::schema::validate_policy_keys`]), so every key the
 //!    loader reads, the `[signature]` table excepted, is in the signed bytes.
-//! 5. All comments stripped.
-//! 6. Whitespace normalised; no trailing whitespace; no BOM.
+//! 5. The mainnet binding's `approval_credentials` array is validated and
+//!    emitted sorted by raw credential ID, each entry an inline table with
+//!    `credential_id_b64url` then `public_key_sec1_b64url` in canonical
+//!    base64url, so reordering entries or their keys keeps the bytes and
+//!    changing an ID or a key changes them. A body without the array keeps
+//!    its bytes.
+//! 6. All comments stripped.
+//! 7. Whitespace normalised; no trailing whitespace; no BOM.
 //!
 //! ## Determinism guarantee
 //!
@@ -187,6 +193,13 @@ fn build_canonical_document(doc: &DocumentMut) -> Result<String, PolicyError> {
                             thresholds.insert(key, Item::Value(canonical_scalar(value)?));
                         }
                         table.insert(key, Item::Table(thresholds));
+                    } else if *key == "approval_credentials" {
+                        table.insert(
+                            key,
+                            Item::Value(
+                                super::approval_credentials::canonical_approval_credentials(item)?,
+                            ),
+                        );
                     } else {
                         table.insert(key, Item::Value(canonical_scalar(item)?));
                     }
@@ -508,6 +521,74 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    /// The canonical bytes carry every approval credential's ID and key:
+    /// changing either changes the bytes, while the entry order, the key
+    /// order inside an entry and the spacing do not.
+    #[test]
+    fn credential_canonicalization_signs_id_and_key() {
+        use stellar_agent_test_support::webauthn::TestAuthenticator;
+        let first = TestAuthenticator::from_seed([0x21; 32], vec![0x5a; 16]);
+        let second = TestAuthenticator::from_seed([0x33; 32], vec![0x44; 16]);
+        let entry = |id: &str, key: &str| {
+            format!("{{ credential_id_b64url = \"{id}\", public_key_sec1_b64url = \"{key}\" }}")
+        };
+        let document = |credentials: &str| {
+            format!(
+                "version = 2\nscope = \"profile:main\"\nsequence = 1\n[mainnet]\n\
+                 profile = \"main\"\napproval_credentials = {credentials}\nrules = []\n"
+            )
+        };
+        let bytes = |credentials: &str| canonical_bytes(&document(credentials)).unwrap();
+        let one = entry(
+            &first.credential_id_b64url(),
+            &first.public_key_sec1_b64url(),
+        );
+        let two = entry(
+            &second.credential_id_b64url(),
+            &second.public_key_sec1_b64url(),
+        );
+        let reference = bytes(&format!("[{one}, {two}]"));
+        let text = String::from_utf8(reference.clone()).unwrap();
+        assert!(text.contains(&first.credential_id_b64url()), "{text}");
+        assert!(text.contains(&first.public_key_sec1_b64url()), "{text}");
+        assert!(text.contains(&second.public_key_sec1_b64url()), "{text}");
+
+        assert_eq!(bytes(&format!("[{two}, {one}]")), reference, "entry order");
+        assert_eq!(
+            bytes(&format!(
+                "[ {{public_key_sec1_b64url=\"{}\",credential_id_b64url=\"{}\"}} , {two} ]",
+                first.public_key_sec1_b64url(),
+                first.credential_id_b64url()
+            )),
+            reference,
+            "key order and spacing"
+        );
+        let other_id = entry(
+            &TestAuthenticator::from_seed([0x21; 32], vec![0x5b; 16]).credential_id_b64url(),
+            &first.public_key_sec1_b64url(),
+        );
+        assert_ne!(
+            bytes(&format!("[{other_id}, {two}]")),
+            reference,
+            "another ID"
+        );
+        let other_key = entry(
+            &first.credential_id_b64url(),
+            &second.public_key_sec1_b64url(),
+        );
+        assert_ne!(
+            bytes(&format!("[{other_key}, {two}]")),
+            reference,
+            "another key"
+        );
+        assert_ne!(
+            bytes(&format!("[{one}]")),
+            reference,
+            "a removed credential"
+        );
+        assert!(canonical_bytes(&document("[{ credential_id_b64url = \"AA\" }]")).is_err());
+    }
 
     #[test]
     fn canonical_bytes_rejects_non_array_rules() {

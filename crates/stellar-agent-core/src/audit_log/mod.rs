@@ -155,8 +155,8 @@ pub use reader::{AuditLogIntegrityError, AuditReader, PinnedHashesRecord};
 pub use rotation::{SidecarResignError, resign_chain_root_sidecars};
 pub use schema::{
     CrossCheckRecord, EVENT_KIND_VARIANT_COUNT, EventKind, ExecutableRefPin, KeyPurpose,
-    PinsUpdateReason, PolicyDecision, TipAnchorReason, ValueActionKind, ValueLegRecord,
-    executable_refs_or_empty,
+    MainnetPresenceAudit, PinsUpdateReason, PolicyDecision, TipAnchorReason, ValueActionKind,
+    ValueLegRecord, executable_refs_or_empty,
 };
 pub use signer_set::{
     BaselineReason, DOMAIN_SA_ACCOUNT_ID_V1, DOMAIN_SA_SIGNER_SET_V1, DOMAIN_SA_SIGNER_SET_V2,

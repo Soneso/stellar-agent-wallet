@@ -14,6 +14,8 @@
 //! - `stellar-agent approve list`: enumerate pending approvals (read-only).
 //! - `stellar-agent approve serve`: local web UI for the pending-approval
 //!   queue (loopback HTTP; approve/reject in a browser).
+//! - `stellar-agent approve credential enroll --profile <name>`: enroll a
+//!   WebAuthn approval credential for the owner-signed mainnet policy.
 //!
 //! # Dispatch
 //!
@@ -44,6 +46,7 @@
 
 mod common;
 pub(crate) use common::{approval_store_dir, approval_store_open_error};
+pub mod credential;
 pub mod gc;
 pub mod list;
 pub mod operator;
@@ -105,6 +108,10 @@ pub enum ApproveSubcommand {
 
     /// Manage operator-approval credentials for the remote-approval surface.
     Operator(operator::OperatorArgs),
+
+    /// Manage the WebAuthn approval credentials of the owner-signed mainnet
+    /// policy.
+    Credential(credential::CredentialArgs),
 }
 
 /// Runs the `approve` subcommand group.
@@ -128,6 +135,9 @@ pub async fn dispatch(args: ApproveArgs) -> i32 {
         Some(ApproveSubcommand::List(list_args)) => list::run(list_args).await,
         Some(ApproveSubcommand::Serve(serve_args)) => serve::run(serve_args).await,
         Some(ApproveSubcommand::Operator(operator_args)) => operator::dispatch(operator_args).await,
+        Some(ApproveSubcommand::Credential(credential_args)) => {
+            credential::dispatch(credential_args).await
+        }
         None => run::run(args.run).await,
     }
 }
@@ -147,6 +157,7 @@ impl ApproveArgs {
             Some(ApproveSubcommand::List(a)) => a.profile.as_deref(),
             Some(ApproveSubcommand::Serve(a)) => a.profile.as_deref(),
             Some(ApproveSubcommand::Operator(a)) => a.profile_flag(),
+            Some(ApproveSubcommand::Credential(a)) => a.profile_flag(),
             None => self.run.profile.as_deref(),
         }
     }

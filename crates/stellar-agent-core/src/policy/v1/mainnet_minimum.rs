@@ -67,6 +67,7 @@ requirements! {
     FeeCap => "fee_cap",
     Thresholds => "thresholds",
     Ttl => "ttl",
+    ApprovalCredentials => "approval_credentials",
 }
 
 /// The detail of every `[mainnet]` table requirement when the table is absent.
@@ -269,12 +270,24 @@ pub fn evaluate(
                 Requirement::Ttl,
                 (!ttl_ok).then(|| "authorization_ttl_seconds must be between 1 and 120".to_owned()),
             );
+            findings.body(
+                Requirement::ApprovalCredentials,
+                super::approval_credentials::parse_approval_credentials(
+                    mainnet.get("approval_credentials"),
+                )
+                .err()
+                .map(|error| match error {
+                    PolicyError::PolicyFileParseFailed { detail } => detail,
+                    _ => super::approval_credentials::DETAIL_MISSING.to_owned(),
+                }),
+            );
         }
         None => {
             for requirement in [
                 Requirement::FeeCap,
                 Requirement::Thresholds,
                 Requirement::Ttl,
+                Requirement::ApprovalCredentials,
             ] {
                 findings.body(requirement, Some(table_failure.to_owned()));
             }

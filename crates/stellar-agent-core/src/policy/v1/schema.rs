@@ -27,6 +27,7 @@ pub(crate) const MAINNET_KEYS: &[&str] = &[
     "classic_max_fee_per_op_stroops",
     "authorization_ttl_seconds",
     "cross_check_thresholds",
+    "approval_credentials",
 ];
 
 /// Keys of the previous owner's rotation statement, in canonical order.
@@ -161,6 +162,7 @@ pub fn validate_policy_keys(doc: &DocumentMut) -> Result<(), PolicyError> {
     reject_unknown_keys(doc.as_table(), root, None, "the policy file")?;
     if let Some(mainnet) = doc.get("mainnet").and_then(Item::as_table_like) {
         reject_unknown_keys(mainnet, MAINNET_KEYS, Some("mainnet"), "the mainnet table")?;
+        super::approval_credentials::reject_unknown_fields(mainnet.get("approval_credentials"))?;
         if let Some(thresholds) = mainnet
             .get("cross_check_thresholds")
             .and_then(Item::as_table_like)

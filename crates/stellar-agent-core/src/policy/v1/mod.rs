@@ -88,6 +88,8 @@ pub mod value;
 /// Owner-signed policy file loader.
 pub mod loader;
 
+/// The signed approval credentials of a mainnet policy.
+pub mod approval_credentials;
 /// Network-aware classic and contract asset identities.
 pub mod asset_equivalence;
 /// Canonical-form serializer for owner-signature pre-image.
@@ -120,6 +122,7 @@ pub mod proptest_strategies;
 #[cfg(test)]
 mod proptest_properties;
 
+pub use approval_credentials::parse_approval_credentials;
 pub use criteria::Criterion;
 pub use criteria::PolicyStateStore;
 pub use loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId, validate_unsigned_policy};

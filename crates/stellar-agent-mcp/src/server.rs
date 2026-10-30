@@ -1666,6 +1666,25 @@ impl WalletServer {
         Ok(())
     }
 
+    /// The startup mainnet policy, when the signed policy and enablement on
+    /// disk still verify to the startup facts; `None` on a server without
+    /// mainnet admission state or after any change.
+    pub(crate) fn current_mainnet_policy(
+        &self,
+    ) -> Option<&stellar_agent_core::mainnet::verified_policy::VerifiedPolicy> {
+        let guard = MainnetWriteGuard {
+            context: self.mainnet_context.as_deref()?,
+            policy: self
+                .verified_policy
+                .as_deref()
+                .filter(|policy| policy.mainnet().is_some())?,
+            enablement: self.enablement.as_deref()?,
+            profiles_dir: self.profiles_dir.as_deref()?,
+        };
+        self.verify_mainnet_freshness(&guard).ok()?;
+        Some(guard.policy)
+    }
+
     pub(crate) fn mainnet_enrolled_signer(
         &self,
         guard: &MainnetWriteGuard<'_>,

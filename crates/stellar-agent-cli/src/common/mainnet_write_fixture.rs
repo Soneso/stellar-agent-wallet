@@ -9,8 +9,10 @@
 //! in-memory mock store that every keyring initialization keeps, so the
 //! runners' own initialization and the verbs' initializer reach the same
 //! entries. It is not a headless store, so the mainnet keyring-backend check
-//! passes as it does on the platform keyring. The terminal check passes and the
-//! confirmation answers the profile name unless a test says otherwise.
+//! passes as it does on the platform keyring. The enabled policy admits the
+//! test-support fixture credential, and every presence ceremony is answered
+//! with an assertion of that credential over the issued challenge, verified
+//! by the core verifier, unless a test installs another driver.
 //!
 //! Every test that builds a fixture is `#[serial]`: the data root, the
 //! environment, the keyring store and the mainnet clock are process-global.
@@ -22,7 +24,7 @@
     reason = "test fixture; a failed setup step fails the calling test loudly"
 )]
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -52,7 +54,8 @@ use crate::commands::profile::{
     enable_mainnet, enroll_owner_key, enroll_signer, rotate_attestation_key, rotate_audit_key,
     rotate_nonce_key, sign_policy,
 };
-use crate::common::mainnet_confirm::{ConfirmationInputGuard, set_confirmation_input};
+use crate::common::mainnet_confirm::{clear_shown_summaries, shown_summaries};
+use crate::common::mainnet_presence::driver::{self, Ceremony, Driver, DriverGuard};
 use crate::common::mainnet_write::{TestRoutesGuard, set_test_routes};
 use crate::common::signer_ceremony::{LedgerSignerFactoryGuard, set_ledger_signer_factory};
 use crate::common::tty::tests::{TestTty, test_tty, tty_checks_on_this_thread};
@@ -310,8 +313,7 @@ pub(crate) struct MainnetFixture {
     /// The oracle endpoint.
     pub(crate) oracle: MockServer,
     calls: Rc<Cell<usize>>,
-    prompts: Rc<RefCell<Vec<String>>>,
-    confirmation: Option<ConfirmationInputGuard>,
+    presence: Option<DriverGuard>,
     tty: Option<TestTty>,
     tty_checks_at_start: u64,
     _routes: TestRoutesGuard,
@@ -461,16 +463,14 @@ impl MainnetFixture {
         home: tempfile::TempDir,
     ) -> Self {
         let calls = Rc::new(Cell::new(0));
-        let prompts = Rc::new(RefCell::new(Vec::new()));
-        let confirmation = Self::answering(&prompts, name.to_owned());
+        clear_shown_summaries();
         Self {
             name,
             agent,
             primary,
             oracle,
             calls,
-            prompts,
-            confirmation: Some(confirmation),
+            presence: Some(driver::install(driver::fixture_credential())),
             tty: Some(test_tty(true, true)),
             tty_checks_at_start: tty_checks_on_this_thread(),
             _routes: routes,
@@ -575,6 +575,19 @@ impl MainnetFixture {
             toml_edit::value(NATIVE_THRESHOLD_STROOPS.to_string()),
         );
         doc["mainnet"]["cross_check_thresholds"] = toml_edit::Item::Table(thresholds);
+        let authenticator = stellar_agent_test_support::webauthn::fixture_authenticator();
+        let mut credential = toml_edit::InlineTable::new();
+        credential.insert(
+            "credential_id_b64url",
+            authenticator.credential_id_b64url().into(),
+        );
+        credential.insert(
+            "public_key_sec1_b64url",
+            authenticator.public_key_sec1_b64url().into(),
+        );
+        let mut credentials = toml_edit::Array::new();
+        credentials.push(credential);
+        doc["mainnet"]["approval_credentials"] = toml_edit::value(credentials);
         let sequence = doc
             .get("sequence")
             .and_then(toml_edit::Item::as_integer)
@@ -587,29 +600,19 @@ impl MainnetFixture {
         );
     }
 
-    /// Installs a confirmation that records the prompt and answers `line`.
-    fn answering(prompts: &Rc<RefCell<Vec<String>>>, line: String) -> ConfirmationInputGuard {
-        let prompts = Rc::clone(prompts);
-        set_confirmation_input(Box::new(move |prompt| {
-            prompts.borrow_mut().push(prompt.to_owned());
-            Ok(Some(line.clone()))
-        }))
-    }
-
-    /// Answers every later confirmation through `input`; the prompts are
-    /// still recorded.
-    pub(crate) fn answer_with(
+    /// Answers every later presence ceremony through `driver`, starting
+    /// with an empty ceremony record.
+    pub(crate) fn present_with(
         &mut self,
-        mut input: impl FnMut(&str) -> std::io::Result<Option<String>> + 'static,
+        driver: impl FnMut(
+            &Ceremony,
+        ) -> Result<stellar_agent_core::approval::AssertionInput, WalletError>
+        + 'static,
     ) {
-        let prompts = Rc::clone(&self.prompts);
-        // The previous guard clears the input when it drops, so it goes
-        // before the new input is set.
-        self.confirmation = None;
-        self.confirmation = Some(set_confirmation_input(Box::new(move |prompt| {
-            prompts.borrow_mut().push(prompt.to_owned());
-            input(prompt)
-        })));
+        // The previous guard clears the driver when it drops, so it goes
+        // before the new driver is installed.
+        self.presence = None;
+        self.presence = Some(driver::install(Box::new(driver) as Driver));
     }
 
     /// Reports `stdin` and `stderr` as the terminal state.
@@ -620,21 +623,27 @@ impl MainnetFixture {
         self.tty = Some(test_tty(stdin, stderr));
     }
 
-    /// The prompts the confirmation rendered, oldest first.
-    pub(crate) fn prompts(&self) -> Vec<String> {
-        self.prompts.borrow().clone()
+    /// The summaries the confirmation showed, oldest first.
+    pub(crate) fn summaries(&self) -> Vec<String> {
+        shown_summaries()
     }
 
-    /// How often the mainnet terminal check ran since the fixture was built.
+    /// The presence ceremonies the confirmation started, oldest first.
+    pub(crate) fn ceremonies(&self) -> Vec<Ceremony> {
+        driver::ceremonies()
+    }
+
+    /// How often a terminal check ran since the fixture was built.
     pub(crate) fn terminal_checks(&self) -> u64 {
         tty_checks_on_this_thread() - self.tty_checks_at_start
     }
 
-    /// Fails unless the run neither checked the terminal nor rendered a
-    /// prompt.
-    pub(crate) fn assert_terminal_untouched(&self) {
+    /// Fails unless the run showed no summary, started no presence ceremony
+    /// and checked no terminal.
+    pub(crate) fn assert_no_consent_ceremony(&self) {
         assert_eq!(self.terminal_checks(), 0, "the terminal is never checked");
-        assert!(self.prompts().is_empty(), "the terminal is never asked");
+        assert!(self.summaries().is_empty(), "no summary is shown");
+        assert!(self.ceremonies().is_empty(), "no ceremony starts");
     }
 
     fn policy_path_of(name: &str) -> PathBuf {

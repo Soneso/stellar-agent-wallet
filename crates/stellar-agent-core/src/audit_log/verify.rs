@@ -2269,6 +2269,7 @@ mod tests {
                 envelope_sha256_hex: Some("a".repeat(64)),
                 nonce_prefix: "AAAAAAAA".to_owned(),
                 origin: "cli".to_owned(),
+                mainnet_presence: None,
             },
             EventKind::ApprovalRejected {
                 approval_kind: "PaymentSimulated".to_owned(),

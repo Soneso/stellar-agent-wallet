@@ -283,6 +283,8 @@ jobs:
           node-version: 24.5.0
       - name: Test the inbox renderers
         run: node --test crates/stellar-agent-approval-ui/src/web/app_shared.test.mjs
+      - name: Test the mainnet enrollment page
+        run: node --test crates/stellar-agent-approval-ui/src/web/mainnet-presence.test.mjs
 
   mpp-interop:
     name: mpp released-sdk interop

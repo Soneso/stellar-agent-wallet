@@ -785,7 +785,9 @@ mod tests {
                 &binding,
                 Surface::Cli,
                 stellar_agent_core::approval::ConsentAudit::Writer(&mut audit_writer),
-                &stellar_agent_core::approval::AttestedApprover::Local,
+                stellar_agent_core::approval::ConsentAuthorization::Standard(
+                    &stellar_agent_core::approval::AttestedApprover::Local,
+                ),
                 |_, _| Err("MPP cannot persist a toolset grant".to_owned()),
             )
             .expect("attest MPP entry");
@@ -923,7 +925,9 @@ mod tests {
                 &binding,
                 Surface::Cli,
                 stellar_agent_core::approval::ConsentAudit::Writer(&mut audit_writer),
-                &stellar_agent_core::approval::AttestedApprover::Local,
+                stellar_agent_core::approval::ConsentAuthorization::Standard(
+                    &stellar_agent_core::approval::AttestedApprover::Local,
+                ),
                 |_, _| Err("MPP cannot persist a toolset grant".to_owned()),
             )
             .expect("the fingerprint does not cover the edited field");

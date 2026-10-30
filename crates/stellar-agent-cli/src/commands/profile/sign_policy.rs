@@ -1620,6 +1620,150 @@ mod tests {
         );
     }
 
+    /// A mainnet body whose `approval_credentials` list is missing, empty or
+    /// malformed is refused with the shared validator's detail inside the
+    /// established wrappers, leaving the file byte-identical and no pin; the
+    /// valid list signs, and the verified loader accepts the result.
+    #[tokio::test]
+    #[serial]
+    async fn sign_policy_refuses_invalid_credentials_without_writing() {
+        use stellar_agent_core::policy::v1::verified::{
+            OwnerKeySource, PinMode, PolicyLoad, load_verified_policy,
+        };
+        let full = include_str!("../../../../stellar-agent-core/tests/fixtures/policy-v2.toml")
+            .replace("operator", PROFILE_NAME);
+        let entry = full
+            .lines()
+            .find(|line| line.trim_start().starts_with("{ credential_id_b64url"))
+            .unwrap()
+            .trim()
+            .trim_end_matches(',')
+            .to_owned();
+        let list = |entries: &str| format!("approval_credentials = [{entries}]");
+        let with_list = |replacement: &str| {
+            let start = full.find("approval_credentials = [").unwrap();
+            let end = start + full[start..].find("\n]\n").unwrap() + 2;
+            format!("{}{replacement}{}", &full[..start], &full[end..])
+        };
+        let invalid_id = entry.replace("WlpaWlpaWlpaWlpaWlpaWg", "WlpaWlpaWlpaWlpaWlpa");
+        let invalid_key = entry.replace("BEYt", "BEYu");
+        let unknown = entry.replace(" }", ", label = \"phone\" }");
+        let cases = [
+            (
+                with_list(""),
+                "policy.mainnet_minimum_unmet",
+                "policy.mainnet_minimum_unmet: requirement=approval_credentials, rule=None",
+            ),
+            (
+                with_list(&list("")),
+                "sign_policy.canonicalization_failed",
+                "policy.mainnet_minimum_unmet: requirement=approval_credentials, rule=None",
+            ),
+            (
+                with_list(&list(&invalid_id)),
+                "sign_policy.canonicalization_failed",
+                "mainnet.approval_credentials contains an invalid credential id",
+            ),
+            (
+                with_list(&list(&format!("{entry}, {entry}"))),
+                "sign_policy.canonicalization_failed",
+                "mainnet.approval_credentials contains a duplicate credential id",
+            ),
+            (
+                with_list(&list(&invalid_key)),
+                "sign_policy.canonicalization_failed",
+                "mainnet.approval_credentials contains an invalid P-256 public key",
+            ),
+            (
+                with_list(&list(&unknown)),
+                "sign_policy.canonicalization_failed",
+                "mainnet.approval_credentials contains an unknown field",
+            ),
+        ];
+        for (body, code, detail) in cases {
+            let (exit, envelope, after, _pk, dir) =
+                sign_mainnet_file_holding("CREDENTIALS", &body).await;
+            assert_eq!(exit, 1, "{detail}: {envelope}");
+            assert_eq!(envelope["error"]["code"], code, "{detail}: {envelope}");
+            let message = envelope["error"]["message"].as_str().unwrap();
+            assert!(message.contains(detail), "{detail}: {message}");
+            assert_eq!(after, body, "{detail}: the file is left byte-identical");
+            assert!(
+                !stellar_agent_core::profile::schema::default_policy_window_state_path_for(
+                    PROFILE_NAME
+                )
+                .exists(),
+                "{detail}: no pin is written"
+            );
+            drop(dir);
+        }
+        let (exit, envelope, _after, pk, dir) =
+            sign_mainnet_file_holding("CREDENTIALS_OK", &full).await;
+        assert_eq!(exit, 0, "{envelope}");
+        let profile = mainnet_profile_for(PROFILE_NAME);
+        let verified = load_verified_policy(
+            &PolicyLoad {
+                path: &dir.path().join("policy.toml"),
+                profile: &profile,
+                profile_name: PROFILE_NAME,
+                owner_pubkey: &pk,
+                owner_source: OwnerKeySource::Keyring,
+                window_path: &dir.path().join("state.window"),
+            },
+            stellar_agent_core::policy::v1::PolicyStateStore::new(),
+            PinMode::CompareOnly,
+        )
+        .unwrap();
+        let credentials = &verified.mainnet().unwrap().approval_credentials;
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(
+            credentials[0].credential_id_b64url(),
+            "WlpaWlpaWlpaWlpaWlpaWg"
+        );
+    }
+
+    /// The mainnet counterpart of [`profile_for`], on the policy fixture's
+    /// endpoint host.
+    fn mainnet_profile_for(name: &str) -> Profile {
+        let mut profile = Profile::builder_mainnet_named(
+            name,
+            "https://rpc.example.invalid",
+            "stellar-agent-signer",
+            "default",
+            "stellar-agent-nonce",
+            "default",
+        )
+        .build();
+        profile.wallet.mlock_required = MlockRequired::Warn;
+        profile
+    }
+
+    /// [`sign_file_holding`] for the mainnet profile of
+    /// [`mainnet_profile_for`].
+    async fn sign_mainnet_file_holding(
+        tag: &str,
+        body: &str,
+    ) -> (i32, serde_json::Value, String, [u8; 32], TempDir) {
+        keyring_mock::install().expect("mock store");
+        let (s_strkey, pk, _g) = seed_material([0x66u8; 32]);
+        enroll_owner_pubkey(PROFILE_NAME, &pk);
+        let dir = TempDir::new().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(dir.path());
+        let path = dir.path().join("policy.toml");
+        std::fs::write(&path, body).unwrap();
+        let var = unique_var(tag);
+        let _guard = EnvGuard::set(var.clone(), &s_strkey);
+        crate::common::render::take_rendered_for_test();
+        let profile = mainnet_profile_for(PROFILE_NAME);
+        let code =
+            run_with_dependencies(&args(&path, &var), move |_n| Ok(profile.clone()), || Ok(()))
+                .await;
+        let mut rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1, "one envelope per run: {rendered:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        (code, rendered.remove(0), after, pk, dir)
+    }
+
     #[test]
     #[serial]
     fn unsigned_and_minimum_validation_precede_signing() {

@@ -144,6 +144,7 @@ endpoint_host = "rpc.example.invalid"
 installation_nonce_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 classic_max_fee_per_op_stroops = 500
 authorization_ttl_seconds = 60
+approval_credentials = [{ credential_id_b64url = "WlpaWlpaWlpaWlpaWlpaWg", public_key_sec1_b64url = "BEYtuhrk_BqWi02s8gzdbb4frjSqlxUUpj00BcPRz9ODtYu7CMEzg0KMWFPHHEyFHhNLBWgh5Gj-Cpd6v0MT3eE" }]
 
 [mainnet.cross_check_thresholds]
 "USD:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" = "100"
@@ -185,6 +186,72 @@ macro_rules! minimum {
         }
     };
 }
+/// The mainnet minimum requires one to sixteen well-formed, distinct
+/// approval credentials; an absent, empty, malformed or duplicated list is
+/// unmet with its own detail.
+#[test]
+fn mainnet_minimum_requires_approval_credentials() {
+    let profile = profile(true);
+    let entry = |id: &str| {
+        format!(
+            "{{ credential_id_b64url = \"{id}\", public_key_sec1_b64url = \"BEYtuhrk_BqWi02s8gzdbb4frjSqlxUUpj00BcPRz9ODtYu7CMEzg0KMWFPHHEyFHhNLBWgh5Gj-Cpd6v0MT3eE\" }}"
+        )
+    };
+    let fixture = entry("WlpaWlpaWlpaWlpaWlpaWg");
+    let seventeen = (0..17_u8)
+        .map(|i| {
+            entry(&format!(
+                "WlpaWlpaWlpaWlpaWlpa{}",
+                [
+                    "AA", "AQ", "Ag", "Aw", "BA", "BQ", "Bg", "Bw", "CA", "CQ", "Cg", "Cw", "DA",
+                    "DQ", "Dg", "Dw", "EA"
+                ][usize::from(i)]
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cases = [
+        ("absent", None),
+        ("empty", Some("[]".to_owned())),
+        (
+            "malformed id",
+            Some(format!("[{}]", entry("WlpaWlpaWlpaWlpaWlpaWg=="))),
+        ),
+        ("duplicate", Some(format!("[{fixture}, {fixture}]"))),
+        ("seventeen", Some(format!("[{seventeen}]"))),
+    ];
+    for (label, array) in cases {
+        let mut doc = FULL.parse::<DocumentMut>().unwrap();
+        let mainnet = doc["mainnet"].as_table_like_mut().unwrap();
+        mainnet.remove("approval_credentials");
+        if let Some(array) = array {
+            let parsed = format!("v = {array}").parse::<DocumentMut>().unwrap();
+            mainnet.insert("approval_credentials", parsed["v"].clone());
+        }
+        let failures = mainnet_minimum::failures(&doc, &profile, "operator");
+        assert!(
+            failures.iter().any(|error| matches!(
+                error,
+                PolicyError::MainnetMinimumUnmet {
+                    requirement: "approval_credentials",
+                    rule: None,
+                }
+            )),
+            "{label}: {failures:?}"
+        );
+        let outcome = mainnet_minimum::evaluate(&doc, &profile, "operator")
+            .into_iter()
+            .find(|outcome| outcome.requirement == "approval_credentials")
+            .unwrap();
+        assert!(
+            matches!(outcome.status, RequirementStatus::Failed { .. }),
+            "{label}: {outcome:?}"
+        );
+    }
+    let doc = FULL.parse::<DocumentMut>().unwrap();
+    assert!(mainnet_minimum::failures(&doc, &profile, "operator").is_empty());
+}
+
 fn rule(doc: &mut DocumentMut) -> &mut toml_edit::Table {
     doc["rules"]
         .as_array_of_tables_mut()
@@ -1721,15 +1788,22 @@ fn minimum_report_lists_every_requirement_with_its_status() {
     );
 
     for outcome in evaluate(&without_mainnet().parse::<DocumentMut>().unwrap()) {
-        let expected =
-            if ["mainnet_table", "fee_cap", "thresholds", "ttl"].contains(&outcome.requirement) {
-                RequirementStatus::Failed {
-                    rules: vec![],
-                    detail: "the [mainnet] table is missing".into(),
-                }
-            } else {
-                RequirementStatus::Passed
-            };
+        let expected = if [
+            "mainnet_table",
+            "fee_cap",
+            "thresholds",
+            "ttl",
+            "approval_credentials",
+        ]
+        .contains(&outcome.requirement)
+        {
+            RequirementStatus::Failed {
+                rules: vec![],
+                detail: "the [mainnet] table is missing".into(),
+            }
+        } else {
+            RequirementStatus::Passed
+        };
         assert_eq!(outcome.status, expected, "{}", outcome.requirement);
     }
 

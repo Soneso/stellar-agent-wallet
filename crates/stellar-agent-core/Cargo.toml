@@ -42,6 +42,10 @@ schemars = { workspace = true }
 toml_edit = { workspace = true }
 blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
+# P-256 for approval credentials: SEC1 key validation in the signed mainnet
+# policy and ES256 verification of WebAuthn assertions. Pure Rust, so core
+# links no OpenSSL.
+p256 = { workspace = true }
 region = { workspace = true }
 # File identity for the audit writer's replaced-underneath-the-handle check:
 # `Handle` compares device+inode on Unix and the volume serial plus file index
@@ -72,13 +76,18 @@ stellar-agent-windows-identity = { workspace = true }
 # and the build information that reports the feature. Disabled by default.
 mainnet-write = []
 
-# Exposes policy strategies and verified audit reads to integration tests,
-# which do not receive cfg(test).
-test-helpers = ["dep:proptest", "dep:stellar-agent-test-support"]
+# Exposes policy strategies, verified audit reads and the mainnet consent
+# fixture to integration tests, which do not receive cfg(test). The fixture
+# signs WebAuthn assertions with the test-support authenticator.
+test-helpers = [
+    "dep:proptest",
+    "dep:stellar-agent-test-support",
+    "stellar-agent-test-support/test-helpers",
+]
 
 [dev-dependencies]
 proptest = { workspace = true }
-stellar-agent-test-support = { path = "../stellar-agent-test-support" }
+stellar-agent-test-support = { path = "../stellar-agent-test-support", features = ["test-helpers"] }
 serial_test = { workspace = true }
 rand_core = { workspace = true }
 # `test-util` (paused-clock control for `rpc_budget`'s deterministic timeout

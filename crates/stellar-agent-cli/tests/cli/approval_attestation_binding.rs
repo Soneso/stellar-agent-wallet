@@ -1,9 +1,10 @@
 //! The approve binary binds attestations to the selected profile and network
 //! and reports approval refusals without persisting consent.
 //!
-//! On mainnet the operator approves at a terminal without `--yes`: the binary
-//! refuses `--yes` and refuses a missing terminal, in both cases before the
-//! approval store is opened, so the pending file stays byte-identical.
+//! On mainnet the binary refuses `--yes` before the approval store is
+//! opened, and without it refuses with `approval.presence_required`: no
+//! passkey ceremony is available, and terminal input is no consent. Either
+//! way the pending file stays byte-identical.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -211,7 +212,7 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
         (true, ApprovalCase::Attest | ApprovalCase::Trustline | ApprovalCase::UnknownNonce) => {
             Some("approve.yes_refused_on_mainnet")
         }
-        (true, ApprovalCase::ClosedStdin) => Some("confirm.tty_required"),
+        (true, ApprovalCase::ClosedStdin) => Some("approval.presence_required"),
         (false, ApprovalCase::UnknownNonce) => Some("approval.not_found"),
         (false, ApprovalCase::ClosedStdin) => Some("approval.denied"),
         (false, ApprovalCase::Attest | ApprovalCase::Trustline) => None,
@@ -312,7 +313,7 @@ fn approve_binary_mainnet_refuses_yes() {
 
 #[test]
 #[serial]
-fn approve_binary_mainnet_without_a_terminal_refuses() {
+fn approve_binary_mainnet_without_yes_refuses_without_presence() {
     approve_binary_case(true, ApprovalCase::ClosedStdin);
 }
 

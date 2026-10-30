@@ -4504,7 +4504,7 @@ mod tests {
 
             assert_refused_before_confirmation(&fixture, &run, "auth.enrolled_signer_unpinned")
                 .await;
-            fixture.assert_terminal_untouched();
+            fixture.assert_no_consent_ceremony();
         }
 
         /// Enrollment: a source other than the enrolled key refuses with the
@@ -4534,7 +4534,7 @@ mod tests {
                     .unwrap()
                     .contains("public_key_mismatch")
             );
-            fixture.assert_terminal_untouched();
+            fixture.assert_no_consent_ceremony();
         }
 
         /// Claim confirmation: the prompt shows the asset and the amount as
@@ -4591,9 +4591,10 @@ mod tests {
             assert_eq!(*fee_stroops, 100);
             assert_eq!(open.len(), 1, "{open:?}");
             assert_eq!(open[0].consumer, MainnetConsumer::CliClaim);
-            let prompts = fixture.prompts();
-            assert_eq!(prompts.len(), 1);
-            let prompt = &prompts[0];
+            let summaries = fixture.summaries();
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(fixture.ceremonies().len(), 1);
+            let prompt = &summaries[0];
             assert!(prompt.contains(balance_id_strkey.as_str()), "{prompt}");
             assert!(prompt.contains(&fixture.agent.g), "{prompt}");
             assert!(prompt.contains("Fee: 100 stroops"), "{prompt}");

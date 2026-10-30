@@ -344,6 +344,11 @@ Additional refusals:
 - `sign_policy.sequence_exhausted`: the previous maximum is `i64::MAX`.
 - `policy.mainnet_table_on_testnet`: a testnet profile carries `[mainnet]`.
 - `policy.mainnet_minimum_unmet`: an enabled mainnet policy omits a restriction.
+  A `[mainnet]` table without `approval_credentials` refuses with
+  `requirement=approval_credentials` in either build.
+- `sign_policy.canonicalization_failed` also reports an empty or malformed
+  `approval_credentials` list with a fixed detail, such as
+  `mainnet.approval_credentials contains an invalid P-256 public key`.
 - `policy.state_lock_busy`: another writer holds the lock through three attempts.
 - `policy.state_lock_io`: the lock file cannot be opened; the detail gives the I/O kind.
 - `policy.pin_unusable`: the installation's policy pin cannot be read or is malformed.
@@ -358,7 +363,8 @@ its signature does not verify for this body.
 After signing an enabled mainnet policy, restart the MCP server. A stale
 startup binding refuses with `network.mainnet_write_forbidden` and
 `enablement or policy changed, restart the server`. Missing startup authority
-names its missing prerequisite instead.
+names its missing prerequisite instead. A mainnet approval recorded under the
+previous policy needs fresh consent.
 
 ### `profile enable-mainnet`
 
@@ -394,7 +400,9 @@ The ceremony records `mainnet_enablement_minted` through the
 strict audit writer, stores an installation nonce, then atomically rewrites
 the policy with the profile, normalized endpoint host, and nonce digest.
 The operator supplies the fee cap, optional authorization
-TTL, and thresholds, then signs the policy as the output's `next` list directs.
+TTL, thresholds, and at least one approval credential from
+`approve credential enroll`, then signs the policy as the output's `next`
+list directs.
 
 See [the policy schema and minimum](../profiles.md#mainnet-policy-body) for
 required signed fields and rules. After enablement, complete and sign the
@@ -431,7 +439,9 @@ engine, such as starting the MCP server, recreates it, and the nonce stays.
 `--check` reports every check with the status `passed`, `failed`, or
 `not_evaluated` and a detail, and exits `1` when any check failed. The checks
 are the preconditions, `verified_policy`, `pin`, `enablement`, every minimum
-restriction in either build, and `oracle_provider_url`. The last fails when
+restriction in either build, and `oracle_provider_url`. A policy without
+approval credentials fails `verified_policy` with
+`requirement=approval_credentials`. The last fails when
 the profile names no oracle, and its detail names what is missing. `--check`
 reads the prerequisite state, keyring entries included, and writes no nonce,
 pin, policy change, or audit row.
@@ -736,6 +746,7 @@ The recorded process uid must match the approving local user.
 Consent records an HMAC attestation, or persists a toolset grant and consumes its pending request.
 The versioned HMAC binds the profile name, CAIP-2 chain id, approval nonce, digest, and process uid.
 The agent verifies it before executing.
+On a mainnet profile, consent also requires a verified passkey assertion from an approval credential in the owner-signed policy, and this release refuses every mainnet consent with `approval.presence_required`; see [Mainnet write behavior](index.md#mainnet-write-behavior).
 See [concepts](../concepts.md) for the attestation model and [toolsets](../toolsets.md) for first-invoke grants.
 
 A `require_approval` rule's `ttl_secs` sets the pending entry's lifetime,
@@ -777,7 +788,14 @@ Both inboxes label it `INCONSISTENT` and offer only Reject.
 Nothing is attested for it on any surface.
 
 The `approve`, `approve gc`, `approve list`, and `approve serve` commands return failures with `error.code` and a plain diagnostic message.
-These failures carry `approval.*` codes: `approval.not_found`, `approval.expired`, `approval.already_attested`, `approval.user_mismatch`, `approval.clock_error`, `approval.sha256_hex_error`, `approval.key_decode_failed`, `approval.key_length_error`, `approval.binding_mismatch`, `approval.grant_persist`, `approval.wrong_kind`, `approval.rejected`, `approval.consumed`, `approval.record_failed`, `approval.uid_unavailable`, `approval.denied`, `approval.store_dir_error`, `approval.permission_denied`, `approval.invalid_nonce_length`, `approval.writer_locked`, `approval.store_open_failed`, `approval.gc_failed`, `approval.entry_inconsistent`, `approval.operator_credential_revoked`, `approval.remote_authorization_unavailable`.
+These failures carry `approval.*` codes: `approval.not_found`, `approval.expired`, `approval.already_attested`, `approval.user_mismatch`, `approval.clock_error`, `approval.sha256_hex_error`, `approval.key_decode_failed`, `approval.key_length_error`, `approval.binding_mismatch`, `approval.grant_persist`, `approval.wrong_kind`, `approval.rejected`, `approval.consumed`, `approval.record_failed`, `approval.uid_unavailable`, `approval.denied`, `approval.store_dir_error`, `approval.permission_denied`, `approval.invalid_nonce_length`, `approval.writer_locked`, `approval.store_open_failed`, `approval.gc_failed`, `approval.entry_inconsistent`, `approval.operator_credential_revoked`, `approval.remote_authorization_unavailable`, `approval.presence_required`, `approval.presence_policy_unavailable`, `approval.mainnet_remote_unsupported`.
+`approval.presence_invalid`: The passkey assertion fails verification; start a fresh consent.
+`approval.presence_changed`: The pending request or policy differs from the displayed consent; reload it.
+`approval.presence_expired`: The presence deadline expires; start a fresh consent.
+`approval.presence_consumed`: The challenge is consumed; start a fresh consent.
+`approval.presence_unavailable`: The presence ceremony cannot complete; check the local browser and authenticator.
+`approval.presence_canceled`: The presence ceremony is canceled; no approval is recorded.
+`approval.presence_browser_required`: The ceremony requires a local browser; no approval is recorded.
 `approval.gc_failed` reports a collection failure from `approve gc`.
 `approval.operator_credential_revoked` reports a remote approval whose operator credential is missing from the profile's `allowed_credentials` list or from the operator-credential store; `approval.remote_authorization_unavailable` reports that the profile's remote-approval authorization or the operator-credential store could not be read, or that the profile does not enable remote approval for that chain.
 `approval.entry_inconsistent` reports a payment, claim, or trustline request whose stored digest is not the digest of its stored envelope, or whose envelope does not decode, and an MPP charge request whose shown terms do not match what it would authorize.
@@ -790,8 +808,9 @@ State-changing (records an attestation or a grant in the on-disk pending-approva
 - `--id <NONCE>` (required in this form) — the approval nonce printed in the agent surface's simulate response.
 - `--profile <NAME>` — the profile whose attestation key and pending-approval store to use. Optional; resolves from `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
 - `--yes` — non-interactive auto-approve. Bypasses the stdin prompt; the wallet-controlled summary is still printed so there is a visible record. Intended for trusted automation and tests, not routine operator use.
+  It applies to a testnet profile only: a mainnet profile refuses it before store access with `approve.yes_refused_on_mainnet`.
 
-Interactively, the command prints the summary and prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. It exits `1` when the nonce is unknown, expired, already attested, created by a different local user, inconsistent, denied at the prompt, or on an I/O error.
+On a mainnet profile the command prints the summary, then refuses with `approval.presence_required` and records nothing; it reads no terminal input. On a testnet profile, interactively, the command prints the summary and prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. It exits `1` when the nonce is unknown, expired, already attested, created by a different local user, inconsistent, denied at the prompt, or on an I/O error.
 
 The `approval_attested` audit row is written before the approval is persisted. When an MCP server or `approve serve` inbox holds that profile's audit writer, the row is queued in the audit outbox. The running process appends it to the log before any process loads a signing key for the approved action. The envelope's `audit` field says which happened: `"written"` or `"queued"`. The command refuses, persists nothing, and exits `1` when the writer is held by a process that does not drain the outbox (`audit.writer_locked`). It does the same on any other audit failure. Examples are a missing audit key, a rolled-back log (`audit.tip_anchor_mismatch`), and a busy outbox (`audit.outbox_busy`).
 
@@ -877,6 +896,9 @@ every later decision until the inbox restarts. `approve serve` itself refuses
 to start while another process, such as a running MCP server, holds the audit
 writer (`audit.writer_locked`).
 
+On a mainnet profile, Approve answers HTTP 403 with `approval.presence_required`
+and records nothing; Reject works.
+
 The printed URL contains a single-use bootstrap token: the first visit
 exchanges it for an HttpOnly session cookie and an origin-scoped session
 proof, and the token dies. The page keeps the proof in the tab's session
@@ -937,7 +959,8 @@ host, without an SSH tunnel. Requires the profile's `[remote_approval]` block
 with `enabled = true` AND `--confirm-remote-exposure` as a separate, explicit
 consent flag; either alone refuses to start. See
 [Remote approval](../remote-approval.md) for the full setup, trust model, and
-walkthrough.
+walkthrough. The remote listener approves testnet requests only: an approve of
+a mainnet request answers HTTP 403 with `approval.mainnet_remote_unsupported`.
 
 ### `approve operator enroll`
 
@@ -1085,13 +1108,69 @@ To revoke an operator credential, remove its id from the profile's
 `[remote_approval] allowed_credentials` list first, then run this command.
 Either step alone already revokes the credential: a running listener reads
 the list and the store at every login and decision and stops honoring the
-credential at once, and a mainnet commit refuses every pending approval
-that credential approved and that is not yet committed. Doing both keeps a
-later edit of one of them from authorizing the credential again.
+credential at once. Doing both keeps a later edit of one of them from
+authorizing the credential again. Operator credentials approve remote testnet
+requests only and do not change the mainnet approval credentials of the
+signed policy.
 
 ```json
 {"ok":true,"data":{"removed":true},"request_id":"..."}
 ```
+
+### `approve credential enroll`
+
+```bash
+stellar-agent approve credential enroll --profile operator --label laptop
+```
+
+Enrolls a WebAuthn approval credential for the owner-signed mainnet policy and
+prints its policy entry. It writes nothing: no profile, policy, keyring entry,
+or operator-credential store changes. The credential approves mainnet consent
+only after the owner adds the entry to `mainnet.approval_credentials` and signs
+the policy; see [Approval credentials](../profiles.md#approval-credentials).
+
+- `--profile <NAME>` (required): a persisted mainnet profile. Neither an
+  enabled installation nor a mainnet policy is required, so a credential can be
+  enrolled before the policy that lists it.
+- `--label <LABEL>`: pre-fills the page's label field. The label stays on the
+  page and is absent from the output.
+- `--timeout-seconds <SECS>`: one deadline for the browser registration and
+  the terminal code, from 1 to 600 (default 300).
+
+The command needs a terminal on stdin and stderr and a local browser. It
+starts a one-shot server on `127.0.0.1` and opens the page at
+`http://localhost:<port>` through a private redirect file; the bearer URL is
+never printed. The page creates a passkey with relying-party ID `localhost`
+over the server's single-use challenge, and the server verifies the
+registration as `approve operator enroll --interactive` does, user presence
+and user verification included. The page then shows a 16-hex-digit
+confirmation code derived from the credential under a mainnet-approval domain,
+so a code from a remote-operator enrollment page never matches. Type it at the
+terminal before the deadline. On success stdout carries one envelope and
+stderr a reminder to add the entry, review the key, and sign the policy:
+
+```json
+{"ok":true,"data":{"profile":"operator","rp_id":"localhost","credential_id_b64url":"<id>","public_key_sec1_b64url":"<key>","credential_fingerprint":"sha256:<hex>","policy_entry_toml":"{ credential_id_b64url = \"<id>\", public_key_sec1_b64url = \"<key>\" }"},"request_id":"..."}
+```
+
+`credential_fingerprint` is the SHA-256 of a domain tag, the length-prefixed
+credential ID, and the public key; mainnet audit rows name a credential by it.
+
+Exits `1` on refusal, and exports nothing:
+
+| Code | Message |
+|---|---|
+| `approve.credential_enroll_tty_required` | `Approval credential enrollment needs a terminal on stdin and stderr to type the code shown by the browser.` |
+| `approve.credential_enroll_profile_required` | `Approval credential enrollment requires a persisted mainnet profile selected with --profile.` |
+| `approval.presence_browser_required` | `Mainnet consent requires a local browser with WebAuthn user verification; no approval is recorded.` No display, or the browser did not open. |
+| `approve.credential_enroll_confirmation_mismatch` | `The confirmation code does not match the browser credential; no policy credential is exported.` |
+| `approve.credential_enroll_expired` | `The approval credential enrollment deadline has passed; no policy credential is exported.` |
+| `approve.credential_enroll_canceled` | `Approval credential enrollment is canceled; no policy credential is exported.` Ctrl-C, or the prompt ended without a code. |
+| `approve.credential_enroll_unavailable` | `The approval credential enrollment cannot start or complete; no policy credential is exported.` |
+
+A profile that does not load for a safety reason keeps the loader's refusal.
+To revoke an approval credential, remove its entry from the policy and sign
+the policy at a higher sequence.
 
 ## `audit`
 

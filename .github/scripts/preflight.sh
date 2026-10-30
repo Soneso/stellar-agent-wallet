@@ -23,7 +23,8 @@
 #   surface    each path that is_scanned of check-install-surface.py accepts:
 #              the Markdown files and manifests that check reads
 #   skill      skills/, .claude-plugin/
-#   inbox-js   crates/stellar-agent-approval-ui/src/web/
+#   inbox-js   crates/stellar-agent-approval-ui/src/web/ and
+#              crates/stellar-agent-approval-ui/src/operator_enroll/web/
 #   rust       crates/, tests/, examples/, and the root files Cargo.toml,
 #              Cargo.lock, rust-toolchain.toml, rustfmt.toml, Cross.toml, and
 #              deny.toml
@@ -159,6 +160,7 @@ coverage-floors	python3 .github/scripts/check-coverage.py cov-feature-off.json -
 coverage:feature-on	cargo llvm-cov --workspace --features mainnet-write,$OFFLINE_FEATURES --json --output-path cov-feature-on.json	cargo,cargo-llvm-cov	coverage.yml	coverage	Measure feature-on offline line coverage
 coverage-floors:feature-on	python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on	-	coverage.yml	coverage	Enforce feature-on line-coverage floors
 inbox-js	node --test crates/stellar-agent-approval-ui/src/web/app_shared.test.mjs	node	ci.yml	inbox-js	Test the inbox renderers
+mainnet-presence-js	node --test crates/stellar-agent-approval-ui/src/web/mainnet-presence.test.mjs	node	ci.yml	inbox-js	Test the mainnet enrollment page
 interop:mpp	.github/scripts/test-mpp-interop.sh	node,corepack	ci.yml	mpp-interop	Run the MPP interop harness
 interop:sdk-v17	.github/scripts/test-sdk-v17-interop.sh	node,corepack	ci.yml	sdk-v17-interop	Run the stellar-sdk v17 interop harness
 EOF
@@ -388,7 +390,10 @@ select_for_path() {
       ;;
   esac
   case "$path" in
-    crates/stellar-agent-approval-ui/src/web/*) select_gate inbox-js ;;
+    crates/stellar-agent-approval-ui/src/web/* | crates/stellar-agent-approval-ui/src/operator_enroll/web/*)
+      select_gate inbox-js
+      select_gate mainnet-presence-js
+      ;;
   esac
   select_self_tests "$path"
   case "$path" in

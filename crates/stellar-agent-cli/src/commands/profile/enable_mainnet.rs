@@ -439,6 +439,10 @@ pub(super) fn execute(
         "Set [mainnet].classic_max_fee_per_op_stroops, optional authorization_ttl_seconds, \
          and cross_check_thresholds."
             .to_owned(),
+        format!(
+            "Enroll an approval credential with stellar-agent approve credential enroll \
+             --profile {name} and add its entry to [mainnet].approval_credentials."
+        ),
         format!("stellar-agent profile sign-policy --profile {name} --secret-env OWNER_SEED"),
     ];
     if !cfg!(feature = "mainnet-write") {
@@ -651,6 +655,28 @@ fn inspection_checks(
                 checks.push(check(requirement, Status::NotEvaluated, not_loaded()));
             }
         }
+    }
+    // The parsed credential requirement also fails when an empty list has
+    // no canonical form, so this row stays actionable without a document.
+    if let Ok(PolicyInspection {
+        verified:
+            Err(
+                error @ PolicyError::MainnetMinimumUnmet {
+                    requirement: "approval_credentials",
+                    ..
+                },
+            ),
+        ..
+    }) = inspection
+        && let Some(row) = checks
+            .iter_mut()
+            .find(|row| row.item == "approval_credentials")
+    {
+        *row = check(
+            "approval_credentials",
+            Status::Failed,
+            Some(policy_failure(error)),
+        );
     }
     checks
 }
@@ -901,14 +927,36 @@ mod tests {
                     .replace("sequence = 7", &format!("sequence = {sequence}")),
             );
         }
-        /// Completes the rewritten policy with a fee cap and `sequence`, signs
-        /// it, and loads it with installation verification.
-        fn sign_rewritten_and_verify(&self, sequence: i64) -> VerifiedPolicy {
+        /// The rewritten policy completed with a fee cap, `sequence` and
+        /// `credentials` approval credential entries, unsigned.
+        fn rewritten_body(&self, sequence: i64, credentials: usize) -> String {
             let raw = std::fs::read_to_string(self.path()).unwrap();
             let mut doc = raw.parse::<toml_edit::DocumentMut>().unwrap();
+            doc.remove("signature");
             doc["mainnet"]["classic_max_fee_per_op_stroops"] = toml_edit::value(500);
             doc["sequence"] = toml_edit::value(sequence);
-            let body = doc.to_string();
+            let authenticator = stellar_agent_test_support::webauthn::fixture_authenticator();
+            let mut list = toml_edit::Array::new();
+            for _ in 0..credentials {
+                let mut credential = toml_edit::InlineTable::new();
+                credential.insert(
+                    "credential_id_b64url",
+                    authenticator.credential_id_b64url().into(),
+                );
+                credential.insert(
+                    "public_key_sec1_b64url",
+                    authenticator.public_key_sec1_b64url().into(),
+                );
+                list.push(credential);
+            }
+            doc["mainnet"]["approval_credentials"] = toml_edit::value(list);
+            doc.to_string()
+        }
+        /// Completes the rewritten policy with a fee cap, `sequence` and the
+        /// fixture approval credential, signs it, and loads it with
+        /// installation verification.
+        fn sign_rewritten_and_verify(&self, sequence: i64) -> VerifiedPolicy {
+            let body = self.rewritten_body(sequence, 1);
             stellar_agent_core::policy::v1::validate_unsigned_policy(&body, "operator").unwrap();
             self.sign(&body);
             let owner = self.owner.verifying_key().to_bytes();
@@ -1050,6 +1098,8 @@ mod tests {
             "classic_max_fee_per_op_stroops",
             "authorization_ttl_seconds",
             "cross_check_thresholds",
+            "approval_credentials",
+            "stellar-agent approve credential enroll --profile operator",
         ] {
             assert!(next.contains(field));
         }
@@ -1439,6 +1489,74 @@ mod tests {
         assert_eq!(get(&owner), Some(older));
         assert_eq!(get(&fixture.nonce_ref()), None);
         assert!(!fixture.dir.path().join("audit.jsonl").exists());
+    }
+    /// A first enablement from a v2 policy without `[mainnet]` still pins
+    /// and enables. The check then names `approval_credentials` when the
+    /// owner signed the bound body without one or with an empty list, and
+    /// passes it once the body lists a credential.
+    #[test]
+    #[serial]
+    fn enablement_check_reports_approval_credentials() {
+        let mut fixture = Fixture::new();
+        fixture.run().unwrap();
+        assert!(get(&fixture.nonce_ref()).is_some());
+        assert!(matches!(fixture.pin(), PinState::Present(_)));
+        let bound = std::fs::read_to_string(fixture.path()).unwrap();
+        fixture.args.check = true;
+        // The owner signs the body without the array; the empty array has
+        // no canonical form, so it is added to the signed file afterwards.
+        for empty in [false, true] {
+            std::fs::write(fixture.path(), &bound).unwrap();
+            let mut doc = fixture
+                .rewritten_body(2, 0)
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            doc["mainnet"]
+                .as_table_like_mut()
+                .unwrap()
+                .remove("approval_credentials");
+            fixture.sign(&doc.to_string());
+            if empty {
+                let signed = std::fs::read_to_string(fixture.path()).unwrap();
+                let mut signed = signed.parse::<toml_edit::DocumentMut>().unwrap();
+                signed["mainnet"]["approval_credentials"] =
+                    toml_edit::value(toml_edit::Array::new());
+                std::fs::write(fixture.path(), signed.to_string()).unwrap();
+            }
+            let output = fixture.run().unwrap();
+            assert_eq!(output["valid"], false, "{empty}");
+            assert_eq!(
+                check_of(&output, "approval_credentials"),
+                (
+                    "failed".to_owned(),
+                    Some(
+                        "policy.mainnet_minimum_unmet: requirement=approval_credentials, rule=None"
+                            .to_owned()
+                    )
+                ),
+                "{empty}"
+            );
+            let (status, detail) = check_of(&output, "verified_policy");
+            assert_eq!(status, "failed", "{empty}");
+            assert!(
+                detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("requirement=approval_credentials"),
+                "{empty}: {detail:?}"
+            );
+        }
+        std::fs::write(fixture.path(), &bound).unwrap();
+        fixture.sign(&fixture.rewritten_body(2, 1));
+        let output = fixture.run().unwrap();
+        assert_eq!(
+            check_of(&output, "approval_credentials"),
+            ("passed".to_owned(), None)
+        );
+        assert_eq!(
+            check_of(&output, "verified_policy"),
+            ("passed".to_owned(), None)
+        );
     }
     #[test]
     #[serial]

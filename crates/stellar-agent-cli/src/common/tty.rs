@@ -1,13 +1,8 @@
-//! Terminal requirements for interactive operator prompts: mainnet consent
-//! and the operator-enrollment confirmation code.
+//! Terminal requirements for interactive operator prompts: the confirmation
+//! codes of operator enrollment and approval credential enrollment. Mainnet
+//! consent reads no terminal.
 
 use std::io::IsTerminal as _;
-use stellar_agent_core::error::{ValidationError, WalletError};
-
-pub(crate) fn require_tty_for_mainnet() -> Result<(), WalletError> {
-    let (stdin, stderr) = terminal_streams();
-    require_streams(stdin, stderr)
-}
 
 /// Whether stdin and stderr are both terminals, the condition every
 /// interactive operator prompt needs.
@@ -30,13 +25,6 @@ fn terminal_streams() -> (bool, bool) {
     )
 }
 
-fn require_streams(stdin: bool, stderr: bool) -> Result<(), WalletError> {
-    if !stdin || !stderr {
-        return Err(ValidationError::ConfirmTtyRequired.into());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
@@ -44,11 +32,12 @@ pub(crate) mod tests {
 
     thread_local! {
         /// The terminal state of stdin and stderr that
-        /// [`require_tty_for_mainnet`] reports in place of the real streams.
+        /// [`stdin_and_stderr_are_terminals`] reports in place of the real
+        /// streams.
         pub(crate) static TEST_TTY: std::cell::Cell<Option<(bool, bool)>> =
             const { std::cell::Cell::new(None) };
-        /// How often [`require_tty_for_mainnet`] answered from [`TEST_TTY`] on
-        /// this thread.
+        /// How often [`stdin_and_stderr_are_terminals`] answered from
+        /// [`TEST_TTY`] on this thread.
         pub(crate) static TEST_TTY_CHECKS: std::cell::Cell<u64> =
             const { std::cell::Cell::new(0) };
     }
@@ -68,41 +57,25 @@ pub(crate) mod tests {
         TestTty(TEST_TTY.replace(Some((stdin, stderr))))
     }
 
-    /// How often [`require_tty_for_mainnet`] answered from the reported
-    /// terminal state on this thread.
+    /// How often [`stdin_and_stderr_are_terminals`] answered from the
+    /// reported terminal state on this thread.
     #[cfg(feature = "mainnet-write")]
     pub(crate) fn tty_checks_on_this_thread() -> u64 {
         TEST_TTY_CHECKS.get()
     }
 
-    /// Every check under a reported terminal state is counted, whether it
-    /// passes or refuses.
+    /// Every check under a reported terminal state is counted, and both
+    /// streams must be terminals.
     #[test]
     fn each_reported_check_is_counted() {
         let previous = TEST_TTY.replace(Some((true, false)));
         let before = TEST_TTY_CHECKS.get();
-        assert_eq!(
-            require_tty_for_mainnet().unwrap_err().code(),
-            "confirm.tty_required"
-        );
+        assert!(!stdin_and_stderr_are_terminals());
+        TEST_TTY.set(Some((false, true)));
+        assert!(!stdin_and_stderr_are_terminals());
         TEST_TTY.set(Some((true, true)));
-        require_tty_for_mainnet().unwrap();
-        assert_eq!(TEST_TTY_CHECKS.get() - before, 2);
+        assert!(stdin_and_stderr_are_terminals());
+        assert_eq!(TEST_TTY_CHECKS.get() - before, 3);
         TEST_TTY.set(previous);
-    }
-
-    #[test]
-    fn confirm_refuses_non_tty_stdin() {
-        assert_eq!(
-            require_streams(false, true).unwrap_err().code(),
-            "confirm.tty_required"
-        );
-    }
-    #[test]
-    fn confirm_refuses_non_tty_stderr() {
-        assert_eq!(
-            require_streams(true, false).unwrap_err().code(),
-            "confirm.tty_required"
-        );
     }
 }

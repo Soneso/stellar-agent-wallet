@@ -186,13 +186,20 @@ fn parse_mainnet(doc: &DocumentMut, profile: &Profile) -> Result<Option<MainnetB
             table.get("cross_check_thresholds"),
             &profile.network_passphrase,
         )?,
+        approval_credentials: super::approval_credentials::parse_approval_credentials(
+            table.get("approval_credentials"),
+        )?,
     }))
 }
 
 /// Validates profile-dependent fields before a policy is signed.
 ///
+/// A present `[mainnet]` table requires `approval_credentials` with at least
+/// one credential in every build.
+///
 /// # Errors
-/// Refuses malformed mainnet fields or a mainnet table on testnet.
+/// Refuses malformed mainnet fields, a mainnet table without approval
+/// credentials, or a mainnet table on testnet.
 pub fn validate_profile_body(doc: &DocumentMut, profile: &Profile) -> Result<(), PolicyError> {
     parse_mainnet(doc, profile).map(|_| ())
 }

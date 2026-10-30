@@ -678,6 +678,95 @@ pub enum ApprovalFailure {
         /// Non-secret operator-facing diagnostic.
         detail: String,
     },
+    /// A mainnet consent lacks a verified WebAuthn assertion from an approval
+    /// credential in the owner-signed policy: a terminal, local-HMAC or
+    /// remote approval reached a mainnet binding.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_required"`.
+    #[error(
+        "Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy."
+    )]
+    PresenceRequired,
+    /// A mainnet presence assertion is malformed, names a credential the
+    /// signed policy does not list, or fails a signature, challenge, origin
+    /// or flag check.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_invalid"`.
+    #[error("The mainnet presence assertion is invalid; start a new approval ceremony.")]
+    PresenceInvalid,
+    /// The consent details a page renders differ from the current entry or
+    /// policy when a challenge is requested.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_changed"`.
+    #[error("The consent details have changed; reload the approval page and review them again.")]
+    PresenceChanged,
+    /// The presence challenge's deadline has passed on either clock, or the
+    /// wall clock moved before its issue time.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_expired"`.
+    #[error("The mainnet presence challenge has expired; start a new approval ceremony.")]
+    PresenceExpired,
+    /// No outstanding presence challenge matches the request.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_consumed"`.
+    #[error(
+        "The mainnet presence challenge is unavailable or already used; start a new approval ceremony."
+    )]
+    PresenceConsumed,
+    /// The current owner-signed mainnet approval policy cannot be loaded and
+    /// verified, lists no approval credential, or differs from the policy the
+    /// ceremony bound.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_policy_unavailable"`.
+    #[error(
+        "The current owner-signed mainnet approval policy cannot be verified; restore a valid policy and start a new approval ceremony."
+    )]
+    PresencePolicyUnavailable,
+    /// No local browser with WebAuthn user verification can run the
+    /// ceremony.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_browser_required"`.
+    #[error(
+        "Mainnet consent requires a local browser with WebAuthn user verification; no approval is recorded."
+    )]
+    PresenceBrowserRequired,
+    /// The presence ceremony cannot start or complete.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_unavailable"`.
+    #[error("The mainnet presence ceremony cannot start or complete; no approval is recorded.")]
+    PresenceUnavailable,
+    /// The operator canceled the presence ceremony.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.presence_canceled"`.
+    #[error("Mainnet consent is canceled; no approval is recorded.")]
+    PresenceCanceled,
+    /// A remote approval surface reached a mainnet consent.
+    ///
+    /// # Wire code
+    ///
+    /// `"approval.mainnet_remote_unsupported"`.
+    #[error(
+        "Mainnet consent uses the local localhost passkey page; remote approval is unavailable for mainnet."
+    )]
+    MainnetRemoteUnsupported,
 }
 
 impl ApprovalFailure {
@@ -713,6 +802,16 @@ impl ApprovalFailure {
             Self::RemoteAuthorizationUnavailable { .. } => {
                 "approval.remote_authorization_unavailable"
             }
+            Self::PresenceRequired => "approval.presence_required",
+            Self::PresenceInvalid => "approval.presence_invalid",
+            Self::PresenceChanged => "approval.presence_changed",
+            Self::PresenceExpired => "approval.presence_expired",
+            Self::PresenceConsumed => "approval.presence_consumed",
+            Self::PresencePolicyUnavailable => "approval.presence_policy_unavailable",
+            Self::PresenceBrowserRequired => "approval.presence_browser_required",
+            Self::PresenceUnavailable => "approval.presence_unavailable",
+            Self::PresenceCanceled => "approval.presence_canceled",
+            Self::MainnetRemoteUnsupported => "approval.mainnet_remote_unsupported",
         }
     }
 }
@@ -758,16 +857,6 @@ pub enum CapKind {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ValidationError {
-    /// Mainnet confirmation requires terminal input and diagnostics.
-    #[error("mainnet confirmation requires terminal stdin and stderr")]
-    ConfirmTtyRequired,
-    /// The typed profile name differs from the selected profile.
-    #[error("the typed profile name does not match")]
-    ConfirmProfileNameMismatch,
-    /// Confirmation input ended or could not be read.
-    #[error("mainnet confirmation input is unavailable")]
-    ConfirmInputUnavailable,
-
     /// The verified policy's installation bindings do not match the selected profile.
     #[error("profile.mainnet_enablement_invalid: {binding}")]
     MainnetEnablementInvalid {
@@ -1902,10 +1991,6 @@ impl ValidationError {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
-            Self::ConfirmTtyRequired => "confirm.tty_required",
-            Self::ConfirmProfileNameMismatch => "confirm.profile_name_mismatch",
-            Self::ConfirmInputUnavailable => "confirm.input_unavailable",
-
             Self::AmountUnitsRequired => "validation.amount_units_required",
             Self::AmountPrecisionExceeded { .. } => "validation.amount_precision_exceeded",
             Self::MemoRequired { .. } => "validation.memo_required",
@@ -3894,13 +3979,6 @@ mod tests {
 
         for (variant, expected_code) in cases {
             let wallet_err = WalletError::Validation(match variant {
-                ValidationError::ConfirmTtyRequired => ValidationError::ConfirmTtyRequired,
-                ValidationError::ConfirmProfileNameMismatch => {
-                    ValidationError::ConfirmProfileNameMismatch
-                }
-                ValidationError::ConfirmInputUnavailable => {
-                    ValidationError::ConfirmInputUnavailable
-                }
                 ValidationError::MainnetEnablementInvalid { binding } => {
                     ValidationError::MainnetEnablementInvalid { binding }
                 }
@@ -5510,6 +5588,69 @@ mod tests {
             assert_eq!(error.category(), ErrorCategory::Approval);
             assert_eq!(error.to_string(), "operator diagnostic");
             assert_eq!(error.message(), "operator diagnostic");
+        }
+    }
+
+    #[test]
+    fn mainnet_presence_failure_wire_codes_and_messages() {
+        let cases = [
+            (
+                ApprovalFailure::PresenceRequired,
+                "approval.presence_required",
+                "Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy.",
+            ),
+            (
+                ApprovalFailure::PresenceInvalid,
+                "approval.presence_invalid",
+                "The mainnet presence assertion is invalid; start a new approval ceremony.",
+            ),
+            (
+                ApprovalFailure::PresenceChanged,
+                "approval.presence_changed",
+                "The consent details have changed; reload the approval page and review them again.",
+            ),
+            (
+                ApprovalFailure::PresenceExpired,
+                "approval.presence_expired",
+                "The mainnet presence challenge has expired; start a new approval ceremony.",
+            ),
+            (
+                ApprovalFailure::PresenceConsumed,
+                "approval.presence_consumed",
+                "The mainnet presence challenge is unavailable or already used; start a new approval ceremony.",
+            ),
+            (
+                ApprovalFailure::PresencePolicyUnavailable,
+                "approval.presence_policy_unavailable",
+                "The current owner-signed mainnet approval policy cannot be verified; restore a valid policy and start a new approval ceremony.",
+            ),
+            (
+                ApprovalFailure::PresenceBrowserRequired,
+                "approval.presence_browser_required",
+                "Mainnet consent requires a local browser with WebAuthn user verification; no approval is recorded.",
+            ),
+            (
+                ApprovalFailure::PresenceUnavailable,
+                "approval.presence_unavailable",
+                "The mainnet presence ceremony cannot start or complete; no approval is recorded.",
+            ),
+            (
+                ApprovalFailure::PresenceCanceled,
+                "approval.presence_canceled",
+                "Mainnet consent is canceled; no approval is recorded.",
+            ),
+            (
+                ApprovalFailure::MainnetRemoteUnsupported,
+                "approval.mainnet_remote_unsupported",
+                "Mainnet consent uses the local localhost passkey page; remote approval is unavailable for mainnet.",
+            ),
+        ];
+        for (failure, code, message) in cases {
+            let error = WalletError::Approval(failure);
+            assert_eq!(error.code(), code);
+            assert_eq!(error.category(), ErrorCategory::Approval);
+            assert_eq!(error.to_string(), message);
+            assert_eq!(error.message(), message);
         }
     }
 

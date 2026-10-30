@@ -122,13 +122,16 @@ impl std::fmt::Debug for OpaqueToken {
 ///
 /// Fixes the cookie-name prefix, the `sessionStorage` key the bootstrap page
 /// stores the proof under, and the page the bootstrap page navigates to, so
-/// the two servers never share a cookie name or a storage key.
+/// no two servers share a cookie name or a storage key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SessionPurpose {
     /// The approval inbox (`approve serve`).
     Inbox,
     /// The interactive operator enrollment (`approve operator enroll --interactive`).
     OperatorEnroll,
+    /// The mainnet approval credential enrollment
+    /// (`approve credential enroll`).
+    MainnetApprovalEnroll,
 }
 
 impl SessionPurpose {
@@ -137,6 +140,7 @@ impl SessionPurpose {
         match self {
             Self::Inbox => "stellar_agent_approval_session_",
             Self::OperatorEnroll => "stellar_agent_operator_enroll_session_",
+            Self::MainnetApprovalEnroll => "stellar_agent_mainnet_approval_enroll_session_",
         }
     }
 
@@ -146,6 +150,7 @@ impl SessionPurpose {
         match self {
             Self::Inbox => "stellar-agent-approval-session-proof",
             Self::OperatorEnroll => "stellar-agent-operator-enroll-session-proof",
+            Self::MainnetApprovalEnroll => "stellar-agent-mainnet-approval-enroll-session-proof",
         }
     }
 
@@ -154,7 +159,7 @@ impl SessionPurpose {
     pub(crate) fn landing_path(self) -> &'static str {
         match self {
             Self::Inbox => "/inbox",
-            Self::OperatorEnroll => "/enroll",
+            Self::OperatorEnroll | Self::MainnetApprovalEnroll => "/enroll",
         }
     }
 }
@@ -722,13 +727,40 @@ mod tests {
         assert!(require_session_proof(&session, &headers).is_ok());
     }
 
-    /// Two listeners never share a cookie name, and the two servers use
-    /// distinct prefixes and storage keys.
+    /// Two listeners never share a cookie name, and the servers use distinct
+    /// prefixes and storage keys.
     #[test]
     fn cookie_names_are_distinct_per_listener_and_purpose() {
         let a = AuthState::new(OpaqueToken::generate(), SessionPurpose::Inbox);
         let b = AuthState::new(OpaqueToken::generate(), SessionPurpose::Inbox);
         let e = AuthState::new(OpaqueToken::generate(), SessionPurpose::OperatorEnroll);
+        let m = AuthState::new(
+            OpaqueToken::generate(),
+            SessionPurpose::MainnetApprovalEnroll,
+        );
+        assert!(
+            m.cookie_name()
+                .starts_with("stellar_agent_mainnet_approval_enroll_session_")
+        );
+        assert_eq!(
+            SessionPurpose::MainnetApprovalEnroll.proof_storage_key(),
+            "stellar-agent-mainnet-approval-enroll-session-proof"
+        );
+        assert_eq!(
+            SessionPurpose::MainnetApprovalEnroll.landing_path(),
+            "/enroll"
+        );
+        let purposes = [
+            SessionPurpose::Inbox,
+            SessionPurpose::OperatorEnroll,
+            SessionPurpose::MainnetApprovalEnroll,
+        ];
+        for (index, first) in purposes.iter().enumerate() {
+            for second in &purposes[index + 1..] {
+                assert_ne!(first.cookie_name_prefix(), second.cookie_name_prefix());
+                assert_ne!(first.proof_storage_key(), second.proof_storage_key());
+            }
+        }
         assert_ne!(a.cookie_name(), b.cookie_name());
         assert!(
             a.cookie_name()
