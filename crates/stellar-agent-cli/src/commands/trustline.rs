@@ -19,10 +19,10 @@
 //!    `ClassicOpBuilder::change_trust`, so the policy counts the fee.
 //! 6. Operator policy evaluation: the shared
 //!    [`crate::commands::policy_engine::build_v1_policy_engine`]
-//!    (V1 `NoopPolicyEngine` / `PolicyEngineV1`; fail-closed on build failures),
-//!    once both views from steps 3-4 are populated, with the envelope's total
-//!    fee in the arguments. A denial is a clean refusal that signs nothing and
-//!    requires no audit setup.
+//!    (V1 `NoopPolicyEngine` / `PolicyEngineV1`; fail-closed on build
+//!    failures), once both views from steps 3-4 are populated, with the
+//!    envelope's total fee in the arguments. A denial is a clean refusal that
+//!    signs nothing and requires no audit setup.
 //! 7. Audit pre-flight (fail-closed): the profile's audit
 //!    chain-root key must be acquirable via
 //!    [`crate::commands::value_audit::require_value_audit_writer`] before any
@@ -47,9 +47,9 @@
 //! the feature, the run takes the stored profile of an explicit `--profile`
 //! selection, a verified signed policy with a `[mainnet]` table and its
 //! enablement, the enrolled keyring signer, the independent witness, and a
-//! confirmation on a terminal where the operator types the profile name. The
-//! signed fee cap applies before the audit pre-flight and the clawback gate,
-//! and the keyring seed is read only after the authorization is minted.
+//! browser consent with an owner-pinned passkey. The signed fee cap applies
+//! before the audit pre-flight and the clawback gate, and the keyring seed is
+//! read only after the authorization is minted.
 //!
 //! # Policy engine
 //!
@@ -57,8 +57,8 @@
 //! `vault` and `trade` CLI commands. Policy evaluation uses
 //! `evaluate_value_moving_policy`; `derive_value_class` derives the `Trustline`
 //! leg from `policy_args`. `commands::policy_engine::trustline_policy_args`
-//! builds those arguments with the MCP `stellar_trustline` tool's `{from, asset}`
-//! dispatch fields.
+//! builds those arguments with the MCP `stellar_trustline` tool's
+//! `{from, asset}` dispatch fields.
 //! `account_view` is the fetched source account; `identity_view` is `None`
 //! (the issuer's on-chain `home_domain` is self-asserted and must not feed
 //! allowlist matching, so identity-class criteria configured on this verb
@@ -2815,6 +2815,37 @@ mod tests {
             Run {
                 code,
                 envelope: crate::common::render::single_json_document(&out),
+            }
+        }
+
+        /// A real browser listener gates the signer, authorization, and submission.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn direct_mainnet_confirmation_requires_uv_before_signing() {
+            for (name, flags) in [("trustline-browser-no-uv", 1), ("trustline-browser-uv", 5)] {
+                let mut fixture = spec(name).build().await;
+                fixture.present_in_browser(flags);
+                let before = crate::common::signer_ceremony::signer_resolutions_on_this_thread();
+                let result = run(&fixture, &mainnet_args(&fixture)).await;
+                if flags == 1 {
+                    assert_eq!(
+                        result.code(),
+                        "approval.presence_invalid",
+                        "{}",
+                        result.envelope
+                    );
+                    assert!(records(&fixture).is_empty());
+                    assert!(fixture.sent_envelopes().await.is_empty());
+                    assert!(fixture.audit_rows("approval_attested").is_empty());
+                    assert_eq!(
+                        crate::common::signer_ceremony::signer_resolutions_on_this_thread(),
+                        before
+                    );
+                } else {
+                    assert_eq!(result.code, 0, "{}", result.envelope);
+                    assert_eq!(fixture.sent_envelopes().await.len(), 1);
+                    assert_eq!(fixture.audit_rows("approval_attested").len(), 1);
+                }
             }
         }
 

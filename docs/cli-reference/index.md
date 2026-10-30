@@ -135,31 +135,24 @@ Mainnet consent requires a fresh WebAuthn assertion, with user presence and
 user verification, from an approval credential listed in the owner-signed
 policy ([approval credentials](../profiles.md#approval-credentials)). Terminal input, a
 pseudo-terminal, `--yes`, and the local process identity supply no mainnet
-consent. This release connects no presence ceremony to the consent surfaces,
-so every mainnet consent refuses with `approval.presence_required` and
-`Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy.`
-No approval is recorded:
+consent.
 
-- Direct confirmation of `pay`, `claim`, sponsored `accounts create`, and
-  `trustline` renders the summary on stderr, then refuses before any approval,
-  signature, or submission. It reads no terminal input.
-- `approve --id <NONCE>` on a mainnet profile renders the summary, then
-  refuses. It needs no terminal. In either build, `--yes` refuses first, before
-  store access, with `approve.yes_refused_on_mainnet`:
-  `approve --yes is refused on a mainnet profile; mainnet consent requires a verified passkey assertion from an approval credential in the owner-signed policy.`
-- Approve in the local `approve serve` inbox answers HTTP 403 with
-  `approval.presence_required`; the remote listener answers
-  `approval.mainnet_remote_unsupported`. Reject works on both.
-- An MCP mainnet commit accepts only a version 5 approval with its verified
-  presence receipt. Any other approval, a version 4 approval recorded by an
-  earlier release included, refuses with `policy.approval_required`.
+Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
+passkey page. The operator reviews the authoritative transaction and approves
+with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
+mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
+this passkey ceremony.
 
-Mainnet writes therefore remain unavailable in this release.
-[`approve credential enroll`](profile-and-governance.md#approve-credential-enroll), policy signing, reads, and
-simulation work as documented, and testnet approvals keep version 4 on every
-surface. An Allow rule gives a consent 600 seconds; RequireApproval supplies
-its lifetime. Authorization defaults to 120 seconds and cannot outlive
-approval.
+An MCP mainnet commit accepts only a version 5 approval with its verified
+presence receipt. An invalid proof refuses with `policy.approval_required`.
+Each challenge lasts at most 120 seconds. The command waits until pending
+expiry. A canceled authenticator prompt ends the ceremony; retry the command
+for a fresh challenge.
+Testnet approvals retain version 4 and their terminal and remote paths.
+
+`approval.presence_required`: `Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page.`
+
+`approve.yes_refused_on_mainnet`: `approve --yes is refused on a mainnet profile; approve with a pinned passkey in the local browser.`
 
 `network.mainnet_write_forbidden` means the build, operation, or selected context
 has no admitted path. Missing CLI engine, verified policy, or enablement is an

@@ -152,6 +152,16 @@ pub async fn run(args: ServeArgs) -> i32 {
         }
     };
 
+    let mainnet = profile.chain_id.is_mainnet();
+    if mainnet && (args.remote || args.no_open || !crate::common::display_available()) {
+        let failure = if args.remote {
+            stellar_agent_core::ApprovalFailure::MainnetRemoteUnsupported
+        } else {
+            stellar_agent_core::ApprovalFailure::PresenceBrowserRequired
+        };
+        render_json(&Envelope::<()>::err(&WalletError::Approval(failure)));
+        return 1;
+    }
     let store_path = match super::common::approval_store_dir() {
         Ok(dir) => dir.join(format!("{profile_name}.toml")),
         Err(err) => {
@@ -178,7 +188,7 @@ pub async fn run(args: ServeArgs) -> i32 {
         }
     };
 
-    let context = DecisionContext::new(
+    let mut context = DecisionContext::new(
         stellar_agent_core::approval::ApprovalContext::from_profile(&profile_name, &profile),
         store_path,
         profile.attestation_key_id.clone(),
@@ -190,6 +200,21 @@ pub async fn run(args: ServeArgs) -> i32 {
         None,
     );
 
+    if mainnet {
+        let authority =
+            stellar_agent_core::approval::MainnetApprovalAuthority::for_profile(&profile_name)
+                .and_then(|authority| {
+                    authority.load_current()?;
+                    Ok(authority)
+                });
+        match authority {
+            Ok(authority) => context = context.with_mainnet_authority(authority),
+            Err(error) => {
+                render_json(&Envelope::<()>::err(&error));
+                return 1;
+            }
+        }
+    }
     let page_identity = page_identity_for(&profile);
 
     if args.remote {
@@ -221,6 +246,9 @@ pub async fn run(args: ServeArgs) -> i32 {
     let port = handle.local_addr().port();
     let port_was_explicit = args.port != 0;
 
+    if mainnet {
+        return serve_mainnet(handle, &bootstrap_url, port).await;
+    }
     print_startup(&bootstrap_url, port, port_was_explicit);
 
     // CLI-side notice printer: reads the watcher's count-increase events.
@@ -244,6 +272,33 @@ pub async fn run(args: ServeArgs) -> i32 {
     .await;
 
     notice_task.abort();
+    0
+}
+
+async fn serve_mainnet(handle: ServeHandle, url: &str, port: u16) -> i32 {
+    let handoff = match private_open::open_private(url, private_open::browser_opener) {
+        Ok(handoff) => handoff,
+        Err(_) => {
+            let _ = handle.shutdown().await;
+            render_json(&Envelope::<()>::err(&WalletError::Approval(
+                stellar_agent_core::ApprovalFailure::PresenceBrowserRequired,
+            )));
+            return 1;
+        }
+    };
+    #[allow(
+        clippy::print_stderr,
+        reason = "CLI startup notice excludes bearer material"
+    )]
+    {
+        eprintln!("Mainnet approval inbox listens on localhost port {port}.");
+    }
+    let _ = tokio::signal::ctrl_c().await;
+    let stopped = handle.shutdown().await;
+    let closed = handoff.close();
+    if stopped.is_err() || closed.is_err() {
+        return 1;
+    }
     0
 }
 
@@ -425,7 +480,12 @@ fn print_remote_startup(rp_id: &str, port: u16, fingerprint_sha256_hex: &str) {
 }
 
 /// Maps a [`ServeStartError`] to a wallet error for the JSON envelope.
+///
+/// A mainnet presence refusal keeps its approval code and fixed message.
 fn start_error_to_wallet_error(e: &ServeStartError) -> WalletError {
+    if let Some(failure) = e.presence_failure() {
+        return WalletError::Approval(failure);
+    }
     let detail = match e {
         ServeStartError::NonLoopbackBind { .. } => {
             format!("approve.serve_bind: {e}")
@@ -482,6 +542,40 @@ mod tests {
 
     use super::*;
     use clap::Parser;
+
+    /// Each presence start refusal surfaces with its approval code and the
+    /// fixed message of that code, never as a generic serve-start error.
+    #[test]
+    fn presence_start_refusals_keep_their_codes() {
+        use stellar_agent_approval_ui::PresenceStartRefusal;
+        for (refusal, code, message) in [
+            (
+                PresenceStartRefusal::PolicyUnavailable,
+                "approval.presence_policy_unavailable",
+                "The current owner-signed mainnet approval policy cannot be verified; restore a \
+                 valid policy and start a new approval ceremony.",
+            ),
+            (
+                PresenceStartRefusal::Changed,
+                "approval.presence_changed",
+                "The consent details have changed; reload the approval page and review them again.",
+            ),
+            (
+                PresenceStartRefusal::Unavailable,
+                "approval.presence_unavailable",
+                "The mainnet presence ceremony cannot start or complete; no approval is recorded.",
+            ),
+        ] {
+            let error = start_error_to_wallet_error(&ServeStartError::Presence(refusal));
+            assert_eq!(error.code(), code, "{refusal:?}");
+            assert_eq!(error.to_string(), message, "{refusal:?}");
+        }
+        let bind = start_error_to_wallet_error(&ServeStartError::Bind {
+            kind: std::io::ErrorKind::AddrInUse,
+            source: std::io::Error::from(std::io::ErrorKind::AddrInUse),
+        });
+        assert!(bind.to_string().contains("approve.serve_bind"), "{bind}");
+    }
 
     /// Minimal parser wrapper so `ServeArgs` can be exercised through clap.
     #[derive(Debug, Parser)]

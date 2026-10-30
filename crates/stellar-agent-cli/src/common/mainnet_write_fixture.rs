@@ -314,6 +314,7 @@ pub(crate) struct MainnetFixture {
     pub(crate) oracle: MockServer,
     calls: Rc<Cell<usize>>,
     presence: Option<DriverGuard>,
+    listener_presence: Option<crate::common::mainnet_presence::listener_driver::Guard>,
     tty: Option<TestTty>,
     tty_checks_at_start: u64,
     _routes: TestRoutesGuard,
@@ -471,6 +472,7 @@ impl MainnetFixture {
             oracle,
             calls,
             presence: Some(driver::install(driver::fixture_credential())),
+            listener_presence: None,
             tty: Some(test_tty(true, true)),
             tty_checks_at_start: tty_checks_on_this_thread(),
             _routes: routes,
@@ -613,6 +615,14 @@ impl MainnetFixture {
         // before the new driver is installed.
         self.presence = None;
         self.presence = Some(driver::install(Box::new(driver) as Driver));
+    }
+
+    /// Drives the real loopback listener with signed assertion flags.
+    pub(crate) fn present_in_browser(&mut self, flags: u8) {
+        self.presence = None;
+        self.listener_presence = Some(crate::common::mainnet_presence::listener_driver::install(
+            flags,
+        ));
     }
 
     /// Reports `stdin` and `stderr` as the terminal state.

@@ -865,7 +865,7 @@ async fn action_decision_post(
         Decision::Reject { nonce }
     };
 
-    let outcome = apply_decision(&state.ctx, decision, &requester);
+    let outcome = apply_decision(&state.ctx, decision, requester);
     outcome_to_response(outcome)
 }
 
@@ -915,8 +915,8 @@ fn outcome_to_response(outcome: stellar_agent_approval_ui::Outcome) -> Response 
         // removed credential from a bad signature.
         Outcome::Unauthorized => return assertion_invalid(),
         Outcome::PresenceRefused { code, message } => (
-            StatusCode::FORBIDDEN,
-            json!({"status": "presence_refused", "code": code, "error": message}),
+            stellar_agent_approval_ui::presence::refusal_status_of_code(code),
+            json!({"error": code, "message": message}),
         ),
         _ => (
             StatusCode::SERVICE_UNAVAILABLE,

@@ -87,6 +87,73 @@ fn put(entry: &KeyringEntryRef, text: &str) {
         .expect("keyring write");
 }
 
+/// The unsigned version 2 policy body of the mainnet profile `name` at
+/// `sequence`, bound to `endpoint_host` and the digest of
+/// [`ENABLEMENT_NONCE`], admitting `credentials` as approval credentials,
+/// with one require-approval payment rule to [`ALLOWED_DESTINATION`].
+#[must_use]
+pub fn policy_body_for(
+    name: &str,
+    endpoint_host: &str,
+    sequence: i64,
+    credentials: &[&TestAuthenticator],
+) -> String {
+    let digest = crate::hex::encode(&sha2::Sha256::digest(ENABLEMENT_NONCE.as_bytes()));
+    let entries: String = credentials
+        .iter()
+        .map(|credential| {
+            format!(
+                "    {{ credential_id_b64url = \"{}\", public_key_sec1_b64url = \"{}\" }},\n",
+                credential.credential_id_b64url(),
+                credential.public_key_sec1_b64url()
+            )
+        })
+        .collect();
+    let rules = [
+        "[[rules]]".to_owned(),
+        "match = { tool = \"stellar_pay\", chain = \"stellar:mainnet\" }".to_owned(),
+        "criteria = [".to_owned(),
+        "    { kind = \"asset_allowlist\", assets = [\"native\"] },".to_owned(),
+        format!(
+            "    {{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [\"{ALLOWED_DESTINATION}\"] }},"
+        ),
+        "    { kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"100\" },".to_owned(),
+        "    { kind = \"per_period_cap\", window = \"1d\", asset = \"native\", max_stroops = \"200\" },"
+            .to_owned(),
+        "    { kind = \"rate_limit\", window = \"1d\", max_calls = 10 },".to_owned(),
+        "]".to_owned(),
+        "decision = \"require_approval\"".to_owned(),
+        "allow_opaque_signing = false".to_owned(),
+        "ttl_secs = 3600".to_owned(),
+    ]
+    .join("\n");
+    format!(
+        "version = 2\nscope = \"profile:{name}\"\nsequence = {sequence}\n\n[mainnet]\n\
+         endpoint_host = \"{endpoint_host}\"\nprofile = \"{name}\"\n\
+         installation_nonce_sha256 = \"{digest}\"\n\
+         classic_max_fee_per_op_stroops = 500\nauthorization_ttl_seconds = 60\n\
+         approval_credentials = [\n{entries}]\n\
+         [mainnet.cross_check_thresholds]\nnative = \"10000000000\"\n\n{rules}\n"
+    )
+}
+
+/// `body` signed by `owner`, as the policy file holds it.
+///
+/// # Panics
+///
+/// Panics when `body` has no canonical form.
+#[must_use]
+pub fn signed_policy_text(body: &str, owner: &ed25519_dalek::SigningKey) -> String {
+    use crate::policy::v1::{canonical, signature};
+    let canonical = canonical::canonical_bytes(body).expect("canonical fixture policy");
+    let sig = signature::sign(&signature::digest(&canonical), owner);
+    format!(
+        "{body}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
+        stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()),
+        crate::hex::encode(&sig)
+    )
+}
+
 impl MainnetConsentFixture {
     /// An enabled mainnet profile `name` whose policy at sequence 1 admits
     /// the test-support fixture credential.
@@ -262,44 +329,7 @@ impl MainnetConsentFixture {
     /// The unsigned policy body at `sequence` admitting `credentials`.
     #[must_use]
     pub fn policy_body(&self, sequence: i64, credentials: &[&TestAuthenticator]) -> String {
-        let digest = crate::hex::encode(&sha2::Sha256::digest(ENABLEMENT_NONCE.as_bytes()));
-        let entries: String = credentials
-            .iter()
-            .map(|credential| {
-                format!(
-                    "    {{ credential_id_b64url = \"{}\", public_key_sec1_b64url = \"{}\" }},\n",
-                    credential.credential_id_b64url(),
-                    credential.public_key_sec1_b64url()
-                )
-            })
-            .collect();
-        let name = &self.name;
-        let rules = [
-            "[[rules]]".to_owned(),
-            "match = { tool = \"stellar_pay\", chain = \"stellar:mainnet\" }".to_owned(),
-            "criteria = [".to_owned(),
-            "    { kind = \"asset_allowlist\", assets = [\"native\"] },".to_owned(),
-            format!(
-                "    {{ kind = \"counterparty_allowlist\", kinds = [\"G_ACCOUNT\"], allowlist = [\"{ALLOWED_DESTINATION}\"] }},"
-            ),
-            "    { kind = \"per_tx_cap\", asset = \"native\", max_stroops = \"100\" },".to_owned(),
-            "    { kind = \"per_period_cap\", window = \"1d\", asset = \"native\", max_stroops = \"200\" },"
-                .to_owned(),
-            "    { kind = \"rate_limit\", window = \"1d\", max_calls = 10 },".to_owned(),
-            "]".to_owned(),
-            "decision = \"require_approval\"".to_owned(),
-            "allow_opaque_signing = false".to_owned(),
-            "ttl_secs = 3600".to_owned(),
-        ]
-        .join("\n");
-        format!(
-            "version = 2\nscope = \"profile:{name}\"\nsequence = {sequence}\n\n[mainnet]\n\
-             endpoint_host = \"{ENDPOINT_HOST}\"\nprofile = \"{name}\"\n\
-             installation_nonce_sha256 = \"{digest}\"\n\
-             classic_max_fee_per_op_stroops = 500\nauthorization_ttl_seconds = 60\n\
-             approval_credentials = [\n{entries}]\n\
-             [mainnet.cross_check_thresholds]\nnative = \"10000000000\"\n\n{rules}\n"
-        )
+        policy_body_for(&self.name, ENDPOINT_HOST, sequence, credentials)
     }
 
     /// Signs `body` with the fixture owner and writes it as the policy file.
@@ -317,21 +347,10 @@ impl MainnetConsentFixture {
     ///
     /// Panics when `body` has no canonical form or the file cannot be written.
     pub fn write_signed_by(&self, body: &str, owner: &ed25519_dalek::SigningKey) {
-        use crate::policy::v1::{canonical, signature};
-        let canonical = canonical::canonical_bytes(body).expect("canonical fixture policy");
-        let sig = signature::sign(&signature::digest(&canonical), owner);
         let path = self.policy_path();
         std::fs::create_dir_all(path.parent().expect("policy directory"))
             .expect("create policy directory");
-        std::fs::write(
-            &path,
-            format!(
-                "{body}\n[signature]\nowner_id = \"{}\"\nsig = \"{}\"\n",
-                stellar_strkey::ed25519::PublicKey(owner.verifying_key().to_bytes()),
-                crate::hex::encode(&sig)
-            ),
-        )
-        .expect("write fixture policy");
+        std::fs::write(&path, signed_policy_text(body, owner)).expect("write fixture policy");
     }
 
     /// Signs a policy at the next sequence that admits `credentials` and

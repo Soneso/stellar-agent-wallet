@@ -128,8 +128,11 @@ fn store_unavailable() -> Response {
     clippy::result_large_err,
     reason = "the Err variant is the ready-to-return axum Response for the auth-boundary rejection; boxing would only add an allocation on the reject path"
 )]
-fn require_session(state: &ServeState, headers: &HeaderMap) -> Result<SessionState, Response> {
-    let mut guard = match state.auth.lock() {
+pub(crate) fn require_session(
+    auth: &std::sync::Mutex<crate::auth::AuthState>,
+    headers: &HeaderMap,
+) -> Result<SessionState, Response> {
+    let mut guard = match auth.lock() {
         Ok(g) => g,
         Err(poison) => poison.into_inner(),
     };
@@ -147,15 +150,15 @@ fn require_session(state: &ServeState, headers: &HeaderMap) -> Result<SessionSta
     clippy::result_large_err,
     reason = "the Err variant is the ready-to-return axum Response for the auth-boundary rejection; boxing would only add an allocation on the reject path"
 )]
-fn authorize_mutation(
-    state: &ServeState,
+pub(crate) fn authorize_mutation(
+    auth: &std::sync::Mutex<crate::auth::AuthState>,
     headers: &HeaderMap,
     csrf_nonce: &str,
 ) -> Result<(), Response> {
-    let session = require_session(state, headers)?;
+    let session = require_session(auth, headers)?;
     require_csrf(&session, headers, csrf_nonce)?;
     require_session_proof(&session, headers)?;
-    let mut guard = match state.auth.lock() {
+    let mut guard = match auth.lock() {
         Ok(g) => g,
         Err(poison) => poison.into_inner(),
     };
@@ -253,11 +256,10 @@ async fn bootstrap_get(State(state): State<ServeState>, Path(token): Path<String
     let purpose = guard.purpose();
     drop(guard);
 
-    let mut resp = Html(render_session_bootstrap_page(
-        &session.session_proof.to_hex(),
-        purpose,
-    ))
-    .into_response();
+    let Some(page) = render_session_bootstrap_page(&session.session_proof.to_hex(), purpose) else {
+        return not_found();
+    };
+    let mut resp = Html(page).into_response();
     if let Ok(hv) = HeaderValue::from_str(&cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, hv);
     }
@@ -270,7 +272,7 @@ async fn inbox_get(
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
-    let session = match require_session(&state, &headers) {
+    let session = match require_session(&state.auth, &headers) {
         Ok(s) => s,
         Err(resp) => return resp,
     };
@@ -308,7 +310,7 @@ async fn pending_json(
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
-    if let Err(resp) = require_session(&state, &headers) {
+    if let Err(resp) = require_session(&state.auth, &headers) {
         return resp;
     }
     let include_expired = include_expired_flag(raw_query.as_deref());
@@ -333,11 +335,14 @@ async fn approval_detail_get(
     headers: HeaderMap,
     Path(nonce): Path<String>,
 ) -> Response {
-    let session = match require_session(&state, &headers) {
+    let session = match require_session(&state.auth, &headers) {
         Ok(s) => s,
         Err(resp) => return resp,
     };
 
+    if let Some(presence) = &state.presence {
+        return crate::presence::detail(presence, &session, &nonce);
+    }
     let store = match open_with_retry(
         &state.ctx.store_path,
         DEFAULT_RETRY_ATTEMPTS,
@@ -394,13 +399,13 @@ async fn approve_post(
     headers: HeaderMap,
     Path(nonce): Path<String>,
 ) -> Response {
-    if let Err(resp) = authorize_mutation(&state, &headers, &nonce) {
+    if let Err(resp) = authorize_mutation(&state.auth, &headers, &nonce) {
         return resp;
     }
     let outcome = apply_decision(
         &state.ctx,
         Decision::Approve { nonce },
-        &RequestIdentity::Local,
+        RequestIdentity::Local,
     );
     outcome_to_response(outcome)
 }
@@ -411,13 +416,16 @@ async fn reject_post(
     headers: HeaderMap,
     Path(nonce): Path<String>,
 ) -> Response {
-    if let Err(resp) = authorize_mutation(&state, &headers, &nonce) {
+    if let Err(resp) = authorize_mutation(&state.auth, &headers, &nonce) {
         return resp;
+    }
+    if let Some(presence) = &state.presence {
+        presence.discard(&nonce);
     }
     let outcome = apply_decision(
         &state.ctx,
         Decision::Reject { nonce },
-        &RequestIdentity::Local,
+        RequestIdentity::Local,
     );
     outcome_to_response(outcome)
 }
@@ -430,7 +438,7 @@ async fn reject_post(
 /// trusted user interaction, throttled to once a minute; background polling
 /// never reaches it.
 async fn session_activity_post(State(state): State<ServeState>, headers: HeaderMap) -> Response {
-    match authorize_mutation(&state, &headers, SESSION_ACTIVITY_NONCE) {
+    match authorize_mutation(&state.auth, &headers, SESSION_ACTIVITY_NONCE) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(resp) => resp,
     }
@@ -456,7 +464,7 @@ async fn session_bootstrap_js() -> Response {
 /// `GET /static/app-shared.js` — the approval rendering both approval
 /// surfaces share (see [`crate::web::APP_SHARED_JS`]).
 async fn app_shared_js(State(state): State<ServeState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = require_session(&state, &headers) {
+    if let Err(resp) = require_session(&state.auth, &headers) {
         return resp;
     }
     (
@@ -472,7 +480,7 @@ async fn app_shared_js(State(state): State<ServeState>, headers: HeaderMap) -> R
 
 /// `GET /static/app.js` — the same-origin browser glue.
 async fn app_js(State(state): State<ServeState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = require_session(&state, &headers) {
+    if let Err(resp) = require_session(&state.auth, &headers) {
         return resp;
     }
     (
@@ -487,7 +495,7 @@ async fn app_js(State(state): State<ServeState>, headers: HeaderMap) -> Response
 }
 
 /// Maps an [`Outcome`] onto the wire JSON response.
-fn outcome_to_response(outcome: Outcome) -> Response {
+pub(crate) fn outcome_to_response(outcome: Outcome) -> Response {
     let (status, body) = match outcome {
         Outcome::Attested {
             attestation: Some(blob),
@@ -543,8 +551,8 @@ fn outcome_to_response(outcome: Outcome) -> Response {
             json!({ "status": "unavailable", "retriable": false }),
         ),
         Outcome::PresenceRefused { code, message } => (
-            StatusCode::FORBIDDEN,
-            json!({ "status": "presence_refused", "code": code, "error": message }),
+            crate::presence::refusal_status_of_code(code),
+            json!({ "error": code, "message": message }),
         ),
     };
     (

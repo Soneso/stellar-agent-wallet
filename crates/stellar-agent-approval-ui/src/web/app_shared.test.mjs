@@ -189,6 +189,63 @@ for (const next of ["https://example.invalid/", "//example.invalid", "/approval/
   });
 }
 
+// testdata/bootstrap_islands.json lists the (storageKey, next) pair of every
+// island a server renders on its bootstrap page; the Rust test
+// `every_bootstrap_island_matches_the_shared_list` renders each through the
+// production renderers and compares it with the same list, so a change on
+// either side fails a test.
+const ISLANDS = JSON.parse(readFileSync(new URL("./testdata/bootstrap_islands.json", import.meta.url), "utf8"));
+const CONSENT_PROOF_KEY = "stellar-agent-mainnet-presence-session-proof";
+const NONCE_PATH = "/approval/" + "A".repeat(22);
+
+function bootstrapLog(storageKey, next) {
+  const page = browser({
+    islands: { "session-bootstrap-data": { proof: PROOF, storageKey, next } },
+    elements: ["bootstrap-status"],
+  });
+  page.run("./session_bootstrap.js");
+  return page;
+}
+
+test("the shared list names the four server-rendered bootstrap islands", () => {
+  assert.deepEqual(ISLANDS.map(({ purpose }) => purpose), ["inbox", "operator_enroll", "mainnet_approval_enroll", "mainnet_presence"]);
+});
+
+for (const { purpose, storageKey, next } of ISLANDS) {
+  test(`bootstrap script lands the ${purpose} island on ${next}`, () => {
+    const page = bootstrapLog(storageKey, next);
+    assert.equal(page.stored.get(storageKey), PROOF);
+    assert.deepEqual(page.log, [["setItem", storageKey], ["replace", next]]);
+  });
+}
+
+test("bootstrap script lands the mainnet consent key on a 22-character nonce path", () => {
+  const page = bootstrapLog(CONSENT_PROOF_KEY, NONCE_PATH);
+  assert.deepEqual(page.log, [["setItem", CONSENT_PROOF_KEY], ["replace", NONCE_PATH]]);
+});
+
+for (const [storageKey, next] of [
+  [CONSENT_PROOF_KEY, "/inbox"],
+  [CONSENT_PROOF_KEY, "/enroll"],
+  [CONSENT_PROOF_KEY, "/approval/" + "A".repeat(21)],
+  [CONSENT_PROOF_KEY, "/approval/" + "A".repeat(23)],
+  [CONSENT_PROOF_KEY, "/approval/x"],
+  [CONSENT_PROOF_KEY, "/approval/" + "A".repeat(21) + "="],
+  [CONSENT_PROOF_KEY, "/approval/" + "A".repeat(22) + "/challenge"],
+  [CONSENT_PROOF_KEY, "//approval/" + "A".repeat(22)],
+  [INBOX_PROOF_KEY, NONCE_PATH],
+  [INBOX_PROOF_KEY, "/enroll"],
+  [ENROLL_PROOF_KEY, "/inbox"],
+  [ENROLL_PROOF_KEY, NONCE_PATH],
+  ["stellar-agent-unknown-session-proof", "/inbox"],
+]) {
+  test(`bootstrap script refuses ${next} under ${storageKey}`, () => {
+    const page = bootstrapLog(storageKey, next);
+    assert.deepEqual(page.log, []);
+    assert.match(page.byId["bootstrap-status"].textContent, /could not be opened/);
+  });
+}
+
 function detailPage(storage) {
   const page = browser({
     islands: {

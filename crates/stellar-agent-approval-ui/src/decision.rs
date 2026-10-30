@@ -77,9 +77,15 @@ pub const REJECT_TOMBSTONE_TTL_MS: u64 = 3_600_000;
 /// [`apply_decision`] is authentication-agnostic per the module docs; this
 /// type is the narrow seam a caller uses to say WHO is deciding, without
 /// `apply_decision` itself knowing how that identity was established.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the mainnet arm owns its single-use sealed proof"
+)]
 #[non_exhaustive]
 pub enum RequestIdentity {
+    /// Verified consent from the owner-signed mainnet policy.
+    Mainnet(stellar_agent_core::approval::VerifiedMainnetPresence),
     /// The loopback approval-inbox server: derive
     /// `ApproverIdentity::OsUid(process_uid_for_attestation())` internally.
     /// The remote-approval allowlist is never consulted, and the attestation
@@ -129,6 +135,8 @@ pub enum Decision {
 /// mock) before the first [`apply_decision`] call.
 #[non_exhaustive]
 pub struct DecisionContext {
+    /// Current signed authority for mainnet consent.
+    pub mainnet_authority: Option<stellar_agent_core::approval::MainnetApprovalAuthority>,
     /// Serving profile context: the store name, the chain id, the endpoint host and
     /// the enrolled signer; its binding enters every attestation.
     pub context: stellar_agent_core::approval::ApprovalContext,
@@ -153,6 +161,16 @@ pub struct DecisionContext {
 }
 
 impl DecisionContext {
+    /// Supplies the authority that mainnet decisions reload before persistence.
+    #[must_use]
+    pub fn with_mainnet_authority(
+        mut self,
+        authority: stellar_agent_core::approval::MainnetApprovalAuthority,
+    ) -> Self {
+        self.mainnet_authority = Some(authority);
+        self
+    }
+
     /// Construct a decision context. Production callers pass `None` for
     /// `grant_store_path_override`, and build `owner` with
     /// [`OwnerKeyContext::for_profile`] from the serving profile and its name.
@@ -166,6 +184,7 @@ impl DecisionContext {
         grant_store_path_override: Option<PathBuf>,
     ) -> Self {
         Self {
+            mainnet_authority: None,
             context,
             store_path,
             attestation_key_entry_ref,
@@ -251,7 +270,7 @@ pub(crate) fn presence_refusal(error: &WalletError) -> Option<Outcome> {
     let message = match failure {
         F::PresenceRequired => {
             "Mainnet consent requires a verified assertion from an approval credential in the \
-             owner-signed policy."
+             owner-signed policy; use the local passkey approval page."
         }
         F::PresenceInvalid => {
             "The mainnet presence assertion is invalid; start a new approval ceremony."
@@ -279,7 +298,7 @@ pub(crate) fn presence_refusal(error: &WalletError) -> Option<Outcome> {
         }
         F::PresenceCanceled => "Mainnet consent is canceled; no approval is recorded.",
         F::MainnetRemoteUnsupported => {
-            "Mainnet consent uses the local localhost passkey page; remote approval is \
+            "Mainnet consent uses the local passkey page; remote approval is \
              unavailable for mainnet."
         }
         _ => return None,
@@ -288,6 +307,59 @@ pub(crate) fn presence_refusal(error: &WalletError) -> Option<Outcome> {
         code: failure.code(),
         message,
     })
+}
+
+/// The mainnet presence refusals, each with the stable code
+/// [`presence_refusal`] answers it with.
+fn presence_refusals() -> [stellar_agent_core::ApprovalFailure; 10] {
+    use stellar_agent_core::ApprovalFailure as F;
+    [
+        F::PresenceRequired,
+        F::PresenceInvalid,
+        F::PresenceChanged,
+        F::PresenceExpired,
+        F::PresenceConsumed,
+        F::PresencePolicyUnavailable,
+        F::PresenceBrowserRequired,
+        F::PresenceUnavailable,
+        F::PresenceCanceled,
+        F::MainnetRemoteUnsupported,
+    ]
+}
+
+/// The presence refusal whose stable code is `code`, or `None` for a code
+/// that is not one.
+#[must_use]
+pub(crate) fn presence_refusal_failure(code: &str) -> Option<stellar_agent_core::ApprovalFailure> {
+    presence_refusals()
+        .into_iter()
+        .find(|failure| failure.code() == code)
+}
+
+/// The outcome of an entry check that refused a mainnet presence request, as
+/// the inbox decision routes answer it.
+///
+/// An unknown, expired, rejected, spent, mismatched or inconsistent entry
+/// keeps its decision outcome; an entry that already holds a consent cannot
+/// take another ceremony; any other failure is unavailable.
+#[must_use]
+pub(crate) fn entry_outcome(error: &WalletError) -> Outcome {
+    use stellar_agent_core::ApprovalFailure as F;
+    let WalletError::Approval(failure) = error else {
+        return Outcome::Unavailable;
+    };
+    match failure {
+        F::NotFound { .. } => Outcome::NotFound,
+        F::Expired { .. } => Outcome::Expired,
+        F::Rejected { .. } | F::Consumed { .. } => Outcome::AlreadyResolved { attestation: None },
+        F::UserMismatch { .. } => Outcome::UserMismatch,
+        F::BindingMismatch { .. } => Outcome::BindingMismatch,
+        F::WrongKind { .. } => Outcome::WrongKind,
+        F::EntryInconsistent { .. } => Outcome::Inconsistent,
+        F::AlreadyAttested { .. } => presence_refusal(&WalletError::Approval(F::PresenceConsumed))
+            .unwrap_or(Outcome::Unavailable),
+        _ => Outcome::Unavailable,
+    }
 }
 
 /// Apply one operator [`Decision`] against the profile's approval store, on
@@ -306,11 +378,11 @@ pub(crate) fn presence_refusal(error: &WalletError) -> Option<Outcome> {
 pub fn apply_decision(
     ctx: &DecisionContext,
     decision: Decision,
-    requester: &RequestIdentity,
+    requester: RequestIdentity,
 ) -> Outcome {
     match decision {
         Decision::Approve { nonce } => apply_approve(ctx, &nonce, requester),
-        Decision::Reject { nonce } => apply_reject(ctx, &nonce, requester),
+        Decision::Reject { nonce } => apply_reject(ctx, &nonce, &requester),
     }
 }
 
@@ -358,7 +430,7 @@ impl Resolved {
 )]
 fn resolve_requester(requester: &RequestIdentity) -> Result<Resolved, Outcome> {
     match requester {
-        RequestIdentity::Local => {
+        RequestIdentity::Local | RequestIdentity::Mainnet(_) => {
             let uid = process_uid_for_attestation().map_err(|e| {
                 tracing::warn!(error = %e, "decision: process uid derivation failed");
                 Outcome::Unavailable
@@ -478,7 +550,7 @@ fn approval_code_is(err: &WalletError, code: &str) -> bool {
     err.code() == code
 }
 
-fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity) -> Outcome {
+fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: RequestIdentity) -> Outcome {
     if ctx.context.chain_id == MAINNET_CHAIN_ID
         && matches!(requester, RequestIdentity::Remote { .. })
     {
@@ -487,12 +559,19 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
         ))
         .unwrap_or(Outcome::Unavailable);
     }
+    if ctx.context.chain_id == MAINNET_CHAIN_ID && !matches!(requester, RequestIdentity::Mainnet(_))
+    {
+        return presence_refusal(&WalletError::Approval(
+            stellar_agent_core::ApprovalFailure::PresenceRequired,
+        ))
+        .unwrap_or(Outcome::Unavailable);
+    }
     let store = match open_store(ctx, "approve") {
         Ok(s) => s,
         Err(outcome) => return outcome,
     };
 
-    let resolved = match resolve_requester(requester) {
+    let resolved = match resolve_requester(&requester) {
         Ok(resolved) => resolved,
         Err(outcome) => return outcome,
     };
@@ -515,6 +594,12 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
                 return Outcome::NotFound;
             }
             if approval_code_is(&e, "approval.already_attested") {
+                if ctx.context.chain_id == MAINNET_CHAIN_ID {
+                    return presence_refusal(&WalletError::Approval(
+                        stellar_agent_core::ApprovalFailure::PresenceConsumed,
+                    ))
+                    .unwrap_or(Outcome::Unavailable);
+                }
                 // Recoverable lost-response re-show: return the already-stored
                 // blob without re-attesting.
                 let attestation = store
@@ -573,12 +658,41 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
     // The key load above may have waited on a keyring prompt, and the writer
     // lock on other decisions: read the authorization again, immediately
     // before the row and the attestation are persisted.
-    if let Err(outcome) = authorize_remote(requester) {
+    if let Err(outcome) = authorize_remote(&requester) {
         return outcome;
     }
 
     let grant_override = ctx.grant_store_path_override.clone();
     let profile_name = ctx.context.profile_name.as_str();
+    let current = if matches!(requester, RequestIdentity::Mainnet(_)) {
+        let loaded = ctx
+            .mainnet_authority
+            .as_ref()
+            .ok_or(WalletError::Approval(
+                stellar_agent_core::ApprovalFailure::PresencePolicyUnavailable,
+            ))
+            .and_then(
+                stellar_agent_core::approval::MainnetApprovalAuthority::load_current_compare_only,
+            );
+        match loaded {
+            Ok(current) => Some(current),
+            Err(error) => return presence_refusal(&error).unwrap_or(Outcome::Unavailable),
+        }
+    } else {
+        None
+    };
+    let authorization = match requester {
+        RequestIdentity::Mainnet(presence) => {
+            let Some(current) = &current else {
+                return Outcome::Unavailable;
+            };
+            ConsentAuthorization::Mainnet {
+                presence,
+                policy: current.policy(),
+            }
+        }
+        _ => ConsentAuthorization::Standard(&resolved.approver),
+    };
     let result = attest_and_persist(
         &mut store,
         &entry,
@@ -586,7 +700,7 @@ fn apply_approve(ctx: &DecisionContext, nonce: &str, requester: &RequestIdentity
         &ctx.context.binding(),
         resolved.surface,
         ConsentAudit::Writer(&mut writer),
-        ConsentAuthorization::Standard(&resolved.approver),
+        authorization,
         |req, grant_key| {
             stellar_agent_toolsets_runtime::record_first_invoke_grant(
                 profile_name,
@@ -1017,7 +1131,7 @@ mod tests {
             Decision::Approve {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Inconsistent);
         let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
@@ -1046,7 +1160,7 @@ mod tests {
             Decision::Approve {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         let attestation = match outcome {
             Outcome::Attested { attestation, .. } => attestation.expect("payment surfaces a blob"),
@@ -1108,7 +1222,7 @@ mod tests {
                 Decision::Approve {
                     nonce: nonce.clone(),
                 },
-                &RequestIdentity::Local,
+                RequestIdentity::Local,
             ));
         });
         assert!(
@@ -1176,14 +1290,14 @@ mod tests {
             Decision::Approve {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(
             outcome,
             Outcome::PresenceRefused {
                 code: "approval.presence_required",
                 message: "Mainnet consent requires a verified assertion from an approval \
-                          credential in the owner-signed policy.",
+                          credential in the owner-signed policy; use the local passkey approval page.",
             }
         );
         let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
@@ -1208,11 +1322,7 @@ mod tests {
             DEFAULT_TTL_MS,
         );
         let nonce = insert(&fx.ctx, entry);
-        let outcome = apply_decision(
-            &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
-        );
+        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
         assert!(matches!(
             outcome,
             Outcome::Attested {
@@ -1244,7 +1354,7 @@ mod tests {
             Decision::Approve {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert!(matches!(
             outcome,
@@ -1271,11 +1381,7 @@ mod tests {
         )
         .unwrap();
         let nonce = insert(&fx.ctx, entry);
-        let outcome = apply_decision(
-            &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
-        );
+        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
         assert!(matches!(
             outcome,
             Outcome::Attested {
@@ -1302,11 +1408,7 @@ mod tests {
         )
         .unwrap();
         let nonce = insert(&fx.ctx, entry);
-        let outcome = apply_decision(
-            &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
-        );
+        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
         assert_eq!(outcome, Outcome::WrongKind);
     }
 
@@ -1318,11 +1420,7 @@ mod tests {
         let entry = payment_entry(1);
         let nonce = insert(&fx.ctx, entry);
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let outcome = apply_decision(
-            &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
-        );
+        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
         assert_eq!(outcome, Outcome::Expired);
     }
 
@@ -1338,7 +1436,7 @@ mod tests {
             Decision::Approve {
                 nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::NotFound);
     }
@@ -1354,7 +1452,7 @@ mod tests {
             Decision::Approve {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         let first_blob = match first {
             Outcome::Attested {
@@ -1363,11 +1461,7 @@ mod tests {
             } => b,
             other => panic!("expected Attested, got {other:?}"),
         };
-        let second = apply_decision(
-            &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
-        );
+        let second = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
         match second {
             Outcome::AlreadyResolved {
                 attestation: Some(b),
@@ -1387,7 +1481,7 @@ mod tests {
             Decision::Reject {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Rejected);
 
@@ -1397,7 +1491,7 @@ mod tests {
         drop(store);
 
         // Second reject is idempotent.
-        let again = apply_decision(&fx.ctx, Decision::Reject { nonce }, &RequestIdentity::Local);
+        let again = apply_decision(&fx.ctx, Decision::Reject { nonce }, RequestIdentity::Local);
         assert_eq!(again, Outcome::AlreadyResolved { attestation: None });
     }
 
@@ -1413,15 +1507,11 @@ mod tests {
                 Decision::Reject {
                     nonce: nonce.clone()
                 },
-                &RequestIdentity::Local
+                RequestIdentity::Local
             ),
             Outcome::Rejected
         );
-        let outcome = apply_decision(
-            &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
-        );
+        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
         assert_eq!(outcome, Outcome::AlreadyResolved { attestation: None });
     }
 
@@ -1436,7 +1526,7 @@ mod tests {
             Decision::Reject {
                 nonce: "BBBBBBBBBBBBBBBBBBBBBB".to_owned(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::AlreadyResolved { attestation: None });
     }
@@ -1452,7 +1542,7 @@ mod tests {
             Decision::Approve {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::UserMismatch);
 
@@ -1473,7 +1563,7 @@ mod tests {
             Decision::Reject {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::UserMismatch);
 
@@ -1502,7 +1592,7 @@ mod tests {
             Decision::Approve {
                 nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
     }
@@ -1518,7 +1608,7 @@ mod tests {
             Decision::Reject {
                 nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
     }
@@ -1558,7 +1648,7 @@ mod tests {
                 Decision::Approve {
                     nonce: nonce.clone()
                 },
-                &RequestIdentity::Local
+                RequestIdentity::Local
             ),
             Outcome::BindingMismatch
         );
@@ -1724,11 +1814,7 @@ mod tests {
         *store_path.lock().unwrap() = Some(fx.ctx.store_path.clone());
         *nonce_slot.lock().unwrap() = Some(nonce.clone());
 
-        let outcome = apply_decision(
-            &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
-        );
+        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
         assert!(
             fired.load(std::sync::atomic::Ordering::SeqCst),
             "the other handle attested between validation and the attest"
@@ -1778,11 +1864,7 @@ mod tests {
         let nonce = insert(&fx.ctx, payment_entry(DEFAULT_TTL_MS));
         *target.lock().unwrap() = Some((fx.ctx.store_path.clone(), nonce.clone()));
 
-        let outcome = apply_decision(
-            &fx.ctx,
-            Decision::Approve { nonce },
-            &RequestIdentity::Local,
-        );
+        let outcome = apply_decision(&fx.ctx, Decision::Approve { nonce }, RequestIdentity::Local);
         assert!(
             fired.load(std::sync::atomic::Ordering::SeqCst),
             "the other handle resolved the entry between validation and the attest"
@@ -1839,7 +1921,7 @@ mod tests {
             Decision::Approve {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
         assert!(still_pending(&fx, &nonce));
@@ -1849,7 +1931,7 @@ mod tests {
             Decision::Approve {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(again, Outcome::Unavailable);
         assert!(still_pending(&fx, &nonce));
@@ -1867,7 +1949,7 @@ mod tests {
             Decision::Reject {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
         assert!(still_pending(&fx, &nonce));
@@ -1885,7 +1967,7 @@ mod tests {
             Decision::Reject {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
         assert!(
@@ -1906,7 +1988,7 @@ mod tests {
             Decision::Approve {
                 nonce: nonce.clone(),
             },
-            &RequestIdentity::Local,
+            RequestIdentity::Local,
         );
         assert_eq!(outcome, Outcome::Unavailable);
         assert!(
@@ -1926,7 +2008,7 @@ mod tests {
             apply_decision(
                 &fx.ctx,
                 Decision::Approve { nonce: approved },
-                &RequestIdentity::Local
+                RequestIdentity::Local
             ),
             Outcome::Attested { .. }
         ));
@@ -1934,7 +2016,7 @@ mod tests {
             apply_decision(
                 &fx.ctx,
                 Decision::Reject { nonce: rejected },
-                &RequestIdentity::Local
+                RequestIdentity::Local
             ),
             Outcome::Rejected
         );
@@ -2034,7 +2116,7 @@ mod tests {
             Decision::Approve {
                 nonce: nonce.clone(),
             },
-            &remote_requester(&fx, &credential_id(1), &nonce),
+            remote_requester(&fx, &credential_id(1), &nonce),
         );
         assert!(matches!(outcome, Outcome::Attested { .. }), "{outcome:?}");
         let store = PendingApprovalStore::open(fx.ctx.store_path.clone()).unwrap();
@@ -2069,13 +2151,13 @@ mod tests {
             Decision::Approve {
                 nonce: nonce.clone(),
             },
-            &remote_requester(&fx, &credential_id(1), &nonce),
+            remote_requester(&fx, &credential_id(1), &nonce),
         );
         assert_eq!(
             outcome,
             Outcome::PresenceRefused {
                 code: "approval.mainnet_remote_unsupported",
-                message: "Mainnet consent uses the local localhost passkey page; remote \
+                message: "Mainnet consent uses the local passkey page; remote \
                           approval is unavailable for mainnet.",
             }
         );
@@ -2092,7 +2174,7 @@ mod tests {
             Decision::Reject {
                 nonce: nonce.clone(),
             },
-            &remote_requester(&fx, &credential_id(1), &nonce),
+            remote_requester(&fx, &credential_id(1), &nonce),
         );
         assert_eq!(outcome, Outcome::Rejected);
     }
@@ -2124,7 +2206,7 @@ mod tests {
                 Decision::Approve {
                     nonce: nonce.clone(),
                 },
-                &remote_requester(&fx, &credential_id(1), &nonce),
+                remote_requester(&fx, &credential_id(1), &nonce),
             );
             assert!(fired.get());
             assert_eq!(outcome, Outcome::Unauthorized);
@@ -2140,7 +2222,7 @@ mod tests {
                 Decision::Approve {
                     nonce: nonce.clone(),
                 },
-                &remote_requester(&fx, &credential_id(2), &nonce),
+                remote_requester(&fx, &credential_id(2), &nonce),
             );
             assert!(matches!(outcome, Outcome::Attested { .. }), "{outcome:?}");
         }
@@ -2202,7 +2284,7 @@ mod tests {
                 Decision::Reject {
                     nonce: nonce.clone(),
                 },
-                &remote_requester(&fx, &credential_id(1), &nonce),
+                remote_requester(&fx, &credential_id(1), &nonce),
             );
             assert!(fired.get(), "{revoke}");
             assert_eq!(outcome, Outcome::Unauthorized, "{revoke}");
@@ -2217,7 +2299,7 @@ mod tests {
                 Decision::Reject {
                     nonce: nonce.clone(),
                 },
-                &remote_requester(&fx, &credential_id(2), &nonce),
+                remote_requester(&fx, &credential_id(2), &nonce),
             );
             assert_eq!(outcome, Outcome::Rejected, "{revoke}");
             assert_eq!(
@@ -2256,7 +2338,7 @@ mod tests {
                 apply_decision(
                     &fx.ctx,
                     decision,
-                    &remote_requester(&fx, &credential_id(1), &nonce)
+                    remote_requester(&fx, &credential_id(1), &nonce)
                 ),
                 Outcome::Unauthorized
             );
@@ -2270,11 +2352,11 @@ mod tests {
         else {
             unreachable!()
         };
-        let os_identity = RequestIdentity::Remote {
+        let os_identity = || RequestIdentity::Remote {
             identity: ApproverIdentity::OsUid(uid()),
-            authority,
+            authority: authority.clone(),
             chain,
-            rp_id,
+            rp_id: rp_id.clone(),
         };
         for decision in [
             Decision::Approve {
@@ -2285,7 +2367,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                apply_decision(&fx.ctx, decision, &os_identity),
+                apply_decision(&fx.ctx, decision, os_identity()),
                 Outcome::Unauthorized
             );
         }

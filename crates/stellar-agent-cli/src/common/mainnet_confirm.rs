@@ -51,8 +51,8 @@ impl ConfirmDecision {
 }
 
 /// The last line of the rendered summary: what records consent to it.
-const CONSENT_LINE: &str = "Consent requires a passkey assertion from an approval credential in the \
-                            owner-signed policy.";
+pub(crate) const CONSENT_LINE: &str =
+    "Review this transaction in the local browser and approve with a pinned passkey.";
 
 pub(crate) struct MainnetWriteSummary {
     envelope: String,
@@ -1164,13 +1164,13 @@ mod tests {
             .count()
     }
 
-    /// Drives the confirmation with `presence` as the browser side, or the
-    /// release adapter when it is `None`, and returns the refusal code after
-    /// asserting that nothing was recorded and the parked entry is gone.
+    /// Drives the confirmation with `presence` as the browser side and
+    /// returns the refusal code after asserting that nothing was recorded
+    /// and the parked entry is gone.
     #[cfg(feature = "mainnet-write")]
-    async fn refused_confirmation(name: &str, presence: Option<driver::Driver>) -> String {
+    async fn refused_confirmation(name: &str, presence: driver::Driver) -> String {
         let (fixture, context, envelope) = confirmation_fixture(name);
-        let _presence = presence.map(driver::install);
+        let _presence = driver::install(presence);
         let summary =
             MainnetWriteSummary::from_envelope(&envelope, MainnetConsumer::CliPay, 500).unwrap();
         let code = confirm(&fixture, &context, &summary)
@@ -1185,19 +1185,23 @@ mod tests {
         code
     }
 
-    /// Without a ceremony the release adapter refuses, and terminal input is
-    /// never read: a reported terminal and a reported absence of one both
-    /// end in `approval.presence_required`.
+    /// A browser refusal records nothing for either reported terminal state.
     #[cfg(feature = "mainnet-write")]
     #[tokio::test]
     #[serial_test::serial]
-    async fn confirm_without_a_ceremony_records_nothing() {
+    async fn confirm_browser_refusal_records_nothing_for_each_terminal_state() {
         for (index, streams) in [(true, true), (false, false)].into_iter().enumerate() {
             let _tty = super::super::tty::tests::test_tty(streams.0, streams.1);
             let checks = super::super::tty::tests::TEST_TTY_CHECKS.get();
             assert_eq!(
-                refused_confirmation(&format!("confirm-closed-{index}"), None).await,
-                "approval.presence_required",
+                refused_confirmation(
+                    &format!("confirm-browser-{index}"),
+                    Box::new(|_| Err(WalletError::Approval(
+                        ApprovalFailure::PresenceBrowserRequired
+                    )))
+                )
+                .await,
+                "approval.presence_browser_required",
                 "{streams:?}"
             );
             assert_eq!(super::super::tty::tests::TEST_TTY_CHECKS.get(), checks);
@@ -1244,7 +1248,7 @@ mod tests {
         ];
         for (index, (presence, expected)) in cases.into_iter().enumerate() {
             assert_eq!(
-                refused_confirmation(&format!("confirm-refused-{index}"), Some(presence)).await,
+                refused_confirmation(&format!("confirm-refused-{index}"), presence).await,
                 expected,
                 "case {index}"
             );

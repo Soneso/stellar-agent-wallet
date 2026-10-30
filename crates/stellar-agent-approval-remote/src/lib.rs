@@ -246,6 +246,11 @@ impl RemoteServeHandle {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RemoteServeStartError {
+    /// Remote origins cannot authorize mainnet consent.
+    #[error(
+        "Mainnet consent uses the local passkey page; remote approval is unavailable for mainnet."
+    )]
+    MainnetPresenceUnsupported,
     /// The TLS certificate/key could not be loaded into a `rustls`
     /// `ServerConfig`.
     #[error("remote-approval TLS config load failed: {detail}")]
@@ -275,6 +280,11 @@ pub enum RemoteServeStartError {
 pub async fn start_remote_serve(
     config: RemoteServeConfig,
 ) -> Result<RemoteServeHandle, RemoteServeStartError> {
+    if config.decision_context.context.chain_id
+        == stellar_agent_core::approval::presence::MAINNET_CHAIN_ID
+    {
+        return Err(RemoteServeStartError::MainnetPresenceUnsupported);
+    }
     let rustls_config =
         RustlsConfig::from_pem(config.tls.cert_pem.clone(), config.tls.key_pem.clone())
             .await
@@ -393,4 +403,47 @@ pub(crate) fn build_router(state: RemoteServeState, rp_id: &str, port: u16) -> R
         .layer(RequestBodyLimitLayer::new(BODY_LIMIT_BYTES))
         .layer(remote_origin::RemoteOriginAllowlistLayer::new(rp_id, port))
         .layer(stellar_agent_loopback_http::security_headers::SecurityHeadersLayer::new())
+}
+
+#[cfg(test)]
+mod mainnet_presence_tests {
+    #![allow(clippy::unwrap_used, reason = "startup refusal assertions")]
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mainnet_remote_refuses_before_bind() {
+        let fixture = stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture::new(
+            "remote-refusal",
+        );
+        let context = DecisionContext::new(
+            stellar_agent_core::approval::ApprovalContext::from_profile(
+                fixture.name(),
+                fixture.profile(),
+            ),
+            fixture.store_path(),
+            fixture.profile().attestation_key_id.clone(),
+            stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
+                fixture.name(),
+                fixture.profile(),
+            ),
+            std::sync::Arc::new(StdMutex::new(fixture.audit_writer())),
+            None,
+        );
+        let config = RemoteServeConfig::new(
+            "0.0.0.0:0".parse().unwrap(),
+            "remote.example",
+            RemoteApprovalAuthority::for_profile(fixture.name()).unwrap(),
+            context,
+            ProvisionedTls {
+                cert_pem: vec![],
+                key_pem: vec![],
+                fingerprint_sha256_hex: String::new(),
+            },
+        );
+        assert!(matches!(
+            start_remote_serve(config).await,
+            Err(RemoteServeStartError::MainnetPresenceUnsupported)
+        ));
+    }
 }

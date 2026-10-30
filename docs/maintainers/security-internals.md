@@ -688,10 +688,20 @@ digest and sequence, the relying-party ID and origin, the UP and UV flags, the
 signature counter, and the verification time. The counter is recorded only; no
 durable counter is kept and no clone is detected.
 
-This release connects no presence ceremony: direct CLI confirmation and bare
-`approve` render the summary and refuse with `approval.presence_required`, the
-local inbox refuses the same way, and the remote listener refuses with
-`approval.mainnet_remote_unsupported`. No mainnet consent is recorded.
+Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
+passkey page. The operator reviews the authoritative transaction and approves
+with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
+mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
+this passkey ceremony.
+The page binds its rendered view digest to the current entry and signed policy
+before issuing a challenge. Challenge and assertion requests require the
+session cookie, per-nonce CSRF header, and origin-scoped session proof.
+A challenge is consumed before assertion decoding, including on failure.
+The one-shot listener returns a sealed proof to the command; the inbox consumes
+it through the shared decision path. Both paths reload authority after waits.
+The command waits until pending expiry; each challenge lasts at most 120 seconds.
+The listener uses the exact bound localhost port as its assertion origin.
+
 
 ### Endpoint identity before the first signed read
 

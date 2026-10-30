@@ -854,9 +854,11 @@ sequence. An approval recorded under an earlier policy needs fresh consent,
 also when its credential stays listed. The `[remote_approval]` allowlist and
 `approve operator remove` do not change the approval credentials.
 
-This release connects no presence ceremony to the consent surfaces: every
-mainnet consent refuses with `approval.presence_required`, so mainnet writes
-remain unavailable. See [Mainnet write behavior](cli-reference.md#mainnet-write-behavior).
+Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
+passkey page. The operator reviews the authoritative transaction and approves
+with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
+mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
+this passkey ceremony.
 
 #### Enabled-policy minimum
 

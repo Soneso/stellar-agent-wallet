@@ -584,7 +584,8 @@ impl EnrollmentClient {
 }
 
 /// The JSON data island with `id` in `html`.
-fn island(html: &str, id: &str) -> Option<serde_json::Value> {
+#[must_use]
+pub fn island(html: &str, id: &str) -> Option<serde_json::Value> {
     let open = format!(r#"<script type="application/json" id="{id}""#);
     let tag = html.find(&open)?;
     let start = tag + html[tag..].find('>')? + 1;
@@ -595,7 +596,10 @@ fn island(html: &str, id: &str) -> Option<serde_json::Value> {
 
 /// Sends one HTTP/1.1 request on a fresh connection and reads the response
 /// to the end.
-async fn request(
+///
+/// # Errors
+/// Returns a transport error or an invalid HTTP response.
+pub async fn request(
     addr: SocketAddr,
     method: &str,
     path: &str,

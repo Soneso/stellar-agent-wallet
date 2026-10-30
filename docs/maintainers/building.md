@@ -458,6 +458,7 @@ Run `cargo fmt --all` to format Rust sources.
 #### Lint
 
 ```bash
+# operator-enroll-browser-acceptance covers browser acceptance tests of the approval pages.
 FEATURES_EXCEPT_MAINNET_WRITE=deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
 cargo clippy --workspace --all-targets --features "$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings
 cargo clippy --workspace --all-targets --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings

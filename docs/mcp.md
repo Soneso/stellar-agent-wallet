@@ -317,8 +317,7 @@ verified presence receipt: a version 4 approval, an assertion that does not
 verify or comes from a credential the signed policy does not list, and a
 receipt bound to a policy other than the current one. Mainnet consent
 requires a verified passkey assertion from an approval credential in the
-owner-signed policy, and this release refuses every mainnet consent with
-`approval.presence_required`, so a mainnet commit cannot succeed yet. The
+owner-signed policy, and the operator approves on the local passkey page. The
 approval hint names the same `stellar-agent approve --id <nonce> --profile <name>`
 command on every network. A live rejection uses `policy.approval_rejected`. A
 live consumed approval or an approval held by a submission receipt uses
@@ -864,9 +863,9 @@ payment payload. Its fields are `approval_nonce`, `profile`, `chain_id`,
 `instructions`. `summary` contains `payTo`, `amount`, and `asset`.
 
 Approve x402 payments through `stellar-agent approve --id <nonce> --profile <name>`
-in a terminal. Approval-ui and remote approval do not attest this approval kind.
-On mainnet that command refuses with `approval.presence_required` in this
-release, as every mainnet consent does.
+in the local browser on mainnet, or in a terminal on testnet.
+The mainnet local inbox also supports this approval kind. Remote approval
+does not serve mainnet; testnet x402 uses the terminal command.
 For an x402 payment, `stellar-agent approve` shows the payee, amount, and asset,
 and a `Home domain:` line that reads `none` for the plain tool.
 The authenticated approval subject binds the payment intent digest and home

@@ -183,7 +183,7 @@ tokio                      = { workspace = true, features = ["rt-multi-thread", 
 regex-lite                 = { workspace = true }
 # The loopback approval-inbox server, driven over real HTTP in the
 # approve-serve testnet acceptance test (gated behind testnet-acceptance).
-stellar-agent-approval-ui = { path = "../stellar-agent-approval-ui" }
+stellar-agent-approval-ui = { path = "../stellar-agent-approval-ui", features = ["test-helpers"] }
 serde_json                 = { workspace = true }
 # registry_walk.rs iterates McpToolRegistration records and cross-checks the
 # rmcp ToolRouter.

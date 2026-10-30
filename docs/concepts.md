@@ -183,7 +183,7 @@ simulate and approve again to create a trustline approval.
 
 ### What `approve` does
 
-`stellar-agent approve --id <nonce> --profile <name>` loads the store and renders a wallet-controlled summary of the pending action. A payment, claim, or trustline summary is decoded from the envelope whose digest the attestation binds, and an entry whose stored digest is not that envelope's digest is refused with `approval.entry_inconsistent`. Every value renders control characters as visible escapes, so a hostile entry cannot inject terminal-rendering content into that summary. On testnet the operator confirms at the terminal, and the command then computes and records the attestation. On mainnet a consent needs a verified passkey assertion from an approval credential in the owner-signed policy instead, which this release refuses with `approval.presence_required`. Recording is one-shot: a nonce that is expired, of the wrong kind, or already attested is rejected.
+`stellar-agent approve --id <nonce> --profile <name>` loads the store and renders a wallet-controlled summary of the pending action. A payment, claim, or trustline summary is decoded from the envelope whose digest the attestation binds, and an entry whose stored digest is not that envelope's digest is refused with `approval.entry_inconsistent`. Every value renders control characters as visible escapes, so a hostile entry cannot inject terminal-rendering content into that summary. On testnet the operator confirms at the terminal, and the command then computes and records the attestation. On mainnet a consent needs a verified passkey assertion from an approval credential in the owner-signed policy on the local passkey page. Recording is one-shot: a nonce that is expired, of the wrong kind, or already attested is rejected.
 
 ### The attestation
 
@@ -211,7 +211,11 @@ The consent request ID names one ceremony; the approval nonce names the pending 
 The commit witness verifies the receipt again: it recomputes the challenge from the stored record and binding, checks the raw assertion under the credential key of the current signed policy, and requires that policy to be the one the receipt names.
 A version 4 blob never verifies as version 5, so a local or remote approval cannot stand for a mainnet consent.
 The authenticator's signature counter is recorded and not enforced: fresh single-use challenges provide replay protection, and the wallet does not detect cloned credentials.
-This release connects no presence ceremony, so it records no version 5 approval and refuses every mainnet consent.
+Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
+passkey page. The operator reviews the authoritative transaction and approves
+with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
+mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
+this passkey ceremony.
 
 The length prefixes on the variable fields prevent boundary-collision attacks (two different nonce/uid pairs cannot collide into the same input). The `envelope_sha256` slot binds the attestation to the exact transaction envelope that will be signed. The `process_uid` (numeric OS uid on Unix) gives cross-account-on-host non-replay: a tag minted by one local user cannot be replayed by another.
 

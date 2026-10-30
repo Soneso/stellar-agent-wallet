@@ -280,8 +280,7 @@ On testnet the operator confirms at the terminal, and the command records an
 HMAC-SHA256 attestation. On mainnet a consent also needs a fresh WebAuthn
 assertion, with user presence and user verification, from an approval
 credential in the owner-signed policy; terminal input and the HMAC key alone
-record no mainnet consent, and this release refuses every mainnet consent with
-`approval.presence_required`. The attestation:
+record no mainnet consent. The local browser obtains the signed assertion. The attestation:
 
 - Is keyed by the profile's attestation key, which lives only in the keyring.
 - Binds the profile name, CAIP-2 chain id, approval nonce, envelope digest, and OS process uid under a versioned domain tag.

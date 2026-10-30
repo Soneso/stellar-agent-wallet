@@ -401,6 +401,10 @@ async fn approve_mainnet(
     mainnet_consent_subject(entry, &context.binding())?;
     let authority = MainnetApprovalAuthority::for_profile(&context.profile_name)?;
     drop(store);
+    #[allow(clippy::print_stderr, reason = "CLI operator consent instructions")]
+    {
+        eprintln!("{}", crate::common::mainnet_confirm::CONSENT_LINE);
+    }
     init_platform_keyring_store()?;
     let presence = acquire_mainnet_presence(entry, context, &authority, store_path).await?;
     let data = PresenceData {
@@ -558,9 +562,7 @@ fn mainnet_approve_rule(profile: &Profile, yes: bool) -> Result<(), Envelope<()>
 }
 
 /// The message of `approve.yes_refused_on_mainnet`.
-const YES_REFUSED_ON_MAINNET: &str = "approve --yes is refused on a mainnet profile; mainnet \
-                                      consent requires a verified passkey assertion from an \
-                                      approval credential in the owner-signed policy.";
+const YES_REFUSED_ON_MAINNET: &str = "approve --yes is refused on a mainnet profile; approve with a pinned passkey in the local browser.";
 
 /// Builds the store path for `<profile>` as `<approval_dir>/<profile>.toml`.
 fn build_store_path(profile_name: &str) -> Result<PathBuf, WalletError> {
@@ -1533,6 +1535,162 @@ mod tests {
             stored.process_uid, our_uid,
             "test entry must have a mismatched process_uid"
         );
+    }
+
+    /// A browser refusal cannot fall back to local process consent.
+    #[tokio::test]
+    #[serial]
+    async fn mainnet_browser_open_and_no_browser_refusal() {
+        struct KeepMock;
+        impl Drop for KeepMock {
+            fn drop(&mut self) {
+                stellar_agent_network::keyring::KEEP_REGISTERED_STORE
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        stellar_agent_network::keyring::KEEP_REGISTERED_STORE
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _mock = KeepMock;
+        let fixture = stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture::new(
+            "browser-refusal",
+        );
+        let entry = fixture.payment(DEFAULT_TTL_MS);
+        let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        store
+            .insert(entry.clone(), timefmt::now_unix_ms().unwrap())
+            .unwrap();
+        let context = ApprovalContext::from_profile(fixture.name(), fixture.profile());
+        let _driver = crate::common::mainnet_presence::driver::install(Box::new(|_| {
+            Err(WalletError::Approval(
+                ApprovalFailure::PresenceBrowserRequired,
+            ))
+        }));
+        let result = approve_mainnet(
+            store,
+            &fixture.store_path(),
+            &entry,
+            &context,
+            fixture.profile(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(WalletError::Approval(
+                ApprovalFailure::PresenceBrowserRequired
+            ))
+        ));
+        let store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+        assert_nothing_persisted(&store, &entry.approval_nonce);
+        assert!(
+            !std::fs::read_to_string(fixture.audit_path())
+                .unwrap_or_default()
+                .contains("approval_attested")
+        );
+    }
+
+    /// The MCP preparation completes through bare approval and the browser listener.
+    #[cfg(all(feature = "mainnet-write", feature = "test-helpers"))]
+    #[tokio::test]
+    #[serial]
+    async fn mcp_approve_browser_round_trip_records_before_signing() {
+        use crate::common::mainnet_write_fixture::{
+            DESTINATION, ORACLE_HOST, PRIMARY_HOST, Spec, pay_rule,
+        };
+        use stellar_agent_mcp::server::WalletServer;
+        // Each run names its own profile: the audit writer a recorded consent
+        // registers for a profile name stays bound to that run's log path for
+        // the life of the process.
+        for (fail_audit, name) in [(false, "mcp-browser-cli"), (true, "mcp-browser-cli-audit")] {
+            let rule = pay_rule("allow", "");
+            let mut fixture = Spec::new(name)
+                .rules(vec![
+                    rule.clone(),
+                    rule.replace("stellar_pay", "stellar_pay_commit"),
+                ])
+                .build()
+                .await;
+            fixture.present_in_browser(5);
+            let profile = fixture.profile();
+            let server = WalletServer::new_with_selection_and_routes_for_test(
+                profile.clone(),
+                stellar_agent_core::profile::name::ProfileNameSource::Flag,
+                &stellar_agent_core::profile::schema::default_profile_dir().unwrap(),
+                &[
+                    (PRIMARY_HOST, &fixture.primary.uri()),
+                    (ORACLE_HOST, &fixture.oracle.uri()),
+                ],
+            )
+            .unwrap();
+            let mut args = serde_json::json!({"chain_id":"stellar:mainnet", "source":fixture.agent.g, "destination":DESTINATION,
+                "amount_in_stroops":"10", "asset":"native", "fee":"100"});
+            let response = server
+                .call_stellar_pay(serde_json::from_value(args.clone()).unwrap())
+                .await
+                .unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+            assert_eq!(response["ok"], true, "{response}");
+            let data = &response["data"];
+            let nonce = data["approval"]["approval_nonce"].as_str().unwrap();
+            let store = PendingApprovalStore::open(fixture.approval_store_path()).unwrap();
+            let entry = store.get(nonce).unwrap().clone();
+            assert!(entry.mainnet_presence.is_none());
+            assert!(fixture.sent_envelopes().await.is_empty());
+            if fail_audit {
+                std::fs::remove_file(&profile.audit_log_path).unwrap();
+                std::fs::create_dir(&profile.audit_log_path).unwrap();
+            }
+            let approved = approve_mainnet(
+                store,
+                &fixture.approval_store_path(),
+                &entry,
+                &ApprovalContext::from_profile(fixture.name, &profile),
+                &profile,
+            )
+            .await;
+            let (blob, presence) = if fail_audit {
+                assert!(approved.is_err(), "an unusable audit log refuses consent");
+                let store = PendingApprovalStore::open(fixture.approval_store_path()).unwrap();
+                assert_nothing_persisted(&store, nonce);
+                (
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0; 32]),
+                    None,
+                )
+            } else {
+                let approved = approved.unwrap();
+                assert_eq!(approved.presence.method, "webauthn_uv");
+                (approved.attestation.unwrap(), Some(approved.presence))
+            };
+            args["approval_nonce"] = serde_json::json!(nonce);
+            args["approval_attestation"] = serde_json::json!(blob);
+            for field in ["envelope_xdr", "nonce", "expires_at_unix_ms"] {
+                args[field] = data[field].clone();
+            }
+            let response = server
+                .call_stellar_pay_commit(serde_json::from_value(args).unwrap())
+                .await
+                .unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+            if let Some(presence) = presence {
+                assert_eq!(response["ok"], true, "{response}");
+                assert_eq!(fixture.sent_envelopes().await.len(), 1);
+                let rows = fixture.audit_rows("approval_attested");
+                assert_eq!(rows.len(), 1);
+                let row = rows[0].to_string();
+                assert!(row.contains(&presence.request_id));
+                assert!(row.contains(&presence.credential_fingerprint));
+                let current = MainnetApprovalAuthority::for_profile(fixture.name)
+                    .unwrap()
+                    .load_current_compare_only()
+                    .unwrap();
+                assert!(row.contains(&stellar_agent_core::hex::encode(&current.policy().digest())));
+            } else {
+                assert_eq!(response["ok"], false, "{response}");
+                assert!(fixture.sent_envelopes().await.is_empty());
+                assert!(profile.audit_log_path.is_dir());
+            }
+        }
     }
 
     /// On mainnet the local operator's approval records nothing, whatever
@@ -2980,8 +3138,7 @@ mod tests {
         }
         assert_eq!(
             YES_REFUSED_ON_MAINNET,
-            "approve --yes is refused on a mainnet profile; mainnet consent requires a verified \
-             passkey assertion from an approval credential in the owner-signed policy."
+            "approve --yes is refused on a mainnet profile; approve with a pinned passkey in the local browser."
         );
     }
 

@@ -750,7 +750,7 @@ The recorded process uid must match the approving local user.
 Consent records an HMAC attestation, or persists a toolset grant and consumes its pending request.
 The versioned HMAC binds the profile name, CAIP-2 chain id, approval nonce, digest, and process uid.
 The agent verifies it before executing.
-On a mainnet profile, consent also requires a verified passkey assertion from an approval credential in the owner-signed policy, and this release refuses every mainnet consent with `approval.presence_required`; see [Mainnet write behavior](index.md#mainnet-write-behavior).
+On a mainnet profile, consent also requires a verified passkey assertion from an approval credential in the owner-signed policy, and the operator approves on the local passkey page; see [Mainnet write behavior](index.md#mainnet-write-behavior).
 See [concepts](../concepts.md) for the attestation model and [toolsets](../toolsets.md) for first-invoke grants.
 
 A `require_approval` rule's `ttl_secs` sets the pending entry's lifetime,
@@ -814,7 +814,7 @@ State-changing (records an attestation or a grant in the on-disk pending-approva
 - `--yes` — non-interactive auto-approve. Bypasses the stdin prompt; the wallet-controlled summary is still printed so there is a visible record. Intended for trusted automation and tests, not routine operator use.
   It applies to a testnet profile only: a mainnet profile refuses it before store access with `approve.yes_refused_on_mainnet`.
 
-On a mainnet profile the command prints the summary, then refuses with `approval.presence_required` and records nothing; it reads no terminal input. On a testnet profile, interactively, the command prints the summary and prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. It exits `1` when the nonce is unknown, expired, already attested, created by a different local user, inconsistent, denied at the prompt, or on an I/O error.
+On a mainnet profile the command prints the summary and opens the local passkey page; it reads no terminal input. On a testnet profile, interactively, the command prints the summary and prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. It exits `1` when the nonce is unknown, expired, already attested, created by a different local user, inconsistent, denied at the prompt, or on an I/O error.
 
 The `approval_attested` audit row is written before the approval is persisted. When an MCP server or `approve serve` inbox holds that profile's audit writer, the row is queued in the audit outbox. The running process appends it to the log before any process loads a signing key for the approved action. The envelope's `audit` field says which happened: `"written"` or `"queued"`. The command refuses, persists nothing, and exits `1` when the writer is held by a process that does not drain the outbox (`audit.writer_locked`). It does the same on any other audit failure. Examples are a missing audit key, a rolled-back log (`audit.tip_anchor_mismatch`), and a busy outbox (`audit.outbox_busy`).
 
@@ -900,8 +900,11 @@ every later decision until the inbox restarts. `approve serve` itself refuses
 to start while another process, such as a running MCP server, holds the audit
 writer (`audit.writer_locked`).
 
-On a mainnet profile, Approve answers HTTP 403 with `approval.presence_required`
-and records nothing; Reject works.
+On a mainnet profile, Approve with passkey requests a fresh verified assertion.
+The terminal-style approve route refuses with `approval.presence_required`.
+Reject works. Mainnet refuses `--no-open` and browser-launch failures, and
+prints only a startup notice and the port. It keeps the private redirect file
+until shutdown. Testnet retains the manual URL handoff.
 
 The printed URL contains a single-use bootstrap token: the first visit
 exchanges it for an HttpOnly session cookie and an origin-scoped session
@@ -963,8 +966,10 @@ host, without an SSH tunnel. Requires the profile's `[remote_approval]` block
 with `enabled = true` AND `--confirm-remote-exposure` as a separate, explicit
 consent flag; either alone refuses to start. See
 [Remote approval](../remote-approval.md) for the full setup, trust model, and
-walkthrough. The remote listener approves testnet requests only: an approve of
-a mainnet request answers HTTP 403 with `approval.mainnet_remote_unsupported`.
+walkthrough. The remote listener serves testnet profiles only: on a mainnet
+profile it refuses to start with `approval.mainnet_remote_unsupported`. Approve
+or reject a mainnet request in the local inbox (`approve serve` without
+`--remote`).
 
 ### `approve operator enroll`
 

@@ -2,9 +2,10 @@
 //! and reports approval refusals without persisting consent.
 //!
 //! On mainnet the binary refuses `--yes` before the approval store is
-//! opened, and without it refuses with `approval.presence_required`: no
-//! passkey ceremony is available, and terminal input is no consent. Either
-//! way the pending file stays byte-identical.
+//! opened. Without it, with the owner-signed policy in place, the approval
+//! reaches the browser boundary and, with no browser, refuses with
+//! `approval.presence_browser_required`: terminal input is no consent.
+//! Either way the pending file stays byte-identical.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -72,10 +73,12 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
         )
         .rpc_url(rpc_url)
     };
-    let mut profile = builder
-        .audit_log_path(home.join("audit").join("approval.jsonl"))
-        .with_noop_engine()
-        .build();
+    let builder = builder.audit_log_path(home.join("audit").join("approval.jsonl"));
+    let mut profile = if mainnet {
+        builder.build()
+    } else {
+        builder.with_noop_engine().build()
+    };
     profile.attestation_key_id = KeyringEntryRef::default_attestation_key(name);
     save_new_to_dir(name, &profile, &home.join("profiles")).unwrap();
     let protection_key = [7_u8; 32];
@@ -104,6 +107,9 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
     .unwrap()
     .set_password(&URL_SAFE_NO_PAD.encode([0x24_u8; 32]))
     .unwrap();
+    if mainnet {
+        crate::mainnet_presence::sign_presence_policy(home, name, &profile);
+    }
     let transaction_source = MuxedAccount::Ed25519(Uint256([2; 32]));
     let operation_source = MuxedAccount::Ed25519(Uint256([3; 32]));
     let operation_source_strkey = stellar_strkey::ed25519::PublicKey([3; 32]).to_string();
@@ -203,6 +209,7 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
             "STELLAR_AGENT_HEADLESS_KEYRING_KEY",
             URL_SAFE_NO_PAD.encode(protection_key),
         )
+        .env(crate::mainnet_presence::NO_BROWSER_ENV, "1")
         .env_remove("STELLAR_AGENT_PROFILE")
         .output()
         .expect("approve binary runs");
@@ -212,7 +219,7 @@ fn approve_binary_case(mainnet: bool, case: ApprovalCase) {
         (true, ApprovalCase::Attest | ApprovalCase::Trustline | ApprovalCase::UnknownNonce) => {
             Some("approve.yes_refused_on_mainnet")
         }
-        (true, ApprovalCase::ClosedStdin) => Some("approval.presence_required"),
+        (true, ApprovalCase::ClosedStdin) => Some("approval.presence_browser_required"),
         (false, ApprovalCase::UnknownNonce) => Some("approval.not_found"),
         (false, ApprovalCase::ClosedStdin) => Some("approval.denied"),
         (false, ApprovalCase::Attest | ApprovalCase::Trustline) => None,
@@ -311,9 +318,10 @@ fn approve_binary_mainnet_refuses_yes() {
     approve_binary_case(true, ApprovalCase::Attest);
 }
 
+#[cfg(feature = "test-helpers")]
 #[test]
 #[serial]
-fn approve_binary_mainnet_without_yes_refuses_without_presence() {
+fn approve_binary_mainnet_without_yes_requires_a_browser() {
     approve_binary_case(true, ApprovalCase::ClosedStdin);
 }
 
