@@ -73,7 +73,7 @@ pub struct AccountReserveLookupError {
 /// Bundle decomposition and overlay substrate for multicall policy evaluation.
 ///
 /// Provides [`bundle::BundleView`], [`bundle::InnerOpDescriptor`], `BundleStateOverlay`, and
-/// [`bundle::decompose_bundle`].  Consumed by `PolicyEngineV1::evaluate_bundle` and
+/// [`bundle::decompose_bundle_calls`].  Consumed by `PolicyEngineV1::evaluate_bundle` and
 /// injected into `EvalContext::bundle` for bundle-level criteria.
 pub mod bundle;
 
@@ -1591,10 +1591,14 @@ impl PolicyEngineV1 {
                     inners: bundle.inners,
                     overlay: &overlay,
                 };
-                // Populate the value axis from this inner's typed descriptor so
-                // value criteria read ctx.value uniformly. Generic inners map to
-                // ReadOnly (they contribute nothing to value caps).
+                // The matched rule can exempt unsizable calls from its value criteria.
                 let value = value::value_class_for_inner(inner);
+                let value =
+                    if rule.allow_opaque_signing && matches!(value, value::ValueClass::Opaque(_)) {
+                        value::ValueClass::ReadOnly
+                    } else {
+                        value
+                    };
                 let ctx = EvalContext {
                     tool,
                     args,
@@ -2678,6 +2682,43 @@ mod tests {
     /// evaluate_bundle: no `bundle_aggregate_cap`, no
     /// `restrict_bundle_to_recognised_kinds` on the rule — a Generic inner is
     /// allowed. Existing behavior is unchanged when the cap is absent.
+    #[test]
+    fn evaluate_bundle_per_tx_cap_denies_an_unvalued_inner() {
+        let result = evaluate_unvalued_inner(false);
+        assert!(
+            matches!(result, Decision::Deny(DenyReason::BundleDenied { inner_index: 0, deny_reason }) if matches!(*deny_reason, DenyReason::UnsizableValueEffect { .. }))
+        );
+    }
+
+    #[test]
+    fn evaluate_bundle_allow_opaque_signing_admits_an_unvalued_inner() {
+        assert_eq!(evaluate_unvalued_inner(true), Decision::Allow);
+    }
+
+    fn evaluate_unvalued_inner(allow_opaque_signing: bool) -> Decision {
+        use crate::policy::v1::criteria::per_tx_cap::PerTxCapCriterion;
+        let mut doc = allow_all_doc_with_criteria(vec![Box::new(PerTxCapCriterion::new(
+            "native".to_owned(),
+            20,
+        ))]);
+        doc.rules[0].allow_opaque_signing = allow_opaque_signing;
+        let engine = PolicyEngineV1::new(doc, "alice".into());
+        let inners = vec![generic_inner()];
+        let overlay = BundleStateOverlay::default();
+        let view = BundleView {
+            inners: &inners,
+            overlay: &overlay,
+        };
+        engine
+            .evaluate_bundle(
+                &tool("stellar_multicall", "stellar:testnet"),
+                &Value::Null,
+                &testnet_profile(),
+                &view,
+            )
+            .unwrap()
+    }
+
     #[test]
     fn evaluate_bundle_no_cap_no_guard_allows_generic_inner() {
         let doc = allow_all_doc_with_criteria(vec![]);

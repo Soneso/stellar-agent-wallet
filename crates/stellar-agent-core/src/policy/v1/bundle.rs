@@ -1,46 +1,14 @@
-//! Bundle decomposition and overlay substrate for multicall policy evaluation.
+//! Typed bundle decomposition and state overlays for multicall policy evaluation.
 //!
-//! This module provides:
-//!
-//! - [`crate::policy::v1::bundle::InnerOpDescriptor`] — typed description of a single inner operation in a
-//!   multicall bundle, produced by [`crate::policy::v1::bundle::decompose_bundle`].
-//! - [`crate::policy::v1::bundle::BundleView`] — a read-only view of the full bundle passed into each
-//!   [`crate::policy::v1::EvalContext`] during
-//!   [`crate::policy::v1::PolicyEngineV1::evaluate_bundle`].
-//! - `BundleStateOverlay` — a per-`StateKey` `i128` accumulator that lets
-//!   stateful criteria (`per_period_cap`, `rate_limit`) account for inners
-//!   evaluated earlier in the same bundle without committing to the persistent
-//!   [`crate::policy::v1::criteria::state_store::PolicyStateStore`].
-//! - [`crate::policy::v1::bundle::decompose_bundle`] — converts raw `(target, fn_name, args)` triples into
-//!   typed `InnerOpDescriptor` values, recognising canonical SAC token-transfer
-//!   invocations.
-//!
-//! # SAC token-transfer recognition
-//!
-//! An inner is classified as `InnerOpDescriptor::TokenTransfer` when ALL of:
-//!
-//! 1. `target` decodes via [`stellar_strkey::Contract::from_string`] (strict).
-//! 2. `fn_name == "transfer"` (exact byte equality).
-//! 3. `args.len() == 3`.
-//! 4. `args[0]` and `args[1]` are strings that decode via
-//!    [`stellar_strkey::ed25519::PublicKey::from_string`] (strict).
-//! 5. `args[2]` is a string parseable as `i128` via `parse_i128_arg`.
-//!
-//! If any condition fails, the inner is classified as
-//! `InnerOpDescriptor::Generic`.
-//!
-//! # i128 amount convention
-//!
-//! Policy amounts for bundle aggregation use `i128` because the per-bundle sum
-//! may exceed `i64::MAX` when multiple inners are combined.  Individual inner
-//! amounts in a SAC token transfer are `i128` at the XDR layer (the SAC ABI
-//! uses `Int128Parts` for transfer amounts).
-//!
-//! The JSON convention (matching the wallet's existing `per_tx_cap` / `per_period_cap`
-//! string-amount style) passes `args[2]` as a decimal string `"<decimal>"`.
-//! `parse_i128_arg` accepts that form.
+//! A valued call is exactly `transfer(Address from, Address to, I128 amount)`
+//! with a nonnegative amount and `from` equal to the wallet. The recipient
+//! has an account or contract strkey. Every other call is generic.
+//! The gate values the calls the wallet authorizes. A transfer between other
+//! addresses needs their authorization and contributes no sized wallet outflow.
 
+use crate::sc_address::scaddress_to_strkey;
 use std::collections::HashMap;
+use stellar_xdr::{InvokeContractArgs, ScAddress, ScVal};
 
 use crate::policy::v1::criteria::state_store::StateKey;
 
@@ -48,48 +16,35 @@ use crate::policy::v1::criteria::state_store::StateKey;
 // InnerOpDescriptor
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Typed descriptor for a single inner operation within a multicall bundle.
+/// Typed descriptor for a call in a multicall bundle.
 ///
-/// Produced by [`decompose_bundle`] from raw `(target, fn_name, args)` triples.
-/// The `#[non_exhaustive]` attribute ensures that new recognised kinds (e.g.
-/// clawback, mint) can be added in future releases without breaking downstream
-/// `match` exhaustion.
+/// Produced by [`decompose_bundle_calls`] from the encoded calls.
 ///
 /// # Examples
 ///
 /// ```
-/// use stellar_agent_core::policy::v1::bundle::{InnerOpDescriptor, decompose_bundle};
-///
-/// // SOURCE_G and DEST_G are valid G-strkeys from the codebase test fixtures.
-/// let raw = vec![(
-///     "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-///     "transfer".to_owned(),
-///     vec![
-///         serde_json::Value::String("GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned()),
-///         serde_json::Value::String("GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned()),
-///         serde_json::Value::String("1000000000".to_owned()),
-///     ],
-/// )];
-/// let descriptors = decompose_bundle(&raw);
-/// assert!(matches!(descriptors[0], InnerOpDescriptor::TokenTransfer { .. }));
+/// use stellar_agent_core::policy::v1::bundle::{InnerOpDescriptor, decompose_bundle_calls};
+/// use stellar_xdr::{ContractId, Hash, Int128Parts, InvokeContractArgs, ScAddress, ScVal};
+/// let wallet = ScAddress::Contract(ContractId(Hash([0x44; 32])));
+/// let call = InvokeContractArgs {
+///     contract_address: ScAddress::Contract(ContractId(Hash([0x47; 32]))),
+///     function_name: "transfer".try_into().unwrap(),
+///     args: vec![ScVal::Address(wallet.clone()), ScVal::Address(wallet.clone()),
+///         ScVal::I128(Int128Parts { hi: 0, lo: 30 })].try_into().unwrap(),
+/// };
+/// let descriptors = decompose_bundle_calls(&[call], &wallet);
+/// assert!(matches!(descriptors[0], InnerOpDescriptor::TokenTransfer { amount: 30, .. }));
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum InnerOpDescriptor {
-    /// A canonical SAC (Stellar Asset Contract) token transfer.
-    ///
-    /// All fields are validated at decomposition time:
-    /// - `asset` — the contract address (C-strkey) of the SAC.
-    /// - `from` — the sender G-strkey (ed25519 public key).
-    /// - `to` — the recipient G-strkey.
-    /// - `amount` — the transfer amount as `i128` (raw stroop units from the
-    ///   SAC ABI).
+    /// A token transfer from the wallet, with a nonnegative amount.
     TokenTransfer {
         /// SAC contract address (C-strkey).
         asset: String,
-        /// Sender address (G-strkey).
+        /// Wallet address (account or contract strkey).
         from: String,
-        /// Recipient address (G-strkey).
+        /// Recipient address (account or contract strkey).
         to: String,
         /// Transfer amount in SAC raw units (i128; typically stroop-scale).
         amount: i128,
@@ -104,7 +59,7 @@ pub enum InnerOpDescriptor {
     /// require a `u8` truncation (`usize → u8`) that is unsound for arg lists
     /// longer than 255, and the count is not used by any criterion.
     Generic {
-        /// Raw target contract address (may be any string; not strkey-validated).
+        /// Target strkey, or the name of an unsupported address variant.
         target: String,
         /// Raw function name.
         fn_name: String,
@@ -221,150 +176,63 @@ pub struct BundleView<'a> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// decompose_bundle
+// decompose_bundle_calls
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Converts raw `(target, fn_name, args)` triples into typed [`InnerOpDescriptor`] values.
+/// Decomposes encoded calls into wallet transfers and unsized calls.
 ///
-/// Each triple is matched against the canonical SAC token-transfer shape; any
-/// triple that fails one or more conditions falls through to
-/// [`InnerOpDescriptor::Generic`].
-///
-/// # SAC recognition criteria
-///
-/// 1. `target` decodes via [`stellar_strkey::Contract::from_string`] (strict).
-/// 2. `fn_name == "transfer"` (exact).
-/// 3. `args.len() == 3`.
-/// 4. `args[0]` and `args[1]` are strings decodable via
-///    [`stellar_strkey::ed25519::PublicKey::from_string`] (strict).
-/// 5. `args[2]` is a string parseable as `i128` via [`parse_i128_arg`].
+/// Only `transfer` with exactly two addresses and an `I128` amount counts.
+/// The sender equals `wallet`, the recipient has a strkey, and the amount
+/// is nonnegative. Every other shape is [`InnerOpDescriptor::Generic`].
 ///
 /// # Examples
 ///
 /// ```
-/// use stellar_agent_core::policy::v1::bundle::{InnerOpDescriptor, decompose_bundle};
-///
-/// // Generic triple (wrong function name).
-/// let raw = vec![(
-///     "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
-///     "mint".to_owned(),
-///     vec![
-///         serde_json::Value::String("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".to_owned()),
-///         serde_json::Value::String("1000000000".to_owned()),
-///     ],
-/// )];
-/// let descriptors = decompose_bundle(&raw);
-/// assert!(matches!(descriptors[0], InnerOpDescriptor::Generic { .. }));
+/// use stellar_agent_core::policy::v1::bundle::{InnerOpDescriptor, decompose_bundle_calls};
+/// use stellar_xdr::{ContractId, Hash, Int128Parts, InvokeContractArgs, ScAddress, ScVal};
+/// let wallet = ScAddress::Contract(ContractId(Hash([0x44; 32])));
+/// let call = InvokeContractArgs {
+///     contract_address: ScAddress::Contract(ContractId(Hash([0x47; 32]))),
+///     function_name: "transfer".try_into().unwrap(),
+///     args: vec![ScVal::Address(wallet.clone()), ScVal::Address(wallet.clone()),
+///         ScVal::I128(Int128Parts { hi: 0, lo: 30 })].try_into().unwrap(),
+/// };
+/// let descriptors = decompose_bundle_calls(&[call], &wallet);
+/// assert!(matches!(descriptors[0], InnerOpDescriptor::TokenTransfer { amount: 30, .. }));
 /// ```
 #[must_use]
-pub fn decompose_bundle(
-    raw: &[(String, String, Vec<serde_json::Value>)],
+pub fn decompose_bundle_calls(
+    calls: &[InvokeContractArgs],
+    wallet: &ScAddress,
 ) -> Vec<InnerOpDescriptor> {
-    raw.iter()
-        .map(|(target, fn_name, args)| {
-            try_decompose_as_token_transfer(target, fn_name, args).unwrap_or_else(|| {
-                InnerOpDescriptor::Generic {
-                    target: target.clone(),
-                    fn_name: fn_name.clone(),
+    calls
+        .iter()
+        .map(|call| {
+            let target = scaddress_to_strkey(&call.contract_address)
+                .unwrap_or_else(|error| error.variant.to_owned());
+            if call.function_name.0.as_slice() == b"transfer"
+                && let [ScVal::Address(from), ScVal::Address(to), ScVal::I128(parts)] =
+                    call.args.as_slice()
+                && from == wallet
+                && let (Ok(from), Ok(to)) = (scaddress_to_strkey(from), scaddress_to_strkey(to))
+            {
+                let amount = (i128::from(parts.hi) << 64) | i128::from(parts.lo);
+                if amount >= 0 {
+                    return InnerOpDescriptor::TokenTransfer {
+                        asset: target,
+                        from,
+                        to,
+                        amount,
+                    };
                 }
-            })
+            }
+            InnerOpDescriptor::Generic {
+                target,
+                fn_name: String::from_utf8_lossy(call.function_name.0.as_slice()).into_owned(),
+            }
         })
         .collect()
 }
-
-/// Attempts to recognise a single raw triple as a SAC token transfer.
-///
-/// Returns `Some(TokenTransfer { .. })` when all five recognition criteria are
-/// met; `None` otherwise.
-fn try_decompose_as_token_transfer(
-    target: &str,
-    fn_name: &str,
-    args: &[serde_json::Value],
-) -> Option<InnerOpDescriptor> {
-    // Condition 1: target must be a valid C-strkey.
-    stellar_strkey::Contract::from_string(target).ok()?;
-
-    // Condition 2: function name must be exactly "transfer".
-    if fn_name != "transfer" {
-        return None;
-    }
-
-    // Condition 3: must have exactly 3 arguments.
-    if args.len() != 3 {
-        return None;
-    }
-
-    // Condition 4a: args[0] must be a string decodable as a G-strkey.
-    let from_str = args[0].as_str()?;
-    stellar_strkey::ed25519::PublicKey::from_string(from_str).ok()?;
-
-    // Condition 4b: args[1] must be a string decodable as a G-strkey.
-    let to_str = args[1].as_str()?;
-    stellar_strkey::ed25519::PublicKey::from_string(to_str).ok()?;
-
-    // Condition 5: args[2] must be a string parseable as i128.
-    let amount = parse_i128_arg(&args[2])?;
-
-    // Condition 6: amount must be non-negative (defence-in-depth).
-    // A negative amount does not represent a valid token transfer quantity.
-    // Falling through to Generic lets RestrictBundleToRecognisedKindsCriterion
-    // deny the inner when enabled, which is the correct fail-CLOSED posture.
-    if amount < 0 {
-        return None;
-    }
-
-    Some(InnerOpDescriptor::TokenTransfer {
-        asset: target.to_owned(),
-        from: from_str.to_owned(),
-        to: to_str.to_owned(),
-        amount,
-    })
-}
-
-/// Parses a JSON value as an `i128`.
-///
-/// The wallet uses a string-encoded decimal convention for large integer amounts
-/// (matching the `per_tx_cap` / `per_period_cap` style).  This function accepts:
-///
-/// - A JSON string containing a decimal `i128` (e.g. `"1000000000"`).
-/// - A JSON unsigned 64-bit integer (`u64`-range; checked BEFORE `i64` so that
-///   values such as `u64::MAX` are not silently rejected by `as_i64()`).
-/// - A JSON signed 64-bit integer (`i64`-range; for forward compat with callers
-///   that emit bare negative integers).
-///
-/// Returns `None` when the value is neither a parseable string nor a JSON integer.
-///
-/// # Examples
-///
-/// ```
-/// use stellar_agent_core::policy::v1::bundle::parse_i128_arg;
-/// use serde_json::json;
-///
-/// assert_eq!(parse_i128_arg(&json!("1000000000")), Some(1_000_000_000_i128));
-/// assert_eq!(parse_i128_arg(&json!(42i64)), Some(42_i128));
-/// assert_eq!(parse_i128_arg(&json!(u64::MAX)), Some(i128::from(u64::MAX)));
-/// assert_eq!(parse_i128_arg(&json!("not-a-number")), None);
-/// assert_eq!(parse_i128_arg(&json!(null)), None);
-/// ```
-#[must_use]
-pub fn parse_i128_arg(v: &serde_json::Value) -> Option<i128> {
-    if let Some(s) = v.as_str() {
-        return s.parse::<i128>().ok();
-    }
-    // Check u64 first: serde_json represents large positive integers (e.g. u64::MAX)
-    // as unsigned, which as_i64() would reject.  Both branches widen losslessly to i128.
-    if let Some(n) = v.as_u64() {
-        return Some(i128::from(n));
-    }
-    if let Some(n) = v.as_i64() {
-        return Some(i128::from(n));
-    }
-    None
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -375,161 +243,122 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
-    use serde_json::json;
+    use stellar_xdr::{AccountId, ContractId, Hash, Int128Parts, PublicKey, Uint256};
 
     use super::*;
     use crate::policy::v1::criteria::state_store::StateKey;
 
-    // ── SAC strkey test fixtures ──────────────────────────────────────────────
-    //
-    // Contract (C-strkey): CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM
-    // This is a valid Stellar C-strkey (32 zero bytes with CRC-16 checksum).
-    // Verified via stellar_strkey::Contract::from_string (passes).
-    //
-    // Public keys (G-strkeys): both verified via
-    // stellar_strkey::ed25519::PublicKey::from_string (passes).
-
-    const SAC_CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-    const ADDR_FROM: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
-    const ADDR_TO: &str = "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL";
-
-    fn make_transfer_triple(amount: &str) -> (String, String, Vec<serde_json::Value>) {
-        (
-            SAC_CONTRACT.to_owned(),
-            "transfer".to_owned(),
-            vec![json!(ADDR_FROM), json!(ADDR_TO), json!(amount)],
-        )
+    fn contract(byte: u8) -> ScAddress {
+        ScAddress::Contract(ContractId(Hash([byte; 32])))
     }
 
-    // ── decompose_bundle tests ────────────────────────────────────────────────
+    fn account() -> ScAddress {
+        ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+            [0x48; 32],
+        ))))
+    }
 
-    #[test]
-    fn decompose_recognises_sac_transfer() {
-        let raw = vec![make_transfer_triple("1000000000")];
-        let descriptors = decompose_bundle(&raw);
-        assert_eq!(descriptors.len(), 1);
-        match &descriptors[0] {
-            InnerOpDescriptor::TokenTransfer {
-                asset,
-                from,
-                to,
-                amount,
-            } => {
-                assert_eq!(asset, SAC_CONTRACT);
-                assert_eq!(from, ADDR_FROM);
-                assert_eq!(to, ADDR_TO);
-                assert_eq!(*amount, 1_000_000_000_i128);
-            }
-            other => panic!("expected TokenTransfer, got {other:?}"),
+    fn transfer(from: ScAddress, to: ScAddress) -> InvokeContractArgs {
+        InvokeContractArgs {
+            contract_address: contract(0x47),
+            function_name: "transfer".try_into().unwrap(),
+            args: vec![
+                ScVal::Address(from),
+                ScVal::Address(to),
+                ScVal::I128(Int128Parts { hi: 0, lo: 30 }),
+            ]
+            .try_into()
+            .unwrap(),
         }
     }
 
     #[test]
-    fn decompose_falls_through_to_generic_on_wrong_fn_name() {
-        let raw = vec![(
-            SAC_CONTRACT.to_owned(),
-            "mint".to_owned(),
-            vec![json!(ADDR_FROM), json!("1000000000")],
-        )];
-        let descriptors = decompose_bundle(&raw);
-        assert!(
-            matches!(descriptors[0], InnerOpDescriptor::Generic { .. }),
-            "wrong fn_name must produce Generic"
-        );
+    fn a_transfer_from_the_wallet_is_a_token_transfer() {
+        let wallet = contract(0x44);
+        for to in [contract(0x48), account()] {
+            let result = decompose_bundle_calls(&[transfer(wallet.clone(), to.clone())], &wallet);
+            let InnerOpDescriptor::TokenTransfer {
+                asset,
+                from,
+                to: recipient,
+                amount,
+            } = &result[0]
+            else {
+                panic!("wallet transfer must be valued");
+            };
+            assert_eq!(asset, &scaddress_to_strkey(&contract(0x47)).unwrap());
+            assert_eq!(from, &scaddress_to_strkey(&wallet).unwrap());
+            assert_eq!(recipient, &scaddress_to_strkey(&to).unwrap());
+            assert_eq!(*amount, 30);
+        }
     }
 
     #[test]
-    fn decompose_falls_through_to_generic_on_invalid_contract() {
-        let raw = vec![(
-            "not-a-strkey".to_owned(),
-            "transfer".to_owned(),
-            vec![json!(ADDR_FROM), json!(ADDR_TO), json!("100")],
-        )];
-        let descriptors = decompose_bundle(&raw);
-        assert!(
-            matches!(descriptors[0], InnerOpDescriptor::Generic { .. }),
-            "invalid contract address must produce Generic"
-        );
+    fn a_transfer_from_another_address_is_not_valued() {
+        for from in [account(), contract(0x45)] {
+            let result = decompose_bundle_calls(&[transfer(from, contract(0x48))], &contract(0x44));
+            assert!(matches!(result[0], InnerOpDescriptor::Generic { .. }));
+        }
     }
 
     #[test]
-    fn decompose_falls_through_to_generic_on_wrong_arg_count() {
-        let raw = vec![(
-            SAC_CONTRACT.to_owned(),
-            "transfer".to_owned(),
-            vec![json!(ADDR_FROM), json!("100")], // only 2 args
-        )];
-        let descriptors = decompose_bundle(&raw);
-        assert!(
-            matches!(descriptors[0], InnerOpDescriptor::Generic { .. }),
-            "wrong arg count must produce Generic"
-        );
-    }
-
-    #[test]
-    fn decompose_falls_through_to_generic_on_invalid_from_address() {
-        let raw = vec![(
-            SAC_CONTRACT.to_owned(),
-            "transfer".to_owned(),
-            vec![json!("not-a-gstrkey"), json!(ADDR_TO), json!("100")],
-        )];
-        let descriptors = decompose_bundle(&raw);
-        assert!(
-            matches!(descriptors[0], InnerOpDescriptor::Generic { .. }),
-            "invalid from address must produce Generic"
-        );
-    }
-
-    #[test]
-    fn decompose_falls_through_to_generic_on_invalid_to_address() {
-        let raw = vec![(
-            SAC_CONTRACT.to_owned(),
-            "transfer".to_owned(),
-            vec![json!(ADDR_FROM), json!("not-a-gstrkey"), json!("100")],
-        )];
-        let descriptors = decompose_bundle(&raw);
-        assert!(
-            matches!(descriptors[0], InnerOpDescriptor::Generic { .. }),
-            "invalid to address must produce Generic"
-        );
-    }
-
-    #[test]
-    fn decompose_falls_through_to_generic_on_non_parseable_amount() {
-        let raw = vec![(
-            SAC_CONTRACT.to_owned(),
-            "transfer".to_owned(),
-            vec![json!(ADDR_FROM), json!(ADDR_TO), json!("not-a-number")],
-        )];
-        let descriptors = decompose_bundle(&raw);
-        assert!(
-            matches!(descriptors[0], InnerOpDescriptor::Generic { .. }),
-            "non-parseable amount must produce Generic"
-        );
-    }
-
-    #[test]
-    fn decompose_empty_bundle_returns_empty_vec() {
-        let descriptors = decompose_bundle(&[]);
-        assert!(descriptors.is_empty());
-    }
-
-    #[test]
-    fn decompose_mixed_bundle_classifies_correctly() {
-        let raw = vec![
-            make_transfer_triple("500"),
-            (SAC_CONTRACT.to_owned(), "unknown_fn".to_owned(), vec![]),
-        ];
-        let descriptors = decompose_bundle(&raw);
-        assert_eq!(descriptors.len(), 2);
-        assert!(matches!(
-            descriptors[0],
-            InnerOpDescriptor::TokenTransfer { .. }
+    fn string_arguments_are_not_a_transfer() {
+        let mut call = transfer(contract(0x44), account());
+        let address = ScVal::String(stellar_xdr::ScString(
+            scaddress_to_strkey(&account()).unwrap().try_into().unwrap(),
         ));
-        assert!(matches!(descriptors[1], InnerOpDescriptor::Generic { .. }));
+        call.args = vec![
+            address.clone(),
+            address,
+            ScVal::I128(Int128Parts { hi: 0, lo: 30 }),
+        ]
+        .try_into()
+        .unwrap();
+        assert!(matches!(
+            decompose_bundle_calls(&[call], &contract(0x44))[0],
+            InnerOpDescriptor::Generic { .. }
+        ));
     }
 
-    // ── BundleStateOverlay tests ──────────────────────────────────────────────
+    #[test]
+    fn a_negative_or_misshaped_transfer_is_not_valued() {
+        let wallet = contract(0x44);
+        let call = transfer(wallet.clone(), account());
+        let args = call.args.to_vec();
+        let cases = [
+            vec![
+                args[0].clone(),
+                args[1].clone(),
+                ScVal::I128(Int128Parts {
+                    hi: -1,
+                    lo: u64::MAX,
+                }),
+            ],
+            args[..2].to_vec(),
+            vec![
+                args[0].clone(),
+                args[1].clone(),
+                args[2].clone(),
+                ScVal::Void,
+            ],
+            vec![args[0].clone(), args[1].clone(), ScVal::I64(30)],
+        ];
+        for args in cases {
+            let mut malformed = call.clone();
+            malformed.args = args.try_into().unwrap();
+            assert!(matches!(
+                decompose_bundle_calls(&[malformed], &wallet)[0],
+                InnerOpDescriptor::Generic { .. }
+            ));
+        }
+        let mut call = call;
+        call.function_name = "transfer_from".try_into().unwrap();
+        assert!(matches!(
+            decompose_bundle_calls(&[call], &wallet)[0],
+            InnerOpDescriptor::Generic { .. }
+        ));
+        assert!(decompose_bundle_calls(&[], &wallet).is_empty());
+    }
 
     #[test]
     fn overlay_get_returns_zero_for_unknown_key() {
@@ -579,63 +408,5 @@ mod tests {
         let k2 = StateKey::new("alice", 1, "USDC:GISSUER", 3_600);
         overlay.accumulate(k1.clone(), 100);
         assert_eq!(overlay.get(&k2), 0);
-    }
-
-    // ── parse_i128_arg tests ──────────────────────────────────────────────────
-
-    #[test]
-    fn parse_i128_arg_string_decimal() {
-        assert_eq!(
-            parse_i128_arg(&json!("1000000000")),
-            Some(1_000_000_000_i128)
-        );
-    }
-
-    #[test]
-    fn parse_i128_arg_negative_string() {
-        assert_eq!(parse_i128_arg(&json!("-1")), Some(-1_i128));
-    }
-
-    #[test]
-    fn parse_i128_arg_i64_integer() {
-        assert_eq!(parse_i128_arg(&json!(42i64)), Some(42_i128));
-    }
-
-    #[test]
-    fn parse_i128_arg_non_parseable_string_returns_none() {
-        assert_eq!(parse_i128_arg(&json!("not-a-number")), None);
-    }
-
-    #[test]
-    fn parse_i128_arg_null_returns_none() {
-        assert_eq!(parse_i128_arg(&serde_json::Value::Null), None);
-    }
-
-    /// Regression test: u64::MAX exceeds i64::MAX and must be returned via the
-    /// `as_u64` branch, not silently rejected.  The `as_u64` branch must be
-    /// checked before `as_i64` because serde_json represents large positive
-    /// integers (e.g. `u64::MAX`) only as unsigned.
-    #[test]
-    fn parse_i128_arg_u64_max_returns_some() {
-        // serde_json stores u64::MAX as a Number in u64 range; as_i64() returns None.
-        assert_eq!(
-            parse_i128_arg(&json!(u64::MAX)),
-            Some(i128::from(u64::MAX)),
-            "u64::MAX must be returned via the as_u64 branch"
-        );
-    }
-
-    /// Negative amounts are not valid token transfer quantities.  A negative
-    /// `args[2]` value falls through to `Generic` so that
-    /// `RestrictBundleToRecognisedKindsCriterion` can deny the inner when
-    /// enabled — the correct fail-closed posture.
-    #[test]
-    fn decompose_negative_amount_falls_through_to_generic() {
-        let raw = vec![make_transfer_triple("-1")];
-        let descriptors = decompose_bundle(&raw);
-        assert!(
-            matches!(descriptors[0], InnerOpDescriptor::Generic { .. }),
-            "negative amount must produce Generic (fallthrough; defence-in-depth)"
-        );
     }
 }

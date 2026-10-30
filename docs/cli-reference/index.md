@@ -274,6 +274,8 @@ The same pre-flight proves the audit log still contains the chain tip its keyrin
 
 Before dispatching any command, the CLI runs a local-only startup advisory: it scans the profile's audit log for context rules that reference revoked or retired verifier WASM hashes. The scan issues no network calls and is non-fatal. If it cannot run, the error is logged at warn level and the command proceeds. The advisory reads the audit log of the profile the command it precedes operates on: it takes the profile the parsed subcommand resolved and applies the same resolution order as that subcommand. The advisory therefore never opens — or appends to — a different profile's log than the command itself uses.
 
+Signing under a rule pinned to a revoked or retired verifier refuses with `sa.verifier_wasm_revoked` or `sa.verifier_wasm_retired`. No flag overrides this status.
+
 ## Command index
 
 | Command group | Purpose | Page |

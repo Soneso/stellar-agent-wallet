@@ -35,7 +35,9 @@ use stellar_agent_core::audit_log::AuditWriter;
 use stellar_agent_core::audit_log::schema::EventKind;
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::policy::v1::PolicyEngineV1;
-use stellar_agent_core::policy::v1::bundle::{BundleStateOverlay, BundleView, decompose_bundle};
+use stellar_agent_core::policy::v1::bundle::{
+    BundleStateOverlay, BundleView, decompose_bundle_calls,
+};
 use stellar_agent_core::policy::{Decision, DenyReason};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::scval::scval_variant_name;
@@ -174,9 +176,9 @@ pub struct MulticallInvocation {
     pub fn_name: String,
     /// JSON-encoded arguments for the function call.
     ///
-    /// Step 1 validates that this is a JSON array; individual element shapes
-    /// are not validated host-side (the router contract passes them directly
-    /// as `Vec<Val>` to the target).
+    /// Elements are integers, strings, null, or exact single-member objects
+    /// `{"scval": "<base64 XDR ScVal>"}`. The build stage decodes each element
+    /// once for valuation, the declaration and the router arguments.
     pub args_json: serde_json::Value,
 }
 
@@ -1202,8 +1204,14 @@ fn normalize_simulated_nonce_keys(
 /// - `SaError::MulticallFailed { phase: "build", .. }` on any XDR encoding
 ///   failure (invalid C-strkey, invalid symbol, argument encoding error).
 pub fn build_exec_invocations(bundle: &[MulticallInvocation]) -> Result<Vec<ScVal>, SaError> {
-    bundle_calls(bundle)?
-        .into_iter()
+    exec_invocations_from_calls(&bundle_calls(bundle)?)
+}
+
+/// Encodes the declared calls for the router without reinterpreting arguments.
+fn exec_invocations_from_calls(calls: &[InvokeContractArgs]) -> Result<Vec<ScVal>, SaError> {
+    calls
+        .iter()
+        .cloned()
         .enumerate()
         .map(|(idx, call)| {
             // The (Address, Symbol, Vec<Val>) tuple as a ScVal::Vec.
@@ -1236,6 +1244,18 @@ pub fn build_exec_invocations(bundle: &[MulticallInvocation]) -> Result<Vec<ScVa
 /// - `SaError::MulticallFailed { phase: "build", .. }` on any XDR encoding
 ///   failure (invalid C-strkey, invalid symbol, argument encoding error).
 fn bundle_calls(bundle: &[MulticallInvocation]) -> Result<Vec<InvokeContractArgs>, SaError> {
+    bundle
+        .iter()
+        .enumerate()
+        .map(|(idx, invocation)| bundle_call(idx, invocation))
+        .collect()
+}
+
+/// Encodes one invocation for valuation, authorization and router dispatch.
+fn bundle_call(
+    idx: usize,
+    invocation: &MulticallInvocation,
+) -> Result<InvokeContractArgs, SaError> {
     use stellar_xdr::{ContractId, Hash};
 
     let build_err = |reason: String| SaError::MulticallFailed {
@@ -1244,39 +1264,33 @@ fn bundle_calls(bundle: &[MulticallInvocation]) -> Result<Vec<InvokeContractArgs
         post_submit_kind: None,
     };
 
-    let mut result = Vec::with_capacity(bundle.len());
+    // 1. The target contract address.
+    let contract_strkey = stellar_strkey::Contract::from_string(&invocation.target_contract)
+        .map_err(|e| {
+            build_err(format!(
+                "inner[{idx}]: invalid target_contract C-strkey: {e}"
+            ))
+        })?;
 
-    for (idx, invocation) in bundle.iter().enumerate() {
-        // 1. The target contract address.
-        let contract_strkey = stellar_strkey::Contract::from_string(&invocation.target_contract)
-            .map_err(|e| {
-                build_err(format!(
-                    "inner[{idx}]: invalid target_contract C-strkey: {e}"
-                ))
-            })?;
+    // 2. The function name as a Soroban symbol.
+    let symbol_str = validate_soroban_symbol(&invocation.fn_name)
+        .map_err(|e| build_err(format!("inner[{idx}]: invalid fn_name symbol: {e}")))?;
+    let function_name = ScSymbol(
+        symbol_str
+            .as_bytes()
+            .try_into()
+            .map_err(|_| build_err(format!("inner[{idx}]: fn_name symbol encoding failed")))?,
+    );
 
-        // 2. The function name as a Soroban symbol.
-        let symbol_str = validate_soroban_symbol(&invocation.fn_name)
-            .map_err(|e| build_err(format!("inner[{idx}]: invalid fn_name symbol: {e}")))?;
-        let function_name = ScSymbol(
-            symbol_str
-                .as_bytes()
-                .try_into()
-                .map_err(|_| build_err(format!("inner[{idx}]: fn_name symbol encoding failed")))?,
-        );
+    // 3. The JSON args as the call's argument vector.
+    let args = json_args_to_scval_vec(&invocation.args_json, idx)
+        .map_err(|e| build_err(format!("inner[{idx}]: args encoding failed: {e}")))?;
 
-        // 3. The JSON args as the call's argument vector.
-        let args = json_args_to_scval_vec(&invocation.args_json, idx)
-            .map_err(|e| build_err(format!("inner[{idx}]: args encoding failed: {e}")))?;
-
-        result.push(InvokeContractArgs {
-            contract_address: ScAddress::Contract(ContractId(Hash(contract_strkey.0))),
-            function_name,
-            args,
-        });
-    }
-
-    Ok(result)
+    Ok(InvokeContractArgs {
+        contract_address: ScAddress::Contract(ContractId(Hash(contract_strkey.0))),
+        function_name,
+        args,
+    })
 }
 
 // ── submit_multicall_bundle ───────────────────────────────────────────────────
@@ -1288,7 +1302,8 @@ fn bundle_calls(bundle: &[MulticallInvocation]) -> Result<Vec<InvokeContractArgs
 /// 1. **build** — validate bundle size ∈ [1, `MULTICALL_BUNDLE_CAP`]; validate
 ///    each invocation shape (C-strkey target, symbol fn_name, JSON args). Fail-CLOSED
 ///    `MulticallFailed { phase: "build" }` + emit `SaMulticallBundleDenied`.
-/// 2. **policy_gate** — decompose bundle via `decompose_bundle` → build `BundleView`
+/// 2. **policy_gate**: decompose the encoded calls via `decompose_bundle_calls`,
+///    then build `BundleView`
 ///    → call `policy_engine.evaluate_bundle`. Only `Allow` proceeds to submission.
 ///    Every other decision refuses with `MulticallFailed { phase: "policy_gate" }`
 ///    and emits `SaMulticallBundleDenied`: a `Deny` carries its reason code and
@@ -1427,7 +1442,8 @@ pub async fn submit_multicall_bundle(
         });
     }
 
-    // Per-invocation shape validation.
+    // Validate and encode every call before policy evaluation.
+    let mut declared_calls = Vec::with_capacity(args.bundle.len());
     for (idx, inv) in args.bundle.iter().enumerate() {
         if stellar_strkey::Contract::from_string(&inv.target_contract).is_err() {
             let _ = emit_denied(
@@ -1480,25 +1496,28 @@ pub async fn submit_multicall_bundle(
                 post_submit_kind: None,
             });
         }
+        match bundle_call(idx, inv) {
+            Ok(call) => declared_calls.push(call),
+            Err(error) => {
+                let _ = emit_denied(
+                    &args.audit_writer,
+                    Some(u32::try_from(idx).unwrap_or(u32::MAX)),
+                    None,
+                    None,
+                    "multicall.invalid_args_json".to_owned(),
+                    "build",
+                    inner_count,
+                );
+                return Err(error);
+            }
+        }
     }
 
     // ── Step 2: policy gate ───────────────────────────────────────────────────
 
-    // Decompose bundle into typed descriptors for policy evaluation.
-    let raw_bundle: Vec<(String, String, Vec<serde_json::Value>)> = args
-        .bundle
-        .iter()
-        .map(|inv| {
-            let args_vec = if let Some(arr) = inv.args_json.as_array() {
-                arr.clone()
-            } else {
-                Vec::new()
-            };
-            (inv.target_contract.clone(), inv.fn_name.clone(), args_vec)
-        })
-        .collect();
-
-    let descriptors = decompose_bundle(&raw_bundle);
+    // The gate values the encoded calls the wallet declares and dispatches.
+    let caller_scaddr = parse_c_strkey_to_smart_account(args.smart_account)?;
+    let descriptors = decompose_bundle_calls(&declared_calls, &caller_scaddr);
 
     let overlay = BundleStateOverlay::default();
     let bundle_view = BundleView {
@@ -1565,11 +1584,10 @@ pub async fn submit_multicall_bundle(
     })?;
 
     // Build the exec invocations XDR arg.
-    let exec_invocations_xdr = build_exec_invocations(&args.bundle)?;
+    let exec_invocations_xdr = exec_invocations_from_calls(&declared_calls)?;
     // The same calls, declared as the sub-invocations the wallet authorizes
     // under `exec`: a simulated subtree holding any other call is refused
     // before signing.
-    let declared_calls = bundle_calls(&args.bundle)?;
 
     // Build the InvokeContractArgs for the router's `exec` function.
     let exec_invocations_scval: VecM<ScVal> =
@@ -1581,8 +1599,6 @@ pub async fn submit_multicall_bundle(
                 post_submit_kind: None,
             })?;
 
-    // Caller address (smart_account).
-    let caller_scaddr = parse_c_strkey_to_smart_account(args.smart_account)?;
     let caller_scval = ScVal::Address(caller_scaddr);
 
     // Build the args for `exec(caller, invocations)`.
@@ -1836,10 +1852,11 @@ fn validate_soroban_symbol(s: &str) -> Result<&str, String> {
 /// |------------|-----------|----------------|
 /// | `Number` (non-negative, fits u64) | `as_u64()` succeeds | `I128(Int128Parts { hi: 0, lo: v })` |
 /// | `Number` (negative, fits i64) | `as_i64()` succeeds and value is negative | `I128(Int128Parts { hi: -1, lo: v as u64 })` (sign-extended) |
-/// | `String` | — | `ScVal::String` |
-/// | `Null` | (empty args list sentinel) | produces empty `Vec<Val>` |
+/// | `String` | any UTF-8 | `ScVal::String` |
+/// | `Null` | top level or element | empty argument list or `ScVal::Void` |
 /// | `Array` | (only at top level; NOT nested) | the elements of the array |
-/// | Any other shape (bool, object, nested array) | — | **explicit error** |
+/// | `{"scval": "<base64 XDR ScVal>"}` | exactly one member, bounded XDR | decoded argument value |
+/// | Any other shape (bool, other object, nested array) | unsupported | explicit error |
 ///
 /// Non-primitive JSON shapes are rejected with an explicit error rather than
 /// silently converting to `ScVal::Void`. The router passes arguments directly
@@ -1901,21 +1918,42 @@ fn json_args_to_scval_vec(
                     format!("inner[{idx}] arg[{elem_idx}]: string arg too long")
                 })?))
             }
+            serde_json::Value::Object(object)
+                if object.len() == 1 && object.contains_key("scval") =>
+            {
+                use stellar_xdr::ReadXdr as _;
+                let encoded = object["scval"].as_str().ok_or_else(|| {
+                    format!("inner[{idx}] arg[{elem_idx}]: scval must be a base64 XDR string")
+                })?;
+                let value = ScVal::from_xdr_base64(
+                    encoded,
+                    stellar_agent_xdr_limits::untrusted_decode_limits(encoded.len()),
+                )
+                .map_err(|error| {
+                    format!("inner[{idx}] arg[{elem_idx}]: invalid ScVal XDR: {error}")
+                })?;
+                if matches!(
+                    value,
+                    ScVal::ContractInstance(_)
+                        | ScVal::LedgerKeyContractInstance
+                        | ScVal::LedgerKeyNonce(_)
+                ) {
+                    return Err(format!(
+                        "inner[{idx}] arg[{elem_idx}]: ledger-only ScVal is not a contract argument"
+                    ));
+                }
+                value
+            }
             serde_json::Value::Bool(_)
             | serde_json::Value::Object(_)
             | serde_json::Value::Array(_) => {
-                // Non-primitive JSON shapes are explicitly refused.  The caller
-                // must encode complex args as pre-serialised XDR base64 strings
-                // or decompose them into scalar fields before passing to this API.
                 let kind = match elem {
                     serde_json::Value::Bool(_) => "Bool",
                     serde_json::Value::Object(_) => "Object",
-                    serde_json::Value::Array(_) => "Array (nested)",
-                    _ => "unknown",
+                    _ => "Array (nested)",
                 };
                 return Err(format!(
-                    "inner[{idx}] arg[{elem_idx}]: unsupported JSON argument shape '{kind}'; \
-                     encode complex args as pre-serialised XDR base64 strings"
+                    "inner[{idx}] arg[{elem_idx}]: unsupported {kind}; use integers, strings or null; use {{\"scval\": \"<base64 XDR ScVal>\"}} for any other type"
                 ));
             }
             serde_json::Value::Null => {
@@ -2163,6 +2201,8 @@ fn classify_submit_failure(sa_err: SaError) -> (Option<SubmitDeniedRow>, SaError
 ///   `"sa.threshold_policy_identification_failed"` / `"sa.threshold_read_failed"`
 ///   → `"policy_gate"` (the signer-set check of the authorizing rule).
 /// - `"sa.multicall_failed"` (nested) keeps its own phase.
+///
+/// `sa.verifier_wasm_revoked` and `sa.verifier_wasm_retired` map to `policy_gate`.
 /// - Other (unrecognized) → `"submit"` as last resort.
 fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
     if let SaError::MulticallFailed { phase, .. } = err {
@@ -2209,6 +2249,8 @@ fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
         | "sa.policy_hash_drift"
         | "sa.pinned_policy_absent"
         | "sa.pinned_verifier_absent"
+        | "sa.verifier_wasm_revoked"
+        | "sa.verifier_wasm_retired"
         | "sa.pin_check_unavailable" => {
             // The pinned-hash drift check refuses before simulation: a wallet
             // security gate on the authorizing rule, not a network failure.
@@ -2248,6 +2290,7 @@ fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
 fn deny_reason_wire_code(reason: &DenyReason) -> String {
     use stellar_agent_core::policy::DenyReason;
     match reason {
+        DenyReason::UnsizableValueEffect { .. } => "unsizable_value_effect".to_owned(),
         DenyReason::AssetNotAllowlisted => "asset_not_allowlisted".to_owned(),
         DenyReason::PerTxCapExceeded { .. } => "per_tx_cap_exceeded".to_owned(),
         DenyReason::PerPeriodCapExceeded { .. } => "per_period_cap_exceeded".to_owned(),
@@ -2493,6 +2536,87 @@ mod tests {
     /// The denied-path callers discard the emitter's result, so a row that is
     /// not written is logged at `error` with its event kind, and the emitter
     /// reports `Err`.
+    #[test]
+    fn map_sa_error_to_phase_verifier_status_refusals_map_to_policy_gate() {
+        use stellar_agent_core::observability::RedactedStrkey;
+        let errors = [
+            SaError::VerifierWasmRevoked {
+                rule_id: None,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
+                verifier_hash_first8: "eeeeeeee".to_owned(),
+                revoked_reason: "problem".to_owned(),
+                request_id: "status".to_owned(),
+            },
+            SaError::VerifierWasmRetired {
+                rule_id: Some(1),
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
+                verifier_hash_first8: "eeeeeeee".to_owned(),
+                request_id: "status".to_owned(),
+            },
+        ];
+        for error in errors {
+            assert_eq!(map_sa_error_to_multicall_phase(&error), "policy_gate");
+        }
+    }
+
+    #[test]
+    fn deny_reason_wire_code_unsizable_value_effect() {
+        assert_eq!(
+            deny_reason_wire_code(&DenyReason::UnsizableValueEffect {
+                detail: "unsized".to_owned()
+            }),
+            "unsizable_value_effect"
+        );
+    }
+
+    #[test]
+    fn json_args_scval_form_encodes_any_value() {
+        use stellar_xdr::{ContractId, Hash, Int128Parts, Limits, ScMap, WriteXdr};
+        for value in [
+            ScVal::Address(ScAddress::Contract(ContractId(Hash([0x44; 32])))),
+            ScVal::I128(Int128Parts { hi: 1, lo: 30 }),
+            ScVal::Map(Some(ScMap::default())),
+        ] {
+            let json =
+                serde_json::json!([{ "scval": value.to_xdr_base64(Limits::none()).unwrap() }]);
+            assert_eq!(
+                json_args_to_scval_vec(&json, 0).unwrap().as_slice(),
+                &[value]
+            );
+        }
+    }
+
+    #[test]
+    fn json_args_scval_form_is_exact() {
+        use stellar_xdr::{Limits, ScNonceKey, WriteXdr};
+        let encoded = ScVal::Void.to_xdr_base64(Limits::none()).unwrap();
+        let nonce = ScVal::LedgerKeyNonce(ScNonceKey { nonce: 1 })
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        let key = ScVal::LedgerKeyContractInstance
+            .to_xdr_base64(Limits::none())
+            .unwrap();
+        for object in [
+            serde_json::json!({"scval": encoded, "extra": 1}),
+            serde_json::json!({"scval": 1}),
+            serde_json::json!({"other": encoded}),
+            serde_json::json!({"scval": "!"}),
+            serde_json::json!({"scval": "AQIDBA=="}),
+            serde_json::json!({"scval": nonce}),
+            serde_json::json!({"scval": key}),
+        ] {
+            let error = json_args_to_scval_vec(&serde_json::json!([null, object]), 2).unwrap_err();
+            assert!(error.contains("inner[2] arg[1]"), "{error}");
+        }
+    }
+
+    #[test]
+    fn json_args_refusal_names_the_accepted_forms() {
+        let error = json_args_to_scval_vec(&serde_json::json!([true]), 0).unwrap_err();
+        assert!(error.contains("{\"scval\""), "{error}");
+        assert!(!error.contains("pre-serialised"));
+    }
+
     #[test]
     fn a_denied_row_behind_a_poisoned_writer_is_logged_at_error_with_its_kind() {
         let dir = TempDir::new().unwrap();

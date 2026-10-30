@@ -5,6 +5,7 @@
 //! and auth digest. Signer bytes are attached through the network-crate
 //! `Signer::sign_auth_digest` sibling primitive.
 
+use crate::submit::CheckedSigningRules;
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::error::{NetworkError, WalletError};
 use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
@@ -543,6 +544,9 @@ fn compute_signature_payload(
 /// alphabetically (`context_rule_ids` precedes `signers`) per the on-chain
 /// canonical encoding rule.
 ///
+/// Consumes the manager's checked rule set. The account, network and rule IDs
+/// must match the entry, or `AuthEntryBindingMismatch` refuses before key access.
+///
 /// # Errors
 ///
 /// - [`SaError::MainnetWriteForbidden`] and
@@ -558,9 +562,15 @@ fn compute_signature_payload(
 ///   trait uniformity and for the future hardware-signer paths where the
 ///   upstream `WalletError` propagation is the substantive failure case.
 pub async fn complete_authorization_entry(
+    checked_rules: CheckedSigningRules,
     partial: PartialSorobanAuthorizationEntry,
     signer: &(dyn Signer + Send + Sync),
 ) -> Result<SorobanAuthorizationEntry, SaError> {
+    checked_rules.check_binding(
+        &partial.smart_account,
+        partial.network_id,
+        &partial.context_rule_ids,
+    )?;
     let digest = partial.signing_digest()?;
 
     let pubkey = signer
@@ -841,6 +851,9 @@ fn build_multi_signer_auth_payload_scval(
 /// per signer to the wire payload + chain XDR. This choice is intentional
 /// (audit-trail completeness over minimal wire size).
 ///
+/// Consumes the manager's checked rule set. The account, network and rule IDs
+/// must match the entry, or `AuthEntryBindingMismatch` refuses before key access.
+///
 /// # Errors
 ///
 /// Returns [`SaError::MainnetWriteForbidden`] or
@@ -855,9 +868,15 @@ fn build_multi_signer_auth_payload_scval(
 /// - Any XDR encoding failure.
 ///
 pub async fn complete_authorization_entry_multi_signer(
+    checked_rules: CheckedSigningRules,
     partial: PartialSorobanAuthorizationEntry,
     signers: &[&(dyn Signer + Send + Sync)],
 ) -> Result<SorobanAuthorizationEntry, SaError> {
+    checked_rules.check_binding(
+        &partial.smart_account,
+        partial.network_id,
+        &partial.context_rule_ids,
+    )?;
     let digest = partial.signing_digest()?;
 
     if signers.is_empty() {
@@ -1015,11 +1034,17 @@ pub(crate) struct MixedSigner<'a> {
 ///   when `signers` is empty, when any signer's `public_key()` /
 ///   `sign_auth_digest()` fails, or on any XDR encoding failure.
 pub(crate) async fn collect_mixed_signer_entries(
+    checked_rules: CheckedSigningRules,
     partial: PartialSorobanAuthorizationEntry,
     signers: &[MixedSigner<'_>],
     signature_expiration_ledger: u32,
     network_passphrase: &str,
 ) -> Result<Vec<SorobanAuthorizationEntry>, SaError> {
+    checked_rules.check_binding(
+        &partial.smart_account,
+        partial.network_id,
+        &partial.context_rule_ids,
+    )?;
     let digest = check_partial_against_passphrase(&partial, network_passphrase)?;
 
     if signers.is_empty() {
@@ -1131,6 +1156,9 @@ pub(crate) async fn collect_mixed_signer_entries(
 /// simulation before any signer key access. Building the partial touches no
 /// key, so this function carries no check of its own.
 ///
+/// Consumes the manager's checked rule set. The account, network and rule IDs
+/// must match the entry, or `AuthEntryBindingMismatch` refuses before key access.
+///
 /// # Errors
 ///
 /// - [`SaError::MainnetWriteForbidden`]: `network_passphrase` or
@@ -1150,6 +1178,7 @@ pub(crate) async fn collect_mixed_signer_entries(
               borrowed signer and simulation/envelope references"
 )]
 pub async fn sign_with_ed25519_rule(
+    checked_rules: CheckedSigningRules,
     target_contract: ScAddress,
     function_name: ScSymbol,
     args: Vec<ScVal>,
@@ -1176,7 +1205,7 @@ pub async fn sign_with_ed25519_rule(
         kind: MixedSignerKind::ExternalEd25519 { verifier },
     }];
 
-    collect_mixed_signer_entries(partial, &signers, expiry, network_passphrase).await
+    collect_mixed_signer_entries(checked_rules, partial, &signers, expiry, network_passphrase).await
 }
 
 /// Builds and signs the secondary "Delegated G-key" auth entry that OZ
@@ -2105,9 +2134,13 @@ mod tests {
         .await
         .unwrap();
 
-        let err = complete_authorization_entry_multi_signer(partial, &[])
-            .await
-            .unwrap_err();
+        let err = complete_authorization_entry_multi_signer(
+            crate::submit::checked_rules_for_test(&partial),
+            partial,
+            &[],
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -2168,9 +2201,13 @@ mod tests {
         let s_a: &(dyn stellar_agent_network::signing::Signer + Send + Sync) = &signer_a;
         let s_b: &(dyn stellar_agent_network::signing::Signer + Send + Sync) = &signer_b;
 
-        let entry = complete_authorization_entry_multi_signer(partial, &[s_a, s_b])
-            .await
-            .unwrap();
+        let entry = complete_authorization_entry_multi_signer(
+            crate::submit::checked_rules_for_test(&partial),
+            partial,
+            &[s_a, s_b],
+        )
+        .await
+        .unwrap();
 
         // Credentials shape.
         let SorobanCredentials::Address(addr_creds) = entry.credentials else {
@@ -2517,9 +2554,13 @@ mod tests {
         let saved_nonce = partial.nonce;
         let saved_expiry = partial.signature_expiration_ledger;
 
-        let entry = complete_authorization_entry(partial, &signer)
-            .await
-            .unwrap();
+        let entry = complete_authorization_entry(
+            crate::submit::checked_rules_for_test(&partial),
+            partial,
+            &signer,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(entry.root_invocation.sub_invocations.len(), 0);
 
@@ -2786,6 +2827,7 @@ mod tests {
                 },
             }];
             let entries = collect_mixed_signer_entries(
+                crate::submit::checked_rules_for_test(&partial),
                 partial,
                 &signers,
                 simulation.signature_expiration_ledger,
@@ -2820,6 +2862,7 @@ mod tests {
                 },
             ];
             let entries = collect_mixed_signer_entries(
+                crate::submit::checked_rules_for_test(&partial),
                 partial,
                 &signers,
                 simulation.signature_expiration_ledger,
@@ -3161,12 +3204,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_authorization_entry_refuses_a_different_checked_rule() {
+        let partial = partial_on(TESTNET_PASSPHRASE);
+        let mut other = partial.clone();
+        other.context_rule_ids = vec![ContextRuleId::new(999)];
+        let checked = crate::submit::checked_rules_for_test(&other);
+        let signer = CountingSigner::new([0x46; 32]);
+        let error = complete_authorization_entry(checked, partial, &signer)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SaError::AuthEntryBindingMismatch {
+                    field: "checked_signing_rules"
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    async fn multi_signer_completion_refuses_a_different_checked_account() {
+        let partial = partial_on(TESTNET_PASSPHRASE);
+        let mut other = partial.clone();
+        other.smart_account = contract_address(0x99);
+        let checked = crate::submit::checked_rules_for_test(&other);
+        let signer = CountingSigner::new([0x46; 32]);
+        let error = complete_authorization_entry_multi_signer(checked, partial, &[&signer])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SaError::AuthEntryBindingMismatch {
+                    field: "checked_signing_rules"
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
+    async fn ed25519_rule_signing_refuses_a_different_checked_network() {
+        let (simulation, envelope) = contexts();
+        let checked = crate::submit::checked_context_for_test(
+            &contract_address(7),
+            [0x99; 32],
+            &[ContextRuleId::new(42)],
+        );
+        let signer = CountingSigner::new([0x46; 32]);
+        let error = sign_with_ed25519_rule(
+            checked,
+            contract_address(7),
+            symbol("transfer"),
+            vec![],
+            vec![ContextRuleId::new(42)],
+            &simulation,
+            &envelope,
+            &signer,
+            contract_address(0xc1),
+            TESTNET_PASSPHRASE,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SaError::AuthEntryBindingMismatch {
+                    field: "checked_signing_rules"
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(signer.key_accesses(), 0);
+    }
+
+    #[tokio::test]
     async fn complete_authorization_entry_signs_a_testnet_partial() {
         let signer = CountingSigner::new([0x41; 32]);
 
-        complete_authorization_entry(partial_on(TESTNET_PASSPHRASE), &signer)
-            .await
-            .unwrap();
+        complete_authorization_entry(
+            crate::submit::checked_rules_for_test(&partial_on(TESTNET_PASSPHRASE)),
+            partial_on(TESTNET_PASSPHRASE),
+            &signer,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(signer.public_key_calls(), 1);
         assert_eq!(signer.sign_calls(), 1);
@@ -3176,9 +3302,13 @@ mod tests {
     async fn complete_authorization_entry_refuses_a_mainnet_partial_before_any_key_access() {
         let signer = CountingSigner::new([0x41; 32]);
 
-        let err = complete_authorization_entry(partial_on(MAINNET_PASSPHRASE), &signer)
-            .await
-            .unwrap_err();
+        let err = complete_authorization_entry(
+            crate::submit::checked_rules_for_test(&partial_on(MAINNET_PASSPHRASE)),
+            partial_on(MAINNET_PASSPHRASE),
+            &signer,
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(err, SaError::MainnetWriteForbidden), "{err:?}");
         assert_eq!(err.wire_code(), "network.mainnet_write_forbidden");
@@ -3189,9 +3319,13 @@ mod tests {
     async fn complete_authorization_entry_refuses_a_tampered_digest_before_any_key_access() {
         let signer = CountingSigner::new([0x41; 32]);
 
-        let err = complete_authorization_entry(tampered_testnet_partial(), &signer)
-            .await
-            .unwrap_err();
+        let err = complete_authorization_entry(
+            crate::submit::checked_rules_for_test(&tampered_testnet_partial()),
+            tampered_testnet_partial(),
+            &signer,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -3211,9 +3345,13 @@ mod tests {
         let a = CountingSigner::new([0x42; 32]);
         let b = CountingSigner::new([0x43; 32]);
 
-        complete_authorization_entry_multi_signer(partial_on(TESTNET_PASSPHRASE), &[&a, &b])
-            .await
-            .unwrap();
+        complete_authorization_entry_multi_signer(
+            crate::submit::checked_rules_for_test(&partial_on(TESTNET_PASSPHRASE)),
+            partial_on(TESTNET_PASSPHRASE),
+            &[&a, &b],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(a.key_accesses() + b.key_accesses(), 4);
     }
@@ -3224,10 +3362,13 @@ mod tests {
         let a = CountingSigner::new([0x42; 32]);
         let b = CountingSigner::new([0x43; 32]);
 
-        let err =
-            complete_authorization_entry_multi_signer(partial_on(MAINNET_PASSPHRASE), &[&a, &b])
-                .await
-                .unwrap_err();
+        let err = complete_authorization_entry_multi_signer(
+            crate::submit::checked_rules_for_test(&partial_on(MAINNET_PASSPHRASE)),
+            partial_on(MAINNET_PASSPHRASE),
+            &[&a, &b],
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(err, SaError::MainnetWriteForbidden), "{err:?}");
         assert_eq!(a.key_accesses() + b.key_accesses(), 0);
@@ -3239,9 +3380,13 @@ mod tests {
         let a = CountingSigner::new([0x42; 32]);
         let b = CountingSigner::new([0x43; 32]);
 
-        let err = complete_authorization_entry_multi_signer(tampered_testnet_partial(), &[&a, &b])
-            .await
-            .unwrap_err();
+        let err = complete_authorization_entry_multi_signer(
+            crate::submit::checked_rules_for_test(&tampered_testnet_partial()),
+            tampered_testnet_partial(),
+            &[&a, &b],
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -3260,6 +3405,7 @@ mod tests {
         let signer = CountingSigner::new([0x44; 32]);
 
         let entries = collect_mixed_signer_entries(
+            crate::submit::checked_rules_for_test(&partial_on(TESTNET_PASSPHRASE)),
             partial_on(TESTNET_PASSPHRASE),
             &external_signer(&signer),
             9999,
@@ -3277,6 +3423,7 @@ mod tests {
         let signer = CountingSigner::new([0x44; 32]);
 
         let err = collect_mixed_signer_entries(
+            crate::submit::checked_rules_for_test(&partial_on(TESTNET_PASSPHRASE)),
             partial_on(TESTNET_PASSPHRASE),
             &external_signer(&signer),
             9999,
@@ -3294,6 +3441,7 @@ mod tests {
         let signer = CountingSigner::new([0x44; 32]);
 
         let err = collect_mixed_signer_entries(
+            crate::submit::checked_rules_for_test(&partial_on(MAINNET_PASSPHRASE)),
             partial_on(MAINNET_PASSPHRASE),
             &external_signer(&signer),
             9999,
@@ -3311,6 +3459,7 @@ mod tests {
         let signer = CountingSigner::new([0x44; 32]);
 
         let err = collect_mixed_signer_entries(
+            crate::submit::checked_rules_for_test(&tampered_testnet_partial()),
             tampered_testnet_partial(),
             &external_signer(&signer),
             9999,
@@ -3337,6 +3486,7 @@ mod tests {
         let signer = CountingSigner::new([0x44; 32]);
 
         let err = collect_mixed_signer_entries(
+            crate::submit::checked_rules_for_test(&partial_on(TESTNET_PASSPHRASE)),
             partial_on(TESTNET_PASSPHRASE),
             &external_signer(&signer),
             9999,
@@ -3366,6 +3516,11 @@ mod tests {
         let signer = CountingSigner::new([0x45; 32]);
 
         let err = sign_with_ed25519_rule(
+            crate::submit::checked_context_for_test(
+                &contract_address(7),
+                simulation.network_id,
+                &[ContextRuleId::new(42)],
+            ),
             contract_address(7),
             symbol("transfer"),
             vec![],

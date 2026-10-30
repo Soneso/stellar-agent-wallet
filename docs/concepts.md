@@ -146,6 +146,8 @@ A Criterion is one typed check. The available criteria include per-transaction c
 
 Value criteria size a call through a typed value descriptor derived at the dispatch gate. A rule matching a value-moving tool constrains every debit leg, and per-asset caps aggregate across legs. A matched call whose value cannot be sized (including raw signing tools) denies fail-closed with `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. `minimum_reserve` counts only native-XLM outflow legs. Cap amounts are i128 and cross the wire as decimal strings.
 
+In a multicall bundle, every call other than a typed transfer from the smart account has an unsizable value effect.
+
 Each Deny carries a structured reason with a stable wire code. At the MCP boundary, account, strkey, and contract-id fields inside a deny reason are redacted to first-five-last-five characters before they cross the wire.
 
 The tool registry is also fail-closed at startup: a duplicate tool registration, or an unrecognized policy-engine kind, is a fatal error rather than a silent fallback. This prevents a registration that mislabels a destructive tool as read-only from shadowing the real one and slipping past the mainnet gate.

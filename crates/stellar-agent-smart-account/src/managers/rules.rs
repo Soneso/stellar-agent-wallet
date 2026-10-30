@@ -5565,6 +5565,7 @@ async fn verify_kind_pins(
                     smart_account_redacted,
                     request_id,
                     wasm_hash_cache,
+                    crate::managers::verifiers::VerifierStatusGate::Skip,
                 )
                 .await
             }

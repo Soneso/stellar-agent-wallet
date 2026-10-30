@@ -1129,39 +1129,14 @@ impl<'a> MigrationPlanner<'a> {
                 request_id: request_id.to_owned(),
             })?;
 
-        // Pre-flight 2: destination audit status — refuse Revoked / Retired.
+        // Membership admits a verifier; disclosed problems refuse migration.
         let destination_audit_status = allowlist_entry.audit_status.clone();
-        match &destination_audit_status {
-            VerifierAuditStatus::Revoked { reason, .. } => {
-                return Err(SaError::VerifierWasmRevoked {
-                    rule_id: 0,
-                    smart_account_redacted: RedactedStrkey::from_already_redacted(
-                        smart_account_redacted.clone(),
-                    ),
-                    verifier_hash_first8: to_hash_first8.clone(),
-                    revoked_reason: (*reason).to_owned(),
-                    request_id: request_id.to_owned(),
-                });
-            }
-            VerifierAuditStatus::Retired { .. } => {
-                return Err(SaError::VerifierWasmRetired {
-                    rule_id: 0,
-                    smart_account_redacted: RedactedStrkey::from_already_redacted(
-                        smart_account_redacted.clone(),
-                    ),
-                    verifier_hash_first8: to_hash_first8.clone(),
-                    request_id: request_id.to_owned(),
-                });
-            }
-            VerifierAuditStatus::Audited { .. }
-            | VerifierAuditStatus::Provisional { .. }
-            | VerifierAuditStatus::Unaudited => {
-                // Accepted — continue to mutability check. Migration
-                // preflight refuses only statuses that record a disclosed
-                // problem (`Revoked`, `Retired`); allowlist membership, not
-                // the audit status, is what admits a verifier.
-            }
-        }
+        crate::verifier_allowlist::refuse_revoked_or_retired_verifier(
+            &to_hash,
+            None,
+            &smart_account_redacted,
+            request_id,
+        )?;
 
         // Pre-flight 3: destination contract must be immutable.
         let mutability = detect_contract_mutability(

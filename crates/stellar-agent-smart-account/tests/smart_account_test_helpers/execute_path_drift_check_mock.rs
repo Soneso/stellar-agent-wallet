@@ -2437,7 +2437,7 @@ async fn an_unknown_new_verifier_needs_the_override() {
 }
 
 /// A signer add on a rule without a pin record writes no pins-updated row and
-/// observes no new verifier.
+/// checks the added verifier status.
 #[tokio::test]
 async fn a_signer_add_on_an_unpinned_rule_writes_no_row() {
     let h = signer_add_harness(false).await;
@@ -2446,7 +2446,7 @@ async fn a_signer_add_on_an_unpinned_rule_writes_no_row() {
         .unwrap();
     assert!(h.pins_updated_rows().is_empty());
     assert_eq!(h.sends(), 1);
-    assert_eq!(h.primary_instance_reads(&verifier_w()), 0);
+    assert_eq!(h.primary_instance_reads(&verifier_w()), 1);
 }
 
 /// A confirmed signer add on an unknown verifier under the override writes
@@ -9228,4 +9228,176 @@ async fn a_refresh_refuses_live_verifiers_running_two_executables() {
         other => panic!("expected MultiplePinnedHashesUnsupported; got {other:?}"),
     }
     assert!(row_kinds(&h.rows(), "req-refresh-two-hashes").is_empty());
+}
+
+#[tokio::test]
+async fn a_revoked_pinned_verifier_refuses_before_simulation() {
+    let h = Harness::new(chain_with_rule_one([0xee; 32])).await;
+    h.baseline_v2(1);
+    h.pin_created(
+        1,
+        vec![first8(&[0xee; 32])],
+        vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    let error = h.submit(&[1], Some("revoked-signing")).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SaError::VerifierWasmRevoked {
+                rule_id: Some(1),
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.wire_code(), "sa.verifier_wasm_revoked");
+    assert!(!h.simulated("noop"));
+    assert_eq!(h.sends(), 0);
+    assert!(
+        !h.rows()
+            .iter()
+            .any(|entry| matches!(entry.event_kind, EventKind::SaVerifierHashDrift { .. }))
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_new_verifier_is_refused_with_every_override() {
+    for pinned in [false, true] {
+        let h = Harness::new(signer_add_chain().with_wasm(&verifier_w(), [0xee; 32])).await;
+        h.baseline_v2(1);
+        if pinned {
+            h.pin_created(
+                1,
+                vec![first8(&webauthn_hash())],
+                vec![first8(&KNOWN_WASM_HASH)],
+                vec![],
+                vec![],
+            );
+        }
+        let signer = SoftwareSigningKey::new_from_bytes(SEED);
+        let error = h
+            .manager
+            .add_signer(
+                smart_account(),
+                1,
+                external_signer(&verifier_w(), &[0x33; 32]),
+                &signer,
+                "revoked-add".to_owned(),
+                true,
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SaError::VerifierWasmRevoked {
+                    rule_id: Some(1),
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(h.sends(), 0);
+        assert!(h.pins_updated_rows().is_empty());
+        assert!(!h.rows().iter().any(|entry| matches!(
+            entry.event_kind,
+            EventKind::SaUnknownContractOverride { .. }
+                | EventKind::SaMutableContractOverride { .. }
+        )));
+    }
+}
+
+#[tokio::test]
+async fn a_migration_away_from_a_revoked_verifier_signs() {
+    let h = Harness::new(signer_add_chain().with_wasm(&verifier_v(), [0xee; 32])).await;
+    h.baseline_v2(1);
+    h.pin_created(
+        1,
+        vec![first8(&[0xee; 32])],
+        vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    on_send_one_pair(&h);
+    let result = migrate(
+        &h,
+        &migration_plan([0xee; 32], ed25519_hash()),
+        "revoked-repair",
+    )
+    .await;
+    assert!(
+        result.failed_step_error.is_none(),
+        "{:?}",
+        result.failed_step_error
+    );
+    assert_eq!(h.sends(), 2);
+    assert_eq!(row_kinds(&h.rows(), "revoked-repair"), PAIR_ROWS);
+}
+
+#[tokio::test]
+async fn quorum_collection_refuses_a_revoked_signing_rule() {
+    use stellar_agent_smart_account::managers::auth_entry::test_helpers::{
+        baseline_authorization_simulation, matching_envelope_context,
+    };
+    use stellar_agent_smart_account::managers::authorization::{
+        AuthorizationInfo, Combinator, SignerGroup, collect_quorum_signatures,
+    };
+    let h = Harness::new(chain_with_rule_one([0xee; 32])).await;
+    h.pin_created(
+        1,
+        vec![first8(&[0xee; 32])],
+        vec![first8(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new(SEED);
+    let rule = ContextRuleId::new(1);
+    let result: Result<_, SaError> = async {
+        let checked = h
+            .manager
+            .check_signing_rules(&smart_account(), &[rule], "quorum-status")
+            .await?;
+        let simulation =
+            baseline_authorization_simulation(PASSPHRASE, "stellar:testnet", vec![rule]);
+        let envelope = matching_envelope_context(&simulation);
+        let authz = AuthorizationInfo::new(
+            vec![SignerGroup::new("one".to_owned(), vec![SEED], 1).unwrap()],
+            Combinator::And,
+        );
+        collect_quorum_signatures(
+            checked,
+            &authz,
+            &[&signer],
+            smart_account(),
+            "noop".try_into().unwrap(),
+            vec![],
+            vec![rule],
+            &simulation,
+            &envelope,
+            PASSPHRASE,
+            9999,
+        )
+        .await
+        .map_err(|error| SaError::AuthEntryConstructionFailed {
+            stage: "quorum_signatures",
+            redacted_reason: error.to_string(),
+        })
+    }
+    .await;
+    let error = result.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SaError::VerifierWasmRevoked {
+                rule_id: Some(1),
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.wire_code(), "sa.verifier_wasm_revoked");
+    assert_eq!(signer.key_accesses(), 0);
 }

@@ -2166,11 +2166,10 @@ pub enum SaError {
 
     /// Verifier wasm hash is allowlisted but flagged as Revoked.
     ///
-    /// Fired at install-time and at `migrate-verifier --to <hash>` destination
-    /// validation when the wasm hash is in `VERIFIER_ALLOWLIST` with
-    /// `VerifierAuditStatus::Revoked { revoked_at, reason }`. Unconditional
-    /// refusal — no opt-in flag overrides a Revoked entry. The operator response
-    /// is `smart-account migrate-verifier` to a non-revoked hash, NOT bypass.
+    /// Refused when signer and rule commands install or refresh a verifier pin,
+    /// when signing under a pinned rule, and at the migration destination check.
+    /// No flag overrides this status. Use `smart-account migrate-verifier` to
+    /// move away from the hash, or authorize a repair through rule `0`.
     ///
     /// # Forensic spine
     ///
@@ -2178,16 +2177,16 @@ pub enum SaError {
     /// `stellar_agent_core::observability::redact_strkey_first5_last5` at the
     /// call site. `verifier_hash_first8` is the first-8 hex chars of the revoked
     /// hash. `revoked_reason` is the string from
-    /// `VerifierAuditStatus::Revoked { reason }` — owned because envelope
+    /// `VerifierAuditStatus::Revoked { reason }`: owned because envelope
     /// serialisation is producer-side.
     #[error(
-        "verifier wasm hash flagged as revoked for rule_id={rule_id}: \
-         hash_first8={verifier_hash_first8}, reason='{revoked_reason}'"
+        "verifier wasm hash flagged as revoked{}: \
+         hash_first8={verifier_hash_first8}, reason='{revoked_reason}'", rule_suffix(.rule_id)
     )]
     #[serde(rename = "sa.verifier_wasm_revoked")]
     VerifierWasmRevoked {
         /// Context-rule identifier for which the revoked check fired.
-        rule_id: u32,
+        rule_id: Option<u32>,
         /// Redacted smart-account C-strkey (first-5-last-5).
         ///
         /// MUST be redacted at the call site via
@@ -2205,13 +2204,12 @@ pub enum SaError {
         request_id: String,
     },
 
-    /// Verifier wasm hash flagged as Retired — 24-month rotation past Revoked.
+    /// Verifier wasm hash flagged as Retired: 24-month rotation past Revoked.
     ///
-    /// Fired at install-time and at migration-destination time. Unconditional
-    /// refusal — Retired status retains the startup-advisory + install-time gate
-    /// behaviour of Revoked. The long-form revocation reason text is absent from
-    /// `VerifierAuditStatus::Retired`, so this variant carries only the
-    /// audit-status class and hash projection.
+    /// Refused when signer and rule commands install or refresh a verifier pin,
+    /// when signing under a pinned rule, and at the migration destination check.
+    /// No flag overrides this status. Use `smart-account migrate-verifier` to
+    /// move away from the hash, or authorize a repair through rule `0`.
     ///
     /// # Forensic spine
     ///
@@ -2219,13 +2217,13 @@ pub enum SaError {
     /// `stellar_agent_core::observability::redact_strkey_first5_last5` at the
     /// call site.
     #[error(
-        "verifier wasm hash flagged as retired for rule_id={rule_id}: \
-         hash_first8={verifier_hash_first8}"
+        "verifier wasm hash flagged as retired{}: \
+         hash_first8={verifier_hash_first8}", rule_suffix(.rule_id)
     )]
     #[serde(rename = "sa.verifier_wasm_retired")]
     VerifierWasmRetired {
         /// Context-rule identifier for which the retired check fired.
-        rule_id: u32,
+        rule_id: Option<u32>,
         /// Redacted smart-account C-strkey (first-5-last-5).
         ///
         /// MUST be redacted at the call site via
@@ -3708,7 +3706,7 @@ mod tests {
             (
                 "sa.verifier_wasm_revoked",
                 SaError::VerifierWasmRevoked {
-                    rule_id: 2,
+                    rule_id: Some(2),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     verifier_hash_first8: "cafebabe".to_owned(),
                     revoked_reason: "critical vulnerability in signature verification".to_owned(),
@@ -3718,7 +3716,7 @@ mod tests {
             (
                 "sa.verifier_wasm_retired",
                 SaError::VerifierWasmRetired {
-                    rule_id: 3,
+                    rule_id: Some(3),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     verifier_hash_first8: "11223344".to_owned(),
                     request_id: "req-ret-001".to_owned(),
@@ -4569,7 +4567,7 @@ mod tests {
             (
                 "sa.verifier_wasm_revoked",
                 SaError::VerifierWasmRevoked {
-                    rule_id: 2,
+                    rule_id: Some(2),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     verifier_hash_first8: "cafebabe".to_owned(),
                     revoked_reason: "critical vulnerability in signature verification".to_owned(),
@@ -4586,7 +4584,7 @@ mod tests {
             (
                 "sa.verifier_wasm_retired",
                 SaError::VerifierWasmRetired {
-                    rule_id: 3,
+                    rule_id: Some(3),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     verifier_hash_first8: "11223344".to_owned(),
                     request_id: "req-ret-001".to_owned(),
@@ -5323,14 +5321,14 @@ mod tests {
                 request_id: "req-div-req-001".to_owned(),
             },
             SaError::VerifierWasmRevoked {
-                rule_id: 2,
+                rule_id: Some(2),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 verifier_hash_first8: "cafebabe".to_owned(),
                 revoked_reason: "critical vulnerability in signature verification".to_owned(),
                 request_id: "req-rev-001".to_owned(),
             },
             SaError::VerifierWasmRetired {
-                rule_id: 3,
+                rule_id: Some(3),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 verifier_hash_first8: "11223344".to_owned(),
                 request_id: "req-ret-001".to_owned(),
@@ -6460,7 +6458,7 @@ mod tests {
     #[test]
     fn verifier_wasm_revoked_round_trip() {
         let err = SaError::VerifierWasmRevoked {
-            rule_id: 2,
+            rule_id: Some(2),
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
             verifier_hash_first8: "cafebabe".to_owned(),
             revoked_reason: "critical vulnerability in signature verification".to_owned(),
@@ -6490,7 +6488,7 @@ mod tests {
     #[test]
     fn verifier_wasm_retired_round_trip() {
         let err = SaError::VerifierWasmRetired {
-            rule_id: 3,
+            rule_id: Some(3),
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
             verifier_hash_first8: "11223344".to_owned(),
             request_id: "req-ret-rt-001".to_owned(),

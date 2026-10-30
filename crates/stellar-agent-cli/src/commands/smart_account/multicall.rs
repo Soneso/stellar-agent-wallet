@@ -33,7 +33,8 @@
 //! Each `--invocation` value MUST have the form `<target>:<fn>:<json-args>`:
 //! - `<target>` — C-strkey of the target contract.
 //! - `<fn>` — Soroban function name (≤32 bytes, no special characters).
-//! - `<json-args>` — JSON array of arguments.
+//! - `<json-args>`: JSON array of integers, strings, null, or exact objects
+//!   `{"scval": "<base64 XDR ScVal>"}`. Use the object form for addresses.
 //!
 //! Parse errors at the CLI layer surface as `MulticallInvocation` candidates
 //! with sentinel error fields; `submit_multicall_bundle` Step 1 (build) validates
@@ -144,11 +145,15 @@ pub struct MulticallArgs {
 
     /// Invocation descriptor: `<target_c_strkey>:<fn_name>:<json_args_array>`.
     ///
-    /// Repeatable (1–50 invocations). Each value MUST have the form:
+    /// Repeatable (1 to 50 invocations). Each value has the form:
     /// `<target>:<fn>:<json-args>` where `<json-args>` is a JSON array.
     ///
     /// Examples:
-    /// - `CABC...WXYZ:transfer:["GABC...","GWXYZ...","1000000"]`
+    /// - `CTOKEN:transfer:[{"scval":"<wallet Address XDR>"},{"scval":"<recipient Address XDR>"},1000000]`
+    ///
+    /// Elements are integers, strings, null, or exact `scval` objects.
+    /// Address placeholders contain standard-base64 XDR `ScVal::Address` values.
+    /// The wallet address is the transfer sender.
     ///
     /// Parse errors surface at Step 1 (build validation) of `submit_multicall_bundle`.
     #[arg(

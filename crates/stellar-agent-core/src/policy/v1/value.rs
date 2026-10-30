@@ -285,6 +285,8 @@ impl ValueLeg {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpaqueReason {
+    /// A wallet-authorized multicall call whose value effect cannot be sized.
+    UnvaluedBundleCall,
     /// The tool signs a caller-supplied transaction envelope whose value
     /// effect the wallet does not decode (`sep43_sign_transaction`,
     /// `sep43_sign_and_submit_transaction`; also the CLI `pay`/`claim`
@@ -306,6 +308,7 @@ impl OpaqueReason {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::UnvaluedBundleCall => "unvalued_bundle_call",
             Self::RawTransactionSignature => "raw_transaction_signature",
             Self::RawAuthEntrySignature => "raw_auth_entry_signature",
         }
@@ -489,29 +492,18 @@ pub enum ValueGate<'a> {
     Deny(DenyReason),
 }
 
-/// Classifies a call's value axis for a value criterion, applying the
-/// fail-closed default (design §2.2).
-///
-/// - `ValueClass::Value(effects)` → [`ValueGate::Effects`]; the criterion sizes
-///   the legs.
-/// - `ValueClass::Opaque(_)` → [`ValueGate::Deny`] under a matched value rule,
-///   UNLESS `ctx.bundle.is_some()` (bundle inners are typed by
-///   `decompose_bundle` and never opaque, so the opaque-deny is suppressed on
-///   the per-inner axis).
-/// - `ValueClass::ReadOnly` → [`ValueGate::NotApplicable`], EXCEPT a
-///   `MovesValue` tool that resolved no effects on the single-tx path: that is
-///   a forgotten/failed population and is denied fail-closed
-///   ([`DenyReason::UnsizableValueEffect`]) rather than waved through. In bundle
-///   mode a ReadOnly inner (a `Generic` inner) is not-applicable — Generic-inner
-///   policing belongs to `restrict_bundle_to_recognised_kinds`, not the value
-///   caps.
+/// Classifies the value axis for a matched value criterion.
+/// Opaque calls refuse in single-call and bundle evaluation. Read-only calls
+/// are not applicable unless a single-call value tool lacks its effects.
 #[must_use]
 pub fn classify_value<'a>(ctx: &'a EvalContext<'_>) -> ValueGate<'a> {
     match &ctx.value {
         ValueClass::Value(effects) => ValueGate::Effects(effects),
         ValueClass::Opaque(_) => {
             if ctx.bundle.is_some() {
-                ValueGate::NotApplicable
+                ValueGate::Deny(DenyReason::UnsizableValueEffect {
+                    detail: "a multicall call whose value effect the wallet cannot size; only a transfer from the wallet is valued; a value rule matched it without allow_opaque_signing".to_owned(),
+                })
             } else {
                 ValueGate::Deny(DenyReason::UnsizableValueEffect {
                     detail: format!(
@@ -542,17 +534,10 @@ pub fn classify_value<'a>(ctx: &'a EvalContext<'_>) -> ValueGate<'a> {
 // value_class_for_inner
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Maps a decomposed multicall inner descriptor to its [`ValueClass`].
-///
-/// A recognised [`InnerOpDescriptor::TokenTransfer`] maps to a single-leg
-/// value effect (SAC contract as the asset, the transfer `to` as the
-/// destination). An [`InnerOpDescriptor::Generic`] maps to
-/// [`ValueClass::ReadOnly`] on the value axis: it contributes nothing to
-/// value caps (matching the existing per-inner zero-contribution for Generic),
-/// and Generic-inner policing stays with the dedicated
-/// `restrict_bundle_to_recognised_kinds` criterion. Mapping Generic to a leg
-/// with `amount == None` would wrongly trip the fail-closed `None`-is-deny
-/// rule and over-deny any bundle containing a Generic inner.
+/// Maps a typed wallet transfer to one value leg.
+/// Generic calls are unsizable. A matched per-call value criterion denies
+/// them unless the rule sets `allow_opaque_signing`. Bundle caps retain
+/// their own rejection of generic calls.
 #[must_use]
 pub fn value_class_for_inner(inner: &InnerOpDescriptor) -> ValueClass {
     match inner {
@@ -564,7 +549,7 @@ pub fn value_class_for_inner(inner: &InnerOpDescriptor) -> ValueClass {
             asset: Some(asset_normalise(asset)),
             destination: Some(to.clone()),
         }),
-        _ => ValueClass::ReadOnly,
+        _ => ValueClass::Opaque(OpaqueReason::UnvaluedBundleCall),
     }
 }
 
@@ -922,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_value_opaque_denies_on_single_tx_but_suppressed_in_bundle() {
+    fn classify_value_opaque_denies_on_single_tx_and_in_bundle() {
         use crate::policy::v1::bundle::{BundleStateOverlay, BundleView, InnerOpDescriptor};
 
         let tool = tool_with_kind("stellar_sep43_sign_transaction", ToolValueKind::OpaqueSign);
@@ -946,7 +931,14 @@ mod tests {
         let bundled = EvalContext::new(&tool, &args, "alice", &profile, &store)
             .with_value(ValueClass::Opaque(OpaqueReason::RawTransactionSignature))
             .with_bundle(&view);
-        assert!(matches!(classify_value(&bundled), ValueGate::NotApplicable));
+        let ValueGate::Deny(DenyReason::UnsizableValueEffect { detail }) = classify_value(&bundled)
+        else {
+            panic!("opaque bundle call must deny");
+        };
+        assert_eq!(
+            detail,
+            "a multicall call whose value effect the wallet cannot size; only a transfer from the wallet is valued; a value rule matched it without allow_opaque_signing"
+        );
     }
 
     #[test]
@@ -997,14 +989,14 @@ mod tests {
     }
 
     #[test]
-    fn inner_generic_maps_to_read_only() {
-        // A Generic inner must NOT become a leg with amount None (which would
-        // trip the fail-closed None-is-deny rule and over-deny bundles); it maps
-        // to ReadOnly on the value axis.
+    fn inner_generic_maps_to_opaque() {
         let inner = InnerOpDescriptor::Generic {
             target: "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA".into(),
             fn_name: "do_something".into(),
         };
-        assert_eq!(value_class_for_inner(&inner), ValueClass::ReadOnly);
+        assert_eq!(
+            value_class_for_inner(&inner),
+            ValueClass::Opaque(OpaqueReason::UnvaluedBundleCall)
+        );
     }
 }

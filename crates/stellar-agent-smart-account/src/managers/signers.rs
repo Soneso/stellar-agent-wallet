@@ -797,11 +797,39 @@ impl SignersManager {
         self.health.handle()
     }
 
-    /// Returns the CAIP-2 chain identifier configured for this manager.
+    /// Checks verifier pins and statuses for each signing rule.
     ///
-    /// `pub(crate)` — used by `managers::verifiers::verify_pinned_verifier_against_chain`
-    /// and `verify_pinned_policy_against_chain` to populate the
-    /// `chain_id` field on drift audit entries.
+    /// The returned proof is bound to this manager's network, the account and
+    /// the complete rule set. Rule `0` has no pin check.
+    ///
+    /// # Errors
+    ///
+    /// Returns pin drift, verifier status and pin-check availability refusals.
+    pub async fn check_signing_rules(
+        &self,
+        smart_account: &ScAddress,
+        rule_ids: &[stellar_agent_core::smart_account::rule_id::ContextRuleId],
+        request_id: &str,
+    ) -> Result<crate::submit::CheckedSigningRules, SaError> {
+        crate::submit::check_signing_rules(
+            self,
+            smart_account,
+            rule_ids,
+            request_id,
+            crate::managers::auth_entry::PreSubmitBudget {
+                deadline: tokio::time::Instant::now() + self.timeout,
+                total: self.timeout,
+            },
+        )
+        .await
+    }
+
+    pub(crate) fn signing_network_id(&self) -> [u8; 32] {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(self.network_passphrase.as_bytes()).into()
+    }
+
+    /// Returns the CAIP-2 chain identifier for drift audit entries.
     #[must_use]
     pub(crate) fn chain_id(&self) -> &str {
         &self.chain_id
@@ -5510,6 +5538,9 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::VerifierWasmRevoked`] and [`SaError::VerifierWasmRetired`]:
+    ///   the verifier status refuses the operation; no flag overrides it.
+    ///
     /// - [`SaError::VerifierWasmNotInAllowlist`]: no code, or an effective
     ///   hash outside the allowlist (fail-closed; allowlist is the
     ///   authoritative gate).
@@ -5563,6 +5594,13 @@ impl SignersManager {
                 request_id,
             });
         }
+
+        crate::verifier_allowlist::refuse_revoked_or_retired_verifier(
+            &observation.effective_hash,
+            Some(rule_id),
+            &smart_account_redacted,
+            &request_id,
+        )?;
 
         Ok(observation.effective_hash)
     }
@@ -7062,7 +7100,8 @@ impl SignersManager {
     /// `External` signers, decoded from the signers being added. `live` is
     /// the rule's signer set as the pre-submission comparison observed it
     /// through both endpoints. Returns `None` when `new_verifiers` is empty
-    /// or the rule has no pin record. Otherwise each new verifier address
+    /// or the rule has no pin record. Every added verifier gets a status check
+    /// before this decision. Otherwise each new verifier address
     /// that no `External` signer of `live` uses is identified and probed
     /// here, before submission, with the overrides applied to it pending. A
     /// probed pin equal to a recorded verifier pin, in hash and executable
@@ -7087,6 +7126,24 @@ impl SignersManager {
     ) -> Result<Option<PlannedPinUpdate>, SaError> {
         if new_verifiers.is_empty() {
             return Ok(None);
+        }
+        for verifier in new_verifiers {
+            let observation = self
+                .observe_contract(
+                    verifier,
+                    ContractKind::Verifier,
+                    verifier_hash_allowlisted,
+                    Some(rule_id),
+                    smart_account_redacted,
+                    request_id,
+                )
+                .await?;
+            crate::verifier_allowlist::refuse_revoked_or_retired_verifier(
+                &observation.effective_hash,
+                Some(rule_id),
+                smart_account_redacted,
+                request_id,
+            )?;
         }
         let Some(record) = crate::managers::verifiers::read_pinned_hashes_for_rule(
             self,

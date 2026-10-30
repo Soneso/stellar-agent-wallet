@@ -3,7 +3,7 @@
 //! [`RestrictBundleToRecognisedKindsCriterion`] fails-CLOSED on any bundle
 //! containing a [`crate::policy::v1::bundle::InnerOpDescriptor::Generic`] inner.
 //! When enabled, it ensures that only operations whose ABI shape has been
-//! recognised by [`crate::policy::v1::bundle::decompose_bundle`] (currently:
+//! recognised by [`crate::policy::v1::bundle::decompose_bundle_calls`] (currently:
 //! SAC token transfers) are permitted in a multicall bundle.
 //!
 //! # Relationship to the value-summing bundle caps

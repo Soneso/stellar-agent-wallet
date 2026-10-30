@@ -152,3 +152,61 @@ async fn verifier_wasm_hash_drift_detected_and_audit_row_emitted() {
         "SaVerifierHashDrift row must carry the same request_id as the verify call"
     );
 }
+
+#[tokio::test]
+async fn a_pinned_revoked_verifier_refuses_after_the_pin_matches() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(JsonRpcResultResponder(
+            build_ledger_entries_contract_instance(&verifier_addr(), [0xee; 32]),
+        ))
+        .mount(&server)
+        .await;
+    let (audit, path, _dir) = tmp_audit_writer();
+    let manager = manager_one_url(&server.uri(), Arc::clone(&audit), path);
+    audit
+        .lock()
+        .unwrap()
+        .write_entry(AuditEntry::new_sa_context_rule_created(
+            ZERO_CONTRACT_REDACTED,
+            1,
+            "default",
+            1,
+            0,
+            None,
+            "stellar:testnet",
+            "revoked-pin",
+            vec!["eeeeeeeeeeeeeeee".to_owned()],
+            vec![],
+            false,
+            false,
+            vec![],
+            vec![],
+        ))
+        .unwrap();
+    let error = test_helpers::verify_pinned_verifier_against_chain(
+        &manager,
+        verifier_addr(),
+        1,
+        ZERO_CONTRACT_REDACTED,
+        "revoked-pin",
+        &mut HashMap::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SaError::VerifierWasmRevoked {
+                rule_id: Some(1),
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(
+        !verified_audit_entries(&audit)
+            .iter()
+            .any(|entry| matches!(entry.event_kind, EventKind::SaVerifierHashDrift { .. }))
+    );
+}

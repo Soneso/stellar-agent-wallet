@@ -516,6 +516,15 @@ pub enum CredentialsError {
         source: Box<crate::SaError>,
     },
 
+    /// The pinned verifier is revoked or retired. No drift row is written,
+    /// and the ceremony aborts before any bridge I/O.
+    #[error("the rule's pinned verifier is revoked or retired; passkey signing refused: {source}")]
+    VerifierStatusRefused {
+        /// The verifier status refusal.
+        #[source]
+        source: Box<crate::SaError>,
+    },
+
     /// The pre-signing drift-check infrastructure was unavailable.
     ///
     /// Distinct from [`CredentialsError::WasmHashDrift`] (which indicates
@@ -1711,7 +1720,7 @@ impl CredentialsManager {
 
         // Derive the audit result tag from the full Result, covering all
         // closed-set outcomes enumerated in
-        // `audit_log/schema.rs PasskeyAssertion.result` (thirteen classes).
+        // `audit_log/schema.rs PasskeyAssertion.result` (result classes).
         let result_tag = match &inner_result {
             Ok(SignWithPasskeyOutcome::Signed { .. }) => {
                 info!(credential_name, "passkey signing ceremony completed");
@@ -1740,6 +1749,9 @@ impl CredentialsManager {
             // Infrastructure failures are routed to DriftCheckUnavailable by drift_err_route().
             // The `_` catch-all below is defensive for future variants; it should be
             // unreachable given drift_err_route() routing.
+            Err(CredentialsError::VerifierStatusRefused { .. }) => {
+                "failure:verifier_status_refused"
+            }
             Err(CredentialsError::WasmHashDrift { source }) => match source.as_ref() {
                 crate::SaError::PolicyHashDrift { .. } => "failure:policy_hash_drift",
                 crate::SaError::VerifierHashDrift { .. } => "failure:verifier_hash_drift",
@@ -2472,6 +2484,7 @@ fn encode_auth_digest_hex(auth_digest: &[u8; 32]) -> String {
 ///
 /// - [`CredentialsError::SignerSetDivergence`] wrapping the refusal of steps
 ///   1, 2 and 4, a deadline elapse included.
+/// - [`CredentialsError::VerifierStatusRefused`] for a revoked or retired verifier.
 /// - [`CredentialsError::WasmHashDrift`] for a drifted verifier or policy,
 ///   and [`CredentialsError::DriftCheckUnavailable`] for every other
 ///   refusal of step 3 (see [`drift_err_route`]).
@@ -2534,9 +2547,8 @@ async fn check_passkey_rules(
             drift_err_route(sa_err)
         })?;
 
-        // Only a drifted verifier or policy routes to WasmHashDrift, which is
-        // paired with the drift row the check wrote; every other refusal
-        // routes to DriftCheckUnavailable (see `drift_err_route`).
+        // Drift carries a drift row. Status refusals carry their own result
+        // tag; infrastructure failures use DriftCheckUnavailable.
         for verifier_addr in verifier_addrs {
             bound_pre_submit_stage(
                 budget,
@@ -2549,6 +2561,7 @@ async fn check_passkey_rules(
                     smart_account_redacted,
                     request_id,
                     &mut wasm_hash_cache,
+                    crate::managers::verifiers::VerifierStatusGate::Refuse,
                 ),
             )
             .await
@@ -2621,10 +2634,18 @@ async fn check_passkey_rules(
 /// `WasmHashDrift` would break the result-tag ↔ audit-row join that operator
 /// tooling relies on.
 ///
+/// Revoked and retired verifier statuses route to `VerifierStatusRefused`
+/// without a drift row and before bridge I/O.
+///
 /// This function enforces the invariant at a single call site rather than
 /// repeating the match in every loop.
 fn drift_err_route(sa_err: crate::SaError) -> CredentialsError {
     match &sa_err {
+        crate::SaError::VerifierWasmRevoked { .. } | crate::SaError::VerifierWasmRetired { .. } => {
+            CredentialsError::VerifierStatusRefused {
+                source: Box::new(sa_err),
+            }
+        }
         // Actual drift detected — paired SaVerifierHashDrift audit row was emitted.
         crate::SaError::VerifierHashDrift { .. } => CredentialsError::WasmHashDrift {
             source: Box::new(sa_err),
