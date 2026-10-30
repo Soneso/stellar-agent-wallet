@@ -8,10 +8,12 @@
 //!
 //! - `prepare_registration` URL uses the nonce verbatim (base64url, NOT
 //!   hex-encoded); `GET /register/{nonce}` returns 200.
-//! - The manager and bridge share the SAME store Arc; the bridge POST populates
-//!   the entry; `poll_registration` observes it without a second `open()` call.
-//! - `CredentialMetadata.public_key_sec1_b64` is non-empty after
-//!   `poll_registration` returns `Registered`.
+//! - The manager and bridge share the SAME store Arc; the bridge POST of a
+//!   response verified against the entry's challenge populates the entry;
+//!   `poll_registration` observes it without a second `open()` call.
+//! - Polling stages the registration and writes nothing; only
+//!   `confirm_registration` with the page's confirmation code puts the
+//!   credential into the registry.
 //!
 //! # Test sequence (happy path)
 //!
@@ -20,12 +22,14 @@
 //! 3. Construct a `CredentialsManager` pointing at the same `Arc<Mutex<>>`.
 //! 4. Call `prepare_registration` → get `RegistrationHandle { nonce, url }`.
 //! 5. `GET {url}` via `reqwest` → assert 200 + HTML.
-//! 6. Read the CSRF token from the shared store.
-//! 7. `POST /register/{nonce}/credential` with a synthetic SEC1 public key →
-//!    assert 200 + `{"status":"recorded"}`.
-//! 8. `poll_registration` with a short deadline → assert `Registered { metadata
-//!    }` with `public_key_sec1_b64` non-empty, 65-byte decoded, `0x04` prefix.
-//! 9. Assert credential persists: `show` + `list` return the new entry.
+//! 6. Read the CSRF token and the registration challenge from the shared store.
+//! 7. `POST /register/{nonce}/credential` with a software registrar's response
+//!    over that challenge → assert 200 + `{"status":"recorded"}`.
+//! 8. `poll_registration` with a short deadline → assert `AwaitingConfirmation`
+//!    and an empty registry.
+//! 9. `confirm_registration` with the passkey-domain code of the registrar's
+//!    credential → the metadata; `show` + `list` return the new entry with
+//!    the registrar's key.
 
 #![allow(
     clippy::unwrap_used,
@@ -44,7 +48,12 @@ use base64::{
     Engine as _, engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD,
 };
 use reqwest::{Client, StatusCode};
+use stellar_agent_approval_ui::operator_enroll::test_support::SoftwareRegistrar;
+use stellar_agent_core::approval::webauthn_registration::{
+    ConfirmationCode, PASSKEY_REGISTRATION_CODE_DOMAIN,
+};
 use stellar_agent_core::approval::{ApprovalKind, store::PendingApprovalStore};
+use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_smart_account::managers::credentials::{AddPasskeyOutcome, CredentialsManager};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -75,20 +84,6 @@ fn no_redirect_client() -> Client {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("reqwest::Client")
-}
-
-/// Construct a minimal valid 65-byte uncompressed SEC1 P-256 public key fixture.
-///
-/// Byte 0 is `0x04` (uncompressed marker per ANSI X9.62 §4.3.6).  Bytes 1..=64
-/// are a sequential pattern — NOT a valid P-256 point, but passes the
-/// structural `[0] == 0x04` + `len == 65` check in `RegistrationInput::new`.
-fn synthetic_pubkey_sec1() -> [u8; 65] {
-    let mut pk = [0u8; 65];
-    pk[0] = 0x04;
-    for (i, byte) in pk.iter_mut().enumerate().skip(1) {
-        *byte = i as u8;
-    }
-    pk
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -185,40 +180,39 @@ async fn bridge_registration_happy_path() {
     // Consume the body so the connection is released cleanly.
     let _body_text = resp.text().await.expect("response body");
 
-    // ── 6. Read CSRF token from shared store ──────────────────────────────
+    // ── 6. Read CSRF token and challenge from shared store ────────────────
     //
     // The same Arc is used; no second open() is needed.
-    let csrf_hex = {
+    let (csrf_hex, challenge) = {
         let guard = shared_store.lock().await;
         let entry = guard
             .get(&nonce)
             .expect("entry must exist after prepare_registration");
         match &entry.kind {
-            ApprovalKind::RegisterPasskey { csrf_token, .. } => hex::encode(csrf_token),
+            ApprovalKind::RegisterPasskey {
+                csrf_token,
+                registration_challenge: Some(challenge),
+                ..
+            } => (hex::encode(csrf_token), *challenge),
             other => panic!(
-                "expected RegisterPasskey, got: {:?}",
+                "expected RegisterPasskey with a challenge, got: {:?}",
                 std::mem::discriminant(other)
             ),
         }
     };
 
-    // ── 7. POST synthetic credential to bridge ────────────────────────────
+    // ── 7. POST the registrar's credential to bridge ──────────────────────
     //
-    // Wire shape mirrors `wire::RegistrationResponseJSON`:
-    // - `id`         : 16 zero-bytes in base64url (CTAP2-valid credential ID)
-    // - `rawId`      : same
-    // - `type`       : "public-key"
-    // - `response.clientDataJSON`    : arbitrary base64url (not validated here)
-    // - `response.attestationObject` : arbitrary base64url (not validated here)
-    // - `response.publicKeySec1B64`  : standard-base64 of the 65-byte SEC1 key
-    // - `response.transports`        : ["internal"]
-    //
-    // `publicKeySec1B64` uses serde `camelCase` rename: `public_key_sec1_b64`
-    // becomes `publicKeySec1B64` in JSON.  The bridge's `STANDARD.decode` path
-    // expects standard-base64 (not URL-safe).
-    let credential_id_b64 = URL_SAFE_NO_PAD.encode([0u8; 16]);
-    let pubkey = synthetic_pubkey_sec1();
-    let pubkey_b64_standard = STANDARD.encode(pubkey);
+    // Wire shape mirrors `wire::RegistrationResponseJSON`: base64url `id`,
+    // `rawId`, `clientDataJSON` and `attestationObject`, and the SEC1 key in
+    // standard base64. The client data names the entry's challenge and the
+    // page origin `http://localhost:<port>`.
+    let registrar = SoftwareRegistrar::new([0x11; 32], vec![0xa5; 16]);
+    let builder = registrar.builder(
+        &challenge,
+        &format!("http://localhost:{}", local_addr.port()),
+    );
+    let credential_id_b64 = registrar.credential_id_b64url();
 
     let post_url = format!("http://{local_addr}/register/{nonce}/credential");
     let payload = serde_json::json!({
@@ -226,9 +220,9 @@ async fn bridge_registration_happy_path() {
         "rawId": credential_id_b64,
         "type": "public-key",
         "response": {
-            "clientDataJSON": URL_SAFE_NO_PAD.encode(b"{}"),
-            "attestationObject": URL_SAFE_NO_PAD.encode(b"dummy-attestation"),
-            "publicKeySec1B64": pubkey_b64_standard,
+            "clientDataJSON": URL_SAFE_NO_PAD.encode(builder.client_data_json()),
+            "attestationObject": URL_SAFE_NO_PAD.encode(builder.attestation_object()),
+            "publicKeySec1B64": STANDARD.encode(registrar.public_key_sec1()),
             "transports": ["internal"]
         }
     });
@@ -278,45 +272,50 @@ async fn bridge_registration_happy_path() {
         }
     }
 
-    // ── 8. poll_registration observes the bridge-submitted credential ─────
+    // ── 8. poll_registration stages the bridge-submitted credential ──────
+    let audit_path = dir.path().join("smoke-profile-audit.jsonl");
+    let mut writer = AuditWriter::open(audit_path, None).expect("unkeyed audit writer");
     let deadline = Instant::now() + Duration::from_secs(5);
     let outcome = mgr
-        .poll_registration(credential_name, &nonce, deadline, None)
+        .poll_registration(credential_name, &nonce, deadline, &mut writer)
         .await
         .expect("poll_registration must not return Err");
+    let pending = match outcome {
+        AddPasskeyOutcome::AwaitingConfirmation { pending } => pending,
+        other => panic!("expected AddPasskeyOutcome::AwaitingConfirmation, got: {other:?}"),
+    };
+    assert_eq!(pending.credential_name(), credential_name);
+    assert!(
+        mgr.list().expect("list").is_empty(),
+        "nothing is registered before the code is confirmed"
+    );
 
-    match outcome {
-        AddPasskeyOutcome::Registered { metadata } => {
-            assert_eq!(metadata.credential_name, credential_name);
-            assert_eq!(metadata.rp_id, "localhost");
+    // ── 9. confirm_registration with the page's code registers it ─────────
+    let code = ConfirmationCode::compute(
+        PASSKEY_REGISTRATION_CODE_DOMAIN,
+        &challenge,
+        registrar.credential_id(),
+        &registrar.public_key_sec1(),
+    )
+    .display();
+    let metadata = mgr
+        .confirm_registration(pending, &code, Instant::now(), &mut writer)
+        .expect("the page's code confirms the registration");
+    assert_eq!(metadata.credential_name, credential_name);
+    assert_eq!(metadata.rp_id, "localhost");
+    assert_eq!(
+        metadata.credential_id_b64url,
+        registrar.credential_id_b64url()
+    );
+    let decoded = URL_SAFE_NO_PAD
+        .decode(&metadata.public_key_sec1_b64)
+        .expect("public_key_sec1_b64 must be valid base64url");
+    assert_eq!(decoded, registrar.public_key_sec1());
 
-            // public_key_sec1_b64 must be populated.
-            assert!(
-                !metadata.public_key_sec1_b64.is_empty(),
-                "public_key_sec1_b64 must be non-empty after bridge registration"
-            );
-            let decoded = URL_SAFE_NO_PAD
-                .decode(&metadata.public_key_sec1_b64)
-                .expect("public_key_sec1_b64 must be valid base64url");
-            assert_eq!(
-                decoded.len(),
-                65,
-                "decoded public key must be exactly 65 bytes"
-            );
-            assert_eq!(decoded[0], 0x04, "first decoded byte must be 0x04");
-        }
-        other => panic!("expected AddPasskeyOutcome::Registered, got: {other:?}"),
-    }
-
-    // ── 9. Credential persists in registry ────────────────────────────────
     let shown = mgr
         .show(credential_name)
         .expect("show must find the newly registered credential");
-    assert_eq!(shown.credential_name, credential_name);
-    assert!(
-        !shown.public_key_sec1_b64.is_empty(),
-        "public_key_sec1_b64 must persist to registry TOML"
-    );
+    assert_eq!(shown, metadata);
 
     let creds = mgr.list().expect("list must succeed after registration");
     assert_eq!(

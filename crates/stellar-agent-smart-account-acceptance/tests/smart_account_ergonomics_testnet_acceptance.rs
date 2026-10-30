@@ -119,6 +119,7 @@ use chromiumoxide::cdp::browser_protocol::web_authn::{
     AddVirtualAuthenticatorParams, AuthenticatorProtocol, AuthenticatorTransport, EnableParams,
     VirtualAuthenticatorOptions,
 };
+use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use common::{TESTNET_PASSPHRASE, TESTNET_RPC_URL, fund_via_friendbot};
 use ed25519_dalek::SigningKey;
 use futures::StreamExt as _;
@@ -1877,6 +1878,37 @@ async fn goto_loopback(page: &chromiumoxide::Page, url: &str) -> Result<(), Goto
     Ok(())
 }
 
+/// Reads the confirmation code the registration page shows once the bridge
+/// accepted the browser's response, retrying for up to ten seconds.
+async fn read_confirmation_code(page: &chromiumoxide::Page) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let code: String = page
+            .evaluate(
+                EvaluateParams::builder()
+                    .expression(
+                        "(function(){var el = document.getElementById('confirmation-code'); \
+                         return el && !el.hidden ? el.textContent : '';})()",
+                    )
+                    .return_by_value(true)
+                    .build()
+                    .expect("EvaluateParams must build"),
+            )
+            .await
+            .expect("evaluate must not error")
+            .into_value()
+            .expect("evaluate result must deserialise as String");
+        if !code.is_empty() {
+            return code;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the registration page did not show a confirmation code within ten seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Drives a CDP virtual-authenticator registration ceremony for a single
 /// credential and returns `(credential_id_bytes, pubkey_65_bytes)`.
 async fn register_one_credential(
@@ -1904,14 +1936,18 @@ async fn register_one_credential(
             credential_name,
             &reg_handle.nonce,
             reg_deadline,
-            Some(&mut reg_audit),
+            &mut reg_audit,
         )
         .await
         .expect("poll_registration must not error");
-    let metadata = match reg_outcome {
-        AddPasskeyOutcome::Registered { metadata } => metadata,
-        other => panic!("registration: expected Registered; got {other:?}"),
+    let pending = match reg_outcome {
+        AddPasskeyOutcome::AwaitingConfirmation { pending } => pending,
+        other => panic!("registration: expected AwaitingConfirmation; got {other:?}"),
     };
+    let code = read_confirmation_code(page).await;
+    let metadata = creds_manager
+        .confirm_registration(pending, &code, Instant::now(), &mut reg_audit)
+        .expect("the code the page shows must confirm the registration");
 
     let credential_id_bytes = URL_SAFE_NO_PAD
         .decode(&metadata.credential_id_b64url)

@@ -1,7 +1,8 @@
 // The minimal browser the page-script tests run in: a fresh VM context
 // with a fake DOM, a recorded sessionStorage, a recorded fetch, and a manual
 // clock, so a test observes exactly what a script stores, requests, and
-// navigates to. Shared by app_shared.test.mjs and mainnet-presence.test.mjs.
+// navigates to. Shared by app_shared.test.mjs, mainnet-presence.test.mjs and
+// the WebAuthn bridge's glue.test.mjs.
 
 import { readFileSync } from "node:fs";
 import { webcrypto } from "node:crypto";
@@ -56,6 +57,8 @@ export function browser({
   credential = () => {
     throw new Error("this page creates no credential");
   },
+  // Further globals the page script reads, such as a vendored library.
+  globals = {},
 } = {}) {
   const byId = {};
   for (const [id, value] of Object.entries(islands)) {
@@ -141,6 +144,7 @@ export function browser({
       return reply(url, init || {});
     },
   };
+  Object.assign(context, globals);
   vm.createContext(context);
   return {
     byId,

@@ -38,12 +38,12 @@ use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{ApprovalFailure, WalletError};
 use stellar_agent_core::profile::ResolvedProfileName;
 
-use super::operator::{print_confirmation_prompt, read_code_from_terminal};
+use super::operator::print_confirmation_prompt;
 use crate::common::private_open;
 use crate::common::profile_access::load_profile_reconciled;
 use crate::common::render::render_json;
 use crate::common::served_pages::page_identity_for;
-use crate::common::tty::stdin_and_stderr_are_terminals;
+use crate::common::tty::{read_line_from_terminal, stdin_and_stderr_are_terminals};
 use crate::common::{display_available, interrupted, validate_path_component_ascii_safe};
 
 /// The note printed on stderr after a successful enrollment.
@@ -191,7 +191,7 @@ async fn run_enroll(args: EnrollApprovalCredentialArgs) -> i32 {
         private_open::browser_opener,
         Duration::from_secs(args.timeout_seconds),
         tokio::signal::ctrl_c(),
-        read_code_from_terminal,
+        || read_line_from_terminal("operator-enroll-code"),
     )
     .await;
     report(end, &args.profile)

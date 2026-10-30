@@ -14,11 +14,12 @@ use p256::elliptic_curve::sec1::ToEncodedPoint as _;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+use stellar_agent_core::approval::webauthn::{FLAG_AT, FLAG_UP, FLAG_UV};
+use stellar_agent_core::approval::webauthn_registration::COSE_ALG_ES256;
+
 use super::EnrollmentPurpose;
 use super::confirmation::enrollment_confirmation_code;
-use super::registration::{
-    COSE_ALG_ES256, EnrollCredentialRequest, FLAG_AT, FLAG_UP, FLAG_UV, REGISTRATION_RP_ID,
-};
+use super::registration::{EnrollCredentialRequest, REGISTRATION_RP_ID};
 
 /// A minimal CBOR encoder for building registration fixtures, including
 /// malformed ones. Every head it writes uses the shortest encoding.

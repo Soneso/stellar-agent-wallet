@@ -88,6 +88,7 @@ pub mod toolset_grant;
 pub mod user_id;
 pub mod view;
 pub mod webauthn;
+pub mod webauthn_registration;
 pub mod witness;
 
 pub use assertion_input::AssertionInput;

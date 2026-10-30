@@ -33,6 +33,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use p256::ecdsa::Signature;
+use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 /// The step of a WebAuthn assertion that failed.
@@ -94,6 +95,35 @@ pub const FLAG_BS: u8 = 0x10;
 pub const FLAG_AT: u8 = 0x40;
 /// The extension-data flag of the authenticator data.
 pub const FLAG_ED: u8 = 0x80;
+
+/// The origin security members of bounded `clientDataJSON` supplied by a
+/// caller. Duplicate members refuse; unknown members are ignored.
+#[derive(Deserialize)]
+pub(super) struct ClientDataOrigin {
+    origin: String,
+    #[serde(rename = "crossOrigin", default, deserialize_with = "present")]
+    cross_origin: Option<bool>,
+    #[serde(rename = "topOrigin", default, deserialize_with = "present")]
+    top_origin: Option<serde::de::IgnoredAny>,
+}
+
+impl ClientDataOrigin {
+    /// Requires the exact origin, no cross-origin ceremony and no top origin.
+    pub(super) fn matches(&self, expected_origin: &str) -> bool {
+        self.origin == expected_origin
+            && self.cross_origin != Some(true)
+            && self.top_origin.is_none()
+    }
+}
+
+/// Keeps explicit `null` distinct from an absent member.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
 
 /// Verifies a WebAuthn assertion with the workspace's ES256 verifier.
 ///

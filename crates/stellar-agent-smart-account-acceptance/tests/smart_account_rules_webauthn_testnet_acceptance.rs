@@ -102,6 +102,7 @@ use chromiumoxide::cdp::browser_protocol::web_authn::{
     AddVirtualAuthenticatorParams, AuthenticatorProtocol, AuthenticatorTransport, EnableParams,
     VirtualAuthenticatorOptions,
 };
+use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use ed25519_dalek::SigningKey;
 use futures::StreamExt as _;
 use rand_core::OsRng;
@@ -357,6 +358,37 @@ impl Drop for BrowserGuard {
 // ─────────────────────────────────────────────────────────────────────────────
 // Browser launch helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Reads the confirmation code the registration page shows once the bridge
+/// accepted the browser's response, retrying for up to ten seconds.
+async fn read_confirmation_code(page: &chromiumoxide::Page) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let code: String = page
+            .evaluate(
+                EvaluateParams::builder()
+                    .expression(
+                        "(function(){var el = document.getElementById('confirmation-code'); \
+                         return el && !el.hidden ? el.textContent : '';})()",
+                    )
+                    .return_by_value(true)
+                    .build()
+                    .expect("EvaluateParams must build"),
+            )
+            .await
+            .expect("evaluate must not error")
+            .into_value()
+            .expect("evaluate result must deserialise as String");
+        if !code.is_empty() {
+            return code;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the registration page did not show a confirmation code within ten seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
 
 /// Launches a headless Chromium browser for the WebAuthn ceremony.
 ///
@@ -657,9 +689,11 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
     // approval entry.  The virtual authenticator generates the P-256 keypair
     // internally and returns the attestation object to the page.  The page's
     // fetch POST to `/register/<nonce>/credential` delivers the credential ID
-    // and uncompressed SEC1 public key to the bridge, which records them in the
-    // approval store.  `poll_registration` then picks up the `RegistrationInput`
-    // and writes `CredentialMetadata` to the passkeys registry.
+    // and uncompressed SEC1 public key to the bridge, which verifies the
+    // response against the entry's challenge and records it in the approval
+    // store.  `poll_registration` then picks up the `RegistrationInput`, and
+    // `confirm_registration` with the code the page shows writes
+    // `CredentialMetadata` to the passkeys registry.
     //
     // Private-key bytes NEVER cross the CDP wire.
     let creds_manager = CredentialsManager::new(
@@ -696,14 +730,18 @@ async fn webauthn_passkey_signing_testnet_acceptance() {
             credential_name,
             &reg_handle.nonce,
             reg_deadline,
-            Some(&mut reg_audit),
+            &mut reg_audit,
         )
         .await
         .expect("poll_registration must not error");
-    let metadata = match reg_outcome {
-        AddPasskeyOutcome::Registered { metadata } => metadata,
-        other => panic!("W-REG: expected Registered; got {other:?}"),
+    let pending = match reg_outcome {
+        AddPasskeyOutcome::AwaitingConfirmation { pending } => pending,
+        other => panic!("W-REG: expected AwaitingConfirmation; got {other:?}"),
     };
+    let code = read_confirmation_code(&page).await;
+    let metadata = creds_manager
+        .confirm_registration(pending, &code, Instant::now(), &mut reg_audit)
+        .expect("W-REG: the code the page shows must confirm the registration");
     assert_eq!(
         metadata.rp_id, TEST_RP_ID,
         "registered credential rp_id must match TEST_RP_ID"

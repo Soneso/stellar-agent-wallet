@@ -53,6 +53,13 @@ pub(crate) fn credentials_error_code(err: &CredentialsError) -> &'static str {
         CredentialsError::Signing { .. } => "credentials.signing_failed",
         CredentialsError::MissingPublicKey { .. } => "credentials.missing_public_key",
         CredentialsError::MalformedPublicKey { .. } => "credentials.malformed_public_key",
+        CredentialsError::RegistrationConfirmationMismatch => {
+            "credentials.registration_confirmation_mismatch"
+        }
+        CredentialsError::RegistrationConfirmationExpired => {
+            "credentials.registration_confirmation_expired"
+        }
+        CredentialsError::AuditWrite { .. } => "credentials.audit_write_failed",
         // Forward-compatibility wildcard: future variants (e.g. the
         // divergence-check family) default to a generic code rather than
         // failing to compile on every new variant added upstream.
@@ -75,10 +82,9 @@ pub struct CredentialsArgs {
 pub enum CredentialsSubcommand {
     /// Register a new WebAuthn passkey via browser handoff.
     ///
-    /// Generates a registration nonce, opens the OS default browser to the
-    /// wallet-owned bridge registration URL, and polls the approval store until
-    /// the browser-side WebAuthn ceremony completes. On success, stores the
-    /// credential metadata in the per-profile passkeys registry.
+    /// Requires terminals on stdin and stderr and the profile's keyed audit writer.
+    /// After the browser ceremony, type the page's confirmation code before the
+    /// deadline to register the passkey.
     ///
     /// Prints the standard result envelope on completion:
     ///
@@ -184,6 +190,20 @@ mod tests {
             (
                 CredentialsError::MainnetWriteForbidden,
                 "sa.credentials.mainnet_write_forbidden",
+            ),
+            (
+                CredentialsError::RegistrationConfirmationMismatch,
+                "credentials.registration_confirmation_mismatch",
+            ),
+            (
+                CredentialsError::RegistrationConfirmationExpired,
+                "credentials.registration_confirmation_expired",
+            ),
+            (
+                CredentialsError::AuditWrite {
+                    detail: "the log was replaced".to_owned(),
+                },
+                "credentials.audit_write_failed",
             ),
         ];
         for (err, expected_code) in cases {

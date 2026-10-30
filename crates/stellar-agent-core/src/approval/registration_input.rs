@@ -20,10 +20,10 @@ use super::error::ApprovalError;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Minimum credential-ID length in bytes (CTAP2 §4.2 / WebAuthn-2 §5.4.7).
-pub(crate) const CREDENTIAL_ID_MIN_BYTES: usize = 16;
+pub const CREDENTIAL_ID_MIN_BYTES: usize = 16;
 
 /// Maximum credential-ID length in bytes (CTAP2 §4.2 / WebAuthn-2 §5.4.7).
-pub(crate) const CREDENTIAL_ID_MAX_BYTES: usize = 64;
+pub const CREDENTIAL_ID_MAX_BYTES: usize = 64;
 
 /// Expected length of an uncompressed SEC1 P-256 public key in bytes.
 ///
@@ -34,7 +34,7 @@ pub(crate) const CREDENTIAL_ID_MAX_BYTES: usize = 64;
 ///
 /// Serde's built-in array support only covers `[T; 0..=32]`, so the field is
 /// stored as `Vec<u8>` and length-checked at construction + deserialisation.
-pub(crate) const PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN: usize = 65;
+pub const PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN: usize = 65;
 
 /// Maximum number of CTAP transport strings per credential record.
 pub(crate) const TRANSPORTS_MAX_COUNT: usize = 4;
