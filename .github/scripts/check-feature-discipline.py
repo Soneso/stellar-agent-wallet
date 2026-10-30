@@ -304,7 +304,7 @@ CROSS_PRE_BUILD = ['dpkg --add-architecture $CROSS_DEB_ARCH',
 
 
 def run_cargo(root, args):
-    result = subprocess.run(['cargo', *args], cwd=root, text=True, capture_output=True,
+    result = subprocess.run(['cargo', '--color', 'never', *args], cwd=root, text=True, capture_output=True,
                             env={**os.environ, 'CARGO_NET_OFFLINE': 'true'})
     if result.returncode:
         raise ValueError('cargo ' + ' '.join(args) + ': ' + result.stderr.strip())

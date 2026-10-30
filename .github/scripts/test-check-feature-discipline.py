@@ -811,13 +811,23 @@ def case_tree_output(m, tmp, checker):
     assert graph['roots']['stellar-agent-mcp']['leaf'] == [False], 'tree-output: subtree link'
     assert graph['roots']['stellar-agent-mcp']['stellar-agent-core'] == [True], 'tree-output: occurrence identity'
     for output in ('unexpected', '0sample v0.0.0|\nunknown output', '0sample v0.0.0|\n2child v0.0.0|',
-                   '0sample v0.0.0| (*)', '0sample v0.0.0|bad feature', ''):
+                   '0sample v0.0.0| (*)', '0sample v0.0.0|bad feature', '0sample v0.0.0|\x1b[0m', ''):
         try:
             m.parse_tree(output)
         except ValueError:
             pass
         else:
             raise AssertionError(f'tree-output: unknown output accepted: {output!r}')
+
+
+@unit('cargo-color-never')
+def case_cargo_color_never(m, tmp, checker):
+    result = subprocess.run([sys.executable, str(HERE / 'test-check-feature-discipline.py'),
+                             '--case', 'graph-baseline', '--checker', str(checker)],
+                            env={**os.environ, 'CARGO_TERM_COLOR': 'always'},
+                            text=True, capture_output=True)
+    assert result.returncode == 0, \
+        f'cargo-color-never: forced color query fails: {result.stdout}\n{result.stderr}'
 
 
 @unit('environment-guard')
@@ -1836,6 +1846,8 @@ MUTATIONS = {
         'name, enabled = nodes[key]\n            if name not in PACKAGES:\n                continue', 'graph-any-package:'),
     'D3-unknown-output': ('tree-output',
         "raise ValueError(f'invalid cargo tree line: {line!r}')", 'continue', 'tree-output: unknown output accepted'),
+    'D3-cargo-color': ('cargo-color-never',
+        "['cargo', '--color', 'never', *args]", "['cargo', *args]", 'cargo-color-never: forced color query fails'),
     'D4-metadata-only': ('build-script-outside-metadata',
         "paths = {path.resolve() for path in source_files(self.root, ('build.rs',))}", 'paths = set()',
         "D4: no error with 'rustc-cfg sets a feature'"),
