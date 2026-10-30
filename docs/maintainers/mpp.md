@@ -135,31 +135,84 @@ of authorization IDs, fingerprints and approval nonces. When the counter is
 proven absent by the keyring, opening adopts a verifying snapshot under the
 store lock. It records `mpp_state_adopted` with the profile and generation before
 anchoring. Only version 1, which has no generation, is adopted; it is rewritten
-as version 2 at generation one with all records preserved. Every store holds its
-committed counter before its first version 2 snapshot. A version 2 file with an
-absent counter refuses as an invalid anchor. Generation zero remains reserved
-for an unwritten store. A present counter, an unverifiable file, or a keyring
-access error cannot trigger adoption. A state key with neither counter nor file
-refuses the same way; it holds no history, and reset recovers it without
-discarding records.
+as version 2 at generation one with all records preserved. An adoption
+interrupted at intent one before publication leaves the version 1 file,
+and the next open adopts at generation two, above that reservation. If this
+resumed adoption stops before publication, opening refuses: intent two cannot
+be told apart from anchor removal. Move the state file out of the MPP state
+directory and run the reset to discard.
+A write that publishes while the committed counter is absent, an adoption or a
+discarding reset, and stops before its commit leaves a version 2 file whose
+generation equals the intent; the next open commits that generation through the
+guarded commit. Every other store holds its committed counter before its first
+version 2 snapshot, so any other version 2 file with an absent counter, or a
+version 1 file beside any other intent, refuses as an invalid anchor.
+Generation zero remains reserved for an unwritten store. A present counter, an
+unverifiable file, or a keyring access error cannot trigger adoption. A state
+key with neither counter nor file refuses the same way. The invalid-anchor
+refusal names a discarding reset, the one recovery for these states.
 Concurrent opens share the lock, and an anchored read emits no adoption row.
 
-Mutation holds a sibling-file cross-process lock and chooses one plus the
-maximum of the committed counter and intent, with overflow checking. It checks
-that the committed counter still matches and the intent is below that
-generation. A changed counter or an intent at or above that generation refuses
-with a retry message. Adoption requires both counters to be absent.
+Mutation holds the sibling state lock across preparation, reservation,
+publication, and commit. Its namespace is the canonical state path plus `.lock`.
+The OS lock excludes separate open file descriptions or handles, including
+other processes. Dropping the guard unlocks it; process exit releases the handle.
 
-The write burns the generation in the intent counter, writes and syncs a
-temporary snapshot, atomically renames it, and syncs the parent directory.
-It then reads both counters again and advances the committed counter only while
-they still hold this write's values; a counter moved by a second writer refuses
-with the retry message. Failure before publication keeps the committed snapshot
-readable and prevents reuse of the burned generation.
-A read under the lock completes a published snapshot whose generation equals
-the intent and exceeds the committed counter. Other generation mismatches
-refuse. A missing file reads as empty at committed generation zero, regardless
-of intent. Reads never lower either counter.
+The guard retains its path and handle. Acquisition, atomic snapshot replacement,
+and every counter write check that the path still names the held regular file.
+Unix checks device and inode against no-follow metadata. Windows opens with
+read and write sharing only, preventing deletion or renaming while held.
+Windows also checks regular-file metadata and creation time through an opened
+path, refusing inaccessible paths and reparse points.
+
+Counter updates are guarded read-compare-writes. The keyring supplies ordinary
+reads and writes; exclusion comes from the verified state lock. A reservation
+chooses one plus the maximum committed counter and intent, with checked overflow.
+It requires both counters to hold exactly the values observed during
+preparation, and the proposed generation strictly exceeds each valid one.
+Adoption requires an absent committed counter. Initialization writes zero only
+while both counters remain absent; a counter that appears refuses with the retry
+message, and a leftover intent refuses as an invalid anchor.
+
+The write reserves the generation in the intent, syncs a temporary snapshot,
+rechecks lock identity, atomically replaces the snapshot, and syncs its directory.
+Commit verifies the authenticated publication, re-reads both counters, and
+requires the exact expected committed value and an intent equal to its target.
+Every counter write goes through one guarded setter. It checks lock identity
+immediately before the keyring write and again after it. A path that changed in
+between refuses with a message saying the update is not confirmed, and the store
+logs it at warn level. Outside the limit below, neither counter decreases, an
+equal competing target never counts as success, and a losing writer returns the
+concurrent-update retry message without replacing the winning snapshot. Failure
+before publication in an ordinary mutation keeps acknowledged records readable
+and prevents reuse of the reserved generation.
+
+A read rejects a snapshot below the committed counter before record lookup.
+Equality requires valid format, HMAC, and records. A higher snapshot requires
+an exact matching intent and completes through the same guarded commit checks.
+A missing file reads as empty only at committed generation zero.
+
+On Unix, three windows remain after the final identity check. Each needs an
+actor with write access to the state directory who replaces the lock path with
+timing inside the window, which lets a second writer take the lock. Windows
+denies deleting or renaming the held lock path, so none of the windows exists
+there.
+
+- Between the identity check before a counter write and the keyring write, the
+  stale writer's value can overwrite a newer one. A lowered committed counter
+  lets a restored older snapshot pass reads, which loses the replay records
+  written after it. The check after the write reports the update as not
+  confirmed but cannot undo it.
+- Between the identity check before the atomic replacement and the rename, the
+  stale writer's snapshot can overwrite a newer committed one. Reads then refuse
+  it as rolled back, and a reset carries it without reporting a stale carry,
+  because it sits only one generation below the committed counter. The newer
+  writer's replay records are lost.
+- Between the identity check before a state-key rotation and the rotation, the
+  stale writer can replace the key. This covers the discarding reset and the
+  key mint on first open. The newer writer's snapshot survives as bytes but no
+  longer authenticates, so every open refuses, and only a discarding reset
+  recovers. The newer writer's replay records are lost.
 
 Deletion or generation mismatch returns `mpp.state_unavailable` with a message
 identifying the state as rolled back and naming `profile reset-mpp-state`.
@@ -167,10 +220,15 @@ identifying the state as rolled back and naming `profile reset-mpp-state`.
 `stellar-agent profile reset-mpp-state <NAME> --acknowledge --reason <REASON>`
 recovers refused state. Under the store lock it reads the state, then writes
 `mpp_state_reset` with the profile, discarded generation, carried generation,
-stale flag, and bounded reason, and only then mutates. An absent or malformed
-counter is represented by a null discarded generation. The row omits the
-carried generation when the reset discards, and the stale flag when it is
-false.
+stale flag, and bounded reason, and only then mutates. An inaccessible counter
+refuses before the audit row. A carry needs a valid committed counter and an
+intent that is absent or valid, because only they bound the generations the
+retained key sealed. A file that authenticates beside an absent or malformed
+committed counter, or a malformed intent, therefore refuses before the audit
+row. That refusal names the one recovery, a discarding reset: move the state
+file out of the MPP state directory and rerun the reset. An absent or malformed
+committed counter is recorded as a null discarded generation. The row omits the
+carried generation when the reset discards, and the stale flag when it is false.
 
 The reset discards only when no snapshot can authenticate: the state key is
 missing, malformed, or equal to an owner public key, or the file is missing, a
@@ -181,12 +239,11 @@ reset before its audit row, and nothing changes.
 When the state key authenticates the file, reset keeps every record and the
 prune watermark. It closes `prepared`, `approval_pending`, and `ready` records
 as `expired_unresolved`, with an update time at least as recent as their last
-update. All other statuses survive. Reset sets the committed counter to the
-maximum parseable counter, intent, and snapshot generation, then publishes the
-carried history one generation higher through the normal write path. A
-malformed intent is repaired to that floor before publication. The state key
-stays unchanged, and older snapshots fall below the committed counter. Existing
-handles can read the carried history. Retrying a partial reset carries
+update. All other statuses survive. Reset publishes the carried history above
+the maximum committed counter, intent, and authenticated snapshot generation
+through the guarded write path. Both counters retain their high-water marks.
+The state key stays unchanged, and older snapshots fall below the committed
+counter. Existing handles can read the carried history. Retrying a partial reset carries
 authenticated history again.
 
 The carried snapshot is the one on disk. No write leaves the file more than one
@@ -197,17 +254,36 @@ after the carried snapshot belongs to a challenge prepared before the reset,
 whose effective expiry lies within that cap, so the challenge refuses with
 `mpp.challenge_expired` while it can still be live.
 
-When no snapshot authenticates, reset rotates the state key, removes the file,
-syncs its directory, sets the committed counter to zero, and deletes the intent.
-It then publishes an empty snapshot at generation one with the same raised
-watermark. This path discards every replay marker; a settled charge loses its
-settled status. The fresh key invalidates snapshots of discarded history, and
+When no snapshot authenticates, reset rotates the state key and retains every
+valid counter. Guarded atomic replacement publishes an empty snapshot strictly
+above their maximum with the same raised watermark, then syncs the directory.
+An absent or malformed counter does not block this path: the guarded writes
+replace it while it holds exactly the observed value. Malformed values include
+non-UTF-8 bytes, which the comparisons retain exactly. The fresh key leaves no
+earlier snapshot that authenticates.
+
+A discard interrupted after key rotation and before publication leaves no
+snapshot that authenticates under the new key. Opening refuses; rerunning the
+reset completes the discard.
+A discard under a malformed committed counter interrupted after publication
+refuses on open with the anchor error. Reset refuses the authenticated carry.
+Move the state file out of the MPP state directory and rerun the reset to
+discard. With an absent or valid committed counter, a publication whose intent
+names the snapshot completes on open through the guarded commit.
+
+A discarding reset removes every replay marker; a settled charge loses its settled
+status. The fresh key invalidates snapshots of discarded history, and
 profile handles check their cached key against the keyring before reading or
 writing. The result reports `carried_records`, `carried_generation`,
 `stale_carry`, `discarded_generation`, and a one-line `warnings` entry for a
-stale carry. Audit failures and failures reading the committed counter refuse
-before mutation. The audit row records the request even when a later step
+stale carry. Audit failures and keyring access failures reading either counter
+refuse before mutation. The audit row records the request even when a later step
 fails. There is no automatic reset on read failure.
+
+The recovery verb remains `profile reset-mpp-state`, and it never infers a
+trusted counter from a state file. Outside the automatic adoption and
+publication completion cases above, a missing or malformed counter needs a
+discarding reset, which loses replay history; no counter-repair verb exists.
 
 Filesystem rollback cannot pass a read while the keyring remains trusted: every
 read compares the snapshot generation with the committed counter. The reset

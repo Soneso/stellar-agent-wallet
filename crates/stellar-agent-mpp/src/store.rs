@@ -55,7 +55,9 @@ const fn is_zero(value: &i64) -> bool {
 /// Outcome of an audited MPP state reset.
 #[derive(Debug)]
 pub struct MppStateReset {
-    /// Parseable committed generation observed before the reset.
+    /// Committed generation observed before the reset, or `None` when the
+    /// committed counter was absent or malformed, which only a discarding
+    /// reset accepts.
     pub discarded_generation: Option<u64>,
     /// Number of authenticated authorization records retained by the reset.
     pub carried_records: usize,
@@ -70,10 +72,136 @@ pub struct MppStateReset {
     pub stale_carry: bool,
 }
 
+/// Lets other handles read the lock file.
+#[cfg(windows)]
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+/// Lets other handles write the lock file. The lock omits delete sharing, so
+/// its path cannot be deleted or renamed while the guard holds its handle.
+#[cfg(windows)]
+const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+/// Opens a reparse point itself rather than the target it names.
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+/// Marks a file or directory that is a reparse point.
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
 struct StoreLock {
     /// The guard explicitly releases the lock on drop.
-    _file: HeldFileLock,
+    file: HeldFileLock,
+    path: PathBuf,
 }
+
+impl StoreLock {
+    /// The pathname must still identify the regular file this guard locks.
+    ///
+    /// A path that is gone or names another file refuses with the retry
+    /// message, since the next acquisition takes a fresh lock. Any other
+    /// metadata or open failure refuses as unavailable state, which a retry
+    /// does not clear.
+    fn verify_identity(&self) -> Result<(), MppError> {
+        let path_error = |error: std::io::Error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                concurrent_update_error()
+            } else {
+                state_error()
+            }
+        };
+        let held = self.file.metadata().map_err(|_error| state_error())?;
+        let named = fs::symlink_metadata(&self.path).map_err(path_error)?;
+        if !held.is_file() || !named.is_file() || named.file_type().is_symlink() {
+            return Err(concurrent_update_error());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if held.dev() != named.dev() || held.ino() != named.ino() {
+                return Err(concurrent_update_error());
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+            // Delete sharing is denied for the lifetime of the held handle.
+            // Opening the path also refuses inaccessible names and reparse points.
+            let opened = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&self.path)
+                .and_then(|file| file.metadata())
+                .map_err(path_error)?;
+            if named.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                || opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                || held.creation_time() != opened.creation_time()
+            {
+                return Err(concurrent_update_error());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A trusted counter entry as the keyring holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Counter {
+    Absent,
+    Value(u64),
+    /// Bytes that name no generation. Only a discarding reset, which rotates
+    /// the state key, replaces it.
+    Malformed(Vec<u8>),
+}
+
+impl Counter {
+    /// A missing entry is `Absent`; a keyring access error refuses.
+    fn read(entry_ref: &KeyringEntryRef) -> Result<Self, MppError> {
+        let entry = keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+            .map_err(|_error| state_error())?;
+        Ok(match entry.get_password() {
+            Ok(text) => match text.parse() {
+                Ok(value) => Self::Value(value),
+                Err(_) => Self::Malformed(text.into_bytes()),
+            },
+            Err(keyring_core::Error::NoEntry) => Self::Absent,
+            Err(keyring_core::Error::BadEncoding(bytes)) => Self::Malformed(bytes),
+            Err(_error) => return Err(state_error()),
+        })
+    }
+
+    const fn value(&self) -> Option<u64> {
+        match self {
+            Self::Value(value) => Some(*value),
+            Self::Absent | Self::Malformed(_) => None,
+        }
+    }
+}
+
+impl From<Option<u64>> for Counter {
+    fn from(value: Option<u64>) -> Self {
+        value.map_or(Self::Absent, Self::Value)
+    }
+}
+
+/// Both counters as a write observed them under the lock before it chose its
+/// generation. Its reservation proceeds only while both still hold exactly
+/// these values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Observed {
+    committed: Counter,
+    intent: Counter,
+}
+
+impl Observed {
+    fn new(committed: Option<u64>, intent: Option<u64>) -> Self {
+        Self {
+            committed: committed.into(),
+            intent: intent.into(),
+        }
+    }
+}
+
+/// The generation an adoption publishes its version 1 history at.
+const ADOPTED_GENERATION: u64 = 1;
 
 /// Per-profile durable MPP authorization store.
 pub struct MppAuthorizationStore {
@@ -178,7 +306,7 @@ impl MppAuthorizationStore {
 
         refuse_owner_coordinate(entry_ref)?;
         let mut store = Self::at_path(path, [0; 32], generation_entry_ref(entry_ref));
-        let _lock = store.acquire_lock()?;
+        let lock = store.acquire_lock()?;
         let generation = load_generation(&store.generation_entry)?;
         if generation.is_some_and(|value| value > 0) && provably_absent(&store.path) {
             return Err(rollback_error());
@@ -189,8 +317,13 @@ impl MppAuthorizationStore {
                 return Err(state_error());
             }
             if generation.is_none() {
-                write_generation(&store.generation_entry, 0)?;
+                store.initialize_generation(&lock)?;
             }
+            #[cfg(test)]
+            tests::run_hook(&tests::BEFORE_KEY_MINT)?;
+            // The lock path must name the held file immediately before the
+            // key write, as for every other state-key rotation.
+            lock.verify_identity()?;
             rotate_keyring_secret_32(&entry_ref.service, &entry_ref.account).map_err(|error| {
                 tracing::debug!(error = %error, "mpp state key mint failed");
                 state_error()
@@ -207,7 +340,7 @@ impl MppAuthorizationStore {
         }
         store.state_key_entry = Some(entry_ref.clone());
         store.owner = Some(owner);
-        store.verify_or_adopt(adopt)?;
+        store.verify_or_adopt(&lock, adopt)?;
         Ok(store)
     }
 
@@ -253,7 +386,7 @@ impl MppAuthorizationStore {
         refuse_owner_coordinate(entry_ref)?;
         let mut store = Self::at_path(path, [0; 32], generation_entry_ref(entry_ref));
         // The lock also serializes first-read adoption and prepare/reset.
-        let _lock = store.acquire_lock()?;
+        let lock = store.acquire_lock()?;
         let generation = load_generation(&store.generation_entry)?;
         if generation.is_some_and(|value| value > 0) && provably_absent(&store.path) {
             return Err(rollback_error());
@@ -270,7 +403,7 @@ impl MppAuthorizationStore {
         refuse_owner_public_key(store.key.as_slice(), &owner)?;
         store.state_key_entry = Some(entry_ref.clone());
         store.owner = Some(owner);
-        store.verify_or_adopt(adopt)?;
+        store.verify_or_adopt(&lock, adopt)?;
         Ok(Some(store))
     }
 
@@ -291,40 +424,64 @@ impl MppAuthorizationStore {
 
     fn verify_or_adopt(
         &self,
+        lock: &StoreLock,
         audit: impl FnOnce(u64) -> Result<(), MppError>,
     ) -> Result<(), MppError> {
         if load_generation(&self.generation_entry)?.is_some() {
-            return self.read_verified().map(|_| ());
+            return self.read_verified(lock).map(|_| ());
         }
         if provably_absent(&self.path) {
             return Err(anchor_error());
         }
         let mut wire = self.read_authenticated()?;
-        // Every store holds its counter before its first version 2 snapshot.
-        // An absent counter on that format proves anchor removal.
+        let intent = load_intent(&self.generation_intent_entry)?;
+        // Every store holds its counter before its first version 2 snapshot,
+        // except after an adoption or a discarding reset that published under
+        // an absent counter and stopped before its commit: the intent names
+        // that snapshot. That publication commits here; any other version 2
+        // file without its counter proves anchor removal.
         if wire.version != 1 {
-            return Err(anchor_error());
+            if intent != Some(wire.generation) {
+                return Err(anchor_error());
+            }
+            self.commit_generation(lock, &Counter::Absent, wire.generation)?;
+            return self.read_verified(lock).map(|_| ());
         }
         // The initial zero counter means no file has been committed. A version
         // 1 snapshot therefore enters the protected format at generation one.
+        // An intent of exactly that generation is an adoption interrupted
+        // before its publication, which resumes one generation higher so the
+        // burned generation is not reused. Any other intent cannot be told
+        // apart from anchor removal, so opening refuses and a discarding
+        // reset recovers the store.
+        let generation = match intent {
+            None => ADOPTED_GENERATION,
+            Some(ADOPTED_GENERATION) => ADOPTED_GENERATION + 1,
+            Some(_) => return Err(anchor_error()),
+        };
         wire.version = STORE_VERSION;
-        wire.generation = 1;
+        wire.generation = generation;
         audit(wire.generation)?;
-        self.write_atomic(&wire, None)
+        self.write_atomic(lock, &wire, &Observed::new(None, intent))
     }
 
     /// Resets MPP state after the caller's operator acknowledgement.
     ///
-    /// Under the store lock the reset reads the state file before it changes
-    /// anything. A file that authenticates under the retained state key is
-    /// carried: its records survive with unclaimed charges closed as expired,
-    /// and it is published above both counters under the same key. The reset
-    /// discards the history only when no snapshot can authenticate: the state
-    /// key is missing, malformed or equal to an owner public key, the file is
+    /// Under the store lock the reset reads both counters and the state file
+    /// before it changes anything. A file that authenticates under the
+    /// retained state key is carried: its records survive with unclaimed
+    /// charges closed as expired, and it is published above both counters
+    /// under the same key. A carry needs a valid committed counter and an
+    /// intent that is absent or valid, because only they bound the
+    /// generations the retained key has sealed. The reset discards the
+    /// history only when no snapshot can authenticate: the state key is
+    /// missing, malformed or equal to an owner public key, the file is
     /// missing, or the file fails its HMAC, parse or validation checks. It
-    /// then rotates the key and publishes an empty snapshot. The carried
-    /// snapshot is the one on disk, so a state file rolled back before the
-    /// reset loses the records written after it;
+    /// then rotates the key and publishes an empty snapshot above every valid
+    /// counter, replacing an absent or malformed counter through the same
+    /// guarded writes; the fresh key leaves no earlier snapshot that
+    /// authenticates. The carried snapshot is the one on disk, so a state
+    /// file rolled back before the reset loses the records written after it;
     /// [`MppStateReset::stale_carry`] reports a rollback the committed counter
     /// proves. A stale carry and a discard both raise the pruned-expiry
     /// watermark to the challenge lifetime cap past `now_unix`, so a challenge
@@ -335,9 +492,13 @@ impl MppAuthorizationStore {
     ///
     /// Refuses on lock or audit errors, and on every keyring access or I/O
     /// error while reading the state, without changing anything; a transient
-    /// error never discards history. A failure after the audit row can be
-    /// retried with the same explicit acknowledgement. `binding` is the audit
-    /// binding check of the reset row's writer.
+    /// error never discards history. A file that authenticates while the
+    /// committed counter is absent or malformed, or the intent is malformed,
+    /// refuses before the audit row: only a discarding reset recovers that
+    /// state. A discard interrupted before publication recovers by rerunning
+    /// reset. After publication under a malformed committed counter, recovery
+    /// requires moving the state file out and rerunning reset with explicit
+    /// acknowledgement. `binding` is the reset row's audit binding check.
     pub fn reset_for_profile(
         profile_name: &str,
         profile: &Profile,
@@ -379,10 +540,23 @@ impl MppAuthorizationStore {
     ) -> Result<MppStateReset, MppError> {
         refuse_owner_coordinate(key_ref)?;
         let mut store = Self::at_path(path, [0; 32], generation_entry_ref(key_ref));
-        let _lock = store.acquire_lock()?;
-        let discarded =
-            load_generation_value(&store.generation_entry)?.and_then(|value| value.parse().ok());
+        let lock = store.acquire_lock()?;
+        let observed = Observed {
+            committed: Counter::read(&store.generation_entry)?,
+            intent: Counter::read(&store.generation_intent_entry)?,
+        };
+        let discarded = observed.committed.value();
+        let next_generation = discarded
+            .unwrap_or(0)
+            .max(observed.intent.value().unwrap_or(0))
+            .checked_add(1)
+            .ok_or_else(state_error)?;
         let carried = store.read_for_reset(key_ref, profile_name)?;
+        if carried.is_some()
+            && (discarded.is_none() || matches!(observed.intent, Counter::Malformed(_)))
+        {
+            return Err(carry_anchor_error());
+        }
         let outcome = MppStateReset {
             discarded_generation: discarded,
             carried_records: carried.as_ref().map_or(0, |wire| wire.records.len()),
@@ -408,61 +582,32 @@ impl MppAuthorizationStore {
                     )?;
                 }
             }
-            let raw_intent = load_generation_value(&store.generation_intent_entry)?;
-            let intent = raw_intent
-                .as_ref()
-                .and_then(|value| value.parse::<u64>().ok());
-            let floor = discarded
-                .unwrap_or(0)
-                .max(intent.unwrap_or(0))
-                .max(wire.generation);
             wire.version = STORE_VERSION;
-            wire.generation = floor.checked_add(1).ok_or_else(state_error)?;
-            write_generation(&store.generation_entry, floor)?;
-            // A malformed intent has no generation to preserve. The committed
-            // floor protects the authenticated history while it is repaired.
-            if raw_intent.is_some() && intent.is_none() {
-                write_intent(&store.generation_intent_entry, floor)?;
-            }
-            store.write_atomic(&wire, Some(floor))?;
+            wire.generation =
+                next_generation.max(wire.generation.checked_add(1).ok_or_else(state_error)?);
+            store.write_atomic(&lock, &wire, &observed)?;
             return Ok(outcome);
         }
+        lock.verify_identity()?;
         stellar_agent_network::keyring::rotate_keyring_secret_32(
             &key_ref.service,
             &key_ref.account,
         )
         .map_err(|_error| state_error())?;
-        match fs::remove_file(&store.path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(state_error()),
-        }
-        #[cfg(unix)]
-        fs::File::open(store.path.parent().ok_or_else(state_error)?)
-            .and_then(|parent| parent.sync_all())
-            .map_err(|_error| state_error())?;
-        write_generation(&store.generation_entry, 0)?;
-        match keyring_core::Entry::new(
-            &store.generation_intent_entry.service,
-            &store.generation_intent_entry.account,
-        )
-        .and_then(|entry| entry.delete_credential())
-        {
-            Ok(()) | Err(keyring_core::Error::NoEntry) => {}
-            Err(_) => return Err(state_error()),
-        }
-        // The empty snapshot carries the watermark under the fresh key. A
-        // failure before it publishes leaves a valid empty store that a
-        // repeated reset discards again.
+        #[cfg(test)]
+        tests::run_hook(&tests::AFTER_KEY_ROTATION)?;
+        // Valid counters survive key rotation and a partial reset. The guarded
+        // writes replace an absent or malformed counter only while it still
+        // holds what this reset observed.
         store.key = stellar_agent_network::keyring::load_hmac_key_32(key_ref)
             .map_err(|_error| state_error())?;
         let empty = WireStore {
             version: STORE_VERSION,
-            generation: 1,
+            generation: next_generation,
             pruned_through: lost_marker_horizon,
             records: Vec::new(),
         };
-        store.write_atomic(&empty, Some(0))?;
+        store.write_atomic(&lock, &empty, &observed)?;
         Ok(outcome)
     }
 
@@ -557,8 +702,8 @@ impl MppAuthorizationStore {
         record: &AuthorizationRecord,
         now_unix: i64,
     ) -> Result<Option<AuthorizationRecord>, MppError> {
-        let _lock = self.acquire_lock()?;
-        let wire = self.read_verified()?;
+        let lock = self.acquire_lock()?;
+        let wire = self.read_verified(&lock)?;
         Ok(find_prepare_match(&wire, record, now_unix)?.cloned())
     }
 
@@ -571,8 +716,8 @@ impl MppAuthorizationStore {
     /// a malformed identifier or a store that cannot be read and verified.
     pub fn load(&self, authorization_id: &str) -> Result<AuthorizationRecord, MppError> {
         validate_authorization_id(authorization_id)?;
-        let _lock = self.acquire_lock()?;
-        let wire = self.read_verified()?;
+        let lock = self.acquire_lock()?;
+        let wire = self.read_verified(&lock)?;
         wire.records
             .into_iter()
             .find(|record| record.authorization_id() == authorization_id)
@@ -592,8 +737,8 @@ impl MppAuthorizationStore {
         approval_nonce: &str,
     ) -> Result<AuthorizationRecord, MppError> {
         validate_approval_nonce(approval_nonce)?;
-        let _lock = self.acquire_lock()?;
-        let wire = self.read_verified()?;
+        let lock = self.acquire_lock()?;
+        let wire = self.read_verified(&lock)?;
         let mut matching = wire
             .records
             .into_iter()
@@ -943,16 +1088,16 @@ impl MppAuthorizationStore {
     {
         // The store directory is established by lock acquisition, which every
         // path — read and write — goes through first.
-        let _lock = self.acquire_lock()?;
-        let mut wire = self.read_verified()?;
+        let lock = self.acquire_lock()?;
+        let mut wire = self.read_verified(&lock)?;
         let generation = wire.generation;
         let result = update(&mut wire)?;
-        let intent = load_intent(&self.generation_intent_entry)?.unwrap_or(0);
+        let intent = load_intent(&self.generation_intent_entry)?;
         wire.generation = generation
-            .max(intent)
+            .max(intent.unwrap_or(0))
             .checked_add(1)
             .ok_or_else(state_error)?;
-        self.write_atomic(&wire, Some(generation))?;
+        self.write_atomic(&lock, &wire, &Observed::new(Some(generation), intent))?;
         Ok(result)
     }
 
@@ -1005,21 +1150,37 @@ impl MppAuthorizationStore {
                 .write(true)
                 .truncate(false)
                 .mode(0o600)
-                .open(path)
+                .open(&path)
                 .map_err(|_error| state_error())?
         };
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&path)
+                .map_err(|_error| state_error())?
+        };
+        #[cfg(not(any(unix, windows)))]
         let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(path)
+            .open(&path)
             .map_err(|_error| state_error())?;
         let file = HeldFileLock::try_lock(file).map_err(|_error| state_error())?;
-        Ok(StoreLock { _file: file })
+        let lock = StoreLock { file, path };
+        #[cfg(test)]
+        tests::run_hook(&tests::AFTER_LOCK_ACQUIRED)?;
+        lock.verify_identity()?;
+        Ok(lock)
     }
 
-    fn read_verified(&self) -> Result<WireStore, MppError> {
+    fn read_verified(&self, lock: &StoreLock) -> Result<WireStore, MppError> {
         if let Some(key_ref) = &self.state_key_entry {
             let current = stellar_agent_network::keyring::load_hmac_key_32(key_ref)
                 .map_err(|_error| state_error())?;
@@ -1047,17 +1208,25 @@ impl MppAuthorizationStore {
         }
         let wire = self.read_authenticated()?;
         let mut generation = load_generation(&self.generation_entry)?.ok_or_else(anchor_error)?;
+        if wire.generation < generation {
+            return Err(rollback_error());
+        }
         // A version 1 file has generation zero and never exceeds the counter.
         if wire.generation > generation
             && load_intent(&self.generation_intent_entry)? == Some(wire.generation)
         {
-            write_generation(&self.generation_entry, wire.generation)?;
+            self.commit_generation(lock, &Counter::Value(generation), wire.generation)?;
             generation = wire.generation;
         }
         if wire.version != STORE_VERSION || wire.generation != generation || generation == 0 {
             return Err(rollback_error());
         }
         Ok(wire)
+    }
+
+    #[cfg(test)]
+    fn read_for_test(&self) -> Result<WireStore, MppError> {
+        self.read_verified(&self.acquire_lock()?)
     }
 
     fn read_authenticated(&self) -> Result<WireStore, MppError> {
@@ -1124,14 +1293,15 @@ impl MppAuthorizationStore {
         Ok(wire)
     }
 
-    /// Publishes `wire` as the next snapshot. `expected_generation` is the
-    /// counter value this write started from; `None` means the counter must
-    /// still be absent, which holds only for the adoption of an unanchored
-    /// store.
+    /// Publishes `wire` as the next snapshot. `expected` holds both counters
+    /// as this write observed them under `lock`. An absent committed counter
+    /// holds only for an adoption or a discarding reset, and a malformed one
+    /// only for a discarding reset.
     fn write_atomic(
         &self,
+        lock: &StoreLock,
         wire: &WireStore,
-        expected_generation: Option<u64>,
+        expected: &Observed,
     ) -> Result<(), MppError> {
         let body = serde_json::to_vec(wire).map_err(|_error| state_error())?;
         if body.len() > MAX_STORE_BYTES {
@@ -1139,24 +1309,9 @@ impl MppAuthorizationStore {
         }
         let tag = compute_tag(&self.key, &body)?;
         let parent = self.path.parent().ok_or_else(state_error)?;
-        // A replaced lock file can admit a second writer. Publishing only
-        // while the counter still holds the generation this write started from
-        // keeps that writer's committed snapshot; it is intact, so the refusal
-        // asks for a retry rather than a reset.
-        if load_generation(&self.generation_entry)? != expected_generation {
-            return Err(concurrent_update_error());
-        }
-        let intent = load_intent(&self.generation_intent_entry)?;
-        if expected_generation.is_none() && intent.is_some() {
-            return Err(anchor_error());
-        }
-        if intent.is_some_and(|intent| intent >= wire.generation) {
-            return Err(concurrent_update_error());
-        }
-        // Burn the generation before writing authenticated bytes. Publish and
-        // sync the snapshot before committing its counter. A read completes an
-        // interrupted commit only when the snapshot equals the burned intent.
-        write_intent(&self.generation_intent_entry, wire.generation)?;
+        self.reserve_generation(lock, expected, wire.generation)?;
+        #[cfg(test)]
+        tests::run_hook(&tests::AFTER_RESERVATION)?;
         let mut temporary =
             tempfile::NamedTempFile::new_in(parent).map_err(|_error| state_error())?;
         temporary.write_all(&tag).map_err(|_error| state_error())?;
@@ -1165,6 +1320,9 @@ impl MppAuthorizationStore {
             .as_file()
             .sync_data()
             .map_err(|_error| state_error())?;
+        #[cfg(test)]
+        tests::run_hook(&tests::BEFORE_PUBLICATION)?;
+        lock.verify_identity()?;
         temporary
             .persist(&self.path)
             .map_err(|_error| state_error())?;
@@ -1174,18 +1332,108 @@ impl MppAuthorizationStore {
                 .and_then(|directory| directory.sync_all())
                 .map_err(|_error| state_error())?;
         }
-        // A second writer admitted by a replaced lock file can commit while
-        // this snapshot is written. The commit proceeds only while both
-        // counters still hold this write's values, so a counter that moved is
-        // left to the writer that moved it and this write asks for a retry.
+        #[cfg(test)]
+        tests::run_hook(&tests::AFTER_PUBLICATION)?;
         #[cfg(test)]
         tests::before_commit(&self.generation_entry, &self.generation_intent_entry);
-        if load_generation(&self.generation_entry)? != expected_generation
-            || load_intent(&self.generation_intent_entry)? != Some(wire.generation)
+        self.commit_generation(lock, &expected.committed, wire.generation)
+    }
+
+    /// Zero belongs only to an absent anchor with no reserved generation.
+    ///
+    /// A counter that appears during the call refuses with the retry message;
+    /// a leftover intent is an invalid anchor.
+    fn initialize_generation(&self, lock: &StoreLock) -> Result<(), MppError> {
+        #[cfg(test)]
+        tests::run_hook(&tests::BEFORE_GENERATION_WRITE)?;
+        if Counter::read(&self.generation_entry)? != Counter::Absent {
+            return Err(concurrent_update_error());
+        }
+        if Counter::read(&self.generation_intent_entry)? != Counter::Absent {
+            return Err(anchor_error());
+        }
+        self.write_counter(lock, &self.generation_entry, 0)
+    }
+
+    /// A reservation requires both counters to hold exactly what the write
+    /// observed and strictly exceeds every valid one.
+    fn reserve_generation(
+        &self,
+        lock: &StoreLock,
+        expected: &Observed,
+        proposed: u64,
+    ) -> Result<(), MppError> {
+        #[cfg(test)]
+        tests::run_hook(&tests::BEFORE_INTENT_WRITE)?;
+        let current = Observed {
+            committed: Counter::read(&self.generation_entry)?,
+            intent: Counter::read(&self.generation_intent_entry)?,
+        };
+        if current != *expected
+            || [&current.committed, &current.intent]
+                .into_iter()
+                .filter_map(Counter::value)
+                .any(|value| value >= proposed)
         {
             return Err(concurrent_update_error());
         }
-        write_generation(&self.generation_entry, wire.generation)?;
+        #[cfg(test)]
+        tests::run_hook(&tests::AFTER_RESERVATION_CHECKS)?;
+        self.write_counter(lock, &self.generation_intent_entry, proposed)
+    }
+
+    /// Completion owns the exact reservation and an authenticated publication.
+    fn commit_generation(
+        &self,
+        lock: &StoreLock,
+        expected: &Counter,
+        proposed: u64,
+    ) -> Result<(), MppError> {
+        #[cfg(test)]
+        tests::run_hook(&tests::BEFORE_GENERATION_WRITE)?;
+        if self.read_authenticated()?.generation != proposed {
+            return Err(concurrent_update_error());
+        }
+        let committed = Counter::read(&self.generation_entry)?;
+        if committed != *expected
+            || committed.value().is_some_and(|value| value >= proposed)
+            || Counter::read(&self.generation_intent_entry)? != Counter::Value(proposed)
+        {
+            return Err(concurrent_update_error());
+        }
+        #[cfg(test)]
+        tests::run_hook(&tests::AFTER_COMMIT_CHECKS)?;
+        self.write_counter(lock, &self.generation_entry, proposed)
+    }
+
+    /// The only setter of either counter. The caller has validated both
+    /// counters under `lock`; the lock path must name the held file
+    /// immediately before the keyring write. A path that names another file
+    /// after the write means another writer could have run inside that
+    /// window, so the write is reported as unconfirmed.
+    fn write_counter(
+        &self,
+        lock: &StoreLock,
+        entry_ref: &KeyringEntryRef,
+        value: u64,
+    ) -> Result<(), MppError> {
+        let intent = *entry_ref == self.generation_intent_entry;
+        lock.verify_identity()?;
+        #[cfg(test)]
+        {
+            tests::run_hook(&tests::AFTER_COUNTER_IDENTITY)?;
+            tests::fail_counter_write(entry_ref, intent);
+        }
+        keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+            .and_then(|entry| entry.set_password(&value.to_string()))
+            .map_err(|_error| state_error())?;
+        if lock.verify_identity().is_err() {
+            tracing::warn!(
+                counter = if intent { "intent" } else { "committed" },
+                "mpp state lock path changed during a counter write"
+            );
+            return Err(lock_window_error());
+        }
         Ok(())
     }
 }
@@ -1234,14 +1482,6 @@ fn load_intent(entry_ref: &KeyringEntryRef) -> Result<Option<u64>, MppError> {
     load_generation(entry_ref)
 }
 
-fn write_intent(entry_ref: &KeyringEntryRef, generation: u64) -> Result<(), MppError> {
-    #[cfg(test)]
-    tests::before_intent_write(entry_ref);
-    keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
-        .and_then(|entry| entry.set_password(&generation.to_string()))
-        .map_err(|_error| state_error())
-}
-
 fn is_unclaimed(record: &AuthorizationRecord) -> bool {
     matches!(
         record.status(),
@@ -1287,27 +1527,23 @@ fn find_prepare_match<'a>(
 }
 
 fn load_generation(entry_ref: &KeyringEntryRef) -> Result<Option<u64>, MppError> {
-    load_generation_value(entry_ref)?
-        .map(|value| value.parse().map_err(|_| anchor_error()))
-        .transpose()
-}
-
-fn load_generation_value(entry_ref: &KeyringEntryRef) -> Result<Option<String>, MppError> {
-    let entry = keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
-        .map_err(|_error| state_error())?;
-    match entry.get_password() {
-        Ok(value) => Ok(Some(value)),
-        Err(keyring_core::Error::NoEntry) => Ok(None),
-        Err(_error) => Err(state_error()),
+    match Counter::read(entry_ref)? {
+        Counter::Absent => Ok(None),
+        Counter::Value(value) => Ok(Some(value)),
+        Counter::Malformed(_) => Err(anchor_error()),
     }
 }
 
+#[cfg(test)]
 fn write_generation(entry_ref: &KeyringEntryRef, generation: u64) -> Result<(), MppError> {
-    #[cfg(test)]
-    tests::before_generation_write(entry_ref);
     keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
         .and_then(|entry| entry.set_password(&generation.to_string()))
-        .map_err(|_error| state_error())
+        .map_err(|_| state_error())
+}
+
+#[cfg(test)]
+fn write_intent(entry_ref: &KeyringEntryRef, generation: u64) -> Result<(), MppError> {
+    write_generation(entry_ref, generation)
 }
 
 fn key_is_absent(entry_ref: &KeyringEntryRef) -> Result<bool, MppError> {
@@ -1392,7 +1628,23 @@ const fn concurrent_update_error() -> MppError {
 const fn anchor_error() -> MppError {
     MppError::new(
         MppErrorCode::StateUnavailable,
-        "MPP authorization state generation anchor is missing or invalid; recover with stellar-agent profile reset-mpp-state <NAME> --acknowledge --reason <REASON>",
+        "MPP authorization state generation anchor is missing or invalid; only a discarding reset recovers it: move any state file out of the MPP state directory, then run stellar-agent profile reset-mpp-state <NAME> --acknowledge --reason <REASON>",
+    )
+}
+
+/// A reset cannot carry an authenticated file without trusted counters.
+const fn carry_anchor_error() -> MppError {
+    MppError::new(
+        MppErrorCode::StateUnavailable,
+        "MPP authorization state generation anchor is missing or invalid, so reset cannot carry the authenticated state file; only a discarding reset recovers it: move the state file out of the MPP state directory, then rerun stellar-agent profile reset-mpp-state <NAME> --acknowledge --reason <REASON>",
+    )
+}
+
+/// The lock path stopped naming the held file during a counter write.
+const fn lock_window_error() -> MppError {
+    MppError::new(
+        MppErrorCode::StateUnavailable,
+        "MPP authorization state lock path changed while a generation counter was written; another writer could have run in that window, so this update is not confirmed",
     )
 }
 
@@ -1525,6 +1777,8 @@ pub(crate) mod tests {
         reason = "test fixtures use expect for concise setup"
     )]
 
+    mod generation;
+
     use super::*;
     use crate::sponsored::tests::{prepared_fixture, prepared_fixture_for_resource};
     use crate::{ReceiptInput, parse_receipt};
@@ -1534,7 +1788,25 @@ pub(crate) mod tests {
     use stellar_agent_network::keyring::{load_hmac_key_32, rotate_keyring_secret_32};
     use tempfile::TempDir;
 
+    type Hook = std::cell::RefCell<Option<Box<dyn FnOnce() -> Result<(), MppError>>>>;
+
+    pub(super) fn run_hook(cell: &'static std::thread::LocalKey<Hook>) -> Result<(), MppError> {
+        let hook = cell.with(|slot| slot.borrow_mut().take());
+        hook.map_or(Ok(()), |callback| callback())
+    }
+
     thread_local! {
+        pub(super) static AFTER_LOCK_ACQUIRED: Hook = const { std::cell::RefCell::new(None) };
+        pub(super) static BEFORE_INTENT_WRITE: Hook = const { std::cell::RefCell::new(None) };
+        pub(super) static BEFORE_GENERATION_WRITE: Hook = const { std::cell::RefCell::new(None) };
+        pub(super) static AFTER_RESERVATION: Hook = const { std::cell::RefCell::new(None) };
+        pub(super) static BEFORE_PUBLICATION: Hook = const { std::cell::RefCell::new(None) };
+        pub(super) static AFTER_PUBLICATION: Hook = const { std::cell::RefCell::new(None) };
+        pub(super) static AFTER_RESERVATION_CHECKS: Hook = const { std::cell::RefCell::new(None) };
+        pub(super) static AFTER_COMMIT_CHECKS: Hook = const { std::cell::RefCell::new(None) };
+        pub(super) static AFTER_COUNTER_IDENTITY: Hook = const { std::cell::RefCell::new(None) };
+        pub(super) static AFTER_KEY_ROTATION: Hook = const { std::cell::RefCell::new(None) };
+        pub(super) static BEFORE_KEY_MINT: Hook = const { std::cell::RefCell::new(None) };
         static FAIL_NEXT_INTENT_WRITE: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
         static FAIL_NEXT_GENERATION_WRITE: std::cell::Cell<bool> =
@@ -1545,18 +1817,20 @@ pub(crate) mod tests {
             const { std::cell::Cell::new(None) };
     }
 
-    /// A commit reads both counters immediately before it writes the
-    /// committed one, and the mock keyring fails only the next operation on a
-    /// credential, so no injection placed before the publish can reach the
-    /// write. When armed, this injects the keyring failure between that read
-    /// and the write; the refusal it produces is the production one.
-    pub(super) fn before_generation_write(entry_ref: &KeyringEntryRef) {
-        if FAIL_NEXT_GENERATION_WRITE.with(std::cell::Cell::take) {
+    /// When armed for the counter `entry_ref` names, fails its next keyring
+    /// write after the validation reads and the identity check succeed.
+    pub(super) fn fail_counter_write(entry_ref: &KeyringEntryRef, intent: bool) {
+        let armed = if intent {
+            &FAIL_NEXT_INTENT_WRITE
+        } else {
+            &FAIL_NEXT_GENERATION_WRITE
+        };
+        if armed.with(std::cell::Cell::take) {
             stellar_agent_test_support::keyring_mock::inject_no_logon_session(
                 &entry_ref.service,
                 &entry_ref.account,
             )
-            .expect("inject the generation write failure");
+            .expect("inject the counter write failure");
         }
     }
 
@@ -1571,18 +1845,6 @@ pub(crate) mod tests {
             if let Some(value) = cell.with(std::cell::Cell::take) {
                 put_raw(entry_ref, &value.to_string());
             }
-        }
-    }
-
-    /// The intent write is the first keyring write of a publish; when armed,
-    /// this fails it the way [`before_generation_write`] fails the commit.
-    pub(super) fn before_intent_write(entry_ref: &KeyringEntryRef) {
-        if FAIL_NEXT_INTENT_WRITE.with(std::cell::Cell::take) {
-            stellar_agent_test_support::keyring_mock::inject_no_logon_session(
-                &entry_ref.service,
-                &entry_ref.account,
-            )
-            .expect("inject the intent write failure");
         }
     }
 
@@ -2119,7 +2381,11 @@ pub(crate) mod tests {
         };
         assert_eq!(
             store
-                .write_atomic(&wire, Some(0))
+                .write_atomic(
+                    &store.acquire_lock().expect("lock"),
+                    &wire,
+                    &Observed::new(Some(0), None)
+                )
                 .expect_err("refusal")
                 .code(),
             STATE_CODE
@@ -2307,7 +2573,7 @@ pub(crate) mod tests {
                 .code(),
             "mpp.authorization_replayed"
         );
-        assert_eq!(store.read_verified().expect("store").records.len(), 1);
+        assert_eq!(store.read_for_test().expect("store").records.len(), 1);
     }
 
     #[tokio::test]
@@ -2332,7 +2598,7 @@ pub(crate) mod tests {
                 .authorization_id(),
             first.authorization_id()
         );
-        assert_eq!(store.read_verified().expect("store").records.len(), 1);
+        assert_eq!(store.read_for_test().expect("store").records.len(), 1);
     }
 
     #[tokio::test]
@@ -2387,7 +2653,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             store
-                .read_verified()
+                .read_for_test()
                 .expect("legacy records remain valid")
                 .records
                 .len(),
@@ -2418,7 +2684,7 @@ pub(crate) mod tests {
                 id
             );
         }
-        assert_eq!(store.read_verified().expect("store").records.len(), 2);
+        assert_eq!(store.read_for_test().expect("store").records.len(), 2);
     }
 
     #[tokio::test]
@@ -2454,7 +2720,7 @@ pub(crate) mod tests {
                 "challenge expires no later than an authorization this store has pruned; check the host clock"
             );
         }
-        assert!(reopened.read_verified().expect("store").records.is_empty());
+        assert!(reopened.read_for_test().expect("store").records.is_empty());
     }
 
     #[tokio::test]
@@ -2482,7 +2748,7 @@ pub(crate) mod tests {
         store
             .insert_prepared(record, now + 1_000)
             .expect("insert after correction");
-        assert_eq!(store.read_verified().expect("store").records.len(), 1);
+        assert_eq!(store.read_for_test().expect("store").records.len(), 1);
     }
 
     #[tokio::test]
@@ -2528,7 +2794,7 @@ pub(crate) mod tests {
             error.message(),
             "challenge expired before its prepared authorization was committed"
         );
-        let wire = store.read_verified().expect("store");
+        let wire = store.read_for_test().expect("store");
         assert_eq!(wire.records.len(), 1);
         assert_eq!(wire.records[0].status(), AuthorizationStatus::Prepared);
     }
@@ -2539,23 +2805,23 @@ pub(crate) mod tests {
     #[serial_test::serial]
     fn a_counter_moved_before_the_commit_refuses_it() {
         stellar_agent_test_support::keyring_mock::install().expect("mock keyring store");
-        for moved_counter in [true, false] {
+        for (moved_counter, value) in [(true, 5), (false, 9), (true, 1)] {
             let directory = TempDir::new().expect("tempdir");
             let store = test_store(directory.path().join("state"), [7; 32]);
             if moved_counter {
-                MOVE_COUNTER_BEFORE_COMMIT.with(|cell| cell.set(Some(5)));
+                MOVE_COUNTER_BEFORE_COMMIT.with(|cell| cell.set(Some(value)));
             } else {
-                MOVE_INTENT_BEFORE_COMMIT.with(|cell| cell.set(Some(9)));
+                MOVE_INTENT_BEFORE_COMMIT.with(|cell| cell.set(Some(value)));
             }
             let error = store.prune(0).expect_err("moved counter");
             assert_eq!(error.message(), concurrent_update_error().message());
             assert_eq!(
                 load_generation(&store.generation_entry).expect("counter"),
-                Some(if moved_counter { 5 } else { 0 })
+                Some(if moved_counter { value } else { 0 })
             );
             assert_eq!(
                 load_intent(&store.generation_intent_entry).expect("intent"),
-                Some(if moved_counter { 1 } else { 9 })
+                Some(if moved_counter { 1 } else { value })
             );
         }
     }
@@ -2636,13 +2902,14 @@ pub(crate) mod tests {
         store.ensure_parent().expect("test value");
         store
             .write_atomic(
+                &store.acquire_lock().expect("lock"),
                 &WireStore {
                     version: STORE_VERSION,
                     generation: u64::MAX,
                     pruned_through: 0,
                     records: Vec::new(),
                 },
-                Some(0),
+                &Observed::new(Some(0), None),
             )
             .expect("test value");
         let snapshot = fs::read(&path).expect("test value");
@@ -2841,11 +3108,17 @@ pub(crate) mod tests {
             records: Vec::new(),
         };
         store.ensure_parent().expect("parent");
-        store.write_atomic(&wire, Some(0)).expect("write");
+        store
+            .write_atomic(
+                &store.acquire_lock().expect("lock"),
+                &wire,
+                &Observed::new(Some(0), None),
+            )
+            .expect("write");
         let mut bytes = fs::read(&path).expect("read");
         bytes[HMAC_TAG_BYTES] ^= 1;
         fs::write(&path, bytes).expect("tamper");
-        assert!(store.read_verified().is_err());
+        assert!(store.read_for_test().is_err());
     }
 
     #[test]
@@ -2858,17 +3131,18 @@ pub(crate) mod tests {
         first.ensure_parent().expect("parent");
         first
             .write_atomic(
+                &first.acquire_lock().expect("lock"),
                 &WireStore {
                     version: STORE_VERSION,
                     generation: 1,
                     pruned_through: 0,
                     records: Vec::new(),
                 },
-                Some(0),
+                &Observed::new(Some(0), None),
             )
             .expect("write");
         let second = test_store(path, [8; 32]);
-        assert!(second.read_verified().is_err());
+        assert!(second.read_for_test().is_err());
     }
 
     #[test]
@@ -2880,7 +3154,7 @@ pub(crate) mod tests {
         let store = test_store(path.clone(), [7; 32]);
         store.ensure_parent().expect("parent");
         fs::write(path, [0_u8; HMAC_TAG_BYTES - 1]).expect("truncated file");
-        assert!(store.read_verified().is_err());
+        assert!(store.read_for_test().is_err());
     }
 
     #[cfg(unix)]
@@ -2893,7 +3167,7 @@ pub(crate) mod tests {
             KeyringEntryRef::new("mpp-lock-test", "generation"),
         );
         let guard = store.acquire_lock().expect("store lock");
-        let duplicate = guard._file.try_clone_file().expect("duplicate descriptor");
+        let duplicate = guard.file.try_clone_file().expect("duplicate descriptor");
         assert!(store.acquire_lock().is_err());
         drop(guard);
         let _next = store.acquire_lock().expect("store lock");
@@ -2930,7 +3204,7 @@ pub(crate) mod tests {
         fs::write(&target, b"not state").expect("target");
         symlink(target, &path).expect("symlink");
         let store = test_store(path, [7; 32]);
-        assert!(store.read_verified().is_err());
+        assert!(store.read_for_test().is_err());
     }
 
     /// A symlink whose target does not exist refuses on every store path, and
@@ -3019,16 +3293,17 @@ pub(crate) mod tests {
         store.ensure_parent().expect("parent");
         store
             .write_atomic(
+                &store.acquire_lock().expect("lock"),
                 &WireStore {
                     version: STORE_VERSION,
                     generation: 1,
                     pruned_through: 0,
                     records: vec![record.clone(), record],
                 },
-                Some(0),
+                &Observed::new(Some(0), None),
             )
-            .expect("authenticated duplicate store");
-        assert!(store.read_verified().is_err());
+            .expect_err("invalid snapshot refuses commit");
+        assert!(store.read_for_test().is_err());
     }
 
     #[tokio::test]

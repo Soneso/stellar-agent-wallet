@@ -619,8 +619,9 @@ loses the records written after that copy. When the generation counter proves
 the rollback, the result sets `stale_carry` and names it in one `warnings` line.
 
 When no snapshot authenticates, reset discards every replay marker, rotates the
-key, removes the file, sets the committed counter to zero, deletes the intent,
-and publishes an empty store. A charge settled before that discard loses its
+key, retains every valid generation counter, and atomically replaces the file
+with an empty store strictly above their maximum through the guarded write.
+An absent or malformed counter does not block the discard. A charge settled before that discard loses its
 settled status. A stale carry and a discard both refuse, with
 `mpp.challenge_expired`, every challenge that expires no later than five minutes
 after the reset, which covers every charge whose record the reset could not
@@ -631,10 +632,28 @@ file refuses the reset before its audit row and changes nothing.
 Reset requires a usable audit log and writes `mpp_state_reset` with the
 profile, discarded generation, carried generation, stale flag, and reason before
 mutation. The result adds `carried_records`, `carried_generation` (null on a
-discard), `stale_carry`, and `warnings`. An absent or malformed committed
-counter has a null discarded generation. A failed reset can be retried with
-acknowledgement; each attempt records its request. A blank or whitespace-only
-`--reason` exits `1` with `validation.reason_empty` before anything changes.
+discard), `stale_carry`, and `warnings`. `discarded_generation` is null when the
+committed counter was absent or malformed. An inaccessible counter refuses
+before audit or mutation. A state file that authenticates while the committed
+counter is absent or malformed, or the intent counter is malformed, cannot be
+carried and refuses before audit or mutation; its message names the recovery,
+a discarding reset after the state file is moved out of the MPP state
+directory. Recovery after an interruption depends on its boundary:
+
+- A discard interrupted after key rotation and before publication leaves no
+  snapshot that authenticates under the new key. Opening refuses; rerun the
+  reset to discard.
+- A discard under a malformed committed counter interrupted after publication
+  refuses on open with the anchor error, and reset refuses the carry. Move the
+  state file out of the MPP state directory and rerun the reset to discard.
+- An adoption interrupted at intent one resumes at generation two on open.
+  If that attempt stops before publication, opening refuses because the intent
+  cannot be told apart from anchor removal. Move the state file out and reset.
+- A publication under an absent or valid committed counter completes on open
+  when the intent names the authenticated snapshot.
+
+Every reset requires acknowledgement. A blank or whitespace-only `--reason`
+exits `1` with `validation.reason_empty` before anything changes.
 
 A discarding reset row has no `carried_generation` and retains its serialized
 form. A carrying row adds `carried_generation`, and `stale_carry` when it is

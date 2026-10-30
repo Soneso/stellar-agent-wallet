@@ -167,6 +167,13 @@ impl Fixture {
             .expect("keyring value");
     }
 
+    fn put_bytes(entry_ref: &KeyringEntryRef, value: &[u8]) {
+        keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+            .expect("entry")
+            .set_secret(value)
+            .expect("keyring bytes");
+    }
+
     /// The pruned-expiry watermark of the state file on disk.
     fn watermark(&self) -> i64 {
         let bytes = fs::read(&self.path).expect("state");
@@ -193,6 +200,13 @@ impl Fixture {
 
     fn generation(&self) -> Option<u64> {
         load_generation(&generation_entry_ref(&self.key_ref)).expect("counter")
+    }
+
+    /// The operator step a carry refusal names: the state file leaves the
+    /// MPP state directory.
+    fn move_state_file_out(&self) {
+        fs::rename(&self.path, self._directory.path().join("moved-out.state"))
+            .expect("move the state file out");
     }
 }
 
@@ -310,13 +324,14 @@ async fn adoption_and_reset_require_a_durable_audit_row() {
             .message()
             .contains("audit")
     );
+    Fixture::put(&generation_entry_ref(&fx.key_ref), "0");
     assert!(
         fx.reset()
             .expect_err("audit required for reset")
             .message()
             .contains("audit")
     );
-    assert_eq!(fx.generation(), None);
+    assert_eq!(fx.generation(), Some(0));
     assert_eq!(fs::read(&fx.path).expect("state"), fx.snapshot);
     assert_eq!(*load_hmac_key_32(&fx.key_ref).expect("state key"), *key);
     assert!(fx.rows("mpp_state_adopted").is_empty());
@@ -355,8 +370,8 @@ async fn adoption_and_reset_share_the_prepare_lock() {
     assert_eq!(fx.generation(), Some(1));
 }
 
-/// A present intent means a version 2 write began, so the store already held
-/// its counter: adoption refuses as an invalid anchor whatever the intent.
+/// Only intent one identifies a resumable adoption beside a version 1 file.
+/// Any other intent cannot be told apart from anchor removal, so it refuses.
 #[tokio::test]
 #[serial_test::serial]
 async fn adoption_refuses_a_present_intent() {
@@ -368,6 +383,50 @@ async fn adoption_refuses_a_present_intent() {
         assert_eq!(error.message(), anchor_error().message());
         assert_eq!(fx.generation(), None);
         assert_eq!(fs::read(&fx.path).expect("snapshot"), fx.snapshot);
+    }
+}
+
+/// An adoption at intent one resumes at generation two before publication.
+/// A publication under an absent counter completes through its matching intent.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_interrupted_adoption_completes_on_the_next_open() {
+    keyring_mock::install().expect("keyring");
+    for (index, (hook, published)) in [
+        (&tests::AFTER_RESERVATION, false),
+        (&tests::BEFORE_PUBLICATION, false),
+        (&tests::AFTER_PUBLICATION, true),
+        (&tests::BEFORE_GENERATION_WRITE, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fx = Fixture::new(&format!("adopt-interrupted-{index}"), 1, 0).await;
+        hook.with(|slot| *slot.borrow_mut() = Some(Box::new(|| Err(state_error()))));
+        assert_eq!(
+            fx.open().expect_err("interrupted adoption").code(),
+            "mpp.state_unavailable"
+        );
+        assert_eq!(fx.generation(), None);
+        assert_eq!(fx.intent(), Some(1));
+        let expected = if published { 1 } else { 2 };
+        let store = fx.open().expect("the next open completes the adoption");
+        assert_eq!(fx.generation(), Some(expected));
+        assert_eq!(fx.intent(), Some(expected));
+        assert_eq!(
+            store.read_for_test().expect("adopted snapshot").generation,
+            expected
+        );
+        for record in &fx.records {
+            assert_eq!(
+                serde_json::to_value(store.load(record.authorization_id()).expect("record"))
+                    .expect("value"),
+                serde_json::to_value(record).expect("value")
+            );
+        }
+        let rows = fx.rows("mpp_state_adopted");
+        assert_eq!(rows.len(), if published { 1 } else { 2 });
+        assert_eq!(rows[rows.len() - 1]["generation"], expected);
     }
 }
 
@@ -482,28 +541,97 @@ async fn reset_reports_a_stale_carry_and_refuses_challenges_it_may_have_lost() {
         .expect("a challenge expiring past the cap prepares");
 }
 
-/// The floor includes the snapshot generation, so a reset under malformed
-/// counters never publishes a generation the retained key already sealed.
+/// A malformed counter cannot bound the generations the retained key sealed,
+/// so a carry refuses before audit, key rotation, or publication. Once the
+/// state file is moved out, the reset discards: the fresh key leaves no
+/// earlier snapshot that authenticates, and the guarded writes replace the
+/// malformed value above every valid counter.
 #[tokio::test]
 #[serial_test::serial]
-async fn reset_publishes_above_the_snapshot_under_malformed_counters() {
+async fn malformed_counters_refuse_a_carry_and_recover_by_discarding() {
     keyring_mock::install().expect("keyring");
-    let fx = Fixture::new("mpp-reset-floor-snapshot", STORE_VERSION, 3).await;
-    Fixture::put(&generation_entry_ref(&fx.key_ref), "bad-counter");
-    Fixture::put(&fx.intent_entry(), "bad-intent");
-    let outcome = fx.reset().expect("reset");
-    assert_eq!(outcome.discarded_generation, None);
-    assert_eq!(outcome.carried_generation, Some(3));
-    assert_eq!(outcome.carried_records, 4);
+    check_malformed_counter_recovery("text-committed", b"bad-counter", b"3", None).await;
+    check_malformed_counter_recovery("text-intent", b"3", b"bad-intent", Some(3)).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn non_utf8_committed_counter_recovers_by_discarding() {
+    keyring_mock::install().expect("keyring");
+    check_malformed_counter_recovery("bytes-committed", &[0xff, 0xfe], b"3", None).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn non_utf8_intent_counter_recovers_by_discarding() {
+    keyring_mock::install().expect("keyring");
+    check_malformed_counter_recovery("bytes-intent", b"3", &[0xff, 0xfe], Some(3)).await;
+}
+
+async fn check_malformed_counter_recovery(
+    label: &str,
+    counter: &[u8],
+    intent: &[u8],
+    discarded: Option<u64>,
+) {
+    let fx = Fixture::new(&format!("mpp-reset-{label}"), STORE_VERSION, 3).await;
+    let anchor = generation_entry_ref(&fx.key_ref);
+    Fixture::put_bytes(&anchor, counter);
+    Fixture::put_bytes(&fx.intent_entry(), intent);
+    let key = load_hmac_key_32(&fx.key_ref).expect("key");
+    if discarded.is_none() {
+        assert_eq!(
+            fx.open().expect_err("invalid anchor").message(),
+            anchor_error().message()
+        );
+    } else {
+        assert_eq!(
+            fx.open()
+                .expect("committed snapshot reads")
+                .prune(NOW)
+                .expect_err("invalid intent refuses mutation")
+                .message(),
+            anchor_error().message()
+        );
+    }
+    assert_eq!(
+        fx.reset().expect_err("invalid counter").message(),
+        carry_anchor_error().message()
+    );
+    for (entry_ref, expected) in [(&anchor, counter), (&fx.intent_entry(), intent)] {
+        assert_eq!(
+            keyring_core::Entry::new(&entry_ref.service, &entry_ref.account)
+                .expect("entry")
+                .get_secret()
+                .expect("counter bytes"),
+            expected
+        );
+    }
+    assert_eq!(fs::read(&fx.path).expect("snapshot"), fx.snapshot);
+    assert_eq!(*load_hmac_key_32(&fx.key_ref).expect("key"), *key);
+    assert!(fx.rows("mpp_state_reset").is_empty());
+    fx.move_state_file_out();
+    let outcome = fx.reset().expect("discarding reset");
+    assert_eq!(outcome.discarded_generation, discarded);
+    assert_eq!(outcome.carried_records, 0);
+    assert_eq!(outcome.carried_generation, None);
     assert_eq!(fx.generation(), Some(4));
     assert_eq!(fx.intent(), Some(4));
+    assert_ne!(*load_hmac_key_32(&fx.key_ref).expect("rotated key"), *key);
+    assert_eq!(fx.watermark(), NOW + MAX_CHALLENGE_LIFETIME_SECS);
+    let rows = fx.rows("mpp_state_reset");
+    assert_eq!(rows.len(), 1);
     assert_eq!(
+        rows[0]["discarded_generation"],
+        discarded.map_or(serde_json::Value::Null, Into::into)
+    );
+    assert!(
         fx.open()
-            .expect("carried store")
-            .read_verified()
+            .expect("discarded store")
+            .read_for_test()
             .expect("snapshot")
-            .generation,
-        4
+            .records
+            .is_empty()
     );
 }
 
@@ -544,7 +672,7 @@ async fn reset_discards_history_under_an_owner_state_key() {
     assert!(
         fx.open()
             .expect("fresh store")
-            .read_verified()
+            .read_for_test()
             .expect("snapshot")
             .records
             .is_empty()
@@ -569,12 +697,13 @@ async fn reset_discards_a_file_that_does_not_authenticate() {
     assert_eq!(outcome.carried_generation, None);
     assert!(!outcome.stale_carry);
     assert_ne!(*load_hmac_key_32(&fx.key_ref).expect("rotated key"), *key);
-    assert_eq!(fx.generation(), Some(1));
+    assert_eq!(fx.generation(), Some(2));
+    assert_eq!(fx.intent(), Some(2));
     assert_eq!(fx.watermark(), NOW + MAX_CHALLENGE_LIFETIME_SECS);
     assert!(
         fx.open()
             .expect("fresh store")
-            .read_verified()
+            .read_for_test()
             .expect("snapshot")
             .records
             .is_empty()
@@ -657,66 +786,104 @@ async fn reset_closes_a_ready_record() {
     assert_eq!(record.updated_at(), NOW + 10);
 }
 
+/// An absent counter cannot bound the generations the retained key sealed,
+/// so a carry refuses and names the discarding reset, which then recovers
+/// the profile by initializing the counter through the guarded writes.
 #[tokio::test]
 #[serial_test::serial]
-async fn reset_with_a_malformed_anchor_carries_an_authenticated_file() {
+async fn an_absent_anchor_refuses_a_carry_and_recovers_by_discarding() {
     keyring_mock::install().expect("keyring");
-    for malformed_intent in [false, true] {
-        let fx = Fixture::new(&format!("mpp-reset-authenticated-{malformed_intent}"), 1, 0).await;
-        if malformed_intent {
-            Fixture::put(&fx.intent_entry(), "bad-intent");
-        }
-        let anchor = generation_entry_ref(&fx.key_ref);
-        keyring_core::Entry::new(&anchor.service, &anchor.account)
-            .expect("anchor")
-            .set_password("bad-counter")
-            .expect("counter");
-        let key = load_hmac_key_32(&fx.key_ref).expect("key");
-        let outcome = fx.reset().expect("reset");
-        assert_eq!(outcome.discarded_generation, None);
-        assert_eq!(outcome.carried_records, 4);
-        assert_eq!(fx.generation(), Some(1));
-        assert_eq!(*load_hmac_key_32(&fx.key_ref).expect("key"), *key);
-        assert_eq!(
-            fx.open()
-                .expect("carried store")
-                .read_verified()
-                .expect("snapshot")
-                .records
-                .len(),
-            4
-        );
-    }
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn reset_recovers_a_malformed_anchor_and_missing_state_key() {
-    keyring_mock::install().expect("keyring");
-    let fx = Fixture::new("mpp-reset-malformed", 1, 0).await;
-    let anchor = generation_entry_ref(&fx.key_ref);
-    keyring_core::Entry::new(&anchor.service, &anchor.account)
-        .expect("anchor")
-        .set_password("bad-counter")
-        .expect("counter");
-    keyring_core::Entry::new(&fx.key_ref.service, &fx.key_ref.account)
-        .expect("key")
-        .delete_credential()
-        .expect("remove key");
-    assert!(
-        fx.open()
-            .expect_err("invalid anchor")
-            .message()
-            .contains("profile reset-mpp-state")
+    let fx = Fixture::new("mpp-reset-absent", STORE_VERSION, 3).await;
+    let key = load_hmac_key_32(&fx.key_ref).expect("key");
+    assert_eq!(
+        fx.open().expect_err("absent anchor").message(),
+        anchor_error().message()
     );
-    write_intent(&fx.intent_entry(), 9).expect("intent");
-    let outcome = fx.reset().expect("reset");
+    assert_eq!(
+        fx.reset().expect_err("absent anchor").message(),
+        carry_anchor_error().message()
+    );
+    assert_eq!(fx.generation(), None);
+    assert_eq!(fx.intent(), None);
+    assert_eq!(fs::read(&fx.path).expect("snapshot"), fx.snapshot);
+    assert_eq!(*load_hmac_key_32(&fx.key_ref).expect("key"), *key);
+    assert!(fx.rows("mpp_state_reset").is_empty());
+    fx.move_state_file_out();
+    let outcome = fx.reset().expect("discarding reset");
     assert_eq!(outcome.discarded_generation, None);
     assert_eq!(outcome.carried_records, 0);
     assert_eq!(outcome.carried_generation, None);
     assert!(!outcome.stale_carry);
-    assert_eq!(fx.intent(), Some(1), "the burned intent 9 is deleted");
     assert_eq!(fx.generation(), Some(1));
+    assert_eq!(fx.intent(), Some(1));
+    assert_ne!(*load_hmac_key_32(&fx.key_ref).expect("rotated key"), *key);
+    let rows = fx.rows("mpp_state_reset");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["discarded_generation"].is_null());
+    assert!(
+        fx.open()
+            .expect("discarded store")
+            .read_for_test()
+            .expect("snapshot")
+            .records
+            .is_empty()
+    );
+}
+
+/// A state key with neither a counter nor a state file holds no history the
+/// reset could carry, so the reset discards without operator file moves.
+#[tokio::test]
+#[serial_test::serial]
+async fn reset_recovers_a_state_key_without_counter_or_file() {
+    keyring_mock::install().expect("keyring");
+    let fx = Fixture::new("mpp-reset-keyonly", STORE_VERSION, 3).await;
+    fs::remove_file(&fx.path).expect("remove state file");
+    assert_eq!(
+        fx.open().expect_err("absent anchor").message(),
+        anchor_error().message()
+    );
+    let outcome = fx.reset().expect("discarding reset");
+    assert_eq!(outcome.discarded_generation, None);
+    assert_eq!(outcome.carried_generation, None);
+    assert_eq!(fx.generation(), Some(1));
+    assert_eq!(fx.intent(), Some(1));
+    assert!(
+        fx.open()
+            .expect("discarded store")
+            .read_for_test()
+            .expect("snapshot")
+            .records
+            .is_empty()
+    );
+}
+
+/// Without a state key no snapshot authenticates, so a malformed counter
+/// does not block the discard. It publishes above the valid burned intent,
+/// and a challenge whose marker the discard dropped refuses while it can
+/// still be live.
+#[tokio::test]
+#[serial_test::serial]
+async fn reset_discards_under_a_malformed_anchor_and_missing_state_key() {
+    keyring_mock::install().expect("keyring");
+    let fx = Fixture::new("mpp-reset-malformed", 1, 0).await;
+    let anchor = generation_entry_ref(&fx.key_ref);
+    Fixture::put(&anchor, "bad-counter");
+    Fixture::put(&fx.intent_entry(), "9");
+    keyring_core::Entry::new(&fx.key_ref.service, &fx.key_ref.account)
+        .expect("key")
+        .delete_credential()
+        .expect("remove key");
+    assert_eq!(
+        fx.open().expect_err("invalid anchor").message(),
+        anchor_error().message()
+    );
+    let outcome = fx.reset().expect("discarding reset");
+    assert_eq!(outcome.discarded_generation, None);
+    assert_eq!(outcome.carried_records, 0);
+    assert_eq!(outcome.carried_generation, None);
+    assert!(!outcome.stale_carry);
+    assert_eq!(fx.generation(), Some(10));
+    assert_eq!(fx.intent(), Some(10));
     assert_eq!(fx.watermark(), NOW + MAX_CHALLENGE_LIFETIME_SECS);
     assert!(load_hmac_key_32(&fx.key_ref).is_ok());
     let rows = fx.rows("mpp_state_reset");
@@ -726,7 +893,7 @@ async fn reset_recovers_a_malformed_anchor_and_missing_state_key() {
     let clean = fx.open().expect("clean state");
     assert!(
         clean
-            .read_verified()
+            .read_for_test()
             .expect("empty snapshot")
             .records
             .is_empty()
@@ -740,5 +907,135 @@ async fn reset_recovers_a_malformed_anchor_and_missing_state_key() {
             .expect_err("a discarded marker's challenge is refused")
             .code(),
         "mpp.challenge_expired"
+    );
+}
+
+/// Every committed-counter state has a recovery at each discard boundary.
+#[tokio::test]
+#[serial_test::serial]
+async fn discard_crash_boundaries_have_documented_recovery() {
+    keyring_mock::install().expect("keyring");
+    for (label, committed) in [
+        ("absent", None),
+        ("text", Some(b"bad".as_slice())),
+        ("bytes", Some([0xff, 0xfe].as_slice())),
+        ("valid", Some(b"3".as_slice())),
+    ] {
+        for (phase, hook, published, reserved) in [
+            ("rotation", &tests::AFTER_KEY_ROTATION, false, false),
+            ("publication", &tests::BEFORE_PUBLICATION, false, true),
+            ("commit", &tests::AFTER_PUBLICATION, true, true),
+        ] {
+            let fx =
+                Fixture::new(&format!("discard-crash-{label}-{phase}"), STORE_VERSION, 3).await;
+            let anchor = generation_entry_ref(&fx.key_ref);
+            if let Some(bytes) = committed {
+                Fixture::put_bytes(&anchor, bytes);
+            }
+            Fixture::put(&fx.intent_entry(), "5");
+            keyring_core::Entry::new(&fx.key_ref.service, &fx.key_ref.account)
+                .expect("key entry")
+                .delete_credential()
+                .expect("absent key");
+            let observed = Counter::read(&anchor).expect("observed counter");
+            hook.with(|slot| *slot.borrow_mut() = Some(Box::new(|| Err(state_error()))));
+            assert_eq!(
+                fx.reset().expect_err("interrupted discard").message(),
+                state_error().message()
+            );
+            assert_eq!(
+                Counter::read(&anchor).expect("uncommitted counter"),
+                observed
+            );
+            assert_eq!(fx.intent(), Some(if reserved { 6 } else { 5 }));
+            assert_eq!(fx.rows("mpp_state_reset").len(), 1);
+            let malformed = matches!(observed, Counter::Malformed(_));
+            let expected = if published && !malformed {
+                fx.open().expect("matching publication completes");
+                6
+            } else {
+                assert_eq!(
+                    fx.open().expect_err("incomplete discard refuses").message(),
+                    if malformed {
+                        anchor_error().message()
+                    } else {
+                        state_error().message()
+                    }
+                );
+                if published {
+                    let snapshot = fs::read(&fx.path).expect("publication");
+                    assert_eq!(
+                        fx.reset()
+                            .expect_err("malformed counter refuses a carry")
+                            .message(),
+                        carry_anchor_error().message()
+                    );
+                    assert_eq!(fs::read(&fx.path).expect("publication"), snapshot);
+                    assert_eq!(fx.rows("mpp_state_reset").len(), 1);
+                    fx.move_state_file_out();
+                } else {
+                    assert_eq!(
+                        fs::read(&fx.path).expect("unpublished snapshot survives"),
+                        fx.snapshot
+                    );
+                }
+                let outcome = fx.reset().expect("discard recovery");
+                assert_eq!(outcome.carried_generation, None);
+                assert_eq!(outcome.carried_records, 0);
+                if reserved { 7 } else { 6 }
+            };
+            assert_eq!(fx.generation(), Some(expected), "{label} at {phase}");
+            assert_eq!(fx.intent(), Some(expected), "{label} at {phase}");
+            let store = fx.open().expect("recovered store opens");
+            let wire = store.read_for_test().expect("recovered snapshot");
+            assert!(wire.records.is_empty());
+            assert_eq!(wire.pruned_through, NOW + MAX_CHALLENGE_LIFETIME_SECS);
+        }
+    }
+}
+
+/// Intent two beside a version 1 file refuses, and a discarding reset
+/// publishes above that reservation after the operator moves the file out.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_resumed_adoption_interrupted_before_publication_requires_discard() {
+    keyring_mock::install().expect("keyring");
+    let fx = Fixture::new("adopt-resume-interrupted", 1, 0).await;
+    Fixture::put(&fx.intent_entry(), "1");
+    tests::BEFORE_PUBLICATION
+        .with(|slot| *slot.borrow_mut() = Some(Box::new(|| Err(state_error()))));
+    assert_eq!(
+        fx.open()
+            .expect_err("interrupted resumed adoption")
+            .message(),
+        state_error().message()
+    );
+    assert_eq!(fx.generation(), None);
+    assert_eq!(fx.intent(), Some(2));
+    assert_eq!(fs::read(&fx.path).expect("version 1 snapshot"), fx.snapshot);
+    assert_eq!(
+        fx.open().expect_err("ambiguous intent refuses").message(),
+        anchor_error().message()
+    );
+    assert_eq!(
+        fx.reset().expect_err("carry refuses").message(),
+        carry_anchor_error().message()
+    );
+    assert!(fx.rows("mpp_state_reset").is_empty());
+    assert_eq!(fx.rows("mpp_state_adopted").len(), 1);
+    fx.move_state_file_out();
+    assert_eq!(
+        fx.reset().expect("discard recovery").carried_generation,
+        None
+    );
+    assert_eq!(fx.generation(), Some(3));
+    assert_eq!(fx.intent(), Some(3));
+    assert!(
+        fx.open()
+            .expect("recovered store")
+            .read_for_test()
+            .expect("snapshot")
+            .records
+            .is_empty()
     );
 }
