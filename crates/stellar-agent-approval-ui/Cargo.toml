@@ -80,8 +80,10 @@ uuid = { workspace = true }
 # Exposes `operator_enroll::test_support`: a software registrar producing real
 # `none`-attestation registration responses, and a loopback client that drives
 # a running enrollment server. Enabled for tests and by the explicit
-# `test-helpers` feature; the release binaries are built without it.
-test-helpers = []
+# `test-helpers` feature; the release binaries are built without it. It turns
+# on core's test helpers for the display form of the confirmation code the
+# registrar reports.
+test-helpers = ["stellar-agent-core/test-helpers"]
 
 [dev-dependencies]
 # ServiceExt::oneshot for in-process router tests.

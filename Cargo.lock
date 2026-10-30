@@ -5379,6 +5379,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "stellar-agent-approval-ui",
  "stellar-agent-core",
  "stellar-agent-loopback-http",
  "stellar-agent-smart-account",

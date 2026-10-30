@@ -52,7 +52,7 @@ FIXTURE="$TMP/fixture"
 CASES="docs-only upstream-base origin-base synced-fork-base install-surface-doc deleted-install-surface-doc welcome-workflow release-workflow
 release-rehearsal-workflow vendored-wasm-workflow
 triage-workflow triage-review-workflow triage-sweep-workflow
-ci-yml-only python-check-script shell-check-script skill inbox-web enroll-web one-crate two-owners
+ci-yml-only python-check-script shell-check-script skill inbox-web enroll-web bridge-web one-crate two-owners
 target-specific-edge dev-dependency-edge optional-dependency-edge root-manifest lockfile toolchain
 unowned-rust-path
 wallet-manifest removed-member untracked-test-file fixture-markdown
@@ -127,7 +127,7 @@ coverage	cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loop
 coverage-floors	python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off
 coverage:feature-on	cargo llvm-cov --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-on.json
 coverage-floors:feature-on	python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on
-inbox-js	node --test crates/stellar-agent-approval-ui/src/web/app_shared.test.mjs
+inbox-js	node --test crates/stellar-agent-approval-ui/src/web/app_shared.test.mjs crates/stellar-agent-webauthn-bridge/src/web/glue.test.mjs
 mainnet-presence-js	node --test crates/stellar-agent-approval-ui/src/web/mainnet-presence.test.mjs
 interop:mpp	.github/scripts/test-mpp-interop.sh
 interop:sdk-v17	.github/scripts/test-sdk-v17-interop.sh
@@ -1112,7 +1112,7 @@ case_inbox_web() {
   start_case
   mkdir -p crates/stellar-agent-approval-ui/src/web
   edit crates/stellar-agent-approval-ui/src/web/app_shared.js
-  pin_packages "stellar-agent-approval-ui stellar-agent-approval-remote stellar-agent-cli stellar-agent-mcp" test-helpers \
+  pin_packages "stellar-agent-approval-ui stellar-agent-approval-remote stellar-agent-cli stellar-agent-mcp stellar-agent-webauthn-bridge" test-helpers \
     crates/stellar-agent-approval-ui/src/web/app_shared.js
   expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" inbox-js mainnet-presence-js
 }
@@ -1121,9 +1121,18 @@ case_enroll_web() {
   start_case
   mkdir -p crates/stellar-agent-approval-ui/src/operator_enroll/web
   edit crates/stellar-agent-approval-ui/src/operator_enroll/web/operator-enroll.js
-  pin_packages "stellar-agent-approval-ui stellar-agent-approval-remote stellar-agent-cli stellar-agent-mcp" test-helpers \
+  pin_packages "stellar-agent-approval-ui stellar-agent-approval-remote stellar-agent-cli stellar-agent-mcp stellar-agent-webauthn-bridge" test-helpers \
     crates/stellar-agent-approval-ui/src/operator_enroll/web/operator-enroll.js
   expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" inbox-js mainnet-presence-js
+}
+
+case_bridge_web() {
+  start_case
+  mkdir -p crates/stellar-agent-webauthn-bridge/src/web
+  edit crates/stellar-agent-webauthn-bridge/src/web/glue.js
+  pin_packages "stellar-agent-webauthn-bridge stellar-agent-approval-remote stellar-agent-cli stellar-agent-smart-account-acceptance" test-helpers \
+    crates/stellar-agent-webauthn-bridge/src/web/glue.js
+  expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" inbox-js
 }
 
 # The MCP manifest inherits stellar-agent-sep7 from [workspace.dependencies].

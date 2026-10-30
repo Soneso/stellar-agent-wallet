@@ -46,7 +46,6 @@ fn every_audit_writer_open_registers_the_profile_path() {
         "commands/value_audit.rs",
         "commands/profile/audit_emit.rs",
         "commands/accounts/deploy_c.rs",
-        "commands/credentials/add_passkey.rs",
     ];
 
     for (path, source) in &hits {

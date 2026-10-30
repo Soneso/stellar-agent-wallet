@@ -546,11 +546,10 @@ writer compares the profile with the record:
 The refusal names the profile and the remedy, never a path or coordinate. It
 covers the value-moving verbs and tools, the read-only smart-account verbs,
 `approve --id <nonce>`, `approve serve`, `audit verify --profile`,
-`profile rotate-audit-key`, and `profile reset-window-state`. It
-creates nothing at the path the profile names. A command whose audit row is
-best effort skips the row and continues:
-`credentials add-passkey` and the other `profile`
-enroll and rotate verbs.
+`credentials add-passkey` (before its ceremony), `profile rotate-audit-key`,
+and `profile reset-window-state`. It creates nothing at the path the profile
+names. A command whose audit row is best effort skips the row and continues:
+the other `profile` enroll and rotate verbs.
 Not agent-recoverable: the operator establishes
 why the profile changed, then runs `stellar-agent audit reanchor --profile
 <NAME> --acknowledge-binding-change`. The zero-config profile has no profile

@@ -3,9 +3,12 @@
 //! Tests cover:
 //!
 //! - `GET /healthz` — readiness route.
-//! - `GET /register/<nonce>` — 200 HTML, 404 not-found, 404 expired, 400
-//!   wrong-kind.
-//! - `POST /register/<nonce>/credential` — CSRF enforcement, 200 recorded.
+//! - `GET /register/<nonce>`: 200 HTML carrying the entry's challenge, 404
+//!   not-found, 404 without a challenge, 400 wrong-kind.
+//! - `POST /register/<nonce>/credential`: CSRF enforcement, 200 recorded for
+//!   a response verified against the entry's challenge, this bridge's origin
+//!   and the entry's relying party; 400 for every response that does not
+//!   verify, with the entry left pending.
 //! - `GET /approve/<nonce>` — 200 HTML, 404 not-found.
 //! - `POST /approve/<nonce>/assertion` — CSRF enforcement.
 //! - `POST /approve/<nonce>/cancel` — CSRF enforcement, 204 on removal.
@@ -34,11 +37,16 @@ use std::{
     sync::Arc,
 };
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _, engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD,
+};
 use reqwest::{Client, StatusCode};
 use sha2::{Digest, Sha256};
+use stellar_agent_approval_ui::operator_enroll::test_support::{
+    RegistrationBuilder, SoftwareRegistrar,
+};
 use stellar_agent_core::approval::{
-    generate_csrf_token,
+    ApprovalKind, generate_csrf_token,
     store::{PendingApproval, PendingApprovalStore},
 };
 use tempfile::TempDir;
@@ -226,6 +234,118 @@ async fn insert_register_passkey(store: &Arc<Mutex<PendingApprovalStore>>) -> (S
     (nonce, csrf)
 }
 
+/// The software authenticator the registration tests register with.
+fn registrar() -> SoftwareRegistrar {
+    SoftwareRegistrar::new([0x11; 32], vec![0xa5; 16])
+}
+
+/// The registration challenge the entry for `nonce` carries.
+async fn entry_challenge(store: &Arc<Mutex<PendingApprovalStore>>, nonce: &str) -> [u8; 32] {
+    let guard = store.lock().await;
+    match &guard.get(nonce).expect("the pending registration").kind {
+        ApprovalKind::RegisterPasskey {
+            registration_challenge: Some(challenge),
+            ..
+        } => *challenge,
+        _ => panic!("the pending entry is a registration with a challenge"),
+    }
+}
+
+/// The page's origin for a bridge bound at `local`.
+fn page_origin(local: SocketAddr) -> String {
+    format!("http://localhost:{}", local.port())
+}
+
+/// A registration response from [`registrar`] over the entry's challenge at
+/// the bridge's page origin, valid until a setter changes it.
+async fn valid_registration(
+    store: &Arc<Mutex<PendingApprovalStore>>,
+    nonce: &str,
+    local: SocketAddr,
+) -> RegistrationBuilder {
+    registrar().builder(&entry_challenge(store, nonce).await, &page_origin(local))
+}
+
+/// The JSON body the bridge page posts for `builder`'s response: base64url
+/// ID, client data and attestation object, and the SEC1 key in standard
+/// base64.
+fn bridge_payload(builder: &RegistrationBuilder) -> serde_json::Value {
+    let posted = builder.json();
+    let id = posted["credential_id_b64url"].as_str().unwrap().to_owned();
+    let key = URL_SAFE_NO_PAD
+        .decode(posted["public_key_sec1_b64"].as_str().unwrap())
+        .unwrap();
+    serde_json::json!({
+        "id": id,
+        "rawId": id,
+        "type": "public-key",
+        "response": {
+            "clientDataJSON": URL_SAFE_NO_PAD.encode(builder.client_data_json()),
+            "attestationObject": URL_SAFE_NO_PAD.encode(builder.attestation_object()),
+            "publicKeySec1B64": STANDARD.encode(key),
+            "transports": ["internal", "usb"]
+        }
+    })
+}
+
+/// POSTs `payload` to the registration route of `nonce` with `csrf`.
+async fn post_registration(
+    local: SocketAddr,
+    nonce: &str,
+    csrf: &[u8; 32],
+    payload: &serde_json::Value,
+) -> reqwest::Response {
+    client()
+        .post(format!("http://{local}/register/{nonce}/credential"))
+        .header("Host", local.to_string())
+        .header("Origin", format!("http://{local}"))
+        .header("X-Stellar-Approval-CSRF", hex::encode(csrf))
+        .json(payload)
+        .send()
+        .await
+        .expect("POST /register/<nonce>/credential")
+}
+
+/// Asserts that the reply is `400` with `code` and that the entry for
+/// `nonce` still awaits a registration.
+async fn assert_refused_and_pending(
+    resp: reqwest::Response,
+    code: &str,
+    store: &Arc<Mutex<PendingApprovalStore>>,
+    nonce: &str,
+) {
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"], code);
+    let guard = store.lock().await;
+    match &guard.get(nonce).expect("entry still present").kind {
+        ApprovalKind::RegisterPasskey {
+            registration_input, ..
+        } => assert!(registration_input.is_none(), "the entry stays pending"),
+        _ => panic!("expected RegisterPasskey"),
+    }
+}
+
+/// `toml` without the `key = ...` assignment, whose array value may span
+/// several lines.
+fn remove_toml_key(toml: &str, key: &str) -> String {
+    let mut kept = String::new();
+    let mut in_value = false;
+    for line in toml.lines() {
+        let trimmed = line.trim_start();
+        let assigns = trimmed
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='));
+        if in_value || assigns {
+            in_value = !trimmed.trim_end().ends_with(']');
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    kept
+}
+
 /// Construct a minimal valid `PaymentSimulated` entry and insert it into the store.
 ///
 /// Used by wrong-kind tests on bridge passkey routes: PaymentSimulated entries
@@ -397,6 +517,36 @@ async fn register_get_returns_200_html_for_valid_entry() {
     handle.shutdown().await.expect("shutdown");
 }
 
+/// The page's data island carries the entry's registration challenge in
+/// unpadded base64url, the form the browser passes to
+/// `navigator.credentials.create()`.
+#[tokio::test]
+async fn register_get_renders_the_entry_challenge() {
+    let (handle, store, _dir) = start_test_bridge().await;
+    let local = handle.local_addr();
+    let (nonce, _csrf) = insert_register_passkey(&store).await;
+    let challenge = entry_challenge(&store, &nonce).await;
+
+    let body = client()
+        .get(format!("http://{local}/register/{nonce}"))
+        .header("Host", local.to_string())
+        .send()
+        .await
+        .expect("GET /register/<nonce>")
+        .text()
+        .await
+        .expect("body text");
+    let start = body
+        .find(r#"id="webauthn-options">"#)
+        .expect("the data island")
+        + r#"id="webauthn-options">"#.len();
+    let end = start + body[start..].find("</script>").expect("island end");
+    let island: serde_json::Value = serde_json::from_str(&body[start..end]).unwrap();
+    assert_eq!(island["challenge"], URL_SAFE_NO_PAD.encode(challenge));
+
+    handle.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn register_get_returns_404_for_unknown_nonce() {
     let (handle, _store, _dir) = start_test_bridge().await;
@@ -515,85 +665,207 @@ async fn register_post_rejects_wrong_csrf() {
     handle.shutdown().await.expect("shutdown");
 }
 
-/// Happy path: POST /register/<nonce>/credential with valid CSRF + valid
-/// payload records the RegistrationInput into the approval-store entry.
+/// A response the registrar produced over the entry's challenge at the
+/// bridge's origin verifies, and the entry records the attested ID and key.
 #[tokio::test]
-async fn register_post_records_valid_credential() {
-    use base64::{
-        Engine as _, engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD,
-    };
-    use stellar_agent_core::approval::ApprovalKind;
-
+async fn register_post_records_a_verified_registration() {
     let (handle, store, _dir) = start_test_bridge().await;
     let local = handle.local_addr();
     let (nonce, csrf) = insert_register_passkey(&store).await;
-    let csrf_hex = hex::encode(csrf);
+    let builder = valid_registration(&store, &nonce, local).await;
 
-    // Construct a valid 16-byte credential_id (CTAP2 minimum) base64url-encoded.
-    let credential_id_bytes: [u8; 16] = [0x42; 16];
-    let credential_id_b64 = URL_SAFE_NO_PAD.encode(credential_id_bytes);
-    // Construct a valid 65-byte SEC1 uncompressed P-256 pubkey
-    // (`0x04 || X (32 bytes) || Y (32 bytes)`); X+Y are dummy bytes here —
-    // the validator only checks length + the 0x04 marker, not on-curve.
-    let mut pubkey_sec1 = [0u8; 65];
-    pubkey_sec1[0] = 0x04;
-    for (i, byte) in pubkey_sec1.iter_mut().enumerate().skip(1) {
-        *byte = i as u8;
-    }
-    let pubkey_b64 = STANDARD.encode(pubkey_sec1);
-
-    let url = format!("http://{local}/register/{nonce}/credential");
-    // attestationObject is base64url WITHOUT padding per @simplewebauthn/browser
-    // 13.x wire contract; the handler decodes via URL_SAFE_NO_PAD.
-    let payload = serde_json::json!({
-        "id": credential_id_b64,
-        "rawId": credential_id_b64,
-        "type": "public-key",
-        "response": {
-            "clientDataJSON": "ZHVtbXk",
-            "attestationObject": "ZHVtbXk",
-            "publicKeySec1B64": pubkey_b64,
-            "transports": ["internal", "usb"]
-        }
-    });
-
-    let resp = client()
-        .post(&url)
-        .header("Host", local.to_string())
-        .header("Origin", format!("http://{local}"))
-        .header("X-Stellar-Approval-CSRF", csrf_hex)
-        .json(&payload)
-        .send()
-        .await
-        .expect("POST /register/<nonce>/credential");
-
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "expected 200 for valid registration POST, got {}",
-        resp.status()
-    );
+    let resp = post_registration(local, &nonce, &csrf, &bridge_payload(&builder)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert_eq!(body, serde_json::json!({"status": "recorded"}));
 
-    // Verify the entry now carries registration_input.
     let guard = store.lock().await;
-    let entry = guard.get(&nonce).expect("entry still present");
-    match &entry.kind {
-        ApprovalKind::RegisterPasskey {
-            registration_input, ..
-        } => {
-            assert!(
-                registration_input.is_some(),
-                "registration_input must be populated after successful POST"
-            );
-        }
-        other => panic!(
-            "expected RegisterPasskey arm, got: {:?}",
-            std::mem::discriminant(other)
-        ),
-    }
+    let ApprovalKind::RegisterPasskey {
+        registration_input: Some(input),
+        ..
+    } = &guard.get(&nonce).expect("entry still present").kind
+    else {
+        panic!("registration_input must be populated after a verified POST");
+    };
+    let registrar = registrar();
+    assert_eq!(input.credential_id(), registrar.credential_id());
+    assert_eq!(
+        input.public_key_uncompressed_sec1(),
+        registrar.public_key_sec1().as_slice()
+    );
+    assert_eq!(input.transports(), ["internal", "usb"]);
+    assert_eq!(
+        input.attestation_blob_b64(),
+        Some(STANDARD.encode(builder.attestation_object()).as_str())
+    );
     drop(guard);
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// A response whose client data names another challenge than the entry's
+/// refuses, and the entry stays pending.
+#[tokio::test]
+async fn register_post_refuses_a_response_without_the_server_challenge() {
+    let (handle, store, _dir) = start_test_bridge().await;
+    let local = handle.local_addr();
+    let (nonce, csrf) = insert_register_passkey(&store).await;
+    let mut other = entry_challenge(&store, &nonce).await;
+    other[0] ^= 0x01;
+    let builder = valid_registration(&store, &nonce, local)
+        .await
+        .challenge(&other);
+
+    let resp = post_registration(local, &nonce, &csrf, &bridge_payload(&builder)).await;
+    assert_refused_and_pending(resp, "webauthn_registration_invalid", &store, &nonce).await;
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// The posted raw ID must equal the ID the attestation carries.
+#[tokio::test]
+async fn register_post_refuses_a_different_raw_id() {
+    let (handle, store, _dir) = start_test_bridge().await;
+    let local = handle.local_addr();
+    let (nonce, csrf) = insert_register_passkey(&store).await;
+    let mut payload = bridge_payload(&valid_registration(&store, &nonce, local).await);
+    payload["rawId"] = serde_json::json!(URL_SAFE_NO_PAD.encode([0xa6; 16]));
+
+    let resp = post_registration(local, &nonce, &csrf, &payload).await;
+    assert_refused_and_pending(resp, "webauthn_registration_invalid", &store, &nonce).await;
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// A posted key other than the one the authenticator data attests refuses.
+#[tokio::test]
+async fn register_post_refuses_a_substituted_key() {
+    let (handle, store, _dir) = start_test_bridge().await;
+    let local = handle.local_addr();
+    let (nonce, csrf) = insert_register_passkey(&store).await;
+    let substitute = SoftwareRegistrar::new([0x22; 32], vec![0xa5; 16]).public_key_sec1();
+    let builder = valid_registration(&store, &nonce, local)
+        .await
+        .public_key(substitute);
+
+    let resp = post_registration(local, &nonce, &csrf, &bridge_payload(&builder)).await;
+    assert_refused_and_pending(resp, "webauthn_registration_invalid", &store, &nonce).await;
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// An empty attestation object refuses: the authenticator data it carries
+/// is what binds the posted credential.
+#[tokio::test]
+async fn register_post_refuses_a_missing_attestation_object() {
+    let (handle, store, _dir) = start_test_bridge().await;
+    let local = handle.local_addr();
+    let (nonce, csrf) = insert_register_passkey(&store).await;
+    let mut payload = bridge_payload(&valid_registration(&store, &nonce, local).await);
+    payload["response"]["attestationObject"] = serde_json::json!("");
+
+    let resp = post_registration(local, &nonce, &csrf, &payload).await;
+    assert_refused_and_pending(resp, "webauthn_registration_invalid", &store, &nonce).await;
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// Client data from another origin than `http://localhost:<port>` refuses,
+/// the loopback IP literal of the same port included.
+#[tokio::test]
+async fn register_post_refuses_another_origin() {
+    let (handle, store, _dir) = start_test_bridge().await;
+    let local = handle.local_addr();
+    let (nonce, csrf) = insert_register_passkey(&store).await;
+    let builder = valid_registration(&store, &nonce, local)
+        .await
+        .origin(&format!("http://127.0.0.1:{}", local.port()));
+
+    let resp = post_registration(local, &nonce, &csrf, &bridge_payload(&builder)).await;
+    assert_refused_and_pending(resp, "webauthn_registration_invalid", &store, &nonce).await;
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// Authenticator data for another relying party than the entry's refuses.
+#[tokio::test]
+async fn register_post_refuses_another_relying_party() {
+    let (handle, store, _dir) = start_test_bridge().await;
+    let local = handle.local_addr();
+    let (nonce, csrf) = insert_register_passkey(&store).await;
+    let builder = valid_registration(&store, &nonce, local)
+        .await
+        .rp_id_hash(Sha256::digest(b"example.com").into());
+
+    let resp = post_registration(local, &nonce, &csrf, &bridge_payload(&builder)).await;
+    assert_refused_and_pending(resp, "webauthn_registration_invalid", &store, &nonce).await;
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// A registration entry loaded without a challenge gets no page and records
+/// nothing: GET answers like an unknown nonce, POST collapses to the generic
+/// not-found code.
+#[tokio::test]
+async fn register_routes_refuse_an_entry_without_a_challenge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("test.toml");
+    let csrf = generate_csrf_token();
+    let entry = PendingApproval::new_register_passkey_pending(
+        "CAAAA...BBBBB".to_string(),
+        vec![1_u32],
+        csrf,
+        "localhost".to_string(),
+        [0xcc_u8; 32],
+        // A store reopened from disk holds only entries of a well-formed
+        // process identity.
+        stellar_agent_core::approval::process_uid_for_attestation().expect("process uid"),
+        300_000,
+    )
+    .expect("new_register_passkey_pending");
+    let nonce = entry.approval_nonce.clone();
+    let challenge = match entry.kind {
+        ApprovalKind::RegisterPasskey {
+            registration_challenge: Some(challenge),
+            ..
+        } => challenge,
+        _ => panic!("a fresh registration entry carries a challenge"),
+    };
+    {
+        let mut store = PendingApprovalStore::open(path.clone()).expect("open store");
+        store.insert(entry, now_unix_ms()).expect("insert");
+    }
+    let written = std::fs::read_to_string(&path).unwrap();
+    let without = remove_toml_key(&written, "registration_challenge");
+    assert_ne!(written, without, "the store file names the challenge");
+    std::fs::write(&path, without).unwrap();
+
+    let store = Arc::new(Mutex::new(
+        PendingApprovalStore::open(path).expect("reopen store"),
+    ));
+    let handle = start_bridge_with_pubkey_lookup(
+        Arc::clone(&store),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        Arc::new(TestPubkeyLookup::missing()),
+        PageIdentity::neutral(),
+    )
+    .await
+    .expect("start bridge");
+    let local = handle.local_addr();
+
+    let resp = client()
+        .get(format!("http://{local}/register/{nonce}"))
+        .header("Host", local.to_string())
+        .send()
+        .await
+        .expect("GET /register/<nonce>");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"], "approval_not_found");
+
+    let builder = registrar().builder(&challenge, &page_origin(local));
+    let resp = post_registration(local, &nonce, &csrf, &bridge_payload(&builder)).await;
+    assert_refused_and_pending(resp, "approval_not_found", &store, &nonce).await;
 
     handle.shutdown().await.expect("shutdown");
 }
@@ -1911,44 +2183,19 @@ async fn register_post_returns_400_for_unknown_nonce() {
 /// `id` field containing invalid base64url on POST /register/<nonce>/credential
 /// returns 400 webauthn_registration_invalid.
 ///
-/// Requires valid CSRF so the field-decode path is reached.
+/// Every other field is the registrar's valid response, so only the id
+/// decode refuses.
 #[tokio::test]
 async fn register_post_rejects_invalid_credential_id_b64() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-
     let (handle, store, _dir) = start_test_bridge().await;
     let local = handle.local_addr();
     let (nonce, csrf) = insert_register_passkey(&store).await;
-    let csrf_hex = hex::encode(csrf);
+    let mut payload = bridge_payload(&valid_registration(&store, &nonce, local).await);
+    // "!!" is not valid base64url.
+    payload["id"] = serde_json::json!("!!INVALID!!");
+    payload["rawId"] = serde_json::json!("!!INVALID!!");
 
-    // Build a valid 65-byte pubkey for the publicKeySec1B64 field so only the id decode fails.
-    let mut pubkey_sec1 = [0u8; 65];
-    pubkey_sec1[0] = 0x04;
-    let pubkey_b64 = STANDARD.encode(pubkey_sec1);
-
-    let url = format!("http://{local}/register/{nonce}/credential");
-    let payload = serde_json::json!({
-        // "!!" is not valid base64url.
-        "id": "!!INVALID!!",
-        "rawId": "!!INVALID!!",
-        "type": "public-key",
-        "response": {
-            "clientDataJSON": URL_SAFE_NO_PAD.encode(b"{}"),
-            "attestationObject": "",
-            "publicKeySec1B64": pubkey_b64
-        }
-    });
-
-    let resp = client()
-        .post(&url)
-        .header("Host", local.to_string())
-        .header("Origin", format!("http://{local}"))
-        .header("X-Stellar-Approval-CSRF", csrf_hex)
-        .json(&payload)
-        .send()
-        .await
-        .expect("POST /register/<nonce>/credential");
-
+    let resp = post_registration(local, &nonce, &csrf, &payload).await;
     assert_eq!(resp.status().as_u16(), 400);
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert_eq!(body["error"], "webauthn_registration_invalid");
@@ -1959,38 +2206,18 @@ async fn register_post_rejects_invalid_credential_id_b64() {
 /// `publicKeySec1B64` field that is not valid standard base64 returns
 /// 400 webauthn_registration_invalid.
 ///
-/// The bridge decodes this field with `STANDARD.decode` (not URL_SAFE_NO_PAD).
+/// The bridge decodes this field with `STANDARD.decode` (not URL_SAFE_NO_PAD);
+/// every other field is the registrar's valid response.
 #[tokio::test]
 async fn register_post_rejects_invalid_public_key_b64() {
     let (handle, store, _dir) = start_test_bridge().await;
     let local = handle.local_addr();
     let (nonce, csrf) = insert_register_passkey(&store).await;
-    let csrf_hex = hex::encode(csrf);
+    let mut payload = bridge_payload(&valid_registration(&store, &nonce, local).await);
+    // "!!" is not valid standard base64.
+    payload["response"]["publicKeySec1B64"] = serde_json::json!("!!INVALID!!");
 
-    let credential_id_b64 = URL_SAFE_NO_PAD.encode([0x42u8; 16]);
-    let url = format!("http://{local}/register/{nonce}/credential");
-    let payload = serde_json::json!({
-        "id": credential_id_b64,
-        "rawId": credential_id_b64,
-        "type": "public-key",
-        "response": {
-            "clientDataJSON": URL_SAFE_NO_PAD.encode(b"{}"),
-            "attestationObject": "",
-            // "!!" is not valid standard base64.
-            "publicKeySec1B64": "!!INVALID!!"
-        }
-    });
-
-    let resp = client()
-        .post(&url)
-        .header("Host", local.to_string())
-        .header("Origin", format!("http://{local}"))
-        .header("X-Stellar-Approval-CSRF", csrf_hex)
-        .json(&payload)
-        .send()
-        .await
-        .expect("POST /register/<nonce>/credential");
-
+    let resp = post_registration(local, &nonce, &csrf, &payload).await;
     assert_eq!(resp.status().as_u16(), 400);
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert_eq!(body["error"], "webauthn_registration_invalid");
@@ -2001,45 +2228,18 @@ async fn register_post_rejects_invalid_public_key_b64() {
 /// Non-empty `attestationObject` that is not valid base64url returns
 /// 400 webauthn_registration_invalid.
 ///
-/// The bridge only decodes `attestationObject` when it is non-empty; an empty
-/// string maps to `None` (no error). This test covers the non-empty invalid path.
+/// Every other field is the registrar's valid response, so only the
+/// attestation object decode refuses.
 #[tokio::test]
 async fn register_post_rejects_invalid_attestation_object_b64() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-
     let (handle, store, _dir) = start_test_bridge().await;
     let local = handle.local_addr();
     let (nonce, csrf) = insert_register_passkey(&store).await;
-    let csrf_hex = hex::encode(csrf);
+    let mut payload = bridge_payload(&valid_registration(&store, &nonce, local).await);
+    // Non-empty but invalid base64url.
+    payload["response"]["attestationObject"] = serde_json::json!("!!INVALID!!");
 
-    let credential_id_b64 = URL_SAFE_NO_PAD.encode([0x42u8; 16]);
-    let mut pubkey_sec1 = [0u8; 65];
-    pubkey_sec1[0] = 0x04;
-    let pubkey_b64 = STANDARD.encode(pubkey_sec1);
-
-    let url = format!("http://{local}/register/{nonce}/credential");
-    let payload = serde_json::json!({
-        "id": credential_id_b64,
-        "rawId": credential_id_b64,
-        "type": "public-key",
-        "response": {
-            "clientDataJSON": URL_SAFE_NO_PAD.encode(b"{}"),
-            // Non-empty but invalid base64url.
-            "attestationObject": "!!INVALID!!",
-            "publicKeySec1B64": pubkey_b64
-        }
-    });
-
-    let resp = client()
-        .post(&url)
-        .header("Host", local.to_string())
-        .header("Origin", format!("http://{local}"))
-        .header("X-Stellar-Approval-CSRF", csrf_hex)
-        .json(&payload)
-        .send()
-        .await
-        .expect("POST /register/<nonce>/credential");
-
+    let resp = post_registration(local, &nonce, &csrf, &payload).await;
     assert_eq!(resp.status().as_u16(), 400);
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert_eq!(body["error"], "webauthn_registration_invalid");
@@ -2047,46 +2247,21 @@ async fn register_post_rejects_invalid_attestation_object_b64() {
     handle.shutdown().await.expect("shutdown");
 }
 
-/// `RegistrationInput::new` validation failure: `public_key_sec1_b64` decodes
-/// to bytes that do NOT satisfy the 65-byte / `0x04` prefix constraint.
+/// A `public_key_sec1_b64` that decodes to bytes that are not 65 long
+/// returns 400 webauthn_registration_invalid.
 ///
-/// Feeds a 16-byte payload (too short); the `RegistrationInput::new` constructor
-/// rejects it → 400 webauthn_registration_invalid.
+/// Feeds a 16-byte key (too short) beside the registrar's otherwise valid
+/// response, so only the key length refuses.
 #[tokio::test]
 async fn register_post_rejects_pubkey_wrong_length() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-
     let (handle, store, _dir) = start_test_bridge().await;
     let local = handle.local_addr();
     let (nonce, csrf) = insert_register_passkey(&store).await;
-    let csrf_hex = hex::encode(csrf);
-
-    let credential_id_b64 = URL_SAFE_NO_PAD.encode([0x42u8; 16]);
+    let mut payload = bridge_payload(&valid_registration(&store, &nonce, local).await);
     // A 16-byte blob: valid standard base64 but wrong length (not 65 bytes).
-    let short_pubkey_b64 = STANDARD.encode([0x04u8; 16]);
+    payload["response"]["publicKeySec1B64"] = serde_json::json!(STANDARD.encode([0x04u8; 16]));
 
-    let url = format!("http://{local}/register/{nonce}/credential");
-    let payload = serde_json::json!({
-        "id": credential_id_b64,
-        "rawId": credential_id_b64,
-        "type": "public-key",
-        "response": {
-            "clientDataJSON": URL_SAFE_NO_PAD.encode(b"{}"),
-            "attestationObject": "",
-            "publicKeySec1B64": short_pubkey_b64
-        }
-    });
-
-    let resp = client()
-        .post(&url)
-        .header("Host", local.to_string())
-        .header("Origin", format!("http://{local}"))
-        .header("X-Stellar-Approval-CSRF", csrf_hex)
-        .json(&payload)
-        .send()
-        .await
-        .expect("POST /register/<nonce>/credential");
-
+    let resp = post_registration(local, &nonce, &csrf, &payload).await;
     assert_eq!(resp.status().as_u16(), 400);
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert_eq!(body["error"], "webauthn_registration_invalid");
@@ -2094,46 +2269,22 @@ async fn register_post_rejects_pubkey_wrong_length() {
     handle.shutdown().await.expect("shutdown");
 }
 
-/// `RegistrationInput::new` validation failure: 65-byte key that does NOT have
-/// the `0x04` uncompressed-point prefix.
+/// A 65-byte key that does NOT have the `0x04` uncompressed-point prefix
+/// returns 400 webauthn_registration_invalid.
 ///
-/// All bytes are `0x01` (no `0x04` at index 0); the validator rejects this →
-/// 400 webauthn_registration_invalid.
+/// The registrar's key with its first byte set to `0x01`, beside the
+/// registrar's otherwise valid response, so only the prefix refuses.
 #[tokio::test]
 async fn register_post_rejects_pubkey_wrong_prefix() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-
     let (handle, store, _dir) = start_test_bridge().await;
     let local = handle.local_addr();
     let (nonce, csrf) = insert_register_passkey(&store).await;
-    let csrf_hex = hex::encode(csrf);
+    let mut key = registrar().public_key_sec1();
+    key[0] = 0x01;
+    let mut payload = bridge_payload(&valid_registration(&store, &nonce, local).await);
+    payload["response"]["publicKeySec1B64"] = serde_json::json!(STANDARD.encode(key));
 
-    let credential_id_b64 = URL_SAFE_NO_PAD.encode([0x42u8; 16]);
-    // 65 bytes, all `0x01` — wrong prefix (not `0x04`).
-    let wrong_prefix_pubkey_b64 = STANDARD.encode([0x01u8; 65]);
-
-    let url = format!("http://{local}/register/{nonce}/credential");
-    let payload = serde_json::json!({
-        "id": credential_id_b64,
-        "rawId": credential_id_b64,
-        "type": "public-key",
-        "response": {
-            "clientDataJSON": URL_SAFE_NO_PAD.encode(b"{}"),
-            "attestationObject": "",
-            "publicKeySec1B64": wrong_prefix_pubkey_b64
-        }
-    });
-
-    let resp = client()
-        .post(&url)
-        .header("Host", local.to_string())
-        .header("Origin", format!("http://{local}"))
-        .header("X-Stellar-Approval-CSRF", csrf_hex)
-        .json(&payload)
-        .send()
-        .await
-        .expect("POST /register/<nonce>/credential");
-
+    let resp = post_registration(local, &nonce, &csrf, &payload).await;
     assert_eq!(resp.status().as_u16(), 400);
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert_eq!(body["error"], "webauthn_registration_invalid");

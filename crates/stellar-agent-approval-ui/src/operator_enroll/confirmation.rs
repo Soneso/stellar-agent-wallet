@@ -22,25 +22,25 @@
 //! for a mainnet approval credential, so a code of one purpose never
 //! confirms the other. The page computes it from the credential its own
 //! ceremony created, so a code typed at the terminal matches only when the
-//! staged credential is that one.
+//! staged credential is that one. [`ConfirmationCode`] computes and compares
+//! it.
 
 use std::time::Instant;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use sha2::{Digest as _, Sha256};
-use subtle::ConstantTimeEq as _;
 
 use stellar_agent_core::approval::MainnetApprovalCredential;
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::approval::operator_credentials::{
     OperatorApprovalCredential, OperatorApprovalCredentialStore,
 };
+use stellar_agent_core::approval::webauthn_registration::ConfirmationCode;
+#[cfg(any(test, feature = "test-helpers"))]
+use stellar_agent_core::approval::webauthn_registration::PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN;
 
 use super::EnrollmentPurpose;
-use super::registration::{
-    PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN, REGISTRATION_RP_ID, VerifiedOperatorRegistration,
-};
+use super::registration::{REGISTRATION_RP_ID, VerifiedOperatorRegistration};
 
 /// Domain separator of an operator credential's confirmation code.
 pub(super) const OPERATOR_CODE_DOMAIN: &[u8] = b"stellar-agent-operator-enrollment-confirmation:v1";
@@ -51,9 +51,6 @@ pub(super) const MAINNET_APPROVAL_CODE_DOMAIN: &[u8] =
 
 /// The message of a confirmed enrollment used for the other purpose.
 const WRONG_PURPOSE_MESSAGE: &str = "The enrollment purpose does not match the requested export.";
-
-/// Number of hexadecimal characters in a confirmation code.
-const CONFIRMATION_CODE_HEX_LEN: usize = 16;
 
 /// The operator credential's confirmation code of a credential registered
 /// over `challenge`; see [`enrollment_confirmation_code`].
@@ -83,61 +80,20 @@ pub(crate) fn enrollment_confirmation_code(
     credential_id: &[u8],
     public_key_sec1: &[u8; PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN],
 ) -> String {
-    let digits = code_digits(purpose, challenge, credential_id, public_key_sec1);
-    let mut display = String::with_capacity(CONFIRMATION_CODE_HEX_LEN + 3);
-    for (index, digit) in digits.iter().enumerate() {
-        if index > 0 && index % 4 == 0 {
-            display.push('-');
-        }
-        display.push(char::from(*digit));
-    }
-    display
-}
-
-/// The `purpose` code's 16 lowercase hexadecimal digits as ASCII bytes.
-fn code_digits(
-    purpose: EnrollmentPurpose,
-    challenge: &[u8; 32],
-    credential_id: &[u8],
-    public_key_sec1: &[u8; PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN],
-) -> [u8; CONFIRMATION_CODE_HEX_LEN] {
-    let mut hasher = Sha256::new();
-    hasher.update(purpose.code_domain());
-    hasher.update(challenge);
-    let id_len = u32::try_from(credential_id.len()).unwrap_or(u32::MAX);
-    hasher.update(id_len.to_be_bytes());
-    hasher.update(credential_id);
-    hasher.update(public_key_sec1);
-    let digest = hasher.finalize();
-    let mut digits = [0u8; CONFIRMATION_CODE_HEX_LEN];
-    digits.copy_from_slice(hex::encode(&digest[..CONFIRMATION_CODE_HEX_LEN / 2]).as_bytes());
-    digits
-}
-
-/// Normalizes a typed code: surrounding whitespace is dropped, `-` and space
-/// separators are removed, and ASCII letters are lowercased. Anything that
-/// is not then exactly 16 hexadecimal digits is malformed.
-fn normalize_submitted_code(submitted: &str) -> Option<[u8; CONFIRMATION_CODE_HEX_LEN]> {
-    let mut digits = [0u8; CONFIRMATION_CODE_HEX_LEN];
-    let mut count = 0;
-    for byte in submitted.trim().bytes() {
-        if byte == b'-' || byte == b' ' {
-            continue;
-        }
-        if !byte.is_ascii_hexdigit() || count == CONFIRMATION_CODE_HEX_LEN {
-            return None;
-        }
-        digits[count] = byte.to_ascii_lowercase();
-        count += 1;
-    }
-    (count == CONFIRMATION_CODE_HEX_LEN).then_some(digits)
+    ConfirmationCode::compute(
+        purpose.code_domain(),
+        challenge,
+        credential_id,
+        public_key_sec1,
+    )
+    .display()
 }
 
 /// A verified registration the server accepted, with the code its page
 /// shows. Crosses from the server to the handle; never serialized.
 pub(crate) struct StagedEnrollment {
     registration: VerifiedOperatorRegistration,
-    expected_code: [u8; CONFIRMATION_CODE_HEX_LEN],
+    expected_code: ConfirmationCode,
     purpose: EnrollmentPurpose,
 }
 
@@ -149,8 +105,8 @@ impl StagedEnrollment {
         challenge: &[u8; 32],
         purpose: EnrollmentPurpose,
     ) -> Self {
-        let expected_code = code_digits(
-            purpose,
+        let expected_code = ConfirmationCode::compute(
+            purpose.code_domain(),
             challenge,
             registration.credential_id(),
             registration.public_key_sec1(),
@@ -223,10 +179,7 @@ impl PendingOperatorEnrollment {
         if now >= self.deadline {
             return Err(OperatorEnrollmentConfirmationError::Expired);
         }
-        let Some(submitted) = normalize_submitted_code(submitted_code) else {
-            return Err(OperatorEnrollmentConfirmationError::Mismatch);
-        };
-        if !bool::from(submitted.ct_eq(&self.staged.expected_code)) {
+        if !self.staged.expected_code.matches(submitted_code) {
             return Err(OperatorEnrollmentConfirmationError::Mismatch);
         }
         Ok(ConfirmedOperatorEnrollment {
@@ -425,36 +378,6 @@ mod tests {
         other_key[64] ^= 1;
         assert_eq!(code(&challenge, &id, &other_key), "504b-3195-bc18-cf46");
         assert_eq!(code(&challenge, &[0xa5; 32], &key), "1c3b-c8a8-faf5-58cb");
-    }
-
-    #[test]
-    fn submitted_codes_normalize_case_and_separators_only() {
-        let expected = *b"305b424462effd53";
-        for accepted in [
-            "305b-4244-62ef-fd53",
-            "305B-4244-62EF-FD53",
-            "305b424462effd53",
-            "305b 4244 62ef fd53",
-            "  305b-4244-62ef-fd53\n",
-        ] {
-            assert_eq!(
-                normalize_submitted_code(accepted),
-                Some(expected),
-                "{accepted}"
-            );
-        }
-        for refused in [
-            "",
-            "305b-4244-62ef-fd5",
-            "305b-4244-62ef-fd533",
-            "305b_4244_62ef_fd53",
-            "305b-4244-62ef-fd5g",
-            "305b-4244-62ef-fd53x",
-            "305b\t4244\t62ef\tfd53",
-            "３０５b-4244-62ef-fd53",
-        ] {
-            assert_eq!(normalize_submitted_code(refused), None, "{refused:?}");
-        }
     }
 
     fn pending(deadline: Instant) -> (PendingOperatorEnrollment, String, SoftwareRegistrar) {

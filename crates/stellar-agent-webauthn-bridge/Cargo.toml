@@ -76,5 +76,13 @@ serde_json = { workspace = true }
 # P-256 signing fixtures for approval POST pre-verification integration tests.
 p256 = { workspace = true }
 
+# Software registrar and registration-response builder for the registration
+# POST tests: real `none`-attestation responses over the entry's challenge.
+stellar-agent-approval-ui = { path = "../stellar-agent-approval-ui", features = ["test-helpers"] }
+
+# The confirmation code's display form and an unkeyed or anchored audit writer
+# for the registration smoke test.
+stellar-agent-core = { path = "../stellar-agent-core", features = ["test-helpers"] }
+
 [lints]
 workspace = true

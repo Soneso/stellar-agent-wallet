@@ -653,6 +653,18 @@ pub enum ApprovalKind {
         /// handler records the browser's registration response.  One-shot: once
         /// set, cannot be overwritten.
         registration_input: Option<RegistrationInput>,
+
+        /// The 32-byte challenge the registration page passes to
+        /// `navigator.credentials.create()` and the bridge verifies the
+        /// browser's response against.
+        ///
+        /// Generated from the OS CSPRNG at issue time. `None` only for an
+        /// entry loaded without one: the bridge serves no page for it and
+        /// [`PendingApprovalStore::record_passkey_registration`] records no
+        /// registration into it.
+        ///
+        /// Security: MUST NOT be logged.
+        registration_challenge: Option<[u8; 32]>,
     },
 
     /// A simulated agent-proposed context-rule installation awaiting
@@ -982,6 +994,7 @@ impl std::fmt::Debug for ApprovalKind {
                 rp_id,
                 user_handle,
                 registration_input,
+                registration_challenge,
             } => {
                 let reg_display = if registration_input.is_some() {
                     "Some(<set>)"
@@ -995,6 +1008,10 @@ impl std::fmt::Debug for ApprovalKind {
                     .field("rp_id", rp_id)
                     .field("user_handle_len", &user_handle.len())
                     .field("registration_input", &reg_display)
+                    .field(
+                        "registration_challenge_present",
+                        &registration_challenge.is_some(),
+                    )
                     .finish()
             }
             Self::ToolsetFirstInvokeGate {
@@ -1246,11 +1263,16 @@ struct RegisterPasskeyWire {
     csrf_token: [u8; 32],
     rp_id: String,
     user_handle: [u8; 32],
+    /// Absent for an entry written without a registration challenge; such an
+    /// entry loads and records no registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registration_challenge: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for RegisterPasskeyWire {
-    /// Length-only `Debug` for the byte fields (`csrf_token`, `user_handle`) so
-    /// challenge and handle bytes never reach a log line.
+    /// Length-only `Debug` for the byte fields (`csrf_token`, `user_handle`)
+    /// and presence-only for the registration challenge, so token, handle and
+    /// challenge bytes never reach a log line.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RegisterPasskeyWire")
             .field("smart_account_redacted", &self.smart_account_redacted)
@@ -1258,6 +1280,10 @@ impl std::fmt::Debug for RegisterPasskeyWire {
             .field("csrf_token_len", &self.csrf_token.len())
             .field("rp_id", &self.rp_id)
             .field("user_handle_len", &self.user_handle.len())
+            .field(
+                "registration_challenge_present",
+                &self.registration_challenge.is_some(),
+            )
             .finish()
     }
 }
@@ -2017,6 +2043,7 @@ impl Serialize for PendingApproval {
                 rp_id,
                 user_handle,
                 registration_input,
+                registration_challenge,
             } => (
                 None,
                 None,
@@ -2033,6 +2060,7 @@ impl Serialize for PendingApproval {
                     csrf_token: *csrf_token,
                     rp_id: rp_id.clone(),
                     user_handle: *user_handle,
+                    registration_challenge: *registration_challenge,
                 }),
                 None::<ToolsetFirstInvokeGateWire>,
                 None::<TrustlineClawbackOptInWire>,
@@ -2679,6 +2707,7 @@ impl<'de> Deserialize<'de> for PendingApproval {
                 rp_id: rp.rp_id,
                 user_handle: rp.user_handle,
                 registration_input: embedded_registration_input,
+                registration_challenge: rp.registration_challenge,
             }
         } else if let Some(sfig) = raw.toolset_first_invoke_gate {
             // Cross-kind contamination check: ToolsetFirstInvokeGate must not carry
@@ -3673,10 +3702,12 @@ impl PendingApproval {
         validate_register_passkey_invariants(&smart_account_redacted, &rule_ids, &rp_id)
             .map_err(|reason| ApprovalError::Invalid { reason })?;
 
-        // Generate nonce and timestamps.
+        // Generate nonce, registration challenge and timestamps.
         let mut raw = [0u8; 16];
         OsRng.fill_bytes(&mut raw);
         let approval_nonce = URL_SAFE_NO_PAD.encode(raw);
+        let mut registration_challenge = [0u8; 32];
+        OsRng.fill_bytes(&mut registration_challenge);
 
         let created_at_unix_ms = approval_now_unix_ms()?;
 
@@ -3695,6 +3726,7 @@ impl PendingApproval {
                 rp_id,
                 user_handle,
                 registration_input: None,
+                registration_challenge: Some(registration_challenge),
             },
             attestation_blob_b64: None,
             passkey_assertion: None,
@@ -5497,7 +5529,10 @@ impl PendingApprovalStore {
     /// Records the WebAuthn registration result captured by the browser-handoff
     /// bridge for a `RegisterPasskey` approval.
     ///
-    /// One-shot: a second call returns [`ApprovalError::AlreadyAttested`].
+    /// One-shot: a second call returns [`ApprovalError::AlreadyAttested`]. An
+    /// entry that carries no registration challenge records nothing, because
+    /// no page was served for it and no response can have been verified
+    /// against it.
     ///
     /// # Errors
     ///
@@ -5505,6 +5540,8 @@ impl PendingApprovalStore {
     /// - [`ApprovalError::Expired`] if the entry's TTL has elapsed.
     /// - [`ApprovalError::WrongKind`] if the approval is not `RegisterPasskey`
     ///   (`expected = "RegisterPasskey"`, `actual = <other-kind>`).
+    /// - [`ApprovalError::Invalid`] if the entry carries no registration
+    ///   challenge.
     /// - [`ApprovalError::AlreadyAttested`] if `registration_input` is already set.
     /// - [`ApprovalError::Io`] / [`ApprovalError::Toml`] on persistence failure.
     pub fn record_passkey_registration(
@@ -5530,8 +5567,14 @@ impl PendingApprovalStore {
         match entry.kind {
             ApprovalKind::RegisterPasskey {
                 ref mut registration_input,
+                registration_challenge,
                 ..
             } => {
+                if registration_challenge.is_none() {
+                    return Err(ApprovalError::Invalid {
+                        reason: "the registration entry carries no challenge".to_owned(),
+                    });
+                }
                 if registration_input.is_some() {
                     return Err(ApprovalError::AlreadyAttested);
                 }
@@ -8163,6 +8206,120 @@ signature_compact = [13,14,15,16]
                 "registration_input must be None before bridge records it"
             );
         }
+    }
+
+    /// `toml` without the `key = ...` assignment, whose array value may span
+    /// several lines.
+    fn remove_toml_key(toml: &str, key: &str) -> String {
+        let mut kept = String::new();
+        let mut in_value = false;
+        for line in toml.lines() {
+            let trimmed = line.trim_start();
+            if !in_value
+                && trimmed.starts_with(key)
+                && trimmed[key.len()..].trim_start().starts_with('=')
+            {
+                in_value = !trimmed.trim_end().ends_with(']');
+                continue;
+            }
+            if in_value {
+                in_value = !trimmed.trim_end().ends_with(']');
+                continue;
+            }
+            kept.push_str(line);
+            kept.push('\n');
+        }
+        kept
+    }
+
+    /// The registration challenge of a `RegisterPasskey` entry.
+    fn registration_challenge_of(entry: &PendingApproval) -> Option<[u8; 32]> {
+        match entry.kind {
+            ApprovalKind::RegisterPasskey {
+                registration_challenge,
+                ..
+            } => registration_challenge,
+            ref other => panic!("expected RegisterPasskey, got {}", other.kind_name()),
+        }
+    }
+
+    /// Every registration entry carries its own CSPRNG challenge, and the
+    /// store file keeps each across a persist and a reopen.
+    #[test]
+    fn a_register_passkey_entry_carries_a_fresh_challenge() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let first = make_register_passkey_entry(DEFAULT_TTL_MS);
+        let second = make_register_passkey_entry(DEFAULT_TTL_MS);
+        let first_challenge = registration_challenge_of(&first).expect("a fresh challenge");
+        let second_challenge = registration_challenge_of(&second).expect("a fresh challenge");
+        assert_ne!(first_challenge, second_challenge);
+        assert!(
+            !format!("{:?}", first.kind).contains(&format!("{first_challenge:?}")),
+            "Debug must not print the challenge"
+        );
+        let nonces = [first.approval_nonce.clone(), second.approval_nonce.clone()];
+        {
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            store.insert(first, TEST_NOW_MS).unwrap();
+            store.insert(second, TEST_NOW_MS).unwrap();
+        }
+
+        let reopened = PendingApprovalStore::open(path).unwrap();
+        assert_eq!(
+            registration_challenge_of(reopened.get(&nonces[0]).unwrap()),
+            Some(first_challenge)
+        );
+        assert_eq!(
+            registration_challenge_of(reopened.get(&nonces[1]).unwrap()),
+            Some(second_challenge)
+        );
+    }
+
+    /// A store file whose registration entry has no challenge still opens,
+    /// and the store records no registration into that entry.
+    #[test]
+    fn an_entry_without_a_challenge_loads_and_records_nothing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("default.toml");
+        let entry = make_register_passkey_entry(DEFAULT_TTL_MS);
+        let nonce = entry.approval_nonce.clone();
+        {
+            let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+            store.insert(entry, TEST_NOW_MS).unwrap();
+        }
+        let written = std::fs::read_to_string(&path).unwrap();
+        let without = remove_toml_key(&written, "registration_challenge");
+        assert_ne!(written, without, "the store file names the challenge");
+        std::fs::write(&path, without).unwrap();
+
+        let mut store = PendingApprovalStore::open(path.clone()).unwrap();
+        assert_eq!(registration_challenge_of(store.get(&nonce).unwrap()), None);
+        let err = store
+            .record_passkey_registration(&nonce, make_registration_input())
+            .unwrap_err();
+        assert!(
+            matches!(&err, ApprovalError::Invalid { reason } if reason == "the registration entry carries no challenge"),
+            "{err:?}"
+        );
+        let ApprovalKind::RegisterPasskey {
+            ref registration_input,
+            ..
+        } = store.get(&nonce).unwrap().kind
+        else {
+            panic!("expected RegisterPasskey");
+        };
+        assert!(registration_input.is_none(), "the entry stays pending");
+        drop(store);
+        let reopened = PendingApprovalStore::open(path).unwrap();
+        let ApprovalKind::RegisterPasskey {
+            ref registration_input,
+            ..
+        } = reopened.get(&nonce).unwrap().kind
+        else {
+            panic!("expected RegisterPasskey");
+        };
+        assert!(registration_input.is_none(), "nothing was persisted");
     }
 
     // 17. Cross-kind contamination: PaymentSimulated + registration_input ───────

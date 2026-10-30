@@ -50,6 +50,11 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::json;
 
+use stellar_agent_core::approval::webauthn_registration::{
+    COSE_ALG_ES256, CREDENTIAL_ID_MAX_BYTES, CREDENTIAL_ID_MIN_BYTES,
+    PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN,
+};
+
 use crate::auth::{
     CSRF_HEADER_NAME, SessionState, compute_csrf, require_session_proof, verify_csrf,
 };
@@ -57,10 +62,8 @@ use crate::templates::render_session_bootstrap_page;
 
 use super::confirmation::StagedEnrollment;
 use super::registration::{
-    COSE_ALG_ES256, CREDENTIAL_ID_MAX_BYTES, CREDENTIAL_ID_MIN_BYTES, EnrollCredentialRequest,
-    OperatorRegistrationError, PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN, REGISTRATION_RP_ID,
-    RegistrationChallenge, VerifiedOperatorRegistration, normalized_label,
-    verify_operator_registration,
+    EnrollCredentialRequest, OperatorRegistrationError, REGISTRATION_RP_ID, RegistrationChallenge,
+    VerifiedOperatorRegistration, normalized_label, verify_operator_registration,
 };
 use super::templates::render_enroll_page;
 use super::web;

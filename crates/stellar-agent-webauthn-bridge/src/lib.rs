@@ -230,6 +230,11 @@ pub(crate) struct BridgeState {
     /// The identity the two ceremony pages render, neutral unless the
     /// deployment configured one.
     pub(crate) identity: Arc<PageIdentity>,
+    /// The origin the registration page is served from,
+    /// `http://localhost:<bound port>`: the origin of the URL the credentials
+    /// manager hands the browser. A registration response's client data must
+    /// name exactly this origin.
+    pub(crate) expected_origin: Arc<str>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -506,6 +511,7 @@ fn build_router(
         approval_store,
         pubkey_lookup,
         identity: Arc::new(page_identity),
+        expected_origin: Arc::from(format!("http://localhost:{}", local_addr.port())),
     };
 
     routes::build_router()
@@ -782,7 +788,10 @@ mod tests {
     async fn registration_trace_redacts_nonce() {
         use base64::Engine as _;
         use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-        use stellar_agent_core::approval::{generate_csrf_token, store::PendingApproval};
+        use stellar_agent_approval_ui::operator_enroll::test_support::SoftwareRegistrar;
+        use stellar_agent_core::approval::{
+            ApprovalKind, generate_csrf_token, store::PendingApproval,
+        };
 
         let (store, _dir) = test_store();
         let csrf = generate_csrf_token();
@@ -797,6 +806,13 @@ mod tests {
         )
         .unwrap();
         let nonce = entry.approval_nonce.clone();
+        let ApprovalKind::RegisterPasskey {
+            registration_challenge: Some(challenge),
+            ..
+        } = entry.kind
+        else {
+            panic!("a fresh registration entry carries a challenge");
+        };
         let now_ms = u64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -831,17 +847,17 @@ mod tests {
             .unwrap();
         assert_eq!(page.status().as_u16(), 200);
 
-        let credential_id = URL_SAFE_NO_PAD.encode([0x42_u8; 16]);
-        let mut pubkey_sec1 = [0x01_u8; 65];
-        pubkey_sec1[0] = 0x04;
+        let registrar = SoftwareRegistrar::new([0x11; 32], vec![0x42; 16]);
+        let builder = registrar.builder(&challenge, &format!("http://localhost:{}", local.port()));
+        let credential_id = registrar.credential_id_b64url();
         let payload = serde_json::json!({
             "id": credential_id,
             "rawId": credential_id,
             "type": "public-key",
             "response": {
-                "clientDataJSON": "ZHVtbXk",
-                "attestationObject": "ZHVtbXk",
-                "publicKeySec1B64": STANDARD.encode(pubkey_sec1),
+                "clientDataJSON": URL_SAFE_NO_PAD.encode(builder.client_data_json()),
+                "attestationObject": URL_SAFE_NO_PAD.encode(builder.attestation_object()),
+                "publicKeySec1B64": STANDARD.encode(registrar.public_key_sec1()),
                 "transports": ["internal"]
             }
         });

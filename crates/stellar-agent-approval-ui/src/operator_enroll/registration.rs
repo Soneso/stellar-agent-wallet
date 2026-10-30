@@ -5,41 +5,15 @@
 //! `navigator.credentials.create()` over it, and posts the credential ID, the
 //! uncompressed SEC1 public key, the label, and the authenticator's
 //! `clientDataJSON` and `attestationObject`. [`verify_operator_registration`]
-//! accepts the response only when:
-//!
-//! - the label passes [`normalized_label`];
-//! - `clientDataJSON` is a JSON object whose `type` is `webauthn.create`,
-//!   whose `challenge` is the issued challenge, whose `origin` is exactly
-//!   `http://localhost:<bound port>`, which carries no `topOrigin` member at
-//!   all, and whose `crossOrigin` member is absent or `false`;
-//! - `attestationObject` is a CBOR map of exactly `fmt`, `attStmt` and
-//!   `authData`, with `fmt = "none"` and an empty `attStmt`;
-//! - `authData` names the SHA-256 of `localhost` as its RP ID hash, sets the
-//!   user-present, user-verified and attested-credential-data flags, carries
-//!   the posted credential ID, and a COSE EC2 key on P-256 for ES256 whose
-//!   point is on the curve and equals the posted SEC1 key; an extension map
-//!   is accepted only when its flag is set, and nothing may follow it.
-//!
-//! # What the verification establishes
-//!
-//! The `none` attestation format carries no statement about the
-//! authenticator, so a verified response is not evidence of certified
-//! hardware, and it does not prove possession of the private key: the
-//! response is self-asserted by whoever ran the ceremony. It establishes
-//! that the response was produced for this server's challenge, at this
-//! origin, for `localhost`, with user verification, and that the posted
-//! credential ID and key are the ones the authenticator data names. The
-//! operator's terminal confirmation (see
+//! accepts the response only when the challenge has not expired, the label
+//! passes [`normalized_label`], and the response verifies under
+//! [`verify_registration_response`] with the issued challenge, the origin
+//! `http://localhost:<bound port>` and the relying-party ID
+//! [`REGISTRATION_RP_ID`]. The verifier's module documentation lists every
+//! rule it applies and states what a verified `none` registration does and
+//! does not establish; the operator's terminal confirmation (see
 //! [`super::PendingOperatorEnrollment::confirm`]) is what binds the
 //! credential to the operator.
-//!
-//! # Bounded decoding
-//!
-//! Both encoded fields are capped before base64 decoding and again after.
-//! The CBOR decoder accepts only definite-length items with minimal-length
-//! arguments, no tags, no floating-point or undefined values, no duplicate
-//! map keys, a bounded nesting depth and item count, and no trailing bytes.
-//! It imposes no order on map keys.
 
 use std::time::{Duration, Instant};
 
@@ -47,8 +21,12 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand_core::{OsRng, RngCore as _};
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
-use subtle::ConstantTimeEq as _;
+
+use stellar_agent_core::approval::webauthn_registration::{
+    CREDENTIAL_ID_MAX_BYTES, MAX_ATTESTATION_OBJECT_BYTES, MAX_CLIENT_DATA_JSON_BYTES,
+    PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN, RegistrationExpectation, RegistrationResponse,
+    decode_b64url_capped, verify_registration_response,
+};
 
 /// The relying-party ID every credential this server registers is bound to.
 pub(crate) const REGISTRATION_RP_ID: &str = "localhost";
@@ -56,52 +34,9 @@ pub(crate) const REGISTRATION_RP_ID: &str = "localhost";
 /// How long an issued challenge stays acceptable, on the session clock.
 pub(crate) const REGISTRATION_CHALLENGE_TTL: Duration = Duration::from_secs(300);
 
-/// The COSE algorithm the ceremony requests and the verifier accepts: ES256.
-pub(crate) const COSE_ALG_ES256: i64 = -7;
-
-/// Maximum decoded `clientDataJSON` size in bytes.
-pub(crate) const MAX_CLIENT_DATA_JSON_BYTES: usize = 1024;
-
-/// Maximum decoded `attestationObject` size in bytes.
-pub(crate) const MAX_ATTESTATION_OBJECT_BYTES: usize = 2048;
-
-/// Minimum credential ID length in raw bytes (CTAP2 §4.2, WebAuthn-2 §5.4.7),
-/// the store's own lower bound.
-pub(crate) const CREDENTIAL_ID_MIN_BYTES: usize = 16;
-
-/// Maximum credential ID length in raw bytes, the store's own upper bound.
-pub(crate) const CREDENTIAL_ID_MAX_BYTES: usize = 64;
-
-/// Length of an uncompressed SEC1 P-256 public key in bytes.
-pub(crate) const PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN: usize = 65;
-
 /// Maximum accepted trimmed label length in bytes, matching the page's
 /// `maxlength="64"` input attribute.
 pub(crate) const MAX_LABEL_BYTES: usize = 64;
-
-/// Deepest CBOR nesting the decoder accepts. The attestation object nests
-/// two levels, an extension map at most three.
-const CBOR_MAX_DEPTH: usize = 4;
-
-/// Most CBOR items one decode accepts.
-const CBOR_MAX_ITEMS: usize = 64;
-
-/// `authenticatorData` flag bits (WebAuthn Level 3 §6.1).
-pub(crate) const FLAG_UP: u8 = 0x01;
-/// User verified.
-pub(crate) const FLAG_UV: u8 = 0x04;
-/// Backup eligible.
-pub(crate) const FLAG_BE: u8 = 0x08;
-/// Backup state.
-pub(crate) const FLAG_BS: u8 = 0x10;
-/// Attested credential data included.
-pub(crate) const FLAG_AT: u8 = 0x40;
-/// Extension data included.
-pub(crate) const FLAG_ED: u8 = 0x80;
-
-/// Fixed-length prefix of `authenticatorData` before the credential ID:
-/// RP ID hash (32), flags (1), counter (4), AAGUID (16), ID length (2).
-const AUTH_DATA_FIXED_LEN: usize = 32 + 1 + 4 + 16 + 2;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Challenge
@@ -250,8 +185,9 @@ pub(crate) enum OperatorRegistrationError {
 ///
 /// - [`OperatorRegistrationError::Expired`] when `challenge` expired at
 ///   `now`.
-/// - [`OperatorRegistrationError::Invalid`] for any other rule in the module
-///   docs that the response breaks.
+/// - [`OperatorRegistrationError::Invalid`] for any rule of
+///   [`verify_registration_response`] that the response breaks, or a field
+///   that is not canonical unpadded base64url within its cap.
 pub(crate) fn verify_operator_registration(
     request: &EnrollCredentialRequest,
     challenge: &RegistrationChallenge,
@@ -264,29 +200,42 @@ pub(crate) fn verify_operator_registration(
         return Err(OperatorRegistrationError::Expired);
     }
     let label = normalized_label(&request.label).ok_or(Invalid)?;
-    let credential_id = decode_credential_id(&request.credential_id_b64url).ok_or(Invalid)?;
-    let public_key_sec1 = decode_public_key(&request.public_key_sec1_b64).ok_or(Invalid)?;
-
+    let credential_id =
+        decode_b64url_capped(&request.credential_id_b64url, CREDENTIAL_ID_MAX_BYTES)
+            .ok_or(Invalid)?;
+    let public_key_sec1 = decode_b64url_capped(
+        &request.public_key_sec1_b64,
+        PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN,
+    )
+    .ok_or(Invalid)?;
     let client_data_json =
-        decode_capped(&request.client_data_json, MAX_CLIENT_DATA_JSON_BYTES).ok_or(Invalid)?;
-    verify_client_data(&client_data_json, challenge, expected_origin)?;
-
+        decode_b64url_capped(&request.client_data_json, MAX_CLIENT_DATA_JSON_BYTES)
+            .ok_or(Invalid)?;
     let attestation_object =
-        decode_capped(&request.attestation_object, MAX_ATTESTATION_OBJECT_BYTES).ok_or(Invalid)?;
-    let attested = parse_attestation_object(&attestation_object)?;
-    if attested.credential_id != credential_id.as_slice() {
-        return Err(Invalid);
-    }
-    if attested.public_key_sec1 != public_key_sec1 {
-        return Err(Invalid);
-    }
+        decode_b64url_capped(&request.attestation_object, MAX_ATTESTATION_OBJECT_BYTES)
+            .ok_or(Invalid)?;
+
+    let verified = verify_registration_response(
+        &RegistrationResponse {
+            credential_id: &credential_id,
+            public_key_sec1: &public_key_sec1,
+            client_data_json: &client_data_json,
+            attestation_object: &attestation_object,
+        },
+        &RegistrationExpectation {
+            challenge: challenge.bytes(),
+            origin: expected_origin,
+            rp_id: REGISTRATION_RP_ID,
+        },
+    )
+    .map_err(|_| Invalid)?;
 
     Ok(VerifiedOperatorRegistration {
-        credential_id_b64url: URL_SAFE_NO_PAD.encode(&credential_id),
-        credential_id,
-        public_key_sec1,
+        credential_id_b64url: URL_SAFE_NO_PAD.encode(verified.credential_id()),
+        credential_id: verified.credential_id().to_vec(),
+        public_key_sec1: *verified.public_key_sec1(),
         label: label.to_owned(),
-        sign_count: attested.sign_count,
+        sign_count: verified.sign_count(),
     })
 }
 
@@ -309,392 +258,6 @@ pub(crate) fn normalized_label(raw: &str) -> Option<&str> {
     (!label.is_empty() && label.len() <= MAX_LABEL_BYTES).then_some(label)
 }
 
-/// Decodes a canonical base64url credential ID within the store's bounds.
-pub(crate) fn decode_credential_id(b64url: &str) -> Option<Vec<u8>> {
-    let bytes = decode_capped(b64url, CREDENTIAL_ID_MAX_BYTES)?;
-    (bytes.len() >= CREDENTIAL_ID_MIN_BYTES).then_some(bytes)
-}
-
-/// Decodes an uncompressed SEC1 P-256 key and checks that it is a point on
-/// the curve.
-pub(crate) fn decode_public_key(b64url: &str) -> Option<[u8; PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN]> {
-    let bytes = decode_capped(b64url, PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN)?;
-    let key: [u8; PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN] = bytes.try_into().ok()?;
-    (key[0] == 0x04 && p256::PublicKey::from_sec1_bytes(&key).is_ok()).then_some(key)
-}
-
-/// Decodes canonical unpadded base64url of at most `max` bytes, refusing a
-/// longer encoding before decoding it.
-fn decode_capped(b64url: &str, max: usize) -> Option<Vec<u8>> {
-    if b64url.len() > (max * 4).div_ceil(3) {
-        return None;
-    }
-    let bytes = URL_SAFE_NO_PAD.decode(b64url).ok()?;
-    (bytes.len() <= max && URL_SAFE_NO_PAD.encode(&bytes) == b64url).then_some(bytes)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// clientDataJSON
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The `CollectedClientData` members the verifier reads. Other members are
-/// ignored, as WebAuthn requires; a member that appears twice refuses.
-///
-/// `crossOrigin` and `topOrigin` are `None` only when the member is absent:
-/// an explicit JSON `null` is a present member, so `crossOrigin: null`
-/// refuses as a non-boolean and `topOrigin: null` refuses as present.
-#[derive(Deserialize)]
-struct CollectedClientData {
-    #[serde(rename = "type")]
-    kind: String,
-    challenge: String,
-    origin: String,
-    #[serde(rename = "crossOrigin", default, deserialize_with = "present")]
-    cross_origin: Option<bool>,
-    #[serde(rename = "topOrigin", default, deserialize_with = "present")]
-    top_origin: Option<serde::de::IgnoredAny>,
-}
-
-/// Deserializes a member that is present as `Some`, whatever its value, so
-/// that `None` stands for absence alone.
-fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    T::deserialize(deserializer).map(Some)
-}
-
-fn verify_client_data(
-    client_data_json: &[u8],
-    challenge: &RegistrationChallenge,
-    expected_origin: &str,
-) -> Result<(), OperatorRegistrationError> {
-    use OperatorRegistrationError::Invalid;
-
-    let client_data: CollectedClientData =
-        serde_json::from_slice(client_data_json).map_err(|_| Invalid)?;
-    if client_data.kind != "webauthn.create" {
-        return Err(Invalid);
-    }
-    let submitted = decode_capped(&client_data.challenge, 32).ok_or(Invalid)?;
-    if submitted.len() != 32 || !bool::from(submitted.ct_eq(challenge.bytes())) {
-        return Err(Invalid);
-    }
-    if client_data.origin != expected_origin {
-        return Err(Invalid);
-    }
-    if client_data.cross_origin == Some(true) || client_data.top_origin.is_some() {
-        return Err(Invalid);
-    }
-    Ok(())
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// attestationObject and authenticatorData
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// What the attestation object's authenticator data attests.
-struct AttestedCredential<'a> {
-    credential_id: &'a [u8],
-    public_key_sec1: [u8; PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN],
-    sign_count: u32,
-}
-
-fn parse_attestation_object(
-    attestation_object: &[u8],
-) -> Result<AttestedCredential<'_>, OperatorRegistrationError> {
-    use OperatorRegistrationError::Invalid;
-
-    let Cbor::Map(entries) = decode_complete(attestation_object).map_err(|_| Invalid)? else {
-        return Err(Invalid);
-    };
-    if entries.len() != 3 {
-        return Err(Invalid);
-    }
-    let (mut fmt, mut att_stmt, mut auth_data) = (None, None, None);
-    for (key, value) in entries {
-        match key {
-            Cbor::Text("fmt") => fmt = Some(value),
-            Cbor::Text("attStmt") => att_stmt = Some(value),
-            Cbor::Text("authData") => auth_data = Some(value),
-            _ => return Err(Invalid),
-        }
-    }
-    if !matches!(fmt, Some(Cbor::Text("none"))) {
-        return Err(Invalid);
-    }
-    if !matches!(att_stmt, Some(Cbor::Map(ref stmt)) if stmt.is_empty()) {
-        return Err(Invalid);
-    }
-    let Some(Cbor::Bytes(auth_data)) = auth_data else {
-        return Err(Invalid);
-    };
-    parse_auth_data(auth_data)
-}
-
-fn parse_auth_data(auth_data: &[u8]) -> Result<AttestedCredential<'_>, OperatorRegistrationError> {
-    use OperatorRegistrationError::Invalid;
-
-    if auth_data.len() < AUTH_DATA_FIXED_LEN {
-        return Err(Invalid);
-    }
-    let rp_id_hash = Sha256::digest(REGISTRATION_RP_ID.as_bytes());
-    if auth_data[..32] != rp_id_hash[..] {
-        return Err(Invalid);
-    }
-    let flags = auth_data[32];
-    for required in [FLAG_UP, FLAG_UV, FLAG_AT] {
-        if flags & required == 0 {
-            return Err(Invalid);
-        }
-    }
-    if flags & FLAG_BS != 0 && flags & FLAG_BE == 0 {
-        return Err(Invalid);
-    }
-    let sign_count =
-        u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
-    let id_len = usize::from(u16::from_be_bytes([auth_data[53], auth_data[54]]));
-    if !(CREDENTIAL_ID_MIN_BYTES..=CREDENTIAL_ID_MAX_BYTES).contains(&id_len) {
-        return Err(Invalid);
-    }
-    let rest = &auth_data[AUTH_DATA_FIXED_LEN..];
-    if rest.len() < id_len {
-        return Err(Invalid);
-    }
-    let (credential_id, rest) = rest.split_at(id_len);
-    let (cose_key, used) = decode_prefix(rest).map_err(|_| Invalid)?;
-    let public_key_sec1 = parse_cose_es256(&cose_key)?;
-    let rest = &rest[used..];
-    if flags & FLAG_ED != 0 {
-        if !matches!(decode_complete(rest), Ok(Cbor::Map(_))) {
-            return Err(Invalid);
-        }
-    } else if !rest.is_empty() {
-        return Err(Invalid);
-    }
-    Ok(AttestedCredential {
-        credential_id,
-        public_key_sec1,
-        sign_count,
-    })
-}
-
-/// Reads a COSE_Key of exactly the five labels an ES256 EC2 key on P-256
-/// has, and returns its point in uncompressed SEC1 form once it is on the
-/// curve.
-fn parse_cose_es256(
-    key: &Cbor<'_>,
-) -> Result<[u8; PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN], OperatorRegistrationError> {
-    use OperatorRegistrationError::Invalid;
-
-    let Cbor::Map(entries) = key else {
-        return Err(Invalid);
-    };
-    if entries.len() != 5 {
-        return Err(Invalid);
-    }
-    let (mut kty, mut alg, mut crv, mut x, mut y) = (false, false, false, None, None);
-    for (label, value) in entries {
-        match (label.as_integer(), value) {
-            (Some(1), value) => kty = value.as_integer() == Some(2),
-            (Some(3), value) => alg = value.as_integer() == Some(COSE_ALG_ES256),
-            (Some(-1), value) => crv = value.as_integer() == Some(1),
-            (Some(-2), Cbor::Bytes(bytes)) if bytes.len() == 32 => x = Some(*bytes),
-            (Some(-3), Cbor::Bytes(bytes)) if bytes.len() == 32 => y = Some(*bytes),
-            _ => return Err(Invalid),
-        }
-    }
-    let (true, true, true, Some(x), Some(y)) = (kty, alg, crv, x, y) else {
-        return Err(Invalid);
-    };
-    let mut sec1 = [0u8; PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN];
-    sec1[0] = 0x04;
-    sec1[1..33].copy_from_slice(x);
-    sec1[33..].copy_from_slice(y);
-    if p256::PublicKey::from_sec1_bytes(&sec1).is_err() {
-        return Err(Invalid);
-    }
-    Ok(sec1)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Bounded CBOR decoding
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A decoded CBOR item of the subset the attestation object uses.
-#[derive(Debug, PartialEq, Eq)]
-enum Cbor<'a> {
-    /// Major type 0.
-    Unsigned(u64),
-    /// Major type 1: the value is `-1 - n`.
-    Negative(u64),
-    /// Major type 2.
-    Bytes(&'a [u8]),
-    /// Major type 3, valid UTF-8.
-    Text(&'a str),
-    /// Major type 4.
-    Array(Vec<Cbor<'a>>),
-    /// Major type 5, keys unique.
-    Map(Vec<(Cbor<'a>, Cbor<'a>)>),
-    /// Simple values 20 and 21.
-    Bool(bool),
-    /// Simple value 22.
-    Null,
-}
-
-impl Cbor<'_> {
-    /// The item as an integer, when it is one that fits `i64`.
-    fn as_integer(&self) -> Option<i64> {
-        match self {
-            Self::Unsigned(n) => i64::try_from(*n).ok(),
-            Self::Negative(n) => i64::try_from(*n).ok().map(|n| -1 - n),
-            _ => None,
-        }
-    }
-}
-
-/// Why the CBOR decoder refused its input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Malformed;
-
-/// Decodes exactly one item that spans all of `input`.
-fn decode_complete(input: &[u8]) -> Result<Cbor<'_>, Malformed> {
-    let (value, used) = decode_prefix(input)?;
-    if used == input.len() {
-        Ok(value)
-    } else {
-        Err(Malformed)
-    }
-}
-
-/// Decodes one item from the start of `input` and returns it with the
-/// number of bytes it spans.
-fn decode_prefix(input: &[u8]) -> Result<(Cbor<'_>, usize), Malformed> {
-    let mut decoder = Decoder {
-        input,
-        pos: 0,
-        items: 0,
-    };
-    let value = decoder.item(0)?;
-    Ok((value, decoder.pos))
-}
-
-struct Decoder<'a> {
-    input: &'a [u8],
-    pos: usize,
-    items: usize,
-}
-
-impl<'a> Decoder<'a> {
-    fn take(&mut self, len: usize) -> Result<&'a [u8], Malformed> {
-        let end = self.pos.checked_add(len).ok_or(Malformed)?;
-        let bytes = self.input.get(self.pos..end).ok_or(Malformed)?;
-        self.pos = end;
-        Ok(bytes)
-    }
-
-    fn remaining(&self) -> usize {
-        self.input.len() - self.pos
-    }
-
-    /// Reads the argument of an item head, refusing indefinite lengths,
-    /// reserved encodings, and any argument not in its shortest form.
-    fn argument(&mut self, info: u8) -> Result<u64, Malformed> {
-        let (value, minimum) = match info {
-            0..=23 => return Ok(u64::from(info)),
-            24 => (u64::from(self.take(1)?[0]), 24),
-            25 => {
-                let b = self.take(2)?;
-                (u64::from(u16::from_be_bytes([b[0], b[1]])), 0x100)
-            }
-            26 => {
-                let b = self.take(4)?;
-                (
-                    u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]])),
-                    0x1_0000,
-                )
-            }
-            27 => {
-                let b = self.take(8)?;
-                (
-                    u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
-                    0x1_0000_0000,
-                )
-            }
-            _ => return Err(Malformed),
-        };
-        if value < minimum {
-            return Err(Malformed);
-        }
-        Ok(value)
-    }
-
-    fn length(&mut self, info: u8) -> Result<usize, Malformed> {
-        usize::try_from(self.argument(info)?).map_err(|_| Malformed)
-    }
-
-    fn item(&mut self, depth: usize) -> Result<Cbor<'a>, Malformed> {
-        self.items += 1;
-        if self.items > CBOR_MAX_ITEMS || depth > CBOR_MAX_DEPTH {
-            return Err(Malformed);
-        }
-        let head = self.take(1)?[0];
-        let info = head & 0x1f;
-        match head >> 5 {
-            0 => Ok(Cbor::Unsigned(self.argument(info)?)),
-            1 => Ok(Cbor::Negative(self.argument(info)?)),
-            2 => {
-                let len = self.length(info)?;
-                Ok(Cbor::Bytes(self.take(len)?))
-            }
-            3 => {
-                let len = self.length(info)?;
-                let text = std::str::from_utf8(self.take(len)?).map_err(|_| Malformed)?;
-                Ok(Cbor::Text(text))
-            }
-            4 => {
-                let len = self.length(info)?;
-                if len > self.remaining() {
-                    return Err(Malformed);
-                }
-                let mut items = Vec::with_capacity(len);
-                for _ in 0..len {
-                    items.push(self.item(depth + 1)?);
-                }
-                Ok(Cbor::Array(items))
-            }
-            5 => {
-                let len = self.length(info)?;
-                if len > self.remaining() / 2 {
-                    return Err(Malformed);
-                }
-                let mut entries = Vec::with_capacity(len);
-                let mut keys: Vec<&'a [u8]> = Vec::with_capacity(len);
-                for _ in 0..len {
-                    let start = self.pos;
-                    let key = self.item(depth + 1)?;
-                    let encoded = &self.input[start..self.pos];
-                    if keys.contains(&encoded) {
-                        return Err(Malformed);
-                    }
-                    keys.push(encoded);
-                    let value = self.item(depth + 1)?;
-                    entries.push((key, value));
-                }
-                Ok(Cbor::Map(entries))
-            }
-            7 => match info {
-                20 => Ok(Cbor::Bool(false)),
-                21 => Ok(Cbor::Bool(true)),
-                22 => Ok(Cbor::Null),
-                _ => Err(Malformed),
-            },
-            _ => Err(Malformed),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -703,6 +266,11 @@ mod tests {
         clippy::panic,
         reason = "test-only; panics acceptable in unit tests"
     )]
+
+    use sha2::{Digest as _, Sha256};
+    use stellar_agent_core::approval::webauthn::{
+        FLAG_AT, FLAG_BE, FLAG_BS, FLAG_ED, FLAG_UP, FLAG_UV,
+    };
 
     use super::super::test_support::{
         CborWriter, RegistrationBuilder, SoftwareRegistrar, cose_es256_key,
@@ -1110,37 +678,6 @@ mod tests {
             verify_operator_registration(&garbage, &challenge, ORIGIN, at_expiry).unwrap_err(),
             OperatorRegistrationError::Expired
         );
-    }
-
-    #[test]
-    fn cbor_decoder_refuses_what_it_does_not_accept() {
-        for input in [
-            &[0x18, 0x05][..],
-            &[0x19, 0x00, 0x10],
-            &[0x1a, 0x00, 0x00, 0x01, 0x00],
-            &[0x1b, 0, 0, 0, 0, 0, 0, 0xff, 0xff],
-            &[0x1c],
-            &[0x5f, 0xff],
-            &[0x62, 0xff, 0xfe],
-            &[0xf9, 0x00, 0x00],
-            &[0xf7],
-            &[0xc1, 0x00],
-            &[0xa2, 0x01, 0x02, 0x01, 0x03],
-            &[0x81, 0x81, 0x81, 0x81, 0x81, 0x00],
-            &[0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-        ] {
-            assert_eq!(decode_complete(input), Err(Malformed), "{input:02x?}");
-        }
-        let many: Vec<u8> = std::iter::once(0x98)
-            .chain(std::iter::once(CBOR_MAX_ITEMS as u8))
-            .chain(std::iter::repeat_n(0x00, CBOR_MAX_ITEMS))
-            .collect();
-        assert_eq!(decode_complete(&many), Err(Malformed));
-        assert_eq!(
-            decode_complete(&[0x82, 0x20, 0xf5]),
-            Ok(Cbor::Array(vec![Cbor::Negative(0), Cbor::Bool(true)]))
-        );
-        assert_eq!(decode_complete(&[0x18, 0x18]), Ok(Cbor::Unsigned(24)));
     }
 
     #[test]

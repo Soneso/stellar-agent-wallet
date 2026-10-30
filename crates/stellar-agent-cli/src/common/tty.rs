@@ -1,8 +1,10 @@
-//! Terminal requirements for interactive operator prompts: the confirmation
-//! codes of operator enrollment and approval credential enrollment. Mainnet
-//! consent reads no terminal.
+//! Terminal requirements and the line reader for interactive operator
+//! prompts: the confirmation codes of operator enrollment, approval
+//! credential enrollment and passkey registration. Mainnet consent reads no
+//! terminal.
 
-use std::io::IsTerminal as _;
+use std::future::Future;
+use std::io::{self, IsTerminal as _};
 
 /// Whether stdin and stderr are both terminals, the condition every
 /// interactive operator prompt needs.
@@ -23,6 +25,34 @@ fn terminal_streams() -> (bool, bool) {
         std::io::stdin().is_terminal(),
         std::io::stderr().is_terminal(),
     )
+}
+
+/// Reads one line from the process's stdin on a detached thread named
+/// `thread_name`; `Ok(None)` at end of input.
+///
+/// A blocking read cannot be cancelled, so the thread is not joined: when
+/// the caller stops waiting, the line it may read later goes nowhere.
+pub(crate) fn read_line_from_terminal(
+    thread_name: &'static str,
+) -> impl Future<Output = io::Result<Option<String>>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name(thread_name.to_owned())
+        .spawn(move || {
+            let mut line = String::new();
+            let result = match io::stdin().read_line(&mut line) {
+                Ok(0) => Ok(None),
+                Ok(_) => Ok(Some(line)),
+                Err(error) => Err(error),
+            };
+            let _ = sender.send(result);
+        });
+    async move {
+        spawned?;
+        receiver
+            .await
+            .map_err(|_| io::Error::other("the terminal reader stopped"))?
+    }
 }
 
 #[cfg(test)]

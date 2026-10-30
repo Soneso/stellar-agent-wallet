@@ -22,9 +22,10 @@
 //! 2. `is_empty_true_on_new_profile` — `is_empty()` returns `true` before any
 //!    registration.
 //! 3. `registration_round_trip` — `prepare_registration` → inject
-//!    `RegistrationInput` → `poll_registration` → credential persisted in
-//!    registry → `show` + `list` reflect the new credential (including
-//!    `public_key_sec1_b64`).
+//!    `RegistrationInput` → `poll_registration` returns
+//!    `AwaitingConfirmation` with nothing registered → `confirm_registration`
+//!    with the page's code → credential persisted in registry → `show` +
+//!    `list` reflect the new credential (including `public_key_sec1_b64`).
 //! 4. `duplicate_name_rejected` — registering a second credential with the
 //!    same name returns `CredentialsError::DuplicateName`.
 //! 5. `delete_removes_credential` — after registration, `delete` removes the
@@ -36,11 +37,17 @@
 //! 8. `poll_registration_timeout` — when no `RegistrationInput` is injected,
 //!    `poll_registration` returns `AddPasskeyOutcome::Timeout` after the
 //!    deadline expires.
-//! 9. `audit_entry_emitted_on_success` — `poll_registration` writes one JSONL
-//!    `PasskeyRegistered` entry to an `AuditWriter` on success.
+//! 9. `audit_entry_emitted_on_success`: the poll writes no row; the confirmed
+//!    registration writes one `PasskeyRegistered` row with status
+//!    `registered`.
 //! 10. `audit_entry_emitted_on_timeout` — `poll_registration` writes one JSONL
 //!     `PasskeyRegistered` entry with `status: "timeout"` when the deadline
 //!     expires.
+//! 11. `a_wrong_code_registers_nothing`, `an_expired_confirmation_registers_nothing`,
+//!     `a_failed_registered_row_registers_nothing` and
+//!     `an_abandoned_registration_records_why`: a recorded registration that
+//!     is not confirmed in time with its code, or whose `registered` row
+//!     cannot be written, leaves the registry empty.
 //!
 //! # WebAuthn signer
 //!
@@ -54,17 +61,24 @@
 )]
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use stellar_agent_core::approval::RegistrationInput;
-use stellar_agent_core::approval::store::PendingApprovalStore;
+use stellar_agent_core::approval::store::{ApprovalKind, PendingApprovalStore};
+use stellar_agent_core::approval::webauthn_registration::{
+    ConfirmationCode, PASSKEY_REGISTRATION_CODE_DOMAIN,
+};
+use stellar_agent_core::audit_log::BindingHistory;
 use stellar_agent_core::audit_log::schema::EventKind;
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
+use stellar_agent_core::audit_log::tip_anchor::{InMemoryTipAnchorStore, TipAnchorStore};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_smart_account::managers::credentials::{
-    AddPasskeyOutcome, CredentialsError, CredentialsManager,
+    AddPasskeyOutcome, CredentialMetadata, CredentialsError, CredentialsManager,
+    PendingPasskeyRegistration, UnconfirmedEnd,
 };
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -124,8 +138,16 @@ fn make_manager(dir: &TempDir) -> (CredentialsManager, Arc<Mutex<PendingApproval
     (mgr, shared_store)
 }
 
+/// A recorded registration: its nonce and the confirmation code the
+/// registration page shows for it.
+struct Injected {
+    nonce: String,
+    code: String,
+}
+
 /// Prepares a registration entry, injects a `RegistrationInput` directly into
-/// the shared store (simulating the bridge POST handler), and returns the nonce.
+/// the shared store (simulating the bridge POST handler), and returns the nonce
+/// with the code the page computes from the entry's challenge and `reg`.
 ///
 /// Uses the same `Arc<Mutex<PendingApprovalStore>>` as the manager, so
 /// `poll_registration` can observe the injected entry without any re-opening.
@@ -135,7 +157,7 @@ async fn prepare_and_inject(
     credential_name: &str,
     bridge_addr: SocketAddr,
     reg: RegistrationInput,
-) -> String {
+) -> Injected {
     // prepare_registration acquires the shared mutex, inserts, and releases.
     let handle = mgr
         .prepare_registration(credential_name, bridge_addr, None)
@@ -146,14 +168,91 @@ async fn prepare_and_inject(
     // Inject the RegistrationInput via the same shared mutex.
     // This simulates the bridge POST /register/{nonce} handler calling
     // `record_passkey_registration` on the store it shares with the manager.
-    {
-        let mut guard = shared_store.lock().await;
-        guard
-            .record_passkey_registration(&nonce, reg)
-            .expect("record_passkey_registration must succeed");
-    }
+    let mut guard = shared_store.lock().await;
+    let Some(ApprovalKind::RegisterPasskey {
+        registration_challenge: Some(challenge),
+        ..
+    }) = guard.get(&nonce).map(|entry| entry.kind.clone())
+    else {
+        panic!("a prepared registration entry carries its challenge")
+    };
+    let key: [u8; 65] = reg.public_key_uncompressed_sec1().try_into().unwrap();
+    let code = ConfirmationCode::compute(
+        PASSKEY_REGISTRATION_CODE_DOMAIN,
+        &challenge,
+        reg.credential_id(),
+        &key,
+    )
+    .display();
+    guard
+        .record_passkey_registration(&nonce, reg)
+        .expect("record_passkey_registration must succeed");
+    drop(guard);
 
-    nonce
+    Injected { nonce, code }
+}
+
+/// Opens an unkeyed writer over `dir/audit.jsonl` and returns it with the path.
+fn open_writer(dir: &TempDir) -> (AuditWriter, std::path::PathBuf) {
+    let path = dir.path().join("audit.jsonl");
+    let writer = AuditWriter::open(path.clone(), None).expect("AuditWriter must open in tempdir");
+    (writer, path)
+}
+
+/// Polls `injected` to its recorded registration and returns it; the poll
+/// registers nothing.
+async fn poll_to_pending(
+    mgr: &CredentialsManager,
+    credential_name: &str,
+    injected: &Injected,
+    writer: &mut AuditWriter,
+) -> PendingPasskeyRegistration {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let outcome = mgr
+        .poll_registration(credential_name, &injected.nonce, deadline, writer)
+        .await
+        .expect("poll_registration must not return Err");
+    let AddPasskeyOutcome::AwaitingConfirmation { pending } = outcome else {
+        panic!("expected AwaitingConfirmation, got {outcome:?}")
+    };
+    assert_eq!(pending.credential_name(), credential_name);
+    assert!(
+        mgr.list().unwrap().is_empty(),
+        "a recorded registration is not registered before its code is confirmed"
+    );
+    pending
+}
+
+/// Registers `credential_name` end to end: inject, poll, confirm with the
+/// page's code.
+async fn register(
+    mgr: &CredentialsManager,
+    shared_store: &Arc<Mutex<PendingApprovalStore>>,
+    credential_name: &str,
+    writer: &mut AuditWriter,
+) -> CredentialMetadata {
+    let injected = prepare_and_inject(
+        mgr,
+        shared_store,
+        credential_name,
+        fake_bridge_addr(),
+        make_registration_input(),
+    )
+    .await;
+    let pending = poll_to_pending(mgr, credential_name, &injected, writer).await;
+    mgr.confirm_registration(pending, &injected.code, Instant::now(), writer)
+        .expect("the page's code confirms the registration")
+}
+
+/// The statuses of the `PasskeyRegistered` rows of the log at `path`.
+fn passkey_statuses(path: &Path) -> Vec<String> {
+    verified_audit_entries_from_path(path)
+        .into_iter()
+        .filter_map(|entry| match entry.event_kind {
+            EventKind::PasskeyRegistered { status, .. } => Some(status),
+            _ => None,
+        })
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -189,52 +288,34 @@ fn is_empty_true_on_new_profile() {
 async fn registration_round_trip() {
     let dir = TempDir::new().unwrap();
     let (mgr, shared_store) = make_manager(&dir);
-    let bridge_addr = fake_bridge_addr();
-    let reg = make_registration_input();
+    let (mut writer, audit_path) = open_writer(&dir);
     let credential_name = "my-yubikey";
 
-    // Prepare + inject before poll starts.
-    let nonce = prepare_and_inject(&mgr, &shared_store, credential_name, bridge_addr, reg).await;
-
-    // Poll with a short but non-zero deadline.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let outcome = mgr
-        .poll_registration(credential_name, &nonce, deadline, None)
-        .await
-        .expect("poll_registration must not return Err");
-
-    match outcome {
-        AddPasskeyOutcome::Registered { metadata } => {
-            assert_eq!(metadata.credential_name, credential_name);
-            assert_eq!(metadata.rp_id, "localhost");
-            assert_eq!(metadata.transports, "internal");
-            assert!(
-                metadata.registered_at_unix_ms > 0,
-                "registered_at_unix_ms must be non-zero"
-            );
-            // credential_id for the fixture: 32 zero bytes → base64url.
-            assert!(
-                !metadata.credential_id_b64url.is_empty(),
-                "credential_id_b64url must be non-empty"
-            );
-            // public_key_sec1_b64 must be populated.
-            assert!(
-                !metadata.public_key_sec1_b64.is_empty(),
-                "public_key_sec1_b64 must be non-empty after registration"
-            );
-            // The fixture pubkey is 65 bytes → 87 base64url chars.
-            let decoded = URL_SAFE_NO_PAD
-                .decode(&metadata.public_key_sec1_b64)
-                .expect("public_key_sec1_b64 must be valid base64url");
-            assert_eq!(
-                decoded.len(),
-                65,
-                "decoded public key must be exactly 65 bytes"
-            );
-            assert_eq!(decoded[0], 0x04, "first byte must be 0x04 (uncompressed)");
-        }
-        other => panic!("expected Registered, got {other:?}"),
-    }
+    let metadata = register(&mgr, &shared_store, credential_name, &mut writer).await;
+    assert_eq!(metadata.credential_name, credential_name);
+    assert_eq!(metadata.rp_id, "localhost");
+    assert_eq!(metadata.transports, "internal");
+    assert!(
+        metadata.registered_at_unix_ms > 0,
+        "registered_at_unix_ms must be non-zero"
+    );
+    // credential_id for the fixture: 32 zero bytes → base64url.
+    assert_eq!(
+        metadata.credential_id_b64url,
+        URL_SAFE_NO_PAD.encode([0u8; 32])
+    );
+    // The fixture pubkey is 65 bytes → 87 base64url chars.
+    let decoded = URL_SAFE_NO_PAD
+        .decode(&metadata.public_key_sec1_b64)
+        .expect("public_key_sec1_b64 must be valid base64url");
+    assert_eq!(
+        decoded.len(),
+        65,
+        "decoded public key must be exactly 65 bytes"
+    );
+    assert_eq!(decoded[0], 0x04, "first byte must be 0x04 (uncompressed)");
+    drop(writer);
+    assert_eq!(passkey_statuses(&audit_path), ["registered"]);
 
     // Verify persistence: show + list reflect the new credential.
     let shown = mgr
@@ -271,24 +352,10 @@ async fn duplicate_name_rejected() {
     let bridge_addr = fake_bridge_addr();
     let credential_name = "my-key";
 
+    let (mut writer, _audit_path) = open_writer(&dir);
+
     // First registration — complete it so the name is in the registry.
-    let nonce = prepare_and_inject(
-        &mgr,
-        &shared_store,
-        credential_name,
-        bridge_addr,
-        make_registration_input(),
-    )
-    .await;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let outcome = mgr
-        .poll_registration(credential_name, &nonce, deadline, None)
-        .await
-        .unwrap();
-    assert!(
-        matches!(outcome, AddPasskeyOutcome::Registered { .. }),
-        "expected Registered for first registration"
-    );
+    register(&mgr, &shared_store, credential_name, &mut writer).await;
 
     // Second attempt with the same name must fail at prepare_registration.
     let err = mgr
@@ -307,22 +374,10 @@ async fn duplicate_name_rejected() {
 async fn delete_removes_credential() {
     let dir = TempDir::new().unwrap();
     let (mgr, shared_store) = make_manager(&dir);
-    let bridge_addr = fake_bridge_addr();
+    let (mut writer, _audit_path) = open_writer(&dir);
     let credential_name = "to-be-deleted";
 
-    let nonce = prepare_and_inject(
-        &mgr,
-        &shared_store,
-        credential_name,
-        bridge_addr,
-        make_registration_input(),
-    )
-    .await;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let _ = mgr
-        .poll_registration(credential_name, &nonce, deadline, None)
-        .await
-        .unwrap();
+    register(&mgr, &shared_store, credential_name, &mut writer).await;
 
     // Verify it exists.
     mgr.show(credential_name)
@@ -409,9 +464,10 @@ async fn poll_registration_timeout() {
 
     // Set a deadline already in the past (or extremely short).
     let deadline = Instant::now();
+    let (mut writer, _audit_path) = open_writer(&dir);
 
     let outcome = mgr
-        .poll_registration(credential_name, &nonce, deadline, None)
+        .poll_registration(credential_name, &nonce, deadline, &mut writer)
         .await
         .expect("poll_registration must not return Err on timeout");
 
@@ -427,35 +483,26 @@ async fn poll_registration_timeout() {
 async fn audit_entry_emitted_on_success() {
     let dir = TempDir::new().unwrap();
     let (mgr, shared_store) = make_manager(&dir);
-    let bridge_addr = fake_bridge_addr();
     let credential_name = "audit-key";
+    let (mut writer, audit_path) = open_writer(&dir);
 
-    // Wire an AuditWriter backed by a temp file.
-    let audit_file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
-    let audit_path = audit_file.path().to_path_buf();
-    drop(audit_file); // close so AuditWriter can re-open it
-
-    let mut writer = AuditWriter::open(audit_path.clone(), None)
-        .expect("AuditWriter must open for credential test");
-
-    let nonce = prepare_and_inject(
+    let injected = prepare_and_inject(
         &mgr,
         &shared_store,
         credential_name,
-        bridge_addr,
+        fake_bridge_addr(),
         make_registration_input(),
     )
     .await;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let outcome = mgr
-        .poll_registration(credential_name, &nonce, deadline, Some(&mut writer))
-        .await
-        .expect("poll_registration must succeed");
-
+    let pending = poll_to_pending(&mgr, credential_name, &injected, &mut writer).await;
     assert!(
-        matches!(outcome, AddPasskeyOutcome::Registered { .. }),
-        "expected Registered, got {outcome:?}"
+        passkey_statuses(&audit_path).is_empty(),
+        "the poll writes no row for a recorded registration"
     );
+
+    mgr.confirm_registration(pending, &injected.code, Instant::now(), &mut writer)
+        .expect("the page's code confirms the registration");
+    assert_eq!(mgr.list().unwrap().len(), 1);
     drop(writer);
 
     let entries = verified_audit_entries_from_path(&audit_path);
@@ -498,12 +545,7 @@ async fn audit_entry_emitted_on_timeout() {
     let bridge_addr = fake_bridge_addr();
     let credential_name = "timeout-audit-key";
 
-    let audit_file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
-    let audit_path = audit_file.path().to_path_buf();
-    drop(audit_file);
-
-    let mut writer = AuditWriter::open(audit_path.clone(), None)
-        .expect("AuditWriter must open for timeout audit test");
+    let (mut writer, audit_path) = open_writer(&dir);
 
     // Prepare but do NOT inject; use a past deadline.
     let handle = mgr
@@ -514,7 +556,7 @@ async fn audit_entry_emitted_on_timeout() {
     let deadline = Instant::now();
 
     let outcome = mgr
-        .poll_registration(credential_name, &nonce, deadline, Some(&mut writer))
+        .poll_registration(credential_name, &nonce, deadline, &mut writer)
         .await
         .expect("poll_registration must not return Err on timeout");
 
@@ -538,4 +580,193 @@ async fn audit_entry_emitted_on_timeout() {
     };
     assert_eq!(status, "timeout", "status must be timeout");
     assert_eq!(emitted_name, credential_name);
+}
+
+// 11. Unconfirmed registrations ──────────────────────────────────────────────
+
+/// A code for another credential is refused, the refusal is logged with the
+/// credential ID, and nothing reaches the registry.
+#[tokio::test]
+async fn a_wrong_code_registers_nothing() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, shared_store) = make_manager(&dir);
+    let (mut writer, audit_path) = open_writer(&dir);
+    let credential_name = "wrong-code-key";
+
+    let injected = prepare_and_inject(
+        &mgr,
+        &shared_store,
+        credential_name,
+        fake_bridge_addr(),
+        make_registration_input(),
+    )
+    .await;
+    let pending = poll_to_pending(&mgr, credential_name, &injected, &mut writer).await;
+    let mut wrong = injected.code.clone();
+    let last = if wrong.ends_with('0') { "1" } else { "0" };
+    wrong.replace_range(wrong.len() - 1.., last);
+
+    let err = mgr
+        .confirm_registration(pending, &wrong, Instant::now(), &mut writer)
+        .expect_err("a code for another credential must refuse");
+    assert!(
+        matches!(err, CredentialsError::RegistrationConfirmationMismatch),
+        "expected RegistrationConfirmationMismatch, got {err:?}"
+    );
+    assert!(mgr.list().unwrap().is_empty(), "nothing is registered");
+    drop(writer);
+
+    let entries = verified_audit_entries_from_path(&audit_path);
+    let [entry] = entries.as_slice() else {
+        panic!("expected exactly one audit entry: {entries:?}")
+    };
+    let EventKind::PasskeyRegistered {
+        credential_id_redacted,
+        status,
+        ..
+    } = &entry.event_kind
+    else {
+        panic!("expected PasskeyRegistered entry: {entry:?}")
+    };
+    assert_eq!(status, "confirmation_mismatch");
+    assert_ne!(credential_id_redacted, "<no-c...-id>");
+}
+
+/// The right code at or after the deadline is refused and nothing reaches
+/// the registry.
+#[tokio::test]
+async fn an_expired_confirmation_registers_nothing() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, shared_store) = make_manager(&dir);
+    let (mut writer, audit_path) = open_writer(&dir);
+    let credential_name = "late-key";
+
+    let injected = prepare_and_inject(
+        &mgr,
+        &shared_store,
+        credential_name,
+        fake_bridge_addr(),
+        make_registration_input(),
+    )
+    .await;
+    let pending = poll_to_pending(&mgr, credential_name, &injected, &mut writer).await;
+    let late = pending.deadline() + Duration::from_secs(1);
+
+    let err = mgr
+        .confirm_registration(pending, &injected.code, late, &mut writer)
+        .expect_err("a code typed after the deadline must refuse");
+    assert!(
+        matches!(err, CredentialsError::RegistrationConfirmationExpired),
+        "expected RegistrationConfirmationExpired, got {err:?}"
+    );
+    assert!(mgr.list().unwrap().is_empty(), "nothing is registered");
+    drop(writer);
+    assert_eq!(passkey_statuses(&audit_path), ["confirmation_expired"]);
+}
+
+#[tokio::test]
+async fn a_confirmation_at_the_deadline_registers_nothing() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, shared_store) = make_manager(&dir);
+    let (mut writer, audit_path) = open_writer(&dir);
+    let credential_name = "late-key";
+
+    let injected = prepare_and_inject(
+        &mgr,
+        &shared_store,
+        credential_name,
+        fake_bridge_addr(),
+        make_registration_input(),
+    )
+    .await;
+    let pending = poll_to_pending(&mgr, credential_name, &injected, &mut writer).await;
+    let late = pending.deadline();
+
+    let err = mgr
+        .confirm_registration(pending, &injected.code, late, &mut writer)
+        .expect_err("a code typed at the deadline must refuse");
+    assert!(
+        matches!(err, CredentialsError::RegistrationConfirmationExpired),
+        "expected RegistrationConfirmationExpired, got {err:?}"
+    );
+    assert!(mgr.list().unwrap().is_empty(), "nothing is registered");
+    drop(writer);
+    assert_eq!(passkey_statuses(&audit_path), ["confirmation_expired"]);
+}
+
+/// The `registered` row precedes the registry write: when the writer refuses
+/// it, the credential is not registered. The writer is anchored, and the log
+/// is renamed away under it, which its next append refuses.
+#[tokio::test]
+async fn a_failed_registered_row_registers_nothing() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, shared_store) = make_manager(&dir);
+    let audit_path = dir.path().join("audit.jsonl");
+    let anchor = Arc::new(InMemoryTipAnchorStore::new());
+    let mut writer = AuditWriter::open_with_tip_anchor(
+        audit_path.clone(),
+        None,
+        Arc::clone(&anchor) as Arc<dyn TipAnchorStore>,
+        BindingHistory::NotRecorded,
+    )
+    .expect("anchored AuditWriter must open in tempdir");
+    let credential_name = "unlogged-key";
+
+    let injected = prepare_and_inject(
+        &mgr,
+        &shared_store,
+        credential_name,
+        fake_bridge_addr(),
+        make_registration_input(),
+    )
+    .await;
+    let pending = poll_to_pending(&mgr, credential_name, &injected, &mut writer).await;
+    let moved = dir.path().join("moved.jsonl");
+    std::fs::rename(&audit_path, &moved).unwrap();
+
+    let err = mgr
+        .confirm_registration(pending, &injected.code, Instant::now(), &mut writer)
+        .expect_err("a registration whose row cannot be written must refuse");
+    assert!(
+        matches!(err, CredentialsError::AuditWrite { .. }),
+        "expected AuditWrite, got {err:?}"
+    );
+    assert!(
+        mgr.list().unwrap().is_empty(),
+        "nothing is registered without its row"
+    );
+    assert!(
+        !mgr.registry_path().exists(),
+        "the registry file is not written"
+    );
+}
+
+/// A registration that ends at the prompt without a code logs why, and
+/// nothing reaches the registry.
+#[tokio::test]
+async fn an_abandoned_registration_records_why() {
+    for (end, status) in [
+        (UnconfirmedEnd::Expired, "confirmation_expired"),
+        (UnconfirmedEnd::Canceled, "confirmation_canceled"),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let (mgr, shared_store) = make_manager(&dir);
+        let (mut writer, audit_path) = open_writer(&dir);
+        let credential_name = "abandoned-key";
+
+        let injected = prepare_and_inject(
+            &mgr,
+            &shared_store,
+            credential_name,
+            fake_bridge_addr(),
+            make_registration_input(),
+        )
+        .await;
+        let pending = poll_to_pending(&mgr, credential_name, &injected, &mut writer).await;
+        mgr.abandon_registration(pending, end, &mut writer);
+
+        assert!(mgr.list().unwrap().is_empty(), "nothing is registered");
+        drop(writer);
+        assert_eq!(passkey_statuses(&audit_path), [status], "{end:?}");
+    }
 }

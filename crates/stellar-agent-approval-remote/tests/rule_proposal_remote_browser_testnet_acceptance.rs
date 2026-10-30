@@ -589,6 +589,30 @@ async fn poll_enroll_output(page: &chromiumoxide::Page, deadline: Instant) -> (S
     }
 }
 
+/// Reads the confirmation code the bridge registration page shows once the
+/// bridge accepted the browser's response.
+async fn poll_confirmation_code(page: &chromiumoxide::Page, deadline: Instant) -> String {
+    loop {
+        let code: String = page
+            .evaluate(evaluate_by_value(
+                "(function(){var el = document.getElementById('confirmation-code'); \
+                 return el && !el.hidden ? el.textContent : '';})()",
+            ))
+            .await
+            .expect("evaluate must not error")
+            .into_value()
+            .expect("evaluate result must deserialise as String");
+        if !code.is_empty() {
+            return code;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the registration page did not show a confirmation code within the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 async fn poll_attestation_textarea(page: &chromiumoxide::Page, deadline: Instant) -> String {
     loop {
         let value: String = page
@@ -725,14 +749,18 @@ async fn register_cosigner_credential_via_bridge(
             credential_name,
             &reg_handle.nonce,
             reg_deadline,
-            Some(&mut reg_audit),
+            &mut reg_audit,
         )
         .await
         .expect("poll_registration must not error");
-    let metadata = match reg_outcome {
-        AddPasskeyOutcome::Registered { metadata } => metadata,
-        other => panic!("co-signer registration: expected Registered; got {other:?}"),
+    let pending = match reg_outcome {
+        AddPasskeyOutcome::AwaitingConfirmation { pending } => pending,
+        other => panic!("co-signer registration: expected AwaitingConfirmation; got {other:?}"),
     };
+    let code = poll_confirmation_code(page, Instant::now() + Duration::from_secs(10)).await;
+    let metadata = creds_manager
+        .confirm_registration(pending, &code, Instant::now(), &mut reg_audit)
+        .expect("co-signer registration: the code the page shows must confirm it");
     assert_eq!(metadata.rp_id, TEST_RP_ID);
     assert!(!metadata.credential_id_b64url.is_empty());
     assert!(!metadata.public_key_sec1_b64.is_empty());

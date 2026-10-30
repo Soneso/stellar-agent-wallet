@@ -14,14 +14,20 @@
 //! 2. Report the registration URL back to the caller so the CLI can launch the
 //!    browser (or print the URL for manual use).
 //! 3. The CLI polls the approval store via [`CredentialsManager::poll_registration`]
-//!    at 500 ms intervals until the bridge POST handler calls
-//!    `record_passkey_registration` and embeds a `RegistrationInput`, or until
-//!    the deadline expires.
-//! 4. On success, write a `CredentialMetadata` record to the passkeys registry
-//!    TOML file at `<passkeys_dir>/<profile>.toml` (atomic write).
-//! 5. Emit a `PasskeyRegistered` audit-log entry via the optional
-//!    `AuditWriter` (sourced from the `SignersManager`'s shared writer —
-//!    shared `AuditWriter` from `SignersManager`).
+//!    at 500 ms intervals until the bridge POST handler verifies the
+//!    browser's response against the entry's registration challenge and
+//!    calls `record_passkey_registration`, or until the deadline expires. A
+//!    recorded registration comes back as a [`PendingPasskeyRegistration`];
+//!    nothing is written yet.
+//! 4. The CLI asks the operator for the confirmation code the registration
+//!    page shows. [`CredentialsManager::confirm_registration`] compares it
+//!    with the code of the recorded credential; only a match before the
+//!    deadline goes on.
+//! 5. A `PasskeyRegistered` row with status `registered` is written to the
+//!    profile's audit log, and only then is the `CredentialMetadata` record
+//!    written to the passkeys registry TOML file at
+//!    `<passkeys_dir>/<profile>.toml` (atomic write). A registration whose
+//!    row cannot be written is not registered.
 //!
 //! ## Registry storage
 //!
@@ -63,8 +69,11 @@ use stellar_agent_core::approval::store::{
     ApprovalKind, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore, generate_csrf_token,
 };
 use stellar_agent_core::approval::user_id::process_uid_for_attestation;
+use stellar_agent_core::approval::webauthn_registration::{
+    ConfirmationCode, PASSKEY_REGISTRATION_CODE_DOMAIN, PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN,
+};
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::writer::AuditWriter;
+use stellar_agent_core::audit_log::writer::{AuditWriter, WriterError};
 use stellar_agent_core::observability::{RedactedStrkey, is_loopback_http_url};
 use stellar_agent_core::profile::schema::default_passkeys_dir;
 use stellar_agent_core::redact_first5_last5;
@@ -210,9 +219,13 @@ impl std::fmt::Debug for RegistrationHandle {
 ///
 /// # Variant triggers
 ///
-/// - [`AddPasskeyOutcome::Registered`] — the bridge POST handler called
-///   `record_passkey_registration` and the polling loop observed the completed
-///   `RegistrationInput` in the shared approval store.
+/// - [`AddPasskeyOutcome::AwaitingConfirmation`]: the bridge POST handler
+///   verified the browser's response against the entry's registration
+///   challenge and called `record_passkey_registration`, and the polling loop
+///   observed the recorded `RegistrationInput` in the shared approval store.
+///   Nothing is registered yet: the registration waits for
+///   [`CredentialsManager::confirm_registration`] with the code the
+///   registration page shows.
 /// - [`AddPasskeyOutcome::Timeout`] — the polling deadline elapsed before
 ///   a `RegistrationInput` appeared.
 /// - [`AddPasskeyOutcome::UserCanceled`] — the approval store entry exists
@@ -235,11 +248,13 @@ impl std::fmt::Debug for RegistrationHandle {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum AddPasskeyOutcome {
-    /// Registration completed successfully; the credential is stored in the
-    /// passkeys registry.
-    Registered {
-        /// The stored credential metadata.
-        metadata: CredentialMetadata,
+    /// The bridge recorded a verified registration response; the credential
+    /// awaits the operator's confirmation code and is not in the registry.
+    AwaitingConfirmation {
+        /// The recorded registration, for
+        /// [`CredentialsManager::confirm_registration`] or
+        /// [`CredentialsManager::abandon_registration`].
+        pending: PendingPasskeyRegistration,
     },
     /// The polling deadline elapsed before the registration ceremony completed.
     Timeout,
@@ -253,6 +268,64 @@ pub enum AddPasskeyOutcome {
     /// cancellation — the bridge did not reject the ceremony; the entry simply
     /// does not exist.
     EntryMissing,
+}
+
+/// A registration the bridge verified and recorded, awaiting the operator's
+/// confirmation code.
+///
+/// Holds the credential name, the recorded credential ID and key, the
+/// authenticator's transports, the relying-party ID, the code the
+/// registration page computes for that credential, and the deadline the
+/// polling ran under. It cannot be cloned or serialized, and `Debug` shows
+/// only the credential name, so the expected code never leaves it.
+#[must_use]
+pub struct PendingPasskeyRegistration {
+    credential_name: String,
+    credential_id: Vec<u8>,
+    public_key_sec1: [u8; PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN],
+    transports: Vec<String>,
+    rp_id: String,
+    expected_code: ConfirmationCode,
+    deadline: Instant,
+}
+
+impl PendingPasskeyRegistration {
+    /// The name the operator chose for the credential.
+    #[must_use]
+    pub fn credential_name(&self) -> &str {
+        &self.credential_name
+    }
+
+    /// The deadline after which [`CredentialsManager::confirm_registration`]
+    /// refuses.
+    #[must_use]
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// The canonical base64url form of the recorded credential ID.
+    fn credential_id_b64url(&self) -> String {
+        URL_SAFE_NO_PAD.encode(&self.credential_id)
+    }
+}
+
+impl std::fmt::Debug for PendingPasskeyRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingPasskeyRegistration")
+            .field("credential_name", &self.credential_name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a recorded registration ended without a confirmation code.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnconfirmedEnd {
+    /// The deadline passed at the prompt.
+    Expired,
+    /// The prompt ended without a code: end of input, a read error, or an
+    /// interrupt.
+    Canceled,
 }
 
 /// Outcome of [`CredentialsManager::sign_with_passkey_rule`].
@@ -601,6 +674,36 @@ pub enum CredentialsError {
     /// ceremony starts and no `PasskeyAssertion` audit row is written.
     #[error("passkey signing on mainnet is not permitted (sa.credentials.mainnet_write_forbidden)")]
     MainnetWriteForbidden,
+
+    /// The confirmation code typed is not the code the registration page
+    /// shows for the recorded credential.
+    ///
+    /// Returned by [`CredentialsManager::confirm_registration`]; the
+    /// registry is untouched.
+    #[error(
+        "the confirmation code typed is not the one the registration page shows; \
+         nothing was registered"
+    )]
+    RegistrationConfirmationMismatch,
+
+    /// The registration deadline passed before the confirmation code was
+    /// typed.
+    ///
+    /// Returned by [`CredentialsManager::confirm_registration`]; the
+    /// registry is untouched.
+    #[error("the timeout passed before the confirmation code was typed; nothing was registered")]
+    RegistrationConfirmationExpired,
+
+    /// The `registered` audit row could not be written, so the credential
+    /// was not written to the registry.
+    #[error(
+        "the passkey registration audit row could not be written; nothing was registered: \
+         {detail}"
+    )]
+    AuditWrite {
+        /// The audit writer's refusal.
+        detail: String,
+    },
 
     /// Passkey signing was refused because the auth entry's digests are not
     /// the values its own facts produce.
@@ -1295,24 +1398,27 @@ impl CredentialsManager {
     /// The bridge (which holds an `Arc` clone of the same mutex) can write to
     /// the store between poll cycles without contention.
     ///
-    /// On success, writes the credential metadata (including the SEC1 public
-    /// key for assertion verification) to the passkeys registry and
-    /// optionally emits an audit-log entry.
+    /// A recorded registration returns
+    /// [`AddPasskeyOutcome::AwaitingConfirmation`] with the
+    /// [`PendingPasskeyRegistration`] that
+    /// [`CredentialsManager::confirm_registration`] takes; polling writes
+    /// neither the registry nor an audit row for it. A timeout, a missing
+    /// entry and an entry of another kind each write their `PasskeyRegistered`
+    /// row to `audit_writer`, best effort.
     ///
     /// # Errors
     ///
     /// - [`CredentialsError::ApprovalStoreUnavailable`] — the manager was
     ///   constructed without an approval store (e.g. via
     ///   [`CredentialsManager::from_defaults_readonly`]).
-    /// - [`CredentialsError::DuplicateName`] — (internal; should not occur in
-    ///   practice because `prepare_registration` already checked).
-    /// - [`CredentialsError`] variants on registry I/O failure.
+    /// - [`CredentialsError::ApprovalStore`]: the entry holds a recorded
+    ///   registration but no registration challenge.
     pub async fn poll_registration(
         &self,
         credential_name: &str,
         nonce: &str,
         deadline: Instant,
-        mut audit_writer: Option<&mut AuditWriter>,
+        audit_writer: &mut AuditWriter,
     ) -> Result<AddPasskeyOutcome, CredentialsError> {
         // Require approval store — read-only managers cannot poll registrations.
         let _store_check = self
@@ -1323,12 +1429,12 @@ impl CredentialsManager {
         loop {
             // Check deadline before sleeping.
             if Instant::now() >= deadline {
-                self.emit_audit(audit_writer.as_deref_mut(), credential_name, "", "timeout");
+                self.emit_audit_best_effort(audit_writer, credential_name, "", "timeout");
                 return Ok(AddPasskeyOutcome::Timeout);
             }
 
             if let Some(outcome) = self
-                .check_store_for_registration(nonce, credential_name, audit_writer.as_deref_mut())
+                .check_store_for_registration(nonce, credential_name, deadline, audit_writer)
                 .await?
             {
                 return Ok(outcome);
@@ -1339,7 +1445,7 @@ impl CredentialsManager {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let sleep_for = self.poll_interval.min(remaining);
             if sleep_for.is_zero() {
-                self.emit_audit(audit_writer.as_deref_mut(), credential_name, "", "timeout");
+                self.emit_audit_best_effort(audit_writer, credential_name, "", "timeout");
                 return Ok(AddPasskeyOutcome::Timeout);
             }
             tokio::time::sleep(sleep_for).await;
@@ -1352,7 +1458,8 @@ impl CredentialsManager {
     ///
     /// Acquires the tokio mutex, reads the entry for `nonce`, then releases
     /// immediately. Returns `Ok(Some(outcome))` if the nonce is found with a
-    /// completed `RegistrationInput`, `Ok(None)` if still pending, or an
+    /// recorded `RegistrationInput` (staged as a [`PendingPasskeyRegistration`]
+    /// under `deadline`, nothing written), `Ok(None)` if still pending, or an
     /// error on failure.
     ///
     /// Callers MUST only invoke this method after verifying that
@@ -1362,7 +1469,8 @@ impl CredentialsManager {
         &self,
         nonce: &str,
         credential_name: &str,
-        audit_writer: Option<&mut AuditWriter>,
+        deadline: Instant,
+        audit_writer: &mut AuditWriter,
     ) -> Result<Option<AddPasskeyOutcome>, CredentialsError> {
         // Require approval store. This is a private method called only from
         // `poll_registration`, which has already verified `Some(_)` at its
@@ -1385,7 +1493,7 @@ impl CredentialsManager {
             // user-driven cancellation — the entry simply does not exist.
             let nonce_redacted = redact_first5_last5(nonce);
             warn!(nonce = %nonce_redacted, "registration nonce not found in store");
-            self.emit_audit(audit_writer, credential_name, "", "entry_missing");
+            self.emit_audit_best_effort(audit_writer, credential_name, "", "entry_missing");
             return Ok(Some(AddPasskeyOutcome::EntryMissing));
         };
 
@@ -1393,54 +1501,41 @@ impl CredentialsManager {
             ApprovalKind::RegisterPasskey {
                 registration_input: Some(reg_input),
                 rp_id,
+                registration_challenge,
                 ..
             } => {
-                // Registration completed — write to registry and emit audit.
-                let credential_id_bytes = reg_input.credential_id();
-                let credential_id_b64url = URL_SAFE_NO_PAD.encode(credential_id_bytes);
-                let transports = reg_input.transports().join(",");
-                let registered_at_unix_ms = unix_now_ms();
-
-                // Encode the SEC1 public key (65-byte uncompressed P-256 point).
-                // Required for assertion verification. The fixture in tests
-                // supplies an all-zero key (`[0x04, 0, 0, ...]`) which is not a
-                // valid P-256 point but satisfies the 65-byte structural check.
-                let public_key_sec1_b64 =
-                    URL_SAFE_NO_PAD.encode(reg_input.public_key_uncompressed_sec1());
-
-                let metadata = CredentialMetadata {
-                    credential_name: credential_name.to_owned(),
-                    credential_id_b64url: credential_id_b64url.clone(),
-                    rp_id: rp_id.clone(),
-                    transports,
-                    registered_at_unix_ms,
-                    public_key_sec1_b64,
-                };
-
-                // Write to passkeys registry (no mutex held during persist).
-                let mut registry = self.load_registry()?;
-                // Guard against a concurrent duplicate (defensive).
-                if registry
-                    .credentials
-                    .iter()
-                    .any(|c| c.credential_name == credential_name)
-                {
-                    return Err(CredentialsError::DuplicateName {
-                        name: credential_name.to_owned(),
+                // The bridge recorded a verified response. Stage it with the
+                // code the page computes for the recorded credential; the
+                // registry and the audit log are written only once the
+                // operator confirms that code.
+                let Some(challenge) = registration_challenge else {
+                    return Err(CredentialsError::ApprovalStore {
+                        detail: "the registration entry carries no challenge".to_owned(),
                     });
-                }
-                registry.credentials.push(metadata.clone());
-                self.persist_registry(&registry)?;
-
-                // Emit audit entry.
-                self.emit_audit(
-                    audit_writer,
-                    credential_name,
-                    &credential_id_b64url,
-                    "registered",
+                };
+                let public_key_sec1: [u8; PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN] = reg_input
+                    .public_key_uncompressed_sec1()
+                    .try_into()
+                    .map_err(|_| CredentialsError::ApprovalStore {
+                        detail: "the recorded registration key is not 65 bytes".to_owned(),
+                    })?;
+                let expected_code = ConfirmationCode::compute(
+                    PASSKEY_REGISTRATION_CODE_DOMAIN,
+                    challenge,
+                    reg_input.credential_id(),
+                    &public_key_sec1,
                 );
-
-                Ok(Some(AddPasskeyOutcome::Registered { metadata }))
+                Ok(Some(AddPasskeyOutcome::AwaitingConfirmation {
+                    pending: PendingPasskeyRegistration {
+                        credential_name: credential_name.to_owned(),
+                        credential_id: reg_input.credential_id().to_vec(),
+                        public_key_sec1,
+                        transports: reg_input.transports().to_vec(),
+                        rp_id: rp_id.clone(),
+                        expected_code,
+                        deadline,
+                    },
+                }))
             }
             ApprovalKind::RegisterPasskey {
                 registration_input: None,
@@ -1453,32 +1548,156 @@ impl CredentialsManager {
                 // Kind mismatch — unexpected; treat as user-cancelled.
                 let nonce_redacted = redact_first5_last5(nonce);
                 warn!(nonce = %nonce_redacted, "approval store entry has unexpected kind");
-                self.emit_audit(audit_writer, credential_name, "", "user_canceled");
+                self.emit_audit_best_effort(audit_writer, credential_name, "", "user_canceled");
                 Ok(Some(AddPasskeyOutcome::UserCanceled))
             }
         }
     }
 
-    /// Emits a `PasskeyRegistered` audit entry if `audit_writer` is `Some`.
+    /// Registers the credential of `pending` once `typed_code` is the code
+    /// the registration page shows for it, at `now`.
+    ///
+    /// Consumes the pending registration: one code is compared per
+    /// ceremony. In this order:
+    ///
+    /// 1. At or after the deadline, a `confirmation_expired` row is written
+    ///    and the registration refuses.
+    /// 2. A code that is malformed or names another credential writes a
+    ///    `confirmation_mismatch` row carrying the credential ID and refuses.
+    ///    The comparison runs in constant time over the normalized digits.
+    /// 3. A name already in the registry refuses with no row.
+    /// 4. The `registered` row is written; when it cannot be, nothing reaches
+    ///    the registry.
+    /// 5. The credential goes into the registry; when that write fails, a
+    ///    `registry_write_failed` row is written and the error returned.
+    ///
+    /// The rows of steps 1, 2 and 5 are best effort, because none of them
+    /// registers anything; only the `registered` row fails closed.
+    ///
+    /// # Errors
+    ///
+    /// - [`CredentialsError::RegistrationConfirmationExpired`]: step 1.
+    /// - [`CredentialsError::RegistrationConfirmationMismatch`]: step 2.
+    /// - [`CredentialsError::DuplicateName`]: step 3.
+    /// - [`CredentialsError::AuditWrite`]: step 4.
+    /// - [`CredentialsError`] variants on registry I/O failure: step 5, or a
+    ///   registry that cannot be read at step 3.
+    pub fn confirm_registration(
+        &self,
+        pending: PendingPasskeyRegistration,
+        typed_code: &str,
+        now: Instant,
+        audit_writer: &mut AuditWriter,
+    ) -> Result<CredentialMetadata, CredentialsError> {
+        let credential_id_b64url = pending.credential_id_b64url();
+        if now >= pending.deadline {
+            self.emit_audit_best_effort(
+                audit_writer,
+                &pending.credential_name,
+                &credential_id_b64url,
+                "confirmation_expired",
+            );
+            return Err(CredentialsError::RegistrationConfirmationExpired);
+        }
+        if !pending.expected_code.matches(typed_code) {
+            self.emit_audit_best_effort(
+                audit_writer,
+                &pending.credential_name,
+                &credential_id_b64url,
+                "confirmation_mismatch",
+            );
+            return Err(CredentialsError::RegistrationConfirmationMismatch);
+        }
+
+        let mut registry = self.load_registry()?;
+        if registry
+            .credentials
+            .iter()
+            .any(|c| c.credential_name == pending.credential_name)
+        {
+            return Err(CredentialsError::DuplicateName {
+                name: pending.credential_name,
+            });
+        }
+
+        let metadata = CredentialMetadata {
+            credential_name: pending.credential_name,
+            credential_id_b64url,
+            rp_id: pending.rp_id,
+            transports: pending.transports.join(","),
+            registered_at_unix_ms: unix_now_ms(),
+            public_key_sec1_b64: URL_SAFE_NO_PAD.encode(pending.public_key_sec1),
+        };
+
+        // The row precedes the registry write, so no credential is ever
+        // registered without its trail.
+        self.emit_audit(
+            audit_writer,
+            &metadata.credential_name,
+            &metadata.credential_id_b64url,
+            "registered",
+        )
+        .map_err(|e| CredentialsError::AuditWrite {
+            detail: e.to_string(),
+        })?;
+
+        registry.credentials.push(metadata.clone());
+        if let Err(e) = self.persist_registry(&registry) {
+            self.emit_audit_best_effort(
+                audit_writer,
+                &metadata.credential_name,
+                &metadata.credential_id_b64url,
+                "registry_write_failed",
+            );
+            return Err(e);
+        }
+        Ok(metadata)
+    }
+
+    /// Records why `pending` ended without a confirmation code:
+    /// `confirmation_expired` for [`UnconfirmedEnd::Expired`],
+    /// `confirmation_canceled` for [`UnconfirmedEnd::Canceled`]. Nothing
+    /// reaches the registry, and the row is best effort.
+    pub fn abandon_registration(
+        &self,
+        pending: PendingPasskeyRegistration,
+        end: UnconfirmedEnd,
+        audit_writer: &mut AuditWriter,
+    ) {
+        let status = match end {
+            UnconfirmedEnd::Expired => "confirmation_expired",
+            UnconfirmedEnd::Canceled => "confirmation_canceled",
+        };
+        let PendingPasskeyRegistration {
+            credential_name,
+            credential_id,
+            ..
+        } = pending;
+        self.emit_audit_best_effort(
+            audit_writer,
+            &credential_name,
+            &URL_SAFE_NO_PAD.encode(credential_id),
+            status,
+        );
+    }
+
+    /// Writes a `PasskeyRegistered` audit entry with `status`.
     ///
     /// `credential_id_b64url` must be provided so the
     /// `AuditEntry` constructor can apply first-5-last-5 redaction internally.
     /// Pass `""` for non-success outcomes where no credential ID is available;
     /// the constructor substitutes a fixed placeholder in that case.
     ///
-    /// Audit-log failures are non-fatal — a warn is emitted
-    /// and the caller continues normally.
+    /// # Errors
+    ///
+    /// The [`WriterError`] of the append.
     fn emit_audit(
         &self,
-        audit_writer: Option<&mut AuditWriter>,
+        audit_writer: &mut AuditWriter,
         credential_name: &str,
         credential_id_b64url: &str,
         status: &str,
-    ) {
-        let Some(writer) = audit_writer else {
-            return;
-        };
-
+    ) -> Result<(), WriterError> {
         // Generate a short request_id (8 random bytes, base64url-encoded).
         let mut raw = [0u8; 8];
         OsRng.fill_bytes(&mut raw);
@@ -1506,11 +1725,24 @@ impl CredentialsManager {
             request_id,
         );
 
-        if let Err(e) = writer.write_entry(entry) {
-            // Audit-log failures are non-fatal but must be warned.
+        audit_writer.write_entry(entry)
+    }
+
+    /// [`Self::emit_audit`] for a row that registers nothing: a failed write
+    /// is warned about and the caller continues.
+    fn emit_audit_best_effort(
+        &self,
+        audit_writer: &mut AuditWriter,
+        credential_name: &str,
+        credential_id_b64url: &str,
+        status: &str,
+    ) {
+        if let Err(e) = self.emit_audit(audit_writer, credential_name, credential_id_b64url, status)
+        {
             warn!(
                 error = %e,
                 credential_name = %credential_name,
+                status = %status,
                 "failed to write passkey_registered audit entry"
             );
         }
@@ -4535,8 +4767,9 @@ registered_at_unix_ms = 1700000000000
 
         // Deadline in the future so the deadline check doesn't fire first.
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut writer = AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap();
         let outcome = mgr
-            .poll_registration("some-name", &nonce, deadline, None)
+            .poll_registration("some-name", &nonce, deadline, &mut writer)
             .await
             .expect("poll_registration must not return Err on kind mismatch");
 
@@ -4555,8 +4788,14 @@ registered_at_unix_ms = 1700000000000
 
         // Deadline in the future; nonce is never inserted.
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut writer = AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap();
         let outcome = mgr
-            .poll_registration("some-name", "nonce-that-was-never-inserted", deadline, None)
+            .poll_registration(
+                "some-name",
+                "nonce-that-was-never-inserted",
+                deadline,
+                &mut writer,
+            )
             .await
             .expect("poll_registration must not return Err on missing nonce");
 
@@ -4573,26 +4812,16 @@ registered_at_unix_ms = 1700000000000
         let dir = TempDir::new().unwrap();
         let mgr = test_manager_readonly(&dir);
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut writer = AuditWriter::open(dir.path().join("audit.jsonl"), None).unwrap();
 
         let err = mgr
-            .poll_registration("some-name", "any-nonce", deadline, None)
+            .poll_registration("some-name", "any-nonce", deadline, &mut writer)
             .await
             .unwrap_err();
         assert!(
             matches!(err, CredentialsError::ApprovalStoreUnavailable),
             "readonly manager must return ApprovalStoreUnavailable; got {err:?}"
         );
-    }
-
-    // ── emit_audit: non-fatal when audit_writer is None ───────────────────────
-
-    #[test]
-    fn emit_audit_with_none_writer_is_noop() {
-        let dir = TempDir::new().unwrap();
-        let mgr = test_manager(&dir);
-        // Should not panic; no audit file should be created.
-        mgr.emit_audit(None, "my-key", "some-cred-id", "registered");
-        // No audit file to check — just verify no panic.
     }
 
     // ── emit_audit: writes entry with correct credential_id sentinel ──────────
@@ -4606,7 +4835,8 @@ registered_at_unix_ms = 1700000000000
             AuditWriter::open(audit_path.clone(), None).expect("AuditWriter must open");
 
         // Empty credential_id → uses "<no-credential-id>" sentinel.
-        mgr.emit_audit(Some(&mut writer), "my-key", "", "timeout");
+        mgr.emit_audit(&mut writer, "my-key", "", "timeout")
+            .unwrap();
         drop(writer);
 
         let content = std::fs::read_to_string(&audit_path).unwrap();
@@ -4634,7 +4864,8 @@ registered_at_unix_ms = 1700000000000
 
         // 32-byte zero credential produces a 43-char base64url string.
         let cred_id_b64 = URL_SAFE_NO_PAD.encode([0u8; 32]);
-        mgr.emit_audit(Some(&mut writer), "my-key", &cred_id_b64, "registered");
+        mgr.emit_audit(&mut writer, "my-key", &cred_id_b64, "registered")
+            .unwrap();
         drop(writer);
 
         let content = std::fs::read_to_string(&audit_path).unwrap();

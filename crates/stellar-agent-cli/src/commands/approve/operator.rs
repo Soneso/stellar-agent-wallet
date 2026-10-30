@@ -79,7 +79,7 @@ use crate::common::private_open;
 use crate::common::profile_access::load_profile_reconciled;
 use crate::common::render::{escape_for_terminal, render_json};
 use crate::common::served_pages::page_identity_for;
-use crate::common::tty::stdin_and_stderr_are_terminals;
+use crate::common::tty::{read_line_from_terminal, stdin_and_stderr_are_terminals};
 use crate::common::{display_available, interrupted};
 use crate::common::{resolve_profile_name, validate_path_component_ascii_safe};
 
@@ -454,7 +454,7 @@ async fn run_enroll_interactive(resolved: ResolvedProfileName, args: EnrollArgs)
         private_open::browser_opener,
         Duration::from_secs(args.timeout_seconds),
         tokio::signal::ctrl_c(),
-        read_code_from_terminal,
+        || read_line_from_terminal("operator-enroll-code"),
     )
     .await;
     report_enrollment_end(end, &store)
@@ -584,31 +584,6 @@ where
             | OperatorEnrollmentConfirmationError::CredentialInvalid,
         ) => EnrollmentEnd::Mismatch,
         Err(OperatorEnrollmentConfirmationError::Expired) => EnrollmentEnd::Expired,
-    }
-}
-
-/// Reads one line from the process's stdin on a detached thread.
-///
-/// A blocking read cannot be cancelled, so the thread is not joined: when
-/// the caller stops waiting, the line it may read later goes nowhere.
-pub(super) fn read_code_from_terminal() -> impl Future<Output = io::Result<Option<String>>> {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    let spawned = std::thread::Builder::new()
-        .name("operator-enroll-code".to_owned())
-        .spawn(move || {
-            let mut line = String::new();
-            let result = match io::stdin().read_line(&mut line) {
-                Ok(0) => Ok(None),
-                Ok(_) => Ok(Some(line)),
-                Err(error) => Err(error),
-            };
-            let _ = sender.send(result);
-        });
-    async move {
-        spawned?;
-        receiver
-            .await
-            .map_err(|_| io::Error::other("the terminal reader stopped"))?
     }
 }
 

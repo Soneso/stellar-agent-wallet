@@ -147,11 +147,7 @@ pub const MAINNET_APPROVAL_CREDENTIALS_MIN: usize = 1;
 /// The most approval credentials a mainnet policy lists.
 pub const MAINNET_APPROVAL_CREDENTIALS_MAX: usize = 16;
 
-/// The shortest credential ID, in decoded bytes.
-pub const CREDENTIAL_ID_MIN_BYTES: usize = 16;
-
-/// The longest credential ID, in decoded bytes.
-pub const CREDENTIAL_ID_MAX_BYTES: usize = 64;
+pub use super::registration_input::{CREDENTIAL_ID_MAX_BYTES, CREDENTIAL_ID_MIN_BYTES};
 
 /// The only authenticator-data length a mainnet consent accepts: the RP-ID
 /// hash, the flags byte and the counter, with no attested credential data and
@@ -176,7 +172,7 @@ const RECEIPT_ORIGIN_MAX_BYTES: usize = "http://localhost:65535".len();
 const RECEIPT_SIGNATURE_BYTES: usize = 64;
 
 /// The SEC1 uncompressed P-256 point length.
-const SEC1_UNCOMPRESSED_BYTES: usize = 65;
+const SEC1_UNCOMPRESSED_BYTES: usize = super::registration_input::PUBLIC_KEY_UNCOMPRESSED_SEC1_LEN;
 
 /// The version of the receipt layout this build writes and reads.
 pub const MAINNET_PRESENCE_RECEIPT_VERSION: u32 = 1;
@@ -428,12 +424,8 @@ impl MainnetApprovalCredential {
         if !(CREDENTIAL_ID_MIN_BYTES..=CREDENTIAL_ID_MAX_BYTES).contains(&credential_id.len()) {
             return Err(ApprovalCredentialError::CredentialId);
         }
-        let key: [u8; 65] = public_key_sec1
-            .try_into()
-            .map_err(|_| ApprovalCredentialError::PublicKey)?;
-        if key[0] != 0x04 || p256::PublicKey::from_sec1_bytes(&key).is_err() {
-            return Err(ApprovalCredentialError::PublicKey);
-        }
+        let key = super::webauthn_registration::uncompressed_p256_point(public_key_sec1)
+            .ok_or(ApprovalCredentialError::PublicKey)?;
         Ok(Self {
             credential_id: credential_id.to_vec(),
             public_key_sec1: key,
@@ -659,13 +651,6 @@ pub(crate) fn mainnet_presence_challenge(facts: &ChallengeFacts<'_>) -> Option<[
 // Assertion checks
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Detects a member's presence, `null` included.
-fn present<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<serde_json::Value>, D::Error> {
-    serde_json::Value::deserialize(deserializer).map(Some)
-}
-
 /// The security members of `clientDataJSON`. A duplicate of any of them
 /// refuses; other members are ignored.
 #[derive(Deserialize)]
@@ -673,11 +658,8 @@ struct ClientDataSecurity {
     #[serde(rename = "type")]
     type_field: String,
     challenge: String,
-    origin: String,
-    #[serde(rename = "crossOrigin", default, deserialize_with = "present")]
-    cross_origin: Option<serde_json::Value>,
-    #[serde(rename = "topOrigin", default, deserialize_with = "present")]
-    top_origin: Option<serde_json::Value>,
+    #[serde(flatten)]
+    security: super::webauthn::ClientDataOrigin,
 }
 
 /// What a verified assertion's authenticator data says.
@@ -726,16 +708,9 @@ pub(crate) fn check_assertion(
     }
     let client: ClientDataSecurity =
         serde_json::from_slice(&assertion.client_data_json).map_err(|_| presence_invalid())?;
-    let cross_origin_ok = match &client.cross_origin {
-        None => true,
-        Some(serde_json::Value::Bool(cross)) => !cross,
-        Some(_) => false,
-    };
     if client.type_field != "webauthn.get"
         || client.challenge != URL_SAFE_NO_PAD.encode(challenge)
-        || client.origin != expected_origin
-        || !cross_origin_ok
-        || client.top_origin.is_some()
+        || !client.security.matches(expected_origin)
     {
         return Err(presence_invalid());
     }

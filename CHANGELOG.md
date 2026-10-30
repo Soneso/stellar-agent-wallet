@@ -15,6 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CredentialsError::VerifierStatusRefused` identifies passkey status refusals.
 - `SignersManager::check_signing_rules` produces `CheckedSigningRules`, a consumed
   proof required by public smart-account signing APIs, including quorum signing.
+- `stellar_agent_core::approval::webauthn_registration` verifies WebAuthn
+  registration responses for a caller's challenge, origin and relying-party
+  ID: `verify_registration_response`, `RegistrationResponse`,
+  `RegistrationExpectation`, `VerifiedRegistration`,
+  `RegistrationVerifyError`, `ConfirmationCode`,
+  `PASSKEY_REGISTRATION_CODE_DOMAIN`, `decode_b64url_capped`, and the size
+  and credential bounds it applies.
+- `CredentialsManager::confirm_registration` and `abandon_registration`,
+  `PendingPasskeyRegistration` and `UnconfirmedEnd` complete a passkey
+  registration from its confirmation code. `CredentialsError` gains
+  `RegistrationConfirmationMismatch`, `RegistrationConfirmationExpired` and
+  `AuditWrite`, with the wire codes
+  `credentials.registration_confirmation_mismatch`,
+  `credentials.registration_confirmation_expired` and
+  `credentials.audit_write_failed`. `credentials add-passkey` adds
+  `credentials.registration_tty_required` and
+  `credentials.registration_confirmation_canceled`.
 
 - `audit acknowledge-outbox-loss --profile <NAME> --reason <TEXT>` records
   queued consent loss and revokes the profile's decided approvals and toolset
@@ -237,6 +254,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sa.verifier_wasm_retired`, `sa.contract_instance_unsupported`,
   `network.rpc_divergence` or `sa.deployment_failed`, and the pin record stays
   absent.
+- Breaking (`stellar-agent-smart-account` API): `AddPasskeyOutcome::Registered`
+  is replaced by `AwaitingConfirmation`, and `poll_registration` takes
+  `&mut AuditWriter`. Polling registers nothing; the registration completes
+  through `confirm_registration`.
+- Breaking (`stellar-agent-core` API): `ApprovalKind::RegisterPasskey`
+  carries `registration_challenge`, and `record_passkey_registration` refuses
+  an entry without one.
 
 - Breaking (`stellar-agent-network` API): every ed25519 method of `Signer`
   takes a typed payload from `signing::payload`, and `Signer::sign_message` is
@@ -890,6 +914,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are unsizable under per-call value criteria unless `allow_opaque_signing` applies.
   Bundle caps keep their generic-call refusal. `minimum_reserve` requires an
   account view and fails closed in bundle evaluation.
+- Passkey registration through the WebAuthn bridge validates the challenge
+  the bridge issued, the page's exact origin, and the relying-party ID hash.
+  It checks user presence and verification, and matches the posted credential
+  ID and key against the authenticator's response. `credentials add-passkey`
+  registers the passkey only after the operator types the confirmation code
+  the registration page shows. It requires terminals on stdin and stderr.
+  It refuses before the ceremony when the profile's keyed audit writer is
+  unavailable. The `passkey_registered` row precedes the registry write.
 
 - The keyring, software, and hardware signers refuse a mainnet payload bound to another signer key; the mainnet Soroban signing call rechecks freshness.
 

@@ -1036,9 +1036,11 @@ pub enum EventKind {
 
     /// Passkey registration event.
     ///
-    /// Emitted by `CredentialsManager::add_passkey` when a WebAuthn registration
-    /// ceremony completes (status `registered`) or is attempted but fails
-    /// (status `timeout`, `user_canceled`, `entry_missing`).
+    /// Emitted by the `CredentialsManager` registration steps: when the
+    /// operator confirms a verified WebAuthn registration (status
+    /// `registered`), and when a registration is attempted but ends without
+    /// one (every other status). The `registered` row precedes the registry
+    /// write: when it cannot be written, nothing is registered.
     ///
     /// # Redaction
     ///
@@ -1072,13 +1074,24 @@ pub enum EventKind {
         rp_id: String,
 
         /// Registration outcome. One of `"registered"`, `"timeout"`,
-        /// `"user_canceled"`, or `"entry_missing"`.
+        /// `"user_canceled"`, `"entry_missing"`, `"confirmation_mismatch"`,
+        /// `"confirmation_expired"`, `"confirmation_canceled"`, or
+        /// `"registry_write_failed"`.
         ///
-        /// - `"registered"` — ceremony completed; credential stored in registry.
+        /// - `"registered"`: the operator typed the code the registration
+        ///   page shows; written before the credential goes into the registry.
         /// - `"timeout"` — polling deadline elapsed before completion.
         /// - `"user_canceled"` — store entry has unexpected kind (bridge-side abort).
         /// - `"entry_missing"` — nonce not found in store (TTL-expired or never
         ///   persisted); distinct from a user-driven cancellation.
+        /// - `"confirmation_mismatch"`: the typed code is not the page's code
+        ///   for the recorded credential; nothing was registered.
+        /// - `"confirmation_expired"`: the deadline passed before a code was
+        ///   typed or confirmed; nothing was registered.
+        /// - `"confirmation_canceled"`: the prompt ended without a code;
+        ///   nothing was registered.
+        /// - `"registry_write_failed"`: the `registered` row was written but
+        ///   the registry write failed; the credential is not in the registry.
         status: String,
     },
 

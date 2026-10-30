@@ -1,20 +1,34 @@
 //! `stellar-agent credentials add-passkey <name>` — register a WebAuthn passkey.
 //!
 //! Registration path:
-//! 1. First-registration RP-ID binding prompt (if no prior passkeys).
-//! 2. Open `PendingApprovalStore` exactly once; wrap in `Arc<Mutex<>>`.
-//! 3. Construct `CredentialsManager::new` with the shared store Arc.
-//! 4. Start the WebAuthn bridge with the same shared store Arc.
-//! 5. Insert `PendingApproval { kind: RegisterPasskey }` via `CredentialsManager`.
-//! 6. Print the registration URL to stderr and open the browser through a
+//! 1. Validate the profile name and load the reconciled profile; every load
+//!    error refuses.
+//! 2. Require a terminal on stdin and stderr, where the operator types the
+//!    confirmation code; without one the command refuses
+//!    (`credentials.registration_tty_required`).
+//! 3. Acquire the profile's keyed audit writer; without it the command
+//!    refuses with the `audit.*` codes before any ceremony starts.
+//! 4. Open `PendingApprovalStore` exactly once; wrap in `Arc<Mutex<>>`.
+//! 5. Construct `CredentialsManager::new` with the shared store Arc.
+//! 6. First-registration RP-ID binding prompt (if no prior passkeys).
+//! 7. Start the WebAuthn bridge with the same shared store Arc.
+//! 8. Insert `PendingApproval { kind: RegisterPasskey }`, which carries a
+//!    fresh registration challenge, via `CredentialsManager`.
+//! 9. Print the registration URL to stderr and open the browser through a
 //!    private redirect file, so the launcher never receives the URL itself.
 //!    A failed launch is reported and polling continues.
-//! 7. Poll the shared store until the ceremony completes, the deadline
-//!    expires, or the operator presses Ctrl-C.
-//! 8. Shut down the bridge, then remove the redirect file.
-//! 9. Write the credential metadata to the passkeys registry.
-//! 10. Print the JSON result envelope; an interrupt ends with
-//!     `credentials.registration_user_canceled` and exit code `1`.
+//! 10. Poll the shared store until the bridge records a response it verified
+//!     against the entry's challenge, the deadline expires, or the operator
+//!     presses Ctrl-C.
+//! 11. Shut down the bridge, then remove the redirect file.
+//! 12. Ask at the terminal for the confirmation code the registration page
+//!     shows, until the same deadline or Ctrl-C.
+//! 13. A matching code writes the `registered` audit row and then the
+//!     credential metadata to the passkeys registry; any other end registers
+//!     nothing.
+//! 14. Print the JSON result envelope; an interrupt during the ceremony ends
+//!     with `credentials.registration_user_canceled`, a wrong code with
+//!     `credentials.registration_confirmation_mismatch`, and exit code `1`.
 //!
 //! # Shared store design
 //!
@@ -45,7 +59,7 @@
 use std::{
     io::{self, BufRead as _, Write as _},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex as StdMutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -54,26 +68,24 @@ use serde::Serialize;
 use stellar_agent_core::approval::retry::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, open_with_retry,
 };
-use stellar_agent_core::audit_log::writer::{AuditWriter, AuditWriterRegistry};
+use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::envelope::Envelope;
-use stellar_agent_core::profile::ResolvedProfileName;
 use stellar_agent_core::redact_first5_last5;
 use stellar_agent_smart_account::managers::credentials::{
-    AddPasskeyOutcome, CredentialsError, CredentialsManager,
+    AddPasskeyOutcome, CredentialsError, CredentialsManager, PendingPasskeyRegistration,
+    UnconfirmedEnd,
 };
 use stellar_agent_webauthn_bridge::{BridgeHandle, start_bridge_register_only};
 use tokio::sync::Mutex;
-use tracing::warn;
 
 use crate::commands::credentials::credentials_error_code;
+use crate::commands::value_audit::{audit_writer_open_failed, require_value_audit_writer};
 use crate::common::private_open;
-use crate::common::profile_access::{
-    ProfileAccessError, load_profile_reconciled, profile_access_envelope,
-};
-use crate::common::render::render_json;
+use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
+use crate::common::render::{escape_for_terminal, render_json};
 use crate::common::served_pages::page_identity_for;
+use crate::common::tty::{read_line_from_terminal, stdin_and_stderr_are_terminals};
 use crate::common::{interrupted, resolve_profile_name, validate_path_component_ascii_safe};
-use stellar_agent_loopback_http::brand::PageIdentity;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Wire types
@@ -143,6 +155,12 @@ pub struct AddPasskeyArgs {
 /// Runs `credentials add-passkey`.
 ///
 /// Returns `0` on success, `1` on any error, user cancel, or timeout.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the audit writer guard spans the ceremony, whose poll and confirmation write \
+              through it; no other task in this process locks the profile's writer meanwhile, \
+              since the bridge records into the approval store and writes no audit row"
+)]
 pub async fn run(args: &AddPasskeyArgs) -> i32 {
     let resolved = resolve_profile_name(args.profile.as_deref());
     let profile = resolved.name.clone();
@@ -164,15 +182,44 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
     // while the audit rows follow the FILE, so a registration under a
     // mismatched profile would split the credential from its own trail.
     //
-    // Protected refusals are not tolerated. Other load failures yield the
-    // neutral identity for registration with an unconfigured profile, and
-    // the audit-writer open below also tolerates those failures.
-    let loaded_profile = match optional_registration_profile(load_profile_reconciled(&resolved)) {
+    // The registration writes its audit row through the profile's keyed
+    // writer, so every load failure refuses.
+    let loaded_profile = match load_profile_reconciled(&resolved) {
         Ok(loaded) => loaded,
         Err(e) => {
             render_json(&profile_access_envelope(&e, &profile));
             return 1;
         }
+    };
+
+    // ── Require a terminal for the confirmation code ─────────────────────────
+    // The passkey is registered only once the operator types the code the
+    // registration page shows, so without a terminal on stdin and stderr the
+    // command refuses before any store, bridge or browser.
+    if !stdin_and_stderr_are_terminals() {
+        return emit_error(
+            "credentials.registration_tty_required",
+            "passkey registration needs a terminal on stdin and stderr to type the \
+             confirmation code the registration page shows"
+                .to_owned(),
+        );
+    }
+
+    // ── Acquire the keyed audit writer (fail-closed) ─────────────────────────
+    // The `registered` row precedes the registry write, so a registration
+    // that cannot write its row cannot start.
+    let audit_writer = match require_value_audit_writer(&loaded_profile, &profile) {
+        Ok(writer) => writer,
+        Err(e) => {
+            render_json(&Envelope::<()>::err(&e));
+            return 1;
+        }
+    };
+    // The guard is held across the whole ceremony, because the poll and the
+    // confirmation write their rows through it.
+    let Ok(mut audit_guard) = audit_writer.lock() else {
+        render_json(&Envelope::<()>::err(&audit_writer_open_failed(&profile)));
+        return 1;
     };
 
     // ── Open the approval store ONCE; wrap in Arc<Mutex<>> ───────────────────
@@ -238,9 +285,7 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
     let bridge = match start_bridge_register_only(
         Arc::clone(&shared_store),
         bind_addr,
-        loaded_profile
-            .as_ref()
-            .map_or_else(PageIdentity::neutral, page_identity_for),
+        page_identity_for(&loaded_profile),
     )
     .await
     {
@@ -272,89 +317,109 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
     // fails and when a sandboxed browser cannot read the redirect file.
     print_registration_handoff(&handle.url);
 
-    // ── Open audit writer (non-fatal: warn on failure, continue) ──────────
-    // Wire a real AuditWriter so PasskeyRegistered events are emitted. If the
-    // profile is not yet configured with an HMAC key, the writer cannot be
-    // opened — this is expected for early-lifecycle wallets. Continue with
-    // None; the audit entry is silently skipped under the non-fatal audit
-    // posture.
-    //
-    // Use AuditWriterRegistry::get_or_open instead of AuditWriter::open
-    // directly so the single-writer invariant is enforced.
-    let audit_writer_arc: Option<Arc<StdMutex<AuditWriter>>> =
-        open_profile_audit_writer_non_fatal(&resolved).await;
-
-    // Lock the Arc<StdMutex<AuditWriter>> for the duration of poll_registration
-    // so we can pass `Option<&mut AuditWriter>` to the manager.
-    let mut guard = audit_writer_arc.as_ref().map(|arc| arc.lock());
-    let audit_writer_ref: Option<&mut AuditWriter> = match guard.as_mut() {
-        Some(Ok(g)) => Some(&mut **g),
-        Some(Err(_poison)) => {
-            warn!(
-                profile = %profile,
-                "credentials add-passkey: audit writer mutex poisoned before poll; audit entry will be skipped"
-            );
-            None
-        }
-        None => None,
-    };
-
-    // ── Open the browser, poll for completion, shut down ──────────────────
+    // ── Open the browser, poll, shut down, then ask for the code ──────────
     // The browser opens through a private redirect file. Polling continues
     // whether or not the launch succeeds, and the launch outcome is not
     // surfaced through `AddPasskeyOutcome`. The registration timeout counts
-    // from the end of the launch.
+    // from the end of the launch and also bounds the confirmation prompt.
+    let writer: &mut AuditWriter = &mut audit_guard;
     let end = register_until_done(
         bridge,
         &handle.url,
         private_open::browser_opener,
         Duration::from_secs(args.timeout_seconds),
-        |deadline| mgr.poll_registration(&args.name, &handle.nonce, deadline, audit_writer_ref),
+        |deadline| mgr.poll_registration(&args.name, &handle.nonce, deadline, &mut *writer),
         tokio::signal::ctrl_c(),
+        || read_line_from_terminal("add-passkey-code"),
     )
     .await;
 
-    report_registration_end(end, &args.name)
+    finish_registration(end, &mgr, writer, &args.name)
 }
 
-/// How the registration phase ended.
-#[derive(Debug)]
+/// A browser phase that ends without a staged credential.
+enum BrowserCompletion {
+    Timeout,
+    UserCanceled,
+    EntryMissing,
+    Unknown,
+}
+
+/// How the registration ended.
 enum RegistrationEnd {
-    /// Polling returned an outcome or an error.
-    Finished(Result<AddPasskeyOutcome, CredentialsError>),
-    /// The operator interrupted the wait (Ctrl-C).
+    /// Polling returned an outcome other than a recorded registration, or an
+    /// error.
+    Finished(Result<BrowserCompletion, CredentialsError>),
+    /// The operator interrupted the wait for the browser (Ctrl-C).
     Interrupted,
+    /// The bridge recorded a verified registration and the operator typed
+    /// `line` at the prompt.
+    Typed {
+        /// The recorded registration.
+        pending: PendingPasskeyRegistration,
+        /// The line typed at the prompt.
+        line: String,
+    },
+    /// The bridge recorded a verified registration and the prompt ended
+    /// without a code.
+    Unconfirmed {
+        /// The recorded registration.
+        pending: PendingPasskeyRegistration,
+        /// Why the prompt ended.
+        end: UnconfirmedEnd,
+    },
 }
 
-/// Runs the registration ceremony on the started bridge until the polling
-/// loop returns or `interrupt` resolves.
+impl std::fmt::Debug for RegistrationEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Finished(_) => "Finished",
+            Self::Interrupted => "Interrupted",
+            Self::Typed { .. } => "Typed",
+            Self::Unconfirmed { .. } => "Unconfirmed",
+        })
+    }
+}
+
+/// Runs the registration ceremony on the started bridge, then asks for the
+/// confirmation code.
 ///
 /// Opens the registration URL through a private redirect file first;
 /// `opener` receives only the file's URL, never the registration URL with
 /// its nonce. The polling deadline is `timeout` after the opener returns, so
 /// a slow launcher never shortens the operator's window; `registration`
 /// builds the polling loop for that deadline. The file stays while polling
-/// runs. Every end, an interrupt included, then shuts the bridge down and
-/// removes the file and its directory. When the open fails, the URL printed
-/// by [`print_registration_handoff`] is the handoff.
-async fn register_until_done<F>(
+/// runs. Every end of the browser phase, an interrupt included, then shuts
+/// the bridge down and removes the file and its directory. When the open
+/// fails, the URL printed by [`print_registration_handoff`] is the handoff.
+///
+/// `interrupt` is watched across both phases. `read_code` reads the typed
+/// line, `Ok(None)` at end of input; it runs only once the bridge recorded a
+/// registration, under that registration's deadline, and its future is
+/// dropped at the deadline or an interrupt, so a line it reads after that
+/// confirms nothing.
+async fn register_until_done<F, Code>(
     bridge: BridgeHandle,
     url: &str,
     opener: impl FnOnce(&str) -> io::Result<()>,
     timeout: Duration,
     registration: impl FnOnce(Instant) -> F,
     interrupt: impl Future<Output = io::Result<()>>,
+    read_code: impl FnOnce() -> Code,
 ) -> RegistrationEnd
 where
     F: Future<Output = Result<AddPasskeyOutcome, CredentialsError>>,
+    Code: Future<Output = io::Result<Option<String>>>,
 {
     let browser_handoff =
         private_open::open_or_point_to_handoff(url, opener, "the registration URL printed above");
     let polling = registration(Instant::now() + timeout);
+    let interrupt = interrupted(interrupt);
+    tokio::pin!(interrupt);
 
-    let end = tokio::select! {
-        outcome = polling => RegistrationEnd::Finished(outcome),
-        () = interrupted(interrupt) => RegistrationEnd::Interrupted,
+    let browser_end = tokio::select! {
+        outcome = polling => Some(outcome),
+        () = &mut interrupt => None,
     };
 
     if let Err(e) = bridge.shutdown().await {
@@ -373,13 +438,101 @@ where
             "credentials add-passkey: redirect file cleanup failed"
         );
     }
-    end
+
+    let pending = match browser_end {
+        Some(Ok(AddPasskeyOutcome::AwaitingConfirmation { pending })) => pending,
+        Some(Ok(AddPasskeyOutcome::Timeout)) => {
+            return RegistrationEnd::Finished(Ok(BrowserCompletion::Timeout));
+        }
+        Some(Ok(AddPasskeyOutcome::UserCanceled)) => {
+            return RegistrationEnd::Finished(Ok(BrowserCompletion::UserCanceled));
+        }
+        Some(Ok(AddPasskeyOutcome::EntryMissing)) => {
+            return RegistrationEnd::Finished(Ok(BrowserCompletion::EntryMissing));
+        }
+        Some(Ok(_)) => return RegistrationEnd::Finished(Ok(BrowserCompletion::Unknown)),
+        Some(Err(error)) => return RegistrationEnd::Finished(Err(error)),
+        None => return RegistrationEnd::Interrupted,
+    };
+
+    print_confirmation_prompt(pending.credential_name());
+    let deadline = tokio::time::Instant::from_std(pending.deadline());
+    let typed = tokio::select! {
+        typed = tokio::time::timeout_at(deadline, read_code()) => typed,
+        () = &mut interrupt => {
+            return RegistrationEnd::Unconfirmed {
+                pending,
+                end: UnconfirmedEnd::Canceled,
+            };
+        }
+    };
+    let end = match typed {
+        Ok(Ok(Some(line))) => return RegistrationEnd::Typed { pending, line },
+        Ok(Ok(None)) => UnconfirmedEnd::Canceled,
+        Ok(Err(error)) => {
+            tracing::debug!(
+                error.kind = ?error.kind(),
+                "credentials add-passkey: reading the confirmation code failed"
+            );
+            UnconfirmedEnd::Canceled
+        }
+        Err(_elapsed) => UnconfirmedEnd::Expired,
+    };
+    RegistrationEnd::Unconfirmed { pending, end }
 }
 
-/// Renders the result envelope for how the registration phase ended and
-/// returns the exit code: `0` for a registered credential, `1` otherwise.
-fn report_registration_end(end: RegistrationEnd, name: &str) -> i32 {
+/// Asks for the code the registration page shows, on stderr.
+#[allow(
+    clippy::print_stderr,
+    reason = "CLI binary intentional prompt; stdout stays JSON-only"
+)]
+fn print_confirmation_prompt(name: &str) {
+    eprint!("{}", confirmation_prompt(name));
+}
+
+/// The confirmation prompt for the passkey named `name`. The expected code is
+/// never part of the prompt.
+fn confirmation_prompt(name: &str) -> String {
+    format!(
+        "stellar-agent: the passkey '{}' was created in the browser.\n  \
+         Type the confirmation code the registration page shows, then press Enter: ",
+        escape_for_terminal(name)
+    )
+}
+
+/// Completes the registration for how the ceremony ended, renders the result
+/// envelope and returns the exit code: `0` for a registered credential, `1`
+/// otherwise.
+///
+/// A typed line goes to [`CredentialsManager::confirm_registration`], which
+/// writes the `registered` row to `audit_writer` and then the registry; a
+/// prompt that ended without a code goes to
+/// [`CredentialsManager::abandon_registration`]. Nothing else registers.
+fn finish_registration(
+    end: RegistrationEnd,
+    mgr: &CredentialsManager,
+    audit_writer: &mut AuditWriter,
+    name: &str,
+) -> i32 {
     let outcome = match end {
+        RegistrationEnd::Typed { pending, line } => {
+            return match mgr.confirm_registration(pending, &line, Instant::now(), audit_writer) {
+                Ok(metadata) => {
+                    render_json(&Envelope::ok(RegisteredSuccess {
+                        credential_id: redact_first5_last5(&metadata.credential_id_b64url),
+                        credential_name: metadata.credential_name,
+                        rp_id: metadata.rp_id,
+                        registered_at_unix_ms: metadata.registered_at_unix_ms,
+                    }));
+                    0
+                }
+                Err(e) => emit_error(credentials_error_code(&e), e.to_string()),
+            };
+        }
+        RegistrationEnd::Unconfirmed { pending, end } => {
+            mgr.abandon_registration(pending, end, audit_writer);
+            return emit_unconfirmed(end);
+        }
         RegistrationEnd::Finished(outcome) => outcome,
         RegistrationEnd::Interrupted => {
             return emit_error(
@@ -389,34 +542,40 @@ fn report_registration_end(end: RegistrationEnd, name: &str) -> i32 {
         }
     };
     match outcome {
-        Ok(AddPasskeyOutcome::Registered { metadata }) => {
-            render_json(&Envelope::ok(RegisteredSuccess {
-                credential_id: redact_first5_last5(&metadata.credential_id_b64url),
-                credential_name: metadata.credential_name,
-                rp_id: metadata.rp_id,
-                registered_at_unix_ms: metadata.registered_at_unix_ms,
-            }));
-            0
-        }
-        Ok(AddPasskeyOutcome::Timeout) => emit_error(
+        Ok(BrowserCompletion::Timeout) => emit_error(
             "credentials.registration_timeout",
             format!("registration of '{name}' timed out before the ceremony completed"),
         ),
-        Ok(AddPasskeyOutcome::UserCanceled) => emit_error(
+        Ok(BrowserCompletion::UserCanceled) => emit_error(
             "credentials.registration_user_canceled",
             format!("registration of '{name}' was canceled by the user"),
         ),
-        Ok(AddPasskeyOutcome::EntryMissing) => emit_error(
+        Ok(BrowserCompletion::EntryMissing) => emit_error(
             "credentials.registration_entry_missing",
             format!(
                 "registration of '{name}' failed: the approval-store entry was not found (TTL-expired or never persisted)"
             ),
         ),
         Err(e) => emit_error(credentials_error_code(&e), e.to_string()),
-        // Non-exhaustive: future variants are non-success.
-        Ok(_) => emit_error(
+        Ok(BrowserCompletion::Unknown) => emit_error(
             "credentials.unknown_registration_outcome",
             "unknown registration outcome".to_owned(),
+        ),
+    }
+}
+
+/// Renders the refusal for a registration whose prompt ended without a code.
+fn emit_unconfirmed(end: UnconfirmedEnd) -> i32 {
+    match end {
+        UnconfirmedEnd::Expired => emit_error(
+            "credentials.registration_confirmation_expired",
+            "the timeout passed before the confirmation code was typed; nothing was registered"
+                .to_owned(),
+        ),
+        // `Canceled`, and any other end without a typed code.
+        _ => emit_error(
+            "credentials.registration_confirmation_canceled",
+            "no confirmation code was typed; nothing was registered".to_owned(),
         ),
     }
 }
@@ -490,92 +649,9 @@ fn print_registration_handoff(url: &str) {
     );
 }
 
-/// Opens or retrieves the cached `Arc<StdMutex<AuditWriter>>` for the passkey
-/// registration event via [`AuditWriterRegistry`].
-///
-/// Non-fatal wrapper. If the profile cannot be loaded (not yet configured,
-/// keyring miss, IO error), warns via `tracing::warn!` and returns `None`. The
-/// registration flow continues without an audit entry.
-///
-/// A name mismatch cannot reach here: [`run`] reconciles before it opens the
-/// approval store, so this helper only ever sees a profile that already
-/// belongs to the requested name.
-///
-/// Uses [`AuditWriterRegistry::get_or_open_keyed`] instead of `AuditWriter::open`
-/// directly so the single-writer invariant is enforced — if another call site
-/// in the same process holds the writer for this profile the same `Arc` is
-/// returned rather than a second open attempt that would receive `FileLocked`.
-///
-/// Steps: (1) reconciled profile load, (2) `keyed_audit_access`, the one helper
-/// that pairs the chain-root key with the log's tip-anchor store, (3)
-/// `AuditWriterRegistry::get_or_open_keyed`. Each step is non-fatal — returns
-/// `None` on the first failure.
-async fn open_profile_audit_writer_non_fatal(
-    resolved: &ResolvedProfileName,
-) -> Option<Arc<StdMutex<AuditWriter>>> {
-    let profile_name = &resolved.name;
-    let profile = match load_profile_reconciled(resolved) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(
-                profile = %profile_name,
-                error = %e,
-                "credentials add-passkey: profile not found; audit entry will be skipped"
-            );
-            return None;
-        }
-    };
-
-    let access = match stellar_agent_network::keyring::keyed_audit_access(
-        &profile,
-        profile_name,
-        stellar_agent_core::audit_log::BindingCheck::Enforce,
-    ) {
-        Ok(access) => access,
-        Err(e) if crate::commands::value_audit::is_binding_refusal(&e) => {
-            warn!(
-                profile = %profile_name,
-                code = %e.code(),
-                "credentials add-passkey: audit binding changed; audit entry will be skipped"
-            );
-            return None;
-        }
-        Err(e) => {
-            warn!(
-                profile = %profile_name,
-                error = %e,
-                "credentials add-passkey: audit chain key unavailable; audit entry will be skipped"
-            );
-            return None;
-        }
-    };
-
-    match AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access) {
-        Ok(arc) => Some(arc),
-        Err(e) => {
-            warn!(
-                path = %profile.audit_log_path.display(),
-                error = %e,
-                "credentials add-passkey: keyed audit writer open failed; audit entry will be skipped"
-            );
-            None
-        }
-    }
-}
-
 fn emit_error(code: &'static str, message: String) -> i32 {
     render_json(&Envelope::<()>::err_raw(code, message));
     1
-}
-
-fn optional_registration_profile(
-    loaded: Result<stellar_agent_core::profile::schema::Profile, ProfileAccessError>,
-) -> Result<Option<stellar_agent_core::profile::schema::Profile>, ProfileAccessError> {
-    match loaded {
-        Ok(profile) => Ok(Some(profile)),
-        Err(error) if error.requires_refusal() => Err(error),
-        Err(_) => Ok(None),
-    }
 }
 
 #[cfg(test)]
@@ -587,17 +663,19 @@ mod tests {
         reason = "test-only; panics acceptable in unit tests"
     )]
 
-    use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use stellar_agent_approval_ui::operator_enroll::test_support::SoftwareRegistrar;
+    use stellar_agent_core::approval::ApprovalKind;
+    use stellar_agent_core::approval::webauthn_registration::{
+        ConfirmationCode, PASSKEY_REGISTRATION_CODE_DOMAIN,
+    };
+    use stellar_agent_core::audit_log::schema::EventKind;
+    use stellar_agent_core::audit_log::test_helpers::verified_audit_entries_from_path;
+    use stellar_agent_loopback_http::brand::PageIdentity;
+    use stellar_agent_smart_account::managers::credentials::CredentialMetadata;
 
-    #[test]
-    fn passkey_registration_preserves_protected_refusals() {
-        for error in crate::common::profile_access::protected_load_errors_for_test() {
-            let expected = error.code();
-            let result = optional_registration_profile(Err(error));
-            let error = result.expect_err("protected refusal was swallowed");
-            assert_eq!(error.code(), expected);
-        }
-    }
+    use super::*;
 
     type SharedStore = Arc<Mutex<stellar_agent_core::approval::store::PendingApprovalStore>>;
 
@@ -629,40 +707,56 @@ mod tests {
         (bridge, mgr, store)
     }
 
+    /// The software authenticator the browser side of the tests uses.
+    fn registrar() -> SoftwareRegistrar {
+        SoftwareRegistrar::new([0x11; 32], vec![0xa5; 16])
+    }
+
+    /// An unkeyed audit writer over `dir/<tag>-audit.jsonl`, and its path.
+    fn test_writer(dir: &tempfile::TempDir, tag: &str) -> (AuditWriter, std::path::PathBuf) {
+        let path = dir.path().join(format!("{tag}-audit.jsonl"));
+        (AuditWriter::open(path.clone(), None).unwrap(), path)
+    }
+
     /// Completes the browser side of the registration for `nonce`: POSTs a
-    /// structurally valid credential to the bridge with the entry's CSRF
-    /// value, as the registration page does.
+    /// [`registrar`] response over the entry's challenge to the bridge with
+    /// the entry's CSRF value, as the registration page does, and returns
+    /// the confirmation code the page then shows.
     async fn complete_registration_in_browser(
         bridge_addr: SocketAddr,
         store: &SharedStore,
         nonce: &str,
-    ) {
-        use base64::Engine as _;
-        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-        use stellar_agent_core::approval::ApprovalKind;
-
-        let csrf = {
+    ) -> String {
+        let (csrf, challenge) = {
             let guard = store.lock().await;
             match &guard.get(nonce).expect("the pending registration").kind {
-                ApprovalKind::RegisterPasskey { csrf_token, .. } => hex::encode(csrf_token),
-                _ => panic!("the pending entry is a registration"),
+                ApprovalKind::RegisterPasskey {
+                    csrf_token,
+                    registration_challenge: Some(challenge),
+                    ..
+                } => (hex::encode(csrf_token), *challenge),
+                _ => panic!("the pending entry is a registration with a challenge"),
             }
         };
-        let credential_id = URL_SAFE_NO_PAD.encode([0x42_u8; 16]);
-        let mut public_key = [0x01_u8; 65];
-        public_key[0] = 0x04;
+        let registrar = registrar();
+        let response = registrar.builder(
+            &challenge,
+            &format!("http://localhost:{}", bridge_addr.port()),
+        );
+        let credential_id = registrar.credential_id_b64url();
+        let public_key = registrar.public_key_sec1();
         let payload = serde_json::json!({
             "id": credential_id,
             "rawId": credential_id,
             "type": "public-key",
             "response": {
-                "clientDataJSON": "ZHVtbXk",
-                "attestationObject": "ZHVtbXk",
+                "clientDataJSON": URL_SAFE_NO_PAD.encode(response.client_data_json()),
+                "attestationObject": URL_SAFE_NO_PAD.encode(response.attestation_object()),
                 "publicKeySec1B64": STANDARD.encode(public_key),
                 "transports": ["internal"]
             }
         });
-        let response = reqwest::Client::new()
+        let reply = reqwest::Client::new()
             .post(format!("http://{bridge_addr}/register/{nonce}/credential"))
             .header("Origin", format!("http://{bridge_addr}"))
             .header("X-Stellar-Approval-CSRF", csrf)
@@ -671,7 +765,14 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(reply.status().as_u16(), 200);
+        ConfirmationCode::compute(
+            PASSKEY_REGISTRATION_CODE_DOMAIN,
+            &challenge,
+            registrar.credential_id(),
+            &public_key,
+        )
+        .display()
     }
 
     /// The registration timeout counts from the end of the browser launch: a
@@ -687,7 +788,8 @@ mod tests {
             .prepare_registration("laptop", bridge_addr, None)
             .await
             .unwrap();
-        complete_registration_in_browser(bridge_addr, &store, &handle.nonce).await;
+        let code = complete_registration_in_browser(bridge_addr, &store, &handle.nonce).await;
+        let (mut writer, _path) = test_writer(&dir, "slow-launch");
 
         let timeout = Duration::from_millis(100);
         let probe = HandoffProbe::default();
@@ -703,19 +805,14 @@ mod tests {
                 &handle.url,
                 slow_launch,
                 timeout,
-                |deadline| mgr.poll_registration("laptop", &handle.nonce, deadline, None),
+                |deadline| mgr.poll_registration("laptop", &handle.nonce, deadline, &mut writer),
                 std::future::pending(),
+                move || async move { Ok(Some(code)) },
             ),
         )
         .await
         .expect("polling returns");
-        assert!(
-            matches!(
-                end,
-                RegistrationEnd::Finished(Ok(AddPasskeyOutcome::Registered { .. }))
-            ),
-            "{end:?}"
-        );
+        assert!(matches!(end, RegistrationEnd::Typed { .. }), "{end:?}");
         assert_eq!(probe.launched().len(), 1);
     }
 
@@ -731,6 +828,7 @@ mod tests {
         let patience = Duration::from_secs(3600);
         let bound = Duration::from_secs(30);
         let dir = tempfile::tempdir().unwrap();
+        let (mut writer, _path) = test_writer(&dir, "opened");
 
         let (bridge, mgr, _store) = start_test_registration(&dir, "opened").await;
         let bridge_addr = bridge.local_addr();
@@ -746,8 +844,9 @@ mod tests {
                 &handle.url,
                 probe.opener(Ok(())),
                 patience,
-                |deadline| mgr.poll_registration("laptop", &handle.nonce, deadline, None),
+                |deadline| mgr.poll_registration("laptop", &handle.nonce, deadline, &mut writer),
                 probe.interrupt(),
+                std::future::pending,
             ),
         )
         .await
@@ -759,7 +858,7 @@ mod tests {
             "the bridge stopped"
         );
         crate::common::render::take_rendered_for_test();
-        assert_eq!(report_registration_end(end, "laptop"), 1);
+        assert_eq!(finish_registration(end, &mgr, &mut writer, "laptop"), 1);
         let rendered = crate::common::render::take_rendered_for_test();
         assert_eq!(rendered.len(), 1, "{rendered:?}");
         assert_eq!(rendered[0]["ok"], false, "{rendered:?}");
@@ -786,8 +885,9 @@ mod tests {
                 &handle.url,
                 probe.opener(Err(io::Error::other("no browser"))),
                 patience,
-                |deadline| mgr.poll_registration("laptop", &handle.nonce, deadline, None),
+                |deadline| mgr.poll_registration("laptop", &handle.nonce, deadline, &mut writer),
                 probe.interrupt(),
+                std::future::pending,
             ),
         )
         .await
@@ -797,22 +897,380 @@ mod tests {
         probe.assert_failed_open_left_nothing(&handle.nonce);
     }
 
-    /// Audit writer failure must not prevent registration.
-    ///
-    /// Simulated by calling `open_profile_audit_writer_non_fatal` with a
-    /// profile name that does not exist in the system keyring. The function
-    /// must return `None` without panicking.
-    #[tokio::test]
-    async fn audit_writer_failure_returns_none_not_panic() {
-        // A profile that is almost certainly not configured on any test machine.
-        let result = open_profile_audit_writer_non_fatal(&ResolvedProfileName::from_flag(
-            "test-nonexistent-profile-xyz123",
-        ))
-        .await;
-        // Must return None, not panic.
+    /// What the operator does at the confirmation prompt.
+    #[derive(Debug, Clone, Copy)]
+    enum Typing {
+        /// Types the code the registration page shows.
+        PageCode,
+        /// Types a code that differs in its last digit.
+        OtherCode,
+        /// Presses Ctrl-C once the prompt is up.
+        InterruptAtPrompt,
+        /// Types nothing.
+        Nothing,
+    }
+
+    /// How a registration whose browser side completed ended at the prompt.
+    struct PromptCase {
+        exit: i32,
+        envelope: serde_json::Value,
+        registered: Vec<CredentialMetadata>,
+        statuses: Vec<String>,
+    }
+
+    /// Runs a registration whose browser side completes, with `typing` at
+    /// the prompt under `timeout`, and finishes it.
+    async fn prompt_case(tag: &str, typing: Typing, timeout: Duration) -> PromptCase {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, mgr, store) = start_test_registration(&dir, tag).await;
+        let bridge_addr = bridge.local_addr();
+        let handle = mgr
+            .prepare_registration("laptop", bridge_addr, None)
+            .await
+            .unwrap();
+        let code = complete_registration_in_browser(bridge_addr, &store, &handle.nonce).await;
+        let (mut writer, audit_path) = test_writer(&dir, tag);
+
+        let line = match typing {
+            Typing::PageCode => Some(code),
+            Typing::OtherCode => {
+                let mut other = code;
+                let last = if other.ends_with('0') { "1" } else { "0" };
+                other.replace_range(other.len() - 1.., last);
+                Some(other)
+            }
+            Typing::InterruptAtPrompt | Typing::Nothing => None,
+        };
+        let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel::<()>();
+        // A dropped sender is no interrupt: the watch never resolves.
+        let interrupt = async move {
+            interrupt_rx
+                .await
+                .map_err(|_| io::Error::other("no interrupt"))
+        };
+        // The ceremony calls the reader once the prompt is up.
+        let read_code = move || {
+            if matches!(typing, Typing::InterruptAtPrompt) {
+                interrupt_tx.send(()).unwrap();
+            }
+            async move {
+                match line {
+                    Some(line) => Ok(Some(line)),
+                    None => std::future::pending().await,
+                }
+            }
+        };
+        let end = tokio::time::timeout(
+            Duration::from_secs(60),
+            register_until_done(
+                bridge,
+                &handle.url,
+                |_| Ok(()),
+                timeout,
+                |deadline| mgr.poll_registration("laptop", &handle.nonce, deadline, &mut writer),
+                interrupt,
+                read_code,
+            ),
+        )
+        .await
+        .expect("the registration ends");
         assert!(
-            result.is_none(),
-            "audit writer must return None for an unconfigured profile"
+            std::net::TcpStream::connect(bridge_addr).is_err(),
+            "the bridge stopped before the prompt"
         );
+
+        crate::common::render::take_rendered_for_test();
+        let exit = finish_registration(end, &mgr, &mut writer, "laptop");
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        drop(writer);
+        let statuses = verified_audit_entries_from_path(&audit_path)
+            .into_iter()
+            .filter_map(|entry| match entry.event_kind {
+                EventKind::PasskeyRegistered { status, .. } => Some(status),
+                _ => None,
+            })
+            .collect();
+        PromptCase {
+            exit,
+            envelope: rendered.into_iter().next().unwrap(),
+            registered: mgr.list().unwrap(),
+            statuses,
+        }
+    }
+
+    /// The code the page shows registers the passkey: the envelope carries
+    /// the redacted ID, the registry holds the key, and the log holds one
+    /// `registered` row.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_matching_code_registers_the_passkey() {
+        let case = prompt_case("matching", Typing::PageCode, Duration::from_secs(30)).await;
+        assert_eq!(case.exit, 0, "{}", case.envelope);
+        assert_eq!(case.envelope["ok"], true, "{}", case.envelope);
+        let registrar = registrar();
+        assert_eq!(
+            case.envelope["data"]["credential_id"],
+            redact_first5_last5(&registrar.credential_id_b64url())
+        );
+        let [registered] = case.registered.as_slice() else {
+            panic!("expected one registered passkey: {:?}", case.registered)
+        };
+        assert_eq!(registered.credential_name, "laptop");
+        assert_eq!(
+            registered.credential_id_b64url,
+            registrar.credential_id_b64url()
+        );
+        assert_eq!(
+            registered.public_key_sec1_b64,
+            URL_SAFE_NO_PAD.encode(registrar.public_key_sec1())
+        );
+        assert_eq!(case.statuses, ["registered"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_wrong_code_registers_nothing() {
+        let case = prompt_case("wrong", Typing::OtherCode, Duration::from_secs(30)).await;
+        assert_eq!(case.exit, 1, "{}", case.envelope);
+        assert_eq!(
+            case.envelope["error"]["code"], "credentials.registration_confirmation_mismatch",
+            "{}",
+            case.envelope
+        );
+        assert!(case.registered.is_empty(), "{:?}", case.registered);
+        assert_eq!(case.statuses, ["confirmation_mismatch"]);
+    }
+
+    /// An interrupt once the prompt is up ends the registration with nothing
+    /// registered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_interrupt_at_the_prompt_registers_nothing() {
+        let case = prompt_case(
+            "interrupt",
+            Typing::InterruptAtPrompt,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(case.exit, 1, "{}", case.envelope);
+        assert_eq!(
+            case.envelope["error"]["code"], "credentials.registration_confirmation_canceled",
+            "{}",
+            case.envelope
+        );
+        assert_eq!(
+            case.envelope["error"]["message"],
+            "no confirmation code was typed; nothing was registered"
+        );
+        assert!(case.registered.is_empty(), "{:?}", case.registered);
+        assert_eq!(case.statuses, ["confirmation_canceled"]);
+    }
+
+    /// A prompt nobody answers ends at the registration deadline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_prompt_ends_at_the_deadline() {
+        let case = prompt_case("deadline", Typing::Nothing, Duration::from_secs(2)).await;
+        assert_eq!(case.exit, 1, "{}", case.envelope);
+        assert_eq!(
+            case.envelope["error"]["code"], "credentials.registration_confirmation_expired",
+            "{}",
+            case.envelope
+        );
+        assert_eq!(
+            case.envelope["error"]["message"],
+            "the timeout passed before the confirmation code was typed; nothing was registered"
+        );
+        assert!(case.registered.is_empty(), "{:?}", case.registered);
+        assert_eq!(case.statuses, ["confirmation_expired"]);
+    }
+
+    async fn audit_prerequisite_case(name: &str, mismatch: bool, expected: &str) {
+        use stellar_agent_core::audit_log::AuditBinding;
+
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let _tty = crate::common::tty::tests::test_tty(true, true);
+        let (bridge, _, _) = start_test_registration(&home, "audit-prerequisite").await;
+        let mut profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+            name,
+            &format!("stellar-agent-signer-{name}"),
+            "default",
+            &format!("stellar-agent-nonce-{name}"),
+            "default",
+        )
+        .build();
+        profile.audit_log_path = home.path().join("audit").join(format!("{name}.jsonl"));
+        if mismatch {
+            stellar_agent_network::keyring::KeyringAuditBindingStore::for_profile(name)
+                .store(&AuditBinding::for_profile(&profile))
+                .unwrap();
+            profile.audit_log_path = home.path().join("other-audit.jsonl");
+        }
+        stellar_agent_core::profile::loader::save_to_dir(
+            name,
+            &profile,
+            &home.path().join("profiles"),
+        )
+        .unwrap();
+        let args = AddPasskeyArgs {
+            name: "laptop".to_owned(),
+            profile: Some(name.to_owned()),
+            rp_id: "localhost".to_owned(),
+            timeout_seconds: 1,
+            accept_rp_id_binding_risk: true,
+        };
+        crate::common::render::take_rendered_for_test();
+        assert_eq!(run(&args).await, 1);
+        let rendered = crate::common::render::take_rendered_for_test();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert_eq!(rendered[0]["error"]["code"], expected);
+        assert!(
+            !home
+                .path()
+                .join("approvals")
+                .join(format!("{name}.toml"))
+                .exists(),
+            "no approval store is opened"
+        );
+        assert!(
+            !home
+                .path()
+                .join("approvals")
+                .join(format!("{name}.toml.lock"))
+                .exists(),
+            "no approval store lock file is created"
+        );
+        assert!(
+            !home.path().join("passkeys").exists(),
+            "nothing is registered"
+        );
+        bridge.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn add_passkey_requires_the_audit_chain_key() {
+        audit_prerequisite_case("passkey-audit-key", false, "audit.chain_key_unavailable").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn add_passkey_requires_the_audit_binding() {
+        audit_prerequisite_case("passkey-audit-binding", true, "audit.log_binding_changed").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn typed_registration_debug_omits_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = stellar_agent_core::approval::store::PendingApprovalStore::open(
+            dir.path().join("approval.toml"),
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let mgr = CredentialsManager::new(
+            dir.path().join("passkeys"),
+            "debug",
+            "localhost",
+            Some(Arc::clone(&store)),
+        );
+        let handle = mgr
+            .prepare_registration("laptop", "127.0.0.1:9999".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let input = stellar_agent_core::approval::RegistrationInput::new(
+            vec![0xa5; 16],
+            registrar().public_key_sec1().to_vec(),
+            None,
+            vec![],
+        )
+        .unwrap();
+        store
+            .lock()
+            .await
+            .record_passkey_registration(&handle.nonce, input)
+            .unwrap();
+        let (mut writer, _) = test_writer(&dir, "debug");
+        let AddPasskeyOutcome::AwaitingConfirmation { pending } = mgr
+            .poll_registration(
+                "laptop",
+                &handle.nonce,
+                Instant::now() + Duration::from_secs(5),
+                &mut writer,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("the credential awaits confirmation")
+        };
+        let line = "0123-4567-89ab-cdef";
+        let end = RegistrationEnd::Typed {
+            pending,
+            line: line.to_owned(),
+        };
+        let debug = format!("{end:?}");
+        assert_eq!(debug, "Typed");
+        assert!(!debug.contains(line));
+    }
+
+    /// Without a terminal on stdin and stderr the command refuses after the
+    /// profile load and before it opens a store, starts a bridge or opens a
+    /// browser.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn add_passkey_requires_a_terminal() {
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let name = "passkey-tty";
+        let mut profile = stellar_agent_core::profile::schema::Profile::builder_testnet_named(
+            name,
+            "stellar-agent-signer-passkey-tty",
+            "default",
+            "stellar-agent-nonce-passkey-tty",
+            "default",
+        )
+        .build();
+        profile.audit_log_path = home.path().join("audit").join(format!("{name}.jsonl"));
+        stellar_agent_core::profile::loader::save_to_dir(
+            name,
+            &profile,
+            &home.path().join("profiles"),
+        )
+        .unwrap();
+
+        for streams in [(false, true), (true, false), (false, false)] {
+            let _tty = crate::common::tty::tests::test_tty(streams.0, streams.1);
+            let args = AddPasskeyArgs {
+                name: "laptop".to_owned(),
+                profile: Some(name.to_owned()),
+                rp_id: "localhost".to_owned(),
+                timeout_seconds: 1,
+                accept_rp_id_binding_risk: true,
+            };
+            crate::common::render::take_rendered_for_test();
+            assert_eq!(run(&args).await, 1, "{streams:?}");
+            let rendered = crate::common::render::take_rendered_for_test();
+            assert_eq!(rendered.len(), 1, "{rendered:?}");
+            assert_eq!(
+                rendered[0]["error"]["code"], "credentials.registration_tty_required",
+                "{streams:?}"
+            );
+            assert_eq!(
+                rendered[0]["error"]["message"],
+                "passkey registration needs a terminal on stdin and stderr to type the \
+                 confirmation code the registration page shows"
+            );
+            assert!(
+                !home
+                    .path()
+                    .join("approvals")
+                    .join(format!("{name}.toml"))
+                    .exists(),
+                "no approval store is opened"
+            );
+            assert!(
+                !home.path().join("passkeys").exists(),
+                "no passkeys registry is touched"
+            );
+        }
     }
 }

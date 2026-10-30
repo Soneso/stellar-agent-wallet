@@ -2,9 +2,12 @@
 //!
 //! Implements the two-step browser-handoff registration ceremony:
 //!
-//! 1. `GET /register/<nonce>` — serves the registration HTML page.
-//! 2. `POST /register/<nonce>/credential` — records the browser's registration
-//!    response into the approval store.
+//! 1. `GET /register/<nonce>`: serves the registration HTML page, which
+//!    carries the entry's registration challenge.
+//! 2. `POST /register/<nonce>/credential`: verifies the browser's
+//!    registration response against that challenge, this bridge's origin and
+//!    the entry's relying-party ID, and records the verified credential into
+//!    the approval store.
 //!
 //! # State type
 //!
@@ -35,6 +38,11 @@ use base64::{
 };
 use serde_json::json;
 
+use stellar_agent_core::approval::webauthn_registration::{
+    CREDENTIAL_ID_MAX_BYTES, MAX_ATTESTATION_OBJECT_BYTES, MAX_CLIENT_DATA_JSON_BYTES,
+    RegistrationExpectation, RegistrationResponse, decode_b64url_capped,
+    verify_registration_response,
+};
 use stellar_agent_core::approval::{ApprovalKind, RegistrationInput};
 
 use crate::{BridgeState, CsrfToken, templates, wire::RegistrationResponseJSON};
@@ -45,13 +53,15 @@ use crate::{BridgeState, CsrfToken, templates, wire::RegistrationResponseJSON};
 
 /// Serve the passkey-registration HTML page for the given approval nonce.
 ///
-/// Looks up `nonce` in the approval store. If found, not expired, and of kind
-/// `RegisterPasskey`, renders and returns the HTML registration page.
+/// Looks up `nonce` in the approval store. If found, not expired, of kind
+/// `RegisterPasskey` and carrying a registration challenge, renders and
+/// returns the HTML registration page with that challenge.
 ///
 /// # Error-shape contract (GET path)
 ///
-/// - `404 Not Found` + `{"error":"approval_not_found"}` — nonce absent OR
-///   expired (the two indistinguishable from the caller's view).
+/// - `404 Not Found` + `{"error":"approval_not_found"}`: nonce absent,
+///   expired, or the entry carries no registration challenge (the three
+///   indistinguishable from the caller's view).
 /// - `400 Bad Request` + `{"error":"approval_kind_mismatch"}` — entry
 ///   present but not `RegisterPasskey`. This deliberately distinguishes
 ///   wrong-kind from not-found because the caller (operator's MCP client
@@ -63,7 +73,7 @@ use crate::{BridgeState, CsrfToken, templates, wire::RegistrationResponseJSON};
 ///
 /// # Errors
 ///
-/// - `404 Not Found` — nonce absent or expired.
+/// - `404 Not Found`: nonce absent or expired, or no registration challenge.
 /// - `400 Bad Request` — entry is present but not a `RegisterPasskey` entry.
 pub(crate) async fn register_get(
     Path(nonce): Path<String>,
@@ -99,13 +109,19 @@ pub(crate) async fn register_get(
     // with a distinct code (not 404) so the client knows the nonce exists but
     // is the wrong kind — acceptable because the nonce is already known to
     // the caller (they navigated to this URL).
-    let (csrf_bytes, rp_id, user_handle) = match &entry.kind {
+    let (csrf_bytes, rp_id, user_handle, challenge) = match &entry.kind {
         ApprovalKind::RegisterPasskey {
             csrf_token,
             rp_id,
             user_handle,
+            registration_challenge,
             ..
-        } => (*csrf_token, rp_id.clone(), *user_handle),
+        } => (
+            *csrf_token,
+            rp_id.clone(),
+            *user_handle,
+            *registration_challenge,
+        ),
         _ => {
             tracing::debug!(path = "/register", "approval kind mismatch");
             return (
@@ -120,14 +136,31 @@ pub(crate) async fn register_get(
     // Release lock before rendering.
     drop(guard);
 
+    // An entry without a challenge has no response the POST could verify,
+    // so it is served like an unknown nonce.
+    let Some(challenge) = challenge else {
+        tracing::debug!(
+            path = "/register",
+            "registration entry carries no challenge"
+        );
+        return (
+            StatusCode::NOT_FOUND,
+            [("content-type", "application/json")],
+            json!({"error": "approval_not_found"}).to_string(),
+        )
+            .into_response();
+    };
+
     let csrf_hex = hex::encode(csrf_bytes);
     let user_handle_b64 = URL_SAFE_NO_PAD.encode(user_handle);
+    let challenge_b64url = URL_SAFE_NO_PAD.encode(challenge);
 
     let html = templates::render_register_page(
         &nonce,
         &csrf_hex,
         &rp_id,
         &user_handle_b64,
+        &challenge_b64url,
         &state.identity,
     );
     axum::response::Response::builder()
@@ -141,10 +174,11 @@ pub(crate) async fn register_get(
 // POST /register/<nonce>/credential
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Record the browser's WebAuthn registration response.
+/// Verify and record the browser's WebAuthn registration response.
 ///
-/// Validates the CSRF token, parses the `RegistrationResponseJSON` payload,
-/// and records the result in the approval store.
+/// Validates the CSRF token, verifies the `RegistrationResponseJSON` payload
+/// against the entry's registration challenge, and records the verified
+/// credential in the approval store.
 ///
 /// # CSRF validation
 ///
@@ -152,24 +186,33 @@ pub(crate) async fn register_get(
 /// was embedded in the registration page served by `register_get`. Validation
 /// uses `subtle::ConstantTimeEq` for a constant-time comparison.
 ///
-/// # Wire payload contract
+/// # Verification
 ///
-/// The `response.public_key_sec1_b64` field is provided by the vendored
-/// JS bundle, which decodes the COSE public key from the attestation object
-/// client-side and passes the uncompressed SEC1 form (`0x04 || X || Y`) in
-/// standard base64. This avoids adding a CBOR / COSE parser to the bridge.
+/// `id` must equal `rawId` and decode as canonical unpadded base64url of
+/// 16 to 64 bytes; the page's `publicKeySec1B64` is standard base64 of the
+/// uncompressed SEC1 key; `clientDataJSON` and `attestationObject` are
+/// canonical unpadded base64url within their caps, and an empty
+/// `attestationObject` refuses. The decoded response then passes
+/// [`verify_registration_response`] with the entry's challenge, this
+/// bridge's origin `http://localhost:<port>` and the entry's `rp_id`: the
+/// client data names the challenge, the origin and `webauthn.create`; the
+/// `none` attestation's authenticator data names the RP ID hash, user
+/// presence and user verification; and the attested credential ID and key
+/// are the posted ones. Only the verified ID and key are recorded.
 ///
 /// # Error indistinguishability
 ///
-/// `NotFound`, `Expired`, `WrongKind`, and `AlreadyAttested` store errors all
-/// collapse to the single code `approval_not_found`. The `RegistrationInput`
-/// validation failure collapses to `webauthn_registration_invalid`.
+/// `NotFound`, `Expired`, `WrongKind`, `AlreadyAttested` and a missing
+/// registration challenge all collapse to the single code
+/// `approval_not_found`. Every decode or verification failure collapses to
+/// `webauthn_registration_invalid`.
 ///
 /// # Errors
 ///
 /// - `403 Forbidden` — CSRF header absent, non-hex, or mismatch.
-/// - `400 Bad Request` — nonce not found / expired / wrong kind; or
-///   registration data failed validation.
+/// - `400 Bad Request`: nonce not found / expired / wrong kind / no
+///   registration challenge; or the response failed decoding or
+///   verification.
 /// - `200 OK` — `{"status":"recorded"}` on success.
 pub(crate) async fn register_post(
     Path(nonce): Path<String>,
@@ -213,9 +256,9 @@ pub(crate) async fn register_post(
     };
 
     // ── Lookup + kind check ───────────────────────────────────────────────
-    // All of: not-found, expired, wrong-kind collapse to the same 400 error
-    // (error indistinguishability).
-    let expected_csrf_bytes = {
+    // All of: not-found, expired, wrong-kind, no challenge collapse to the
+    // same 400 error (error indistinguishability).
+    let (expected_csrf_bytes, registration_challenge, rp_id) = {
         let guard = state.approval_store.lock().await;
         let entry = match guard.get(&nonce) {
             Some(e) => e,
@@ -238,7 +281,12 @@ pub(crate) async fn register_post(
                 .into_response();
         }
         match &entry.kind {
-            ApprovalKind::RegisterPasskey { csrf_token, .. } => *csrf_token,
+            ApprovalKind::RegisterPasskey {
+                csrf_token,
+                registration_challenge,
+                rp_id,
+                ..
+            } => (*csrf_token, *registration_challenge, rp_id.clone()),
             _ => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -263,73 +311,29 @@ pub(crate) async fn register_post(
             .into_response();
     }
 
-    // ── Parse the wire payload into RegistrationInput ─────────────────────
-
-    // Decode credential_id from base64url.
-    let credential_id = match URL_SAFE_NO_PAD.decode(&payload.id) {
-        Ok(b) => b,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                [("content-type", "application/json")],
-                json!({"error": "webauthn_registration_invalid"}).to_string(),
-            )
-                .into_response();
-        }
+    let Some(registration_challenge) = registration_challenge else {
+        return (
+            StatusCode::BAD_REQUEST,
+            [("content-type", "application/json")],
+            json!({"error": "approval_not_found"}).to_string(),
+        )
+            .into_response();
     };
 
-    // Decode public_key_sec1_b64 from standard base64 (per the vendored-JS contract).
-    let public_key_uncompressed_sec1 = match STANDARD.decode(&payload.response.public_key_sec1_b64)
-    {
-        Ok(b) => b,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                [("content-type", "application/json")],
-                json!({"error": "webauthn_registration_invalid"}).to_string(),
-            )
-                .into_response();
-        }
-    };
-
-    // Normalise attestation_object from URL-safe base64 to standard base64.
-    // The WebAuthn spec provides attestationObject as base64url; RegistrationInput
-    // stores it in standard base64 per the validation contract.
-    let attestation_blob_b64 = if payload.response.attestation_object.is_empty() {
-        None
-    } else {
-        match URL_SAFE_NO_PAD.decode(&payload.response.attestation_object) {
-            Ok(raw_bytes) => Some(STANDARD.encode(&raw_bytes)),
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    [("content-type", "application/json")],
-                    json!({"error": "webauthn_registration_invalid"}).to_string(),
-                )
-                    .into_response();
-            }
-        }
-    };
-
-    let transports = payload.response.transports;
-
-    // Construct RegistrationInput — runs all invariant validators.
-    let registration_input = match RegistrationInput::new(
-        credential_id,
-        public_key_uncompressed_sec1,
-        attestation_blob_b64,
-        transports,
-    ) {
-        Ok(ri) => ri,
-        Err(_) => {
-            // Error indistinguishability: never echo the typed ApprovalError reason.
-            return (
-                StatusCode::BAD_REQUEST,
-                [("content-type", "application/json")],
-                json!({"error": "webauthn_registration_invalid"}).to_string(),
-            )
-                .into_response();
-        }
+    // ── Decode and verify the registration response ───────────────────────
+    let Some(registration_input) = verified_registration_input(
+        &payload,
+        &registration_challenge,
+        &state.expected_origin,
+        &rp_id,
+    ) else {
+        // Error indistinguishability: never echo which rule refused.
+        return (
+            StatusCode::BAD_REQUEST,
+            [("content-type", "application/json")],
+            json!({"error": "webauthn_registration_invalid"}).to_string(),
+        )
+            .into_response();
     };
 
     // ── Record in store ───────────────────────────────────────────────────
@@ -360,6 +364,59 @@ pub(crate) async fn register_post(
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Decodes `payload`, verifies it against `challenge`, `origin` and `rp_id`,
+/// and returns the [`RegistrationInput`] of the verified credential, or
+/// `None` for any refusal.
+///
+/// The recorded ID and key are the ones the verified authenticator data
+/// names; the attestation object is kept in standard base64.
+fn verified_registration_input(
+    payload: &RegistrationResponseJSON,
+    challenge: &[u8; 32],
+    origin: &str,
+    rp_id: &str,
+) -> Option<RegistrationInput> {
+    if payload.raw_id != payload.id {
+        return None;
+    }
+    let credential_id = decode_b64url_capped(&payload.id, CREDENTIAL_ID_MAX_BYTES)?;
+    // The page posts the SEC1 key in standard base64.
+    let public_key_sec1 = STANDARD
+        .decode(&payload.response.public_key_sec1_b64)
+        .ok()?;
+    let client_data_json = decode_b64url_capped(
+        &payload.response.client_data_json,
+        MAX_CLIENT_DATA_JSON_BYTES,
+    )?;
+    let attestation_object = decode_b64url_capped(
+        &payload.response.attestation_object,
+        MAX_ATTESTATION_OBJECT_BYTES,
+    )?;
+
+    let verified = verify_registration_response(
+        &RegistrationResponse {
+            credential_id: &credential_id,
+            public_key_sec1: &public_key_sec1,
+            client_data_json: &client_data_json,
+            attestation_object: &attestation_object,
+        },
+        &RegistrationExpectation {
+            challenge,
+            origin,
+            rp_id,
+        },
+    )
+    .ok()?;
+
+    RegistrationInput::new(
+        verified.credential_id().to_vec(),
+        verified.public_key_sec1().to_vec(),
+        Some(STANDARD.encode(&attestation_object)),
+        payload.response.transports.clone(),
+    )
+    .ok()
+}
 
 /// Current Unix epoch time in milliseconds, or `u64::MAX` if the system clock
 /// fails.
