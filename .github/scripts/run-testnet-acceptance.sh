@@ -187,11 +187,14 @@ SUITES=(
 # that need an unavailable precondition print a SKIP line and return without
 # failing; surfacing the count in the summary keeps a green run honest about
 # what did not execute.
+#
+# Every suite builds with --no-default-features, so live acceptance runs with
+# mainnet-write off; no entry of SUITES enables the feature.
 run_suite() {
   local crate="$1" feature="$2" target="$3" log status summary executed deterministic tmp_root
   tmp_root=${TMPDIR:-/tmp}
   log=$(mktemp "${tmp_root%/}/run-testnet-acceptance.XXXXXX")
-  cargo test -p "$crate" --features "$feature" --test "$target" \
+  cargo test -p "$crate" --no-default-features --features "$feature" --test "$target" \
     -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$log"
   status=${PIPESTATUS[0]}
   # Last harness summary line, e.g.:

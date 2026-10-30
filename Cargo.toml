@@ -151,7 +151,7 @@ stellar-agent-sep48 = { path = "crates/stellar-agent-sep48", version = "0.1.0-al
 stellar-agent-sep7 = { path = "crates/stellar-agent-sep7", version = "0.1.0-alpha.12" }
 stellar-agent-anchor = { path = "crates/stellar-agent-anchor", version = "0.1.0-alpha.12" }
 stellar-agent-mcp-macros = { path = "crates/stellar-agent-mcp-macros", version = "0.1.0-alpha.12" }
-stellar-agent-mcp = { path = "crates/stellar-agent-mcp", version = "0.1.0-alpha.12" }
+stellar-agent-mcp = { path = "crates/stellar-agent-mcp", version = "0.1.0-alpha.12", default-features = false }
 # CLI binary (stellar-agent) deps.
 clap = { version = "=4.6.1", default-features = false, features = ["std", "derive", "help", "usage"] }
 # webbrowser: launches the system browser for the loopback handoffs. The only

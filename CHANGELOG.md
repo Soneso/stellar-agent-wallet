@@ -177,8 +177,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version from its `getNetwork` answer. This release supports protocol 29. On
   testnet and other networks, a version outside that range logs a warning and
   the submission continues. On mainnet such a version refuses with the new code
-  `network.unsupported_protocol_version`; while mainnet writes are refused, a
-  mainnet endpoint is refused with `network.mainnet_write_forbidden` first.
+  `network.unsupported_protocol_version`; ordinary submission refuses a mainnet
+  endpoint with `network.mainnet_write_forbidden` first.
 - `StellarRpcClient::simulate_transaction_envelope` sends an envelope to
   `simulateTransaction` without `authMode` and returns the answer as received,
   with its `error` string scrubbed. A failed request reports
@@ -240,6 +240,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `stellar-agent-cli` and `stellar-agent-mcp` enable the `mainnet-write`
+  feature by default. Release archives, `cargo binstall`, `cargo install` and
+  source builds produce binaries that report
+  `STELLAR_AGENT_BUILD_MAINNET_WRITE=on`. A mainnet write still requires an
+  explicit mainnet profile, the owner-signed policy and its enablement, the
+  enrolled identities, the cross-check witness, and passkey consent for each
+  action. `--no-default-features` builds the binaries with the feature off.
+  The library crates keep it off by default; a dependency on the
+  `stellar-agent-mcp` library sets `default-features = false` to stay off.
+- The messages of `network.mainnet_write_forbidden` and
+  `network.envelope_signed_for_mainnet` describe the refused path; the codes
+  stay.
 - Breaking (`stellar-agent-smart-account` API): `complete_authorization_entry`,
   `complete_authorization_entry_multi_signer`, `sign_with_ed25519_rule` and
   `collect_quorum_signatures` take a `CheckedSigningRules` as their first

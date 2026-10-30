@@ -112,9 +112,9 @@ vendored-tree-check	bash .github/scripts/rebuild-vendored-wasm.sh --check-tree -
 publish-check	.github/scripts/publish-crates.sh --check
 baseline-gate	bash .github/scripts/check-no-direct-sasignersetbaselined-emit.sh
 fmt	cargo fmt --all -- --check
-clippy	cargo clippy --workspace --all-targets --features deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers -- -D warnings
-rustdoc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
-test	cargo test --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry
+clippy	cargo clippy --workspace --all-targets --no-default-features --features deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers -- -D warnings
+rustdoc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --no-default-features --features deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
+test	cargo test --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry
 feature-on:clippy	cargo clippy --workspace --all-targets --features mainnet-write,deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers -- -D warnings
 feature-on:doc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features mainnet-write,deploy-cli,operator-enroll-browser-acceptance,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-helpers,testnet-integration,verifier-registry,wiremock-helpers
 feature-on:test	cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry
@@ -123,7 +123,7 @@ release-shape	bash .github/scripts/release/check-host.sh
 test-vendored-release-cfg	cargo test -p stellar-agent-smart-account --test vendored_wasm_release_cfg
 machete	cargo machete
 deny	cargo deny check
-coverage	cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json
+coverage	cargo llvm-cov --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json
 coverage-floors	python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off
 coverage:feature-on	cargo llvm-cov --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-on.json
 coverage-floors:feature-on	python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on
@@ -401,11 +401,11 @@ pin_packages() {
   for package in "${list[@]}"; do
     operands="$operands -p $package"
   done
-  test_command="cargo test$operands"
+  test_command="cargo test$operands --no-default-features"
   if [ -n "$features" ]; then
     test_command="$test_command --features $features"
   fi
-  local declared on_declared all_args="" on_args="" on_test="$test_command"
+  local declared on_declared all_args="" on_args="" on_test="cargo test$operands${features:+ --features $features}"
   declared=$(python3 - "$packages" <<'PYDECLARED'
 import pathlib, sys, tomllib
 selected = sys.argv[1].split()
@@ -427,8 +427,8 @@ PYDECLARED
   else
     on_args=$all_args
   fi
-  PACKAGE_GATES=(fmt "clippy=cargo clippy$operands --all-targets$all_args -- -D warnings"
-    "rustdoc=${RUSTDOC_PREFIX}cargo doc --no-deps$operands$all_args" "test=$test_command"
+  PACKAGE_GATES=(fmt "clippy=cargo clippy$operands --all-targets --no-default-features$all_args -- -D warnings"
+    "rustdoc=${RUSTDOC_PREFIX}cargo doc --no-deps$operands --no-default-features$all_args" "test=$test_command"
     "feature-on:clippy=cargo clippy$operands --all-targets$on_args -- -D warnings"
     "feature-on:doc=${RUSTDOC_PREFIX}cargo doc --no-deps$operands$on_args" "feature-on:test=$on_test"
     feature-on:network)

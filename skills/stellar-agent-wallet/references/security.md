@@ -165,9 +165,10 @@ window.
 
 ## Mainnet authorization boundaries
 
-Released binaries have `mainnet-write` disabled. With the feature off, no code
-path in the shipped binary can satisfy the mainnet-write guard, and the binary
-attests its feature state.
+Released binaries have `mainnet-write` on. With the feature on, only a typed
+authorization issued for the action can satisfy the mainnet-write guard, and
+the binary attests its feature state. A build with `--no-default-features` has
+the feature off, and no code path in it can satisfy the guard.
 The guarantee has one precondition: the claim holds only under the dependency
 set pinned and verified by the release.
 

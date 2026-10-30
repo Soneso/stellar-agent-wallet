@@ -2182,10 +2182,12 @@ pub enum NetworkError {
         account_id: String,
     },
 
-    /// A mainnet write operation was attempted; every mainnet write is
-    /// structurally refused in this alpha, regardless of the configured
-    /// policy engine or enrolled keys.
-    #[error("mainnet writes are structurally refused in this alpha")]
+    /// A mainnet write reached a path that cannot carry a mainnet
+    /// authorization: a build without the `mainnet-write` feature, an
+    /// operation outside the mainnet scope, a staged mode, or an ordinary
+    /// signing or submission entry. The configured policy engine and enrolled
+    /// keys do not change this refusal.
+    #[error("this mainnet write is structurally refused")]
     MainnetWriteForbidden,
 
     /// A mainnet authorization did not match the action it was presented for,
@@ -2338,9 +2340,10 @@ pub enum NetworkError {
     /// A release adds a protocol version to its supported range only after
     /// its testnet acceptance tests ran against that version. On testnet and
     /// on any other network, a version outside the range is logged as a
-    /// warning instead. While every mainnet write is refused, an endpoint
-    /// reporting mainnet is refused with
-    /// [`NetworkError::MainnetWriteForbidden`] before this check runs.
+    /// warning instead. Ordinary submission refuses an endpoint reporting
+    /// mainnet with [`NetworkError::MainnetWriteForbidden`] before this check
+    /// runs; authorized mainnet submission refuses a version outside the
+    /// range.
     #[error(
         "the RPC endpoint runs protocol version {protocol_version}, outside the supported \
          range {supported_min} to {supported_max}; not submitting"
@@ -2354,14 +2357,14 @@ pub enum NetworkError {
         supported_max: u32,
     },
 
-    /// A signature on the envelope was produced under the mainnet network id.
+    /// A signature on the envelope verifies under the mainnet network id
+    /// while the endpoint serves another network.
     ///
-    /// Every mainnet write is structurally refused, including one reaching a
-    /// non-mainnet endpoint: an envelope signed for mainnet is a mainnet
-    /// authorisation regardless of where it is relayed.
+    /// An envelope signed for mainnet is a mainnet authorization wherever it
+    /// is relayed.
     #[error(
-        "the envelope carries a signature produced for mainnet; \
-         mainnet writes are structurally refused in this alpha"
+        "the envelope carries a signature produced for mainnet and the endpoint \
+         serves another network; not submitting"
     )]
     EnvelopeSignedForMainnet,
 

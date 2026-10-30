@@ -124,8 +124,10 @@ enum Commands {
 
     /// Send a payment from source to destination.
     ///
-    /// Enforces SEP-29 memo-required destinations. Structurally refuses mainnet
-    /// (returns `network.mainnet_write_forbidden` before any RPC call).
+    /// Enforces SEP-29 memo-required destinations. On mainnet only the full
+    /// pipeline runs, under the mainnet authorization; the staged modes, and
+    /// every mainnet run of a build without `mainnet-write`, refuse with
+    /// `network.mainnet_write_forbidden` before any RPC call.
     /// Supports three-stage pipeline: `--build-only`, `--sign-only <xdr>`,
     /// `--submit-only <xdr>`. Default: build → sign → submit atomically.
     Pay(Box<commands::pay::PayArgs>),
@@ -204,8 +206,10 @@ enum Commands {
     /// Fetches the on-chain `ClaimableBalanceEntry`, renders a typed preview,
     /// then enforces the claim guards before signing: claimant membership,
     /// predicate satisfaction, non-native trustline state, and native-XLM fee
-    /// affordability. Structurally refuses mainnet (returns
-    /// `network.mainnet_write_forbidden` before any RPC call). Supports the
+    /// affordability. On mainnet only the full pipeline runs, under the
+    /// mainnet authorization; the staged modes, and every mainnet run of a
+    /// build without `mainnet-write`, refuse with
+    /// `network.mainnet_write_forbidden` before any RPC call. Supports the
     /// three-stage pipeline: `--build-only`, `--sign-only <xdr>`,
     /// `--submit-only <xdr>`. Default: build → sign → submit atomically.
     Claim(Box<commands::claim::ClaimArgs>),

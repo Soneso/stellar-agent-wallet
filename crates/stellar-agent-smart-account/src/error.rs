@@ -1115,7 +1115,7 @@ pub enum SaError {
     /// [`Self::NetworkRpcDivergence`], [`Self::SubmissionUnresolved`], and
     /// [`Self::PolicyDenied`] are, so every mainnet refusal carries one code.
     /// The serde tag carries the same code.
-    #[error("mainnet writes are structurally refused in this alpha")]
+    #[error("this mainnet write is structurally refused")]
     #[serde(rename = "network.mainnet_write_forbidden")]
     MainnetWriteForbidden,
 

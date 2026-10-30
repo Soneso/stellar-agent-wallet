@@ -77,8 +77,10 @@ jobs:
           tool: cargo-llvm-cov@0.8.7
       # Offline tier only, matching the test jobs. Coverage of
       # the remaining live-network lines is out of scope for this offline gate.
+      # --no-default-features keeps mainnet-write off; the binary packages
+      # enable it by default.
       - name: Measure offline line coverage
-        run: cargo llvm-cov --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json
+        run: cargo llvm-cov --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json
       - name: Enforce per-crate line-coverage floors
         run: python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off
       - name: Measure feature-on offline line coverage

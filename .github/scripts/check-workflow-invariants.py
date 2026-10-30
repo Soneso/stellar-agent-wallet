@@ -171,8 +171,13 @@ runs the function.
   ``RUSTUP_TOOLCHAIN`` between the install and the build or packaging.
 - ``ci-feature-jobs``: a job of ``CI_FEATURE_JOBS`` is missing, it or one of
   its steps sets ``if`` or ``continue-on-error``, or it does not run each of
-  its commands unconditionally; or ``check-host.sh`` does not run each
-  command of ``HOST_CHECKS`` unconditionally.
+  its commands unconditionally; a job of ``CONDITIONED_FEATURE_JOBS`` is
+  missing, its ``if`` differs from its documented condition after the check
+  strips the surrounding whitespace and one enclosing ``${{ }}``, it sets
+  ``continue-on-error``, one of its steps sets ``if`` or
+  ``continue-on-error``, or it does not run each of its commands
+  unconditionally; or ``check-host.sh`` does not run each command of
+  ``HOST_CHECKS`` unconditionally.
 """
 
 import fnmatch
@@ -285,8 +290,16 @@ VERIFY_JOBS = (("release.yml", "verify-packaged"), ("release.yml", "verify-prove
                ("publish.yml", "verify"), ("publish.yml", "verify-install"),
                ("release-rehearsal.yml", "verify-packaged"), ("release-rehearsal.yml", "verify-crates"))
 TOKEN_ENV = {"GH_TOKEN", "GITHUB_TOKEN"}
-# The feature jobs of ci.yml and the commands that define each of them.
+# The feature jobs of ci.yml and the commands that define each of them. The
+# off jobs pass --no-default-features, which keeps mainnet-write off; the
+# binary packages enable it by default.
 CI_FEATURE_JOBS = {
+    "clippy": (
+        'cargo clippy --workspace --all-targets --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE" '
+        '-- -D warnings',),
+    "doc": ('cargo doc --workspace --no-deps --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE"',),
+    "test": (
+        "cargo test --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry",),
     "feature-on-clippy": (
         'cargo clippy --workspace --all-targets --features "mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE" '
         '-- -D warnings',),
@@ -303,11 +316,24 @@ CI_FEATURE_JOBS = {
         '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-provenance.py'),
     "release-shape": ("bash .github/scripts/release/check-host.sh",),
 }
+# The feature jobs of other workflows that run under a documented job
+# condition: for each workflow and job, that condition and the commands that
+# define the job.
+CONDITIONED_FEATURE_JOBS = {
+    (COVERAGE_WORKFLOW, "coverage"): (COVERAGE_CONDITION, (
+        "cargo llvm-cov --workspace --no-default-features --features "
+        "test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json",)),
+}
 # The host recipe: the release build for the host target and the marker
-# check of both binaries.
+# check of both binaries, then the build of each binary package alone and
+# its marker check.
 HOST_CHECKS = ('bash .github/scripts/release/build.sh "$target"',
-               'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent" off',
-               'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" off')
+               'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent" on',
+               'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on',
+               "cargo build --locked -p stellar-agent-cli",
+               "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent on",
+               "cargo build --locked -p stellar-agent-mcp",
+               "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent-mcp on")
 # For each job: the action that receives a credential, and the text of the
 # checks that earlier steps must hold. The third entry is the text of the
 # workspace code that reads the downloaded data. A clean-checkout check must
@@ -1162,6 +1188,20 @@ class Checker:
             for command in commands:
                 if self.runs_in_job("ci.yml", name, command, "ci-feature-jobs") < 0:
                     self.report("ci.yml", "ci-feature-jobs", f"{name} does not run unconditionally: {command}")
+        for (workflow, name), (condition, commands) in CONDITIONED_FEATURE_JOBS.items():
+            job = self.job(workflow, name)
+            if job is None:
+                self.report(workflow, "ci-feature-jobs", f"missing {name}")
+                continue
+            documented = isinstance(job.get("if"), str) and self.unwrap_expression(job["if"]) == condition
+            if not documented or "continue-on-error" in job:
+                self.report(workflow, "ci-feature-jobs", f"{name} can be bypassed")
+            for step in job.get("steps", []):
+                if "if" in step or "continue-on-error" in step:
+                    self.report(workflow, "ci-feature-jobs", f"{name} step can be bypassed")
+            for command in commands:
+                if self.runs_in_job(workflow, name, command, "ci-feature-jobs") < 0:
+                    self.report(workflow, "ci-feature-jobs", f"{name} does not run unconditionally: {command}")
         script = self.read_script(HOST_SCRIPT, "ci-feature-jobs")
         for command in HOST_CHECKS:
             position, problem = self.runs_line(script, command) if script is not None else (0, None)

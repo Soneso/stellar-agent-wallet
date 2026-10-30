@@ -76,7 +76,7 @@ unset WALLET_SK
 
 ### Mainnet write behavior
 
-Released binaries have `mainnet-write` disabled. Enabled builds admit full-mode
+Released binaries have `mainnet-write` on and admit full-mode
 `pay`, `claim`, sponsored `accounts create`, and `trustline` after installation
 setup and consent for each action. Build-only, sign-only, submit-only,
 Friendbot creation, generated-account creation, and relayer paths remain excluded.

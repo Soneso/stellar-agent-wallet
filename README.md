@@ -41,8 +41,8 @@ the planned work per release.
 
 - testnet (`stellar:testnet`) is the default network: a command with no
   named profile and no `default.toml` runs on the zero-config testnet profile.
-- Released binaries have `mainnet-write` disabled. Feature-enabled builds admit
-  configured operations with approval for each action.
+- Released binaries have `mainnet-write` on and admit configured mainnet
+  operations with approval for each action.
   [Mainnet configurations and scope](docs/getting-started.md#mainnet-configurations-and-scope)
   lists the commands, the layers, and the wire codes.
 - Mainnet writes move real funds. The wallet is alpha software and comes

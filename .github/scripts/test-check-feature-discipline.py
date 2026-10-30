@@ -8,7 +8,7 @@ and the copied live inputs pass D5 to D12 before each edit. Named unit
 cases pin the command scanner, the translation, the Rust lexer and each
 refusal branch; --case runs one of them, or units, graphs or a rule.
 
---mutations disables each rule in a scratch copy of the checker and
+--mutations disables each rule or its MCP default equality in a scratch copy and
 requires every regression of that rule to fail against the copy. It
 proves that each regression depends on its rule rather than on another
 rule or on the fixture alone. D3's target and dev-edge fixtures isolate
@@ -36,18 +36,22 @@ RULE_INPUTS = {'D5': (), 'D6': ('Cross.toml',), 'D7': (),
                'D8': ('docs/maintainers/building.md',), 'D9': (),
                'D10': ('docs/maintainers/building.md',), 'D11': (),
                'D12': ('crates',), 'D13': ()}
-# Violating variants per rule. D1 has a core forward missing from network's
-# declaration, a sep10 forward missing from x402-identity's, an x402-identity
-# forward missing from mcp's, and an x402-identity test-helpers feature that
-# reaches the feature through sep10. D2 has a dev dependency that requests
-# core's feature and one that requests x402's. D3 has a crate outside the
+# Violating variants per rule. D1 has eight variants. Three remove forwards:
+# network to core, x402-identity to sep10, and mcp to x402-identity.
+# One lets x402-identity's test-helpers reach the feature through sep10.
+# One gives core the feature by default; two remove it from the binary defaults.
+# One keeps mcp's default on a normal dependency.
+# D2 has a dev dependency that requests core's feature, one that requests
+# x402's, one that keeps mcp's default, and an mcp self dev
+# dependency that keeps its own default. D3 has a crate outside the
 # workspace that enables core's feature in an off graph, and x402 off in an
 # on graph of cli and mcp whose declaration does not forward to it. D7 has
 # the workflow env map, an echo that appends a lower-case refused name to
 # the environment file and a lower-case PowerShell assignment.
-VARIANTS = {'D1': 4, 'D2': 2, 'D3': 2, 'D7': 3, 'D13': 6}
+VARIANTS = {'D1': 8, 'D2': 4, 'D3': 2, 'D7': 3, 'D13': 6}
 # The normal dependencies of each synthetic workspace member, in the order
 # its mainnet-write declaration forwards to them; other declares no feature.
+# The binary members cli and mcp enable mainnet-write by default.
 FIXTURE_DEPENDENCIES = {
     'core': [], 'network': ['core'], 'cli': ['core', 'network'],
     'mcp': ['core', 'network', 'sep43', 'x402', 'x402-identity'],
@@ -61,9 +65,17 @@ SINGLE_ERRORS = {
     ('D1', 1): 'D1: stellar-agent-x402-identity: declaration differs',
     ('D1', 2): 'D1: stellar-agent-mcp: declaration differs',
     ('D1', 3): 'D1: stellar-agent-x402-identity/test-helpers reaches mainnet-write',
+    ('D1', 5): 'D1: stellar-agent-cli: default differs',
+    ('D1', 6): 'D1: stellar-agent-other: normal dependency stellar-agent-mcp enables mainnet-write',
+    ('D1', 7): 'D1: stellar-agent-mcp: default differs',
     ('D2', 1): 'D2: stellar-agent-other: dev dependency enables mainnet-write',
+    ('D2', 2): 'D2: stellar-agent-other: dev dependency enables mainnet-write',
+    ('D2', 3): 'D2: stellar-agent-mcp: dev dependency enables mainnet-write',
     ('D3', 1): 'positive control lacks feature',
 }
+# The binary members of the synthetic workspace and their default.
+BINARY_DEFAULT = 'default=["mainnet-write"]'
+
 # The on graph of D3's second variant: both binaries reach every declaring
 # crate, and neither selects x402 itself.
 SELECTED_ON = 'cargo test -p stellar-agent-cli -p stellar-agent-mcp --features mainnet-write'
@@ -113,7 +125,8 @@ def workspace(root, mutation=None):
         dependencies = FIXTURE_DEPENDENCIES[name]
         edges = [f'stellar-agent-{dep}/mainnet-write' for dep in dependencies]
         features = '' if name == 'other' else 'mainnet-write=' + json.dumps(edges) + '\n'
-        manifest = f'[package]\nname="stellar-agent-{name}"\nversion="0.0.0"\nedition="2024"\n[features]\ndefault=[]\n' + features
+        default = BINARY_DEFAULT if name in ('cli', 'mcp') else 'default=[]'
+        manifest = f'[package]\nname="stellar-agent-{name}"\nversion="0.0.0"\nedition="2024"\n[features]\n{default}\n' + features
         manifest += '[dependencies]\n' + ''.join(f'stellar-agent-{dep}={{path="../{dep}"}}\n' for dep in dependencies)
         (path / 'Cargo.toml').write_text(manifest)
     if mutation:
@@ -225,13 +238,25 @@ def rule_fixture(m, rule, directory, variant=0):
                 replace(r, 'x402-identity/Cargo.toml', ', "stellar-agent-sep10/mainnet-write"', '')
             elif rule == 'D1' and variant == 2:
                 replace(r, 'mcp/Cargo.toml', ', "stellar-agent-x402-identity/mainnet-write"', '')
-            elif rule == 'D1':
+            elif rule == 'D1' and variant == 3:
                 replace(r, 'x402-identity/Cargo.toml', 'default=[]\n',
                         'default=[]\ntest-helpers=["stellar-agent-sep10/mainnet-write"]\n')
+            elif rule == 'D1' and variant == 4:
+                replace(r, 'core/Cargo.toml', 'default=[]\n', 'default=["mainnet-write"]\n')
+            elif rule == 'D1' and variant == 5:
+                replace(r, 'cli/Cargo.toml', BINARY_DEFAULT + '\n', 'default=[]\n')
+            elif rule == 'D1' and variant == 6:
+                append(r, 'other/Cargo.toml', 'stellar-agent-mcp={path="../mcp"}\n')
+            elif rule == 'D1':
+                replace(r, 'mcp/Cargo.toml', BINARY_DEFAULT + '\n', 'default=[]\n')
             elif rule == 'D2' and variant == 0:
                 append(r, 'other/Cargo.toml', '[dev-dependencies]\nstellar-agent-core={path="../core",features=["mainnet-write"]}\n')
-            elif rule == 'D2':
+            elif rule == 'D2' and variant == 1:
                 append(r, 'other/Cargo.toml', '[dev-dependencies]\nstellar-agent-x402={path="../x402",features=["mainnet-write"]}\n')
+            elif rule == 'D2' and variant == 2:
+                append(r, 'other/Cargo.toml', '[dev-dependencies]\nstellar-agent-mcp={path="../mcp"}\n')
+            elif rule == 'D2':
+                append(r, 'mcp/Cargo.toml', '[dev-dependencies]\nstellar-agent-mcp={path="."}\n')
             elif rule == 'D3' and variant == 1:
                 replace(r, 'mcp/Cargo.toml', ', "stellar-agent-x402/mainnet-write"', '')
             elif rule == 'D3':
@@ -246,7 +271,7 @@ def rule_fixture(m, rule, directory, variant=0):
         if rule == 'D3' and variant == 1:
             c = graph_checker(m, root, SELECTED_ON, 'on')
         elif rule == 'D3':
-            c = graph_checker(m, root, 'cargo build --workspace')
+            c = graph_checker(m, root, 'cargo build --workspace --no-default-features')
         else:
             c = m.Checker(root)
     else:
@@ -275,7 +300,7 @@ def rule_fixture(m, rule, directory, variant=0):
         elif rule == 'D10':
             c.workflows['ci.yml']['env']['FEATURES_EXCEPT_MAINNET_WRITE'] = 'test-helpers'
         elif rule == 'D11':
-            c.workflows['release.yml']['env']['EXPECTED_MAINNET_WRITE'] = 'on'
+            c.workflows['release.yml']['env']['EXPECTED_MAINNET_WRITE'] = 'off'
         elif rule == 'D12':
             append(root, 'crates/stellar-agent-core/src/lib.rs', '\nconst EXTRA: &str = "' + m.MARKER + 'off";\n')
     getattr(c, rule)()
@@ -303,7 +328,7 @@ def graph_cases(m, tmp, selected=None):
         if bool(c.errors) != want:
             raise AssertionError(f'{name}: errors {c.errors}, expected failure={want}')
         print(f'ok {name}')
-    check('graph-baseline', None, 'cargo build --workspace', False)
+    check('graph-baseline', None, 'cargo build --workspace --no-default-features', False)
     check('graph-positive', None, 'cargo test --workspace --features mainnet-write', False, 'on')
     check('graph-positive-selected', None, SELECTED_ON, False, 'on')
     if not selected or selected == 'graph-positive-mutated':
@@ -323,19 +348,86 @@ def graph_cases(m, tmp, selected=None):
         print('ok graph-positive-mutated')
     check('graph-bin-workspace', lambda r: append(r, 'other/Cargo.toml',
           'stellar-agent-core={path="../core",features=["mainnet-write"]}\n'),
-          'cargo build --bin stellar-agent-cli', True)
+          'cargo build --no-default-features --bin stellar-agent-cli', True)
     check('graph-target-specific', lambda r: append(r, 'other/Cargo.toml',
           '[target.\'cfg(windows)\'.dependencies]\nstellar-agent-core={path="../core",features=["mainnet-write"]}\n'),
-          'cargo build --workspace', True)
+          'cargo build --workspace --no-default-features', True)
     dev = lambda r: append(r, 'other/Cargo.toml',
                            '[dev-dependencies]\nstellar-agent-core={path="../core",features=["mainnet-write"]}\n')
-    check('graph-dev-build', dev, 'cargo build --workspace', False)
-    check('graph-dev-test', dev, 'cargo test --workspace', True)
+    check('graph-dev-build', dev, 'cargo build --workspace --no-default-features', False)
+    check('graph-dev-test', dev, 'cargo test --workspace --no-default-features', True)
     check('graph-absent', None, 'cargo check -p stellar-agent-other', False)
+    # The binary defaults: kept defaults resolve the feature on, and every
+    # declaration that keeps a binary default turns an off run on.
+    check('graph-default-on', None, 'cargo build --workspace', False, 'on')
+    check('graph-default-recorded-off', None, 'cargo build --workspace', True)
+    check('graph-default-dev-edge', lambda r: append(r, 'other/Cargo.toml',
+          '[dev-dependencies]\nstellar-agent-mcp={path="../mcp"}\n'),
+          'cargo test --workspace --no-default-features', True)
+    check('graph-default-self-edge', lambda r: append(r, 'mcp/Cargo.toml',
+          '[dev-dependencies]\nstellar-agent-mcp={path="."}\n'),
+          'cargo test -p stellar-agent-mcp --no-default-features', True)
+    check('graph-default-edge-disabled', lambda r: append(r, 'other/Cargo.toml',
+          '[dev-dependencies]\nstellar-agent-mcp={path="../mcp",default-features=false}\n'),
+          'cargo test --workspace --no-default-features', False)
+    # A binary package built alone, as cargo install builds it: its default
+    # turns the feature on in the declaring packages it reaches.
+    check('graph-single-cli', None, 'cargo build -p stellar-agent-cli', False, 'on')
+    check('graph-single-mcp', None, 'cargo build -p stellar-agent-mcp', False, 'on')
+    check('graph-single-cli-missing', lambda r: replace(r, 'cli/Cargo.toml', ', "stellar-agent-network/mainnet-write"', ''),
+          'cargo build -p stellar-agent-cli', True, 'on')
+    check('graph-single-mcp-missing', lambda r: replace(r, 'mcp/Cargo.toml', ', "stellar-agent-x402-identity/mainnet-write"', ''),
+          'cargo build -p stellar-agent-mcp', True, 'on')
+    if not selected or selected == 'graph-single-mutated':
+        root = tmp / 'graph-single-mutated'
+        workspace(root)
+        original = m.graph_state
+        cli = m.PACKAGES[2]
+        wanted = {cli: m.PACKAGES[:3], m.PACKAGES[3]: tuple(p for p in m.PACKAGES if p != cli)}
+        try:
+            for binary, required in wanted.items():
+                command = f'cargo build -p {binary}'
+                states = {p: ([True] if p in required else []) for p in m.PACKAGES}
+                m.graph_state = lambda _root, _query: states
+                c = graph_checker(m, root, command, 'on')
+                with contextlib.redirect_stdout(io.StringIO()):
+                    c.D3()
+                assert not c.errors, f'graph-single-mutated: {binary} alone refused its reached packages: {c.errors}'
+                for name in required:
+                    for activation in ([False], []):
+                        states = {p: ([True] if p in required else []) for p in m.PACKAGES}
+                        states[name] = activation
+                        c = graph_checker(m, root, command, 'on')
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            c.D3()
+                        assert len(c.errors) == 1 and 'positive control lacks feature' in c.errors[0], \
+                            f'graph-single-mutated: {binary} requires activation on {name}, state={activation}: {c.errors}'
+        finally:
+            m.graph_state = original
+        print('ok graph-single-mutated')
+    for binary in (m.PACKAGES[2], m.PACKAGES[3]):
+        name = f'graph-single-{binary.removeprefix("stellar-agent-")}-empty-required'
+        if selected and selected != name:
+            continue
+        root = tmp / name
+        workspace(root)
+        selection = ('-p', binary)
+        original_graph, original_required = m.graph_state, m.POSITIVE_CONTROLS[selection]
+        try:
+            m.POSITIVE_CONTROLS[selection] = []
+            m.graph_state = lambda _root, _query: {p: [] for p in m.PACKAGES}
+            c = graph_checker(m, root, f'cargo build -p {binary}', 'on')
+            with contextlib.redirect_stdout(io.StringIO()):
+                c.D3()
+            assert len(c.errors) == 1 and 'positive control lacks feature' in c.errors[0], \
+                f'{name}: empty required set needs positive control lacks feature: {c.errors}'
+        finally:
+            m.graph_state, m.POSITIVE_CONTROLS[selection] = original_graph, original_required
+        print(f'ok {name}')
     if not selected or selected == 'graph-missing-metadata':
         root = tmp / 'graph-missing-metadata'
         workspace(root)
-        c = graph_checker(m, root, 'cargo build --workspace')
+        c = graph_checker(m, root, 'cargo build --workspace --no-default-features')
         del c.packages[m.PACKAGES[0]]
         c.D3()
         assert c.errors, 'graph-missing-metadata: missing queried crate accepted'
@@ -343,7 +435,7 @@ def graph_cases(m, tmp, selected=None):
     if not selected or selected == 'synthetic-baseline':
         root = tmp / 'synthetic-baseline'
         workspace(root, lambda r: (r / 'core/build.rs').write_text(SAFE_BUILD))
-        c = graph_checker(m, root, 'cargo build --workspace')
+        c = graph_checker(m, root, 'cargo build --workspace --no-default-features')
         for rule in ('D1', 'D2', 'D3', 'D4'):
             c.errors = []
             with contextlib.redirect_stdout(io.StringIO()):
@@ -363,7 +455,7 @@ def graph_cases(m, tmp, selected=None):
             continue
         root = tmp / name
         workspace(root)
-        c = graph_checker(m, root, 'cargo build --workspace')
+        c = graph_checker(m, root, 'cargo build --workspace --no-default-features')
         steps = c.workflows['fixture.yml']['jobs']['test']['steps']
         if mode == 'add':
             steps.append({'name': 'extra', 'run': 'cargo check --workspace'})
@@ -381,6 +473,10 @@ def graph_cases(m, tmp, selected=None):
 GRAPHS = ('graph-baseline', 'graph-positive', 'graph-positive-selected', 'graph-positive-mutated',
           'graph-bin-workspace',
           'graph-target-specific', 'graph-dev-build', 'graph-dev-test', 'graph-absent',
+          'graph-default-on', 'graph-default-recorded-off', 'graph-default-dev-edge',
+          'graph-default-self-edge', 'graph-default-edge-disabled', 'graph-single-cli',
+          'graph-single-mcp', 'graph-single-cli-missing', 'graph-single-mcp-missing',
+          'graph-single-mutated', 'graph-single-cli-empty-required', 'graph-single-mcp-empty-required',
           'graph-missing-metadata', 'synthetic-baseline', 'D4-formatted', 'inventory-added',
           'inventory-vanished', 'inventory-duplicate', 'inventory-drift')
 UNITS = {}
@@ -804,7 +900,7 @@ def case_d1_normal_dependency(m, tmp, checker):
     packages = {}
     for name, declaration in m.DECLARATIONS.items():
         deps = [forward.split('/', 1)[0] for forward in declaration]
-        packages[name] = {'features': {m.FEATURE: declaration, 'default': []},
+        packages[name] = {'features': {m.FEATURE: declaration, 'default': m.DEFAULTS.get(name, [])},
                           'dependencies': [dep(d) for d in deps]}
     packages['other'] = {'features': {'default': []}, 'dependencies': [dep(core, [m.FEATURE])]}
     c = bare_checker(m, packages=packages)
@@ -816,10 +912,29 @@ def case_d1_normal_dependency(m, tmp, checker):
 def case_d11_workflows(m, tmp, checker):
     c = bare_checker(m)
     for workflow in ('release.yml', 'publish.yml', 'release-rehearsal.yml'):
-        c.workflows = {name: {'env': {'EXPECTED_MAINNET_WRITE': 'off'}}
+        c.workflows = {name: {'env': {'EXPECTED_MAINNET_WRITE': 'on'}}
                        for name in ('release.yml', 'publish.yml', 'release-rehearsal.yml')}
         c.workflows[workflow]['env'].clear()
         rejects(c, 'D11', workflow)
+
+
+@unit('relied-state')
+def case_relied_state(m, tmp, checker):
+    for command, state in (
+            ('cargo build --workspace', 'on'),
+            ('cargo build --release --locked --bin stellar-agent --bin stellar-agent-mcp', 'on'),
+            ('cargo build -p stellar-agent-cli', 'on'),
+            ('cargo build -p stellar-agent-mcp', 'on'),
+            ('cargo test --workspace --exclude stellar-agent-cli', 'on'),
+            ('cargo test --workspace --exclude stellar-agent-cli --exclude stellar-agent-mcp', 'off'),
+            ('cargo check -p stellar-agent-core', 'off'),
+            ('cargo test --workspace --no-default-features --features test-helpers', 'off'),
+            ('cargo test -p stellar-agent-mcp --no-default-features --lib', 'off'),
+            ('cargo check -p stellar-agent-network --features mainnet-write', 'on'),
+            ('cargo check -p stellar-agent-core --features stellar-agent-core/mainnet-write', 'on'),
+            ('cargo test --workspace --no-default-features --features mainnet-write,test-helpers', 'on')):
+        found = m.relied_state(m.translate(command))
+        assert found == state, f'relied-state: {command}: {found}, expected {state}'
 
 
 @unit('cargo-error')
@@ -851,7 +966,7 @@ def case_inventory_order(m, tmp, checker):
     original, calls = m.graph_state, []
     def stub(_root, query):
         calls.append(query)
-        on = m.FEATURE in ','.join(query['features'])
+        on = m.relied_state(query) == 'on'
         return {name: [on] for name in m.PACKAGES}
     m.graph_state = stub
     try:
@@ -1351,20 +1466,27 @@ def main():
                     print(f'ok {rule} variant {variant}')
                     if not args.mutations:
                         continue
-                    if rule not in mutants:
+                    mutation = f'{rule}-mcp-default' if (rule, variant) == ('D1', 7) else rule
+                    if mutation not in mutants:
                         source = args.checker.read_text()
-                        needle = f'    def {rule}(self):\n'
-                        assert source.count(needle) == 1, f'{rule}: rule method not found'
-                        path = tmp / f'mutant-{rule}.py'
-                        docstring = source.split(needle, 1)[1].split('\n', 1)[0] + '\n'
-                        path.write_text(source.replace(needle + docstring, needle + docstring + '        return\n', 1))
-                        mutants[rule] = load(path)
+                        if mutation == 'D1-mcp-default':
+                            needle = '        for package, expected in DEFAULTS.items():\n'
+                            replacement = needle + "            if package == 'stellar-agent-mcp':\n                continue\n"
+                        else:
+                            needle = f'    def {rule}(self):\n'
+                            assert source.count(needle) == 1, f'{rule}: rule method is missing'
+                            needle += source.split(needle, 1)[1].split('\n', 1)[0] + '\n'
+                            replacement = needle + '        return\n'
+                        assert source.count(needle) == 1, f'{mutation}: mutation target is missing'
+                        path = tmp / f'mutant-{mutation}.py'
+                        path.write_text(source.replace(needle, replacement, 1))
+                        mutants[mutation] = load(path)
                     try:
-                        regression(mutants[rule], rule, tmp / 'mutants', variant)
+                        regression(mutants[mutation], rule, tmp / 'mutants', variant)
                     except AssertionError as error:
                         if 'violating fixture accepted' not in str(error):
                             raise
-                        print(f'ok mutation-{rule} variant {variant}: the regression fails against the disabled rule')
+                        print(f'ok mutation-{mutation} variant {variant}: {error}')
                     else:
                         raise AssertionError(f'{rule}: the regression passed against the disabled rule')
     except (AssertionError, ValueError, OSError) as error:

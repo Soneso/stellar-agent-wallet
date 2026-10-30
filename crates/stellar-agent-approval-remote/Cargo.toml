@@ -93,7 +93,7 @@ keyring-core = { workspace = true }
 # client, a headless-Chromium CDP client for the shipped browser frontend, and
 # the WebAuthn-ceremony-adjacent signing/encoding helpers the acceptance test
 # needs to seed a virtual authenticator with a known keypair.
-stellar-agent-mcp = { path = "../stellar-agent-mcp" }
+stellar-agent-mcp = { path = "../stellar-agent-mcp", default-features = false }
 stellar-agent-network = { path = "../stellar-agent-network" }
 # The rule-proposal acceptance suite registers a co-signer WebAuthn credential
 # via the local bridge (the rules_webauthn precedent) and exercises the

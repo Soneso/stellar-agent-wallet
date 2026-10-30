@@ -73,8 +73,10 @@ jobs:
       # the testnet-acceptance features, without executing any test. The
       # workspace lints declared in the root Cargo.toml deny warnings; -D
       # warnings turns any remaining warning into a failure.
+      # --no-default-features keeps mainnet-write off; the binary packages
+      # enable it by default.
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --features "$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings
 
   doc:
     name: rustdoc
@@ -92,8 +94,10 @@ jobs:
       - name: Install libudev (Linux hidapi)
         run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # --no-default-features keeps mainnet-write off; the binary packages
+      # enable it by default.
       - name: Build the rustdoc
-        run: cargo doc --workspace --no-deps --features "$FEATURES_EXCEPT_MAINNET_WRITE"
+        run: cargo doc --workspace --no-deps --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE"
 
   test:
     name: test (offline)
@@ -128,8 +132,10 @@ jobs:
       # testnet client helpers. The testnet-acceptance / testnet-integration
       # features stay off and the heavy submit flows are #[ignore]d, so no test
       # reaches the network. The live tiers stay disabled.
+      # --no-default-features keeps mainnet-write off; the binary packages
+      # enable it by default.
       - name: Run the offline tests
-        run: cargo test --workspace --features test-helpers,test-hooks,test-loopback,verifier-registry
+        run: cargo test --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry
       # Without test-helpers, the integration target also checks that the library excludes the revoked test fixture.
       - name: Test the vendored Wasm release configuration
         run: cargo test -p stellar-agent-smart-account --test vendored_wasm_release_cfg
@@ -439,7 +445,7 @@ jobs:
       # rest of the job budget.
       - name: Build test binaries (unbounded compile phase)
         shell: bash
-        run: cargo test -p stellar-agent-core -p stellar-agent-mpp -p stellar-agent-smart-account -p stellar-agent-mcp -p stellar-agent-headless-keyring -p stellar-agent-windows-identity -p stellar-agent-network --lib --no-run
+        run: cargo test -p stellar-agent-core -p stellar-agent-mpp -p stellar-agent-smart-account -p stellar-agent-mcp -p stellar-agent-headless-keyring -p stellar-agent-windows-identity -p stellar-agent-network --no-default-features --lib --no-run
       - name: Headless keyring and Windows identity suites
         shell: bash
         run: "timeout 600 cargo test -p stellar-agent-headless-keyring -p stellar-agent-windows-identity --lib"
@@ -463,7 +469,7 @@ jobs:
         run: "timeout 600 cargo test -p stellar-agent-smart-account --lib"
       - name: MCP rule-tool suite (audit path end-to-end)
         shell: bash
-        run: "timeout 600 cargo test -p stellar-agent-mcp --lib -- tools::rules:: tools::rule_create::"
+        run: "timeout 600 cargo test -p stellar-agent-mcp --no-default-features --lib -- tools::rules:: tools::rule_create::"
 
   machete:
     name: unused-deps

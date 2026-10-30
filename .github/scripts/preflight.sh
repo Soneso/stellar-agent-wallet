@@ -44,7 +44,8 @@
 # deleted members, select workspace commands. Tests use the declared subset
 # of the offline features; clippy and rustdoc use every declared feature
 # except mainnet-write. Feature-on rows add mainnet-write only when a
-# selected package declares it.
+# selected package declares it. Off rows pass --no-default-features;
+# feature-on rows keep the default features.
 #
 # A selected gate whose tool or Python module is missing is unavailable: its
 # row names the requirement and an install hint, and the later gates still
@@ -145,9 +146,9 @@ vendored-tree-check	bash .github/scripts/rebuild-vendored-wasm.sh --check-tree -
 publish-check	.github/scripts/publish-crates.sh --check	cargo	ci.yml	release-contracts	Check the publish tiers
 baseline-gate	bash .github/scripts/check-no-direct-sasignersetbaselined-emit.sh	-	ci.yml	release-contracts	Check the signer-set baseline gate
 fmt	cargo fmt --all -- --check	cargo	ci.yml	fmt	Check formatting
-clippy	cargo clippy --workspace --all-targets --features $FEATURES_EXCEPT_MAINNET_WRITE -- -D warnings	cargo	ci.yml	clippy	Run clippy
-rustdoc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features $FEATURES_EXCEPT_MAINNET_WRITE	cargo	ci.yml	doc	Build the rustdoc
-test	cargo test --workspace --features $OFFLINE_FEATURES	cargo	ci.yml	test	Run the offline tests
+clippy	cargo clippy --workspace --all-targets --no-default-features --features $FEATURES_EXCEPT_MAINNET_WRITE -- -D warnings	cargo	ci.yml	clippy	Run clippy
+rustdoc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --no-default-features --features $FEATURES_EXCEPT_MAINNET_WRITE	cargo	ci.yml	doc	Build the rustdoc
+test	cargo test --workspace --no-default-features --features $OFFLINE_FEATURES	cargo	ci.yml	test	Run the offline tests
 feature-on:clippy	cargo clippy --workspace --all-targets --features mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE -- -D warnings	cargo	ci.yml	feature-on-clippy	Run clippy
 feature-on:doc	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features mainnet-write,$FEATURES_EXCEPT_MAINNET_WRITE	cargo	ci.yml	feature-on-doc	Build the rustdoc
 feature-on:test	cargo test --workspace --features mainnet-write,$OFFLINE_FEATURES	cargo	ci.yml	feature-on-test	Run the offline tests
@@ -156,7 +157,7 @@ release-shape	bash .github/scripts/release/check-host.sh	cargo,libudev	ci.yml	re
 test-vendored-release-cfg	cargo test -p $VENDORED_CRATE --test vendored_wasm_release_cfg	cargo	ci.yml	test	Test the vendored Wasm release configuration
 machete	cargo machete	cargo,cargo-machete	ci.yml	machete	Check for unused dependencies
 deny	cargo deny check	cargo,cargo-deny	ci.yml	deny	Check licenses and advisories
-coverage	cargo llvm-cov --workspace --features $OFFLINE_FEATURES --json --output-path cov-feature-off.json	cargo,cargo-llvm-cov	coverage.yml	coverage	Measure offline line coverage
+coverage	cargo llvm-cov --workspace --no-default-features --features $OFFLINE_FEATURES --json --output-path cov-feature-off.json	cargo,cargo-llvm-cov	coverage.yml	coverage	Measure offline line coverage
 coverage-floors	python3 .github/scripts/check-coverage.py cov-feature-off.json --configuration feature-off	-	coverage.yml	coverage	Enforce per-crate line-coverage floors
 coverage:feature-on	cargo llvm-cov --workspace --features mainnet-write,$OFFLINE_FEATURES --json --output-path cov-feature-on.json	cargo,cargo-llvm-cov	coverage.yml	coverage	Measure feature-on offline line coverage
 coverage-floors:feature-on	python3 .github/scripts/check-coverage.py cov-feature-on.json --configuration feature-on	-	coverage.yml	coverage	Enforce feature-on line-coverage floors
@@ -596,10 +597,12 @@ for package in selected:
     packages += ["-p", package]
 all_features = sorted(declared - {"default", "mainnet-write"})
 feature_args = ["--features", ",".join(all_features)] if all_features else []
-print(shlex.join(["cargo", "clippy", *packages, "--all-targets", *feature_args, "--", "-D", "warnings"]))
-print('RUSTDOCFLAGS="-D warnings" ' + shlex.join(["cargo", "doc", "--no-deps", *packages, *feature_args]))
+print(shlex.join(["cargo", "clippy", *packages, "--all-targets", "--no-default-features", *feature_args,
+                  "--", "-D", "warnings"]))
+print('RUSTDOCFLAGS="-D warnings" ' + shlex.join(["cargo", "doc", "--no-deps", *packages, "--no-default-features",
+                                                  *feature_args]))
 command = ["cargo", "test", *packages]
-print(shlex.join(command + (["--features", ",".join(features)] if features else [])))
+print(shlex.join(command + ["--no-default-features"] + (["--features", ",".join(features)] if features else [])))
 print(1 if vendored_crate in selected else 0)
 on_features = (["mainnet-write"] if "mainnet-write" in declared else []) + all_features
 on_args = ["--features", ",".join(on_features)] if on_features else []

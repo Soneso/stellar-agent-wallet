@@ -71,7 +71,7 @@ def before_sign_macos_tools(text):
 REHEARSAL_TIMEOUT = "    timeout-minutes: 120\n"
 REHEARSAL_JOB_PERMISSIONS = "    permissions:\n      contents: read\n    strategy:\n"
 REHEARSAL_VERSION_ECHO = '          echo "Rehearsing version: $VERSION"\n'
-REHEARSAL_ENV = '  EXPECTED_MAINNET_WRITE: "off"\n'
+REHEARSAL_ENV = '  EXPECTED_MAINNET_WRITE: "on"\n'
 REHEARSAL_SODIUM_STEP = (
     "      - name: Prefetch libsodium dist (Windows)\n"
     "        if: matrix.target == 'x86_64-pc-windows-msvc'\n"
@@ -116,7 +116,7 @@ REHEARSAL_PIN_STEP = (
     "      - name: Pin the toolchain for every later step\n"
     '        run: echo "RUSTUP_TOOLCHAIN=$RELEASE_TOOLCHAIN" >> "$GITHUB_ENV"\n'
 )
-RELEASE_WORKFLOW_ENV = ('env:\n  EXPECTED_MAINNET_WRITE: "off"\n'
+RELEASE_WORKFLOW_ENV = ('env:\n  EXPECTED_MAINNET_WRITE: "on"\n'
                         "  # The toolchain publish.yml packages with; every build leg compiles with it.\n"
                         '  RELEASE_TOOLCHAIN: "1.99.0"\n')
 REHEARSAL_MARKER_RUN = ('        run: bash .github/scripts/check-packaged-markers.sh target '
@@ -129,6 +129,23 @@ CI_FEATURE_JOBS = {
     "feature-discipline": "cargo fetch --locked",
     "release-shape": "bash .github/scripts/release/check-host.sh",
 }
+# The off jobs of ci.yml: the job's opening lines and the defining command as
+# its run: line, which passes --no-default-features.
+CI_OFF_JOBS = {
+    "clippy": ("  clippy:\n    name: clippy\n",
+               'cargo clippy --workspace --all-targets --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE"'),
+    "doc": ("  doc:\n    name: rustdoc\n",
+            'cargo doc --workspace --no-deps --no-default-features --features "$FEATURES_EXCEPT_MAINNET_WRITE"'),
+    "test": ("  test:\n    name: test (offline)\n",
+             "cargo test --workspace --no-default-features --features test-helpers,"),
+}
+COVERAGE_OFF_RUN = "        run: cargo llvm-cov --workspace --no-default-features --features test-helpers,"
+# The host recipe lines that build each binary package alone and check its
+# marker.
+HOST_SINGLE_CLI = ("cargo build --locked -p stellar-agent-cli\n"
+                   "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent on\n")
+HOST_SINGLE_MCP = ("cargo build --locked -p stellar-agent-mcp\n"
+                   "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent-mcp on\n")
 
 
 def archive_block(suffix):
@@ -1232,11 +1249,58 @@ CASES = [
          '--features "$FEATURES_EXCEPT_MAINNET_WRITE" -- -D warnings', 1)]),
     ("host recipe with a marker check in a subshell", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: unmodelled shell syntax around", [
-        (HOST_SCRIPT, 'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" off\n',
-         '( bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" off ) || true\n', 1)]),
+        (HOST_SCRIPT, 'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on\n',
+         '( bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on ) || true\n', 1)]),
     ("host recipe without the MCP marker check", "ci-feature-jobs",
      ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally", [
-        (HOST_SCRIPT, 'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" off\n', "", 1)]),
+        (HOST_SCRIPT, 'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent-mcp" on\n', "", 1)]),
+    ("host recipe that expects the release CLI off", "ci-feature-jobs",
+     ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
+     'bash .github/scripts/check-binary-marker.sh "target/$target/release/stellar-agent" on', [
+        (HOST_SCRIPT, '"target/$target/release/stellar-agent" on\n', '"target/$target/release/stellar-agent" off\n', 1)]),
+    ("host recipe without the single CLI build", "ci-feature-jobs",
+     ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
+     "cargo build --locked -p stellar-agent-cli", [
+        (HOST_SCRIPT, HOST_SINGLE_CLI, "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent on\n", 1)]),
+    ("host recipe that expects the single MCP binary off", "ci-feature-jobs",
+     ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
+     "bash .github/scripts/check-binary-marker.sh target/debug/stellar-agent-mcp on", [
+        (HOST_SCRIPT, "target/debug/stellar-agent-mcp on\n", "target/debug/stellar-agent-mcp off\n", 1)]),
+    ("host recipe with the single builds in a condition", "ci-feature-jobs",
+     ".github/scripts/release/check-host.sh: ci-feature-jobs: does not run unconditionally: "
+     "cargo build --locked -p stellar-agent-mcp", [
+        (HOST_SCRIPT, HOST_SINGLE_MCP, "if false; then\n" + HOST_SINGLE_MCP + "fi\n", 1)]),
+] + [
+    (f"conditional {job}", "ci-feature-jobs", f"ci.yml: ci-feature-jobs: {job} can be bypassed", [
+        (CI, header, header + "    if: false\n", 1)])
+    for job, (header, _) in CI_OFF_JOBS.items()
+] + [
+    (f"{job} step that continues on error", "ci-feature-jobs", f"ci.yml: ci-feature-jobs: {job} step can be bypassed", [
+        (CI, f"        run: {command}", f"        continue-on-error: true\n        run: {command}", 1)])
+    for job, (_, command) in CI_OFF_JOBS.items()
+] + [
+    (f"{job} without --no-default-features", "ci-feature-jobs",
+     f"ci.yml: ci-feature-jobs: {job} does not run unconditionally: {command}", [
+        (CI, f"        run: {command}", f"        run: {command.replace(' --no-default-features', '')}", 1)])
+    for job, (_, command) in CI_OFF_JOBS.items()
+] + [
+    ("coverage off measurement without --no-default-features", "ci-feature-jobs",
+     "coverage.yml: ci-feature-jobs: coverage does not run unconditionally: cargo llvm-cov --workspace "
+     "--no-default-features", [
+        (COVERAGE, COVERAGE_OFF_RUN, COVERAGE_OFF_RUN.replace(" --no-default-features", ""), 1)]),
+    ("coverage off measurement that continues on error", "ci-feature-jobs",
+     "coverage.yml: ci-feature-jobs: coverage step can be bypassed", [
+        (COVERAGE, COVERAGE_OFF_RUN, "        continue-on-error: true\n" + COVERAGE_OFF_RUN, 1)]),
+    ("coverage job that continues on error", "ci-feature-jobs", "coverage.yml: ci-feature-jobs: coverage can be bypassed", [
+        (COVERAGE, COVERAGE_IF_LINE, COVERAGE_IF_LINE + "    continue-on-error: true\n", 1)], 1),
+    ("coverage job under another condition", ("coverage-condition", "ci-feature-jobs"), (
+        "coverage.yml: coverage-condition: coverage job runs without the label condition",
+        "coverage.yml: ci-feature-jobs: coverage can be bypassed"), [
+        (COVERAGE, COVERAGE_IF_LINE, "    if: false\n", 1)], 2),
+    ("coverage workflow without its coverage job for the feature pin", ("coverage-condition", "ci-feature-jobs"), (
+        "coverage.yml: coverage-condition: job coverage not found",
+        "coverage.yml: ci-feature-jobs: missing coverage"), [
+        (COVERAGE, "  coverage:\n    name: coverage\n", "  measure:\n    name: coverage\n", 1)], 2),
 ]
 
 

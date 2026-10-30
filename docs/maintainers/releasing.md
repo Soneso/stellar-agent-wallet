@@ -348,7 +348,7 @@ in `release-signing`, signs and notarizes the binaries with the version
 
 ### Feature-state checks
 
-Release, publish and rehearsal expect `mainnet-write` to be off. The shared
+Release, publish and rehearsal expect `mainnet-write` to be on. The shared
 build script runs the environment guard immediately before the release recipe.
 Archive verification executes both packaged binaries and checks their embedded
 markers. Archive and host checks also refuse either test-override literal,
