@@ -195,15 +195,31 @@ fn json_data_island(value: &serde_json::Value) -> String {
 /// `/static/session-bootstrap.js` stores the proof and replaces the location
 /// with that path. No inline script and no external resource, so the
 /// listener's `script-src 'self'` policy holds unchanged.
+///
+/// Returns `None` for a purpose without a fixed landing path; its listener
+/// renders the page with [`render_session_bootstrap_destination`].
 #[must_use]
 pub(crate) fn render_session_bootstrap_page(
     proof_hex: &str,
     purpose: crate::auth::SessionPurpose,
+) -> Option<String> {
+    purpose
+        .landing_path()
+        .map(|path| render_session_bootstrap_destination(proof_hex, purpose, path))
+}
+
+/// The bootstrap page for `purpose` whose landing path is `destination`, a
+/// path the listener selects and never one taken from the request.
+#[must_use]
+pub(crate) fn render_session_bootstrap_destination(
+    proof_hex: &str,
+    purpose: crate::auth::SessionPurpose,
+    destination: &str,
 ) -> String {
     let data_island = json_data_island(&serde_json::json!({
         "proof": proof_hex,
         "storageKey": purpose.proof_storage_key(),
-        "next": purpose.landing_path(),
+        "next": destination,
     }));
     format!(
         r#"<!DOCTYPE html>
@@ -348,7 +364,33 @@ pub(crate) fn render_detail_page(
     attestation_blob: Option<&str>,
     identity: &PageIdentity,
 ) -> String {
-    let approvable = kind_is_approvable(&view.summary) && !view.expired && !view.attested;
+    render_detail_page_with(
+        view,
+        context,
+        csrf_hex,
+        activity_csrf_hex,
+        attestation_blob,
+        identity,
+        true,
+    )
+}
+
+/// [`render_detail_page`] with the decision buttons offered only when
+/// `decisions` is set. A listener without decision routes, the single
+/// mainnet consent ceremony, renders the same card, notices and recorded
+/// attestation with no action.
+#[must_use]
+pub(crate) fn render_detail_page_with(
+    view: &PendingApprovalView,
+    context: &stellar_agent_core::approval::ApprovalContext,
+    csrf_hex: &str,
+    activity_csrf_hex: &str,
+    attestation_blob: Option<&str>,
+    identity: &PageIdentity,
+    decisions: bool,
+) -> String {
+    let approvable =
+        decisions && kind_is_approvable(&view.summary) && !view.expired && !view.attested;
     let summary_html = render_summary_html(view);
     let context_html = render_context_header_html(context);
     // The full rule definition (context callout, signer table, policy table,
@@ -362,25 +404,8 @@ pub(crate) fn render_detail_page(
         _ => String::new(),
     };
 
-    let (kind_label, kind_is_passkey) = kind_pill(view);
-    let kind_class = if kind_is_passkey { "kind warn" } else { "kind" };
-
-    // The neutral (pending) state carries no notice: the expiry line already
-    // states where the request stands. A notice appears only when the entry
-    // can no longer be approved, so it never competes with the decision.
-    let status_notice = if view.attested {
-        r#"<div class="notice">Already resolved &mdash; consent for this request is recorded.</div>"#
-    } else if matches!(view.summary, ApprovalSummaryView::Rejected { .. }) {
-        r#"<div class="notice">This request was rejected. Nothing was signed.</div>"#
-    } else if matches!(view.summary, ApprovalSummaryView::Consumed { .. }) {
-        r#"<div class="notice">This approval was already spent on a submission. There is nothing left to decide; ask the wallet what became of that transaction.</div>"#
-    } else if matches!(view.summary, ApprovalSummaryView::Inconsistent { .. }) {
-        INCONSISTENT_NOTICE
-    } else if view.expired {
-        r#"<div class="notice warn">This request has expired. It can only be rejected now.</div>"#
-    } else {
-        ""
-    };
+    let kind_head = kind_head_html(view);
+    let status_notice = status_notice_html(view, decisions);
 
     let attested_block = match (view.attested, attestation_blob) {
         (true, Some(blob)) => format!(
@@ -404,7 +429,8 @@ pub(crate) fn render_detail_page(
       <p class="caution">Approve only if you expected this request. Nothing is signed until you decide.</p>"#,
             html_escape(approve_button_label(&view.summary))
         )
-    } else if view.attested
+    } else if !decisions
+        || view.attested
         || matches!(
             view.summary,
             ApprovalSummaryView::Rejected { .. } | ApprovalSummaryView::Consumed { .. }
@@ -423,38 +449,7 @@ pub(crate) fn render_detail_page(
             .to_owned()
     };
 
-    // The sentence around the two timestamps is chosen server-side, because
-    // only the server knows whether a decision is still available. A live
-    // request gets the remaining-time form and the clause naming what happens
-    // at expiry; one that can no longer be approved gets the plain form, with
-    // no action clause to contradict a page that offers no approve button.
-    // `data-expiry-form` tells `/static/app-shared.js` which slot filling the
-    // sentence expects.
-    let expiry_line = if view.expired
-        || view.attested
-        || matches!(
-            view.summary,
-            ApprovalSummaryView::Rejected { .. }
-                | ApprovalSummaryView::Consumed { .. }
-                | ApprovalSummaryView::Inconsistent { .. }
-        ) {
-        format!(
-            r#"<p class="expiry" id="expiry-line" data-created-ms="{created}" data-expires-ms="{expires}" data-expiry-form="absolute">
-        Created <b id="created-text">{created} (unix ms)</b>. Expiry:
-        <b id="expires-text">{expires} (unix ms)</b>.</p>"#,
-            created = view.created_at_unix_ms,
-            expires = view.expires_at_unix_ms,
-        )
-    } else {
-        format!(
-            r#"<p class="expiry" id="expiry-line" data-created-ms="{created}" data-expires-ms="{expires}" data-expiry-form="remaining">
-        Created <b id="created-text">{created} (unix ms)</b>, expires
-        <b id="expires-text">{expires} (unix ms)</b>. After that this request can
-        only be rejected.</p>"#,
-            created = view.created_at_unix_ms,
-            expires = view.expires_at_unix_ms,
-        )
-    };
+    let expiry_line = expiry_line_html(view, decisions);
 
     let data_island = json_data_island(&serde_json::json!({
         "nonce": view.approval_nonce,
@@ -464,6 +459,11 @@ pub(crate) fn render_detail_page(
     }));
     let title = identity.page_title("Approval detail");
     let topbar = identity.topbar_html("Approvals");
+    let back = if decisions {
+        r#"<a class="back" href="/inbox">&larr; Back to inbox</a>"#
+    } else {
+        ""
+    };
 
     format!(
         r#"<!DOCTYPE html>
@@ -477,12 +477,9 @@ pub(crate) fn render_detail_page(
 <body>
 {topbar}
   <main class="content">
-    <a class="back" href="/inbox">&larr; Back to inbox</a>
+    {back}
     <div class="decision">
-      <div class="d-kind">
-        <span class="{kind_class}">{kind_label}</span>
-        <span class="d-origin">requested by your wallet agent</span>
-      </div>
+      {kind_head}
       {status_notice}
 {context_html}
 {summary_html}
@@ -497,17 +494,180 @@ pub(crate) fn render_detail_page(
   <script src="/static/app-shared.js"></script>
   <script src="/static/app.js"></script>
 </body>
-</html>"#,
-        kind_class = kind_class,
-        kind_label = html_escape(&kind_label),
-        status_notice = status_notice,
-        expiry_line = expiry_line,
-        summary_html = summary_html,
-        rule_proposal_extra_html = rule_proposal_extra_html,
-        attested_block = attested_block,
-        actions = actions,
-        data_island = data_island,
+</html>"#
     )
+}
+
+/// Which listener serves a mainnet consent page, and so which decisions the
+/// page offers beside the passkey approval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConsentPageMode {
+    /// The persistent inbox: the operator can reject the entry.
+    Inbox,
+    /// The ceremony of one command: the operator can cancel it.
+    OneShot,
+}
+
+/// Render the mainnet consent page of a pending entry.
+///
+/// The card is the detail page's: the kind pill, the serving profile, the
+/// server-rendered summary and the expiry line, under the same stylesheet.
+/// For an x402 payment the authoritative intent digest follows the summary.
+/// `data` rides in the `#presence-data` island for
+/// `/static/mainnet-presence.js`, which starts a WebAuthn ceremony only on a
+/// trusted click of the passkey button; nothing runs on page load.
+#[must_use]
+pub(crate) fn render_mainnet_consent_page(
+    view: &PendingApprovalView,
+    context: &stellar_agent_core::approval::ApprovalContext,
+    data: &serde_json::Value,
+    intent_digest_hex: Option<&str>,
+    mode: ConsentPageMode,
+    identity: &PageIdentity,
+) -> String {
+    let kind_head = kind_head_html(view);
+    let context_html = render_context_header_html(context);
+    let summary_html = render_summary_html(view);
+    let intent_html = intent_digest_hex.map_or_else(String::new, |digest| {
+        format!(
+            "<dl class=\"facts\">\n<dt>Intent digest</dt><dd><code>{}</code></dd>\n</dl>",
+            html_escape(digest)
+        )
+    });
+    let expiry_line = expiry_line_html(view, mode == ConsentPageMode::Inbox);
+    let (back, topbar_label, second) = match mode {
+        ConsentPageMode::Inbox => (
+            r#"<a class="back" href="/inbox">&larr; Back to inbox</a>"#,
+            "Approvals",
+            r#"<button class="btn reject" id="presence-reject" type="button">Reject</button>"#,
+        ),
+        ConsentPageMode::OneShot => (
+            "",
+            "Mainnet consent",
+            r#"<button class="btn reject" id="presence-cancel" type="button">Cancel</button>"#,
+        ),
+    };
+    let data_island = json_data_island(data);
+    let title = identity.page_title("Mainnet consent");
+    let topbar = identity.topbar_html(topbar_label);
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>{BRAND_STYLE}{DETAIL_STYLE}</style>
+</head>
+<body>
+{topbar}
+  <main class="content">
+    {back}
+    <div class="decision">
+      {kind_head}
+{context_html}
+{summary_html}
+      {intent_html}
+      {expiry_line}
+      <div class="actions" id="actions">
+        <button class="btn approve" id="presence-approve" type="button">Approve with passkey</button>
+        {second}
+      </div>
+      <p class="caution">Review this transaction in the local browser and approve with a pinned passkey.</p>
+      <div class="result" id="presence-result" role="status"></div>
+    </div>
+  </main>
+  <script type="application/json" id="presence-data">{data_island}</script>
+  <script src="/static/app-shared.js"></script>
+  <script src="/static/mainnet-presence.js"></script>
+</body>
+</html>"#
+    )
+}
+
+/// The kind pill and the requester line every decision card opens with.
+fn kind_head_html(view: &PendingApprovalView) -> String {
+    let (kind_label, kind_is_passkey) = kind_pill(view);
+    let kind_class = if kind_is_passkey { "kind warn" } else { "kind" };
+    format!(
+        r#"<div class="d-kind">
+        <span class="{kind_class}">{}</span>
+        <span class="d-origin">requested by your wallet agent</span>
+      </div>"#,
+        html_escape(&kind_label)
+    )
+}
+
+/// The notice of an entry that cannot be approved, or the empty
+/// string for a pending one.
+///
+/// The neutral (pending) state carries no notice: the expiry line already
+/// states where the request stands. A notice appears only when the entry
+/// cannot be approved, so it never competes with the decision. `rejectable`
+/// says whether the serving listener has a reject route: only then does the
+/// expired notice offer rejection, and otherwise it points at a new request.
+fn status_notice_html(view: &PendingApprovalView, rejectable: bool) -> &'static str {
+    if view.attested {
+        r#"<div class="notice">Already resolved. Consent for this request is recorded.</div>"#
+    } else if matches!(view.summary, ApprovalSummaryView::Rejected { .. }) {
+        r#"<div class="notice">This request was rejected. Nothing was signed.</div>"#
+    } else if matches!(view.summary, ApprovalSummaryView::Consumed { .. }) {
+        r#"<div class="notice">This approval was already spent on a submission. There is nothing left to decide; ask the wallet what became of that transaction.</div>"#
+    } else if matches!(view.summary, ApprovalSummaryView::Inconsistent { .. }) {
+        INCONSISTENT_NOTICE
+    } else if view.expired && rejectable {
+        r#"<div class="notice warn">This request has expired. It can only be rejected now.</div>"#
+    } else if view.expired {
+        r#"<div class="notice warn">This request has expired. Restart the command for a new request.</div>"#
+    } else {
+        ""
+    }
+}
+
+/// The sentence around the two timestamps is chosen server-side, because
+/// only the server knows whether a decision is still available. A live
+/// request gets the remaining-time form and the clause naming what happens
+/// at expiry; one that cannot be approved gets the plain form, with
+/// no action clause to contradict a page that offers no approve button.
+/// The clause promises rejection only when `rejectable` says the serving
+/// listener has a reject route; otherwise the live form names the deadline
+/// alone. `data-expiry-form` tells `/static/app-shared.js` which slot filling
+/// the sentence expects.
+fn expiry_line_html(view: &PendingApprovalView, rejectable: bool) -> String {
+    if view.expired
+        || view.attested
+        || matches!(
+            view.summary,
+            ApprovalSummaryView::Rejected { .. }
+                | ApprovalSummaryView::Consumed { .. }
+                | ApprovalSummaryView::Inconsistent { .. }
+        )
+    {
+        format!(
+            r#"<p class="expiry" id="expiry-line" data-created-ms="{created}" data-expires-ms="{expires}" data-expiry-form="absolute">
+        Created <b id="created-text">{created} (unix ms)</b>. Expiry:
+        <b id="expires-text">{expires} (unix ms)</b>.</p>"#,
+            created = view.created_at_unix_ms,
+            expires = view.expires_at_unix_ms,
+        )
+    } else if rejectable {
+        format!(
+            r#"<p class="expiry" id="expiry-line" data-created-ms="{created}" data-expires-ms="{expires}" data-expiry-form="remaining">
+        Created <b id="created-text">{created} (unix ms)</b>, expires
+        <b id="expires-text">{expires} (unix ms)</b>. After that this request can
+        only be rejected.</p>"#,
+            created = view.created_at_unix_ms,
+            expires = view.expires_at_unix_ms,
+        )
+    } else {
+        format!(
+            r#"<p class="expiry" id="expiry-line" data-created-ms="{created}" data-expires-ms="{expires}" data-expiry-form="remaining">
+        Created <b id="created-text">{created} (unix ms)</b>, expires
+        <b id="expires-text">{expires} (unix ms)</b>.</p>"#,
+            created = view.created_at_unix_ms,
+            expires = view.expires_at_unix_ms,
+        )
+    }
 }
 
 /// Expands to the sentence every approval surface shows for an
@@ -660,6 +820,30 @@ pub fn render_summary_html(view: &PendingApprovalView) -> String {
     };
 
     match &view.summary {
+        ApprovalSummaryView::X402Payment {
+            payee,
+            amount,
+            asset,
+            home_domain,
+        } => {
+            let mut rows = row(
+                "Amount (token base units)",
+                amount.as_deref().unwrap_or("Unknown"),
+            );
+            rows.push_str(&row(
+                "Token contract",
+                asset.as_deref().unwrap_or("Unknown"),
+            ));
+            rows.push_str(&row(
+                "Home domain",
+                home_domain.as_deref().unwrap_or("Unauthenticated"),
+            ));
+            format!(
+                "{}{}",
+                address_block("Recipient", payee.as_deref().unwrap_or("Unknown")),
+                facts(&rows)
+            )
+        }
         ApprovalSummaryView::Payment {
             source,
             to,
@@ -1225,7 +1409,7 @@ mod tests {
                 "stellar-agent-operator-enroll-session-proof",
             ),
         ] {
-            let html = render_session_bootstrap_page(&proof, purpose);
+            let html = render_session_bootstrap_page(&proof, purpose).unwrap();
             assert_eq!(html.matches(&proof).count(), 1, "{html}");
             let open = r#"<script type="application/json" id="session-bootstrap-data">"#;
             let start = html.find(open).unwrap() + open.len();
@@ -1241,6 +1425,116 @@ mod tests {
             // The only executable script is the same-origin file.
             assert_eq!(html.matches("<script").count(), 2);
         }
+    }
+
+    /// Each island a server renders on its bootstrap page carries the
+    /// (storageKey, next) pair `web/testdata/bootstrap_islands.json` lists,
+    /// which the node test runs `session-bootstrap.js` against.
+    #[test]
+    fn every_bootstrap_island_matches_the_shared_list() {
+        use crate::auth::SessionPurpose;
+        let listed: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("web/testdata/bootstrap_islands.json")).unwrap();
+        let proof = "cd".repeat(32);
+        let purposes = [
+            ("inbox", SessionPurpose::Inbox),
+            ("operator_enroll", SessionPurpose::OperatorEnroll),
+            (
+                "mainnet_approval_enroll",
+                SessionPurpose::MainnetApprovalEnroll,
+            ),
+            ("mainnet_presence", SessionPurpose::MainnetPresence),
+        ];
+        assert_eq!(listed.len(), purposes.len());
+        for (entry, (name, purpose)) in listed.iter().zip(purposes) {
+            assert_eq!(entry["purpose"], name);
+            let next = entry["next"].as_str().unwrap();
+            let html = match purpose.landing_path() {
+                Some(_) => render_session_bootstrap_page(&proof, purpose).unwrap(),
+                None => {
+                    let nonce = next.strip_prefix("/approval/").unwrap();
+                    assert_eq!(nonce.len(), 22, "{name}");
+                    render_session_bootstrap_destination(
+                        &proof,
+                        purpose,
+                        &crate::presence::one_shot_destination(nonce),
+                    )
+                }
+            };
+            let open = r#"<script type="application/json" id="session-bootstrap-data">"#;
+            let start = html.find(open).unwrap() + open.len();
+            let end = start + html[start..].find("</script>").unwrap();
+            let island: serde_json::Value = serde_json::from_str(&html[start..end]).unwrap();
+            assert_eq!(island["storageKey"], entry["storageKey"], "{name}");
+            assert_eq!(island["next"], entry["next"], "{name}");
+            assert_eq!(island["proof"], proof, "{name}");
+        }
+        assert_eq!(
+            render_session_bootstrap_page(&proof, SessionPurpose::MainnetPresence),
+            None
+        );
+    }
+
+    /// The mainnet consent page is the detail card under the brand
+    /// stylesheet: the summary and context the detail page renders, the
+    /// intent digest when given, the island escaped, and the decisions of
+    /// its listener beside the passkey button.
+    #[test]
+    fn mainnet_consent_page_shares_the_detail_card() {
+        let dir = TempDir::new().unwrap();
+        let view = payment_view(&dir, false, NOW_MS);
+        let context = test_context();
+        let data = serde_json::json!({"nonce": view.approval_nonce, "note": "</script><b>"});
+        for (mode, present, absent) in [
+            (ConsentPageMode::Inbox, "presence-reject", "presence-cancel"),
+            (
+                ConsentPageMode::OneShot,
+                "presence-cancel",
+                "presence-reject",
+            ),
+        ] {
+            let html =
+                render_mainnet_consent_page(&view, &context, &data, Some("ab12"), mode, &marked());
+            assert_eq!(html.matches(BRAND_STYLE).count(), 1, "{mode:?}");
+            assert!(html.contains(DETAIL_STYLE), "{mode:?}");
+            assert!(html.contains(&render_summary_html(&view)), "{mode:?}");
+            assert!(
+                html.contains(&render_context_header_html(&context)),
+                "{mode:?}"
+            );
+            assert!(html.contains(&kind_head_html(&view)), "{mode:?}");
+            let rejectable = mode == ConsentPageMode::Inbox;
+            assert!(
+                html.contains(&expiry_line_html(&view, rejectable)),
+                "{mode:?}"
+            );
+            assert_eq!(html.contains("only be rejected"), rejectable, "{mode:?}");
+            assert!(html.contains("<dt>Intent digest</dt><dd><code>ab12</code></dd>"));
+            assert!(html.contains(r#"id="presence-approve""#));
+            assert!(html.contains("Approve with passkey"));
+            assert!(html.contains(&format!(r#"id="{present}""#)), "{mode:?}");
+            assert!(!html.contains(&format!(r#"id="{absent}""#)), "{mode:?}");
+            assert!(html.contains(
+                "Review this transaction in the local browser and approve with a pinned passkey."
+            ));
+            assert!(!html.contains("</script><b>"), "{mode:?}");
+            assert!(html.contains(r#"<script src="/static/app-shared.js"></script>"#));
+            assert!(html.contains(r#"<script src="/static/mainnet-presence.js"></script>"#));
+            assert_eq!(
+                html.contains("Back to inbox"),
+                mode == ConsentPageMode::Inbox,
+                "{mode:?}"
+            );
+        }
+        let html = render_mainnet_consent_page(
+            &view,
+            &context,
+            &data,
+            None,
+            ConsentPageMode::OneShot,
+            &neutral(),
+        );
+        assert!(!html.contains("Intent digest"));
     }
 
     #[test]

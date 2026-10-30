@@ -968,9 +968,11 @@ sequence. An approval recorded under an earlier policy needs fresh consent,
 also when its credential stays listed. The `[remote_approval]` allowlist and
 `approve operator remove` do not change the approval credentials.
 
-This release connects no presence ceremony to the consent surfaces: every
-mainnet consent refuses with `approval.presence_required`, so mainnet writes
-remain unavailable. See [Mainnet write behavior](cli-reference/index.md#mainnet-write-behavior).
+Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
+passkey page. The operator reviews the authoritative transaction and approves
+with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
+mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
+this passkey ceremony.
 
 #### Enabled-policy minimum
 
@@ -1054,7 +1056,7 @@ or `trustline.policy_engine_unavailable`.
 | `profile.reset_window_state_newer_version` | This build cannot reset an unsupported newer state format. |
 | `policy.window_state_unverifiable` | Enabled-mainnet state cannot be verified. Follow the operator recovery procedure. |
 | `profile.reset_window_state_open_authorizations` | Effective open authorizations prevent reset. |
-| `approval.presence_required` | Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy. This release records no mainnet consent. |
+| `approval.presence_required` | Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page. |
 | `approval.presence_policy_unavailable` | The current owner-signed mainnet policy cannot be verified, lists no approval credential, or changed since the consent was recorded. |
 | `approval.mainnet_remote_unsupported` | The remote approval listener does not approve mainnet requests. |
 | `approve.yes_refused_on_mainnet` | On mainnet, `--yes` refuses before store access in either build. |

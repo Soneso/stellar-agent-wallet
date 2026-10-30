@@ -120,8 +120,11 @@ page outside the wallet, or an operator approving an unwanted request can defeat
 intended consent. The wallet requires the signed proof and does not claim an
 operating-system security boundary against all same-user code.
 
-This release connects no presence ceremony to the consent surfaces, so every mainnet
-consent is refused and mainnet writes are unavailable.
+Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
+passkey page. The operator reviews the authoritative transaction and approves
+with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
+mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
+this passkey ceremony.
 
 ## Security model summary
 

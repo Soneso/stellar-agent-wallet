@@ -102,6 +102,7 @@ impl Harness {
         let bootstrap_hex = bootstrap.to_hex();
         let clock = SessionClock::manual();
         let state = ServeState {
+            presence: None,
             auth: Arc::new(StdMutex::new(AuthState::with_clock(
                 bootstrap,
                 SessionPurpose::Inbox,
@@ -1381,6 +1382,7 @@ async fn approve_with_unseeded_keyring_returns_unavailable_status() {
     let bootstrap = OpaqueToken::generate();
     let bootstrap_hex = bootstrap.to_hex();
     let state = ServeState {
+        presence: None,
         auth: Arc::new(StdMutex::new(AuthState::new(
             bootstrap,
             SessionPurpose::Inbox,

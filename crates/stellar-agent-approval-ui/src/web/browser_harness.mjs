@@ -52,6 +52,7 @@ export function browser({
   elements = [],
   storage = {},
   storageThrows = false,
+  webauthn = true,
   readBackDiffers = false,
   reply = () => new Promise(() => {}),
   credential = () => {
@@ -116,6 +117,8 @@ export function browser({
     document,
     window: {
       sessionStorage,
+      isSecureContext: webauthn,
+      PublicKeyCredential: webauthn ? function () {} : undefined,
       location: {
         replace(url) {
           log.push(["replace", url]);
@@ -124,6 +127,10 @@ export function browser({
     },
     navigator: {
       credentials: {
+        get(options) {
+          credentialCalls.push(options);
+          return Promise.resolve(credential());
+        },
         create(options) {
           credentialCalls.push(options);
           return Promise.resolve(credential());

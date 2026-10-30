@@ -686,7 +686,7 @@ pub enum ApprovalFailure {
     ///
     /// `"approval.presence_required"`.
     #[error(
-        "Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy."
+        "Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page."
     )]
     PresenceRequired,
     /// A mainnet presence assertion is malformed, names a credential the
@@ -764,7 +764,7 @@ pub enum ApprovalFailure {
     ///
     /// `"approval.mainnet_remote_unsupported"`.
     #[error(
-        "Mainnet consent uses the local localhost passkey page; remote approval is unavailable for mainnet."
+        "Mainnet consent uses the local passkey page; remote approval is unavailable for mainnet."
     )]
     MainnetRemoteUnsupported,
 }
@@ -5597,7 +5597,7 @@ mod tests {
             (
                 ApprovalFailure::PresenceRequired,
                 "approval.presence_required",
-                "Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy.",
+                "Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page.",
             ),
             (
                 ApprovalFailure::PresenceInvalid,
@@ -5642,7 +5642,7 @@ mod tests {
             (
                 ApprovalFailure::MainnetRemoteUnsupported,
                 "approval.mainnet_remote_unsupported",
-                "Mainnet consent uses the local localhost passkey page; remote approval is unavailable for mainnet.",
+                "Mainnet consent uses the local passkey page; remote approval is unavailable for mainnet.",
             ),
         ];
         for (failure, code, message) in cases {

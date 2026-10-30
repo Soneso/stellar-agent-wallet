@@ -132,6 +132,8 @@ pub(crate) enum SessionPurpose {
     /// The mainnet approval credential enrollment
     /// (`approve credential enroll`).
     MainnetApprovalEnroll,
+    /// A single mainnet consent ceremony.
+    MainnetPresence,
 }
 
 impl SessionPurpose {
@@ -139,6 +141,7 @@ impl SessionPurpose {
     fn cookie_name_prefix(self) -> &'static str {
         match self {
             Self::Inbox => "stellar_agent_approval_session_",
+            Self::MainnetPresence => "stellar_agent_mainnet_presence_session_",
             Self::OperatorEnroll => "stellar_agent_operator_enroll_session_",
             Self::MainnetApprovalEnroll => "stellar_agent_mainnet_approval_enroll_session_",
         }
@@ -149,17 +152,20 @@ impl SessionPurpose {
     pub(crate) fn proof_storage_key(self) -> &'static str {
         match self {
             Self::Inbox => "stellar-agent-approval-session-proof",
+            Self::MainnetPresence => "stellar-agent-mainnet-presence-session-proof",
             Self::OperatorEnroll => "stellar-agent-operator-enroll-session-proof",
             Self::MainnetApprovalEnroll => "stellar-agent-mainnet-approval-enroll-session-proof",
         }
     }
 
     /// The fixed page the bootstrap page navigates to once the proof is
-    /// stored.
-    pub(crate) fn landing_path(self) -> &'static str {
+    /// stored, or `None` for a purpose whose destination is the consent page
+    /// of one pending entry, which its listener selects.
+    pub(crate) fn landing_path(self) -> Option<&'static str> {
         match self {
-            Self::Inbox => "/inbox",
-            Self::OperatorEnroll | Self::MainnetApprovalEnroll => "/enroll",
+            Self::Inbox => Some("/inbox"),
+            Self::OperatorEnroll | Self::MainnetApprovalEnroll => Some("/enroll"),
+            Self::MainnetPresence => None,
         }
     }
 }
@@ -748,8 +754,9 @@ mod tests {
         );
         assert_eq!(
             SessionPurpose::MainnetApprovalEnroll.landing_path(),
-            "/enroll"
+            Some("/enroll")
         );
+        assert_eq!(SessionPurpose::MainnetPresence.landing_path(), None);
         let purposes = [
             SessionPurpose::Inbox,
             SessionPurpose::OperatorEnroll,

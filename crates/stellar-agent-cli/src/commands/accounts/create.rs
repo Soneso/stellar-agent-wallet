@@ -21,9 +21,8 @@
 //! takes the stored profile of an explicit `--profile` selection, a verified
 //! signed policy with a `[mainnet]` table and its enablement, the enrolled
 //! sponsor signer, the independent witness the effective witness rule
-//! requires, and a confirmation on a terminal where the operator types the
-//! profile name. The seed is read and the Ledger opened only after the
-//! authorization is minted.
+//! requires, and browser consent with an owner-pinned passkey. The seed is
+//! read and the Ledger opened only after the authorization is minted.
 //!
 //! ## Mode B — Friendbot
 //!
@@ -3272,6 +3271,37 @@ mod tests {
             Run {
                 code,
                 envelope: last_rendered(),
+            }
+        }
+
+        /// A real browser listener gates the signer, authorization, and submission.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn direct_mainnet_confirmation_requires_uv_before_signing() {
+            for (name, flags) in [("create-browser-no-uv", 1), ("create-browser-uv", 5)] {
+                let mut fixture = Spec::new(name).build().await;
+                fixture.present_in_browser(flags);
+                let before = crate::common::signer_ceremony::signer_resolutions_on_this_thread();
+                let result = run(&fixture, &mainnet_args(&fixture)).await;
+                if flags == 1 {
+                    assert_eq!(
+                        result.code(),
+                        "approval.presence_invalid",
+                        "{}",
+                        result.envelope
+                    );
+                    assert!(records(&fixture).is_empty());
+                    assert!(fixture.sent_envelopes().await.is_empty());
+                    assert!(fixture.audit_rows("approval_attested").is_empty());
+                    assert_eq!(
+                        crate::common::signer_ceremony::signer_resolutions_on_this_thread(),
+                        before
+                    );
+                } else {
+                    assert_eq!(result.code, 0, "{}", result.envelope);
+                    assert_eq!(fixture.sent_envelopes().await.len(), 1);
+                    assert_eq!(fixture.audit_rows("approval_attested").len(), 1);
+                }
             }
         }
 

@@ -261,6 +261,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Breaking (`stellar-agent-core` API): `ApprovalKind::RegisterPasskey`
   carries `registration_challenge`, and `record_passkey_registration` refuses
   an entry without one.
+- Mainnet approve, the local inbox, and direct CLI confirmation use the localhost passkey page. Headless consent, --yes, --no-open on the mainnet inbox, and remote mainnet approval are refused.
+- Mainnet audit rows record the credential fingerprint, consent request, challenge and receipt digests, policy, origin, verification flags and signature counter.
 
 - Breaking (`stellar-agent-network` API): every ed25519 method of `Signer`
   takes a typed payload from `signing::payload`, and `Signer::sign_message` is
@@ -297,8 +299,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outstanding mainnet approval receipt bound to the previous one. Restart
   every wallet process after the upgrade: a process from an earlier release
   cannot load a pending-approval store that holds a mainnet passkey approval.
-  This release still refuses every mainnet consent, so mainnet writes stay
-  unavailable.
 - `decode_owner_public_key` returns `Result<[u8; 32], OwnerKeyDecodeError>`.
   `OwnerKeyForm`, `OwnerEntryRewrite`, `rewrite_older_form_owner_entry`,
   `rewrite_owner_value_if_older`, `log_owner_entry_rewrite`,
@@ -925,8 +925,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The keyring, software, and hardware signers refuse a mainnet payload bound to another signer key; the mainnet Soroban signing call rechecks freshness.
 
-- Mainnet consent refuses terminal-only and local-HMAC approvals. Mainnet
-  writes remain unavailable until the local presence ceremony is connected.
+- Every admitted mainnet consent requires a fresh WebAuthn assertion with user presence and user verification from an owner-pinned approval credential. The commit witness verifies the retained assertion against the current signed policy.
 - Owner readers refuse entries in the older base64 form and keep them unchanged.
   An installation that runs `profile rotate-owner-key` on v0.1.0-alpha.1 or
   v0.1.0-alpha.2 holds that command's generated owner seed at the owner coordinate.

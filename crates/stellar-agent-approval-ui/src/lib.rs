@@ -65,6 +65,8 @@ use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 pub mod decision;
 pub mod error;
 pub mod operator_enroll;
+pub mod presence;
+pub use presence::{MainnetPresenceConfig, MainnetPresenceHandle, start_mainnet_presence};
 
 mod auth;
 mod routes;
@@ -80,7 +82,7 @@ mod trace_capture;
 pub use decision::{
     Decision, DecisionContext, Outcome, REJECT_TOMBSTONE_TTL_MS, RequestIdentity, apply_decision,
 };
-pub use error::{ServeShutdownError, ServeStartError};
+pub use error::{PresenceStartRefusal, ServeShutdownError, ServeStartError};
 pub use stellar_agent_loopback_http::brand::PageIdentity;
 pub use stellar_agent_loopback_http::host_header::HostHeaderAllowlistLayer;
 pub use stellar_agent_loopback_http::origin_header::OriginHeaderAllowlistLayer;
@@ -111,6 +113,7 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 /// Shared axum state for all handlers.
 #[derive(Clone)]
 pub(crate) struct ServeState {
+    pub(crate) presence: Option<Arc<presence::PresenceState>>,
     pub(crate) auth: Arc<StdMutex<AuthState>>,
     pub(crate) ctx: Arc<DecisionContext>,
     /// The identity every served page renders, neutral unless the deployment
@@ -173,6 +176,7 @@ impl ServeConfig {
 /// exit.
 pub struct ServeHandle {
     local_addr: SocketAddr,
+    bootstrap_host: &'static str,
     bootstrap_token_hex: String,
     server_shutdown_tx: oneshot::Sender<()>,
     server_join: JoinHandle<()>,
@@ -207,7 +211,8 @@ impl ServeHandle {
     #[must_use]
     pub fn bootstrap_url(&self) -> String {
         format!(
-            "http://127.0.0.1:{}/bootstrap/{}",
+            "http://{}:{}/bootstrap/{}",
+            self.bootstrap_host,
             self.local_addr.port(),
             self.bootstrap_token_hex
         )
@@ -281,11 +286,36 @@ pub async fn start_serve(config: ServeConfig) -> Result<ServeHandle, ServeStartE
         SessionPurpose::Inbox,
     )));
 
+    let mainnet =
+        config.context.context.chain_id == stellar_agent_core::approval::presence::MAINNET_CHAIN_ID;
+    if mainnet {
+        let refused = || ServeStartError::Presence(PresenceStartRefusal::PolicyUnavailable);
+        config
+            .context
+            .mainnet_authority
+            .as_ref()
+            .ok_or_else(refused)?
+            .load_current()
+            .map_err(|_| refused())?;
+    }
     let store_path = config.context.store_path.clone();
+    let ctx = Arc::new(config.context);
+    let identity = Arc::new(config.page_identity);
+    let presence = if mainnet {
+        presence::PresenceState::inbox(
+            auth.clone(),
+            ctx.clone(),
+            identity.clone(),
+            local_addr.port(),
+        )
+    } else {
+        None
+    };
     let state = ServeState {
         auth,
-        ctx: Arc::new(config.context),
-        identity: Arc::new(config.page_identity),
+        ctx,
+        identity,
+        presence,
     };
 
     let router = build_router(state, local_addr);
@@ -314,6 +344,7 @@ pub async fn start_serve(config: ServeConfig) -> Result<ServeHandle, ServeStartE
 
     Ok(ServeHandle {
         local_addr,
+        bootstrap_host: if mainnet { "localhost" } else { "127.0.0.1" },
         bootstrap_token_hex,
         server_shutdown_tx,
         server_join,
@@ -349,8 +380,12 @@ fn build_router(state: ServeState, local_addr: SocketAddr) -> Router {
         },
     );
 
-    routes::build_router()
-        .with_state(state)
+    let presence = state.presence.clone();
+    let mut router = routes::build_router().with_state(state);
+    if let Some(presence) = presence {
+        router = router.merge(presence::routes(presence));
+    }
+    router
         .layer(trace_layer)
         .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
         .layer(RequestBodyLimitLayer::new(BODY_LIMIT_BYTES))

@@ -74,13 +74,11 @@ owner-signed policy. `approval.attestation_invalid` covers missing coverage or
 a mismatched subject. MCP reports failed approval proofs as
 `policy.approval_required`.
 
-This release connects no presence ceremony to the consent surfaces. Direct CLI
-confirmation and `approve` render the summary, then refuse every mainnet
-consent with `approval.presence_required` before anything is recorded; neither
-reads terminal input. The local inbox refuses mainnet approval the same way,
-and the remote listener refuses it with `approval.mainnet_remote_unsupported`.
-Mainnet writes therefore remain unavailable. Never attempt a mainnet approval
-on the operator's behalf.
+Mainnet approve, the local inbox, and direct CLI confirmation open a localhost
+passkey page. The operator reviews the authoritative transaction and approves
+with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
+mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
+this passkey ceremony.
 
 Allow supplies a 600-second confirmation lifetime. RequireApproval supplies its
 configured lifetime. Classic MCP approvals expire at the shorter prepare/commit

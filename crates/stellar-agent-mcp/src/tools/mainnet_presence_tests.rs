@@ -327,10 +327,21 @@ fn assert_classic_unsigned(context: &str, run: &ClassicRun, entry: &PendingAppro
 
 /// Asserts the accepted classic commit of the run's own approval.
 fn assert_classic_accepted(context: &str, run: &ClassicRun, result: &serde_json::Value) {
+    assert_classic_accepted_for(context, run, result, &run.entry.approval_nonce);
+}
+
+/// Asserts the accepted classic commit of the approval `approval_nonce`:
+/// one submission, and that approval spent.
+fn assert_classic_accepted_for(
+    context: &str,
+    run: &ClassicRun,
+    result: &serde_json::Value,
+    approval_nonce: &str,
+) {
     assert_eq!(result["ok"], true, "{context}: {result}");
     assert_eq!(run.control.count("sendTransaction"), 1, "{context}");
     assert!(
-        is_consumed(&stored_approval(&run.f, &run.entry.approval_nonce).unwrap()),
+        is_consumed(&stored_approval(&run.f, approval_nonce).unwrap()),
         "{context}"
     );
 }
@@ -708,4 +719,108 @@ async fn mainnet_presence_failures_are_indistinguishable() {
     for (context, result) in &refusals {
         assert_eq!(normalized(result.clone()), uniform, "{context}: {result}");
     }
+}
+
+/// A real loopback ceremony records a correlated row before the commit signer.
+#[tokio::test]
+#[serial_test::serial(keyring)]
+async fn mcp_approve_browser_round_trip_records_before_signing() {
+    use stellar_agent_approval_ui::{
+        MainnetPresenceConfig, PageIdentity, presence::test_support::PresenceClient,
+        start_mainnet_presence,
+    };
+    use stellar_agent_core::approval::{
+        ApprovalContext, ConsentAudit, ConsentAuthorization, MainnetApprovalAuthority, Surface,
+        attest_and_persist,
+    };
+    let run = ClassicRun::new(Tool::Pay).await;
+    let xdr = run.args["envelope_xdr"].as_str().unwrap();
+    let entry = approval_for(Tool::Pay, &run.f, xdr, 600_000);
+    let mut store = PendingApprovalStore::open(store_path(&run.f)).unwrap();
+    store.insert(entry.clone(), now_ms()).unwrap();
+    drop(store);
+    let profile = run.f.server.security_profile();
+    let context = ApprovalContext::from_profile(PROFILE, profile);
+    let authority = MainnetApprovalAuthority::for_profile(PROFILE).unwrap();
+    let mut handle = start_mainnet_presence(MainnetPresenceConfig {
+        entry: entry.clone(),
+        context: context.clone(),
+        authority: authority.clone(),
+        store_path: store_path(&run.f),
+        page_identity: PageIdentity::neutral(),
+    })
+    .await
+    .unwrap();
+    let browser = PresenceClient::connect(handle.bootstrap_url(), &entry.approval_nonce)
+        .await
+        .unwrap();
+    let options = browser.challenge().await.unwrap().json();
+    let challenge = URL_SAFE_NO_PAD
+        .decode(options["challenge"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let assertion = fixture_authenticator().assert(
+        challenge,
+        &browser.origin(),
+        MAINNET_APPROVAL_RP_ID,
+        FLAG_UP | FLAG_UV,
+        7,
+    );
+    let posted = serde_json::json!({"request_id": options["request_id"], "credential_id_b64url": URL_SAFE_NO_PAD.encode(assertion.credential_id),
+        "authenticator_data_b64url": URL_SAFE_NO_PAD.encode(assertion.authenticator_data), "client_data_json_b64url": URL_SAFE_NO_PAD.encode(assertion.client_data_json),
+        "signature_der_b64url": URL_SAFE_NO_PAD.encode(assertion.signature_der)});
+    assert_eq!(
+        browser.post("assertion", &posted).await.unwrap().status,
+        200
+    );
+    let presence = handle
+        .await_presence(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    handle.shutdown().await.unwrap();
+    let request_id = presence.request_id().to_owned();
+    let fingerprint = presence.credential_fingerprint().to_owned();
+    let mut store = PendingApprovalStore::open(store_path(&run.f)).unwrap();
+    let readiness =
+        stellar_agent_network::mainnet::audit_readiness::audit_readiness(profile, PROFILE).unwrap();
+    let current = authority.load_current_compare_only().unwrap();
+    let policy_digest = stellar_agent_core::hex::encode(&current.policy().digest());
+    let blob = attest_and_persist(
+        &mut store,
+        &entry,
+        &attestation_key(&run.f),
+        &context.binding(),
+        Surface::Cli,
+        ConsentAudit::Writer(&mut readiness.writer().lock().unwrap()),
+        ConsentAuthorization::Mainnet {
+            presence,
+            policy: current.policy(),
+        },
+        |_, _| unreachable!(),
+    )
+    .unwrap()
+    .unwrap();
+    drop(store);
+    let audit_path = profile.audit_log_path.clone();
+    *run.f.on_seed_read.lock().unwrap() = Some(std::sync::Arc::new(move || {
+        let rows = std::fs::read_to_string(&audit_path).unwrap();
+        let correlated: Vec<_> = rows
+            .lines()
+            .filter(|row| row.contains(&request_id))
+            .collect();
+        assert_eq!(correlated.len(), 1);
+        assert!(correlated[0].contains("credential_fingerprint"));
+        assert!(correlated[0].contains("policy_digest"));
+        assert!(correlated[0].contains(&fingerprint));
+        assert!(correlated[0].contains(&policy_digest));
+    }));
+    let result = run
+        .commit_with(run.commit_args_for(xdr, &entry.approval_nonce, &blob))
+        .await;
+    assert_classic_accepted_for("browser consent", &run, &result, &entry.approval_nonce);
+    assert!(
+        !is_consumed(&stored_approval(&run.f, &run.entry.approval_nonce).unwrap()),
+        "browser consent: the preparation's own approval stays unspent"
+    );
 }

@@ -155,11 +155,10 @@ async fn bootstrap_get(
     let purpose = guard.purpose();
     drop(guard);
 
-    let mut resp = Html(render_session_bootstrap_page(
-        &session.session_proof.to_hex(),
-        purpose,
-    ))
-    .into_response();
+    let Some(page) = render_session_bootstrap_page(&session.session_proof.to_hex(), purpose) else {
+        return not_found();
+    };
+    let mut resp = Html(page).into_response();
     if let Ok(hv) = HeaderValue::from_str(&cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, hv);
     }

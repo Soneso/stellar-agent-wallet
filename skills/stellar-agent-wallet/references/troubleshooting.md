@@ -281,7 +281,7 @@ or `trustline.policy_engine_unavailable`.
 | `profile.reset_window_state_newer_version` | This build cannot reset an unsupported newer state format. |
 | `policy.window_state_unverifiable` | Enabled-mainnet state cannot be verified. Follow the operator recovery procedure. |
 | `profile.reset_window_state_open_authorizations` | Effective open authorizations prevent reset. |
-| `approval.presence_required` | Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy. This release records no mainnet consent; report it to the operator. |
+| `approval.presence_required` | Mainnet consent requires a verified assertion from an approval credential in the owner-signed policy; use the local passkey approval page. |
 | `approval.presence_policy_unavailable` | The current owner-signed mainnet policy cannot be verified, lists no approval credential, or changed since the consent was recorded. |
 | `approval.mainnet_remote_unsupported` | The remote approval listener does not approve mainnet requests. |
 | `approve.yes_refused_on_mainnet` | On mainnet, `--yes` refuses before store access in either build. |

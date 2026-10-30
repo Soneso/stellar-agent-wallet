@@ -1,4 +1,5 @@
-// Session bootstrap for the loopback approval inbox and operator enrollment.
+// Session bootstrap for the loopback approval inbox, the enrollment pages and
+// the mainnet consent page.
 //
 // Same-origin, no build step, no external dependency. Served by both loopback
 // servers at GET /static/session-bootstrap.js and loaded only by the page the
@@ -15,13 +16,37 @@
 // If the proof cannot be stored and read back, the page stops here and says
 // so: navigating on would open a page whose every action is refused.
 //
-// The landing path is one of two fixed values; anything else in the island is
-// refused rather than followed.
+// The landing path is admitted by the storage key it arrives with: the inbox
+// key lands on /inbox, the two enrollment keys on /enroll, and the mainnet
+// consent key on the consent page of exactly one pending entry,
+// /approval/<nonce> with the 22-character base64url approval nonce. Any other
+// combination is refused rather than followed.
 
 (function () {
   "use strict";
 
-  var LANDING_PATHS = ["/inbox", "/enroll"];
+  var FIXED_LANDINGS = [
+    ["stellar-agent-approval-session-proof", "/inbox"],
+    ["stellar-agent-operator-enroll-session-proof", "/enroll"],
+    ["stellar-agent-mainnet-approval-enroll-session-proof", "/enroll"],
+  ];
+  var CONSENT_KEY = "stellar-agent-mainnet-presence-session-proof";
+  var CONSENT_PATH = /^\/approval\/[A-Za-z0-9_-]{22}$/;
+
+  function admitted(storageKey, next) {
+    if (typeof next !== "string") {
+      return false;
+    }
+    if (storageKey === CONSENT_KEY) {
+      return CONSENT_PATH.test(next);
+    }
+    for (var i = 0; i < FIXED_LANDINGS.length; i += 1) {
+      if (FIXED_LANDINGS[i][0] === storageKey) {
+        return FIXED_LANDINGS[i][1] === next;
+      }
+    }
+    return false;
+  }
 
   function fail(text) {
     var status = document.getElementById("bootstrap-status");
@@ -44,7 +69,7 @@
     data.proof.length === 0 ||
     typeof data.storageKey !== "string" ||
     data.storageKey.length === 0 ||
-    LANDING_PATHS.indexOf(data.next) === -1
+    !admitted(data.storageKey, data.next)
   ) {
     fail("This link could not be opened. Restart the command for a new link.");
     return;

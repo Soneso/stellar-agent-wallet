@@ -283,7 +283,7 @@ jobs:
           node-version: 24.5.0
       - name: Test the inbox renderers
         run: node --test crates/stellar-agent-approval-ui/src/web/app_shared.test.mjs crates/stellar-agent-webauthn-bridge/src/web/glue.test.mjs
-      - name: Test the mainnet enrollment page
+      - name: Test the mainnet approval pages
         run: node --test crates/stellar-agent-approval-ui/src/web/mainnet-presence.test.mjs
 
   mpp-interop:

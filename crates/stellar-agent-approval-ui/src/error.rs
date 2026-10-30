@@ -9,6 +9,11 @@ use std::net::SocketAddr;
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum ServeStartError {
+    /// A mainnet listener refuses to start: its signed approval policy, its
+    /// pending entry or its pending store is not as the command presents it.
+    /// Display is the fixed message of the refusal's approval code.
+    #[error("{}", .0.failure())]
+    Presence(PresenceStartRefusal),
     /// The requested bind address is not a loopback address.
     ///
     /// The approval-inbox server binds loopback-only as a defence-in-depth
@@ -32,6 +37,47 @@ pub enum ServeStartError {
         #[source]
         source: std::io::Error,
     },
+}
+
+impl ServeStartError {
+    /// The approval failure a mainnet presence refusal reports, or `None`
+    /// for a bind refusal.
+    #[must_use]
+    pub fn presence_failure(&self) -> Option<stellar_agent_core::ApprovalFailure> {
+        match self {
+            Self::Presence(refusal) => Some(refusal.failure()),
+            _ => None,
+        }
+    }
+}
+
+/// Why a mainnet listener refuses to start, by the approval code it reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PresenceStartRefusal {
+    /// The current owner-signed approval policy cannot be verified, or names
+    /// another profile or network: `approval.presence_policy_unavailable`.
+    PolicyUnavailable,
+    /// The stored pending entry differs from the one the command presents:
+    /// `approval.presence_changed`.
+    Changed,
+    /// The pending store or the process identity cannot be read:
+    /// `approval.presence_unavailable`.
+    Unavailable,
+}
+
+impl PresenceStartRefusal {
+    /// The approval failure with this refusal's stable code and fixed
+    /// message.
+    #[must_use]
+    pub fn failure(self) -> stellar_agent_core::ApprovalFailure {
+        use stellar_agent_core::ApprovalFailure as F;
+        match self {
+            Self::PolicyUnavailable => F::PresencePolicyUnavailable,
+            Self::Changed => F::PresenceChanged,
+            Self::Unavailable => F::PresenceUnavailable,
+        }
+    }
 }
 
 /// Error returned by [`crate::ServeHandle::shutdown`].

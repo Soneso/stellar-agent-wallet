@@ -1,0 +1,22 @@
+[
+  {
+    "purpose": "inbox",
+    "storageKey": "stellar-agent-approval-session-proof",
+    "next": "/inbox"
+  },
+  {
+    "purpose": "operator_enroll",
+    "storageKey": "stellar-agent-operator-enroll-session-proof",
+    "next": "/enroll"
+  },
+  {
+    "purpose": "mainnet_approval_enroll",
+    "storageKey": "stellar-agent-mainnet-approval-enroll-session-proof",
+    "next": "/enroll"
+  },
+  {
+    "purpose": "mainnet_presence",
+    "storageKey": "stellar-agent-mainnet-presence-session-proof",
+    "next": "/approval/Ab-9_zZ0aB1cD2eF3gH4iJ"
+  }
+]

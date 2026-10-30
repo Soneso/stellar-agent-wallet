@@ -27,10 +27,10 @@
 //! that code. With the feature, the run takes the stored profile of an
 //! explicit `--profile` selection, a verified signed policy with a
 //! `[mainnet]` table and its enablement, the enrolled signer, the independent
-//! witness the effective witness rule requires, and a confirmation on a
-//! terminal where the operator types the profile name. The seed is read and
-//! the Ledger opened only after the authorization is minted, and the submit
-//! layer checks the endpoint and passphrase again.
+//! witness the effective witness rule requires, and browser consent with an
+//! owner-pinned passkey. The seed is read and the Ledger opened only after
+//! the authorization is minted, and the submit layer checks the endpoint and
+//! passphrase again.
 //!
 //! # Endpoint identity
 //!
@@ -6155,6 +6155,42 @@ mod tests {
 
                 assert_confirmation_refused(&fixture, &run, "approval.presence_invalid").await;
                 assert_eq!(signer_resolutions_on_this_thread(), before);
+            }
+        }
+
+        /// A real listener requires user verification before signer resolution.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn direct_mainnet_confirmation_requires_uv_before_signing() {
+            for (name, flags, verdict) in [
+                ("pay-browser-no-uv", 1, "allow"),
+                ("pay-browser-uv", 5, "allow"),
+                ("pay-browser-required-no-uv", 1, "require_approval"),
+                ("pay-browser-required-uv", 5, "require_approval"),
+            ] {
+                let mut fixture = Spec::new(name)
+                    .rules(vec![pay_rule(verdict, "")])
+                    .build()
+                    .await;
+                fixture.present_in_browser(flags);
+                let before = signer_resolutions_on_this_thread();
+                let result = run(&fixture, &memo_args(&fixture)).await;
+                if flags == 1 {
+                    assert_eq!(
+                        result.code(),
+                        "approval.presence_invalid",
+                        "{}",
+                        result.envelope
+                    );
+                    assert!(fixture.audit_rows("approval_attested").is_empty());
+                    assert!(records(&fixture).is_empty());
+                    assert!(fixture.sent_envelopes().await.is_empty());
+                    assert_eq!(signer_resolutions_on_this_thread(), before);
+                } else {
+                    assert_eq!(result.code, 0, "{}", result.envelope);
+                    assert!(signer_resolutions_on_this_thread() > before);
+                    assert_eq!(fixture.sent_envelopes().await.len(), 1);
+                }
             }
         }
 
