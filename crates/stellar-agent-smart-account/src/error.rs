@@ -1751,13 +1751,15 @@ pub enum SaError {
     /// from the entry's network ID, nonce, expiration, root invocation and
     /// context-rule IDs and the stored value differs, and `"network_id"` when
     /// the entry's network ID differs from the network ID of the passphrase
-    /// a signing function was given. Every case is refused before any signer
-    /// key access.
+    /// a signing function was given. It is `"checked_signing_rules"` when the
+    /// entry's smart account, network ID or rule set differs from the one the
+    /// consumed `CheckedSigningRules` was produced for. Every case is refused
+    /// before any signer key access.
     #[error("auth entry {field} does not match its signing context; nothing was signed")]
     #[serde(rename = "sa.auth_entry_binding_mismatch")]
     AuthEntryBindingMismatch {
-        /// The mismatching field: `"signature_payload"`, `"auth_digest"` or
-        /// `"network_id"`.
+        /// The mismatching field: `"signature_payload"`, `"auth_digest"`,
+        /// `"network_id"` or `"checked_signing_rules"`.
         field: &'static str,
     },
 
@@ -2167,7 +2169,8 @@ pub enum SaError {
     /// Verifier wasm hash is allowlisted but flagged as Revoked.
     ///
     /// Refused when signer and rule commands install or refresh a verifier pin,
-    /// when signing under a pinned rule, and at the migration destination check.
+    /// when signing under a rule whose pin record pins the hash, and at the
+    /// migration destination check.
     /// No flag overrides this status. Use `smart-account migrate-verifier` to
     /// move away from the hash, or authorize a repair through rule `0`.
     ///
@@ -2185,7 +2188,9 @@ pub enum SaError {
     )]
     #[serde(rename = "sa.verifier_wasm_revoked")]
     VerifierWasmRevoked {
-        /// Context-rule identifier for which the revoked check fired.
+        /// Context-rule identifier for which the revoked check fired; `None`
+        /// when no rule exists yet (a rule being created, or the migration
+        /// destination).
         rule_id: Option<u32>,
         /// Redacted smart-account C-strkey (first-5-last-5).
         ///
@@ -2207,7 +2212,8 @@ pub enum SaError {
     /// Verifier wasm hash flagged as Retired: 24-month rotation past Revoked.
     ///
     /// Refused when signer and rule commands install or refresh a verifier pin,
-    /// when signing under a pinned rule, and at the migration destination check.
+    /// when signing under a rule whose pin record pins the hash, and at the
+    /// migration destination check.
     /// No flag overrides this status. Use `smart-account migrate-verifier` to
     /// move away from the hash, or authorize a repair through rule `0`.
     ///
@@ -2222,7 +2228,9 @@ pub enum SaError {
     )]
     #[serde(rename = "sa.verifier_wasm_retired")]
     VerifierWasmRetired {
-        /// Context-rule identifier for which the retired check fired.
+        /// Context-rule identifier for which the retired check fired; `None`
+        /// when no rule exists yet (a rule being created, or the migration
+        /// destination).
         rule_id: Option<u32>,
         /// Redacted smart-account C-strkey (first-5-last-5).
         ///

@@ -586,15 +586,16 @@ A mismatch refuses with `simulation.divergence` regardless of the policy verdict
 
 Install and simulation refuse an invalid simple-threshold parameter with `sa.simple_threshold_install_refused`. A duplicate policy address or two simple-threshold policies refuse with `sa.deployment_failed` at phase `build`. An `external` entry whose `pubkey_data_hex` decodes to empty key data refuses with `sa.auth_entry_construction_failed`.
 
-Every non-zero `auth_rule_ids` entry first passes the pre-submission checks, and a refusal signs nothing. Baseline and comparison refusals are `sa.signer_set_missing_baseline`, `sa.signer_set_diverged`, `sa.audit_log`, and `network.rpc_divergence`. Lock timeout is `sa.auth_entry_construction_failed` at stage `rule_lock`. A deadline that elapses during the baseline read or the comparison uses that code at `baseline_read` or `signer_set_compare`. Pin refusals are `sa.verifier_hash_drift`, `sa.policy_hash_drift`, `sa.pinned_policy_absent`, `sa.pinned_verifier_absent`, and `sa.pin_check_unavailable`. A version 1 authorizing rule compares through its projection. Its own refusals are `sa.threshold_policy_not_installed`, `sa.threshold_policy_identification_failed`, and `sa.deployment_failed`. After the install confirms, the observed rule's signer identities and simple threshold must equal the proposal's. That observation is recorded as the rule's signer-set baseline. The name, context, expiry, and other policy attachments are not compared. Otherwise the rule stays on chain without a baseline, and the tool returns `sa.install_state_mismatch` or `sa.baseline_write_failed` with the transaction hash.
-
-A pinned verifier marked revoked or retired refuses signing with `sa.verifier_wasm_revoked` or `sa.verifier_wasm_retired`. No flag overrides this refusal, and it writes no drift row.
+Every non-zero `auth_rule_ids` entry first passes the pre-submission checks, and a refusal signs nothing. Baseline and comparison refusals are `sa.signer_set_missing_baseline`, `sa.signer_set_diverged`, `sa.audit_log`, and `network.rpc_divergence`. Lock timeout is `sa.auth_entry_construction_failed` at stage `rule_lock`. A deadline that elapses during the baseline read or the comparison uses that code at `baseline_read` or `signer_set_compare`. Pin refusals are `sa.verifier_hash_drift`, `sa.policy_hash_drift`, `sa.pinned_policy_absent`, `sa.pinned_verifier_absent`, `sa.verifier_wasm_revoked`, `sa.verifier_wasm_retired`, and `sa.pin_check_unavailable`. A version 1 authorizing rule compares through its projection. Its own refusals are `sa.threshold_policy_not_installed`, `sa.threshold_policy_identification_failed`, and `sa.deployment_failed`. After the install confirms, the observed rule's signer identities and simple threshold must equal the proposal's. That observation is recorded as the rule's signer-set baseline. The name, context, expiry, and other policy attachments are not compared. Otherwise the rule stays on chain without a baseline, and the tool returns `sa.install_state_mismatch` or `sa.baseline_write_failed` with the transaction hash.
 
 `sa.pinned_verifier_absent` names an authorizing rule holding an External signer
-
-A pinned verifier marked revoked or retired refuses signing with `sa.verifier_wasm_revoked` or `sa.verifier_wasm_retired`. No flag overrides this refusal, and it writes no drift row.
 whose verifier its pin record does not pin. The operator runs
 `smart-account signers refresh --rule-id N`.
+
+`sa.verifier_wasm_revoked` and `sa.verifier_wasm_retired` name an authorizing
+rule whose pin record pins a verifier hash the allowlist marks revoked or
+retired. No flag overrides them, and they write no drift row. The operator
+moves the rule with `smart-account migrate-verifier` or removes it.
 
 ## DeFi
 

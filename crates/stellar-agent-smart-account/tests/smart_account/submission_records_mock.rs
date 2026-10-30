@@ -60,6 +60,23 @@ fn contract(byte: u8) -> String {
     stellar_strkey::Contract([byte; 32]).to_string().to_string()
 }
 
+/// The `{"scval": ...}` multicall argument of the address `strkey`, a G- or
+/// C-strkey, encoded as a standard-base64 `ScVal::Address`.
+fn scval_address(strkey: &str) -> Value {
+    let address = match stellar_strkey::Strkey::from_string(strkey).unwrap() {
+        stellar_strkey::Strkey::PublicKeyEd25519(key) => {
+            ScAddress::Account(stellar_xdr::AccountId(
+                stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(key.0)),
+            ))
+        }
+        stellar_strkey::Strkey::Contract(contract) => {
+            ScAddress::Contract(ContractId(Hash(contract.0)))
+        }
+        _ => panic!("not an address strkey"),
+    };
+    json!({"scval": ScVal::Address(address).to_xdr_base64(Limits::none()).unwrap()})
+}
+
 /// Runs once inside the mock RPC, on the first simulation.
 type SimulateHook = Box<dyn FnOnce() + Send>;
 
@@ -373,8 +390,8 @@ impl Fixture {
                 target_contract: contract(0x47),
                 fn_name: "transfer".to_owned(),
                 args_json: json!([
-                    {"scval": ScVal::Address(ScAddress::Contract(ContractId(Hash([0x44; 32])))).to_xdr_base64(Limits::none()).unwrap()},
-                    {"scval": ScVal::Address(ScAddress::Account(stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(ed25519_dalek::SigningKey::from_bytes(&[0x48; 32]).verifying_key().to_bytes()))))).to_xdr_base64(Limits::none()).unwrap()},
+                    scval_address(&contract(0x44)),
+                    scval_address(&account_id_for_seed([0x48; 32])),
                     30
                 ]),
             })
@@ -1086,6 +1103,10 @@ async fn allow_opaque_signing_admits_an_unvalued_call() {
     assert_eq!(sends.load(Ordering::SeqCst), 1);
 }
 
+/// A simulated `exec` subtree that carries a transfer after the declared
+/// calls is refused by the declared sub-invocation check before anything is
+/// signed: the bundle reports the divergence at phase `sign` and writes the
+/// denied row naming it.
 #[tokio::test]
 #[serial]
 async fn a_simulated_transfer_outside_the_bundle_is_refused() {
@@ -1094,15 +1115,22 @@ async fn a_simulated_transfer_outside_the_bundle_is_refused() {
     let error = fixture.multicall(&server.uri()).await.unwrap_err();
     assert!(
         matches!(
-            error,
-            SaError::SimulationDivergence {
-                sub_code:
-                    stellar_agent_smart_account::error::SimulationDivergenceSubCode::AuthContexts,
-                ..
-            }
+            &error,
+            SaError::MulticallFailed {
+                phase: "sign",
+                redacted_reason,
+                post_submit_kind: None,
+            } if redacted_reason == "submit error: simulation.divergence.auth_contexts"
         ),
         "{error:?}"
     );
+    let rows = fixture.rows("sa_multicall_bundle_denied");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["deny_wire_code"],
+        "multicall.simulation.divergence.auth_contexts"
+    );
+    assert_eq!(rows[0]["refusal_phase"], "sign");
     assert_eq!(sends.load(Ordering::SeqCst), 0);
     assert!(seen.lock().unwrap().signed_simulations.is_empty());
 }

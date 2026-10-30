@@ -1,8 +1,9 @@
 //! Typed bundle decomposition and state overlays for multicall policy evaluation.
 //!
 //! A valued call is exactly `transfer(Address from, Address to, I128 amount)`
-//! with a nonnegative amount and `from` equal to the wallet. The recipient
-//! has an account or contract strkey. Every other call is generic.
+//! on a contract address, with a nonnegative amount and `from` equal to the
+//! wallet. The recipient has an account or contract strkey. Every other call
+//! is generic.
 //! The gate values the calls the wallet authorizes. A transfer between other
 //! addresses needs their authorization and contributes no sized wallet outflow.
 
@@ -181,9 +182,11 @@ pub struct BundleView<'a> {
 
 /// Decomposes encoded calls into wallet transfers and unsized calls.
 ///
-/// Only `transfer` with exactly two addresses and an `I128` amount counts.
-/// The sender equals `wallet`, the recipient has a strkey, and the amount
-/// is nonnegative. Every other shape is [`InnerOpDescriptor::Generic`].
+/// Only `transfer` on a contract address, with exactly two addresses and an
+/// `I128` amount, counts: the token is the called contract, so a call whose
+/// target is any other address variant names no token to value. The sender
+/// equals `wallet`, the recipient has a strkey, and the amount is
+/// nonnegative. Every other shape is [`InnerOpDescriptor::Generic`].
 ///
 /// # Examples
 ///
@@ -210,7 +213,8 @@ pub fn decompose_bundle_calls(
         .map(|call| {
             let target = scaddress_to_strkey(&call.contract_address)
                 .unwrap_or_else(|error| error.variant.to_owned());
-            if call.function_name.0.as_slice() == b"transfer"
+            if matches!(call.contract_address, ScAddress::Contract(_))
+                && call.function_name.0.as_slice() == b"transfer"
                 && let [ScVal::Address(from), ScVal::Address(to), ScVal::I128(parts)] =
                     call.args.as_slice()
                 && from == wallet
@@ -299,6 +303,19 @@ mod tests {
             let result = decompose_bundle_calls(&[transfer(from, contract(0x48))], &contract(0x44));
             assert!(matches!(result[0], InnerOpDescriptor::Generic { .. }));
         }
+    }
+
+    #[test]
+    fn a_transfer_on_an_account_address_is_not_a_token_transfer() {
+        let wallet = contract(0x44);
+        let mut call = transfer(wallet.clone(), contract(0x48));
+        call.contract_address = account();
+        let result = decompose_bundle_calls(&[call], &wallet);
+        let InnerOpDescriptor::Generic { target, fn_name } = &result[0] else {
+            panic!("a transfer on an account address must not be valued");
+        };
+        assert_eq!(target, &scaddress_to_strkey(&account()).unwrap());
+        assert_eq!(fn_name, "transfer");
     }
 
     #[test]

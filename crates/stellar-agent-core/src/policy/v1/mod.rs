@@ -2679,9 +2679,8 @@ mod tests {
         );
     }
 
-    /// evaluate_bundle: no `bundle_aggregate_cap`, no
-    /// `restrict_bundle_to_recognised_kinds` on the rule — a Generic inner is
-    /// allowed. Existing behavior is unchanged when the cap is absent.
+    /// evaluate_bundle: a per-call value criterion denies a Generic inner,
+    /// whose value effect the wallet cannot size, at its index.
     #[test]
     fn evaluate_bundle_per_tx_cap_denies_an_unvalued_inner() {
         let result = evaluate_unvalued_inner(false);
@@ -2690,11 +2689,14 @@ mod tests {
         );
     }
 
+    /// evaluate_bundle: `allow_opaque_signing` exempts the Generic inner from
+    /// the rule's per-call value criteria, as it does for a single call.
     #[test]
     fn evaluate_bundle_allow_opaque_signing_admits_an_unvalued_inner() {
         assert_eq!(evaluate_unvalued_inner(true), Decision::Allow);
     }
 
+    /// Evaluates a one-inner Generic bundle under a rule with a per-call cap.
     fn evaluate_unvalued_inner(allow_opaque_signing: bool) -> Decision {
         use crate::policy::v1::criteria::per_tx_cap::PerTxCapCriterion;
         let mut doc = allow_all_doc_with_criteria(vec![Box::new(PerTxCapCriterion::new(
@@ -2719,6 +2721,9 @@ mod tests {
             .unwrap()
     }
 
+    /// evaluate_bundle: no `bundle_aggregate_cap`, no
+    /// `restrict_bundle_to_recognised_kinds` on the rule — a Generic inner is
+    /// allowed. Existing behavior is unchanged when the cap is absent.
     #[test]
     fn evaluate_bundle_no_cap_no_guard_allows_generic_inner() {
         let doc = allow_all_doc_with_criteria(vec![]);

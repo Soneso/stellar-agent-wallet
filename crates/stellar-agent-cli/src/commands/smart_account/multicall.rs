@@ -51,7 +51,9 @@
 //! `simulate` or `submit` phase. A version 1 authorizing rule with a contract
 //! delegate cannot form its projection and refuses at phase `simulate`. A
 //! signer-set read that refuses with `sa.contract_instance_unsupported`
-//! renders at phase `submit`.
+//! renders at phase `submit`. A refused simulated authorization tree
+//! (`simulation.divergence.*`) renders at phase `sign`, before anything is
+//! signed.
 //!
 //! # Policy
 //!

@@ -797,10 +797,13 @@ impl SignersManager {
         self.health.handle()
     }
 
-    /// Checks verifier pins and statuses for each signing rule.
+    /// Runs the pinned-hash drift check, with its verifier status gate, for
+    /// each signing rule.
     ///
     /// The returned proof is bound to this manager's network, the account and
-    /// the complete rule set. Rule `0` has no pin check.
+    /// the complete rule set. Rule `0` and a rule without a pin record pass
+    /// unchecked: neither has a pin to compare the live verifier with, so
+    /// neither is status-checked.
     ///
     /// # Errors
     ///
@@ -7100,10 +7103,11 @@ impl SignersManager {
     /// `External` signers, decoded from the signers being added. `live` is
     /// the rule's signer set as the pre-submission comparison observed it
     /// through both endpoints. Returns `None` when `new_verifiers` is empty
-    /// or the rule has no pin record. Every added verifier gets a status check
-    /// before this decision. Otherwise each new verifier address
-    /// that no `External` signer of `live` uses is identified and probed
-    /// here, before submission, with the overrides applied to it pending. A
+    /// or the rule has no pin record. Every added verifier is observed and
+    /// status-checked first, whether or not the rule has a pin record. On a
+    /// rule with a pin record, each new verifier address that no `External`
+    /// signer of `live` uses is then identified and probed here, before
+    /// submission, with the overrides applied to it pending. A
     /// probed pin equal to a recorded verifier pin, in hash and executable
     /// reference, adds no pin. The signing check compares the verifier with
     /// that pin and accepts it, and only the overrides applied to it are
@@ -7113,6 +7117,11 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::VerifierWasmRevoked`] / [`SaError::VerifierWasmRetired`]:
+    ///   an added verifier's hash carries that allowlist status.
+    /// - The refusals of `observe_contract` for an added verifier
+    ///   ([`SaError::ContractInstanceUnsupported`],
+    ///   [`SaError::NetworkRpcDivergence`], [`SaError::DeploymentFailed`]).
     /// - [`SaError::AuditLog`]: the pin record could not be read.
     /// - The refusals of `pin_added_contract` for a new verifier.
     async fn plan_signer_add_pin_update(

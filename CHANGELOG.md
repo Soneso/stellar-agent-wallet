@@ -223,8 +223,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Breaking (`stellar-agent-smart-account` API): `complete_authorization_entry`,
+  `complete_authorization_entry_multi_signer`, `sign_with_ed25519_rule` and
+  `collect_quorum_signatures` take a `CheckedSigningRules` as their first
+  argument. `SignersManager::check_signing_rules` produces it; the value binds
+  the smart account, the network and the rule IDs, and each entry point
+  refuses a partial entry outside that binding before any key access.
 - `VerifierWasmRevoked` and `VerifierWasmRetired` carry `rule_id: Option<u32>`.
   Unsizable multicall calls use audit code `multicall.unsizable_value_effect`.
+- `smart-account signers add` and `signers batch-add` observe every new
+  verifier before submission, also on a rule without a pin record. On such a
+  rule the add can refuse with `sa.verifier_wasm_revoked`,
+  `sa.verifier_wasm_retired`, `sa.contract_instance_unsupported`,
+  `network.rpc_divergence` or `sa.deployment_failed`, and the pin record stays
+  absent.
 
 - Breaking (`stellar-agent-network` API): every ed25519 method of `Signer`
   takes a typed payload from `signing::payload`, and `Signer::sign_message` is

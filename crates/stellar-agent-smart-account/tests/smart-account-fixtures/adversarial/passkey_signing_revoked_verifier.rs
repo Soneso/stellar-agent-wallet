@@ -154,11 +154,15 @@ async fn passkey_signing_refuses_a_revoked_verifier_before_bridge_io() {
     let rule = ScVal::Map(Some(fields.try_into().unwrap()))
         .to_xdr_base64(Limits::none())
         .unwrap();
+    // Both endpoints share this server. The drift check reads the rule, then
+    // the verifier's instance from each endpoint; the live hash matches the
+    // pin, so the status gate on the match path refuses. A ledger read past
+    // those two fails the responder's range assertion.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))
         .respond_with(SequencedLedgerResponder::new(
-            vec![[0xee; 32]],
+            vec![[0xee; 32]; 2],
             vec![build_simulate_response(&rule)],
         ))
         .mount(&server)

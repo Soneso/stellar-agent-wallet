@@ -1585,9 +1585,6 @@ pub async fn submit_multicall_bundle(
 
     // Build the exec invocations XDR arg.
     let exec_invocations_xdr = exec_invocations_from_calls(&declared_calls)?;
-    // The same calls, declared as the sub-invocations the wallet authorizes
-    // under `exec`: a simulated subtree holding any other call is refused
-    // before signing.
 
     // Build the InvokeContractArgs for the router's `exec` function.
     let exec_invocations_scval: VecM<ScVal> =
@@ -1662,6 +1659,10 @@ pub async fn submit_multicall_bundle(
             .auth_address(args.smart_account)
             .auth_rule_ids(&auth_rule_ids)
             .host_function(host_function)
+            // The calls the gate valued and the router argument carries,
+            // declared as the sub-invocations the wallet authorizes under
+            // `exec`: a simulated subtree holding any other call is refused
+            // before signing.
             .sub_invocations(DeclaredSubInvocations::Calls(&declared_calls))
             .signer(args.signer)
             .primary_rpc_url(args.primary_rpc_url)
@@ -2188,25 +2189,30 @@ fn classify_submit_failure(sa_err: SaError) -> (Option<SubmitDeniedRow>, SaError
 ///   `rule_lock_missing`, `rule_locks_without_pin_check`, `baseline_read`,
 ///   `signer_set_compare`) → `"policy_gate"`; at any other stage → `"sign"`
 ///   (auth-entry assembly failure).
-/// - `"sa.rule_id_mismatch"` / `"sa.simulation_divergence"` → `"sign"` (context-rule
-///   divergence checks after simulation, before submission).
+/// - `"sa.rule_id_mismatch"` and [`SaError::SimulationDivergence`] under every
+///   `simulation.divergence.*` sub-code → `"sign"` (the signed-tree and
+///   context-rule divergence checks after simulation, before signing).
 /// - `"sa.submit_check_missing"` → `"build"` (programming-gate; fires before any I/O).
 /// - `"sa.horizon_exceeded"` / `"sa.rule_expired"` → `"policy_gate"`.
 /// - `"sa.verifier_hash_drift"` / `"sa.policy_hash_drift"` / `"sa.pinned_policy_absent"` /
-///   `"sa.pinned_verifier_absent"` / `"sa.pin_check_unavailable"` → `"policy_gate"` (the
-///   pinned-hash drift check).
+///   `"sa.pinned_verifier_absent"` / `"sa.verifier_wasm_revoked"` /
+///   `"sa.verifier_wasm_retired"` / `"sa.pin_check_unavailable"` → `"policy_gate"` (the
+///   pinned-hash drift check and its verifier status gate).
 /// - `"sa.signer_set_missing_baseline"` / `"sa.signer_set_baseline_legacy"` /
 ///   `"sa.signer_set_diverged"` / `"sa.audit_log"` / `"network.rpc_divergence"` /
 ///   `"sa.threshold_policy_not_installed"` /
 ///   `"sa.threshold_policy_identification_failed"` / `"sa.threshold_read_failed"`
 ///   → `"policy_gate"` (the signer-set check of the authorizing rule).
 /// - `"sa.multicall_failed"` (nested) keeps its own phase.
-///
-/// `sa.verifier_wasm_revoked` and `sa.verifier_wasm_retired` map to `policy_gate`.
 /// - Other (unrecognized) → `"submit"` as last resort.
 fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
     if let SaError::MulticallFailed { phase, .. } = err {
         return phase;
+    }
+    // A divergence's wire code names its sub-code
+    // (`simulation.divergence.auth_contexts`, ...), so the variant decides.
+    if let SaError::SimulationDivergence { .. } = err {
+        return "sign";
     }
     match err.wire_code() {
         "sa.deployment_failed" => {
@@ -2234,9 +2240,7 @@ fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
             // rule refuse before simulation, as the pin check does.
             "policy_gate"
         }
-        "sa.auth_entry_construction_failed"
-        | "sa.rule_id_mismatch"
-        | "sa.simulation_divergence" => {
+        "sa.auth_entry_construction_failed" | "sa.rule_id_mismatch" => {
             // Auth-entry construction and context-rule divergence checks fire at the
             // sign stage (after simulate, before submit).
             "sign"
@@ -2531,11 +2535,10 @@ mod tests {
 
     use super::*;
 
-    // ── A denied-path row that is not written is logged ──────────────────────
+    // ── Verifier status phase, unsizable calls and argument forms ────────────
 
-    /// The denied-path callers discard the emitter's result, so a row that is
-    /// not written is logged at `error` with its event kind, and the emitter
-    /// reports `Err`.
+    /// A revoked or retired verifier refuses at the policy gate, like the
+    /// pinned-hash drift check whose match path raises it.
     #[test]
     fn map_sa_error_to_phase_verifier_status_refusals_map_to_policy_gate() {
         use stellar_agent_core::observability::RedactedStrkey;
@@ -2559,6 +2562,7 @@ mod tests {
         }
     }
 
+    /// An unsizable call's denial records `unsizable_value_effect`.
     #[test]
     fn deny_reason_wire_code_unsizable_value_effect() {
         assert_eq!(
@@ -2569,6 +2573,7 @@ mod tests {
         );
     }
 
+    /// The `scval` form decodes to the value its XDR encodes.
     #[test]
     fn json_args_scval_form_encodes_any_value() {
         use stellar_xdr::{ContractId, Hash, Int128Parts, Limits, ScMap, WriteXdr};
@@ -2586,6 +2591,8 @@ mod tests {
         }
     }
 
+    /// Every object other than one string `scval` member holding a contract
+    /// argument refuses, naming the argument index.
     #[test]
     fn json_args_scval_form_is_exact() {
         use stellar_xdr::{Limits, ScNonceKey, WriteXdr};
@@ -2610,6 +2617,7 @@ mod tests {
         }
     }
 
+    /// A refused argument names the `scval` form the encoder accepts.
     #[test]
     fn json_args_refusal_names_the_accepted_forms() {
         let error = json_args_to_scval_vec(&serde_json::json!([true]), 0).unwrap_err();
@@ -2617,6 +2625,11 @@ mod tests {
         assert!(!error.contains("pre-serialised"));
     }
 
+    // ── A denied-path row that is not written is logged ──────────────────────
+
+    /// The denied-path callers discard the emitter's result, so a row that is
+    /// not written is logged at `error` with its event kind, and the emitter
+    /// reports `Err`.
     #[test]
     fn a_denied_row_behind_a_poisoned_writer_is_logged_at_error_with_its_kind() {
         let dir = TempDir::new().unwrap();
@@ -3944,6 +3957,27 @@ wasm_sha256 = "{drifted_sha}"
             observed_len: 0,
         };
         assert_eq!(map_sa_error_to_multicall_phase(&err), "sign");
+    }
+
+    /// `SimulationDivergence` maps to `"sign"` under every sub-code: the
+    /// signed-tree and context-rule checks refuse after simulation, before
+    /// anything is signed or sent.
+    #[test]
+    fn map_sa_error_to_phase_simulation_divergence_maps_to_sign() {
+        use crate::error::SimulationDivergenceSubCode;
+        for sub_code in [
+            SimulationDivergenceSubCode::ContextRuleIds,
+            SimulationDivergenceSubCode::AuthContexts,
+            SimulationDivergenceSubCode::Network,
+            SimulationDivergenceSubCode::Sequence,
+            SimulationDivergenceSubCode::FeeEnvelope,
+        ] {
+            let err = SaError::SimulationDivergence {
+                sub_code,
+                redacted_reason: "test".to_owned(),
+            };
+            assert_eq!(map_sa_error_to_multicall_phase(&err), "sign", "{err:?}");
+        }
     }
 
     /// `SubmitCheckMissing` maps to `"build"`.

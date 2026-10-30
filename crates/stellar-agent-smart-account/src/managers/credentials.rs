@@ -1720,7 +1720,7 @@ impl CredentialsManager {
 
         // Derive the audit result tag from the full Result, covering all
         // closed-set outcomes enumerated in
-        // `audit_log/schema.rs PasskeyAssertion.result` (result classes).
+        // `audit_log/schema.rs PasskeyAssertion.result` (fifteen classes).
         let result_tag = match &inner_result {
             Ok(SignWithPasskeyOutcome::Signed { .. }) => {
                 info!(credential_name, "passkey signing ceremony completed");
@@ -1733,6 +1733,11 @@ impl CredentialsManager {
             Err(CredentialsError::Signing { .. }) => "failure:signer_error",
             // Per-signing divergence check fired before the WebAuthn ceremony.
             Err(CredentialsError::SignerSetDivergence { .. }) => "failure:signer_set_diverged",
+            // The pinned verifier's allowlist status refused signing before the
+            // WebAuthn ceremony; no drift row was written.
+            Err(CredentialsError::VerifierStatusRefused { .. }) => {
+                "failure:verifier_status_refused"
+            }
             // Verifier or policy wasm-hash drift check fired before the WebAuthn ceremony.
             // The result tag distinguishes:
             //   - "failure:verifier_hash_drift" — verifier drift detected
@@ -1749,9 +1754,6 @@ impl CredentialsManager {
             // Infrastructure failures are routed to DriftCheckUnavailable by drift_err_route().
             // The `_` catch-all below is defensive for future variants; it should be
             // unreachable given drift_err_route() routing.
-            Err(CredentialsError::VerifierStatusRefused { .. }) => {
-                "failure:verifier_status_refused"
-            }
             Err(CredentialsError::WasmHashDrift { source }) => match source.as_ref() {
                 crate::SaError::PolicyHashDrift { .. } => "failure:policy_hash_drift",
                 crate::SaError::VerifierHashDrift { .. } => "failure:verifier_hash_drift",

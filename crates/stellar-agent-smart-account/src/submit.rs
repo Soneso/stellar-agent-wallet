@@ -273,15 +273,26 @@ pub struct PinCheck<'a> {
     pub migrating_rule: Option<MigratingRule>,
 }
 
-/// Proof that the manager checks the verifier pins and statuses of these rules.
+/// Proof that the manager ran the pinned-hash drift check, with its verifier
+/// status gate, for these rules.
 ///
 /// Obtain it through [`SignersManager::check_signing_rules`]. Signing consumes
 /// the proof and checks its account, network and rule set against the entry.
-/// The proof has no public constructor and cannot be cloned.
+/// Rule 0 and a rule without a pin record pass unchecked: neither has a pin
+/// to compare the live verifier with, so neither is status-checked.
+///
+/// The proof has no public constructor:
 ///
 /// ```compile_fail
 /// use stellar_agent_smart_account::submit::CheckedSigningRules;
 /// let proof = CheckedSigningRules::new();
+/// ```
+///
+/// and cannot be cloned:
+///
+/// ```compile_fail
+/// use stellar_agent_smart_account::submit::CheckedSigningRules;
+/// fn f(p: &CheckedSigningRules) -> CheckedSigningRules { p.clone() }
 /// ```
 #[derive(Debug)]
 pub struct CheckedSigningRules {
@@ -297,12 +308,9 @@ impl CheckedSigningRules {
         network_id: [u8; 32],
         rule_ids: &[ContextRuleId],
     ) -> Result<(), SaError> {
-        let mut ids: Vec<u32> = rule_ids.iter().map(ContextRuleId::as_u32).collect();
-        ids.sort_unstable();
-        ids.dedup();
         if self.smart_account != *smart_account
             || self.network_id != network_id
-            || self.rule_ids != ids
+            || self.rule_ids != distinct_rule_ids(rule_ids)
         {
             return Err(SaError::AuthEntryBindingMismatch {
                 field: "checked_signing_rules",
@@ -323,6 +331,15 @@ impl CheckedSigningRules {
     }
 }
 
+/// The distinct rule ids of `rules`, in ascending order: the form the
+/// pinned-hash drift check runs over and a [`CheckedSigningRules`] binds.
+fn distinct_rule_ids(rules: &[ContextRuleId]) -> Vec<u32> {
+    let mut ids: Vec<u32> = rules.iter().map(ContextRuleId::as_u32).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 #[cfg(test)]
 pub(crate) fn checked_rules_for_test(
     partial: &PartialSorobanAuthorizationEntry,
@@ -340,13 +357,10 @@ pub(crate) fn checked_context_for_test(
     network_id: [u8; 32],
     rules: &[ContextRuleId],
 ) -> CheckedSigningRules {
-    let mut rule_ids: Vec<u32> = rules.iter().map(ContextRuleId::as_u32).collect();
-    rule_ids.sort_unstable();
-    rule_ids.dedup();
     CheckedSigningRules {
         smart_account: smart_account.clone(),
         network_id,
-        rule_ids,
+        rule_ids: distinct_rule_ids(rules),
     }
 }
 
@@ -358,16 +372,13 @@ pub(crate) async fn check_signing_rules(
     request_id: &str,
     budget: PreSubmitBudget,
 ) -> Result<CheckedSigningRules, SaError> {
-    let mut ids: Vec<u32> = rules.iter().map(ContextRuleId::as_u32).collect();
-    ids.sort_unstable();
-    ids.dedup();
     run_pin_check(
         &PinCheck {
             signers_manager: manager,
             request_id,
             migrating_rule: None,
         },
-        &ids,
+        &distinct_rule_ids(rules),
         smart_account,
         budget,
     )
@@ -2212,13 +2223,12 @@ async fn run_rule_checks(
 ) -> Result<(Vec<RuleLockGuard>, CheckedSigningRules), SaError> {
     let manager = pin_check.signers_manager;
     let smart_account_strkey = scaddress_to_strkey(smart_account)?;
-    let mut rule_ids: Vec<u32> = auth_rule_ids
+    let signing_ids = distinct_rule_ids(auth_rule_ids);
+    let rule_ids: Vec<u32> = signing_ids
         .iter()
-        .map(ContextRuleId::as_u32)
+        .copied()
         .filter(|rule_id| *rule_id != 0)
         .collect();
-    rule_ids.sort_unstable();
-    rule_ids.dedup();
 
     // Step 1: the locks.
     let owned = match rule_locks {
@@ -2272,9 +2282,6 @@ async fn run_rule_checks(
     }
 
     // Step 3: the pinned-hash drift check.
-    let mut signing_ids: Vec<u32> = auth_rule_ids.iter().map(ContextRuleId::as_u32).collect();
-    signing_ids.sort_unstable();
-    signing_ids.dedup();
     let checked = run_pin_check(pin_check, &signing_ids, smart_account, budget).await?;
 
     // Step 4: the signer-set comparisons.
@@ -2297,8 +2304,9 @@ async fn run_rule_checks(
 }
 
 /// Runs the pinned-hash drift check of each rule in `rule_ids`, the distinct
-/// non-zero auth rules in ascending order, each bounded by `budget` as stage
-/// `"pin_check"`; see [`PinCheck`] for the outcomes.
+/// auth rules in ascending order, each bounded by `budget` as stage
+/// `"pin_check"`; see [`PinCheck`] for the outcomes. Rule 0 is skipped, and
+/// the returned proof binds every rule of `rule_ids`, rule 0 included.
 ///
 /// # Errors
 ///

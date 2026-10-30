@@ -1166,7 +1166,7 @@ pub enum EventKind {
         ///   disagreed, the baseline was missing, or the audit-log integrity check
         ///   failed (`CredentialsError::SignerSetDivergence`).  The browser window
         ///   is never opened on this path.
-        /// - `failure:verifier_status_refused`: the pinned verifier is revoked
+        /// - `"failure:verifier_status_refused"`: the pinned verifier is revoked
         ///   or retired; no bridge request or drift row occurs.
         /// - `"failure:verifier_hash_drift"` — the pre-signing verifier wasm-hash
         ///   drift check detected that the live on-chain wasm hash differs from the
