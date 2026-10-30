@@ -10,8 +10,10 @@ unmodified copy must pass, and so must each copy that a PASSING entry edits
 into another accepted form. Each replacement must match the expected number
 of times; a case whose text drifted fails. A fixture read from the live
 workflows must match exactly once, or the run stops before any case.
-With --case LABEL, the run checks the unmodified copy and that one failing
-case or PASSING entry.
+Each named mutation of the check then must fail the entries it names, and
+the restored check must pass them. With --case LABEL, the run checks the
+unmodified copy and that one failing case or PASSING entry, and the
+mutations that name it.
 """
 
 import pathlib
@@ -386,6 +388,21 @@ WASM_GATE_RUN = ('        run: bash .github/scripts/rebuild-vendored-wasm.sh --g
 WASM_DECIDE_RUN = '          echo "rebuild=$rebuild" >>"$GITHUB_OUTPUT"\n'
 
 
+# Insertion points for a vars reference in release.yml, the workflow it
+# calls and the signing action it uses, and the vendored-wasm tree check
+# step a local reference follows.
+WASM_JOBS = "permissions:\n  contents: read\n\njobs:\n"
+WASM_TREE_CHECK = "        run: bash .github/scripts/rebuild-vendored-wasm.sh --check-tree --repo-root .\n"
+ACTION_P12 = "        P12_B64: ${{ inputs.developer-id-p12-base64 }}\n"
+VARS_READ = "${{ vars.SAMPLE }}"
+VARS_TEXT = "vars.SAMPLE ${{ format('{0}', 'vars.SAMPLE') }}"
+VARS_LOCATIONS = (
+    ("release.yml", RELEASE, RELEASE_WORKFLOW_ENV, RELEASE_WORKFLOW_ENV + "  SAMPLE: {}\n"),
+    ("the called vendored-wasm workflow", WASM, WASM_JOBS, "env:\n  SAMPLE: {}\n\n" + WASM_JOBS),
+    ("the signing action", ACTION, ACTION_P12, "        SAMPLE: {}\n" + ACTION_P12),
+)
+
+
 # label, [(file, old, new, expected occurrences)];
 # the edited copy must pass.
 PASSING = [
@@ -415,6 +432,10 @@ PASSING = [
     ("heredoc in a step without the archive check passes", [
         (RELEASE, VERIFY_PACKAGED_STEP, "      - name: Write notes\n        shell: bash\n        run: |\n"
          "          cat <<'EOF'\n          notes\n          EOF\n" + VERIFY_PACKAGED_STEP, 1)]),
+] + [
+    (f"vars text outside the context in {where} passes", [
+        (path, old, new.format(VARS_TEXT), 1)])
+    for where, path, old, new in VARS_LOCATIONS
 ]
 
 # label, expected rule, a fragment that one line naming the rule must hold,
@@ -1301,7 +1322,36 @@ CASES = [
         "coverage.yml: coverage-condition: job coverage not found",
         "coverage.yml: ci-feature-jobs: missing coverage"), [
         (COVERAGE, "  coverage:\n    name: coverage\n", "  measure:\n    name: coverage\n", 1)], 2),
+] + [
+    (f"vars context in {where}", "release-vars",
+     f"{path}: release-vars: an expression reads the vars context: vars.SAMPLE", [
+        (path, old, new.format(VARS_READ), 1)], 1)
+    for where, path, old, new in VARS_LOCATIONS
+] + [
+    ("unresolved local reference in the called vendored-wasm workflow", "release-vars",
+     f"{WASM}: release-vars: local reference ./.github/actions/absent names no file", [
+        (WASM, WASM_TREE_CHECK, WASM_TREE_CHECK + "      - uses: ./.github/actions/absent\n", 1)], 1),
 ]
+
+# Each mutation of check-workflow-invariants.py: the text it replaces, the
+# replacement, and the CASES or PASSING labels that must fail against the
+# mutated copy and pass against the restored one.
+MUTATIONS = {
+    "release-vars-context": (
+        "if VARS_CONTEXT.search(EXPRESSION_STRING.sub(\"''\", expression)):", "if False:",
+        [f"vars context in {where}" for where, *_ in VARS_LOCATIONS]),
+    "release-vars-strings": (
+        "if VARS_CONTEXT.search(EXPRESSION_STRING.sub(\"''\", expression)):",
+        "if VARS_CONTEXT.search(expression):",
+        [f"vars text outside the context in {where} passes" for where, *_ in VARS_LOCATIONS]),
+    "release-vars-transitive": (
+        "                    pending.append(target)\n", "                    pass\n",
+        ["vars context in the called vendored-wasm workflow", "vars context in the signing action",
+         "unresolved local reference in the called vendored-wasm workflow"]),
+    "release-vars-unresolved": (
+        'self.report(str(relative), rule, f"local reference {reference} names no file")', "pass",
+        ["unresolved local reference in the called vendored-wasm workflow"]),
+}
 
 
 COUNT_CASES = [
@@ -1317,10 +1367,63 @@ def copy_tree(destination):
     shutil.copytree(ROOT / ".github", destination / ".github")
 
 
-def run_check(root):
-    result = subprocess.run([sys.executable, "-B", str(SCRIPT), str(root)],
+def run_check(root, script=SCRIPT):
+    result = subprocess.run([sys.executable, "-B", str(script), str(root)],
                             capture_output=True, text=True, check=False)
     return result.returncode, result.stdout + result.stderr
+
+
+def entry_problems(root, label, script=SCRIPT):
+    """Copies the tree to root, applies the edits of the CASES or PASSING
+    entry with this label, runs script and returns its problems."""
+    copy_tree(root)
+    try:
+        passing = dict(PASSING)
+        if label in passing:
+            problems = apply_edits(root, passing[label])
+            if not problems:
+                rc, output = run_check(root, script)
+                if rc != 0:
+                    problems.append(f"exit {rc}, expected 0: {output.strip()}")
+            return problems
+        case = next(case for case in CASES if case[0] == label)
+        problems = apply_edits(root, case[3])
+        if not problems:
+            rc, output = run_check(root, script)
+            if rc != 1:
+                problems.append(f"exit {rc}, expected 1")
+            problems.extend(case_problems(output, case))
+        return problems
+    finally:
+        shutil.rmtree(root)
+
+
+def mutation_failures(tmp, selected):
+    """Runs each mutation's entries against the mutated copy, which must
+    fail them, and against the restored copy, which must pass them."""
+    failures = []
+    source = SCRIPT.read_text()
+    path = pathlib.Path(tmp) / "mutant-check-workflow-invariants.py"
+    for name, (needle, replacement, labels) in MUTATIONS.items():
+        labels = [label for label in labels if not selected or selected == label]
+        if not labels:
+            continue
+        if source.count(needle) != 1:
+            failures.append(f"mutation-{name}: mutation target found {source.count(needle)} times")
+            continue
+        for phase, text in (("mutation", source.replace(needle, replacement, 1)), ("control", source)):
+            path.write_text(text)
+            path.touch()
+            for label in labels:
+                problems = entry_problems(pathlib.Path(tmp) / "mutant", label, path)
+                if phase == "mutation" and not problems:
+                    failures.append(f"mutation-{name}: {label}: passes against the mutated check")
+                elif phase == "control" and problems:
+                    failures.append(f"control-{name}: {label}: {'; '.join(problems)}")
+                else:
+                    detail = f": {problems[0].splitlines()[0]}" if problems else ""
+                    print(f"ok   {phase}-{name}: {label}{detail}")
+    return failures
 
 
 def apply_edits(root, edits):
@@ -1413,40 +1516,16 @@ def main():
         else:
             print("ok   unmodified tree passes")
 
-        for index, (label, edits) in enumerate(PASSING):
+        for label in [label for label, _ in PASSING] + [case[0] for case in CASES]:
             if selected and selected != label:
                 continue
-            root = pathlib.Path(tmp) / f"passing{index}"
-            copy_tree(root)
-            problems = apply_edits(root, edits)
-            if not problems:
-                rc, output = run_check(root)
-                if rc != 0:
-                    problems.append(f"exit {rc}, expected 0: {output.strip()}")
+            problems = entry_problems(pathlib.Path(tmp) / "entry", label)
             if problems:
                 failures.append(f"{label}: {'; '.join(problems)}")
             else:
                 print(f"ok   {label}")
-            shutil.rmtree(root)
 
-        for index, case in enumerate(CASES):
-            label, edits = case[0], case[3]
-            if selected and selected != label:
-                continue
-            root = pathlib.Path(tmp) / f"case{index}"
-            copy_tree(root)
-            problems = apply_edits(root, edits)
-            output = ""
-            if not problems:
-                rc, output = run_check(root)
-                if rc != 1:
-                    problems.append(f"exit {rc}, expected 1")
-                problems.extend(case_problems(output, case))
-            if problems:
-                failures.append(f"{label}: {'; '.join(problems)}")
-            else:
-                print(f"ok   {label}")
-            shutil.rmtree(root)
+        failures.extend(mutation_failures(tmp, selected))
 
     if failures:
         for failure in failures:

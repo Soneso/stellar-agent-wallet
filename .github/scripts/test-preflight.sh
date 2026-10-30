@@ -86,7 +86,7 @@ feature-discipline	cargo fetch --locked && python3 .github/scripts/check-feature
 self-test:test-check-feature-discipline.py	python3 .github/scripts/test-check-feature-discipline.py --mutations
 self-test:test-check-binary-marker.sh	bash .github/scripts/test-check-binary-marker.sh
 self-test:test-release-checks.sh	bash .github/scripts/test-release-checks.sh
-self-test:test-check-provenance.py	python3 .github/scripts/test-check-provenance.py
+self-test:test-check-provenance.py	python3 .github/scripts/test-check-provenance.py --mutations
 workflow-invariants	python3 .github/scripts/check-workflow-invariants.py
 self-test:test-check-coverage.py	python3 .github/scripts/test-check-coverage.py
 self-test:test-check-crates-exist.sh	bash .github/scripts/test-check-crates-exist.sh

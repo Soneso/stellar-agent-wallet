@@ -119,7 +119,7 @@ feature-discipline	cargo fetch --locked && python3 .github/scripts/check-feature
 self-test:test-check-feature-discipline.py	python3 .github/scripts/test-check-feature-discipline.py --mutations	cargo,yaml	ci.yml	feature-discipline	Check feature discipline and assertions
 self-test:test-check-binary-marker.sh	bash .github/scripts/test-check-binary-marker.sh	-	ci.yml	feature-discipline	Check feature discipline and assertions
 self-test:test-release-checks.sh	bash .github/scripts/test-release-checks.sh	-	ci.yml	feature-discipline	Check feature discipline and assertions
-self-test:test-check-provenance.py	python3 .github/scripts/test-check-provenance.py	-	ci.yml	feature-discipline	Check feature discipline and assertions
+self-test:test-check-provenance.py	python3 .github/scripts/test-check-provenance.py --mutations	-	ci.yml	feature-discipline	Check feature discipline and assertions
 workflow-invariants	python3 .github/scripts/check-workflow-invariants.py	yaml	ci.yml	release-contracts	Check the workflow structure and the label sync
 self-test:test-check-coverage.py	python3 .github/scripts/test-check-coverage.py	-	ci.yml	release-contracts	Self-test the coverage floor gate
 self-test:test-check-crates-exist.sh	bash .github/scripts/test-check-crates-exist.sh	jq	ci.yml	release-contracts	Self-test the crates.io existence check

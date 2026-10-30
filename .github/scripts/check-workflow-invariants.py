@@ -163,6 +163,14 @@ runs the function.
   unconditionally. The ``vendored-wasm`` job runs on ``always()``, needs
   exactly ``WASM_GATE_NEEDS``, and has one unconditional gate step that runs
   ``WASM_GATE_CALL`` with ``WASM_GATE_ENV``.
+- ``release-vars``: an expression reads the ``vars`` context in
+  ``release.yml``, in a local reusable workflow it calls, or in the
+  ``action.yml`` of a local action it uses, followed through every local
+  ``uses:`` of a job or step, or such a local reference names no file in the
+  repository. The expressions are read as for ``rehearsal-credentials``, with
+  string literals masked. The release provenance records the ``vars`` context
+  as its parameters; this keeps a repository, organization, or environment
+  variable out of the release build.
 - ``release-publish-sums``: ``publish`` does not run the archive checksum
   check unconditionally before the GitHub Release action.
 - ``release-toolchain``: ``RELEASE_TOOLCHAIN`` of ``release.yml`` or
@@ -313,7 +321,7 @@ CI_FEATURE_JOBS = {
         '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-feature-discipline.py --mutations',
         "bash .github/scripts/test-check-binary-marker.sh",
         "bash .github/scripts/test-release-checks.sh",
-        '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-provenance.py'),
+        '"$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-provenance.py --mutations'),
     "release-shape": ("bash .github/scripts/release/check-host.sh",),
 }
 # The feature jobs of other workflows that run under a documented job
@@ -395,6 +403,8 @@ EXPRESSION_STRING = re.compile(r"'(?:[^']|'')*'")
 SECRETS_CONTEXT = re.compile(r"(?<![\w.-])secrets(?![\w-])", re.IGNORECASE)
 GITHUB_CONTEXT = re.compile(r"(?<![\w.-])github(?![\w-])", re.IGNORECASE)
 NAMED_PROPERTY = re.compile(r"\s*\.\s*([A-Za-z_][\w-]*)")
+VARS_CONTEXT = re.compile(r"(?<![\w.-])vars(?![\w-])", re.IGNORECASE)
+WORKFLOW_DIR = pathlib.PurePosixPath(".github/workflows")
 
 
 class Checker:
@@ -1252,11 +1262,75 @@ class Checker:
                     self.report(f"{relative} step {index + 1}", "composite-expression",
                                 f"run: holds ${{{{ {expression} }}}}")
 
+    @staticmethod
+    def local_references(doc):
+        """Yields the local uses: values of a workflow's jobs and steps or of
+        an action's steps."""
+        steps = []
+        for job in (doc.get("jobs") or {}).values():
+            if isinstance(job, dict):
+                yield job.get("uses")
+                steps.extend(job.get("steps") or [])
+        runs = doc.get("runs")
+        if isinstance(runs, dict):
+            steps.extend(runs.get("steps") or [])
+        for step in steps:
+            if isinstance(step, dict):
+                yield step.get("uses")
+
+    def resolve_local(self, reference):
+        """The file a local uses: value names: a workflow file, or the
+        action.yml or action.yaml of an action directory; None when it names
+        no file inside the repository."""
+        relative = pathlib.PurePosixPath(reference[2:])
+        if ".." in relative.parts:
+            return None
+        path = self.root / relative
+        if path.is_dir():
+            for name in ("action.yml", "action.yaml"):
+                if (path / name).is_file():
+                    return relative / name
+            return None
+        return relative if path.is_file() else None
+
+    def check_release_vars(self):
+        rule = "release-vars"
+        pending, seen = [WORKFLOW_DIR / "release.yml"], set()
+        while pending:
+            relative = pending.pop(0)
+            if relative in seen:
+                continue
+            seen.add(relative)
+            # A listed workflow that does not load is reported as unreadable once.
+            if relative.parent == WORKFLOW_DIR and relative.name in WORKFLOWS:
+                doc = self.docs.get(relative.name)
+            else:
+                doc = self.load(relative)
+            if not isinstance(doc, dict):
+                continue
+            try:
+                expressions = list(self.expression_values(doc))
+            except ValueError as err:
+                self.report(str(relative), rule, str(err))
+                expressions = []
+            for expression in expressions:
+                if VARS_CONTEXT.search(EXPRESSION_STRING.sub("''", expression)):
+                    self.report(str(relative), rule, f"an expression reads the vars context: {expression}")
+            for reference in self.local_references(doc):
+                if not isinstance(reference, str) or not reference.startswith("./"):
+                    continue
+                target = self.resolve_local(reference)
+                if target is None:
+                    self.report(str(relative), rule, f"local reference {reference} names no file")
+                else:
+                    pending.append(target)
+
     def run(self):
         for workflow in WORKFLOWS:
             self.check_workflow(workflow)
         self.check_composite_expressions()
         self.check_release_checks()
+        self.check_release_vars()
         return self.violations
 
 

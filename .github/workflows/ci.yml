@@ -255,7 +255,7 @@ jobs:
           "$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-feature-discipline.py --mutations
           bash .github/scripts/test-check-binary-marker.sh
           bash .github/scripts/test-release-checks.sh
-          "$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-provenance.py
+          "$RUNNER_TEMP/feature-check/bin/python" .github/scripts/test-check-provenance.py --mutations
 
   release-shape:
     name: release-shape
