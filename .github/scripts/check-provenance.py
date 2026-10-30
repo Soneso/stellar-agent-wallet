@@ -6,7 +6,11 @@ release's .intoto.jsonl asset; any other shape fails. This checks content,
 not signatures: docs/verifying-releases.md describes signature
 verification. The predicate must name the generator at v2.1.0, the release
 workflow, the repository, tag and commit the job passes, and a material at
-that commit, and its subjects must equal SHA256SUMS.
+that commit, and its subjects must equal SHA256SUMS. Its build type is the
+generator's generic one, its environment is empty, and its parameters hold
+only the vars context the generator records, a mapping of names to string
+values. The release workflow, the workflows it calls and its local actions
+never read that context, which check-workflow-invariants.py enforces.
 """
 import argparse
 import base64
@@ -17,6 +21,24 @@ import sys
 
 BUILDER = ('https://github.com/slsa-framework/slsa-github-generator/'
            '.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.1.0')
+BUILD_TYPE = 'https://github.com/slsa-framework/slsa-github-generator/generic@v1'
+
+
+def check_parameters(parameters):
+    """The parameters are a mapping whose only key is vars, itself a mapping
+    of strings to strings of any size."""
+    if not isinstance(parameters, dict):
+        raise ValueError('invocation.parameters is not a mapping')
+    if set(parameters) != {'vars'}:
+        unexpected = sorted(str(key) for key in parameters if key != 'vars')
+        if unexpected:
+            raise ValueError('invocation.parameters holds unexpected keys: ' + ', '.join(unexpected))
+        raise ValueError('invocation.parameters lacks vars')
+    variables = parameters['vars']
+    if not isinstance(variables, dict):
+        raise ValueError('invocation.parameters vars is not a mapping')
+    if not all(isinstance(name, str) and isinstance(value, str) for name, value in variables.items()):
+        raise ValueError('invocation.parameters vars holds a name or value that is not a string')
 
 
 def check(document, sums, sha, repository, ref):
@@ -31,6 +53,11 @@ def check(document, sums, sha, repository, ref):
     predicate = statement['predicate']
     if predicate['builder']['id'] != BUILDER:
         raise ValueError('builder differs')
+    if predicate.get('buildType') != BUILD_TYPE:
+        raise ValueError('buildType differs')
+    check_parameters(predicate['invocation'].get('parameters'))
+    if predicate['invocation'].get('environment') != {}:
+        raise ValueError('invocation.environment differs')
     source = predicate['invocation']['configSource']
     if source['entryPoint'] != '.github/workflows/release.yml':
         raise ValueError('entry point differs')
@@ -67,7 +94,8 @@ def main():
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f'provenance: {error}', file=sys.stderr)
         return 1
-    print('provenance: builder, source and subjects match')
+    print('provenance: builder, source, subjects and build type match, '
+          'the parameters hold only string vars, and the environment is empty')
     return 0
 
 

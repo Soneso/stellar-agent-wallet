@@ -19,7 +19,17 @@ Rules:
       resolved graph has mainnet-write in the state its record relies on;
       a record relies on the feature when its feature list names
       mainnet-write, or when it keeps the default features and selects the
-      workspace or a binary package;
+      workspace or a binary package; each resolving record resolves for its
+      explicit --target, or else for the triple RUNNER_TARGETS gives its
+      runner label, and an unknown or unresolved runner fails; feature-off
+      records refuse mainnet-write on any resolved package, and each
+      selected binary gets a root view of the one resolution, whose
+      positive-control closure feature-on records require; a compiler
+      argument --cfg fails; a --config word anywhere in a call, a
+      +toolchain word after cargo or cross and a leading option outside
+      GLOBAL_OPTIONS fail, and the family is the first word after the
+      allowed leading options; a $ left in the family or a word before it
+      fails;
       spaces and tabs are the only blanks and a line ends at a line feed;
       a heredoc is read only when its delimiter, after << and at most one
       space, is an identifier, alone or in one pair of quotes, and, when
@@ -28,7 +38,8 @@ Rules:
       is a bare word that names no interpreter or command runner, and an
       interpreter outside that table, such as busybox sh, reads a
       here-string unseen
-  D4  no custom-build source emits a feature cfg, and every line it
+  D4  no build script, every build.rs in the tree and every custom-build
+      target in metadata, emits a feature cfg, and every line it
       prints is a literal or a formatted line with {} or {name}
       placeholders whose arguments are plain literals or form a reviewed
       statement
@@ -56,8 +67,11 @@ Rules:
       earlier that redefines echo or Add-Content changes what a shape line
       writes; escaped quotes keep the raw counts even while an argument
       spans lines, as after printf "\\"; and a shape line inside a heredoc
-      body or a PowerShell block comment is data and writes nothing
-  D8  no workflow, named script or building.md enables every feature
+      body or a PowerShell block comment is data and writes nothing; a
+      mapping key whose name ends in RUSTFLAGS or RUSTDOCFLAGS, in any
+      case, such as an action's rustflags input, holds no --cfg
+  D8  no workflow document, read whole, no named script and not
+      building.md enables every feature
   D9  only the CI feature-on jobs and the coverage job name mainnet-write
       in a feature list; release-shaped builds activate it through the
       binary defaults
@@ -105,6 +119,14 @@ DECLARATIONS = {
 # The binary packages and their exact default. Every other package keeps
 # mainnet-write out of its default.
 DEFAULTS = {PACKAGES[2]: [FEATURE], PACKAGES[3]: [FEATURE]}
+BINARY_NAMES = {PACKAGES[2]: 'stellar-agent', PACKAGES[3]: 'stellar-agent-mcp'}
+# Runner labels define the implicit target of each reviewed invocation.
+RUNNER_TARGETS = {
+    'ubuntu-24.04': 'x86_64-unknown-linux-gnu',
+    'ubuntu-24.04-arm': 'aarch64-unknown-linux-gnu',
+    'windows-2025': 'x86_64-pc-windows-msvc',
+    'macos-26': 'aarch64-apple-darwin',
+}
 # The declaring packages a single-package on record resolves with the
 # feature: the network-only forwarding tripwire reaches core and network,
 # the CLI alone core, network and the CLI, and the MCP server alone every
@@ -178,6 +200,12 @@ DROP_FLAGS = {
 FAMILIES = {'build': 'normal,build', 'check': 'normal,build',
             'test': 'normal,build,dev', 'clippy': 'normal,build,dev',
             'doc': 'normal,build,dev', 'llvm-cov': 'normal,build,dev'}
+# The options a cargo or cross call may place before its subcommand, with
+# their arity. None of them changes what the build compiles or with which
+# features; every other leading option fails.
+GLOBAL_OPTIONS = {'-V': 0, '--version': 0, '-v': 0, '-vv': 0, '--verbose': 0,
+                  '-q': 0, '--quiet': 0, '--locked': 0, '--frozen': 0,
+                  '--offline': 0, '--color': 1}
 # Target selections that compile tests, benches or examples: a build or
 # check with one of them resolves the dev-dependencies too.
 DEV_TARGET_FLAGS = ('--all-targets', '--tests', '--test', '--benches',
@@ -338,13 +366,16 @@ def refused_value(name, value):
     return refused(name) or (name in RUSTDOC_VARS and '--cfg' in str(value))
 
 
-def config_paths(root):
+def source_files(root, names):
     for directory, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d not in ('target', 'node_modules', '.git')]
-        if pathlib.Path(directory).name == '.cargo':
-            for name in ('config', 'config.toml'):
-                if name in files:
-                    yield pathlib.Path(directory) / name
+        for name in names:
+            if name in files:
+                yield pathlib.Path(directory) / name
+
+
+def config_paths(root):
+    return (path for path in source_files(root, ('config', 'config.toml')) if path.parent.name == '.cargo')
 
 
 def env_guard(directory, environ):
@@ -362,20 +393,61 @@ def env_guard(directory, environ):
     return errors
 
 
+def subcommand(words):
+    """The subcommand of a cargo or cross call and the index after it.
+
+    A --config word anywhere in the call fails, since it can set rustflags
+    or features; so does a +toolchain word after the command name. The
+    options before the subcommand come from GLOBAL_OPTIONS, and any other
+    leading option fails. A $ left in the subcommand or in a word before it
+    fails, so a variable cannot hide the family from the inventory: add()
+    reads the raw call, and translate() the expanded one. A call without a
+    subcommand, such as cargo -V, has the empty subcommand.
+    """
+    for word in words[1:]:
+        if word == '--config' or word.startswith('--config='):
+            raise ValueError('forbidden flag --config')
+    if len(words) > 1 and words[1].startswith('+'):
+        raise ValueError(f'forbidden toolchain override {words[1]}')
+    i = 1
+    while i < len(words) and words[i].startswith('-'):
+        flag, equal, _ = words[i].partition('=')
+        if flag not in GLOBAL_OPTIONS or (equal and not GLOBAL_OPTIONS[flag]):
+            raise ValueError(f'forbidden global option {flag}')
+        if GLOBAL_OPTIONS[flag] and not equal:
+            i += 1
+            if i == len(words):
+                raise ValueError(f'missing value for {flag}')
+        i += 1
+    for word in words[1:i + 1]:
+        if '$' in word:
+            raise ValueError(f'unresolved command family {word}')
+    return (words[i], i + 1) if i < len(words) else ('', i)
+
+
+def selected_packages(selection):
+    """The packages a translated selection names with -p and with --exclude."""
+    def values(option):
+        return {selection[i + 1] for i, word in enumerate(selection[:-1]) if word == option}
+    return values('-p'), values('--exclude')
+
+
 def translate(command):
     words = shlex.split(command)
-    if len(words) < 2 or words[0] not in ('cargo', 'cross') or words[1] not in FAMILIES:
+    if not words or words[0] not in ('cargo', 'cross'):
         raise ValueError('unsupported resolving command family')
-    family = words[1]
+    family, i = subcommand(words)
+    if family not in FAMILIES:
+        raise ValueError('unsupported resolving command family')
     edges = FAMILIES[family]
     selected, features, target = [], [], None
-    i = 2
+    bins, target_filters, all_bins = [], False, False
     while i < len(words):
         word = words[i]
         if word == '--':
             break
         flag, equal, value = word.partition('=')
-        if flag in (ALL_FEATURES, '--config'):
+        if flag == ALL_FEATURES:
             raise ValueError(f'forbidden flag {flag}')
         if flag in ('-p', '--package', '--features', '-F', '--exclude'):
             if not equal:
@@ -393,6 +465,11 @@ def translate(command):
             (selected if flag == '--workspace' else features).append(flag)
         elif flag in DROP_FLAGS:
             arity = DROP_FLAGS[flag]
+            # Integration tests and benchmarks also build package binaries.
+            if flag in ('--bins', '--all-targets', '--tests', '--test', '--benches', '--bench'):
+                all_bins = True
+            if flag in ('--lib', '--bin', '--test', '--tests', '--example', '--examples', '--bench', '--benches'):
+                target_filters = True
             if flag in DEV_TARGET_FLAGS and family in ('build', 'check'):
                 edges = 'normal,build,dev'
             if arity:
@@ -402,7 +479,11 @@ def translate(command):
                         raise ValueError(f'missing value for {flag}')
                     value = words[i]
                 if flag == '--target':
+                    if target is not None:
+                        raise ValueError('multiple targets require separate inventory rows')
                     target = value
+                if flag == '--bin':
+                    bins.append(value)
             elif equal:
                 raise ValueError(f'unexpected value for {flag}')
         elif word.startswith('-') or family not in ('test', 'llvm-cov'):
@@ -410,22 +491,60 @@ def translate(command):
         i += 1
     if not selected or (selected and selected[0] == '--exclude'):
         selected.insert(0, '--workspace')
-    return {'selection': selected, 'features': features, 'edges': edges, 'target': target}
+    return {'selection': selected, 'features': features, 'edges': edges, 'target': target,
+            'bins': None if all_bins or not target_filters else bins}
 
 
 def parse_tree(output):
-    found = {name: [] for name in PACKAGES}
+    """Read package occurrences and follow Cargo's deduplicated subtree links.
+
+    A node includes its source, version and resolved features. Root views
+    follow this one resolution, preserving workspace feature unification.
+    """
+    nodes, children, roots, stack, definitions, references = {}, {}, {}, [], set(), set()
+    pattern = re.compile(r'(\d+)([A-Za-z0-9_-]+) v(\d+\.\d+\.\d+(?:[-+][\w.+-]+)?)'
+                         r'( \([^|\n]+\))?\|([\w+.,-]*)( \(\*\))?')
     for line in output.splitlines():
-        if not line or line in ('[build-dependencies]', '[dev-dependencies]'):
+        if not line:
             continue
-        line = line.replace(' (*)', '')
-        if ' ' not in line:
+        match = pattern.fullmatch(line)
+        if match is None:
             raise ValueError(f'invalid cargo tree line: {line!r}')
-        features, package = line.split(' ', 1)
-        name = package.split(' ', 1)[0]
-        if name in found:
-            found[name].append(FEATURE in features.split(','))
-    return found
+        depth, name, version, source, features, repeated = match.groups()
+        depth = int(depth)
+        if depth > len(stack):
+            raise ValueError(f'invalid cargo tree depth: {line!r}')
+        key = (name, version, source, features)
+        nodes[key] = (name, FEATURE in features.split(','))
+        children.setdefault(key, set())
+        if depth:
+            children[stack[depth - 1]].add(key)
+        else:
+            if name in roots:
+                raise ValueError(f'duplicate cargo tree root: {name}')
+            roots[name] = key
+        stack[depth:] = [key]
+        (references if repeated else definitions).add(key)
+    if not roots or references - definitions:
+        raise ValueError('cargo tree has no roots or an unresolved subtree')
+
+    def states(keys):
+        found = {}
+        for key in keys:
+            name, enabled = nodes[key]
+            found.setdefault(name, []).append(enabled)
+        return found
+
+    def reachable(root):
+        seen, pending = set(), [root]
+        while pending:
+            key = pending.pop()
+            if key not in seen:
+                seen.add(key)
+                pending.extend(children[key])
+        return states(seen)
+
+    return {'all': states(nodes), 'roots': {name: reachable(key) for name, key in roots.items()}}
 
 
 def relied_state(translated):
@@ -435,20 +554,55 @@ def relied_state(translated):
         return 'on'
     if '--no-default-features' in features:
         return 'off'
-    named = {selection[i + 1] for i, w in enumerate(selection[:-1]) if w == '-p'}
-    excluded = {selection[i + 1] for i, w in enumerate(selection[:-1]) if w == '--exclude'}
+    named, excluded = selected_packages(selection)
     binaries = set(DEFAULTS)
     return 'on' if ('--workspace' in selection and binaries - excluded) or named & binaries else 'off'
 
 
 def graph_state(root, translated):
-    # Inverse package specs fail when a requested crate is absent. A single
-    # forward graph preserves Cargo's package/feature selection and lets the
-    # parser record absent declaring crates without suppressing Cargo errors.
-    args = ['tree', '--locked', '--offline', '--prefix', 'none', '--target', 'all',
-            '-e', translated['edges'] + ',features', '-f', '{f} {p}',
+    # The package format includes resolved features on every occurrence.
+    args = ['tree', '--locked', '--offline', '--prefix', 'depth', '--target', translated['target'],
+            '-e', translated['edges'], '-f', '{p}|{f}',
             *translated['selection'], *translated['features']]
     return parse_tree(run_cargo(root, args))
+
+
+def query_key(row):
+    return json.dumps({key: row[key] for key in ('selection', 'features', 'edges', 'target')}, sort_keys=True)
+
+
+def binary_views(graph, row):
+    selection = row['selection']
+    named, excluded = selected_packages(selection)
+    views = {}
+    for package, binary in BINARY_NAMES.items():
+        selected = (('--workspace' in selection and package not in excluded) or package in named)
+        selected = selected and (row['bins'] is None or binary in row['bins'])
+        views[package] = graph['roots'].get(package, {}) if selected else None
+    return views
+
+
+def runner_label(runner, values):
+    """A job's runs-on value with its variables expanded, a label of RUNNER_TARGETS."""
+    if not isinstance(runner, str):
+        raise ValueError('unresolvable runner host')
+    runner = expand(runner, values)
+    if runner not in RUNNER_TARGETS:
+        raise ValueError(f'unknown runner {runner}')
+    return runner
+
+
+def runner_target(runner, values):
+    """The implicit target triple of a job's runner."""
+    return RUNNER_TARGETS[runner_label(runner, values)]
+
+
+def resolve_context(runner, values, translated):
+    host = runner_target(runner, values)
+    target = translated['target'] or host
+    if not re.fullmatch(r'[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,}', target):
+        raise ValueError(f'unresolvable target {target!r}')
+    return {**translated, 'target': target, 'runner': runner_label(runner, values)}
 
 
 def expand(command, env):
@@ -714,35 +868,46 @@ def step_scripts(text, scripts):
 
 def inventory(root, workflows, scripts):
     rows = []
-    def add(workflow, job, step, source, command, env):
+    def add(workflow, job, step, source, command, env, runner, matrix):
         words = shlex.split(command)
-        family = words[1] if len(words) > 1 else ''
+        family, _ = subcommand(words)
         # Packaged and installed sources are checked by their binary markers.
         resolving = family in FAMILIES
         variants = [env]
+        if resolving and matrix:
+            if set(matrix) != {'include'} or not isinstance(matrix['include'], list) or not matrix['include']:
+                raise ValueError('unresolvable runner matrix')
+            variants = [{**env, **{f'matrix.{key}': value for key, value in cell.items()}}
+                        for cell in matrix['include']]
         if '$feature' in command and source == 'ci.yml':
             loop = re.search(r'for[ \t]+feature[ \t]+in[ \t]+([^;\n]+);[ \t]*do', env['_run'])
             if loop is None or '$' in loop[1]:
                 raise ValueError('feature loop must have a literal feature list')
-            variants = [{**env, 'feature': f} for f in shlex.split(loop[1])]
+            variants = [{**values, 'feature': f} for values in variants for f in shlex.split(loop[1])]
         if source.endswith('/release/build.sh'):
-            targets = env.get('_targets') or ['x86_64-unknown-linux-gnu']
-            variants = [{**env, 'TARGET': t} for t in targets
-                        if (words[0] == 'cross') == (t == 'aarch64-unknown-linux-gnu')]
+            builds = []
+            for values in variants:
+                target = values.get('matrix.target', runner_target(runner, values))
+                if (words[0] == 'cross') == (target == 'aarch64-unknown-linux-gnu'):
+                    builds.append({**values, 'TARGET': target})
+            variants = builds
         if source.endswith('run-testnet-acceptance.sh'):
             suites = re.search(r'^SUITES=\((.*?)^\)', scripts[source], re.M | re.S)
             if not suites:
                 raise ValueError('SUITES literal is missing')
-            variants = []
+            contexts, variants = variants, []
             for suite in shlex.split(suites[1], comments=True):
                 # The script splits an entry on IFS: space, tab and line feed.
                 fields = [field for field in re.split(r'[ \t\n]+', suite) if field]
                 if len(fields) != 3:
                     raise ValueError('invalid SUITES entry')
-                variants.append({**env, **dict(zip(('crate', 'feature', 'target'), fields))})
+                variants.extend({**values, **dict(zip(('crate', 'feature', 'target'), fields))}
+                                for values in contexts)
         for values in variants:
             expanded = expand(command, values) if resolving else command
-            translated = translate(expanded) if resolving else None
+            if any(word == '--cfg' or word.startswith('--cfg=') for word in shlex.split(expanded)):
+                raise ValueError(f'{source}: compiler argument --cfg is forbidden')
+            translated = resolve_context(runner, values, translate(expanded)) if resolving else None
             rows.append({'workflow': workflow, 'job': job, 'step': step, 'source': source,
                          'command': expanded, 'relied_on': relied_state(translated) if resolving else 'not relied on',
                          **(translated or {'selection': [], 'features': [], 'edges': None, 'target': None})})
@@ -750,17 +915,16 @@ def inventory(root, workflows, scripts):
         jobs = document.get('jobs') or {'composite': {'steps': document.get('runs', {}).get('steps', [])}}
         for job_name, job in jobs.items():
             env = {**document.get('env', {}), **job.get('env', {})}
-            targets = [r['target'] for r in job.get('strategy', {}).get('matrix', {}).get('include', []) if 'target' in r]
+            matrix = job.get('strategy', {}).get('matrix', {})
             for step in job.get('steps', []):
-                values = {**env, **step.get('env', {}), '_targets': targets,
-                          '_run': run_text(step)}
+                values = {**env, **step.get('env', {}), '_run': run_text(step)}
                 name = step.get('name', step.get('uses', 'unnamed'))
                 text = run_text(step)
                 for command in commands(text, f'{workflow}:{job_name}:{name}'):
-                    add(workflow, job_name, name, workflow, command, values)
+                    add(workflow, job_name, name, workflow, command, values, job.get('runs-on'), matrix)
                 for path, source in step_scripts(text, scripts):
                     for command in script_commands(path, source):
-                        add(workflow, job_name, name, path.as_posix(), command, values)
+                        add(workflow, job_name, name, path.as_posix(), command, values, job.get('runs-on'), matrix)
     return sorted(rows, key=lambda row: json.dumps(row, sort_keys=True))
 
 
@@ -1052,37 +1216,50 @@ class Checker:
         for row in actual:
             if row['relied_on'] == 'not relied on':
                 continue
-            query = {key: row[key] for key in ('selection', 'features', 'edges')}
-            key = json.dumps(query, sort_keys=True)
+            key = query_key(row)
             if key not in queries:
-                queries[key] = graph_state(self.root, query)
-                absent = [name for name, states in queries[key].items() if not states]
-                if absent:
-                    print(f'D3: absent (off): {", ".join(absent)}; {row["command"]}')
-            states = queries[key]
+                queries[key] = graph_state(self.root, row)
+            graph = queries[key]
+            states = graph['all']
+            context = f'{row["workflow"]}:{row["job"]}:{row["step"]}: {row["command"]}: {row["target"]}'
             if row['relied_on'] == 'off' and any(any(v) for v in states.values()):
-                self.fail('D3', f'{row["command"]}: resolved {FEATURE}')
+                enabled = sorted(name for name, values in states.items() if any(values))
+                self.fail('D3', f'{context}: resolved {FEATURE} on {", ".join(enabled)}')
+            positive = True
             if row['relied_on'] == 'on':
                 wanted = POSITIVE_CONTROLS.get(tuple(row['selection']), PACKAGES)
-                if not wanted or not all(states[name] and all(states[name]) for name in wanted):
-                    self.fail('D3', f'{row["command"]}: positive control lacks feature on {wanted}')
-                else:
-                    print(f'D3: positive control on: {", ".join(wanted)}')
-        print(f'D3: {len(queries)} distinct offline queries; absent packages recorded as off')
+                positive = bool(wanted) and all(states.get(name) and all(states[name]) for name in wanted)
+                if not positive:
+                    self.fail('D3', f'{context}: positive control lacks feature on {wanted}')
+            for package, view in binary_views(graph, row).items():
+                binary = BINARY_NAMES[package]
+                if view is None:
+                    print(f'D3: {context}: {binary}: not selected')
+                    continue
+                if not view:
+                    self.fail('D3', f'{context}: {binary}: graph missing')
+                elif row['relied_on'] == 'on' and positive:
+                    wanted = POSITIVE_CONTROLS[('-p', package)]
+                    if not wanted or not all(view.get(name) and all(view[name]) for name in wanted):
+                        self.fail('D3', f'{context}: {binary}: positive control lacks feature on {wanted}')
+                print(f'D3: {context}: {binary}: {row["relied_on"]}; {len(view)} packages')
+        print(f'D3: {len(queries)} distinct offline target queries')
 
     def D4(self):
-        """No custom-build source emits a feature cfg or an opaque line."""
+        """No build.rs in the tree or custom-build target emits a feature cfg or an opaque line."""
+        paths = {path.resolve() for path in source_files(self.root, ('build.rs',))}
         for package in self.packages.values():
             for target in package['targets']:
                 if 'custom-build' in target['kind']:
-                    path = pathlib.Path(target['src_path'])
-                    try:
-                        relative = path.resolve().relative_to(pathlib.Path(self.root).resolve()).as_posix()
-                    except ValueError:
-                        relative = None
-                    reviewed = REVIEWED_EMISSIONS.get(relative, frozenset())
-                    for number, problem, line in cfg_emissions(path.read_text(), reviewed):
-                        self.fail('D4', f'{package["name"]}: {path.name}:{number}: {problem}: {line}')
+                    paths.add(pathlib.Path(target['src_path']).resolve())
+        for path in sorted(paths):
+            try:
+                relative = path.relative_to(pathlib.Path(self.root).resolve()).as_posix()
+            except ValueError:
+                relative = None
+            reviewed = REVIEWED_EMISSIONS.get(relative, frozenset())
+            for number, problem, line in cfg_emissions(path.read_text(), reviewed):
+                self.fail('D4', f'{relative or path}:{number}: {problem}: {line}')
 
     def D5(self):
         """The tree holds no cargo configuration file."""
@@ -1105,14 +1282,17 @@ class Checker:
 
     def D7(self):
         """No workflow, action or named script sets a refused variable."""
-        def walk(where, value):
+        def walk(where, value, environment=False):
+            # An env mapping reports a refused variable once, as a refused
+            # mapping; every other key whose name ends in a flag variable
+            # reports a --cfg value.
             if isinstance(value, dict):
                 for name, content in value.items():
-                    if name == 'env' and isinstance(content, dict):
-                        for variable, entry in content.items():
-                            if refused_value(variable, entry):
-                                self.fail('D7', f'{where}: refused env mapping {variable}')
-                    walk(where, content)
+                    if environment and refused_value(name, content):
+                        self.fail('D7', f'{where}: refused env mapping {name}')
+                    elif str(name).upper().endswith(('RUSTFLAGS', 'RUSTDOCFLAGS')) and '--cfg' in str(content):
+                        self.fail('D7', f'{where}: {name} contains --cfg')
+                    walk(where, content, name == 'env' and isinstance(content, dict))
             elif isinstance(value, list):
                 for entry in value:
                     walk(where, entry)
@@ -1212,10 +1392,7 @@ class Checker:
 
     def texts(self):
         for name, document in self.workflows.items():
-            jobs = document.get('jobs') or {'composite': {'steps': document.get('runs', {}).get('steps', [])}}
-            for job in jobs.values():
-                for step in job.get('steps', []):
-                    yield name, '\n'.join(logical_lines(run_text(step)))
+            yield name, json.dumps(document)
         for path, text in self.scripts.items():
             if path not in EXEMPT:
                 yield path, text
@@ -1323,34 +1500,110 @@ def env_file_problem(line):
 
 
 # Reviewed command records. Updating a workflow command requires reviewing its
-# package selection, feature flags, edge kinds and expected feature state here.
+# package selection, feature flags, edge kinds, target, runner, selected
+# binaries and expected feature state here.
 INVOCATIONS = [
+    {'workflow': 'release-rehearsal.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "aarch64-apple-darwin" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'aarch64-apple-darwin', 'bins': ['stellar-agent', 'stellar-agent-mcp'], 'runner': 'macos-26'},
+    {'workflow': 'release.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "aarch64-apple-darwin" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'aarch64-apple-darwin', 'bins': ['stellar-agent', 'stellar-agent-mcp'], 'runner': 'macos-26'},
+    {'workflow': 'release-rehearsal.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "x86_64-apple-darwin" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-apple-darwin', 'bins': ['stellar-agent', 'stellar-agent-mcp'], 'runner': 'macos-26'},
+    {'workflow': 'release.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "x86_64-apple-darwin" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-apple-darwin', 'bins': ['stellar-agent', 'stellar-agent-mcp'], 'runner': 'macos-26'},
+    {'workflow': 'release-rehearsal.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "x86_64-pc-windows-msvc" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-pc-windows-msvc', 'bins': ['stellar-agent', 'stellar-agent-mcp'], 'runner': 'windows-2025'},
+    {'workflow': 'release.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "x86_64-pc-windows-msvc" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-pc-windows-msvc', 'bins': ['stellar-agent', 'stellar-agent-mcp'], 'runner': 'windows-2025'},
+    {'workflow': 'release-rehearsal.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "x86_64-unknown-linux-gnu" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': ['stellar-agent', 'stellar-agent-mcp'], 'runner': 'ubuntu-24.04'},
+    {'workflow': 'release.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "x86_64-unknown-linux-gnu" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': ['stellar-agent', 'stellar-agent-mcp'], 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'release-shape', 'step': 'Build and check the release binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "x86_64-unknown-linux-gnu" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': ['stellar-agent', 'stellar-agent-mcp'], 'runner': 'ubuntu-24.04'},
+    {'workflow': 'notarize-smoke.yml', 'job': 'build', 'step': 'Build binaries', 'source': 'notarize-smoke.yml', 'command': 'cargo build --release --locked --target aarch64-apple-darwin --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'aarch64-apple-darwin', 'bins': ['stellar-agent', 'stellar-agent-mcp'], 'runner': 'macos-26'},
+    {'workflow': 'release-rehearsal.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cross build --release --locked --target "aarch64-unknown-linux-gnu" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'aarch64-unknown-linux-gnu', 'bins': ['stellar-agent', 'stellar-agent-mcp'], 'runner': 'ubuntu-24.04'},
+    {'workflow': 'release.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cross build --release --locked --target "aarch64-unknown-linux-gnu" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'aarch64-unknown-linux-gnu', 'bins': ['stellar-agent', 'stellar-agent-mcp'], 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'Approval + toolset-grant store persist regression (stellar-agent-core)', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-core --lib -- approval::store::tests::persist approval::toolset_grant::tests::persist', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-core'], 'features': [], 'edges': 'normal,build,dev', 'target': 'x86_64-pc-windows-msvc', 'bins': [], 'runner': 'windows-2025'},
+    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'Audit-log regression (stellar-agent-core)', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-core --lib audit_log::', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-core'], 'features': [], 'edges': 'normal,build,dev', 'target': 'x86_64-pc-windows-msvc', 'bins': [], 'runner': 'windows-2025'},
+    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'Build test binaries (unbounded compile phase)', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-core -p stellar-agent-mpp -p stellar-agent-smart-account -p stellar-agent-mcp -p stellar-agent-headless-keyring -p stellar-agent-windows-identity -p stellar-agent-network --no-default-features --lib --no-run', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-core', '-p', 'stellar-agent-mpp', '-p', 'stellar-agent-smart-account', '-p', 'stellar-agent-mcp', '-p', 'stellar-agent-headless-keyring', '-p', 'stellar-agent-windows-identity', '-p', 'stellar-agent-network'], 'features': ['--no-default-features'], 'edges': 'normal,build,dev', 'target': 'x86_64-pc-windows-msvc', 'bins': [], 'runner': 'windows-2025'},
+    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'Headless keyring and Windows identity suites', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-headless-keyring -p stellar-agent-windows-identity --lib', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-headless-keyring', '-p', 'stellar-agent-windows-identity'], 'features': [], 'edges': 'normal,build,dev', 'target': 'x86_64-pc-windows-msvc', 'bins': [], 'runner': 'windows-2025'},
+    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'MCP rule-tool suite (audit path end-to-end)', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-mcp --no-default-features --lib -- tools::rules:: tools::rule_create::', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features'], 'edges': 'normal,build,dev', 'target': 'x86_64-pc-windows-msvc', 'bins': [], 'runner': 'windows-2025'},
+    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'MPP authorization-store regression', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-mpp --lib store::tests::', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mpp'], 'features': [], 'edges': 'normal,build,dev', 'target': 'x86_64-pc-windows-msvc', 'bins': [], 'runner': 'windows-2025'},
+    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'DPAPI protect failure regression', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-network --lib keyring::tests::dpapi_protect_failure_reaches_wallet_error -- --exact', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-network'], 'features': [], 'edges': 'normal,build,dev', 'target': 'x86_64-pc-windows-msvc', 'bins': [], 'runner': 'windows-2025'},
+    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'Smart-account wire-code suite', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-smart-account --lib', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': [], 'edges': 'normal,build,dev', 'target': 'x86_64-pc-windows-msvc', 'bins': [], 'runner': 'windows-2025'},
+    {'workflow': 'ci.yml', 'job': 'release-shape', 'step': 'Build and check the release binaries', 'source': '.github/scripts/release/check-host.sh', 'command': 'cargo build --locked -p stellar-agent-cli', 'relied_on': 'on', 'selection': ['-p', 'stellar-agent-cli'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'release-shape', 'step': 'Build and check the release binaries', 'source': '.github/scripts/release/check-host.sh', 'command': 'cargo build --locked -p stellar-agent-mcp', 'relied_on': 'on', 'selection': ['-p', 'stellar-agent-mcp'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'feature-on-test', 'step': 'Check network feature forwarding in isolation', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-network --features mainnet-write', 'relied_on': 'on', 'selection': ['-p', 'stellar-agent-network'], 'features': ['--features', 'mainnet-write'], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'test', 'step': 'Check each test-support feature set', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-test-support --no-default-features --features "test-helpers"', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-test-support'], 'features': ['--no-default-features', '--features', 'test-helpers'], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'test', 'step': 'Check each test-support feature set', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-test-support --no-default-features --features "testnet-helpers"', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-test-support'], 'features': ['--no-default-features', '--features', 'testnet-helpers'], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'test', 'step': 'Check each test-support feature set', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-test-support --no-default-features --features "verifier-registry"', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-test-support'], 'features': ['--no-default-features', '--features', 'verifier-registry'], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'test', 'step': 'Check each test-support feature set', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-test-support --no-default-features --features "wiremock-helpers"', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-test-support'], 'features': ['--no-default-features', '--features', 'wiremock-helpers'], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'test', 'step': 'Check each test-support feature set', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-test-support --no-default-features', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-test-support'], 'features': ['--no-default-features'], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'feature-on-clippy', 'step': 'Run clippy', 'source': 'ci.yml', 'command': 'cargo clippy --workspace --all-targets --features "mainnet-write,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance" -- -D warnings', 'relied_on': 'on', 'selection': ['--workspace'], 'features': ['--features', 'mainnet-write,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'clippy', 'step': 'Run clippy', 'source': 'ci.yml', 'command': 'cargo clippy --workspace --all-targets --no-default-features --features "test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance" -- -D warnings', 'relied_on': 'off', 'selection': ['--workspace'], 'features': ['--no-default-features', '--features', 'test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'feature-on-doc', 'step': 'Build the rustdoc', 'source': 'ci.yml', 'command': 'cargo doc --workspace --no-deps --features "mainnet-write,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance"', 'relied_on': 'on', 'selection': ['--workspace'], 'features': ['--features', 'mainnet-write,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'doc', 'step': 'Build the rustdoc', 'source': 'ci.yml', 'command': 'cargo doc --workspace --no-deps --no-default-features --features "test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance"', 'relied_on': 'off', 'selection': ['--workspace'], 'features': ['--no-default-features', '--features', 'test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'coverage.yml', 'job': 'coverage', 'step': 'Measure feature-on offline line coverage', 'source': 'coverage.yml', 'command': 'cargo llvm-cov --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-on.json', 'relied_on': 'on', 'selection': ['--workspace'], 'features': ['--features', 'mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'coverage.yml', 'job': 'coverage', 'step': 'Measure offline line coverage', 'source': 'coverage.yml', 'command': 'cargo llvm-cov --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json', 'relied_on': 'off', 'selection': ['--workspace'], 'features': ['--no-default-features', '--features', 'test-helpers,test-hooks,test-loopback,verifier-registry'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'feature-on-test', 'step': 'Run the offline tests', 'source': 'ci.yml', 'command': 'cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry', 'relied_on': 'on', 'selection': ['--workspace'], 'features': ['--features', 'mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'test', 'step': 'Run the offline tests', 'source': 'ci.yml', 'command': 'cargo test --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry', 'relied_on': 'off', 'selection': ['--workspace'], 'features': ['--no-default-features', '--features', 'test-helpers,test-hooks,test-loopback,verifier-registry'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-anchor" --no-default-features --features "testnet-acceptance" --test "anchor_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-anchor'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-approval-remote" --no-default-features --features "operator-enroll-browser-acceptance" --test "operator_enroll_browser_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-approval-remote'], 'features': ['--no-default-features', '--features', 'operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-approval-remote" --no-default-features --features "testnet-acceptance" --test "remote_approval_browser_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-approval-remote'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-approval-remote" --no-default-features --features "testnet-acceptance" --test "rule_proposal_remote_browser_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-approval-remote'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "cap85_external_ref_cli_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "claim_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "cli_submit_only_network_binding_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "pay_policy_v1_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "pay_timeout_reconcile_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "profile_init_enroll_signer_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "smart_account_execute_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "smart_account_multicall_cli_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-defindex" --no-default-features --features "testnet-acceptance" --test "defindex_deposit_submit_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-defindex'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-defindex" --no-default-features --features "testnet-acceptance" --test "defindex_vault_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-defindex'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-dex" --no-default-features --features "testnet-acceptance" --test "dex_swap_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-dex'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "approve_serve_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "claim_commit_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "create_account_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "dex_quote_wire_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "pay_commit_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "policy_value_descriptor_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "rule_create_commit_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "sep43_sign_and_submit_transaction_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "toolset_sign_payment_gated_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "trustline_classic_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "x402_authenticated_payment_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "x402_create_payment_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mpp" --no-default-features --features "testnet-acceptance" --test "sponsored_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mpp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-network" --no-default-features --features "testnet-acceptance" --test "fee_bump_idempotent_testnet"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-network'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-network" --no-default-features --features "testnet-acceptance" --test "fee_bump_testnet"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-network'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-pool" --no-default-features --features "testnet-acceptance" --test "load_testnet"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-pool'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-pool" --no-default-features --features "testnet-acceptance" --test "pool_concurrent_testnet"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-pool'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-pool" --no-default-features --features "testnet-acceptance" --test "pool_testnet_init"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-pool'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-sep10" --no-default-features --features "testnet-integration" --test "sep10_replay_adversarial"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-sep10'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-sep10" --no-default-features --features "testnet-integration" --test "sep10_round_trip_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-sep10'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-sep43" --no-default-features --features "testnet-acceptance" --test "sep43_sdk_v17_interop_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-sep43'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-sep48" --no-default-features --features "testnet-acceptance" --test "sep48_preview_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-sep48'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-sep7" --no-default-features --features "testnet-acceptance" --test "sep7_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-sep7'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account-acceptance" --no-default-features --features "testnet-integration" --test "cap85_external_ref_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account-acceptance'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account-acceptance" --no-default-features --features "testnet-integration" --test "smart_account_ergonomics_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account-acceptance'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account-acceptance" --no-default-features --features "testnet-integration" --test "smart_account_policy_observability_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account-acceptance'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account-acceptance" --no-default-features --features "testnet-integration" --test "smart_account_rules_webauthn_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account-acceptance'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "deploy_c_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "quorum_authorization_info_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_caps_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_delegation_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_list_rules_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_migrate_verifier_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_multicall_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_policy_mutators_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_rules_pinning_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_rules_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_session_rule_expiry_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_session_rule_horizon_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_signers_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_sim_audit_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_timelock_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-stablecoin" --no-default-features --features "testnet-acceptance" --test "trustline_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-stablecoin'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-x402-identity" --no-default-features --features "testnet-acceptance" --test "sep10_gate_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-x402-identity'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-x402" --no-default-features --features "testnet-acceptance" --test "x402_exact_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-x402'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
+    {'workflow': 'ci.yml', 'job': 'test', 'step': 'Test the vendored Wasm release configuration', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-smart-account --test vendored_wasm_release_cfg', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': [], 'edges': 'normal,build,dev', 'target': 'x86_64-unknown-linux-gnu', 'bins': None, 'runner': 'ubuntu-24.04'},
     {'workflow': 'publish.yml', 'job': 'publish', 'step': 'Require the pinned toolchain', 'source': 'publish.yml', 'command': 'cargo -V', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
     {'workflow': 'publish.yml', 'job': 'publish', 'step': 'Require the pinned toolchain', 'source': 'publish.yml', 'command': 'cargo -V', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
-    {'workflow': 'release-rehearsal.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "aarch64-apple-darwin" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'aarch64-apple-darwin'},
-    {'workflow': 'release.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "aarch64-apple-darwin" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'aarch64-apple-darwin'},
-    {'workflow': 'release-rehearsal.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "x86_64-apple-darwin" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-apple-darwin'},
-    {'workflow': 'release.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "x86_64-apple-darwin" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-apple-darwin'},
-    {'workflow': 'release-rehearsal.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "x86_64-pc-windows-msvc" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-pc-windows-msvc'},
-    {'workflow': 'release.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "x86_64-pc-windows-msvc" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-pc-windows-msvc'},
-    {'workflow': 'release-rehearsal.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "x86_64-unknown-linux-gnu" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu'},
-    {'workflow': 'release.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "x86_64-unknown-linux-gnu" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu'},
-    {'workflow': 'ci.yml', 'job': 'release-shape', 'step': 'Build and check the release binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cargo build --release --locked --target "x86_64-unknown-linux-gnu" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'x86_64-unknown-linux-gnu'},
-    {'workflow': 'ci.yml', 'job': 'release-shape', 'step': 'Build and check the release binaries', 'source': '.github/scripts/release/check-host.sh', 'command': 'cargo build --locked -p stellar-agent-cli', 'relied_on': 'on', 'selection': ['-p', 'stellar-agent-cli'], 'features': [], 'edges': 'normal,build', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'release-shape', 'step': 'Build and check the release binaries', 'source': '.github/scripts/release/check-host.sh', 'command': 'cargo build --locked -p stellar-agent-mcp', 'relied_on': 'on', 'selection': ['-p', 'stellar-agent-mcp'], 'features': [], 'edges': 'normal,build', 'target': None},
-    {'workflow': 'notarize-smoke.yml', 'job': 'build', 'step': 'Build binaries', 'source': 'notarize-smoke.yml', 'command': 'cargo build --release --locked --target aarch64-apple-darwin --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'aarch64-apple-darwin'},
-    {'workflow': 'ci.yml', 'job': 'feature-on-test', 'step': 'Check network feature forwarding in isolation', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-network --features mainnet-write', 'relied_on': 'on', 'selection': ['-p', 'stellar-agent-network'], 'features': ['--features', 'mainnet-write'], 'edges': 'normal,build', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'test', 'step': 'Check each test-support feature set', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-test-support --no-default-features --features "test-helpers"', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-test-support'], 'features': ['--no-default-features', '--features', 'test-helpers'], 'edges': 'normal,build', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'test', 'step': 'Check each test-support feature set', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-test-support --no-default-features --features "testnet-helpers"', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-test-support'], 'features': ['--no-default-features', '--features', 'testnet-helpers'], 'edges': 'normal,build', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'test', 'step': 'Check each test-support feature set', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-test-support --no-default-features --features "verifier-registry"', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-test-support'], 'features': ['--no-default-features', '--features', 'verifier-registry'], 'edges': 'normal,build', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'test', 'step': 'Check each test-support feature set', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-test-support --no-default-features --features "wiremock-helpers"', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-test-support'], 'features': ['--no-default-features', '--features', 'wiremock-helpers'], 'edges': 'normal,build', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'test', 'step': 'Check each test-support feature set', 'source': 'ci.yml', 'command': 'cargo check -p stellar-agent-test-support --no-default-features', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-test-support'], 'features': ['--no-default-features'], 'edges': 'normal,build', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'feature-on-clippy', 'step': 'Run clippy', 'source': 'ci.yml', 'command': 'cargo clippy --workspace --all-targets --features "mainnet-write,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance" -- -D warnings', 'relied_on': 'on', 'selection': ['--workspace'], 'features': ['--features', 'mainnet-write,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'clippy', 'step': 'Run clippy', 'source': 'ci.yml', 'command': 'cargo clippy --workspace --all-targets --no-default-features --features "test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance" -- -D warnings', 'relied_on': 'off', 'selection': ['--workspace'], 'features': ['--no-default-features', '--features', 'test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': None},
     {'workflow': 'ci.yml', 'job': 'deny', 'step': 'Check licenses and advisories', 'source': 'ci.yml', 'command': 'cargo deny check', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
     {'workflow': 'release.yml', 'job': 'preflight', 'step': 'unnamed', 'source': 'release.yml', 'command': 'cargo deny check', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
-    {'workflow': 'ci.yml', 'job': 'feature-on-doc', 'step': 'Build the rustdoc', 'source': 'ci.yml', 'command': 'cargo doc --workspace --no-deps --features "mainnet-write,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance"', 'relied_on': 'on', 'selection': ['--workspace'], 'features': ['--features', 'mainnet-write,test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'doc', 'step': 'Build the rustdoc', 'source': 'ci.yml', 'command': 'cargo doc --workspace --no-deps --no-default-features --features "test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance"', 'relied_on': 'off', 'selection': ['--workspace'], 'features': ['--no-default-features', '--features', 'test-helpers,test-hooks,test-loopback,testnet-acceptance,testnet-integration,testnet-helpers,verifier-registry,wiremock-helpers,deploy-cli,operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': None},
     {'workflow': 'ci.yml', 'job': 'feature-discipline', 'step': 'Fetch the locked graph', 'source': 'ci.yml', 'command': 'cargo fetch --locked', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
     {'workflow': 'release.yml', 'job': 'verify-provenance', 'step': 'Fetch the locked graph', 'source': 'release.yml', 'command': 'cargo fetch --locked', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
     {'workflow': 'ci.yml', 'job': 'fmt', 'step': 'Check formatting', 'source': 'ci.yml', 'command': 'cargo fmt --all -- --check', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
@@ -1359,8 +1612,6 @@ INVOCATIONS = [
     {'workflow': 'vendored-wasm.yml', 'job': 'stellar-cli-28', 'step': 'Build the crates.io package', 'source': 'vendored-wasm.yml', 'command': 'cargo install --locked stellar-cli --version "$CLI_VERSION" --root "$RUNNER_TEMP/stellar-cli-28"', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
     {'workflow': 'release-rehearsal.yml', 'job': 'build', 'step': 'Install cross (for aarch64-unknown-linux-gnu)', 'source': 'release-rehearsal.yml', 'command': 'cargo install cross --version 0.2.5 --locked', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
     {'workflow': 'release.yml', 'job': 'build', 'step': 'Install cross (for aarch64-unknown-linux-gnu)', 'source': 'release.yml', 'command': 'cargo install cross --version 0.2.5 --locked', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
-    {'workflow': 'coverage.yml', 'job': 'coverage', 'step': 'Measure feature-on offline line coverage', 'source': 'coverage.yml', 'command': 'cargo llvm-cov --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-on.json', 'relied_on': 'on', 'selection': ['--workspace'], 'features': ['--features', 'mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'coverage.yml', 'job': 'coverage', 'step': 'Measure offline line coverage', 'source': 'coverage.yml', 'command': 'cargo llvm-cov --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry --json --output-path cov-feature-off.json', 'relied_on': 'off', 'selection': ['--workspace'], 'features': ['--no-default-features', '--features', 'test-helpers,test-hooks,test-loopback,verifier-registry'], 'edges': 'normal,build,dev', 'target': None},
     {'workflow': 'ci.yml', 'job': 'machete', 'step': 'Check for unused dependencies', 'source': 'ci.yml', 'command': 'cargo machete', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
     {'workflow': 'release-rehearsal.yml', 'job': 'build', 'step': 'Read the workspace version', 'source': 'release-rehearsal.yml', 'command': 'cargo metadata --format-version 1 --no-deps --locked', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
     {'workflow': 'release.yml', 'job': 'preflight', 'step': 'Warn when a workspace member is missing on crates.io', 'source': '.github/scripts/check-crates-exist.sh', 'command': 'cargo metadata --format-version 1 --no-deps --offline --frozen', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
@@ -1375,79 +1626,6 @@ INVOCATIONS = [
     {'workflow': 'release-rehearsal.yml', 'job': 'verify-crates', 'step': 'Build and package every crate', 'source': 'release-rehearsal.yml', 'command': 'cargo package --workspace --locked', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
     {'workflow': 'publish.yml', 'job': 'publish', 'step': 'Publish all crates in dependency order', 'source': '.github/scripts/publish-crates.sh', 'command': 'cargo publish -p "$name" --locked --no-verify', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
     {'workflow': 'ci.yml', 'job': 'release-contracts', 'step': 'Check the publish tiers', 'source': '.github/scripts/publish-crates.sh', 'command': 'cargo publish -p "$name" --locked --no-verify', 'relied_on': 'not relied on', 'selection': [], 'features': [], 'edges': None, 'target': None},
-    {'workflow': 'ci.yml', 'job': 'feature-on-test', 'step': 'Run the offline tests', 'source': 'ci.yml', 'command': 'cargo test --workspace --features mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry', 'relied_on': 'on', 'selection': ['--workspace'], 'features': ['--features', 'mainnet-write,test-helpers,test-hooks,test-loopback,verifier-registry'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'test', 'step': 'Run the offline tests', 'source': 'ci.yml', 'command': 'cargo test --workspace --no-default-features --features test-helpers,test-hooks,test-loopback,verifier-registry', 'relied_on': 'off', 'selection': ['--workspace'], 'features': ['--no-default-features', '--features', 'test-helpers,test-hooks,test-loopback,verifier-registry'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-anchor" --no-default-features --features "testnet-acceptance" --test "anchor_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-anchor'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-approval-remote" --no-default-features --features "operator-enroll-browser-acceptance" --test "operator_enroll_browser_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-approval-remote'], 'features': ['--no-default-features', '--features', 'operator-enroll-browser-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-approval-remote" --no-default-features --features "testnet-acceptance" --test "remote_approval_browser_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-approval-remote'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-approval-remote" --no-default-features --features "testnet-acceptance" --test "rule_proposal_remote_browser_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-approval-remote'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "cap85_external_ref_cli_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "claim_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "cli_submit_only_network_binding_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "pay_policy_v1_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "pay_timeout_reconcile_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "profile_init_enroll_signer_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "smart_account_execute_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-cli" --no-default-features --features "testnet-acceptance" --test "smart_account_multicall_cli_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-cli'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-defindex" --no-default-features --features "testnet-acceptance" --test "defindex_deposit_submit_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-defindex'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-defindex" --no-default-features --features "testnet-acceptance" --test "defindex_vault_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-defindex'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-dex" --no-default-features --features "testnet-acceptance" --test "dex_swap_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-dex'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "approve_serve_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "claim_commit_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "create_account_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "dex_quote_wire_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "pay_commit_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "policy_value_descriptor_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "rule_create_commit_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "sep43_sign_and_submit_transaction_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "toolset_sign_payment_gated_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "trustline_classic_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "x402_authenticated_payment_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mcp" --no-default-features --features "testnet-acceptance" --test "x402_create_payment_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-mpp" --no-default-features --features "testnet-acceptance" --test "sponsored_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mpp'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-network" --no-default-features --features "testnet-acceptance" --test "fee_bump_idempotent_testnet"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-network'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-network" --no-default-features --features "testnet-acceptance" --test "fee_bump_testnet"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-network'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-pool" --no-default-features --features "testnet-acceptance" --test "load_testnet"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-pool'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-pool" --no-default-features --features "testnet-acceptance" --test "pool_concurrent_testnet"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-pool'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-pool" --no-default-features --features "testnet-acceptance" --test "pool_testnet_init"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-pool'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-sep10" --no-default-features --features "testnet-integration" --test "sep10_replay_adversarial"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-sep10'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-sep10" --no-default-features --features "testnet-integration" --test "sep10_round_trip_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-sep10'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-sep43" --no-default-features --features "testnet-acceptance" --test "sep43_sdk_v17_interop_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-sep43'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-sep48" --no-default-features --features "testnet-acceptance" --test "sep48_preview_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-sep48'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-sep7" --no-default-features --features "testnet-acceptance" --test "sep7_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-sep7'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account-acceptance" --no-default-features --features "testnet-integration" --test "cap85_external_ref_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account-acceptance'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account-acceptance" --no-default-features --features "testnet-integration" --test "smart_account_ergonomics_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account-acceptance'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account-acceptance" --no-default-features --features "testnet-integration" --test "smart_account_policy_observability_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account-acceptance'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account-acceptance" --no-default-features --features "testnet-integration" --test "smart_account_rules_webauthn_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account-acceptance'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "deploy_c_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "quorum_authorization_info_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_caps_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_delegation_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_list_rules_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_migrate_verifier_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_multicall_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_policy_mutators_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_rules_pinning_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_rules_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_session_rule_expiry_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_session_rule_horizon_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_signers_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_sim_audit_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-smart-account" --no-default-features --features "testnet-integration" --test "smart_account_timelock_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': ['--no-default-features', '--features', 'testnet-integration'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-stablecoin" --no-default-features --features "testnet-acceptance" --test "trustline_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-stablecoin'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-x402-identity" --no-default-features --features "testnet-acceptance" --test "sep10_gate_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-x402-identity'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'testnet.yml', 'job': 'acceptance', 'step': 'Run testnet acceptance suites', 'source': '.github/scripts/run-testnet-acceptance.sh', 'command': 'cargo test -p "stellar-agent-x402" --no-default-features --features "testnet-acceptance" --test "x402_exact_testnet_acceptance"  -- --include-ignored --test-threads=1 --nocapture', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-x402'], 'features': ['--no-default-features', '--features', 'testnet-acceptance'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'Approval + toolset-grant store persist regression (stellar-agent-core)', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-core --lib -- approval::store::tests::persist approval::toolset_grant::tests::persist', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-core'], 'features': [], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'Audit-log regression (stellar-agent-core)', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-core --lib audit_log::', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-core'], 'features': [], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'Build test binaries (unbounded compile phase)', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-core -p stellar-agent-mpp -p stellar-agent-smart-account -p stellar-agent-mcp -p stellar-agent-headless-keyring -p stellar-agent-windows-identity -p stellar-agent-network --no-default-features --lib --no-run', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-core', '-p', 'stellar-agent-mpp', '-p', 'stellar-agent-smart-account', '-p', 'stellar-agent-mcp', '-p', 'stellar-agent-headless-keyring', '-p', 'stellar-agent-windows-identity', '-p', 'stellar-agent-network'], 'features': ['--no-default-features'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'Headless keyring and Windows identity suites', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-headless-keyring -p stellar-agent-windows-identity --lib', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-headless-keyring', '-p', 'stellar-agent-windows-identity'], 'features': [], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'MCP rule-tool suite (audit path end-to-end)', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-mcp --no-default-features --lib -- tools::rules:: tools::rule_create::', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mcp'], 'features': ['--no-default-features'], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'MPP authorization-store regression', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-mpp --lib store::tests::', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-mpp'], 'features': [], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'DPAPI protect failure regression', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-network --lib keyring::tests::dpapi_protect_failure_reaches_wallet_error -- --exact', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-network'], 'features': [], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'windows-storage', 'step': 'Smart-account wire-code suite', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-smart-account --lib', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': [], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'ci.yml', 'job': 'test', 'step': 'Test the vendored Wasm release configuration', 'source': 'ci.yml', 'command': 'cargo test -p stellar-agent-smart-account --test vendored_wasm_release_cfg', 'relied_on': 'off', 'selection': ['-p', 'stellar-agent-smart-account'], 'features': [], 'edges': 'normal,build,dev', 'target': None},
-    {'workflow': 'release-rehearsal.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cross build --release --locked --target "aarch64-unknown-linux-gnu" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'aarch64-unknown-linux-gnu'},
-    {'workflow': 'release.yml', 'job': 'build', 'step': 'Build binaries', 'source': '.github/scripts/release/build.sh', 'command': 'cross build --release --locked --target "aarch64-unknown-linux-gnu" --bin stellar-agent --bin stellar-agent-mcp', 'relied_on': 'on', 'selection': ['--workspace'], 'features': [], 'edges': 'normal,build', 'target': 'aarch64-unknown-linux-gnu'},
 ]
 
 

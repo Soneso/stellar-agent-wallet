@@ -357,10 +357,38 @@ verification and on the vendored Wasm rebuild of the tagged commit, so
 signing and provenance wait for that rebuild. Publication depends on the
 provenance content check, the source discipline check, and the rebuild.
 
+The generic SLSA generator records source identity and checksum subjects.
+It records the `vars` context, which holds the repository, organization, and
+environment variables, as its only parameter. Its environment is `{}`, and it
+records no Cargo command. The content checker requires a parameters mapping
+whose only key is `vars`, a mapping of string names to string values, and an
+empty environment, and pins the generic build type, the builder, the source,
+and the exact subjects. The release workflow, the reusable workflows it calls,
+and its local actions never read the `vars` context, and the `release-vars`
+rule of the workflow invariants check refuses a reference to it, so a
+repository or organization variable cannot reach the build.
+Empty provenance fields do not prove that the compiler receives no extra flags.
+
+The provenance boundary combines three checks: statement content, workflow
+guards and resolved feature graphs, and markers from packaged executables.
+The graph checker resolves each invocation for its explicit target or the
+reviewed [runner triple](building.md#feature-discipline-and-release-markers).
+Release and rehearsal cover all five archive targets in the Linux checker job.
+CLI and MCP root views share workspace feature unification; isolated package
+commands keep their own selection. Unknown runners, missing binary roots, and
+unexpected graph output fail.
+
+These checks detect configuration drift and feature-state mismatches.
+They do not establish compiler execution against a compromised build job.
+[Signature verification](../verifying-releases.md) establishes authenticity;
+the content checker validates the statement's fields.
+
 The publish verification job checks the binaries produced from unpacked crate
 sources, including their freshness. The install check runs only after a real
 publish, retries index propagation a bounded number of times, and verifies both
 installed binaries. It holds no publishing credential.
+Package and install inventory rows use these marker checks as their evidence.
+They require no graph claim about registry sources.
 
 The checks that the ruleset of `main` requires include the five feature jobs
 of `ci.yml`: `feature-on-clippy`, `feature-on-test`, `feature-on-doc`,

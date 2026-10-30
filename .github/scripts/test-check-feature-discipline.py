@@ -127,11 +127,13 @@ def workspace(root, mutation=None):
         features = '' if name == 'other' else 'mainnet-write=' + json.dumps(edges) + '\n'
         default = BINARY_DEFAULT if name in ('cli', 'mcp') else 'default=[]'
         manifest = f'[package]\nname="stellar-agent-{name}"\nversion="0.0.0"\nedition="2024"\n[features]\n{default}\n' + features
+        if name == 'cli':
+            manifest += '[[bin]]\nname="stellar-agent"\npath="src/main.rs"\n'
         manifest += '[dependencies]\n' + ''.join(f'stellar-agent-{dep}={{path="../{dep}"}}\n' for dep in dependencies)
         (path / 'Cargo.toml').write_text(manifest)
     if mutation:
         mutation(root)
-    result = subprocess.run(['cargo', 'generate-lockfile', '--offline'], cwd=root, text=True, capture_output=True)
+    result = subprocess.run(['cargo', 'metadata', '--offline', '--format-version', '1'], cwd=root, text=True, capture_output=True)
     if result.returncode:
         raise AssertionError(result.stderr)
 
@@ -148,12 +150,17 @@ def replace(root, path, old, new):
     p.write_text(text.replace(old, new))
 
 
+def graph_fixture(states):
+    return {'all': states, 'roots': {name: states for name in ('stellar-agent-cli', 'stellar-agent-mcp')}}
+
+
 def graph_checker(m, root, command, state='off'):
     c = m.Checker(root)
-    c.workflows = {'fixture.yml': {'jobs': {'test': {'steps': [{'name': 'test', 'run': command}]}}}}
+    c.workflows = {'fixture.yml': {'jobs': {'test': {'runs-on': 'ubuntu-24.04', 'steps': [{'name': 'test', 'run': command}]}}}}
     c.scripts = {}
     row = {'workflow': 'fixture.yml', 'job': 'test', 'step': 'test', 'source': 'fixture.yml',
            'command': command, 'relied_on': state, **m.translate(command)}
+    row.update(target=row['target'] or 'x86_64-unknown-linux-gnu', runner='ubuntu-24.04')
     m.INVOCATIONS = [row]
     return c
 
@@ -339,7 +346,7 @@ def graph_cases(m, tmp, selected=None):
             c = graph_checker(m, root, 'cargo test --workspace --features mainnet-write', 'on')
             states = {p: [True] for p in m.PACKAGES}
             states[name] = [False]
-            m.graph_state = lambda _root, _query: states
+            m.graph_state = lambda _root, _query: graph_fixture(states)
             try:
                 c.D3()
                 assert c.errors, f'graph-positive-mutated: accepted missing activation on {name}'
@@ -348,10 +355,10 @@ def graph_cases(m, tmp, selected=None):
         print('ok graph-positive-mutated')
     check('graph-bin-workspace', lambda r: append(r, 'other/Cargo.toml',
           'stellar-agent-core={path="../core",features=["mainnet-write"]}\n'),
-          'cargo build --no-default-features --bin stellar-agent-cli', True)
+          'cargo build --no-default-features --bin stellar-agent', True)
     check('graph-target-specific', lambda r: append(r, 'other/Cargo.toml',
           '[target.\'cfg(windows)\'.dependencies]\nstellar-agent-core={path="../core",features=["mainnet-write"]}\n'),
-          'cargo build --workspace --no-default-features', True)
+          'cargo build --workspace --no-default-features --target x86_64-pc-windows-msvc', True)
     dev = lambda r: append(r, 'other/Cargo.toml',
                            '[dev-dependencies]\nstellar-agent-core={path="../core",features=["mainnet-write"]}\n')
     check('graph-dev-build', dev, 'cargo build --workspace --no-default-features', False)
@@ -388,7 +395,7 @@ def graph_cases(m, tmp, selected=None):
             for binary, required in wanted.items():
                 command = f'cargo build -p {binary}'
                 states = {p: ([True] if p in required else []) for p in m.PACKAGES}
-                m.graph_state = lambda _root, _query: states
+                m.graph_state = lambda _root, _query: graph_fixture(states)
                 c = graph_checker(m, root, command, 'on')
                 with contextlib.redirect_stdout(io.StringIO()):
                     c.D3()
@@ -415,7 +422,7 @@ def graph_cases(m, tmp, selected=None):
         original_graph, original_required = m.graph_state, m.POSITIVE_CONTROLS[selection]
         try:
             m.POSITIVE_CONTROLS[selection] = []
-            m.graph_state = lambda _root, _query: {p: [] for p in m.PACKAGES}
+            m.graph_state = lambda _root, _query: graph_fixture({p: [] for p in m.PACKAGES})
             c = graph_checker(m, root, f'cargo build -p {binary}', 'on')
             with contextlib.redirect_stdout(io.StringIO()):
                 c.D3()
@@ -493,7 +500,7 @@ def translation_case(family, edges):
     def case(m, tmp, checker):
         actual = m.translate(f'cargo {family} --bin sample --all-targets --target wasm32-unknown-unknown --locked --offline --release -- -D warnings')
         wanted = 'normal,build,dev' if family in ('build', 'check') else edges
-        assert actual == {'selection': ['--workspace'], 'features': [], 'edges': wanted, 'target': 'wasm32-unknown-unknown'}, f'translation-{family}'
+        assert actual == {'selection': ['--workspace'], 'features': [], 'edges': wanted, 'target': 'wasm32-unknown-unknown', 'bins': None}, f'translation-{family}'
         actual = m.translate(f'cargo {family} -p sample --features helpers --no-default-features')
         assert actual['selection'] == ['-p', 'sample'] and actual['features'] == ['--features', 'helpers', '--no-default-features'], f'selection-{family}'
         assert actual['edges'] == edges, f'edges-{family}'
@@ -711,7 +718,7 @@ def case_fd_redirect(m, tmp, checker):
 
 @unit('feature-loop')
 def case_feature_loop(m, tmp, checker):
-    workflow = {'ci.yml': {'jobs': {'check': {'steps': [{'name': 'loop', 'run':
+    workflow = {'ci.yml': {'jobs': {'check': {'runs-on': 'ubuntu-24.04', 'steps': [{'name': 'loop', 'run':
         'for feature in test-helpers testnet-helpers; do\n'
         'cargo check -p sample --features "$feature"\ndone'}]}}}}
     rows = m.inventory(tmp, workflow, {})
@@ -721,7 +728,7 @@ def case_feature_loop(m, tmp, checker):
 
 @unit('transitive-scripts')
 def case_transitive_scripts(m, tmp, checker):
-    workflow = {'ci.yml': {'jobs': {'check': {'steps': [{'name': 'outer', 'run': 'bash .github/scripts/outer.sh'}]}}}}
+    workflow = {'ci.yml': {'jobs': {'check': {'runs-on': 'ubuntu-24.04', 'steps': [{'name': 'outer', 'run': 'bash .github/scripts/outer.sh'}]}}}}
     scripts = {'.github/scripts/outer.sh': 'bash .github/scripts/inner.sh',
                '.github/scripts/inner.sh': 'cargo check -p sample'}
     rows = m.inventory(tmp, workflow, scripts)
@@ -730,7 +737,7 @@ def case_transitive_scripts(m, tmp, checker):
 
 @unit('test-script-scanned')
 def case_test_script_scanned(m, tmp, checker):
-    workflow = {'ci.yml': {'jobs': {'check': {'steps': [{'name': 'self-test', 'run':
+    workflow = {'ci.yml': {'jobs': {'check': {'runs-on': 'ubuntu-24.04', 'steps': [{'name': 'self-test', 'run':
         'bash .github/scripts/test-sample.sh\nbash .github/scripts/test-preflight.sh'}]}}}}
     scripts = {'.github/scripts/test-sample.sh': 'cargo check -p sample',
                '.github/scripts/test-preflight.sh': 'cargo check -p data'}
@@ -759,7 +766,7 @@ def case_yaml_workflows(m, tmp, checker):
     (root / '.github/workflows').mkdir(parents=True)
     (root / '.github/actions').mkdir()
     (root / '.github/workflows/sample.yaml').write_text(
-        'jobs:\n  check:\n    steps:\n      - name: check\n        run: cargo check -p sample\n')
+        'jobs:\n  check:\n    runs-on: ubuntu-24.04\n    steps:\n      - name: check\n        run: cargo check -p sample\n')
     workflows, scripts = m.workflow_inputs(root)
     rows = m.inventory(root, workflows, scripts)
     assert [row['workflow'] for row in rows] == ['sample.yaml'], f'yaml-workflows: {rows}'
@@ -794,8 +801,23 @@ def case_unresolved_variable(m, tmp, checker):
 
 @unit('tree-output')
 def case_tree_output(m, tmp, checker):
-    states = m.parse_tree(' mainnet-write-path v0.0.0 (/a/mainnet-write)\nmainnet-write stellar-agent-core v0.0.0 (/a path)\n stellar-agent-core v0.0.0 (/mainnet-write path) (*)\n')
-    assert states[m.PACKAGES[0]] == [True, False] and states[m.PACKAGES[3]] == [], 'tree-output'
+    graph = m.parse_tree('0mainnet-write-path v0.0.0 (/a/mainnet-write)|\n'
+                         '1stellar-agent-core v0.0.0 (/a path)|mainnet-write\n'
+                         '2leaf v1.0.0|\n'
+                         '1stellar-agent-core v0.0.0 (/mainnet-write path)|\n'
+                         '0stellar-agent-mcp v0.0.0 (/a)|\n'
+                         '1stellar-agent-core v0.0.0 (/a path)|mainnet-write (*)\n')
+    assert sorted(graph['all']['stellar-agent-core']) == [False, True], 'tree-output: feature state'
+    assert graph['roots']['stellar-agent-mcp']['leaf'] == [False], 'tree-output: subtree link'
+    assert graph['roots']['stellar-agent-mcp']['stellar-agent-core'] == [True], 'tree-output: occurrence identity'
+    for output in ('unexpected', '0sample v0.0.0|\nunknown output', '0sample v0.0.0|\n2child v0.0.0|',
+                   '0sample v0.0.0| (*)', '0sample v0.0.0|bad feature', ''):
+        try:
+            m.parse_tree(output)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'tree-output: unknown output accepted: {output!r}')
 
 
 @unit('environment-guard')
@@ -961,13 +983,13 @@ def case_inventory_order(m, tmp, checker):
     c = m.Checker(ROOT)
     c.workflows, c.scripts = m.workflow_inputs(ROOT)
     committed = list(m.INVOCATIONS)
-    expected = len({json.dumps({key: row[key] for key in ('selection', 'features', 'edges')}, sort_keys=True)
+    expected = len({json.dumps({key: row[key] for key in ('selection', 'features', 'edges', 'target')}, sort_keys=True)
                     for row in committed if row['relied_on'] != 'not relied on'})
     original, calls = m.graph_state, []
     def stub(_root, query):
         calls.append(query)
         on = m.relied_state(query) == 'on'
-        return {name: [on] for name in m.PACKAGES}
+        return graph_fixture({name: [on] for name in m.PACKAGES})
     m.graph_state = stub
     try:
         for label, table in (('reversed', committed[::-1]), ('rotated', committed[1:] + committed[:1])):
@@ -1163,7 +1185,7 @@ def case_d6_pre_build(m, tmp, checker):
 
 
 def job(steps, **extra):
-    return {'jobs': {'job': {'steps': steps, **extra}}}
+    return {'jobs': {'job': {'runs-on': 'ubuntu-24.04', 'steps': steps, **extra}}}
 
 
 @unit('d7-job-env')
@@ -1434,6 +1456,431 @@ def case_d10_documentation(m, tmp, checker):
     assert c.errors == ['D10: documented feature set differs from metadata'], f'd10-documentation: {c.errors}'
 
 
+RELEASE_TARGETS = ('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu',
+                   'x86_64-apple-darwin', 'aarch64-apple-darwin', 'x86_64-pc-windows-msvc')
+
+
+@unit('graph-target-pair')
+def case_graph_target_pair(m, tmp, checker):
+    for index, (table, active) in enumerate((
+            ('cfg(windows)', {RELEASE_TARGETS[4]}),
+            ('cfg(target_arch = "aarch64")', {RELEASE_TARGETS[1], RELEASE_TARGETS[3]}),
+            ('x86_64-apple-darwin', {RELEASE_TARGETS[2]}))):
+        root = tmp / str(index)
+        workspace(root, lambda r: append(r, 'other/Cargo.toml',
+                  f"[target.'{table}'.dependencies]\n"
+                  'stellar-agent-core={path="../core",features=["mainnet-write"]}\n'))
+        for target in RELEASE_TARGETS:
+            c = graph_checker(m, root, f'cargo build --workspace --no-default-features --target {target}')
+            with contextlib.redirect_stdout(io.StringIO()):
+                c.D3()
+            expected = target in active
+            assert bool(c.errors) == expected, f'graph-target-pair: {table}: {target}: {c.errors}, failure={expected}'
+            if expected:
+                assert len(c.errors) == 1 and f'{target}: resolved mainnet-write on stellar-agent-core' in c.errors[0], c.errors
+            print(f'graph-target-pair: {table}: {target}: {"refuses" if expected else "passes"}')
+
+
+@unit('graph-target-cache')
+def case_graph_target_cache(m, tmp, checker):
+    root = tmp / 'workspace'
+    workspace(root)
+    linux, windows = RELEASE_TARGETS[0], RELEASE_TARGETS[4]
+    command = 'cargo build --workspace --no-default-features --target '
+    c = graph_checker(m, root, command + linux)
+    c.workflows['fixture.yml']['jobs']['test']['steps'] = [
+        {'name': 'test', 'run': command + target} for target in (linux, windows, linux)]
+    base = m.INVOCATIONS[0]
+    m.INVOCATIONS = [{**base, 'command': command + target, 'target': target} for target in (linux, windows, linux)]
+    original, calls = m.graph_state, []
+    def graph(_root, row):
+        calls.append(row['target'])
+        return graph_fixture({name: [row['target'] == windows] for name in m.PACKAGES})
+    m.graph_state = graph
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            c.D3()
+        assert sorted(calls) == sorted([linux, windows]), f'graph-target-cache: targets share a query: {calls}'
+        assert len(c.errors) == 1 and windows in c.errors[0] and 'resolved mainnet-write' in c.errors[0], c.errors
+    finally:
+        m.graph_state = original
+
+
+@unit('graph-binary-views')
+def case_graph_binary_views(m, tmp, checker):
+    root = tmp / 'workspace'
+    workspace(root)
+    c = graph_checker(m, root, 'cargo build --workspace', 'on')
+    row = m.INVOCATIONS[0]
+    graph = m.graph_state(root, row)
+    views = m.binary_views(graph, row)
+    assert set(graph['roots']) == set(c.packages), 'graph-binary-views: workspace selection differs'
+    cli, mcp = m.PACKAGES[2:4]
+    assert views[cli]['stellar-agent-core'] == [True] and views[mcp]['stellar-agent-sep10'] == [True], views
+    assert cli not in views[mcp] and mcp not in views[cli], 'graph-binary-views: roots mix'
+    original = m.graph_state
+    try:
+        for package in (cli, mcp):
+            for absent in (True, False):
+                changed = {'all': graph['all'], 'roots': {name: dict(view) for name, view in graph['roots'].items()}}
+                if absent:
+                    del changed['roots'][package]
+                else:
+                    changed['roots'][package]['stellar-agent-core'] = [False]
+                m.graph_state = lambda _root, _row: changed
+                c.errors = []
+                with contextlib.redirect_stdout(io.StringIO()):
+                    c.D3()
+                diagnostic = 'graph missing' if absent else 'positive control lacks feature'
+                assert len(c.errors) == 1 and f'{m.BINARY_NAMES[package]}: {diagnostic}' in c.errors[0], \
+                    f'graph-binary-views: {package}: {diagnostic}: {c.errors}'
+    finally:
+        m.graph_state = original
+    command = 'cargo build --workspace --no-default-features --features stellar-agent-mcp/mainnet-write'
+    c = graph_checker(m, root, command, 'on')
+    graph = m.graph_state(root, m.INVOCATIONS[0])
+    assert m.binary_views(graph, m.INVOCATIONS[0])[cli]['stellar-agent-core'] == [True], \
+        'graph-binary-views: workspace unification disappears from CLI view'
+    c = graph_checker(m, root, 'cargo build -p stellar-agent-cli --no-default-features')
+    row = m.INVOCATIONS[0]
+    graph = m.graph_state(root, row)
+    assert graph['all']['stellar-agent-core'] == [False], 'graph-binary-views: isolated scope differs'
+    assert m.binary_views(graph, row)[mcp] is None, 'graph-binary-views: unselected MCP reports a state'
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        c.D3()
+    assert not c.errors and 'stellar-agent-mcp: not selected' in output.getvalue(), c.errors
+    for flags, selected in (('--bin stellar-agent', {cli}), ('--lib', set()), ('--bins', {cli, mcp}),
+                            ('--test sample', {cli, mcp}), ('--tests', {cli, mcp}),
+                            ('--bench sample', {cli, mcp}), ('--benches', {cli, mcp}),
+                            ('--example sample', set())):
+        c = graph_checker(m, root, 'cargo build --workspace --no-default-features ' + flags)
+        views = m.binary_views(graph, m.INVOCATIONS[0])
+        assert {name for name, view in views.items() if view is not None} == selected, \
+            f'graph-binary-views: {flags}: binary selection differs'
+
+
+@unit('graph-any-package')
+def case_graph_any_package(m, tmp, checker):
+    def external(r):
+        (r / 'external/src').mkdir(parents=True)
+        (r / 'external/src/lib.rs').write_text('pub fn sample() {}\n')
+        (r / 'external/Cargo.toml').write_text(
+            '[package]\nname="external"\nversion="0.0.0"\nedition="2024"\n[features]\nmainnet-write=[]\n')
+        replace(r, 'Cargo.toml', 'resolver="2"', 'resolver="2"\nexclude=["external"]')
+        append(r, 'other/Cargo.toml', 'external={path="../external",features=["mainnet-write"]}\n')
+    root = tmp / 'workspace'
+    workspace(root, external)
+    c = graph_checker(m, root, 'cargo build --workspace --no-default-features')
+    with contextlib.redirect_stdout(io.StringIO()):
+        c.D3()
+    assert len(c.errors) == 1 and 'resolved mainnet-write on external' in c.errors[0], \
+        f'graph-any-package: external activation accepted: {c.errors}'
+    c = graph_checker(m, root, 'cargo build -p stellar-agent-core --no-default-features')
+    with contextlib.redirect_stdout(io.StringIO()):
+        c.D3()
+    assert not c.errors, f'graph-any-package: clean scope refused: {c.errors}'
+
+
+@unit('graph-host-context')
+def case_graph_host_context(m, tmp, checker):
+    expected = {'ubuntu-24.04': RELEASE_TARGETS[0], 'ubuntu-24.04-arm': RELEASE_TARGETS[1],
+                'windows-2025': RELEASE_TARGETS[4], 'macos-26': RELEASE_TARGETS[3]}
+    for runner, target in expected.items():
+        rows = m.inventory(tmp, {'w.yml': job([{'run': 'cargo check --workspace'}], **{'runs-on': runner})}, {})
+        assert len(rows) == 1 and rows[0]['target'] == target and rows[0]['runner'] == runner, \
+            f'graph-host-context: {runner}: {rows}'
+    for runner in ('unknown', 'ubuntu-latest', '${{ matrix.os }}', None, ['self-hosted', 'linux']):
+        try:
+            m.inventory(tmp, {'w.yml': job([{'run': 'cargo check --workspace'}], **{'runs-on': runner})}, {})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'graph-host-context: unknown host accepted: {runner}')
+    c = m.resolve_context('ubuntu-24.04', {}, m.translate('cross build --target aarch64-unknown-linux-gnu'))
+    assert c['target'] == RELEASE_TARGETS[1] and c['runner'] == 'ubuntu-24.04', 'graph-host-context: cross target'
+    workflows, scripts = m.workflow_inputs(ROOT)
+    rows = m.inventory(ROOT, workflows, scripts)
+    for workflow in ('release.yml', 'release-rehearsal.yml'):
+        builds = [row for row in rows if row['workflow'] == workflow and row['source'].endswith('/release/build.sh')]
+        assert sorted(row['target'] for row in builds) == sorted(RELEASE_TARGETS), f'graph-host-context: {workflow}'
+        for row in builds:
+            assert row['bins'] == ['stellar-agent', 'stellar-agent-mcp'], row
+    host = {'ci.yml': job([{'run': 'bash .github/scripts/release/check-host.sh'}], **{'runs-on': 'macos-26'})}
+    rows = m.inventory(ROOT, host, scripts)
+    assert len(rows) == 3 and all(row['target'] == RELEASE_TARGETS[3] for row in rows), 'graph-host-context: host script'
+
+
+@unit('workflow-flag-guards')
+def case_workflow_flag_guards(m, tmp, checker):
+    (tmp / 'docs/maintainers').mkdir(parents=True)
+    (tmp / 'docs/maintainers/building.md').write_text('')
+    variables = (REFUSED, 'CARGO_ENCODED_' + REFUSED, 'CARGO_BUILD_' + REFUSED, 'CARGO_FEATURE_SAMPLE')
+    for workflow in ('release.yml', 'release-rehearsal.yml', 'publish.yml', 'ci.yml'):
+        for variable in variables:
+            for step in ({'env': {variable: 'sample'}, 'run': 'true'}, {'run': f'{variable}=sample cargo build'}):
+                c = bare_checker(m, tmp, {workflow: job([step])})
+                rejects(c, 'D7', variable)
+        for step in ({'run': 'cargo build ' + m.ALL_FEATURES}, {'env': {'FLAGS': m.ALL_FEATURES}},
+                     {'uses': 'sample/action@v1', 'with': {'args': m.ALL_FEATURES}}):
+            rejects(bare_checker(m, tmp, {workflow: job([step])}), 'D8', 'forbidden feature umbrella')
+    accepts(bare_checker(m, tmp, {'ci.yml': job([{'env': {'RUSTDOCFLAGS': '-D warnings'}}])}), 'D7', 'safe rustdoc')
+
+
+@unit('rustflags-input')
+def case_rustflags_input(m, tmp, checker):
+    for variable in ('rustflags', 'rustdocflags', 'CARGO_TARGET_SAMPLE_RUSTFLAGS'):
+        steps = [{'uses': 'sample/action@v1', 'with': {variable: '--cfg feature="mainnet-write"'}}]
+        rejects(bare_checker(m, workflows={'release.yml': job(steps)}), 'D7', variable + ' contains --cfg')
+    accepts(bare_checker(m, workflows={'release.yml': job([{'with': {'rustflags': '-C debuginfo=0'}}])}),
+            'D7', 'safe action input')
+
+
+@unit('compiler-cfg-argument')
+def case_compiler_cfg_argument(m, tmp, checker):
+    for family in ('rustc', 'rustdoc', 'clippy'):
+        for argument in ('--cfg sample', '--cfg=sample'):
+            workflow = {'ci.yml': job([{'run': f'cargo {family} -- {argument}'}])}
+            try:
+                m.inventory(tmp, workflow, {})
+            except ValueError as error:
+                assert 'compiler argument --cfg is forbidden' in str(error), str(error)
+            else:
+                raise AssertionError('compiler-cfg-argument: compiler cfg accepted')
+    workflow = {'ci.yml': job([{'run': 'cargo clippy -- $FLAGS'}], env={'FLAGS': '--cfg sample'})}
+    try:
+        m.inventory(tmp, workflow, {})
+    except ValueError as error:
+        assert 'compiler argument --cfg is forbidden' in str(error), str(error)
+    else:
+        raise AssertionError('compiler-cfg-argument: compiler cfg accepted through a variable')
+    rows = m.inventory(tmp, {'ci.yml': job([{'run': 'cargo clippy -- -D warnings'}])}, {})
+    assert len(rows) == 1, 'compiler-cfg-argument: safe compiler flags refused'
+
+
+@unit('build-script-outside-metadata')
+def case_build_script_outside_metadata(m, tmp, checker):
+    path = tmp / 'excluded/build.rs'
+    path.parent.mkdir()
+    path.write_text('fn main() { println!("cargo:rerun-if-changed=src"); }\n')
+    c = bare_checker(m, tmp)
+    accepts(c, 'D4', 'literal build output')
+    path.write_text('fn main() { println!("cargo:rustc-cfg=feature=\\"mainnet-write\\""); }\n')
+    rejects(c, 'D4', 'rustc-cfg sets a feature')
+
+
+@unit('cargo-config-paths')
+def case_cargo_config_paths(m, tmp, checker):
+    c = bare_checker(m, tmp)
+    accepts(c, 'D5', 'no configuration')
+    for name in ('config', 'config.toml'):
+        path = tmp / 'excluded/nested/.cargo' / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('[build]\n')
+        rejects(c, 'D5', f'excluded/nested/.cargo/{name}')
+        path.unlink()
+
+
+def refuses_inventory(m, tmp, workflow, fragment, label):
+    """inventory() refuses the workflow with a diagnostic holding fragment."""
+    try:
+        m.inventory(tmp, {'ci.yml': workflow}, {})
+    except ValueError as error:
+        assert fragment in str(error), f'{label}: diagnostic differs: {error}'
+    else:
+        raise AssertionError(f'{label}: accepted')
+
+
+@unit('cargo-global-options')
+def case_cargo_global_options(m, tmp, checker):
+    for command, fragment in (
+            ('cargo --config \'build.rustflags=["--cfg","feature=\\"mainnet-write\\""]\' build --release --locked',
+             'forbidden flag --config'),
+            ('cargo --config=ci.toml build', 'forbidden flag --config'),
+            ('cargo +stable build --release --locked', 'forbidden toolchain override +stable'),
+            ('cargo -Z unstable-options build', 'forbidden global option -Z'),
+            ('cargo -C sub build', 'forbidden global option -C'),
+            ('cross --list', 'forbidden global option --list'),
+            ('cargo --color', 'missing value for --color'),
+            ('cargo $ARGS build --release', 'unresolved command family $ARGS'),
+            ('cargo ${FLAGS} build', 'unresolved command family ${FLAGS}'),
+            ('cross $X build', 'unresolved command family $X')):
+        refuses_inventory(m, tmp, job([{'run': command}]), fragment, 'cargo-global-options: ' + command)
+    trailing = 'cargo build --locked --release --target x86_64-unknown-linux-gnu'
+    for leading in ('cargo --locked build --release --target x86_64-unknown-linux-gnu',
+                    'cargo --color always -q build --locked --release --target x86_64-unknown-linux-gnu',
+                    'cargo --color=never build --locked --release --target x86_64-unknown-linux-gnu'):
+        assert m.translate(leading) == m.translate(trailing), f'cargo-global-options: {leading}: translation differs'
+        rows = [m.inventory(tmp, {'ci.yml': job([{'run': command}])}, {})
+                for command in (leading, trailing)]
+        assert len(rows[0]) == len(rows[1]) == 1, f'cargo-global-options: {leading}: {rows}'
+        resolved = [{key: value for key, value in row[0].items() if key != 'command'} for row in rows]
+        assert resolved[0] == resolved[1] and resolved[0]['relied_on'] == 'on', \
+            f'cargo-global-options: {leading} resolves differently: {resolved}'
+    for command in ('cargo -V', 'cargo --version'):
+        rows = m.inventory(tmp, {'ci.yml': job([{'run': command}])}, {})
+        assert [row['relied_on'] for row in rows] == ['not relied on'], f'cargo-global-options: {command}: {rows}'
+
+
+@unit('translation-multiple-targets')
+def case_translation_multiple_targets(m, tmp, checker):
+    for command in ('cargo build --target x86_64-unknown-linux-gnu --target aarch64-apple-darwin',
+                    'cargo build --target=x86_64-unknown-linux-gnu --target aarch64-apple-darwin'):
+        try:
+            m.translate(command)
+        except ValueError as error:
+            assert 'multiple targets require separate inventory rows' in str(error), str(error)
+        else:
+            raise AssertionError(f'translation-multiple-targets: accepted {command}')
+
+
+@unit('tree-duplicate-root')
+def case_tree_duplicate_root(m, tmp, checker):
+    try:
+        m.parse_tree('0stellar-agent-cli v0.0.0 (/a)|\n'
+                     '1stellar-agent-core v0.0.0 (/b)|\n'
+                     '0stellar-agent-cli v0.0.0 (/a)|mainnet-write\n')
+    except ValueError as error:
+        assert 'duplicate cargo tree root: stellar-agent-cli' in str(error), str(error)
+    else:
+        raise AssertionError('tree-duplicate-root: accepted a second root of one package')
+
+
+@unit('unresolvable-target')
+def case_unresolvable_target(m, tmp, checker):
+    for target in ('wasm32', 'x86_64-unknown', '../x86_64-unknown-linux-gnu'):
+        refuses_inventory(m, tmp, job([{'run': f"cargo build --target '{target}'"}]),
+                          f'unresolvable target {target!r}', f'unresolvable-target: {target}')
+    rows = m.inventory(tmp, {'ci.yml': job([{'run': 'cargo build --target wasm32-unknown-unknown'}])}, {})
+    assert [row['target'] for row in rows] == ['wasm32-unknown-unknown'], f'unresolvable-target: {rows}'
+
+
+@unit('runner-matrix')
+def case_runner_matrix(m, tmp, checker):
+    include = [{'target': 'x86_64-unknown-linux-gnu'}]
+    for matrix in ({'os': ['ubuntu-24.04'], 'include': include}, {'os': ['ubuntu-24.04']},
+                   {'include': []}, {'include': 'x86_64-unknown-linux-gnu'}):
+        refuses_inventory(m, tmp, job([{'run': 'cargo check --workspace'}], strategy={'matrix': matrix}),
+                          'unresolvable runner matrix', f'runner-matrix: {matrix}')
+    rows = m.inventory(tmp, {'ci.yml': job([{'run': 'cargo check --workspace'}],
+                                           strategy={'matrix': {'include': include}})}, {})
+    assert len(rows) == 1 and rows[0]['target'] == 'x86_64-unknown-linux-gnu', f'runner-matrix: {rows}'
+
+
+@unit('graph-exclude-binary')
+def case_graph_exclude_binary(m, tmp, checker):
+    root = tmp / 'workspace'
+    workspace(root)
+    cli, mcp = m.PACKAGES[2:4]
+    c = graph_checker(m, root, f'cargo build --workspace --exclude {mcp} --no-default-features')
+    row = m.INVOCATIONS[0]
+    graph = m.graph_state(root, row)
+    views = m.binary_views(graph, row)
+    assert views[mcp] is None and views[cli], f'graph-exclude-binary: binary selection differs: {views}'
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        c.D3()
+    assert not c.errors and 'stellar-agent-mcp: not selected' in output.getvalue(), \
+        f'graph-exclude-binary: excluded binary reports a state: {c.errors}'
+    changed = {'all': graph['all'], 'roots': {name: view for name, view in graph['roots'].items() if name != cli}}
+    original = m.graph_state
+    m.graph_state = lambda _root, _row: changed
+    try:
+        c.errors = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            c.D3()
+    finally:
+        m.graph_state = original
+    assert c.errors == [f'D3: fixture.yml:test:test: {row["command"]}: {row["target"]}: stellar-agent: graph missing'], \
+        f'graph-exclude-binary: missing selected root accepted: {c.errors}'
+
+
+@unit('rustdocflags-env-once')
+def case_rustdocflags_env_once(m, tmp, checker):
+    for name in ('RUSTDOCFLAGS', 'rustdocflags', REFUSED):
+        for workflow in (job([{'env': {name: '--cfg x'}, 'run': 'true'}]), {'env': {name: '--cfg x'}}):
+            c = bare_checker(m, workflows={'w.yml': workflow})
+            c.D7()
+            assert c.errors == [f'D7: w.yml: refused env mapping {name}'], \
+                f'rustdocflags-env-once: {name}: {c.errors}'
+    c = bare_checker(m, workflows={'w.yml': job([{'uses': 'sample/action@v1', 'with': {'rustdocflags': '--cfg x'}}])})
+    c.D7()
+    assert c.errors == ['D7: w.yml: rustdocflags contains --cfg'], f'rustdocflags-env-once: action input: {c.errors}'
+
+
+# Each mutation names one assertion whose failure proves its refusal path.
+MUTATIONS = {
+    'D3-test-binaries': ('graph-binary-views',
+        "if flag in ('--bins', '--all-targets', '--tests', '--test', '--benches', '--bench'):",
+        "if flag in ('--bins', '--all-targets'):", 'graph-binary-views: --test sample: binary selection differs'),
+    'D3-compiler-cfg': ('compiler-cfg-argument',
+        "if any(word == '--cfg' or word.startswith('--cfg=') for word in shlex.split(expanded)):",
+        'if False:', 'compiler-cfg-argument: compiler cfg accepted'),
+    'D3-target-all': ('graph-target-pair',
+        "'--target', translated['target']", "'--target', 'all'", 'graph-target-pair:'),
+    'D3-cache-without-target': ('graph-target-cache',
+        "('selection', 'features', 'edges', 'target')", "('selection', 'features', 'edges')", 'graph-target-cache:'),
+    'D3-host-collapse': ('graph-host-context',
+        "target = translated['target'] or host",
+        "target = translated['target'] or 'x86_64-unknown-linux-gnu'", 'graph-host-context:'),
+    'D3-one-binary': ('graph-binary-views',
+        'for package, view in binary_views(graph, row).items():',
+        'for package, view in binary_views(graph, row).items():\n                if package == PACKAGES[3]:\n                    continue',
+        'graph-binary-views:'),
+    'D3-isolate-workspace': ('graph-binary-views',
+        "*translated['selection'], *translated['features']",
+        "*(['-p', PACKAGES[2]] if '--workspace' in translated['selection'] else translated['selection']), *translated['features']",
+        'graph-binary-views:'),
+    'D3-known-packages-only': ('graph-any-package',
+        'name, enabled = nodes[key]',
+        'name, enabled = nodes[key]\n            if name not in PACKAGES:\n                continue', 'graph-any-package:'),
+    'D3-unknown-output': ('tree-output',
+        "raise ValueError(f'invalid cargo tree line: {line!r}')", 'continue', 'tree-output: unknown output accepted'),
+    'D4-metadata-only': ('build-script-outside-metadata',
+        "paths = {path.resolve() for path in source_files(self.root, ('build.rs',))}", 'paths = set()',
+        "D4: no error with 'rustc-cfg sets a feature'"),
+    'D5-legacy-config': ('cargo-config-paths',
+        "source_files(root, ('config', 'config.toml'))", "source_files(root, ('config.toml',))", 'D5: no error with'),
+    'D7-rustflags-input': ('rustflags-input',
+        "elif str(name).upper().endswith(('RUSTFLAGS', 'RUSTDOCFLAGS')) and '--cfg' in str(content):",
+        "elif False:", "D7: no error with 'rustflags contains --cfg'"),
+    'D3-global-options': ('cargo-global-options',
+        'family, _ = subcommand(words)', "family = words[1] if len(words) > 1 else ''",
+        'cargo-global-options: cargo --config \'build.rustflags=["--cfg","feature=\\"mainnet-write\\""]\' '
+        'build --release --locked: accepted'),
+    'D3-variable-family': ('cargo-global-options',
+        "        if '$' in word:\n            raise ValueError(f'unresolved command family {word}')\n",
+        "        if False:\n            raise ValueError(f'unresolved command family {word}')\n",
+        'cargo-global-options: cargo $ARGS build --release: accepted'),
+    'D8-mapping-flags': ('workflow-flag-guards',
+        'yield name, json.dumps(document)',
+        "yield name, '\\n'.join(run_text(step) for job in document.get('jobs', {}).values() for step in job.get('steps', []))",
+        'D8: no error with'),
+}
+
+
+def named_mutations(checker, directory, selected=None):
+    source = checker.read_text()
+    for name, (case, needle, replacement, diagnostic) in MUTATIONS.items():
+        if selected and selected != case:
+            continue
+        assert source.count(needle) == 1, f'{name}: mutation target differs'
+        path = directory / (name + '.py')
+        path.write_text(source.replace(needle, replacement, 1))
+        path.touch()
+        result = subprocess.run([sys.executable, str(HERE / 'test-check-feature-discipline.py'),
+                                 '--case', case, '--checker', str(path)], text=True, capture_output=True)
+        assert result.returncode == 1 and 'FAIL ' + diagnostic in result.stderr, \
+            f'{name}: expected assertion does not fail: {result.stdout}\n{result.stderr}'
+        print(f'ok mutation-{name}: {result.stderr.strip()}')
+        path.write_text(source)
+        path.touch()
+        result = subprocess.run([sys.executable, str(HERE / 'test-check-feature-discipline.py'),
+                                 '--case', case, '--checker', str(path)], text=True, capture_output=True)
+        assert result.returncode == 0, f'{name}: control fails: {result.stdout}\n{result.stderr}'
+        print(f'ok control-{name}')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mutations', action='store_true')
@@ -1489,6 +1936,8 @@ def main():
                         print(f'ok mutation-{mutation} variant {variant}: {error}')
                     else:
                         raise AssertionError(f'{rule}: the regression passed against the disabled rule')
+            if args.mutations:
+                named_mutations(args.checker, tmp, args.case)
     except (AssertionError, ValueError, OSError) as error:
         print(f'FAIL {error}', file=sys.stderr)
         return 1

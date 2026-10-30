@@ -1091,12 +1091,40 @@ python3 .github/scripts/check-feature-discipline.py
 python3 .github/scripts/test-check-feature-discipline.py --mutations
 bash .github/scripts/test-check-binary-marker.sh
 bash .github/scripts/test-release-checks.sh
-python3 .github/scripts/test-check-provenance.py
+python3 .github/scripts/test-check-provenance.py --mutations
 bash .github/scripts/release/check-host.sh
 ```
 
-The checker reads metadata and Cargo trees with `--locked --offline`. Each
-error message names the rule that failed:
+The checker reads metadata and Cargo trees with `--locked --offline`.
+Each resolving inventory row uses its explicit target, or the runner's
+triple from `RUNNER_TARGETS` in the checker:
+
+| Runner | Implicit target |
+|---|---|
+| `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
+| `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
+| `windows-2025` | `x86_64-pc-windows-msvc` |
+| `macos-26` | `aarch64-apple-darwin` |
+
+Unknown runners and unresolved hosts fail. The release and rehearsal recipe
+resolves each of its five target triples. The Linux feature-discipline job
+runs every query; foreign-target resolution needs no target compiler.
+The query cache includes the target, selection, features, and dependency edges.
+`cargo tree --target` filters a target-specific build-dependency table by the
+host that runs the checker, not by the queried triple: on an Apple silicon
+host, the Windows and Linux queries of a fixture omit its `cfg(windows)` and
+`cfg(target_os = "linux")` build dependencies and list its
+`cfg(target_os = "macos")` one.
+
+Workspace queries keep feature unification. Each selected binary gets a root
+view of that resolution, including Cargo's deduplicated subtree references.
+A binary outside the command's package or binary selection reports `not selected`.
+Integration-test and benchmark selections include their package binaries.
+Feature-off checks refuse `mainnet-write` on any resolved package.
+Feature-on checks require each selected binary's positive-control closure.
+Missing roots and unknown Cargo tree output fail.
+
+Each error message names its rule:
 
 - D1: the `mainnet-write` declarations and the `default = ["mainnet-write"]`
   of `stellar-agent-cli` and `stellar-agent-mcp` that the checker pins hold,
@@ -1110,7 +1138,13 @@ error message names the rule that failed:
   matches the reviewed inventory in the checker, and each resolved graph has
   `mainnet-write` in the state its record relies on. A record relies on the
   feature when its feature list names `mainnet-write`, or when it keeps the
-  default features and selects the workspace or a binary package. The scanner reads
+  default features and selects the workspace or a binary package. A
+  `--config` word anywhere in a call, a `+toolchain` word after `cargo` or
+  `cross`, and an option before the subcommand other than `-V`, `--version`,
+  `-v`, `-vv`, `--verbose`, `-q`, `--quiet`, `--locked`, `--frozen`,
+  `--offline`, and `--color` fail. The subcommand is the first word after
+  those options, and a `$` left in it or in a word before it fails. The
+  scanner reads
   spaces and tabs as the only blanks, and a physical line ends at a line
   feed. It reads a heredoc only when its delimiter, after `<<` and at most
   one space, is an identifier, an ASCII letter or underscore followed by
@@ -1130,7 +1164,8 @@ error message names the rule that failed:
   text, where a `;` ends the here-string's pipeline, so the scanner admits
   `cat <<< 'cargo build' $(case x in x) true;; esac) | sh` and
   `cat <<< 'cargo build' $( : ${v:-)}; true) | sh`.
-- D4: no build script emits a feature cfg, and every line it prints is a
+- D4: no build script, including a `build.rs` outside workspace metadata,
+  emits a feature cfg, and every line it prints is a
   string literal or a formatted line whose placeholders are `{}` or `{name}`
   and whose arguments are plain string literals or form a statement reviewed
   in the checker.
@@ -1172,6 +1207,8 @@ error message names the rule that failed:
   heredoc body or a PowerShell block comment is data and writes nothing. A
   write that reaches the file without spelling `GITHUB_ENV`, through another
   variable or a path found at run time, is outside the scan.
+  Rustflags and rustdocflags inputs that contain `--cfg` also fail.
+  The invocation inventory refuses a compiler argument that passes `--cfg`.
 - D8: no workflow, named script, or this guide enables every feature.
 - D9: only the CI feature-on jobs and the coverage job name `mainnet-write`
   in a feature list; release-shaped builds activate it through the binary
@@ -1191,6 +1228,11 @@ through the checker's `--env-guard` mode, which `build.sh` runs on its own
 checkout. `check-binary-marker.sh <binary> <on|off>` checks the second version
 line, the embedded expected marker, and the absence of the opposite marker
 and test-override literals.
+
+The [release provenance boundary](releasing.md#feature-state-checks) combines
+statement-content validation, workflow guards and resolved graphs, and packaged
+binary markers. Package and registry-install rows retain marker evidence;
+their packaged or registry source graphs are outside this check.
 
 `check-host.sh` builds the release binaries for the host target through
 `build.sh` and checks both markers, then builds each binary package alone with
