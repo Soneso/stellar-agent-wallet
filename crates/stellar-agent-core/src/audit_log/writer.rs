@@ -13263,7 +13263,8 @@ mod tests {
     #[test]
     fn a_row_at_the_cap_with_its_tag_refuses() {
         let dir = TempDir::new().unwrap();
-        let unkeyed = dir.path().join("unkeyed.jsonl");
+        let unkeyed_dir = TempDir::new().unwrap();
+        let unkeyed = unkeyed_dir.path().join("unkeyed.jsonl");
         let mut plain = open_no_key(unkeyed.clone());
         plain.write_entry(make_entry("")).unwrap();
         let row = row_of_len(&plain, MAX_ROW_BYTES - 10);
