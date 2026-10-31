@@ -430,6 +430,98 @@ decision = "allow"
 
 #[tokio::test]
 #[serial]
+async fn approval_above_payment_gate_pending_reason_and_approval_round_trip() {
+    use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope};
+
+    let rules = ["stellar_pay", "stellar_pay_commit"]
+        .map(|tool| {
+            format!(
+                r#"
+[[rules]]
+match = {{ tool = "{tool}", chain = "*" }}
+criteria = [
+    {{ kind = "approval_above", asset = "native", max_stroops = 100 }},
+    {{ kind = "per_tx_cap", asset = "native", max_stroops = 500 }},
+]
+decision = "allow"
+"#
+            )
+        })
+        .join("\n");
+    let h = Harness::with_rules("approval-above", Outcome::Success, &rules).await;
+
+    let small = h.simulate_pay(25).await;
+    assert_eq!(small["ok"], true, "{small}");
+    assert!(small["data"].get("approval").is_none(), "{small}");
+
+    let large = h.simulate_pay(600).await;
+    assert_eq!(
+        large["error"]["code"], "policy.deny.per_tx_cap_exceeded",
+        "{large}"
+    );
+    assert!(h.sends.lock().unwrap().is_empty());
+
+    let sim = h.simulate_pay(150).await;
+    assert_eq!(sim["ok"], true, "{sim}");
+    assert_eq!(h.signer_reads.load(Ordering::SeqCst), 0);
+    let envelope = TransactionEnvelope::from_xdr_base64(
+        sim["data"]["envelope_xdr"].as_str().unwrap(),
+        Limits::none(),
+    )
+    .unwrap();
+    let TransactionEnvelope::Tx(unsigned) = envelope else {
+        panic!("payment simulation returns a v1 envelope");
+    };
+    assert!(unsigned.signatures.is_empty());
+    let nonce = sim["data"]["approval"]["approval_nonce"].as_str().unwrap();
+    let reason = "approval_above: 150 stroops of native exceeds threshold 100 stroops";
+    assert_eq!(sim["data"]["approval"]["reason"], reason);
+    {
+        let store =
+            PendingApprovalStore::open(h.approval_dir.path().join(format!("{}.toml", h.name)))
+                .unwrap();
+        let pending = store
+            .get(nonce)
+            .expect("escalation persists a pending approval");
+        assert_eq!(pending.reason.as_deref(), Some(reason));
+    }
+    let unapproved = h.commit_pay(h.pay_args(&sim["data"], 150, None)).await;
+    assert_eq!(
+        unapproved["error"]["code"], "policy.approval_required",
+        "{unapproved}"
+    );
+    assert!(h.sends.lock().unwrap().is_empty());
+
+    assert_eq!(h.signer_reads.load(Ordering::SeqCst), 0);
+
+    let approved = h.attest(&sim["data"]);
+    let result = h
+        .commit_pay(h.pay_args(&sim["data"], 150, Some(approved)))
+        .await;
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(h.sends.lock().unwrap().len(), 1);
+    assert!(h.signer_reads.load(Ordering::SeqCst) > 0);
+    let requests = h.rpc.received_requests().await.unwrap();
+    let submissions: Vec<Value> = requests
+        .iter()
+        .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
+        .filter(|body| body["method"] == "sendTransaction")
+        .collect();
+    assert_eq!(submissions.len(), 1);
+    let envelope = TransactionEnvelope::from_xdr_base64(
+        submissions[0]["params"]["transaction"].as_str().unwrap(),
+        Limits::none(),
+    )
+    .unwrap();
+    let TransactionEnvelope::Tx(signed) = envelope else {
+        panic!("payment submission carries a v1 envelope");
+    };
+    assert_eq!(signed.tx, unsigned.tx);
+    assert_eq!(signed.signatures.len(), 1);
+}
+
+#[tokio::test]
+#[serial]
 async fn approved_payment_reserves_before_send_and_settles_with_sized_audit_legs() {
     let h = Harness::new("cap-approved-confirm", "require_approval", Outcome::Success).await;
     let sim = h.simulate_pay(AMOUNT).await;

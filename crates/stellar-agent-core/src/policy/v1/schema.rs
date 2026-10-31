@@ -43,6 +43,7 @@ const MATCH_KEYS: &[&str] = &["tool", "chain"];
 /// parsed without a closed key set.
 pub(crate) const CRITERION_KEY_SETS: &[(&str, &[&str])] = &[
     ("per_tx_cap", &["kind", "asset", "max_stroops"]),
+    ("approval_above", &["kind", "asset", "max_stroops"]),
     (
         "per_period_cap",
         &["kind", "asset", "window", "max_stroops"],
