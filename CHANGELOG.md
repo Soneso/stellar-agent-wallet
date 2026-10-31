@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.13] - 2026-10-31
+
+The `approval_above` policy criterion requests approval above a per-payment threshold, and `profile halt` and `profile resume` stop and restore the actions of one profile that sign or submit. Value-moving submits can cross-check a witness from an independent RPC endpoint before signing, and the audit log's settlement and receipt-clear lookups report a history they cannot read or verify. A V1 policy signed by an earlier release needs a new signature when its rules carry `reason`, `ttl_secs` or `allow_opaque_signing`. Dependency updates resolve five RustSec advisories in the wallet crates and eight advisories in the JavaScript test harnesses. This release had internal review only; no external security audit has taken place.
+
+Contributions by @canakyuz (#464), @huong8373tt-beep (#446, #449), @jiangyuer018 (#409, #412, #418, #420, #421, #424, #439, #442), @ngybnc (#403, #410, #438) and @norman-bodis (#394).
+
 ### Added
 
 - V1 policy criterion `approval_above` requests approval above a positive
@@ -3411,7 +3417,8 @@ policy engine, operator-approval spine, and tamper-evident audit log.
 - An agent integration guide (`docs/agents.md`) and capability-isolation example
   toolsets under `examples/toolsets/`.
 
-[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.12...HEAD
+[Unreleased]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.13...HEAD
+[0.1.0-alpha.13]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.12...v0.1.0-alpha.13
 [0.1.0-alpha.12]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.11...v0.1.0-alpha.12
 [0.1.0-alpha.11]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.10...v0.1.0-alpha.11
 [0.1.0-alpha.10]: https://github.com/Soneso/stellar-agent-wallet/compare/v0.1.0-alpha.9...v0.1.0-alpha.10
