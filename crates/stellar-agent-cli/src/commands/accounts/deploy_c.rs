@@ -1236,9 +1236,11 @@ mod tests {
             profile.audit_log_path.exists(),
             "profile-backed dry-run should still open the audit writer"
         );
+        // The keyed writer opens the log with its entry-tag boundary row; the
+        // dry-run itself appends nothing.
         let entries = read_jsonl(&profile.audit_log_path);
         assert!(
-            entries.is_empty(),
+            entries.len() == 1 && entries[0]["kind"] == "audit_entry_tags_started",
             "deploy_smart_account dry-run invariant remains no audit entries: {entries:#?}"
         );
     }

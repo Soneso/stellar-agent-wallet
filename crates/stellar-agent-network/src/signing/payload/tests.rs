@@ -316,6 +316,7 @@ mod authorized {
                 tip_hash: [0; 32],
                 log_path_sha256: [5; 32],
                 anchor_covers_tip: true,
+                entry_tags_in_force: true,
             };
             let mut header = fixtures::header("fixture", None, &self.writer, facts, NOW);
             let mut binding = fixtures::tx_binding(envelope.envelope_xdr(), envelope.tx_hash_hex());

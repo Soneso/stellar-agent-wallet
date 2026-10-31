@@ -1400,6 +1400,18 @@ fn unrelated_row(request_id: &str) -> AuditEntry {
     ))
 }
 
+/// A consent row, the only kind the audit outbox queues.
+fn consent_row(request_id: &str) -> AuditEntry {
+    AuditEntry::new_approval_attested(
+        "PaymentSimulated",
+        "stellar_pay_commit",
+        None,
+        "ABCDEFGHIJKLMNOPQRSTUV",
+        "cli",
+        request_id,
+    )
+}
+
 /// Mounts a `sendTransaction` answer that must never be asked for.
 async fn mount_no_send(server: &MockServer, envelope: &SignedTestEnvelope) {
     Mock::given(method("POST"))
@@ -1591,8 +1603,9 @@ async fn an_uncovered_pending_row_is_closed_and_its_reservation_released() {
     let anchored: Vec<u64> = store.writes().iter().map(|a| a.entry_count).collect();
     assert_eq!(
         anchored,
-        vec![1, 2],
-        "the closing append repairs the pending row's anchor, then anchors itself"
+        vec![1, 2, 3],
+        "the open anchors the boundary row; the closing append repairs the pending \
+         row's anchor, then anchors itself"
     );
 }
 
@@ -1744,7 +1757,7 @@ async fn submit_after_a_queued_outbox_row(
     let store = Arc::new(InMemoryTipAnchorStore::new());
     let audit = anchored_audit(&mut fx, &store);
     AuditOutbox::for_log(&fx.profile.audit_log_path, store.clone())
-        .append(&unrelated_row("queued-consent"))
+        .append(&consent_row("queued-consent"))
         .unwrap();
     let envelope = SignedTestEnvelope::for_source([seed; 32]);
     let server = MockServer::start().await;
@@ -1775,17 +1788,21 @@ async fn a_drained_outbox_row_left_uncovered_refuses_the_send() {
     let error = result.expect_err("six failed anchor writes leave the rows uncovered");
     assert_eq!(error.code(), "submission.record_unavailable", "{error:?}");
     assert!(error.message().contains(AFTER_ROW), "{error:?}");
-    assert_eq!(kinds.len(), 3, "{kinds:?}");
+    assert_eq!(kinds.len(), 4, "{kinds:?}");
     assert!(
-        matches!(kinds[0], EventKind::ToolInvocation),
-        "the queued row lands first: {kinds:?}"
+        matches!(kinds[0], EventKind::AuditEntryTagsStarted { .. }),
+        "the open appends the boundary row: {kinds:?}"
     );
     assert!(
-        matches!(kinds[1], EventKind::ValueActionPending { .. }),
+        matches!(kinds[1], EventKind::ApprovalAttested { .. }),
+        "the queued row lands first after the boundary: {kinds:?}"
+    );
+    assert!(
+        matches!(kinds[2], EventKind::ValueActionPending { .. }),
         "{kinds:?}"
     );
     assert_eq!(
-        failed_code(&kinds[2]),
+        failed_code(&kinds[3]),
         Some("submission.record_unavailable"),
         "{kinds:?}"
     );
@@ -1799,13 +1816,17 @@ async fn a_drained_outbox_row_covered_by_the_repair_lets_the_send_proceed() {
     let (result, kinds) =
         submit_after_a_queued_outbox_row("record-anchor-drain-repaired", 0x69, 5).await;
     assert!(result.is_ok(), "the repair covers both rows: {result:?}");
-    assert_eq!(kinds.len(), 3, "{kinds:?}");
+    assert_eq!(kinds.len(), 4, "{kinds:?}");
     assert!(
-        matches!(kinds[1], EventKind::ValueActionPending { .. }),
+        matches!(kinds[1], EventKind::ApprovalAttested { .. }),
         "{kinds:?}"
     );
     assert!(
-        matches!(kinds[2], EventKind::ValueActionSubmitted { .. }),
+        matches!(kinds[2], EventKind::ValueActionPending { .. }),
+        "{kinds:?}"
+    );
+    assert!(
+        matches!(kinds[3], EventKind::ValueActionSubmitted { .. }),
         "{kinds:?}"
     );
 }
@@ -1814,8 +1835,8 @@ async fn a_drained_outbox_row_covered_by_the_repair_lets_the_send_proceed() {
 /// refuses the send and removes the receipt the gate recorded; no row and no
 /// reservation exist.
 ///
-/// A complete outbox line that does not parse refuses the drain the append
-/// runs first, and the check before the row reads no outbox.
+/// A complete outbox line past the recorded commitment refuses the drain the
+/// append runs first, and the check before the row reads no outbox.
 #[tokio::test]
 #[serial]
 async fn a_pending_row_append_failure_after_the_anchor_check_unwinds_the_receipt() {
@@ -1842,7 +1863,7 @@ async fn a_pending_row_append_failure_after_the_anchor_check_unwinds_the_receipt
         "{error:?}"
     );
     assert!(
-        error.message().contains("audit.outbox_unusable"),
+        error.message().contains("audit.outbox_rows_missing"),
         "{error:?}"
     );
     assert_eq!(calls.lock().unwrap().as_slice(), &[Call::PreSend]);
@@ -1861,11 +1882,13 @@ async fn a_pending_row_append_failure_after_the_anchor_check_unwinds_the_receipt
             .unwrap()
             .is_empty()
     );
+    let kinds: Vec<EventKind> = verified_audit_entries(&audit)
+        .into_iter()
+        .map(|entry| entry.event_kind)
+        .collect();
     assert!(
-        std::fs::read_to_string(&fx.profile.audit_log_path)
-            .unwrap_or_default()
-            .is_empty(),
-        "no row is written"
+        matches!(kinds.as_slice(), [EventKind::AuditEntryTagsStarted { .. }]),
+        "no row is written past the boundary row: {kinds:?}"
     );
 }
 
@@ -2017,14 +2040,14 @@ async fn a_reservation_the_window_cannot_admit_is_refused_as_a_policy_denial() {
     );
     drop(first_recorder);
     drop(second_recorder);
-    drop(audit);
     assert!(
         matches!(
-            try_value_action_settlement(&audit_path, &second_hash).unwrap(),
+            try_value_action_settlement(&audit.lock().unwrap(), &second_hash).unwrap(),
             ValueActionSettlement::Settled
         ),
         "the pending row the refused submission wrote is closed out"
     );
+    drop(audit);
     // The row that closes the pending row names the refusal that stopped the
     // submission, so the audit log records a cap refusal as the policy denial
     // it is.
@@ -2172,14 +2195,14 @@ async fn a_resend_after_a_lost_receipt_is_refused_before_the_send() {
 
     drop(recorder);
     drop(resend_recorder);
-    drop(audit);
     assert!(
         matches!(
-            try_value_action_settlement(&audit_path, &hash).unwrap(),
+            try_value_action_settlement(&audit.lock().unwrap(), &hash).unwrap(),
             ValueActionSettlement::Owed(_)
         ),
         "the original's settlement stays owed"
     );
+    drop(audit);
     let rows: Vec<EventKind> = verified_audit_entries_from_path(&audit_path)
         .into_iter()
         .filter(|entry| entry.envelope_hash.as_deref() == Some(hash.as_str()))

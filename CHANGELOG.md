@@ -258,6 +258,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The first keyed acquisition of an existing log appends
+  `audit_entry_tags_started` with the anchored count and the count of rows it
+  absorbs; `audit verify` warns when that count is nonzero. Builds without
+  entry tags refuse a log holding the new rows (`audit.parse_error`).
+- `audit verify` reports `entry_tags_verified` and `entry_tags_boundary`;
+  `profile rotate-audit-key` appends `audit_entry_tags_rekeyed`;
+  `audit acknowledge-outbox-loss` reports `discarded`; read-only verbs whose
+  audit key does not load refuse a keyed log.
 - Smart-account Wasm pins compare all 32 bytes of the code hash: the
   verifier and policy drift checks, the resolved hash of an executable
   reference, the migration repoint, the refresh and signer-add pin
@@ -977,6 +985,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Audit entries carry a keyed `entry_tag` derived from the profile's audit
+  key. Once a log holds its `audit_entry_tags_started` row, keyed writers
+  refuse an untagged tail (`audit.tip_anchor_mismatch`, reason
+  `unauthenticated_tail`), `audit verify --profile` refuses it
+  (`audit.entry_tag_invalid`), and the settlement, pin, signer-set, timelock,
+  rule-id and pool readers stop at the writer's verified tip.
+  `audit reanchor --acknowledge-unauthenticated-tail` quarantines such a tail
+  and keeps it.
+- The audit outbox drains only committed consent rows; a line past the
+  commitment or of another kind refuses the drain. An unkeyed writer refuses
+  a log that shows keying (`audit.chain_key_unavailable`).
 - MPP checks the held state lock identity before publication, before each
   state-key rotation, and before and after counter writes. Guarded counter
   comparisons refuse stale writers and equal reservations and retain generation

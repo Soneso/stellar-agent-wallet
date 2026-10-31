@@ -32,7 +32,6 @@
 )]
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -2001,12 +2000,7 @@ async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
         vec![],
         vec![],
     );
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&h.log_path)
-        .unwrap()
-        .write_all(b"not an audit row\n")
-        .unwrap();
+    rewrite_the_last_row(&h.log_path);
     let err = h.submit(&[1], Some("req-integrity")).await.unwrap_err();
     assert!(matches!(err, SaError::AuditLog(_)), "{err:?}");
     assert_eq!(err.wire_code(), "sa.audit_log");
@@ -2219,6 +2213,23 @@ fn signer_add_chain() -> Chain {
 
 /// A [`signer_add_chain`] harness with rule 1's version-2 baseline recorded
 /// from the served chain, and a pin record when `pinned`.
+/// Overwrites the log's last row in place with bytes of the same length.
+///
+/// The damage lies inside the writer's verified bound, so every bounded audit
+/// read refuses the log. A line appended past that bound would be ignored by
+/// the readers instead.
+fn rewrite_the_last_row(path: &std::path::Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let body_end = bytes.len() - 1;
+    assert_eq!(bytes[body_end], b'\n', "the log ends in a complete row");
+    let row_start = bytes[..body_end]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    bytes[row_start..body_end].fill(b'#');
+    std::fs::write(path, bytes).unwrap();
+}
+
 async fn signer_add_harness(pinned: bool) -> Harness {
     let h = Harness::new(signer_add_chain()).await;
     h.baseline_v2(1);
@@ -2940,12 +2951,7 @@ async fn a_migration_pair_refuses_before_any_send() {
     }
 
     let h = signer_add_harness(false).await;
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&h.log_path)
-        .unwrap()
-        .write_all(b"not an audit row\n")
-        .unwrap();
+    rewrite_the_last_row(&h.log_path);
     let result = migrate(&h, &plan, "req-integrity").await;
     let err = result.failed_step_error.as_ref().expect("the pair refused");
     assert!(matches!(err, SaError::AuditLog(_)), "{err:?}");

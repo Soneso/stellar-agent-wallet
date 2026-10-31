@@ -776,7 +776,7 @@ The policy-file owner key is NOT rotated here — it is an ed25519 key enrolled 
 | Subcommand | Keyring entry | Effect |
 |---|---|---|
 | `rotate-attestation-key` | approval-spine attestation HMAC (`attestation_key_id`) | Invalidates all pending approvals; the simulate-and-approve round trip must be re-run. `key_kind:"hmac_32_bytes"`. |
-| `rotate-audit-key` | audit-log chain-root HMAC (`audit_log_hash_chain_key_id`) | Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify <LOG_PATH> --profile <NAME>` stays green and the old key stops verifying. Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds the writer. A changed audit binding refuses with `audit.log_binding_changed` before the writer opens. |
+| `rotate-audit-key` | audit-log chain-root HMAC (`audit_log_hash_chain_key_id`) | Before any key write, checks the log's entry tags under the old key and refuses with that check's code (`audit.entry_tag_invalid` among them). Once entry tags are in force it appends `audit_entry_tags_rekeyed` (cause `rotation`) under the new key before its `keyring_key_written` row; an interrupted rotation is repaired at the next keyed open. Re-signs every existing per-file chain-root sidecar with the new key, so `audit verify <LOG_PATH> --profile <NAME>` stays green and the old key stops verifying. Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. Takes the audit writer's exclusive lock, so it refuses while an MCP server holds the writer. A changed audit binding refuses with `audit.log_binding_changed` before the writer opens. |
 | `rotate-nonce-key` | HMAC nonce key (`mcp_nonce_key_alias`) | Invalidates outstanding nonces. Returns only `profile` + `rotated`. |
 | `rotate-counterparty-key` | `stellar.toml` cache-integrity HMAC (`counterparty_cache_key_id`) | Invalidates cached bindings. `counterparty refresh <domain>` rewrites one binding, and `counterparty warm-up` refreshes only the `HOME_DOMAIN` entries of the policy allowlist. Adds `key_kind:"hmac_32_bytes"` and `cache_invalidated:true`. |
 | `rotate-policy-state-key` | policy-window-state HMAC (`policy_window_state_key_id`) | Re-signs the persisted window-state store under the new key, so accumulated `per_period_cap` / `rate_limit` history is preserved, not invalidated. Refused if the store does not verify under the current key (use `reset-window-state` instead). Adds `key_kind:"hmac_32_bytes"` and `sidecars_resigned`. |
@@ -1045,7 +1045,9 @@ The chain and the per-file chain-root signatures verify a PREFIX, so an older co
 
 ### `audit verify <LOG_PATH>`
 
-Read-only. Walks the log at `<LOG_PATH>`, following rotation manifests, and verifies the hash chain end to end. With `--profile`, also loads that profile's audit chain-root HMAC key and verifies the chain-root sidecars; without it, only the hash chain is checked and `hmac_verified` is `false`.
+Read-only. Walks the log at `<LOG_PATH>`, following rotation manifests, and verifies the hash chain end to end. With `--profile`, also loads that profile's audit chain-root HMAC key, verifies the chain-root sidecars, and checks the keyed entry tag of every entry from the log's boundary row on; without it, only the hash chain is checked, and `hmac_verified` and `entry_tags_verified` are `false`.
+
+`hmac_verified` covers each walked file's first entry only. `entry_tags_verified` is `true` when entry tags are in force and every entry past the boundary carries a valid tag; `entry_tags_boundary` names the newest `audit_entry_tags_started` or `audit_entry_tags_rekeyed` row with a valid tag as `{file, line, kind}`, or is `null`. A missing or wrong tag exits `1` with `audit.entry_tag_invalid`. Warnings `entry_tags_absorbed`, `entries_quarantined`, and `entry_tags_rekeyed_at_open` report rows the boundary absorbed without a tag check, rows a repair quarantined, and a rekey a keyed open appended.
 
 | Flag / arg | Meaning |
 |---|---|
@@ -1053,18 +1055,18 @@ Read-only. Walks the log at `<LOG_PATH>`, following rotation manifests, and veri
 | `--profile <NAME>` | Profile whose chain-root HMAC key verifies sidecars |
 | `--output <FORMAT>` | `json` is the default and only stable format |
 
-The tip anchor is checked only when `--profile` is supplied AND `<LOG_PATH>` is the log that profile configures, since the anchor names a path. Every other case reports `anchor.status` as `"not_checked"` with the reason and still verifies the chain in full. The check proves the anchored entry is still at the anchored offset, so a longer internally consistent log that does not contain it refuses rather than passing on length alone.
+The tip anchor is checked only when `--profile` is supplied AND `<LOG_PATH>` is the log that profile configures, since the anchor names a path. Every other case reports `anchor.status` as `"not_checked"` with the reason and still verifies the chain in full. The check proves the anchored entry is still at the anchored offset, so a longer internally consistent log that does not contain it refuses rather than passing on length alone. `"verified"` means the anchored entry is intact and the file ends at or past it; entries past the anchor are authenticated only when `entry_tags_verified` is `true`.
 
 When no anchor is stored for the profile's own log, the log must show that it was never anchored. An audit binding recorded for the profile, a chain-root sidecar beside the active file, or an `audit_tip_anchored` row in it shows it was; the command then fails with `audit.tip_anchor_missing`, and the message says `anchor: missing` and names the evidence. A log with none of them reports `anchor.status` as `"not_checked"`.
 
-On Unix, refuses to verify a log whose parent directory is owned by a different user. Exits `0` when the chain is intact, `1` on any integrity violation (broken chain, rotation gap, HMAC mismatch, missing sidecar, unparseable line, tip-anchor mismatch, missing tip anchor), path-contract failure, or I/O error.
+On Unix, refuses to verify a log whose parent directory is owned by a different user. Exits `0` when the chain is intact, `1` on any integrity violation (broken chain, rotation gap, HMAC mismatch, missing sidecar, invalid entry tag, unparseable line, tip-anchor mismatch, missing tip anchor), path-contract failure, or I/O error.
 
 A `pruned_prefix` warning reports `first_file`, the oldest file walked, and
 `pruned_files`, the count in `<log>.pruned`. The marker seeds that file's first
 entry and is authenticated when an audit key is supplied. Verification checks
 every retained entry and bridge, and the warning leaves the verdict successful.
 
-`outbox_pending` counts complete queued consent lines. With `--profile` and the profile's log path, verification checks the keyring commitment under the outbox lock after the chain walk. A missing or changed committed prefix fails with `audit.outbox_rows_missing`; a held lock fails with `audit.outbox_busy`. Without a profile, no commitment is checked. The separate count inspection can report `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` warnings.
+`outbox_pending` counts complete queued consent lines. With `--profile` and the profile's log path, verification checks the keyring commitment under the outbox lock after the chain walk. A missing or changed committed prefix, or a complete line past it, fails with `audit.outbox_rows_missing`; a held lock fails with `audit.outbox_busy`. Without a profile, no commitment is checked. The separate count inspection can report `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` warnings.
 
 An `outbox_loss_acknowledged` warning names each loss acknowledgement's file, line, `expected_rows`, and `found_rows`. It leaves the chain verdict unchanged.
 
@@ -1073,24 +1075,27 @@ stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --pr
 ```
 
 ```json
-{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"per_file":[],"warnings":[],"audit_writer_degraded":false,"anchor":{"status":"verified","reason":null},"outbox_pending":0},"request_id":"..."}
+{"ok":true,"data":{"entries_verified":42,"files_walked":2,"hmac_verified":true,"entry_tags_verified":true,"entry_tags_boundary":{"file":"default.jsonl","line":3,"kind":"audit_entry_tags_started"},"per_file":[],"warnings":[],"audit_writer_degraded":false,"anchor":{"status":"verified","reason":null},"outbox_pending":0},"request_id":"..."}
 ```
 
 ### `audit reanchor --profile <NAME> --acknowledge-rollback`
 
-State-changing (writes the keyring anchor, appends one or two audit rows, then drains the audit outbox; no network). The only way out of an `audit.tip_anchor_mismatch`, `audit.tip_anchor_missing`, or `audit.log_binding_changed` refusal. Operator-only: an agent must never run it on its own initiative, because it accepts a log or a profile change that may have been tampered with.
+State-changing (writes the keyring anchor, appends one to three audit rows, then drains the audit outbox; no network). The only way out of an `audit.tip_anchor_mismatch`, `audit.tip_anchor_missing`, or `audit.log_binding_changed` refusal. Operator-only: an agent must never run it on its own initiative, because it accepts a log or a profile change that may have been tampered with.
 
 | Flag / arg | Meaning |
 |---|---|
 | `--profile <NAME>` (required) | Profile whose configured `audit_log_path` and audit keyring coordinate identify the anchor |
 | `--acknowledge-rollback` (required to act on a rolled-back log) | Accept the log's current tip as authoritative |
 | `--acknowledge-binding-change` (required to act on a changed binding) | Accept a log path or audit key that differs from the recorded audit binding |
+| `--acknowledge-unauthenticated-tail` (required with an unauthenticated tail) | Keep the entries past the last authenticated entry and quarantine them |
 
 | Recorded binding | Current path's anchor | Flags required | Rows appended |
 |---|---|---|---|
 | Equal or absent | Any | `--acknowledge-rollback` | `rollback_acknowledged` |
 | Changed or unreadable | Agrees, or absent without prior anchoring evidence | `--acknowledge-binding-change` | `binding_changed` |
 | Changed or unreadable | Disagrees, cannot be parsed, or absent with prior anchoring evidence | Both | `rollback_acknowledged`, then `binding_changed` |
+
+In every row, an active file that ends in entries without a valid entry tag, on a log whose tags are in force, also requires `--acknowledge-unauthenticated-tail`: the command appends `audit_entries_quarantined` directly after those entries, before its other rows, lists `unauthenticated_tail` first in `acknowledged`, and reports `quarantined_rows`. Readers skip quarantined entries. Without such a tail the flag is ignored. A tail ending on a rotation handoff without a valid tag refuses with `audit.reanchor_failed` and names the line to remove.
 
 The first row covers both anchor refusals: an anchor that disagrees with the log (`audit.tip_anchor_mismatch`), and an absent anchor on a log that shows it was anchored before (`audit.tip_anchor_missing`). In the binding-changed rows an absent anchor disagrees when a chain-root sidecar or an `audit_tip_anchored` row shows prior anchoring. Without evidence it agrees.
 
@@ -1104,7 +1109,7 @@ stellar-agent audit reanchor --profile default --acknowledge-binding-change
 ```
 
 ```json
-{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1,"acknowledged":["rollback"],"recorded_binding":"equal","previous_binding_anchor":null,"outbox_drained":0},"request_id":"..."}
+{"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1,"acknowledged":["rollback"],"quarantined_rows":0,"recorded_binding":"equal","previous_binding_anchor":null,"outbox_drained":0},"request_id":"..."}
 ```
 
 ### `audit acknowledge-outbox-loss --profile <NAME> --reason <TEXT>`
@@ -1113,14 +1118,14 @@ Operator-only recovery for `audit.outbox_rows_missing`; an agent must not run it
 Stop the process holding the profile's writer and inspect the queued rows first.
 `--reason` is required, non-empty, and recorded with the audit string bound.
 
-The command checks the tip anchor, checks that the loss holds and that every remaining queued row parses, and then revokes every decided, unexpired, unconsumed approval and every toolset grant.
+The command checks the tip anchor, checks that the loss holds and, when the committed prefix is intact, that every committed row parses and is a consent row, and then revokes every decided, unexpired, unconsumed approval and every toolset grant.
 Mainnet confirmations and recorded passkey assertions count as decided approvals.
-It records `audit_outbox_loss_acknowledged`, drains the remaining complete rows, resets the commitment, and empties the outbox.
+It records `audit_outbox_loss_acknowledged`, appends the committed prefix when it is intact and nothing otherwise, resets the commitment, and empties the outbox, discarding every other line.
 Approve affected actions again to record fresh consent.
 
-The result contains `profile`, `expected_rows`, `found_rows`, `drained`, `revoked_approvals`, and `revoked_grants`.
+The result contains `profile`, `expected_rows`, `found_rows`, `drained`, `discarded`, `revoked_approvals`, and `revoked_grants`; `discarded` counts the complete lines dropped without being appended.
 No loss returns `audit.outbox_loss_not_found` without an acknowledgement; a held writer returns `audit.writer_locked`; a log rolled back behind its tip anchor returns `audit.tip_anchor_mismatch`.
-A remaining row that does not parse returns `audit.outbox_unusable` before anything is revoked or written.
+An intact committed row that does not parse, or that is not a consent row, returns `audit.outbox_unusable` before anything is revoked or written.
 A row that cannot append leaves the queue and commitment in place for inspection and retry.
 
 ```bash

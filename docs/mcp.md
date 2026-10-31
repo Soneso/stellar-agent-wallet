@@ -529,16 +529,22 @@ A log restored from an older copy, truncated, or substituted refuses with
 rename are checked. The file at the path is compared by identity against
 the handle the server holds; its tip is also checked. Every row the server appends is checked
 again, for identity and for the file still ending where the server left it, and
-a refused row is anchored so the refusal survives a restart. A log that simply moved FORWARD past its anchor
-is not a refusal. Unkeyed writers append without moving it, and the next
-acquisition absorbs the gap and re-anchors. A log with no anchor at all is
+a refused row is anchored so the refusal survives a restart. A log that moved FORWARD past its anchor
+before the log's `audit_entry_tags_started` row is not a refusal: the next
+acquisition absorbs the gap once, counts it in that row, and re-anchors. Once
+entry tags are in force, growth past the anchor is accepted only when every
+appended entry carries a valid entry tag; otherwise the server refuses with
+`audit.tip_anchor_mismatch`, reason `unauthenticated_tail`, and a writer
+without the audit key refuses the log with `audit.chain_key_unavailable`. A log with no anchor at all is
 adopted on first use with no operator action when nothing shows it was anchored
 before, such as a log written only by unkeyed writers. A recorded audit
 binding, a chain-root sidecar, or an `audit_tip_anchored` row in the file shows
 it was, and the server then refuses with `audit.tip_anchor_missing`. An
 adoption writes its `audit_tip_anchored` row only for a non-empty file.
 Recovery from a mismatch or a missing anchor is `stellar-agent audit reanchor
---profile <name> --acknowledge-rollback`. Stop this server first if it holds that profile's
+--profile <name> --acknowledge-rollback`, with
+`--acknowledge-unauthenticated-tail` for an unauthenticated tail, which it keeps
+and quarantines. Stop this server first if it holds that profile's
 audit writer.
 
 Acquiring the writer also checks the profile's audit binding: the keyring

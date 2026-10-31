@@ -16,6 +16,23 @@
 //! the reader acquires the writer mutex before reading, multi-process isolation
 //! is also guaranteed for the single-writer invariant.
 //!
+//! # The verified-tip bound
+//!
+//! Every scan reads under the caller's writer guard and stops at that
+//! writer's verified tip. The active file is read only up to
+//! `AuditWriter::end_offset`; its first row must chain from the segment start
+//! the writer holds, and its last row read must hash to the writer's
+//! `last_entry_hash`. Each archive's in-file chain must verify, and its last
+//! row must hash to the `previous_entry_hash` of the first row of the next
+//! newer file. A broken link is [`AuditLogIntegrityError::ChainBroken`] with
+//! reason `bridge_mismatch` or `tip_mismatch`. Rows that an
+//! `audit_entries_quarantined` row covers are dropped. No key is read.
+//!
+//! A row appended to the file outside the writer therefore never reaches a
+//! scan: it lies past the bound. The one exception is
+//! [`scan_all_context_rule_pin_records_unanchored`], which takes no writer,
+//! reads the whole active file, and feeds only operator-facing warnings.
+//!
 //! # Scan order
 //!
 //! The active file is scanned first (most-recent entries), then rotated files
@@ -39,10 +56,11 @@
 //! `crate::audit_log::lock`), so a reader may observe the log directory
 //! mid-write or mid-rotation, on every platform:
 //!
-//! - **Mid-append** (a write in progress): the active file's last line may be
-//!   incomplete. This is the pre-existing torn-tail case, surfaced as
-//!   [`AuditLogIntegrityError::ParseError`] — never silently treated as
-//!   `Ok(None)`. Unaffected by this module's design.
+//! - **Mid-append** (a write in progress): the guard the scan holds keeps
+//!   this process's writer from appending, and the bound stops at the last
+//!   row that writer committed. A bound that ends inside a line refuses with
+//!   [`AuditLogIntegrityError::ChainBroken`] reason `tip_mismatch`, never
+//!   `Ok(None)`.
 //!
 //! - **Mid-rotation** (the active file transiently absent): `AuditWriter::rotate`
 //!   renames the active file to its archive name and then creates the new
@@ -482,9 +500,9 @@ pub struct AuditReader {
 
     /// Optional HMAC key for chain-root sidecar verification.
     ///
-    /// When `Some`, the reader calls through to the chain-root HMAC check in
-    /// `verify_single_file`. When `None`, HMAC verification is skipped (the
-    /// hash chain is still verified). Mirrors the `verify_log` contract.
+    /// When `Some`, every scan checks each walked file's chain-root sidecar
+    /// under it, with the check `verify_log` applies. When `None`, the
+    /// sidecars are not checked; the hash chain still is.
     hmac_key: Option<[u8; 32]>,
 }
 
@@ -492,21 +510,37 @@ impl AuditReader {
     /// Constructs a new `AuditReader` from the shared writer mutex and an
     /// optional HMAC key.
     ///
-    /// The `log_path` is derived from the writer under a brief mutex acquire at
-    /// construction time. Subsequent scans re-acquire the mutex for the duration
-    /// of the traversal.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the writer mutex is poisoned (indicates a previous panicking
-    /// write operation — the audit log is in an unknown state).
+    /// Construction takes no lock. Each scan holds the writer's mutex for its
+    /// whole traversal and reads the log path and the bound from the guard;
+    /// a poisoned mutex fails that scan with [`AuditLogIntegrityError::Io`].
     #[must_use]
     pub fn new(writer: Arc<Mutex<AuditWriter>>, hmac_key: Option<[u8; 32]>) -> Self {
         Self { writer, hmac_key }
     }
 
+    /// Acquires the shared writer's guard for one scan.
+    ///
+    /// A poisoned mutex is an [`AuditLogIntegrityError::Io`]: the reader may
+    /// see a half-written state from the panicking writer, so silent recovery
+    /// via `into_inner()` is unsound.
+    fn lock_writer(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, AuditWriter>, AuditLogIntegrityError> {
+        self.writer.lock().map_err(|_| {
+            AuditLogIntegrityError::Io(std::io::Error::other(
+                "audit-log writer mutex is poisoned; a prior write path panicked \
+                 mid-write; audit-log integrity is unknown; restart the process",
+            ))
+        })
+    }
+
     /// Finds the completion event for one pool lifecycle across the verified
     /// active and rotated log. The shared writer excludes concurrent appends.
+    ///
+    /// The log is verified first, with the active file read only up to the
+    /// writer's verified tip, so bytes appended past that tip outside the
+    /// writer change neither the verification nor the result; the rows are
+    /// then read through the writer's bound (see the module documentation).
     ///
     /// # Errors
     /// Propagates integrity, parse, and I/O failures. Completion lookup requires
@@ -515,29 +549,19 @@ impl AuditReader {
         &self,
         request_id: &str,
     ) -> Result<bool, AuditLogIntegrityError> {
-        let writer = self.writer.lock().map_err(|_| {
-            AuditLogIntegrityError::Io(std::io::Error::other("audit writer mutex is poisoned"))
-        })?;
-        let path = writer.path();
-        super::verify::verify_log(path, self.hmac_key.as_ref())?;
-        for file in collect_files_newest_first(path)? {
-            let raw = std::fs::read_to_string(&file).map_err(AuditLogIntegrityError::Io)?;
-            for (line, text) in raw
-                .lines()
-                .enumerate()
-                .filter(|(_, text)| !text.trim().is_empty())
-            {
-                let entry: AuditEntry = serde_json::from_str(text).map_err(|error| {
-                    AuditLogIntegrityError::ParseError {
-                        line: line + 1,
-                        detail: error.to_string(),
-                    }
-                })?;
-                if entry.request_id == request_id
+        let writer = self.lock_writer()?;
+        super::verify::verify_log_within(
+            writer.path(),
+            self.hmac_key.as_ref(),
+            writer.end_offset(),
+        )?;
+        for file in bounded_files(&writer, self.hmac_key.as_ref())? {
+            let found = file?.rows.iter().any(|(_, entry)| {
+                entry.request_id == request_id
                     && matches!(entry.event_kind, EventKind::ChannelPoolInitialised { .. })
-                {
-                    return Ok(true);
-                }
+            });
+            if found {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -560,159 +584,65 @@ impl AuditReader {
     /// strkey (`signer_set::account_digest`), which binds exactly one account
     /// on one network.
     ///
-    /// Every version-2 state row the scan parses, for any rule or account,
+    /// Every version-2 state row the scan reads, for any rule or account,
     /// must pass [`super::signer_set::SignerSetSnapshotV2::validate`]; a row
     /// that fails is a [`AuditLogIntegrityError::ParseError`] at its line,
     /// as a malformed JSON line is.
     ///
     /// # Scan semantics
     ///
-    /// The scan traverses: active file (newest entries last, all read) → rotated
-    /// files newest-first (oldest-timestamp sibling last). Within each file
-    /// entries are read first-to-last. The most-recent matching entry across the
-    /// full chain is returned. HMAC integrity is checked when `hmac_key` is set.
+    /// The scan reads the writer's bounded walk: the active file up to the
+    /// writer's verified tip, then rotated files newest-first, with
+    /// quarantined rows removed. Within each file entries are read
+    /// first-to-last. The most-recent matching entry across the chain is
+    /// returned. HMAC integrity is checked when `hmac_key` is set.
     ///
     /// # Returns
     ///
     /// - `Ok(Some(payload))`: matching row found; `payload.row_hash()` is the
     ///   SHA-256 of the canonical JSON body of the row (body with
-    ///   `previous_entry_hash = ""`), suitable for binding into
-    ///   `FrozenChainStateTuple`, and `payload.file()` / `payload.line()` name
-    ///   the row.
-    /// - `Ok(None)`: full rotated-chain traversal completed cleanly with no
-    ///   matching row (reserved for "no baseline"; never silently masks integrity
-    ///   errors).
+    ///   `previous_entry_hash = ""` and no entry tag), suitable for binding
+    ///   into `FrozenChainStateTuple`, and `payload.file()` /
+    ///   `payload.line()` name the row.
+    /// - `Ok(None)`: the walk completed cleanly with no matching row
+    ///   (reserved for "no baseline"; never silently masks integrity errors).
     ///
     /// # Errors
     ///
     /// - [`AuditLogIntegrityError::ChainBroken`] — hash chain break at a
-    ///   specific line (integrity violation, not a configuration error).
+    ///   specific line, or a broken bridge or tip (integrity violation, not a
+    ///   configuration error).
     /// - [`AuditLogIntegrityError::RotationGap`] — a rotated file in the chain
-    ///   is missing or the handoff entry names a non-existent file.
+    ///   is missing, or the active file is missing while archives exist.
     /// - [`AuditLogIntegrityError::HmacMismatch`] — chain-root HMAC tag did
     ///   not verify (only when `hmac_key` is `Some`).
     /// - [`AuditLogIntegrityError::HmacSidecarMissing`] — HMAC key provided
     ///   but per-file sidecar is absent (integrity violation).
-    /// - [`AuditLogIntegrityError::ParseError`] — a log line could not be
-    ///   parsed as an [`AuditEntry`], or a version-2 state row carries a
-    ///   malformed snapshot. Includes torn-tail scenarios where the active
-    ///   file's last line is incomplete (a truncated write produces an
-    ///   unparseable line).
-    /// - [`AuditLogIntegrityError::Io`] — ambient filesystem failure.
-    ///
-    /// # Errors
-    ///
-    /// In addition to the integrity errors listed above, returns
-    /// [`AuditLogIntegrityError::Io`] if the writer mutex is poisoned (a prior
-    /// writer thread panicked while holding the lock — the audit log is in an
-    /// unknown state; process restart is the only safe recovery). The Io error
-    /// message describes the lock-poisoned condition.
+    /// - [`AuditLogIntegrityError::ParseError`]: a log line inside the bound
+    ///   could not be parsed as an [`AuditEntry`], or a version-2 state row
+    ///   carries a malformed snapshot.
+    /// - [`AuditLogIntegrityError::Io`]: ambient filesystem failure, or a
+    ///   poisoned writer mutex (a prior writer thread panicked while holding
+    ///   the lock; process restart is the only safe recovery).
     pub fn find_latest_signer_set_view(
         &self,
         rule_id: u32,
         smart_account_redacted: &str,
         account_digest: &[u8; 32],
     ) -> Result<Option<SignerSetViewPayload>, AuditLogIntegrityError> {
-        // Acquire the writer mutex for the full duration of the scan.
-        // If the mutex is poisoned (a prior writer thread panicked), propagate
-        // as AuditLogIntegrityError::Io so callers get a structured typed error
-        // rather than an unhandled panic. The lock-poisoned condition means the
-        // audit-log in-memory state may be inconsistent; process restart is the
-        // recommended recovery.
-        // Promoted to an Io error: the reader may see a half-written state from
-        // the panicking writer, so silent recovery via `into_inner()` is unsound.
-        let writer_guard = self.writer.lock().map_err(|_| {
-            AuditLogIntegrityError::Io(std::io::Error::other(
-                "audit-log writer mutex is poisoned; a prior write path panicked \
-                 mid-write — audit-log integrity is unknown; restart the process",
-            ))
-        })?;
-
-        let log_path = writer_guard.path().to_path_buf();
-        let hmac_key = self.hmac_key.as_ref();
-
-        // Collect the file chain in scan order: active first, then rotated files
-        // newest-first. We reverse the verification order (verify.rs goes oldest
-        // first; we want newest-first so we can stop at the first match).
-        let files_newest_first = collect_files_newest_first(&log_path)?;
-
-        // Determine whether any rotated siblings exist. If the active file
-        // is absent AND rotated siblings are present, the log directory is in an
-        // inconsistent state (filesystem tampering / out-of-band deletion of the
-        // active file). Promote to RotationGap rather than silently falling
-        // through to rotated-sibling data as if it were the most-recent state.
-        let has_rotated_siblings = files_newest_first.len() > 1;
-
-        let mut best: Option<SignerSetViewPayload> = None;
-
-        for path in &files_newest_first {
-            if !path.exists() {
-                if *path == log_path {
-                    if has_rotated_siblings {
-                        // Active file is missing but rotated siblings exist.
-                        // This indicates filesystem tampering or an out-of-band
-                        // deletion: the writer always creates the active file on
-                        // open, so absence with siblings present is anomalous.
-                        // Promote to RotationGap so callers get a typed integrity
-                        // error rather than silently falling through to rotated data.
-                        return Err(AuditLogIntegrityError::RotationGap {
-                            file: log_path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("<active>")
-                                .to_owned(),
-                        });
-                    }
-                    // No rotated siblings: active file missing = empty log.
-                    // (Writer may not have written any entries yet.)
-                    continue;
-                }
-                return Err(AuditLogIntegrityError::RotationGap {
-                    file: path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("<unknown>")
-                        .to_owned(),
-                });
-            }
-
-            // Pass ZERO_BLOCK_HASH as the expected first-row
-            // `previous_entry_hash` only when the active file is the ONLY file
-            // in the chain (single-file wallet). For that case the first row's
-            // `previous_entry_hash` MUST equal ZERO_BLOCK_HASH; any other value
-            // means the row body was tampered after write.
-            //
-            // When rotated siblings exist, the cross-file handoff hash is
-            // `verify_log`'s responsibility; we pass `None` so the first-row
-            // check in `scan_file_for_signer_set` is skipped for those files.
-            let is_active = *path == log_path;
-            let expected_first_row_prev: Option<&str> = if is_active && !has_rotated_siblings {
-                Some(ZERO_BLOCK_HASH)
-            } else {
-                None
-            };
-            let file_result = scan_file_for_signer_set(
-                path,
-                SignerSetKey {
-                    rule_id,
-                    smart_account_redacted,
-                    account_digest,
-                },
-                hmac_key,
-                expected_first_row_prev,
-            )?;
-
-            if let Some(payload) = file_result {
-                // Keep the most-recent (latest row_hash from the latest file).
-                // Since we scan newest-file-first and within each file we read
-                // all entries and keep the last match, the first non-None result
-                // from any file is already the most-recent across the chain.
-                best = Some(payload);
-                break;
+        let writer = self.lock_writer()?;
+        let key = SignerSetKey {
+            rule_id,
+            smart_account_redacted,
+            account_digest,
+        };
+        for file in bounded_files(&writer, self.hmac_key.as_ref())? {
+            let file = file?;
+            if let Some(payload) = latest_signer_set_view(&file, key)? {
+                return Ok(Some(payload));
             }
         }
-
-        Ok(best)
+        Ok(None)
     }
 
     /// Scans the rotated chain for the rule's pin record: the most-recent
@@ -722,9 +652,10 @@ impl AuditReader {
     ///
     /// Used by `managers::verifiers::verify_pinned_verifier_against_chain` and
     /// `verify_pinned_policy_against_chain` to derive the audit-log-expected hash
-    /// at signing time. Only the newest matching row is the record: an
-    /// incomplete newest row is returned as such and never replaced by an
-    /// older row.
+    /// at signing time. Only the newest matching row inside the writer's
+    /// bound is the record: an incomplete newest row is returned as such and
+    /// never replaced by an older row, and a row past the writer's verified
+    /// tip or a quarantined row is never read.
     ///
     /// # Returns
     ///
@@ -752,74 +683,22 @@ impl AuditReader {
         rule_id: u32,
         smart_account_redacted: &str,
     ) -> Result<Option<ContextRulePinRecord>, AuditLogIntegrityError> {
-        let writer_guard = self.writer.lock().map_err(|_| {
-            AuditLogIntegrityError::Io(std::io::Error::other(
-                "audit-log writer mutex is poisoned; a prior write path panicked \
-                 mid-write — audit-log integrity is unknown; restart the process",
-            ))
-        })?;
-
-        let log_path = writer_guard.path().to_path_buf();
-        let hmac_key = self.hmac_key.as_ref();
-
-        let files_newest_first = collect_files_newest_first(&log_path)?;
-        let has_rotated_siblings = files_newest_first.len() > 1;
-
-        let mut best: Option<ContextRulePinRecord> = None;
-
-        for path in &files_newest_first {
-            if !path.exists() {
-                if *path == log_path {
-                    if has_rotated_siblings {
-                        return Err(AuditLogIntegrityError::RotationGap {
-                            file: log_path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("<active>")
-                                .to_owned(),
-                        });
-                    }
-                    continue;
-                }
-                return Err(AuditLogIntegrityError::RotationGap {
-                    file: path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("<unknown>")
-                        .to_owned(),
-                });
-            }
-
-            let is_active = *path == log_path;
-            let expected_first_row_prev: Option<&str> = if is_active && !has_rotated_siblings {
-                Some(ZERO_BLOCK_HASH)
-            } else {
-                None
-            };
-
-            let file_result = scan_file_for_context_rule_pins(
-                path,
-                rule_id,
-                smart_account_redacted,
-                hmac_key,
-                expected_first_row_prev,
-            )?;
-
-            if let Some(hashes) = file_result {
-                best = Some(hashes);
-                break;
+        let writer = self.lock_writer()?;
+        for file in bounded_files(&writer, self.hmac_key.as_ref())? {
+            let file = file?;
+            if let Some(record) = latest_pin_record(&file, rule_id, smart_account_redacted)? {
+                return Ok(Some(record));
             }
         }
-
-        Ok(best)
+        Ok(None)
     }
 
     /// Scans the full rotated chain and returns ALL pin records (the pin rows
     /// of both versions), deduplicated to the most-recent row per
     /// `(rule_id, smart_account_redacted)`.
     ///
-    /// Used by the startup advisory to identify every context rule referencing
-    /// a revoked or retired verifier wasm hash. Unlike
+    /// Reads the writer's bounded walk, so rows past the writer's verified tip
+    /// and quarantined rows are not part of the result. Unlike
     /// `find_latest_context_rule_pinned_hashes`, this method does NOT filter by
     /// a specific `(rule_id, smart_account_redacted)` pair — it collects ALL
     /// rules across the full log chain.
@@ -847,79 +726,14 @@ impl AuditReader {
     pub fn scan_all_context_rule_pin_records(
         &self,
     ) -> Result<Vec<(u32, String, ContextRulePinRecord)>, AuditLogIntegrityError> {
-        let writer_guard = self.writer.lock().map_err(|_| {
-            AuditLogIntegrityError::Io(std::io::Error::other(
-                "audit-log writer mutex is poisoned; a prior write path panicked \
-                 mid-write — audit-log integrity is unknown; restart the process",
-            ))
-        })?;
-
-        let log_path = writer_guard.path().to_path_buf();
-        let hmac_key = self.hmac_key.as_ref();
-
-        let files_newest_first = collect_files_newest_first(&log_path)?;
-        let has_rotated_siblings = files_newest_first.len() > 1;
-
-        // Collect all (rule_id, smart_account, record) tuples across all files.
-        // Files are scanned newest-first; within each file entries are collected
-        // in read order (oldest-to-newest). Use a HashMap to deduplicate to the
-        // most-recent row per (rule_id, smart_account) key.
-        let mut latest: std::collections::HashMap<(u32, String), ContextRulePinRecord> =
-            std::collections::HashMap::new();
-
-        for path in &files_newest_first {
-            if !path.exists() {
-                if *path == log_path {
-                    if has_rotated_siblings {
-                        return Err(AuditLogIntegrityError::RotationGap {
-                            file: log_path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("<active>")
-                                .to_owned(),
-                        });
-                    }
-                    continue;
-                }
-                return Err(AuditLogIntegrityError::RotationGap {
-                    file: path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("<unknown>")
-                        .to_owned(),
-                });
-            }
-
-            let is_active = *path == log_path;
-            let expected_first_row_prev: Option<&str> = if is_active && !has_rotated_siblings {
-                Some(ZERO_BLOCK_HASH)
-            } else {
-                None
-            };
-
-            let mut this_file: std::collections::HashMap<(u32, String), ContextRulePinRecord> =
-                std::collections::HashMap::new();
-            scan_file_for_all_pin_records(path, hmac_key, expected_first_row_prev, &mut this_file)?;
-            // Files are scanned newest-first; keep the first-seen (newest) row
-            // per key so a reinstall in a newer file wins over an older file's.
-            for (key, rec) in this_file {
-                latest.entry(key).or_insert(rec);
-            }
-        }
-
-        // Collect into a stable-ordered Vec (rule_id ascending for deterministic output).
-        let mut result: Vec<(u32, String, ContextRulePinRecord)> = latest
-            .into_iter()
-            .map(|((rid, sa), rec)| (rid, sa, rec))
-            .collect();
-        result.sort_by_key(|(rid, sa, _)| (*rid, sa.clone()));
-        Ok(result)
+        let writer = self.lock_writer()?;
+        all_pin_records(bounded_files(&writer, self.hmac_key.as_ref())?)
     }
 
     /// Returns the set of context-rule IDs that the local audit log records as
     /// installed on `sa_address_redacted` but NOT subsequently deleted.
     ///
-    /// Scans the full rotated chain for all `SaContextRuleCreated` and
+    /// Reads the writer's bounded walk for all `SaContextRuleCreated` and
     /// `SaContextRuleCreatedV2` rows whose `smart_account` field matches
     /// `sa_address_redacted`, then subtracts any
     /// `rule_id` that also has a matching `SaContextRuleDeleted` row for the
@@ -947,66 +761,34 @@ impl AuditReader {
         &self,
         sa_address_redacted: &str,
     ) -> Result<Vec<u32>, AuditLogIntegrityError> {
-        let writer_guard = self.writer.lock().map_err(|_| {
-            AuditLogIntegrityError::Io(std::io::Error::other(
-                "audit-log writer mutex is poisoned; a prior write path panicked \
-                 mid-write — audit-log integrity is unknown; restart the process",
-            ))
-        })?;
-
-        let log_path = writer_guard.path().to_path_buf();
-        let hmac_key = self.hmac_key.as_ref();
-
-        let files_newest_first = collect_files_newest_first(&log_path)?;
-        let has_rotated_siblings = files_newest_first.len() > 1;
-
-        // created_ids: set of rule IDs seen in SaContextRuleCreated rows.
-        // deleted_ids: set of rule IDs seen in SaContextRuleDeleted rows.
-        // Both are collected across all files; newest-file-first order does not
-        // matter here because we do a set-difference at the end.
+        let writer = self.lock_writer()?;
         let mut created_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut deleted_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-
-        for path in &files_newest_first {
-            if !path.exists() {
-                if *path == log_path {
-                    if has_rotated_siblings {
-                        return Err(AuditLogIntegrityError::RotationGap {
-                            file: log_path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("<active>")
-                                .to_owned(),
-                        });
+        for file in bounded_files(&writer, self.hmac_key.as_ref())? {
+            for (_, entry) in &file?.rows {
+                match &entry.event_kind {
+                    EventKind::SaContextRuleCreated {
+                        rule_id,
+                        smart_account,
+                        ..
                     }
-                    continue;
+                    | EventKind::SaContextRuleCreatedV2 {
+                        rule_id,
+                        smart_account,
+                        ..
+                    } if smart_account == sa_address_redacted => {
+                        created_ids.insert(*rule_id);
+                    }
+                    EventKind::SaContextRuleDeleted {
+                        rule_id,
+                        smart_account,
+                    } if smart_account == sa_address_redacted => {
+                        deleted_ids.insert(*rule_id);
+                    }
+                    _ => {}
                 }
-                return Err(AuditLogIntegrityError::RotationGap {
-                    file: path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("<unknown>")
-                        .to_owned(),
-                });
             }
-
-            let is_active = *path == log_path;
-            let expected_first_row_prev: Option<&str> = if is_active && !has_rotated_siblings {
-                Some(ZERO_BLOCK_HASH)
-            } else {
-                None
-            };
-
-            scan_file_for_context_rule_lifecycle(
-                path,
-                sa_address_redacted,
-                hmac_key,
-                expected_first_row_prev,
-                &mut created_ids,
-                &mut deleted_ids,
-            )?;
         }
-
         // Live = created - deleted.
         let mut live: Vec<u32> = created_ids.difference(&deleted_ids).copied().collect();
         live.sort_unstable();
@@ -1019,7 +801,7 @@ impl AuditReader {
     ///
     /// A "pending" operation is one that has a `SaTimelockScheduled` row but
     /// no corresponding `SaTimelockCancelled` or `SaTimelockExecuted` row with
-    /// the same `operation_id_full_hex`.
+    /// the same `operation_id_full_hex`, inside the writer's bounded walk.
     ///
     /// The `timelock_contract_strkey` parameter is matched against the
     /// `timelock_contract_redacted` field in each row. Because the audit log
@@ -1041,76 +823,114 @@ impl AuditReader {
         &self,
         timelock_contract_redacted: &str,
     ) -> Result<Vec<(String, String, String)>, AuditLogIntegrityError> {
-        let writer_guard = self.writer.lock().map_err(|_| {
-            AuditLogIntegrityError::Io(std::io::Error::other(
-                "audit-log writer mutex is poisoned; a prior write path panicked \
-                 mid-write — audit-log integrity is unknown; restart the process",
-            ))
-        })?;
-
-        let log_path = writer_guard.path().to_path_buf();
-        let hmac_key = self.hmac_key.as_ref();
-
-        let files_newest_first = collect_files_newest_first(&log_path)?;
-        let has_rotated_siblings = files_newest_first.len() > 1;
-
+        let writer = self.lock_writer()?;
         // scheduled_ops: map from operation_id_full_hex → (request_id, timelock_redacted).
-        // cancelled_or_executed: set of operation_id_full_hex that have been
-        // cancelled or executed.
+        // cancelled_or_executed: operation ids that have been cancelled or
+        // executed.
         let mut scheduled_ops: std::collections::HashMap<String, (String, String)> =
             std::collections::HashMap::new();
         let mut cancelled_or_executed: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-
-        for path in &files_newest_first {
-            if !path.exists() {
-                if *path == log_path {
-                    if has_rotated_siblings {
-                        return Err(AuditLogIntegrityError::RotationGap {
-                            file: log_path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("<active>")
-                                .to_owned(),
-                        });
+        for file in bounded_files(&writer, self.hmac_key.as_ref())? {
+            for (_, entry) in &file?.rows {
+                match &entry.event_kind {
+                    EventKind::SaTimelockScheduled {
+                        operation_id_full_hex,
+                        timelock_contract_redacted: tl_redacted,
+                        audit_request_id,
+                        ..
+                    } if tl_redacted.as_str() == timelock_contract_redacted => {
+                        scheduled_ops
+                            .entry(operation_id_full_hex.clone())
+                            .or_insert_with(|| {
+                                (audit_request_id.clone(), tl_redacted.as_str().to_owned())
+                            });
                     }
-                    continue;
+                    // Cancel and execute rows carry `operation_id_full_hex`,
+                    // so dedupe uses the exact 64-hex match instead of the
+                    // redacted form.
+                    EventKind::SaTimelockCancelled {
+                        operation_id_full_hex,
+                        timelock_contract_redacted: tl_redacted,
+                        ..
+                    }
+                    | EventKind::SaTimelockExecuted {
+                        operation_id_full_hex,
+                        timelock_contract_redacted: tl_redacted,
+                        ..
+                    } if tl_redacted.as_str() == timelock_contract_redacted => {
+                        scheduled_ops.remove(operation_id_full_hex.as_str());
+                        cancelled_or_executed.insert(operation_id_full_hex.clone());
+                    }
+                    _ => {}
                 }
-                return Err(AuditLogIntegrityError::RotationGap {
-                    file: path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("<unknown>")
-                        .to_owned(),
-                });
             }
-
-            let is_active = *path == log_path;
-            let expected_first_row_prev: Option<&str> = if is_active && !has_rotated_siblings {
-                Some(ZERO_BLOCK_HASH)
-            } else {
-                None
-            };
-
-            scan_file_for_timelock_operations(
-                path,
-                timelock_contract_redacted,
-                hmac_key,
-                expected_first_row_prev,
-                &mut scheduled_ops,
-                &mut cancelled_or_executed,
-            )?;
         }
-
         // Pending = scheduled - (cancelled ∪ executed).
         let pending: Vec<(String, String, String)> = scheduled_ops
             .into_iter()
             .filter(|(op_id, _)| !cancelled_or_executed.contains(op_id))
             .map(|(op_id, (request_id, tl_redacted))| (op_id, request_id, tl_redacted))
             .collect();
-
         Ok(pending)
     }
+}
+
+/// Collects every pin record of `files`, deduplicated to the newest row per
+/// `(rule_id, smart_account_redacted)` and sorted by that key.
+///
+/// Files come newest first; within a file the last row of a key wins, and
+/// across files the newest file's.
+fn all_pin_records(
+    files: BoundedFiles<'_>,
+) -> Result<Vec<(u32, String, ContextRulePinRecord)>, AuditLogIntegrityError> {
+    let mut latest: std::collections::HashMap<(u32, String), ContextRulePinRecord> =
+        std::collections::HashMap::new();
+    for file in files {
+        let file = file?;
+        let mut this_file: std::collections::HashMap<(u32, String), ContextRulePinRecord> =
+            std::collections::HashMap::new();
+        for (line, entry) in &file.rows {
+            if let Some(row) = PinRow::from_event_kind(&entry.event_kind) {
+                this_file.insert(
+                    (row.rule_id, row.smart_account.to_owned()),
+                    row.record(*line)?,
+                );
+            }
+        }
+        // Keep the first-seen (newest) row per key, so a reinstall in a newer
+        // file wins over an older file's.
+        for (key, record) in this_file {
+            latest.entry(key).or_insert(record);
+        }
+    }
+    let mut result: Vec<(u32, String, ContextRulePinRecord)> = latest
+        .into_iter()
+        .map(|((rule_id, account), record)| (rule_id, account, record))
+        .collect();
+    result.sort_by_key(|(rule_id, account, _)| (*rule_id, account.clone()));
+    Ok(result)
+}
+
+/// Every pin record of the log at `log_path`, as
+/// [`AuditReader::scan_all_context_rule_pin_records`] returns them, read
+/// without a writer and without its bound.
+///
+/// Takes no lock: it serves the startup advisory when no writer can be
+/// opened, for example on a keyed log whose key did not load, and its result
+/// feeds operator-facing warnings only. Each file's in-file chain, the bridge
+/// between consecutive files, and quarantine rows are applied; rows past the
+/// last verified tip are read like every other row, since there is no writer
+/// to name that tip.
+///
+/// # Errors
+///
+/// The integrity errors of the reader's walk: `ChainBroken`, `RotationGap`,
+/// `ParseError`, `Io`.
+pub fn scan_all_context_rule_pin_records_unanchored(
+    log_path: &Path,
+) -> Result<Vec<(u32, String, ContextRulePinRecord)>, AuditLogIntegrityError> {
+    all_pin_records(unbounded_files(log_path)?)
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -1201,208 +1021,380 @@ fn scan_files_newest_first(log_path: &Path) -> Result<Vec<PathBuf>, AuditLogInte
     Ok(chain)
 }
 
-/// Scans a single log file for the most-recent signer-set row matching
-/// `(rule_id, smart_account_redacted)`.
+// ── Bounded walk ─────────────────────────────────────────────────────────────
+
+/// [`AuditLogIntegrityError::ChainBroken`] reason for a file whose last entry
+/// is not the entry the next newer file chains from, or whose first entry
+/// does not chain from the segment start the writer holds.
+const BRIDGE_MISMATCH_REASON: &str = "bridge_mismatch";
+
+/// [`AuditLogIntegrityError::ChainBroken`] reason for an active file whose
+/// last entry inside the bound is not the writer's tip.
+const TIP_MISMATCH_REASON: &str = "tip_mismatch";
+
+/// One file of a reader walk, newest file first.
+struct BoundedFile {
+    /// The file's basename.
+    name: String,
+    /// The file's entries inside the walk's bound, oldest first, with their
+    /// one-based lines, and without the entries an `audit_entries_quarantined`
+    /// row covers.
+    rows: Vec<(usize, AuditEntry)>,
+}
+
+/// What the writer verified about the active file: where it ends, what its
+/// first entry chains from, and its last entry's hash.
+struct WriterBound {
+    end_offset: u64,
+    segment_start: String,
+    last_hash: String,
+}
+
+/// The files of one log, newest first, read and checked one at a time.
 ///
-/// Reads the file line-by-line. ALL lines must parse cleanly (parse errors
-/// propagate as `AuditLogIntegrityError::ParseError`). Empty lines are skipped.
-/// Returns the LAST (most-recent within this file) matching row's
-/// `SignerSetStatePayload`.
+/// Built by [`bounded_files`] under a writer guard, or by
+/// [`unbounded_files`] without one. Each item is one file's rows; the first
+/// error ends the walk.
+struct BoundedFiles<'k> {
+    log_path: PathBuf,
+    files: std::vec::IntoIter<PathBuf>,
+    has_rotated: bool,
+    bound: Option<WriterBound>,
+    hmac_key: Option<&'k [u8; 32]>,
+    /// The hash the next older file must end on, once a newer file named it.
+    expected_tip: Option<String>,
+    failed: bool,
+}
+
+/// The writer-bounded walk of the log `writer` holds, under the caller's guard
+/// of that writer.
 ///
-/// # Hash-chain verification
+/// The active file is read only up to [`AuditWriter::end_offset`]. Its first
+/// entry must chain from the segment start the writer holds and its last
+/// entry inside the bound must hash to [`AuditWriter::last_entry_hash`]; an
+/// empty bound must have the segment start as the writer's tip. Each archive's
+/// in-file chain must verify, and its last entry must hash to the
+/// `previous_entry_hash` of the first entry of the next newer file, or to the
+/// segment start when the active file is empty. A broken link is
+/// [`AuditLogIntegrityError::ChainBroken`] with reason `bridge_mismatch` or
+/// `tip_mismatch`. Rows an `audit_entries_quarantined` row inside the bound
+/// covers are dropped. No key is read; `hmac_key` checks each file's
+/// chain-root sidecar when given.
 ///
-/// The reader verifies the within-file `previous_entry_hash` chain for every
-/// row. At row N (N ≥ 1) the entry's stored `previous_entry_hash` is compared
-/// against the `current_hash` computed from the prior row's canonical body. A
-/// mismatch returns `AuditLogIntegrityError::ChainBroken` — it MUST NOT be
-/// silently reinterpreted as `Ok(None)`.
+/// # Errors
 ///
-/// When `expected_first_row_prev` is `Some(hash)`, the FIRST row's
-/// `previous_entry_hash` is additionally validated to equal `hash`. The caller
-/// passes `Some(ZERO_BLOCK_HASH)` when the active file is the only file in the
-/// chain (single-file wallet, `files_newest_first.len() == 1`). This closes the
-/// fresh-wallet baseline tampering gap: an attacker who rewrites only the first
-/// (and only) row's body cannot escape detection, because the row's stored
-/// `previous_entry_hash` must still equal `ZERO_BLOCK_HASH` — any deviation
-/// returns `ChainBroken`.
+/// [`AuditLogIntegrityError::PathContract`] and the listing errors of the
+/// file walk.
+fn bounded_files<'k>(
+    writer: &AuditWriter,
+    hmac_key: Option<&'k [u8; 32]>,
+) -> Result<BoundedFiles<'k>, AuditLogIntegrityError> {
+    let bound = WriterBound {
+        end_offset: writer.end_offset(),
+        segment_start: super::chain::encode_hash(writer.segment_start_hash()),
+        last_hash: writer.last_entry_hash().to_owned(),
+    };
+    walk_files(writer.path(), Some(bound), hmac_key)
+}
+
+/// The walk of the log at `log_path` without a writer: the whole active file
+/// is read, and no tip is checked. Chains, bridges and quarantine rows apply
+/// as in [`bounded_files`].
 ///
-/// When `expected_first_row_prev` is `None` (rotated files or multi-file chains),
-/// the first-row check is skipped. The cross-file handoff hash is `verify_log`'s
-/// responsibility; the reader's added value is catching intra-file tampering
-/// (row 2 onward) without a full chain walk.
+/// # Errors
 ///
-/// When `hmac_key` is `Some`, the chain-root HMAC sidecar is verified on the
-/// first entry of each file to confirm chain-root authenticity.
+/// [`AuditLogIntegrityError::PathContract`] and the listing errors of the
+/// file walk.
+fn unbounded_files(log_path: &Path) -> Result<BoundedFiles<'static>, AuditLogIntegrityError> {
+    walk_files(log_path, None, None)
+}
+
+fn walk_files<'k>(
+    log_path: &Path,
+    bound: Option<WriterBound>,
+    hmac_key: Option<&'k [u8; 32]>,
+) -> Result<BoundedFiles<'k>, AuditLogIntegrityError> {
+    let files = collect_files_newest_first(log_path)?;
+    Ok(BoundedFiles {
+        log_path: log_path.to_path_buf(),
+        has_rotated: files.len() > 1,
+        files: files.into_iter(),
+        bound,
+        hmac_key,
+        expected_tip: None,
+        failed: false,
+    })
+}
+
+impl Iterator for BoundedFiles<'_> {
+    type Item = Result<BoundedFile, AuditLogIntegrityError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        let path = self.files.next()?;
+        let result = if path == self.log_path {
+            self.read_active(&path)
+        } else {
+            self.read_archive(&path)
+        };
+        self.failed = result.is_err();
+        Some(result)
+    }
+}
+
+impl BoundedFiles<'_> {
+    /// Reads the active file, the first item of every walk.
+    fn read_active(&mut self, path: &Path) -> Result<BoundedFile, AuditLogIntegrityError> {
+        let name = basename(path);
+        if !path.exists() {
+            // A writer always creates the active file, so its absence beside
+            // archives is a gap, never permission to read archived rows as the
+            // newest state.
+            if self.has_rotated {
+                return Err(AuditLogIntegrityError::RotationGap { file: name });
+            }
+            if let Some(bound) = &self.bound
+                && (bound.end_offset != 0 || bound.last_hash != bound.segment_start)
+            {
+                return Err(chain_broken(&name, 1, TIP_MISMATCH_REASON));
+            }
+            return Ok(BoundedFile {
+                name,
+                rows: Vec::new(),
+            });
+        }
+        let limit = self.bound.as_ref().map(|bound| bound.end_offset);
+        let first_prev = match &self.bound {
+            Some(bound) => Some(bound.segment_start.clone()),
+            None if !self.has_rotated => Some(ZERO_BLOCK_HASH.to_owned()),
+            None => None,
+        };
+        let read = read_file_rows(path, limit, first_prev.as_deref(), self.hmac_key)?;
+        if let Some(bound) = &self.bound {
+            let tip = read.last_hash.as_deref().unwrap_or(&bound.segment_start);
+            if tip != bound.last_hash {
+                return Err(chain_broken(&name, read.last_line, TIP_MISMATCH_REASON));
+            }
+        }
+        self.expected_tip = match (&read.first_prev, &self.bound) {
+            (Some(first_prev), _) => Some(first_prev.clone()),
+            (None, Some(bound)) => Some(bound.segment_start.clone()),
+            (None, None) => None,
+        };
+        Ok(BoundedFile {
+            name,
+            rows: drop_quarantined(read.rows),
+        })
+    }
+
+    /// Reads one archive, checking that it ends where the next newer file
+    /// starts.
+    fn read_archive(&mut self, path: &Path) -> Result<BoundedFile, AuditLogIntegrityError> {
+        let name = basename(path);
+        if !path.exists() {
+            return Err(AuditLogIntegrityError::RotationGap { file: name });
+        }
+        let read = read_file_rows(path, None, None, self.hmac_key)?;
+        if let Some(expected) = &self.expected_tip
+            && read.last_hash.as_deref() != Some(expected.as_str())
+        {
+            return Err(chain_broken(&name, read.last_line, BRIDGE_MISMATCH_REASON));
+        }
+        self.expected_tip = read.first_prev.clone();
+        Ok(BoundedFile {
+            name,
+            rows: drop_quarantined(read.rows),
+        })
+    }
+}
+
+/// One file's entries as read, before quarantine filtering.
+#[derive(Debug)]
+struct FileRows {
+    rows: Vec<(usize, AuditEntry)>,
+    /// The first entry's `previous_entry_hash`.
+    first_prev: Option<String>,
+    /// The last entry's chain hash.
+    last_hash: Option<String>,
+    /// The last entry's one-based line, or 1 for a file with no entry.
+    last_line: usize,
+}
+
+/// Reads the entries of `path`, up to `limit` bytes when given, verifying the
+/// in-file chain: every entry after the first names the hash of the entry
+/// before it, and the first names `first_prev` when given. With `hmac_key`,
+/// the first entry's chain-root sidecar must verify.
 ///
-/// # EOF handling
-///
-/// Both active and rotated files apply the same parse-error propagation rule.
-/// `BufReader::lines` yields incomplete trailing lines (from a mid-write crash)
-/// as non-empty strings; if the last line does not parse as valid JSON it is a
-/// `ParseError`. There is no leniency difference between active and rotated files.
-fn scan_file_for_signer_set(
+/// A `limit` is where the writer's last entry ends, just past its newline, so
+/// bytes there that do not end a line show the file changed inside the bound:
+/// [`AuditLogIntegrityError::ChainBroken`] with reason `tip_mismatch`.
+fn read_file_rows(
     path: &Path,
-    key: SignerSetKey<'_>,
+    limit: Option<u64>,
+    first_prev: Option<&str>,
     hmac_key: Option<&[u8; 32]>,
-    expected_first_row_prev: Option<&str>,
-) -> Result<Option<SignerSetViewPayload>, AuditLogIntegrityError> {
-    use super::chain::verify_chain_root;
-    use super::writer::hmac_sidecar_path;
+) -> Result<FileRows, AuditLogIntegrityError> {
+    use std::io::Read as _;
 
+    let name = basename(path);
     let file = open_regular_file(path)?;
-    let reader = BufReader::new(file);
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_owned();
-
-    let mut best: Option<SignerSetViewPayload> = None;
-    let mut is_first_entry = true;
-    // Thread the hash computed from each row into the next row's chain check.
-    // Starts as `None` until the first row is parsed; from row 2 onward this
-    // holds the `current_hash` of the preceding row.
-    let mut prev_computed_hash: Option<String> = None;
-
-    for (line_index, line_result) in reader.lines().enumerate() {
-        let line = line_result.map_err(AuditLogIntegrityError::Io)?;
-        let line_number = line_index + 1;
-
-        if line.trim().is_empty() {
+    let mut reader = BufReader::new(file.take(limit.unwrap_or(u64::MAX)));
+    let mut rows = Vec::new();
+    let mut expected_prev = first_prev.map(str::to_owned);
+    let mut first = None;
+    let mut last_hash = None;
+    let mut last_line = 1;
+    let mut raw = Vec::new();
+    let mut line_number = 0usize;
+    loop {
+        raw.clear();
+        if reader
+            .read_until(b'\n', &mut raw)
+            .map_err(AuditLogIntegrityError::Io)?
+            == 0
+        {
+            break;
+        }
+        line_number += 1;
+        if limit.is_some() && raw.last() != Some(&b'\n') {
+            return Err(chain_broken(&name, line_number, TIP_MISMATCH_REASON));
+        }
+        if raw.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-
-        // Parse error means a torn write or corrupted entry. MUST propagate;
-        // never reinterpret as Ok(None).
+        let parse_error = |detail: String| AuditLogIntegrityError::ParseError {
+            line: line_number,
+            detail,
+        };
         let entry: AuditEntry =
-            serde_json::from_str(&line).map_err(|e| AuditLogIntegrityError::ParseError {
-                line: line_number,
-                detail: e.to_string(),
-            })?;
+            serde_json::from_slice(&raw).map_err(|e| parse_error(e.to_string()))?;
+        let body = entry
+            .canonical_json_body()
+            .map_err(|e| parse_error(e.to_string()))?;
+        if first.is_none() {
+            if let Some(key) = hmac_key {
+                super::verify::verify_root_sidecar(path, key, &body)?;
+            }
+            first = Some(entry.previous_entry_hash.clone());
+        }
+        if let Some(expected) = &expected_prev
+            && entry.previous_entry_hash != *expected
+        {
+            let reason = if rows.is_empty() {
+                BRIDGE_MISMATCH_REASON
+            } else {
+                "previous_entry_hash mismatch"
+            };
+            return Err(chain_broken(&name, line_number, reason));
+        }
+        let hash = compute_entry_hash(&body, &entry.previous_entry_hash)
+            .map_err(|e| parse_error(format!("chain hash computation failed: {e}")))?;
+        expected_prev = Some(hash.clone());
+        last_hash = Some(hash);
+        last_line = line_number;
+        rows.push((line_number, entry));
+    }
+    Ok(FileRows {
+        rows,
+        first_prev: first,
+        last_hash,
+        last_line,
+    })
+}
 
-        // A version-2 snapshot that breaks its structural rules is refused
-        // like an unparseable line, for every rule and account, so every
-        // reader of the file sees the same verdict.
+/// Drops the entries the `audit_entries_quarantined` rows of one file cover,
+/// as [`super::verify::quarantine_coverage`] decides it: a quarantine row
+/// covers the entries directly before it only when no later quarantine row
+/// that takes effect covers it.
+fn drop_quarantined(rows: Vec<(usize, AuditEntry)>) -> Vec<(usize, AuditEntry)> {
+    let quarantine: Vec<Option<u64>> = rows
+        .iter()
+        .map(|(_, entry)| match entry.event_kind {
+            EventKind::AuditEntriesQuarantined { quarantined_count } => Some(quarantined_count),
+            _ => None,
+        })
+        .collect();
+    let covered = super::verify::quarantine_coverage(&quarantine);
+    rows.into_iter()
+        .zip(covered)
+        .filter_map(|(row, covered)| (!covered).then_some(row))
+        .collect()
+}
+
+/// The basename of `path`, or an empty string.
+fn basename(path: &Path) -> String {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn chain_broken(file: &str, line: usize, reason: &'static str) -> AuditLogIntegrityError {
+    AuditLogIntegrityError::ChainBroken {
+        line,
+        file: file.to_owned(),
+        reason,
+    }
+}
+
+/// The newest signer-set state row of `file` matching `key`.
+///
+/// Every version-2 snapshot in the file must validate, for every rule and
+/// account, so every reader of the file sees the same verdict.
+fn latest_signer_set_view(
+    file: &BoundedFile,
+    key: SignerSetKey<'_>,
+) -> Result<Option<SignerSetViewPayload>, AuditLogIntegrityError> {
+    let mut best = None;
+    for (line, entry) in &file.rows {
         if let Some(snapshot) = v2_snapshot(&entry.event_kind)
             && let Err(e) = snapshot.validate()
         {
             return Err(AuditLogIntegrityError::ParseError {
-                line: line_number,
+                line: *line,
                 detail: e.to_string(),
             });
         }
-
-        // Verify chain-root HMAC on the first entry of each file when a key is
-        // provided. This authenticates the chain root without a full chain walk,
-        // sufficient for the reader's narrower integrity scope.
-        if is_first_entry {
-            if let Some(key) = hmac_key {
-                let body = entry.canonical_json_body().map_err(|e| {
-                    AuditLogIntegrityError::ParseError {
-                        line: line_number,
-                        detail: e.to_string(),
-                    }
-                })?;
-                let sidecar = hmac_sidecar_path(path);
-                if sidecar.exists() {
-                    let tag =
-                        std::fs::read_to_string(&sidecar).map_err(AuditLogIntegrityError::Io)?;
-                    verify_chain_root(key, &body, tag.trim()).map_err(|_| {
-                        AuditLogIntegrityError::HmacMismatch {
-                            file: path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("")
-                                .to_owned(),
-                        }
-                    })?;
-                } else {
-                    return Err(AuditLogIntegrityError::HmacSidecarMissing {
-                        file: path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_owned(),
-                    });
-                }
-            }
-            // First-row `previous_entry_hash` must equal the expected predecessor
-            // hash when the caller provides one.  The caller passes
-            // `Some(ZERO_BLOCK_HASH)` for single-file chains (active file is the
-            // only file); this closes the fresh-wallet tamper gap where an
-            // attacker rewrites the single row's `previous_entry_hash` field and
-            // the chain-only primitive has no row-2 check to catch it.  Row 1's
-            // check is performed here when `expected_first_row_prev` is `Some(_)`
-            // (single-file-chain case); otherwise the cross-file handoff hash
-            // check is deferred to `verify_log`.
-            if let Some(expected_prev) = expected_first_row_prev
-                && entry.previous_entry_hash != expected_prev
-            {
-                return Err(AuditLogIntegrityError::ChainBroken {
-                    line: line_number,
-                    file: path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    reason: "first row previous_entry_hash mismatch \
-                             (expected ZERO_BLOCK_HASH for single-file chain)",
-                });
-            }
-            is_first_entry = false;
-        }
-
-        // Compute SHA-256 of the canonical body (body-only, without prev hash)
-        // for the row_hash TOCTOU anchor AND for the chain-link computation.
-        let body = entry
-            .canonical_json_body()
-            .map_err(|e| AuditLogIntegrityError::ParseError {
-                line: line_number,
-                detail: e.to_string(),
-            })?;
-        let row_hash: [u8; 32] = Sha256::digest(&body).into();
-
-        // Chain-hash verification. From row 2 onward: verify the entry's stored
-        // `previous_entry_hash` matches the `current_hash` computed from the
-        // preceding row's body.
-        // Row 1's `previous_entry_hash` check is performed above (lines
-        // 452-467) when `expected_first_row_prev` is `Some(_)` (single-file-
-        // chain case); otherwise the cross-file handoff hash check is deferred
-        // to `verify_log`.
-        if let Some(ref expected_hash) = prev_computed_hash
-            && entry.previous_entry_hash != *expected_hash
-        {
-            return Err(AuditLogIntegrityError::ChainBroken {
-                line: line_number,
-                file: path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_owned(),
-                reason: "previous_entry_hash mismatch",
-            });
-        }
-
-        // Compute the current entry's chain hash for the next row's check.
-        let current_hash = compute_entry_hash(&body, &entry.previous_entry_hash).map_err(|e| {
-            AuditLogIntegrityError::ParseError {
-                line: line_number,
-                detail: format!("chain hash computation failed: {e}"),
-            }
-        })?;
-        prev_computed_hash = Some(current_hash);
-
-        // Check if this entry is a signer-set state row for our target.
         if let Some(view) = extract_signer_set_view(&entry.event_kind, key) {
+            let body =
+                entry
+                    .canonical_json_body()
+                    .map_err(|e| AuditLogIntegrityError::ParseError {
+                        line: *line,
+                        detail: e.to_string(),
+                    })?;
+            let row_hash: [u8; 32] = Sha256::digest(&body).into();
             best = Some(SignerSetViewPayload::new(
                 view,
                 row_hash,
-                line_number,
-                file_name.clone(),
+                *line,
+                file.name.clone(),
             ));
         }
     }
+    Ok(best)
+}
 
+/// The pin record of the newest pin row of `file` for
+/// `(rule_id, smart_account_redacted)`, of either version.
+fn latest_pin_record(
+    file: &BoundedFile,
+    rule_id: u32,
+    smart_account_redacted: &str,
+) -> Result<Option<ContextRulePinRecord>, AuditLogIntegrityError> {
+    let mut best = None;
+    for (line, entry) in &file.rows {
+        // The file is read oldest to newest, so the last match is the newest
+        // record.
+        if let Some(row) = PinRow::from_event_kind(&entry.event_kind)
+            && row.rule_id == rule_id
+            && row.smart_account == smart_account_redacted
+        {
+            best = Some(row.record(*line)?);
+        }
+    }
     Ok(best)
 }
 
@@ -1557,594 +1549,6 @@ fn open_regular_file(path: &Path) -> Result<std::fs::File, AuditLogIntegrityErro
     std::fs::File::open(path).map_err(AuditLogIntegrityError::Io)
 }
 
-/// Scans a single log file for the most-recent pin row of either version
-/// matching `(rule_id, smart_account_redacted)`.
-///
-/// Mirrors `scan_file_for_signer_set` structurally: reads all entries with full
-/// hash-chain integrity verification, then returns the pin record of the LAST
-/// matching entry of either kind.
-///
-/// # Integrity contract
-///
-/// Chain-hash verification applies identically to `scan_file_for_signer_set`.
-/// Parse errors and chain-breaks propagate; `Ok(None)` means clean traversal
-/// with no match.
-///
-/// # Return
-///
-/// `Ok(Some(ContextRulePinRecord))` on match;
-/// `Ok(None)` if no pin row matches the filter.
-fn scan_file_for_context_rule_pins(
-    path: &Path,
-    rule_id: u32,
-    smart_account_redacted: &str,
-    hmac_key: Option<&[u8; 32]>,
-    expected_first_row_prev: Option<&str>,
-) -> Result<Option<ContextRulePinRecord>, AuditLogIntegrityError> {
-    use super::chain::verify_chain_root;
-    use super::writer::hmac_sidecar_path;
-
-    let file = open_regular_file(path)?;
-    let reader = BufReader::new(file);
-
-    let mut best: Option<ContextRulePinRecord> = None;
-    let mut is_first_entry = true;
-    let mut prev_computed_hash: Option<String> = None;
-
-    for (line_index, line_result) in reader.lines().enumerate() {
-        let line = line_result.map_err(AuditLogIntegrityError::Io)?;
-        let line_number = line_index + 1;
-
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let entry: AuditEntry =
-            serde_json::from_str(&line).map_err(|e| AuditLogIntegrityError::ParseError {
-                line: line_number,
-                detail: e.to_string(),
-            })?;
-
-        if is_first_entry {
-            if let Some(key) = hmac_key {
-                let body = entry.canonical_json_body().map_err(|e| {
-                    AuditLogIntegrityError::ParseError {
-                        line: line_number,
-                        detail: e.to_string(),
-                    }
-                })?;
-                let sidecar = hmac_sidecar_path(path);
-                if sidecar.exists() {
-                    let tag =
-                        std::fs::read_to_string(&sidecar).map_err(AuditLogIntegrityError::Io)?;
-                    verify_chain_root(key, &body, tag.trim()).map_err(|_| {
-                        AuditLogIntegrityError::HmacMismatch {
-                            file: path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("")
-                                .to_owned(),
-                        }
-                    })?;
-                } else {
-                    return Err(AuditLogIntegrityError::HmacSidecarMissing {
-                        file: path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_owned(),
-                    });
-                }
-            }
-            if let Some(expected_prev) = expected_first_row_prev
-                && entry.previous_entry_hash != expected_prev
-            {
-                return Err(AuditLogIntegrityError::ChainBroken {
-                    line: line_number,
-                    file: path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    reason: "first row previous_entry_hash mismatch \
-                             (expected ZERO_BLOCK_HASH for single-file chain)",
-                });
-            }
-            is_first_entry = false;
-        }
-
-        let body = entry
-            .canonical_json_body()
-            .map_err(|e| AuditLogIntegrityError::ParseError {
-                line: line_number,
-                detail: e.to_string(),
-            })?;
-
-        if let Some(ref expected_hash) = prev_computed_hash
-            && entry.previous_entry_hash != *expected_hash
-        {
-            return Err(AuditLogIntegrityError::ChainBroken {
-                line: line_number,
-                file: path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_owned(),
-                reason: "previous_entry_hash mismatch",
-            });
-        }
-
-        let current_hash = compute_entry_hash(&body, &entry.previous_entry_hash).map_err(|e| {
-            AuditLogIntegrityError::ParseError {
-                line: line_number,
-                detail: format!("chain hash computation failed: {e}"),
-            }
-        })?;
-        prev_computed_hash = Some(current_hash);
-
-        // A pin-record row for our target replaces any earlier one: the file
-        // is read oldest to newest, so the last match is the newest record.
-        if let Some(row) = PinRow::from_event_kind(&entry.event_kind)
-            && row.rule_id == rule_id
-            && row.smart_account == smart_account_redacted
-        {
-            best = Some(row.record(line_number)?);
-        }
-    }
-
-    Ok(best)
-}
-
-/// Scans a single log file and inserts/updates `(rule_id, smart_account_redacted)`
-/// → [`ContextRulePinRecord`] entries in `out` for every pin row of either
-/// version found.
-///
-/// Mirrors `scan_file_for_context_rule_pins` structurally but collects ALL
-/// pin-record rows instead of filtering by `(rule_id, smart_account)`.
-/// Each invocation overwrites any existing entry for the same key, preserving
-/// "most-recent wins" semantics when this function is called file-by-file
-/// (newest-file-first) — newer files overwrite older files' entries.
-///
-/// # Integrity contract
-///
-/// Chain-hash verification applies identically to `scan_file_for_context_rule_pins`.
-/// Parse errors and chain-breaks propagate; `Ok(())` means the file was fully
-/// traversed cleanly.
-fn scan_file_for_all_pin_records(
-    path: &Path,
-    hmac_key: Option<&[u8; 32]>,
-    expected_first_row_prev: Option<&str>,
-    out: &mut std::collections::HashMap<(u32, String), ContextRulePinRecord>,
-) -> Result<(), AuditLogIntegrityError> {
-    use super::chain::verify_chain_root;
-    use super::writer::hmac_sidecar_path;
-
-    let file = open_regular_file(path)?;
-    let reader = BufReader::new(file);
-
-    let mut is_first_entry = true;
-    let mut prev_computed_hash: Option<String> = None;
-
-    for (line_index, line_result) in reader.lines().enumerate() {
-        let line = line_result.map_err(AuditLogIntegrityError::Io)?;
-        let line_number = line_index + 1;
-
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let entry: AuditEntry =
-            serde_json::from_str(&line).map_err(|e| AuditLogIntegrityError::ParseError {
-                line: line_number,
-                detail: e.to_string(),
-            })?;
-
-        if is_first_entry {
-            if let Some(key) = hmac_key {
-                let body = entry.canonical_json_body().map_err(|e| {
-                    AuditLogIntegrityError::ParseError {
-                        line: line_number,
-                        detail: e.to_string(),
-                    }
-                })?;
-                let sidecar = hmac_sidecar_path(path);
-                if sidecar.exists() {
-                    let tag =
-                        std::fs::read_to_string(&sidecar).map_err(AuditLogIntegrityError::Io)?;
-                    verify_chain_root(key, &body, tag.trim()).map_err(|_| {
-                        AuditLogIntegrityError::HmacMismatch {
-                            file: path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("")
-                                .to_owned(),
-                        }
-                    })?;
-                } else {
-                    return Err(AuditLogIntegrityError::HmacSidecarMissing {
-                        file: path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_owned(),
-                    });
-                }
-            }
-            if let Some(expected_prev) = expected_first_row_prev
-                && entry.previous_entry_hash != expected_prev
-            {
-                return Err(AuditLogIntegrityError::ChainBroken {
-                    line: line_number,
-                    file: path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    reason: "first row previous_entry_hash mismatch \
-                             (expected ZERO_BLOCK_HASH for single-file chain)",
-                });
-            }
-            is_first_entry = false;
-        }
-
-        let body = entry
-            .canonical_json_body()
-            .map_err(|e| AuditLogIntegrityError::ParseError {
-                line: line_number,
-                detail: e.to_string(),
-            })?;
-
-        if let Some(ref expected_hash) = prev_computed_hash
-            && entry.previous_entry_hash != *expected_hash
-        {
-            return Err(AuditLogIntegrityError::ChainBroken {
-                line: line_number,
-                file: path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_owned(),
-                reason: "previous_entry_hash mismatch",
-            });
-        }
-
-        let current_hash = compute_entry_hash(&body, &entry.previous_entry_hash).map_err(|e| {
-            AuditLogIntegrityError::ParseError {
-                line: line_number,
-                detail: format!("chain hash computation failed: {e}"),
-            }
-        })?;
-        prev_computed_hash = Some(current_hash);
-
-        // Collect every pin-record row; overwrite on duplicate key to keep
-        // the most-recent record per (rule_id, smart_account).
-        if let Some(row) = PinRow::from_event_kind(&entry.event_kind) {
-            out.insert(
-                (row.rule_id, row.smart_account.to_owned()),
-                row.record(line_number)?,
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// Scans a single log file for `SaContextRuleCreated`, `SaContextRuleCreatedV2`
-/// and `SaContextRuleDeleted` rows matching `sa_address_redacted`, inserting
-/// rule IDs into the provided
-/// `created_ids` and `deleted_ids` sets.
-///
-/// Used by [`AuditReader::find_installed_context_rule_ids`] to determine which
-/// rule IDs the audit log believes are currently installed on a smart account.
-///
-/// Verifies the hash chain for every row in the file (same discipline as
-/// `scan_file_for_context_rule_pins`). Integrity errors propagate and MUST NOT
-/// be masked as empty sets.
-fn scan_file_for_context_rule_lifecycle(
-    path: &Path,
-    sa_address_redacted: &str,
-    hmac_key: Option<&[u8; 32]>,
-    expected_first_row_prev: Option<&str>,
-    created_ids: &mut std::collections::HashSet<u32>,
-    deleted_ids: &mut std::collections::HashSet<u32>,
-) -> Result<(), AuditLogIntegrityError> {
-    use super::chain::verify_chain_root;
-    use super::writer::hmac_sidecar_path;
-
-    let file = open_regular_file(path)?;
-    let reader = BufReader::new(file);
-
-    let mut is_first_entry = true;
-    let mut prev_computed_hash: Option<String> = None;
-
-    for (line_index, line_result) in reader.lines().enumerate() {
-        let line = line_result.map_err(AuditLogIntegrityError::Io)?;
-        let line_number = line_index + 1;
-
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let entry: AuditEntry =
-            serde_json::from_str(&line).map_err(|e| AuditLogIntegrityError::ParseError {
-                line: line_number,
-                detail: e.to_string(),
-            })?;
-
-        if is_first_entry {
-            // HMAC chain-root verification (same discipline as
-            // scan_file_for_context_rule_pins).
-            if let Some(key) = hmac_key {
-                let body = entry.canonical_json_body().map_err(|e| {
-                    AuditLogIntegrityError::ParseError {
-                        line: line_number,
-                        detail: e.to_string(),
-                    }
-                })?;
-                let sidecar = hmac_sidecar_path(path);
-                if sidecar.exists() {
-                    let tag =
-                        std::fs::read_to_string(&sidecar).map_err(AuditLogIntegrityError::Io)?;
-                    verify_chain_root(key, &body, tag.trim()).map_err(|_| {
-                        AuditLogIntegrityError::HmacMismatch {
-                            file: path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("")
-                                .to_owned(),
-                        }
-                    })?;
-                } else {
-                    return Err(AuditLogIntegrityError::HmacSidecarMissing {
-                        file: path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_owned(),
-                    });
-                }
-            }
-            // First-row previous_entry_hash check (single-file chain).
-            if let Some(expected) = expected_first_row_prev
-                && entry.previous_entry_hash != expected
-            {
-                return Err(AuditLogIntegrityError::ChainBroken {
-                    line: line_number,
-                    file: path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    reason: "first row previous_entry_hash mismatch \
-                             (expected ZERO_BLOCK_HASH for single-file chain)",
-                });
-            }
-            is_first_entry = false;
-        }
-
-        let body = entry
-            .canonical_json_body()
-            .map_err(|e| AuditLogIntegrityError::ParseError {
-                line: line_number,
-                detail: e.to_string(),
-            })?;
-
-        if let Some(ref expected_hash) = prev_computed_hash
-            && entry.previous_entry_hash != *expected_hash
-        {
-            return Err(AuditLogIntegrityError::ChainBroken {
-                line: line_number,
-                file: path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_owned(),
-                reason: "previous_entry_hash mismatch",
-            });
-        }
-
-        let current_hash = compute_entry_hash(&body, &entry.previous_entry_hash).map_err(|e| {
-            AuditLogIntegrityError::ParseError {
-                line: line_number,
-                detail: format!("chain hash computation failed: {e}"),
-            }
-        })?;
-        prev_computed_hash = Some(current_hash);
-
-        // Collect the creation rows of both versions for the target smart
-        // account.
-        if let EventKind::SaContextRuleCreated {
-            rule_id: rid,
-            smart_account: sa,
-            ..
-        }
-        | EventKind::SaContextRuleCreatedV2 {
-            rule_id: rid,
-            smart_account: sa,
-            ..
-        } = &entry.event_kind
-            && sa == sa_address_redacted
-        {
-            created_ids.insert(*rid);
-        }
-
-        // Collect SaContextRuleDeleted rows for the target smart account.
-        if let EventKind::SaContextRuleDeleted {
-            rule_id: rid,
-            smart_account: sa,
-        } = &entry.event_kind
-            && sa == sa_address_redacted
-        {
-            deleted_ids.insert(*rid);
-        }
-    }
-
-    Ok(())
-}
-
-/// Scans a single log file for timelock scheduled / cancelled / executed rows
-/// matching the given `timelock_contract_redacted`, accumulating them into the
-/// caller-owned maps.
-///
-/// # Chain integrity
-///
-/// The within-file `previous_entry_hash` chain is verified for every row,
-/// following the same discipline as [`scan_file_for_context_rule_lifecycle`].
-fn scan_file_for_timelock_operations(
-    path: &Path,
-    timelock_contract_redacted: &str,
-    hmac_key: Option<&[u8; 32]>,
-    expected_first_row_prev: Option<&str>,
-    scheduled_ops: &mut std::collections::HashMap<String, (String, String)>,
-    cancelled_or_executed: &mut std::collections::HashSet<String>,
-) -> Result<(), AuditLogIntegrityError> {
-    use super::chain::verify_chain_root;
-    use super::writer::hmac_sidecar_path;
-    use crate::audit_log::schema::EventKind;
-
-    let file = open_regular_file(path)?;
-    let reader = BufReader::new(file);
-
-    let mut is_first_entry = true;
-    let mut prev_computed_hash: Option<String> = None;
-
-    for (line_index, line_result) in reader.lines().enumerate() {
-        let line = line_result.map_err(AuditLogIntegrityError::Io)?;
-        let line_number = line_index + 1;
-
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let entry: AuditEntry =
-            serde_json::from_str(&line).map_err(|e| AuditLogIntegrityError::ParseError {
-                line: line_number,
-                detail: e.to_string(),
-            })?;
-
-        if is_first_entry {
-            if let Some(key) = hmac_key {
-                let body = entry.canonical_json_body().map_err(|e| {
-                    AuditLogIntegrityError::ParseError {
-                        line: line_number,
-                        detail: e.to_string(),
-                    }
-                })?;
-                let sidecar = hmac_sidecar_path(path);
-                if sidecar.exists() {
-                    let tag =
-                        std::fs::read_to_string(&sidecar).map_err(AuditLogIntegrityError::Io)?;
-                    verify_chain_root(key, &body, tag.trim()).map_err(|_| {
-                        AuditLogIntegrityError::HmacMismatch {
-                            file: path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("")
-                                .to_owned(),
-                        }
-                    })?;
-                } else {
-                    return Err(AuditLogIntegrityError::HmacSidecarMissing {
-                        file: path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_owned(),
-                    });
-                }
-            }
-            if let Some(expected) = expected_first_row_prev
-                && entry.previous_entry_hash != expected
-            {
-                return Err(AuditLogIntegrityError::ChainBroken {
-                    line: line_number,
-                    file: path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_owned(),
-                    reason: "first row previous_entry_hash mismatch \
-                             (expected ZERO_BLOCK_HASH for single-file chain)",
-                });
-            }
-            is_first_entry = false;
-        }
-
-        let body = entry
-            .canonical_json_body()
-            .map_err(|e| AuditLogIntegrityError::ParseError {
-                line: line_number,
-                detail: e.to_string(),
-            })?;
-
-        if let Some(ref expected_hash) = prev_computed_hash
-            && entry.previous_entry_hash != *expected_hash
-        {
-            return Err(AuditLogIntegrityError::ChainBroken {
-                line: line_number,
-                file: path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_owned(),
-                reason: "previous_entry_hash mismatch",
-            });
-        }
-
-        let current_hash = compute_entry_hash(&body, &entry.previous_entry_hash).map_err(|e| {
-            AuditLogIntegrityError::ParseError {
-                line: line_number,
-                detail: format!("chain hash computation failed: {e}"),
-            }
-        })?;
-        prev_computed_hash = Some(current_hash);
-
-        // Match SaTimelockScheduled for the target timelock contract.
-        if let EventKind::SaTimelockScheduled {
-            operation_id_full_hex,
-            timelock_contract_redacted: tl_redacted,
-            audit_request_id,
-            ..
-        } = &entry.event_kind
-            && tl_redacted.as_str() == timelock_contract_redacted
-        {
-            scheduled_ops
-                .entry(operation_id_full_hex.clone())
-                .or_insert_with(|| (audit_request_id.clone(), tl_redacted.as_str().to_owned()));
-        }
-
-        // Match SaTimelockCancelled for the target timelock contract.
-        // `SaTimelockCancelled` carries `operation_id_full_hex`, so dedupe uses
-        // the exact 64-hex match instead of the redacted form, eliminating the
-        // 64-bit collision surface.
-        if let EventKind::SaTimelockCancelled {
-            operation_id_full_hex,
-            timelock_contract_redacted: tl_redacted,
-            ..
-        } = &entry.event_kind
-            && tl_redacted.as_str() == timelock_contract_redacted
-        {
-            scheduled_ops.remove(operation_id_full_hex.as_str());
-            cancelled_or_executed.insert(operation_id_full_hex.clone());
-        }
-
-        // Match SaTimelockExecuted for the target timelock contract.
-        // Exact `operation_id_full_hex` match (same rationale as Cancelled above).
-        if let EventKind::SaTimelockExecuted {
-            operation_id_full_hex,
-            timelock_contract_redacted: tl_redacted,
-            ..
-        } = &entry.event_kind
-            && tl_redacted.as_str() == timelock_contract_redacted
-        {
-            scheduled_ops.remove(operation_id_full_hex.as_str());
-            cancelled_or_executed.insert(operation_id_full_hex.clone());
-        }
-    }
-
-    Ok(())
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Pending value-action lookup
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2211,27 +1615,27 @@ pub enum ValueActionSettlement {
 /// walk stops at the first file holding a match, leaving older files
 /// unvisited. The last match in that file wins.
 ///
-/// Each visited file's in-file chain is verified forward; in a log with no
-/// archives the first row must also chain from the zero hash. No HMAC or
-/// cross-file check runs, and the lookup acquires no writer lock.
+/// `writer` is the caller's guard of the profile's writer, held across the
+/// lookup and the append that follows it. The lookup reads the writer's
+/// bounded walk: the active file only up to the writer's verified tip, each
+/// archive bridged to the file after it, and quarantined rows dropped. A row
+/// appended outside the writer, past that tip, is never read. No key is read
+/// and no chain-root sidecar is checked.
 ///
-/// Two limits follow from that read. The eleventh rotation deletes the oldest
-/// archive, so a submission whose rows only that archive held reads as
-/// [`ValueActionSettlement::OwedWithoutLegs`]. Without a writer guard held by the
-/// caller, two reconciliations of one hash can both find
-/// [`ValueActionSettlement::Owed`]. A concurrent in-process append can also rotate
-/// the log between the file listing and the scan, renaming the matched file out
-/// of the walk.
+/// The eleventh rotation deletes the oldest archive, so a submission whose
+/// rows only that archive held reads as
+/// [`ValueActionSettlement::OwedWithoutLegs`].
 ///
 /// # Errors
 ///
-/// Returns a read, parse, rotation-gap, or in-file chain integrity error.
+/// Returns a read, parse, rotation-gap, in-file chain, bridge, or tip
+/// integrity error.
 pub fn try_value_action_settlement(
-    log_path: &Path,
+    writer: &AuditWriter,
     envelope_hash: &str,
 ) -> Result<ValueActionSettlement, AuditLogIntegrityError> {
     Ok(
-        find_latest_value_row(log_path, envelope_hash, |entry| match entry.event_kind {
+        find_latest_value_row(writer, envelope_hash, |entry| match &entry.event_kind {
             EventKind::ValueActionSubmitted { .. } | EventKind::ValueActionFailed { .. } => {
                 Some(ValueActionSettlement::Settled)
             }
@@ -2241,13 +1645,13 @@ pub fn try_value_action_settlement(
                 approval_nonce,
                 ..
             } => Some(ValueActionSettlement::Owed(PendingValueAction {
-                witness,
-                legs,
-                tool: entry.tool,
-                chain_id: entry.chain_id,
-                nonce_id: entry.nonce_id,
-                policy_decision: entry.policy_decision,
-                approval_nonce,
+                witness: witness.clone(),
+                legs: legs.clone(),
+                tool: entry.tool.clone(),
+                chain_id: entry.chain_id.clone(),
+                nonce_id: entry.nonce_id.clone(),
+                policy_decision: entry.policy_decision.clone(),
+                approval_nonce: approval_nonce.clone(),
             })),
             _ => None,
         })?
@@ -2265,112 +1669,47 @@ pub fn try_value_action_settlement(
 /// second row for one clear. This lookup is what makes the re-run complete the
 /// mark instead.
 ///
-/// The walk and its limits are those of [`try_value_action_settlement`], with
-/// a `submission_receipt_cleared` row as the only match.
+/// The walk, the writer guard and the limits are those of
+/// [`try_value_action_settlement`], with a `submission_receipt_cleared` row as
+/// the only match.
 ///
 /// # Errors
 ///
-/// Returns a read, parse, rotation-gap, or in-file chain integrity error.
+/// Returns a read, parse, rotation-gap, in-file chain, bridge, or tip
+/// integrity error.
 pub fn try_submission_receipt_cleared_exists(
-    log_path: &Path,
+    writer: &AuditWriter,
     envelope_hash: &str,
 ) -> Result<bool, AuditLogIntegrityError> {
-    Ok(find_latest_value_row(log_path, envelope_hash, |entry| {
+    Ok(find_latest_value_row(writer, envelope_hash, |entry| {
         matches!(entry.event_kind, EventKind::SubmissionReceiptCleared { .. }).then_some(())
     })?
     .is_some())
 }
 
-/// Walks the retained history newest file first and returns what `select`
+/// Walks the writer's bounded files newest first and returns what `select`
 /// maps from the last matching row of the first file that holds one.
 ///
 /// A missing active file is an empty log only while no archive exists. With
 /// archives it is a rotation gap, so archived rows never stand in for the
-/// active file. A log with no archives is the whole chain, so its first row
-/// must name the zero hash as its predecessor.
+/// active file.
 fn find_latest_value_row<T>(
-    log_path: &Path,
+    writer: &AuditWriter,
     envelope_hash: &str,
-    select: impl Fn(AuditEntry) -> Option<T>,
+    select: impl Fn(&AuditEntry) -> Option<T>,
 ) -> Result<Option<T>, AuditLogIntegrityError> {
-    let files = collect_files_newest_first(log_path)?;
-    let expected_first_prev = (files.len() == 1).then_some(ZERO_BLOCK_HASH);
-    for path in &files {
-        if !path.exists() {
-            if path == log_path && files.len() == 1 {
-                continue;
-            }
-            return Err(AuditLogIntegrityError::RotationGap {
-                file: path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-            });
-        }
-        if let Some(found) =
-            scan_file_for_value_row(path, envelope_hash, &select, expected_first_prev)?
-        {
-            return Ok(Some(found));
+    for file in bounded_files(writer, None)? {
+        let found = file?
+            .rows
+            .iter()
+            .rev()
+            .filter(|(_, entry)| entry.envelope_hash.as_deref() == Some(envelope_hash))
+            .find_map(|(_, entry)| select(entry));
+        if found.is_some() {
+            return Ok(found);
         }
     }
     Ok(None)
-}
-
-/// Scans one file forward and returns what `select` maps from the last row
-/// carrying `envelope_hash`.
-///
-/// Every row after the first must name the hash of the row before it, and the
-/// first row must name `expected_first_prev` when the caller supplies one. The
-/// whole file is read even after a match, so a break after the match still
-/// refuses.
-fn scan_file_for_value_row<T>(
-    path: &Path,
-    envelope_hash: &str,
-    select: &impl Fn(AuditEntry) -> Option<T>,
-    expected_first_prev: Option<&str>,
-) -> Result<Option<T>, AuditLogIntegrityError> {
-    let reader = BufReader::new(open_regular_file(path)?);
-    let mut previous = expected_first_prev.map(str::to_owned);
-    let mut best = None;
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.map_err(AuditLogIntegrityError::Io)?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let parse_error = |error: String| AuditLogIntegrityError::ParseError {
-            line: index + 1,
-            detail: error,
-        };
-        let entry: AuditEntry =
-            serde_json::from_str(&line).map_err(|error| parse_error(error.to_string()))?;
-        if let Some(expected) = &previous
-            && entry.previous_entry_hash != *expected
-        {
-            return Err(AuditLogIntegrityError::ChainBroken {
-                line: index + 1,
-                file: path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-                reason: "previous_entry_hash mismatch",
-            });
-        }
-        let body = entry
-            .canonical_json_body()
-            .map_err(|error| parse_error(error.to_string()))?;
-        previous = Some(
-            compute_entry_hash(&body, &entry.previous_entry_hash)
-                .map_err(|error| parse_error(error.to_string()))?,
-        );
-        if entry.envelope_hash.as_deref() == Some(envelope_hash)
-            && let Some(found) = select(entry)
-        {
-            best = Some(found);
-        }
-    }
-    Ok(best)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2468,7 +1807,7 @@ mod tests {
             .unwrap();
 
         let ValueActionSettlement::Owed(found) =
-            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap()
+            try_value_action_settlement(&writer.lock().unwrap(), SETTLE_ENVELOPE).unwrap()
         else {
             panic!("a pending row with no settled row is owed one");
         };
@@ -2493,7 +1832,7 @@ mod tests {
         }
 
         assert_eq!(
-            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
+            try_value_action_settlement(&writer.lock().unwrap(), SETTLE_ENVELOPE).unwrap(),
             ValueActionSettlement::Settled,
             "a submission already accounted for is owed no second row"
         );
@@ -2512,15 +1851,16 @@ mod tests {
             guard.write_entry(submitted_row(OTHER_ENVELOPE)).unwrap();
         }
 
+        let guard = writer.lock().unwrap();
         assert!(
             matches!(
-                try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
+                try_value_action_settlement(&guard, SETTLE_ENVELOPE).unwrap(),
                 ValueActionSettlement::Owed(_)
             ),
             "the settled row names a different submission"
         );
         assert_eq!(
-            try_value_action_settlement(&path, OTHER_ENVELOPE).unwrap(),
+            try_value_action_settlement(&guard, OTHER_ENVELOPE).unwrap(),
             ValueActionSettlement::Settled
         );
     }
@@ -2538,7 +1878,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
+            try_value_action_settlement(&writer.lock().unwrap(), SETTLE_ENVELOPE).unwrap(),
             ValueActionSettlement::OwedWithoutLegs
         );
     }
@@ -2566,7 +1906,7 @@ mod tests {
         guard.force_rotate_for_test().unwrap();
         guard.write_entry(cleared_row()).unwrap();
         let ValueActionSettlement::Owed(found) =
-            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap()
+            try_value_action_settlement(&guard, SETTLE_ENVELOPE).unwrap()
         else {
             panic!("the archived pending row is still owed with its legs");
         };
@@ -2585,7 +1925,7 @@ mod tests {
         guard.force_rotate_for_test().unwrap();
         guard.write_entry(cleared_row()).unwrap();
         assert_eq!(
-            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
+            try_value_action_settlement(&guard, SETTLE_ENVELOPE).unwrap(),
             ValueActionSettlement::Settled
         );
     }
@@ -2597,9 +1937,9 @@ mod tests {
         let writer = open_writer(path.clone());
         let mut guard = writer.lock().unwrap();
         guard.write_entry(cleared_row()).unwrap();
-        assert!(try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE).unwrap());
+        assert!(try_submission_receipt_cleared_exists(&guard, SETTLE_ENVELOPE).unwrap());
         guard.force_rotate_for_test().unwrap();
-        assert!(try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE).unwrap());
+        assert!(try_submission_receipt_cleared_exists(&guard, SETTLE_ENVELOPE).unwrap());
     }
 
     #[test]
@@ -2624,11 +1964,11 @@ mod tests {
             .collect::<String>();
         std::fs::write(&archive, changed).unwrap();
         assert!(matches!(
-            try_value_action_settlement(&path, SETTLE_ENVELOPE),
+            try_value_action_settlement(&guard, SETTLE_ENVELOPE),
             Err(AuditLogIntegrityError::ChainBroken { line: 3, .. })
         ));
         assert!(matches!(
-            try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE),
+            try_submission_receipt_cleared_exists(&guard, SETTLE_ENVELOPE),
             Err(AuditLogIntegrityError::ChainBroken { line: 3, .. })
         ));
     }
@@ -2643,11 +1983,11 @@ mod tests {
         guard.force_rotate_for_test().unwrap();
         std::fs::remove_file(&path).unwrap();
         assert!(matches!(
-            try_value_action_settlement(&path, SETTLE_ENVELOPE),
+            try_value_action_settlement(&guard, SETTLE_ENVELOPE),
             Err(AuditLogIntegrityError::RotationGap { .. })
         ));
         assert!(matches!(
-            try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE),
+            try_submission_receipt_cleared_exists(&guard, SETTLE_ENVELOPE),
             Err(AuditLogIntegrityError::RotationGap { .. })
         ));
     }
@@ -2665,40 +2005,42 @@ mod tests {
         let archive = collect_files_newest_first(&path).unwrap().remove(1);
         std::fs::write(&archive, "corrupt\n").unwrap();
         assert_eq!(
-            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
+            try_value_action_settlement(&guard, SETTLE_ENVELOPE).unwrap(),
             ValueActionSettlement::Settled
         );
-        assert!(try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE).unwrap());
+        assert!(try_submission_receipt_cleared_exists(&guard, SETTLE_ENVELOPE).unwrap());
     }
 
-    /// A one-file log whose only row names `predecessor`.
-    fn one_row_log(row: AuditEntry, predecessor: &str) -> (TempDir, PathBuf) {
+    /// A one-file log whose only row names `predecessor`, rewritten in place
+    /// under the writer that appended it.
+    fn one_row_log(
+        row: AuditEntry,
+        predecessor: &str,
+    ) -> (TempDir, PathBuf, Arc<Mutex<AuditWriter>>) {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
-        open_writer(path.clone())
-            .lock()
-            .unwrap()
-            .write_entry(row)
-            .unwrap();
+        let writer = open_writer(path.clone());
+        writer.lock().unwrap().write_entry(row).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         let mut entry: AuditEntry = serde_json::from_str(written.trim()).unwrap();
         entry.previous_entry_hash = predecessor.to_owned();
         std::fs::write(&path, serde_json::to_string(&entry).unwrap() + "\n").unwrap();
-        (dir, path)
+        (dir, path, writer)
     }
 
     /// The only row of a log with no archives is the root of the whole chain,
     /// so a settled row that names any predecessor but the zero hash refuses.
     #[test]
     fn a_lone_settled_row_with_a_nonzero_predecessor_refuses_the_settlement_lookup() {
-        let (_root, rooted) = one_row_log(submitted_row(SETTLE_ENVELOPE), ZERO_BLOCK_HASH);
+        let (_root, _rooted, root_writer) =
+            one_row_log(submitted_row(SETTLE_ENVELOPE), ZERO_BLOCK_HASH);
         assert_eq!(
-            try_value_action_settlement(&rooted, SETTLE_ENVELOPE).unwrap(),
+            try_value_action_settlement(&root_writer.lock().unwrap(), SETTLE_ENVELOPE).unwrap(),
             ValueActionSettlement::Settled
         );
-        let (_dir, path) = one_row_log(submitted_row(SETTLE_ENVELOPE), &"1".repeat(64));
+        let (_dir, _path, writer) = one_row_log(submitted_row(SETTLE_ENVELOPE), &"1".repeat(64));
         assert!(matches!(
-            try_value_action_settlement(&path, SETTLE_ENVELOPE),
+            try_value_action_settlement(&writer.lock().unwrap(), SETTLE_ENVELOPE),
             Err(AuditLogIntegrityError::ChainBroken { line: 1, .. })
         ));
     }
@@ -2706,11 +2048,14 @@ mod tests {
     /// The clear lookup applies the same root rule as the settlement lookup.
     #[test]
     fn a_lone_cleared_row_with_a_nonzero_predecessor_refuses_the_clear_lookup() {
-        let (_root, rooted) = one_row_log(cleared_row(), ZERO_BLOCK_HASH);
-        assert!(try_submission_receipt_cleared_exists(&rooted, SETTLE_ENVELOPE).unwrap());
-        let (_dir, path) = one_row_log(cleared_row(), &"1".repeat(64));
+        let (_root, _rooted, root_writer) = one_row_log(cleared_row(), ZERO_BLOCK_HASH);
+        assert!(
+            try_submission_receipt_cleared_exists(&root_writer.lock().unwrap(), SETTLE_ENVELOPE)
+                .unwrap()
+        );
+        let (_dir, _path, writer) = one_row_log(cleared_row(), &"1".repeat(64));
         assert!(matches!(
-            try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE),
+            try_submission_receipt_cleared_exists(&writer.lock().unwrap(), SETTLE_ENVELOPE),
             Err(AuditLogIntegrityError::ChainBroken { line: 1, .. })
         ));
     }
@@ -2726,9 +2071,9 @@ mod tests {
         guard.write_entry(pending_row(SETTLE_ENVELOPE)).unwrap();
         guard.force_rotate_for_test().unwrap();
         guard.write_entry(submitted_row(SETTLE_ENVELOPE)).unwrap();
-        assert!(!try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE).unwrap());
+        assert!(!try_submission_receipt_cleared_exists(&guard, SETTLE_ENVELOPE).unwrap());
         assert_eq!(
-            try_value_action_settlement(&path, OTHER_ENVELOPE).unwrap(),
+            try_value_action_settlement(&guard, OTHER_ENVELOPE).unwrap(),
             ValueActionSettlement::OwedWithoutLegs
         );
     }
@@ -2749,17 +2094,17 @@ mod tests {
         guard.force_rotate_for_test().unwrap();
         guard.write_entry(pending_row(OTHER_ENVELOPE)).unwrap();
         assert_eq!(
-            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
+            try_value_action_settlement(&guard, SETTLE_ENVELOPE).unwrap(),
             ValueActionSettlement::Settled
         );
         let files = collect_files_newest_first(&path).unwrap();
         assert_eq!(files.len(), 3);
         std::fs::write(&files[2], "corrupt\n").unwrap();
         assert_eq!(
-            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
+            try_value_action_settlement(&guard, SETTLE_ENVELOPE).unwrap(),
             ValueActionSettlement::Settled
         );
-        assert!(try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE).unwrap());
+        assert!(try_submission_receipt_cleared_exists(&guard, SETTLE_ENVELOPE).unwrap());
     }
 
     /// A tool-invocation row carrying the hash is not a settlement row, so it
@@ -2783,7 +2128,7 @@ mod tests {
         invocation.envelope_hash = Some(SETTLE_ENVELOPE.to_owned());
         guard.write_entry(invocation).unwrap();
         let ValueActionSettlement::Owed(found) =
-            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap()
+            try_value_action_settlement(&guard, SETTLE_ENVELOPE).unwrap()
         else {
             panic!("the tool-invocation row must not settle the archived pending row");
         };
@@ -2816,10 +2161,10 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(
-            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
+            try_value_action_settlement(&guard, SETTLE_ENVELOPE).unwrap(),
             ValueActionSettlement::Settled
         );
-        assert!(try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE).unwrap());
+        assert!(try_submission_receipt_cleared_exists(&guard, SETTLE_ENVELOPE).unwrap());
     }
 
     /// A failed row is not an operator clear: with no clear row anywhere in
@@ -2849,10 +2194,10 @@ mod tests {
             .unwrap();
         assert_eq!(collect_files_newest_first(&path).unwrap().len(), 2);
         assert_eq!(
-            try_value_action_settlement(&path, SETTLE_ENVELOPE).unwrap(),
+            try_value_action_settlement(&guard, SETTLE_ENVELOPE).unwrap(),
             ValueActionSettlement::Settled
         );
-        assert!(!try_submission_receipt_cleared_exists(&path, SETTLE_ENVELOPE).unwrap());
+        assert!(!try_submission_receipt_cleared_exists(&guard, SETTLE_ENVELOPE).unwrap());
     }
 
     // ── Helper: build a SaSignerSetBaselined EventKind ────────────────────────
@@ -3028,7 +2373,7 @@ mod tests {
     // ── 4. Torn-tail returns integrity error not None ─────────────────────────
 
     #[test]
-    fn find_latest_signer_set_view_torn_tail_returns_parse_error_not_none() {
+    fn find_latest_signer_set_view_on_a_torn_tip_returns_tip_mismatch_not_none() {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
@@ -3068,14 +2413,17 @@ mod tests {
         let reader = AuditReader::new(Arc::clone(&writer), None);
         let result = reader.find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST);
 
-        // Must return an error, NOT Ok(None).
+        // Must return an error, NOT Ok(None): the writer's last entry no
+        // longer ends where the writer wrote it.
         assert!(
             result.is_err(),
             "torn tail must return Err, not Ok(None): {result:?}"
         );
         match result.unwrap_err() {
-            AuditLogIntegrityError::ParseError { .. } => {}
-            other => panic!("expected ParseError, got: {other:?}"),
+            AuditLogIntegrityError::ChainBroken {
+                line: 1, reason, ..
+            } if reason == TIP_MISMATCH_REASON => {}
+            other => panic!("expected ChainBroken with tip_mismatch, got: {other:?}"),
         }
     }
 
@@ -3163,6 +2511,7 @@ mod tests {
                 AuditLogIntegrityError::PartialRotation { .. } => "audit.partial_rotation",
                 AuditLogIntegrityError::TipAnchorMismatch { .. } => "audit.tip_anchor_mismatch",
                 AuditLogIntegrityError::TipAnchorMissing { .. } => "audit.tip_anchor_missing",
+                AuditLogIntegrityError::EntryTagInvalid { .. } => "audit.entry_tag_invalid",
             }
         }
 
@@ -3219,6 +2568,11 @@ mod tests {
                 evidence: crate::audit_log::PriorAnchoring::BindingRecorded,
                 actual_count: 9,
                 actual_offset: 2600,
+            },
+            AuditLogIntegrityError::EntryTagInvalid {
+                file: "f".to_owned(),
+                line: 3,
+                reason: "missing",
             },
         ];
 
@@ -5378,39 +4732,9 @@ mod tests {
         // Create a dangling symlink at the log path.
         symlink(&target, &path).unwrap();
 
-        // scan_file_for_signer_set calls open_regular_file which rejects symlinks.
-        // We drive it through find_latest_signer_set_view. The writer is never
-        // opened on this path (path doesn't exist as a real file), so we construct
-        // the writer separately on a different path and then manually create a
-        // reader pointing at the symlink path.
-        let real_path = dir.path().join("real_audit.jsonl");
-        let writer = open_writer(real_path.clone());
-
-        // Write one entry via the real writer so we can swap the reader's path
-        // below. Actually we bypass the reader's path-from-writer by creating
-        // a symlink at the writer's own path — but the writer's path()
-        // always points to real_path. Instead, test open_regular_file directly
-        // through the internal function by constructing a temporary log file
-        // that IS real, then replacing it with a symlink after opening.
-        //
-        // Simplest approach: write one valid entry to real_path,
-        // then call scan_file_for_signer_set with the symlink path directly
-        // (it's a module-private function reachable from the test mod via super::*).
-        {
-            let mut w = writer.lock().unwrap();
-            write_event(&mut w, baselined_event(1, "CDABC...12345", 1, 1));
-        }
-
-        let result = scan_file_for_signer_set(
-            &path, // symlink to non-existent target
-            SignerSetKey {
-                rule_id: 1,
-                smart_account_redacted: "CDABC...12345",
-                account_digest: &NO_DIGEST,
-            },
-            None,
-            None,
-        );
+        // Every walk reads a file through `read_file_rows`, which opens it with
+        // `open_regular_file`; that open rejects the symlink.
+        let result = read_file_rows(&path, None, None, None);
 
         match result {
             Err(AuditLogIntegrityError::NonRegularFileLogPath { .. }) => {}
@@ -5852,5 +5176,711 @@ mod tests {
         assert_eq!(v2_state(&payload), &ed25519_snapshot(2, 2));
         assert_eq!(payload.file(), rotated[0]);
         assert_eq!(payload.line(), 2);
+    }
+    // ── bounded walk ─────────────────────────────────────────────────────
+
+    /// An entry carrying `kind`, as a smart-account verb writes it.
+    fn event_entry(kind: EventKind) -> AuditEntry {
+        let mut entry = AuditEntry::new_tool_invocation(NewToolInvocation::new(
+            "smart-account.forged",
+            Option::<String>::None,
+            vec![],
+            PolicyDecision::Allow,
+            uuid::Uuid::new_v4().to_string(),
+        ));
+        entry.event_kind = kind;
+        entry
+    }
+
+    /// Appends `entry` to `path` past the tip, chained and untagged, as a
+    /// process without the writer would.
+    fn forge(path: &Path, entry: AuditEntry) {
+        crate::audit_log::test_helpers::append_forged_entry(path, entry, |_| None);
+    }
+
+    fn failed_row(envelope_hash: &str) -> AuditEntry {
+        AuditEntry::new_value_action_failed(
+            "stellar_pay",
+            Some("stellar:testnet".to_owned()),
+            vec![],
+            "6ba7aaac...69060003",
+            "submission.failed",
+            PolicyDecision::Allow,
+            Some(envelope_hash.to_owned()),
+            None,
+            None,
+            "req-forged-failed",
+        )
+    }
+
+    /// A failed row appended past the writer's verified tip is not read: the
+    /// pending row stays owed. Inside the bound of a writer that replayed it,
+    /// the same row settles the submission.
+    #[test]
+    fn a_forged_failed_row_past_the_verified_tip_leaves_settlement_owed() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        writer
+            .lock()
+            .unwrap()
+            .write_entry(pending_row(SETTLE_ENVELOPE))
+            .unwrap();
+        forge(&path, failed_row(SETTLE_ENVELOPE));
+        assert!(matches!(
+            try_value_action_settlement(&writer.lock().unwrap(), SETTLE_ENVELOPE).unwrap(),
+            ValueActionSettlement::Owed(_)
+        ));
+        drop(writer);
+        let reopened = open_writer(path);
+        assert_eq!(
+            try_value_action_settlement(&reopened.lock().unwrap(), SETTLE_ENVELOPE).unwrap(),
+            ValueActionSettlement::Settled
+        );
+    }
+
+    /// The version-2 pin the writer wrote wins over a newer forged pin row
+    /// past the verified tip.
+    #[test]
+    fn a_forged_pin_row_past_the_verified_tip_is_ignored() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        write_event(
+            &mut writer.lock().unwrap(),
+            context_rule_created_event(1, "CDABC...12345", vec![h(0x11)], vec![], false, false),
+        );
+        forge(
+            &path,
+            event_entry(pins_updated_event(
+                1,
+                "CDABC...12345",
+                vec![h(0x22)],
+                vec![],
+                false,
+                false,
+                vec![],
+                crate::audit_log::schema::PinsUpdateReason::SignerAdded,
+            )),
+        );
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let record = complete(
+            reader
+                .find_latest_context_rule_pinned_hashes(1, "CDABC...12345")
+                .unwrap(),
+        );
+        assert_eq!(record.pinned_verifier_hashes, vec![h(0x11)]);
+    }
+
+    /// One forged row per scan, past the verified tip, leaves every result as
+    /// it was.
+    #[test]
+    fn every_reader_scan_stops_at_the_verified_tip() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        {
+            let mut guard = writer.lock().unwrap();
+            write_event(&mut guard, baselined_event(1, "CDABC...12345", 2, 2));
+            write_event(
+                &mut guard,
+                context_rule_created_event(1, "CDABC...12345", vec![h(0x11)], vec![], false, false),
+            );
+        }
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let op = "ab".repeat(32);
+        let signer_set = reader
+            .find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST)
+            .unwrap();
+        let all_pins = reader.scan_all_context_rule_pin_records().unwrap();
+        let rule_ids = reader
+            .find_installed_context_rule_ids("CDABC...12345")
+            .unwrap();
+        let timelock = reader
+            .find_pending_timelock_operations("CDTLK...54321")
+            .unwrap();
+        assert!(timelock.is_empty());
+        assert!(!reader.pool_initialization_exists("pool-forged").unwrap());
+        assert!(
+            !try_submission_receipt_cleared_exists(&writer.lock().unwrap(), SETTLE_ENVELOPE)
+                .unwrap()
+        );
+
+        forge(
+            &path,
+            event_entry(baselined_event(1, "CDABC...12345", 5, 3)),
+        );
+        forge(
+            &path,
+            event_entry(context_rule_created_event(
+                2,
+                "CDABC...12345",
+                vec![h(0x33)],
+                vec![],
+                false,
+                false,
+            )),
+        );
+        forge(
+            &path,
+            event_entry(timelock_scheduled_event(&op, "CDTLK...54321", "req-forged")),
+        );
+        let mut pool = AuditEntry::new_channel_pool_initialised(
+            "GFUND...FUNDR",
+            2,
+            "txhash...tail",
+            1,
+            "pool-forged",
+        );
+        pool.request_id = "pool-forged".to_owned();
+        forge(&path, pool);
+        forge(&path, cleared_row());
+
+        // Every scan reads the writer's bound, which ends before the forged rows.
+        let unchanged = || {
+            assert_eq!(
+                reader
+                    .find_latest_signer_set_view(1, "CDABC...12345", &NO_DIGEST)
+                    .unwrap(),
+                signer_set
+            );
+            assert_eq!(
+                reader.scan_all_context_rule_pin_records().unwrap(),
+                all_pins
+            );
+            assert_eq!(
+                reader
+                    .find_installed_context_rule_ids("CDABC...12345")
+                    .unwrap(),
+                rule_ids
+            );
+            assert!(
+                reader
+                    .find_pending_timelock_operations("CDTLK...54321")
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(!reader.pool_initialization_exists("pool-forged").unwrap());
+            assert!(
+                !try_submission_receipt_cleared_exists(&writer.lock().unwrap(), SETTLE_ENVELOPE)
+                    .unwrap()
+            );
+        };
+        unchanged();
+    }
+
+    /// An archive rewritten with a chain that verifies on its own does not
+    /// end on the entry the next file chains from.
+    #[test]
+    fn a_rewritten_archive_fails_the_bridge() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        {
+            let mut guard = writer.lock().unwrap();
+            write_event(
+                &mut guard,
+                context_rule_created_event(1, "CDABC...12345", vec![], vec![], false, false),
+            );
+            guard.force_rotate_for_test().unwrap();
+            write_event(
+                &mut guard,
+                context_rule_created_event(2, "CDABC...12345", vec![], vec![], false, false),
+            );
+        }
+        let archive = collect_files_newest_first(&path).unwrap().remove(1);
+        // Rewrite the archive's first row and chain every later row, the
+        // handoff included, onto it again: the archive's own chain verifies.
+        let rows: Vec<AuditEntry> = std::fs::read_to_string(&archive)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let mut previous = rows[0].previous_entry_hash.clone();
+        let mut rewritten = String::new();
+        for (index, mut row) in rows.into_iter().enumerate() {
+            if index == 0 {
+                row.request_id = "rewritten".to_owned();
+            }
+            row.previous_entry_hash = previous.clone();
+            let body = row.canonical_json_body().unwrap();
+            previous = compute_entry_hash(&body, &row.previous_entry_hash).unwrap();
+            rewritten.push_str(&serde_json::to_string(&row).unwrap());
+            rewritten.push('\n');
+        }
+        std::fs::write(&archive, rewritten).unwrap();
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let err = reader
+            .find_installed_context_rule_ids("CDABC...12345")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditLogIntegrityError::ChainBroken { reason, .. } if reason == BRIDGE_MISMATCH_REASON
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// Entries an `audit_entries_quarantined` row covers are invisible to
+    /// every scan: the quarantined pin row and the quarantined failed row
+    /// read as absent.
+    #[test]
+    fn quarantined_rows_are_skipped_by_every_scan() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        {
+            let writer = open_writer(path.clone());
+            writer
+                .lock()
+                .unwrap()
+                .write_entry(pending_row(SETTLE_ENVELOPE))
+                .unwrap();
+        }
+        forge(
+            &path,
+            event_entry(context_rule_created_event(
+                1,
+                "CDABC...12345",
+                vec![h(0x44)],
+                vec![],
+                false,
+                false,
+            )),
+        );
+        forge(&path, failed_row(SETTLE_ENVELOPE));
+        let writer = open_writer(path.clone());
+        writer
+            .lock()
+            .unwrap()
+            .write_entry(AuditEntry::new_audit_entries_quarantined(2, "quarantine"))
+            .unwrap();
+
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        assert_eq!(
+            reader
+                .find_latest_context_rule_pinned_hashes(1, "CDABC...12345")
+                .unwrap(),
+            None
+        );
+        assert!(
+            reader
+                .scan_all_context_rule_pin_records()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reader
+                .find_installed_context_rule_ids("CDABC...12345")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            try_value_action_settlement(&writer.lock().unwrap(), SETTLE_ENVELOPE).unwrap(),
+            ValueActionSettlement::Owed(_)
+        ));
+    }
+
+    /// The audit key of the keyed reader fixtures.
+    const KEYED_READER_KEY: [u8; 32] = [0x2b; 32];
+
+    /// Opens a keyed, anchored writer on `path` under [`KEYED_READER_KEY`].
+    fn open_keyed_writer(
+        path: &Path,
+        store: &Arc<crate::audit_log::tip_anchor::InMemoryTipAnchorStore>,
+    ) -> AuditWriter {
+        AuditWriter::open(
+            path.to_path_buf(),
+            Some(crate::audit_log::KeyedAuditAccess::new(
+                zeroize::Zeroizing::new(KEYED_READER_KEY),
+                Arc::clone(store) as Arc<dyn crate::audit_log::TipAnchorStore>,
+            )),
+        )
+        .unwrap()
+    }
+
+    /// Re-anchors the log at `path`, keeping and quarantining its
+    /// unauthenticated tail.
+    fn reanchor_quarantining(
+        path: &Path,
+        store: &Arc<crate::audit_log::tip_anchor::InMemoryTipAnchorStore>,
+    ) -> u64 {
+        use crate::audit_log::writer::ReanchorAcknowledgement;
+
+        let mut writer = AuditWriter::open_for_reanchor(
+            path.to_path_buf(),
+            Some(zeroize::Zeroizing::new(KEYED_READER_KEY)),
+            Arc::clone(store) as Arc<dyn crate::audit_log::TipAnchorStore>,
+        )
+        .unwrap();
+        writer
+            .reanchor_acknowledging(&[
+                ReanchorAcknowledgement::UnauthenticatedTail,
+                ReanchorAcknowledgement::Rollback,
+            ])
+            .unwrap()
+            .quarantined
+    }
+
+    /// A planted quarantine row whose count reaches back over an authentic
+    /// pending row hides nothing once a genuine quarantine row covers it: the
+    /// pending row stays owed and keyed verify passes. A genuine earlier
+    /// quarantine row that nothing covers still drops the row it covers.
+    #[test]
+    fn a_covered_forged_quarantine_row_hides_nothing() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let store = Arc::new(crate::audit_log::tip_anchor::InMemoryTipAnchorStore::new());
+        open_keyed_writer(&path, &store)
+            .write_entry(pending_row(SETTLE_ENVELOPE))
+            .unwrap();
+        forge(
+            &path,
+            event_entry(context_rule_created_event(
+                1,
+                "CDABC...12345",
+                vec![h(0x44)],
+                vec![],
+                false,
+                false,
+            )),
+        );
+        assert_eq!(reanchor_quarantining(&path, &store), 1);
+        forge(
+            &path,
+            AuditEntry::new_audit_entries_quarantined(1_000, "req-forged-quarantine"),
+        );
+        assert_eq!(reanchor_quarantining(&path, &store), 1);
+
+        let writer = Arc::new(Mutex::new(open_keyed_writer(&path, &store)));
+        assert!(
+            matches!(
+                try_value_action_settlement(&writer.lock().unwrap(), SETTLE_ENVELOPE).unwrap(),
+                ValueActionSettlement::Owed(_)
+            ),
+            "the authentic pending row is still read"
+        );
+        let reader = AuditReader::new(Arc::clone(&writer), Some(KEYED_READER_KEY));
+        assert!(
+            reader
+                .find_installed_context_rule_ids("CDABC...12345")
+                .unwrap()
+                .is_empty(),
+            "the earlier genuine quarantine row still drops the forged pin row"
+        );
+        assert_eq!(
+            reader
+                .find_latest_context_rule_pinned_hashes(1, "CDABC...12345")
+                .unwrap(),
+            None
+        );
+        drop(reader);
+        drop(writer);
+        let verified =
+            crate::audit_log::verify::verify_log(&path, Some(&KEYED_READER_KEY)).unwrap();
+        assert!(verified.entry_tags_verified, "{verified:?}");
+        // Verify reports the two genuine quarantines and nothing for the
+        // covered directive, with the key and without it.
+        for verified in [
+            verified,
+            crate::audit_log::verify::verify_log(&path, None).unwrap(),
+        ] {
+            let quarantined: Vec<u64> = verified
+                .warnings
+                .iter()
+                .filter_map(|warning| match warning {
+                    crate::audit_log::VerifyWarning::EntriesQuarantined {
+                        quarantined_count,
+                        ..
+                    } => Some(*quarantined_count),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(quarantined, [1, 1], "{:?}", verified.warnings);
+        }
+    }
+
+    /// An anchor store over an in-memory store that refuses every write from
+    /// its `fail_from`-th on, counting anchor, re-anchor counter and outbox
+    /// commitment writes: a keyring that stops answering partway through.
+    #[derive(Debug)]
+    struct WritesFailFrom {
+        inner: Arc<crate::audit_log::tip_anchor::InMemoryTipAnchorStore>,
+        writes: std::sync::atomic::AtomicUsize,
+        fail_from: usize,
+    }
+
+    impl WritesFailFrom {
+        fn write(&self) -> Result<(), crate::audit_log::TipAnchorStoreError> {
+            let call = self
+                .writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if call >= self.fail_from {
+                return Err(crate::audit_log::TipAnchorStoreError::new(
+                    "test fault: the store refuses writes",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl crate::audit_log::TipAnchorStore for WritesFailFrom {
+        fn load_outbox_state(
+            &self,
+        ) -> Result<
+            Option<crate::audit_log::outbox::OutboxState>,
+            crate::audit_log::TipAnchorStoreError,
+        > {
+            self.inner.load_outbox_state()
+        }
+        fn store_outbox_state(
+            &self,
+            state: &crate::audit_log::outbox::OutboxState,
+        ) -> Result<(), crate::audit_log::TipAnchorStoreError> {
+            self.write()?;
+            self.inner.store_outbox_state(state)
+        }
+        fn load_anchor(
+            &self,
+        ) -> Result<Option<crate::audit_log::TipAnchor>, crate::audit_log::TipAnchorStoreError>
+        {
+            self.inner.load_anchor()
+        }
+        fn load_raw(&self) -> Result<Option<String>, crate::audit_log::TipAnchorStoreError> {
+            self.inner.load_raw()
+        }
+        fn store_anchor(
+            &self,
+            anchor: &crate::audit_log::TipAnchor,
+        ) -> Result<(), crate::audit_log::TipAnchorStoreError> {
+            self.write()?;
+            self.inner.store_anchor(anchor)
+        }
+        fn bump_reanchor_count(&self) -> Result<u64, crate::audit_log::TipAnchorStoreError> {
+            self.write()?;
+            self.inner.bump_reanchor_count()
+        }
+        fn reanchor_count(&self) -> Result<Option<u64>, crate::audit_log::TipAnchorStoreError> {
+            self.inner.reanchor_count()
+        }
+    }
+
+    /// Where a re-anchor of a forged tail is interrupted.
+    #[derive(Debug, Clone, Copy)]
+    enum ReanchorFault {
+        /// Every store write from this one on is refused. With no earlier
+        /// refusal the writes run: the quarantine row's anchor, the repaired
+        /// anchor, the re-anchor counter, the acknowledgement row's anchor; a
+        /// refused anchor write of a row is retried once, and the retry counts.
+        StoreWritesFrom(usize),
+        /// The quarantine row's append is refused before it writes.
+        QuarantineRefused,
+        /// The quarantine row's bytes reach the file and its fsync fails.
+        QuarantineSync,
+        /// The missing chain-root sidecar cannot be written.
+        SidecarRepair,
+        /// The acknowledgement row's append is refused.
+        AcknowledgementRow,
+    }
+
+    /// Whether `path` holds, directly after the forged pin row, the
+    /// quarantine row covering both forged rows.
+    fn forged_rows_are_quarantined(path: &Path) -> bool {
+        let rows: Vec<AuditEntry> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let pin = rows
+            .iter()
+            .position(|row| row.request_id == "req-forged-pin")
+            .unwrap();
+        rows.get(pin + 1).is_some_and(|row| {
+            matches!(
+                row.event_kind,
+                EventKind::AuditEntriesQuarantined {
+                    quarantined_count: 2
+                }
+            )
+        })
+    }
+
+    /// Asserts that `writer` reads none of the forged rows: the pending row
+    /// stays owed and no forged pin row is installed.
+    fn reads_no_forged_row(writer: AuditWriter) {
+        let writer = Arc::new(Mutex::new(writer));
+        assert!(matches!(
+            try_value_action_settlement(&writer.lock().unwrap(), SETTLE_ENVELOPE).unwrap(),
+            ValueActionSettlement::Owed(_)
+        ));
+        let reader = AuditReader::new(Arc::clone(&writer), Some(KEYED_READER_KEY));
+        assert!(
+            reader
+                .find_installed_context_rule_ids("CDABC...12345")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reader
+                .scan_all_context_rule_pin_records()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A re-anchor that quarantines a forged tail and fails after any of its
+    /// writes leaves no forged row readable through an ordinary keyed open
+    /// and none that keyed verify accepts without the quarantine row
+    /// covering it, and a rerun completes the repair with one quarantine row.
+    #[test]
+    fn a_reanchor_interrupted_after_any_write_never_exposes_the_forged_tail() {
+        use crate::audit_log::writer::ReanchorAcknowledgement;
+
+        let acknowledged = [
+            ReanchorAcknowledgement::UnauthenticatedTail,
+            ReanchorAcknowledgement::Rollback,
+        ];
+        for fault in [
+            ReanchorFault::StoreWritesFrom(1),
+            ReanchorFault::StoreWritesFrom(2),
+            ReanchorFault::StoreWritesFrom(3),
+            ReanchorFault::StoreWritesFrom(4),
+            ReanchorFault::QuarantineRefused,
+            ReanchorFault::QuarantineSync,
+            ReanchorFault::SidecarRepair,
+            ReanchorFault::AcknowledgementRow,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = tmp_log(&dir);
+            let store = Arc::new(crate::audit_log::tip_anchor::InMemoryTipAnchorStore::new());
+            open_keyed_writer(&path, &store)
+                .write_entry(pending_row(SETTLE_ENVELOPE))
+                .unwrap();
+            forge(&path, failed_row(SETTLE_ENVELOPE));
+            let mut pin = event_entry(context_rule_created_event(
+                1,
+                "CDABC...12345",
+                vec![h(0x44)],
+                vec![],
+                false,
+                false,
+            ));
+            pin.request_id = "req-forged-pin".to_owned();
+            forge(&path, pin);
+            if matches!(fault, ReanchorFault::SidecarRepair) {
+                std::fs::remove_file(crate::audit_log::writer::hmac_sidecar_path(&path)).unwrap();
+            }
+
+            let fail_from = match fault {
+                ReanchorFault::StoreWritesFrom(call) => call,
+                _ => usize::MAX,
+            };
+            let faulting = Arc::new(WritesFailFrom {
+                inner: Arc::clone(&store),
+                writes: std::sync::atomic::AtomicUsize::new(0),
+                fail_from,
+            });
+            let mut repair = AuditWriter::open_for_reanchor(
+                path.clone(),
+                Some(zeroize::Zeroizing::new(KEYED_READER_KEY)),
+                faulting as Arc<dyn crate::audit_log::TipAnchorStore>,
+            )
+            .unwrap();
+            match fault {
+                ReanchorFault::StoreWritesFrom(_) => {}
+                ReanchorFault::QuarantineRefused => repair.set_appends_before_fault(Some(0)),
+                ReanchorFault::QuarantineSync => repair.set_fail_sync_after_entry_write(true),
+                ReanchorFault::SidecarRepair => repair.set_fail_root_sidecar_repair(true),
+                ReanchorFault::AcknowledgementRow => repair.set_appends_before_fault(Some(1)),
+            }
+            let interrupted = repair.reanchor_acknowledging(&acknowledged);
+            drop(repair);
+
+            if crate::audit_log::verify::verify_log(&path, Some(&KEYED_READER_KEY)).is_ok() {
+                assert!(
+                    forged_rows_are_quarantined(&path),
+                    "{fault:?}: keyed verify passed over forged rows no quarantine row covers"
+                );
+            }
+            match AuditWriter::open(
+                path.clone(),
+                Some(crate::audit_log::KeyedAuditAccess::new(
+                    zeroize::Zeroizing::new(KEYED_READER_KEY),
+                    Arc::clone(&store) as Arc<dyn crate::audit_log::TipAnchorStore>,
+                )),
+            ) {
+                Ok(writer) => reads_no_forged_row(writer),
+                Err(err) => assert!(
+                    matches!(
+                        &err,
+                        crate::audit_log::WriterError::TipAnchorMismatch { reason, .. }
+                            if reason.starts_with("unauthenticated_tail")
+                    ),
+                    "{fault:?} ({interrupted:?}): {err:?}"
+                ),
+            }
+
+            reanchor_quarantining(&path, &store);
+            let quarantine_rows = std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains("\"audit_entries_quarantined\""))
+                .count();
+            assert_eq!(quarantine_rows, 1, "{fault:?}");
+            assert!(forged_rows_are_quarantined(&path), "{fault:?}");
+            reads_no_forged_row(open_keyed_writer(&path, &store));
+            let verified =
+                crate::audit_log::verify::verify_log(&path, Some(&KEYED_READER_KEY)).unwrap();
+            assert!(verified.entry_tags_verified, "{fault:?}");
+        }
+    }
+
+    /// The pool-initialization lookup of a keyed writer reads the log up to
+    /// the writer's verified tip only: an untagged forged completion row and a
+    /// malformed line past that tip each leave the result as it is without
+    /// them.
+    #[test]
+    fn the_pool_initialization_lookup_ignores_bytes_past_the_verified_tip() {
+        use std::io::Write as _;
+
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let store = Arc::new(crate::audit_log::tip_anchor::InMemoryTipAnchorStore::new());
+        let writer = Arc::new(Mutex::new(open_keyed_writer(&path, &store)));
+        let completion = |request_id: &str| {
+            AuditEntry::new_channel_pool_initialised(
+                "GFUND...FUNDR",
+                2,
+                "txhash...tail",
+                1,
+                request_id,
+            )
+        };
+        writer
+            .lock()
+            .unwrap()
+            .write_entry(completion("pool-written"))
+            .unwrap();
+        let reader = AuditReader::new(Arc::clone(&writer), Some(KEYED_READER_KEY));
+        let results = |reader: &AuditReader| {
+            (
+                reader.pool_initialization_exists("pool-written").unwrap(),
+                reader.pool_initialization_exists("pool-forged").unwrap(),
+            )
+        };
+        let before = results(&reader);
+        assert_eq!(before, (true, false));
+
+        forge(&path, completion("pool-forged"));
+        assert_eq!(results(&reader), before, "an untagged row past the tip");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"not\": \"an audit row\"}\n")
+            .unwrap();
+        assert_eq!(results(&reader), before, "a malformed line past the tip");
     }
 }

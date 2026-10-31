@@ -39,9 +39,13 @@
 //! - File length equals `end_offset` and the entry ending there hashes to
 //!   `tip_hash`: current, accept.
 //! - File length exceeds `end_offset` and the anchored entry is intact: the
-//!   file moved forward (an unkeyed writer appended, or a crash landed between
-//!   the entry fsync and the anchor write). Accept, replay from `end_offset`,
-//!   and re-anchor to the new tip.
+//!   file moved forward (a crash landed between the entry fsync and the anchor
+//!   write, or, before entry tags are in force, an unkeyed writer appended).
+//!   Replay from `end_offset`. Once entry tags are in force, a keyed writer
+//!   accepts the tail only when every entry in it carries a valid entry tag,
+//!   and otherwise refuses with reason `unauthenticated_tail`. Before that,
+//!   the tail is absorbed once and counted in the `audit_entry_tags_started`
+//!   row. An accepted tail re-anchors to the new tip.
 //! - File length is below `end_offset`, or the entry ending at `end_offset` does
 //!   not hash to `tip_hash`: the file was rolled back, truncated, or replaced.
 //!   Refuse.
@@ -82,8 +86,12 @@
 //!
 //! The anchor detects rollback and truncation. It does not detect forgery: the
 //! chain hash is unkeyed, so an attacker who can write the file can append
-//! well-formed entries and move the tip forward legitimately. Detecting that
-//! requires a per-entry keyed tag, which this substrate does not have. See
+//! well-formed entries that chain from the tip. The keyed entry tag is what
+//! detects that: once a log holds its `audit_entry_tags_started` row, every
+//! entry carries a tag under a key derived from the audit key, and keyed
+//! writers and `audit verify --profile` refuse an entry without a valid one.
+//! Entries before that row, logs no keyed writer has reached, and code that
+//! can read the audit key are outside that check. See
 //! `docs/maintainers/security-internals.md`.
 //!
 //! # Scope: one path inside one profile's keyring namespace
@@ -399,8 +407,10 @@ pub enum PriorAnchoring {
     /// check cannot then rule a sidecar out; a directory or other non-file
     /// there was not written by a writer and does not count.
     ChainRootSidecar,
-    /// The active file holds an `audit_tip_anchored` row: an adoption, an
-    /// acknowledged rollback, or an acknowledged binding change.
+    /// The active file holds an anchoring row or carries entry tags: an
+    /// `audit_tip_anchored` row (an adoption, an acknowledged rollback, or an
+    /// acknowledged binding change), an entry-tag row, a row with an entry
+    /// tag, or a seed handoff that carries `entry_tags`.
     AnchoringRow,
 }
 
@@ -408,7 +418,8 @@ impl PriorAnchoring {
     /// Finds the evidence that the log at `log_path` was anchored before.
     ///
     /// `entry_count` and `holds_anchoring_row` describe the active file as a
-    /// full replay found it. A file with entries is checked for all three
+    /// full replay found it; `holds_anchoring_row` covers every anchoring row
+    /// and every sign of entry tags. A file with entries is checked for all three
     /// facts, in the order of the variants. A file with no entries is checked
     /// for the sidecar alone: a binding recorded before a keyed use that found
     /// an empty log is the ordinary state, and an empty file holds no row.
@@ -444,7 +455,9 @@ impl PriorAnchoring {
         match self {
             Self::BindingRecorded => "an audit binding is recorded for the profile",
             Self::ChainRootSidecar => "the active log file carries a chain-root sidecar",
-            Self::AnchoringRow => "the active log file holds an audit_tip_anchored row",
+            Self::AnchoringRow => {
+                "the active log file holds an anchoring row or carries entry tags"
+            }
         }
     }
 }

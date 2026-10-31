@@ -22,8 +22,14 @@
 //!
 //! The advisory is purely informational and NON-FATAL. Audit-log errors
 //! (file absent, I/O error, integrity violation) are logged at `warn!` level
-//! and the advisory returns an empty [`AdvisoryResult`] — CLI startup
+//! and the advisory returns an empty [`AdvisoryResult`]; CLI startup
 //! continues normally.
+//!
+//! The advisory opens an unkeyed writer, which refuses a log that shows
+//! keying (`audit.chain_key_unavailable`). On such a log the advisory reads
+//! the pin records without a writer and without its verified-tip bound, keeps
+//! its stderr lines, and writes no audit row: those reads feed only the
+//! operator-facing warnings.
 //!
 //! # Test-helpers feature gate
 //!
@@ -43,7 +49,9 @@ use tracing::warn;
 use uuid::Uuid;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::reader::{AuditReader, ContextRulePinRecord};
+use stellar_agent_core::audit_log::reader::{
+    AuditReader, ContextRulePinRecord, scan_all_context_rule_pin_records_unanchored,
+};
 use stellar_agent_core::audit_log::schema::{VerifierAdvisoryKind, WasmHashPin};
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::RedactedStrkey;
@@ -110,16 +118,18 @@ pub fn run_startup_advisory(audit_log_path: &Path) -> AdvisoryResult {
 /// # Algorithm
 ///
 /// 1. If the audit-log file is absent or empty, return early.
-/// 2. Open an `AuditWriter` to drive `AuditReader` construction and
-///    advisory-row emission.
+/// 2. Open an unkeyed `AuditWriter` to drive `AuditReader` construction and
+///    advisory-row emission. When the open refuses, for example on a keyed
+///    log, continue without a writer.
 /// 3. Scan every rule's pin record: the newest pin row of either version per
-///    rule.
+///    rule, through the writer's bounded reader, or without a writer through
+///    `scan_all_context_rule_pin_records_unanchored`.
 /// 4. For a record of eight-byte hash prefixes, emit one `[advisory]` stderr
 ///    line naming `sa.wasm_pin_incomplete` and the recovery, record the rule
 ///    in [`AdvisoryResult::incomplete_pin_rule_ids`], and look up no status.
 /// 5. For a complete record, deduplicate the full verifier hashes, and for
 ///    any hash equal in all 32 bytes to a `Revoked` or `Retired` allowlist
-///    entry, emit one `[advisory]` stderr line and one
+///    entry, emit one `[advisory]` stderr line and, with a writer, one
 ///    `SaVerifierAllowlistAdvisory` audit row.
 /// 6. Record `rule_id` in [`AdvisoryResult::triggered_rule_ids`] once per rule.
 #[cfg(any(test, feature = "test-helpers"))]
@@ -155,22 +165,30 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
     }
 
     // ── 1. Open the audit writer ─────────────────────────────────────────────
-    // Writer needed for AuditReader construction AND for writing advisory rows.
-    let writer: Arc<Mutex<AuditWriter>> = match open_audit_writer_for_advisory(audit_log_path) {
-        Ok(w) => w,
-        Err(e) => {
-            warn!(
-                audit_log_path = %audit_log_path.display(),
-                error = %e,
-                "startup advisory: could not open audit writer; advisory skipped"
-            );
-            return AdvisoryResult::default();
-        }
-    };
+    // The writer drives AuditReader construction and writes the advisory rows.
+    // An unkeyed open refuses a keyed log; the scan then reads without it.
+    let writer: Option<Arc<Mutex<AuditWriter>>> =
+        match open_audit_writer_for_advisory(audit_log_path) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                warn!(
+                    audit_log_path = %audit_log_path.display(),
+                    error = %e,
+                    "startup advisory: could not open audit writer; the log is read without \
+                     it and no advisory row is written"
+                );
+                None
+            }
+        };
 
     // ── 2. Scan every rule's pin record (newest created or pins-updated row) ──
-    let reader = AuditReader::new(Arc::clone(&writer), None);
-    let all_rules = match reader.scan_all_context_rule_pin_records() {
+    let scanned = match &writer {
+        Some(writer) => {
+            AuditReader::new(Arc::clone(writer), None).scan_all_context_rule_pin_records()
+        }
+        None => scan_all_context_rule_pin_records_unanchored(audit_log_path),
+    };
+    let all_rules = match scanned {
         Ok(rows) => rows,
         Err(e) => {
             warn!(
@@ -229,36 +247,17 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
 
             // 3b. Emit SaVerifierAllowlistAdvisory audit row; its hash field
             //     is the labeled first-8 display projection of the full hash.
+            //     Without a writer the stderr line is the whole advisory.
             let hash_first8 = hash.first8_display();
-            let entry = AuditEntry::new_sa_verifier_allowlist_advisory(
-                *rule_id,
-                RedactedStrkey::from_already_redacted(smart_account_redacted.as_str()),
-                hash_first8.as_str(),
-                advisory_kind,
-                Option::<String>::None,
-                request_id.as_str(),
-            );
-            match writer.lock() {
-                Ok(mut w) => {
-                    if let Err(e) = w.write_entry(entry) {
-                        warn!(
-                            rule_id = rule_id,
-                            hash_first8 = %hash_first8,
-                            error = %e,
-                            "startup advisory: failed to write advisory audit row"
-                        );
-                    }
-                }
-                Err(poison) => {
-                    // Mutex is poisoned — a prior write path panicked mid-write.
-                    // Log at warn and continue; advisory row is best-effort.
-                    warn!(
-                        rule_id = rule_id,
-                        hash_first8 = %hash_first8,
-                        error = %format!("audit writer mutex poisoned: {poison}"),
-                        "startup advisory: could not acquire audit writer lock; audit row skipped"
-                    );
-                }
+            if let Some(writer) = &writer {
+                write_advisory_row(
+                    writer,
+                    *rule_id,
+                    smart_account_redacted,
+                    &hash_first8,
+                    advisory_kind,
+                    &request_id,
+                );
             }
 
             // 3c. Record triggered rule_id (once per rule, not once per hash).
@@ -271,6 +270,49 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
     AdvisoryResult {
         triggered_rule_ids,
         incomplete_pin_rule_ids,
+    }
+}
+
+/// Writes one `SaVerifierAllowlistAdvisory` row through `writer`, logging a
+/// failed append or a poisoned writer mutex at `warn!`: the row is
+/// best-effort.
+fn write_advisory_row(
+    writer: &Arc<Mutex<AuditWriter>>,
+    rule_id: u32,
+    smart_account_redacted: &str,
+    hash_first8: &str,
+    advisory_kind: VerifierAdvisoryKind,
+    request_id: &str,
+) {
+    let entry = AuditEntry::new_sa_verifier_allowlist_advisory(
+        rule_id,
+        RedactedStrkey::from_already_redacted(smart_account_redacted),
+        hash_first8,
+        advisory_kind,
+        Option::<String>::None,
+        request_id,
+    );
+    match writer.lock() {
+        Ok(mut w) => {
+            if let Err(e) = w.write_entry(entry) {
+                warn!(
+                    rule_id = rule_id,
+                    hash_first8 = %hash_first8,
+                    error = %e,
+                    "startup advisory: failed to write advisory audit row"
+                );
+            }
+        }
+        Err(poison) => {
+            // A prior write path panicked mid-write. Log at warn and
+            // continue; the advisory row is best-effort.
+            warn!(
+                rule_id = rule_id,
+                hash_first8 = %hash_first8,
+                error = %format!("audit writer mutex poisoned: {poison}"),
+                "startup advisory: could not acquire audit writer lock; audit row skipped"
+            );
+        }
     }
 }
 
@@ -556,6 +598,41 @@ mod tests {
             binding() == recorded,
             "the advisory checks and rewrites no binding"
         );
+    }
+
+    /// On a keyed log the unkeyed advisory writer refuses to open: the
+    /// advisory reads the pin records without it, reports the rule, and
+    /// writes no row.
+    #[test]
+    fn the_advisory_on_a_keyed_log_prints_and_writes_no_row() {
+        use stellar_agent_core::audit_log::tip_anchor::{
+            InMemoryTipAnchorStore, KeyedAuditAccess, TipAnchorStore,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let access = KeyedAuditAccess::new(
+            zeroize::Zeroizing::new([0x4e; 32]),
+            Arc::new(InMemoryTipAnchorStore::new()) as Arc<dyn TipAnchorStore>,
+        );
+        let writer = Arc::new(Mutex::new(
+            AuditWriter::open(path.clone(), Some(access)).unwrap(),
+        ));
+        write_context_rule_created(&writer, 4, "CDABC...12345", vec![h(0xab)]);
+        drop(writer);
+        let before = std::fs::read(&path).unwrap();
+        let allowlist = [VerifierAllowlistEntry::new_for_test(
+            [0xAB; 32],
+            VerifierAuditStatus::Revoked {
+                revoked_at: "2026-01-01",
+                reason: "test fixture",
+            },
+        )];
+
+        let result = run_startup_advisory_with_allowlist(&path, &allowlist);
+
+        assert_eq!(result.triggered_rule_ids, vec![4]);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "no row is written");
     }
 
     #[test]

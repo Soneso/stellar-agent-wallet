@@ -45,6 +45,12 @@
 //! - Binding changed or unreadable, anchor disagreeing, which includes an
 //!   absent anchor whose log shows prior anchoring: both flags are required.
 //!   The verb appends `rollback_acknowledged`, then `binding_changed`.
+//! - In every row of this matrix, an active file that ends in entries without
+//!   a valid entry tag, on a log whose entry tags are in force, also requires
+//!   `--acknowledge-unauthenticated-tail`. The verb keeps those entries and
+//!   appends an `audit_entries_quarantined` row naming their count directly
+//!   after them, before its `audit_tip_anchored` rows. Without such entries
+//!   the flag is ignored. The count is decided under the writer's lock.
 //!
 //! An anchor disagrees when the anchor-against-walk rule of `audit verify`
 //! refuses it, or when it cannot be parsed. A log that moved forward past its
@@ -141,12 +147,20 @@ pub struct ReanchorArgs {
     /// otherwise. Without it the verb changes nothing and exits 1.
     #[arg(long)]
     pub acknowledge_binding_change: bool,
+
+    /// Keep the entries past the last authenticated entry and quarantine them.
+    ///
+    /// Required when the log's entry tags are in force and its active file
+    /// ends in entries without a valid entry tag, and ignored otherwise.
+    /// Without it the verb changes nothing and exits 1.
+    #[arg(long)]
+    pub acknowledge_unauthenticated_tail: bool,
 }
 
 /// Success payload for the `audit reanchor` envelope.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-struct ReanchorData {
+pub(crate) struct ReanchorData {
     /// Profile whose audit log was re-anchored.
     profile: String,
     /// Coordinates of the replaced anchor as `<entry count>:<end offset>`,
@@ -160,8 +174,11 @@ struct ReanchorData {
     /// once, whether it acknowledged a rollback, a binding change, or both.
     reanchor_count: u64,
     /// The conditions this run acknowledged, in the order their rows were
-    /// appended: `rollback`, `binding_change`.
+    /// appended: `unauthenticated_tail`, `rollback`, `binding_change`.
     acknowledged: Vec<&'static str>,
+    /// Number of entries the `audit_entries_quarantined` row of this run
+    /// covers; 0 when the run quarantined nothing.
+    quarantined_rows: u64,
     /// How the recorded audit binding compared with the profile before this
     /// run: `absent`, `equal`, `changed`, or `unreadable`.
     recorded_binding: &'static str,
@@ -228,7 +245,10 @@ where
 }
 
 /// Performs the repair and returns what the verb renders, or the refusal.
-fn reanchor<LoadProfile, InitKeyring>(
+///
+/// Crate-visible so the key rotation's tests drive the re-anchor that a
+/// lost-key recovery runs between its two rotation attempts.
+pub(crate) fn reanchor<LoadProfile, InitKeyring>(
     args: &ReanchorArgs,
     load_profile: LoadProfile,
     init_keyring: InitKeyring,
@@ -258,6 +278,7 @@ where
         .current_tip_anchor()
         .map_err(|e| writer_error(&e, &args.profile))?;
 
+    let quarantine = unauthenticated_tail_acknowledged(args, &writer)?;
     if !args.acknowledge_rollback {
         return Err(WalletError::Validation(
             ValidationError::AuditReanchorNotAcknowledged {
@@ -270,8 +291,16 @@ where
         ));
     }
 
+    let mut acknowledgements = Vec::with_capacity(2);
+    let mut acknowledged = Vec::with_capacity(2);
+    if quarantine {
+        acknowledgements.push(ReanchorAcknowledgement::UnauthenticatedTail);
+        acknowledged.push("unauthenticated_tail");
+    }
+    acknowledgements.push(ReanchorAcknowledgement::Rollback);
+    acknowledged.push("rollback");
     let report = writer
-        .reanchor()
+        .reanchor_acknowledging(&acknowledgements)
         .map_err(|e| writer_error(&e, &args.profile))?;
     // An absent binding is recorded after a successful repair.
     if recorded == RecordedBinding::Absent {
@@ -280,10 +309,42 @@ where
     Ok(reanchor_data(
         &args.profile,
         report,
-        vec!["rollback"],
+        acknowledged,
         recorded.label(),
         None,
     ))
+}
+
+/// Whether the repair quarantines an unauthenticated tail, decided under the
+/// lock `writer` holds.
+///
+/// `false` when the active file ends in no entry without a valid entry tag,
+/// whatever the flag says.
+///
+/// # Errors
+///
+/// [`ValidationError::AuditUnauthenticatedTailNotAcknowledged`] for such
+/// entries without `--acknowledge-unauthenticated-tail`, and the writer's
+/// failure to count them.
+fn unauthenticated_tail_acknowledged(
+    args: &ReanchorArgs,
+    writer: &AuditWriter,
+) -> Result<bool, WalletError> {
+    let count = writer
+        .unauthenticated_tail_count()
+        .map_err(|e| writer_error(&e, &args.profile))?;
+    if count == 0 {
+        return Ok(false);
+    }
+    if !args.acknowledge_unauthenticated_tail {
+        return Err(WalletError::Validation(
+            ValidationError::AuditUnauthenticatedTailNotAcknowledged {
+                profile: args.profile.clone(),
+                count,
+            },
+        ));
+    }
+    Ok(true)
 }
 
 /// The arm of [`reanchor`] for a binding that changed or does not parse.
@@ -324,14 +385,19 @@ fn reanchor_binding_change_locked(
     if let Some(missing) = missing_acknowledgements(args, disagreeing) {
         return Err(binding_change_not_acknowledged(args, missing));
     }
+    let quarantine = unauthenticated_tail_acknowledged(args, writer)?;
 
     let previous_binding_anchor = match recorded {
         RecordedBinding::Changed(old) => previous_binding_anchor(old)?,
         RecordedBinding::Absent | RecordedBinding::Equal | RecordedBinding::Unparseable => None,
     };
 
-    let mut acknowledgements = Vec::with_capacity(2);
-    let mut acknowledged = Vec::with_capacity(2);
+    let mut acknowledgements = Vec::with_capacity(3);
+    let mut acknowledged = Vec::with_capacity(3);
+    if quarantine {
+        acknowledgements.push(ReanchorAcknowledgement::UnauthenticatedTail);
+        acknowledged.push("unauthenticated_tail");
+    }
     if disagreeing {
         acknowledgements.push(ReanchorAcknowledgement::Rollback);
         acknowledged.push("rollback");
@@ -450,6 +516,7 @@ fn reanchor_data(
             .as_ref()
             .map_or_else(|| "none".to_owned(), TipAnchor::coordinates),
         reanchor_count: report.reanchor_count,
+        quarantined_rows: report.quarantined,
         outbox_drained: report.outbox_drained,
         warnings: report.outbox_refusal.into_iter().collect(),
         acknowledged,
@@ -609,6 +676,7 @@ mod tests {
             profile: "reanchor-gate".to_owned(),
             acknowledge_rollback: false,
             acknowledge_binding_change: false,
+            acknowledge_unauthenticated_tail: false,
         };
         let cloned = profile.clone();
         let code = run_with_dependencies(&args, move |_| Ok(cloned.clone()), || Ok(())).await;
@@ -643,6 +711,7 @@ mod tests {
             profile: "reanchor-repair".to_owned(),
             acknowledge_rollback: true,
             acknowledge_binding_change: false,
+            acknowledge_unauthenticated_tail: false,
         };
         let cloned = profile.clone();
         let code = run_with_dependencies(&args, move |_| Ok(cloned.clone()), || Ok(())).await;
@@ -689,6 +758,7 @@ mod tests {
             profile: profile.to_owned(),
             acknowledge_rollback: rollback,
             acknowledge_binding_change: binding,
+            acknowledge_unauthenticated_tail: false,
         }
     }
 
@@ -795,6 +865,85 @@ mod tests {
             raw_binding(name).map(String::into_bytes),
             counter(new).map(|c| c.to_string().into_bytes()),
         ]
+    }
+
+    /// Appends `count` chained rows without an entry tag to `profile`'s log,
+    /// with every writer dropped.
+    fn forge_untagged_tail(profile: &Profile, count: usize) {
+        for _ in 0..count {
+            stellar_agent_core::audit_log::test_helpers::append_forged_entry(
+                &profile.audit_log_path,
+                sample_entry(),
+                |_| None,
+            );
+        }
+    }
+
+    /// Both arms of the matrix require `--acknowledge-unauthenticated-tail`
+    /// for an active file that ends in untagged entries: without it the run
+    /// refuses and writes nothing; with it the entries are quarantined and
+    /// the acknowledgement comes first.
+    #[test]
+    #[serial]
+    fn reanchor_requires_the_unauthenticated_tail_flag() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+
+        // Binding absent: the rollback arm.
+        let name = "tail-rollback";
+        let profile = anchored_profile(name, &dir.path().join("a"), 2);
+        forge_untagged_tail(&profile, 2);
+        let before = snapshot(name, &profile, &profile);
+        let mut args = args_with(name, true, false);
+        let refused = run_reanchor(&args, &profile).expect_err("the tail needs its flag");
+        assert_eq!(refused.code(), "validation.acknowledgement_required");
+        assert!(
+            refused
+                .to_string()
+                .contains("--acknowledge-unauthenticated-tail"),
+            "{refused}"
+        );
+        assert_eq!(
+            snapshot(name, &profile, &profile),
+            before,
+            "nothing is written"
+        );
+        args.acknowledge_unauthenticated_tail = true;
+        let data = run_reanchor(&args, &profile).expect("the repair runs");
+        assert_eq!(data.acknowledged, ["unauthenticated_tail", "rollback"]);
+        assert_eq!(data.quarantined_rows, 2);
+        let kinds: Vec<String> = log_rows(&profile)
+            .iter()
+            .map(|row| row["kind"].as_str().expect("kind").to_owned())
+            .collect();
+        assert_eq!(
+            kinds[kinds.len() - 2..],
+            ["audit_entries_quarantined", "audit_tip_anchored"]
+        );
+
+        // Binding changed, anchor agreeing: the binding-change arm.
+        let name = "tail-binding";
+        let profile = anchored_profile(name, &dir.path().join("b"), 2);
+        let mut previous = profile.clone();
+        previous.audit_log_path = dir.path().join("b").join("previous.jsonl");
+        record_binding(name, &previous);
+        forge_untagged_tail(&profile, 2);
+        let before = snapshot(name, &previous, &profile);
+        let mut args = args_with(name, false, true);
+        let refused = run_reanchor(&args, &profile).expect_err("the tail needs its flag");
+        assert_eq!(refused.code(), "validation.acknowledgement_required");
+        assert_eq!(
+            snapshot(name, &previous, &profile),
+            before,
+            "nothing is written"
+        );
+        args.acknowledge_unauthenticated_tail = true;
+        let data = run_reanchor(&args, &profile).expect("the repair runs");
+        assert_eq!(
+            data.acknowledged,
+            ["unauthenticated_tail", "binding_change"]
+        );
+        assert_eq!(data.quarantined_rows, 2);
     }
 
     #[test]
@@ -1374,10 +1523,9 @@ mod tests {
                     &new.audit_log_path,
                 ),
             );
-            outbox.append(&queued_consent("queued-1")).expect("queue");
-            let mut bytes = std::fs::read(outbox.path()).expect("outbox");
-            bytes.extend_from_slice(b"not an audit entry\n");
-            std::fs::write(outbox.path(), &bytes).expect("corrupt the outbox");
+            // A committed row that is not a consent row: the drain refuses it.
+            outbox.append(&sample_entry()).expect("queue");
+            let bytes = std::fs::read(outbox.path()).expect("outbox");
 
             let data = run_reanchor(&args_with("bind-outbox-unusable", rollback, true), &new)
                 .expect("the repair stands");
@@ -1616,6 +1764,7 @@ mod tests {
             profile: "reanchor-outbox-gate".to_owned(),
             acknowledge_rollback: false,
             acknowledge_binding_change: false,
+            acknowledge_unauthenticated_tail: false,
         };
         let cloned = profile.clone();
         let code = run_with_dependencies(&args, move |_| Ok(cloned.clone()), || Ok(())).await;
@@ -1664,6 +1813,7 @@ mod tests {
             profile: "reanchor-outbox-drain".to_owned(),
             acknowledge_rollback: true,
             acknowledge_binding_change: false,
+            acknowledge_unauthenticated_tail: false,
         };
         let cloned = profile.clone();
         let code = run_with_dependencies(&args, move |_| Ok(cloned.clone()), || Ok(())).await;
@@ -1705,10 +1855,9 @@ mod tests {
                 &profile.audit_log_path,
             ),
         );
-        outbox.append(&queued_consent("queued-1")).expect("queue");
-        let mut bytes = std::fs::read(outbox.path()).expect("outbox");
-        bytes.extend_from_slice(b"not an audit entry\n");
-        std::fs::write(outbox.path(), &bytes).expect("corrupt the outbox");
+        // A committed row that is not a consent row: the drain refuses it.
+        outbox.append(&sample_entry()).expect("queue");
+        let bytes = std::fs::read(outbox.path()).expect("outbox");
 
         let mut writer = open_repair_writer(&profile, "reanchor-outbox-unusable").expect("open");
         let report = writer.reanchor().expect("the repair succeeds");
@@ -1732,8 +1881,9 @@ mod tests {
             "a refused drain reports no count: {data}"
         );
 
-        // Removing committed consent still refuses after a successful tip repair.
+        // Removing the committed row still refuses after a successful tip repair.
         std::fs::remove_file(outbox.path()).expect("move the outbox aside");
+        let key = load_audit_hmac_key(&profile, "reanchor-outbox-unusable").expect("load key");
         let store = TestAnchorStore::shared(
             &profile.audit_log_hash_chain_key_id,
             &profile.audit_log_path,
@@ -1741,7 +1891,7 @@ mod tests {
         assert!(matches!(
             AuditWriter::open_with_tip_anchor(
                 profile.audit_log_path.clone(),
-                None,
+                Some(key.clone()),
                 store,
                 stellar_agent_core::audit_log::BindingHistory::NotRecorded
             ),
@@ -1750,23 +1900,21 @@ mod tests {
                 found: 0
             })
         ));
-        // Keep the committed line byte-identical; discard only the invalid suffix.
-        let end = bytes
-            .iter()
-            .position(|b| *b == b'\n')
-            .expect("complete line")
-            + 1;
-        std::fs::write(outbox.path(), &bytes[..end]).expect("restore committed consent");
-        let key = load_audit_hmac_key(&profile, "reanchor-outbox-unusable").expect("load key");
-        AuditWriter::open_with_tip_anchor(
+        // The repair itself stands: the anchor agrees with the repaired log.
+        let writer = AuditWriter::open_for_reanchor(
             profile.audit_log_path.clone(),
             Some(key),
             TestAnchorStore::shared(
                 &profile.audit_log_hash_chain_key_id,
                 &profile.audit_log_path,
             ),
-            stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
-        .expect("the repaired log opens cleanly");
+        .expect("the repaired log opens for inspection");
+        assert!(
+            !writer
+                .stored_anchor_disagrees(stellar_agent_core::audit_log::BindingHistory::NotRecorded)
+                .expect("decide"),
+            "the anchor agrees with the repaired log"
+        );
     }
 }

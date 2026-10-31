@@ -503,13 +503,18 @@ pub(crate) fn write_settled_row(
 /// once, at the gate, and are never re-derived here. `ledger` is the ledger
 /// the chain reports the transaction in.
 ///
+/// The writer guard is taken once and held through the settlement lookup and
+/// the append, so the lookup reads the history up to the writer's verified
+/// tip and the row lands on the tip it read.
+///
 /// Non-fatal: the chain has already answered, and the settled record is the
-/// receipt and the spending window. A row that cannot be appended is logged,
-/// and the receipt keeps what a later run needs to write it. A settlement
-/// lookup that cannot read the retained history is logged at WARN with the
-/// profile, the envelope hash, and the error, and writes nothing: whether the
-/// row is owed is unknown, and a row written on a guess could count one spend
-/// twice. A later run retries the lookup and appends any row still owed.
+/// receipt and the spending window. A poisoned guard or a row that cannot be
+/// appended is logged, and the receipt keeps what a later run needs to write
+/// it. A settlement lookup that cannot read the retained history is logged at
+/// WARN with the profile, the envelope hash, and the error, and writes
+/// nothing: whether the row is owed is unknown, and a row written on a guess
+/// could count one spend twice. A later run retries the lookup and appends
+/// any row still owed.
 #[allow(
     clippy::too_many_arguments,
     reason = "settlement carries submission identity, its evidence and the reconciliation decision"
@@ -525,8 +530,16 @@ pub(crate) fn write_settled_row_with_evidence(
     ledger: Option<u32>,
     reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
 ) {
+    let Ok(mut guard) = audit.lock() else {
+        tracing::warn!(
+            profile = %profile_name,
+            "value audit: audit writer mutex poisoned; row NOT emitted"
+        );
+        return;
+    };
     match settled_row(
         profile,
+        &guard,
         envelope_hash,
         tx_hash,
         status,
@@ -534,8 +547,8 @@ pub(crate) fn write_settled_row_with_evidence(
         ledger,
         reconciliation_decision,
     ) {
-        Ok(Some(entry)) => crate::commands::value_audit::emit_value_audit_row_with_writer(
-            audit,
+        Ok(Some(entry)) => crate::commands::value_audit::emit_value_audit_row_on_guard(
+            &mut guard,
             profile_name,
             entry,
         ),
@@ -557,7 +570,8 @@ pub(crate) fn write_settled_row_with_evidence(
 /// verb that is about to close the submission's record calls this first, so
 /// the record is closed only once its settlement is in the log. A history
 /// that cannot be read refuses, because it cannot show that the row is
-/// there.
+/// there. The writer guard is taken first and held through the lookup and
+/// the append.
 ///
 /// # Errors
 ///
@@ -579,8 +593,14 @@ pub(crate) fn append_settled_row(
     release_code: Option<ReleaseEvidence>,
     reconciliation_decision: stellar_agent_core::audit_log::PolicyDecision,
 ) -> Result<(), Envelope<()>> {
+    let mut guard = audit.lock().map_err(|_| {
+        Envelope::err(&crate::commands::value_audit::audit_writer_open_failed(
+            profile_name,
+        ))
+    })?;
     let Some(entry) = settled_row(
         profile,
+        &guard,
         envelope_hash,
         tx_hash,
         status,
@@ -592,11 +612,6 @@ pub(crate) fn append_settled_row(
     else {
         return Ok(());
     };
-    let mut guard = audit.lock().map_err(|_| {
-        Envelope::err(&crate::commands::value_audit::audit_writer_open_failed(
-            profile_name,
-        ))
-    })?;
     crate::commands::value_audit::append_value_audit_row_strict(&mut guard, profile_name, entry)
         .map_err(|error| Envelope::err(&error))
 }
@@ -613,8 +628,9 @@ pub(crate) fn append_settled_row(
 /// window closed. A receipt an operator cleared owes no row by design; the
 /// `submission_receipt_cleared` row records the clear.
 ///
-/// The settlement lookup reads the retained history, newest file first. A
-/// settled row found there means the submission is accounted for, so a
+/// The settlement lookup reads the retained history through `writer`, the
+/// guard the caller holds, newest file first and up to the writer's verified
+/// tip. A settled row found there means the submission is accounted for, so a
 /// repeated reconciliation writes nothing. A status that owes no row returns
 /// before the lookup.
 ///
@@ -624,8 +640,13 @@ pub(crate) fn append_settled_row(
 /// chain does not verify. Whether a row is owed is then unknown, which the
 /// caller handles: [`write_settled_row_with_evidence`] logs it and writes
 /// nothing, and [`append_settled_row`] refuses.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "settlement carries submission identity, its evidence and the reconciliation decision"
+)]
 fn settled_row(
     profile: &Profile,
+    writer: &AuditWriter,
     envelope_hash: &str,
     tx_hash: &str,
     status: &ReceiptStatus,
@@ -644,7 +665,7 @@ fn settled_row(
 
     let (tool, chain_id, legs, nonce_id, policy_decision, approval_nonce, witness) =
         match stellar_agent_core::audit_log::reader::try_value_action_settlement(
-            &profile.audit_log_path,
+            writer,
             envelope_hash,
         )? {
             // Already accounted for. Reconciliation is repeatable, and a second
@@ -1543,7 +1564,7 @@ mod tests {
             drop(threshold);
         }
         assert!(matches!(
-            try_value_action_settlement(path, "envelope").unwrap(),
+            try_value_action_settlement(&audit.lock().unwrap(), "envelope").unwrap(),
             ValueActionSettlement::Owed(_)
         ));
         break_newest_archive_link(path);

@@ -23,7 +23,7 @@ use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 
 /// Maps an audit-writer failure onto the CLI envelope model.
 ///
-/// Three conditions are operator-actionable and get the codes the documentation
+/// Four conditions are operator-actionable and get the codes the documentation
 /// names for them, rather than being flattened into the caller's generic
 /// failure code:
 ///
@@ -40,6 +40,9 @@ use stellar_agent_core::error::{InternalError, ValidationError, WalletError};
 ///   comes from.
 /// - An absent anchor the log shows was written is `audit.tip_anchor_missing`,
 ///   again the pre-flight's code. Both name `audit reanchor` as the remedy.
+/// - A keyed log opened without its audit key is `audit.chain_key_unavailable`,
+///   the code [`stellar_agent_core::audit_log::audit_writer_refusal`] gives it
+///   for every audited verb, with the writer's detail naming the evidence.
 ///
 /// Everything else carries `fallback_code`, the caller's own label for "this
 /// verb could not use the audit writer".
@@ -80,6 +83,11 @@ pub(crate) fn audit_writer_error(
                 detail: e.to_string(),
             })
         }
+        // A keyed log opened without its key is the condition every other
+        // audited verb reports as an unusable log; one condition, one code.
+        WriterError::KeyedLogNeedsKey { .. } => {
+            stellar_agent_core::audit_log::audit_writer_refusal(profile_name, e)
+        }
         // Variants whose own Display already leads with an `audit.*` code carry
         // it through unchanged; prefixing the caller's fallback would put two
         // codes in one detail and an agent matching on the first would read the
@@ -87,6 +95,10 @@ pub(crate) fn audit_writer_error(
         WriterError::RotationBridgeUnusable { .. }
         | WriterError::OutboxBusy
         | WriterError::OutboxUnusable { .. }
+        | WriterError::OutboxRowKindRefused { .. }
+        | WriterError::UnauthenticatedTailNotAcknowledged { .. }
+        | WriterError::UnauthenticatedHandoff { .. }
+        | WriterError::AppendUnsettled { .. }
         | WriterError::RowTooLarge { .. } => {
             WalletError::Internal(InternalError::UnexpectedState {
                 detail: e.to_string(),

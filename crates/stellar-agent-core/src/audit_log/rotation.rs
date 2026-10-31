@@ -250,9 +250,19 @@ impl std::error::Error for SidecarResignError {}
 /// persistence but before (or during) re-signing is recoverable — re-running
 /// rotate-audit-key re-signs with the already-persisted key and converges.
 ///
-/// It runs LAST in `rotate-audit-key`, after the key-write row has been
-/// appended, so a row that happens to open a new file has that file's chain
-/// root brought onto the new key by the same pass.
+/// `rotate-audit-key` runs in this order: it checks the log's entry tags
+/// under the old key, requires the anchor to cover the writer's last row,
+/// which carries a tag under that key, persists the new key, switches the
+/// held writer to it (which appends `audit_entry_tags_rekeyed { cause:
+/// rotation }` once tags are in force), appends the key-write row,
+/// reconciles the anchor, and runs this primitive LAST, so a row that
+/// happens to open a new file has that file's chain root brought onto the
+/// new key by the same pass. No log file is rewritten: entry tags written
+/// under the old key stay, and the rekey row's own tag, under the new key,
+/// starts the run the new key checks. A crash after persistence and before
+/// the rekey row leaves entries tagged under the old key past the newest
+/// keyed start, all of them inside the anchored prefix; the next keyed open
+/// appends `audit_entry_tags_rekeyed { cause: open_repair }` for them.
 ///
 /// The optional `<log>.pruned` marker is also re-signed under `new_key`.
 /// Returns the number of sidecars re-signed, including that marker.

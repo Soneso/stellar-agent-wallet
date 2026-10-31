@@ -1437,9 +1437,11 @@ pub enum ValidationError {
     /// `stellar-agent profile init` mints the audit-log keyring-coordinate
     /// REFERENCE only — no key material — so an init-minted profile has no
     /// audit chain-root key until `stellar-agent profile rotate-audit-key`
-    /// mints one. A stored key that cannot be read or decoded is refused by
-    /// that verb too, so the message names minting for a missing key only and
-    /// sends every other cause to investigation. This is the fail-closed
+    /// mints one. That first mint applies only to a log without entry tags:
+    /// a log under entry tags takes rows only under its own key, so the
+    /// message sends a missing key on such a log to restoring it. A
+    /// stored key that cannot be read or decoded is refused by that verb too.
+    /// This is the fail-closed
     /// pre-flight: the verb proves the audit writer is acquirable BEFORE any
     /// signing key is touched or transaction submitted, refusing here instead
     /// of proceeding unaudited.
@@ -1457,10 +1459,11 @@ pub enum ValidationError {
     /// `"audit.chain_key_unavailable"`.
     #[error(
         "profile '{profile}' has no usable audit chain-root key; the command refuses to proceed \
-         unaudited. A profile without one mints it with `stellar-agent profile rotate-audit-key \
-         {profile}`. A stored key that cannot be read or decoded is refused by that command \
-         too: investigate, and if the stored key is corrupt, remove its keyring entry with the \
-         platform keyring tool before minting a new one"
+         unaudited. A profile whose audit log carries no entry tags mints one with \
+         `stellar-agent profile rotate-audit-key {profile}`. A log under entry tags takes \
+         rows only under its own key: restore that key to its keyring entry, or see \
+         docs/maintainers/audit-log-recovery.md section 10. A stored key that cannot be read or \
+         decoded is refused by the rotation too"
     )]
     AuditChainKeyUnavailable {
         /// The profile name whose audit chain-root key is unavailable.
@@ -1629,6 +1632,27 @@ pub enum ValidationError {
         current: String,
         /// Coordinates the anchor would move to.
         proposed: String,
+    },
+
+    /// `audit reanchor` found entries past the last entry with a valid entry
+    /// tag and was run without `--acknowledge-unauthenticated-tail`.
+    ///
+    /// Once a log's entry tags are in force, an entry without a valid tag was
+    /// not written by a writer holding the profile's audit key. The repair
+    /// keeps such entries and covers them with an `audit_entries_quarantined`
+    /// row only when the operator says so; nothing is written otherwise.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.acknowledgement_required"`.
+    #[error(
+        "profile '{profile}' audit log ends in {count} entries without a valid entry tag; nothing was written. Re-run `stellar-agent audit reanchor --profile {profile}` with --acknowledge-unauthenticated-tail to keep them as quarantined entries once you have established where they came from"
+    )]
+    AuditUnauthenticatedTailNotAcknowledged {
+        /// The profile whose audit log ends in unauthenticated entries.
+        profile: String,
+        /// The number of entries past the last authenticated entry.
+        count: u64,
     },
 
     /// A keyed audit writer refused because the profile's audit binding in the
@@ -2055,6 +2079,7 @@ impl ValidationError {
             // remedy in the message differs.
             Self::AuditLogUnusable { .. } => "audit.chain_key_unavailable",
             Self::AuditReanchorNotAcknowledged { .. }
+            | Self::AuditUnauthenticatedTailNotAcknowledged { .. }
             | Self::AuditBindingChangeNotAcknowledged { .. } => {
                 "validation.acknowledgement_required"
             }
@@ -3893,6 +3918,13 @@ mod tests {
                 "validation.acknowledgement_required",
             ),
             (
+                ValidationError::AuditUnauthenticatedTailNotAcknowledged {
+                    profile: "default".to_owned(),
+                    count: 2,
+                },
+                "validation.acknowledgement_required",
+            ),
+            (
                 ValidationError::AuditLogBindingChanged {
                     profile: "default".to_owned(),
                 },
@@ -4191,6 +4223,12 @@ mod tests {
                     current: current.clone(),
                     proposed: proposed.clone(),
                 },
+                ValidationError::AuditUnauthenticatedTailNotAcknowledged { profile, count } => {
+                    ValidationError::AuditUnauthenticatedTailNotAcknowledged {
+                        profile: profile.clone(),
+                        count: *count,
+                    }
+                }
                 ValidationError::AuditLogBindingChanged { profile } => {
                     ValidationError::AuditLogBindingChanged {
                         profile: profile.clone(),

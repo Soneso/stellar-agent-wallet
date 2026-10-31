@@ -17,8 +17,8 @@
 //! value-moving signing verb calls BEFORE any signing key is touched or
 //! transaction submitted: it proves the audit writer is acquirable, refusing
 //! with `audit.chain_key_unavailable` if not. The verb then threads the
-//! returned writer into [`emit_value_audit_row_with_writer`] for the post-confirm
-//! row, reusing the acquired writer.
+//! returned writer to the post-confirm row, which
+//! [`emit_value_audit_row_on_guard`] appends on a guard of that writer.
 //!
 //! The reset ceremony acquires the keyed writer before locking the window
 //! store. Its recorder uses the strict append mapping through that writer.
@@ -53,7 +53,7 @@ use crate::common::profile_access::ProfileOrigin;
 ///
 /// Callers invoke this BEFORE any signing key is touched and BEFORE any
 /// transaction is submitted (see the module docs). A verb with a post-confirm
-/// row reuses the returned writer for it ([`emit_value_audit_row_with_writer`])
+/// row reuses the returned writer for it ([`emit_value_audit_row_on_guard`])
 /// rather than re-acquiring it. A verb whose row is written strictly before a
 /// transmission discards the handle, and the strict write acquires again.
 /// [`drain_consent_rows_before_signing`] discards it too: that acquisition
@@ -274,12 +274,18 @@ pub(crate) fn require_value_audit_writer_for_origin(
 /// and a long-lived MCP server resolves its profile once at startup.
 ///
 /// A binding refusal is returned rather than answered with the unkeyed
-/// fallback, so nothing is written to a log the binding does not name.
+/// fallback, so nothing is written to a log the binding does not name. The
+/// unkeyed open refuses a log that shows keying (tags in force, a tagged row,
+/// a chain-root sidecar, or an anchoring row), so a keyed log is never
+/// appended to without its key.
 ///
 /// # Errors
 ///
 /// - [`ValidationError::AuditLogBindingChanged`] when the profile's audit
 ///   binding changed.
+/// - [`ValidationError::AuditLogUnusable`] with the
+///   `audit.chain_key_unavailable` detail when the key does not load and the
+///   log shows keying.
 /// - [`WalletError`] when even the unkeyed open fails, mapped as the keyed
 ///   acquisition's failures are: a log that cannot be read or written carries
 ///   [`ValidationError::AuditLogUnusable`] with the `audit.io_error` detail.
@@ -342,33 +348,26 @@ fn try_keyed_value_audit_writer(
     }
 }
 
-/// Writes `entry` through an audit writer the caller already acquired (via
-/// [`require_value_audit_writer`]).
+/// Writes `entry` on `guard`, a held guard of an audit writer the caller
+/// already acquired (via [`require_value_audit_writer`]).
 ///
-/// Non-fatal: the write has nothing left to gate — the transaction already
-/// committed — so a failure to take the lock or append the row logs a
-/// `tracing::warn!` and returns without disturbing the caller.
-pub(crate) fn emit_value_audit_row_with_writer(
-    writer: &Arc<Mutex<AuditWriter>>,
+/// The caller holds the guard through any lookup the row depends on, so the
+/// row lands on the tip that lookup read.
+///
+/// Non-fatal: the write has nothing left to gate, since the transaction
+/// already committed, so a failure to append the row logs a `tracing::warn!`
+/// and returns without disturbing the caller.
+pub(crate) fn emit_value_audit_row_on_guard(
+    guard: &mut AuditWriter,
     profile_name: &str,
     entry: AuditEntry,
 ) {
-    match writer.lock() {
-        Ok(mut guard) => {
-            if let Err(e) = guard.write_entry(entry) {
-                tracing::warn!(
-                    profile = %profile_name,
-                    error = %e,
-                    "value audit: write_entry failed; row NOT emitted"
-                );
-            }
-        }
-        Err(_) => {
-            tracing::warn!(
-                profile = %profile_name,
-                "value audit: audit writer mutex poisoned; row NOT emitted"
-            );
-        }
+    if let Err(e) = guard.write_entry(entry) {
+        tracing::warn!(
+            profile = %profile_name,
+            error = %e,
+            "value audit: write_entry failed; row NOT emitted"
+        );
     }
 }
 
@@ -529,11 +528,12 @@ mod tests {
 
         assert_eq!(
             rows.len(),
-            1,
-            "one row written through the real loader path"
+            2,
+            "the open's boundary row and one row written through the real loader path"
         );
-        assert_eq!(rows[0]["kind"], "value_action_submitted", "row kind");
-        assert_eq!(rows[0]["tool"], "stellar_pay", "outer tool identity");
+        assert_eq!(rows[0]["kind"], "audit_entry_tags_started");
+        assert_eq!(rows[1]["kind"], "value_action_submitted", "row kind");
+        assert_eq!(rows[1]["tool"], "stellar_pay", "outer tool identity");
     }
 
     // ── require_value_audit_writer — the fail-closed pre-flight ──────────────
@@ -600,7 +600,7 @@ mod tests {
             "req-require-1",
             None,
         );
-        emit_value_audit_row_with_writer(&writer, "require-seeded", entry);
+        emit_value_audit_row_on_guard(&mut writer.lock().unwrap(), "require-seeded", entry);
 
         let file = std::fs::File::open(&profile.audit_log_path).expect("audit.jsonl exists");
         let rows: Vec<serde_json::Value> = std::io::BufReader::new(file)
@@ -609,9 +609,11 @@ mod tests {
             .collect();
         assert_eq!(
             rows.len(),
-            1,
+            2,
             "the writer returned by require_value_audit_writer must write through"
         );
+        assert_eq!(rows[0]["kind"], "audit_entry_tags_started");
+        assert_eq!(rows[1]["request_id"], "req-require-1");
     }
 
     // ── require_value_audit_writer_for_origin — origin-aware dispatch ───────
@@ -710,7 +712,7 @@ mod tests {
             "req-origin-synth-1",
             None,
         );
-        emit_value_audit_row_with_writer(&writer, "origin-synth-seeded", entry);
+        emit_value_audit_row_on_guard(&mut writer.lock().unwrap(), "origin-synth-seeded", entry);
 
         let file = std::fs::File::open(&profile.audit_log_path).expect("audit.jsonl exists");
         let rows: Vec<serde_json::Value> = std::io::BufReader::new(file)
@@ -719,9 +721,11 @@ mod tests {
             .collect();
         assert_eq!(
             rows.len(),
-            1,
+            2,
             "the writer returned on the synthesized path must write through"
         );
+        assert_eq!(rows[0]["kind"], "audit_entry_tags_started");
+        assert_eq!(rows[1]["request_id"], "req-origin-synth-1");
     }
 
     // ── The pre-flight's failure mapping ─────────────────────────────────────
@@ -1228,11 +1232,11 @@ mod tests {
             err.message(),
             format!(
                 "profile '{name}' has no usable audit chain-root key; the command refuses to \
-                 proceed unaudited. A profile without one mints it with `stellar-agent profile \
-                 rotate-audit-key {name}`. A stored key that cannot be read or decoded is \
-                 refused by that command too: investigate, and if the stored key is corrupt, \
-                 remove its keyring entry with the platform keyring tool before minting a new \
-                 one"
+                 proceed unaudited. A profile whose audit log carries no entry tags mints one \
+                 with `stellar-agent profile rotate-audit-key {name}`. A log under entry tags \
+                 takes rows only under its own key: restore that key to its keyring \
+                 entry, or see docs/maintainers/audit-log-recovery.md section 10. A stored key \
+                 that cannot be read or decoded is refused by the rotation too"
             )
         );
     }
@@ -1284,6 +1288,47 @@ mod tests {
             "{}",
             err.message()
         );
+    }
+
+    /// With a key that does not load, the unkeyed fallback refuses a log that
+    /// a keyed writer wrote, and the log is left as it was.
+    #[test]
+    #[serial]
+    fn the_best_effort_fallback_refuses_a_keyed_log() {
+        use stellar_agent_core::audit_log::tip_anchor::{
+            InMemoryTipAnchorStore, KeyedAuditAccess, TipAnchorStore,
+        };
+
+        keyring_mock::install().expect("mock keyring store");
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let mut profile =
+            Profile::builder_testnet("keyed-fallback", "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        {
+            let access = KeyedAuditAccess::new(
+                zeroize::Zeroizing::new([0x4f; 32]),
+                Arc::new(InMemoryTipAnchorStore::new()) as Arc<dyn TipAnchorStore>,
+            );
+            AuditWriter::open(profile.audit_log_path.clone(), Some(access)).expect("keyed writer");
+        }
+        let before = std::fs::read(&profile.audit_log_path).expect("log");
+
+        let Err(err) = acquire_best_effort_audit_writer(
+            &profile,
+            "keyed-fallback",
+            ProfileOrigin::Synthesized,
+        ) else {
+            panic!("an unkeyed open refuses a keyed log");
+        };
+
+        assert_eq!(err.code(), "audit.chain_key_unavailable", "{err}");
+        assert!(
+            err.message()
+                .contains("only a writer holding the profile's audit key appends to this log"),
+            "{}",
+            err.message()
+        );
+        assert_eq!(std::fs::read(&profile.audit_log_path).expect("log"), before);
     }
 
     /// A synthesized profile's warn-only pre-flight records no binding.
