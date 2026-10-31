@@ -12,6 +12,8 @@ shipping a `stellar-agent` CLI and a `stellar-agent-mcp` MCP server.
   testnet account, and make a first payment.
 - [Verifying releases](verifying-releases.md): check a release archive against
   its checksums, its cosign signature, and its SLSA provenance.
+- [Architecture](architecture.md): actors, trust boundaries, the payment flow,
+  and key custody.
 - [Concepts](concepts.md): the security and governance model: profiles, key
   custody, the policy engine, the approval spine, and the audit log.
 - [CLI reference](cli-reference/index.md): the `stellar-agent` command surface.
@@ -43,7 +45,7 @@ describes.
 
 ## For maintainers
 
-- [Architecture](maintainers/architecture.md): the crate map and dependency
+- [Maintainer architecture](maintainers/architecture.md): the crate map and dependency
   layering.
 - [Stability tiers](maintainers/stability-tiers.md): per-crate support intent,
   maturity, and mainnet posture.
