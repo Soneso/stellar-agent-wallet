@@ -8,7 +8,7 @@ For the cryptographic detail behind these states see [Security internals](securi
 
 **Wire code:** `audit.tip_anchor_mismatch`
 
-**What it means.** The keyring holds a tip anchor for the log file: the number of entries in it, the SHA-256 hash of its last entry, and the byte offset just past that entry. The log at that path diverges from that tip. It is shorter than the anchor, or the entry ending at the anchored offset is not the anchored entry. A live writer also refuses growth beyond its own last append offset, including complete foreign rows or a torn prefix.
+**What it means.** The keyring holds a tip anchor for the log file: the number of entries in it, the SHA-256 hash of its last entry, and the byte offset just past that entry. The log at that path diverges from that tip. It is shorter than the anchor, or the entry ending at the anchored offset is not the anchored entry. A live writer also refuses growth beyond its own last append offset, including complete foreign rows or a torn prefix. Once the log holds its `audit_entry_tags_started` row, a keyed writer also refuses a log that grew past the anchor when an entry of that tail carries no valid entry tag; the reason is `unauthenticated_tail`.
 
 **Why it is checked at all.** The hash chain links each entry to its predecessor, and each file's `.root_hmac` sidecar signs that file's first entry. Both verify a PREFIX. Restoring yesterday's copy of the active log, or truncating the last few entries off it, leaves a log that passes the chain walk and the root signature and looks clean. The anchor is the only thing that knows how far the log had got. The anchor, the re-anchor counter, and the audit binding live in the keyring, outside the log file. Anyone who can restore the keyring's own storage together with the log can restore an older state. With a headless keyring backend these entries are kept in a file on the same host. Anyone who can write that file can restore older entries or delete one, which needs no key material. A deleted binding is recorded again from the profile file at the next keyed use. A deleted anchor is refused while anything shows it was written (section 1.1). Mainnet readiness refuses a headless backend, because a restored copy of its file can make a truncated log and its anchor agree.
 
@@ -24,10 +24,11 @@ For the cryptographic detail behind these states see [Security internals](securi
 2. **A truncation.** The file was clipped by a log-management tool, a failed copy, or a disk-full condition. `stellar-agent audit verify <log-path>` without `--profile` tells you whether the remaining prefix is intact.
 3. **A second machine.** Two hosts sharing a profile directory over a network filesystem, or a profile directory synced by a file-sync client, each anchor independently in their own keyring. The anchor is per host.
 4. **Tampering.** Someone with write access to the audit directory removed rows. Nothing about a rollback distinguishes this from case 1 on its own; the modification times, the contents, and your own change record do.
+5. **An unauthenticated tail** (reason `unauthenticated_tail`). Entries were appended past the anchor by something that does not hold the profile's audit key: a forged row, or a row written by a build without entry tags. `stellar-agent audit verify --profile <name> <log-path>` names the first such line with `audit.entry_tag_invalid`. Inspect those entries before deciding: the repair keeps them, and `--acknowledge-unauthenticated-tail` quarantines them so readers skip them.
 
 **Recovery.**
 
-Establish which of the four it was BEFORE running the repair. Once the anchor moves, the evidence that it had moved is gone from the anchor. Only the row the repair writes remains.
+Establish which of the five it was BEFORE running the repair. Once the anchor moves, the evidence that it had moved is gone from the anchor. Only the row the repair writes remains.
 
 ```
 stellar-agent audit verify <log-path>                       # is the remaining prefix intact
@@ -35,7 +36,7 @@ stellar-agent audit reanchor --profile <name>               # report only, chang
 stellar-agent audit reanchor --profile <name> --acknowledge-rollback
 ```
 
-When the profile's audit binding has also changed, the verb needs `--acknowledge-binding-change` as well; see §4.
+When the profile's audit binding has also changed, the verb needs `--acknowledge-binding-change` as well; see §4. For an unauthenticated tail it also needs `--acknowledge-unauthenticated-tail`: it appends `audit_entries_quarantined { quarantined_count }` directly after those entries, then its `audit_tip_anchored` rows, and reports `quarantined_rows`. Without the flag it exits 1 with `validation.acknowledgement_required` and writes nothing. A tail that ends on a rotation handoff without a valid tag refuses with `audit.reanchor_failed` and names that line; remove the line, then rerun the repair.
 
 The reporting form prints the anchor in force and the anchor it would write, both as `<entry count>:<byte offset>`, and exits 1. A stored anchor that cannot be parsed at all is reported as `unusable (<field count> colon-separated fields, <n> bytes)` rather than echoed. This includes a corrupted value, or one written by a build that predates the current format. The acknowledging form replaces it. Every other verb refuses on such a value: reading it as "nothing is anchored" would turn a corrupted anchor into a silently disarmed guard. Nothing is written. The acknowledging form replays the whole log first (a log whose own chain is broken is refused here, not blessed). It writes the current tip as the anchor, increments a monotonic per-path re-anchor counter in the keyring, and appends an `audit_tip_anchored` row naming the superseded anchor. That row is permanent: the log carries its own record that a rollback was accepted, including how far back it went.
 
@@ -151,13 +152,21 @@ repair coordinates. After process exit, open and `audit verify` report
 `audit.tip_anchor_mismatch` on this honest log. Verify the chain and investigate
 the outage, then use `audit reanchor --profile <name> --acknowledge-rollback`.
 
-## 3. What the anchor does not protect
+## 3. What the anchor and the entry tags do not protect
 
-The anchor detects rollback and truncation. It does not detect forgery.
+The anchor detects rollback and truncation. The entry tags detect appended forgeries past the log's boundary row.
 
-The entry-to-entry chain hash is unkeyed. Someone who can write the log file can append a well-formed entry that chains correctly off the current tip, and both the chain walk and the anchor will accept it. The tip moved forward, which is what an honest append also looks like. Only the FIRST entry of each file carries a keyed signature, the `.root_hmac` sidecar, and only its own file's root.
+The entry-to-entry chain hash is unkeyed. Someone who can write the log file can append a well-formed entry that chains correctly off the current tip; the chain walk and the anchor accept it, because the tip moved forward, which is what an honest append also looks like. The `.root_hmac` sidecar signs only each file's FIRST entry. Every entry a keyed writer appends also carries an `entry_tag`, an HMAC over the entry's hash under a key derived from the profile's audit key. Past the boundary row, an entry without a valid tag is refused by keyed writers (`unauthenticated_tail`) and by `audit verify --profile` (`audit.entry_tag_invalid`), and the readers stop at the writer's verified tip, so they never act on it.
 
-Detecting appended forgeries would need a keyed tag per entry. This substrate does not have one. What it gives you is: entries cannot be edited or removed without detection, the log cannot be rewound without detection, and a file cannot be substituted for another without detection.
+What stays open:
+
+- Code that can read the profile's audit key can compute valid tags.
+- Rows before the boundary row are covered by the anchor only. The boundary row absorbs an unanchored tail once and records how many rows it absorbed.
+- `audit verify` without `--profile` checks no tag.
+- Zero-config logs, written without an audit key, carry no tags.
+- Tags stripped inside the anchored prefix fail keyed verify until the next keyed open appends `audit_entry_tags_rekeyed { cause: open_repair }`, which `audit verify` reports as a warning.
+
+What the substrate gives you: entries cannot be edited or removed without detection, the log cannot be rewound without detection, a file cannot be substituted for another without detection, and past the boundary row an entry cannot be appended without the audit key.
 
 The anchor is also not a cross-host guarantee. It is held in the local keyring and describes one path on one host. The anchor, the re-anchor counter, and the audit binding live in the keyring, outside the log file. Anyone who can restore the keyring's own storage together with the log can restore an older state. With a headless keyring backend these entries are kept in a file on the same host. Anyone who can write that file can restore older entries or delete one, which needs no key material. A deleted binding is recorded again from the profile file at the next keyed use. A deleted anchor is refused while anything shows it was written (section 1.1). Mainnet readiness refuses a headless backend, because a restored copy of its file can make a truncated log and its anchor agree.
 
@@ -214,11 +223,17 @@ Adoption replays the whole log first. A broken chain is refused rather than adop
 
 On success the current tip becomes the anchor and an `audit_tip_anchored` row with reason `adopted` is appended. An adoption writes its row only for a non-empty file: an empty file stores no anchor and gets no row, and its first append writes the first anchor. A non-empty file gets exactly one such row per adoption.
 
+### 5.1 The entry-tag boundary
+
+The first acquisition by a writer that holds the audit key and the anchor store appends `audit_entry_tags_started { anchored_count, absorbed_count }`, tagged like every row. From that row on, entry tags are in force: every later entry must carry a valid tag, and each rotation handoff carries `entry_tags: true`, so the rule survives rotation and prune. `anchored_count` is the stored anchor's count, 0 for an adopted log. `absorbed_count` counts the rows the acquisition took without a tag check: the tail past the anchor, the rows of a file a rotation completed, or every row of an adopted file. `audit verify` warns `entry_tags_absorbed` when that count is nonzero; inspect those rows, since nothing authenticated them. A failed boundary append does not fail the acquisition; the next one retries it. Mainnet readiness requires tags in force and refuses with `audit.tip_anchor_unavailable` until the row is written.
+
+Once a log's entry tags are in force, or its active file holds a row that carries an entry tag, a writer without the audit key refuses it with `audit.chain_key_unavailable`. A writer without the key and without the anchor store also refuses a log with a chain-root sidecar or an anchoring row. Builds without entry tags cannot parse the new rows and refuse a log that holds them with `audit.parse_error`.
+
 ## 6. Appends made without the anchor
 
-Not every writer carries the anchor. The CLI startup advisory, the zero-config best-effort path, and the read-only smart-account verbs open the log unkeyed and do not move it. Their appends leave the log AHEAD of the anchor, which is not an error: the next acquisition that does carry the anchor replays the appended tail, confirms it chains off the anchored tip, and re-anchors on the new tip. No row is written for that; the appended rows are their own record.
+Not every writer carries the anchor. The zero-config best-effort path and the read-only smart-account verbs of a profile whose audit key does not load open the log unkeyed and do not move it; on a log that shows keying they refuse instead (section 5.1), and the CLI startup advisory then reads without a writer and writes no row. Appends of an unkeyed writer leave the log AHEAD of the anchor, which is not an error before the boundary row: the next acquisition that does carry the anchor replays the appended tail, confirms it chains off the anchored tip, and re-anchors on the new tip. No row is written for that; the appended rows are their own record. Past the boundary, an untagged tail refuses (section 1).
 
-The same path absorbs the crash window between an entry's `fsync` and the anchor write. The entry is durable, the anchor is one behind, and the next reconciliation closes the gap.
+The same path absorbs the crash window between an entry's `fsync` and the anchor write. The entry is durable and tagged, the anchor is one behind, and the next reconciliation closes the gap.
 
 ## 7. Reading the tip-anchor rows
 
@@ -234,6 +249,14 @@ grep '"kind":"audit_tip_anchored"' <log-path>
 | `reanchor_count` | The current path's re-anchor counter after this repair. One repair bumps it once, so a `rollback_acknowledged` row and the `binding_changed` row after it carry the same count. Absent for an adoption. |
 
 A `rollback_acknowledged` or `binding_changed` row is the thing to look for when reading a log's history: it marks a point where the log's own continuity was accepted rather than proven. A `rollback_acknowledged` row names how many entries and bytes were given up. A `binding_changed` row names where the previous log ended.
+
+Three more rows record the entry tags:
+
+| Kind | Fields | Meaning |
+| --- | --- | --- |
+| `audit_entry_tags_started` | `anchored_count`, `absorbed_count` | Entry tags are in force from this row; the counts are those of section 5.1. |
+| `audit_entry_tags_rekeyed` | `cause` | Entries after this row are tagged under the key this row's tag verifies under. `rotation`: `profile rotate-audit-key` switched the key. `open_repair`: a keyed open found entries past the newest keyed start whose tags fail under the current key, after an interrupted rotation or stripped tags. `audit verify` warns `entry_tags_rekeyed_at_open` for the latter. |
+| `audit_entries_quarantined` | `quarantined_count` | `audit reanchor --acknowledge-unauthenticated-tail` kept that many entries directly before this row, in the same file, without a valid tag. Readers skip them; `audit verify` warns `entries_quarantined`. |
 
 ## 8. The audit outbox
 
@@ -251,7 +274,7 @@ A `rollback_acknowledged` or `binding_changed` row is the thing to look for when
 Every append checks the committed prefix, syncs its new line, then stores the updated commitment.
 A failed state write truncates the append back and refuses consent.
 
-**Drain points.** A draining writer checks the commitment, appends every queued row, stores zero state, then truncates the outbox:
+**Drain points.** A draining writer checks the commitment, appends the committed queued rows, stores zero state, then truncates the outbox. Only consent rows (`approval_attested`, `approval_attested_remote`) drain; a committed row of any other kind refuses with `audit.outbox_unusable` (section 8.1). Drains run:
 
 - when it opens, right after the tip-anchor check;
 - on every keyed acquisition in a running process, under the same lock as that check;
@@ -259,15 +282,15 @@ A failed state write truncates the append back and refuses consent.
 
 A command that consumes an approval acquires the writer after it reads the approval and before it loads a signing key. A queued consent row is therefore in the log before the key is touched. `audit reanchor` drains after its repair rows. The repair writer never drains when it opens, and its reporting form never drains.
 
-**Delivery is at least once.** A crash between a drain's appends and its truncation appends the same rows again on the next drain. A repeated row keeps its `request_id`, which identifies it. An append that never returned `Ok` can leave a final segment with no newline; the next append or drain discards it with a warning.
+**Delivery.** A crash between a drain's reset of the commitment and its truncation leaves a zero commitment and complete lines whose rows the log already ends with. The next drain recognizes that batch, truncates the outbox, and appends nothing. A crash between the appends and the reset appends the same rows again on the next drain; a repeated row keeps its `request_id`, which identifies it. An append that never returned `Ok` can leave a final segment with no newline; the next append or drain discards it with a warning.
 
 **A row can record a consent that did not take effect.** The consent row is written, or queued, before the approval is persisted. A persist failure after the row, or a crash between the row and the persist, leaves an `approval_attested` row for an approval that never took effect. To tell, find the entry whose nonce starts with the row's `nonce_prefix` in `stellar-agent approve list --profile <name> --include-expired`. The approval took effect when the entry shows `attested: true` or kind `Consumed`. It did not when the entry still shows its original kind with `attested: false`, or is a `Rejected` tombstone. A listed toolset gate entry is inconclusive, because its removal after a persisted grant is best-effort. An entry already removed by `approve gc` cannot be judged from the store.
 
 **Timestamps.** A drained row keeps its consent timestamp. Every draining writer drains before its own rows, so the log stays in time order. Three cases can still put an older timestamp after a newer one. The first is a row from a writer that does not drain: the CLI startup advisory, the zero-config path, or the `audit reanchor` repair rows. The second is a repeated row after a crash. The third is the adoption row an acquisition appends when its drain refuses. `audit verify` can then report `backward_timestamp_jump`; with the `request_id` of a repeated row, or the row's kind, that warning is explained.
 
-**Committed queue.** A missing, shortened, changed, or reordered committed prefix refuses with `audit.outbox_rows_missing` before any queued row is appended.
+**Committed queue.** A missing, shortened, changed, or reordered committed prefix refuses with `audit.outbox_rows_missing` before any queued row is appended, and so does a complete line past the commitment.
 This blocks keyed acquisition and approval consumption until the operator acknowledges the loss.
-Rows beyond the commitment drain too, preserving delivery after an interrupted append or drain.
+A line past the commitment is one an append left after a crash between its line sync and its commitment, or one written outside the wallet; the consent it records never took effect, and `approve --id` refuses until the acknowledgement.
 An absent keyring state reads as zero for an outbox without a commitment.
 Raw deletion or restore of keyring entries outside the wallet rests on the platform keyring, as described in SECURITY.md.
 The commitment does not authenticate who queued a row.
@@ -279,17 +302,16 @@ It reports `outbox_pending` separately and warns about torn, unparseable, or unr
 
 **Detail sub-code:** `audit.outbox_unusable` (under `audit.chain_key_unavailable`)
 
-**What it means.** A complete line of `<log>.outbox` does not parse as an audit entry. Every drain refuses, so every keyed acquisition refuses too, and the outbox is left unchanged. `audit verify` lists the line numbers under an `outbox_unparseable` warning.
+**What it means.** A committed line of `<log>.outbox` does not parse as an audit entry, or holds a row that is not a consent row. Every drain refuses, so every keyed acquisition refuses too, and the outbox is left unchanged. `audit verify` lists unparseable line numbers under an `outbox_unparseable` warning.
 
 **Recovery.**
 
 1. Stop the processes that use the profile: the MCP server, `approve serve`, and any CLI verb.
 2. Inspect the file: `cat -n <log>.outbox`. Each intact line is one consent row, with its `kind`, `ts`, `request_id`, and `nonce_prefix`.
-3. Move the file out of the audit directory: `mv <log>.outbox <somewhere-else>/outbox.saved`.
-4. Re-queue the intact lines byte-identically, in their original order and with each newline, into a new `<log>.outbox` with mode `0600`. Leave out only the unparseable lines.
-5. Start one keyed verb, or the MCP server. Its first acquisition checks and drains the re-queued rows. A missing or changed committed line reports `audit.outbox_rows_missing`; follow section 8.3.
+3. Move the file out of the audit directory: `mv <log>.outbox <somewhere-else>/outbox.saved`. The keyring still records the committed rows, so the next acquisition reports `audit.outbox_rows_missing`.
+4. Follow section 8.3. The acknowledgement records the loss, revokes every decided approval and toolset grant, appends no queued row, and resets the commitment. Approve the affected actions again.
 
-Deleting a line drops a consent row whose approval may already have taken effect. Keep the saved file with the incident record, and leave out only what does not parse.
+The saved file holds consent rows whose approvals may already have taken effect. Keep it with the incident record.
 
 ### 8.2 Busy outbox
 
@@ -315,17 +337,17 @@ stellar-agent audit acknowledge-outbox-loss --profile default --reason "Queue in
 ```
 
 The command checks the log's tip anchor and takes its writer and drain locks.
-It checks that the loss holds and that every remaining complete line parses.
+It checks that the loss holds. When the committed prefix is intact, every committed line must parse and be a consent row.
 It then revokes every decided, unexpired, unconsumed approval, including mainnet confirmations and recorded passkey assertions, and every toolset grant.
 Undecided requests remain.
-It appends `audit_outbox_loss_acknowledged`, drains the remaining complete rows, stores zero state, and truncates the outbox.
+It appends `audit_outbox_loss_acknowledged`, appends the committed prefix when it is intact and nothing otherwise, stores zero state, and truncates the outbox, discarding every other line.
 The operator approves affected actions again, creating new consent rows.
 
-The result reports `profile`, `expected_rows`, `found_rows`, `drained`, `revoked_approvals`, and `revoked_grants`.
+The result reports `profile`, `expected_rows`, `found_rows`, `drained`, `discarded`, `revoked_approvals`, and `revoked_grants`. `discarded` counts the complete lines the truncation dropped without appending them.
 A held writer refuses with `audit.writer_locked`.
 A log rolled back behind its tip anchor refuses with `audit.tip_anchor_mismatch`; follow section 1 first.
 No divergence refuses with `audit.outbox_loss_not_found` and writes no acknowledgement.
-A remaining line that does not parse refuses with `audit.outbox_unusable` before anything is revoked or written.
+An intact committed line that does not parse, or that is not a consent row, refuses with `audit.outbox_unusable` before anything is revoked or written.
 Follow section 8.1 for that line, then rerun the acknowledgement.
 An append refusal after the acknowledgement row leaves the queue and commitment in place; a rerun records the loss again.
 A crash after revocation leaves the loss in place; rerunning revokes any remaining permissions.
@@ -372,27 +394,45 @@ read as "nothing queued".
 1. Stop the processes that use the profile: the MCP server, `approve serve`,
    and any CLI verb.
 2. Copy `<log>.outbox` out of the audit directory with the incident record.
-3. Remove the keyring entry at that account with the platform keyring tool, as
-   in section 10. An absent commitment reads as zero.
-4. Start one keyed verb, or the MCP server. Its first acquisition drains every
-   complete queued line.
+   Its lines are the evidence of the queued consent; nothing appends them to
+   the log from here on.
+3. Remove the keyring entry at that account with the platform keyring tool.
+   An absent commitment reads as zero.
+4. When the outbox holds complete lines, every one of them now lies past the
+   commitment: keyed acquisitions and drains refuse with
+   `audit.outbox_rows_missing`, and nothing is drained. Run
+   `stellar-agent audit acknowledge-outbox-loss --profile <name> --reason
+   <text>` (section 8.3). It records the loss, revokes every decided approval
+   and toolset grant, appends no queued row, and empties the outbox. Approve
+   the affected actions again.
+5. When the outbox is empty or absent, the zero commitment matches it and no
+   loss is detectable: `audit acknowledge-outbox-loss` refuses with
+   `audit.outbox_loss_not_found`, writes nothing, and revokes nothing. Start
+   the processes again; the next keyed acquisition finds nothing queued and
+   proceeds.
 
 Removing the entry gives up the check of the rows queued before it, as a
 deletion of the entry outside the wallet does (section 8, "Committed queue").
-Compare the saved outbox with the `approval_attested` rows the drain appended
-before approving anything new.
+The saved outbox is the only record of that consent; keep it with the
+incident record.
 
 ## 10. Unreadable or undecodable audit key
 
-**Wire codes:** `audit.chain_key_unavailable` from the value-moving verbs and tools; from `stellar-agent profile rotate-audit-key`, the keyring read failure's own code, or `internal.unexpected_state` with the detail sub-code `audit.key_decode_failed` or `audit.key_length_error`.
+**Wire codes:** `audit.chain_key_unavailable` from the value-moving verbs and tools; from `stellar-agent profile rotate-audit-key`, the keyring read failure's own code, `internal.unexpected_state` with the detail sub-code `audit.key_decode_failed` or `audit.key_length_error`, or, for a removed key on a log under entry tags, `audit.chain_key_unavailable`.
 
 **What it means.** The profile's audit chain-root key entry exists, but it cannot be read, or its value is not base64 of exactly 32 bytes. `rotate-audit-key` mints a key only where no entry exists. It refuses an entry it cannot read or decode, before it records a binding, writes a key, or touches the log. The entry may hold the key the log's chain-root sidecars are signed under, and a read failure may be the keyring itself failing, which a new write would hide.
 
+**A first mint applies only to a log without entry tags.** A log whose entry tags are in force, or whose active file holds a row that carries an entry tag, takes rows only from a writer that holds its key. With the key entry removed, `rotate-audit-key` opens such a log without a key and refuses with `audit.chain_key_unavailable` and the detail `audit.chain_key_unavailable: ... only a writer holding the profile's audit key appends to this log`, before it writes a key or a row. The log's entry tags authenticate its rows under that key only, so no other key continues it. A chain-root sidecar or an anchoring row alone does not refuse the rotation, which opens the log with the anchor store; a writer without the key and without the anchor store refuses those as well (section 5.1).
+
 **Recovery.** Investigate first: a locked or failing keyring is fixed in the keyring, and the key comes back unchanged. If the stored audit key is corrupt:
 
-1. Remove that keyring entry with the platform keyring tool, such as Keychain Access on macOS, Seahorse on Linux, or Credential Manager on Windows. The entry's service and account are the profile's `audit_log_hash_chain_key_id`.
-2. Run `stellar-agent profile rotate-audit-key <name>` to mint a new key. It re-signs the log's chain-root sidecars under that key.
-3. If the log's anchor is gone, the rotation refuses with `audit.tip_anchor_missing` (section 1.1). Run `stellar-agent audit reanchor --profile <name> --acknowledge-rollback` after the checks that section names.
+1. Restore the trusted key from a copy of that keyring entry, such as a keychain backup, to the entry the profile's `audit_log_hash_chain_key_id` names. The log, its anchor, and its entry tags then verify as before, and `audit verify --profile <name>` confirms it.
+2. Without a copy, the existing log stays evidence that only its hash chain checks. Stop the processes that use the profile, then move every file of the log out of the audit directory with the incident record: the active file, its rotated files, their `.root_hmac` sidecars, `<log>.pruned` and its sidecar, and `<log>.outbox`. `stellar-agent audit verify <saved-log>` without `--profile` still walks the moved chain.
+3. Remove the corrupt keyring entry with the platform keyring tool, such as Keychain Access on macOS, Seahorse on Linux, or Credential Manager on Windows.
+4. Run `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`. The stored anchor still names the moved log, so the new, empty log is refused with `audit.tip_anchor_mismatch` until this re-anchor acknowledges it. When the keyring still commits queued consent rows of the moved outbox, the repair stands and the envelope's `warnings` list `audit.outbox_rows_missing`; acknowledge that loss as in section 8.3 before the next step.
+5. Run `stellar-agent profile rotate-audit-key <name>` to mint a new key. Its first keyed acquisition puts entry tags in force on the new log.
+
+On a log without entry tags, steps 3 and 5 alone apply: the rotation opens the log under its anchor, or adopts it as section 5 describes, mints the key, and re-signs the log's chain-root sidecars under it.
 
 ## 11. Retained history without an authenticated start
 

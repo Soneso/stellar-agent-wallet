@@ -193,12 +193,13 @@ impl AuditReadiness {
         self.facts.segment_start_hash
     }
 
-    /// Rechecks the writer's provenance, path, verified tip, and anchor coverage.
+    /// Rechecks the writer's provenance, path, verified tip, anchor coverage,
+    /// and entry tags in force.
     ///
     /// # Errors
     /// Refuses a poisoned writer lock and changed provenance or path with
-    /// `AuditProvenance`, and an unverifiable or uncovered tip with
-    /// `AuditNotAnchored`.
+    /// `AuditProvenance`, and an unverifiable or uncovered tip, or a log
+    /// without entry tags in force, with `AuditNotAnchored`.
     pub fn fresh_facts(&self) -> Result<AuditFacts, MainnetAuthorizationError> {
         use MainnetPrecondition as P;
         let mut writer = self
@@ -220,6 +221,7 @@ impl AuditReadiness {
             .verified_tip_facts()
             .map_err(|_| MainnetAuthorizationError::Refused(P::AuditNotAnchored))?;
         super::refusal::require(facts.anchor_covers_tip, P::AuditNotAnchored)?;
+        super::refusal::require(facts.entry_tags_in_force, P::AuditNotAnchored)?;
         Ok(AuditFacts {
             log_path_digest: facts.log_path_sha256,
             anchored_count: facts.entry_count,
@@ -295,17 +297,28 @@ fn keyring_backed_at(recorded: &dyn TipAnchorStore, expected: &KeyringTipAnchorS
         .is_some_and(|store| store.anchor_entry_ref() == expected.anchor_entry_ref())
 }
 
-/// Refuses facts whose anchor does not cover the tip.
+/// Refuses facts whose anchor does not cover the tip, and facts of a log
+/// whose entries past the boundary row are not tag-checked.
+///
+/// A keyed writer appends the boundary row at its first acquisition; when
+/// that append fails, the writer stays out of force and the next acquisition
+/// retries it.
 fn refuse_unless_covered(profile_name: &str, facts: &VerifiedTipFacts) -> Result<(), WalletError> {
-    if facts.anchor_covers_tip {
-        Ok(())
-    } else {
-        Err(unusable(
+    if !facts.anchor_covers_tip {
+        return Err(unusable(
             profile_name,
             "audit.tip_anchor_unavailable: the tip anchor does not cover the log's last \
              entry; retry once the keyring is reachable",
-        ))
+        ));
     }
+    if !facts.entry_tags_in_force {
+        return Err(unusable(
+            profile_name,
+            "audit.tip_anchor_unavailable: the audit log has no entry-tag boundary; retry \
+             once the audit writer can append",
+        ));
+    }
+    Ok(())
 }
 
 /// Refuses a process whose keyring backend is not the platform keyring.
@@ -343,7 +356,7 @@ pub fn refuse_headless_keyring_backend() -> Result<(), WalletError> {
 /// locks the writer, requires its anchor store to be the keyring-backed store
 /// at the profile's coordinate and its path to match the profile, runs
 /// [`stellar_agent_core::audit_log::AuditWriter::verified_tip_facts`], and
-/// requires the anchor to cover the tip.
+/// requires the anchor to cover the tip and entry tags to be in force.
 ///
 /// # Errors
 ///
@@ -356,7 +369,7 @@ pub fn refuse_headless_keyring_backend() -> Result<(), WalletError> {
 ///   for a cached writer opened with another anchor store or at a path other
 ///   than the profile's, naming `audit.io_error` for a poisoned writer lock,
 ///   and naming `audit.tip_anchor_unavailable` for an anchor that does not
-///   cover the tip.
+///   cover the tip or a log without its entry-tag boundary row.
 /// - `wallet.clock_error` when the clock cannot be read.
 pub fn audit_readiness(
     profile: &Profile,
@@ -439,6 +452,18 @@ mod tests {
         profile
     }
 
+    /// A consent row, the only kind the audit outbox queues.
+    fn consent_row() -> AuditEntry {
+        AuditEntry::new_approval_attested(
+            "PaymentSimulated",
+            "stellar_pay_commit",
+            None,
+            "ABCDEFGHIJKLMNOPQRSTUV",
+            "cli",
+            "00000000-0000-4000-8000-000000000000",
+        )
+    }
+
     fn row() -> AuditEntry {
         AuditEntry::new_tool_invocation(NewToolInvocation::new(
             "stellar_pay_commit",
@@ -449,9 +474,10 @@ mod tests {
         ))
     }
 
-    /// A fresh log yields the proof at count zero; a later row and a drained
-    /// outbox row raise the count, the proof keeps the registry's writer, and
-    /// its fact digest follows the documented layout.
+    /// A fresh log yields the proof at count one, its entry-tag boundary row;
+    /// a later row and a drained outbox row raise the count, the proof keeps
+    /// the registry's writer, and its fact digest follows the documented
+    /// layout.
     #[test]
     #[serial]
     fn the_keyring_backed_writer_yields_the_proof() {
@@ -461,7 +487,11 @@ mod tests {
         let profile = profile(dir.path(), name);
         let first = audit_readiness(&profile, name).unwrap();
         assert_eq!(first.profile(), name);
-        assert_eq!(first.anchored_count(), 0, "an empty verified genesis");
+        assert_eq!(
+            first.anchored_count(),
+            1,
+            "a fresh log holds only the boundary row"
+        );
         assert_eq!(
             first.log_path_digest(),
             stellar_agent_core::audit_log::log_path_sha256(&profile.audit_log_path)
@@ -474,12 +504,12 @@ mod tests {
                 &profile.audit_log_path,
             ),
         )
-        .append(&row())
+        .append(&consent_row())
         .unwrap();
         let second = audit_readiness(&profile, name).unwrap();
         assert_eq!(
             second.anchored_count(),
-            2,
+            3,
             "the count is taken after the drain"
         );
         assert!(Arc::ptr_eq(first.writer(), second.writer()));
@@ -489,7 +519,7 @@ mod tests {
         expected.extend(name.as_bytes());
         expected.extend(second.log_path_digest());
         expected.extend(second.segment());
-        expected.extend(2_u64.to_be_bytes());
+        expected.extend(3_u64.to_be_bytes());
         expected.extend(second.tip_hash());
         expected.extend(second.verified_at_ms().to_be_bytes());
         let independent: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&expected).into();
@@ -591,7 +621,8 @@ mod tests {
         ));
     }
 
-    /// Facts whose anchor does not cover the tip refuse; covered facts pass.
+    /// Facts whose anchor does not cover the tip refuse, and so do facts of a
+    /// log without entry tags in force; covered facts with tags in force pass.
     #[test]
     fn uncovered_facts_refuse() {
         let mut facts = VerifiedTipFacts {
@@ -600,8 +631,17 @@ mod tests {
             tip_hash: [1; 32],
             log_path_sha256: [2; 32],
             anchor_covers_tip: true,
+            entry_tags_in_force: true,
         };
         assert!(refuse_unless_covered("p", &facts).is_ok());
+        facts.entry_tags_in_force = false;
+        let err = refuse_unless_covered("p", &facts).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("audit.tip_anchor_unavailable: the audit log has no entry-tag boundary"),
+            "{err}"
+        );
+        facts.entry_tags_in_force = true;
         facts.anchor_covers_tip = false;
         let err = refuse_unless_covered("p", &facts).unwrap_err();
         assert!(
@@ -663,11 +703,14 @@ mod tests {
                 MainnetPrecondition::AuditProvenance
             ))
         ));
-        // Keeping the original path does not restore keyring provenance.
+        // Keeping the original path, the audit key and the anchor's value in
+        // another store does not restore keyring provenance.
+        let copied = InMemoryTipAnchorStore::new();
+        copied.set(proof.expected.load_anchor().unwrap());
         let replacement = AuditWriter::open_with_tip_anchor(
             profile.audit_log_path.clone(),
-            None,
-            Arc::new(InMemoryTipAnchorStore::new()),
+            crate::keyring::read_secret_32(&profile.audit_log_hash_chain_key_id).unwrap(),
+            Arc::new(copied),
             stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
         .unwrap();
@@ -696,9 +739,12 @@ mod tests {
         let name = "readiness-path";
         let profile = profile(dir.path(), name);
         let proof = audit_readiness(&profile, name).unwrap();
+        // A copy of the log matches the profile's anchor at another path.
+        let other = dir.path().join("other.jsonl");
+        std::fs::copy(&profile.audit_log_path, &other).unwrap();
         let replacement = AuditWriter::open_with_tip_anchor(
-            dir.path().join("other.jsonl"),
-            None,
+            other,
+            crate::keyring::read_secret_32(&profile.audit_log_hash_chain_key_id).unwrap(),
             Arc::new(proof.expected.clone()),
             stellar_agent_core::audit_log::BindingHistory::NotRecorded,
         )
@@ -758,7 +804,7 @@ mod tests {
                 &profile.audit_log_path,
             ),
         )
-        .append(&row())
+        .append(&consent_row())
         .unwrap();
         assert!(matches!(
             proof.fresh_facts(),
@@ -767,7 +813,55 @@ mod tests {
             ))
         ));
         failing.store(false, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(proof.fresh_facts().unwrap().anchored_count, 1);
+        assert_eq!(proof.fresh_facts().unwrap().anchored_count, 2);
+    }
+
+    /// A keyring-anchored writer without the audit key leaves its log
+    /// without entry tags in force: its facts are covered, and `fresh_facts`
+    /// still refuses them. The keyed open that follows appends the boundary
+    /// row, and its proof's facts pass.
+    #[test]
+    #[serial]
+    fn fresh_facts_refuse_a_log_without_tags_in_force() {
+        use stellar_agent_core::audit_log::{AuditWriter, BindingHistory};
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "readiness-untagged";
+        let profile = profile(dir.path(), name);
+        let mut writer = AuditWriter::open_with_tip_anchor(
+            profile.audit_log_path.clone(),
+            None,
+            KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+        writer.write_entry(row()).unwrap();
+        let facts = writer.verified_tip_facts().unwrap();
+        assert!(facts.anchor_covers_tip);
+        assert!(!facts.entry_tags_in_force);
+        let untagged = AuditReadiness {
+            expected: KeyringTipAnchorStore::for_path_digest(
+                &profile.audit_log_hash_chain_key_id,
+                &facts.log_path_sha256,
+            ),
+            profile: name.to_owned(),
+            facts,
+            verified_at_ms: 5,
+            writer: Arc::new(std::sync::Mutex::new(writer)),
+        };
+        assert!(matches!(
+            untagged.fresh_facts(),
+            Err(MainnetAuthorizationError::Refused(
+                MainnetPrecondition::AuditNotAnchored
+            ))
+        ));
+        drop(untagged);
+
+        let proof = audit_readiness(&profile, name).unwrap();
+        assert_eq!(proof.fresh_facts().unwrap().anchored_count, 2);
     }
 
     #[test]
@@ -785,6 +879,7 @@ mod tests {
                 log_path_sha256: [2; 32],
                 segment_start_hash: [4; 32],
                 anchor_covers_tip: true,
+                entry_tags_in_force: true,
             },
             writer: Arc::new(std::sync::Mutex::new(writer)),
             expected: KeyringTipAnchorStore::for_path_digest(

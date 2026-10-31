@@ -332,6 +332,13 @@ fn both_locks_refuse_with_the_audit_code_first() {
     assert_eq!(f.state(), before);
 }
 
+/// An audit append failure refuses the reset with the append's I/O cause and
+/// leaves the window state unchanged.
+///
+/// The keyed writer's first row is its entry-tag boundary row, so the
+/// blocked chain-root sidecar fails that row after it is written. The reset
+/// then refuses before its own row with that failure, `audit.io_error`, not
+/// as growth of the log by another writer.
 #[test]
 #[serial]
 fn append_failure_refuses_without_changing_window_state() {
@@ -344,10 +351,28 @@ fn append_failure_refuses_without_changing_window_state() {
         output["error"]["code"], "audit.chain_key_unavailable",
         "{output}"
     );
-    assert_eq!(f.state(), before);
     assert!(
-        !std::fs::read(&f.profile.audit_log_path).unwrap().is_empty(),
-        "the failure occurs after append acquisition and the row write"
+        output["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("audit.io_error: an append to the audit log failed"),
+        "{output}"
+    );
+    assert_eq!(f.state(), before);
+    let kinds: Vec<String> = std::fs::read_to_string(&f.profile.audit_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["audit_entry_tags_started"],
+        "the boundary row is written and the reset row is not"
     );
 }
 
@@ -360,10 +385,14 @@ fn first_use_mint_is_recorded_after_the_reset_row() {
     let rows = verified_audit_entries_from_path(&f.profile.audit_log_path);
     assert!(matches!(
         rows[0].event_kind,
-        EventKind::PolicyWindowStateReset { .. }
+        EventKind::AuditEntryTagsStarted { .. }
     ));
     assert!(matches!(
         rows[1].event_kind,
+        EventKind::PolicyWindowStateReset { .. }
+    ));
+    assert!(matches!(
+        rows[2].event_kind,
         EventKind::KeyringKeyWritten {
             key_purpose: KeyPurpose::PolicyWindowStateHmac,
             ..
@@ -390,10 +419,14 @@ fn mint_is_recorded_even_when_the_store_write_fails() {
     let rows = verified_audit_entries_from_path(&f.profile.audit_log_path);
     assert!(matches!(
         rows[0].event_kind,
-        EventKind::PolicyWindowStateReset { .. }
+        EventKind::AuditEntryTagsStarted { .. }
     ));
     assert!(matches!(
         rows[1].event_kind,
+        EventKind::PolicyWindowStateReset { .. }
+    ));
+    assert!(matches!(
+        rows[2].event_kind,
         EventKind::KeyringKeyWritten {
             key_purpose: KeyPurpose::PolicyWindowStateHmac,
             ..

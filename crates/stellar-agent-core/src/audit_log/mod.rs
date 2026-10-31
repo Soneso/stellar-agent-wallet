@@ -32,9 +32,18 @@
 //! # Hash chain mechanism
 //!
 //! ```text
-//! current_entry_hash = SHA-256(canonical_json(entry \ previous_entry_hash)
+//! current_entry_hash = SHA-256(canonical_json(entry \ previous_entry_hash
+//!                                                   \ entry_tag)
 //!                              || previous_entry_hash)
 //! ```
+//!
+//! A keyed writer also stores `entry_tag`, an HMAC-SHA256 over the entry's
+//! chain hash under a key derived from the profile's audit key (see
+//! [`chain::derive_entry_tag_key`](crate::audit_log::chain::derive_entry_tag_key)).
+//! The tag sits outside the hashed body, so entry hashes are the same with
+//! and without it. Once a log holds its `audit_entry_tags_started` row, keyed
+//! writers and `audit verify --profile` require a valid tag on every later
+//! entry.
 //!
 //! # Canonical-form contract
 //!
@@ -69,7 +78,8 @@
 //!
 //! Each log file gets its own `<file>.root_hmac` sidecar, written on the first
 //! entry of that file.  On rotation the sidecar is renamed alongside the log
-//! file: `audit.jsonl.root_hmac` → `audit.jsonl.<ts>.root_hmac`.
+//! file: `audit.jsonl.root_hmac` to `audit.jsonl.<ts>.root_hmac`. The sidecar
+//! covers that first entry only; the entry tags cover every later entry.
 //! Retention writes `<log>.pruned` before deleting an archive. It holds the
 //! oldest retained file's seed, the outgoing file's seed, a file count, and an
 //! HMAC tag when the writer has a key.
@@ -145,6 +155,9 @@ pub mod writer;
 pub use binding::{
     AuditBinding, AuditBindingParseError, BindingCheck, BindingHistory, RecordedBinding,
 };
+pub use chain::{
+    EntryTagCheck, EntryTagKey, check_entry_tag, compute_entry_tag, derive_entry_tag_key,
+};
 pub use entry::{AuditEntry, NewToolInvocation};
 pub use health::{AuditWriterHealth, AuditWriterHealthHandle};
 pub use outbox::{
@@ -157,7 +170,7 @@ pub use reader::{
 };
 pub use rotation::{SidecarResignError, resign_chain_root_sidecars};
 pub use schema::{
-    CrossCheckRecord, EVENT_KIND_VARIANT_COUNT, EventKind, ExecutableRefPin,
+    CrossCheckRecord, EVENT_KIND_VARIANT_COUNT, EntryTagsRekeyCause, EventKind, ExecutableRefPin,
     ExecutableRefPinFirst8, KeyPurpose, MainnetPresenceAudit, PinsUpdateReason, PolicyDecision,
     TipAnchorReason, ValueActionKind, ValueLegRecord, WasmHashPin, WasmHashPinParseError,
     executable_refs_or_empty,
@@ -176,8 +189,9 @@ pub use tip_anchor::{
     tip_anchor_account_for_digest,
 };
 pub use verify::{
-    FileVerifyResult, PartialRotationState, VerifiedTip, VerifyError, VerifyOk, VerifyWarning,
-    check_anchor_against_walk, check_missing_anchor, stored_anchor_disagrees_with_walk, verify_log,
+    EntryTagsBoundary, FileVerifyResult, PartialRotationState, VerifiedTip, VerifyError, VerifyOk,
+    VerifyWarning, check_anchor_against_walk, check_missing_anchor,
+    stored_anchor_disagrees_with_walk, verify_entry_tags, verify_log,
 };
 pub use writer::{
     AuditWriter, AuditWriterRegistry, OutboxLossReport, ReanchorAcknowledgement, ReanchorReport,

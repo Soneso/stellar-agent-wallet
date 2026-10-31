@@ -677,8 +677,9 @@ mod tests {
         assert!(error.to_string().contains("audit.tip_anchor_unavailable"));
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(generation.get_password().unwrap(), counter);
+        // The open's boundary row and the unanchored reset row.
         let rows = std::fs::read(&profile.audit_log_path).unwrap();
-        assert_eq!(String::from_utf8_lossy(&rows).lines().count(), 1);
+        assert_eq!(String::from_utf8_lossy(&rows).lines().count(), 2);
         assert!(
             store
                 .reset(&profile, 100_000, |record| record_window_reset(

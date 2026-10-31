@@ -328,8 +328,14 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let rows = std::fs::read_to_string(&profile.audit_log_path).unwrap();
-        let row: serde_json::Value = serde_json::from_str(rows.lines().next().unwrap()).unwrap();
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["kind"], "audit_entry_tags_started");
+        let row = &rows[1];
         assert_eq!(row["kind"], "audit_outbox_loss_acknowledged");
         assert_eq!(row["revoked_approvals"], 1);
         assert_eq!(row["revoked_grants"], 1);
@@ -368,10 +374,251 @@ mod tests {
             state
         );
         assert_eq!(
-            std::fs::read(&profile.audit_log_path).unwrap_or_default(),
-            Vec::<u8>::new(),
+            log_kinds(&profile),
+            ["audit_entry_tags_started"],
             "no acknowledgement row"
         );
+    }
+
+    /// An outbox commitment the keyring holds in a form that does not parse
+    /// refuses the acknowledgement. With that entry removed, the queued line
+    /// is past the absent commitment: no acquisition drains it, and the
+    /// acknowledgement records the loss, revokes the decided approvals,
+    /// appends no queued row and empties the outbox.
+    #[test]
+    #[serial_test::serial]
+    fn a_removed_unusable_commitment_is_recovered_by_the_acknowledgement() {
+        use stellar_agent_core::audit_log::{
+            BindingHistory, log_path_sha256, tip_anchor::AuditKeyringEntries,
+        };
+
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (args, profile) = fixture(dir.path());
+        let permissions = Permissions::seed(dir.path());
+        queue(&profile);
+        let commitment = AuditKeyringEntries::for_path_digest(
+            &profile.audit_log_hash_chain_key_id,
+            &log_path_sha256(&profile.audit_log_path),
+        )
+        .outbox_state;
+        let entry = keyring_core::Entry::new(&commitment.service, &commitment.account).unwrap();
+        entry.set_password("not a commitment").unwrap();
+
+        let error = permissions.acknowledge(&args, &profile).unwrap_err();
+        assert!(
+            error.message().contains("outbox state is unusable"),
+            "{error}"
+        );
+        permissions.assert_untouched();
+
+        entry.delete_credential().unwrap();
+        let drained = AuditWriter::open_with_tip_anchor(
+            profile.audit_log_path.clone(),
+            Some(load_audit_hmac_key(&profile, &args.profile).unwrap()),
+            KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+            BindingHistory::NotRecorded,
+        );
+        assert!(
+            matches!(
+                drained,
+                Err(WriterError::OutboxRowsMissing {
+                    recorded: 0,
+                    found: 1
+                })
+            ),
+            "a keyed acquisition drains nothing past an absent commitment"
+        );
+
+        let result = permissions.acknowledge(&args, &profile).unwrap();
+        assert_eq!(
+            (
+                result.report.expected_rows,
+                result.report.found_rows,
+                result.report.drained,
+                result.report.discarded
+            ),
+            (0, 1, 0, 1)
+        );
+        assert_eq!(result.report.revoked_approvals, 1);
+        assert!(
+            !log_kinds(&profile)
+                .iter()
+                .any(|kind| kind == "approval_attested"),
+            "the queued row is not appended"
+        );
+        assert!(
+            log_kinds(&profile)
+                .iter()
+                .any(|kind| kind == "audit_outbox_loss_acknowledged")
+        );
+        assert!(
+            std::fs::read(outbox_path(&profile.audit_log_path))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// An outbox commitment that does not parse, removed beside an absent
+    /// outbox, leaves no detectable loss: the acknowledgement refuses with
+    /// its own code and revokes nothing, and a keyed acquisition proceeds.
+    #[test]
+    #[serial_test::serial]
+    fn a_removed_unusable_commitment_without_queued_lines_leaves_no_loss() {
+        use stellar_agent_core::audit_log::{
+            BindingHistory, log_path_sha256, tip_anchor::AuditKeyringEntries,
+        };
+
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (args, profile) = fixture(dir.path());
+        let permissions = Permissions::seed(dir.path());
+        let commitment = AuditKeyringEntries::for_path_digest(
+            &profile.audit_log_hash_chain_key_id,
+            &log_path_sha256(&profile.audit_log_path),
+        )
+        .outbox_state;
+        let entry = keyring_core::Entry::new(&commitment.service, &commitment.account).unwrap();
+        entry.set_password("not a commitment").unwrap();
+        let error = permissions.acknowledge(&args, &profile).unwrap_err();
+        assert!(
+            error.message().contains("outbox state is unusable"),
+            "{error}"
+        );
+
+        entry.delete_credential().unwrap();
+        assert!(!outbox_path(&profile.audit_log_path).exists());
+        let error = permissions.acknowledge(&args, &profile).unwrap_err();
+        assert_eq!(error.code(), "audit.outbox_loss_not_found", "{error}");
+        permissions.assert_untouched();
+        assert!(
+            !log_kinds(&profile)
+                .iter()
+                .any(|kind| kind == "audit_outbox_loss_acknowledged")
+        );
+        AuditWriter::open_with_tip_anchor(
+            profile.audit_log_path.clone(),
+            Some(load_audit_hmac_key(&profile, &args.profile).unwrap()),
+            KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+    }
+
+    /// A lost audit key on a keyed log with a committed queue: the log and
+    /// its outbox moved aside, the re-anchor of the new log stands while the
+    /// commitment still names the moved rows, the acknowledgement records
+    /// that loss, and a writer without a key then opens the new log, as the
+    /// first mint of the key rotation does.
+    #[test]
+    #[serial_test::serial]
+    fn a_lost_key_recovery_acknowledges_the_moved_queue() {
+        use crate::commands::audit::reanchor::{ReanchorArgs, reanchor};
+        use stellar_agent_core::audit_log::BindingHistory;
+
+        keyring_mock::install().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (args, profile) = fixture(dir.path());
+        let permissions = Permissions::seed(dir.path());
+        let store = || {
+            KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            )
+        };
+        drop(
+            AuditWriter::open_with_tip_anchor(
+                profile.audit_log_path.clone(),
+                Some(load_audit_hmac_key(&profile, &args.profile).unwrap()),
+                store(),
+                BindingHistory::NotRecorded,
+            )
+            .unwrap(),
+        );
+        queue(&profile);
+        let key = &profile.audit_log_hash_chain_key_id;
+        keyring_core::Entry::new(&key.service, &key.account)
+            .unwrap()
+            .delete_credential()
+            .unwrap();
+        let saved = dir.path().join("saved");
+        std::fs::create_dir(&saved).unwrap();
+        for file in std::fs::read_dir(dir.path()).unwrap() {
+            let file = file.unwrap().path();
+            if file.is_file() && file.extension().is_none_or(|extension| extension != "lock") {
+                std::fs::rename(&file, saved.join(file.file_name().unwrap())).unwrap();
+            }
+        }
+
+        let cloned_profile = profile.clone();
+        reanchor(
+            &ReanchorArgs {
+                profile: args.profile.clone(),
+                acknowledge_rollback: true,
+                acknowledge_binding_change: false,
+                acknowledge_unauthenticated_tail: false,
+            },
+            move |_name| Ok(cloned_profile.clone()),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            commitment_store(&profile)
+                .load_outbox_state()
+                .unwrap()
+                .map(|state| state.pending),
+            Some(1),
+            "the commitment still names the moved row"
+        );
+        assert!(matches!(
+            AuditWriter::open_with_tip_anchor(
+                profile.audit_log_path.clone(),
+                None,
+                store(),
+                BindingHistory::NotRecorded,
+            ),
+            Err(WriterError::OutboxRowsMissing {
+                recorded: 1,
+                found: 0
+            })
+        ));
+
+        let result = permissions.acknowledge(&args, &profile).unwrap();
+        assert_eq!(
+            (result.report.expected_rows, result.report.found_rows),
+            (1, 0)
+        );
+        assert_eq!(
+            log_kinds(&profile),
+            ["audit_tip_anchored", "audit_outbox_loss_acknowledged"]
+        );
+        AuditWriter::open_with_tip_anchor(
+            profile.audit_log_path.clone(),
+            None,
+            store(),
+            BindingHistory::NotRecorded,
+        )
+        .unwrap();
+    }
+
+    /// The kinds of the rows in `profile`'s log.
+    fn log_kinds(profile: &Profile) -> Vec<String> {
+        std::fs::read_to_string(&profile.audit_log_path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
     }
 
     /// The acknowledgement checks the tip anchor: over a log rolled back
@@ -425,21 +672,39 @@ mod tests {
         );
     }
 
-    /// A remaining queued line that does not parse refuses the verb before it
-    /// revokes anything or writes a row.
+    /// A committed queued line the acknowledgement cannot append refuses the
+    /// verb before it revokes anything or writes a row: here a committed row
+    /// that is not a consent row, beside a line past the commitment.
     #[test]
     #[serial_test::serial]
     fn an_unusable_remaining_line_refuses_before_any_revocation() {
+        use std::io::Write as _;
+
         keyring_mock::install().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let (args, profile) = fixture(dir.path());
         let permissions = Permissions::seed(dir.path());
-        queue(&profile);
-        std::fs::write(
-            outbox_path(&profile.audit_log_path),
-            b"not an audit entry\n",
+        AuditOutbox::for_log(
+            &profile.audit_log_path,
+            KeyringTipAnchorStore::shared(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
         )
+        .append(&AuditEntry::new_tool_invocation(NewToolInvocation::new(
+            "stellar_pay_commit",
+            "stellar:testnet",
+            vec![],
+            PolicyDecision::Allow,
+            "queued-tool-row".to_owned(),
+        )))
         .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(outbox_path(&profile.audit_log_path))
+            .unwrap()
+            .write_all(b"past the commitment\n")
+            .unwrap();
 
         let error = permissions.acknowledge(&args, &profile).unwrap_err();
         assert!(
@@ -449,8 +714,8 @@ mod tests {
         );
         permissions.assert_untouched();
         assert_eq!(
-            std::fs::read(&profile.audit_log_path).unwrap_or_default(),
-            Vec::<u8>::new(),
+            log_kinds(&profile),
+            ["audit_entry_tags_started"],
             "no acknowledgement row"
         );
         assert_eq!(

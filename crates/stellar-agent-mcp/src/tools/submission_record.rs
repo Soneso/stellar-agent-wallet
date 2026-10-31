@@ -466,17 +466,20 @@ pub(crate) async fn sign_and_submit_classic(
 /// and an ambiguous one whose retention window closed. A receipt an operator
 /// cleared owes no row by design.
 ///
-/// The settlement lookup reads the retained history, newest file first. A
-/// settled row found there means the submission is accounted for, so a
-/// repeated reconciliation writes nothing.
+/// The writer guard is taken once and held through the settlement lookup and
+/// the append. The lookup reads the retained history through that guard,
+/// newest file first, up to the writer's verified tip, so a row appended to
+/// the file outside the writer is never read as a settlement. A settled row
+/// found there means the submission is accounted for, so a repeated
+/// reconciliation writes nothing.
 ///
 /// Non-fatal: the chain has already answered, and the settled record is the
-/// receipt and the spending window. A row that cannot be appended is logged,
-/// and the receipt keeps what a later run needs to write it. A settlement
-/// lookup that cannot read the retained history is logged at WARN with the
-/// profile, the envelope hash, and the error, and writes nothing: whether the
-/// row is owed is unknown, and a row written on a guess could count one spend
-/// twice.
+/// receipt and the spending window. A poisoned guard or a row that cannot be
+/// appended is logged, and the receipt keeps what a later run needs to write
+/// it. A settlement lookup that cannot read the retained history is logged at
+/// WARN with the profile, the envelope hash, and the error, and writes
+/// nothing: whether the row is owed is unknown, and a row written on a guess
+/// could count one spend twice.
 #[allow(
     clippy::too_many_arguments,
     reason = "settlement carries submission identity, its evidence and the reconciliation decision"
@@ -498,8 +501,15 @@ pub(crate) fn write_settled_row(
         return;
     };
 
+    let Ok(mut guard) = audit.lock() else {
+        tracing::warn!(
+            profile = %profile_name,
+            "value audit: audit writer mutex poisoned; row NOT emitted"
+        );
+        return;
+    };
     let settlement = match stellar_agent_core::audit_log::reader::try_value_action_settlement(
-        &profile.audit_log_path,
+        &guard,
         envelope_hash,
     ) {
         Ok(settlement) => settlement,
@@ -570,7 +580,13 @@ pub(crate) fn write_settled_row(
             &request_id,
         ),
     };
-    crate::tools::value_audit::emit_value_audit_row_with_writer(audit, profile_name, entry);
+    if let Err(error) = guard.write_entry(entry) {
+        tracing::warn!(
+            profile = %profile_name,
+            error = %error,
+            "value audit: write_entry failed; row NOT emitted"
+        );
+    }
 }
 
 /// Renders a submit-path error as a tool result, attaching the structured
@@ -1311,6 +1327,74 @@ mod tests {
         assert_eq!(rows[1]["witness"], serde_json::to_value(&witness).unwrap());
         assert_eq!(rows[0]["witness"], rows[1]["witness"]);
     }
+    /// A settled row appended past the writer's verified tip is not read as
+    /// the settlement: reconciliation still writes its own
+    /// `value_action_submitted` row.
+    #[test]
+    fn a_forged_settled_row_past_the_tip_does_not_suppress_the_settled_row() {
+        use stellar_agent_core::audit_log::{AuditEntry, PolicyDecision};
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = Profile::builder_testnet("forged", "forged", "nonce", "forged").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(Mutex::new(
+            AuditWriter::open(profile.audit_log_path.clone(), None).unwrap(),
+        ));
+        audit
+            .lock()
+            .unwrap()
+            .write_entry(AuditEntry::new_value_action_pending(
+                "stellar_pay_commit",
+                "stellar:testnet",
+                vec![],
+                "transaction",
+                "source",
+                7,
+                PolicyDecision::Allow,
+                Some("envelope".to_owned()),
+                None,
+                None,
+                "pending-request",
+                None,
+            ))
+            .unwrap();
+        stellar_agent_core::audit_log::test_helpers::append_forged_entry(
+            &profile.audit_log_path,
+            AuditEntry::new_value_action_submitted(
+                "stellar_pay_commit",
+                Some("stellar:testnet".to_owned()),
+                vec![],
+                "transaction",
+                124,
+                PolicyDecision::Allow,
+                Some("envelope".to_owned()),
+                None,
+                None,
+                "forged-request",
+                None,
+            ),
+            |_| None,
+        );
+        write_settled_row(
+            &profile,
+            "forged",
+            &audit,
+            "envelope",
+            "transaction",
+            &ReceiptStatus::Success,
+            None,
+            Some(124),
+            PolicyDecision::Allow,
+        );
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[2]["kind"], "value_action_submitted");
+        assert_ne!(rows[2]["request_id"], "forged-request");
+    }
+
     #[test]
     fn mainnet_classic_cleanup_tracks_signing_and_pre_send_entry() {
         use stellar_agent_network::mainnet::resolve::InvalidationStage as S;

@@ -46,27 +46,38 @@
 //!
 //! [`AuditWriter::drain_outbox`](super::writer::AuditWriter::drain_outbox)
 //! takes the outbox lock, reads the file, discards a torn final segment,
-//! checks the committed prefix, parses every complete line strictly, appends
-//! each entry to the log, stores the zero state, and truncates the outbox to
-//! zero. A complete line that does not parse refuses the drain with
-//! `audit.outbox_unusable` and leaves the file unchanged. A refused append
-//! also leaves the file unchanged, and the entries appended before it are
-//! appended again by the next drain.
+//! checks that the complete lines are exactly the committed prefix, parses
+//! every complete line strictly, appends each entry to the log, stores the
+//! zero state, and truncates the outbox to zero. A complete line that does not
+//! parse, or that holds a row other than a consent row (`approval_attested`,
+//! `approval_attested_remote`), refuses the drain with `audit.outbox_unusable`
+//! and leaves the file unchanged. A refused append also leaves the file
+//! unchanged, and the entries appended before it are appended again by the
+//! next drain.
 //!
 //! # Delivery and its limits
 //!
-//! Delivery is at least once. A crash between the appends and the truncation
-//! repeats those rows on the next drain; a repeated row keeps its
-//! `request_id`, which identifies it. The keyring commitment detects missing,
-//! changed, or reordered queued rows before parsing or appending any of them.
-//! An absent commitment reads as zero. Raw deletion or restore of keyring
-//! entries outside the wallet rests on the platform keyring. The commitment
-//! does not authenticate who queues a row.
+//! Only committed consent rows drain. A complete line past the committed
+//! prefix refuses every drain and every append with `audit.outbox_rows_missing`
+//! until `audit acknowledge-outbox-loss` discards it: nothing that was not
+//! committed under the outbox lock enters the log through the outbox, and a
+//! line synced by an append that stopped before its commitment records a
+//! consent that never took effect.
+//!
+//! Delivery is at least once. A crash between the appends and the reset of
+//! the commitment repeats those rows on the next drain; a repeated row keeps
+//! its `request_id`, which identifies it. A crash between that reset and the
+//! truncation leaves a zero commitment and complete lines whose canonical
+//! bodies equal, in order, those of the active file's last entries; the next
+//! drain recognizes that batch as delivered and truncates the outbox without
+//! appending. The keyring commitment detects missing, changed, reordered, or
+//! added queued rows before parsing or appending any of them. An absent
+//! commitment reads as zero. Raw deletion or restore of keyring entries
+//! outside the wallet rests on the platform keyring.
 //!
 //! The stored value is `{"v":1,"pending":N,"head":"sha256:<64 hex>"}`.
 //! The initial head is zero; each next head hashes `stellar-agent-outbox:v1`,
 //! the prior head, and the line bytes without the newline, in that order.
-//! Rows beyond the committed prefix drain too, preserving interrupted appends.
 
 use super::tip_anchor::{TipAnchorStore, TipAnchorStoreError};
 use sha2::{Digest, Sha256};
@@ -78,6 +89,7 @@ use std::time::{Duration, Instant};
 
 use super::entry::AuditEntry;
 use super::lock::AuditWriterLock;
+use super::schema::EventKind;
 use super::writer::{WriterError, basename_lossy_path as basename, sidecar_path};
 
 /// Commitment to the complete lines queued in one outbox.
@@ -154,19 +166,65 @@ pub struct OutboxLoss {
     pub found_rows: u64,
 }
 
-/// The loss, when the first `state.pending` of `lines` do not exist or do not
-/// chain to `state.head`.
+/// The loss, when `lines` are not exactly the committed prefix: the first
+/// `state.pending` of them do not exist or do not chain to `state.head`, or
+/// there are more complete lines than `state.pending`.
 fn committed_prefix_loss(lines: &[&[u8]], state: &OutboxState) -> Option<OutboxLoss> {
-    let committed = usize::try_from(state.pending)
-        .ok()
-        .and_then(|pending| lines.get(..pending));
-    match committed {
-        Some(prefix) if OutboxState::over(prefix).head == state.head => None,
-        _ => Some(OutboxLoss {
-            expected_rows: state.pending,
-            found_rows: lines.len() as u64,
-        }),
+    if committed_prefix(lines, state).is_some() && lines.len() as u64 == state.pending {
+        return None;
     }
+    Some(OutboxLoss {
+        expected_rows: state.pending,
+        found_rows: lines.len() as u64,
+    })
+}
+
+/// The first `state.pending` of `lines`, when they exist and chain to
+/// `state.head`.
+fn committed_prefix<'l, 'b>(lines: &'l [&'b [u8]], state: &OutboxState) -> Option<&'l [&'b [u8]]> {
+    usize::try_from(state.pending)
+        .ok()
+        .and_then(|pending| lines.get(..pending))
+        .filter(|prefix| OutboxState::over(prefix).head == state.head)
+}
+
+/// Whether `entry` is a consent row, the only kind the outbox carries.
+///
+/// The CLI queues exactly these when a draining writer in another process
+/// holds the log: the attested approval, local or remote.
+fn is_consent_row(entry: &AuditEntry) -> bool {
+    matches!(
+        entry.event_kind,
+        EventKind::ApprovalAttested { .. } | EventKind::ApprovalAttestedRemote { .. }
+    )
+}
+
+/// Parses `lines`, numbered from one, as consent rows.
+///
+/// # Errors
+///
+/// [`WriterError::OutboxUnusable`] for a line that does not parse as an
+/// [`AuditEntry`], and [`WriterError::OutboxRowKindRefused`] for one that
+/// holds another kind of row.
+fn parse_consent_rows(lines: &[&[u8]]) -> Result<Vec<AuditEntry>, WriterError> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let entry = serde_json::from_slice::<AuditEntry>(line).map_err(|e| {
+                WriterError::OutboxUnusable {
+                    line: index + 1,
+                    column: e.column(),
+                    reason: parse_failure_class(&e),
+                }
+            })?;
+            if is_consent_row(&entry) {
+                Ok(entry)
+            } else {
+                Err(WriterError::OutboxRowKindRefused { line: index + 1 })
+            }
+        })
+        .collect()
 }
 
 fn check_committed_prefix(lines: &[&[u8]], state: &OutboxState) -> Result<(), WriterError> {
@@ -343,8 +401,8 @@ impl AuditOutbox {
     ///
     /// - [`WriterError::OutboxBusy`] when the outbox lock stays held.
     /// - [`WriterError::OutboxRowsMissing`] when committed rows are lost or
-    ///   changed, a missing file included. The file is neither created nor
-    ///   changed.
+    ///   changed, a missing file included, or when a complete line follows
+    ///   them. The file is neither created nor changed.
     /// - [`WriterError::TipAnchorStore`] when the commitment cannot be read or
     ///   stored.
     /// - [`WriterError::Serialise`] when the entry cannot be serialized.
@@ -370,7 +428,9 @@ impl AuditOutbox {
         let mut file = open_outbox_0600(&self.path)?;
         // The check reads the bytes as they are: the torn-tail repair would
         // cut a committed line that lost its newline, turning a restorable
-        // file into a loss.
+        // file into a loss. A complete line past the commitment refuses too,
+        // so the commitment below covers exactly the committed lines and this
+        // append's own.
         let bytes = read_all(&mut file)?;
         let lines = parse_lines(&bytes).lines;
         check_committed_prefix(&lines, &state)?;
@@ -583,7 +643,8 @@ impl OutboxBatch {
         })
     }
 
-    /// Reads the outbox under its lock and checks its committed prefix.
+    /// Reads the outbox under its lock and checks that its complete lines are
+    /// exactly the committed prefix.
     ///
     /// `Ok(None)` means there is no outbox file and nothing is committed, so
     /// there is nothing to drain. A torn final segment is left for
@@ -592,20 +653,70 @@ impl OutboxBatch {
     /// # Errors
     ///
     /// - Every error of [`Self::read_locked`].
-    /// - [`WriterError::OutboxRowsMissing`] when the committed prefix is
-    ///   missing, changed, or reordered, a missing file under a nonzero
-    ///   commitment included. The file is left unchanged.
+    /// - Every error of [`Self::checked`].
+    #[cfg(test)]
     pub(crate) fn take(
         log_path: &Path,
         store: &dyn TipAnchorStore,
     ) -> Result<Option<Self>, WriterError> {
-        let batch = Self::read_locked(log_path, store)?;
-        let lines = parse_lines(&batch.bytes).lines;
-        check_committed_prefix(&lines, &batch.state)?;
-        if batch.file.is_none() {
+        Self::read_locked(log_path, store)?.checked()
+    }
+
+    /// Checks that the complete lines are exactly the committed prefix, and
+    /// returns the batch unless there is no outbox file.
+    ///
+    /// # Errors
+    ///
+    /// [`WriterError::OutboxRowsMissing`] when the committed prefix is
+    /// missing, changed, or reordered, a missing file under a nonzero
+    /// commitment included, or when complete lines follow it. The file is
+    /// left unchanged.
+    pub(crate) fn checked(self) -> Result<Option<Self>, WriterError> {
+        let lines = parse_lines(&self.bytes).lines;
+        check_committed_prefix(&lines, &self.state)?;
+        if self.file.is_none() {
             return Ok(None);
         }
-        Ok(Some(batch))
+        Ok(Some(self))
+    }
+
+    /// The entries of a batch a drain may already have delivered: under a
+    /// zero commitment, every complete line, when there is at least one and
+    /// each parses as an [`AuditEntry`].
+    ///
+    /// A drain resets the commitment after its appends and truncates the
+    /// outbox after that, so a crash between the two leaves exactly this
+    /// shape. The caller decides whether the entries are the log's last rows.
+    pub(crate) fn uncommitted_entries(&self) -> Option<Vec<AuditEntry>> {
+        if self.state.pending != 0 {
+            return None;
+        }
+        let lines = parse_lines(&self.bytes).lines;
+        if lines.is_empty() {
+            return None;
+        }
+        lines
+            .iter()
+            .map(|line| serde_json::from_slice::<AuditEntry>(line).ok())
+            .collect()
+    }
+
+    /// The committed prefix as consent rows, when it is intact, or `None`
+    /// when committed lines are missing, changed, or reordered.
+    ///
+    /// # Errors
+    ///
+    /// Every error of the consent-row parse, for a line of the intact prefix.
+    pub(crate) fn committed_entries(&self) -> Result<Option<Vec<AuditEntry>>, WriterError> {
+        let lines = parse_lines(&self.bytes).lines;
+        committed_prefix(&lines, &self.state)
+            .map(parse_consent_rows)
+            .transpose()
+    }
+
+    /// The number of complete lines.
+    pub(crate) fn complete_lines(&self) -> usize {
+        parse_lines(&self.bytes).lines.len()
     }
 
     /// Whether the checked file has neither complete lines nor a torn tail.
@@ -619,13 +730,15 @@ impl OutboxBatch {
         committed_prefix_loss(&parse_lines(&self.bytes).lines, &self.state)
     }
 
-    /// Parses every complete line, in queue order, before the caller appends
-    /// any of them. A torn final segment is discarded with a `warn`.
+    /// Parses every complete line, in queue order, as a consent row before the
+    /// caller appends any of them. A torn final segment is discarded with a
+    /// `warn`.
     ///
     /// # Errors
     ///
     /// [`WriterError::OutboxUnusable`] when a complete line does not parse as
-    /// an [`AuditEntry`]. The file is left unchanged.
+    /// an [`AuditEntry`], and [`WriterError::OutboxRowKindRefused`] when it
+    /// holds a row other than a consent row. The file is left unchanged.
     pub(crate) fn parse_entries(&self) -> Result<Vec<AuditEntry>, WriterError> {
         let parsed = parse_lines(&self.bytes);
         if parsed.torn_bytes > 0 {
@@ -636,20 +749,7 @@ impl OutboxBatch {
                  completed"
             );
         }
-        parsed
-            .lines
-            .iter()
-            .enumerate()
-            .map(|(index, line)| {
-                serde_json::from_slice::<AuditEntry>(line).map_err(|e| {
-                    WriterError::OutboxUnusable {
-                        line: index + 1,
-                        column: e.column(),
-                        reason: parse_failure_class(&e),
-                    }
-                })
-            })
-            .collect()
+        parse_consent_rows(&parsed.lines)
     }
 
     /// Truncates the outbox to zero and syncs it, then releases the lock.
@@ -860,6 +960,26 @@ mod tests {
         fs::read(outbox_path(path)).unwrap_or_default()
     }
 
+    /// Commits every complete line of the outbox as it stands, as a
+    /// commitment over those exact bytes would.
+    fn commit_every_line(path: &Path, store: &InMemoryTipAnchorStore) {
+        let bytes = outbox_bytes(path);
+        let lines = parse_lines(&bytes).lines;
+        store
+            .store_outbox_state(&OutboxState::over(&lines))
+            .unwrap();
+    }
+
+    /// Appends `line` and its newline to the outbox and syncs it without
+    /// touching the commitment, as an append that stopped before its state
+    /// write leaves it.
+    fn plant_uncommitted(path: &Path, line: &[u8]) {
+        let outbox = outbox_path(path);
+        let mut bytes = line.to_vec();
+        bytes.push(b'\n');
+        write_line(&mut open_outbox_0600(&outbox).unwrap(), &outbox, &bytes).unwrap();
+    }
+
     #[test]
     fn append_and_drain_round_trip() {
         let dir = TempDir::new().unwrap();
@@ -1006,6 +1126,9 @@ mod tests {
             .unwrap();
         file.write_all(b"not an audit entry\n").unwrap();
         drop(file);
+        // A committed line that does not parse: only a committed line reaches
+        // the parse, since a line past the commitment refuses before it.
+        commit_every_line(&path, &store);
         let before = outbox_bytes(&path);
 
         let mut writer = AuditWriter::open_for_reanchor(path.clone(), None, store.clone()).unwrap();
@@ -1048,6 +1171,7 @@ mod tests {
             let store = Arc::new(InMemoryTipAnchorStore::new());
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(outbox_path(&path), line.as_bytes()).unwrap();
+            commit_every_line(&path, &store);
 
             let mut writer =
                 AuditWriter::open_for_reanchor(path.clone(), None, store.clone()).unwrap();
@@ -1236,11 +1360,16 @@ mod tests {
         let access = || KeyedAuditAccess::new(key(), store.clone() as Arc<dyn TipAnchorStore>);
         let profile = "outbox-cache-hit";
         let _first = AuditWriterRegistry::get_or_open_keyed(profile, &path, access()).unwrap();
+        let rows_at_open = log_rows(&path);
+        assert_eq!(rows_at_open.len(), 1);
+        assert_eq!(rows_at_open[0]["kind"], "audit_entry_tags_started");
+        let mut expected = request_ids(&path);
         AuditOutbox::for_log(&path, store.clone())
             .append(&row("queued-after-open"))
             .unwrap();
         let _second = AuditWriterRegistry::get_or_open_keyed(profile, &path, access()).unwrap();
-        assert_eq!(request_ids(&path), vec!["queued-after-open"]);
+        expected.push("queued-after-open".to_owned());
+        assert_eq!(request_ids(&path), expected);
         assert!(outbox_bytes(&path).is_empty());
     }
 
@@ -1267,8 +1396,11 @@ mod tests {
         assert_eq!(rows[0]["ts"], "2026-01-02T03:04:05.000Z");
     }
 
+    /// A drain whose commitment reset fails has appended its rows and still
+    /// holds a committed outbox, so the next drain appends them once more:
+    /// delivery is at least once.
     #[test]
-    fn a_crash_between_the_appends_and_the_truncate_repeats_the_rows_once() {
+    fn a_drain_whose_commitment_reset_fails_repeats_its_rows_once() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
         let store = Arc::new(InMemoryTipAnchorStore::new());
@@ -1277,11 +1409,37 @@ mod tests {
             AuditOutbox::for_log(&path, store.clone())
                 .append(&row("repeated"))
                 .unwrap();
-            writer.set_skip_outbox_truncate(true);
-            assert_eq!(writer.drain_outbox().unwrap(), 1);
+            store.set_outbox_failing(false, true);
+            assert!(matches!(
+                writer.drain_outbox(),
+                Err(WriterError::TipAnchorStore(_))
+            ));
+            store.set_outbox_failing(false, false);
         }
         let _reopened = open_draining(&path, &store);
         assert_eq!(request_ids(&path), vec!["repeated", "repeated"]);
+        assert!(outbox_bytes(&path).is_empty());
+    }
+
+    /// A crash between a drain's commitment reset and its truncation leaves a
+    /// zero commitment and lines that are the log's last rows: the next drain
+    /// truncates them without appending them again.
+    #[test]
+    fn a_crash_between_the_reset_and_the_truncate_appends_the_rows_once() {
+        let dir = TempDir::new().unwrap();
+        let path = log_path(&dir);
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        {
+            let mut writer = open_draining(&path, &store);
+            AuditOutbox::for_log(&path, store.clone())
+                .append(&row("delivered"))
+                .unwrap();
+            writer.set_skip_outbox_truncate(true);
+            assert_eq!(writer.drain_outbox().unwrap(), 1);
+        }
+        assert!(!outbox_bytes(&path).is_empty(), "the crash kept the outbox");
+        let _reopened = open_draining(&path, &store);
+        assert_eq!(request_ids(&path), vec!["delivered"]);
         assert!(outbox_bytes(&path).is_empty());
     }
 
@@ -1549,24 +1707,88 @@ mod tests {
         assert_eq!(store.load_outbox_state().unwrap(), state);
     }
 
+    /// A complete line past the committed prefix, synced without a
+    /// commitment, refuses the drain with everything left as it was.
     #[test]
-    fn a_line_beyond_the_commitment_drains() {
+    fn a_planted_line_past_the_commitment_is_not_drained() {
         let (_dir, path, store, mut writer) = committed_pair();
-        let outbox = outbox_path(&path);
-        let mut line = serde_json::to_vec(&row("uncommitted")).unwrap();
-        line.push(b'\n');
-        // Sync the bytes without advancing state, as an interrupted append does.
-        write_line(&mut open_outbox_0600(&outbox).unwrap(), &outbox, &line).unwrap();
-        assert_eq!(writer.drain_outbox().unwrap(), 3);
-        assert_eq!(request_ids(&path), ["one", "two", "uncommitted"]);
-        assert_eq!(
-            store.load_outbox_state().unwrap(),
-            Some(OutboxState::default())
+        plant_uncommitted(&path, &serde_json::to_vec(&row("uncommitted")).unwrap());
+        let outbox = outbox_bytes(&path);
+        let log = fs::read(&path).unwrap();
+        let state = store.load_outbox_state().unwrap();
+        assert!(matches!(
+            writer.drain_outbox(),
+            Err(WriterError::OutboxRowsMissing {
+                recorded: 2,
+                found: 3
+            })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), log, "nothing is appended");
+        assert_eq!(outbox_bytes(&path), outbox, "the outbox is unchanged");
+        assert_eq!(store.load_outbox_state().unwrap(), state);
+    }
+
+    /// A committed line of a kind other than a consent row refuses the drain
+    /// at its line; a remote consent row drains.
+    #[test]
+    fn a_queued_value_row_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = log_path(&dir);
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = open_draining(&path, &store);
+        let failed = AuditEntry::new_value_action_failed(
+            "stellar_pay",
+            Some("stellar:testnet".to_owned()),
+            vec![],
+            "6ba7aaac...69060003",
+            "submission.failed",
+            PolicyDecision::Allow,
+            Some("sha256:abcdef01".to_owned()),
+            None,
+            None,
+            "planted-failed",
         );
+        AuditOutbox::for_log(&path, store.clone())
+            .append(&failed)
+            .unwrap();
+        let outbox = outbox_bytes(&path);
+        let log = fs::read(&path).unwrap();
+        let err = writer.drain_outbox().unwrap_err();
+        assert!(
+            matches!(err, WriterError::OutboxRowKindRefused { line: 1 }),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().starts_with("audit.outbox_unusable"),
+            "{err}"
+        );
+        assert_eq!(
+            crate::audit_log::writer::audit_log_unusable_detail(&err),
+            Some(err.to_string())
+        );
+        assert_eq!(fs::read(&path).unwrap(), log);
+        assert_eq!(outbox_bytes(&path), outbox);
+
+        let dir = TempDir::new().unwrap();
+        let path = log_path(&dir);
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = open_draining(&path, &store);
+        AuditOutbox::for_log(&path, store.clone())
+            .append(&AuditEntry::new_approval_attested_remote(
+                "PaymentSimulated",
+                "stellar_pay_commit",
+                None,
+                "ABCDEFGHIJKLMNOPQRSTUV",
+                "credential",
+                "remote-consent",
+            ))
+            .unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 1);
+        assert_eq!(request_ids(&path), ["remote-consent"]);
     }
 
     #[test]
-    fn a_drain_interrupted_before_its_truncation_redelivers() {
+    fn a_drain_interrupted_before_its_truncation_is_not_redelivered() {
         let (_dir, path, store, mut writer) = committed_pair();
         writer.set_skip_outbox_truncate(true);
         assert_eq!(writer.drain_outbox().unwrap(), 2);
@@ -1576,26 +1798,32 @@ mod tests {
         );
         drop(writer);
         let _writer = open_draining(&path, &store);
-        assert_eq!(request_ids(&path), ["one", "two", "one", "two"]);
+        assert_eq!(request_ids(&path), ["one", "two"]);
         assert!(outbox_bytes(&path).is_empty());
     }
 
+    /// Lines under a zero commitment that are not the log's last rows are
+    /// past the commitment: the drain refuses with nothing changed.
     #[test]
-    fn an_outbox_without_a_state_drains() {
+    fn an_outbox_line_without_a_state_refuses_the_drain() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
         let store = Arc::new(InMemoryTipAnchorStore::new());
         let mut writer = open_draining(&path, &store);
         let mut line = serde_json::to_vec(&row("upgrade")).unwrap();
         line.push(b'\n');
-        fs::write(outbox_path(&path), line).unwrap();
+        fs::write(outbox_path(&path), &line).unwrap();
         assert_eq!(store.load_outbox_state().unwrap(), None);
-        assert_eq!(writer.drain_outbox().unwrap(), 1);
-        assert_eq!(request_ids(&path), ["upgrade"]);
-        assert_eq!(
-            store.load_outbox_state().unwrap(),
-            Some(OutboxState::default())
-        );
+        assert!(matches!(
+            writer.drain_outbox(),
+            Err(WriterError::OutboxRowsMissing {
+                recorded: 0,
+                found: 1
+            })
+        ));
+        assert!(log_rows(&path).is_empty());
+        assert_eq!(outbox_bytes(&path), line);
+        assert_eq!(store.load_outbox_state().unwrap(), None);
     }
 
     #[test]
@@ -1652,7 +1880,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledging_a_loss_records_it_before_the_found_rows() {
+    fn acknowledging_a_lost_prefix_records_it_and_discards_the_rest() {
         let (_dir, path, store, writer) = committed_pair();
         remove_first_line(&outbox_path(&path));
         drop(writer);
@@ -1668,16 +1896,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            (report.expected_rows, report.found_rows, report.drained),
-            (2, 1, 1)
+            (
+                report.expected_rows,
+                report.found_rows,
+                report.drained,
+                report.discarded
+            ),
+            (2, 1, 0, 1)
         );
         let rows = log_rows(&path);
+        assert_eq!(rows.len(), 1, "a broken prefix appends nothing");
         assert_eq!(rows[0]["kind"], "audit_outbox_loss_acknowledged");
         assert_eq!(rows[0]["expected_rows"], 2);
         assert_eq!(rows[0]["found_rows"], 1);
         assert_eq!(rows[0]["revoked_approvals"], 3);
         assert_eq!(rows[0]["revoked_grants"], 4);
-        assert_eq!(rows[1]["request_id"], "two");
         assert_eq!(
             store.load_outbox_state().unwrap(),
             Some(OutboxState::default())
@@ -1733,29 +1966,24 @@ mod tests {
         assert_eq!(store.load_outbox_state().unwrap(), state);
     }
 
-    /// An append commits every complete line in the file, a line synced by an
-    /// append that stopped before its state write included, so the next drain
-    /// finds the prefix it commits to.
+    /// An append over a line synced past the commitment refuses: the
+    /// commitment covers committed lines only, and the file and the
+    /// commitment stay as they were.
     #[test]
-    fn an_append_absorbs_an_uncommitted_line_into_the_commitment() {
-        let (_dir, path, store, mut writer) = committed_pair();
-        let outbox = outbox_path(&path);
-        let mut line = serde_json::to_vec(&row("uncommitted")).unwrap();
-        line.push(b'\n');
-        write_line(&mut open_outbox_0600(&outbox).unwrap(), &outbox, &line).unwrap();
-        AuditOutbox::for_log(&path, store.clone())
-            .append(&row("four"))
-            .unwrap();
-
+    fn an_append_refuses_an_uncommitted_line() {
+        let (_dir, path, store, _writer) = committed_pair();
+        plant_uncommitted(&path, &serde_json::to_vec(&row("uncommitted")).unwrap());
         let bytes = outbox_bytes(&path);
-        let lines = parse_lines(&bytes).lines;
-        assert_eq!(lines.len(), 4);
-        assert_eq!(
-            store.load_outbox_state().unwrap(),
-            Some(OutboxState::over(&lines))
-        );
-        assert_eq!(writer.drain_outbox().unwrap(), 4);
-        assert_eq!(request_ids(&path), ["one", "two", "uncommitted", "four"]);
+        let state = store.load_outbox_state().unwrap();
+        assert!(matches!(
+            AuditOutbox::for_log(&path, store.clone()).append(&row("four")),
+            Err(WriterError::OutboxRowsMissing {
+                recorded: 2,
+                found: 3
+            })
+        ));
+        assert_eq!(outbox_bytes(&path), bytes, "the outbox is unchanged");
+        assert_eq!(store.load_outbox_state().unwrap(), state);
     }
 
     /// The state parser accepts exactly the value the store writes: a zero
@@ -1785,19 +2013,20 @@ mod tests {
         }
     }
 
-    /// Every remaining line is parsed before the acknowledgement row: an
-    /// unusable line refuses with the log, the outbox, and the commitment
-    /// unchanged.
+    /// The intact committed prefix is parsed before the acknowledgement row:
+    /// an unusable committed line refuses the loss report and the
+    /// acknowledgement with the log, the outbox, and the commitment unchanged.
     #[test]
-    fn an_unusable_remaining_line_refuses_the_acknowledgement_with_nothing_written() {
+    fn an_unusable_committed_line_refuses_the_acknowledgement_with_nothing_written() {
         let (_dir, path, store, writer) = committed_pair();
-        remove_first_line(&outbox_path(&path));
         let mut file = OpenOptions::new()
             .append(true)
             .open(outbox_path(&path))
             .unwrap();
         file.write_all(b"not an audit entry\n").unwrap();
         drop(file);
+        commit_every_line(&path, &store);
+        plant_uncommitted(&path, &serde_json::to_vec(&row("past")).unwrap());
         drop(writer);
         let outbox = outbox_bytes(&path);
         let log = fs::read(&path).unwrap();
@@ -1805,8 +2034,12 @@ mod tests {
 
         let mut writer = open_acknowledging(&path, &store);
         assert!(matches!(
+            writer.outbox_loss(),
+            Err(WriterError::OutboxUnusable { line: 3, .. })
+        ));
+        assert!(matches!(
             writer.acknowledge_outbox_loss("inspection", Default::default()),
-            Err(WriterError::OutboxUnusable { line: 2, .. })
+            Err(WriterError::OutboxUnusable { line: 3, .. })
         ));
         assert_eq!(fs::read(&path).unwrap(), log, "no acknowledgement row");
         assert_eq!(outbox_bytes(&path), outbox);

@@ -601,9 +601,21 @@ async fn a_confirmed_sep43_submission_writes_one_settled_row() {
         submitted[0]["envelope_hash"], envelope_hash,
         "the settled row names the submission it settles: {rows:?}"
     );
+    let profile_name = server.profile_name_for_approval();
+    let writer = stellar_agent_core::audit_log::AuditWriterRegistry::get_or_open_keyed(
+        &profile_name,
+        &profile.audit_log_path,
+        stellar_agent_network::keyring::keyed_audit_access(
+            &profile,
+            &profile_name,
+            stellar_agent_core::audit_log::BindingCheck::Enforce,
+        )
+        .expect("audit access"),
+    )
+    .expect("the server's cached writer");
     assert_eq!(
         stellar_agent_core::audit_log::reader::try_value_action_settlement(
-            &profile.audit_log_path,
+            &writer.lock().unwrap(),
             &envelope_hash
         )
         .unwrap(),

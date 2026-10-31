@@ -100,7 +100,7 @@ fn rotated_file_is_named_by_the_handoff_row_that_ends_it() {
     let last = text.lines().last().unwrap();
     let entry: AuditEntry = serde_json::from_str(last).unwrap();
     match entry.event_kind {
-        EventKind::AuditRotationHandoff { next_file_name } => {
+        EventKind::AuditRotationHandoff { next_file_name, .. } => {
             assert_eq!(next_file_name, ROTATED);
         }
         other => panic!("the rotated file ends with a handoff row, got {other:?}"),

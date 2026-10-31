@@ -1438,6 +1438,7 @@ mod tests {
                             tip_hash: [6; 32],
                             log_path_sha256: [5; 32],
                             anchor_covers_tip: true,
+                            entry_tags_in_force: true,
                         },
                         900,
                         Arc::clone(&self.writer),
@@ -2180,7 +2181,7 @@ mod tests {
                 },
                 DomainBinding::X402Submit { .. } => unreachable!(),
             };
-            if rotation.is_some() {
+            if let Some(count) = rotation {
                 header
                     .audit
                     .writer()
@@ -2201,6 +2202,17 @@ mod tests {
                     .write_entry(row())
                     .unwrap();
                 drop(threshold);
+                // The new segment reaches the recorded count, so only the
+                // segment refuses the authority.
+                for _ in 0..count {
+                    header
+                        .audit
+                        .writer()
+                        .lock()
+                        .unwrap()
+                        .write_entry(row())
+                        .unwrap();
+                }
                 let fresh = header.audit.fresh_facts().unwrap();
                 assert!(fresh.anchored_count >= header.audit.anchored_count());
                 assert_eq!(
@@ -2382,9 +2394,12 @@ mod tests {
             header.check_audit(&[5; 32], 11, &[0; 32]).unwrap();
         }
 
+        /// Authority recorded over the boundary row alone, or over the
+        /// boundary row and one more row, is refused after a rotation by its
+        /// segment, while the new segment's count reaches the recorded one.
         #[tokio::test]
         #[serial]
-        async fn rotation_refuses_authority_recorded_at_zero_or_one() {
+        async fn rotation_refuses_authority_recorded_at_one_or_two() {
             for count in [0, 1] {
                 proof_composition(AuthorizationDomain::Transaction, true, Some(count)).await;
             }

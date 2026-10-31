@@ -11,6 +11,16 @@
 //! `--profile`, the CLI verifies the hash chain only and `hmac_verified`
 //! remains `false`.
 //!
+//! # Entry tags
+//!
+//! With `--profile <name>`, the walk also checks the keyed entry tag of every
+//! entry from the log's boundary row on, under a key derived from the
+//! profile's audit key. An entry past that boundary with a missing or wrong
+//! tag exits 1 with `audit.entry_tag_invalid`. `entry_tags_verified` reports
+//! whether tags were in force and checked, and `entry_tags_boundary` names
+//! the newest keyed start the walk found. Without `--profile` no tag is
+//! checked and `entry_tags_verified` is `false`.
+//!
 //! # Tip-anchor verification
 //!
 //! The chain walk and the chain-root signatures verify a PREFIX of the log, so
@@ -61,7 +71,7 @@ use stellar_agent_core::{
         outbox::inspect_outbox,
         tip_anchor::{TipAnchor, normalize_path_lexically},
         verify::{
-            FileVerifyResult, VerifyError, VerifyWarning, check_missing_anchor,
+            EntryTagsBoundary, FileVerifyResult, VerifyError, VerifyWarning, check_missing_anchor,
             verify_log_with_health,
         },
     },
@@ -135,11 +145,23 @@ pub struct AuditVerifyResult {
     pub entries_verified: usize,
     /// Number of log files walked (active + rotated).
     pub files_walked: usize,
-    /// Whether the HMAC chain-root signature was verified.
+    /// Whether the HMAC chain-root signatures were verified.
     ///
-    /// The CLI emits `true` only when `--profile <name>` supplies an audit key
-    /// and every chain-root sidecar verifies.
+    /// `true` when `--profile <name>` supplies the audit key and every walked
+    /// file's chain-root sidecar verifies over that file's first entry. It
+    /// covers no later entry: [`Self::entry_tags_verified`] reports the check
+    /// that covers them.
     pub hmac_verified: bool,
+    /// Whether the walk checked entry tags under the profile's audit key and
+    /// found them in force: from the boundary row on, every entry carries a
+    /// valid tag. `false` without `--profile`, and on a log whose tags are not
+    /// in force.
+    pub entry_tags_verified: bool,
+    /// The newest `audit_entry_tags_started` or `audit_entry_tags_rekeyed`
+    /// row with a valid tag in the walked chain, as its file basename,
+    /// one-based line, and kind. `null` when the walk checked no tags or a
+    /// prune removed that row.
+    pub entry_tags_boundary: Option<EntryTagsBoundary>,
     /// Per-file verification results in verifier walk order.
     pub per_file: Vec<FileVerifyResult>,
     /// Informational verifier warnings that do not make verification fail.
@@ -169,15 +191,20 @@ pub struct AuditVerifyResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct AuditAnchorStatus {
-    /// `"verified"` when the anchor was loaded and matched the log's tip;
-    /// `"not_checked"` otherwise.
+    /// `"verified"` when the anchor was loaded and the walk found the
+    /// anchored entry intact; `"not_checked"` otherwise.
+    ///
+    /// `verified` means the anchored entry is intact at the anchored offset
+    /// and the active file ends at or past it. Entries past the anchor are
+    /// authenticated only when `entry_tags_verified` is `true`.
     pub status: String,
     /// Why the anchor was not checked.  `None` when it was.
     pub reason: Option<String>,
 }
 
 impl AuditAnchorStatus {
-    /// The anchor was loaded and the walk matched it.
+    /// The anchor was loaded and the walk found the anchored entry intact at
+    /// the anchored offset.
     fn verified() -> Self {
         Self {
             status: "verified".to_owned(),
@@ -321,6 +348,8 @@ fn verify_resolved(
         entries_verified: ok.entries_verified,
         files_walked: ok.files_walked,
         hmac_verified: ok.hmac_verified,
+        entry_tags_verified: ok.entry_tags_verified,
+        entry_tags_boundary: ok.entry_tags_boundary,
         per_file: ok.per_file,
         warnings,
         audit_writer_degraded: ok_with_health.audit_writer_degraded,
@@ -1012,6 +1041,14 @@ mod tests {
                 "audit.hmac_mismatch",
             ),
             (
+                VerifyError::EntryTagInvalid {
+                    file: "f.jsonl".to_owned(),
+                    line: 4,
+                    reason: "missing",
+                },
+                "audit.entry_tag_invalid",
+            ),
+            (
                 VerifyError::HmacSidecarMissing {
                     file: "f.jsonl".to_owned(),
                 },
@@ -1541,26 +1578,103 @@ mod tests {
         );
     }
 
+    /// `audit verify --profile` reports both entry-tag fields on a log whose
+    /// tags are in force, and a chained row without a tag past the boundary
+    /// fails with `audit.entry_tag_invalid`.
+    #[test]
+    #[serial]
+    fn verify_json_reports_entry_tag_fields() {
+        keyring_mock::install().expect("mock keyring store");
+        let dir = TempDir::new().unwrap();
+        let name = "verify-entry-tags";
+        let mut profile = Profile::builder_testnet(name, "acct", "n-svc", "n-acct").build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let coord = profile.audit_log_hash_chain_key_id.clone();
+        stellar_agent_network::keyring::rotate_keyring_secret_32(&coord.service, &coord.account)
+            .expect("seed audit key");
+        let key = load_audit_hmac_key(&profile, name).expect("load audit key");
+        {
+            let mut writer = AuditWriter::open_with_tip_anchor(
+                profile.audit_log_path.clone(),
+                Some(key),
+                stellar_agent_network::keyring::KeyringTipAnchorStore::shared(
+                    &coord,
+                    &profile.audit_log_path,
+                ),
+                BindingHistory::NotRecorded,
+            )
+            .expect("keyed writer");
+            writer
+                .write_entry(AuditEntry::new_tool_invocation(NewToolInvocation::new(
+                    "stellar_pay_commit",
+                    "stellar:testnet",
+                    vec![],
+                    PolicyDecision::Allow,
+                    "req-tagged",
+                )))
+                .expect("append");
+        }
+
+        let result = verify_profile_log(&profile, name).expect("the tagged log verifies");
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["entry_tags_verified"], true);
+        assert_eq!(json["entry_tags_boundary"]["file"], "audit.jsonl");
+        assert_eq!(json["entry_tags_boundary"]["line"], 1);
+        assert_eq!(
+            json["entry_tags_boundary"]["kind"],
+            "audit_entry_tags_started"
+        );
+
+        stellar_agent_core::audit_log::test_helpers::append_forged_entry(
+            &profile.audit_log_path,
+            AuditEntry::new_tool_invocation(NewToolInvocation::new(
+                "stellar_pay_commit",
+                "stellar:testnet",
+                vec![],
+                PolicyDecision::Allow,
+                "req-forged",
+            )),
+            |_| None,
+        );
+        let Err(VerifyFailure::Raw { code, message }) = verify_profile_log(&profile, name) else {
+            panic!("a forged tail must fail with the verifier's own code");
+        };
+        assert_eq!(code, "audit.entry_tag_invalid", "{message}");
+        assert!(message.contains("missing"), "{message}");
+    }
+
     // ── The audit outbox ──────────────────────────────────────────────────────
 
+    /// Queues one consent row for the log at `path`, committed in a fresh
+    /// in-memory store.
     fn queue_consent(path: &std::path::Path, request_id: &str) {
-        stellar_agent_core::audit_log::AuditOutbox::for_log(
+        queue_consent_in(
             path,
             std::sync::Arc::new(
                 stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore::new(),
             ),
-        )
-        .append(
-            &stellar_agent_core::audit_log::AuditEntry::new_approval_attested(
-                "PaymentSimulated",
-                "stellar_pay_commit",
-                None,
-                "ABCDEFGHIJKLMNOPQRSTUV",
-                "cli",
-                request_id,
-            ),
-        )
-        .unwrap();
+            request_id,
+        );
+    }
+
+    /// Queues one consent row for the log at `path`, committed in `store`.
+    fn queue_consent_in(
+        path: &std::path::Path,
+        store: std::sync::Arc<stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore>,
+        request_id: &str,
+    ) {
+        stellar_agent_core::audit_log::AuditOutbox::for_log(path, store)
+            .append(
+                &stellar_agent_core::audit_log::AuditEntry::new_approval_attested(
+                    "PaymentSimulated",
+                    "stellar_pay_commit",
+                    None,
+                    "ABCDEFGHIJKLMNOPQRSTUV",
+                    "cli",
+                    request_id,
+                ),
+            )
+            .unwrap();
     }
 
     fn append_to_outbox(path: &std::path::Path, bytes: &[u8]) {
@@ -1579,8 +1693,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("audit.jsonl");
         make_writer_and_entries(path.clone(), 2, None);
-        queue_consent(&path, "queued-1");
-        queue_consent(&path, "queued-2");
+        let store = std::sync::Arc::new(
+            stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore::new(),
+        );
+        queue_consent_in(&path, std::sync::Arc::clone(&store), "queued-1");
+        queue_consent_in(&path, store, "queued-2");
         append_to_outbox(&path, b"{\"ts\":\"torn");
 
         let result = verify_to_result(&VerifyArgs {

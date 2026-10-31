@@ -2161,6 +2161,14 @@ pub enum EventKind {
         /// Renaming or moving the archive file after rotation will cause
         /// `audit verify` to report `RotationGap`.
         next_file_name: String,
+        /// Entry tags are in force when this handoff is written; every later
+        /// file carries them.
+        ///
+        /// Absent when false, so a handoff written while tags are not in force
+        /// serializes as it always has. The flag sits inside the hashed body,
+        /// so removing it breaks the chain.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        entry_tags: bool,
     },
 
     /// Verifier wasm hash on a context rule was migrated from one hash to
@@ -3647,6 +3655,42 @@ pub enum EventKind {
         /// Toolset grants revoked before this row.
         revoked_grants: usize,
     },
+    /// The audit log's entry-tag boundary: from this row on, every entry
+    /// carries a keyed entry tag.
+    ///
+    /// Appended and tagged by the first acquisition of a writer that holds
+    /// both the audit key and a tip-anchor store. Its tag covers every entry
+    /// before it, through its chain hash. Every keyed writer and the keyed
+    /// `audit verify` then require a valid tag on every later entry.
+    AuditEntryTagsStarted {
+        /// Entry count of the stored anchor the acquisition found, or zero
+        /// when it adopted the log.
+        anchored_count: u64,
+        /// Entries past that anchor the acquisition took in without tags:
+        /// the tail it absorbed, the file a completed rotation left, or the
+        /// whole adopted file.
+        absorbed_count: u64,
+    },
+    /// Entry tags continue under a new key from this row on.
+    ///
+    /// Tagged under the new key, and its tag covers every entry before it.
+    /// `audit verify` requires every later entry to carry a tag under that
+    /// key.
+    AuditEntryTagsRekeyed {
+        /// Why the key changed.
+        cause: EntryTagsRekeyCause,
+    },
+    /// The operator acknowledged the entries directly before this row in its
+    /// file, which carry no valid entry tag, and kept them as quarantined.
+    ///
+    /// Written by `audit reanchor --acknowledge-unauthenticated-tail`. Readers
+    /// skip the quarantined entries, and `audit verify` accepts them under
+    /// this row's valid tag.
+    AuditEntriesQuarantined {
+        /// Number of entries directly before this row in its file that it
+        /// covers.
+        quarantined_count: u64,
+    },
 }
 
 /// Total number of [`EventKind`] variants.
@@ -3669,7 +3713,7 @@ pub enum EventKind {
 /// the test stays green, leaving the new variant unpinned by any tag assertion.
 /// Closing that would need the count derived from the enum itself, which needs a
 /// derive macro this workspace does not carry.
-pub const EVENT_KIND_VARIANT_COUNT: usize = 75;
+pub const EVENT_KIND_VARIANT_COUNT: usize = 78;
 
 /// Why an [`EventKind::AuditTipAnchored`] row was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3686,6 +3730,19 @@ pub enum TipAnchorReason {
     /// a profile whose audit log path or audit key differs from the binding
     /// recorded in the keyring.
     BindingChanged,
+}
+
+/// Why an [`EventKind::AuditEntryTagsRekeyed`] row was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum EntryTagsRekeyCause {
+    /// `profile rotate-audit-key` switched the writer to the new audit key.
+    Rotation,
+    /// A keyed open found entries after the newest valid keyed start whose
+    /// tags do not verify under the current key, for example after a key
+    /// rotation stopped between persisting the new key and writing its row.
+    OpenRepair,
 }
 
 impl std::fmt::Display for TipAnchorReason {
@@ -3813,6 +3870,7 @@ mod tests {
     fn event_kind_rotation_handoff_round_trip() {
         let ev = EventKind::AuditRotationHandoff {
             next_file_name: "default.jsonl.20260428T123456".to_owned(),
+            entry_tags: false,
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: EventKind = serde_json::from_str(&s).unwrap();
@@ -3832,6 +3890,7 @@ mod tests {
         let archive_name = "default.jsonl.20260429T123456789";
         let ev = EventKind::AuditRotationHandoff {
             next_file_name: archive_name.to_owned(),
+            entry_tags: false,
         };
         // Verify that next_file_name matches the rotated-sibling pattern.
         assert!(
@@ -3852,6 +3911,7 @@ mod tests {
         let back: EventKind = serde_json::from_str(&s).unwrap();
         if let EventKind::AuditRotationHandoff {
             next_file_name: ref n,
+            ..
         } = back
         {
             assert_eq!(

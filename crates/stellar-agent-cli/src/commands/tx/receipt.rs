@@ -140,7 +140,7 @@ use stellar_agent_network::policy_state::{
     PersistedWindowStore, ReconcileFailureKind, ReconcileReport, SubmissionHold,
 };
 
-use crate::common::profile_access::{ProfileOrigin, load_profile_or_synthesize_testnet};
+use crate::common::profile_access::load_profile_or_synthesize_testnet;
 use crate::common::render::render_json;
 use crate::common::resolve_profile_name;
 
@@ -566,7 +566,6 @@ async fn run_clear(args: &ClearArgs) -> i32 {
     match record_and_mark_clear(
         &profile,
         &resolved.name,
-        origin,
         audit_writer.as_ref(),
         &receipts,
         &receipt,
@@ -600,6 +599,12 @@ async fn run_clear(args: &ClearArgs) -> i32 {
 /// released and the receipt clearable. A repeated clear finds the rows already
 /// written and writes neither again.
 ///
+/// The clear's history lookup and its row run under one guard of
+/// `audit_writer`, the writer the caller acquired under the audit binding
+/// check of the profile's origin. The lookup reads up to the writer's
+/// verified tip, so a clear row appended to the file outside the writer does
+/// not stand in for the one this clear writes.
+///
 /// `audit_writer` is `None` only for a synthesized profile whose writer could
 /// not be acquired; nothing is recorded for it, no history is read, and the
 /// receipt is marked.
@@ -617,7 +622,6 @@ async fn run_clear(args: &ClearArgs) -> i32 {
 fn record_and_mark_clear(
     profile: &stellar_agent_core::profile::schema::Profile,
     profile_name: &str,
-    origin: ProfileOrigin,
     audit_writer: Option<
         &std::sync::Arc<std::sync::Mutex<stellar_agent_core::audit_log::AuditWriter>>,
     >,
@@ -643,10 +647,15 @@ fn record_and_mark_clear(
         )?;
     }
 
-    if audit_writer.is_some() {
+    if let Some(audit) = audit_writer {
+        let mut guard = audit.lock().map_err(|_| {
+            Envelope::<()>::err(&crate::commands::value_audit::audit_writer_open_failed(
+                profile_name,
+            ))
+        })?;
         let already_recorded =
             stellar_agent_core::audit_log::reader::try_submission_receipt_cleared_exists(
-                &profile.audit_log_path,
+                &guard,
                 &receipt.envelope_hash,
             )
             .map_err(|error| Envelope::err_raw(error.wire_code(), error.to_string()))?;
@@ -662,8 +671,12 @@ fn record_and_mark_clear(
                 Some(receipt.envelope_hash.clone()),
                 &request_id,
             );
-            emit_clear_row(profile, profile_name, origin, entry)
-                .map_err(|e| Envelope::<()>::err(&e))?;
+            crate::commands::value_audit::append_value_audit_row_strict(
+                &mut guard,
+                profile_name,
+                entry,
+            )
+            .map_err(|e| Envelope::<()>::err(&e))?;
         }
     }
 
@@ -951,22 +964,6 @@ fn acknowledgement_required(
     )
 }
 
-/// Writes the clear's row under the audit binding check of the profile's
-/// origin, so a synthesized profile records no binding.
-fn emit_clear_row(
-    profile: &stellar_agent_core::profile::schema::Profile,
-    profile_name: &str,
-    origin: ProfileOrigin,
-    entry: AuditEntry,
-) -> Result<(), stellar_agent_core::error::WalletError> {
-    crate::commands::value_audit::emit_value_audit_row_strict(
-        profile,
-        profile_name,
-        origin.binding_check(),
-        entry,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, reason = "test-only assertions")]
@@ -977,22 +974,34 @@ mod tests {
     use stellar_agent_test_support::keyring_mock;
 
     use super::*;
+    use crate::common::profile_access::ProfileOrigin;
 
-    fn cleared_entry() -> AuditEntry {
-        AuditEntry::new_submission_receipt_cleared(
-            "tx receipt clear",
-            "stellar:testnet",
-            "2222…22bb",
-            "pending",
-            true,
-            None,
-            None,
-            "req-receipt-clear",
-        )
+    /// A receipt store under `dir` holding one submitted receipt for
+    /// `envelope_hash`, and that receipt.
+    fn submitted_receipt_in(
+        dir: &std::path::Path,
+        name: &str,
+        envelope_hash: &str,
+    ) -> (ReceiptStore, SubmissionReceipt) {
+        let receipts = ReceiptStore::open_at(dir, name).expect("store");
+        receipts
+            .try_begin(
+                envelope_hash,
+                &"9c".repeat(32),
+                "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+                1,
+                0,
+                100,
+            )
+            .expect("receipt");
+        receipts.mark_submitted(envelope_hash).expect("sent");
+        let receipt = receipts.get(envelope_hash).expect("read").expect("present");
+        (receipts, receipt)
     }
 
-    /// The clear's row records an absent binding for a persisted profile and
-    /// records none for a synthesized one; both rows are written.
+    /// The clear's row is written through the writer acquired under the
+    /// binding check of the profile's origin: a persisted profile records its
+    /// binding and a synthesized one records none; both rows are written.
     #[test]
     #[serial]
     fn the_clear_row_applies_the_binding_check_of_the_origin() {
@@ -1007,7 +1016,27 @@ mod tests {
             let coord = &profile.audit_log_hash_chain_key_id;
             rotate_keyring_secret_32(&coord.service, &coord.account).expect("seed audit key");
 
-            emit_clear_row(&profile, name, origin, cleared_entry()).expect("the row is written");
+            let writer = crate::commands::value_audit::require_value_audit_writer_for_origin(
+                &profile, name, origin,
+            )
+            .expect("the writer")
+            .expect("a keyed writer");
+            let (receipts, receipt) = submitted_receipt_in(
+                &dir.path().join(format!("{name}-receipts")),
+                name,
+                &"7a".repeat(32),
+            );
+            record_and_mark_clear(
+                &profile,
+                name,
+                Some(&writer),
+                &receipts,
+                &receipt,
+                None,
+                true,
+                "stellar:testnet",
+            )
+            .expect("the clear is recorded");
 
             assert!(
                 std::fs::read_to_string(&profile.audit_log_path)
@@ -1084,7 +1113,6 @@ mod tests {
         let refused = record_and_mark_clear(
             &profile,
             name,
-            ProfileOrigin::Persisted,
             Some(&broken),
             &receipts,
             &receipt,
@@ -1117,7 +1145,6 @@ mod tests {
         let cleared = record_and_mark_clear(
             &profile,
             name,
-            ProfileOrigin::Persisted,
             Some(&writer),
             &receipts,
             &receipt,
@@ -1136,9 +1163,16 @@ mod tests {
             .iter()
             .map(|r| r["kind"].as_str().expect("kind"))
             .collect();
-        assert_eq!(kinds, ["value_action_failed", "submission_receipt_cleared"]);
-        assert_eq!(rows[0]["code"], "submission.sequence_consumed");
-        assert_eq!(rows[1]["evidence"], "submission.sequence_consumed");
+        assert_eq!(
+            kinds,
+            [
+                "audit_entry_tags_started",
+                "value_action_failed",
+                "submission_receipt_cleared"
+            ]
+        );
+        assert_eq!(rows[1]["code"], "submission.sequence_consumed");
+        assert_eq!(rows[2]["evidence"], "submission.sequence_consumed");
         assert_eq!(
             receipts
                 .get(&envelope_hash)
@@ -1225,7 +1259,6 @@ mod tests {
         let refused = record_and_mark_clear(
             &profile,
             name,
-            ProfileOrigin::Persisted,
             Some(&writer),
             &receipts,
             &receipt,
@@ -1262,6 +1295,59 @@ mod tests {
         );
     }
 
+    /// A clear row appended past the writer's verified tip does not stand in
+    /// for the clear's own row: the clear writes its row.
+    #[test]
+    fn a_forged_cleared_row_past_the_tip_does_not_suppress_the_clear_row() {
+        use stellar_agent_core::audit_log::AuditWriter;
+
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let name = "receipt-clear-forged";
+        let mut profile = Profile::builder_testnet_named(name, "s", name, "n", name).build();
+        profile.audit_log_path = dir.path().join("audit.jsonl");
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(
+            AuditWriter::open(profile.audit_log_path.clone(), None).expect("writer"),
+        ));
+        let envelope_hash = "8b".repeat(32);
+        stellar_agent_core::audit_log::test_helpers::append_forged_entry(
+            &profile.audit_log_path,
+            AuditEntry::new_submission_receipt_cleared(
+                "tx receipt clear",
+                "stellar:testnet",
+                "9c9c9c9c...9c9c9c9c",
+                "pending",
+                false,
+                None,
+                Some(envelope_hash.clone()),
+                "req-forged-clear",
+            ),
+            |_| None,
+        );
+        let (receipts, receipt) =
+            submitted_receipt_in(&dir.path().join("receipts"), name, &envelope_hash);
+
+        record_and_mark_clear(
+            &profile,
+            name,
+            Some(&writer),
+            &receipts,
+            &receipt,
+            None,
+            false,
+            "stellar:testnet",
+        )
+        .expect("the clear is recorded");
+
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
+            .expect("log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("row"))
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[1]["kind"], "submission_receipt_cleared");
+        assert_ne!(rows[1]["request_id"], "req-forged-clear");
+    }
+
     /// A synthesized profile without a writer clears its receipt even when
     /// retained audit history cannot be read, since it owes no audit row.
     #[test]
@@ -1273,17 +1359,17 @@ mod tests {
         let name = "receipt-clear-no-writer";
         let mut profile = Profile::builder_testnet_named(name, "s", name, "n", name).build();
         profile.audit_log_path = dir.path().join("audit.jsonl");
+        let envelope_hash = "5e".repeat(32);
         {
             let mut writer =
                 AuditWriter::open(profile.audit_log_path.clone(), None).expect("fixture writer");
             break_clear_history(&profile.audit_log_path, &mut writer);
+            assert!(matches!(
+                reader::try_submission_receipt_cleared_exists(&writer, &envelope_hash),
+                Err(VerifyError::ChainBroken { .. })
+            ));
         }
         let active = std::fs::read(&profile.audit_log_path).expect("active file");
-        let envelope_hash = "5e".repeat(32);
-        assert!(matches!(
-            reader::try_submission_receipt_cleared_exists(&profile.audit_log_path, &envelope_hash),
-            Err(VerifyError::ChainBroken { .. })
-        ));
         let receipts = ReceiptStore::open_at(&dir.path().join("receipts"), name).expect("store");
         receipts
             .try_begin(
@@ -1303,7 +1389,6 @@ mod tests {
         let cleared = record_and_mark_clear(
             &profile,
             name,
-            ProfileOrigin::Synthesized,
             None,
             &receipts,
             &receipt,

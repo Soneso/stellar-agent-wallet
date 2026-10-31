@@ -1034,18 +1034,21 @@ impl WalletSubmissionRecorder<'_> {
     /// Refuses bytes whose original pending row still owes settlement.
     ///
     /// The receipt can be lost even when the original policy had no window
-    /// entries. The audit row preserves ownership in that case. The caller holds
-    /// the writer guard through this lookup, the append, and the fresh tip read.
-    /// A read error fails closed; neither refusal writes a closing row.
-    fn settlement_precheck(&self, intent: &SubmissionIntent) -> Result<(), WalletError> {
+    /// entries. The audit row preserves ownership in that case. The lookup
+    /// reads through `writer`, the guard the caller holds through this lookup,
+    /// the append, and the fresh tip read, so it sees only rows up to the
+    /// writer's verified tip. A read error fails closed; neither refusal
+    /// writes a closing row.
+    fn settlement_precheck(
+        &self,
+        writer: &AuditWriter,
+        intent: &SubmissionIntent,
+    ) -> Result<(), WalletError> {
         #[cfg(feature = "test-hooks")]
         if SKIP_SETTLEMENT_PRECHECK.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
-        let refusal = match try_value_action_settlement(
-            &self.profile.audit_log_path,
-            &intent.envelope_hash,
-        ) {
+        let refusal = match try_value_action_settlement(writer, &intent.envelope_hash) {
             Ok(ValueActionSettlement::Owed(_)) => already_submitted(intent),
             Ok(ValueActionSettlement::OwedWithoutLegs | ValueActionSettlement::Settled) => {
                 return Ok(());
@@ -1184,7 +1187,7 @@ impl WalletSubmissionRecorder<'_> {
         intent: &SubmissionIntent,
     ) -> Result<Option<AuditFacts>, (WalletError, UnwoundAfter)> {
         let mut guard = lock_audit(writer).map_err(|error| (error, UnwoundAfter::Receipt))?;
-        self.settlement_precheck(intent)
+        self.settlement_precheck(&guard, intent)
             .map_err(|error| (error, UnwoundAfter::Receipt))?;
         self.append_pending_row(&mut guard, intent)
             .map_err(|error| {
@@ -1535,6 +1538,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut profile = Profile::builder_testnet("backstop", "s", "n", "a").build();
         profile.audit_log_path = dir.path().join("audit.jsonl");
+        let keyed = access.is_some();
         let audit = Arc::new(Mutex::new(
             AuditWriter::open(profile.audit_log_path.clone(), access).unwrap(),
         ));
@@ -1584,18 +1588,22 @@ mod tests {
         assert!(receipts.get(&intent.envelope_hash).unwrap().is_none());
         assert_eq!(window.pending_reservations(&profile).unwrap().len(), 1);
         drop(recorder);
+        assert!(matches!(
+            try_value_action_settlement(&audit.lock().unwrap(), &intent.envelope_hash).unwrap(),
+            ValueActionSettlement::Owed(_)
+        ));
         drop(audit);
-        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
+        let mut rows: Vec<serde_json::Value> = std::fs::read_to_string(&profile.audit_log_path)
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
+        if keyed {
+            // A keyed writer opens the log with its entry-tag boundary row.
+            assert_eq!(rows.remove(0)["kind"], "audit_entry_tags_started");
+        }
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows.iter().all(|row| row["kind"] == "value_action_pending"));
-        assert!(matches!(
-            try_value_action_settlement(&profile.audit_log_path, &intent.envelope_hash).unwrap(),
-            ValueActionSettlement::Owed(_)
-        ));
         refused
     }
 
@@ -1636,8 +1644,8 @@ mod tests {
         );
         assert_eq!(
             store.writes().len(),
-            1,
-            "only the original row was anchored"
+            2,
+            "only the boundary row and the original row were anchored"
         );
     }
 
@@ -1649,6 +1657,7 @@ mod tests {
             tip_hash: [2; 32],
             log_path_sha256: [3; 32],
             anchor_covers_tip,
+            entry_tags_in_force: true,
         }
     }
 
@@ -1891,8 +1900,13 @@ mod tests {
             );
             assert_eq!(fx.audit_kinds(), ["value_action_pending"]);
             assert!(matches!(
-                try_value_action_settlement(&fx.profile.audit_log_path, &sub.intent.envelope_hash)
-                    .unwrap(),
+                try_value_action_settlement(
+                    &fx.writer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    &sub.intent.envelope_hash
+                )
+                .unwrap(),
                 ValueActionSettlement::Owed(_)
             ));
         }
@@ -1978,8 +1992,13 @@ mod tests {
                 vec!["value_action_pending"; expected_rows]
             );
             assert!(matches!(
-                try_value_action_settlement(&fx.profile.audit_log_path, &sub.intent.envelope_hash)
-                    .unwrap(),
+                try_value_action_settlement(
+                    &fx.writer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    &sub.intent.envelope_hash
+                )
+                .unwrap(),
                 ValueActionSettlement::Owed(_)
             ));
         }
@@ -2071,7 +2090,9 @@ mod tests {
             assert!(
                 matches!(
                     try_value_action_settlement(
-                        &fx.profile.audit_log_path,
+                        &fx.writer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
                         &sub.intent.envelope_hash
                     )
                     .unwrap(),
@@ -2174,7 +2195,9 @@ mod tests {
                 );
                 assert!(matches!(
                     try_value_action_settlement(
-                        &fx.profile.audit_log_path,
+                        &fx.writer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
                         &sub.intent.envelope_hash
                     )
                     .unwrap(),
@@ -2188,13 +2211,16 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn a_settlement_lookup_error_takes_the_receipt_stage() {
-            let mut fx = LedgerFixture::new("consume-settlement-error", NOW);
+            let fx = LedgerFixture::new("consume-settlement-error", NOW);
             let sub = submission();
             let (id, authorization) = grant(&fx, &sub, &[], "approval-1");
             let audit_path = fx.profile.audit_log_path.clone();
             let before = std::fs::read(&audit_path).unwrap();
-            // A directory makes the reader fail while the writer remains usable.
-            fx.profile.audit_log_path = fx.dir.path().to_path_buf();
+            // A directory at an archive's name makes the reader fail while the
+            // writer remains usable.
+            let mut archive = audit_path.clone().into_os_string();
+            archive.push(".20260428T123456");
+            std::fs::create_dir(archive).unwrap();
 
             let error = wallet_refusal(
                 fx.recorder(vec![], Some(Arc::clone(&fx.writer)))
@@ -2207,6 +2233,101 @@ mod tests {
             assert_eq!(reservations(&fx), 0);
             assert!(receipt(&fx, &sub.intent).is_none());
             assert_eq!(std::fs::read(audit_path).unwrap(), before);
+        }
+
+        /// The settlement lookup reads through the held guard: a failed row
+        /// appended past the writer's verified tip does not settle the owed
+        /// pending row, so the precheck refuses the bytes as submitted.
+        #[test]
+        #[serial]
+        fn the_precheck_reads_through_the_held_guard() {
+            let fx = LedgerFixture::new("consume-settlement-bound", NOW);
+            let sub = submission();
+            let recorder = fx.recorder(vec![], Some(Arc::clone(&fx.writer)));
+            fx.writer
+                .lock()
+                .unwrap()
+                .write_entry(recorder.pending_entry(&sub.intent))
+                .unwrap();
+            stellar_agent_core::audit_log::test_helpers::append_forged_entry(
+                &fx.profile.audit_log_path,
+                AuditEntry::new_value_action_failed(
+                    "stellar_pay_commit",
+                    Some("stellar:pubnet".to_owned()),
+                    vec![],
+                    "6ba7aaac...69060003",
+                    "submission.failed",
+                    PolicyDecision::Allow,
+                    Some(sub.intent.envelope_hash.clone()),
+                    None,
+                    None,
+                    "req-forged-failed",
+                ),
+                |_| None,
+            );
+
+            let guard = fx.writer.lock().unwrap();
+            let error = recorder
+                .settlement_precheck(&guard, &sub.intent)
+                .unwrap_err();
+            assert_eq!(error.code(), "submission.tx_already_submitted");
+        }
+
+        /// A planted quarantine row whose count reaches back over the owed
+        /// pending row hides nothing once the operator's re-anchor quarantines
+        /// it: the precheck refuses the bytes as submitted, as it does without
+        /// the planted row.
+        #[test]
+        #[serial]
+        fn a_quarantined_forged_quarantine_row_leaves_the_precheck_refusing() {
+            use stellar_agent_core::audit_log::tip_anchor::InMemoryTipAnchorStore;
+            use stellar_agent_core::audit_log::writer::ReanchorAcknowledgement;
+            use stellar_agent_core::audit_log::{KeyedAuditAccess, TipAnchorStore};
+
+            let fx = LedgerFixture::new("consume-settlement-quarantine", NOW);
+            let sub = submission();
+            let recorder = fx.recorder(vec![], Some(Arc::clone(&fx.writer)));
+            let path = fx.dir.path().join("quarantine.jsonl");
+            let store = Arc::new(InMemoryTipAnchorStore::new());
+            let key = [0x5c; 32];
+            let open = || {
+                AuditWriter::open(
+                    path.clone(),
+                    Some(KeyedAuditAccess::new(
+                        zeroize::Zeroizing::new(key),
+                        Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+                    )),
+                )
+                .unwrap()
+            };
+            open()
+                .write_entry(recorder.pending_entry(&sub.intent))
+                .unwrap();
+            stellar_agent_core::audit_log::test_helpers::append_forged_entry(
+                &path,
+                AuditEntry::new_audit_entries_quarantined(1_000, "req-forged-quarantine"),
+                |_| None,
+            );
+            let mut repair = AuditWriter::open_for_reanchor(
+                path.clone(),
+                Some(zeroize::Zeroizing::new(key)),
+                Arc::clone(&store) as Arc<dyn TipAnchorStore>,
+            )
+            .unwrap();
+            let report = repair
+                .reanchor_acknowledging(&[
+                    ReanchorAcknowledgement::UnauthenticatedTail,
+                    ReanchorAcknowledgement::Rollback,
+                ])
+                .unwrap();
+            assert_eq!(report.quarantined, 1);
+            drop(repair);
+
+            let writer = open();
+            let error = recorder
+                .settlement_precheck(&writer, &sub.intent)
+                .unwrap_err();
+            assert_eq!(error.code(), "submission.tx_already_submitted");
         }
 
         /// The row-writing step acquires the writer guard before looking up an
@@ -2248,8 +2369,13 @@ mod tests {
             assert_eq!(reached, UnwoundAfter::Receipt);
             assert_eq!(fx.audit_kinds(), ["value_action_pending"]);
             assert!(matches!(
-                try_value_action_settlement(&fx.profile.audit_log_path, &sub.intent.envelope_hash)
-                    .unwrap(),
+                try_value_action_settlement(
+                    &fx.writer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    &sub.intent.envelope_hash
+                )
+                .unwrap(),
                 ValueActionSettlement::Owed(_)
             ));
         }
@@ -2281,7 +2407,9 @@ mod tests {
             );
             assert!(matches!(
                 try_value_action_settlement(
-                    &fx.profile.audit_log_path,
+                    &fx.writer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
                     &original.intent.envelope_hash
                 )
                 .unwrap(),

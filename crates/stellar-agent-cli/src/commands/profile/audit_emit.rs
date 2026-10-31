@@ -279,7 +279,10 @@ mod tests {
             .load_anchor()
             .expect("read anchor")
             .expect("the row must be anchored");
-        assert_eq!(anchored.entry_count, 1, "the row advanced the anchor");
+        assert_eq!(
+            anchored.entry_count, 2,
+            "the row advanced the anchor past the open's boundary row"
+        );
         assert_eq!(
             anchored.end_offset,
             std::fs::metadata(&profile.audit_log_path)
@@ -325,11 +328,16 @@ mod tests {
             .map(|l| serde_json::from_str(&l.expect("line")).expect("valid JSON row"))
             .collect();
 
-        assert_eq!(rows.len(), 1, "one keyring_key_written row");
-        assert_eq!(rows[0]["kind"], "keyring_key_written", "row kind");
-        assert_eq!(rows[0]["key_purpose"], "nonce_hmac", "key purpose");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the open's boundary row and one keyring_key_written row"
+        );
+        assert_eq!(rows[0]["kind"], "audit_entry_tags_started");
+        assert_eq!(rows[1]["kind"], "keyring_key_written", "row kind");
+        assert_eq!(rows[1]["key_purpose"], "nonce_hmac", "key purpose");
         assert!(
-            rows[0].get("public_address").is_none(),
+            rows[1].get("public_address").is_none(),
             "an HMAC-key rotation row carries no public address"
         );
     }

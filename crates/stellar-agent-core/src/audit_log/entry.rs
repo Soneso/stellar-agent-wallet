@@ -7,11 +7,11 @@
 //! # Canonical JSON
 //!
 //! The hash chain is computed over
-//! `SHA-256(canonical_json(entry without previous_entry_hash) || previous_entry_hash)`.
+//! `SHA-256(canonical_json(entry without previous_entry_hash and entry_tag) || previous_entry_hash)`.
 //! "Canonical JSON" here means the entry serialised with fields in a fixed
 //! insertion order using `serde_json::to_vec` (struct field order is
 //! declaration order in Rust, which is stable).  The `previous_entry_hash`
-//! field is excluded from the hash-input body.
+//! and `entry_tag` fields are excluded from the hash-input body.
 //!
 //! # Canonical-form contract
 //!
@@ -23,7 +23,10 @@
 //!
 //! The `previous_entry_hash` field is set to `""` (empty string) in the
 //! hash-input body so the hash does not depend on itself.  An empty string is
-//! the canonical sentinel; JSON `null` is NOT used.
+//! the canonical sentinel; JSON `null` is NOT used. The `entry_tag` field is
+//! absent from the hash-input body: it is computed over the entry hash, and
+//! leaving it out keeps every hash the same whether or not an entry is
+//! tagged.
 //!
 //! # First-entry-per-file rule
 //!
@@ -204,7 +207,7 @@ impl NewToolInvocation {
 ///
 /// where `canonical_json_body` is the JSON serialisation of the entry with the
 /// `previous_entry_hash` field set to `""` (empty string — excluded from the
-/// hash-input body).
+/// hash-input body) and without the `entry_tag` field.
 ///
 /// The very first file's first entry uses
 /// `previous_entry_hash = SHA-256(zero_block)` (32 zero bytes).
@@ -324,8 +327,21 @@ pub struct AuditEntry {
     /// handoff entry in the preceding file (the cross-file chain bridge).
     ///
     /// This field is EXCLUDED from the hash-input body (set to `""` before
-    /// computing the current entry's hash).  See `AuditEntry::canonical_json_body`.
+    /// computing the current entry's hash), and so is [`Self::entry_tag`].
+    /// See `AuditEntry::canonical_json_body`.
     pub previous_entry_hash: String,
+
+    /// Keyed entry tag over this entry's chain hash, written by a writer that
+    /// holds the profile's audit key.
+    ///
+    /// Format: `sha256:<hex>`; see
+    /// [`compute_entry_tag`](super::chain::compute_entry_tag). Absent from
+    /// the JSON when `None`. The tag is EXCLUDED from the hash-input body
+    /// entirely, never written as `""`, so it changes no entry hash. A valid
+    /// tag authenticates this entry and, through its hash, every entry
+    /// before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_tag: Option<String>,
 }
 
 impl AuditEntry {
@@ -362,6 +378,7 @@ impl AuditEntry {
             // The writer populates this field on append; this constructor
             // leaves it as empty string.  See AuditWriter::write_entry.
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -438,6 +455,7 @@ impl AuditEntry {
             // The writer populates this field on append; this constructor
             // leaves it as empty string.  See AuditWriter::write_entry.
             previous_entry_hash: String::new(),
+            entry_tag: None,
         })
     }
 
@@ -446,6 +464,10 @@ impl AuditEntry {
     /// Written as the last entry in the outgoing log file before rotation.
     /// `audit verify` uses `next_file_name` to follow rotation boundaries.
     ///
+    /// `entry_tags` records that entry tags are in force when the handoff is
+    /// written; every later file then carries them. A handoff with `false`
+    /// serializes without the field.
+    ///
     /// The `previous_entry_hash` field is initialised to an empty string.
     /// [`AuditWriter::rotate`](super::writer::AuditWriter) sets this field
     /// directly before serialising the handoff entry.
@@ -453,6 +475,7 @@ impl AuditEntry {
     pub fn new_rotation_handoff(
         next_file_name: impl Into<String>,
         request_id: impl Into<String>,
+        entry_tags: bool,
     ) -> Self {
         let next = next_file_name.into();
         Self {
@@ -469,10 +492,12 @@ impl AuditEntry {
             request_id: request_id.into(),
             event_kind: EventKind::AuditRotationHandoff {
                 next_file_name: next,
+                entry_tags,
             },
             // The writer populates this field on append; this constructor
             // leaves it as empty string.  See AuditWriter::write_entry.
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -511,6 +536,7 @@ impl AuditEntry {
             // The writer populates this field on append; this constructor
             // leaves it as empty string.  See AuditWriter::write_entry.
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -562,6 +588,7 @@ impl AuditEntry {
                 result,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -620,6 +647,7 @@ impl AuditEntry {
                 ledger,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -762,6 +790,7 @@ impl AuditEntry {
             request_id: request_id.into(),
             event_kind: kind,
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -896,6 +925,7 @@ impl AuditEntry {
                 rule_id,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -936,6 +966,7 @@ impl AuditEntry {
                 audit_request_id: rid,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -976,6 +1007,7 @@ impl AuditEntry {
                 audit_request_id: rid,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1017,6 +1049,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1058,6 +1091,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1105,6 +1139,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1162,6 +1197,7 @@ impl AuditEntry {
                 snapshot_version,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1218,6 +1254,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1276,6 +1313,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1393,6 +1431,7 @@ impl AuditEntry {
             request_id: request_id.into(),
             event_kind,
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1448,6 +1487,7 @@ impl AuditEntry {
                 executable_tag: executable_ref.map(|pin| pin.tag.clone()),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1499,6 +1539,7 @@ impl AuditEntry {
                 observed_hash_first8: observed_hash_first8.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1552,6 +1593,7 @@ impl AuditEntry {
                 observed_executable,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1603,6 +1645,7 @@ impl AuditEntry {
                 observed_executable,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1652,6 +1695,7 @@ impl AuditEntry {
                 tx_hash_redacted: tx_hash_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1706,6 +1750,7 @@ impl AuditEntry {
                 override_acknowledged_at,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1753,6 +1798,7 @@ impl AuditEntry {
                 advised_status,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1804,6 +1850,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1850,6 +1897,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1912,6 +1960,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -1958,6 +2007,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2006,6 +2056,7 @@ impl AuditEntry {
                 smart_account_redacted: smart_account_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2052,6 +2103,7 @@ impl AuditEntry {
                 status: status.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2138,6 +2190,7 @@ impl AuditEntry {
                 result: result.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2183,6 +2236,7 @@ impl AuditEntry {
                 inner_count,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2233,6 +2287,7 @@ impl AuditEntry {
                 transaction_hash_redacted: transaction_hash_redacted.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2283,6 +2338,7 @@ impl AuditEntry {
                 ledger,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2337,6 +2393,7 @@ impl AuditEntry {
                 sequence,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2386,6 +2443,7 @@ impl AuditEntry {
                 code: code.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2433,6 +2491,7 @@ impl AuditEntry {
                 evidence,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2482,6 +2541,7 @@ impl AuditEntry {
                 ledger,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2518,6 +2578,7 @@ impl AuditEntry {
                 signer_redacted,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2566,6 +2627,7 @@ impl AuditEntry {
                 scheme: super::schema::bound_recorded_str(&scheme.into()),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2608,6 +2670,7 @@ impl AuditEntry {
                 failure_stage: super::schema::bound_recorded_str(&failure_stage.into()),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2652,6 +2715,7 @@ impl AuditEntry {
                 approval_present,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2691,6 +2755,7 @@ impl AuditEntry {
                 policy_budget_consumed,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2728,6 +2793,7 @@ impl AuditEntry {
                 claimed_status: super::schema::bound_recorded_str(&claimed_status.into()),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2763,6 +2829,7 @@ impl AuditEntry {
                 verified_outcome: super::schema::bound_recorded_str(&verified_outcome.into()),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2804,6 +2871,7 @@ impl AuditEntry {
                 public_address,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2840,6 +2908,7 @@ impl AuditEntry {
                 role: role.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2878,6 +2947,7 @@ impl AuditEntry {
                 owner_authorization,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2905,6 +2975,7 @@ impl AuditEntry {
                 generation,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2943,6 +3014,7 @@ impl AuditEntry {
                 reason: crate::audit_log::schema::bound_recorded_str(reason),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -2978,6 +3050,7 @@ impl AuditEntry {
                 revoked_grants,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3020,6 +3093,81 @@ impl AuditEntry {
             // The writer populates this field on append; this constructor
             // leaves it as empty string.  See AuditWriter::write_entry.
             previous_entry_hash: String::new(),
+            entry_tag: None,
+        }
+    }
+
+    /// Constructs the `audit_entry_tags_started` boundary row.
+    ///
+    /// Written by the audit writer itself under the fixed tool label
+    /// `audit.entry_tags_started`. `anchored_count` is the stored anchor's
+    /// entry count the acquisition found, zero for an adoption, and
+    /// `absorbed_count` the entries it took in past that anchor without tags.
+    #[must_use]
+    pub fn new_audit_entry_tags_started(
+        anchored_count: u64,
+        absorbed_count: u64,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self::new_audit_substrate_row(
+            "audit.entry_tags_started",
+            EventKind::AuditEntryTagsStarted {
+                anchored_count,
+                absorbed_count,
+            },
+            request_id.into(),
+        )
+    }
+
+    /// Constructs the `audit_entry_tags_rekeyed` row, written under the fixed
+    /// tool label `audit.entry_tags_rekeyed` and tagged under the new key.
+    #[must_use]
+    pub fn new_audit_entry_tags_rekeyed(
+        cause: crate::audit_log::schema::EntryTagsRekeyCause,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self::new_audit_substrate_row(
+            "audit.entry_tags_rekeyed",
+            EventKind::AuditEntryTagsRekeyed { cause },
+            request_id.into(),
+        )
+    }
+
+    /// Constructs the `audit_entries_quarantined` row, written under the
+    /// fixed tool label `audit.entries_quarantined`, covering the
+    /// `quarantined_count` entries directly before it in its file.
+    #[must_use]
+    pub fn new_audit_entries_quarantined(
+        quarantined_count: u64,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self::new_audit_substrate_row(
+            "audit.entries_quarantined",
+            EventKind::AuditEntriesQuarantined { quarantined_count },
+            request_id.into(),
+        )
+    }
+
+    /// A row the audit substrate writes on its own account: no chain, no
+    /// arguments, an `allow` decision, and the fixed `tool` label.
+    fn new_audit_substrate_row(tool: &str, event_kind: EventKind, request_id: String) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.to_owned(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id,
+            event_kind,
+            // The writer populates this field on append; this constructor
+            // leaves it as empty string.  See AuditWriter::write_entry.
+            previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3068,6 +3216,7 @@ impl AuditEntry {
                 return_scval_b64_prefix,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3127,6 +3276,7 @@ impl AuditEntry {
                 bundle_tx_hash_redacted,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3168,6 +3318,7 @@ impl AuditEntry {
                 wasm_sha256: wasm_sha256.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3214,6 +3365,7 @@ impl AuditEntry {
                 refusal_reason: refusal_reason.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3254,6 +3406,7 @@ impl AuditEntry {
                 prior_wasm_sha256: prior_wasm_sha256.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3342,6 +3495,7 @@ impl AuditEntry {
                 load_warnings_truncated: warnings_truncated_by_cap,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         };
 
         // Post-serialisation size guard.
@@ -3442,6 +3596,7 @@ impl AuditEntry {
                 audit_request_id: request_id,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3481,6 +3636,7 @@ impl AuditEntry {
                 audit_request_id: request_id,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3520,6 +3676,7 @@ impl AuditEntry {
                 audit_request_id: request_id,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3574,6 +3731,7 @@ impl AuditEntry {
                 audit_request_id: request_id,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3610,6 +3768,7 @@ impl AuditEntry {
                 index,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3650,6 +3809,7 @@ impl AuditEntry {
                 outcome: outcome.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3696,6 +3856,7 @@ impl AuditEntry {
                 ledger,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3736,6 +3897,7 @@ impl AuditEntry {
                 mainnet_presence: None,
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3781,6 +3943,7 @@ impl AuditEntry {
                 mainnet_presence: Some(presence),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3815,6 +3978,7 @@ impl AuditEntry {
                 origin: origin.into(),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3859,6 +4023,7 @@ impl AuditEntry {
                 ),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
@@ -3897,13 +4062,16 @@ impl AuditEntry {
                 ),
             },
             previous_entry_hash: String::new(),
+            entry_tag: None,
         }
     }
 
     /// Returns the canonical JSON bytes used as the hash-input body.
     ///
     /// The `previous_entry_hash` field is set to `""` (empty string) in the
-    /// hash-input body so the hash does not depend on itself.
+    /// hash-input body so the hash does not depend on itself, and the
+    /// `entry_tag` field is left out of it, because the tag is computed over
+    /// the hash.
     ///
     /// # Errors
     ///
@@ -3917,7 +4085,10 @@ impl AuditEntry {
     /// Writes the canonical JSON bytes used as the hash-input body.
     ///
     /// The `previous_entry_hash` field is set to `""` (empty string) in the
-    /// hash-input body so the hash does not depend on itself.
+    /// hash-input body so the hash does not depend on itself. The `entry_tag`
+    /// field is left out of the body entirely: it is `None` there, which
+    /// serializes as no field at all, so an entry hashes the same with or
+    /// without its tag.
     ///
     /// # Errors
     ///
@@ -3927,9 +4098,10 @@ impl AuditEntry {
         &self,
         writer: &mut W,
     ) -> Result<(), serde_json::Error> {
-        // Clone and set previous_entry_hash to empty string for body computation.
+        // Clone; blank the predecessor hash and drop the tag for the body.
         let mut body = self.clone();
         body.previous_entry_hash = String::new();
+        body.entry_tag = None;
         serde_json::to_writer(writer, &body)
     }
 
@@ -4366,6 +4538,7 @@ mod tests {
         let mut rotation_handoff = AuditEntry::new_rotation_handoff(
             "default.jsonl.20260429T000000000",
             "req-kat-rotation",
+            false,
         );
         fix_kat_ts(&mut rotation_handoff);
 
@@ -4499,6 +4672,121 @@ mod tests {
             prev.as_str().unwrap_or("x").is_empty(),
             "canonical body previous_entry_hash must be empty string, got: {prev:?}"
         );
+    }
+
+    /// The entry fields a build without entry tags parses: every field of
+    /// [`AuditEntry`] except `entry_tag`, with the same serde attributes and
+    /// the flattened, internally tagged [`EventKind`].
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct ReleasedEntry {
+        ts: String,
+        tool: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        chain_id: Option<String>,
+        arg_keys: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arg_keys_truncated: Option<usize>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        envelope_hash: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nonce_id: Option<String>,
+        policy_decision: PolicyDecision,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        decision_reason: Option<String>,
+        request_id: String,
+        #[serde(flatten)]
+        event_kind: EventKind,
+        previous_entry_hash: String,
+    }
+
+    /// Chains `entry` onto the zero block and tags it, as a keyed writer does.
+    fn tagged(mut entry: AuditEntry) -> (AuditEntry, String) {
+        use crate::audit_log::chain::{
+            ZERO_BLOCK_HASH, compute_entry_hash, compute_entry_tag, derive_entry_tag_key,
+        };
+        entry.previous_entry_hash = ZERO_BLOCK_HASH.to_owned();
+        let hash =
+            compute_entry_hash(&entry.canonical_json_body().unwrap(), ZERO_BLOCK_HASH).unwrap();
+        let key = derive_entry_tag_key(&[0x5a; 32]);
+        entry.entry_tag = Some(compute_entry_tag(&key, &hash).unwrap());
+        (entry, hash)
+    }
+
+    #[test]
+    fn a_released_reader_parses_a_tagged_line() {
+        use crate::audit_log::chain::compute_entry_hash;
+        let rows = [
+            make_entry(),
+            AuditEntry::new_value_action_failed(
+                "stellar_pay",
+                Some("stellar:testnet".to_owned()),
+                vec![],
+                "6ba7aaac...69060003",
+                "tx_failed",
+                PolicyDecision::Allow,
+                Some("sha256:abcdef01".to_owned()),
+                None,
+                None,
+                "req-failed",
+            ),
+            AuditEntry::new_approval_attested(
+                "PaymentSimulated",
+                "stellar_pay_commit",
+                None,
+                "ABCDEFGHIJKLMNOPQRSTUV",
+                "cli",
+                "req-attested",
+            ),
+        ];
+        for row in rows {
+            let (entry, hash) = tagged(row);
+            let line = serde_json::to_string(&entry).unwrap();
+            assert!(line.contains("\"entry_tag\":\"sha256:"), "{line}");
+            let mut released: ReleasedEntry = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("a released reader parses {}: {e}", entry.tool));
+            let previous = std::mem::take(&mut released.previous_entry_hash);
+            let released_body = serde_json::to_vec(&released).unwrap();
+            assert_eq!(
+                released_body,
+                entry.canonical_json_body().unwrap(),
+                "a released reader re-serializes {} to the canonical body",
+                entry.tool
+            );
+            assert_eq!(compute_entry_hash(&released_body, &previous).unwrap(), hash);
+        }
+    }
+
+    #[test]
+    fn the_tag_is_outside_the_canonical_body() {
+        use crate::audit_log::chain::compute_entry_hash;
+        let (tagged_entry, hash) = tagged(make_entry());
+        let mut untagged = tagged_entry.clone();
+        untagged.entry_tag = None;
+        assert_eq!(
+            tagged_entry.canonical_json_body().unwrap(),
+            untagged.canonical_json_body().unwrap()
+        );
+        assert!(
+            !String::from_utf8(tagged_entry.canonical_json_body().unwrap())
+                .unwrap()
+                .contains("entry_tag"),
+            "the body carries no entry_tag field at all"
+        );
+        assert_eq!(
+            compute_entry_hash(
+                &untagged.canonical_json_body().unwrap(),
+                &untagged.previous_entry_hash
+            )
+            .unwrap(),
+            hash
+        );
+        let tagged_line = serde_json::to_vec(&tagged_entry).unwrap();
+        let untagged_line = serde_json::to_vec(&untagged).unwrap();
+        assert_eq!(tagged_line.len(), untagged_line.len() + 86);
+        let back: AuditEntry = serde_json::from_slice(&tagged_line).unwrap();
+        assert_eq!(back.entry_tag, tagged_entry.entry_tag);
     }
 
     #[test]
@@ -4666,7 +4954,7 @@ mod tests {
 
     #[test]
     fn rotation_handoff_entry_has_event_kind() {
-        let entry = AuditEntry::new_rotation_handoff("default.jsonl.20260428", "req");
+        let entry = AuditEntry::new_rotation_handoff("default.jsonl.20260428", "req", false);
         assert_eq!(entry.tool, "audit.rotation_handoff_to");
         assert!(matches!(
             entry.event_kind,
@@ -7934,7 +8222,7 @@ mod tests {
         let entries = vec![
             make_entry(),
             AuditEntry::new_mlock_failed("p", "E", Some(1), "req"),
-            AuditEntry::new_rotation_handoff("file.jsonl.20260101T000000000", "req"),
+            AuditEntry::new_rotation_handoff("file.jsonl.20260101T000000000", "req", false),
             AuditEntry::new_plugin_invoked("plug", 0, PolicyDecision::Allow, 0, "req").unwrap(),
             AuditEntry::new_channel_acquired("C...X", 0, "req"),
             AuditEntry::new_channel_released("C...X", 0, "success", "req"),

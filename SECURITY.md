@@ -172,7 +172,10 @@ properties:
   authorization, key-management, and lifecycle events are appended to a per-profile
   hash-chained JSONL audit log. A balance read writes no row.
   The raw argument map is recorded as key names only. Typed value events retain each
-  leg's amount, asset, and redacted destination. The chain is verified end-to-end with `audit verify`. The value-moving signing and
+  leg's amount, asset, and redacted destination. Once the log holds its
+  `audit_entry_tags_started` boundary row, every entry carries a keyed entry tag
+  derived from the profile's audit key. The chain is verified end-to-end with `audit verify`;
+  `audit verify --profile` checks the chain and the entry tags. The value-moving signing and
   submitting verbs are `pay`, `claim`, `accounts create`, `trustline`, `trade`,
   `vault`, the x402 payment tools, and the MPP charge commit. Each proves its audit writer
   is acquirable BEFORE the signing key is touched or a transaction is submitted. It refuses
@@ -188,9 +191,10 @@ properties:
   rejection takes effect only after its audit row is durable, in the log or in the
   log's outbox. A queued row reaches the log before the consumer of the approval loads
   a signing key. Queued rows are committed by count and SHA-256 chain head in the
-  platform keyring. A removed, changed, or reordered committed row refuses keyed
-  acquisition until `audit acknowledge-outbox-loss` records the loss and revokes
-  decided approvals and toolset grants. An absent outbox state reads as zero;
+  platform keyring, and only committed consent rows drain. A removed, changed, or
+  reordered committed row, a line past the commitment, or a committed row of
+  another kind refuses keyed acquisition until `audit acknowledge-outbox-loss`
+  records the loss and revokes decided approvals and toolset grants. An absent outbox state reads as zero;
   raw deletion or restore of that keyring entry shares the boundary below.
   The queue commitment does not authenticate who appended a row.
 - Code running as the same OS user. Such code can write the audit log and the wallet's
@@ -201,8 +205,13 @@ properties:
   These conditions refuse value-moving verbs. After investigation, `audit reanchor`
   accepts an intact prefix and records the acknowledgement; it refuses a broken chain.
   Profile verification checks the chain and HMAC sidecars before anchor agreement,
-  unless the missing-anchor rule applies after an unkeyed chain walk. The wallet does
-  not detect a well-formed entry appended at the tip. Raw
+  unless the missing-anchor rule applies after an unkeyed chain walk. Past the
+  boundary row, an appended entry without a valid entry tag is refused by keyed
+  writers (`audit.tip_anchor_mismatch`, reason `unauthenticated_tail`) and by
+  `audit verify --profile` (`audit.entry_tag_invalid`), and readers stop at the
+  writer's verified tip. Still open: code that can read the audit key can compute
+  valid tags, rows before the boundary row rest on the anchor alone, `audit verify`
+  without `--profile` checks no tag, and zero-config logs carry no tags. Raw
   deletion or restore of platform keyring items outside the wallet, together with a
   matching log, rests on the platform keyring's own access control. A headless keyring
   backend keeps those items in a file that same-user code can restore, so mainnet

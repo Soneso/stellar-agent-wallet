@@ -173,6 +173,7 @@ pub(crate) fn soroban_authorization(
         tip_hash: [0; 32],
         log_path_sha256: [5; 32],
         anchor_covers_tip: true,
+        entry_tags_in_force: true,
     };
     let mut header = header("fixture", None, writer, facts, now);
     header.domain = AuthorizationDomain::Soroban;
@@ -427,9 +428,15 @@ impl LedgerFixture {
         );
     }
 
-    /// The audit rows the fixture's log holds, by kind.
+    /// The audit rows the fixture's log holds after its entry-tag boundary
+    /// row, by kind.
+    ///
+    /// # Panics
+    ///
+    /// When the first row is not the boundary row the fixture's keyed writer
+    /// appends at open.
     pub(crate) fn audit_kinds(&self) -> Vec<String> {
-        std::fs::read_to_string(&self.profile.audit_log_path)
+        let mut kinds: Vec<String> = std::fs::read_to_string(&self.profile.audit_log_path)
             .unwrap_or_default()
             .lines()
             .map(|line| {
@@ -438,7 +445,14 @@ impl LedgerFixture {
                     .unwrap()
                     .to_owned()
             })
-            .collect()
+            .collect();
+        assert_eq!(
+            kinds.first().map(String::as_str),
+            Some("audit_entry_tags_started"),
+            "the keyed writer opens the log with its boundary row"
+        );
+        kinds.remove(0);
+        kinds
     }
 }
 

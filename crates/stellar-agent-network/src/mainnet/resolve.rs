@@ -2916,9 +2916,7 @@ mod tests {
     }
 
     fn append_audit(f: &ResolverFixture) {
-        use stellar_agent_core::audit_log::{
-            AuditEntry, AuditOutbox, NewToolInvocation, PolicyDecision,
-        };
+        use stellar_agent_core::audit_log::{AuditEntry, AuditOutbox};
         AuditOutbox::for_log(
             &f.profile.audit_log_path,
             crate::keyring::KeyringTipAnchorStore::shared(
@@ -2926,13 +2924,14 @@ mod tests {
                 &f.profile.audit_log_path,
             ),
         )
-        .append(&AuditEntry::new_tool_invocation(NewToolInvocation::new(
+        .append(&AuditEntry::new_approval_attested(
+            "PaymentSimulated",
             "stellar_x402_create_payment",
-            "stellar:mainnet",
-            vec![],
-            PolicyDecision::Allow,
+            None,
+            "ABCDEFGHIJKLMNOPQRSTUV",
+            "cli",
             "00000000-0000-4000-8000-000000000000",
-        )))
+        ))
         .unwrap();
     }
     async fn anchor_consume(repair: bool, release: bool) {
