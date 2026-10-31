@@ -172,7 +172,7 @@ pub struct AuditVerifyResult {
     pub audit_writer_degraded: bool,
     /// Whether the keyring-held tip anchor was checked, and if not, why.
     pub anchor: AuditAnchorStatus,
-    /// Number of consent rows queued in the audit outbox beside the log and
+    /// Number of operator rows queued in the audit outbox beside the log and
     /// not yet drained into it: the newline-terminated lines of
     /// `<log>.outbox`, counted after the commitment check and apart from it.
     ///

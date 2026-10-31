@@ -1,11 +1,11 @@
 ---
 name: stellar-agent-wallet
-description: Operate the Stellar Agent Wallet, a self-custodial Stellar wallet built for AI agents, through its stellar-agent CLI and stellar-agent-mcp MCP server. Use when an agent needs to read Stellar account state, send XLM or asset payments, create accounts, manage trustlines, or claim claimable balances. Also use for OpenZeppelin smart-account governance, DeFi trading/deposits, and SEP, x402, and sponsored MPP charge flows. The wallet provides a local policy engine and an operator-approval gate. Its audit log records transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events. MCP balance reads and payment simulations produce no automatic invocation row. Under V1, payment simulations can reconcile overdue reservations and write settlement audit rows. Testnet approval is satisfiable via the CLI, a local web inbox, or a TLS-protected remote-approval surface; mainnet consent requires an owner-pinned passkey through the local browser. Covers the two-phase build-then-commit signing pattern, the simulate-approve-commit handshake, chain_id and the JSON result envelope, and configured mainnet authorization. Reach for it when the user mentions the stellar-agent wallet, an AI-agent wallet on Stellar, MCP-driven Stellar payments, or autonomous-agent key custody.
+description: Operate the Stellar Agent Wallet through MCP tools for agent payments, account creation, trustlines, and claims with two-phase operator approval. Use the CLI for reads, setup, and operator ceremonies; CLI signing exceptions have separate policy and on-chain checks. Use when an agent needs Stellar account state, XLM or asset payments, smart-account governance, DeFi, SEP, x402, or sponsored MPP charges. Covers signed policy limits, shell access and approval authority, chain_id, the JSON result envelope, and configured mainnet authorization. The audit log records submissions, signed authorizations, approvals, and explicit key-management and lifecycle events. Testnet approval is available through the operator's CLI, local inbox, or remote approver; mainnet consent requires an owner-pinned passkey through the local browser.
 license: Apache-2.0
-compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.12 public alpha; install from crates.io with a pinned version, for example cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.12 stellar-agent-mcp@0.1.0-alpha.12, or build from source). Targets Stellar testnet (default) and mainnet.
+compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.13 public alpha; install from crates.io with a pinned version, for example cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13, or build from source). Targets Stellar testnet (default) and mainnet.
 metadata:
-  version: "0.4.10"
-  wallet_version: "0.1.0-alpha.12"
+  version: "0.4.11"
+  wallet_version: "0.1.0-alpha.13"
 ---
 
 # Stellar Agent Wallet
@@ -18,9 +18,9 @@ for build configuration, admitted operations, and exclusions.
 The Stellar Agent Wallet is a self-custodial Stellar wallet for AI agents. It has
 two surfaces over one shared core:
 
-- **`stellar-agent`** — the CLI. The operator uses it to create profiles, custody
-  keys, approve gated actions, and verify the audit log.
-- **`stellar-agent-mcp`** — a Model Context Protocol server over stdio. An agent
+- **`stellar-agent`** is the CLI for reads, setup, and operator ceremonies.
+  The operator manages keys, approves gated actions, and verifies the audit log.
+- **`stellar-agent-mcp`** is a Model Context Protocol server over stdio. An agent
   drives the wallet by calling its MCP tools.
 
 Both surfaces share the **policy engine**, **operator-approval spine**, and
@@ -28,10 +28,37 @@ Both surfaces share the **policy engine**, **operator-approval spine**, and
 authorizations, approvals, and explicit key-management and lifecycle events.
 MCP balance reads and payment simulations produce no automatic invocation row.
 Under V1, payment simulations can reconcile overdue reservations and write
-settlement audit rows. As an agent, you
-operate through the MCP tools; the human operator holds the keys and grants
-approvals through the CLI. The agent
-never holds key material and never approves its own actions.
+settlement audit rows. Route payments, account creation, trustlines, and claims
+through MCP's paired tools, where the pending-store approval loop exists.
+Leave operator approvals and key ceremonies to the operator.
+
+An MCP-only agent receives no operator approval tool. A process that runs as
+the operator's OS user holds the operator's authority; the wallet does not
+distinguish it from the operator.
+On testnet, CLI approval checks the local OS identity; it reads consent from
+standard input or `--yes` and does not establish that a human confirmed. On
+mainnet it refuses `--yes` and terminal input and runs the passkey ceremony.
+Shell permission rules are guard rails for a cooperative agent, not a boundary.
+
+For an MCP-only agent, signed limits apply where V1 is evaluated, and approval
+never lifts a cap. Delegated execution runs through the CLI's operator
+authority under the agent key's on-chain rules. Other CLI signing paths have
+separate checks; see
+[CLI signing coverage](references/cli-reference.md#signing-and-approval-coverage).
+Owner key re-enrollment needs no previous seed while the installation holds no
+policy pin or mainnet enablement nonce. Replacing an owner protected by these
+continuity records requires a rotation statement signed by the pinned owner.
+The profile's `[policy] engine` and `policy_owner_key_id` fields are unsigned.
+The halt marker has no MAC. `profile reset-window-state` requires the pinned
+owner's authorization on an installation enabled for mainnet, and no owner
+signature otherwise. These rules bind the wallet's commands; deleting or
+rewriting keyring entries outside the wallet rests on the platform keyring.
+Same-user processes can read keyring entries on Linux (Secret Service) and
+Windows (Credential Manager). With the `headless-env` backend, any process that
+can read `STELLAR_AGENT_HEADLESS_KEYRING_KEY` can decrypt every entry, on any
+platform. See the
+[shell-agent guide](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/agents.md#coding-agents-with-a-shell)
+for the trust model and Claude Code's three permission modes.
 
 The wallet is self-custodial and runs with no project-operated backend: keys live
 in the host platform keyring, policy is evaluated locally, and nothing is sent to
@@ -44,9 +71,9 @@ prerelease versions are published, the version must be spelled out:
 
 ```bash
 # Prebuilt binaries (fetched from the GitHub release archive):
-cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.12 stellar-agent-mcp@0.1.0-alpha.12
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
 # Or build from the published sources:
-cargo install --locked stellar-agent-cli@0.1.0-alpha.12 stellar-agent-mcp@0.1.0-alpha.12
+cargo install --locked stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
 ```
 
 `--locked` builds with the `Cargo.lock` published in each crate. With the
@@ -106,7 +133,7 @@ message. `request_id` correlates the call with the audit log. Every business
 error uses this envelope — domain refusals, policy and approval outcomes,
 keyring and signing failures, submit failures, and the SEP-53, x402, and DeFi
 verbs alike; codes follow a `<family>.<reason>` convention (for example
-`x402.insufficient_funds`, `sep53.sign_failed`, `nonce.mint_failed`).
+`sep53.sign_failed`, `nonce.mint_failed`).
 
 The six `stellar_sep43_*` tools use this same standard envelope.
 The SEP-43 raw protocol payload, such as `{ address }`, appears inside `data`
@@ -212,9 +239,9 @@ handshake:
 3. Re-invoke `stellar_pay_commit` with `approval_nonce` and `approval_attestation`
    added. The wallet verifies the attestation, then signs and submits.
 
-You cannot mint or guess the attestation. Treat `policy.approval_required` as "ask
-the operator to approve, then retry the commit with the attestation" — never as a
-transient error to retry blindly.
+MCP exposes no attestation-minting tool. On `policy.approval_required`, ask the
+operator to approve, then retry the commit with the attestation. Do not invoke
+CLI approval yourself or retry blindly.
 
 MPP prepare records a request when policy requires approval for prepare or
 `stellar_mpp_charge_commit`. Its preview returns the nonce as
@@ -255,19 +282,20 @@ operator attests to the exact definition you proposed. See
 
 ## 6. DeFi
 
-`stellar_dex_trade`
-(Soroswap swaps) with `stellar_dex_quote`, and `stellar_defindex_vault_deposit` /
-`_withdraw` each run behind an ordered trust gate (WASM-hash pin, oracle/venue
-allowlist, slippage re-verify) and submit through the smart account. See
-`references/defi.md`.
+`stellar_dex_trade` checks the venue allowlist, router WASM pin, and a fresh
+quote against the slippage bound before submitting through the smart account.
+`stellar_dex_quote` reads a quote without that gate.
+`stellar_defindex_vault_deposit` and `stellar_defindex_vault_withdraw` check the
+vault WASM pin, upgrade flag, roles, and assets before submission.
+Neither path evaluates oracle staleness. See `references/defi.md`.
 
 ## 7. Protocols
 
-SEP-7 URI parsing, SEP-10/45 web auth, SEP-24/6 transfer hand-off, SEP-43 wallet
-signing (`get_address`, `get_network`, `sign_transaction`, `sign_auth_entry`,
+SEP-7 URI parsing, SEP-10 web auth through the x402 identity gate, SEP-24/6
+transfer hand-off, SEP-43 wallet signing (`get_address`, `get_network`, `sign_transaction`, `sign_auth_entry`,
 `sign_message`, `sign_and_submit_transaction`), SEP-47/48 contract discovery, and
-SEP-53 signed messages. The wallet also signs x402 v2 Exact Stellar agent
-payments and testnet sponsored MPP charges. Both x402 payment tools support
+SEP-53 signed messages. SEP-45 is library-only, with no CLI command or MCP tool.
+The wallet also signs x402 v2 Exact Stellar agent payments and testnet sponsored MPP charges. Both x402 payment tools support
 approved mainnet payments in a feature-enabled build. Authenticated payments
 bind their SEP-10 identity operation to the payment approval. MPP uses
 `stellar_mpp_charge_prepare` then one `stellar_mpp_charge_commit`; the trusted
@@ -286,6 +314,15 @@ Drive installed toolsets with `stellar_toolset_list` and `stellar_toolset_invoke
 
 ## 9. Safety model
 
+- The operator can halt a profile with `stellar-agent profile halt <name>`, the
+  emergency stop. While it is halted, every tool that is not read-only refuses
+  with `profile.halted`, and so does every CLI verb that signs or submits. The
+  halt takes effect on the next call of a running server. A halt marker that
+  cannot be read refuses with `profile.halt_unreadable`. Read-only tools and
+  the resources keep answering, and `mcp-resource://profiles/<name>` reports
+  `halted`. On either code, stop and report the message to the operator. Never
+  run `stellar-agent profile resume` yourself, and do not retry under another
+  profile; the halt is the operator's decision.
 - Released binaries have `mainnet-write` on and admit the four classic
   full-mode CLI operations and classic MCP commits after operator setup and
   approval for each action. See
@@ -395,8 +432,8 @@ Do not treat a successful `stellar_pay` as a sent payment.
 
 **The envelope is authoritative at commit.** `stellar_pay_commit` decodes the
 destination, asset, and amount from `envelope_xdr`, not from re-supplied
-arguments. Re-submitting a commit with altered amounts to get under a limit does
-not work and is recorded in the audit log.
+arguments. Altered commits are refused. An early policy or envelope-divergence
+refusal returns before submission audit recording.
 
 **Each build mints a fresh single-use nonce.** You cannot reuse a `nonce` across
 commits or call commit twice with the same one. Build again to get a new nonce.

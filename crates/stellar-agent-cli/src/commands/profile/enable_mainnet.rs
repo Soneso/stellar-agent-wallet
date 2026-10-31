@@ -957,7 +957,12 @@ mod tests {
         /// installation verification.
         fn sign_rewritten_and_verify(&self, sequence: i64) -> VerifiedPolicy {
             let body = self.rewritten_body(sequence, 1);
-            stellar_agent_core::policy::v1::validate_unsigned_policy(&body, "operator").unwrap();
+            stellar_agent_core::policy::v1::validate_unsigned_policy(
+                &body,
+                "operator",
+                &self.profile.network_passphrase,
+            )
+            .unwrap();
             self.sign(&body);
             let owner = self.owner.verifying_key().to_bytes();
             let verified = load_verified_policy(

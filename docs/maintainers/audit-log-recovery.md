@@ -70,7 +70,7 @@ A repair against a held writer refuses with `audit.writer_locked` in the
 envelope's error detail. Stop a server holding that profile's writer, repair,
 and start it again. The same applies to `profile rotate-audit-key`.
 
-**Queued consent rows.** After its `audit_tip_anchored` rows, the acknowledging repair drains the audit outbox (section 8), so rows `stellar-agent approve` queued while the log was refused follow the repair rows. If the drain refuses, the repair still stands: the verb exits 0, omits `outbox_drained`, and lists the refusal under `warnings` (`audit.outbox_unusable`, `audit.outbox_busy`, `audit.outbox_rows_missing`, or the condition an append refused on, such as `audit.io_error`). Every queued row stays queued for the next drain, which appends again any row the refused drain had appended. The reporting form leaves the log, the anchor, and the outbox unchanged.
+**Queued operator rows.** After its `audit_tip_anchored` rows, the acknowledging repair drains the audit outbox (section 8), so rows `stellar-agent approve`, `profile halt`, and `profile resume` queued while the log was refused follow the repair rows. If the drain refuses, the repair still stands: the verb exits 0, omits `outbox_drained`, and lists the refusal under `warnings` (`audit.outbox_unusable`, `audit.outbox_busy`, `audit.outbox_rows_missing`, or the condition an append refused on, such as `audit.io_error`). Every queued row stays queued for the next drain, which appends again any row the refused drain had appended. The reporting form leaves the log, the anchor, and the outbox unchanged.
 
 ## 1.1 Missing tip anchor
 
@@ -211,7 +211,7 @@ stellar-agent audit reanchor --profile <name> --acknowledge-binding-change
 | Changed or unreadable | Agrees, or absent without prior anchoring evidence | `--acknowledge-binding-change` | `binding_changed` |
 | Changed or unreadable | Disagrees, cannot be parsed, or absent with prior anchoring evidence | Both | `rollback_acknowledged`, then `binding_changed` |
 
-An anchor agrees when `audit verify` would accept it; a file ahead of its anchor agrees. An absent anchor is covered by the first row: with an equal or absent binding the verb needs `--acknowledge-rollback` for it as for a mismatch (section 1.1). In the changed-binding rows an absent anchor disagrees when a chain-root sidecar or an `audit_tip_anchored` row shows prior anchoring, and agrees otherwise: a changed binding names a log path and audit key no anchor was written for yet, so only the log can show that one was. The verb decides this before it opens the writer and again under the writer's lock, where it reads the rows from its replay of the active file. A missing flag refuses with `validation.acknowledgement_required`, names the flag, and writes nothing. On success the verb anchors the current tip, bumps the current path's re-anchor counter once, and appends the rows, each carrying that count. `binding_changed` names the old path's anchor as `previous_anchor`, or none when the record was unreadable. The new binding is stored last, so a run that stops earlier leaves the refusal in place and a rerun appends its rows again. The envelope lists the conditions acknowledged and how the record compared. Queued consent rows follow the repair rows, as in section 1.
+An anchor agrees when `audit verify` would accept it; a file ahead of its anchor agrees. An absent anchor is covered by the first row: with an equal or absent binding the verb needs `--acknowledge-rollback` for it as for a mismatch (section 1.1). In the changed-binding rows an absent anchor disagrees when a chain-root sidecar or an `audit_tip_anchored` row shows prior anchoring, and agrees otherwise: a changed binding names a log path and audit key no anchor was written for yet, so only the log can show that one was. The verb decides this before it opens the writer and again under the writer's lock, where it reads the rows from its replay of the active file. A missing flag refuses with `validation.acknowledgement_required`, names the flag, and writes nothing. On success the verb anchors the current tip, bumps the current path's re-anchor counter once, and appends the rows, each carrying that count. `binding_changed` names the old path's anchor as `previous_anchor`, or none when the record was unreadable. The new binding is stored last, so a run that stops earlier leaves the refusal in place and a rerun appends its rows again. The envelope lists the conditions acknowledged and how the record compared. Queued operator rows follow the repair rows, as in section 1.
 
 **Two data roots, one keyring.** The default `audit_log_path` derives from the OS data directory, which follows `$HOME` and `$XDG_DATA_HOME`. Two profile files of one name in two data roots that share one keyring bind different digests and refuse each other. Set an explicit `audit_log_path` in the profile file in such a deployment.
 
@@ -260,21 +260,21 @@ Three more rows record the entry tags:
 
 ## 8. The audit outbox
 
-`stellar-agent approve --id` writes its `approval_attested` row before it persists the approval. When a running MCP server or `approve serve` inbox holds the audit writer, the command cannot append to the log itself. It queues the row in the audit outbox, and the running process appends it.
+`stellar-agent approve --id` writes its `approval_attested` row before it persists the approval. When a running MCP server or `approve serve` inbox holds the audit writer, the command cannot append to the log itself. It queues the row in the audit outbox, and the running process appends it. `stellar-agent profile halt` and `stellar-agent profile resume` queue their `profile_halted` and `profile_resumed` rows the same way.
 
 **Files beside the log.**
 
 | File | Purpose |
 | --- | --- |
-| `<log>.outbox` | Queued rows: JSON lines, one audit entry per line, mode `0600`. Each entry carries the timestamp of the consent it records. |
+| `<log>.outbox` | Queued rows: JSON lines, one audit entry per line, mode `0600`. Each entry carries the timestamp of the consent, halt, or resume it records. |
 | `<log>.outbox.lock` | Held by every append and every drain while it touches the outbox. Waited on for up to 2 s, then `audit.outbox_busy`. |
 | `<log>.drain.lock` | Held for its whole life by every writer that drains: the MCP server, `approve serve`, and every keyed CLI verb. `approve --id` reads it once to tell a draining holder from one that does not drain. |
 
 **Keyring commitment.** The audit key's service stores the queue's count and SHA-256 chain head at `<audit-account>-tip-<path-digest>-outbox`.
 Every append checks the committed prefix, syncs its new line, then stores the updated commitment.
-A failed state write truncates the append back and refuses consent.
+A failed state write truncates the line back and refuses the append.
 
-**Drain points.** A draining writer checks the commitment, appends the committed queued rows, stores zero state, then truncates the outbox. Only consent rows (`approval_attested`, `approval_attested_remote`) drain; a committed row of any other kind refuses with `audit.outbox_unusable` (section 8.1). Drains run:
+**Drain points.** A draining writer checks the commitment, appends the committed queued rows, stores zero state, then truncates the outbox. Only operator rows (`approval_attested`, `approval_attested_remote`, `profile_halted`, `profile_resumed`) drain; a committed row of any other kind refuses with `audit.outbox_unusable` (section 8.1). Drains run:
 
 - when it opens, right after the tip-anchor check;
 - on every keyed acquisition in a running process, under the same lock as that check;
@@ -286,11 +286,15 @@ A command that consumes an approval acquires the writer after it reads the appro
 
 **A row can record a consent that did not take effect.** The consent row is written, or queued, before the approval is persisted. A persist failure after the row, or a crash between the row and the persist, leaves an `approval_attested` row for an approval that never took effect. To tell, find the entry whose nonce starts with the row's `nonce_prefix` in `stellar-agent approve list --profile <name> --include-expired`. The approval took effect when the entry shows `attested: true` or kind `Consumed`. It did not when the entry still shows its original kind with `attested: false`, or is a `Rejected` tombstone. A listed toolset gate entry is inconclusive, because its removal after a persisted grant is best-effort. An entry already removed by `approve gc` cannot be judged from the store.
 
-**Timestamps.** A drained row keeps its consent timestamp. Every draining writer drains before its own rows, so the log stays in time order. Three cases can still put an older timestamp after a newer one. The first is a row from a writer that does not drain: the CLI startup advisory, the zero-config path, or the `audit reanchor` repair rows. The second is a repeated row after a crash. The third is the adoption row an acquisition appends when its drain refuses. `audit verify` can then report `backward_timestamp_jump`; with the `request_id` of a repeated row, or the row's kind, that warning is explained.
+**Timestamps.** A drained row keeps the timestamp of the operator action it records. Every draining writer drains before its own rows, so the log stays in time order. Three cases can still put an older timestamp after a newer one. The first is a row from a writer that does not drain: the CLI startup advisory, the zero-config path, or the `audit reanchor` repair rows. The second is a repeated row after a crash. The third is the adoption row an acquisition appends when its drain refuses. `audit verify` can then report `backward_timestamp_jump`; with the `request_id` of a repeated row, or the row's kind, that warning is explained.
 
 **Committed queue.** A missing, shortened, changed, or reordered committed prefix refuses with `audit.outbox_rows_missing` before any queued row is appended, and so does a complete line past the commitment.
 This blocks keyed acquisition and approval consumption until the operator acknowledges the loss.
-A line past the commitment is one an append left after a crash between its line sync and its commitment, or one written outside the wallet; the consent it records never took effect, and `approve --id` refuses until the acknowledgement.
+A line past the commitment is one an append left after a crash between its line sync and its commitment, or one written outside the wallet.
+An interrupted append can leave an uncommitted operator row.
+Approval consent and resuming a halted profile require the row to commit first, so such a row records an approval or a resume that never took effect.
+A halt marker takes effect before its audit row is queued, so an uncommitted `profile_halted` row can record a halt that is in effect; `stellar-agent profile show <name>` reports the halt state from the marker.
+Until the acknowledgement, `approve --id` refuses, and so does `profile resume` on a halted profile.
 An absent keyring state reads as zero for an outbox without a commitment.
 Raw deletion or restore of keyring entries outside the wallet rests on the platform keyring, as described in SECURITY.md.
 The commitment does not authenticate who queued a row.
@@ -302,16 +306,16 @@ It reports `outbox_pending` separately and warns about torn, unparseable, or unr
 
 **Detail sub-code:** `audit.outbox_unusable` (under `audit.chain_key_unavailable`)
 
-**What it means.** A committed line of `<log>.outbox` does not parse as an audit entry, or holds a row that is not a consent row. Every drain refuses, so every keyed acquisition refuses too, and the outbox is left unchanged. `audit verify` lists unparseable line numbers under an `outbox_unparseable` warning.
+**What it means.** A committed line of `<log>.outbox` does not parse as an audit entry, or holds a row that is not an operator row. Every drain refuses, so every keyed acquisition refuses too, and the outbox is left unchanged. `audit verify` lists unparseable line numbers under an `outbox_unparseable` warning.
 
 **Recovery.**
 
 1. Stop the processes that use the profile: the MCP server, `approve serve`, and any CLI verb.
-2. Inspect the file: `cat -n <log>.outbox`. Each intact line is one consent row, with its `kind`, `ts`, `request_id`, and `nonce_prefix`.
+2. Inspect the file: `cat -n <log>.outbox`. Each intact line is one operator row, with its `kind`, `ts`, and `request_id`; a consent row also carries `nonce_prefix`.
 3. Move the file out of the audit directory: `mv <log>.outbox <somewhere-else>/outbox.saved`. The keyring still records the committed rows, so the next acquisition reports `audit.outbox_rows_missing`.
 4. Follow section 8.3. The acknowledgement records the loss, revokes every decided approval and toolset grant, appends no queued row, and resets the commitment. Approve the affected actions again.
 
-The saved file holds consent rows whose approvals may already have taken effect. Keep it with the incident record.
+The saved file can hold consent rows whose approvals may already have taken effect. Keep it with the incident record.
 
 ### 8.2 Busy outbox
 
@@ -337,7 +341,7 @@ stellar-agent audit acknowledge-outbox-loss --profile default --reason "Queue in
 ```
 
 The command checks the log's tip anchor and takes its writer and drain locks.
-It checks that the loss holds. When the committed prefix is intact, every committed line must parse and be a consent row.
+It checks that the loss holds. When the committed prefix is intact, every committed line must parse and be an operator row.
 It then revokes every decided, unexpired, unconsumed approval, including mainnet confirmations and recorded passkey assertions, and every toolset grant.
 Undecided requests remain.
 It appends `audit_outbox_loss_acknowledged`, appends the committed prefix when it is intact and nothing otherwise, stores zero state, and truncates the outbox, discarding every other line.
@@ -347,7 +351,7 @@ The result reports `profile`, `expected_rows`, `found_rows`, `drained`, `discard
 A held writer refuses with `audit.writer_locked`.
 A log rolled back behind its tip anchor refuses with `audit.tip_anchor_mismatch`; follow section 1 first.
 No divergence refuses with `audit.outbox_loss_not_found` and writes no acknowledgement.
-An intact committed line that does not parse, or that is not a consent row, refuses with `audit.outbox_unusable` before anything is revoked or written.
+An intact committed line that does not parse, or that is not an operator row, refuses with `audit.outbox_unusable` before anything is revoked or written.
 Follow section 8.1 for that line, then rerun the acknowledgement.
 An append refusal after the acknowledgement row leaves the queue and commitment in place; a rerun records the loss again.
 A crash after revocation leaves the loss in place; rerunning revokes any remaining permissions.
@@ -387,15 +391,15 @@ unusable` names a different cause: the keyring holds a value at the outbox
 commitment's account, `<audit-account>-tip-<path-digest>-outbox` in the audit
 key's service, that does not parse. The wallet never writes such a value, so
 it was changed outside the wallet. Restoring keyring access does not clear
-it. Every drain, every keyed acquisition, every queued consent, and
+it. Every drain, every keyed acquisition, every queued operator row, and
 `audit acknowledge-outbox-loss` refuse with this sub-code, and nothing is
 read as "nothing queued".
 
 1. Stop the processes that use the profile: the MCP server, `approve serve`,
    and any CLI verb.
 2. Copy `<log>.outbox` out of the audit directory with the incident record.
-   Its lines are the evidence of the queued consent; nothing appends them to
-   the log from here on.
+   Its lines are the evidence of the queued operator rows; nothing appends
+   them to the log from here on.
 3. Remove the keyring entry at that account with the platform keyring tool.
    An absent commitment reads as zero.
 4. When the outbox holds complete lines, every one of them now lies past the
@@ -413,8 +417,8 @@ read as "nothing queued".
 
 Removing the entry gives up the check of the rows queued before it, as a
 deletion of the entry outside the wallet does (section 8, "Committed queue").
-The saved outbox is the only record of that consent; keep it with the
-incident record.
+The saved outbox is the only record of the operator actions its lines
+record; keep it with the incident record.
 
 ## 10. Unreadable or undecodable audit key
 
@@ -429,7 +433,7 @@ incident record.
 1. Restore the trusted key from a copy of that keyring entry, such as a keychain backup, to the entry the profile's `audit_log_hash_chain_key_id` names. The log, its anchor, and its entry tags then verify as before, and `audit verify --profile <name>` confirms it.
 2. Without a copy, the existing log stays evidence that only its hash chain checks. Stop the processes that use the profile, then move every file of the log out of the audit directory with the incident record: the active file, its rotated files, their `.root_hmac` sidecars, `<log>.pruned` and its sidecar, and `<log>.outbox`. `stellar-agent audit verify <saved-log>` without `--profile` still walks the moved chain.
 3. Remove the corrupt keyring entry with the platform keyring tool, such as Keychain Access on macOS, Seahorse on Linux, or Credential Manager on Windows.
-4. Run `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`. The stored anchor still names the moved log, so the new, empty log is refused with `audit.tip_anchor_mismatch` until this re-anchor acknowledges it. When the keyring still commits queued consent rows of the moved outbox, the repair stands and the envelope's `warnings` list `audit.outbox_rows_missing`; acknowledge that loss as in section 8.3 before the next step.
+4. Run `stellar-agent audit reanchor --profile <name> --acknowledge-rollback`. The stored anchor still names the moved log, so the new, empty log is refused with `audit.tip_anchor_mismatch` until this re-anchor acknowledges it. When the keyring still commits queued operator rows of the moved outbox, the repair stands and the envelope's `warnings` list `audit.outbox_rows_missing`; acknowledge that loss as in section 8.3 before the next step.
 5. Run `stellar-agent profile rotate-audit-key <name>` to mint a new key. Its first keyed acquisition puts entry tags in force on the new log.
 
 On a log without entry tags, steps 3 and 5 alone apply: the rotation opens the log under its anchor, or adopts it as section 5 describes, mints the key, and re-signs the log's chain-root sidecars under it.

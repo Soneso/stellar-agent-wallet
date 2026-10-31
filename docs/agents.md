@@ -10,9 +10,9 @@ and how operator approval fits in.
 An agent talks to the wallet through the **MCP server** (`stellar-agent-mcp`),
 which exposes wallet capabilities as MCP tools over stdio. A human **operator**
 uses the `stellar-agent` CLI for setup, key custody, and approvals. The two share
-one policy engine, approval spine, and audit log, so a tool call is gated exactly
-as the equivalent CLI command is. The CLI is the source of truth; the MCP surface
-is a transport over the same dispatch path.
+policy-engine, approval, and audit primitives. Their handlers determine policy
+coverage: MCP balance reads pass through policy, while CLI balance reads fetch
+account state directly.
 
 For the full tool catalog see [mcp.md](mcp.md); for the guardrail model see
 [concepts.md](concepts.md); for signed toolsets see [toolsets.md](toolsets.md).
@@ -24,9 +24,10 @@ For the full tool catalog see [mcp.md](mcp.md); for the guardrail model see
 | Agent | MCP tools over stdio | Reads state, builds and submits transactions, invokes installed toolsets. |
 | Operator | `stellar-agent` CLI | Creates profiles, holds keys in the platform keyring, approves gated actions, verifies the audit log. |
 
-The agent never holds key material and never approves its own actions. Signing
-keys live in the operator's platform keyring; approvals are minted by the
-operator running `stellar-agent approve` in a trusted context.
+MCP tools return no signing keys and expose no operator approval command.
+Signing keys live in the operator's platform keyring; the operator approves
+requests in a trusted context. An agent with shell access has additional
+authority, described in [Coding agents with a shell](#coding-agents-with-a-shell).
 
 ## Connect the MCP server
 
@@ -159,7 +160,8 @@ routes through the operator. The handshake:
    `approval_attestation` added. The wallet verifies the attestation against its
    keyring-held key, then signs and submits.
 
-The agent cannot mint or guess the attestation; the key never leaves the keyring.
+An agent limited to MCP cannot mint the attestation; the approval key stays in
+the operator's keyring.
 A commit that reaches the gate without a valid attestation is refused with
 `policy.approval_required` (the same envelope whether the attestation is absent,
 forged, or expired, so a caller learns nothing from the failure). Treat
@@ -232,7 +234,7 @@ unconditional per-action approval additionally fires on every toolset-routed
 payment regardless of policy. To drive a payment, invoke `action: "stellar_pay"`
 to build the envelope, then `action: "stellar_pay_commit"` with `args` carrying
 the `envelope_xdr` (and `nonce`, `expires_at_unix_ms`) returned by that build. See
-[toolsets.md](toolsets.md) and the runnable [examples](../examples/toolsets/).
+[toolsets.md](toolsets.md) and the runnable [examples](../examples/toolsets/README.md).
 
 ## Agent-payments (x402)
 
@@ -262,6 +264,125 @@ or create an x402/classic-payment fallback after an ambiguous result. Use
 `stellar_mpp_authorization_status`, record a host receipt, and reconcile the
 server transaction instead. The complete testnet-only workflow is in
 [Agent payments with MPP](agent-payments.md).
+
+## Coding agents with a shell
+
+A process that runs as the operator's OS user holds the operator's authority.
+Through the CLI it can re-enroll the owner key of an installation that holds no
+owner continuity records, a policy pin or a mainnet enablement nonce, and then
+sign a policy of its own. With direct access to files and keyring entries it can
+delete the halt marker, and on Linux and Windows read the keyring entries. The
+wallet does not distinguish such a process from the operator.
+
+An MCP-only host reaches only wallet tools: signed policy applies where
+evaluated, approval separates agent and operator, and the halt and audit log
+hold. The MCP server exposes paired request and commit tools over the core the
+CLI also uses.
+On testnet, CLI approval checks the local OS identity; it reads consent from
+standard input or `--yes` and does not establish that a human confirmed. On
+mainnet it refuses `--yes` and terminal input and runs the passkey ceremony,
+which requires a verified passkey assertion from an approval credential in the
+owner-signed policy.
+
+Delegated execution runs through the CLI's operator authority under the agent
+key's on-chain rules. Other signing paths have distinct policy and
+pending-approval checks; see
+[CLI signing coverage](../skills/stellar-agent-wallet/references/cli-reference.md#signing-and-approval-coverage).
+Without `per_tx_cap`, an `approval_above` rule has no per-payment ceiling;
+period caps still deny.
+
+Every transaction-signing or submitting verb checks the halt marker, including
+smart-account governance, deployment, and `pool init`.
+Reads, key, policy, and approval ceremonies, and CLI state recording and
+reconciliation stay usable; see [Halt marker](profiles.md#halt-marker).
+Audit events carry request IDs that connect related rows; see the
+[hash-chained audit log](concepts.md#the-hash-chained-audit-log).
+
+Current limits of the OS-user boundary:
+
+- Owner key re-enrollment needs no previous seed while the installation holds
+  no owner continuity records. Replacing an owner protected by these records
+  requires a policy signed by the new owner with a rotation statement signed by
+  the pinned owner.
+- The profile's `[policy] engine` and `policy_owner_key_id` fields are unsigned.
+- The halt marker has no MAC.
+- `profile reset-window-state` requires no owner signature until
+  `profile enable-mainnet` has run. An enabled installation requires the pinned
+  owner's authorization through `--owner-secret-env`.
+- These rules bind the wallet's commands. Deleting or rewriting the pin, the
+  enablement nonce, or the owner entry outside the wallet rests on the platform
+  keyring.
+- Same-user processes can read keyring entries on Linux (Secret Service) and
+  Windows (Credential Manager). With the `headless-env` backend, any process that
+  can read `STELLAR_AGENT_HEADLESS_KEYRING_KEY` can decrypt every entry, on any
+  platform.
+
+**Default permission prompts.** Review the pending request before permitting
+CLI approval. Shell prompts are a guard rail for a cooperative agent, not a
+boundary.
+
+**Deny rules.** Use MCP for agent actions and a separate operator approval
+surface. Deny rules apply in every mode. The list covers authority, keys,
+policy state, and `pool init`.
+Only `pool init` signs transactions with the agent's enrolled MCP signer
+without evaluating wallet policy; it creates channel accounts with sponsored
+reserves and zero starting balances.
+
+```json
+{
+  "permissions": {
+    "deny": [
+      "Bash(stellar-agent approve *)",
+      "Bash(stellar agent approve *)",
+      "Bash(stellar-agent profile resume *)",
+      "Bash(stellar agent profile resume *)",
+      "Bash(stellar-agent profile enroll-signer *)",
+      "Bash(stellar agent profile enroll-signer *)",
+      "Bash(stellar-agent profile enroll-owner-key *)",
+      "Bash(stellar agent profile enroll-owner-key *)",
+      "Bash(stellar-agent profile enroll-rpc-credential *)",
+      "Bash(stellar agent profile enroll-rpc-credential *)",
+      "Bash(stellar-agent profile sign-policy *)",
+      "Bash(stellar agent profile sign-policy *)",
+      "Bash(stellar-agent profile rotate-nonce-key *)",
+      "Bash(stellar agent profile rotate-nonce-key *)",
+      "Bash(stellar-agent profile rotate-attestation-key *)",
+      "Bash(stellar agent profile rotate-attestation-key *)",
+      "Bash(stellar-agent profile rotate-audit-key *)",
+      "Bash(stellar agent profile rotate-audit-key *)",
+      "Bash(stellar-agent profile rotate-counterparty-key *)",
+      "Bash(stellar agent profile rotate-counterparty-key *)",
+      "Bash(stellar-agent counterparty rotate-hmac-key *)",
+      "Bash(stellar agent counterparty rotate-hmac-key *)",
+      "Bash(stellar-agent profile rotate-policy-state-key *)",
+      "Bash(stellar agent profile rotate-policy-state-key *)",
+      "Bash(stellar-agent profile reset-window-state *)",
+      "Bash(stellar agent profile reset-window-state *)",
+      "Bash(stellar-agent profile reset-mpp-state *)",
+      "Bash(stellar agent profile reset-mpp-state *)",
+      "Bash(stellar-agent pool init *)",
+      "Bash(stellar agent pool init *)",
+      "Bash(stellar-agent credentials add-passkey *)",
+      "Bash(stellar agent credentials add-passkey *)",
+      "Bash(stellar-agent credentials delete *)",
+      "Bash(stellar agent credentials delete *)",
+      "Bash(stellar-agent audit reanchor *)",
+      "Bash(stellar agent audit reanchor *)",
+      "Bash(stellar-agent toolsets install *)",
+      "Bash(stellar agent toolsets install *)",
+      "Bash(stellar-agent toolsets uninstall *)",
+      "Bash(stellar agent toolsets uninstall *)"
+    ]
+  }
+}
+```
+
+Absolute paths such as `~/.cargo/bin/stellar-agent` and shell wrappers such as
+`sh -c` can escape these prefixes. `profile halt` stays allowed.
+
+**Bypass permissions.** With `bypassPermissions`, the deny list is the only
+permission-rule guard rail, and it still applies. A denying `PreToolUse` hook
+also blocks in every mode.
 
 ## Operating safely
 

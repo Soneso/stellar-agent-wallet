@@ -3613,6 +3613,37 @@ pub enum EventKind {
         reason: String,
     },
 
+    /// `profile halt` set the profile's halt marker.
+    ///
+    /// Written after the marker is in place: the halt takes effect whether or
+    /// not this row can be written, because a stop never waits on the audit
+    /// log.
+    ProfileHalted {
+        /// The halted profile.
+        profile: String,
+        /// The `halted_at` timestamp written into the marker.
+        halted_at: String,
+        /// The operator's reason, when one was given (bounded to
+        /// [`RECORDED_STR_MAX`] characters at construction).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// `profile resume` was run for the profile.
+    ///
+    /// Records that the command ran; the halt marker decides the state. On a
+    /// halted profile the row is committed before the marker is removed, so a
+    /// resume that took effect always has a row. A resume whose row cannot be
+    /// written refuses and leaves the halt in place. A row followed by a
+    /// marker that cannot be removed, or by an append that reports a failure
+    /// after the row landed, leaves the profile halted with this row.
+    ProfileResumed {
+        /// The profile being resumed.
+        profile: String,
+        /// Whether a halt marker existed when the resume ran.
+        was_halted: bool,
+    },
+
     /// The audit log's keyring-held tip anchor was established for the active
     /// file.
     ///
@@ -3642,7 +3673,8 @@ pub enum EventKind {
         /// repair. `None` for adoption, which does not touch the counter.
         reanchor_count: Option<u64>,
     },
-    /// The operator acknowledges lost queued consent and revokes permissions.
+    /// The operator acknowledges lost queued operator rows and revokes
+    /// permissions.
     AuditOutboxLossAcknowledged {
         /// Number of rows committed in the keyring.
         expected_rows: u64,
@@ -3713,7 +3745,7 @@ pub enum EventKind {
 /// the test stays green, leaving the new variant unpinned by any tag assertion.
 /// Closing that would need the count derived from the enum itself, which needs a
 /// derive macro this workspace does not carry.
-pub const EVENT_KIND_VARIANT_COUNT: usize = 78;
+pub const EVENT_KIND_VARIANT_COUNT: usize = 80;
 
 /// Why an [`EventKind::AuditTipAnchored`] row was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -6726,6 +6758,41 @@ mod tests {
             !s.contains("\"tool\""),
             "tool must NOT appear as a variant field: {s}"
         );
+    }
+
+    #[test]
+    fn profile_halt_lifecycle_events_round_trip() {
+        use crate::audit_log::AuditEntry;
+        let halted = AuditEntry::new_profile_halted(
+            "alice",
+            "2026-10-31T12:00:00Z",
+            Some("incident"),
+            "halt-request",
+        );
+        let value = serde_json::to_value(&halted).unwrap();
+        assert_eq!(value["kind"], "profile_halted");
+        assert_eq!(value["tool"], "profile_halt");
+        assert_eq!(value["profile"], "alice");
+        assert_eq!(value["halted_at"], "2026-10-31T12:00:00Z");
+        assert_eq!(value["reason"], "incident");
+        let decoded: AuditEntry = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.event_kind, halted.event_kind);
+
+        let no_reason = AuditEntry::new_profile_halted("alice", "2026-10-31T12:00:00Z", None, "r");
+        let wire = serde_json::to_value(&no_reason).unwrap();
+        assert!(wire.get("reason").is_none(), "{wire}");
+
+        let resumed = AuditEntry::new_profile_resumed("alice", true, "resume-request");
+        let value = serde_json::to_value(&resumed).unwrap();
+        assert_eq!(value["kind"], "profile_resumed");
+        assert_eq!(value["tool"], "profile_resume");
+        assert_eq!(value["was_halted"], true);
+        let decoded: AuditEntry = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.event_kind, resumed.event_kind);
+
+        for kind in ["profile_halted", "profile_resumed"] {
+            assert!(serde_json::from_value::<EventKind>(serde_json::json!({"kind":kind})).is_err());
+        }
     }
 
     #[test]

@@ -587,7 +587,8 @@ fn prepare_policy(
         }
     }
     canonical_bytes(&result.raw).map_err(not_canonical)?;
-    validate_unsigned_policy(&result.raw, name).map_err(|e| body_invalid(&e))?;
+    validate_unsigned_policy(&result.raw, name, &profile.network_passphrase)
+        .map_err(|e| body_invalid(&e))?;
     if mainnet_minimum::required(&body, profile) {
         mainnet_minimum::validate(&body, profile, name).map_err(|e| {
             (
@@ -897,6 +898,7 @@ mod tests {
     use serial_test::serial;
     use stellar_agent_core::policy::PolicyError;
     use stellar_agent_core::policy::v1::loader::load_signed_policy;
+    use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
     use stellar_agent_test_support::keyring_mock;
     use tempfile::TempDir;
 
@@ -1049,7 +1051,7 @@ mod tests {
         );
 
         // (d) The REAL loader accepts the signed file under the enrolled key.
-        let doc = load_signed_policy(&path, PROFILE_NAME, &pk)
+        let doc = load_signed_policy(&path, PROFILE_NAME, &pk, TESTNET_PASSPHRASE)
             .expect("the signed policy must load and verify");
         assert_eq!(doc.version, 1);
         let sig = doc.signature.expect("signature must be populated");
@@ -1061,7 +1063,7 @@ mod tests {
         assert_ne!(signed, tampered, "tamper must actually change the body");
         let tpath = dir.path().join("tampered.toml");
         std::fs::write(&tpath, tampered).unwrap();
-        let err = load_signed_policy(&tpath, PROFILE_NAME, &pk).unwrap_err();
+        let err = load_signed_policy(&tpath, PROFILE_NAME, &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::OwnerSignatureInvalid { .. }),
             "a tampered body must fail signature verification, got: {err:?}"
@@ -1090,7 +1092,8 @@ mod tests {
         assert_eq!(code, 0);
 
         let (_other_s, other_pk, _other_g) = seed_material([0x33u8; 32]);
-        let err = load_signed_policy(&path, PROFILE_NAME, &other_pk).unwrap_err();
+        let err =
+            load_signed_policy(&path, PROFILE_NAME, &other_pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::OwnerSignatureInvalid { .. }),
             "verification under a different owner key must fail, got: {err:?}"
@@ -1255,7 +1258,8 @@ mod tests {
             1,
             "re-signing must not duplicate the [signature] table"
         );
-        load_signed_policy(&path, PROFILE_NAME, &pk).expect("re-signed file must verify");
+        load_signed_policy(&path, PROFILE_NAME, &pk, TESTNET_PASSPHRASE)
+            .expect("re-signed file must verify");
     }
 
     /// Runs `sign-policy` with the enrolled owner seed on `policy.toml`
@@ -1376,7 +1380,7 @@ mod tests {
         std::fs::write(&stale_path, &edited).unwrap();
         assert!(
             matches!(
-                load_signed_policy(&stale_path, PROFILE_NAME, &pk),
+                load_signed_policy(&stale_path, PROFILE_NAME, &pk, TESTNET_PASSPHRASE),
                 Err(PolicyError::OwnerSignatureInvalid { .. })
             ),
             "the edited body must not verify under the old signature"
@@ -1399,7 +1403,7 @@ mod tests {
                 "{case}: the old table must be replaced"
             );
             let path = dir.path().join("policy.toml");
-            let loaded = load_signed_policy(&path, PROFILE_NAME, &pk);
+            let loaded = load_signed_policy(&path, PROFILE_NAME, &pk, TESTNET_PASSPHRASE);
             assert!(
                 loaded.is_ok(),
                 "{case}: the re-signed file must load: {:?}",
@@ -1843,7 +1847,7 @@ mod tests {
             assert_eq!(output[0]["data"]["sequence"], expected);
             assert_eq!(output[0]["data"]["previous_sequence"], expected - 1);
             assert_eq!(
-                load_signed_policy(&path, PROFILE_NAME, &pk)
+                load_signed_policy(&path, PROFILE_NAME, &pk, TESTNET_PASSPHRASE)
                     .unwrap()
                     .version,
                 2

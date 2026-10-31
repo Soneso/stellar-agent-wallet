@@ -7,6 +7,15 @@ The `smart-account` CLI group (alias `sa`) governs an on-chain OpenZeppelin smar
 
 This file is self-contained. For the MCP tool surface and result-envelope shape see `./mcp-tools.md`. For the value-transfer / DeFi verbs see `./defi.md`.
 
+The operator runs the governance and deployment examples on this page.
+Agents propose rules through MCP's two-phase rule tools and wait for operator
+approval. Delegated execution runs through the CLI's operator authority under
+the on-chain rules of the agent's key.
+Administration and deployment bypass the wallet policy engine; multicall
+requires V1 and accepts only Allow. Its approval refusal exposes
+`sa.multicall_failed`, with audit code `multicall.approval_required`.
+See [signing coverage](cli-reference.md#signing-and-approval-coverage).
+
 ## Output envelope and amount/asset conventions
 
 - Envelope: `{ ok, data | error, request_id }`. On success `ok: true` with a `data` object; on error `ok: false` with an `error` object carrying a wire code (for example `network.mainnet_write_forbidden`, `validation.rule_name_too_long`, `sa.threshold_policy_identification_failed`).
@@ -35,9 +44,9 @@ printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
 
 After the last of those examples, the operator runs `unset WALLET_SK` to remove the seed from the shell.
 
-All write signing goes through the smart-account auth-entry digest path: the signer signs the auth digest, which binds the authorizing context-rule ids.
+Operations authorized by smart-account context rules sign the auth digest, which binds the authorizing rule ids. Timelock writes use direct G-key Soroban authorization for the proposer, canceller, or executor.
 
-Shared flags available on most verbs: `--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output` (`json` default or `table`). The `smart-account signers` verbs do not accept `--output`.
+Shared flags available on most verbs: `--profile`, `--network`, `--rpc-url`, `--secondary-rpc-url`, `--timeout-seconds`, `--output` (`json` default or `table`). `--output` is available on `rules`, `execute`, `list-rules`, `list-verifiers`, and the four `deploy-*` verbs. The `signers`, `timelock`, `migrate-verifier`, `multicall`, `register-multicall`, and `unregister-multicall` verbs do not accept it.
 
 ## Context rules
 
@@ -214,6 +223,7 @@ stellar-agent smart-account migrate-verifier \
 ### Rule enumeration
 
 `smart-account list-rules` (alias backing `smart-account rules list`) scans the on-chain `[0, max_scan_id)` rule-id space and returns each active rule in `rule_id` order. Read-only, mainnet OK. Each rule's `baseline` reports its signer-set baseline in the profile's audit log: `none`, `v1`, `v2`, `unreadable` (an audit-log integrity error) or `unknown` (the log was not read). A rule reporting `none` refuses every signature under it with `sa.signer_set_missing_baseline` until one `signers list --rule-id N` records the baseline.
+Rule reads refuse `sa.deployment_failed` for a `Delegated` signer with more than two items or an `External` signer with more than three. They also refuse invalid `policies`/`policy_ids` lists (required, equally sized, unique addresses/`u32` ids). Migration planning also refuses these cases.
 
 - `--account <C>` is required. `--source-account <G>` defaults to a funded account on testnet; on mainnet, supply a funded account for simulation.
 - `--rpc-url` and `--secondary-rpc-url` use the profile endpoints. Optional `--network` must match the profile chain; `--profile` selects the profile.
@@ -314,7 +324,7 @@ stellar-agent smart-account timelock cancel \
 
 ## Agent-signed execute
 
-`smart-account execute` submits one `CallContract` invocation against an external contract, authorized by a named context rule and signed by an External-Ed25519 rule signer — the CLI surface for the agent-delegation flow (see `agent-delegation.md`). Testnet only; structurally refuses `mainnet` before any RPC call or key-material access. No MCP tool equivalent exists (see `mcp.md`'s "why there is no agent-facing execute tool" — the typed-tool consent model has no meaningful preview for an arbitrary-invocation verb).
+`smart-account execute` submits one `CallContract` invocation against an external contract, authorized by a named on-chain context rule and signed by an External-Ed25519 rule signer. It does not evaluate the wallet policy engine. This is the CLI surface for the agent-delegation flow (see `agent-delegation.md`). Testnet only; structurally refuses `mainnet` before any RPC call or key-material access. No MCP tool equivalent exists (see `mcp.md`'s "why there is no agent-facing execute tool"). The typed-tool consent model has no meaningful preview for an arbitrary-invocation verb.
 
 Two distinct signers: `--rule-signer-ed25519-secret-env <VAR>` (req) is the agent's own key that authorizes the call (full mlock ceremony; no funded account needed); the ordinary signer-source group (`--signer-secret-env` / `--sign-with-ledger`) is the fee-payer that pays the transaction fee and signs the envelope.
 

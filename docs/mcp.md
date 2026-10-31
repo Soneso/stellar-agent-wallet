@@ -31,7 +31,15 @@ assistant can read account state and submit Stellar transactions through the
 same policy engine, operator-approval spine, and tamper-evident audit log that
 back the `stellar-agent` CLI.
 
-Gated tools evaluate policy before signing. Mainnet writes also require a
+MCP and CLI handlers share policy primitives but determine their own gate
+coverage. MCP balance reads evaluate policy; CLI balance reads do not.
+The policy engine evaluates gated calls to `Allow`, `Deny`, or `RequireApproval`
+before signing.
+`stellar_dex_quote`, `stellar_mpp_record_receipt`,
+`stellar_mpp_reconcile_transaction`, and `stellar_mpp_authorization_status`
+run without a policy verdict. Tools with an approval flow wait for operator
+consent; single-shot signing tools refuse `RequireApproval` with
+`policy.approval_required_unsupported`. Mainnet writes also require a
 feature-enabled build, operator setup, and per-action authorization. The four
 classic commit tools use independent signing and submission checks. See
 [Concepts](./concepts.md) for the shared guardrail model.
@@ -46,7 +54,7 @@ classic commit tools use independent signing and submission checks. See
 - Protocol version: `2024-11-05`. Declared capabilities: `tools` and
   `resources`.
 - Server identity reported at initialize: name `stellar-agent-mcp`, version
-  matching the crate's package version (`0.1.0-alpha.12` as of this release).
+  matching the crate's package version (`0.1.0-alpha.13` as of this release).
 
 `stdout` is reserved for the JSON-RPC wire. Structured logs go to `stderr`, and
 they pass through a redaction layer before they are written, so a client that
@@ -61,9 +69,9 @@ This alpha does not offer an HTTP or SSE transport. stdio is the only transport.
 ### Availability
 
 This is a public alpha. Install with
-`cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-mcp@0.1.0-alpha.12`
+`cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-mcp@0.1.0-alpha.13`
 (prebuilt binary from the tagged GitHub release, resolved through crates.io),
-with `cargo install --locked stellar-agent-mcp@0.1.0-alpha.12` (built from the
+with `cargo install --locked stellar-agent-mcp@0.1.0-alpha.13` (built from the
 published sources and their `Cargo.lock`), or build from source. While
 crates.io holds only prerelease versions, the version must be spelled out. A
 bare crate name matches stable versions only. See
@@ -211,6 +219,45 @@ flag is also surfaced as non-secret metadata on the
 `mcp-resource://profiles/<name>` resource so a client can read whether the MCP
 surface is enabled for that profile.
 
+### Emergency stop
+
+`mcp_disabled` takes effect at the next start. To stop an agent on a running
+server, the operator runs `stellar-agent profile halt <name>` (see
+[`profile halt`](cli-reference/profile-and-governance.md#profile-halt-name---reason-reason)).
+The server reads the profile's halt marker at the start of every tool call
+that is not read-only, so the halt takes effect on the next call without a
+restart. A call that passed
+the check before the halt was written runs to completion.
+
+While the profile is halted, every tool whose descriptor is not read-only
+refuses with `profile.halted` before any keyring access, policy evaluation,
+store reload, or network request. The refusal is a business error envelope; its
+message names the halt time, the operator's reason, and the resume command.
+Besides the signing and submitting tools, the refused set holds the simulate
+steps (`stellar_pay`, `stellar_create_account`, `stellar_trustline`,
+`stellar_claim`, `stellar_rule_create`), `stellar_mpp_charge_prepare`,
+`stellar_mpp_record_receipt`, `stellar_mpp_reconcile_transaction`,
+`stellar_transaction_status`, `stellar_friendbot`, and
+`stellar_sep24_interactive_url`. `stellar_toolset_invoke` applies the check to
+the tool its action routes to, so a signing action refuses and a read-only
+action answers.
+
+These tools keep answering: `stellar_balances`, `stellar_fee_stats`,
+`stellar_dex_quote`, `stellar_rules_list`, `stellar_rules_get`,
+`stellar_sep43_get_address`, `stellar_sep43_get_network`,
+`stellar_sep47_discover`, `stellar_sep48_preview_invocation`,
+`stellar_sep53_verify_message`, `stellar_sep6_deposit_info`,
+`stellar_sep7_parse_uri`, `stellar_x402_parse_receipt`,
+`stellar_mpp_authorization_status`, and `stellar_toolset_list`. The resources
+stay readable, and `mcp-resource://profiles/<name>` reports `halted` and
+`halted_at`.
+
+A marker that exists but cannot be read refuses the same tools with
+`profile.halt_unreadable`, so the stop fails closed. The resource then reports
+`halted: true` with a null `halted_at`. `stellar-agent profile resume <name>`
+refuses such a marker too, so the operator repairs the file or removes the
+marker path by hand. Once the marker is gone, the next call is served normally.
+
 ## Configuring an MCP client
 
 Most MCP clients are configured with a JSON stanza that names a command to spawn
@@ -252,8 +299,9 @@ The server exposes three MCP resources. None contains a secret.
 
 - `mcp-resource://usage.md`: tool usage documentation.
 - `mcp-resource://profiles/<name>`: non-secret profile metadata (chain id, the RPC
-  endpoint as scheme, host, and port, network passphrase, `mcp_disabled`, and
-  the cross-check threshold in stroops).
+  endpoint as scheme, host, and port, network passphrase, `mcp_disabled`,
+  `halted` and `halted_at` from the [halt marker](#emergency-stop), and the
+  cross-check threshold in stroops).
   An agent passing this resource's `rpc_url` to `stellar_fee_stats` passes an
   authority-only URL; the allowlisted hosts have no path, so the call behaves
   the same.
@@ -619,6 +667,8 @@ claimable-balance record. It does not re-read the source trustline at commit.
 On every network, a `memo_text` holding a control character (U+0000 to U+001F, U+007F to U+009F) or a Unicode format character (category Cf), line separator (U+2028), or paragraph separator (U+2029) is refused as invalid parameters whose message names `validation.memo_control_character` and the character, before any request is sent.
 The format characters include the zero-width non-joiner (U+200C) and joiner (U+200D), so a memo cannot carry them.
 Other non-ASCII text is accepted.
+
+`stellar_transaction_status` refuses with `submission.record_unavailable` when the spending-window file cannot be read.
 
 A v1 rule set that names tools explicitly must include `stellar_transaction_status` to settle timed-out submissions through that server; the server logs `policy.transaction_status_unmatched` at startup when neither that tool nor `*` appears.
 
@@ -1014,6 +1064,7 @@ the process exit non-zero before serving any request. A missing keyring backend
 alone is not fatal: the server starts, and signing tools fail closed at call
 time. A profile that selects the V1 engine still fails to start without one,
 because building the engine reads the owner key.
+At startup, an invalid V1 owner signature prompts policy review and re-signing, while a policy body error, such as an unknown key, gets no signing hint.
 
 Business errors return `{ "ok": false, "error": { "code", "message" }, "request_id" }`
 with `is_error` set; consumers branch on `error.code`. Every tool, including
@@ -1027,6 +1078,8 @@ arguments, a `chain_id` mismatch, and the toolset capability refusals.
 `toolset.first_invoke_approval_required` is a JSON-RPC error too, and its error
 data carries the `approval_nonce`. See
 [The result envelope](agents.md#the-result-envelope).
+
+`stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw`, `stellar_x402_create_payment`, and `stellar_x402_authenticated_payment` preserve signer and keyring failures with their original `auth.*` codes and messages.
 
 Three codes carry an additional `details` object on the error:
 `submission.tx_timeout`, `submission.tx_already_submitted` and

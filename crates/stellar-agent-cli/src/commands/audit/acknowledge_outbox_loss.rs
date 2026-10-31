@@ -1,4 +1,5 @@
-//! Acknowledges lost queued consent after revoking the profile's permissions.
+//! Acknowledges lost queued operator rows after revoking the profile's
+//! permissions.
 
 use std::path::Path;
 
@@ -25,7 +26,7 @@ use crate::common::{profile_access::load_profile_reconciled, render};
 /// Arguments for acknowledging an outbox loss.
 #[derive(Debug, Args)]
 pub struct AcknowledgeOutboxLossArgs {
-    /// Profile whose queued consent is lost or changed.
+    /// Profile whose queued operator rows are lost or changed.
     #[arg(long)]
     pub profile: String,
     /// Operator's explanation, recorded in the audit log.
@@ -674,7 +675,7 @@ mod tests {
 
     /// A committed queued line the acknowledgement cannot append refuses the
     /// verb before it revokes anything or writes a row: here a committed row
-    /// that is not a consent row, beside a line past the commitment.
+    /// that is not an operator row, beside a line past the commitment.
     #[test]
     #[serial_test::serial]
     fn an_unusable_remaining_line_refuses_before_any_revocation() {

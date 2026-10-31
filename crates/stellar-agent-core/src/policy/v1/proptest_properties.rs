@@ -13,7 +13,7 @@
 //! global state) would cause non-determinism across runs.  This property
 //! guards against those regressions.
 //!
-//! Scope: the three state-independent criteria (`per_tx_cap`,
+//! Scope: four state-independent criteria (`per_tx_cap`, `approval_above`,
 //! `counterparty_allowlist`, `minimum_reserve`).
 //! `per_period_cap` and `rate_limit` are excluded because they depend on
 //! `SystemTime::now()` and mutate `PolicyStateStore`; including them would
@@ -67,10 +67,10 @@ use proptest::prelude::*;
 
 use crate::policy::v1::PolicyEngineV1;
 use crate::policy::v1::proptest_strategies::{
-    arb_counterparty_allowlist_rule, arb_minimum_reserve_rule, arb_native_payment_args,
-    arb_payment_args, arb_per_tx_cap_rule, arb_profile, arb_strict_deny_per_tx_rule,
-    arb_tool_descriptor, arb_tool_descriptor_for_payment_tools, single_rule_document,
-    two_rule_document,
+    arb_approval_above_rule, arb_counterparty_allowlist_rule, arb_minimum_reserve_rule,
+    arb_native_payment_args, arb_payment_args, arb_per_tx_cap_rule, arb_profile,
+    arb_strict_deny_per_tx_rule, arb_tool_descriptor, arb_tool_descriptor_for_payment_tools,
+    single_rule_document, two_rule_document,
 };
 use crate::policy::{Decision, DenyReason, PolicyEngine};
 
@@ -85,7 +85,7 @@ use crate::policy::{Decision, DenyReason, PolicyEngine};
 /// - `Ok(Decision::Deny(a)) == Ok(Decision::Deny(b))` iff
 ///   `a.code() == b.code()` AND `format!("{a:?}") == format!("{b:?}")`.
 /// - `Ok(Decision::RequireApproval(_)) == Ok(Decision::RequireApproval(_))`
-///   iff the TTL seconds match (the nonce field is not generated in test docs).
+///   if the full approval requests match, including their reasons.
 /// - Error variants compare by their `Debug` representation (no secret
 ///   material in `detail` strings).
 ///
@@ -101,9 +101,7 @@ fn decisions_equiv(
         (Ok(Decision::Deny(da)), Ok(Decision::Deny(db))) => {
             da.code() == db.code() && format!("{da:?}") == format!("{db:?}")
         }
-        (Ok(Decision::RequireApproval(ra)), Ok(Decision::RequireApproval(rb))) => {
-            ra.ttl_seconds == rb.ttl_seconds
-        }
+        (Ok(Decision::RequireApproval(ra)), Ok(Decision::RequireApproval(rb))) => ra == rb,
         (Err(ea), Err(eb)) => format!("{ea:?}") == format!("{eb:?}"),
         _ => false,
     }
@@ -115,6 +113,41 @@ fn decisions_equiv(
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+    #[test]
+    fn prop_approval_above_bounds_and_determinism(
+        (rule, threshold, cap) in arb_approval_above_rule(),
+        amount in 1_i128..=300_000_000_000,
+        tool in arb_tool_descriptor_for_payment_tools(),
+        (profile, profile_name) in arb_profile(),
+    ) {
+        let engine = PolicyEngineV1::new(single_rule_document(rule), profile_name);
+        for amount in [amount, threshold / 2, threshold, threshold + 1,
+            cap.unwrap_or(threshold), cap.unwrap_or(threshold) + 1] {
+            let args = serde_json::json!({
+                "amount_stroops": amount.to_string(),
+                "starting_balance_stroops": amount.to_string(),
+                "asset": "native",
+            });
+            let first = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
+            let second = engine.evaluate(&tool, &args, &profile, None, None, None, None, None);
+            prop_assert!(decisions_equiv(&first, &second));
+            let expected = if let Some(cap) = cap.filter(|cap| amount > *cap) {
+                Decision::Deny(DenyReason::PerTxCapExceeded {
+                    asset: "native".into(), max_stroops: cap, attempted_stroops: amount,
+                })
+            } else if amount > threshold {
+                Decision::RequireApproval(crate::policy::ApprovalRequest::new(
+                    String::new(), crate::policy::v1::loader::DEFAULT_APPROVAL_TTL_SECONDS,
+                ).with_reason(format!(
+                    "approval_above: {amount} stroops of native exceeds threshold {threshold} stroops"
+                )))
+            } else {
+                Decision::Allow
+            };
+            prop_assert_eq!(first.unwrap(), expected);
+        }
+    }
 
     /// Property 1a — Determinism for `per_tx_cap`.
     ///
@@ -217,7 +250,7 @@ proptest! {
     /// always fires for `stellar_pay` and `stellar_create_account`.
     #[test]
     fn prop_adding_deny_rule_cannot_turn_allow_into_allow(
-        base_rule in arb_per_tx_cap_rule(),
+        base_rule in prop_oneof![arb_per_tx_cap_rule(), arb_approval_above_rule().prop_map(|(rule, _, _)| rule)],
         strict_deny_rule in arb_strict_deny_per_tx_rule(),
         tool in arb_tool_descriptor_for_payment_tools(),
         args in arb_native_payment_args(),
@@ -225,38 +258,19 @@ proptest! {
     ) {
         // Step 1: evaluate with base rule only.
         let doc_base = single_rule_document(base_rule);
-        let engine_base = PolicyEngineV1::new(doc_base, profile_name.clone());
+        let mut engine_base = PolicyEngineV1::new(doc_base, profile_name.clone());
         let r_base = engine_base.evaluate(&tool, &args, &profile, None, None, None, None, None);
 
         // Step 2: if base allowed, prepend a strict deny rule.
         if matches!(r_base, Ok(Decision::Allow)) {
-            // Build a maximally-permissive fallback rule (cap = 10 000 000 XLM)
-            // to place after the strict deny rule so the engine has a rule to
-            // fall back to if the deny rule somehow doesn't match.
-            use crate::policy::v1::criteria::PerTxCapCriterion;
-            use crate::policy::v1::loader::{PolicyRule, RuleMatch};
-            let permissive_rule = PolicyRule {
-                r#match: RuleMatch {
-                    tool: "*".to_owned(),
-                    chain: "*".to_owned(),
-                },
-                criteria: vec![Box::new(PerTxCapCriterion::new(
-                    "native".to_owned(),
-                    100_000_000_000_000, // 10 000 000 XLM — always passes
-                ))],
-                decision: Decision::Allow,
-                allow_opaque_signing: false,
-            };
-
-            // The strict deny rule (cap = 1 stroop) is placed first.
-            // The args always carry amounts >= 2 stroops, so the criterion fires.
-            let doc_with_deny = two_rule_document(strict_deny_rule, permissive_rule);
+            let base_rule = engine_base.document.rules.remove(0);
+            let doc_with_deny = two_rule_document(strict_deny_rule, base_rule);
             let engine_with_deny = PolicyEngineV1::new(doc_with_deny, profile_name.clone());
             let r_with_deny = engine_with_deny.evaluate(&tool, &args, &profile, None, None, None, None, None);
 
             prop_assert!(
                 !matches!(r_with_deny, Ok(Decision::Allow)),
-                "monotonicity violated: base allowed but strict deny + permissive also allowed. \
+                "monotonicity violated: base allowed but strict deny + base also allowed. \
                  tool={:?} args={:?} r_base={r_base:?} r_with_deny={r_with_deny:?}",
                 tool.name, args
             );
@@ -288,6 +302,7 @@ fn enumerate_deny_reason_for_test(v: &DenyReason) -> &'static str {
     // `DenyReason` variant added to the enum until this helper is updated.
     match v {
         DenyReason::PerTxCapExceeded { .. } => "per_tx_cap_exceeded",
+        DenyReason::ApprovalAboveExceeded { .. } => "approval_above_exceeded",
         DenyReason::PerPeriodCapExceeded { .. } => "per_period_cap_exceeded",
         DenyReason::RateLimitExceeded { .. } => "rate_limit_exceeded",
         DenyReason::CounterpartyDenied { .. } => "counterparty_denied",
@@ -342,6 +357,11 @@ fn deny_reason_wire_codes_are_unique() {
     // One representative instance per variant.  Payload values are arbitrary
     // (they do not affect `code()`).  Order matches `enumerate_deny_reason_for_test`.
     let variants: Vec<DenyReason> = vec![
+        DenyReason::ApprovalAboveExceeded {
+            asset: "native".into(),
+            max_stroops: 1,
+            attempted_stroops: 2,
+        },
         DenyReason::PerTxCapExceeded {
             asset: "native".into(),
             max_stroops: 0,
@@ -440,7 +460,7 @@ fn deny_reason_wire_codes_are_unique() {
     // but forgets the corresponding entry in `variants`, this catches it.
     assert_eq!(
         variants.len(),
-        20,
+        21,
         "variants list count drifted from DenyReason variant count.  \
          Update enumerate_deny_reason_for_test, the variants vec, and this assertion."
     );

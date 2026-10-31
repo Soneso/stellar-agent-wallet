@@ -372,7 +372,12 @@ struct CheckedBody {
 /// the document parsed from these bytes.
 fn read_signed(load: &PolicyLoad<'_>) -> Result<SignedPolicy, PolicyError> {
     let raw = read_policy_file(load.path)?;
-    let document = load_signed_policy_text(&raw, load.profile_name, load.owner_pubkey)?;
+    let document = load_signed_policy_text(
+        &raw,
+        load.profile_name,
+        load.owner_pubkey,
+        &load.profile.network_passphrase,
+    )?;
     let doc = raw
         .parse::<DocumentMut>()
         .map_err(|e| parse_error(e.to_string()))?;

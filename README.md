@@ -28,6 +28,8 @@ as `stellar agent` inside the Stellar CLI, and the `stellar-agent-mcp` MCP stdio
 server. Both sit on a policy engine, an operator-approval spine, and a
 tamper-evident hash-chained audit log, so an autonomous agent can act while a
 human keeps control of what it is allowed to do.
+The [architecture](docs/architecture.md) shows the trust boundaries, payment flow,
+and key custody.
 
 New to the project? [What is the Stellar Agent Wallet?](docs/onboarding.md)
 is the non-technical tour: what it is, what an agent can do with it, and how a
@@ -66,9 +68,10 @@ each tagged release, and the workspace crates are published to
 - Smart accounts: deploy and govern OpenZeppelin smart accounts with WebAuthn
   passkey signers. Delegate to an agent that holds its own key, within scoped
   rules and spending limits the contract enforces.
-- SEP protocols: the wallet supports SEP-6, SEP-7, SEP-10, SEP-24, SEP-43,
-  SEP-45, SEP-47, SEP-48, and SEP-53. They cover anchor flows, payment URIs,
-  web authentication, wallet signing, message signing, and contract interfaces.
+- SEP protocols: the wallet exposes SEP-6, SEP-7, SEP-24, SEP-43, SEP-47,
+  SEP-48, and SEP-53 for anchor flows, payment URIs, wallet signing, message
+  signing, and contract interfaces. SEP-10 serves the x402 identity gate;
+  SEP-45 is library-only and has no CLI command or MCP tool.
 - Machine payments: pay as an x402 client, and authorize Machine Payments
   Protocol (MPP) sponsored charges on testnet.
 - Operator control: approve or reject pending agent actions from a terminal or
@@ -109,7 +112,7 @@ bare crate name matches stable versions only.
 `cargo binstall` downloads the prebuilt release archive for your platform:
 
 ```bash
-cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.12 stellar-agent-mcp@0.1.0-alpha.12
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
 ```
 
 ### cargo install (from crates.io)
@@ -117,7 +120,7 @@ cargo binstall --locked --disable-strategies quick-install,compile stellar-agent
 `cargo install` builds both binaries from the sources on crates.io:
 
 ```bash
-cargo install --locked stellar-agent-cli@0.1.0-alpha.12 stellar-agent-mcp@0.1.0-alpha.12
+cargo install --locked stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
 ```
 
 ### Build from source
@@ -125,7 +128,7 @@ cargo install --locked stellar-agent-cli@0.1.0-alpha.12 stellar-agent-mcp@0.1.0-
 Clone the release tag and build with its committed `Cargo.lock`:
 
 ```bash
-git clone --branch v0.1.0-alpha.12 https://github.com/Soneso/stellar-agent-wallet.git
+git clone --branch v0.1.0-alpha.13 https://github.com/Soneso/stellar-agent-wallet.git
 cd stellar-agent-wallet
 cargo build --release --locked
 ```
@@ -195,15 +198,16 @@ the binary:
 stellar-agent-mcp
 ```
 
-The server registers its tool families (payments, DeFi, SEP protocols, toolsets)
-behind the same policy engine, approval spine, and audit log as the CLI. See
-[docs/mcp.md](docs/mcp.md) for client configuration and the tool catalogue.
+The server exposes payments, DeFi, SEP protocols, x402, MPP, smart-account rules,
+transaction status, and toolsets. Payment handlers use the shared policy, approval,
+and audit libraries. See the [MCP reference](docs/mcp.md) for configuration and
+tool calls.
 
 ## Documentation
 
 - [Documentation for users](docs/README.md#for-users): getting started,
-  concepts, the CLI and MCP references, protocols, toolsets, profiles, and
-  remote approval.
+  concepts, architecture, the CLI and MCP references, protocols, toolsets,
+  profiles, and remote approval.
 - [Documentation for maintainers](docs/README.md#for-maintainers):
   architecture, building and testing, security internals, and the review
   checklist.

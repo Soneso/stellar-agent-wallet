@@ -149,6 +149,7 @@ The scope table defines mainnet admission for each build configuration. Public S
   - A refused challenge or token answer reports the HTTP method, the status, and the web-auth endpoint's host. The wallet does not read the answer body.
   - A stellar.toml syntax error reports its line and column.
   - The token must be a compact JWT of at most 8192 bytes, with base64url characters in every segment. Any other token refuses.
+  - A mismatched SEP-10 challenge passphrase is reported as the public testnet or mainnet passphrase, or `<other network>`, including for multibyte input.
   - On an admitted mainnet server, one approval binds the payment intent and home domain. Call 2 prepares and validates the SEP-10 challenge, consumes its message authorization, and completes authentication before building the payment.
   - `resolve_and_verify_counterparty` and its transport seam, which exists only with the `test-helpers` feature, refuse mainnet before fetching `stellar.toml`. An ordinary x402 identity entry reports `identity.mainnet_signing_forbidden` before any request.
   - `resolve_and_verify_counterparty_authorized` takes `MainnetIdentityInputs` and returns `MainnetCounterpartySession`. Its `into_parts` method transfers the session and receipt to the payment caller.

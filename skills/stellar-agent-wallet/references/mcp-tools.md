@@ -28,8 +28,8 @@ The `stellar-agent-mcp` server exposes the Stellar Agent Wallet to an MCP client
 over JSON-RPC on stdio. It presents wallet capabilities as MCP tools so an AI
 assistant can read account state and submit Stellar transactions through the same
 policy engine, operator-approval spine, and tamper-evident audit log that back
-the `stellar-agent` CLI. A tool call is gated exactly as the equivalent CLI
-command is.
+the `stellar-agent` CLI. Each surface determines its policy coverage: MCP
+balance reads evaluate policy, while CLI balance reads fetch account state directly.
 
 This file documents the tool catalog: each tool name, purpose, gating, and key
 arguments. For the gating model itself (policy engines, the mainnet-write gate,
@@ -48,14 +48,37 @@ approval attestations) see `./approvals-and-audit.md` and `./security.md`.
   SSE transport.
 - Protocol version `2024-11-05`. Declared capabilities: `tools` and `resources`.
 - Server identity at `initialize`: name `stellar-agent-mcp`, version matching
-  the crate's package version (`0.1.0-alpha.12` as of this release).
+  the crate's package version (`0.1.0-alpha.13` as of this release).
 - The server refuses to start if the active profile sets `mcp_disabled = true`,
   exiting non-zero with `mcp.disabled_per_profile`.
+- The operator can halt a running server's profile with
+  `stellar-agent profile halt <name>`. The server reads the halt marker at the
+  start of every tool call that is not read-only. While it exists, every tool that is not read-only
+  refuses with `profile.halted` before any keyring access, policy evaluation,
+  store reload, or network request; the halt takes effect on the next call.
+  The refused set includes the simulate steps (`stellar_pay`,
+  `stellar_create_account`, `stellar_trustline`, `stellar_claim`,
+  `stellar_rule_create`), `stellar_mpp_charge_prepare`,
+  `stellar_mpp_record_receipt`, `stellar_mpp_reconcile_transaction`,
+  `stellar_transaction_status`, `stellar_friendbot`, and
+  `stellar_sep24_interactive_url`. `stellar_toolset_invoke` refuses a signing
+  action and answers a read-only one. The read-only tools (`stellar_balances`,
+  `stellar_fee_stats`, `stellar_dex_quote`, `stellar_rules_list`,
+  `stellar_rules_get`, `stellar_sep43_get_address`, `stellar_sep43_get_network`,
+  `stellar_sep47_discover`, `stellar_sep48_preview_invocation`,
+  `stellar_sep53_verify_message`, `stellar_sep6_deposit_info`,
+  `stellar_sep7_parse_uri`, `stellar_x402_parse_receipt`,
+  `stellar_mpp_authorization_status`, `stellar_toolset_list`) and the resources
+  keep answering. An unreadable marker refuses with `profile.halt_unreadable`.
+  Neither code is retryable by the agent: stop and report the message to the
+  operator, who lifts the halt with `stellar-agent profile resume <name>`.
 - The server refuses to start when a named profile has no profile file (it is
   never replaced by the first-run testnet fallback), when the profile name is
   not a safe path component, or when the profile file's keyring coordinates name
   a different profile than the one selected — the state a profile file copied
   from another profile is in.
+
+At startup, an invalid V1 owner signature prompts policy review and re-signing, while a policy body error, such as an unknown key, gets no signing hint.
 
 A generic client stanza points the spawn command at the binary:
 
@@ -84,6 +107,7 @@ Every tool returns the same JSON envelope, with five success-path exceptions:
 `stellar_dex_quote`, `stellar_defindex_vault_deposit`, and
 `stellar_defindex_vault_withdraw` return a bare object carrying a `status`
 field on success; their business errors use the envelope.
+`stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw`, `stellar_x402_create_payment`, and `stellar_x402_authenticated_payment` preserve signer and keyring failures with their original `auth.*` codes and messages.
 
 Some refusals use the JSON-RPC error channel instead of the envelope: invalid
 arguments, a `chain_id` mismatch, and the toolset capability refusals.
@@ -91,7 +115,8 @@ arguments, a `chain_id` mismatch, and the toolset capability refusals.
 data carries the `approval_nonce`.
 
 On failure, `ok` is `false` and `error` carries a stable wire `code` (such as
-`policy.deny.<reason>` or `policy.approval_required`) instead of `data`. Branch on
+`policy.deny.<reason>`, `policy.approval_required`, or `profile.halted`) instead
+of `data`. Branch on
 `ok`; use `code` for control flow, not the human message. The `request_id`
 correlates the call with the audit log. Raw argument values are never written to
 the audit log; only key names and lifecycle metadata are recorded. Typed value events retain each leg's amount, asset, and redacted destination.
@@ -253,8 +278,9 @@ BEFORE the signer is loaded or anything is submitted, refusing
 [Approvals and audit](approvals-and-audit.md#fail-closed-on-an-unminted-audit-key)).
 `stellar_mpp_charge_commit` runs the same acquisition after it reads its
 approval and before it loads the signing key. Each acquisition also drains
-consent rows `stellar-agent approve` queued while the server held the audit
-writer, so they are in the log before the key loads. The SEP-43 sign-only pair
+the rows `stellar-agent approve`, `profile halt`, and `profile resume` queued
+while the server held the audit writer, so they are in the log before the key
+loads. The SEP-43 sign-only pair
 (`stellar_sep43_sign_transaction`, `stellar_sep43_sign_auth_entry`) runs the
 same pre-flight and, once the signature is produced, records an
 `opaque_payload_signed` audit row (redacted payload digest and redacted
@@ -319,6 +345,8 @@ their own `x402.*` code before the `chain_id` check.
 | `stellar_balances` | Fetch native XLM balance and optional trustline balances. | Read-only. |
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
 | `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it, by its receipt or, when the receipt is missing, by its reservation. Returns `record` (with `release_code`) and `reservation`. On a mainnet profile the primary's `FAILED` and `NOT_FOUND` settle nothing until the oracle confirms them. | Reads the chain, writes the wallet's record; moves no value and never sends. The way out of `submission.tx_timeout`. |
+
+`stellar_transaction_status` refuses with `submission.record_unavailable` when the spending-window file cannot be read.
 
 ### stellar_pay (simulate) arguments
 
@@ -982,11 +1010,13 @@ An action the policy engine sized no value for takes no reservation at all, so
 `reservation_open` is `false` for it from the start and says nothing about
 whether the submission settled.
 
-`submission.record_unavailable` is different: the wallet could not write the
-record, or the audit log's tip anchor does not cover its pending row (the
-message then carries `audit.tip_anchor_unavailable`), so nothing was sent. The
-condition is local and the submission is safe to retry once the operator has
-fixed it.
+`submission.record_unavailable` before submission means the wallet could not
+record the send or anchor its pending audit row, so that attempt sent nothing.
+An anchor failure carries `audit.tip_anchor_unavailable` in the message.
+The same code can report a receipt or spending-window failure during recovery
+of an existing submission. After the operator repairs that failure, call
+`stellar_transaction_status` again; do not rebuild or resubmit the transaction.
+Retry submission only when the failure is known to precede the send.
 
 `policy.approval_consumed` means the approval you presented was already spent on
 a submission. Check that transaction's status before asking for the action
@@ -998,7 +1028,8 @@ The server exposes three MCP resources; none contains a secret.
 
 - `mcp-resource://usage.md` — tool usage documentation.
 - `mcp-resource://profiles/<name>`: non-secret profile metadata (chain id, the RPC
-  endpoint as scheme, host, and port, network passphrase, `mcp_disabled`, and
-  the cross-check threshold in stroops).
+  endpoint as scheme, host, and port, network passphrase, `mcp_disabled`,
+  `halted` and `halted_at` from the halt marker, and the cross-check threshold
+  in stroops).
 - `mcp-resource://accounts/<G>` — public account directory for the enrolled
   accounts across all configured profiles.

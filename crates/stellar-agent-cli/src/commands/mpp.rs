@@ -251,6 +251,13 @@ async fn authorize(args: MppAuthorizeArgs) -> i32 {
         Err(error) => return render_profile_error(&error, &profile_name),
     };
 
+    // Halt check, fresh and resumed authorizations alike: before the keyring
+    // store, the MPP state, the approval store, and the signer.
+    if let Err(error) = stellar_agent_core::profile::halt::ensure_not_halted(&profile_name) {
+        print_json(&Envelope::<()>::err(&error));
+        return 1;
+    }
+
     if init_platform_keyring_store().is_err() {
         return render_error(&state_error());
     }

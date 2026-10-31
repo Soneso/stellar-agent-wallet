@@ -300,6 +300,11 @@ pub async fn run(args: &MulticallArgs) -> i32 {
             return 1;
         }
     };
+    // Halt check: before the policy engine, the keyring, the signer and any RPC request.
+    if let Err(error) = stellar_agent_core::profile::halt::ensure_not_halted(&profile_name) {
+        render_json(&Envelope::<()>::err(&error));
+        return 1;
+    }
     let context = match network_context_for_command(
         &profile,
         &profile_name,

@@ -78,7 +78,7 @@
 //! place and a rerun appends its rows again.
 //!
 //! After the last repair row, and before the new binding is stored, it drains
-//! the audit outbox. Consent rows queued while the log was refused follow the
+//! the audit outbox. Operator rows queued while the log was refused follow the
 //! repair rows. A drain refusal does not undo the repair: the verb succeeds
 //! and lists the refusal under `warnings`, led by its `audit.*` sub-code, and
 //! the rows stay queued. Without a required acknowledgement the log, the
@@ -1523,7 +1523,7 @@ mod tests {
                     &new.audit_log_path,
                 ),
             );
-            // A committed row that is not a consent row: the drain refuses it.
+            // A committed row that is not an operator row: the drain refuses it.
             outbox.append(&sample_entry()).expect("queue");
             let bytes = std::fs::read(outbox.path()).expect("outbox");
 
@@ -1855,7 +1855,7 @@ mod tests {
                 &profile.audit_log_path,
             ),
         );
-        // A committed row that is not a consent row: the drain refuses it.
+        // A committed row that is not an operator row: the drain refuses it.
         outbox.append(&sample_entry()).expect("queue");
         let bytes = std::fs::read(outbox.path()).expect("outbox");
 

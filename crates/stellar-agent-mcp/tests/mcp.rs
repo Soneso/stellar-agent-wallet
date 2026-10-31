@@ -37,6 +37,8 @@ mod defi_record_integration;
 mod fee_stats_integration;
 #[path = "mcp/friendbot_integration.rs"]
 mod friendbot_integration;
+#[path = "mcp/halt_integration.rs"]
+mod halt_integration;
 #[path = "mcp/integration.rs"]
 mod integration;
 #[path = "mcp/mainnet_oracle_required_integration.rs"]

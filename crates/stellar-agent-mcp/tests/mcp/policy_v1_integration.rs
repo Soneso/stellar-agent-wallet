@@ -41,6 +41,7 @@ use stellar_agent_core::policy::v1::{
 use stellar_agent_core::policy::{
     Decision, DenyReason, McpToolRegistration, PolicyEngine, ToolDescriptor,
 };
+use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
 use stellar_agent_core::profile::schema::{PolicyConfig, PolicyEngineKind, Profile};
 use stellar_agent_mcp::server::{StellarBalancesArgs, WalletServer};
 use tempfile::TempDir;
@@ -146,7 +147,8 @@ decision = "allow"
     let signed = sign_policy_toml(BODY, &sk, "GABCDE");
     let path = write_policy_file(&dir, "default.toml", &signed);
 
-    let document = load_signed_policy(&path, "default", &pk).expect("policy must load");
+    let document =
+        load_signed_policy(&path, "default", &pk, TESTNET_PASSPHRASE).expect("policy must load");
     assert!(
         document.signature.is_some(),
         "verified doc must carry signature"
@@ -197,7 +199,8 @@ decision = "deny"
     let signed = sign_policy_toml(BODY, &sk, "GABCDE");
     let path = write_policy_file(&dir, "default.toml", &signed);
 
-    let document = load_signed_policy(&path, "default", &pk).expect("policy must load");
+    let document =
+        load_signed_policy(&path, "default", &pk, TESTNET_PASSPHRASE).expect("policy must load");
     let engine = PolicyEngineV1::new(document, "default".into());
     let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
 
@@ -239,7 +242,8 @@ decision = "require_approval"
     let signed = sign_policy_toml(BODY, &sk, "GABCDE");
     let path = write_policy_file(&dir, "default.toml", &signed);
 
-    let document = load_signed_policy(&path, "default", &pk).expect("policy must load");
+    let document =
+        load_signed_policy(&path, "default", &pk, TESTNET_PASSPHRASE).expect("policy must load");
     let engine = PolicyEngineV1::new(document, "default".into());
     let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
 
@@ -283,7 +287,8 @@ scope = "profile:default"
     let signed = sign_policy_toml(BODY, &sk, "GABCDE");
     let path = write_policy_file(&dir, "default.toml", &signed);
 
-    let document = load_signed_policy(&path, "default", &pk).expect("policy must load");
+    let document =
+        load_signed_policy(&path, "default", &pk, TESTNET_PASSPHRASE).expect("policy must load");
     let engine = PolicyEngineV1::new(document, "default".into());
     let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
 
@@ -324,7 +329,7 @@ scope = "profile:default"
     let signed = sign_policy_toml(BODY, &sk, "GABCDE");
     let path = write_policy_file(&dir, "default.toml", &signed);
 
-    let err = load_signed_policy(&path, "default", &pk_other)
+    let err = load_signed_policy(&path, "default", &pk_other, TESTNET_PASSPHRASE)
         .expect_err("verification with wrong key must fail");
     use stellar_agent_core::policy::PolicyError;
     assert!(
@@ -357,7 +362,7 @@ decision = "allow"
     let tampered = signed.replace("decision = \"allow\"", "decision = \"deny\"");
     let path = write_policy_file(&dir, "default.toml", &tampered);
 
-    let err = load_signed_policy(&path, "default", &pk)
+    let err = load_signed_policy(&path, "default", &pk, TESTNET_PASSPHRASE)
         .expect_err("tampered body must fail signature verification");
     use stellar_agent_core::policy::PolicyError;
     assert!(
@@ -397,7 +402,8 @@ decision = "deny"
     let signed = sign_policy_toml(BODY, &sk, "GABCDE");
     let path = write_policy_file(&dir, "default.toml", &signed);
 
-    let document = load_signed_policy(&path, "default", &pk).expect("policy must load");
+    let document =
+        load_signed_policy(&path, "default", &pk, TESTNET_PASSPHRASE).expect("policy must load");
     // Engine carries profile_name "default" — but PolicyEngineV1::evaluate
     // resolves scope against `self.profile_name`.  The loader's scope was
     // `profile:default`, so we must construct the engine with the same name
@@ -451,7 +457,8 @@ decision = "require_approval"
     let signed = sign_policy_toml(BODY, &sk, "GABCDE");
     let path = write_policy_file(&dir, "default.toml", &signed);
 
-    let document = load_signed_policy(&path, "default", &pk).expect("policy must load");
+    let document =
+        load_signed_policy(&path, "default", &pk, TESTNET_PASSPHRASE).expect("policy must load");
     let engine = PolicyEngineV1::new(document, "default".into());
     let server = make_server_with_v1_engine(engine);
 

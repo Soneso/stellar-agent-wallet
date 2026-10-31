@@ -142,6 +142,11 @@ pub async fn run(args: &CancelArgs) -> i32 {
             return 1;
         }
     };
+    // Halt check: before the keyring, the signer and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved_profile.name) {
+        render_json(&Envelope::<()>::err(&e));
+        return 1;
+    }
     let context = match network_context_for_command(
         &profile,
         &resolved_profile.name,

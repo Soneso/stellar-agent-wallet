@@ -822,6 +822,7 @@ def excluded_files(tree: pathlib.Path) -> None:
     add_tracked(tree, "CHANGELOG.md", "# Changelog\n\n" + unlocked)
     add_tracked(tree, "crates/stellar-agent-cli/vendor/notes.md", unlocked)
     add_tracked(tree, "crates/stellar-agent-cli/tests/fixtures/notes.md", unlocked)
+    add_tracked(tree, ".github/scripts/fixtures/notes.md", unlocked)
 
 
 def workspace_version(tree: pathlib.Path) -> str:

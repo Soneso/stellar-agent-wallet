@@ -13,10 +13,11 @@ surface that drives the simulate/commit handshake see `./mcp-tools.md`.
 Every gated tool/command invocation is evaluated by the active policy engine
 before any signature. Reads the decision needs, such as the source account, can
 run first. The engine returns Allow, Deny, or RequireApproval.
-A RequireApproval action does not execute on the agent's say-so: it is held in a
-per-profile pending-approval store. For pay, create-account, trustline, and
-claim, simulation records a pending approval when policy requires approval for
-either the simulate tool or its paired commit tool, and returns an
+Two-phase MCP actions hold approval requests in a per-profile pending store.
+Single-shot signing paths refuse approval decisions; see
+[CLI signing coverage](cli-reference.md#signing-and-approval-coverage).
+For MCP pay, create-account, trustline, and claim, simulation records pending
+approval when either tool in the pair requires it. The response returns an
 `approval_nonce`. The wallet owner runs
 `stellar-agent approve --id <nonce> --profile <name>` out-of-band in a trusted
 context, reads a wallet-controlled summary, and consents. The command records an
@@ -33,6 +34,19 @@ MCP balance reads and payment simulations produce no automatic invocation row.
 Under V1, payment simulations can reconcile overdue reservations and write
 settlement audit rows.
 `stellar-agent audit verify` checks the log for tampering.
+
+Use these MCP pairs for agent payments, trustlines, and claims. The CLI serves
+reads, setup, and operator ceremonies. An agent limited to MCP cannot approve
+its own request. A process running as the operator's OS user holds the
+operator's authority; the wallet does not distinguish it from the operator.
+On testnet, CLI approval checks the local OS identity; it reads consent from
+standard input or `--yes` and does not establish that a human confirmed. On
+mainnet it refuses `--yes` and terminal input and runs the passkey ceremony.
+Same-user processes can read keyring entries on Linux (Secret Service) and
+Windows (Credential Manager). With the `headless-env` backend, any process that
+can read `STELLAR_AGENT_HEADLESS_KEYRING_KEY` can decrypt every entry, on any
+platform. See the
+[trust model](../SKILL.md#overview) for the current limits.
 
 ## Conventions used across these surfaces
 
@@ -122,24 +136,79 @@ with `policy.engine_required`. Newly minted profiles default to the V1 engine.
 Evaluates a signed policy document against typed Criteria. The document carries
 an ed25519 owner signature over its canonical form; an invalid signature, or a
 signature from a key rotated after signing, is rejected.
+A policy without a `[signature]` table refuses with `policy.policy_file_parse_failed` and a message naming `stellar-agent profile sign-policy --profile <name>` for the selected profile.
 
-Evaluation is first-match, default-deny:
+Evaluation is **first-match, default-deny**:
 
 1. Rules are walked in declaration order.
 2. The first rule whose match (tool name plus chain-id filter) applies is selected.
+   The chain filter compares the rule's `chain` with the bound profile's chain,
+   on the CLI and in the MCP server.
 3. That rule's criteria run in order; the first failing criterion produces a Deny.
-4. If all criteria pass, the rule's decision is returned.
+4. An escalation on an `allow` rule with no failing criterion returns `RequireApproval`.
+   If all criteria pass, the rule's decision is returned.
 5. If no rule matches, the call is denied (`no_matching_rule`).
 
-A Criterion is one typed check: per-transaction cap, per-period (windowed) cap,
-rate limit, counterparty allowlist (by classic account, contract account, asset
-issuer, or resolved home domain), minimum-reserve guard, multicall bundle-level
-checks (inner-count cap, aggregate cap, rejection of
-unrecognized inner shapes), quorum satisfaction, a home-domain-resolved guard,
-and SEP-10 / SEP-45 session-active checks. Criteria needing external state
-(reserves, identity, the counterparty cache, an active session) receive it as an
-injected view at the dispatch site; when a required view is absent the criterion
-fails closed.
+A Criterion is one typed check. Amount checks include per-transaction caps,
+approval-above thresholds, and per-period (windowed) caps. Other checks include
+rate limits, counterparty allowlists, and minimum-reserve guards.
+Counterparty allowlists match classic accounts, contract accounts, asset issuers,
+or resolved home domains. The `SEP10_IDENTITY` and `ONE_TIME_ADDRESS` kinds are
+reserved and are not evaluated.
+Bundle-level checks cover inner-count caps, aggregate caps, and rejection of
+unrecognized inner shapes.
+The home-domain-resolved guard requires a live cached binding for the
+destination's on-chain `home_domain`.
+The loader also accepts `quorum_satisfied`, `sep10_session_active`, and
+`sep45_session_active`, but shipped CLI and MCP dispatch paths supply none of
+their required views. A matched rule containing any of these criteria refuses
+every call.
+Reserve, identity, and counterparty-cache criteria receive external state
+through injected views; a missing required view refuses the call.
+
+`approval_above` permits amounts at or below its threshold and requests
+approval above it. It uses `asset` and `max_stroops`, with the same units and
+asset matching as `per_tx_cap`. One XLM is 10,000,000 stroops.
+The threshold must be positive and the rule's decision must be `allow`.
+The threshold must be below every `per_tx_cap` on the same asset
+in that rule. Invalid decisions or bounds produce
+`policy.policy_file_parse_failed`, naming the criterion and conflicting bounds.
+
+The commit tool's rule is binding, so the example carries the criterion on both pay tools.
+The threshold applies to its configured asset.
+A payment in another asset passes it, as it passes `per_tx_cap`.
+Single-shot tools and multicall refuse an escalation with their existing approval-required refusal.
+A bundle is sized per inner transfer.
+
+These payment rules allow up to 500 XLM without approval, request approval
+above 500 XLM, and deny above 5,000 XLM:
+
+```toml
+[[rules]]
+match = { tool = "stellar_pay", chain = "stellar:testnet" }
+criteria = [
+  { kind = "approval_above", asset = "native", max_stroops = 500_0000000 },
+  { kind = "per_tx_cap", asset = "native", max_stroops = 5000_0000000 },
+]
+decision = "allow"
+
+[[rules]]
+match = { tool = "stellar_pay_commit", chain = "stellar:testnet" }
+criteria = [
+  { kind = "approval_above", asset = "native", max_stroops = 500_0000000 },
+  { kind = "per_tx_cap", asset = "native", max_stroops = 5000_0000000 },
+]
+decision = "allow"
+```
+
+Omit `per_tx_cap` from both rules to request approval above 500 XLM without
+a per-payment ceiling. Other failing criteria deny, including period caps.
+The MCP payment tool stores the pending request with a reason naming
+`approval_above` and its threshold. Operators approve through the CLI approvals
+commands, terminal, inbox, or remote approver. The CLI `pay` command returns
+`policy.approval_required` and directs the caller to MCP.
+
+MCP pay/create-account/trustline/claim commits and CLI `pay` and `claim` with `--sign-only` or `--submit-only` include envelope fees in `minimum_reserve`. A debit leaving only reserve plus margin refuses `policy.deny.minimum_reserve_breached`. Full CLI pipelines, `--build-only`, and MCP simulations count no fee.
 
 A `HOME_DOMAIN` binding is evidence for one hour from its fetch. An entry
 whose fetch time lies more than five minutes in the future counts as expired.
@@ -774,7 +843,7 @@ A `pruned_prefix` warning reports `first_file`, the oldest file walked, and
 entry and is authenticated when an audit key is supplied. Verification checks
 every retained entry and bridge, and the warning leaves the verdict successful.
 
-`outbox_pending` counts complete queued consent lines. With `--profile` and the profile's log path, verification checks the keyring commitment under the outbox lock after the chain walk. A missing or changed committed prefix, or a complete line past it, fails with `audit.outbox_rows_missing`; a held lock fails with `audit.outbox_busy`. Without a profile, no commitment is checked. The separate count inspection can report `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` warnings.
+`outbox_pending` counts complete queued consent, halt, and resume lines. With `--profile` and the profile's log path, verification checks the keyring commitment under the outbox lock after the chain walk. A missing or changed committed prefix, or a complete line past it, fails with `audit.outbox_rows_missing`; a held lock fails with `audit.outbox_busy`. Without a profile, no commitment is checked. The separate count inspection can report `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` warnings.
 
 An `outbox_loss_acknowledged` warning names each loss acknowledgement's file, line, `expected_rows`, and `found_rows`. It leaves the chain verdict unchanged.
 
@@ -835,7 +904,7 @@ no stop: a server running the edited profile refuses before it opens the new
 path, so it holds no lock there. A server still running the old profile refuses
 after the acknowledgement until it restarts.
 
-Queued consent rows follow the repair rows and are counted in `outbox_drained`. A drain refusal leaves the repair in force and exits `0`. It omits `outbox_drained`, since every queued row stays queued, and lists the refusal under `warnings`: `audit.outbox_unusable`, `audit.outbox_busy`, `audit.outbox_rows_missing`, or the condition an append refused on, such as `audit.io_error`.
+Queued consent, halt, and resume rows follow the repair rows and are counted in `outbox_drained`. A drain refusal leaves the repair in force and exits `0`. It omits `outbox_drained`, since every queued row stays queued, and lists the refusal under `warnings`: `audit.outbox_unusable`, `audit.outbox_busy`, `audit.outbox_rows_missing`, or the condition an append refused on, such as `audit.io_error`.
 
 ```json
 {"ok":true,"data":{"profile":"default","previous_anchor":"42:18104","current_anchor":"39:16820","reanchor_count":1,"acknowledged":["rollback"],"quarantined_rows":0,"recorded_binding":"equal","previous_binding_anchor":null,"outbox_drained":0},"request_id":"..."}
@@ -847,14 +916,14 @@ Operator-only recovery for `audit.outbox_rows_missing`; an agent must not run it
 Stop the process holding the profile's writer and inspect the queued rows first.
 `--reason` is required, non-empty, and recorded with the audit string bound.
 
-The command checks the tip anchor, checks that the loss holds and, when the committed prefix is intact, that every committed row parses and is a consent row, and then revokes every decided, unexpired, unconsumed approval and every toolset grant.
+The command checks the tip anchor, checks that the loss holds and, when the committed prefix is intact, that every committed row parses and is an operator row, and then revokes every decided, unexpired, unconsumed approval and every toolset grant.
 Mainnet confirmations and recorded passkey assertions count as decided approvals.
 It records `audit_outbox_loss_acknowledged`, appends the committed prefix when it is intact and nothing otherwise, resets the commitment, and empties the outbox, discarding every other line.
 Approve affected actions again to record fresh consent.
 
 The result contains `profile`, `expected_rows`, `found_rows`, `drained`, `discarded`, `revoked_approvals`, and `revoked_grants`; `discarded` counts the complete lines dropped without being appended.
 No loss returns `audit.outbox_loss_not_found` without an acknowledgement; a held writer returns `audit.writer_locked`; a log rolled back behind its tip anchor returns `audit.tip_anchor_mismatch`.
-An intact committed row that does not parse, or that is not a consent row, returns `audit.outbox_unusable` before anything is revoked or written.
+An intact committed row that does not parse, or that is not an operator row, returns `audit.outbox_unusable` before anything is revoked or written.
 A row that cannot append leaves the queue and commitment in place for inspection and retry.
 
 ```bash

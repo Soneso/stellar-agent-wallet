@@ -171,6 +171,13 @@ where
         }
     };
 
+    // ── Halt check ────────────────────────────────────────────────────────────
+    // Before the keyring store, the signer, and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&profile_name) {
+        render_json(&Envelope::<()>::err(&e));
+        return 1;
+    }
+
     // ── Network context ───────────────────────────────────────────────────────
     // Built from the loaded profile before the keyring store is registered, so
     // a refused endpoint input never initialises it.

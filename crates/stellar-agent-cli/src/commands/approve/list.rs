@@ -690,8 +690,13 @@ mod tests {
             format!("{body}\n[signature]\nowner_id = \"{owner}\"\nsig = \"{sig}\"\n"),
         )
         .unwrap();
-        let policy =
-            load_signed_policy(&policy_path, "shape", &key.verifying_key().to_bytes()).unwrap();
+        let policy = load_signed_policy(
+            &policy_path,
+            "shape",
+            &key.verifying_key().to_bytes(),
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE,
+        )
+        .unwrap();
         let request = match &policy.rules[0].decision {
             Decision::RequireApproval(request) => Some(request),
             _ => None,

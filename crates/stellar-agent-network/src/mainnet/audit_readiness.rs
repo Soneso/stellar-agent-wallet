@@ -452,7 +452,7 @@ mod tests {
         profile
     }
 
-    /// A consent row, the only kind the audit outbox queues.
+    /// A consent row, one of the operator rows the audit outbox queues.
     fn consent_row() -> AuditEntry {
         AuditEntry::new_approval_attested(
             "PaymentSimulated",

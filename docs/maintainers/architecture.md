@@ -1,18 +1,40 @@
-# Architecture
+# Maintainer architecture
 
-This document maps the workspace for maintainers and contributors. It describes how the 37 workspace members are layered, which crate owns which responsibility, and how the two shipped binaries wire the tool surface to the policy, approval, and audit substrate.
-
-For concept-level background read [../concepts.md](../concepts.md). For build and toolchain instructions read [building.md](building.md). For the security-relevant internals read [security-internals.md](security-internals.md). The contributor gate checklist is [review-checklist.md](review-checklist.md).
+For the wallet's actors, trust boundaries, payment flow, and custody model, start with the [public architecture page](../architecture.md).
+This page maps crate ownership, dependency rules, lints, and binary wiring.
+Build instructions are in [Building and testing](building.md); contribution checks are in the [review checklist](review-checklist.md).
 
 ## Workspace overview
 
-The repository is a single Cargo workspace (`resolver = "2"`) with 37 member crates under `crates/`, all named `stellar-agent-*`. Shared package metadata is inherited from `[workspace.package]`: version `0.1.0-alpha.12`, Rust edition `2024`, license `Apache-2.0`, repository `https://github.com/Soneso/stellar-agent-wallet`, author `Soneso`. Of these, 36 are published on crates.io at the shared workspace version, in dependency order from the tagged release commit. The unpublished `stellar-agent-smart-account-acceptance` member holds the smart-account live suites that need a browser, the MCP server, the WebAuthn bridge, or the SEP-48, DeFi, DeFindex, and soroban-spec-tools crates.
+The Cargo workspace contains 37 members under `crates/`, named `stellar-agent-*`.
+Shared package metadata uses Rust edition 2024 and the Apache-2.0 license.
+Of these members, 36 are published; `stellar-agent-smart-account-acceptance` holds unpublished live acceptance suites.
+Shared dependency pins live in `[workspace.dependencies]` in the root `Cargo.toml`.
 
-Shared dependency pins live in `[workspace.dependencies]` in the root `Cargo.toml` and are added when a crate first needs them, so the workspace only carries dependencies it actually uses.
+## Dependency layers
 
-### Workspace lints
+The layers below order normal workspace dependencies, including optional and target-gated dependencies.
+Crate names omit the `stellar-agent-` prefix.
+A crate depends on lower layers; the listed composite exceptions depend on earlier members of their own layer.
+Neither binary depends on the other, and no published library depends on a binary.
 
-Lints are defined once in `[workspace.lints]` and inherited by each crate via `[lints] workspace = true`.
+| Layer | Members and rules |
+| --- | --- |
+| Foundations | `xdr-limits`, `soroban-auth`, `sep5`, `windows-identity`, `loopback-http`, `toolsets`, `mcp-macros`, and `test-support` have no normal workspace dependencies. |
+| Core | `core` uses `xdr-limits`, optional `test-support`, and `windows-identity` on Windows. `headless-keyring` uses `windows-identity` on Windows. |
+| Network and installation | `network` builds on `core`, `headless-keyring`, `soroban-auth`, and `xdr-limits`. `toolsets-install` uses `toolsets` and `core`. `sep45` uses `core` and `xdr-limits`. |
+| Domain libraries | `nonce`, `pool`, `claimable`, `smart-account`, `defi`, `stablecoin`, `sep7`, `sep10`, `sep48`, `sep53`, `anchor`, and `toolsets-runtime` depend only on earlier layers. |
+| Composite libraries | `sep43`, `x402`, `x402-identity`, `mpp`, `dex`, `defindex`, `webauthn-bridge`, `approval-ui`, and `approval-remote`. Within this layer, `x402` and `mpp` depend on `sep43`; `approval-remote` depends on `approval-ui`. |
+| Binaries | `cli` and `mcp` consume library crates. |
+| Acceptance | `smart-account-acceptance` is a test-only leaf above the binaries. |
+
+`defi` defines contract pins, typed previews, and adapter interfaces.
+`dex` and `defindex` implement its trade and vault adapters through `smart-account` submission.
+`stablecoin` supplies classic trustline helpers over `core` and `network`; the binaries wire the trustline commands.
+
+## Workspace lints
+
+Each crate inherits `[workspace.lints]` through `[lints] workspace = true`.
 
 ```toml
 [workspace.lints.rust]
@@ -32,49 +54,31 @@ print_stderr = "deny"
 dbg_macro = "deny"
 ```
 
-`unsafe_code` is denied workspace-wide, with narrowly-scoped `#[allow(unsafe_code)]` sites where FFI is required: `stellar-agent-windows-identity` for its Win32 token API (its core capability), and `stellar-agent-cli` for a POSIX `geteuid` FFI declaration in the audit-verify owner check. `unwrap_used`, `expect_used`, and `panic` are denied so library and command code surface typed errors rather than aborting. `print_stdout` and `print_stderr` are denied so output is routed through the JSON envelope and the redacting log subscriber rather than ad-hoc prints; the few legitimate fallback writes carry a scoped `#[allow]`.
+Production code has four scoped `unsafe_code` allow sites across three areas: Windows identity and DPAPI, the CLI audit verifier's POSIX user check, and MCP Linux process hardening.
+Tests have additional scoped allowances.
+Errors use typed results; output uses JSON envelopes and redacting logs.
+Scoped allowances document necessary exceptions.
+The [lint gate](building.md#lint) enforces these rules.
 
-## Dependency layering
+## The two binaries
 
-Crates form a directed acyclic graph from foundational substrate up to the two binaries. No published crate depends on a binary. The unpublished `stellar-agent-smart-account-acceptance` member sits above layer 4 as a test-only leaf that nothing depends on.
+`stellar-agent-cli` builds `stellar-agent` from `src/main.rs`.
+The external-command convention also makes it discoverable as `stellar agent ...`.
+`stellar-agent-mcp` builds the MCP server, with a library entry point used by integration tests.
 
-### Layer 0: substrate
+MCP directly links `sep7`, `sep43`, `sep48`, `sep53`, `anchor`, `x402`, and `x402-identity`.
+Both binaries link `mpp`, which uses `sep43`.
+`sep10` reaches MCP through `x402-identity`; neither binary links `sep45`.
 
-`stellar-agent-core`, `stellar-agent-network` (depends on `core`), `stellar-agent-sep5`, `stellar-agent-xdr-limits`, `stellar-agent-soroban-auth`, and `stellar-agent-nonce`. These carry the typed errors, amounts, envelopes, RPC transport, key derivation, untrusted-XDR bounds, Soroban authorization preimages, and replay-nonce primitives that every higher layer builds on. `xdr-limits`, `soroban-auth`, and `sep5` are independent leaves; `network` depends on `core`, and `nonce` depends on `core` and `network`.
-
-### Layer 1: orchestration and platform
-
-`stellar-agent-smart-account` (off-chain orchestration over OpenZeppelin `stellar-accounts`), `stellar-agent-webauthn-bridge` (loopback HTTP listener into the core approval store), `stellar-agent-loopback-http` (shared loopback-HTTP middleware behind the browser-facing listeners), `stellar-agent-approval-ui` and `stellar-agent-approval-remote` (the loopback and TLS-plus-passkey operator approval surfaces), `stellar-agent-claimable` (claimable-balance domain logic over `core`/`network`), `stellar-agent-pool` (channel-account pool over `core`/`network`/`sep5`), `stellar-agent-windows-identity` (platform leaf), and `stellar-agent-headless-keyring` (opt-in file-backed keyring store; a leaf except for `windows-identity` on Windows).
-
-### Layer 2: protocol and SEP crates
-
-`stellar-agent-sep7`, `stellar-agent-sep10`, `stellar-agent-sep43`, `stellar-agent-sep45`, `stellar-agent-sep48`, `stellar-agent-sep53`, `stellar-agent-anchor`, `stellar-agent-x402`, `stellar-agent-x402-identity`, `stellar-agent-mpp`, and the toolsets triad `stellar-agent-toolsets` with `stellar-agent-toolsets-install` and `stellar-agent-toolsets-runtime`. `stellar-agent-sep5` has no workspace dependency; `stellar-agent-sep7` and `stellar-agent-sep48` depend on `xdr-limits` and `network`; the other SEP crates also depend on `core`. MPP is the exception to the MCP-only protocol pattern: its shared library is adapted by both the CLI and MCP binaries.
-
-### Layer 3: DeFi substrate and adapters
-
-`stellar-agent-defi` is the adapter substrate: the contract-pin framework, the typed-preview trait, and the dispatch-verb seam (`lend`/`trade`/`vault`/`bridge`). It ships no live verb. The adapters `stellar-agent-defindex`, `stellar-agent-dex`, and `stellar-agent-stablecoin` implement that substrate and register the `vault`, `trade`/`quote`, and `trustline` verbs; the adapters whose submit path runs through a smart account also depend on `smart-account`.
-
-### Layer 4: binaries
-
-`stellar-agent-mcp-macros` is the proc-macro crate feeding the MCP registry. `stellar-agent-mcp` and `stellar-agent-cli` are the two sibling binaries; both consume the library crates and neither depends on the other.
-
-## The two-sibling-binary model
-
-The wallet ships two surfaces from two binary crates.
-
-- `stellar-agent` is built from `stellar-agent-cli`. It is installed on `PATH` and is also discovered as `stellar agent ...` by the incumbent `stellar-cli` through its external-binary plugin convention. The crate root is `crates/stellar-agent-cli/src/main.rs`.
-- `stellar-agent-mcp` is built from `stellar-agent-mcp`. It is an MCP server spoken over stdio. The crate has both `src/lib.rs` (re-exported for integration tests) and `src/main.rs` (the binary entry point that starts the server process).
-
-The two binaries are siblings, not a dependency pair. `stellar-agent-cli` does not depend on `stellar-agent-mcp`. Most SEP, anchor, and x402 protocol crates remain MCP-only; `stellar-agent-mpp` is shared by both binaries because MPP has a first-class operator CLI. The MCP binary adds the wider protocol surface plus the `mcp-macros` proc-macro with the `inventory` runtime. The per-crate table below carries the detail.
-
-Both binaries share a single release archive. The `[package.metadata.binstall]` blocks in both crates point at the same `stellar-agent-{version}-{target}.tar.xz` (`.zip` on Windows), and `{ bin }` resolves to each crate's own binary name. Each tagged release publishes those archives; `cargo binstall` resolves the crate on crates.io and fetches the matching archive from the release assets. It installs this repository's release archive for the host's target, or for a compatible target the host runs, such as the x86_64 Windows archive under emulation. Both blocks set `disabled-strategies = ["quick-install", "compile"]`, so binstall fails when no such archive exists; it checks the download over TLS only, with no signature. On a host outside the release matrix in `release.yml`, `cargo install --locked stellar-agent-cli@<version> stellar-agent-mcp@<version>` from crates.io, or a source build with `cargo build --release --locked`, applies. See [building.md](building.md) for the build flow.
+Both binaries share the release archive referenced by their `package.metadata.binstall` blocks.
+See [Getting started](../getting-started.md) for installation and [Building](building.md#building) for source builds.
 
 ## Per-crate responsibility
 
 | Crate | Responsibility |
 | --- | --- |
-| `stellar-agent-core` | Synchronous, runtime-free substrate: typed amounts, typed `WalletError`, JSON `Envelope`, profiles, observability, smart-account auth-digest helpers, the policy-engine trait and Noop/V1 implementations, the approval spine, the audit log, and the `rpc_budget` module: a shared wall-clock budget primitive (`SequentialRpcBudget` / `bound_stage`) that bounds sequential RPC flows: deployment stages, rule scans, list operations, and retry attempts. |
-| `stellar-agent-network` | Async Stellar RPC client, account-view projection, transaction assembly, SEP-29 memo enforcement, hardware-signer preparation, Friendbot funding, and the idempotent submit primitive. |
+| `stellar-agent-core` | Typed amounts, errors, envelopes, profiles, policy engines, approvals, and audit records. Its `policy`, `approval`, and `audit_log` modules provide synchronous evaluation and stores, including the TOML approval store with its exclusive lifetime lock. Owns the receipt store, audit tip anchor, binding, and consent outbox. Wallet unlock and seed access are synchronous and runtime-free; Tokio bounds sequential RPC deadlines. |
+| `stellar-agent-network` | Async Stellar RPC client, account views, assembly, SEP-29 checks, hardware signers, and Friendbot. Enforces endpoint identity, signature-network binding, witnesses, and submission recording. Owns keyring initialization, the policy window store, counterparty cache, and sequence-floor hook. The idempotent-submit APIs are library-only; shipped verbs use `submit_transaction_and_wait`. |
 | `stellar-agent-claimable` | Claimable-balance domain logic: balance-id normalization, predicate evaluation, entry and trustline fetch, and claim preview; drives the `claim` verb. |
 | `stellar-agent-sep5` | SEP-5 / BIP-44 HD ed25519 key derivation (`m/44'/148'/index'`, SLIP-0010 hardened) from a BIP-39 mnemonic or seed; no I/O or RNG. |
 | `stellar-agent-xdr-limits` | Leaf crate supplying recursion-depth and length bounds for decoding untrusted XDR. |
@@ -82,11 +86,11 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 | `stellar-agent-nonce` | HMAC-SHA256 wallet-issued nonce, in-memory TTL replay window, `ToolCatalogue` trait, and nonce-key rotation. |
 | `stellar-agent-smart-account` | Off-chain orchestration over OpenZeppelin `stellar-accounts`: deployment, context-rule install, WebAuthn passkey signer, threshold updates, signer-set baseline checks before signing, wasm-hash pinning, verifier migration, multicall, and upgrade timelock. |
 | `stellar-agent-webauthn-bridge` | Loopback-only HTTP listener ferrying browser WebAuthn ceremony bytes into the core approval store, behind a host/origin/CSP/body-limit middleware stack. |
-| `stellar-agent-loopback-http` | Shared tower/axum defence-in-depth middleware for the wallet's browser-facing HTTP listeners (Host and Origin allowlists, hardened security headers), plus the `brand` module holding the stylesheet, the inline project mark, and `PageIdentity` (the optional per-deployment name and mark those listeners' pages render), and the `escape` module holding the one HTML-escaping definition every page applies to dynamic text. |
+| `stellar-agent-loopback-http` | Shared HTTP middleware for Host and Origin allowlists and security headers. The `brand` module supplies page identity and styles; `escape` provides HTML escaping for dynamic text. |
 | `stellar-agent-approval-ui` | Localhost approval-inbox web UI: a loopback HTTP server surfacing the pending-approval queue for browser approve/reject (`approve serve`). |
 | `stellar-agent-approval-remote` | TLS-protected, passkey-authenticated remote approval surface: approve or reject pending actions from a device other than the wallet host (`approve serve --remote`). |
-| `stellar-agent-windows-identity` | Windows-only safe wrapper reading the process token user SID to bind approval attestations to the OS user, plus DPAPI protect/unprotect wrappers for the headless keyring store. Absent off Windows; uses `unsafe` for its Win32 FFI. |
-| `stellar-agent-headless-keyring` | Opt-in, file-backed `keyring-core` credential store for non-interactive deployments (services, SSH sessions, scheduled tasks) where the platform keyring is unreachable: XChaCha20-Poly1305 under an operator-supplied environment key, or DPAPI protection on Windows; sidecar-locked, fail-closed, never a silent fallback. |
+| `stellar-agent-windows-identity` | Safe wrappers for Windows user identity and DPAPI encryption, with scoped `unsafe` calls to Win32. Builds on other platforms as a shim returning `UnsupportedPlatform`; consumers gate the dependency to Windows. |
+| `stellar-agent-headless-keyring` | Explicitly selected file-backed credential store with sidecar locks. Uses XChaCha20-Poly1305 with an operator-supplied key or Windows DPAPI. Configuration failures refuse access. |
 | `stellar-agent-pool` | SEP-5-derived channel-account pool with in-pool sequence management for concurrent submission without `tx_bad_seq`. |
 | `stellar-agent-sep7` | Inbound `web+stellar:` URI parse and anti-phishing origin-domain signature verification; never signs, submits, or auto-POSTs. |
 | `stellar-agent-sep10` | SEP-10 web-auth client: challenge parse and validation, JWT session, HTTP challenge fetch and submit, ephemeral-key flow, and the authorized mainnet completion that takes a message-use receipt. |
@@ -95,12 +99,12 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 | `stellar-agent-sep48` | SEP-48 contract-interface typed-arg preview and SEP-47 contract-interface discovery; non-authoritative display only. |
 | `stellar-agent-sep53` | SEP-53 prefixed message sign and verify over ed25519. |
 | `stellar-agent-anchor` | Privacy-first anchor client: SEP-6 `/info` discovery and SEP-24 interactive-URL hand-off with same-domain SSRF bind; never opens or follows the URL. |
-| `stellar-agent-toolsets` | `TOOLSET.md` format parse, capability-manifest validation, and the pre-canonicalisation argument-validation guard; format and parse substrate only. |
+| `stellar-agent-toolsets` | `TOOLSET.md` format parse, capability-manifest validation, and the pre-canonicalization argument-validation guard; format and parse substrate only. |
 | `stellar-agent-toolsets-install` | Toolset install and uninstall with hash verification, ed25519 publisher signature and trust set, safe tar extraction, attestation gate, toolsets directory lock, and an atomic pin record authenticated by an HMAC under the installation's pin key. |
 | `stellar-agent-toolsets-runtime` | Capability-to-tool matrix, gated resolver, signing denylist, pin and manifest-digest verification, and the enforcement bounding what the toolset dispatcher routes (not the server's native tools). |
 | `stellar-agent-defi` | DeFi-adapter substrate: contract-pin framework, the typed-preview trait, and the dispatch-verb seam (`lend`/`trade`/`vault`/`bridge`); ships no live verb. |
 | `stellar-agent-defindex` | DeFindex vault adapter: typed deposit and withdraw with mandatory `min_out`, role disclosure, upgradable-flag refusal gate; drives the `vault` verb. |
-| `stellar-agent-dex` | Soroswap router-direct swap adapter with absolute `amount_out_min`, pre-sign slippage re-verify, token canonicalisation, bounded deadline, venue allowlist and router pin; drives `trade`/`quote`. |
+| `stellar-agent-dex` | Soroswap router-direct swap adapter with absolute `amount_out_min`, pre-sign slippage re-verify, token canonicalization, bounded deadline, venue allowlist and router pin; drives `trade`/`quote`. |
 | `stellar-agent-stablecoin` | Stablecoin substrate: USDC/EURC issuer pins, denomination resolver, USDT hard-refusal, clawback disclosure, typed trustline preview; backs the `trustline` verb. |
 | `stellar-agent-x402` | Payer-side x402 Exact-Stellar payment payload builder (validate, build, simulate, sign, re-simulate, finalize), and the authorized mainnet path that consumes the payment intent before signed re-simulation and returns the release authorization. |
 | `stellar-agent-x402-identity` | SEP-10 counterparty-identity pre-payment gate for x402, returning a JWT Bearer companion bound at the HTTP layer; never mutates the payment XDR. It also holds the authorized mainnet gate that binds the authentication to the approved payment and returns the receipt continuation. |
@@ -111,24 +115,12 @@ Both binaries share a single release archive. The `[package.metadata.binstall]` 
 | `stellar-agent-test-support` | Dev-only harness: log-capture and secret-leakage assertions, in-memory keyring mock, XDR and strkey fixtures, HTTP and contract doubles, live-network testnet helpers. |
 | `stellar-agent-smart-account-acceptance` | Unpublished member holding the smart-account live testnet suites that drive a browser, the MCP server, the WebAuthn bridge, or the SEP-48, DeFi, and DeFindex crates. Its `testnet-integration` feature activates every dependency, so offline builds compile an empty library. |
 
-## Crate classification
+## Crate kinds
 
-- **Binaries (2):** `stellar-agent-cli` (binary `stellar-agent`) and `stellar-agent-mcp` (binary `stellar-agent-mcp`, plus a library re-export for integration tests).
-- **Plain libraries:** `core`, `network`, `claimable`, `sep5`, `xdr-limits`, `soroban-auth`, `nonce`, `headless-keyring`, `smart-account`, `webauthn-bridge`, `loopback-http`, `approval-ui`, `approval-remote`, `pool`, `sep7`, `sep10`, `sep43`, `sep45`, `sep48`, `sep53`, `anchor`, `toolsets`, `toolsets-install`, `toolsets-runtime`, `defi`, `defindex`, `dex`, `stablecoin`, `x402`, `x402-identity`, `mpp`.
-- **Proc-macro library:** `mcp-macros`, the compiler-plugin companion to the `inventory` runtime in `mcp`.
-- **Platform-gated:** `windows-identity`, target-gated to `cfg(target_os = "windows")`. It uses `unsafe` for Win32 FFI as its core capability and is absent off Windows. (The CLI also carries a narrowly-scoped `#[allow(unsafe_code)]` for a POSIX `geteuid` FFI declaration in the audit-verify owner check.)
-- **Dev-only:** `test-support`, consumed only by tests and test-only members and never by a shipped code path. Most members take it as a `[dev-dependencies]` entry; `core` and the acceptance member take it as an optional `[dependencies]` entry behind a test feature.
-- **Unpublished test member:** `smart-account-acceptance`, which holds live acceptance suites only and is never published.
-
-## Where the policy, approval, and audit substrate lives
-
-The policy engine, approval spine, and audit log all live in `stellar-agent-core`. The relevant modules:
-
-- `policy`: the `PolicyEngine` trait, the typed `Decision` surface, the `NoopPolicyEngine`, and `policy::v1::PolicyEngineV1` (signature-verified typed `Criterion` rules, first-match default-deny). The registry these policy types serve is built in the MCP crate: `build_tool_registry` in `stellar-agent-mcp`'s `tools/common.rs` fails closed: a duplicate registration name is a fatal startup error, not a silent first-wins drop.
-- `approval`: the per-profile `PendingApprovalStore` (TOML-backed, with an exclusive lifetime advisory lock that refuses a second opener), the HMAC-SHA256 attestation primitive, and the process-uid helper that binds an attestation to the OS user.
-- `audit_log`: the append-only hash-chained JSONL writer, the chain primitives, and `verify_log` for end-to-end chain verification.
-
-Wallet unlock and seed access are synchronous and runtime-free. The RPC budget helper uses Tokio to bound async stages. The security rationale for each is in [security-internals.md](security-internals.md).
+The workspace contains two binary packages, the `mcp-macros` procedural macro, ordinary libraries, and test helpers.
+`test-support` serves test code; `core` and the acceptance member enable it through optional dependencies.
+`windows-identity` builds on every platform; `core` and `headless-keyring` gate their dependency to Windows.
+The acceptance member's dependencies activate through its test feature.
 
 ### Approval error taxonomy
 
@@ -140,17 +132,58 @@ The UI classifies failures through `WalletError::code()`.
 The shared MCP envelope carries these codes; direct JSON-RPC approval errors use their message form.
 MCP attestation validation reports missing and expired approvals as `policy.approval_required`.
 
-## How the binaries wire the tool registry to the substrate
+## Link-time tool wiring
 
-The MCP server registers tools at link time. Each tool function inside the `#[mcp_tool_router]` impl block carries an `#[mcp_tool_item(...)]` annotation; the `mcp-macros` proc-macro emits an `inventory::submit!` record per tool. `WalletServer::new` iterates `inventory::iter::<McpToolRegistration>()` to build the descriptor map, and the same map is what `PolicyEngine::evaluate` is called against at `tools/call` dispatch. The policy-engine call site at dispatch is identical whether the active engine is `NoopPolicyEngine` or `PolicyEngineV1`; only the resolved engine differs per profile. The bridge from the network account view to the policy engine's `AccountReservesView` / `AccountIdentityView` lives in `stellar-agent-network::policy_view` (`AccountViewAdapter`). It is hosted there rather than in `core` or `mcp` because `AccountView` is defined in `network`, which already depends on `core`, so no new dependency edge is needed. Both the MCP tool handlers and the CLI's classic verbs (`pay`, `claim`, `accounts create`) construct the adapter directly when populating the evaluation context. `stellar-agent-mcp::policy_adapter` re-exports `AccountViewAdapter` from its former path for compatibility. The MCP transport is a bounded stdio codec with a 1 MiB maximum line length, set explicitly rather than using the framework default.
+Each MCP tool carries `#[mcp_tool_item(...)]` inside a `#[mcp_tool_router]` implementation.
+The macro emits an `inventory::submit!` registration; `WalletServer::new` collects the records into the descriptor map.
+Duplicate names are fatal startup errors.
 
-`WalletServer` holds a small amount of in-process, long-lived state alongside the tool registry, each behind its own `TokioMutex` for async-safe access across concurrent dispatches. This includes the nonce replay window (`stellar-agent-nonce::ReplayWindow`), and `stellar-agent-mcp::sequence_floor::SequenceFloorTracker`. The latter is a bounded, FIFO-evicted map from source account to the highest sequence number a confirmed submit in this process consumed. The `stellar_pay_commit` / `stellar_claim_commit` / `stellar_trustline_commit` / `stellar_create_account_commit` build paths (and their simulate-phase twins) consult the tracker after every `fetch_account`. A fetched sequence below the tracked floor triggers a bounded re-poll before the build proceeds. This closes an ordinary read-after-write propagation-lag window between the RPC node that served a just-confirmed submit and the node that serves the next build. The tracker is advisory only: a build that still observes a stale sequence after the bounded window proceeds with it. The eventual submit fails typed `submission.sequence_number_stale` exactly as it would without the tracker. It is MCP-server-only: the CLI is a fresh process per invocation with no history to track against.
+Gated handlers call `PolicyEngine::evaluate_full` or `evaluate_with_value_full` with a descriptor and arguments.
+The result includes the decision and sized value effects, which submission recording uses without deriving them again.
+The profile selects Noop or the signature-verified V1 engine.
+See the [payment flow](../architecture.md#one-agent-payment-end-to-end) for the order of checks, approval, and submission.
 
-The replay window belongs to one `WalletServer` instance; the boot salt belongs
-to the process. The sequence floor is advisory and never invents a sequence.
-See [Two sessions on one profile](security-internals.md#two-sessions-on-one-profile)
-for durable stores, contention results and restart limits.
+### Account views
 
-The same tracker also backs the DeFi adapter submit paths (`stellar_dex_trade`, `stellar_defindex_vault_deposit`/`_withdraw`), via a `SequenceFloorHook` trait (`stellar-agent-network::sequence_floor`) that decouples the tracker's concrete type from the lower crates in the dependency graph. Each MCP DeFi tool wraps `WalletServer`'s tracker in a local `TrackerHook` and sets it on `DefiAdapterCtx::sequence_floor`, which the adapter crates (`stellar-agent-dex`, `stellar-agent-defindex`) forward into `SubmitInvokeArgs::sequence_floor` at their `submit_signed_invoke` call site (`stellar-agent-smart-account::submit`). `submit_signed_invoke`'s own account fetch consults the SAME hook for the bounded catch-up poll, and records the consumed sequence back into it on confirmed submit. There is one shared floor per source account across the classic commit verbs and the DeFi adapters, not two independent ones. `SubmitInvokeArgs::sequence_floor` defaults to `None` for every other caller of `submit_signed_invoke` (rules/signers self-calls, the multicall bundle path), which is CLI-only and out of scope for the same reason the tracker itself is MCP-server-only.
+`stellar-agent-network::policy_view::AccountViewAdapter` connects network account data to the policy engine's reserve and identity views.
+Keeping the adapter in `network` uses its existing dependency on `core`.
+MCP handlers and CLI `pay`, `claim`, `accounts create`, and `trustline` construct it directly.
+`stellar-agent-mcp::policy_adapter` re-exports the type.
 
-The CLI registers no MCP tools. It is a clap `Subcommand` tree in `main.rs` dispatching to per-command `run` functions over the library crates. The top-level subcommands are `approve`, `tx`, `audit`, `accounts`, `balances`, `counterparty`, `friendbot`, `fees`, `pay`, `mpp`, `pool`, `profile`, `credentials`, `vault`, `trade`, `trustline`, `claim`, `toolsets`, and `smart-account`. Before dispatch, `main` installs the redacting log subscriber and runs a local-only startup advisory that scans the active profile's audit log for context rules referencing retired verifier wasm hashes. The advisory makes no network calls and never aborts startup. Each command renders a JSON `Envelope` and the process exits `0` on success or `1` on error.
+### In-process state
+
+`WalletServer` holds a nonce replay window and a sequence-floor tracker behind separate Tokio mutexes.
+The replay window belongs to one server instance; the nonce boot salt belongs to the process.
+The tracker records the highest confirmed sequence per source in a bounded map with oldest-entry eviction.
+
+Classic payment, claim, trustline, and account-creation handlers consult the tracker after fetching an account.
+If a read is behind the floor, they poll again for a bounded interval.
+The floor is advisory: an unresolved stale read proceeds and can receive `submission.sequence_number_stale` at submission.
+
+One shared `TrackerHook` type implements the network crate's `SequenceFloorHook` trait for MCP callers.
+DeFi handlers pass it through `DefiAdapterCtx` into `SubmitInvokeArgs`.
+The smart-account submit path polls through that hook and records confirmed sequences back into it.
+Classic and DeFi handlers therefore share the same floor for each source.
+Other callers can leave the hook unset.
+
+The CLI starts a fresh process per invocation.
+See [Two sessions on one profile](security-internals.md#two-sessions-on-one-profile) for durable stores, lock contention, and restart limits.
+
+## CLI dispatch
+
+The CLI uses a clap `Subcommand` tree in `main.rs`, dispatching to command `run` functions over library crates.
+Its top-level commands are `approve`, `tx`, `audit`, `accounts`, `balances`, `counterparty`, `friendbot`, `fees`, `pay`, `mpp`, `pool`, `profile`, `credentials`, `vault`, `trade`, `trustline`, `claim`, `toolsets`, and `smart-account`.
+
+Before dispatch, `main` installs redacting logs and scans the active profile's audit log for context rules referencing retired verifier hashes.
+This local advisory makes no network calls and never aborts startup.
+Commands render a JSON `Envelope`; success exits with `0`, and errors exit with `1`.
+
+## Security detail
+
+The public page describes [guarantees and enforcement](../architecture.md#guarantees-and-who-enforces-them).
+Implementation detail lives in [Security internals](security-internals.md):
+
+- [Attestations](security-internals.md#attestation-primitive) and [nonces](security-internals.md#nonce-scheme).
+- [Audit records](security-internals.md#audit-hash-chain), tip anchors, bindings, and the consent outbox.
+- [Network binding](security-internals.md#submit-layer-network-binding) and submission recording.
+- [Policy evaluation](security-internals.md#policy-v1-evaluator) and its persistent spending windows.

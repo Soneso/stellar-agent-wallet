@@ -712,6 +712,10 @@ async fn create_run(args: &CreateArgs) -> i32 {
             return emit_error(&e, args.common.output, &request_id);
         }
     };
+    // Halt check: before the keyring, the signer and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name) {
+        return emit_error(&e, args.common.output, &request_id);
+    }
     let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
     {
         Ok(context) => context,
@@ -1332,6 +1336,10 @@ async fn set_name_run(args: &SetNameArgs) -> i32 {
             return emit_error(&e, args.common.output, &request_id);
         }
     };
+    // Halt check: before the keyring, the signer and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name) {
+        return emit_error(&e, args.common.output, &request_id);
+    }
     let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
     {
         Ok(context) => context,
@@ -1454,6 +1462,10 @@ async fn set_valid_until_run(args: &SetValidUntilArgs) -> i32 {
             return emit_error(&e, args.common.output, &request_id);
         }
     };
+    // Halt check: before the keyring, the signer and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name) {
+        return emit_error(&e, args.common.output, &request_id);
+    }
     let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
     {
         Ok(context) => context,
@@ -1571,6 +1583,10 @@ async fn delete_run(args: &DeleteArgs) -> i32 {
             return emit_error(&e, args.common.output, &request_id);
         }
     };
+    // Halt check: before the keyring, the signer and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name) {
+        return emit_error(&e, args.common.output, &request_id);
+    }
     let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
     {
         Ok(context) => context,
@@ -2086,6 +2102,10 @@ async fn add_policy_run(args: &AddPolicyArgs) -> i32 {
             return emit_error(&e, args.output, &request_id);
         }
     };
+    // Halt check: before the keyring, the signer and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name) {
+        return emit_error(&e, args.output, &request_id);
+    }
     let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
     {
         Ok(context) => context,
@@ -2791,6 +2811,10 @@ async fn remove_policy_run(args: &RemovePolicyArgs) -> i32 {
             return emit_error(&e, args.output, &request_id);
         }
     };
+    // Halt check: before the keyring, the signer and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name) {
+        return emit_error(&e, args.output, &request_id);
+    }
     let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
     {
         Ok(context) => context,
@@ -3150,6 +3174,10 @@ async fn set_spending_limit_run(args: &SetSpendingLimitArgs) -> i32 {
             return emit_error(&e, args.output, &request_id);
         }
     };
+    // Halt check: before the keyring, the signer and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name) {
+        return emit_error(&e, args.output, &request_id);
+    }
     let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
     {
         Ok(context) => context,

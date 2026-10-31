@@ -20,6 +20,7 @@
 //!   HMAC key.
 //! - [`rotate_counterparty_key`] — rotate the `stellar.toml` cache-integrity
 //!   HMAC key.
+//! - [`halt`]: `halt` and `resume`, the per-profile emergency stop.
 //!
 //! # Dispatch
 //!
@@ -32,6 +33,7 @@ pub mod enable_mainnet;
 pub mod enroll_owner_key;
 pub mod enroll_rpc_credential;
 pub mod enroll_signer;
+pub mod halt;
 pub mod init;
 pub mod key_ops;
 pub mod list;
@@ -171,6 +173,23 @@ pub enum ProfileSubcommand {
     /// charges not yet committed; discards the replay history only when no
     /// snapshot authenticates.
     ResetMppState(reset_mpp_state::ResetMppStateArgs),
+    /// Halt every agent action on a profile until `profile resume` lifts it.
+    ///
+    /// Writes the halt marker beside the profile file. From the next call on,
+    /// every MCP tool that is not read-only and every CLI verb that signs or
+    /// submits refuses with `profile.halted`, on a running MCP server too; no
+    /// restart, key change, or policy change is needed. Operator ceremonies,
+    /// approvals, and read-only commands keep working. Writes a
+    /// `profile_halted` audit row after the marker.
+    Halt(halt::HaltArgs),
+    /// Lift a halt set by `profile halt`.
+    ///
+    /// Reads the halt marker, writes a `profile_resumed` audit row, then
+    /// removes the marker. A marker that cannot be read, a row that cannot be
+    /// written, or a marker that cannot be removed exits `1` and leaves the
+    /// profile halted. A profile that is not halted is left unchanged and the
+    /// command exits `0`.
+    Resume(halt::ResumeArgs),
 }
 
 /// Runs the `profile` subcommand group.
@@ -204,6 +223,8 @@ pub async fn run(args: &ProfileArgs) -> i32 {
         ProfileSubcommand::RotatePolicyStateKey(a) => rotate_policy_state_key::run(a).await,
         ProfileSubcommand::ResetWindowState(a) => reset_window_state::run(a).await,
         ProfileSubcommand::ResetMppState(a) => reset_mpp_state::run(a),
+        ProfileSubcommand::Halt(a) => halt::run_halt(a).await,
+        ProfileSubcommand::Resume(a) => halt::run_resume(a).await,
     }
 }
 
@@ -238,6 +259,8 @@ impl ProfileArgs {
             ProfileSubcommand::RotatePolicyStateKey(a) => Some(a.profile_name()),
             ProfileSubcommand::ResetWindowState(a) => Some(a.profile_name()),
             ProfileSubcommand::ResetMppState(a) => Some(a.profile_name()),
+            ProfileSubcommand::Halt(a) => Some(a.profile_name()),
+            ProfileSubcommand::Resume(a) => Some(a.profile_name()),
         }
     }
 }

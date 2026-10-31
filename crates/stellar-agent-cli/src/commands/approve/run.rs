@@ -94,7 +94,7 @@ use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::timefmt;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
-use crate::common::consent::{ConsentSink, acquire_consent_sink};
+use crate::common::consent::{OperatorRowSink, acquire_operator_row_sink};
 use crate::common::mainnet_presence::acquire_mainnet_presence;
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::{render, resolve_profile_name};
@@ -481,7 +481,7 @@ fn approve_with_consent_row(
 ///
 /// # Errors
 ///
-/// The acquisition refusal of [`acquire_consent_sink`], a poisoned writer
+/// The acquisition refusal of [`acquire_operator_row_sink`], a poisoned writer
 /// mutex, or any error of `attest_and_persist`. Nothing is persisted when the
 /// row is refused.
 fn record_consent(
@@ -511,10 +511,10 @@ fn record_consent(
         .map(|_grant| ())
         .map_err(|e| e.to_string())
     };
-    let sink = acquire_consent_sink(profile, profile_name)?;
+    let sink = acquire_operator_row_sink(profile, profile_name)?;
     let mut guard;
     let (audit, outcome) = match &sink {
-        ConsentSink::Writer(writer) => {
+        OperatorRowSink::Writer(writer) => {
             guard = writer.lock().map_err(|_| {
                 tracing::error!(
                     event_kind = "approval_attested",
@@ -526,7 +526,9 @@ fn record_consent(
             })?;
             (ConsentAudit::Writer(&mut guard), ConsentRowOutcome::Written)
         }
-        ConsentSink::Outbox(outbox) => (ConsentAudit::Outbox(outbox), ConsentRowOutcome::Queued),
+        OperatorRowSink::Outbox(outbox) => {
+            (ConsentAudit::Outbox(outbox), ConsentRowOutcome::Queued)
+        }
     };
     let attestation = attest_and_persist(
         store,
@@ -1279,9 +1281,7 @@ mod tests {
         stellar_agent_core::approval::ApprovalContext::from_profile("render-test", &profile)
     }
     use super::*;
-    use crate::commands::value_audit::KeyedAcquireError;
-    use crate::common::consent::is_sidecar_contention;
-    use stellar_agent_core::audit_log::writer::{AuditWriter, WriterError};
+    use stellar_agent_core::audit_log::writer::AuditWriter;
     use stellar_agent_core::audit_log::{AuditOutbox, drain_lock_is_held};
     use stellar_agent_core::profile::schema::default_approval_dir;
 
@@ -2437,42 +2437,6 @@ mod tests {
     ) -> Result<(Option<String>, ConsentRowOutcome), WalletError> {
         let context = stellar_agent_core::approval::ApprovalContext::from_profile(name, profile);
         approve_with_consent_row(store, entry, &[0x42; 32], &context, profile)
-    }
-
-    /// The acquisition is classified by the typed writer error: only sidecar
-    /// contention is retried and resolved through the drain lock.
-    #[test]
-    fn only_sidecar_contention_is_resolved_through_the_drain_lock() {
-        assert!(is_sidecar_contention(&KeyedAcquireError::Writer(
-            WriterError::FileLocked
-        )));
-        for refused in [
-            KeyedAcquireError::KeyUnavailable,
-            KeyedAcquireError::BindingChanged(WalletError::Validation(
-                stellar_agent_core::error::ValidationError::AuditLogBindingChanged {
-                    profile: "p".to_owned(),
-                },
-            )),
-            KeyedAcquireError::Writer(WriterError::OutboxBusy),
-            KeyedAcquireError::Writer(WriterError::OutboxUnusable {
-                line: 1,
-                column: 1,
-                reason: "invalid JSON",
-            }),
-            KeyedAcquireError::Writer(WriterError::TipAnchorMismatch {
-                expected_count: 2,
-                expected_offset: 10,
-                actual_len: 0,
-                reason: "file is shorter than the anchor",
-            }),
-            KeyedAcquireError::Writer(WriterError::Io(std::io::Error::other("disk"))),
-            KeyedAcquireError::Writer(WriterError::TipAnchorUnavailable),
-            KeyedAcquireError::Writer(WriterError::HmacKeyMismatch {
-                profile_name: "p".to_owned(),
-            }),
-        ] {
-            assert!(!is_sidecar_contention(&refused), "{refused:?}");
-        }
     }
 
     #[test]

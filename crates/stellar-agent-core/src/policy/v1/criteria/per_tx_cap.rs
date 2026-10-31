@@ -121,55 +121,11 @@ impl Criterion for PerTxCapCriterion {
     /// Returns [`PolicyError::CriterionEvaluationFailed`] when the required
     /// argument field is missing or cannot be parsed as a valid Stellar amount.
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError> {
-        let tool_name = ctx.tool.name.as_str();
-
-        let criterion_asset = asset_normalise(&self.asset);
-
-        // Descriptor-driven path with the fail-closed default: an unsizable
-        // effect (MovesValue tool that resolved no effects, or an opaque-sign
-        // call) denies here rather than passing silently.
-        let effects = match classify_value(ctx) {
-            ValueGate::NotApplicable => return Ok(None),
-            ValueGate::Deny(reason) => return Ok(Some(reason)),
-            ValueGate::Effects(effects) => effects,
+        let sum = match asset_debit_sum(ctx, &self.asset, self.kind())? {
+            AssetDebitSum::NotApplicable => return Ok(None),
+            AssetDebitSum::Deny(reason) => return Ok(Some(reason)),
+            AssetDebitSum::Amount(sum) => sum,
         };
-
-        // Aggregate the debit legs matching the configured asset (per-asset
-        // aggregation across the N legs of a multi-leg call). A non-debit leg
-        // (Claim/Trustline) contributes nothing; a debit leg with an
-        // unresolvable amount or asset is refused fail-closed.
-        let mut matched = false;
-        let mut sum: i128 = 0;
-        for leg in effects.legs() {
-            if !leg.kind.carries_debit() {
-                continue;
-            }
-            let leg_asset =
-                leg.asset
-                    .as_deref()
-                    .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-                        detail: format!(
-                            "per_tx_cap: debit leg of tool '{tool_name}' carries no asset"
-                        ),
-                    })?;
-            if !assets_equivalent(leg_asset, &criterion_asset, &ctx.profile.network_passphrase) {
-                continue;
-            }
-            let amount = leg
-                .amount
-                .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
-                    detail: format!(
-                        "per_tx_cap: unresolvable amount for a debit leg of tool '{tool_name}'"
-                    ),
-                })?;
-            matched = true;
-            sum = sum.saturating_add(amount);
-        }
-
-        // The configured asset is not moved by this call — criterion not applicable.
-        if !matched {
-            return Ok(None);
-        }
 
         if sum > self.max_stroops {
             return Ok(Some(DenyReason::PerTxCapExceeded {
@@ -181,6 +137,68 @@ impl Criterion for PerTxCapCriterion {
 
         Ok(None)
     }
+}
+
+/// The matching debit total or the value-sizing refusal.
+pub(super) enum AssetDebitSum {
+    NotApplicable,
+    Deny(DenyReason),
+    Amount(i128),
+}
+
+/// Sums matching debit legs with saturation and preserves sizing failures.
+pub(super) fn asset_debit_sum(
+    ctx: &EvalContext<'_>,
+    asset: &str,
+    criterion: &str,
+) -> Result<AssetDebitSum, PolicyError> {
+    let tool_name = ctx.tool.name.as_str();
+
+    let criterion_asset = asset_normalise(asset);
+
+    // Unsizable value effects deny before asset matching.
+    let effects = match classify_value(ctx) {
+        ValueGate::NotApplicable => return Ok(AssetDebitSum::NotApplicable),
+        ValueGate::Deny(reason) => return Ok(AssetDebitSum::Deny(reason)),
+        ValueGate::Effects(effects) => effects,
+    };
+
+    // Debit legs contribute to the configured asset's total. Missing assets
+    // or matching amounts fail closed because the debit cannot be bounded.
+    let mut matched = false;
+    let mut sum: i128 = 0;
+    for leg in effects.legs() {
+        if !leg.kind.carries_debit() {
+            continue;
+        }
+        let leg_asset =
+            leg.asset
+                .as_deref()
+                .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                    detail: format!(
+                        "{criterion}: debit leg of tool '{tool_name}' carries no asset"
+                    ),
+                })?;
+        if !assets_equivalent(leg_asset, &criterion_asset, &ctx.profile.network_passphrase) {
+            continue;
+        }
+        let amount = leg
+            .amount
+            .ok_or_else(|| PolicyError::CriterionEvaluationFailed {
+                detail: format!(
+                    "{criterion}: unresolvable amount for a debit leg of tool '{tool_name}'"
+                ),
+            })?;
+        matched = true;
+        sum = sum.saturating_add(amount);
+    }
+
+    // A call with no matching debit leaves this asset unconstrained.
+    if !matched {
+        return Ok(AssetDebitSum::NotApplicable);
+    }
+
+    Ok(AssetDebitSum::Amount(sum))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
