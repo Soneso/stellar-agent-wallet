@@ -67,7 +67,7 @@ A repair against a held writer refuses with `audit.writer_locked` in the
 envelope's error detail. Stop a server holding that profile's writer, repair,
 and start it again. The same applies to `profile rotate-audit-key`.
 
-**Queued consent rows.** After its `audit_tip_anchored` rows, the acknowledging repair drains the audit outbox (section 8), so rows `stellar-agent approve` queued while the log was refused follow the repair rows. If the drain refuses, the repair still stands: the verb exits 0, omits `outbox_drained`, and lists the refusal under `warnings` (`audit.outbox_unusable`, `audit.outbox_busy`, or the condition an append refused on, such as `audit.io_error`). Every queued row stays queued for the next drain, which appends again any row the refused drain had appended. The reporting form leaves the log, the anchor, and the outbox unchanged.
+**Queued operator rows.** After its `audit_tip_anchored` rows, the acknowledging repair drains the audit outbox (section 8), so rows `stellar-agent approve`, `profile halt`, and `profile resume` queued while the log was refused follow the repair rows. If the drain refuses, the repair still stands: the verb exits 0, omits `outbox_drained`, and lists the refusal under `warnings` (`audit.outbox_unusable`, `audit.outbox_busy`, or the condition an append refused on, such as `audit.io_error`). Every queued row stays queued for the next drain, which appends again any row the refused drain had appended. The reporting form leaves the log, the anchor, and the outbox unchanged.
 
 ## 2. Partial rotation
 
@@ -170,7 +170,7 @@ stellar-agent audit reanchor --profile <name> --acknowledge-binding-change
 | Changed or unreadable | Absent, or agrees with the log | `--acknowledge-binding-change` | `binding_changed` |
 | Changed or unreadable | Disagrees with the log, or cannot be parsed | Both | `rollback_acknowledged`, then `binding_changed` |
 
-An anchor agrees when `audit verify` would accept it; a file ahead of its anchor agrees. The verb decides this before it opens the writer and again under the writer's lock. A missing flag refuses with `validation.acknowledgement_required`, names the flag, and writes nothing. On success the verb anchors the current tip, bumps the current path's re-anchor counter once, and appends the rows, each carrying that count. `binding_changed` names the old path's anchor as `previous_anchor`, or none when the record was unreadable. The new binding is stored last, so a run that stops earlier leaves the refusal in place and a rerun appends its rows again. The envelope lists the conditions acknowledged and how the record compared. Queued consent rows follow the repair rows, as in section 1.
+An anchor agrees when `audit verify` would accept it; a file ahead of its anchor agrees. The verb decides this before it opens the writer and again under the writer's lock. A missing flag refuses with `validation.acknowledgement_required`, names the flag, and writes nothing. On success the verb anchors the current tip, bumps the current path's re-anchor counter once, and appends the rows, each carrying that count. `binding_changed` names the old path's anchor as `previous_anchor`, or none when the record was unreadable. The new binding is stored last, so a run that stops earlier leaves the refusal in place and a rerun appends its rows again. The envelope lists the conditions acknowledged and how the record compared. Queued operator rows follow the repair rows, as in section 1.
 
 **Two data roots, one keyring.** The default `audit_log_path` derives from the OS data directory, which follows `$HOME` and `$XDG_DATA_HOME`. Two profile files of one name in two data roots that share one keyring bind different digests and refuse each other. Set an explicit `audit_log_path` in the profile file in such a deployment.
 
@@ -205,13 +205,13 @@ A `rollback_acknowledged` or `binding_changed` row is the thing to look for when
 
 ## 8. The audit outbox
 
-`stellar-agent approve --id` writes its `approval_attested` row before it persists the approval. When a running MCP server or `approve serve` inbox holds the audit writer, the command cannot append to the log itself. It queues the row in the audit outbox, and the running process appends it.
+`stellar-agent approve --id` writes its `approval_attested` row before it persists the approval. When a running MCP server or `approve serve` inbox holds the audit writer, the command cannot append to the log itself. It queues the row in the audit outbox, and the running process appends it. `stellar-agent profile halt` and `stellar-agent profile resume` queue their `profile_halted` and `profile_resumed` rows the same way.
 
 **Files beside the log.**
 
 | File | Purpose |
 | --- | --- |
-| `<log>.outbox` | Queued rows: JSON lines, one audit entry per line, mode `0600`. Each entry carries the timestamp of the consent it records. |
+| `<log>.outbox` | Queued rows: JSON lines, one audit entry per line, mode `0600`. Each entry carries the timestamp of the consent, halt, or resume it records. |
 | `<log>.outbox.lock` | Held by every append and every drain while it touches the outbox. Waited on for up to 2 s, then `audit.outbox_busy`. |
 | `<log>.drain.lock` | Held for its whole life by every writer that drains: the MCP server, `approve serve`, and every keyed CLI verb. `approve --id` reads it once to tell a draining holder from one that does not drain. |
 

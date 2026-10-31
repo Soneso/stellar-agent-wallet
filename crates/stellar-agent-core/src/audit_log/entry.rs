@@ -2734,6 +2734,62 @@ impl AuditEntry {
         }
     }
 
+    /// Records `profile halt` after the halt marker was written.
+    #[must_use]
+    pub fn new_profile_halted(
+        profile: impl Into<String>,
+        halted_at: impl Into<String>,
+        reason: Option<&str>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "profile_halt".to_owned(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::ProfileHalted {
+                profile: profile.into(),
+                halted_at: halted_at.into(),
+                reason: reason.map(crate::audit_log::schema::bound_recorded_str),
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs the audit entry for `profile resume`.
+    #[must_use]
+    pub fn new_profile_resumed(
+        profile: impl Into<String>,
+        was_halted: bool,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: "profile_resume".to_owned(),
+            chain_id: None,
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: EventKind::ProfileResumed {
+                profile: profile.into(),
+                was_halted,
+            },
+            previous_entry_hash: String::new(),
+        }
+    }
+
     /// Records the verified MPP baseline selected for anchoring.
     #[must_use]
     pub fn new_mpp_state_adopted(

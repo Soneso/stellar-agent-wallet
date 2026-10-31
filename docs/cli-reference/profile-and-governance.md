@@ -25,11 +25,11 @@ Unset the `STELLAR_AGENT_*` variable the refusal names. On every chain that cove
 
 ## `profile`
 
-The `profile` group creates, lists, shows, and migrates profiles, and rotates the keyring-backed keys a profile names. A profile is a per-environment TOML config (schema version 2) binding a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. Wallet keys stay in the keyring, and the profile only names their entries. An endpoint URL can still embed a credential.
+The `profile` group creates, lists, shows, and migrates profiles, rotates the keyring-backed keys a profile names, and halts and resumes a profile's agent actions. A profile is a per-environment TOML config (schema version 2) binding a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. Wallet keys stay in the keyring, and the profile only names their entries. An endpoint URL can still embed a credential.
 
 The eight key-writing commands (`enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and the five key-rotation subcommands) each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `reset-window-state` writes the same row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
 
-`profile list` lists all profile names and takes no profile selector. Every other `profile` subcommand accepts `--profile <NAME>`. For `init`, `enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, `reset-window-state`, and `reset-mpp-state`, supply exactly one positional `<NAME>` or `--profile <NAME>`. These commands require an explicit selection. `reset-mpp-state` requires `--acknowledge`; the other profile verbs have no confirmation flag.
+`profile list` lists all profile names and takes no profile selector. Every other `profile` subcommand accepts `--profile <NAME>`. For `init`, `enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, `reset-window-state`, `reset-mpp-state`, `halt`, and `resume`, supply exactly one positional `<NAME>` or `--profile <NAME>`. These commands require an explicit selection. `reset-mpp-state` requires `--acknowledge`; the other profile verbs have no confirmation flag.
 
 The name itself becomes a path component and is validated before any path is built — charset, length, no leading `-`, and no Windows reserved device name. The rules and the recovery path for a file that already carries a refused name are in [Profile names](../profiles.md#profile-names).
 
@@ -109,6 +109,8 @@ URL fields (`rpc_url`, `secondary_rpc_url`, `oracle_provider_url`) are printed a
 Read-only. Loads the named profile (applying any environment-variable overlays) and prints its resolved configuration as a JSON envelope. Keyring entry references appear as opaque `{service, account}` objects; the secret material they name is never read or printed. Provider records print in full, including `credential` references and `placement`; the credential value is never read.
 
 - `<NAME>` (positional) or `--profile <NAME>` — the profile to display. Supply exactly one; supplying both, or neither, is a usage error.
+
+The result also carries the profile's halt state: `halted`, `halted_at`, and `halt_reason` from the halt marker (see [`profile halt`](#profile-halt-name---reason-reason)). A marker that exists but cannot be read shows `halted: true`, null `halted_at` and `halt_reason`, and a `halt_marker_error` that says why.
 
 Exits `1` with `validation.profile_not_found` when the profile does not exist. A mainnet file without `rpc_url` exits with `validation.mainnet_rpc_url_required`. An invalid provider attestation exits with `validation.provider_attestation_invalid`; correct the named field in the profile file. An endpoint URL that breaks the endpoint rule (see [Loader source order](../profiles.md#loader-source-order)), an unsupported schema version, or another unreadable file exits with `validation.config_invalid`.
 
@@ -422,6 +424,67 @@ Verified version 1 MPP state is adopted automatically on open and records
 `mpp_state_adopted`, so an upgrade keeps its replay history. A profile whose
 state key was minted but which never stored a charge has no history to adopt
 and refuses with a missing anchor; resetting it discards nothing.
+
+### `profile halt <NAME> [--reason <REASON>]`
+
+```bash
+stellar-agent profile halt default --reason "agent sent unexpected payments"
+```
+
+State-changing (writes the halt marker and one audit row; no network). The emergency stop: every action on the profile that signs or submits, and every MCP tool that is not read-only, refuses until `profile resume` runs. Operator-only.
+
+- `<NAME>` (positional) or `--profile <NAME>`: the profile to halt. Supply exactly one.
+- `--reason <REASON>`: optional, recorded in the marker, the refusal message, and the audit row. A blank reason refuses with `validation.reason_empty`; a reason over 128 characters or holding a control character refuses with `validation.reason_invalid`. Both refusals change nothing.
+- `--output <FORMAT>`: `json` (default) or `table`.
+
+The command loads the profile first. A profile that does not load refuses with the profile's load or reconciliation code and writes no marker; the reason is examined only after the profile loads. It then writes `profiles/<name>.halt` in the data directory: a TOML file holding `halted_at` (RFC 3339 UTC, whole seconds) and the `reason`, written to a temporary file and renamed into place. Halting a halted profile rewrites the marker with the new time and reason. A marker write failure refuses with `io.halt_marker`.
+
+While the marker exists, these refuse with `profile.halted` and exit `1`, before they read a signer and before any network request:
+
+- `pay` and `claim` (each except `--build-only`), `accounts create` in both its sponsored and its Friendbot mode, `accounts deploy-c`, `trustline`, `trade`, `vault deposit`, `vault withdraw`, `mpp charge authorize`, and `pool init`;
+- `smart-account multicall`, `execute`, the `rules` and `signers` subcommands that change on-chain state, `migrate-verifier` (except `--dry-run`), the four `deploy-*` commands, and `timelock schedule`, `cancel`, and `execute`;
+- every MCP tool that is not read-only, from the server's next call on (see [Emergency stop](../mcp.md#emergency-stop)).
+
+The CLI verbs that only record or reconcile local state, `mpp receipt record`, `mpp settlement reconcile`, `mpp state prune`, and `tx status`, sign and submit nothing and stay usable for the operator.
+
+```text
+profile "default" is halted since 2026-10-31T12:00:00Z: agent sent unexpected payments; run "stellar-agent profile resume --profile default" to lift it
+```
+
+Read-only commands, `profile show`, `audit verify`, the operator ceremonies (`profile sign-policy` and the `enroll-*` and `rotate-*` subcommands), and the approval surfaces (`approve`, `approve serve`, and the remote approver) keep working, so the operator can inspect the profile and replace its keys while it is halted. A marker that exists but cannot be read, such as a directory at its path, a file without read permission, or malformed or oversized content, refuses the same verbs and tools with `profile.halt_unreadable` until it is readable again. `profile resume` refuses it too, so the operator repairs the file or removes the marker path by hand.
+
+The `profile_halted` audit row records the profile, `halted_at`, and the reason. The marker is written first, so the halt is in effect even when the row cannot be written. The result's `audit_row` field reports where the row went: `written`, `queued` when a running MCP server or `approve serve` inbox holds the audit writer and the row waits in the audit outbox, or `not_written` with the cause in the log.
+
+```json
+{"ok":true,"data":{"profile":"default","halted":true,"halted_at":"2026-10-31T12:00:00Z","reason":"agent sent unexpected payments","audit_row":"written"},"request_id":"..."}
+```
+
+The marker carries no signature. Anyone who can write the data directory can remove it, and `profile resume` does exactly that. The halt stops an agent that misbehaves; it does not defend against a compromised host account.
+
+### `profile resume <NAME>`
+
+```bash
+stellar-agent profile resume default
+```
+
+State-changing (removes the halt marker and writes one audit row; no network). Operator-only.
+
+- `<NAME>` (positional) or `--profile <NAME>`: the profile to resume. Supply exactly one.
+- `--output <FORMAT>`: `json` (default) or `table`.
+
+The command loads the profile first, like `profile halt`. On a halted profile it then runs three steps in order:
+
+1. It reads the marker. A marker that cannot be read, such as a directory at the marker path, refuses with `profile.halt_unreadable` and writes no row.
+2. It appends the `profile_resumed` row through the audit writer or the outbox. A row that cannot be appended refuses with its audit code and leaves the marker in place.
+3. It removes the marker. A removal failure refuses with `io.halt_marker`; the marker stays, the profile stays halted, and the message tells the operator to fix the file and run `profile resume` again.
+
+The marker is removed only after a committed row, so a resume that took effect is always recorded, and no agent action passes the halt check while the row is pending. A `profile_resumed` row records that the command ran; the marker file decides the state. Exit code `1` means the profile is still halted. A removal failure in step 3, or an append in step 2 that reports an error after its row landed, leaves a `profile_resumed` row on a profile that stays halted. A running MCP server serves its next call normally; it needs no restart.
+
+Resuming a profile that is not halted exits `0` with `halted: false` and `was_halted: false`. Its row is written when the audit writer is available and reported as `not_written` otherwise.
+
+```json
+{"ok":true,"data":{"profile":"default","halted":false,"was_halted":true,"audit_row":"written"},"request_id":"..."}
+```
 
 ## `credentials`
 
@@ -745,7 +808,7 @@ Profile and ownership pre-checks carry their own codes.
 
 On Unix, the command refuses to verify a log whose parent directory is owned by a different user, since such a directory could be used to substitute log files or sidecars. It exits `0` when the chain is intact and `1` on any integrity violation (a broken chain, a rotation gap, an HMAC mismatch, a missing sidecar, an unparseable line, or a tip-anchor mismatch), a path-contract failure, or an I/O error.
 
-`outbox_pending` counts the consent rows queued in the audit outbox beside the log (`<LOG_PATH>.outbox`) and not yet drained into it, read without taking the outbox lock. Queued rows sit outside the tip anchor until a draining writer appends them. A torn outbox adds an `outbox_torn_tail` warning and unparseable lines add `outbox_unparseable`. An unreadable outbox adds `outbox_unreadable` and omits `outbox_pending`, since no count is known. None of them changes the chain verdict.
+`outbox_pending` counts the consent, halt, and resume rows queued in the audit outbox beside the log (`<LOG_PATH>.outbox`) and not yet drained into it, read without taking the outbox lock. Queued rows sit outside the tip anchor until a draining writer appends them. A torn outbox adds an `outbox_torn_tail` warning and unparseable lines add `outbox_unparseable`. An unreadable outbox adds `outbox_unreadable` and omits `outbox_pending`, since no count is known. None of them changes the chain verdict.
 
 ```bash
 stellar-agent audit verify ~/.local/share/stellar-agent/audit/default.jsonl --profile default
@@ -773,7 +836,7 @@ A flag the matrix does not require is ignored. The binding is checked before the
 
 With the required flags, the command replays the whole log first, so a log whose own chain is broken is refused rather than blessed. It writes the current tip as the anchor, bumps the current path's re-anchor counter held in the keyring once, and appends the rows, each carrying that count. `rollback_acknowledged` names the superseded anchor. `binding_changed` names the anchor of the log path the previous binding named, or none when the record was unreadable. The rows are permanent: the log carries its own record that a rollback or a binding change was accepted. The new binding is stored last, so a run that stops earlier leaves the refusal in place, and an absent binding is recorded after a rollback repair. The envelope lists the conditions acknowledged and how the recorded binding compared.
 
-Queued consent rows follow the repair rows and are counted in `outbox_drained`. A drain refusal leaves the repair in force and exits `0`. It omits `outbox_drained`, since every queued row stays queued, and lists the refusal under `warnings`: `audit.outbox_unusable`, `audit.outbox_busy`, or the condition an append refused on, such as `audit.io_error`.
+Queued consent, halt, and resume rows follow the repair rows and are counted in `outbox_drained`. A drain refusal leaves the repair in force and exits `0`. It omits `outbox_drained`, since every queued row stays queued, and lists the refusal under `warnings`: `audit.outbox_unusable`, `audit.outbox_busy`, or the condition an append refused on, such as `audit.io_error`.
 
 The command takes the audit writer's exclusive lock. Stop an MCP server that holds this profile's writer before a rollback repair. See [Key-rotation subcommands](#key-rotation-subcommands) for acquisition and replacement eviction. A binding change needs no stop: a server running the edited profile refuses before it opens the new path, so it holds no lock there. A server still running the old profile refuses after the acknowledgement until it restarts.
 

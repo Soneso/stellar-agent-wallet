@@ -3246,7 +3246,7 @@ pub enum WriterError {
     #[error(
         "audit.outbox_busy: the audit outbox lock stayed held for {} ms; another \
          process is appending to or draining the outbox",
-        super::outbox::OUTBOX_LOCK_WAIT.as_millis()
+        super::outbox::outbox_lock_wait().as_millis()
     )]
     OutboxBusy,
 

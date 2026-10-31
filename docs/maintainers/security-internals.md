@@ -328,6 +328,98 @@ Each profile command that writes long-lived key material to the keyring records 
 
 `rotate-audit-key` takes the audit writer's exclusive sidecar lock first and holds it throughout. No other process can append or rotate while the per-file sidecars are being rewritten. The MCP server acquires its audit writer when an operation needs it, such as a commit preflight before signing. MCP balance reads do not acquire it. Under V1, payment simulations can reconcile overdue reservations, acquire the writer, and write settlement audit rows. The registry normally caches the writer and holds its lock until process exit. A replaced-file refusal during acquisition marks the cached writer for eviction. After callers release it, the next acquisition drops it and checks the file at the path against the anchor. While the server holds the writer, rotation refuses with `audit.writer_locked`, even if the operation that acquired it later fails. The envelope carries that code in its detail, as the `approval.*` and `counterparty.*` lock codes do. Acquiring the writer also runs the tip-anchor check before the key is touched, so a rolled-back log is refused with the profile's key left alone. It then (1) persists the new key, (2) appends the `keyring_key_written` row, (3) reconciles the tip anchor and drains the audit outbox, and (4) re-signs every per-file chain-root sidecar with the new key. Re-signing last is what covers a row that happened to open a new file: its chain root is brought onto the new key by the same pass. A drained consent row that opens a new file is covered by the same pass. The re-sign pass reads the replacement key from the keyring after persistence.
 
+## Emergency stop
+
+`stellar-agent profile halt` writes `<data_root>/profiles/<name>.halt`, and both
+binaries refuse an agent action while it exists. The module is
+`stellar_agent_core::profile::halt`.
+
+### Marker read
+
+`read_halt` returns `Ok(None)` only for a missing file. Every other outcome is
+an error, and every caller refuses on an error: a directory or another
+non-file at the path, a permission failure, a file over 4096 bytes, content
+that is not UTF-8, TOML that does not parse or carries an unknown key, a
+`halted_at` that is not an RFC 3339 UTC timestamp in whole seconds, and a
+reason that breaks the reason rule. The stop therefore fails closed:
+`profile.halted` for a valid marker, `profile.halt_unreadable` for any other
+marker, and `profile.halt_unreadable` when the data root cannot be determined.
+The read is bounded, and the handle closes before the content is parsed.
+
+### Marker write and removal
+
+`write_halt` writes a temporary file in the `profiles` directory, syncs it, and
+renames it over the marker. `clear_halt` removes the file and treats a missing
+file as success. Neither keeps a handle open past the call, so on Windows a
+concurrent reader never blocks a rename or a removal, and a reader sees the old
+marker or the new one.
+
+### Check points
+
+- **MCP server.** `call_tool` checks the marker before it dispatches to any
+  tool handler. The check applies unless the tool's descriptor is read-only on
+  both axes: `read_only_hint` is true and `value_kind` is `ReadOnly`. A tool
+  without a descriptor is checked. `stellar_toolset_invoke` is read-only on
+  both axes, so it checks again, against the descriptor of the tool its action
+  routes to, right after it sanitizes the action name. Each call that is not
+  read-only reads the marker once. The check runs before the policy gate, the window-store reload,
+  the reconcile pass, the keyring, and the network reads that some commit
+  tools make before their gate. The marker is read on every such call and
+  the profile is not reloaded, so a halt written while the server runs refuses the
+  next call, and a call that passed the check runs to completion.
+- **CLI.** Each verb that signs or submits checks the marker right after it
+  loads its profile, before its network context, keyring, policy engine,
+  signer, and first request. The check is not inside the signer constructors:
+  they are shared with the MCP server, which would then read the marker twice
+  per call, and several verbs make RPC requests before they build a signer.
+  `tests/cli/profile_halt.rs` runs one invocation per check site on a halted
+  profile with no signer secret and a connection counter as its endpoints, so
+  each site is shown to refuse before any signer read or request.
+  `tests/cli/halt_check_discipline.rs` holds the rule for new code: every
+  production file that calls a signer constructor also calls the check, and
+  every write verb of `smart-account rules` and `smart-account signers` calls
+  it. `pay --build-only`, `claim --build-only` and
+  `smart-account migrate-verifier --dry-run` build no signer and skip the
+  check. `accounts create` checks before it splits into its sponsored and its
+  Friendbot mode. The `accounts deploy-c` and `deploy-*` dry runs
+  resolve the deployer key and are checked.
+
+The approval surfaces (`approve`, the loopback inbox, the remote approver), the
+key ceremonies (`profile sign-policy`, `enroll-*`, `rotate-*`), and read-only
+commands do not check the marker, so the operator can repair a halted profile.
+Nor do the CLI verbs that only record or reconcile local state
+(`mpp receipt record`, `mpp settlement reconcile`, `mpp state prune`,
+`tx status`): they sign and submit nothing, while their MCP counterparts are
+not read-only and refuse.
+
+### Audit rows
+
+`profile halt` writes the marker, then a `profile_halted` row carrying the
+profile, `halted_at`, and the bounded reason. The row is best effort: a halt
+must never wait on, or fail because of, the audit log, and the result reports
+`audit_row: not_written` when the append fails. `profile resume` on a halted
+profile reads the marker, appends the `profile_resumed` row strictly, and only
+then removes the marker. A marker that cannot be read refuses with
+`profile.halt_unreadable` and writes no row. A row that cannot be appended
+refuses and leaves the marker in place. A marker that cannot be removed after
+the row refuses with `io.halt_marker` and leaves the profile halted. The
+marker is therefore never absent before the row is committed: no agent call
+passes the halt check during the append, and a resume that took effect is
+always recorded. A `profile_resumed` row records that the command ran, and the
+marker file decides the state, so a removal failure, or an append that reports
+an error after its row landed, leaves a row on a profile that stays halted.
+Resuming a profile that is not halted writes its row best effort. Both commands write through the operator-row sink of
+`stellar-agent approve`: the keyed writer of their own process, or the audit
+outbox when a draining MCP server or `approve serve` inbox holds the log. A
+refused action writes no row of its own.
+
+### Trust boundary
+
+The marker carries no MAC. A process that can write the data directory can
+create or delete it, as it can replace the profile files beside it. The halt is
+an operator control against an agent that misbehaves through the wallet's
+tools; it is not a defence against a compromised host account.
+
 ## Wallet unlock lifecycle
 
 The unlock window holds a 32-byte signing seed in pinned, zeroize-on-drop memory for a bounded TTL. The CLI secret-env transaction path copies the seed into an unpinned, zeroize-on-drop `SoftwareSigningKey` and disposes the window before signing. `profile sign-policy` signs while the window is open. MCP keyring signers never enter it. The lifecycle manager is `Wallet` in `crates/stellar-agent-core/src/wallet/lifecycle.rs`; the locked seed holder is `LockedSeed` in `wallet/mlock.rs`.

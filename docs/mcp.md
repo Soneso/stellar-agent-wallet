@@ -190,6 +190,45 @@ flag is also surfaced as non-secret metadata on the
 `mcp-resource://profiles/<name>` resource so a client can read whether the MCP
 surface is enabled for that profile.
 
+### Emergency stop
+
+`mcp_disabled` takes effect at the next start. To stop an agent on a running
+server, the operator runs `stellar-agent profile halt <name>` (see
+[`profile halt`](cli-reference/profile-and-governance.md#profile-halt-name---reason-reason)).
+The server reads the profile's halt marker at the start of every tool call
+that is not read-only, so the halt takes effect on the next call without a
+restart. A call that passed
+the check before the halt was written runs to completion.
+
+While the profile is halted, every tool whose descriptor is not read-only
+refuses with `profile.halted` before any keyring access, policy evaluation,
+store reload, or network request. The refusal is a business error envelope; its
+message names the halt time, the operator's reason, and the resume command.
+Besides the signing and submitting tools, the refused set holds the simulate
+steps (`stellar_pay`, `stellar_create_account`, `stellar_trustline`,
+`stellar_claim`, `stellar_rule_create`), `stellar_mpp_charge_prepare`,
+`stellar_mpp_record_receipt`, `stellar_mpp_reconcile_transaction`,
+`stellar_transaction_status`, `stellar_friendbot`, and
+`stellar_sep24_interactive_url`. `stellar_toolset_invoke` applies the check to
+the tool its action routes to, so a signing action refuses and a read-only
+action answers.
+
+These tools keep answering: `stellar_balances`, `stellar_fee_stats`,
+`stellar_dex_quote`, `stellar_rules_list`, `stellar_rules_get`,
+`stellar_sep43_get_address`, `stellar_sep43_get_network`,
+`stellar_sep47_discover`, `stellar_sep48_preview_invocation`,
+`stellar_sep53_verify_message`, `stellar_sep6_deposit_info`,
+`stellar_sep7_parse_uri`, `stellar_x402_parse_receipt`,
+`stellar_mpp_authorization_status`, and `stellar_toolset_list`. The resources
+stay readable, and `mcp-resource://profiles/<name>` reports `halted` and
+`halted_at`.
+
+A marker that exists but cannot be read refuses the same tools with
+`profile.halt_unreadable`, so the stop fails closed. The resource then reports
+`halted: true` with a null `halted_at`. `stellar-agent profile resume <name>`
+refuses such a marker too, so the operator repairs the file or removes the
+marker path by hand. Once the marker is gone, the next call is served normally.
+
 ## Configuring an MCP client
 
 Most MCP clients are configured with a JSON stanza that names a command to spawn
@@ -227,8 +266,9 @@ The server exposes three MCP resources. None contains a secret.
 
 - `mcp-resource://usage.md`: tool usage documentation.
 - `mcp-resource://profiles/<name>`: non-secret profile metadata (chain id, the RPC
-  endpoint as scheme, host, and port, network passphrase, `mcp_disabled`, and
-  the cross-check threshold in stroops).
+  endpoint as scheme, host, and port, network passphrase, `mcp_disabled`,
+  `halted` and `halted_at` from the [halt marker](#emergency-stop), and the
+  cross-check threshold in stroops).
   An agent passing this resource's `rpc_url` to `stellar_fee_stats` passes an
   authority-only URL; the allowlisted hosts have no path, so the call behaves
   the same.

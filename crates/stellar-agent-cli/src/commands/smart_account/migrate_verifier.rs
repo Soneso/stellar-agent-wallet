@@ -401,6 +401,13 @@ pub async fn run(args: &MigrateVerifierArgs) -> i32 {
             return emit_error(&e, &request_id);
         }
     };
+    // Halt check: before the signer and any submit. A dry run reads chain state
+    // only and builds no signer, so it stays available while halted.
+    if !args.dry_run
+        && let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved_profile.name)
+    {
+        return emit_error(&e, &request_id);
+    }
     let context = match network_context_for_command(
         &profile,
         &resolved_profile.name,

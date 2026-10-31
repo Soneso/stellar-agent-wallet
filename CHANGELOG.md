@@ -139,6 +139,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the rehearsal workflow that reads a secret or the workflow token,
   top-level keys and job IDs included. It also refuses a double quote
   outside a single-quoted string in such an expression.
+- `stellar-agent profile halt <NAME> [--reason <REASON>]` stops the agent
+  actions on a profile that sign or submit, and `stellar-agent profile resume
+  <NAME>` lifts the stop. The halt writes `profiles/<name>.halt` in the data
+  directory. While it exists, the MCP server refuses every tool that is not
+  read-only with `profile.halted`, from the next call of a running server,
+  before any keyring access, policy evaluation, store reload, or network
+  request. The CLI verbs that sign or submit, and `accounts create` in its
+  Friendbot mode, refuse the same way before they read a signer or send a
+  request. A marker that cannot be read refuses with `profile.halt_unreadable`.
+  Read-only tools and commands, the resources, `profile sign-policy`, the
+  `enroll-*` and `rotate-*` subcommands, the approval surfaces, and the CLI
+  verbs that only record or reconcile local state (`mpp receipt record`,
+  `mpp settlement reconcile`, `mpp state prune`, `tx status`) keep working.
+- `profile halt` and `profile resume` write the audit kinds `profile_halted`
+  and `profile_resumed`, and queue them in the audit outbox while a running MCP
+  server or `approve serve` inbox holds the log. An older binary cannot replay
+  or verify a log holding either row. `profile resume` reads the marker,
+  commits its row, and only then removes the marker, so a resume that took
+  effect is always recorded. On a halted profile, a marker that cannot be
+  read, a row that cannot be written, or a marker that cannot be removed exits
+  `1` and leaves the profile halted.
+- `profile show` reports `halted`, `halted_at`, and `halt_reason`, plus
+  `halt_marker_error` for a marker that cannot be read. The
+  `mcp-resource://profiles/<name>` resource reports `halted` and `halted_at`.
+- New wire codes `profile.halted`, `profile.halt_unreadable`,
+  `validation.reason_invalid`, and `io.halt_marker`.
+- `stellar_agent_core::profile::halt` reads, writes, and clears the halt
+  marker and maps its state to a refusal. `ValidationError` gains
+  `ProfileHalted` and `ProfileHaltUnreadable`, `IoSource` gains `HaltMarker`,
+  and `EventKind` gains `ProfileHalted` and `ProfileResumed`; all four enums
+  are non-exhaustive. `AuditEntry::new_profile_halted` and
+  `AuditEntry::new_profile_resumed` construct the rows.
 
 ### Changed
 

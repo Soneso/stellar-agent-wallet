@@ -986,9 +986,11 @@ fn verify_single_file(ctx: VerifySingleFileContext<'_>) -> Result<SingleFileResu
             | EventKind::MppStateAdopted { .. }
             | EventKind::MppStateReset { .. }
             | EventKind::PolicyWindowStateReset { .. }
+            | EventKind::ProfileHalted { .. }
+            | EventKind::ProfileResumed { .. }
             | EventKind::AuditTipAnchored { .. } => {
-                // Value-action, key-write, window-state-reset, and tip-anchor
-                // forensic rows. No rotation-handoff tracking needed; the
+                // Value-action, key-write, window-state-reset, halt, and
+                // tip-anchor forensic rows. No rotation-handoff tracking needed; the
                 // hash-chain is maintained by the surrounding hash check.
             }
             EventKind::AuditRotationHandoff { next_file_name } => {
@@ -1107,21 +1109,53 @@ fn parse_audit_timestamp_ms(ts: &str) -> Result<u64, String> {
     {
         return Err("timestamp must match YYYY-MM-DDTHH:MM:SS.mmmZ".to_owned());
     }
+    let seconds = parse_utc_date_time_seconds(ts)?;
+    let millis = parse_decimal_u32(ts, 20, 23, "millisecond")?;
+    if millis > 999 {
+        return Err("timestamp component out of supported range".to_owned());
+    }
+    Ok(seconds * 1_000 + u64::from(millis))
+}
 
+/// Parses an RFC 3339 UTC timestamp with second precision,
+/// `YYYY-MM-DDTHH:MM:SSZ`, to Unix seconds.
+///
+/// The calendar and range rules are those of the audit row timestamp: a year
+/// from 1970 to 2099, a day that exists in its month, `hour <= 23`,
+/// `minute <= 59`, and `second <= 59`.
+///
+/// # Errors
+///
+/// A message naming the first rule `ts` breaks.
+pub(crate) fn parse_rfc3339_utc_seconds(ts: &str) -> Result<u64, String> {
+    if ts.len() != 20
+        || ts.as_bytes().get(4) != Some(&b'-')
+        || ts.as_bytes().get(7) != Some(&b'-')
+        || ts.as_bytes().get(10) != Some(&b'T')
+        || ts.as_bytes().get(13) != Some(&b':')
+        || ts.as_bytes().get(16) != Some(&b':')
+        || ts.as_bytes().get(19) != Some(&b'Z')
+    {
+        return Err("timestamp must match YYYY-MM-DDTHH:MM:SSZ".to_owned());
+    }
+    parse_utc_date_time_seconds(ts)
+}
+
+/// Parses the `YYYY-MM-DDTHH:MM:SS` prefix of a timestamp whose separators
+/// the caller has checked, to Unix seconds.
+fn parse_utc_date_time_seconds(ts: &str) -> Result<u64, String> {
     let year = parse_decimal_u32(ts, 0, 4, "year")?;
     let month = parse_decimal_u32(ts, 5, 7, "month")?;
     let day = parse_decimal_u32(ts, 8, 10, "day")?;
     let hour = parse_decimal_u32(ts, 11, 13, "hour")?;
     let minute = parse_decimal_u32(ts, 14, 16, "minute")?;
     let second = parse_decimal_u32(ts, 17, 19, "second")?;
-    let millis = parse_decimal_u32(ts, 20, 23, "millisecond")?;
 
     if !(1970..=2099).contains(&year)
         || !(1..=12).contains(&month)
         || hour > 23
         || minute > 59
         || second > 59
-        || millis > 999
     {
         return Err("timestamp component out of supported range".to_owned());
     }
@@ -1139,9 +1173,7 @@ fn parse_audit_timestamp_ms(ts: &str) -> Result<u64, String> {
     }
     days += u64::from(day - 1);
 
-    let seconds =
-        days * 86_400 + u64::from(hour) * 3_600 + u64::from(minute) * 60 + u64::from(second);
-    Ok(seconds * 1_000 + u64::from(millis))
+    Ok(days * 86_400 + u64::from(hour) * 3_600 + u64::from(minute) * 60 + u64::from(second))
 }
 
 fn parse_decimal_u32(ts: &str, start: usize, end: usize, field: &str) -> Result<u32, String> {
@@ -1611,6 +1643,8 @@ mod tests {
             EventKind::PolicyWindowStateReset { .. } => "policy_window_state_reset",
             EventKind::MppStateAdopted { .. } => "mpp_state_adopted",
             EventKind::MppStateReset { .. } => "mpp_state_reset",
+            EventKind::ProfileHalted { .. } => "profile_halted",
+            EventKind::ProfileResumed { .. } => "profile_resumed",
             EventKind::AuditTipAnchored { .. } => "audit_tip_anchored",
         }
     }
@@ -2173,6 +2207,15 @@ mod tests {
                 profile: "default".to_owned(),
                 reason: "corrupt-file recovery".to_owned(),
             },
+            EventKind::ProfileHalted {
+                profile: "default".to_owned(),
+                halted_at: "2026-10-31T12:00:00Z".to_owned(),
+                reason: Some("incident".to_owned()),
+            },
+            EventKind::ProfileResumed {
+                profile: "default".to_owned(),
+                was_halted: true,
+            },
             EventKind::AuditTipAnchored {
                 reason: TipAnchorReason::Adopted,
                 entry_count: 12,
@@ -2436,6 +2479,8 @@ mod tests {
                 "mpp_state_adopted",
                 "mpp_state_reset",
                 "policy_window_state_reset",
+                "profile_halted",
+                "profile_resumed",
                 "audit_tip_anchored",
             ]
         );
@@ -4043,6 +4088,52 @@ mod tests {
             999,
             "millisecond component must be added verbatim"
         );
+    }
+
+    // ── parse_rfc3339_utc_seconds ─────────────────────────────────────────────
+
+    #[test]
+    fn rfc3339_seconds_matches_the_audit_parser_at_second_precision() {
+        assert_eq!(
+            parse_rfc3339_utc_seconds("2026-05-06T00:00:00Z").unwrap() * 1_000,
+            parse_audit_timestamp_ms("2026-05-06T00:00:00.000Z").unwrap()
+        );
+        assert_eq!(
+            parse_rfc3339_utc_seconds("1970-01-01T00:00:00Z").unwrap(),
+            0
+        );
+        assert!(parse_rfc3339_utc_seconds("2024-02-29T23:59:59Z").is_ok());
+        assert!(parse_rfc3339_utc_seconds("2000-02-29T00:00:00Z").is_ok());
+    }
+
+    #[test]
+    fn rfc3339_seconds_rejects_days_the_month_does_not_have() {
+        for ts in [
+            "2026-02-29T12:00:00Z",
+            "2026-04-31T12:00:00Z",
+            "2026-06-31T00:00:00Z",
+            "2026-01-00T00:00:00Z",
+        ] {
+            let err = parse_rfc3339_utc_seconds(ts).unwrap_err();
+            assert!(err.contains("day out of range"), "{ts}: {err}");
+        }
+    }
+
+    #[test]
+    fn rfc3339_seconds_rejects_other_shapes_and_ranges() {
+        for ts in [
+            "2026-05-06T00:00:00.000Z",
+            "2026-05-06T00:00:00+01:00",
+            "2026-05-06 00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-05-06T24:00:00Z",
+            "2026-05-06T00:00:60Z",
+            "1969-12-31T23:59:59Z",
+            "2100-01-01T00:00:00Z",
+            "202X-05-06T00:00:00Z",
+        ] {
+            assert!(parse_rfc3339_utc_seconds(ts).is_err(), "{ts}");
+        }
     }
 
     // ── days_in_month coverage ────────────────────────────────────────────────
