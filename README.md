@@ -28,6 +28,8 @@ as `stellar agent` inside the Stellar CLI, and the `stellar-agent-mcp` MCP stdio
 server. Both sit on a policy engine, an operator-approval spine, and a
 tamper-evident hash-chained audit log, so an autonomous agent can act while a
 human keeps control of what it is allowed to do.
+The [architecture](docs/architecture.md) shows the trust boundaries, payment flow,
+and key custody.
 
 New to the project? [What is the Stellar Agent Wallet?](docs/onboarding.md)
 is the non-technical tour: what it is, what an agent can do with it, and how a
@@ -193,15 +195,16 @@ the binary:
 stellar-agent-mcp
 ```
 
-The server registers its tool families (payments, DeFi, SEP protocols, toolsets)
-behind the same policy engine, approval spine, and audit log as the CLI. See
-[docs/mcp.md](docs/mcp.md) for client configuration and the tool catalogue.
+The server exposes payments, DeFi, SEP protocols, x402, MPP, smart-account rules,
+transaction status, and toolsets. Payment handlers use the shared policy, approval,
+and audit libraries. See the [MCP reference](docs/mcp.md) for configuration and
+tool calls.
 
 ## Documentation
 
 - [Documentation for users](docs/README.md#for-users): getting started,
-  concepts, the CLI and MCP references, protocols, toolsets, profiles, and
-  remote approval.
+  concepts, architecture, the CLI and MCP references, protocols, toolsets,
+  profiles, and remote approval.
 - [Documentation for maintainers](docs/README.md#for-maintainers):
   architecture, building and testing, security internals, and the review
   checklist.
