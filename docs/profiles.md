@@ -735,6 +735,7 @@ or a criterion is part of it.
 The loader refuses unknown keys, while `profile sign-policy` refuses them
 in the policy body and replaces the `[signature]` table whole, dropping any
 extra key in that table.
+A policy without a `[signature]` table refuses with `policy.policy_file_parse_failed` and a message naming `stellar-agent profile sign-policy --profile <name>` for the selected profile.
 
 Then run `stellar-agent profile sign-policy --profile default --secret-env WALLET_OWNER_SK`
 with the enrolled owner's seed in `WALLET_OWNER_SK`.

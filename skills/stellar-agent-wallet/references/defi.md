@@ -288,7 +288,11 @@ stellar-agent pool list --profile default
 ### `stellar-agent pool status`
 
 Report pool utilisation: `initialised`, `pool_size`, `free`, and `in_flight`.
-Read-only and makes no network call: it reads the persisted `PoolConfig` only.
+Read-only and makes no network call: it reads the pool config, initialization
+checkpoint, and the checkpoint's receipt when present. While initialization is
+pending, `initialised` is false and `pending` carries `channel_count`,
+`seed_ready`, `tx_hash`, and `resume_with`. An ambiguous receipt adds `clear_with`,
+the operator acknowledgment command required before resume can retry.
 In a fresh CLI invocation `free == pool_size` and `in_flight == 0`. The result
 carries a note that `free` and `in_flight` reflect the persisted config of a
 stateless process, not a live allocator; do not read `in_flight: 0` as "safe to
@@ -308,7 +312,8 @@ stellar-agent pool status --profile default
 | Code | Raised by | Meaning |
 |---|---|---|
 | `policy.deny.<code>` | all signing verbs | Operator policy denied the operation |
-| `policy.approval_required` | all signing verbs | Policy requires approval; these verbs have no approval path on the CLI or MCP |
+| `policy.approval_required` | CLI signing verbs | Policy requires approval; these verbs have no CLI approval path |
+| `policy.approval_required_unsupported` | MCP DeFi signing tools | Policy requires approval; these tools have no approval flow |
 | `policy.engine_unavailable` | all signing verbs | Policy engine configured but unbuildable (fail-closed) |
 | `oracle.staleness_exceeded` | none | Oracle price older than the staleness threshold |
 | `vault.upgradable_refused` | `vault` | Vault `upgradable:true`; not overridden |

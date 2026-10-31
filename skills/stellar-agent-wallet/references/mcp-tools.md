@@ -4,8 +4,8 @@ The `stellar-agent-mcp` server exposes the Stellar Agent Wallet to an MCP client
 over JSON-RPC on stdio. It presents wallet capabilities as MCP tools so an AI
 assistant can read account state and submit Stellar transactions through the same
 policy engine, operator-approval spine, and tamper-evident audit log that back
-the `stellar-agent` CLI. A tool call is gated exactly as the equivalent CLI
-command is.
+the `stellar-agent` CLI. Each surface determines its policy coverage: MCP
+balance reads evaluate policy, while CLI balance reads fetch account state directly.
 
 This file documents the tool catalog: each tool name, purpose, gating, and key
 arguments. For the gating model itself (policy engines, the mainnet-write gate,
@@ -32,6 +32,8 @@ approval attestations) see `./approvals-and-audit.md` and `./security.md`.
   not a safe path component, or when the profile file's keyring coordinates name
   a different profile than the one selected — the state a profile file copied
   from another profile is in.
+
+At startup, an invalid V1 owner signature prompts policy review and re-signing, while a policy body error, such as an unknown key, gets no signing hint.
 
 A generic client stanza points the spawn command at the binary:
 
@@ -60,6 +62,7 @@ Every tool returns the same JSON envelope, with five success-path exceptions:
 `stellar_dex_quote`, `stellar_defindex_vault_deposit`, and
 `stellar_defindex_vault_withdraw` return a bare object carrying a `status`
 field on success; their business errors use the envelope.
+`stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw`, `stellar_x402_create_payment`, and `stellar_x402_authenticated_payment` preserve signer and keyring failures with their original `auth.*` codes and messages.
 
 Some refusals use the JSON-RPC error channel instead of the envelope: invalid
 arguments, a `chain_id` mismatch, and the toolset capability refusals.
@@ -251,6 +254,8 @@ their own `x402.*` code before the `chain_id` check.
 | `stellar_balances` | Fetch native XLM balance and optional trustline balances. | Read-only. |
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
 | `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it, by its receipt or, when the receipt is missing, by its reservation. Returns `record` (with `release_code`) and `reservation`. | Reads the chain, writes the wallet's record; moves no value and never sends. The way out of `submission.tx_timeout`. |
+
+`stellar_transaction_status` refuses with `submission.record_unavailable` when the spending-window file cannot be read.
 
 ### stellar_pay (simulate) arguments
 
@@ -811,11 +816,13 @@ An action the policy engine sized no value for takes no reservation at all, so
 `reservation_open` is `false` for it from the start and says nothing about
 whether the submission settled.
 
-`submission.record_unavailable` is different: the wallet could not write the
-record, or the audit log's tip anchor does not cover its pending row (the
-message then carries `audit.tip_anchor_unavailable`), so nothing was sent. The
-condition is local and the submission is safe to retry once the operator has
-fixed it.
+`submission.record_unavailable` before submission means the wallet could not
+record the send or anchor its pending audit row, so that attempt sent nothing.
+An anchor failure carries `audit.tip_anchor_unavailable` in the message.
+The same code can report a receipt or spending-window failure during recovery
+of an existing submission. After the operator repairs that failure, call
+`stellar_transaction_status` again; do not rebuild or resubmit the transaction.
+Retry submission only when the failure is known to precede the send.
 
 `policy.approval_consumed` means the approval you presented was already spent on
 a submission. Check that transaction's status before asking for the action

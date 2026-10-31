@@ -136,6 +136,7 @@ All write and signing paths are testnet-only in this alpha. Every signing comman
   - A refused challenge or token answer reports the HTTP method, the status, and the web-auth endpoint's host. The wallet does not read the answer body.
   - A stellar.toml syntax error reports its line and column.
   - The token must be a compact JWT of at most 8192 bytes, with base64url characters in every segment. Any other token refuses.
+  - A mismatched SEP-10 challenge passphrase is reported as the public testnet or mainnet passphrase, or `<other network>`, including for multibyte input.
 
 ## Machine Payments Protocol (MPP)
 

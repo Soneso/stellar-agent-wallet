@@ -103,7 +103,7 @@ message. `request_id` correlates the call with the audit log. Every business
 error uses this envelope — domain refusals, policy and approval outcomes,
 keyring and signing failures, submit failures, and the SEP-53, x402, and DeFi
 verbs alike; codes follow a `<family>.<reason>` convention (for example
-`x402.insufficient_funds`, `sep53.sign_failed`, `nonce.mint_failed`).
+`sep53.sign_failed`, `nonce.mint_failed`).
 
 The six `stellar_sep43_*` tools use this same standard envelope: the SEP-43
 raw protocol payload (`{ address }`, `{ signedTxXdr, signerAddress }`, and so
@@ -253,19 +253,20 @@ operator attests to the exact definition you proposed. See
 
 ## 6. DeFi
 
-`stellar_dex_trade`
-(Soroswap swaps) with `stellar_dex_quote`, and `stellar_defindex_vault_deposit` /
-`_withdraw` each run behind an ordered trust gate (WASM-hash pin, oracle/venue
-allowlist, slippage re-verify) and submit through the smart account. See
-`references/defi.md`.
+`stellar_dex_trade` checks the venue allowlist, router WASM pin, and a fresh
+quote against the slippage bound before submitting through the smart account.
+`stellar_dex_quote` reads a quote without that gate.
+`stellar_defindex_vault_deposit` and `stellar_defindex_vault_withdraw` check the
+vault WASM pin, upgrade flag, roles, and assets before submission.
+Neither path evaluates oracle staleness. See `references/defi.md`.
 
 ## 7. Protocols
 
-SEP-7 URI parsing, SEP-10/45 web auth, SEP-24/6 transfer hand-off, SEP-43 wallet
-signing (`get_address`, `get_network`, `sign_transaction`, `sign_auth_entry`,
+SEP-7 URI parsing, SEP-10 web auth through the x402 identity gate, SEP-24/6
+transfer hand-off, SEP-43 wallet signing (`get_address`, `get_network`, `sign_transaction`, `sign_auth_entry`,
 `sign_message`, `sign_and_submit_transaction`), SEP-47/48 contract discovery, and
-SEP-53 signed messages. The wallet also signs x402 v2 Exact Stellar agent
-payments and testnet sponsored MPP charges. MPP uses
+SEP-53 signed messages. SEP-45 is library-only, with no CLI command or MCP tool.
+The wallet also signs x402 v2 Exact Stellar agent payments and testnet sponsored MPP charges. MPP uses
 `stellar_mpp_charge_prepare` then one `stellar_mpp_charge_commit`; the trusted
 host sends the returned credential to the exact bound HTTP or MCP request. See
 `references/protocols.md`.
@@ -373,8 +374,8 @@ Do not treat a successful `stellar_pay` as a sent payment.
 
 **The envelope is authoritative at commit.** `stellar_pay_commit` decodes the
 destination, asset, and amount from `envelope_xdr`, not from re-supplied
-arguments. Re-submitting a commit with altered amounts to get under a limit does
-not work and is recorded in the audit log.
+arguments. Altered commits are refused. An early policy or envelope-divergence
+refusal returns before submission audit recording.
 
 **Each build mints a fresh single-use nonce.** You cannot reuse a `nonce` across
 commits or call commit twice with the same one. Build again to get a new nonce.

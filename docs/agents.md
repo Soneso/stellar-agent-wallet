@@ -7,9 +7,9 @@ and how operator approval fits in.
 An agent talks to the wallet through the **MCP server** (`stellar-agent-mcp`),
 which exposes wallet capabilities as MCP tools over stdio. A human **operator**
 uses the `stellar-agent` CLI for setup, key custody, and approvals. The two share
-one policy engine, approval spine, and audit log, so a tool call is gated exactly
-as the equivalent CLI command is. The CLI is the source of truth; the MCP surface
-is a transport over the same dispatch path.
+policy-engine, approval, and audit primitives. Their handlers determine policy
+coverage: MCP balance reads pass through policy, while CLI balance reads fetch
+account state directly.
 
 For the full tool catalog see [mcp.md](mcp.md); for the guardrail model see
 [concepts.md](concepts.md); for signed toolsets see [toolsets.md](toolsets.md).

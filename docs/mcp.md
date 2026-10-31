@@ -7,10 +7,15 @@ assistant can read account state and submit Stellar transactions through the
 same policy engine, operator-approval spine, and tamper-evident audit log that
 back the `stellar-agent` CLI.
 
-A tool call is gated exactly as the equivalent CLI command is. The policy
-engine evaluates every call to `Allow`, `Deny`, or `RequireApproval`; signing
-verbs route through the approval spine; and the mainnet-write gate refuses every
-write on `stellar:mainnet`. See [Concepts](./concepts.md) for the shared
+MCP and CLI handlers share policy primitives but determine their own gate
+coverage. MCP balance reads evaluate policy; CLI balance reads do not.
+The policy engine evaluates gated calls to `Allow`, `Deny`, or `RequireApproval`.
+`stellar_dex_quote`, `stellar_mpp_record_receipt`,
+`stellar_mpp_reconcile_transaction`, and `stellar_mpp_authorization_status`
+run without a policy verdict. Tools with an approval flow wait for operator
+consent; single-shot signing tools refuse `RequireApproval` with
+`policy.approval_required_unsupported`. The structural mainnet-write gate refuses
+every write on `stellar:mainnet`. See [Concepts](./concepts.md) for the shared
 guardrail model.
 
 ## What it is
@@ -500,6 +505,8 @@ claimable-balance record. It does not re-read the source trustline at commit.
 | `stellar_friendbot` | Fund a testnet account via Friendbot. | Mutating, testnet-only; gated. |
 | `stellar_transaction_status` | Reconcile one submitted transaction against the chain and settle the wallet's record of it, by its receipt or, when the receipt is missing, by its reservation. The way out of `submission.tx_timeout`. Reports `record.release_code` for a release on chain evidence and `reservation` for a hold that remains. | Reads the chain and writes the wallet's record; moves no value and never sends. Not annotated read-only. |
 
+`stellar_transaction_status` refuses with `submission.record_unavailable` when the spending-window file cannot be read.
+
 A v1 rule set that names tools explicitly must include `stellar_transaction_status` to settle timed-out submissions through that server; the server logs `policy.transaction_status_unmatched` at startup when neither that tool nor `*` appears.
 
 ### Trustline
@@ -723,6 +730,7 @@ the process exit non-zero before serving any request. A missing keyring backend
 alone is not fatal: the server starts, and signing tools fail closed at call
 time. A profile that selects the V1 engine still fails to start without one,
 because building the engine reads the owner key.
+At startup, an invalid V1 owner signature prompts policy review and re-signing, while a policy body error, such as an unknown key, gets no signing hint.
 
 Business errors return `{ "ok": false, "error": { "code", "message" }, "request_id" }`
 with `is_error` set; consumers branch on `error.code`. Every tool, including
@@ -736,6 +744,8 @@ arguments, a `chain_id` mismatch, and the toolset capability refusals.
 `toolset.first_invoke_approval_required` is a JSON-RPC error too, and its error
 data carries the `approval_nonce`. See
 [The result envelope](agents.md#the-result-envelope).
+
+`stellar_dex_trade`, `stellar_defindex_vault_deposit`, `stellar_defindex_vault_withdraw`, `stellar_x402_create_payment`, and `stellar_x402_authenticated_payment` preserve signer and keyring failures with their original `auth.*` codes and messages.
 
 Three codes carry an additional `details` object on the error:
 `submission.tx_timeout`, `submission.tx_already_submitted` and
