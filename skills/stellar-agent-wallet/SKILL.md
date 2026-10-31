@@ -282,6 +282,15 @@ with `stellar_toolset_list` and `stellar_toolset_invoke`. See
 
 ## 9. Safety model
 
+- The operator can halt a profile with `stellar-agent profile halt <name>`, the
+  emergency stop. While it is halted, every tool that is not read-only refuses
+  with `profile.halted`, and so does every CLI verb that signs or submits. The
+  halt takes effect on the next call of a running server. A halt marker that
+  cannot be read refuses with `profile.halt_unreadable`. Read-only tools and
+  the resources keep answering, and `mcp-resource://profiles/<name>` reports
+  `halted`. On either code, stop and report the message to the operator. Never
+  run `stellar-agent profile resume` yourself, and do not retry under another
+  profile; the halt is the operator's decision.
 - On `stellar:mainnet` read-only tools work. The DeFi, sign-and-submit, commit,
   and rule-commit tools refuse a mainnet profile at handler entry with
   `network.mainnet_write_forbidden`, before the policy gate and any RPC call. A

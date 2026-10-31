@@ -972,6 +972,10 @@ async fn add_run(args: &AddArgs) -> i32 {
             return emit_error(&e, &request_id);
         }
     };
+    // Halt check: before the keyring, the signer and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name) {
+        return emit_error(&e, &request_id);
+    }
     let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
     {
         Ok(context) => context,
@@ -1528,6 +1532,10 @@ async fn remove_run(args: &RemoveArgs) -> i32 {
             return emit_error(&e, &request_id);
         }
     };
+    // Halt check: before the keyring, the signer and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name) {
+        return emit_error(&e, &request_id);
+    }
     let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
     {
         Ok(context) => context,
@@ -1667,6 +1675,10 @@ async fn set_threshold_run(args: &SetThresholdArgs) -> i32 {
             return emit_error(&e, &request_id);
         }
     };
+    // Halt check: before the keyring, the signer and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name) {
+        return emit_error(&e, &request_id);
+    }
     let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
     {
         Ok(context) => context,
@@ -1802,6 +1814,10 @@ async fn set_weighted_threshold_run(args: &SetWeightedThresholdArgs) -> i32 {
             return emit_error(&e, &request_id);
         }
     };
+    // Halt check: before the keyring, the signer and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name) {
+        return emit_error(&e, &request_id);
+    }
     let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
     {
         Ok(context) => context,
@@ -1999,6 +2015,10 @@ async fn set_signer_weight_run(args: &SetSignerWeightArgs) -> i32 {
             return emit_error(&e, &request_id);
         }
     };
+    // Halt check: before the keyring, the signer and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name) {
+        return emit_error(&e, &request_id);
+    }
     let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
     {
         Ok(context) => context,
@@ -2183,6 +2203,10 @@ async fn batch_add_run(args: &BatchAddArgs) -> i32 {
             return emit_error(&e, &request_id);
         }
     };
+    // Halt check: before the keyring, the signer and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name) {
+        return emit_error(&e, &request_id);
+    }
     let context = match network_context_for_command(&profile, &resolved.name, args.endpoint_flags())
     {
         Ok(context) => context,

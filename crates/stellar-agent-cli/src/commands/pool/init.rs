@@ -345,6 +345,9 @@ where
     let _lock = lifecycle_lock(&resolved.name)?;
     let profile = load_profile_reconciled(&resolved)
         .map_err(|error| error.to_wallet_error(&resolved.name))?;
+    // Halt check: ahead of the fresh and the resume branch, the keyring store,
+    // the seed, the signer and any RPC request.
+    stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name)?;
     let context = NetworkContext::from_profile(&profile);
     // Structural mainnet refusal: ahead of the pending-initialization branch,
     // the keyring store, the seed, the signer, and any RPC request, on both the

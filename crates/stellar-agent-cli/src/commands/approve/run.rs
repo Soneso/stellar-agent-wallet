@@ -58,7 +58,6 @@
 
 use std::io::{BufRead as _, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use clap::Args;
@@ -73,15 +72,13 @@ use stellar_agent_core::approval::{
     attest_and_persist, load_and_validate_entry, load_attestation_key, open_with_retry,
     process_uid_for_attestation, try_decode_spending_limit_params,
 };
-use stellar_agent_core::audit_log::writer::{AuditWriter, WriterError};
-use stellar_agent_core::audit_log::{AuditOutbox, drain_lock_is_held};
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{ApprovalFailure, ValidationError, WalletError};
 use stellar_agent_core::profile::schema::Profile;
 use stellar_agent_core::timefmt;
 use stellar_agent_network::keyring::init_platform_keyring_store;
 
-use crate::commands::value_audit::{KeyedAcquireError, acquire_keyed_audit_writer};
+use crate::commands::value_audit::{OperatorRowSink, acquire_operator_row_sink};
 use crate::common::profile_access::{load_profile_reconciled, profile_access_envelope};
 use crate::common::{render, resolve_profile_name};
 
@@ -313,71 +310,11 @@ enum ConsentRowOutcome {
     Queued,
 }
 
-/// The sink `approve --id` writes its consent row through.
-enum ConsentSink {
-    /// This process holds the keyed writer.
-    Writer(Arc<Mutex<AuditWriter>>),
-    /// A draining writer in another process holds the log.
-    Outbox(AuditOutbox),
-}
-
-/// Returns `true` when an acquisition failure is contention for the writer's
-/// sidecar lock, the one failure `approve --id` retries and then resolves by
-/// probing the drain lock.
-///
-/// Classified by the typed error. Every other failure, `audit.outbox_busy`
-/// included, refuses the approval.
-fn is_sidecar_contention(error: &KeyedAcquireError) -> bool {
-    matches!(error, KeyedAcquireError::Writer(WriterError::FileLocked))
-}
-
-/// Acquires the sink for the consent row.
-///
-/// The keyed writer is acquired through the registry, which drains any queued
-/// rows at open. Sidecar contention is retried with the approval store's
-/// bounded retry, since a CLI command's startup advisory holds the lock
-/// briefly. Still locked, one `try_lock` on the drain lock, released at once,
-/// decides. Held means a draining writer owns the log, and the row is queued.
-/// Free means the holder does not drain, and the approval is refused with
-/// `audit.writer_locked`.
-///
-/// # Errors
-///
-/// The [`WalletError`] for any acquisition failure other than contention, and
-/// for contention with a holder that does not drain.
-fn acquire_consent_sink(profile: &Profile, profile_name: &str) -> Result<ConsentSink, WalletError> {
-    let mut attempt = 0_u32;
-    let contention = loop {
-        attempt += 1;
-        match acquire_keyed_audit_writer(
-            profile,
-            profile_name,
-            stellar_agent_core::audit_log::BindingCheck::Enforce,
-        ) {
-            Ok(writer) => return Ok(ConsentSink::Writer(writer)),
-            Err(error) if is_sidecar_contention(&error) => {
-                if attempt >= DEFAULT_RETRY_ATTEMPTS {
-                    break error;
-                }
-                std::thread::sleep(DEFAULT_RETRY_BACKOFF);
-            }
-            Err(error) => return Err(error.into_wallet_error(profile_name)),
-        }
-    };
-    match drain_lock_is_held(&profile.audit_log_path) {
-        Ok(true) => Ok(ConsentSink::Outbox(AuditOutbox::for_log(
-            &profile.audit_log_path,
-        ))),
-        Ok(false) => Err(contention.into_wallet_error(profile_name)),
-        Err(error) => Err(KeyedAcquireError::Writer(error).into_wallet_error(profile_name)),
-    }
-}
-
 /// Writes the consent row and persists the approval, in that order.
 ///
 /// # Errors
 ///
-/// The acquisition refusal of [`acquire_consent_sink`], a poisoned writer
+/// The acquisition refusal of [`acquire_operator_row_sink`], a poisoned writer
 /// mutex, or any error of `attest_and_persist`. Nothing is persisted when the
 /// row is refused.
 fn approve_with_consent_row(
@@ -406,8 +343,8 @@ fn approve_with_consent_row(
         .map(|_grant| ())
         .map_err(|e| e.to_string())
     };
-    match acquire_consent_sink(profile, profile_name)? {
-        ConsentSink::Writer(writer) => {
+    match acquire_operator_row_sink(profile, profile_name)? {
+        OperatorRowSink::Writer(writer) => {
             let mut guard = writer.lock().map_err(|_| {
                 tracing::error!(
                     event_kind = "approval_attested",
@@ -429,7 +366,7 @@ fn approve_with_consent_row(
             )?;
             Ok((attestation, ConsentRowOutcome::Written))
         }
-        ConsentSink::Outbox(outbox) => {
+        OperatorRowSink::Outbox(outbox) => {
             let attestation = attest_and_persist(
                 store,
                 entry,
@@ -957,6 +894,8 @@ mod tests {
         ApprovalError, ApprovalKind, DEFAULT_TTL_MS, PendingApproval, PendingApprovalStore,
         attestation::compute_attestation, decode_sha256_hex, process_uid_for_attestation,
     };
+    use stellar_agent_core::audit_log::writer::AuditWriter;
+    use stellar_agent_core::audit_log::{AuditOutbox, drain_lock_is_held};
     use stellar_agent_core::error::AuthError;
     use stellar_agent_core::profile::schema::KeyringEntryRef;
     use stellar_agent_test_support::{StellarAgentHomeGuard, keyring_mock};
@@ -1893,42 +1832,6 @@ mod tests {
     ) -> Result<(Option<String>, ConsentRowOutcome), WalletError> {
         let context = stellar_agent_core::approval::ApprovalContext::from_profile(name, profile);
         approve_with_consent_row(store, entry, &[0x42; 32], &context, profile)
-    }
-
-    /// The acquisition is classified by the typed writer error: only sidecar
-    /// contention is retried and resolved through the drain lock.
-    #[test]
-    fn only_sidecar_contention_is_resolved_through_the_drain_lock() {
-        assert!(is_sidecar_contention(&KeyedAcquireError::Writer(
-            WriterError::FileLocked
-        )));
-        for refused in [
-            KeyedAcquireError::KeyUnavailable,
-            KeyedAcquireError::BindingChanged(WalletError::Validation(
-                stellar_agent_core::error::ValidationError::AuditLogBindingChanged {
-                    profile: "p".to_owned(),
-                },
-            )),
-            KeyedAcquireError::Writer(WriterError::OutboxBusy),
-            KeyedAcquireError::Writer(WriterError::OutboxUnusable {
-                line: 1,
-                column: 1,
-                reason: "invalid JSON",
-            }),
-            KeyedAcquireError::Writer(WriterError::TipAnchorMismatch {
-                expected_count: 2,
-                expected_offset: 10,
-                actual_len: 0,
-                reason: "file is shorter than the anchor",
-            }),
-            KeyedAcquireError::Writer(WriterError::Io(std::io::Error::other("disk"))),
-            KeyedAcquireError::Writer(WriterError::TipAnchorUnavailable),
-            KeyedAcquireError::Writer(WriterError::HmacKeyMismatch {
-                profile_name: "p".to_owned(),
-            }),
-        ] {
-            assert!(!is_sidecar_contention(&refused), "{refused:?}");
-        }
     }
 
     #[test]

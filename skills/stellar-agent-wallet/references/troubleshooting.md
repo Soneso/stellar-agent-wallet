@@ -312,6 +312,23 @@ profile, a duplicate tool registration) also cause the process to exit non-zero
 before serving any request. These are operator-side environment problems, not
 agent-recoverable at runtime.
 
+## Halted-profile codes
+
+The operator stops a profile with `stellar-agent profile halt <name>` and lifts
+the stop with `stellar-agent profile resume <name>`. Both binaries read the
+profile's halt marker before every action that signs or submits, and the MCP
+server reads it before every tool that is not read-only. The CLI verbs that
+only record or reconcile local state (`mpp receipt record`,
+`mpp settlement reconcile`, `mpp state prune`, `tx status`) stay usable for
+the operator. A running MCP server applies a halt from its next call.
+
+| Code | Meaning | Agent action |
+|---|---|---|
+| `profile.halted` | The operator halted the profile. The message names the halt time, the operator's reason, and the resume command. The call was refused before any keyring access, signer read, policy evaluation, or network request; nothing was signed, reserved, or sent. Read-only tools, the resources, and read-only commands keep working. | Stop. Do not retry, do not switch to another profile, and never run `profile resume` yourself. Report the message to the operator; the halt stays until the operator lifts it. |
+| `profile.halt_unreadable` | A halt marker exists but cannot be read: a directory at its path, a file without read permission, or malformed or oversized content. The stop fails closed, so the same actions refuse as under `profile.halted`. | Stop and report the message to the operator. `stellar-agent profile resume <name>` refuses this marker too, so the operator repairs the file or removes the marker path by hand. |
+| `validation.reason_invalid` | `profile halt --reason` holds more than 128 characters or a control character. Nothing changed. A blank reason reports `validation.reason_empty`. | Operator-side: shorten the reason or drop the control character. |
+| `io.halt_marker` | `profile halt` could not write the marker, and the profile's halt state is what it was before the command. Or `profile resume` recorded its `profile_resumed` row and could not remove the marker, and the profile stays halted. | Operator-side: check the permissions of the data directory's `profiles` folder, then run the command again. |
+
 ## Keyring codes
 
 | Code | Meaning | Agent action |
@@ -489,6 +506,8 @@ query authorization status and reconcile any known server transaction.
 - Hard policy refusal (`policy.deny.*`, `policy.engine_required`,
   `network.mainnet_write_forbidden`): do not retry; only the operator can change
   policy or network posture.
+- Halted profile (`profile.halted`, `profile.halt_unreadable`): stop and report
+  the message to the operator; only the operator resumes the profile.
 - Network binding refusal (`network.endpoint_network_mismatch`,
   `network.endpoint_identity_unavailable`, `network.rpc_credential_refused`,
   `network.unsupported_protocol_version`, `network.envelope_signed_for_mainnet`,

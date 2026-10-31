@@ -27,6 +27,27 @@ approval attestations) see `./approvals-and-audit.md` and `./security.md`.
   the crate's package version (`0.1.0-alpha.12` as of this release).
 - The server refuses to start if the active profile sets `mcp_disabled = true`,
   exiting non-zero with `mcp.disabled_per_profile`.
+- The operator can halt a running server's profile with
+  `stellar-agent profile halt <name>`. The server reads the halt marker at the
+  start of every tool call that is not read-only. While it exists, every tool that is not read-only
+  refuses with `profile.halted` before any keyring access, policy evaluation,
+  store reload, or network request; the halt takes effect on the next call.
+  The refused set includes the simulate steps (`stellar_pay`,
+  `stellar_create_account`, `stellar_trustline`, `stellar_claim`,
+  `stellar_rule_create`), `stellar_mpp_charge_prepare`,
+  `stellar_mpp_record_receipt`, `stellar_mpp_reconcile_transaction`,
+  `stellar_transaction_status`, `stellar_friendbot`, and
+  `stellar_sep24_interactive_url`. `stellar_toolset_invoke` refuses a signing
+  action and answers a read-only one. The read-only tools (`stellar_balances`,
+  `stellar_fee_stats`, `stellar_dex_quote`, `stellar_rules_list`,
+  `stellar_rules_get`, `stellar_sep43_get_address`, `stellar_sep43_get_network`,
+  `stellar_sep47_discover`, `stellar_sep48_preview_invocation`,
+  `stellar_sep53_verify_message`, `stellar_sep6_deposit_info`,
+  `stellar_sep7_parse_uri`, `stellar_x402_parse_receipt`,
+  `stellar_mpp_authorization_status`, `stellar_toolset_list`) and the resources
+  keep answering. An unreadable marker refuses with `profile.halt_unreadable`.
+  Neither code is retryable by the agent: stop and report the message to the
+  operator, who lifts the halt with `stellar-agent profile resume <name>`.
 - The server refuses to start when a named profile has no profile file (it is
   never replaced by the first-run testnet fallback), when the profile name is
   not a safe path component, or when the profile file's keyring coordinates name
@@ -70,7 +91,8 @@ arguments, a `chain_id` mismatch, and the toolset capability refusals.
 data carries the `approval_nonce`.
 
 On failure, `ok` is `false` and `error` carries a stable wire `code` (such as
-`policy.deny.<reason>` or `policy.approval_required`) instead of `data`. Branch on
+`policy.deny.<reason>`, `policy.approval_required`, or `profile.halted`) instead
+of `data`. Branch on
 `ok`; use `code` for control flow, not the human message. The `request_id`
 correlates the call with the audit log. Raw argument values are never written to
 the audit log; only key names and lifecycle metadata are recorded. Typed value events retain each leg's amount, asset, and redacted destination.
@@ -188,8 +210,9 @@ BEFORE the signer is loaded or anything is submitted, refusing
 [Approvals and audit](approvals-and-audit.md#fail-closed-on-an-unminted-audit-key)).
 `stellar_mpp_charge_commit` runs the same acquisition after it reads its
 approval and before it loads the signing key. Each acquisition also drains
-consent rows `stellar-agent approve` queued while the server held the audit
-writer, so they are in the log before the key loads. The SEP-43 sign-only pair
+the rows `stellar-agent approve`, `profile halt`, and `profile resume` queued
+while the server held the audit writer, so they are in the log before the key
+loads. The SEP-43 sign-only pair
 (`stellar_sep43_sign_transaction`, `stellar_sep43_sign_auth_entry`) runs the
 same pre-flight and, once the signature is produced, records an
 `opaque_payload_signed` audit row (redacted payload digest and redacted
@@ -834,7 +857,8 @@ The server exposes three MCP resources; none contains a secret.
 
 - `mcp-resource://usage.md` — tool usage documentation.
 - `mcp-resource://profiles/<name>`: non-secret profile metadata (chain id, the RPC
-  endpoint as scheme, host, and port, network passphrase, `mcp_disabled`, and
-  the cross-check threshold in stroops).
+  endpoint as scheme, host, and port, network passphrase, `mcp_disabled`,
+  `halted` and `halted_at` from the halt marker, and the cross-check threshold
+  in stroops).
 - `mcp-resource://accounts/<G>` — public account directory for the enrolled
   accounts across all configured profiles.

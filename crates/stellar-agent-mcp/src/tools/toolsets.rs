@@ -202,6 +202,9 @@ impl WalletServer {
     ///
     /// # Errors
     ///
+    /// - `profile.halted` or `profile.halt_unreadable`: the action names a tool
+    ///   that is not read-only and the profile is halted, answered before any
+    ///   other step.
     /// - `network.mainnet_write_forbidden`: a signing action (sign-payment or
     ///   rule-create) on a mainnet profile, answered as a business envelope
     ///   before any gate, approval, key access, or RPC request.
@@ -235,6 +238,15 @@ impl WalletServer {
 
         let toolset_name = stellar_agent_toolsets::sanitise_display(&args.toolset, 64);
         let action = stellar_agent_toolsets::sanitise_display(&args.action, 128);
+
+        // Halt check for the routed tool. This tool's own descriptor is
+        // read-only, so the server's entry check passes it; the action names
+        // the tool whose handler runs in this process, and that tool's
+        // descriptor decides, before any gate, store, keyring, or network
+        // access of the call.
+        if let Some(refusal) = self.halt_refusal_for_tool(&action) {
+            return Ok(refusal);
+        }
 
         // Structural mainnet refusal for the signing actions (sign-payment and
         // rule-create), keyed on the server's profile context. It precedes the

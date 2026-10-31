@@ -76,7 +76,7 @@ const ALLOW_SET: &[AllowEntry] = &[];
 /// visibility class (say every `pub(crate)` field) would still clear a loose
 /// floor and report a clean tree. Adding or removing a profile-selecting
 /// subcommand is expected to move this number — update it in the same commit.
-const PROFILE_FIELDS: usize = 77;
+const PROFILE_FIELDS: usize = 79;
 
 /// Call-site shapes that substitute the literal `"default"` for an absent
 /// profile name, discarding the environment variable the flag left `None` for.
@@ -666,6 +666,8 @@ fn from_flag_is_confined_to_explicit_argument_boundaries() {
         ("commands/profile/rotate_policy_state_key.rs", "run"),
         ("commands/profile/reset_window_state.rs", "run"),
         ("commands/profile/reset_mpp_state.rs", "run"),
+        ("commands/profile/halt.rs", "run_halt"),
+        ("commands/profile/halt.rs", "run_resume"),
         ("commands/fees/stats.rs", "resolve_rpc_url"),
         ("commands/mpp.rs", "prune"),
         ("commands/audit/verify.rs", "resolve_profile_inputs"),

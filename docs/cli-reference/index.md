@@ -129,6 +129,12 @@ Read-only inspection remains available. `tx` signs nothing, and `pool init` is t
 
 The submit layer applies the same refusal in a fixed order. A declared mainnet network passphrase is refused first, then an `--rpc-url` matching a known mainnet host; both cost zero RPC calls. The envelope is then decoded locally, so a malformed or legacy V0 envelope is refused without a round trip.
 
+## Halted-profile refusal
+
+`stellar-agent profile halt <name>` stops the agent actions on a profile that sign or submit until `stellar-agent profile resume <name>` runs. While the profile is halted, every verb that signs or submits refuses with `profile.halted` and exits `1`. The refusal comes after the profile load and before the verb reads a signer or sends a request. The message names the halt time, the operator's reason, and the resume command. A halt marker that exists but cannot be read refuses the same verbs with `profile.halt_unreadable`.
+
+Read-only commands, `pay --build-only`, `claim --build-only`, `smart-account migrate-verifier --dry-run`, the operator ceremonies (`profile sign-policy`, `profile enroll-*`, `profile rotate-*`), `approve`, and the verbs that only record or reconcile local state (`mpp receipt record`, `mpp settlement reconcile`, `mpp state prune`, `tx status`) keep working. [`profile halt`](profile-and-governance.md#profile-halt-name---reason-reason) lists every refused verb.
+
 ## Endpoint identity before the first read
 
 `pay`, `claim`, sponsored `accounts create`, `trustline`, and `pool init` read the values they sign or gate on through one client per run. That client asks the endpoint which network it serves before its first such request. The requests it precedes include the fee statistics, the account sequence, the claim entry, the policy views, and the reservation reconcile. Every later read and the send use the same client, and the submit layer checks it again before the send. The refusals carry the codes of [Submit-layer network binding](#submit-layer-network-binding).
@@ -216,7 +222,7 @@ Before dispatching any command, the CLI runs a local-only startup advisory: it s
 | `vault` | Deposit into or withdraw from a DeFindex vault via the smart-account (signing). | [defi-and-pool](defi-and-pool.md) |
 | `trade` | Swap tokens via the Soroswap router-direct path via the smart-account (signing). | [defi-and-pool](defi-and-pool.md) |
 | `pool` | Initialise and inspect a channel-account pool for parallel transaction submission. | [defi-and-pool](defi-and-pool.md) |
-| `profile` | Create, list, show, migrate, and rotate the keyring-backed keys of a profile. | [profile-and-governance](profile-and-governance.md) |
+| `profile` | Create, list, show, migrate, and rotate the keyring-backed keys of a profile; halt and resume its agent actions. | [profile-and-governance](profile-and-governance.md) |
 | `credentials` | Register, list, show, and delete WebAuthn passkeys in the per-profile registry. | [profile-and-governance](profile-and-governance.md) |
 | `approve` | Read a pending approval, prompt y/n, and record the HMAC attestation; garbage-collect expired approvals. | [profile-and-governance](profile-and-governance.md) |
 | `audit` | Walk and verify the integrity of a hash-chained audit log, and repair its tip anchor. | [profile-and-governance](profile-and-governance.md) |

@@ -20,6 +20,8 @@ mod cross_check_witness;
 mod endpoint_identity_ordering;
 #[path = "cli/fresh_v1_ceremony.rs"]
 mod fresh_v1_ceremony;
+#[path = "cli/halt_check_discipline.rs"]
+mod halt_check_discipline;
 #[path = "cli/keyring_classification_discipline.rs"]
 mod keyring_classification_discipline;
 #[path = "cli/mpp_authorize_preview_parity.rs"]
@@ -38,6 +40,8 @@ mod pool_init_lifecycle;
 mod profile_env_var_resolution;
 #[path = "cli/profile_flag_discipline.rs"]
 mod profile_flag_discipline;
+#[path = "cli/profile_halt.rs"]
+mod profile_halt;
 #[path = "cli/profile_init_name_refusals.rs"]
 mod profile_init_name_refusals;
 #[path = "cli/profile_migrate_refusal_codes.rs"]

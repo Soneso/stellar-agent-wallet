@@ -1,5 +1,10 @@
-//! The audit outbox: consent rows queued beside the log while a draining
+//! The audit outbox: operator rows queued beside the log while a draining
 //! writer in another process holds the log's sidecar lock.
+//!
+//! The rows queued here are the consent rows of `stellar-agent approve` and
+//! the halt and resume rows of `stellar-agent profile halt` and
+//! `stellar-agent profile resume`, each queued while a running MCP server or
+//! `approve serve` inbox holds the log.
 //!
 //! # Files
 //!
@@ -69,6 +74,30 @@ use super::writer::{WriterError, basename_lossy_path as basename, sidecar_path};
 /// How long an append or a drain waits for the outbox lock before refusing
 /// with [`WriterError::OutboxBusy`].
 pub const OUTBOX_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Environment variable that replaces [`OUTBOX_LOCK_WAIT`] with its value in
+/// milliseconds.
+///
+/// Compiled only with the `test-helpers` feature, so a release binary always
+/// waits [`OUTBOX_LOCK_WAIT`]. A subprocess test sets it to keep an append
+/// waiting long enough to observe the process during the wait.
+#[cfg(any(test, feature = "test-helpers"))]
+pub const OUTBOX_LOCK_WAIT_ENV: &str = "STELLAR_AGENT_TEST_OUTBOX_LOCK_WAIT_MS";
+
+/// The wait [`lock_outbox`] applies: [`OUTBOX_LOCK_WAIT`], or with the
+/// `test-helpers` feature the value of `STELLAR_AGENT_TEST_OUTBOX_LOCK_WAIT_MS`
+/// when it parses as a whole number of milliseconds.
+#[must_use]
+pub(crate) fn outbox_lock_wait() -> Duration {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Some(millis) = std::env::var(OUTBOX_LOCK_WAIT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(millis);
+    }
+    OUTBOX_LOCK_WAIT
+}
 
 /// Delay between two attempts on the outbox lock.
 pub(crate) const OUTBOX_LOCK_STEP: Duration = Duration::from_millis(20);
@@ -144,19 +173,33 @@ pub(crate) fn acquire_drain_lock(log_path: &Path) -> Result<AuditWriterLock, Wri
     }
 }
 
-/// Takes the outbox lock at `lock_path`, waiting up to [`OUTBOX_LOCK_WAIT`].
+/// Takes the outbox lock at `lock_path`, waiting up to [`outbox_lock_wait`].
+///
+/// The first attempt that finds the lock held emits one debug event, so an
+/// operator can tell a command that waits on another appender from one that
+/// stalls elsewhere.
 ///
 /// # Errors
 ///
 /// [`WriterError::OutboxBusy`] when the lock stays held for the whole wait,
 /// and [`WriterError::Io`] for any other failure.
 pub(crate) fn lock_outbox(lock_path: &Path) -> Result<AuditWriterLock, WriterError> {
-    let deadline = Instant::now() + OUTBOX_LOCK_WAIT;
+    let wait = outbox_lock_wait();
+    let deadline = Instant::now() + wait;
+    let mut waiting = false;
     loop {
         match AuditWriterLock::acquire(lock_path) {
             Err(WriterError::FileLocked) => {
                 if Instant::now() >= deadline {
                     return Err(WriterError::OutboxBusy);
+                }
+                if !waiting {
+                    waiting = true;
+                    tracing::debug!(
+                        lock = %basename(lock_path),
+                        wait_ms = wait.as_millis(),
+                        "audit outbox: the outbox lock is held; waiting for it"
+                    );
                 }
                 std::thread::sleep(OUTBOX_LOCK_STEP);
             }
@@ -165,7 +208,7 @@ pub(crate) fn lock_outbox(lock_path: &Path) -> Result<AuditWriterLock, WriterErr
     }
 }
 
-/// The outbox of one audit log, to which a consent row is appended while a
+/// The outbox of one audit log, to which an operator row is appended while a
 /// draining writer in another process holds the log.
 ///
 /// Holds paths only; every append takes the outbox lock for its own duration.

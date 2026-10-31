@@ -22,6 +22,8 @@ An AI agent calls wallet tools on its own initiative. The model does not assume 
 
 A fifth control addresses a different risk: which tool definitions the agent may load. **Toolsets** package third-party or untrusted tool definitions behind capability isolation: a toolset installs only after publisher-signature and hash verification, and a structural boundary keeps it from reaching a signing tool it was not granted. Where the four controls above constrain each action, toolsets constrain the surface an agent can act through. See [Toolsets](toolsets.md).
 
+A sixth control stops an agent outright. The per-profile **emergency stop**, `stellar-agent profile halt`, refuses every action on the profile that signs or submits until the operator runs `stellar-agent profile resume`, with no server restart and no key or policy change. See [Emergency stop](#emergency-stop).
+
 Two structural rules apply across all surfaces in this alpha. The default network is `stellar:testnet`: a command with no named profile and no `default.toml` runs on the zero-config testnet profile. Every write or signing command refuses `stellar:mainnet` with wire code `network.mainnet_write_forbidden`, except MPP, which refuses with `mpp.network_forbidden`. The transaction and smart-account write commands, `vault deposit`, `vault withdraw`, `trade`, `trustline`, and `pool init` refuse a mainnet profile before any RPC call or signer access. The MCP DeFi, sign-and-submit, commit, and rule-commit tools refuse it at entry, before the policy gate and any RPC request. At the submit layer, a declared mainnet network passphrase and a known mainnet RPC URL are each refused at zero RPC cost. Beyond those two, the submit layer asks the endpoint which network it serves and treats that answer as authoritative. Every signature on the envelope must verify under it, so an envelope signed for one network cannot be relayed onto another. `stellar:mainnet` remains accepted for read-only commands.
 
 ## Two account models
@@ -298,7 +300,8 @@ The event-writing paths include:
   x402 authorization, and MPP authorization, receipt, settlement, and state operations.
 - Operator decisions: approvals and rejections, including remote consent.
 - Key and lifecycle changes: signer/owner enrollment, HMAC-key rotation,
-  state resets, audit recovery, wallet mlock failures, and smart-account governance.
+  state resets, profile halts and resumes, audit recovery, wallet mlock
+  failures, and smart-account governance.
 
 The operation's event and failure path determine when it writes. Some rows
 gate transmission or authorization; post-confirmation row failures can be
@@ -344,6 +347,46 @@ binding still refuses with `audit.log_binding_changed` before signing or submiss
 The SEP-43 sign-only pair (`signTransaction`, `signAuthEntry`) runs the same
 preflight. It writes `opaque_payload_signed` when it produces the signature,
 recording the redacted payload digest and signer. The caller broadcasts externally.
+
+## Emergency stop
+
+`stellar-agent profile halt <name> [--reason <text>]` stops a profile's agent
+at once. It writes a halt marker, `profiles/<name>.halt` in the data directory,
+holding the time of the halt and the reason. While the marker exists, both
+binaries refuse every action that signs or submits, and the MCP server refuses
+every tool that is not read-only:
+
+- The MCP server checks it at the start of every tool call that is not
+  read-only, before any keyring access, policy evaluation, store reload, or
+  network request. A running server needs no restart: the next call refuses.
+  A call that passed the check before the halt completes.
+- Each CLI verb that signs or submits checks it after loading the profile and
+  before reading a signer or sending a request. A verb that passed the check
+  before the halt runs to completion.
+
+Both refuse with `profile.halted`, naming the halt time, the reason, and the
+resume command. A marker that exists but cannot be read refuses with
+`profile.halt_unreadable`: the stop fails closed.
+
+The halt stops new signatures, not the ones the wallet already handed out. A
+SEP-43 sign-only signature, an x402 payment payload, or an MPP credential
+returned before the halt stays valid, and whoever holds it can still broadcast
+it.
+
+The halt leaves the operator's tools working. Read-only tools and commands, the
+profile resource, the key ceremonies (`profile sign-policy`, `profile enroll-*`,
+`profile rotate-*`), and the approval surfaces stay usable, so the operator can
+inspect the damage and replace keys before resuming. The CLI verbs that only
+record or reconcile local state, `mpp receipt record`, `mpp settlement
+reconcile`, `mpp state prune`, and `tx status`, also stay usable for the
+operator. `stellar-agent profile resume <name>` removes the marker. Both commands write audit rows,
+`profile_halted` and `profile_resumed`.
+
+The marker carries no signature. Anyone who can write the data directory can
+remove it, so the halt stops a misbehaving agent and does not defend against a
+compromised host account. `mcp_disabled` in the profile file is the other
+per-profile switch: it refuses the MCP server's start, while the halt also
+covers a running server and the CLI.
 
 ## Smart-account context rules
 
@@ -396,5 +439,6 @@ states. See [Agent payments with MPP](agent-payments.md).
 | Spending-limit policy | A context-rule policy enforcing a rolling-window cap on SEP-41 `transfer` amount, evaluated during authorization on a `CallContract`-scoped rule. |
 | Threshold policy | A context-rule policy requiring at least `N` of the rule's signers to authorize, evaluated by signer COUNT regardless of which specific signers are present. |
 | Weighted-threshold policy | A context-rule policy assigning each signer an independent weight and requiring the sum of the WEIGHTS of the signers present in an authorization to meet a configured threshold. Retuned via `smart-account signers set-weighted-threshold` / `set-signer-weight`: see [Agent delegation](agent-delegation.md#weighted-quorums-for-multiple-agents). |
+| Halt marker | The file `profiles/<name>.halt` that `profile halt` writes and `profile resume` removes. While it exists, every action that signs or submits, and every MCP tool that is not read-only, refuses with `profile.halted`; the CLI verbs that only record or reconcile local state stay usable. See [Emergency stop](#emergency-stop). |
 | First-invoke gate | A one-time gate on a toolset's first use of a signing-adjacent capability; once approved, a time-boxed grant suppresses only that re-prompt. |
 | Per-action payment approval | The payment approval that fires unconditionally on every toolset-routed payment and binds the actual executed envelope. |
