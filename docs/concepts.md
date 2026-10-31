@@ -1,10 +1,10 @@
 # Concepts: the security and governance model
 
-This document explains how the Stellar Agent Wallet lets an autonomous agent transact while keeping the agent inside guardrails it cannot bypass. It covers key custody, the policy engine, the operator-approval spine, the audit log, and smart-account authorization rules. It is conceptual; for command syntax see the [CLI reference](cli-reference/profile-and-governance.md), and for profile fields see [Profiles](profiles.md).
+This document explains how the Stellar Agent Wallet lets an autonomous agent transact over MCP within the wallet's controls. It covers key custody, the policy engine, the operator-approval spine, the audit log, and smart-account authorization rules. It is conceptual; for command syntax see the [CLI reference](cli-reference/profile-and-governance.md), and for profile fields see [Profiles](profiles.md).
 
 ## The problem this model solves
 
-An AI agent calls wallet tools on its own initiative. The model does not assume the agent is correct or honest. Instead, the wallet places fixed controls between every tool call and any network or signing action:
+An AI agent calls wallet tools on its own initiative. The model does not assume the agent is correct or honest. Instead, the wallet places fixed controls between every MCP tool call and any network or signing action:
 
 - A **policy engine** evaluates each gated call to allow, deny, or require approval, before any signature. Reads the decision needs, such as the source account, can run first.
 - Out-of-band **operator approval** is required for the cases the policy engine flags, and the approval is cryptographically bound to the exact transaction that will be signed.
@@ -18,7 +18,7 @@ An AI agent calls wallet tools on its own initiative. The model does not assume 
   attempts keyed audit acquisition and tolerates an unavailable key or writer.
   A changed audit binding still refuses with `audit.log_binding_changed`.
   Synthesis applies when no profile is named and no `default.toml` exists.
-- **Key custody** keeps signing seeds out of the agent's reach. Keyring signing loads a seed per signature into zeroize-on-drop buffers without memory locking. CLI environment-seed signing enters an unlock window; Ledger seeds stay on the device.
+- **Key custody** keeps signing seeds out of the reach of an agent that accesses the wallet over MCP. Keyring signing loads a seed per signature into zeroize-on-drop buffers without memory locking. CLI environment-seed signing enters an unlock window; Ledger seeds stay on the device.
 
 A fifth control addresses a different risk: which tool definitions the agent may load. **Toolsets** package third-party or untrusted tool definitions behind capability isolation: a toolset installs only after publisher-signature and hash verification, and a structural boundary keeps it from reaching a signing tool it was not granted. Where the four controls above constrain each action, toolsets constrain the surface an agent can act through. See [Toolsets](toolsets.md).
 

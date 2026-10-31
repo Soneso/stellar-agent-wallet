@@ -10,10 +10,11 @@ surface that drives the simulate/commit handshake see `./mcp-tools.md`.
 Every gated tool/command invocation is evaluated by the active policy engine
 before any signature. Reads the decision needs, such as the source account, can
 run first. The engine returns Allow, Deny, or RequireApproval.
-A RequireApproval action does not execute on the agent's say-so: it is held in a
-per-profile pending-approval store. For pay, create-account, trustline, and
-claim, simulation records a pending approval when policy requires approval for
-either the simulate tool or its paired commit tool, and returns an
+Two-phase MCP actions hold approval requests in a per-profile pending store.
+Single-shot signing paths refuse approval decisions; see
+[CLI signing coverage](cli-reference.md#signing-and-approval-coverage).
+For MCP pay, create-account, trustline, and claim, simulation records pending
+approval when either tool in the pair requires it. The response returns an
 `approval_nonce`. The wallet owner runs
 `stellar-agent approve --id <nonce> --profile <name>` out-of-band in a trusted
 context, reads a wallet-controlled summary, and consents. The command records an
@@ -30,6 +31,18 @@ MCP balance reads and payment simulations produce no automatic invocation row.
 Under V1, payment simulations can reconcile overdue reservations and write
 settlement audit rows.
 `stellar-agent audit verify` checks the log for tampering.
+
+Use these MCP pairs for agent payments, trustlines, and claims. The CLI serves
+reads, setup, and operator ceremonies. An agent limited to MCP cannot approve
+its own request. A process running as the operator's OS user holds the
+operator's authority; the wallet does not distinguish it from the operator.
+CLI approval checks the local OS identity; it reads consent from standard
+input or `--yes` and does not establish that a human confirmed.
+Same-user processes can read keyring entries on Linux (Secret Service) and
+Windows (Credential Manager). With the `headless-env` backend, any process that
+can read `STELLAR_AGENT_HEADLESS_KEYRING_KEY` can decrypt every entry, on any
+platform. See the
+[trust model](../SKILL.md#overview) for the current limits.
 
 ## Conventions used across these surfaces
 

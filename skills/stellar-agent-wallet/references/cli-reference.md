@@ -1,6 +1,50 @@
 # CLI reference
 
-`stellar-agent` is a self-custodial Stellar wallet for AI agents. It builds, signs, and submits transactions on testnet under a policy engine, an operator-approval spine, and a tamper-evident hash-chained audit log. This file documents the full command surface for an agent driving the CLI. For the MCP tool surface, see `./mcp-tools.md` (ships alongside this file).
+Use MCP tools for agent payments, account creation, trustlines, and claims.
+Their paired commit tools carry the pending-store approval loop; see
+[MCP tools](mcp-tools.md). The CLI serves reads, setup, and operator ceremonies.
+The CLI itself is operator authority. Delegated execution runs through it
+under the on-chain rules of the agent's key.
+
+## Signing and approval coverage
+
+CLI payment and claim commands evaluate policy and refuse approval decisions
+with `policy.approval_required`, directing callers to MCP. Sponsored account
+creation, trustline, trade, and vault commands use the same refusal.
+These commands create no pending policy approval. Use their MCP tools for agent
+actions; DeFi tools also refuse policy approval decisions without a pending loop.
+
+Other CLI signing paths have these checks:
+
+| Signing action | Wallet policy behavior |
+|---|---|
+| Smart-account multicall | Requires V1. Only Allow proceeds; approval refuses with public code `sa.multicall_failed` and audit code `multicall.approval_required`. |
+| Delegated smart-account execution | Bypasses wallet policy; the agent's rule key authorizes the invocation under on-chain context rules. |
+| Smart-account administration | Rule and signer mutations, verifier migration, and timelock writes bypass wallet policy. They require their respective on-chain authority. |
+| Contract deployment | Account, verifier, and policy deployment bypass wallet policy and require a deployer signer. |
+| Channel-pool initialization | Bypasses wallet policy; uses the agent's enrolled MCP signer and derived channel keys to create accounts with sponsored reserves and zero starting balances. |
+
+Rule creation also has an MCP proposal-and-commit pair requiring operator approval.
+DeFi actions have MCP tools; SEP signing and x402 authorization are MCP-only
+signing surfaces. MPP has both CLI and MCP flows.
+
+CLI MPP authorization creates pending approval when its prepare policy requires
+it, returning `mpp.approval_required`. After operator approval, it resumes the
+stored authorization and verifies consent before signing. When only the commit
+rule requires approval, CLI MPP refuses with `mpp.approval_invalid` and creates
+no pending approval entry. MCP prepare records pending approval for either rule.
+CLI trustline clawback opt-in creates separate pending consent after policy
+allows the action.
+Passkey registration creates a pending ceremony entry too.
+Every transaction-signing or submitting verb retains the halt check and mainnet
+refusal, including smart-account governance, deployment, and `pool init`.
+Reads, key, policy, and approval ceremonies, and CLI state recording and
+reconciliation stay usable while halted.
+
+CLI approval checks the local OS identity; it reads consent from standard
+input or `--yes` and does not establish that a human confirmed.
+A process running as the operator's OS user holds the operator's authority.
+MCP alone offers no operator approval tool. See [the safety model](../SKILL.md#9-safety-model).
 
 ## Mainnet profile selection
 
@@ -261,9 +305,13 @@ stellar-agent mpp state prune --profile default --reason-file reason.txt
 
 Each input operation requires exactly one stdin/file source; files must be
 bounded regular non-symlinks. `authorize` returns `mpp.approval_required` when
-operator consent is needed. Approve the returned ID through the normal approval
-surface, then resume with `--approval-id`; no challenge may be supplied on
-resume. Credential output is one-shot and sensitive.
+its prepare rule requires approval. The operator approves the returned ID
+through an approval surface. Resume the stored authorization with `--approval-id`;
+no challenge may be supplied on resume. Approval is verified before signing.
+A commit-only approval requirement refuses with `mpp.approval_invalid` and
+creates no pending approval entry.
+Credential output is one-shot and sensitive. Agents use the paired MPP tools
+described in [MCP tools](mcp-tools.md).
 
 Receipt observation does not prove settlement. Reconcile requires the lowercase
 transaction hash and verifies the exact envelope and payer authorization through

@@ -6,6 +6,15 @@ SEP-5-derived channel-account pool (`pool`). It lists the CLI commands of the
 `stellar-agent` binary and the matching tool names on the `stellar-agent-mcp`
 stdio server.
 
+Agents use the MCP trade and vault tools; the signing CLI examples below are
+operator workflows. Both surfaces evaluate wallet policy and refuse approval
+decisions without creating pending approval. The CLI returns
+`policy.approval_required`; the MCP policy gate returns
+`policy.approval_required_unsupported`.
+Channel-pool initialization is CLI-only operator setup and bypasses wallet
+policy. It retains the halt check and mainnet refusal. See
+[signing coverage](cli-reference.md#signing-and-approval-coverage).
+
 ## Conventions
 
 - **CLI binary:** `stellar-agent`. Under the `stellar-cli` external-binary plugin

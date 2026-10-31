@@ -1,6 +1,6 @@
 ---
 name: stellar-agent-wallet
-description: Operate the Stellar Agent Wallet, a self-custodial Stellar wallet built for AI agents, through its stellar-agent CLI and stellar-agent-mcp MCP server. Use when an agent needs to read Stellar account state, send XLM or asset payments, create accounts, manage trustlines, or claim claimable balances. Also use for OpenZeppelin smart-account governance, DeFi trading/deposits, and SEP, x402, and sponsored MPP charge flows. The wallet provides a local policy engine and an operator-approval gate. Its audit log records transaction submissions, signed authorizations, approvals, and explicit key-management and lifecycle events. MCP balance reads and payment simulations produce no automatic invocation row. Under V1, payment simulations can reconcile overdue reservations and write settlement audit rows. Approval is satisfiable via the CLI, a local web inbox, or a TLS-protected remote-approval surface. Covers the two-phase build-then-commit signing pattern, the simulate-approve-commit handshake, chain_id and the JSON result envelope, and the mainnet write gate. Reach for it when the user mentions the stellar-agent wallet, an AI-agent wallet on Stellar, MCP-driven Stellar payments, or autonomous-agent key custody.
+description: Operate the Stellar Agent Wallet through MCP tools for agent payments, account creation, trustlines, and claims with two-phase operator approval. Use the CLI for reads, setup, and operator ceremonies; CLI signing exceptions have separate policy and on-chain checks. Use when an agent needs Stellar account state, XLM or asset payments, smart-account governance, DeFi, SEP, x402, or sponsored MPP charges. Covers signed policy limits, shell access and approval authority, chain_id, the JSON result envelope, and the mainnet write refusal. The audit log records submissions, signed authorizations, approvals, and explicit key-management and lifecycle events. Approval is available through the operator's CLI, local inbox, or remote approver.
 license: Apache-2.0
 compatibility: Requires the stellar-agent CLI and stellar-agent-mcp server (v0.1.0-alpha.13 public alpha; install from crates.io with a pinned version, for example cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13, or build from source). Targets Stellar testnet (default) and mainnet.
 metadata:
@@ -15,9 +15,9 @@ metadata:
 The Stellar Agent Wallet is a self-custodial Stellar wallet for AI agents. It has
 two surfaces over one shared core:
 
-- **`stellar-agent`** — the CLI. The operator uses it to create profiles, custody
-  keys, approve gated actions, and verify the audit log.
-- **`stellar-agent-mcp`** — a Model Context Protocol server over stdio. An agent
+- **`stellar-agent`** is the CLI for reads, setup, and operator ceremonies.
+  The operator manages keys, approves gated actions, and verifies the audit log.
+- **`stellar-agent-mcp`** is a Model Context Protocol server over stdio. An agent
   drives the wallet by calling its MCP tools.
 
 Both surfaces share the **policy engine**, **operator-approval spine**, and
@@ -25,10 +25,31 @@ Both surfaces share the **policy engine**, **operator-approval spine**, and
 authorizations, approvals, and explicit key-management and lifecycle events.
 MCP balance reads and payment simulations produce no automatic invocation row.
 Under V1, payment simulations can reconcile overdue reservations and write
-settlement audit rows. As an agent, you
-operate through the MCP tools; the human operator holds the keys and grants
-approvals through the CLI. The agent
-never holds key material and never approves its own actions.
+settlement audit rows. Route payments, account creation, trustlines, and claims
+through MCP's paired tools, where the pending-store approval loop exists.
+Leave operator approvals and key ceremonies to the operator.
+
+An MCP-only agent receives no operator approval tool. A process that runs as
+the operator's OS user holds the operator's authority; the wallet does not
+distinguish it from the operator.
+CLI approval checks the local OS identity; it reads consent from standard
+input or `--yes` and does not establish that a human confirmed.
+Shell permission rules are guard rails for a cooperative agent, not a boundary.
+
+For an MCP-only agent, signed limits apply where V1 is evaluated, and approval
+never lifts a cap. Delegated execution runs through the CLI's operator
+authority under the agent key's on-chain rules. Other CLI signing paths have
+separate checks; see
+[CLI signing coverage](references/cli-reference.md#signing-and-approval-coverage).
+Owner key re-enrollment needs no previous seed. The profile's `[policy] engine`
+and `policy_owner_key_id` fields are unsigned. The halt marker has no MAC, and
+`profile reset-window-state` requires no owner signature.
+Same-user processes can read keyring entries on Linux (Secret Service) and
+Windows (Credential Manager). With the `headless-env` backend, any process that
+can read `STELLAR_AGENT_HEADLESS_KEYRING_KEY` can decrypt every entry, on any
+platform. See the
+[shell-agent guide](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/agents.md#coding-agents-with-a-shell)
+for the trust model and Claude Code's three permission modes.
 
 The wallet is self-custodial and runs with no project-operated backend: keys live
 in the host platform keyring, policy is evaluated locally, and nothing is sent to
@@ -210,9 +231,9 @@ handshake:
 3. Re-invoke `stellar_pay_commit` with `approval_nonce` and `approval_attestation`
    added. The wallet verifies the attestation, then signs and submits.
 
-You cannot mint or guess the attestation. Treat `policy.approval_required` as "ask
-the operator to approve, then retry the commit with the attestation" — never as a
-transient error to retry blindly.
+MCP exposes no attestation-minting tool. On `policy.approval_required`, ask the
+operator to approve, then retry the commit with the attestation. Do not invoke
+CLI approval yourself or retry blindly.
 
 MPP prepare records a request when policy requires approval for prepare or
 `stellar_mpp_charge_commit`. Its preview returns the nonce as
