@@ -2,11 +2,12 @@
 //!
 //! # Scope
 //!
-//! These generators cover the **three state-independent criteria**:
+//! These generators cover four state-independent criteria:
 //!
 //! | Criterion           | Strategy function               |
 //! |---------------------|---------------------------------|
 //! | `per_tx_cap`        | `arb_per_tx_cap_rule`         |
+//! | `approval_above`    | `arb_approval_above_rule`     |
 //! | `counterparty_allowlist` | `arb_counterparty_allowlist_rule` |
 //! | `minimum_reserve`   | `arb_minimum_reserve_rule`    |
 //!
@@ -19,8 +20,8 @@
 //!
 //! # Coverage
 //!
-//! The three generators cover every criterion the engine can evaluate without
-//! external clock state.  `minimum_reserve` requires an `account_view`; the
+//! The generators exercise criteria without external clock state.
+//! `minimum_reserve` requires an `account_view`; the
 //! property tests inject a synthetic view that always returns a fixed balance
 //! so the criterion's result is deterministic.
 //!
@@ -49,8 +50,8 @@ use proptest::prelude::*;
 use stellar_agent_test_support::testnet_strkeys::{VERSION_PUBLIC_KEY, strkey_from_seed};
 
 use crate::policy::v1::criteria::{
-    CounterpartyAllowlistCriterion, MinimumReserveCriterion, PerTxCapCriterion,
-    counterparty_allowlist::CounterpartyKind,
+    ApprovalAboveCriterion, CounterpartyAllowlistCriterion, MinimumReserveCriterion,
+    PerTxCapCriterion, counterparty_allowlist::CounterpartyKind,
 };
 use crate::policy::v1::loader::{PolicyDocument, PolicyRule, RuleMatch, ScopeId};
 use crate::policy::{Decision, McpToolRegistration, ToolDescriptor};
@@ -141,8 +142,48 @@ pub fn arb_per_tx_cap_rule() -> impl Strategy<Value = PolicyRule> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Strategy: arb_counterparty_allowlist_rule
+// Strategy: arb_approval_above_rule
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Generates an approval rule, its positive threshold, and optional hard cap.
+///
+/// The threshold ranges from 1 stroop to 10,000 XLM. The optional `per_tx_cap`
+/// exceeds it by at least one stroop. Criteria appear in either order.
+/// Rules allow native-asset payments on any chain.
+pub fn arb_approval_above_rule() -> impl Strategy<Value = (PolicyRule, i128, Option<i128>)> {
+    (
+        1_i128..=100_000_000_000,
+        proptest::option::of(1_i128..=100_000_000_000),
+        any::<bool>(),
+    )
+        .prop_map(|(threshold, gap, reverse)| {
+            let cap = gap.map(|gap| threshold + gap);
+            let mut criteria: Vec<Box<dyn crate::policy::v1::criteria::Criterion>> =
+                vec![Box::new(ApprovalAboveCriterion::new(
+                    "native".into(),
+                    threshold,
+                ))];
+            if let Some(cap) = cap {
+                criteria.push(Box::new(PerTxCapCriterion::new("native".into(), cap)));
+            }
+            if reverse {
+                criteria.reverse();
+            }
+            (
+                PolicyRule {
+                    r#match: RuleMatch {
+                        tool: "*".into(),
+                        chain: "*".into(),
+                    },
+                    criteria,
+                    decision: Decision::Allow,
+                    allow_opaque_signing: false,
+                },
+                threshold,
+                cap,
+            )
+        })
+}
 
 /// Generates a [`PolicyRule`] whose single criterion is a random
 /// `counterparty_allowlist` with `G_ACCOUNT` kind.

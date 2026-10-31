@@ -70,8 +70,8 @@ use crate::policy::v1::canonical::{OPTIONAL_RULE_KEYS, canonical_bytes};
 use crate::policy::v1::criteria::counterparty_allowlist::CounterpartyKind;
 use crate::policy::v1::criteria::per_period_cap::Window;
 use crate::policy::v1::criteria::{
-    BundleAggregateCapCriterion, BundlePerPeriodCapCriterion, BundlePerTxCapCriterion,
-    BundleRateLimitCriterion, CounterpartyAllowlistCriterion, Criterion,
+    ApprovalAboveCriterion, BundleAggregateCapCriterion, BundlePerPeriodCapCriterion,
+    BundlePerTxCapCriterion, BundleRateLimitCriterion, CounterpartyAllowlistCriterion, Criterion,
     InnerInvocationCountCapCriterion, MinimumReserveCriterion, PerPeriodCapCriterion,
     PerTxCapCriterion, RateLimitCriterion, RestrictBundleToRecognisedKindsCriterion,
 };
@@ -96,7 +96,8 @@ const MIN_POLICY_VERSION: u32 = 1;
 const MAX_POLICY_VERSION: u32 = 1;
 
 /// Default approval time-to-live for `require_approval` policy decisions, in seconds.
-const DEFAULT_APPROVAL_TTL_SECONDS: u32 = (crate::approval::store::DEFAULT_TTL_MS / 1_000) as u32;
+pub(super) const DEFAULT_APPROVAL_TTL_SECONDS: u32 =
+    (crate::approval::store::DEFAULT_TTL_MS / 1_000) as u32;
 
 /// Longest accepted `require_approval` lifetime, in seconds (seven days).
 const MAX_APPROVAL_TTL_SECONDS: u32 = 604_800;
@@ -281,6 +282,7 @@ impl ScopeId {
 /// Rules are evaluated in declaration order; the first rule whose
 /// [`RuleMatch`] matches the tool call wins.  If all criteria in the rule
 /// pass, `decision` is returned.  If any criterion fails, the call is denied.
+/// An escalation requires approval when no criterion fails.
 #[derive(Debug)]
 pub struct PolicyRule {
     /// The tool + chain-id match clause.
@@ -847,6 +849,7 @@ fn parse_rule(table: &toml_edit::Table, idx: usize) -> Result<PolicyRule, Policy
     let reason = parse_optional_reason(table, idx)?;
     let ttl_secs = parse_optional_ttl_secs(table, idx)?;
     let decision = parse_decision(decision_str, idx, reason, ttl_secs)?;
+    validate_approval_above(&criteria, idx, &decision)?;
 
     // Optional opaque-signing exemption (design §2.4). Absent → false; present
     // but not a boolean → parse error (fail-closed on a malformed exemption).
@@ -865,6 +868,47 @@ fn parse_rule(table: &toml_edit::Table, idx: usize) -> Result<PolicyRule, Policy
         decision,
         allow_opaque_signing,
     })
+}
+
+/// Validates approval thresholds against the decision and hard ceilings.
+fn validate_approval_above(
+    criteria: &[Box<dyn Criterion>],
+    rule_idx: usize,
+    decision: &Decision,
+) -> Result<(), PolicyError> {
+    for (criterion_idx, criterion) in criteria.iter().enumerate() {
+        let Some(threshold) =
+            (criterion.as_ref() as &dyn std::any::Any).downcast_ref::<ApprovalAboveCriterion>()
+        else {
+            continue;
+        };
+        let loc = format!("rule[{rule_idx}].criteria[{criterion_idx}]: `approval_above`");
+        if !matches!(decision, Decision::Allow) {
+            return Err(PolicyError::PolicyFileParseFailed {
+                detail: format!("{loc} requires decision = \"allow\""),
+            });
+        }
+        for criterion in criteria {
+            let Some(cap) =
+                (criterion.as_ref() as &dyn std::any::Any).downcast_ref::<PerTxCapCriterion>()
+            else {
+                continue;
+            };
+            if super::value::asset_normalise(&threshold.asset)
+                == super::value::asset_normalise(cap.asset())
+                && threshold.max_stroops >= cap.max_stroops()
+            {
+                return Err(PolicyError::PolicyFileParseFailed {
+                    detail: format!(
+                        "{loc} threshold {} must be less than `per_tx_cap` bound {}",
+                        threshold.max_stroops,
+                        cap.max_stroops()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Iterates the `criteria` TOML array and instantiates each criterion.
@@ -913,6 +957,7 @@ fn parse_criteria(
 /// | `kind`                     | Criterion type                       |
 /// |----------------------------|--------------------------------------|
 /// | `"per_tx_cap"`             | [`PerTxCapCriterion`]                |
+/// | `"approval_above"`         | [`ApprovalAboveCriterion`]           |
 /// | `"per_period_cap"`         | [`PerPeriodCapCriterion`]            |
 /// | `"rate_limit"`             | [`RateLimitCriterion`]               |
 /// | `"counterparty_allowlist"` | [`CounterpartyAllowlistCriterion`]   |
@@ -971,6 +1016,18 @@ fn parse_criterion(
     }
 
     match kind {
+        "approval_above" => {
+            let asset = require_str(table, "asset", &loc)?;
+            let max_stroops = require_i128(table, "max_stroops", &loc)?;
+            if max_stroops <= 0 {
+                return Err(PolicyError::PolicyFileParseFailed {
+                    detail: format!(
+                        "{loc}: `approval_above` `max_stroops` must be positive, got {max_stroops}"
+                    ),
+                });
+            }
+            Ok(Box::new(ApprovalAboveCriterion::new(asset, max_stroops)))
+        }
         "per_tx_cap" => {
             let asset = require_str(table, "asset", &loc)?;
             let max_stroops = require_i128(table, "max_stroops", &loc)?;
@@ -1205,7 +1262,7 @@ fn unknown_criterion_kind(loc: &str, kind: &str) -> PolicyError {
     PolicyError::PolicyFileParseFailed {
         detail: format!(
             "{loc}: unknown criterion kind `{kind}`; accepted kinds: \
-             per_tx_cap, per_period_cap, rate_limit, counterparty_allowlist, \
+             per_tx_cap, approval_above, per_period_cap, rate_limit, counterparty_allowlist, \
              minimum_reserve, inner_invocation_count_cap, \
              bundle_aggregate_cap, restrict_bundle_to_recognised_kinds, \
              bundle_per_period_cap, bundle_per_tx_cap, bundle_rate_limit, \
@@ -3381,6 +3438,7 @@ decision = "deny"
     fn every_key_of_each_criterion_key_set_loads() {
         let criteria = [
             r#"{ kind = "per_tx_cap", asset = "native", max_stroops = 100 }"#,
+            r#"{ kind = "approval_above", asset = "native", max_stroops = 100 }"#,
             r#"{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 100 }"#,
             r#"{ kind = "rate_limit", window = "1h", max_calls = 5 }"#,
             concat!(
@@ -3426,6 +3484,122 @@ decision = "deny"
                 loaded.err()
             );
         }
+    }
+
+    #[test]
+    fn approval_above_rejects_non_allow_decisions() {
+        for decision in ["deny", "require_approval"] {
+            let body = body_with_criterion(
+                r#"{ kind = "approval_above", asset = "native", max_stroops = 100 }"#,
+            )
+            .replace(
+                "decision = \"allow\"",
+                &format!("decision = \"{decision}\""),
+            );
+            assert_parse_failure(
+                load_signed_body_after(&body, |signed| signed),
+                "rule[0].criteria[0]: `approval_above` requires decision = \"allow\"",
+            );
+            assert!(matches!(
+                validate_unsigned_policy(&body, "alice"),
+                Err(PolicyError::PolicyFileParseFailed { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn approval_above_rejects_nonpositive_thresholds() {
+        for threshold in [0, -1] {
+            let body = body_with_criterion(&format!(
+                "{{ kind = \"approval_above\", asset = \"native\", max_stroops = {threshold} }}"
+            ));
+            assert_parse_failure(
+                load_signed_body_after(&body, |signed| signed),
+                &format!(
+                    "rule[0].criteria[0]: `approval_above` `max_stroops` must be positive, got {threshold}"
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn approval_above_requires_threshold_below_every_same_asset_per_tx_cap() {
+        for threshold in [99, 100, 101] {
+            for reverse in [false, true] {
+                let mut criteria = [
+                    format!(
+                        "{{ kind = \"approval_above\", asset = \"native\", max_stroops = {threshold} }}"
+                    ),
+                    r#"{ kind = "per_tx_cap", asset = "native", max_stroops = 500 }"#.into(),
+                    r#"{ kind = "per_tx_cap", asset = "native", max_stroops = 100 }"#.into(),
+                ];
+                if reverse {
+                    criteria.reverse();
+                }
+                let body = body_with_criterion(&criteria.join(", "));
+                let result = load_signed_body_after(&body, |signed| signed);
+                if threshold < 100 {
+                    assert!(result.is_ok(), "{result:?}");
+                } else {
+                    let criterion_idx = if reverse { 2 } else { 0 };
+                    assert_parse_failure(
+                        result,
+                        &format!(
+                            "rule[0].criteria[{criterion_idx}]: `approval_above` threshold {threshold} must be less than `per_tx_cap` bound 100"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn approval_above_compares_only_normalized_same_asset_caps() {
+        let threshold =
+            r#"{ kind = "approval_above", asset = "native", max_stroops = 500_0000000 }"#;
+        for asset in ["native", "XLM", "xLm", "USDC:GISSUER"] {
+            let cap = format!(
+                "{{ kind = \"per_tx_cap\", asset = \"{asset}\", max_stroops = 400_0000000 }}"
+            );
+            let body = body_with_criterion(&format!("{cap}, {threshold}"));
+            let result = load_signed_body_after(&body, |signed| signed);
+            if asset == "USDC:GISSUER" {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                assert_parse_failure(
+                    result,
+                    "rule[0].criteria[1]: `approval_above` threshold 5000000000 must be less than `per_tx_cap` bound 4000000000",
+                );
+            }
+        }
+        let body = body_with_criterion(&format!(
+            r#"{threshold}, {{ kind = "per_tx_cap", asset = "USDC:GISSUER", max_stroops = 100_0000000 }}"#
+        ));
+        let result = load_signed_body_after(&body, |signed| signed);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn approval_above_fields_are_signed() {
+        let body = body_with_criterion(
+            r#"{ kind = "approval_above", asset = "native", max_stroops = 100 }"#,
+        );
+        for (from, to) in [
+            ("max_stroops = 100", "max_stroops = 200"),
+            ("native", "XLM"),
+        ] {
+            let result = load_signed_body_after(&body, |signed| signed.replace(from, to));
+            assert!(
+                matches!(result, Err(PolicyError::OwnerSignatureInvalid { .. })),
+                "{result:?}"
+            );
+        }
+        assert_parse_failure(
+            load_signed_body_after(&body, |signed| {
+                signed.replace("max_stroops = 100", "max_stroops = 100, extra = 1")
+            }),
+            "rule[0].criteria[0]: unknown key `extra`; a `approval_above` criterion accepts kind, asset, max_stroops",
+        );
     }
 
     /// Every kind with a closed key set is parsed by the loader, and the

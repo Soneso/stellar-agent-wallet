@@ -271,6 +271,8 @@ nonce for one envelope and commit a different one.
 
 ## Operator approval for gated actions
 
+See [approval thresholds](approvals-and-audit.md#v1-engine) for the `approval_above` criterion.
+
 When the policy engine returns `RequireApproval`, the action does not proceed on
 the agent's say-so. It is held in a per-profile pending-approval store until the
 operator approves it out-of-band:

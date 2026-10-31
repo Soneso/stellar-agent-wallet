@@ -561,6 +561,17 @@ pub enum DenyReason {
         #[serde(with = "crate::wire_stroops::i128")]
         attempted_stroops: i128,
     },
+    /// The `approval_above` threshold requires approval through the decision interface.
+    ApprovalAboveExceeded {
+        /// The configured asset identifier.
+        asset: String,
+        /// The approval threshold, serialized as a decimal string.
+        #[serde(with = "crate::wire_stroops::i128")]
+        max_stroops: i128,
+        /// The attempted debit total, serialized as a decimal string.
+        #[serde(with = "crate::wire_stroops::i128")]
+        attempted_stroops: i128,
+    },
     /// The per-period aggregate cap was exceeded.
     PerPeriodCapExceeded {
         /// Asset code or canonical identifier.
@@ -831,6 +842,7 @@ impl DenyReason {
     pub fn code(&self) -> &'static str {
         match self {
             Self::PerTxCapExceeded { .. } => "per_tx_cap_exceeded",
+            Self::ApprovalAboveExceeded { .. } => "approval_above_exceeded",
             Self::PerPeriodCapExceeded { .. } => "per_period_cap_exceeded",
             Self::RateLimitExceeded { .. } => "rate_limit_exceeded",
             Self::CounterpartyDenied { .. } => "counterparty_denied",
@@ -882,6 +894,7 @@ impl DenyReason {
     pub fn wire_code(&self) -> &'static str {
         match self {
             Self::PerTxCapExceeded { .. } => "policy.deny.per_tx_cap_exceeded",
+            Self::ApprovalAboveExceeded { .. } => "policy.deny.approval_above_exceeded",
             Self::PerPeriodCapExceeded { .. } => "policy.deny.per_period_cap_exceeded",
             Self::RateLimitExceeded { .. } => "policy.deny.rate_limit_exceeded",
             Self::CounterpartyDenied { .. } => "policy.deny.counterparty_denied",
@@ -933,9 +946,9 @@ pub struct ApprovalRequest {
     pub nonce: String,
     /// Approval window lifetime in seconds.
     pub ttl_seconds: u32,
-    /// Optional operator-supplied reason for requiring approval.
+    /// Optional reason for requiring approval.
     ///
-    /// Sourced from the rule TOML's optional `reason` key.  Used for
+    /// Sourced from the rule's `reason` key or an escalating criterion. Used for
     /// operator-facing display in the approval prompt; never used as a
     /// trust input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2035,6 +2048,11 @@ mod tests {
     #[test]
     fn deny_reason_wire_code_is_the_prefixed_code_for_every_variant() {
         let all = [
+            DenyReason::ApprovalAboveExceeded {
+                asset: "native".into(),
+                max_stroops: 1,
+                attempted_stroops: 2,
+            },
             DenyReason::PerTxCapExceeded {
                 asset: "native".into(),
                 max_stroops: 1,
@@ -2105,7 +2123,7 @@ mod tests {
 
         assert_eq!(
             all.len(),
-            19,
+            20,
             "the inventory must name every DenyReason variant"
         );
         for reason in &all {

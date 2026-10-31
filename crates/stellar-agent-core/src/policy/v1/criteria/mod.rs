@@ -1,14 +1,15 @@
 //! Per-criterion evaluators for `PolicyEngineV1`.
 //!
-//! Each criterion implements [`Criterion`]: receives an [`EvalContext`], returns
-//! `Ok(None)` on pass, `Ok(Some(reason))` on deny, or `Err(_)` on evaluator
-//! error.
+//! Each criterion implements [`Criterion`]. Its rule evaluation returns
+//! [`Decision::Allow`] on pass, [`Decision::Deny`] on failure, or
+//! [`Decision::RequireApproval`] on escalation. Evaluator errors fail closed.
 //!
 //! # Criterion inventory
 //!
 //! | Module | Struct | Kind tag |
 //! |---|---|---|
 //! | `per_tx_cap` | `PerTxCapCriterion` | `"per_tx_cap"` |
+//! | `approval_above` | `ApprovalAboveCriterion` | `"approval_above"` |
 //! | `per_period_cap` | `PerPeriodCapCriterion` | `"per_period_cap"` |
 //! | `rate_limit` | `RateLimitCriterion` | `"rate_limit"` |
 //! | `counterparty_allowlist` | `CounterpartyAllowlistCriterion` | `"counterparty_allowlist"` |
@@ -26,9 +27,10 @@
 
 use crate::policy::v1::EvalContext;
 use crate::policy::v1::bundle::{BundleStateOverlay, InnerOpDescriptor};
-use crate::policy::{DenyReason, PolicyError};
+use crate::policy::{Decision, DenyReason, PolicyError};
 
 pub(crate) mod amount_extract;
+pub mod approval_above;
 pub mod bundle_aggregate_cap;
 pub mod bundle_per_period_cap;
 pub mod bundle_per_tx_cap;
@@ -46,6 +48,7 @@ pub mod sep10_session_active;
 pub mod sep45_session_active;
 pub mod state_store;
 
+pub use approval_above::ApprovalAboveCriterion;
 pub use bundle_aggregate_cap::BundleAggregateCapCriterion;
 pub use bundle_per_period_cap::BundlePerPeriodCapCriterion;
 pub use bundle_per_tx_cap::BundlePerTxCapCriterion;
@@ -66,10 +69,11 @@ pub use state_store::{PolicyStateStore, WindowEntry, WindowLimit};
 /// A single policy criterion evaluated against an [`EvalContext`].
 ///
 /// Implement this trait for each supported criterion kind.  The engine calls
-/// [`Criterion::evaluate`] for every criterion in a matching rule, in
-/// declaration order.  The first `Ok(Some(_))` stops evaluation and returns
-/// the deny reason.
+/// [`Criterion::evaluate_decision`] for every criterion in a matching rule,
+/// in declaration order. A denial stops evaluation. An escalation requires
+/// approval for an `Allow` rule only when no criterion denies.
 ///
+/// Type inspection lets the loader validate related bounds on parsed criteria.
 /// Implementations MUST be `Send + Sync` because the engine holds criteria
 /// behind `Box<dyn Criterion>` inside an `Arc<PolicyEngineV1>`.
 ///
@@ -97,14 +101,17 @@ pub use state_store::{PolicyStateStore, WindowEntry, WindowLimit};
 /// assert_eq!(c.kind(), "always_pass");
 /// ```
 ///
-pub trait Criterion: Send + Sync + std::fmt::Debug {
+pub trait Criterion: Send + Sync + std::fmt::Debug + std::any::Any {
     /// Returns the snake_case kind tag (e.g. `"per_tx_cap"`).
     ///
     /// Used by the loader to map TOML criterion entries to the correct concrete
     /// type.
     fn kind(&self) -> &'static str;
 
-    /// Evaluates the criterion against the call context.
+    /// Checks the criterion using the deny-only interface.
+    ///
+    /// An unmet threshold fails closed here. Rule evaluation uses
+    /// [`Self::evaluate_decision`] to distinguish escalation from denial.
     ///
     /// # Returns
     ///
@@ -118,6 +125,22 @@ pub trait Criterion: Send + Sync + std::fmt::Debug {
     /// Returns [`PolicyError::CriterionEvaluationFailed`] when the evaluator
     /// encounters an internal error (e.g. state-store I/O failure).
     fn evaluate(&self, ctx: &EvalContext<'_>) -> Result<Option<DenyReason>, PolicyError>;
+
+    /// Evaluates this criterion's pass, denial, or approval escalation.
+    ///
+    /// `Allow` passes the criterion. `RequireApproval` escalates the rule only
+    /// if the rule allows and every other criterion passes or escalates. `Deny` takes precedence.
+    /// The default maps the deny-only check to `Allow` or `Deny`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from [`Self::evaluate`].
+    fn evaluate_decision(&self, ctx: &EvalContext<'_>) -> Result<Decision, PolicyError> {
+        Ok(match self.evaluate(ctx)? {
+            None => Decision::Allow,
+            Some(reason) => Decision::Deny(reason),
+        })
+    }
 
     /// Whether this criterion fires at bundle-level (after all inner
     /// evaluations complete, with the full inners slice and populated overlay

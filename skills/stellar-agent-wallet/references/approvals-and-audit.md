@@ -89,23 +89,72 @@ Evaluates a signed policy document against typed Criteria. The document carries
 an ed25519 owner signature over its canonical form; an invalid signature, or a
 signature from a key rotated after signing, is rejected.
 
-Evaluation is first-match, default-deny:
+Evaluation is **first-match, default-deny**:
 
 1. Rules are walked in declaration order.
 2. The first rule whose match (tool name plus chain-id filter) applies is selected.
+   The chain filter compares the rule's `chain` with the bound profile's chain,
+   on the CLI and in the MCP server.
 3. That rule's criteria run in order; the first failing criterion produces a Deny.
-4. If all criteria pass, the rule's decision is returned.
+4. An escalation on an `allow` rule with no failing criterion returns `RequireApproval`.
+   If all criteria pass, the rule's decision is returned.
 5. If no rule matches, the call is denied (`no_matching_rule`).
 
-A Criterion is one typed check: per-transaction cap, per-period (windowed) cap,
-rate limit, counterparty allowlist (by classic account, contract account, asset
-issuer, or resolved home domain), minimum-reserve guard, multicall bundle-level
-checks (inner-count cap, aggregate cap, rejection of
-unrecognized inner shapes), quorum satisfaction, a home-domain-resolved guard,
-and SEP-10 / SEP-45 session-active checks. Criteria needing external state
-(reserves, identity, the counterparty cache, an active session) receive it as an
-injected view at the dispatch site; when a required view is absent the criterion
-fails closed.
+A Criterion is one typed check. Amount checks include per-transaction caps,
+approval-above thresholds, and per-period (windowed) caps. Other checks include
+rate limits, counterparty allowlists, and minimum-reserve guards.
+Counterparty allowlists match classic accounts, contract accounts, asset issuers,
+or resolved home domains. The `SEP10_IDENTITY` and `ONE_TIME_ADDRESS` kinds are
+reserved and are not evaluated.
+Bundle-level checks cover inner-count caps, aggregate caps, and rejection of
+unrecognized inner shapes. Criteria also check quorum satisfaction, resolved
+home domains, and active SEP-10 or SEP-45 sessions.
+The home-domain-resolved guard requires a live cached binding for the
+destination's on-chain `home_domain`.
+Criteria receive external state as injected views at the dispatch site.
+A required session or cache view that is absent fails closed.
+
+`approval_above` permits amounts at or below its threshold and requests
+approval above it. It uses `asset` and `max_stroops`, with the same units and
+asset matching as `per_tx_cap`. One XLM is 10,000,000 stroops.
+The threshold must be positive and the rule's decision must be `allow`.
+The threshold must be below every `per_tx_cap` on the same asset
+in that rule. Invalid decisions or bounds produce
+`policy.policy_file_parse_failed`, naming the criterion and conflicting bounds.
+
+The commit tool's rule is binding, so the example carries the criterion on both pay tools.
+The threshold applies to its configured asset.
+A payment in another asset passes it, as it passes `per_tx_cap`.
+Single-shot tools and multicall refuse an escalation with their existing approval-required refusal.
+A bundle is sized per inner transfer.
+
+These payment rules allow up to 500 XLM without approval, request approval
+above 500 XLM, and deny above 5,000 XLM:
+
+```toml
+[[rules]]
+match = { tool = "stellar_pay", chain = "stellar:testnet" }
+criteria = [
+  { kind = "approval_above", asset = "native", max_stroops = 500_0000000 },
+  { kind = "per_tx_cap", asset = "native", max_stroops = 5000_0000000 },
+]
+decision = "allow"
+
+[[rules]]
+match = { tool = "stellar_pay_commit", chain = "stellar:testnet" }
+criteria = [
+  { kind = "approval_above", asset = "native", max_stroops = 500_0000000 },
+  { kind = "per_tx_cap", asset = "native", max_stroops = 5000_0000000 },
+]
+decision = "allow"
+```
+
+Omit `per_tx_cap` from both rules to request approval above 500 XLM without
+a per-payment ceiling. Other failing criteria deny, including period caps.
+The MCP payment tool stores the pending request with a reason naming
+`approval_above` and its threshold. Operators approve through the CLI approvals
+commands, terminal, inbox, or remote approver. The CLI `pay` command returns
+`policy.approval_required` and directs the caller to MCP.
 
 A `HOME_DOMAIN` binding is evidence for one hour from its fetch. An entry
 whose fetch time lies more than five minutes in the future counts as expired.

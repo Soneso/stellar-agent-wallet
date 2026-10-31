@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- V1 policy criterion `approval_above` requests approval above a positive
+  per-payment threshold on `allow` rules. An optional `per_tx_cap` denies
+  payments above its higher ceiling on the same asset, including approved payments.
+  `stellar_agent_core::policy::v1::criteria::ApprovalAboveCriterion` implements
+  the threshold. `Criterion::evaluate_decision` reports criterion escalations.
+  `DenyReason::ApprovalAboveExceeded` names a threshold refusal through the
+  deny-only interface.
 - `stellar_agent_core::audit_log::reader` exposes `try_value_action_settlement`
   and `try_submission_receipt_cleared_exists`, which return
   `AuditLogIntegrityError` when a visited file cannot be read or fails its

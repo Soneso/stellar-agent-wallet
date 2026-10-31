@@ -657,7 +657,7 @@ Every signature must pass, and each signature set must have at least one. Hash-x
 
 ### First-match default-deny
 
-`PolicyEngineV1` wraps one `PolicyDocument` whose owner ed25519 signature is verified at load. `evaluate` resolves the rules whose `ScopeId` matches `(profile_name, project_id)`, then walks them in declaration order. The first rule whose `RuleMatch` (tool name + chain-id filter) matches is selected; its criteria run in order; the first criterion returning `Ok(Some(reason))` produces `Decision::Deny`. If every criterion passes, the rule's `decision` is returned. If no rule matches, the engine returns `Decision::Deny(DenyReason::NoMatchingRule)`, default-deny.
+`PolicyEngineV1` wraps one `PolicyDocument` whose owner ed25519 signature is verified at load. `evaluate` resolves the rules whose `ScopeId` matches `(profile_name, project_id)`, then walks them in declaration order. The first rule whose `RuleMatch` (tool name + chain-id filter) matches is selected. Its criteria run in order through `Criterion::evaluate_decision`. The first denial returns `Decision::Deny`. An escalation requires approval only if no criterion denies. If every criterion passes, the rule's `decision` is returned. If no rule matches, the engine returns `Decision::Deny(DenyReason::NoMatchingRule)`, default-deny.
 
 ### Criteria catalog
 
@@ -666,6 +666,7 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | Kind tag | Purpose |
 |----------|---------|
 | `per_tx_cap` | Per-transaction value cap |
+| `approval_above` | Per-transaction approval threshold on `allow` rules |
 | `per_period_cap` | Sliding-window per-period value cap |
 | `rate_limit` | Sliding-window call-rate limit |
 | `counterparty_allowlist` | Destination allowlist (`G_ACCOUNT` / `C_ACCOUNT` / `KNOWN_ISSUER` / `HOME_DOMAIN`; `SEP10_IDENTITY` and `ONE_TIME_ADDRESS` are reserved, not evaluated); `KNOWN_ISSUER` checks debit legs only unless the criterion's `gate_inflows = true` opt-in extends it to inflow legs too |
@@ -680,6 +681,14 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | `home_domain_resolved` | Counterparty `stellar.toml` resolved/cached (contract counterparties only, see below) |
 | `sep10_session_active` | Active SEP-10 session for the account |
 | `sep45_session_active` | Active SEP-45 session for the contract |
+
+`approval_above` shares `per_tx_cap` amount extraction and fail-closed value
+checks. Its `asset` and positive `max_stroops` threshold apply only to `allow`
+rules. The loader requires the threshold below every `per_tx_cap` on the same asset
+in that rule.
+An amount above the threshold produces `RequireApproval` with the criterion
+name and threshold in `ApprovalRequest.reason`, using the default approval TTL.
+A failing criterion denies regardless of criterion order or escalation.
 
 Multicall bundles also carry a hard floor independent of policy: `evaluate_bundle` denies any bundle with more than 50 inners (`DEFAULT_INNER_INVOCATION_COUNT_CAP`) before rule resolution. Policy authors may configure a lower cap but cannot raise it above the floor.
 
