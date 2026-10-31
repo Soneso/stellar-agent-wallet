@@ -76,6 +76,7 @@
 //! - `sa.threshold_read_failed`: `SaError::ThresholdReadFailed`
 //! - `sa.pinned_verifier_absent`: `SaError::PinnedVerifierAbsent`
 //! - `sa.pinned_policy_absent`: `SaError::PinnedPolicyAbsent`
+//! - `sa.wasm_pin_incomplete`: `SaError::WasmPinIncomplete`
 //! - `sa.verifier_hash_drift`: `SaError::VerifierHashDrift`
 //! - `sa.policy_hash_drift`: `SaError::PolicyHashDrift`
 //! - `sa.pin_check_unavailable`: `SaError::PinCheckUnavailable`
@@ -3817,7 +3818,7 @@ mod tests {
         ctx.audit_writer
             .lock()
             .unwrap()
-            .write_entry(AuditEntry::new_sa_context_rule_created(
+            .write_entry(AuditEntry::new_sa_context_rule_created_v2(
                 redact_strkey_first5_last5(ACCOUNT),
                 1,
                 "default",

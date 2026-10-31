@@ -150,6 +150,157 @@ impl fmt::Display for ContractKind {
     }
 }
 
+// ── WasmHashPin ───────────────────────────────────────────────────────────────
+
+/// The full 32-byte SHA-256 hash of a Wasm executable, as a verifier or
+/// policy pin records it.
+///
+/// Two pins are equal exactly when all 32 bytes are equal; a pin never
+/// carries a truncated hash. [`Self::first8_display`] renders the first
+/// eight bytes for labeled display fields, and no such projection is
+/// compared or turned back into a pin.
+///
+/// # Wire form
+///
+/// Exactly 64 lowercase hexadecimal characters. [`Self::parse`] and the
+/// `Deserialize` implementation refuse any other length, a character that
+/// is not a hexadecimal digit, and uppercase digits.
+///
+/// # Examples
+///
+/// ```
+/// use stellar_agent_core::audit_log::WasmHashPin;
+///
+/// let pin = WasmHashPin::new([0x42; 32]);
+/// let mut twin = [0x42; 32];
+/// twin[8..].fill(0x43);
+/// assert!(pin.matches(&[0x42; 32]));
+/// assert!(!pin.matches(&twin));
+/// assert_eq!(WasmHashPin::parse(&pin.to_hex()), Ok(pin));
+/// assert!(WasmHashPin::parse("4242424242424242").is_err());
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WasmHashPin([u8; 32]);
+
+/// Why a string is not the wire form of a [`WasmHashPin`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum WasmHashPinParseError {
+    /// The string is not 64 characters long.
+    #[error("a Wasm hash pin is 64 lowercase hex characters, got {actual} characters")]
+    InvalidLength {
+        /// The length of the refused string, in bytes.
+        actual: usize,
+    },
+    /// A character is not a lowercase hexadecimal digit.
+    #[error("a Wasm hash pin is lowercase hex; offset {offset} is not a lowercase hex digit")]
+    InvalidChar {
+        /// Zero-based byte offset of the first refused character.
+        offset: usize,
+    },
+}
+
+impl WasmHashPin {
+    /// Wraps the 32 bytes of a Wasm hash.
+    #[must_use]
+    pub const fn new(hash: [u8; 32]) -> Self {
+        Self(hash)
+    }
+
+    /// Returns the 32 bytes of the pinned hash.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Returns `true` when `hash` equals the pinned hash in all 32 bytes.
+    #[must_use]
+    pub fn matches(&self, hash: &[u8; 32]) -> bool {
+        self.0 == *hash
+    }
+
+    /// Returns the wire form: 64 lowercase hexadecimal characters.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        crate::hex::encode(&self.0)
+    }
+
+    /// Returns the first eight bytes as 16 lowercase hexadecimal characters,
+    /// for display fields whose name carries the `first8` label.
+    #[must_use]
+    pub fn first8_display(&self) -> String {
+        crate::hex::wasm_hash_first8_hex(&self.0)
+    }
+
+    /// Parses the wire form.
+    ///
+    /// # Errors
+    ///
+    /// [`WasmHashPinParseError::InvalidLength`] when `text` is not 64
+    /// characters, and [`WasmHashPinParseError::InvalidChar`] at the first
+    /// character that is not a lowercase hexadecimal digit.
+    pub fn parse(text: &str) -> Result<Self, WasmHashPinParseError> {
+        if text.len() != 64 {
+            return Err(WasmHashPinParseError::InvalidLength { actual: text.len() });
+        }
+        if let Some(offset) = text
+            .bytes()
+            .position(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(WasmHashPinParseError::InvalidChar { offset });
+        }
+        crate::hex::decode_hex32(text)
+            .map(Self)
+            .map_err(|_| WasmHashPinParseError::InvalidChar { offset: 0 })
+    }
+}
+
+impl From<[u8; 32]> for WasmHashPin {
+    fn from(hash: [u8; 32]) -> Self {
+        Self(hash)
+    }
+}
+
+impl TryFrom<&[u8]> for WasmHashPin {
+    type Error = WasmHashPinParseError;
+
+    /// Accepts exactly 32 bytes; any other length is refused with
+    /// [`WasmHashPinParseError::InvalidLength`] carrying twice the byte
+    /// length, the length of its hexadecimal form.
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        <[u8; 32]>::try_from(bytes)
+            .map(Self)
+            .map_err(|_| WasmHashPinParseError::InvalidLength {
+                actual: bytes.len().saturating_mul(2),
+            })
+    }
+}
+
+impl fmt::Display for WasmHashPin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+impl fmt::Debug for WasmHashPin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WasmHashPin({})", self.to_hex())
+    }
+}
+
+impl Serialize for WasmHashPin {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for WasmHashPin {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
 // ── ExecutableRefPin ──────────────────────────────────────────────────────────
 
 /// Install-time pin of a verifier or policy contract whose executable is a
@@ -158,12 +309,12 @@ impl fmt::Display for ContractKind {
 /// Such a contract runs the Wasm whose hash its owner stores under the
 /// owner's executable-tag entry, and the owner can repoint that entry at any
 /// time. The pin records which owner and tag the instance named at install
-/// time and which hash the tag resolved to, so the signing-time drift check
-/// can refuse when the owner repoints the tag, the instance names a different
-/// reference, or the executable is no longer a reference.
+/// time and the full hash the tag resolved to, so the signing-time drift
+/// check can refuse when the owner repoints the tag, the instance names a
+/// different reference, or the executable is not a reference.
 ///
-/// Carried by [`EventKind::SaContextRuleCreated`] and
-/// [`EventKind::SaContextRulePinsUpdated`] beside the first-8 hash lists, and
+/// Carried by [`EventKind::SaContextRuleCreatedV2`] and
+/// [`EventKind::SaContextRulePinsUpdatedV2`] beside the full hash lists, and
 /// by the rule-install JSON envelopes.
 ///
 /// # Rendering
@@ -186,13 +337,13 @@ pub struct ExecutableRefPin {
     /// ([`crate::sc_address::executable_tag_key_digest`]); identifies the
     /// owner and tag pair exactly.
     pub ref_key_hex: String,
-    /// First-8 hex of the Wasm hash the tag resolved to at install time.
-    pub resolved_hash_first8: String,
+    /// The full Wasm hash the tag resolved to at install time.
+    pub resolved_hash: WasmHashPin,
 }
 
 impl ExecutableRefPin {
     /// Builds the pin for the external reference `owner` / `tag` that
-    /// resolved to `resolved`.
+    /// resolved to `resolved`, keeping all 32 bytes of `resolved`.
     ///
     /// # Errors
     ///
@@ -210,6 +361,68 @@ impl ExecutableRefPin {
             ),
             tag: crate::observability::untrusted_display_bounded(tag.0.as_vec()),
             ref_key_hex: lower_hex(&ref_key),
+            resolved_hash: WasmHashPin::new(*resolved),
+        })
+    }
+
+    /// Returns `true` when every field has the shape [`Self::new`] produces:
+    /// a 64-character lower-case hex reference key, a tag within
+    /// [`crate::observability::UNTRUSTED_DISPLAY_MAX_BYTES`], and a redacted
+    /// owner at most as long as the placeholder. The resolved hash is a
+    /// [`WasmHashPin`], whose wire form deserialization already validates.
+    ///
+    /// Audit readers refuse a record holding a pin of any other shape.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        is_lower_hex(&self.ref_key_hex, 64)
+            && bounded_display_fields(&self.tag, &self.owner_redacted)
+    }
+}
+
+// ── ExecutableRefPinFirst8 ────────────────────────────────────────────────────
+
+/// The executable-reference pin of a version-1 pin row
+/// ([`EventKind::SaContextRuleCreated`] and
+/// [`EventKind::SaContextRulePinsUpdated`]), which recorded only the first
+/// eight bytes of the resolved hash.
+///
+/// The wallet reads such rows for inspection and never signs against them:
+/// the audit reader reports a record holding a hash as incomplete, and the
+/// signing check refuses it. Its serialization is the version-1 row's, byte
+/// for byte, so existing rows keep their chain digest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutableRefPinFirst8 {
+    /// Executable owner, redacted first-5-last-5.
+    pub owner_redacted: RedactedStrkey,
+    /// Owner-chosen tag, bounded for display.
+    pub tag: String,
+    /// Lower-case hex of the full SHA-256 digest of the owner's
+    /// executable-tag `LedgerKey` XDR.
+    pub ref_key_hex: String,
+    /// First eight bytes of the resolved hash, as 16 lower-case hex
+    /// characters.
+    pub resolved_hash_first8: String,
+}
+
+impl ExecutableRefPinFirst8 {
+    /// Builds the version-1 pin for the external reference `owner` / `tag`
+    /// that resolved to `resolved`, recording its first eight bytes. It
+    /// builds version-1 rows for compatibility fixtures.
+    ///
+    /// # Errors
+    ///
+    /// Returns the XDR encoder's error from
+    /// [`crate::sc_address::executable_tag_key_digest`].
+    pub fn new(
+        owner: &stellar_xdr::ScAddress,
+        tag: &stellar_xdr::ScString,
+        resolved: &[u8; 32],
+    ) -> Result<Self, stellar_xdr::Error> {
+        let full = ExecutableRefPin::new(owner, tag, resolved)?;
+        Ok(Self {
+            owner_redacted: full.owner_redacted,
+            tag: full.tag,
+            ref_key_hex: full.ref_key_hex,
             resolved_hash_first8: crate::hex::wasm_hash_first8_hex(resolved),
         })
     }
@@ -218,32 +431,31 @@ impl ExecutableRefPin {
     /// a 64-character and a 16-character lower-case hex string, a tag within
     /// [`crate::observability::UNTRUSTED_DISPLAY_MAX_BYTES`], and a redacted
     /// owner no longer than the placeholder.
-    ///
-    /// Audit readers refuse a record holding a pin of any other shape.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
-        fn is_lower_hex(s: &str, len: usize) -> bool {
-            s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        }
         is_lower_hex(&self.ref_key_hex, 64)
             && is_lower_hex(&self.resolved_hash_first8, 16)
-            && self.tag.len() <= crate::observability::UNTRUSTED_DISPLAY_MAX_BYTES
-            && self.owner_redacted.len() <= crate::sc_address::UNSUPPORTED_ADDRESS_PLACEHOLDER.len()
+            && bounded_display_fields(&self.tag, &self.owner_redacted)
     }
+}
+
+fn is_lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn bounded_display_fields(tag: &str, owner_redacted: &RedactedStrkey) -> bool {
+    tag.len() <= crate::observability::UNTRUSTED_DISPLAY_MAX_BYTES
+        && owner_redacted.len() <= crate::sc_address::UNSUPPORTED_ADDRESS_PLACEHOLDER.len()
 }
 
 /// Returns `refs` unchanged when at least one entry is a pin, or an empty
 /// list when every entry is `None`.
 ///
-/// An executable-reference list on a `SaContextRuleCreated` or
-/// `SaContextRulePinsUpdated` row or an install envelope is either aligned
-/// with its first-8 list or absent;
-/// recording an all-`None` list as empty keeps rules without an external
-/// reference in the shape older readers know.
+/// An executable-reference list on a pin row or an install envelope is
+/// either aligned with its hash list or empty; recording an all-`None` list
+/// as empty keeps rules without an external reference in the shortest form.
 #[must_use]
-pub fn executable_refs_or_empty(
-    refs: Vec<Option<ExecutableRefPin>>,
-) -> Vec<Option<ExecutableRefPin>> {
+pub fn executable_refs_or_empty<T>(refs: Vec<Option<T>>) -> Vec<Option<T>> {
     if refs.iter().all(Option::is_none) {
         Vec::new()
     } else {
@@ -260,9 +472,12 @@ fn lower_hex(bytes: &[u8]) -> String {
 /// The wallet mutation that changed a pinned rule's live verifier or policy
 /// set.
 ///
-/// Carried by [`EventKind::SaContextRulePinsUpdated`]. The pin record of a
-/// rule is the newest `SaContextRuleCreated` or `SaContextRulePinsUpdated`
-/// row for it; this reason records which wallet verb wrote the newer one.
+/// Carried by [`EventKind::SaContextRulePinsUpdatedV2`], the row the wallet
+/// writes, and by [`EventKind::SaContextRulePinsUpdated`]. The pin record of
+/// a rule is the newest `SaContextRuleCreatedV2`, `SaContextRulePinsUpdatedV2`,
+/// `SaContextRuleCreated` or `SaContextRulePinsUpdated` row for it, selected
+/// across both versions; a version 1 row that holds hashes is an incomplete
+/// record. This reason records which wallet verb wrote an update row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum PinsUpdateReason {
@@ -805,10 +1020,14 @@ pub enum EventKind {
         ledger: u32,
     },
 
-    /// Smart-account context-rule installation event.
+    /// Smart-account context-rule installation event, version 1.
     ///
-    /// Emitted by `ContextRuleManager::install_rule` after a successful on-chain
-    /// `add_context_rule` invocation.
+    /// Its pin lists hold the first eight bytes of each pinned hash. No
+    /// production code writes this row: rule install writes
+    /// [`EventKind::SaContextRuleCreatedV2`]. The reader reads it from
+    /// existing logs; a selected version-1 record that holds a hash is
+    /// incomplete and refuses signing. Its serialization is unchanged, so
+    /// existing rows keep their chain digest.
     ///
     /// # Schema additivity
     ///
@@ -884,16 +1103,78 @@ pub enum EventKind {
         /// as empty from rows without the field. A non-empty list has the
         /// length of the first-8 list; readers refuse any other length.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
         /// Executable-reference pins aligned by position with
         /// `pinned_policy_wasm_hashes_first8`, with the same shape and
         /// defaulting rules as `pinned_verifier_executable_refs`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
+    },
+
+    /// Smart-account context-rule installation event, carrying the rule's
+    /// pin record with full hashes.
+    ///
+    /// Emitted by `ContextRuleManager::install_rule` after a successful
+    /// on-chain `add_context_rule` invocation. The signing-time drift check
+    /// reads the newest pin row of either version for
+    /// `(rule_id, smart_account)` as the rule's pin record.
+    ///
+    /// # Field redaction
+    ///
+    /// `smart_account` is the C-strkey form, redacted first-5-last-5. The
+    /// pinned hashes are public on-chain code identifiers.
+    ///
+    /// # Required fields
+    ///
+    /// Every field except `valid_until` is required on the wire, empty lists
+    /// and `false` flags included: a row missing one fails deserialization.
+    SaContextRuleCreatedV2 {
+        /// Smart-account C-strkey, redacted first-5-last-5.
+        smart_account: String,
+        /// Public on-chain rule identifier.
+        rule_id: u32,
+        /// Stable label of the rule's `ContextRuleType` variant: `"default"`,
+        /// `"call_contract"` or `"create_contract"`.
+        context_type: String,
+        /// Number of signer entries the rule was installed with.
+        signers_count: u32,
+        /// Number of policy entries the rule was installed with.
+        policies_count: u32,
+        /// Optional ledger sequence at which the rule expires; absent for a
+        /// permanent rule.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        valid_until: Option<u32>,
+        /// Full hash of each pinned verifier, one entry per distinct
+        /// verifier address; for an external reference, the hash its tag
+        /// resolved to.
+        pinned_verifier_wasm_hashes: Vec<WasmHashPin>,
+        /// Full hash of each pinned policy, one entry per distinct policy
+        /// address.
+        pinned_policy_wasm_hashes: Vec<WasmHashPin>,
+        /// `true` if `--accept-mutable-verifier` admitted a pinned contract.
+        mutable_override: bool,
+        /// `true` if `--accept-unknown-verifier` admitted a pinned contract.
+        unknown_override: bool,
+        /// Executable-reference pins aligned by position with
+        /// `pinned_verifier_wasm_hashes`, `None` at a position pinned by its
+        /// Wasm hash; empty when no pinned verifier is an external reference.
+        /// Each pin's resolved hash equals the aligned hash; readers refuse
+        /// any other length or hash.
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        /// Executable-reference pins aligned by position with
+        /// `pinned_policy_wasm_hashes`, with the shape of
+        /// `pinned_verifier_executable_refs`.
         pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
     },
 
-    /// A pinned context rule's pin record, rewritten after a wallet mutation
-    /// changed the rule's live verifier or policy set.
+    /// A pinned context rule's pin record, version 1, rewritten after a
+    /// wallet mutation changed the rule's live verifier or policy set.
+    ///
+    /// Its pin lists hold the first eight bytes of each pinned hash. No
+    /// production code writes this row: the mutations write
+    /// [`EventKind::SaContextRulePinsUpdatedV2`]. The reader reads it from
+    /// existing logs; a selected version-1 record that holds a hash is
+    /// incomplete and refuses signing. Its serialization is unchanged.
     ///
     /// Written by `smart-account migrate-verifier` after each confirmed
     /// `add_signer` step, by `smart-account signers add` / `signers batch-add`
@@ -938,10 +1219,59 @@ pub enum EventKind {
         /// `pinned_verifier_wasm_hashes_first8`, with the shape and defaulting
         /// rules of the `SaContextRuleCreated` field of the same name.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
         /// Executable-reference pins aligned by position with
         /// `pinned_policy_wasm_hashes_first8`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
+        /// The wallet mutation that wrote this record.
+        reason: PinsUpdateReason,
+    },
+
+    /// A pinned context rule's pin record with full hashes, rewritten after
+    /// a wallet mutation changed the rule's live verifier or policy set.
+    ///
+    /// Written by `smart-account migrate-verifier` after each confirmed
+    /// removal of a pair, by `smart-account signers add` / `signers
+    /// batch-add` after an External signer is added, by `smart-account
+    /// rules add-policy` / `rules remove-policy` after a policy is attached
+    /// or detached, and by `smart-account signers refresh`, only when the
+    /// rule already has a complete pin record. The row carries the whole
+    /// record: both hash lists, their aligned executable-reference lists, the
+    /// override flags and the reason. The outer entry's `request_id`
+    /// correlates it with the mutation's other rows.
+    ///
+    /// # Field redaction
+    ///
+    /// `smart_account` is the C-strkey form, redacted first-5-last-5. The
+    /// pinned hashes are public on-chain code identifiers.
+    ///
+    /// # Required fields
+    ///
+    /// Every field is required on the wire, empty lists and `false` flags
+    /// included: a row missing one fails deserialization.
+    SaContextRulePinsUpdatedV2 {
+        /// Smart-account C-strkey, redacted first-5-last-5.
+        smart_account: String,
+        /// Public on-chain rule identifier.
+        rule_id: u32,
+        /// Full hash of each pinned verifier, one entry per distinct
+        /// verifier address.
+        pinned_verifier_wasm_hashes: Vec<WasmHashPin>,
+        /// Full hash of each pinned policy.
+        pinned_policy_wasm_hashes: Vec<WasmHashPin>,
+        /// `true` when any pin in the record was established under
+        /// `--accept-mutable-verifier`.
+        mutable_override: bool,
+        /// `true` when any pin in the record was established under
+        /// `--accept-unknown-verifier`.
+        unknown_override: bool,
+        /// Executable-reference pins aligned by position with
+        /// `pinned_verifier_wasm_hashes`, with the shape of the
+        /// `SaContextRuleCreatedV2` field of the same name.
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        /// Executable-reference pins aligned by position with
+        /// `pinned_policy_wasm_hashes`.
         pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
         /// The wallet mutation that wrote this record.
         reason: PinsUpdateReason,
@@ -1629,12 +1959,13 @@ pub enum EventKind {
         /// First-8 hex chars of the wasm hash pinned at rule-install time.
         pinned_hash_first8: String,
         /// First-8 hex chars of the effective hash observed via two-RPC
-        /// re-fetch: the Wasm hash, the hash an external reference resolved
-        /// to, or the zero hash for no code or an unresolved reference.
+        /// re-fetch: the Wasm hash or the hash an external reference
+        /// resolved to; `none` for no Wasm code or an unresolved reference, which
+        /// have no hash.
         observed_hash_first8: String,
         /// Bounded summary of the observed executable: `wasm`, `no code`, or
         /// `external reference owner <redacted> tag "<bounded>" resolved
-        /// <first-8 or unset>`.
+        /// <full hash or unset>`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         observed_executable: Option<String>,
     },
@@ -3338,7 +3669,7 @@ pub enum EventKind {
 /// the test stays green, leaving the new variant unpinned by any tag assertion.
 /// Closing that would need the count derived from the enum itself, which needs a
 /// derive macro this workspace does not carry.
-pub const EVENT_KIND_VARIANT_COUNT: usize = 73;
+pub const EVENT_KIND_VARIANT_COUNT: usize = 75;
 
 /// Why an [`EventKind::AuditTipAnchored`] row was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3820,7 +4151,17 @@ mod tests {
         );
     }
 
-    fn executable_ref_pin_fixture(tag: &[u8], resolved: [u8; 32]) -> ExecutableRefPin {
+    fn executable_ref_pin_fixture(tag: &[u8], resolved: [u8; 32]) -> ExecutableRefPinFirst8 {
+        use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
+        ExecutableRefPinFirst8::new(
+            &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+            &ScString(tag.to_vec().try_into().unwrap()),
+            &resolved,
+        )
+        .unwrap()
+    }
+
+    fn full_executable_ref_pin_fixture(tag: &[u8], resolved: [u8; 32]) -> ExecutableRefPin {
         use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
         ExecutableRefPin::new(
             &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
@@ -3830,9 +4171,19 @@ mod tests {
         .unwrap()
     }
 
+    /// The pinned hash of the pin-width tests and a hash sharing its first
+    /// eight bytes that differs in every later byte.
+    fn pinned_and_twin() -> ([u8; 32], [u8; 32]) {
+        let pinned = [0x42u8; 32];
+        let mut twin = pinned;
+        twin[8..].fill(0x43);
+        (pinned, twin)
+    }
+
     /// `ExecutableRefPin::new` renders the redacted owner and the bounded tag,
-    /// records the full SHA-256 of the tag key XDR and the resolved first-8,
-    /// is stable for a fixed owner and tag, and differs for a different tag.
+    /// records the full SHA-256 of the tag key XDR and the full resolved
+    /// hash, is stable for a fixed owner and tag, and differs for a different
+    /// tag.
     #[test]
     fn executable_ref_pin_new_is_stable_and_tag_sensitive() {
         use sha2::{Digest as _, Sha256};
@@ -3856,7 +4207,7 @@ mod tests {
             .collect();
         assert_eq!(pin.ref_key_hex, expected_key);
         assert_eq!(pin.ref_key_hex.len(), 64);
-        assert_eq!(pin.resolved_hash_first8, "abababababababab");
+        assert_eq!(pin.resolved_hash, WasmHashPin::new([0xabu8; 32]));
         assert_eq!(pin.owner_redacted.as_str(), "CAAAA...ABSC4");
         assert_eq!(
             pin.tag, "v1\\u{202e}",
@@ -3867,6 +4218,91 @@ mod tests {
         let other_tag = ScString(b"v2".to_vec().try_into().unwrap());
         let other = ExecutableRefPin::new(&owner, &other_tag, &[0xabu8; 32]).unwrap();
         assert_ne!(other.ref_key_hex, pin.ref_key_hex);
+
+        let first8 = ExecutableRefPinFirst8::new(&owner, &tag, &[0xabu8; 32]).unwrap();
+        assert_eq!(first8.ref_key_hex, pin.ref_key_hex);
+        assert_eq!(first8.resolved_hash_first8, "abababababababab");
+        assert!(first8.is_well_formed());
+    }
+
+    /// The full pin and the reference-pin constructor keep every byte: a
+    /// change at byte 8 or at byte 31 changes the pin, its wire form and its
+    /// round trip.
+    #[test]
+    fn wasm_hash_pin_and_reference_pin_keep_all_32_bytes() {
+        let (pinned, twin) = pinned_and_twin();
+        let mut last = pinned;
+        last[31] = 0x00;
+        for other in [twin, last] {
+            assert_ne!(WasmHashPin::new(pinned), WasmHashPin::new(other));
+            assert!(!WasmHashPin::new(pinned).matches(&other));
+            assert_ne!(
+                WasmHashPin::new(pinned).to_hex(),
+                WasmHashPin::new(other).to_hex()
+            );
+            let pin = full_executable_ref_pin_fixture(b"v1", pinned);
+            let other_pin = full_executable_ref_pin_fixture(b"v1", other);
+            assert_ne!(pin, other_pin, "the reference pin keeps the full hash");
+            assert_eq!(other_pin.resolved_hash.as_bytes(), &other);
+            let wire = serde_json::to_string(&other_pin).unwrap();
+            let back: ExecutableRefPin = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back.resolved_hash.as_bytes(), &other);
+        }
+        assert_eq!(
+            WasmHashPin::new(pinned).first8_display(),
+            WasmHashPin::new(twin).first8_display(),
+            "the labeled display projection cannot tell the twins apart"
+        );
+        let hex = WasmHashPin::new(twin).to_hex();
+        assert_eq!(hex.len(), 64);
+        assert_eq!(WasmHashPin::parse(&hex).unwrap().as_bytes(), &twin);
+        assert_eq!(
+            serde_json::to_string(&WasmHashPin::new(twin)).unwrap(),
+            format!("\"{hex}\"")
+        );
+        assert_eq!(WasmHashPin::try_from(&twin[..]).unwrap().as_bytes(), &twin);
+        assert_eq!(
+            WasmHashPin::try_from(&twin[..8]),
+            Err(WasmHashPinParseError::InvalidLength { actual: 16 })
+        );
+    }
+
+    /// The wire form is exactly 64 lowercase hex characters: 16, 63 and 65
+    /// characters, a non-hex character and an uppercase digit are refused,
+    /// by `parse` and by deserialization.
+    #[test]
+    fn wasm_hash_pin_parse_refuses_every_other_form() {
+        let good = "42".repeat(32);
+        assert!(WasmHashPin::parse(&good).is_ok());
+        for (text, expected) in [
+            (
+                "4242424242424242".to_owned(),
+                WasmHashPinParseError::InvalidLength { actual: 16 },
+            ),
+            (
+                good[..63].to_owned(),
+                WasmHashPinParseError::InvalidLength { actual: 63 },
+            ),
+            (
+                format!("{good}4"),
+                WasmHashPinParseError::InvalidLength { actual: 65 },
+            ),
+            (
+                format!("{}g{}", &good[..10], &good[11..]),
+                WasmHashPinParseError::InvalidChar { offset: 10 },
+            ),
+            (
+                format!("{}A{}", &good[..3], &good[4..]),
+                WasmHashPinParseError::InvalidChar { offset: 3 },
+            ),
+        ] {
+            assert_eq!(WasmHashPin::parse(&text), Err(expected.clone()), "{text}");
+            let quoted = format!("\"{text}\"");
+            assert!(
+                serde_json::from_str::<WasmHashPin>(&quoted).is_err(),
+                "deserialization refuses {text}"
+            );
+        }
     }
 
     /// A pin whose fields do not have the constructor's shape is not
@@ -3891,6 +4327,158 @@ mod tests {
         let mut long_owner = pin;
         long_owner.owner_redacted = RedactedStrkey::from_already_redacted("G".repeat(56));
         assert!(!long_owner.is_well_formed());
+
+        let full = full_executable_ref_pin_fixture(b"v1", [0x11u8; 32]);
+        assert!(full.is_well_formed());
+        let mut full_short_key = full.clone();
+        full_short_key.ref_key_hex.truncate(62);
+        assert!(!full_short_key.is_well_formed());
+        let mut full_upper_key = full.clone();
+        full_upper_key.ref_key_hex = full_upper_key.ref_key_hex.to_uppercase();
+        assert!(!full_upper_key.is_well_formed());
+        let mut full_long_tag = full;
+        full_long_tag.tag = "t".repeat(crate::observability::UNTRUSTED_DISPLAY_MAX_BYTES + 1);
+        assert!(!full_long_tag.is_well_formed());
+    }
+
+    /// A full reference pin whose resolved hash is a 16-character prefix
+    /// does not deserialize.
+    #[test]
+    fn executable_ref_pin_with_a_prefix_resolved_hash_does_not_deserialize() {
+        let pin = full_executable_ref_pin_fixture(b"v1", [0x11u8; 32]);
+        let mut value = serde_json::to_value(&pin).unwrap();
+        value["resolved_hash"] = serde_json::Value::String("1111111111111111".to_owned());
+        assert!(serde_json::from_value::<ExecutableRefPin>(value).is_err());
+    }
+
+    fn created_v2_fixture() -> EventKind {
+        let (pinned, twin) = pinned_and_twin();
+        EventKind::SaContextRuleCreatedV2 {
+            smart_account: "CDABC...XYZ12".to_owned(),
+            rule_id: 6,
+            context_type: "default".to_owned(),
+            signers_count: 2,
+            policies_count: 1,
+            valid_until: None,
+            pinned_verifier_wasm_hashes: vec![WasmHashPin::new(pinned)],
+            pinned_policy_wasm_hashes: vec![WasmHashPin::new(twin)],
+            mutable_override: false,
+            unknown_override: false,
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![Some(full_executable_ref_pin_fixture(
+                b"policy", twin,
+            ))],
+        }
+    }
+
+    fn pins_updated_v2_fixture() -> EventKind {
+        let (pinned, _) = pinned_and_twin();
+        EventKind::SaContextRulePinsUpdatedV2 {
+            smart_account: "CDABC...XYZ12".to_owned(),
+            rule_id: 6,
+            pinned_verifier_wasm_hashes: vec![WasmHashPin::new(pinned)],
+            pinned_policy_wasm_hashes: vec![],
+            mutable_override: false,
+            unknown_override: false,
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
+            reason: PinsUpdateReason::SignerAdded,
+        }
+    }
+
+    /// The version-2 pin rows round-trip byte for byte under their own
+    /// kinds, carry 64-character hashes, and serialize every pin field, empty
+    /// lists and `false` flags included.
+    #[test]
+    fn version_2_pin_rows_round_trip_with_full_hashes() {
+        let (pinned, twin) = pinned_and_twin();
+        let created = assert_round_trips_byte_identically(&created_v2_fixture());
+        assert!(
+            created.contains("\"kind\":\"sa_context_rule_created_v2\""),
+            "{created}"
+        );
+        assert!(
+            created.contains(&WasmHashPin::new(pinned).to_hex()),
+            "{created}"
+        );
+        assert!(
+            created.contains(&WasmHashPin::new(twin).to_hex()),
+            "{created}"
+        );
+        assert!(!created.contains("first8"), "{created}");
+        for field in [
+            "\"pinned_verifier_executable_refs\":[]",
+            "\"mutable_override\":false",
+            "\"unknown_override\":false",
+        ] {
+            assert!(created.contains(field), "{field} is serialized: {created}");
+        }
+        assert!(!created.contains("valid_until"), "{created}");
+
+        let updated = assert_round_trips_byte_identically(&pins_updated_v2_fixture());
+        assert!(
+            updated.contains("\"kind\":\"sa_context_rule_pins_updated_v2\""),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("\"pinned_policy_wasm_hashes\":[]"),
+            "{updated}"
+        );
+        assert!(updated.contains("\"reason\":\"signer_added\""), "{updated}");
+    }
+
+    /// A version-2 pin row without one of its required fields, or holding a
+    /// 16-character or uppercase hash, fails deserialization.
+    #[test]
+    fn version_2_pin_rows_refuse_missing_fields_and_prefix_hashes() {
+        for (ev, fields) in [
+            (
+                created_v2_fixture(),
+                &[
+                    "smart_account",
+                    "rule_id",
+                    "context_type",
+                    "signers_count",
+                    "policies_count",
+                    "pinned_verifier_wasm_hashes",
+                    "pinned_policy_wasm_hashes",
+                    "mutable_override",
+                    "unknown_override",
+                    "pinned_verifier_executable_refs",
+                    "pinned_policy_executable_refs",
+                ][..],
+            ),
+            (
+                pins_updated_v2_fixture(),
+                &[
+                    "smart_account",
+                    "rule_id",
+                    "pinned_verifier_wasm_hashes",
+                    "pinned_policy_wasm_hashes",
+                    "mutable_override",
+                    "unknown_override",
+                    "pinned_verifier_executable_refs",
+                    "pinned_policy_executable_refs",
+                    "reason",
+                ][..],
+            ),
+        ] {
+            for field in fields {
+                assert!(
+                    serde_json::from_str::<EventKind>(&json_without(&ev, field)).is_err(),
+                    "a row without `{field}` must fail deserialization"
+                );
+            }
+            for replacement in ["4242424242424242".to_owned(), "AB".repeat(32)] {
+                let mut value = serde_json::to_value(&ev).unwrap();
+                value["pinned_verifier_wasm_hashes"] =
+                    serde_json::Value::Array(vec![serde_json::Value::String(replacement.clone())]);
+                assert!(
+                    serde_json::from_value::<EventKind>(value).is_err(),
+                    "a row holding {replacement} must fail deserialization"
+                );
+            }
+        }
     }
 
     /// Round-trip: `SaContextRuleCreated` with executable-reference pins

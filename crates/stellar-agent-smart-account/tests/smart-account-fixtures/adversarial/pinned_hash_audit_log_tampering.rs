@@ -1,6 +1,6 @@
 //! Adversarial fixture: pinned-hash audit-log tampering is detected first.
 //!
-//! A `SaContextRuleCreated` row is tampered after a later row has already
+//! A `SaContextRuleCreatedV2` row is tampered after a later row has already
 //! committed to its hash-chain link. Reading pinned hashes must surface
 //! `SaError::AuditLog` before any verifier/policy pin is trusted.
 //!
@@ -14,6 +14,7 @@
 use std::io::Write as _;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
+use stellar_agent_core::audit_log::schema::WasmHashPin;
 use stellar_agent_core::audit_log::test_helpers::verified_audit_lines;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::verifiers::test_helpers;
@@ -26,7 +27,7 @@ fn pinned_hash_tampering_returns_audit_log_error_before_pin_extraction() {
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let rule_id = 1;
 
-    let created = AuditEntry::new_sa_context_rule_created(
+    let created = AuditEntry::new_sa_context_rule_created_v2(
         ZERO_CONTRACT_REDACTED,
         rule_id,
         "default",
@@ -35,14 +36,14 @@ fn pinned_hash_tampering_returns_audit_log_error_before_pin_extraction() {
         None,
         "stellar:testnet",
         Uuid::new_v4().to_string(),
-        vec!["0101010101010101".to_owned()],
+        vec![WasmHashPin::new([0x01; 32])],
         vec![],
         false,
         false,
         vec![],
         vec![],
     );
-    let witness = AuditEntry::new_sa_context_rule_created(
+    let witness = AuditEntry::new_sa_context_rule_created_v2(
         ZERO_CONTRACT_REDACTED,
         rule_id,
         "default",
@@ -51,7 +52,7 @@ fn pinned_hash_tampering_returns_audit_log_error_before_pin_extraction() {
         None,
         "stellar:testnet",
         Uuid::new_v4().to_string(),
-        vec!["0101010101010101".to_owned()],
+        vec![WasmHashPin::new([0x01; 32])],
         vec![],
         false,
         false,
@@ -74,7 +75,7 @@ fn pinned_hash_tampering_returns_audit_log_error_before_pin_extraction() {
         2,
         "fixture writes exactly created + witness rows"
     );
-    let tampered = lines[0].replacen("0101010101010101", "ffffffffffffffff", 1);
+    let tampered = lines[0].replacen(&"01".repeat(32), &"ff".repeat(32), 1);
     assert_ne!(lines[0], tampered, "tamper must mutate row 1");
     lines[0] = tampered;
     let rewritten = format!("{}\n", lines.join("\n"));
@@ -88,8 +89,12 @@ fn pinned_hash_tampering_returns_audit_log_error_before_pin_extraction() {
     file.flush().expect("flush must succeed");
 
     let manager = manager_one_url("http://127.0.0.1:1", audit_writer, audit_log_path);
-    let result =
-        test_helpers::read_pinned_hashes_for_rule(&manager, rule_id, ZERO_CONTRACT_REDACTED);
+    let result = test_helpers::read_pinned_hashes_for_rule(
+        &manager,
+        rule_id,
+        ZERO_CONTRACT_REDACTED,
+        "tampered-read",
+    );
 
     assert!(
         matches!(result, Err(SaError::AuditLog(_))),

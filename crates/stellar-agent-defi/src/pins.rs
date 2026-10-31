@@ -385,9 +385,8 @@ pub enum PinOutcome {
 /// `stellar_agent_network::fetch_contract_wasm_hash`.  `Absent`, `Sac` and
 /// `ExternalRef` map directly to `Err`; no outcome other than a matching
 /// `Wasm` hash reaches `Ok(())`, and no zero value stands in for a missing
-/// hash.  `stellar-agent-smart-account`'s verifier install path applies
-/// `unwrap_or([0u8; 32])` to an absent contract for its
-/// accept-unknown-verifier flow, a use case with no DeFi analogue.
+/// hash.  `stellar-agent-smart-account`'s verifier install path likewise
+/// refuses to pin a contract with no Wasm code.
 pub fn verify_pin_for_sign(
     pin: &DefiContractPin,
     fetch: &WasmHashFetch,

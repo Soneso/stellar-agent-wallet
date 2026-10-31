@@ -45,9 +45,11 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(test, feature = "test-helpers"))]
+use super::schema::ExecutableRefPinFirst8;
 use super::schema::{
     ContractKind, EventKind, ExecutableRefPin, KeyPurpose, MainnetPresenceAudit, PinsUpdateReason,
-    PolicyDecision, ValueLegRecord, VerifierAdvisoryKind, executable_refs_or_empty,
+    PolicyDecision, ValueLegRecord, VerifierAdvisoryKind, WasmHashPin, executable_refs_or_empty,
 };
 use crate::error::ValidationError;
 use crate::observability::RedactedStrkey;
@@ -621,15 +623,15 @@ impl AuditEntry {
         }
     }
 
-    /// Constructs a `SaContextRuleCreated` audit entry.
+    /// Constructs a `SaContextRuleCreatedV2` audit entry, the pin record a
+    /// rule install writes.
     ///
     /// Emitted from `ContextRuleManager::install_rule`.
     ///
+    /// The hash lists carry every pinned hash in full.
     /// `pinned_verifier_executable_refs` and `pinned_policy_executable_refs`
-    /// are aligned by position with the corresponding first-8 lists. A list
-    /// whose entries are all `None` is recorded as empty, so rows for rules
-    /// without an external-reference contract keep the shape older readers
-    /// know.
+    /// are aligned by position with the corresponding hash lists; a list
+    /// whose entries are all `None` is recorded as empty.
     ///
     /// # Redaction
     ///
@@ -641,6 +643,139 @@ impl AuditEntry {
     #[allow(
         clippy::too_many_arguments,
         reason = "irreducible audit-field set; mirrors new_sa_signer_set_baselined shape"
+    )]
+    pub fn new_sa_context_rule_created_v2(
+        smart_account: impl Into<String>,
+        rule_id: u32,
+        context_type: impl Into<String>,
+        signers_count: u32,
+        policies_count: u32,
+        valid_until: Option<u32>,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+        pinned_verifier_wasm_hashes: Vec<WasmHashPin>,
+        pinned_policy_wasm_hashes: Vec<WasmHashPin>,
+        mutable_override: bool,
+        unknown_override: bool,
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
+    ) -> Self {
+        Self::pin_row(
+            "sa.context_rule_created",
+            chain_id,
+            request_id,
+            EventKind::SaContextRuleCreatedV2 {
+                smart_account: smart_account.into(),
+                rule_id,
+                context_type: context_type.into(),
+                signers_count,
+                policies_count,
+                valid_until,
+                pinned_verifier_wasm_hashes,
+                pinned_policy_wasm_hashes,
+                mutable_override,
+                unknown_override,
+                pinned_verifier_executable_refs: executable_refs_or_empty(
+                    pinned_verifier_executable_refs,
+                ),
+                pinned_policy_executable_refs: executable_refs_or_empty(
+                    pinned_policy_executable_refs,
+                ),
+            },
+        )
+    }
+
+    /// Constructs a `SaContextRulePinsUpdatedV2` audit entry.
+    ///
+    /// Emitted by `smart-account migrate-verifier`, `signers add` /
+    /// `signers batch-add`, `signers refresh` and `rules add-policy` /
+    /// `rules remove-policy` after a wallet mutation changed the live
+    /// verifier or policy set of a rule that already has a complete pin
+    /// record. The row carries the rule's whole pin record with full hashes;
+    /// the drift check reads the newest pin row as the record.
+    ///
+    /// The executable-reference lists are aligned by position with the hash
+    /// lists; a list whose entries are all `None` is recorded as empty.
+    ///
+    /// # Redaction
+    ///
+    /// `smart_account` MUST be pre-redacted at the call site to first-5-last-5
+    /// form via `redact_strkey_first5_last5`.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "irreducible audit-field set; mirrors new_sa_context_rule_created_v2"
+    )]
+    pub fn new_sa_context_rule_pins_updated_v2(
+        smart_account: impl Into<String>,
+        rule_id: u32,
+        reason: PinsUpdateReason,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+        pinned_verifier_wasm_hashes: Vec<WasmHashPin>,
+        pinned_policy_wasm_hashes: Vec<WasmHashPin>,
+        mutable_override: bool,
+        unknown_override: bool,
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
+    ) -> Self {
+        Self::pin_row(
+            "sa.context_rule_pins_updated",
+            chain_id,
+            request_id,
+            EventKind::SaContextRulePinsUpdatedV2 {
+                smart_account: smart_account.into(),
+                rule_id,
+                pinned_verifier_wasm_hashes,
+                pinned_policy_wasm_hashes,
+                mutable_override,
+                unknown_override,
+                pinned_verifier_executable_refs: executable_refs_or_empty(
+                    pinned_verifier_executable_refs,
+                ),
+                pinned_policy_executable_refs: executable_refs_or_empty(
+                    pinned_policy_executable_refs,
+                ),
+                reason,
+            },
+        )
+    }
+
+    /// The common envelope of the pin rows: an allowed entry carrying `kind`.
+    fn pin_row(
+        tool: &str,
+        chain_id: impl IntoOptionalChainId,
+        request_id: impl Into<String>,
+        kind: EventKind,
+    ) -> Self {
+        Self {
+            ts: current_iso8601_utc(),
+            tool: tool.to_owned(),
+            chain_id: chain_id.into_optional_chain_id(),
+            arg_keys: vec![],
+            arg_keys_truncated: None,
+            truncated: false,
+            envelope_hash: None,
+            nonce_id: None,
+            policy_decision: PolicyDecision::Allow,
+            decision_reason: None,
+            request_id: request_id.into(),
+            event_kind: kind,
+            previous_entry_hash: String::new(),
+        }
+    }
+
+    /// Constructs a version-1 `SaContextRuleCreated` audit entry, whose pin
+    /// lists hold first-8 projections.
+    ///
+    /// Available to tests only: it builds the version-1 rows that existing
+    /// logs hold, for compatibility fixtures. Production code writes
+    /// [`Self::new_sa_context_rule_created_v2`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "irreducible audit-field set; mirrors new_sa_context_rule_created_v2"
     )]
     pub fn new_sa_context_rule_created(
         smart_account: impl Into<String>,
@@ -655,22 +790,14 @@ impl AuditEntry {
         pinned_policy_wasm_hashes_first8: Vec<String>,
         mutable_override: bool,
         unknown_override: bool,
-        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
-        pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
     ) -> Self {
-        Self {
-            ts: current_iso8601_utc(),
-            tool: "sa.context_rule_created".to_owned(),
-            chain_id: chain_id.into_optional_chain_id(),
-            arg_keys: vec![],
-            arg_keys_truncated: None,
-            truncated: false,
-            envelope_hash: None,
-            nonce_id: None,
-            policy_decision: PolicyDecision::Allow,
-            decision_reason: None,
-            request_id: request_id.into(),
-            event_kind: EventKind::SaContextRuleCreated {
+        Self::pin_row(
+            "sa.context_rule_created",
+            chain_id,
+            request_id,
+            EventKind::SaContextRuleCreated {
                 smart_account: smart_account.into(),
                 rule_id,
                 context_type: context_type.into(),
@@ -688,31 +815,19 @@ impl AuditEntry {
                     pinned_policy_executable_refs,
                 ),
             },
-            previous_entry_hash: String::new(),
-        }
+        )
     }
 
-    /// Constructs a `SaContextRulePinsUpdated` audit entry.
+    /// Constructs a version-1 `SaContextRulePinsUpdated` audit entry, whose
+    /// pin lists hold first-8 projections.
     ///
-    /// Emitted by `smart-account migrate-verifier`, `signers add` /
-    /// `signers batch-add` and `rules add-policy` / `rules remove-policy`
-    /// after a wallet mutation changed the live verifier or policy set of a
-    /// rule that already has a pin record. The row carries the
-    /// rule's whole pin record; the drift check reads the newest
-    /// `SaContextRuleCreated` or `SaContextRulePinsUpdated` row as the pin.
-    ///
-    /// The executable-reference lists are aligned by position with the
-    /// first-8 lists; a list whose entries are all `None` is recorded as
-    /// empty, as on `SaContextRuleCreated`.
-    ///
-    /// # Redaction
-    ///
-    /// `smart_account` MUST be pre-redacted at the call site to first-5-last-5
-    /// form via `redact_strkey_first5_last5`.
+    /// Available to tests only, for compatibility fixtures. Production code
+    /// writes [`Self::new_sa_context_rule_pins_updated_v2`].
+    #[cfg(any(test, feature = "test-helpers"))]
     #[must_use]
     #[allow(
         clippy::too_many_arguments,
-        reason = "irreducible audit-field set; mirrors new_sa_context_rule_created"
+        reason = "irreducible audit-field set; mirrors new_sa_context_rule_created_v2"
     )]
     pub fn new_sa_context_rule_pins_updated(
         smart_account: impl Into<String>,
@@ -724,22 +839,14 @@ impl AuditEntry {
         pinned_policy_wasm_hashes_first8: Vec<String>,
         mutable_override: bool,
         unknown_override: bool,
-        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
-        pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
+        pinned_verifier_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
+        pinned_policy_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
     ) -> Self {
-        Self {
-            ts: current_iso8601_utc(),
-            tool: "sa.context_rule_pins_updated".to_owned(),
-            chain_id: chain_id.into_optional_chain_id(),
-            arg_keys: vec![],
-            arg_keys_truncated: None,
-            truncated: false,
-            envelope_hash: None,
-            nonce_id: None,
-            policy_decision: PolicyDecision::Allow,
-            decision_reason: None,
-            request_id: request_id.into(),
-            event_kind: EventKind::SaContextRulePinsUpdated {
+        Self::pin_row(
+            "sa.context_rule_pins_updated",
+            chain_id,
+            request_id,
+            EventKind::SaContextRulePinsUpdated {
                 smart_account: smart_account.into(),
                 rule_id,
                 pinned_verifier_wasm_hashes_first8,
@@ -754,8 +861,7 @@ impl AuditEntry {
                 ),
                 reason,
             },
-            previous_entry_hash: String::new(),
-        }
+        )
     }
 
     /// Constructs a `SaContextRuleDeleted` audit entry.
@@ -7542,10 +7648,10 @@ mod tests {
     /// empty; a list with a `Some` entry is recorded unchanged.
     #[test]
     fn sa_context_rule_created_records_all_none_executable_refs_empty() {
-        use crate::audit_log::schema::ExecutableRefPin;
+        use crate::audit_log::schema::ExecutableRefPinFirst8;
         use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
 
-        let pin = ExecutableRefPin::new(
+        let pin = ExecutableRefPinFirst8::new(
             &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
             &ScString(b"v1".to_vec().try_into().expect("tag fits")),
             &[0xcdu8; 32],
@@ -7584,9 +7690,10 @@ mod tests {
     /// outer entry, and round-trips through JSON.
     #[test]
     fn sa_context_rule_pins_updated_constructor_plumbs_fields() {
+        use crate::audit_log::schema::ExecutableRefPinFirst8;
         use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
 
-        let pin = ExecutableRefPin::new(
+        let pin = ExecutableRefPinFirst8::new(
             &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
             &ScString(b"v2".to_vec().try_into().expect("tag fits")),
             &[0xcdu8; 32],
@@ -7645,6 +7752,127 @@ mod tests {
         let back: AuditEntry = serde_json::from_str(&json).expect("must deserialise");
         assert_eq!(back.event_kind, entry.event_kind);
         assert_eq!(back.request_id, "req-pins-updated");
+    }
+
+    /// The version-2 constructors keep every byte of every pinned hash and
+    /// reference pin: two hashes sharing their first eight bytes stay
+    /// distinct through construction, serialization and parsing.
+    #[test]
+    fn version_2_pin_constructors_keep_all_32_bytes() {
+        use crate::audit_log::schema::WasmHashPin;
+        use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
+
+        let pinned = [0x42u8; 32];
+        let mut twin = pinned;
+        twin[8..].fill(0x43);
+        let pin = ExecutableRefPin::new(
+            &ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+            &ScString(b"v1".to_vec().try_into().expect("tag fits")),
+            &twin,
+        )
+        .expect("pin builds");
+
+        let created = AuditEntry::new_sa_context_rule_created_v2(
+            "CDABC...12345",
+            3u32,
+            "default",
+            2u32,
+            1u32,
+            None,
+            "stellar:testnet",
+            "req-crc-v2",
+            vec![WasmHashPin::new(pinned), WasmHashPin::new(twin)],
+            vec![WasmHashPin::new(twin)],
+            true,
+            false,
+            vec![None, Some(pin.clone())],
+            vec![None],
+        );
+        assert_eq!(created.tool, "sa.context_rule_created");
+        let back: AuditEntry =
+            serde_json::from_str(&serde_json::to_string(&created).unwrap()).unwrap();
+        let EventKind::SaContextRuleCreatedV2 {
+            pinned_verifier_wasm_hashes,
+            pinned_policy_wasm_hashes,
+            pinned_verifier_executable_refs,
+            pinned_policy_executable_refs,
+            mutable_override,
+            ..
+        } = &back.event_kind
+        else {
+            panic!(
+                "expected SaContextRuleCreatedV2; got: {:?}",
+                back.event_kind
+            );
+        };
+        assert_eq!(pinned_verifier_wasm_hashes[0].as_bytes(), &pinned);
+        assert_eq!(pinned_verifier_wasm_hashes[1].as_bytes(), &twin);
+        assert_eq!(pinned_policy_wasm_hashes[0].as_bytes(), &twin);
+        assert_eq!(
+            pinned_verifier_executable_refs,
+            &vec![None, Some(pin.clone())]
+        );
+        assert!(pinned_policy_executable_refs.is_empty());
+        assert!(*mutable_override);
+
+        let updated = AuditEntry::new_sa_context_rule_pins_updated_v2(
+            "CDABC...12345",
+            3u32,
+            PinsUpdateReason::PolicyRemoved,
+            "stellar:testnet",
+            "req-pins-v2",
+            vec![WasmHashPin::new(twin)],
+            vec![],
+            false,
+            true,
+            vec![Some(pin.clone())],
+            vec![],
+        );
+        assert_eq!(updated.tool, "sa.context_rule_pins_updated");
+        assert_eq!(updated.request_id, "req-pins-v2");
+        let back: AuditEntry =
+            serde_json::from_str(&serde_json::to_string(&updated).unwrap()).unwrap();
+        let EventKind::SaContextRulePinsUpdatedV2 {
+            pinned_verifier_wasm_hashes,
+            pinned_verifier_executable_refs,
+            unknown_override,
+            reason,
+            ..
+        } = &back.event_kind
+        else {
+            panic!(
+                "expected SaContextRulePinsUpdatedV2; got: {:?}",
+                back.event_kind
+            );
+        };
+        assert_eq!(pinned_verifier_wasm_hashes[0].as_bytes(), &twin);
+        assert_eq!(
+            pinned_verifier_executable_refs[0]
+                .as_ref()
+                .unwrap()
+                .resolved_hash
+                .as_bytes(),
+            &twin
+        );
+        assert!(*unknown_override);
+        assert_eq!(*reason, PinsUpdateReason::PolicyRemoved);
+    }
+
+    /// A version-1 pin row as existing logs hold it parses and serializes
+    /// back to the same bytes, so its chain digest is unchanged.
+    #[test]
+    fn version_1_pin_rows_keep_their_canonical_bytes() {
+        let created = r#"{"ts":"2026-04-29T00:00:00.000Z","tool":"sa.context_rule_created","chain_id":"stellar:testnet","arg_keys":[],"policy_decision":"allow","request_id":"req-v1","kind":"sa_context_rule_created","smart_account":"CDABC...12345","rule_id":4,"context_type":"default","signers_count":1,"policies_count":1,"pinned_verifier_wasm_hashes_first8":["4242424242424242"],"pinned_policy_wasm_hashes_first8":["1111111111111111"],"mutable_override":true,"pinned_verifier_executable_refs":[{"owner_redacted":"CAAAA...ABSC4","tag":"v1","ref_key_hex":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","resolved_hash_first8":"4242424242424242"}],"previous_entry_hash":""}"#;
+        let updated = r#"{"ts":"2026-04-29T00:00:00.000Z","tool":"sa.context_rule_pins_updated","chain_id":"stellar:testnet","arg_keys":[],"policy_decision":"allow","request_id":"req-v1","kind":"sa_context_rule_pins_updated","smart_account":"CDABC...12345","rule_id":4,"pinned_verifier_wasm_hashes_first8":["4242424242424242"],"pinned_policy_wasm_hashes_first8":[],"mutable_override":false,"unknown_override":true,"reason":"signer_added","previous_entry_hash":""}"#;
+        for line in [created, updated] {
+            let entry: AuditEntry = serde_json::from_str(line).unwrap();
+            assert!(matches!(
+                entry.event_kind,
+                EventKind::SaContextRuleCreated { .. } | EventKind::SaContextRulePinsUpdated { .. }
+            ));
+            assert_eq!(serde_json::to_string(&entry).unwrap(), line);
+            assert_eq!(entry.canonical_json_body().unwrap(), line.as_bytes());
+        }
     }
 
     #[test]

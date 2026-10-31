@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::health::AuditWriterHealthHandle;
-use stellar_agent_core::audit_log::schema::ExecutableRefPin;
+use stellar_agent_core::audit_log::schema::{ExecutableRefPin, WasmHashPin};
 use stellar_agent_core::audit_log::signer_set::{
     SignerIdentityV2, SignerSetView, ThresholdObservation,
 };
@@ -497,8 +497,9 @@ pub struct SimulateInstallRuleOutput {
 
 /// Output of [`ContextRuleManager::verify_rule_wasm_pins`].
 ///
-/// Carries per-address pin status and first-8-hex hash projections for
-/// the `smart-account rules verify-pins` JSON envelope. See also the CLI envelope type
+/// Carries per-address pin status and the full pinned and observed hashes
+/// for the `smart-account rules verify-pins` JSON envelope, so two hashes
+/// that share a prefix stay distinguishable. See also the CLI envelope type
 /// `stellar_agent_cli::commands::smart_account::rules::VerifyPinsResult`, which adds
 /// chain metadata and CLI-facing field names.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -512,42 +513,46 @@ pub struct VerifyPinsResult {
     pub verifier_pin_status: PinStatus,
     /// Pin status for policy contracts.
     pub policy_pin_status: PinStatus,
-    /// Pinned verifier wasm hashes (first 8 bytes hex each) from the audit log.
-    pub pinned_verifier_first8: Vec<String>,
-    /// Pinned policy wasm hashes (first 8 bytes hex each) from the audit log.
-    pub pinned_policy_first8: Vec<String>,
-    /// Observed live verifier wasm hashes (first 8 bytes hex each) from chain.
-    pub observed_verifier_first8: Vec<String>,
-    /// Observed live policy wasm hashes (first 8 bytes hex each) from chain.
-    pub observed_policy_first8: Vec<String>,
+    /// Pinned verifier wasm hashes, in full, from the audit log. Empty when
+    /// the rule's pin record is incomplete.
+    pub pinned_verifier_hashes: Vec<WasmHashPin>,
+    /// Pinned policy wasm hashes, in full, from the audit log. Empty when
+    /// the rule's pin record is incomplete.
+    pub pinned_policy_hashes: Vec<WasmHashPin>,
+    /// Observed live verifier effective hashes, in full, from chain; `None`
+    /// (JSON `null`) for a verifier with no Wasm code, which has no hash.
+    pub observed_verifier_hashes: Vec<Option<WasmHashPin>>,
+    /// Observed live policy effective hashes, in full, from chain; `None`
+    /// (JSON `null`) for a policy with no Wasm code.
+    pub observed_policy_hashes: Vec<Option<WasmHashPin>>,
     /// Observed executable of each verifier, aligned with
-    /// `observed_verifier_first8`: the bounded
+    /// `observed_verifier_hashes`: the bounded
     /// [`crate::managers::signers::ObservedExecutable::summary`] of an external
     /// reference (owner, tag and resolved hash) or `"no code"`, and `None`
     /// for a plain Wasm executable. Omitted from JSON when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed_verifier_executable: Vec<Option<String>>,
     /// Observed executable of each policy, aligned with
-    /// `observed_policy_first8`, in the form of
+    /// `observed_policy_hashes`, in the form of
     /// `observed_verifier_executable`. Omitted from JSON when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed_policy_executable: Vec<Option<String>>,
     /// Executable-reference pins from the audit log, aligned with
-    /// `pinned_verifier_first8`; empty when no pinned verifier is an external
+    /// `pinned_verifier_hashes`; empty when no pinned verifier is an external
     /// reference, `None` at a position pinned by its Wasm hash. Omitted from
     /// JSON when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
     /// Executable-reference pins from the audit log, aligned with
-    /// `pinned_policy_first8`, in the form of
+    /// `pinned_policy_hashes`, in the form of
     /// `pinned_verifier_executable_refs`. Omitted from JSON when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
-    /// Install-time mutable-contract override flag, sourced from the
-    /// `SaContextRuleCreated` audit row. `false` for pre-Block-B rules.
+    /// Mutable-contract override flag of the rule's pin record. `false`
+    /// without a complete pin record.
     pub mutable_override: bool,
-    /// Install-time unknown-wasm override flag, sourced from the
-    /// `SaContextRuleCreated` audit row. `false` for pre-Block-B rules.
+    /// Unknown-wasm override flag of the rule's pin record. `false` without
+    /// a complete pin record.
     pub unknown_override: bool,
     /// Wire code of the inner `SaError` when `verifier_pin_status` or
     /// `policy_pin_status` is `Unavailable`. `None` when both statuses are not
@@ -2679,9 +2684,14 @@ impl ContextRuleManager {
     /// 3. For each policy address calls
     ///    `verify_pinned_policy_against_chain`; with no policy address, calls
     ///    `verify_policy_pins_present`.
-    /// 4. Reads the pinned first-8-hex strings from the audit log via
+    /// 4. Reads the full pinned hashes from the audit log via
     ///    `AuditReader::find_latest_context_rule_pinned_hashes` for the
     ///    envelope.
+    ///
+    /// A pin record of eight-byte hash prefixes is read before any address
+    /// is checked and reports both statuses `"unavailable"` with
+    /// `unavailable_wire_code` `sa.wasm_pin_incomplete`, empty hash lists and
+    /// both override flags `false`.
     ///
     /// # Status encoding
     ///
@@ -2694,9 +2704,8 @@ impl ContextRuleManager {
     ///   list is then empty.
     /// - `"unavailable"` — any other `SaError` (infrastructure failure; no
     ///   drift audit row emitted).
-    /// - `"no_pin"` — no `SaContextRuleCreated` audit row exists for this
-    ///   rule (rule was installed before wasm-hash pinning landed, or via
-    ///   non-wallet path).
+    /// - `"no_pin"`: no pin row exists for this rule (the rule was
+    ///   installed through a non-wallet path).
     /// - `"no_contracts"` — the on-chain rule has no verifier / policy
     ///   contracts (Delegated-only rule) and, for the policy half, the pin
     ///   record holds no policy pin.
@@ -2751,6 +2760,7 @@ impl ContextRuleManager {
             sm,
             rule_id,
             &smart_account_redacted,
+            request_id,
         ) {
             Ok(Some(r)) => r,
             Ok(None) => {
@@ -2766,10 +2776,10 @@ impl ContextRuleManager {
                     rule_id,
                     verifier_pin_status: status.clone(),
                     policy_pin_status: status,
-                    pinned_verifier_first8: vec![],
-                    pinned_policy_first8: vec![],
-                    observed_verifier_first8: vec![],
-                    observed_policy_first8: vec![],
+                    pinned_verifier_hashes: vec![],
+                    pinned_policy_hashes: vec![],
+                    observed_verifier_hashes: vec![],
+                    observed_policy_hashes: vec![],
                     observed_verifier_executable: vec![],
                     observed_policy_executable: vec![],
                     pinned_verifier_executable_refs: vec![],
@@ -2777,6 +2787,27 @@ impl ContextRuleManager {
                     mutable_override: false,
                     unknown_override: false,
                     unavailable_wire_code: None,
+                });
+            }
+            // A record of eight-byte prefixes cannot report code identity:
+            // both halves are unavailable with the incomplete-pin code.
+            Err(e @ SaError::WasmPinIncomplete { .. }) => {
+                return Ok(VerifyPinsResult {
+                    smart_account: smart_account_strkey,
+                    rule_id,
+                    verifier_pin_status: PinStatus::Unavailable,
+                    policy_pin_status: PinStatus::Unavailable,
+                    pinned_verifier_hashes: vec![],
+                    pinned_policy_hashes: vec![],
+                    observed_verifier_hashes: vec![],
+                    observed_policy_hashes: vec![],
+                    observed_verifier_executable: vec![],
+                    observed_policy_executable: vec![],
+                    pinned_verifier_executable_refs: vec![],
+                    pinned_policy_executable_refs: vec![],
+                    mutable_override: false,
+                    unknown_override: false,
+                    unavailable_wire_code: Some(e.wire_code()),
                 });
             }
             Err(e) => return Err(e),
@@ -2827,10 +2858,10 @@ impl ContextRuleManager {
             rule_id,
             verifier_pin_status: verifier.status,
             policy_pin_status: policy.status,
-            pinned_verifier_first8: pin_record.pinned_verifier_first8,
-            pinned_policy_first8: pin_record.pinned_policy_first8,
-            observed_verifier_first8: verifier.observed_first8,
-            observed_policy_first8: policy.observed_first8,
+            pinned_verifier_hashes: pin_record.pinned_verifier_hashes,
+            pinned_policy_hashes: pin_record.pinned_policy_hashes,
+            observed_verifier_hashes: verifier.observed_hashes,
+            observed_policy_hashes: policy.observed_hashes,
             observed_verifier_executable: verifier.observed_executable,
             observed_policy_executable: policy.observed_executable,
             pinned_verifier_executable_refs: pin_record.pinned_verifier_executable_refs,
@@ -5315,6 +5346,9 @@ pub(crate) fn sa_error_to_invocation_result(
         // record does not pin, refuse before any signing attempt.
         | SaError::PinnedPolicyAbsent { .. }
         | SaError::PinnedVerifierAbsent { .. }
+        // A selected pin record of eight-byte prefixes refuses before any
+        // signing attempt.
+        | SaError::WasmPinIncomplete { .. }
         // The pre-signing drift check could not run; nothing was signed.
         | SaError::PinCheckUnavailable { .. }
         // Verifier diversification pre-submission refusals.
@@ -5486,9 +5520,10 @@ struct KindPinReport {
     /// Last-wins status over the kind's addresses: each address sets
     /// `Match`, `Drift` or `Unavailable` in turn.
     status: PinStatus,
-    /// Observed first-8 of each address that matched or drifted.
-    observed_first8: Vec<String>,
-    /// Bounded summary aligned with `observed_first8`; `None` for a plain
+    /// Full observed hash of each address that matched or drifted; `None`
+    /// for absent Wasm code.
+    observed_hashes: Vec<Option<WasmHashPin>>,
+    /// Bounded summary aligned with `observed_hashes`; `None` for a plain
     /// Wasm executable.
     observed_executable: Vec<Option<String>>,
     /// Wire code of the kind's first failure that is not drift, recorded
@@ -5526,7 +5561,7 @@ async fn verify_kind_pins(
 ) -> Result<KindPinReport, SaError> {
     let mut report = KindPinReport {
         status: PinStatus::Match,
-        observed_first8: Vec::new(),
+        observed_hashes: Vec::new(),
         observed_executable: Vec::new(),
         unavailable_wire_code: None,
     };
@@ -5583,35 +5618,22 @@ async fn verify_kind_pins(
         };
         match (kind, outcome) {
             (_, Ok(())) => {
-                // Observed effective hash for the envelope (already cached);
-                // the check passed, so no code reads as the zero hash the pin
-                // holds.
+                // Observed effective hash for the envelope (already cached).
+                // A match always has a hash, since absent Wasm code matches no
+                // pin; the entry stays `None` for any executable without one.
                 if let Some(executable) = wasm_hash_cache.get(&cache_key) {
-                    let h = executable.effective_hash().unwrap_or([0u8; 32]);
                     report
-                        .observed_first8
-                        .push(crate::managers::signers::hash_first8_hex(&h));
+                        .observed_hashes
+                        .push(executable.effective_hash().map(WasmHashPin::new));
                     report
                         .observed_executable
                         .push(non_wasm_executable_summary(executable));
                 }
             }
-            (
-                PinnedKind::Verifier,
-                Err(SaError::VerifierHashDrift {
-                    observed_hash_first8,
-                    ..
-                }),
-            )
-            | (
-                PinnedKind::Policy,
-                Err(SaError::PolicyHashDrift {
-                    observed_hash_first8,
-                    ..
-                }),
-            ) => {
+            (PinnedKind::Verifier, Err(SaError::VerifierHashDrift { observed_hash, .. }))
+            | (PinnedKind::Policy, Err(SaError::PolicyHashDrift { observed_hash, .. })) => {
                 report.status = PinStatus::Drift;
-                report.observed_first8.push(observed_hash_first8);
+                report.observed_hashes.push(observed_hash);
                 report.observed_executable.push(
                     wasm_hash_cache
                         .get(&cache_key)
@@ -5634,7 +5656,7 @@ async fn verify_kind_pins(
 
 /// Returns the bounded summary of an observed executable for the
 /// verify-pins report, or `None` for a plain Wasm executable, whose hash the
-/// first-8 list already carries.
+/// observed hash list already carries.
 fn non_wasm_executable_summary(
     executable: &crate::managers::signers::ObservedExecutable,
 ) -> Option<String> {
@@ -8827,10 +8849,10 @@ mod tests {
             "rule_id": 2,
             "verifier_pin_status": "match",
             "policy_pin_status": "no_contracts",
-            "pinned_verifier_first8": ["ab12cd34"],
-            "pinned_policy_first8": [],
-            "observed_verifier_first8": ["ab12cd34"],
-            "observed_policy_first8": [],
+            "pinned_verifier_hashes": ["ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34"],
+            "pinned_policy_hashes": [],
+            "observed_verifier_hashes": ["ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34"],
+            "observed_policy_hashes": [],
             "mutable_override": false,
             "unknown_override": false
         }"#;
@@ -8857,7 +8879,7 @@ mod tests {
             owner_redacted: RedactedStrkey::from_already_redacted("GAAAA...AAWHF"),
             tag: "verifier-v1".to_owned(),
             ref_key_hex: "ab".repeat(32),
-            resolved_hash_first8: "ab12cd34ab12cd34".to_owned(),
+            resolved_hash: WasmHashPin::parse(&"ab12cd34".repeat(8)).unwrap(),
         };
         result.observed_verifier_executable = vec![Some("no code".to_owned())];
         result.observed_policy_executable = vec![None];

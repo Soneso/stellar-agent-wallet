@@ -10,8 +10,8 @@
 //!
 //! 1. The rule's pinned verifiers (read from the audit-log-derived
 //!    `PinnedHashesRecord`) belong to at most **one** party: a Wasm pin is one
-//!    party per distinct first-8, and the external-reference pins that share an
-//!    `owner_redacted` are one party together.
+//!    party per distinct full hash, and the external-reference pins that share
+//!    an `owner_redacted` are one party together.
 //! 2. The rule's policy criteria evaluates to **either** `Stroops(n)` where
 //!    `n > HIGH_VALUE_THRESHOLD_STROOPS`, **or** `Undetermined`.
 //!
@@ -36,6 +36,7 @@ use stellar_xdr::ScVal;
 
 use crate::managers::policies::{ValueThresholdResult, extract_value_threshold};
 use stellar_agent_core::audit_log::reader::PinnedHashesRecord;
+use stellar_agent_core::audit_log::schema::WasmHashPin;
 
 // ── Public(crate) types ──────────────────────────────────────────────────────
 
@@ -71,9 +72,10 @@ pub(crate) enum DiversificationCheck {
         ///
         /// Pre-redacted at the call site via `redact_first5_last5`.
         smart_account_redacted: String,
-        /// First-8-hex of the first pinned verifier of this rule. When several
-        /// pins collapse to one party (external references under one owner),
-        /// this is the first pin's first-8; empty when no pin is recorded.
+        /// Labeled first-8 display projection of the first pinned verifier
+        /// hash of this rule, for the forensic rows. When several pins
+        /// collapse to one party (external references under one owner), this
+        /// is the first pin's; empty when no pin is recorded.
         verifier_hash_first8: String,
         /// Observed per-tx value threshold extracted from policy criteria.
         ///
@@ -104,8 +106,8 @@ impl DiversificationCheck {
 ///   smart-account contract. The caller applies redaction before this function
 ///   to avoid logging the full contract address.
 /// - `pinned_hashes` — audit-log-derived pinned hash record for the rule.
-///   An absent record (no `SaContextRuleCreated` row found) carries
-///   `pinned_verifier_first8 = []`, which is treated as single-verifier
+///   An absent record (no pin row found) carries
+///   `pinned_verifier_hashes = []`, which is treated as single-verifier
 ///   (fail-CLOSED: a missing baseline means we cannot confirm diversity).
 /// - `criteria` — the rule's policy criteria `ScVal`. Pass `ScVal::Void` when
 ///   the criteria cannot be fetched (maps to `Undetermined` → fail-CLOSED).
@@ -120,12 +122,12 @@ impl DiversificationCheck {
 ///   Includes:
 ///   - `Stroops(n)` with `n > HIGH_VALUE_THRESHOLD_STROOPS` AND one party.
 ///   - `Undetermined` (fail-CLOSED: unknown criteria treated as high-value).
-///   - Empty `pinned_verifier_first8` (no baseline, zero parties).
+///   - Empty `pinned_verifier_hashes` (no baseline, zero parties).
 ///
 /// # Parties
 ///
 /// A party is whoever decides which verifier code runs. A Wasm pin counts
-/// once per distinct first-8. External-reference pins count once per
+/// once per distinct full hash. External-reference pins count once per
 /// `owner_redacted` of their [`ExecutableRefPin`], because one owner manages
 /// every tag it holds: two references whose tags one owner manages are one
 /// party. The redacted form can collide for two distinct owners, which only
@@ -174,9 +176,9 @@ pub(crate) fn check_diversification_required(
 
     // Build forensic fields for the Required variant.
     let verifier_hash_first8 = pinned_hashes
-        .pinned_verifier_first8
+        .pinned_verifier_hashes
         .first()
-        .cloned()
+        .map(|hash| hash.first8_display())
         .unwrap_or_default();
 
     // Sentinel when Undetermined (cannot fit a real stroop value in the field;
@@ -199,8 +201,8 @@ pub(crate) fn check_diversification_required(
 /// One party that decides which pinned verifier code runs.
 #[derive(PartialEq, Eq, Hash)]
 enum VerifierParty<'a> {
-    /// A Wasm pin, identified by its first-8.
-    Wasm(&'a str),
+    /// A Wasm pin, identified by its full hash.
+    Wasm(&'a WasmHashPin),
     /// The owner of one or more external-reference pins, by its redacted form.
     ReferenceOwner(&'a str),
 }
@@ -208,13 +210,13 @@ enum VerifierParty<'a> {
 /// Counts the distinct parties behind the pinned verifiers of `pinned_hashes`.
 fn verifier_party_count(pinned_hashes: &PinnedHashesRecord) -> usize {
     pinned_hashes
-        .pinned_verifier_first8
+        .pinned_verifier_hashes
         .iter()
         .enumerate()
         .map(
-            |(position, first8)| match pinned_hashes.verifier_executable_ref(position) {
+            |(position, hash)| match pinned_hashes.verifier_executable_ref(position) {
                 Some(pin) => VerifierParty::ReferenceOwner(pin.owner_redacted.as_str()),
-                None => VerifierParty::Wasm(first8.as_str()),
+                None => VerifierParty::Wasm(hash),
             },
         )
         .collect::<std::collections::HashSet<_>>()
@@ -241,16 +243,21 @@ mod tests {
 
     // ── Fixture helpers ───────────────────────────────────────────────────────
 
-    fn pinned_one(hash_first8: &str) -> PinnedHashesRecord {
+    /// A full hash whose hex form repeats `pattern` to 64 characters.
+    fn hash(pattern: &str) -> WasmHashPin {
+        WasmHashPin::parse(&pattern.repeat(64 / pattern.len())).unwrap()
+    }
+
+    fn pinned_one(pattern: &str) -> PinnedHashesRecord {
         PinnedHashesRecord {
-            pinned_verifier_first8: vec![hash_first8.to_owned()],
+            pinned_verifier_hashes: vec![hash(pattern)],
             ..Default::default()
         }
     }
 
     fn pinned_two(h1: &str, h2: &str) -> PinnedHashesRecord {
         PinnedHashesRecord {
-            pinned_verifier_first8: vec![h1.to_owned(), h2.to_owned()],
+            pinned_verifier_hashes: vec![hash(h1), hash(h2)],
             ..Default::default()
         }
     }
@@ -260,24 +267,24 @@ mod tests {
     }
 
     /// An external-reference pin under `owner_redacted` with `tag`.
-    fn reference_pin(owner_redacted: &str, tag: &str, first8: &str) -> ExecutableRefPin {
+    fn reference_pin(owner_redacted: &str, tag: &str, pattern: &str) -> ExecutableRefPin {
         ExecutableRefPin {
             owner_redacted: RedactedStrkey::from_already_redacted(owner_redacted),
             tag: tag.to_owned(),
             ref_key_hex: format!("{tag:0>64}"),
-            resolved_hash_first8: first8.to_owned(),
+            resolved_hash: hash(pattern),
         }
     }
 
-    /// Verifier pins at the given first-8 values, each with its optional
+    /// Verifier pins at the given hash patterns, each with its optional
     /// external-reference pin at the same position.
     fn pinned_with_refs(pins: Vec<(&str, Option<ExecutableRefPin>)>) -> PinnedHashesRecord {
-        let (first8, refs): (Vec<String>, Vec<Option<ExecutableRefPin>>) = pins
+        let (hashes, refs): (Vec<WasmHashPin>, Vec<Option<ExecutableRefPin>>) = pins
             .into_iter()
-            .map(|(first8, pin)| (first8.to_owned(), pin))
+            .map(|(pattern, pin)| (hash(pattern), pin))
             .unzip();
         PinnedHashesRecord {
-            pinned_verifier_first8: first8,
+            pinned_verifier_hashes: hashes,
             pinned_verifier_executable_refs: refs,
             ..Default::default()
         }
@@ -397,7 +404,7 @@ mod tests {
 
     /// Verifies fail-CLOSED when no audit-log baseline exists for the rule.
     ///
-    /// An absent `PinnedHashesRecord` (empty `pinned_verifier_first8`) is
+    /// An absent `PinnedHashesRecord` (empty `pinned_verifier_hashes`) is
     /// treated as single-verifier. Combined with Undetermined criteria (OZ
     /// v0.7.2 default) this triggers the Required variant with an empty
     /// `verifier_hash_first8` field.
@@ -426,7 +433,8 @@ mod tests {
     /// hash's first-8 hex chars.
     ///
     /// When the trigger fires, the forensic `verifier_hash_first8` field in the
-    /// `Required` variant MUST equal `pinned_verifier_first8[0]` so that the
+    /// `Required` variant MUST be the display projection of
+    /// `pinned_verifier_hashes[0]` so that the
     /// `SaError::VerifierDiversificationRequired` and
     /// `SaVerifierDiversificationOverride` audit entries carry the correct hash.
     #[test]
@@ -438,9 +446,9 @@ mod tests {
             matches!(
                 &result,
                 DiversificationCheck::Required { verifier_hash_first8, .. }
-                    if verifier_hash_first8 == "deadbeef"
+                    if verifier_hash_first8 == "deadbeefdeadbeef"
             ),
-            "Required.verifier_hash_first8 must equal pinned_verifier_first8[0]; \
+            "Required.verifier_hash_first8 must project pinned_verifier_hashes[0]; \
              got: {result:?}"
         );
     }
@@ -507,9 +515,9 @@ mod tests {
         assert_eq!(result, DiversificationCheck::NotRequired);
     }
 
-    /// Two Wasm pins with the same first-8 are one party.
+    /// Two Wasm pins of one hash are one party.
     #[test]
-    fn two_wasm_pins_with_one_first8_are_one_party() {
+    fn two_wasm_pins_of_one_hash_are_one_party() {
         let pinned = pinned_two("aabbccdd", "aabbccdd");
         let result =
             check_diversification_required(10, "CAAAA...AAAAA", &pinned, &high_value_criteria());
@@ -517,5 +525,47 @@ mod tests {
             matches!(result, DiversificationCheck::Required { rule_id: 10, .. }),
             "two pins of one Wasm hash must return Required; got: {result:?}"
         );
+    }
+
+    /// Two Wasm pins whose hashes differ only in the last byte are two
+    /// parties, and so are two pins sharing the first eight bytes beside a
+    /// third pin equal to the first: the count compares all 32 bytes.
+    #[test]
+    fn wasm_pins_differing_in_any_byte_are_distinct_parties() {
+        let pinned = [0x42u8; 32];
+        let mut last_byte = pinned;
+        last_byte[31] = 0x00;
+        let mut twin = pinned;
+        twin[8..].fill(0x43);
+        for hashes in [vec![pinned, last_byte], vec![pinned, twin, pinned]] {
+            let record = PinnedHashesRecord {
+                pinned_verifier_hashes: hashes.iter().copied().map(WasmHashPin::new).collect(),
+                ..Default::default()
+            };
+            assert_eq!(verifier_party_count(&record), 2, "{hashes:02x?}");
+            let result = check_diversification_required(
+                12,
+                "CAAAA...AAAAA",
+                &record,
+                &high_value_criteria(),
+            );
+            assert_eq!(result, DiversificationCheck::NotRequired, "{hashes:02x?}");
+        }
+    }
+
+    /// Two Wasm pins whose hashes share the first eight bytes and differ in
+    /// a later byte are two parties: each runs different code.
+    #[test]
+    fn two_wasm_pins_sharing_a_prefix_are_two_parties() {
+        let pinned = [0x42u8; 32];
+        let mut twin = pinned;
+        twin[8..].fill(0x43);
+        let record = PinnedHashesRecord {
+            pinned_verifier_hashes: vec![WasmHashPin::new(pinned), WasmHashPin::new(twin)],
+            ..Default::default()
+        };
+        let result =
+            check_diversification_required(11, "CAAAA...AAAAA", &record, &high_value_criteria());
+        assert_eq!(result, DiversificationCheck::NotRequired);
     }
 }

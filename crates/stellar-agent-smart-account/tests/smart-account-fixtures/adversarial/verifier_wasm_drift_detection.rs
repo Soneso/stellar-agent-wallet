@@ -8,12 +8,11 @@
 //!
 //! # Design
 //!
-//! 1. Write a `SaContextRuleCreated` audit entry whose
-//!    `pinned_verifier_wasm_hashes_first8` is `["0101010101010101"]` (a
-//!    sentinel that will not match the mock RPC's response).
+//! 1. Write a `SaContextRuleCreatedV2` audit entry whose
+//!    `pinned_verifier_wasm_hashes` is `[[0x01; 32]]` (a sentinel that will
+//!    not match the mock RPC's response).
 //! 2. Mount a mock RPC that returns a contract instance with wasm hash
-//!    `VERIFIER_ALLOWLIST[0].wasm_hash` (first-8: `"67800690..."`) — different from
-//!    the audit-pinned `"0101010101010101"`.
+//!    `VERIFIER_ALLOWLIST[0].wasm_hash`, different from the pinned sentinel.
 //! 3. Call `verify_pinned_verifier_against_chain` (exposed via
 //!    `managers::verifiers::test_helpers` under `--features test-helpers`).
 //! 4. Assert `SaError::VerifierHashDrift` is returned AND a `SaVerifierHashDrift`
@@ -21,7 +20,8 @@
 //!
 //! # Implements
 //!
-//! Verifier-pinning drift detection: on-chain WASM hash change at sign time must be caught.
+//! Verifier-pinning drift detection: on-chain WASM hash change at sign time must be caught,
+//! including a hash that shares the pinned hash's first eight bytes.
 
 #![cfg(feature = "test-helpers")]
 
@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::schema::{EventKind, WasmHashPin};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::error::SaError;
@@ -65,7 +65,6 @@ async fn verifier_wasm_hash_drift_detected_and_audit_row_emitted() {
     let verifier = verifier_addr();
 
     // ── Step 1: Set up a mock RPC that serves VERIFIER_ALLOWLIST[0].wasm_hash ──
-    // first-8 hex: "67800690..."
     let live_wasm_hash = VERIFIER_ALLOWLIST[0].wasm_hash;
     let ledger_entries = build_ledger_entries_contract_instance(&verifier, live_wasm_hash);
 
@@ -79,13 +78,12 @@ async fn verifier_wasm_hash_drift_detected_and_audit_row_emitted() {
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
 
-    // ── Step 2: Write a fake SaContextRuleCreated row with a DIFFERENT pinned hash
-    // Pinned sentinel: "0101010101010101" — will not match live_wasm_hash's first-8.
-    let fake_pinned_first8 = "0101010101010101".to_owned();
+    // ── Step 2: Write a fake SaContextRuleCreatedV2 row with a DIFFERENT pinned hash
+    let fake_pinned = WasmHashPin::new([0x01; 32]);
     let rule_id: u32 = 1;
     let request_id = Uuid::new_v4().to_string();
 
-    let fake_entry = AuditEntry::new_sa_context_rule_created(
+    let fake_entry = AuditEntry::new_sa_context_rule_created_v2(
         ZERO_CONTRACT_REDACTED,
         rule_id,
         "default",
@@ -94,7 +92,7 @@ async fn verifier_wasm_hash_drift_detected_and_audit_row_emitted() {
         None,
         "stellar:testnet",
         &request_id,
-        vec![fake_pinned_first8.clone()],
+        vec![fake_pinned],
         vec![],
         false,
         false,
@@ -167,7 +165,7 @@ async fn a_pinned_revoked_verifier_refuses_after_the_pin_matches() {
     audit
         .lock()
         .unwrap()
-        .write_entry(AuditEntry::new_sa_context_rule_created(
+        .write_entry(AuditEntry::new_sa_context_rule_created_v2(
             ZERO_CONTRACT_REDACTED,
             1,
             "default",
@@ -176,7 +174,7 @@ async fn a_pinned_revoked_verifier_refuses_after_the_pin_matches() {
             None,
             "stellar:testnet",
             "revoked-pin",
-            vec!["eeeeeeeeeeeeeeee".to_owned()],
+            vec![WasmHashPin::new([0xee; 32])],
             vec![],
             false,
             false,
@@ -208,5 +206,120 @@ async fn a_pinned_revoked_verifier_refuses_after_the_pin_matches() {
         !verified_audit_entries(&audit)
             .iter()
             .any(|entry| matches!(entry.event_kind, EventKind::SaVerifierHashDrift { .. }))
+    );
+}
+
+/// The pinned hash of the pin-width tests and a hash sharing its first eight
+/// bytes that differs in every later byte.
+fn pinned_and_twin() -> ([u8; 32], [u8; 32]) {
+    let pinned = [0x42u8; 32];
+    let mut twin = pinned;
+    twin[8..].fill(0x43);
+    (pinned, twin)
+}
+
+/// Serves `live` as the verifier's Wasm hash and pins `pinned` for rule 1
+/// with the given override flags; returns the check's outcome and the audit
+/// log's rows.
+async fn check_against(
+    pinned: [u8; 32],
+    live: [u8; 32],
+    overrides: bool,
+) -> (
+    Result<(), SaError>,
+    Vec<stellar_agent_core::audit_log::entry::AuditEntry>,
+) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(JsonRpcResultResponder(
+            build_ledger_entries_contract_instance(&verifier_addr(), live),
+        ))
+        .mount(&server)
+        .await;
+    let (audit, path, _dir) = tmp_audit_writer();
+    let manager = manager_one_url(&server.uri(), Arc::clone(&audit), path);
+    audit
+        .lock()
+        .unwrap()
+        .write_entry(AuditEntry::new_sa_context_rule_created_v2(
+            ZERO_CONTRACT_REDACTED,
+            1,
+            "default",
+            1,
+            0,
+            None,
+            "stellar:testnet",
+            "twin-pin",
+            vec![WasmHashPin::new(pinned)],
+            vec![],
+            overrides,
+            overrides,
+            vec![],
+            vec![],
+        ))
+        .unwrap();
+    let outcome = test_helpers::verify_pinned_verifier_against_chain(
+        &manager,
+        verifier_addr(),
+        1,
+        ZERO_CONTRACT_REDACTED,
+        "twin-pin",
+        &mut HashMap::new(),
+    )
+    .await;
+    (outcome, verified_audit_entries(&audit))
+}
+
+/// A live verifier whose hash shares the pinned hash's first eight bytes
+/// and is in no allowlist refuses as drift, with and without both admission
+/// overrides on the pin record, naming both full hashes and writing the
+/// drift row. The exact pinned hash passes.
+#[tokio::test]
+async fn an_unlisted_equal_prefix_twin_refuses_as_drift_under_both_overrides() {
+    let (pinned, twin) = pinned_and_twin();
+    for overrides in [false, true] {
+        let (outcome, rows) = check_against(pinned, twin, overrides).await;
+        match outcome {
+            Err(SaError::VerifierHashDrift {
+                pinned_hash,
+                observed_hash,
+                ..
+            }) => {
+                assert_eq!(
+                    pinned_hash,
+                    WasmHashPin::new(pinned),
+                    "overrides={overrides}"
+                );
+                assert_eq!(
+                    observed_hash,
+                    Some(WasmHashPin::new(twin)),
+                    "overrides={overrides}"
+                );
+            }
+            other => panic!("overrides={overrides}: expected VerifierHashDrift, got {other:?}"),
+        }
+        assert!(
+            rows.iter()
+                .any(|entry| matches!(entry.event_kind, EventKind::SaVerifierHashDrift { .. })),
+            "overrides={overrides}: the drift row is written"
+        );
+
+        let (outcome, _) = check_against(pinned, pinned, overrides).await;
+        assert!(outcome.is_ok(), "overrides={overrides}: {outcome:?}");
+    }
+}
+
+/// A live twin of a pinned revoked verifier refuses as drift: the status of
+/// the revoked hash is never assigned to a hash that only shares its prefix,
+/// and the pin comparison refuses first.
+#[tokio::test]
+async fn a_twin_of_a_pinned_revoked_verifier_refuses_as_drift() {
+    let revoked = [0xeeu8; 32];
+    let mut twin = revoked;
+    twin[8..].fill(0x43);
+    let (outcome, _) = check_against(revoked, twin, false).await;
+    assert!(
+        matches!(outcome, Err(SaError::VerifierHashDrift { .. })),
+        "{outcome:?}"
     );
 }

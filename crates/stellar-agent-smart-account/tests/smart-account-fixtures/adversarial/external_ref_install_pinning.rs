@@ -9,8 +9,11 @@
 //!   `sa.policy_mutable`, reason `owner-managed external reference`, and a
 //!   detail naming the owner and the tag;
 //! - admit it with `accept_mutable_verifier`, return a pending mutable
-//!   override naming the owner and the tag, and pin the resolved hash
-//!   together with an `ExecutableRefPin` at the same position;
+//!   override naming the owner and the tag, and pin the full resolved hash
+//!   together with an `ExecutableRefPin` at the same position; the pin
+//!   persists in full through the audit row, and signing refuses the same
+//!   reference once it resolves to a hash differing only after the first
+//!   eight bytes;
 //! - require `accept_unknown_verifier` as well when the resolved hash is
 //!   outside the allowlist, returning both pending overrides;
 //! - refuse with `sa.contract_instance_unsupported`, reason
@@ -23,9 +26,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use stellar_agent_core::audit_log::schema::{ContractKind, EventKind, ExecutableRefPin};
+use stellar_agent_core::audit_log::schema::{
+    ContractKind, EventKind, ExecutableRefPin, WasmHashPin,
+};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_lines;
-use stellar_agent_core::audit_log::{AuditReader, AuditWriter};
+use stellar_agent_core::audit_log::{AuditReader, AuditWriter, ContextRulePinRecord};
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::error::{AdminOrOwnerKey, SaError};
 use stellar_agent_smart_account::managers::rules::RuleContext;
@@ -70,10 +75,6 @@ fn owner_scaddress() -> ScAddress {
 
 fn contract_strkey() -> String {
     stellar_agent_core::sc_address::scaddress_to_strkey(&contract_addr()).expect("contract strkey")
-}
-
-fn first8(hash: &[u8; 32]) -> String {
-    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The hash the allowlist of `kind` accepts.
@@ -351,7 +352,7 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
         );
         assert_no_audit_row(&audit_writer, &format!("{kind}"));
 
-        // The created row records the resolved first-8 and the pin at the
+        // The created row records the full resolved hash and the pin at the
         // same position, and the reader returns them.
         let created = pin_result.context_rule_created_entry(
             ZERO_CONTRACT_REDACTED,
@@ -360,32 +361,32 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
             "stellar:testnet",
             &request_id,
         );
-        let EventKind::SaContextRuleCreated {
-            pinned_verifier_wasm_hashes_first8,
-            pinned_policy_wasm_hashes_first8,
+        let EventKind::SaContextRuleCreatedV2 {
+            pinned_verifier_wasm_hashes,
+            pinned_policy_wasm_hashes,
             pinned_verifier_executable_refs,
             pinned_policy_executable_refs,
             mutable_override,
             ..
         } = &created.event_kind
         else {
-            panic!("{kind}: expected SaContextRuleCreated");
+            panic!("{kind}: expected SaContextRuleCreatedV2");
         };
         assert!(*mutable_override, "{kind}");
-        let (created_first8, created_refs, other_refs) = if kind == ContractKind::Policy {
+        let (created_hashes, created_refs, other_refs) = if kind == ContractKind::Policy {
             (
-                pinned_policy_wasm_hashes_first8,
+                pinned_policy_wasm_hashes,
                 pinned_policy_executable_refs,
                 pinned_verifier_executable_refs,
             )
         } else {
             (
-                pinned_verifier_wasm_hashes_first8,
+                pinned_verifier_wasm_hashes,
                 pinned_verifier_executable_refs,
                 pinned_policy_executable_refs,
             )
         };
-        assert_eq!(created_first8, &vec![first8(&resolved)], "{kind}");
+        assert_eq!(created_hashes, &vec![WasmHashPin::new(resolved)], "{kind}");
         assert_eq!(created_refs, &vec![Some(pin.clone())], "{kind}");
         assert!(other_refs.is_empty(), "{kind}");
 
@@ -394,16 +395,138 @@ async fn external_ref_installs_with_accept_mutable_verifier() {
             .expect("audit writer")
             .write_entry(created)
             .expect("created row writes");
-        let record = AuditReader::new(Arc::clone(&audit_writer), None)
-            .find_latest_context_rule_pinned_hashes(4, ZERO_CONTRACT_REDACTED)
-            .expect("reader succeeds")
-            .expect("created row found");
+        let Some(ContextRulePinRecord::Complete(record)) =
+            AuditReader::new(Arc::clone(&audit_writer), None)
+                .find_latest_context_rule_pinned_hashes(4, ZERO_CONTRACT_REDACTED)
+                .expect("reader succeeds")
+        else {
+            panic!("{kind}: the created row reads as a complete record");
+        };
         let read_back = if kind == ContractKind::Policy {
             record.policy_executable_ref(0)
         } else {
             record.verifier_executable_ref(0)
         };
         assert_eq!(read_back, Some(&pin), "{kind}");
+    }
+}
+
+/// An external-reference pin persists in full through the audit row, and
+/// signing under it passes while the reference resolves to the pinned hash
+/// and refuses as drift once the same owner and tag resolve to a hash that
+/// shares the first eight bytes, for a verifier and for a policy.
+#[cfg(feature = "test-helpers")]
+#[tokio::test]
+async fn external_ref_pin_refuses_the_same_reference_resolving_to_a_suffix_twin() {
+    use stellar_agent_smart_account::managers::verifiers::test_helpers;
+
+    for kind in [ContractKind::Verifier, ContractKind::Policy] {
+        let resolved = allowlisted_hash(kind);
+        let mut twin = resolved;
+        twin[8..].iter_mut().for_each(|byte| *byte ^= 0xff);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(external_ref_responder(TAG, resolved))
+            .mount(&server)
+            .await;
+        let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
+        let manager = manager_one_url(
+            &server.uri(),
+            Arc::clone(&audit_writer),
+            audit_log_path.clone(),
+        );
+        let definition = definition_for(kind);
+        let request_id = Uuid::new_v4().to_string();
+        let pin_result = pin_referenced_contracts(
+            &manager,
+            smart_account_addr(),
+            ZERO_CONTRACT_REDACTED,
+            &definition,
+            None,
+            SOURCE_G,
+            true,
+            false,
+            request_id.clone(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{kind}: install must succeed with the flag: {e}"));
+        audit_writer
+            .lock()
+            .expect("audit writer")
+            .write_entry(pin_result.context_rule_created_entry(
+                ZERO_CONTRACT_REDACTED,
+                4,
+                &definition,
+                "stellar:testnet",
+                &request_id,
+            ))
+            .expect("created row writes");
+
+        let sign_check = |manager| {
+            let request_id = request_id.clone();
+            async move {
+                let mut cache = std::collections::HashMap::new();
+                if kind == ContractKind::Policy {
+                    test_helpers::verify_pinned_policy_against_chain(
+                        &manager,
+                        contract_addr(),
+                        4,
+                        ZERO_CONTRACT_REDACTED,
+                        &request_id,
+                        &mut cache,
+                    )
+                    .await
+                } else {
+                    test_helpers::verify_pinned_verifier_against_chain(
+                        &manager,
+                        contract_addr(),
+                        4,
+                        ZERO_CONTRACT_REDACTED,
+                        &request_id,
+                        &mut cache,
+                    )
+                    .await
+                }
+            }
+        };
+        sign_check(manager)
+            .await
+            .unwrap_or_else(|e| panic!("{kind}: the pinned resolution signs: {e}"));
+
+        let twin_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(external_ref_responder(TAG, twin))
+            .mount(&twin_server)
+            .await;
+        let twin_manager = manager_one_url(
+            &twin_server.uri(),
+            Arc::clone(&audit_writer),
+            audit_log_path,
+        );
+        let error = sign_check(twin_manager)
+            .await
+            .expect_err("a suffix twin resolution must refuse");
+        let (pinned, observed) = match (&error, kind) {
+            (
+                SaError::VerifierHashDrift {
+                    pinned_hash,
+                    observed_hash,
+                    ..
+                },
+                ContractKind::Verifier,
+            )
+            | (
+                SaError::PolicyHashDrift {
+                    pinned_hash,
+                    observed_hash,
+                    ..
+                },
+                ContractKind::Policy,
+            ) => (*pinned_hash, *observed_hash),
+            _ => panic!("{kind}: expected the kind's drift refusal; got {error:?}"),
+        };
+        assert_eq!(pinned, WasmHashPin::new(resolved), "{kind}");
+        assert_eq!(observed, Some(WasmHashPin::new(twin)), "{kind}");
     }
 }
 

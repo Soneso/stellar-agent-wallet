@@ -24,10 +24,9 @@
 //! `ExternalRef` as an observation: its install path pins an external
 //! reference's owner, tag and resolved hash only under the operator's
 //! mutable-contract acknowledgement, and its signing-time drift check
-//! compares all three and the executable kind. Its accept-unknown-verifier
-//! install flow, which has no DeFi analogue, pins the zero hash for an absent
-//! contract, so the zero value exists only on that caller's side and never
-//! stands for an owner-managed executable.
+//! compares all three and the executable kind. Its install path refuses to
+//! pin a contract with no Wasm code. Its drift check never matches absent
+//! Wasm code against a pin, so no caller turns a missing hash into a pinned value.
 //!
 //! # External references (CAP-85)
 //!

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `stellar_agent_core::audit_log::schema::WasmHashPin` holds a full 32-byte
+  Wasm code hash and serializes as 64 lowercase hex characters;
+  `WasmHashPin::parse` refuses every other form. The audit event kinds
+  `sa_context_rule_created_v2` and `sa_context_rule_pins_updated_v2`
+  (`AuditEntry::new_sa_context_rule_created_v2`,
+  `AuditEntry::new_sa_context_rule_pins_updated_v2`) record verifier and
+  policy pins and the resolved hash of each executable reference in full.
+  The reader returns `ContextRulePinRecord`: `Complete` for a full record,
+  `Incomplete` (`IncompletePinRecord`) for an older row that holds
+  eight-byte hash prefixes. The newest row across both formats is the record.
+- `sa.wasm_pin_incomplete` (`SaError::WasmPinIncomplete`) refuses signing
+  under a rule whose selected pin record holds eight-byte hash prefixes,
+  before anything is simulated or signed. No override flag bypasses it.
+  Recovery is a reinstall of the rule, after a review of the intended full
+  hashes, through an independently authorized rule such as rule `0`.
+  `rules verify-pins` reports such a rule as `unavailable` with this code,
+  and the startup advisory names it without a status lookup.
+
 - Multicall accepts exact `{"scval": "<base64 XDR ScVal>"}` argument objects.
   `stellar_agent_core::policy::v1::bundle::decompose_bundle_calls` values typed
   wallet transfers. `OpaqueReason::UnvaluedBundleCall` identifies other calls.
@@ -239,6 +257,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports a profile role naming an entry under that service.
 
 ### Changed
+
+- Smart-account Wasm pins compare all 32 bytes of the code hash: the
+  verifier and policy drift checks, the resolved hash of an executable
+  reference, the migration repoint, the refresh and signer-add pin
+  deduplication, the policy-removal match, diversification and the startup
+  advisory. The wallet writes pin records only as
+  `sa_context_rule_created_v2` / `sa_context_rule_pins_updated_v2` rows;
+  older prefix rows keep their bytes and chain hashes. A binary that predates
+  these event kinds refuses an audit log holding one of them with
+  `audit.parse_error`, in its audit-log reads and in `audit verify`. A
+  downgrade after such a row is written therefore stops every signing verb
+  that reads the log until the newer binary is restored.
+- JSON fields carry full 64-character hashes and drop the `_first8` names,
+  with no alias. `smart-account rules create` and the MCP
+  `stellar_rule_create` result: `pinned_verifier_wasm_hashes_first8` and
+  `pinned_policy_wasm_hashes_first8` become `pinned_verifier_wasm_hashes` and
+  `pinned_policy_wasm_hashes`; an executable-reference entry's
+  `resolved_hash_first8` becomes `resolved_hash`. `smart-account rules
+  verify-pins`: `pinned_verifier_first8`, `pinned_policy_first8`,
+  `observed_verifier_first8` and `observed_policy_first8` become
+  `pinned_verifier_hashes`, `pinned_policy_hashes`, `observed_verifier_hashes`
+  and `observed_policy_hashes`. `smart-account migrate-verifier`:
+  `from_hash_first8`, `to_hash_first8` and `current_hash_first8` become
+  `from_hash`, `to_hash` and `current_hash`. The `sa.verifier_hash_drift` and
+  `sa.policy_hash_drift` error details: `pinned_hash_first8` and
+  `observed_hash_first8` become `pinned_hash` and `observed_hash`, and the
+  message prints both in full. The library types follow the same names:
+  `PinResult::pinned_verifier_hashes` and `pinned_policy_hashes`,
+  `PinnedHashesRecord`, `VerifyPinsResult`, `SignerMigrationStep`,
+  `RuleMigration`, `MigrationPlan` and `ExecutableRefPin` carry
+  `WasmHashPin` values.
+- Rule install, `signers add`, `signers batch-add`, `rules add-policy` and
+  `signers refresh` refuse to pin a verifier or policy contract with no
+  Wasm code, no instance at the address or a built-in executable such
+  as the Stellar Asset Contract, with `sa.contract_instance_unsupported` and
+  the reason `no Wasm code` (`AdminOrOwnerKey::NoWasmCode`).
+  Neither override flag admits it. At signing, a contract with no Wasm code never
+  matches a pin. The drift errors omit `observed_hash`, the drift rows carry
+  `none`, and `rules verify-pins` reports a `null` entry in
+  `observed_verifier_hashes` / `observed_policy_hashes` for a contract with
+  no Wasm code or an external reference with no live tag entry, beside its
+  executable summary.
 
 - `stellar-agent-cli` and `stellar-agent-mcp` enable the `mainnet-write`
   feature by default. Release archives, `cargo binstall`, `cargo install` and
@@ -937,6 +997,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   out and resetting. The same recovery applies to an adoption interrupted again
   at generation two before publication.
 
+- A smart-account Wasm pin authenticates the whole 32-byte code hash. A
+  verifier or policy whose code shares only the first eight bytes with its
+  pin refuses as drift, with or without the admission override flags.
 - Signer and rule commands refuse a revoked or retired verifier at install,
   and every signing path refuses it under a rule pinned to that hash.
   No override flag admits either status. Raw wallet self-calls can reach

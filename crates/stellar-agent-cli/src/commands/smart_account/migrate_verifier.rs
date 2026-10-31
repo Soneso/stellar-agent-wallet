@@ -62,6 +62,8 @@
 //!   `submission.hash_mismatch`: [`SaError::SubmissionUnresolved`], by kind
 //! - `sa.policy_hash_drift`: [`SaError::PolicyHashDrift`], passed through by a step
 //! - `sa.pinned_policy_absent`: [`SaError::PinnedPolicyAbsent`], passed through by a step
+//! - `sa.wasm_pin_incomplete`: [`SaError::WasmPinIncomplete`], before a pair's removal is
+//!   sent, when the rule's pin record holds eight-byte hash prefixes
 //! - `sa.pin_check_unavailable`: [`SaError::PinCheckUnavailable`], passed through by a step
 //! - `sa.auth_entry_construction_failed`: [`SaError::AuthEntryConstructionFailed`],
 //!   passed through by a step, including lock and signer-set deadline stages
@@ -72,6 +74,7 @@
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use stellar_agent_core::audit_log::WasmHashPin;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
 use stellar_agent_core::observability::redact_strkey_first5_last5;
@@ -212,8 +215,8 @@ impl_common_args_view!(MigrateVerifierArgs);
 pub struct MigrateStepResult {
     /// On-chain signer ID.
     pub signer_id: u32,
-    /// First-8 hex chars of the old verifier wasm hash.
-    pub current_hash_first8: String,
+    /// The full wasm hash of the old verifier.
+    pub current_hash: WasmHashPin,
     /// The key data the step's add restores on the destination verifier, as
     /// lower-case hex, taken from the plan's add argument. With
     /// `--signer-external <to_verifier_address>` it rebuilds the step's
@@ -269,8 +272,8 @@ pub struct MigratePendingAdd {
 pub struct MigrateRuleResult {
     /// Context-rule identifier.
     pub rule_id: u32,
-    /// First-8 hex chars of the current verifier wasm hash for this rule.
-    pub current_hash_first8: String,
+    /// The full wasm hash of the current verifier for this rule.
+    pub current_hash: WasmHashPin,
     /// Number of on-chain transactions required for this rule (`2 * signer_steps`).
     pub transaction_count: usize,
     /// Per-signer steps within this rule.
@@ -289,10 +292,10 @@ pub struct MigrateRuleResult {
 pub struct MigrateVerifierResult {
     /// Smart-account C-strkey.
     pub smart_account: String,
-    /// First-8 hex chars of the source verifier WASM hash.
-    pub from_hash_first8: String,
-    /// First-8 hex chars of the destination verifier WASM hash (queried from chain).
-    pub to_hash_first8: String,
+    /// The full source verifier WASM hash.
+    pub from_hash: WasmHashPin,
+    /// The full destination verifier WASM hash (queried from chain).
+    pub to_hash: WasmHashPin,
     /// Destination verifier C-strkey (caller-supplied `--to`).
     pub to_verifier_address: String,
     /// Destination verifier audit status label.
@@ -688,14 +691,14 @@ fn migration_plan_to_result_dry_run(
         .iter()
         .map(|r| MigrateRuleResult {
             rule_id: r.rule_id,
-            current_hash_first8: r.current_hash_first8.clone(),
+            current_hash: r.current_hash,
             transaction_count: r.transaction_count(),
             signer_steps: r
                 .signer_steps
                 .iter()
                 .map(|s| MigrateStepResult {
                     signer_id: s.signer_id,
-                    current_hash_first8: s.current_hash_first8.clone(),
+                    current_hash: s.current_hash,
                     key_data_hex: add_step_key_data_hex(s),
                     remove_tx_hash: None,
                     add_tx_hash: None,
@@ -707,8 +710,8 @@ fn migration_plan_to_result_dry_run(
 
     MigrateVerifierResult {
         smart_account: account_strkey.to_owned(),
-        from_hash_first8: plan.from_hash_first8(),
-        to_hash_first8: plan.to_hash_first8(),
+        from_hash: WasmHashPin::new(plan.from_hash),
+        to_hash: WasmHashPin::new(plan.to_hash),
         to_verifier_address: to_verifier_strkey.to_owned(),
         destination_audit_status: audit_status_label(&plan.destination_audit_status),
         total_transaction_count: plan.total_transaction_count(),
@@ -770,7 +773,7 @@ fn migration_plan_to_result_submitted(
         .iter()
         .map(|r| MigrateRuleResult {
             rule_id: r.rule_id,
-            current_hash_first8: r.current_hash_first8.clone(),
+            current_hash: r.current_hash,
             transaction_count: r.transaction_count(),
             signer_steps: r
                 .signer_steps
@@ -779,7 +782,7 @@ fn migration_plan_to_result_submitted(
                     let submitted = step_lookup.remove(&(r.rule_id, s.signer_id));
                     MigrateStepResult {
                         signer_id: s.signer_id,
-                        current_hash_first8: s.current_hash_first8.clone(),
+                        current_hash: s.current_hash,
                         key_data_hex: add_step_key_data_hex(s),
                         remove_tx_hash: submitted
                             .as_ref()
@@ -808,8 +811,8 @@ fn migration_plan_to_result_submitted(
 
     MigrateVerifierResult {
         smart_account: args.account.clone(),
-        from_hash_first8: plan.from_hash_first8(),
-        to_hash_first8: plan.to_hash_first8(),
+        from_hash: WasmHashPin::new(plan.from_hash),
+        to_hash: WasmHashPin::new(plan.to_hash),
         to_verifier_address: args.to_verifier.clone(),
         destination_audit_status: audit_status_label(&plan.destination_audit_status),
         total_transaction_count: plan.total_transaction_count(),
@@ -1154,7 +1157,7 @@ mod tests {
         )));
         SignerMigrationStep::new_for_test(
             signer_id,
-            "aabbccdd",
+            [0xaa; 32],
             call("remove_signer", vec![ScVal::U32(1), ScVal::U32(signer_id)]),
             call("add_signer", vec![ScVal::U32(1), external]),
         )
@@ -1171,10 +1174,54 @@ mod tests {
             [0xaa; 32],
             [0x11; 32],
             parse_c_strkey_to_smart_account(DESTINATION).unwrap(),
-            vec![RuleMigration::new_for_test(1, "aabbccdd", steps)],
+            vec![RuleMigration::new_for_test(1, [0xaa; 32], steps)],
             VerifierAuditStatus::Unaudited,
             "req-partial",
         )
+    }
+
+    /// The migration envelope carries the full source, destination and
+    /// current hashes: a destination sharing the source's first eight bytes
+    /// stays distinguishable, and no `_first8` field appears.
+    #[test]
+    #[allow(clippy::unwrap_used, reason = "test-only; the fixture strkeys parse")]
+    fn migration_envelope_carries_full_source_and_destination_hashes() {
+        let from = [0x42u8; 32];
+        let mut to = from;
+        to[8..].fill(0x43);
+        let plan = MigrationPlan::new_for_test(
+            parse_c_strkey_to_smart_account(ACCOUNT).unwrap(),
+            from,
+            to,
+            parse_c_strkey_to_smart_account(DESTINATION).unwrap(),
+            vec![RuleMigration::new_for_test(
+                1,
+                from,
+                vec![plan_step(7, &[0xab; 4])],
+            )],
+            VerifierAuditStatus::Unaudited,
+            "req-full",
+        );
+        let result =
+            migration_plan_to_result_dry_run(&plan, ACCOUNT, DESTINATION, "stellar:testnet");
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["from_hash"], hex::encode(from));
+        assert_eq!(json["to_hash"], hex::encode(to));
+        assert_ne!(json["from_hash"], json["to_hash"]);
+        assert_eq!(json["affected_rules"][0]["current_hash"], hex::encode(from));
+        // The step fixture records the 0xaa hash for its step.
+        assert_eq!(
+            json["affected_rules"][0]["signer_steps"][0]["current_hash"],
+            "aa".repeat(32)
+        );
+        for field in ["from_hash_first8", "to_hash_first8"] {
+            assert!(json.get(field).is_none(), "{field}: {json}");
+        }
+        assert!(
+            json["affected_rules"][0]
+                .get("current_hash_first8")
+                .is_none()
+        );
     }
 
     /// The envelope data the production converter renders for a plan with

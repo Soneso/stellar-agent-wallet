@@ -29,7 +29,7 @@
 //! verifier-A.  Calls `MigrationPlan::submit` to execute the remove+add pair
 //! on-chain (verifier-A → verifier-B).  Asserts the submit result has no
 //! failure. The pair's rows under the submit's request id are, in order, one
-//! `SaSignerRemovedV2`, one `SaContextRulePinsUpdated` naming verifier-B's
+//! `SaSignerRemovedV2`, one `SaContextRulePinsUpdatedV2` naming verifier-B's
 //! hash, one `SaSignerAddedV2` and one `SaVerifierMigrated`. The added row's
 //! snapshot holds the original key data on verifier-B beside the unchanged
 //! Delegated signer and threshold. A refresh after the pair finds the chain
@@ -70,7 +70,7 @@ use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::{EventKind, PinsUpdateReason};
+use stellar_agent_core::audit_log::schema::{EventKind, PinsUpdateReason, WasmHashPin};
 use stellar_agent_core::audit_log::signer_set::{SignerEntryV2, SignerIdentityV2};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::audit_log::writer::AuditWriter;
@@ -161,9 +161,9 @@ const D3_TRANSFER_STROOPS: i128 = 1_000_000;
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// First-8 hex of a 32-byte hash, as the pin records store it.
-fn first8_hex(hash: &[u8; 32]) -> String {
-    hex::encode(&hash[..8])
+/// The full pin of a 32-byte hash, as the pin records store it.
+fn full(hash: &[u8; 32]) -> WasmHashPin {
+    WasmHashPin::new(*hash)
 }
 
 /// Reads every audit entry `log_path` holds.
@@ -1615,12 +1615,12 @@ async fn d3_migrate_verifier_on_chain_submit() {
     let new_rule_id = install_out.rule_id;
     eprintln!("D3-RECORD install-tx {}", install_out.tx_hash);
     assert_eq!(
-        install_out.pin_result.pinned_verifier_hashes_first8(),
-        vec![first8_hex(&OZ_WEBAUTHN_VERIFIER_HASH)],
+        install_out.pin_result.pinned_verifier_hashes(),
+        vec![full(&OZ_WEBAUTHN_VERIFIER_HASH)],
         "the install must pin verifier-A's hash"
     );
-    let pinned_policy_first8 = install_out.pin_result.pinned_policy_hashes_first8();
-    assert_eq!(pinned_policy_first8.len(), 1, "the install pins the policy");
+    let pinned_policy_hashes = install_out.pin_result.pinned_policy_hashes();
+    assert_eq!(pinned_policy_hashes.len(), 1, "the install pins the policy");
 
     eprintln!("External signer rule installed as rule_id={new_rule_id}");
 
@@ -1891,8 +1891,10 @@ async fn d3_migrate_verifier_on_chain_submit() {
                 EventKind::SaSignerRemovedV2 { rule_id, .. } if *rule_id == new_rule_id => {
                     "sa_signer_removed_v2"
                 }
-                EventKind::SaContextRulePinsUpdated { rule_id, .. } if *rule_id == new_rule_id => {
-                    "sa_context_rule_pins_updated"
+                EventKind::SaContextRulePinsUpdatedV2 { rule_id, .. }
+                    if *rule_id == new_rule_id =>
+                {
+                    "sa_context_rule_pins_updated_v2"
                 }
                 EventKind::SaSignerAddedV2 { rule_id, .. } if *rule_id == new_rule_id => {
                     "sa_signer_added_v2"
@@ -1907,7 +1909,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
             kinds,
             vec![
                 "sa_signer_removed_v2",
-                "sa_context_rule_pins_updated",
+                "sa_context_rule_pins_updated_v2",
                 "sa_signer_added_v2",
                 "sa_verifier_migrated",
             ],
@@ -2251,37 +2253,37 @@ async fn d3_migrate_verifier_on_chain_submit() {
         .filter(|entry| {
             matches!(
                 entry.event_kind,
-                EventKind::SaContextRulePinsUpdated { rule_id, .. } if rule_id == new_rule_id
+                EventKind::SaContextRulePinsUpdatedV2 { rule_id, .. } if rule_id == new_rule_id
             )
         })
         .collect();
     assert_eq!(
         pins_updated.len(),
         1,
-        "one SaContextRulePinsUpdated row: the pair's repoint"
+        "one SaContextRulePinsUpdatedV2 row: the pair's repoint"
     );
     assert_eq!(pins_updated[0].request_id, submit_request_id);
     match &pins_updated[0].event_kind {
-        EventKind::SaContextRulePinsUpdated {
-            pinned_verifier_wasm_hashes_first8,
-            pinned_policy_wasm_hashes_first8,
+        EventKind::SaContextRulePinsUpdatedV2 {
+            pinned_verifier_wasm_hashes,
+            pinned_policy_wasm_hashes,
             pinned_verifier_executable_refs,
             reason,
             ..
         } => {
             assert_eq!(
-                pinned_verifier_wasm_hashes_first8,
-                &vec![first8_hex(&verifier_b_hash)],
+                pinned_verifier_wasm_hashes,
+                &vec![full(&verifier_b_hash)],
                 "the pin record must name verifier-B's hash"
             );
             assert_eq!(
-                pinned_policy_wasm_hashes_first8, &pinned_policy_first8,
+                pinned_policy_wasm_hashes, &pinned_policy_hashes,
                 "the policy pins must be unchanged"
             );
             assert!(pinned_verifier_executable_refs.is_empty());
             assert_eq!(*reason, PinsUpdateReason::VerifierMigrated);
         }
-        other => panic!("filtered to SaContextRulePinsUpdated; got {other:?}"),
+        other => panic!("filtered to SaContextRulePinsUpdatedV2; got {other:?}"),
     }
 
     // ── verify_rule_wasm_pins matches verifier-B's hash ──────────────────────
@@ -2295,13 +2297,10 @@ async fn d3_migrate_verifier_on_chain_submit() {
         .await
         .expect("verify_rule_wasm_pins must return a report");
     assert_eq!(pins.verifier_pin_status, PinStatus::Match);
+    assert_eq!(pins.pinned_verifier_hashes, vec![full(&verifier_b_hash)]);
     assert_eq!(
-        pins.pinned_verifier_first8,
-        vec![first8_hex(&verifier_b_hash)]
-    );
-    assert_eq!(
-        pins.observed_verifier_first8,
-        vec![first8_hex(&verifier_b_hash)]
+        pins.observed_verifier_hashes,
+        vec![Some(full(&verifier_b_hash))]
     );
     assert_eq!(pins.policy_pin_status, PinStatus::Match);
 
@@ -2309,7 +2308,7 @@ async fn d3_migrate_verifier_on_chain_submit() {
         "d3 PASS: migration complete — verifier address changed from {} to {}; \
          remove+add pair confirmed on-chain and recorded as SaSignerRemovedV2 + \
          SaSignerAddedV2; 1 SaVerifierMigrated audit row; \
-         1 SaContextRulePinsUpdated row naming verifier-B's hash; \
+         1 SaContextRulePinsUpdatedV2 row naming verifier-B's hash; \
          on-chain ContextRule verifier-B address + Delegated invariant + \
          policies preservation + Delegated signer-id invariance verified; \
          transfer through the migrated rule confirmed; verify-pins match",

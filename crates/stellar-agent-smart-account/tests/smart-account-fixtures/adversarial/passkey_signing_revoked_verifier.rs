@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::schema::{EventKind, WasmHashPin};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
@@ -119,7 +119,7 @@ async fn passkey_signing_refuses_a_revoked_verifier_before_bridge_io() {
     audit_writer
         .lock()
         .unwrap()
-        .write_entry(AuditEntry::new_sa_context_rule_created(
+        .write_entry(AuditEntry::new_sa_context_rule_created_v2(
             &smart_account_redacted,
             RULE_ID,
             "default",
@@ -128,7 +128,7 @@ async fn passkey_signing_refuses_a_revoked_verifier_before_bridge_io() {
             None,
             "stellar:testnet",
             "revoked-passkey",
-            vec!["eeeeeeeeeeeeeeee".to_owned()],
+            vec![WasmHashPin::new([0xee; 32])],
             vec![],
             false,
             false,

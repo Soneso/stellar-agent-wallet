@@ -186,7 +186,7 @@ itself rejects both conditions the same way.
 
 Because `rules create` pinned the rule, the wallet probes the policy against
 the policy allowlist before submitting and, once the add confirms, pins its
-hash in a `SaContextRulePinsUpdated` audit row, so every later signing verb
+full code hash in a `SaContextRulePinsUpdatedV2` audit row, so every later signing verb
 under the rule checks the policy as well.
 
 ## Submitting an agent-signed call

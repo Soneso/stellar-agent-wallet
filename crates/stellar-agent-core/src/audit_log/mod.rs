@@ -151,12 +151,16 @@ pub use outbox::{
     AuditOutbox, OutboxInspection, OutboxLoss, OutboxState, check_outbox_commitment,
     drain_lock_is_held, inspect_outbox, outbox_path,
 };
-pub use reader::{AuditLogIntegrityError, AuditReader, PinnedHashesRecord};
+pub use reader::{
+    AuditLogIntegrityError, AuditReader, ContextRulePinRecord, IncompletePinRecord,
+    PinnedHashesRecord,
+};
 pub use rotation::{SidecarResignError, resign_chain_root_sidecars};
 pub use schema::{
-    CrossCheckRecord, EVENT_KIND_VARIANT_COUNT, EventKind, ExecutableRefPin, KeyPurpose,
-    MainnetPresenceAudit, PinsUpdateReason, PolicyDecision, TipAnchorReason, ValueActionKind,
-    ValueLegRecord, executable_refs_or_empty,
+    CrossCheckRecord, EVENT_KIND_VARIANT_COUNT, EventKind, ExecutableRefPin,
+    ExecutableRefPinFirst8, KeyPurpose, MainnetPresenceAudit, PinsUpdateReason, PolicyDecision,
+    TipAnchorReason, ValueActionKind, ValueLegRecord, WasmHashPin, WasmHashPinParseError,
+    executable_refs_or_empty,
 };
 pub use signer_set::{
     BaselineReason, DOMAIN_SA_ACCOUNT_ID_V1, DOMAIN_SA_SIGNER_SET_V1, DOMAIN_SA_SIGNER_SET_V2,

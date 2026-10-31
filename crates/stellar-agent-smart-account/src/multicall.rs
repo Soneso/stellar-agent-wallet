@@ -2195,9 +2195,10 @@ fn classify_submit_failure(sa_err: SaError) -> (Option<SubmitDeniedRow>, SaError
 /// - `"sa.submit_check_missing"` → `"build"` (programming-gate; fires before any I/O).
 /// - `"sa.horizon_exceeded"` / `"sa.rule_expired"` → `"policy_gate"`.
 /// - `"sa.verifier_hash_drift"` / `"sa.policy_hash_drift"` / `"sa.pinned_policy_absent"` /
-///   `"sa.pinned_verifier_absent"` / `"sa.verifier_wasm_revoked"` /
-///   `"sa.verifier_wasm_retired"` / `"sa.pin_check_unavailable"` → `"policy_gate"` (the
-///   pinned-hash drift check and its verifier status gate).
+///   `"sa.pinned_verifier_absent"` / `"sa.wasm_pin_incomplete"` /
+///   `"sa.verifier_wasm_revoked"` / `"sa.verifier_wasm_retired"` /
+///   `"sa.pin_check_unavailable"` → `"policy_gate"` (the pinned-hash drift
+///   check and its verifier status gate).
 /// - `"sa.signer_set_missing_baseline"` / `"sa.signer_set_baseline_legacy"` /
 ///   `"sa.signer_set_diverged"` / `"sa.audit_log"` / `"network.rpc_divergence"` /
 ///   `"sa.threshold_policy_not_installed"` /
@@ -2253,6 +2254,7 @@ fn map_sa_error_to_multicall_phase(err: &SaError) -> &'static str {
         | "sa.policy_hash_drift"
         | "sa.pinned_policy_absent"
         | "sa.pinned_verifier_absent"
+        | "sa.wasm_pin_incomplete"
         | "sa.verifier_wasm_revoked"
         | "sa.verifier_wasm_retired"
         | "sa.pin_check_unavailable" => {
@@ -4115,8 +4117,10 @@ wasm_sha256 = "{drifted_sha}"
                 rule_id: 2,
                 smart_account_redacted: redacted(),
                 deploy_address_redacted: redacted(),
-                pinned_hash_first8: "aabbccdd".to_owned(),
-                observed_hash_first8: "11223344".to_owned(),
+                pinned_hash: stellar_agent_core::audit_log::schema::WasmHashPin::new([0xaa; 32]),
+                observed_hash: Some(stellar_agent_core::audit_log::schema::WasmHashPin::new(
+                    [0x11; 32],
+                )),
                 observed_executable: None,
                 request_id: "req".to_owned(),
             },
@@ -4124,8 +4128,10 @@ wasm_sha256 = "{drifted_sha}"
                 rule_id: 2,
                 smart_account_redacted: redacted(),
                 deploy_address_redacted: redacted(),
-                pinned_hash_first8: "aabbccdd".to_owned(),
-                observed_hash_first8: "11223344".to_owned(),
+                pinned_hash: stellar_agent_core::audit_log::schema::WasmHashPin::new([0xaa; 32]),
+                observed_hash: Some(stellar_agent_core::audit_log::schema::WasmHashPin::new(
+                    [0x11; 32],
+                )),
                 observed_executable: None,
                 request_id: "req".to_owned(),
             },
@@ -4138,6 +4144,11 @@ wasm_sha256 = "{drifted_sha}"
             SaError::PinnedVerifierAbsent {
                 rule_id: 2,
                 verifier_redacted: redacted(),
+                smart_account_redacted: redacted(),
+                request_id: "req".to_owned(),
+            },
+            SaError::WasmPinIncomplete {
+                rule_id: 2,
                 smart_account_redacted: redacted(),
                 request_id: "req".to_owned(),
             },

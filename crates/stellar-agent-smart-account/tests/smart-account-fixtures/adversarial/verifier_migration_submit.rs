@@ -190,11 +190,11 @@ async fn submit_refuses_the_first_step_without_a_state_row_before_any_rpc() {
     // both host functions, whose target is the smart account.
     let step = SignerMigrationStep::new_for_test(
         10,
-        "aabbccdd",
+        [0xaa; 32],
         dummy_host_function(&smart_account, "remove_signer"),
         dummy_host_function(&smart_account, "add_signer"),
     );
-    let rule = RuleMigration::new_for_test(1, "aabbccdd", vec![step]);
+    let rule = RuleMigration::new_for_test(1, [0xaa; 32], vec![step]);
     let plan = MigrationPlan::new_for_test(
         smart_account.clone(),
         [0x11u8; 32],

@@ -3,7 +3,7 @@
 //! # Purpose
 //!
 //! When the local audit log records two rules as installed-but-not-deleted
-//! (`SaContextRuleCreated` without a matching `SaContextRuleDeleted`) but the
+//! (`SaContextRuleCreatedV2` without a matching `SaContextRuleDeleted`) but the
 //! on-chain enumeration returns only one of them, `list_active_context_rules` must:
 //! 1. Return the on-chain rule in `rules`.
 //! 2. Return the missing rule ID in `audit_log_missing`.
@@ -15,7 +15,7 @@
 //!
 //! # Setup
 //!
-//! - Audit log: `SaContextRuleCreated` for rule IDs 0 and 1 (no matching
+//! - Audit log: `SaContextRuleCreatedV2` for rule IDs 0 and 1 (no matching
 //!   `SaContextRuleDeleted` for either — both appear installed).
 //! - Mock RPC: `Count=1`, `get_rule(0)` returns a valid rule, `get_rule(1)`
 //!   would not be reached (Count=1, early-exit after rule 0 found).
@@ -88,9 +88,9 @@ fn u32_xdr(n: u32) -> String {
         .expect("ScVal::U32 must encode")
 }
 
-/// Writes a `SaContextRuleCreated` audit entry for the given rule_id.
+/// Writes a `SaContextRuleCreatedV2` audit entry for the given rule_id.
 fn write_rule_created(writer: &Arc<Mutex<AuditWriter>>, rule_id: u32, sa_redacted: &str) {
-    let entry = AuditEntry::new_sa_context_rule_created(
+    let entry = AuditEntry::new_sa_context_rule_created_v2(
         sa_redacted,
         rule_id,
         "Default",
@@ -110,7 +110,7 @@ fn write_rule_created(writer: &Arc<Mutex<AuditWriter>>, rule_id: u32, sa_redacte
         .lock()
         .unwrap()
         .write_entry(entry)
-        .expect("write_entry for SaContextRuleCreated must succeed");
+        .expect("write_entry for SaContextRuleCreatedV2 must succeed");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

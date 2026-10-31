@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::schema::{EventKind, WasmHashPin};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
@@ -65,9 +65,9 @@ fn testnet_entry() -> PartialSorobanAuthorizationEntry {
     .expect("fixture auth entry builds")
 }
 
-/// The first-8 the pin record holds for the rule's verifier; the live
-/// verifier runs another executable.
-const PINNED_VERIFIER_FIRST8: &str = "4242424242424242";
+/// The hash the pin record holds for the rule's verifier; the live verifier
+/// runs another executable.
+const PINNED_VERIFIER_HASH: WasmHashPin = WasmHashPin::new([0x42; 32]);
 
 fn verifier() -> ScAddress {
     ScAddress::Contract(ContractId(Hash([0x2a; 32])))
@@ -106,7 +106,7 @@ async fn a_missing_baseline_refuses_before_the_drift_check_reads_the_chain() {
     audit_writer
         .lock()
         .expect("audit writer poisoned")
-        .write_entry(AuditEntry::new_sa_context_rule_created(
+        .write_entry(AuditEntry::new_sa_context_rule_created_v2(
             &smart_account_redacted,
             RULE_ID,
             "default",
@@ -115,7 +115,7 @@ async fn a_missing_baseline_refuses_before_the_drift_check_reads_the_chain() {
             None,
             "stellar:testnet",
             uuid::Uuid::new_v4().to_string(),
-            vec![PINNED_VERIFIER_FIRST8.to_owned()],
+            vec![PINNED_VERIFIER_HASH],
             vec![],
             false,
             false,

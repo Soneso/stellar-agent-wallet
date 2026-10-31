@@ -133,7 +133,7 @@ use crate::managers::verifiers::{
     MutabilityStatus, detect_contract_mutability, same_executable_reference,
 };
 use crate::verifier_allowlist::{VERIFIER_ALLOWLIST, VerifierAuditStatus};
-use stellar_agent_core::audit_log::schema::ContractKind;
+use stellar_agent_core::audit_log::schema::{ContractKind, WasmHashPin};
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_core::scval::scval_variant_name;
 use stellar_agent_network::Signer;
@@ -163,8 +163,8 @@ use stellar_agent_network::Signer;
 pub struct SignerMigrationStep {
     /// On-chain signer ID to remove (from `get_context_rule` simulation).
     pub signer_id: u32,
-    /// First-8 hex chars of the old verifier wasm hash (for audit + display).
-    pub current_hash_first8: String,
+    /// The full wasm hash of the old verifier the step migrates away from.
+    pub current_hash: WasmHashPin,
     /// Pre-formed `HostFunction::InvokeContract` for the `remove_signer` call.
     ///
     /// Invokes `remove_signer(rule_id, signer_id)` on the smart-account contract.
@@ -188,8 +188,8 @@ pub struct SignerMigrationStep {
 pub struct RuleMigration {
     /// Context-rule identifier.
     pub rule_id: u32,
-    /// First-8 hex chars of the current verifier wasm hash observed on this rule.
-    pub current_hash_first8: String,
+    /// The full wasm hash of the current verifier observed on this rule.
+    pub current_hash: WasmHashPin,
     /// One entry per External signer on this rule whose verifier wasm matches `from_hash`.
     ///
     /// Each step is a remove + add pair submitted sequentially via
@@ -272,7 +272,8 @@ pub struct MigrationPlan {
 }
 
 impl MigrationPlan {
-    /// First-8 hex chars of `from_hash` for envelope display.
+    /// First-8 hex chars of `from_hash`, a labeled display projection for
+    /// logs and human-readable text; it never takes part in a comparison.
     ///
     /// Returns 16 lower-hex characters (8 bytes × 2 chars/byte).
     #[must_use]
@@ -280,7 +281,8 @@ impl MigrationPlan {
         stellar_agent_core::hex::wasm_hash_first8_hex(&self.from_hash)
     }
 
-    /// First-8 hex chars of `to_hash` for envelope display.
+    /// First-8 hex chars of `to_hash`, a labeled display projection for logs
+    /// and human-readable text; it never takes part in a comparison.
     ///
     /// Returns 16 lower-hex characters (8 bytes × 2 chars/byte).
     #[must_use]
@@ -616,6 +618,10 @@ impl MigrationPlan {
 
         let from_hash_first8 = self.from_hash_first8();
         let to_hash_first8 = self.to_hash_first8();
+        // The pair carries the full hashes into the pin repoint and the
+        // migrated row; the first-8 forms above only label log lines.
+        let from_hash = WasmHashPin::new(self.from_hash);
+        let to_hash = WasmHashPin::new(self.to_hash);
 
         // Resolve the source pubkey once — reused across all steps.
         let source_pubkey = match signer.public_key().await {
@@ -684,8 +690,8 @@ impl MigrationPlan {
                         rule.rule_id,
                         step.signer_id,
                         &self.to_verifier_addr,
-                        &from_hash_first8,
-                        &to_hash_first8,
+                        from_hash,
+                        to_hash,
                         remove_args,
                         add_args,
                         signer,
@@ -826,13 +832,13 @@ impl SignerMigrationStep {
     #[doc(hidden)]
     pub fn new_for_test(
         signer_id: u32,
-        current_hash_first8: impl Into<String>,
+        current_hash: [u8; 32],
         remove_host_function: HostFunction,
         add_host_function: HostFunction,
     ) -> Self {
         Self {
             signer_id,
-            current_hash_first8: current_hash_first8.into(),
+            current_hash: WasmHashPin::new(current_hash),
             remove_host_function,
             add_host_function,
         }
@@ -846,12 +852,12 @@ impl RuleMigration {
     #[doc(hidden)]
     pub fn new_for_test(
         rule_id: u32,
-        current_hash_first8: impl Into<String>,
+        current_hash: [u8; 32],
         signer_steps: Vec<SignerMigrationStep>,
     ) -> Self {
         Self {
             rule_id,
-            current_hash_first8: current_hash_first8.into(),
+            current_hash: WasmHashPin::new(current_hash),
             signer_steps,
         }
     }
@@ -1462,7 +1468,7 @@ impl<'a> MigrationPlanner<'a> {
 
                 steps.push(SignerMigrationStep {
                     signer_id: ext.signer_id,
-                    current_hash_first8: from_hash_first8.clone(),
+                    current_hash: WasmHashPin::new(from_hash),
                     remove_host_function,
                     add_host_function,
                 });
@@ -1481,7 +1487,7 @@ impl<'a> MigrationPlanner<'a> {
                 );
                 affected.push(RuleMigration {
                     rule_id,
-                    current_hash_first8: from_hash_first8.clone(),
+                    current_hash: WasmHashPin::new(from_hash),
                     signer_steps: steps,
                 });
             }
@@ -1827,19 +1833,19 @@ mod tests {
         };
         let step = || SignerMigrationStep {
             signer_id: 0,
-            current_hash_first8: "00000000".to_owned(),
+            current_hash: WasmHashPin::new([0x00; 32]),
             remove_host_function: dummy_hf(),
             add_host_function: dummy_hf(),
         };
         let affected_rules = vec![
             RuleMigration {
                 rule_id: 1,
-                current_hash_first8: "aabbccdd".to_owned(),
+                current_hash: WasmHashPin::new([0xaa; 32]),
                 signer_steps: vec![step(), step()], // 2 signers → 4 txs
             },
             RuleMigration {
                 rule_id: 2,
-                current_hash_first8: "aabbccdd".to_owned(),
+                current_hash: WasmHashPin::new([0xaa; 32]),
                 signer_steps: vec![step()], // 1 signer → 2 txs
             },
         ];
@@ -2076,7 +2082,7 @@ mod tests {
     fn rule_migration_transaction_count_zero_for_empty_steps() {
         let rule = RuleMigration {
             rule_id: 5,
-            current_hash_first8: "aabbccdd".to_owned(),
+            current_hash: WasmHashPin::new([0xaa; 32]),
             signer_steps: vec![],
         };
         assert_eq!(
@@ -2573,13 +2579,13 @@ mod tests {
         };
         let step = SignerMigrationStep {
             signer_id: 0,
-            current_hash_first8: "deadbeef".to_owned(),
+            current_hash: WasmHashPin::new([0xde; 32]),
             remove_host_function: dummy_hf(),
             add_host_function: dummy_hf(),
         };
         let rule = RuleMigration {
             rule_id: 0,
-            current_hash_first8: "deadbeef".to_owned(),
+            current_hash: WasmHashPin::new([0xde; 32]),
             signer_steps: vec![step],
         };
         let plan = MigrationPlan {

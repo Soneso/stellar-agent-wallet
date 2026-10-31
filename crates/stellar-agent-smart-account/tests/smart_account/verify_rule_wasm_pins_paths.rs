@@ -9,6 +9,7 @@ use std::time::Duration;
 use serial_test::serial;
 
 use stellar_agent_core::audit_log::AuditEntry;
+use stellar_agent_core::audit_log::schema::WasmHashPin;
 use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 
@@ -177,8 +178,8 @@ async fn verify_rule_wasm_pins_returns_no_contracts_when_rule_has_no_external_co
 
         assert_eq!(result.verifier_pin_status, PinStatus::NoContracts);
         assert_eq!(result.policy_pin_status, PinStatus::NoContracts);
-        assert!(result.pinned_verifier_first8.is_empty());
-        assert!(result.pinned_policy_first8.is_empty());
+        assert!(result.pinned_verifier_hashes.is_empty());
+        assert!(result.pinned_policy_hashes.is_empty());
 
         let recorded = recorded_rpc(&server).await;
         assert_eq!(
@@ -223,8 +224,8 @@ async fn verify_rule_wasm_pins_returns_no_pin_when_contracts_exist_without_audit
 
     assert_eq!(result.verifier_pin_status, PinStatus::NoPin);
     assert_eq!(result.policy_pin_status, PinStatus::NoPin);
-    assert!(result.pinned_verifier_first8.is_empty());
-    assert!(result.pinned_policy_first8.is_empty());
+    assert!(result.pinned_verifier_hashes.is_empty());
+    assert!(result.pinned_policy_hashes.is_empty());
 }
 
 struct MixedPinsResponder {
@@ -315,7 +316,7 @@ async fn verify_pins_mixed_drift_and_unavailable_preserves_both_statuses_and_cod
         audit
             .lock()
             .unwrap()
-            .write_entry(AuditEntry::new_sa_context_rule_created(
+            .write_entry(AuditEntry::new_sa_context_rule_created_v2(
                 redact_strkey_first5_last5(ACCOUNT),
                 7,
                 "default",
@@ -324,8 +325,8 @@ async fn verify_pins_mixed_drift_and_unavailable_preserves_both_statuses_and_cod
                 None,
                 CHAIN_ID,
                 "pins",
-                vec!["1111111111111111".to_owned()],
-                vec!["2222222222222222".to_owned()],
+                vec![WasmHashPin::new([0x11; 32])],
+                vec![WasmHashPin::new([0x22; 32])],
                 false,
                 false,
                 vec![],
@@ -399,20 +400,23 @@ async fn verify_pins_mixed_drift_and_unavailable_preserves_both_statuses_and_cod
             "verifier_drifts={verifier_drifts}"
         );
         assert_eq!(result.unavailable_wire_code, Some("sa.deployment_failed"));
-        assert_eq!(result.pinned_verifier_first8, ["1111111111111111"]);
-        assert_eq!(result.pinned_policy_first8, ["2222222222222222"]);
+        assert_eq!(
+            result.pinned_verifier_hashes,
+            [WasmHashPin::new([0x11; 32])]
+        );
+        assert_eq!(result.pinned_policy_hashes, [WasmHashPin::new([0x22; 32])]);
         let (drifted, unavailable) = if verifier_drifts {
             (
-                &result.observed_verifier_first8,
-                &result.observed_policy_first8,
+                &result.observed_verifier_hashes,
+                &result.observed_policy_hashes,
             )
         } else {
             (
-                &result.observed_policy_first8,
-                &result.observed_verifier_first8,
+                &result.observed_policy_hashes,
+                &result.observed_verifier_hashes,
             )
         };
-        assert_eq!(drifted, &["abababababababab"]);
+        assert_eq!(drifted, &[Some(WasmHashPin::new([0xab; 32]))]);
         assert!(unavailable.is_empty());
         let report = serde_json::to_value(&result).unwrap();
         assert_eq!(
@@ -435,11 +439,14 @@ async fn verify_pins_mixed_drift_and_unavailable_preserves_both_statuses_and_cod
     }
 }
 
-#[cfg(feature = "test-helpers")]
-#[tokio::test]
-#[serial]
+/// Runs `verify_rule_wasm_pins` for rule 7, whose only signer is an
+/// `External` signer on a verifier serving `live`, after writing `created`.
 #[allow(clippy::unwrap_used, reason = "test fixture construction")]
-async fn verify_pins_reports_a_revoked_pinned_verifier_as_matching() {
+async fn single_verifier_report(
+    created: AuditEntry,
+    live: [u8; 32],
+    request_id: &str,
+) -> stellar_agent_smart_account::managers::rules::VerifyPinsResult {
     let verifier = stellar_strkey::Contract([0x41; 32]).to_string();
     let vector = |items: Vec<ScVal>| ScVal::Vec(Some(ScVec(items.try_into().unwrap())));
     let field = |key: &str, val| ScMapEntry {
@@ -467,30 +474,9 @@ async fn verify_pins_reports_a_revoked_pinned_verifier_as_matching() {
         .unwrap(),
     )));
     let (audit, audit_log_path, _dir) = tmp_audit_writer();
-    audit
-        .lock()
-        .unwrap()
-        .write_entry(AuditEntry::new_sa_context_rule_created(
-            redact_strkey_first5_last5(ACCOUNT),
-            7,
-            "default",
-            1,
-            0,
-            None,
-            CHAIN_ID,
-            "revoked-report",
-            vec!["eeeeeeeeeeeeeeee".to_owned()],
-            vec![],
-            false,
-            false,
-            vec![],
-            vec![],
-        ))
-        .unwrap();
-    let available: serde_json::Value = serde_json::from_str(
-        &contract_instance_ledger_entries_json(&verifier, [0xee; 32]),
-    )
-    .unwrap();
+    audit.lock().unwrap().write_entry(created).unwrap();
+    let available: serde_json::Value =
+        serde_json::from_str(&contract_instance_ledger_entries_json(&verifier, live)).unwrap();
     let unavailable: serde_json::Value =
         serde_json::from_str(&contract_instance_ledger_entries_json(
             &stellar_strkey::Contract([0x42; 32]).to_string(),
@@ -526,14 +512,106 @@ async fn verify_pins_reports_a_revoked_pinned_verifier_as_matching() {
         .with_audit_writer(audit),
     )
     .unwrap();
-    let report = manager
+    manager
         .verify_rule_wasm_pins(
             parse_c_strkey_to_smart_account(ACCOUNT).unwrap(),
             7,
             None,
-            "revoked-report",
+            request_id,
         )
         .await
-        .unwrap();
+        .unwrap()
+}
+
+/// A rule-created row pinning `verifier_hashes` for rule 7.
+fn created_v2(verifier_hashes: Vec<WasmHashPin>, request_id: &str) -> AuditEntry {
+    AuditEntry::new_sa_context_rule_created_v2(
+        redact_strkey_first5_last5(ACCOUNT),
+        7,
+        "default",
+        1,
+        0,
+        None,
+        CHAIN_ID,
+        request_id,
+        verifier_hashes,
+        vec![],
+        false,
+        false,
+        vec![],
+        vec![],
+    )
+}
+
+#[cfg(feature = "test-helpers")]
+#[tokio::test]
+#[serial]
+async fn verify_pins_reports_a_revoked_pinned_verifier_as_matching() {
+    let report = single_verifier_report(
+        created_v2(vec![WasmHashPin::new([0xee; 32])], "revoked-report"),
+        [0xee; 32],
+        "revoked-report",
+    )
+    .await;
     assert_eq!(report.verifier_pin_status, PinStatus::Match);
+}
+
+/// A live verifier whose hash shares the pinned hash's first eight bytes
+/// reports drift, and the report's full hashes tell the two apart.
+#[cfg(feature = "test-helpers")]
+#[tokio::test]
+#[serial]
+#[allow(clippy::expect_used, reason = "test fixture assertions")]
+async fn verify_pins_reports_an_equal_prefix_twin_as_drift_with_both_full_hashes() {
+    let pinned = [0x42u8; 32];
+    let mut twin = pinned;
+    twin[8..].fill(0x43);
+    let report = single_verifier_report(
+        created_v2(vec![WasmHashPin::new(pinned)], "twin-report"),
+        twin,
+        "twin-report",
+    )
+    .await;
+    assert_eq!(report.verifier_pin_status, PinStatus::Drift);
+    assert_eq!(report.pinned_verifier_hashes, [WasmHashPin::new(pinned)]);
+    assert_eq!(
+        report.observed_verifier_hashes,
+        [Some(WasmHashPin::new(twin))]
+    );
+    let json = serde_json::to_value(&report).expect("report serializes");
+    assert_eq!(json["pinned_verifier_hashes"][0], hex::encode(pinned));
+    assert_eq!(json["observed_verifier_hashes"][0], hex::encode(twin));
+    assert!(json.get("pinned_verifier_first8").is_none(), "{json}");
+    assert!(json.get("observed_verifier_first8").is_none(), "{json}");
+}
+
+/// A pin record of eight-byte prefixes reports both halves `unavailable`
+/// with `sa.wasm_pin_incomplete`, empty hash lists, and no drift row.
+#[cfg(feature = "test-helpers")]
+#[tokio::test]
+#[serial]
+async fn verify_pins_reports_an_incomplete_pin_record_as_unavailable() {
+    let created = AuditEntry::new_sa_context_rule_created(
+        redact_strkey_first5_last5(ACCOUNT),
+        7,
+        "default",
+        1,
+        0,
+        None,
+        CHAIN_ID,
+        "incomplete-report",
+        vec!["4242424242424242".to_owned()],
+        vec![],
+        true,
+        true,
+        vec![],
+        vec![],
+    );
+    let report = single_verifier_report(created, [0x42; 32], "incomplete-report").await;
+    assert_eq!(report.verifier_pin_status, PinStatus::Unavailable);
+    assert_eq!(report.policy_pin_status, PinStatus::Unavailable);
+    assert_eq!(report.unavailable_wire_code, Some("sa.wasm_pin_incomplete"));
+    assert!(report.pinned_verifier_hashes.is_empty());
+    assert!(report.observed_verifier_hashes.is_empty());
+    assert!(!report.mutable_override && !report.unknown_override);
 }
