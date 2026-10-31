@@ -69,7 +69,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
-use stellar_agent_core::audit_log::ExecutableRefPin;
+use stellar_agent_core::audit_log::{ExecutableRefPin, WasmHashPin};
 use stellar_agent_core::envelope::{Envelope, OutputFormat};
 use stellar_agent_core::error::CapKind;
 use stellar_agent_core::error::{NetworkError, ValidationError, WalletError};
@@ -334,9 +334,10 @@ pub enum RulesSubcommand {
     /// Read-only; no signing, no submission. Reports `verifier_pin_status`
     /// and `policy_pin_status` each as one of `"match"`, `"drift"`,
     /// `"unavailable"`, `"no_pin"`, or `"no_contracts"`. The
-    /// `pinned_*_first8` fields carry the stored pin from the audit log;
-    /// `observed_*_first8` carry the live values fetched via two-RPC
-    /// consultation. Loads no signer and accepts a mainnet profile. The
+    /// `pinned_*_hashes` fields carry the full stored pins from the audit
+    /// log; `observed_*_hashes` carry the full live hashes fetched via
+    /// two-RPC consultation. A pin record of eight-byte hash prefixes
+    /// reports both statuses `"unavailable"` with `sa.wasm_pin_incomplete`. Loads no signer and accepts a mainnet profile. The
     /// optional `--source-account` names an existing account as the source
     /// of the `get_context_rule` simulation.
     VerifyPins(Box<VerifyPinsArgs>),
@@ -575,7 +576,7 @@ pub struct CreateArgs {
     /// against that.
     ///
     /// For an external reference the pin records the owner, the tag and the
-    /// hash the tag resolves to. When the owner repoints the tag, the
+    /// full hash the tag resolves to. When the owner repoints the tag, the
     /// reference changes or the executable kind changes, the pinned-hash
     /// drift check refuses signing under the rule with
     /// `sa.verifier_hash_drift` / `sa.policy_hash_drift` before anything is
@@ -585,7 +586,9 @@ pub struct CreateArgs {
     /// policy pins while the rule has no policy on chain refuses with
     /// `sa.pinned_policy_absent`. A rule holding an `External` signer while
     /// its record pins no verifier refuses with `sa.pinned_verifier_absent`,
-    /// and a check that cannot run with `sa.pin_check_unavailable`.
+    /// a rule whose record holds eight-byte hash prefixes with
+    /// `sa.wasm_pin_incomplete`, and a check that cannot run with
+    /// `sa.pin_check_unavailable`.
     /// `--accept-unknown-verifier` is also required when the resolved hash is
     /// outside the allowlist.
     ///
@@ -598,7 +601,7 @@ pub struct CreateArgs {
     /// `SaMutableContractOverride { rule_id, contract_kind,
     /// contract_address_redacted }`, naming the owner and tag of an external
     /// reference. The row carries the new rule's id and is written after the
-    /// install confirms, before the `SaContextRuleCreated` row; a refused
+    /// install confirms, before the `SaContextRuleCreatedV2` row; a refused
     /// install writes none.
     /// The JSON envelope reflects `mutable_override: true`.
     #[arg(long)]
@@ -617,7 +620,7 @@ pub struct CreateArgs {
     /// `SaUnknownContractOverride { rule_id, contract_kind,
     /// contract_address_redacted, observed_hash_first8 }`. The row carries the
     /// new rule's id and is written after the install confirms, before the
-    /// `SaContextRuleCreated` row; a refused install writes none.
+    /// `SaContextRuleCreatedV2` row; a refused install writes none.
     /// The JSON envelope reflects `unknown_override: true`.
     #[arg(long)]
     pub accept_unknown_verifier: bool,
@@ -647,8 +650,8 @@ pub struct CreateArgs {
 
 /// Result envelope for `smart-account rules create`.
 ///
-/// Carries the wasm-pinning fields `pinned_verifier_wasm_hashes_first8`,
-/// `pinned_policy_wasm_hashes_first8`, `pinned_verifier_executable_refs`,
+/// Carries the wasm-pinning fields `pinned_verifier_wasm_hashes`,
+/// `pinned_policy_wasm_hashes`, `pinned_verifier_executable_refs`,
 /// `pinned_policy_executable_refs`, `mutable_override`, and
 /// `unknown_override` — all sourced from the `PinResult` returned by
 /// `install_rule`.
@@ -671,13 +674,14 @@ pub struct CreateResult {
     pub signer_ed25519_count: u32,
     /// Optional ledger expiry, `null` for permanent rules.
     pub valid_until: Option<u32>,
-    /// First-8-hex of each pinned verifier wasm hash (one per distinct
-    /// External signer verifier contract).  Empty when no External signers
-    /// are present.  Non-empty values confirm the wasm-hash pin was recorded.
-    pub pinned_verifier_wasm_hashes_first8: Vec<String>,
-    /// First-8-hex of each pinned policy wasm hash (one per policy attached
-    /// to the rule).  Empty when no policies are present.
-    pub pinned_policy_wasm_hashes_first8: Vec<String>,
+    /// Each pinned verifier wasm hash in full, 64 lowercase hex characters
+    /// (one per distinct External signer verifier contract).  Empty when no
+    /// External signers are present.  Non-empty values confirm the
+    /// wasm-hash pin was recorded.
+    pub pinned_verifier_wasm_hashes: Vec<WasmHashPin>,
+    /// Each pinned policy wasm hash in full (one per policy attached to the
+    /// rule).  Empty when no policies are present.
+    pub pinned_policy_wasm_hashes: Vec<WasmHashPin>,
     /// `true` when `--accept-mutable-verifier` was set AND at least one
     /// referenced contract had a mutable admin / owner key.
     pub mutable_override: bool,
@@ -685,14 +689,14 @@ pub struct CreateResult {
     /// referenced contract had a wasm hash outside the allowlist.
     pub unknown_override: bool,
     /// Executable-reference pins aligned with
-    /// `pinned_verifier_wasm_hashes_first8`: an object (redacted owner,
-    /// bounded tag, tag-key digest, resolved first-8) for a verifier whose
+    /// `pinned_verifier_wasm_hashes`: an object (redacted owner, bounded
+    /// tag, tag-key digest, full resolved hash) for a verifier whose
     /// executable is an external reference, `null` otherwise. Omitted when no
     /// verifier is an external reference.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
     /// Executable-reference pins aligned with
-    /// `pinned_policy_wasm_hashes_first8`, in the same form. Omitted when no
+    /// `pinned_policy_wasm_hashes`, in the same form. Omitted when no
     /// policy is an external reference.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
@@ -1131,8 +1135,8 @@ async fn create_run(args: &CreateArgs) -> i32 {
             pin_result,
             ..
         }) => {
-            let pinned_verifier_wasm_hashes_first8 = pin_result.pinned_verifier_hashes_first8();
-            let pinned_policy_wasm_hashes_first8 = pin_result.pinned_policy_hashes_first8();
+            let pinned_verifier_wasm_hashes = pin_result.pinned_verifier_hashes();
+            let pinned_policy_wasm_hashes = pin_result.pinned_policy_hashes();
             info!(
                 smart_account = %account_redacted,
                 rule_id,
@@ -1153,8 +1157,8 @@ async fn create_run(args: &CreateArgs) -> i32 {
                 signer_webauthn_count: webauthn_count,
                 signer_ed25519_count: ed25519_count,
                 valid_until,
-                pinned_verifier_wasm_hashes_first8,
-                pinned_policy_wasm_hashes_first8,
+                pinned_verifier_wasm_hashes,
+                pinned_policy_wasm_hashes,
                 mutable_override: pin_result.mutable_override,
                 unknown_override: pin_result.unknown_override,
                 pinned_verifier_executable_refs: pin_result.verifier_executable_refs(),
@@ -1705,44 +1709,46 @@ pub struct VerifyPinsResult {
     pub verifier_pin_status: PinStatus,
     /// Pin status for policy contracts.
     pub policy_pin_status: PinStatus,
-    /// Pinned verifier wasm hashes first-8-hex (from audit log).
-    pub pinned_verifier_first8: Vec<String>,
-    /// Pinned policy wasm hashes first-8-hex (from audit log).
-    pub pinned_policy_first8: Vec<String>,
-    /// Observed live verifier wasm hashes first-8-hex (from chain).
-    pub observed_verifier_first8: Vec<String>,
-    /// Observed live policy wasm hashes first-8-hex (from chain).
-    pub observed_policy_first8: Vec<String>,
+    /// Pinned verifier wasm hashes in full (from audit log). Empty when the
+    /// rule's pin record is incomplete.
+    pub pinned_verifier_hashes: Vec<WasmHashPin>,
+    /// Pinned policy wasm hashes in full (from audit log). Empty when the
+    /// rule's pin record is incomplete.
+    pub pinned_policy_hashes: Vec<WasmHashPin>,
+    /// Observed live verifier effective hashes in full (from chain); `null`
+    /// for a verifier with no Wasm code, which has no hash.
+    pub observed_verifier_hashes: Vec<Option<WasmHashPin>>,
+    /// Observed live policy effective hashes in full (from chain); `null` for
+    /// a policy with no Wasm code.
+    pub observed_policy_hashes: Vec<Option<WasmHashPin>>,
     /// Observed executable of each verifier, aligned with
-    /// `observed_verifier_first8`: the bounded summary of an external
+    /// `observed_verifier_hashes`: the bounded summary of an external
     /// reference (owner, tag and resolved hash) or `"no code"`, and `null` for
     /// a plain Wasm executable. Omitted when no verifier was observed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed_verifier_executable: Vec<Option<String>>,
     /// Observed executable of each policy, aligned with
-    /// `observed_policy_first8`, in the form of
+    /// `observed_policy_hashes`, in the form of
     /// `observed_verifier_executable`. Omitted when no policy was observed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed_policy_executable: Vec<Option<String>>,
-    /// Executable-reference pins (owner, tag, tag-key digest, resolved
-    /// first-8) from the audit log, aligned with `pinned_verifier_first8`,
+    /// Executable-reference pins (owner, tag, tag-key digest, full resolved
+    /// hash) from the audit log, aligned with `pinned_verifier_hashes`,
     /// `null` at a position pinned by its Wasm hash. Omitted when no pinned
     /// verifier is an external reference.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
     /// Executable-reference pins from the audit log, aligned with
-    /// `pinned_policy_first8`, in the form of
+    /// `pinned_policy_hashes`, in the form of
     /// `pinned_verifier_executable_refs`. Omitted when no pinned policy is an
     /// external reference.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
-    /// Install-time mutable-contract override flag, sourced from the
-    /// `SaContextRuleCreated` audit row. `false` for rules installed before
-    /// override tracking was added.
+    /// Mutable-contract override flag of the rule's pin record. `false`
+    /// without a complete pin record.
     pub mutable_override: bool,
-    /// Install-time unknown-wasm override flag, sourced from the
-    /// `SaContextRuleCreated` audit row. `false` for rules installed before
-    /// override tracking was added.
+    /// Unknown-wasm override flag of the rule's pin record. `false` without
+    /// a complete pin record.
     pub unknown_override: bool,
     /// Present when `verifier_pin_status` or `policy_pin_status` is
     /// `Unavailable`, carrying the inner `SaError` wire code.
@@ -1759,10 +1765,10 @@ impl VerifyPinsResult {
             rule_id: sa.rule_id,
             verifier_pin_status: sa.verifier_pin_status,
             policy_pin_status: sa.policy_pin_status,
-            pinned_verifier_first8: sa.pinned_verifier_first8,
-            pinned_policy_first8: sa.pinned_policy_first8,
-            observed_verifier_first8: sa.observed_verifier_first8,
-            observed_policy_first8: sa.observed_policy_first8,
+            pinned_verifier_hashes: sa.pinned_verifier_hashes,
+            pinned_policy_hashes: sa.pinned_policy_hashes,
+            observed_verifier_hashes: sa.observed_verifier_hashes,
+            observed_policy_hashes: sa.observed_policy_hashes,
             observed_verifier_executable: sa.observed_verifier_executable,
             observed_policy_executable: sa.observed_policy_executable,
             pinned_verifier_executable_refs: sa.pinned_verifier_executable_refs,
@@ -3639,8 +3645,8 @@ mod tests {
             signer_webauthn_count: 1,
             signer_ed25519_count: 1,
             valid_until: None,
-            pinned_verifier_wasm_hashes_first8: vec![],
-            pinned_policy_wasm_hashes_first8: vec![],
+            pinned_verifier_wasm_hashes: vec![],
+            pinned_policy_wasm_hashes: vec![],
             mutable_override: false,
             unknown_override: false,
             pinned_verifier_executable_refs: vec![],
@@ -3659,8 +3665,9 @@ mod tests {
     }
 
     /// The executable-reference lists are omitted when empty, serialised
-    /// aligned with the first-8 lists when present, and default to empty for
-    /// envelopes without them.
+    /// aligned with the hash lists when present, and default to empty for
+    /// envelopes without them. Every hash, the resolved hash of a reference
+    /// pin included, is serialised in full and no `_first8` field appears.
     #[test]
     fn create_result_executable_refs_are_optional_and_aligned() {
         use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
@@ -3680,17 +3687,23 @@ mod tests {
             signer_webauthn_count: 1,
             signer_ed25519_count: 0,
             valid_until: None,
-            pinned_verifier_wasm_hashes_first8: vec![
-                "1111111111111111".to_owned(),
-                "4242424242424242".to_owned(),
+            pinned_verifier_wasm_hashes: vec![
+                WasmHashPin::new([0x11; 32]),
+                WasmHashPin::new([0x42; 32]),
             ],
-            pinned_policy_wasm_hashes_first8: vec![],
+            pinned_policy_wasm_hashes: vec![],
             mutable_override: true,
             unknown_override: false,
             pinned_verifier_executable_refs: vec![],
             pinned_policy_executable_refs: vec![],
         };
         let without = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            without["pinned_verifier_wasm_hashes"],
+            serde_json::json!(["11".repeat(32), "42".repeat(32)])
+        );
+        assert!(without.get("pinned_verifier_wasm_hashes_first8").is_none());
+        assert!(without.get("pinned_policy_wasm_hashes_first8").is_none());
         assert!(without.get("pinned_verifier_executable_refs").is_none());
         assert!(without.get("pinned_policy_executable_refs").is_none());
         let legacy: CreateResult = serde_json::from_value(without).unwrap();
@@ -3703,8 +3716,13 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(
-            with["pinned_verifier_executable_refs"][1]["resolved_hash_first8"],
-            "4242424242424242"
+            with["pinned_verifier_executable_refs"][1]["resolved_hash"],
+            "42".repeat(32)
+        );
+        assert!(
+            with["pinned_verifier_executable_refs"][1]
+                .get("resolved_hash_first8")
+                .is_none()
         );
         assert_eq!(with["pinned_verifier_executable_refs"][1]["tag"], "v1");
         assert!(with.get("pinned_policy_executable_refs").is_none());
@@ -4495,10 +4513,10 @@ mod tests {
                 rule_id: 7,
                 verifier_pin_status,
                 policy_pin_status,
-                pinned_verifier_first8: vec![],
-                pinned_policy_first8: vec![],
-                observed_verifier_first8: vec![],
-                observed_policy_first8: vec![],
+                pinned_verifier_hashes: vec![],
+                pinned_policy_hashes: vec![],
+                observed_verifier_hashes: vec![],
+                observed_policy_hashes: vec![],
                 observed_verifier_executable: vec![],
                 observed_policy_executable: vec![],
                 pinned_verifier_executable_refs: vec![],
@@ -4525,10 +4543,10 @@ mod tests {
             rule_id: 2,
             verifier_pin_status: PinStatus::Match,
             policy_pin_status: PinStatus::Match,
-            pinned_verifier_first8: vec!["ab12cd34".to_owned()],
-            pinned_policy_first8: vec!["ef56gh78".to_owned()],
-            observed_verifier_first8: vec!["ab12cd34".to_owned()],
-            observed_policy_first8: vec!["ef56gh78".to_owned()],
+            pinned_verifier_hashes: vec![WasmHashPin::new([0xab; 32])],
+            pinned_policy_hashes: vec![WasmHashPin::new([0xef; 32])],
+            observed_verifier_hashes: vec![Some(WasmHashPin::new([0xab; 32]))],
+            observed_policy_hashes: vec![Some(WasmHashPin::new([0xef; 32]))],
             observed_verifier_executable: vec![],
             observed_policy_executable: vec![],
             pinned_verifier_executable_refs: vec![],
@@ -4544,7 +4562,10 @@ mod tests {
 
         assert_eq!(round_trip.verifier_pin_status, PinStatus::Match);
         assert_eq!(round_trip.policy_pin_status, PinStatus::Match);
-        assert_eq!(round_trip.pinned_verifier_first8, vec!["ab12cd34"]);
+        assert_eq!(
+            round_trip.pinned_verifier_hashes,
+            vec![WasmHashPin::new([0xab; 32])]
+        );
         assert_eq!(round_trip.chain_id, "stellar:testnet");
         assert!(!round_trip.mutable_override);
         assert!(!round_trip.unknown_override);
@@ -4571,7 +4592,7 @@ mod tests {
     }
 
     /// A verifier pinned to an external reference reports the pin and the
-    /// observed reference summary, aligned with the first-8 lists.
+    /// observed reference summary, aligned with the hash lists.
     #[test]
     fn verify_pins_result_carries_external_reference_executables() {
         let pin = ExecutableRefPin {
@@ -4581,20 +4602,22 @@ mod tests {
                 ),
             tag: "verifier-v1".to_owned(),
             ref_key_hex: "ab".repeat(32),
-            resolved_hash_first8: "0102030405060708".to_owned(),
+            resolved_hash: WasmHashPin::parse(&"0102030405060708".repeat(4)).unwrap(),
         };
-        let summary = "external reference owner GAAAA...AAWHF tag \"verifier-v1\" \
-                       resolved 0102030405060708";
+        let summary = format!(
+            "external reference owner GAAAA...AAWHF tag \"verifier-v1\" resolved {}",
+            "0102030405060708".repeat(4)
+        );
         let result = VerifyPinsResult {
             smart_account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
             rule_id: 3,
             verifier_pin_status: PinStatus::Match,
             policy_pin_status: PinStatus::Match,
-            pinned_verifier_first8: vec!["0102030405060708".to_owned()],
-            pinned_policy_first8: vec!["ef56ab78".to_owned()],
-            observed_verifier_first8: vec!["0102030405060708".to_owned()],
-            observed_policy_first8: vec!["ef56ab78".to_owned()],
-            observed_verifier_executable: vec![Some(summary.to_owned())],
+            pinned_verifier_hashes: vec![WasmHashPin::new([0x01; 32])],
+            pinned_policy_hashes: vec![WasmHashPin::new([0xef; 32])],
+            observed_verifier_hashes: vec![Some(WasmHashPin::new([0x01; 32]))],
+            observed_policy_hashes: vec![Some(WasmHashPin::new([0xef; 32]))],
+            observed_verifier_executable: vec![Some(summary.clone())],
             observed_policy_executable: vec![None],
             pinned_verifier_executable_refs: vec![Some(pin.clone())],
             pinned_policy_executable_refs: vec![],
@@ -4633,6 +4656,43 @@ mod tests {
         assert!(round_trip.pinned_policy_executable_refs.is_empty());
     }
 
+    /// A drifted contract with no Wasm code is reported with a `null` observed
+    /// hash beside its `"no code"` executable summary, never as a zero hash.
+    #[test]
+    fn verify_pins_result_reports_absent_code_as_null() {
+        let result = VerifyPinsResult {
+            smart_account: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_owned(),
+            rule_id: 5,
+            verifier_pin_status: PinStatus::Drift,
+            policy_pin_status: PinStatus::Drift,
+            pinned_verifier_hashes: vec![WasmHashPin::new([0xaa; 32])],
+            pinned_policy_hashes: vec![WasmHashPin::new([0xef; 32])],
+            observed_verifier_hashes: vec![None],
+            observed_policy_hashes: vec![None],
+            observed_verifier_executable: vec![Some("no code".to_owned())],
+            observed_policy_executable: vec![Some("no code".to_owned())],
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
+            mutable_override: false,
+            unknown_override: false,
+            unavailable_reason: None,
+            chain_id: "stellar:testnet".to_owned(),
+        };
+
+        let json = serde_json::to_value(&result).unwrap();
+        for field in ["observed_verifier_hashes", "observed_policy_hashes"] {
+            assert_eq!(json[field], serde_json::json!([null]), "{field}");
+        }
+        for field in ["observed_verifier_executable", "observed_policy_executable"] {
+            assert_eq!(json[field], serde_json::json!(["no code"]), "{field}");
+        }
+        assert!(!json.to_string().contains(&"0".repeat(64)), "{json}");
+
+        let round_trip: VerifyPinsResult = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip.observed_verifier_hashes, vec![None]);
+        assert_eq!(round_trip.observed_policy_hashes, vec![None]);
+    }
+
     /// An envelope without the executable fields deserialises with them empty.
     #[test]
     fn verify_pins_result_without_executable_fields_deserialises_empty() {
@@ -4641,10 +4701,10 @@ mod tests {
             "rule_id": 2,
             "verifier_pin_status": "match",
             "policy_pin_status": "no_contracts",
-            "pinned_verifier_first8": ["ab12cd34"],
-            "pinned_policy_first8": [],
-            "observed_verifier_first8": ["ab12cd34"],
-            "observed_policy_first8": [],
+            "pinned_verifier_hashes": ["ab12cd34".repeat(8)],
+            "pinned_policy_hashes": [],
+            "observed_verifier_hashes": ["ab12cd34".repeat(8)],
+            "observed_policy_hashes": [],
             "mutable_override": false,
             "unknown_override": false,
             "chain_id": "stellar:testnet",
@@ -4663,10 +4723,10 @@ mod tests {
             rule_id: 1,
             verifier_pin_status: PinStatus::Unavailable,
             policy_pin_status: PinStatus::Unavailable,
-            pinned_verifier_first8: vec![],
-            pinned_policy_first8: vec![],
-            observed_verifier_first8: vec![],
-            observed_policy_first8: vec![],
+            pinned_verifier_hashes: vec![],
+            pinned_policy_hashes: vec![],
+            observed_verifier_hashes: vec![],
+            observed_policy_hashes: vec![],
             observed_verifier_executable: vec![],
             observed_policy_executable: vec![],
             pinned_verifier_executable_refs: vec![],
@@ -4697,10 +4757,10 @@ mod tests {
             rule_id: 4,
             verifier_pin_status: PinStatus::Drift,
             policy_pin_status: PinStatus::NoPin,
-            pinned_verifier_first8: vec!["aaaaaaaa".to_owned()],
-            pinned_policy_first8: vec![],
-            observed_verifier_first8: vec!["bbbbbbbb".to_owned()],
-            observed_policy_first8: vec![],
+            pinned_verifier_hashes: vec![WasmHashPin::new([0xaa; 32])],
+            pinned_policy_hashes: vec![],
+            observed_verifier_hashes: vec![Some(WasmHashPin::new([0xbb; 32]))],
+            observed_policy_hashes: vec![],
             observed_verifier_executable: vec![],
             observed_policy_executable: vec![],
             pinned_verifier_executable_refs: vec![],
@@ -5106,10 +5166,10 @@ mod tests {
             rule_id: 3,
             verifier_pin_status: PinStatus::Match,
             policy_pin_status: PinStatus::NoContracts,
-            pinned_verifier_first8: vec!["deadbeef".to_owned()],
-            pinned_policy_first8: vec![],
-            observed_verifier_first8: vec!["deadbeef".to_owned()],
-            observed_policy_first8: vec![],
+            pinned_verifier_hashes: vec![WasmHashPin::new([0xde; 32])],
+            pinned_policy_hashes: vec![],
+            observed_verifier_hashes: vec![Some(WasmHashPin::new([0xde; 32]))],
+            observed_policy_hashes: vec![],
             observed_verifier_executable: vec![],
             observed_policy_executable: vec![],
             pinned_verifier_executable_refs: vec![],

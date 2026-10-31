@@ -3,7 +3,12 @@
 //! On every CLI invocation, after profile load and before subcommand dispatch,
 //! scan the local audit log for rules referencing verifier wasm hashes flagged
 //! as `Revoked` or `Retired` in [`VERIFIER_ALLOWLIST`]. Emit one stderr
-//! advisory line per affected rule.
+//! advisory line per affected rule. A pin is matched against an allowlist
+//! entry in all 32 bytes, so a hash sharing only a prefix with a revoked or
+//! retired entry is never assigned that entry's status. A rule whose pin
+//! record holds eight-byte hash prefixes gets an advisory naming
+//! `sa.wasm_pin_incomplete` and its recovery instead: a prefix cannot name
+//! an allowlist entry.
 //!
 //! # No-network invariant
 //!
@@ -30,7 +35,7 @@
 //! the `#[cfg(test)] mod tests` block at the bottom of this file (Revoked,
 //! Retired, dedup, and multi-rule cases).
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -38,10 +43,9 @@ use tracing::warn;
 use uuid::Uuid;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::reader::AuditReader;
-use stellar_agent_core::audit_log::schema::VerifierAdvisoryKind;
+use stellar_agent_core::audit_log::reader::{AuditReader, ContextRulePinRecord};
+use stellar_agent_core::audit_log::schema::{VerifierAdvisoryKind, WasmHashPin};
 use stellar_agent_core::audit_log::writer::AuditWriter;
-use stellar_agent_core::hex::wasm_hash_first8_hex;
 use stellar_agent_core::observability::RedactedStrkey;
 use stellar_agent_smart_account::verifier_allowlist::{
     VERIFIER_ALLOWLIST, VerifierAllowlistEntry, VerifierAuditStatus,
@@ -58,6 +62,10 @@ pub struct AdvisoryResult {
     /// Empty when no revoked/retired verifier hashes are found in the audit
     /// log, or when the audit log is absent or unreadable.
     pub triggered_rule_ids: Vec<u32>,
+    /// Rule IDs whose pin record holds eight-byte hash prefixes, which
+    /// signing refuses with `sa.wasm_pin_incomplete`. No allowlist status is
+    /// looked up for them.
+    pub incomplete_pin_rule_ids: Vec<u32>,
 }
 
 // ── run_startup_advisory ───────────────────────────────────────────────────────
@@ -104,11 +112,15 @@ pub fn run_startup_advisory(audit_log_path: &Path) -> AdvisoryResult {
 /// 1. If the audit-log file is absent or empty, return early.
 /// 2. Open an `AuditWriter` to drive `AuditReader` construction and
 ///    advisory-row emission.
-/// 3. Scan every rule's pin record: the newest `SaContextRuleCreated` or
-///    `SaContextRulePinsUpdated` row per rule.
-/// 4. For each rule, deduplicate `pinned_verifier_first8` before iterating.
-/// 5. For any hash matching a `Revoked` or `Retired` allowlist entry, emit one
-///    `[advisory]` stderr line and one `SaVerifierAllowlistAdvisory` audit row.
+/// 3. Scan every rule's pin record: the newest pin row of either version per
+///    rule.
+/// 4. For a record of eight-byte hash prefixes, emit one `[advisory]` stderr
+///    line naming `sa.wasm_pin_incomplete` and the recovery, record the rule
+///    in [`AdvisoryResult::incomplete_pin_rule_ids`], and look up no status.
+/// 5. For a complete record, deduplicate the full verifier hashes, and for
+///    any hash equal in all 32 bytes to a `Revoked` or `Retired` allowlist
+///    entry, emit one `[advisory]` stderr line and one
+///    `SaVerifierAllowlistAdvisory` audit row.
 /// 6. Record `rule_id` in [`AdvisoryResult::triggered_rule_ids`] once per rule.
 #[cfg(any(test, feature = "test-helpers"))]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -176,19 +188,34 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
 
     // ── 3. Check each rule's pinned hashes against the allowlist ──────────────
     let mut triggered_rule_ids: Vec<u32> = Vec::new();
+    let mut incomplete_pin_rule_ids: Vec<u32> = Vec::new();
     let request_id = Uuid::new_v4().to_string();
 
-    for (rule_id, smart_account_redacted, pinned) in &all_rules {
-        // Deduplicate hashes per rule before iterating: avoids duplicate stderr
-        // lines + audit rows when the same hash appears more than once in the
-        // pinned set.
-        let unique_hashes: HashSet<&String> = pinned.pinned_verifier_first8.iter().collect();
-        // Iterate in a stable order (sort the deduplicated set) for deterministic output.
-        let mut sorted_hashes: Vec<&String> = unique_hashes.into_iter().collect();
-        sorted_hashes.sort_unstable();
+    for (rule_id, smart_account_redacted, record) in &all_rules {
+        let pinned = match record {
+            ContextRulePinRecord::Complete(pinned) => pinned,
+            ContextRulePinRecord::Incomplete(_) => {
+                // A prefix cannot name an allowlist entry: report the
+                // incomplete record and its recovery, and look up no status.
+                eprintln!(
+                    "[advisory] rule {rule_id} has a pin record of eight-byte hash prefixes \
+                     (sa.wasm_pin_incomplete); signing under it is refused until the rule is \
+                     reinstalled through an independently authorized rule such as rule 0"
+                );
+                if !incomplete_pin_rule_ids.contains(rule_id) {
+                    incomplete_pin_rule_ids.push(*rule_id);
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        // Deduplicate hashes per rule, in a stable order, before iterating:
+        // avoids duplicate stderr lines and audit rows when the same hash
+        // appears more than once in the pinned set.
+        let sorted_hashes: BTreeSet<&WasmHashPin> = pinned.pinned_verifier_hashes.iter().collect();
 
-        for hash_first8 in sorted_hashes {
-            let Some(advisory_kind) = find_advisory_kind_in(hash_first8, allowlist) else {
+        for hash in sorted_hashes {
+            let Some(advisory_kind) = find_advisory_kind_in(hash, allowlist) else {
                 continue;
             };
 
@@ -197,10 +224,12 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
             eprintln!(
                 "[advisory] rule {} references {} verifier {}; \
                  run 'stellar-agent smart-account migrate-verifier' to remediate",
-                rule_id, advisory_kind, hash_first8,
+                rule_id, advisory_kind, hash,
             );
 
-            // 3b. Emit SaVerifierAllowlistAdvisory audit row.
+            // 3b. Emit SaVerifierAllowlistAdvisory audit row; its hash field
+            //     is the labeled first-8 display projection of the full hash.
+            let hash_first8 = hash.first8_display();
             let entry = AuditEntry::new_sa_verifier_allowlist_advisory(
                 *rule_id,
                 RedactedStrkey::from_already_redacted(smart_account_redacted.as_str()),
@@ -239,17 +268,19 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
         }
     }
 
-    AdvisoryResult { triggered_rule_ids }
+    AdvisoryResult {
+        triggered_rule_ids,
+        incomplete_pin_rule_ids,
+    }
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────────────
 
-/// Looks up `hash_first8` in the provided `allowlist` slice.
+/// Looks up the full pinned `hash` in the provided `allowlist` slice.
 ///
-/// The pinned string and the allowlist entry are rendered by the same
-/// helper, [`wasm_hash_first8_hex`]: the pin records carry the first 8 bytes
-/// of a hash as 16 hex characters, and each entry's hash is rendered the
-/// same way before the comparison.
+/// An entry matches only when its hash equals the pin in all 32 bytes, so a
+/// hash that shares a prefix with an entry is never assigned that entry's
+/// status.
 ///
 /// Returns [`VerifierAdvisoryKind::Revoked`] for `Revoked` entries and
 /// [`VerifierAdvisoryKind::Retired`] for `Retired` entries.
@@ -274,12 +305,11 @@ fn advisory_impl(audit_log_path: &Path, allowlist: &[VerifierAllowlistEntry]) ->
 /// - `None` — hash not in allowlist (unknown hashes are not flagged; the
 ///   install-time gate already rejected them without `--accept-unknown-verifier`).
 pub(crate) fn find_advisory_kind_in(
-    hash_first8: &str,
+    hash: &WasmHashPin,
     allowlist: &[VerifierAllowlistEntry],
 ) -> Option<VerifierAdvisoryKind> {
     for entry in allowlist {
-        let entry_first8 = wasm_hash_first8_hex(&entry.wasm_hash);
-        if entry_first8 == hash_first8 {
+        if hash.matches(&entry.wasm_hash) {
             return match &entry.audit_status {
                 VerifierAuditStatus::Revoked { .. } => Some(VerifierAdvisoryKind::Revoked),
                 VerifierAuditStatus::Retired { .. } => Some(VerifierAdvisoryKind::Retired),
@@ -349,12 +379,44 @@ mod tests {
         Arc::new(Mutex::new(AuditWriter::open(path, None).unwrap()))
     }
 
-    /// Writes a `SaContextRuleCreated` row with the given pinned verifier hashes.
+    /// Writes a `SaContextRuleCreatedV2` row with the given pinned verifier
+    /// hashes.
     fn write_context_rule_created(
         writer: &Arc<Mutex<AuditWriter>>,
         rule_id: u32,
         smart_account: &str,
-        pinned_hashes: Vec<String>,
+        pinned_hashes: Vec<WasmHashPin>,
+    ) {
+        let mut entry = AuditEntry::new_tool_invocation(NewToolInvocation::new(
+            "smart-account.rules.create",
+            Option::<String>::None,
+            vec![],
+            PolicyDecision::Allow,
+            Uuid::new_v4().to_string(),
+        ));
+        entry.event_kind = EventKind::SaContextRuleCreatedV2 {
+            smart_account: smart_account.to_owned(),
+            rule_id,
+            context_type: "default".to_owned(),
+            signers_count: 1,
+            policies_count: 0,
+            valid_until: None,
+            pinned_verifier_wasm_hashes: pinned_hashes,
+            pinned_policy_wasm_hashes: vec![],
+            mutable_override: false,
+            unknown_override: false,
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
+        };
+        writer.lock().unwrap().write_entry(entry).unwrap();
+    }
+
+    /// Writes a version-1 `SaContextRuleCreated` row of eight-byte prefixes.
+    fn write_prefix_context_rule_created(
+        writer: &Arc<Mutex<AuditWriter>>,
+        rule_id: u32,
+        smart_account: &str,
+        pinned_first8: Vec<String>,
     ) {
         let mut entry = AuditEntry::new_tool_invocation(NewToolInvocation::new(
             "smart-account.rules.create",
@@ -370,7 +432,7 @@ mod tests {
             signers_count: 1,
             policies_count: 0,
             valid_until: None,
-            pinned_verifier_wasm_hashes_first8: pinned_hashes,
+            pinned_verifier_wasm_hashes_first8: pinned_first8,
             pinned_policy_wasm_hashes_first8: vec![],
             mutable_override: false,
             unknown_override: false,
@@ -378,6 +440,11 @@ mod tests {
             pinned_policy_executable_refs: vec![],
         };
         writer.lock().unwrap().write_entry(entry).unwrap();
+    }
+
+    /// A full hash whose bytes all equal `byte`.
+    fn h(byte: u8) -> WasmHashPin {
+        WasmHashPin::new([byte; 32])
     }
 
     #[test]
@@ -398,22 +465,12 @@ mod tests {
             stellar_agent_core::profile::schema::default_audit_log_path_for("configured");
         std::fs::create_dir_all(default_path.parent().unwrap()).unwrap();
         let default_writer = open_writer(default_path.clone());
-        write_context_rule_created(
-            &default_writer,
-            99,
-            "CDABC...12345",
-            vec!["abababababababab".to_owned()],
-        );
+        write_context_rule_created(&default_writer, 99, "CDABC...12345", vec![h(0xab)]);
         drop(default_writer);
         let default_bytes = std::fs::read(&default_path).unwrap();
 
         let writer = open_writer(path.clone());
-        write_context_rule_created(
-            &writer,
-            4,
-            "CDABC...12345",
-            vec!["abababababababab".to_owned()],
-        );
+        write_context_rule_created(&writer, 4, "CDABC...12345", vec![h(0xab)]);
         drop(writer);
         let allowlist = [VerifierAllowlistEntry::new_for_test(
             [0xAB; 32],
@@ -473,12 +530,7 @@ mod tests {
         };
 
         let writer = open_writer(path.clone());
-        write_context_rule_created(
-            &writer,
-            4,
-            "CDABC...12345",
-            vec!["abababababababab".to_owned()],
-        );
+        write_context_rule_created(&writer, 4, "CDABC...12345", vec![h(0xab)]);
         drop(writer);
         assert_eq!(run().triggered_rule_ids, vec![4]);
         assert!(binding().is_none(), "the advisory records no binding");
@@ -493,12 +545,7 @@ mod tests {
         let recorded = binding();
         let before = std::fs::read(&path).unwrap().len();
         let writer = open_writer(path.clone());
-        write_context_rule_created(
-            &writer,
-            5,
-            "CDABC...12345",
-            vec!["abababababababab".to_owned()],
-        );
+        write_context_rule_created(&writer, 5, "CDABC...12345", vec![h(0xab)]);
         drop(writer);
         assert!(
             run().triggered_rule_ids.contains(&5),
@@ -555,7 +602,7 @@ mod tests {
         );
     }
 
-    // ── Test 2: empty result when log has no SaContextRuleCreated rows ─────────
+    // ── Test 2: empty result when log has no pin rows ─────────────────────────
 
     #[test]
     fn advisory_returns_empty_when_audit_log_has_no_context_rule_rows() {
@@ -595,7 +642,7 @@ mod tests {
         // Production VERIFIER_ALLOWLIST has three Provisional entries (OZ WebAuthn
         // v0.7.2 at index 0, OZ WebAuthn v0.7.1 at index 1, OZ Ed25519 v0.7.2 at
         // index 2).
-        // "deadbeefdeadbeef" is not in the allowlist → advisory must NOT trigger.
+        // A 0xde hash is not in the allowlist → advisory must NOT trigger.
         // Positive trigger paths (Revoked + Retired) are tested in
         // `advisory_emits_audit_row_and_eprintln_on_revoked_hash` and
         // `advisory_emits_audit_row_and_eprintln_on_retired_hash` below
@@ -603,12 +650,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
-        write_context_rule_created(
-            &writer,
-            4,
-            "CDABC...12345",
-            vec!["deadbeefdeadbeef".to_owned()],
-        );
+        write_context_rule_created(&writer, 4, "CDABC...12345", vec![h(0xde)]);
         drop(writer);
 
         let result = run_startup_advisory(&path);
@@ -626,13 +668,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
-        // OZ v0.7.1 wasm_hash first-8-hex = "678006909b50c6c3", Provisional in
-        // VERIFIER_ALLOWLIST.
+        // OZ v0.7.1 wasm_hash, Provisional in VERIFIER_ALLOWLIST.
         write_context_rule_created(
             &writer,
             1,
             "CDABC...12345",
-            vec!["678006909b50c6c3".to_owned()],
+            vec![WasmHashPin::new(VERIFIER_ALLOWLIST[1].wasm_hash)],
         );
         drop(writer);
 
@@ -652,18 +693,13 @@ mod tests {
 
     #[test]
     fn advisory_returns_empty_when_hash_not_in_allowlist_retired_path() {
-        // "cafebabecafebabe" is not in VERIFIER_ALLOWLIST → advisory must NOT trigger.
+        // A 0xca hash is not in VERIFIER_ALLOWLIST → advisory must NOT trigger.
         // The positive Retired branch (a Retired entry triggers the advisory) is
         // covered by `advisory_emits_audit_row_and_eprintln_on_retired_hash` below.
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
-        write_context_rule_created(
-            &writer,
-            7,
-            "CDABC...12345",
-            vec!["cafebabecafebabe".to_owned()],
-        );
+        write_context_rule_created(&writer, 7, "CDABC...12345", vec![h(0xca)]);
         drop(writer);
 
         let result = run_startup_advisory(&path);
@@ -694,8 +730,11 @@ mod tests {
 
     #[test]
     fn find_advisory_kind_in_returns_none_for_provisional_oz_v071() {
-        // OZ v0.7.1 hash first-8: "678006909b50c6c3", Provisional: no advisory kind.
-        let kind = find_advisory_kind_in("678006909b50c6c3", VERIFIER_ALLOWLIST);
+        // OZ v0.7.1 hash, Provisional: no advisory kind.
+        let kind = find_advisory_kind_in(
+            &WasmHashPin::new(VERIFIER_ALLOWLIST[1].wasm_hash),
+            VERIFIER_ALLOWLIST,
+        );
         assert!(
             kind.is_none(),
             "Provisional OZ v0.7.1 must not produce an advisory kind"
@@ -713,7 +752,7 @@ mod tests {
                 attested_at: "2026-01-01",
             },
         )];
-        let kind = find_advisory_kind_in("1212121212121212", &allowlist);
+        let kind = find_advisory_kind_in(&h(0x12), &allowlist);
         assert!(
             kind.is_none(),
             "Provisional status must not produce an advisory kind"
@@ -722,7 +761,7 @@ mod tests {
 
     #[test]
     fn find_advisory_kind_in_returns_none_for_unknown_hash() {
-        let kind = find_advisory_kind_in("0000000000000000", VERIFIER_ALLOWLIST);
+        let kind = find_advisory_kind_in(&h(0x00), VERIFIER_ALLOWLIST);
         assert!(
             kind.is_none(),
             "unknown hash must not produce advisory kind"
@@ -747,7 +786,7 @@ mod tests {
                 reason: "test-revoked",
             },
         )];
-        let kind = find_advisory_kind_in("abababababababab", &allowlist);
+        let kind = find_advisory_kind_in(&h(0xab), &allowlist);
         assert_eq!(
             kind,
             Some(VerifierAdvisoryKind::Revoked),
@@ -764,7 +803,7 @@ mod tests {
                 retired_at: "2026-01-01",
             },
         )];
-        let kind = find_advisory_kind_in("cdcdcdcdcdcdcdcd", &allowlist);
+        let kind = find_advisory_kind_in(&h(0xcd), &allowlist);
         assert_eq!(
             kind,
             Some(VerifierAdvisoryKind::Retired),
@@ -772,22 +811,17 @@ mod tests {
         );
     }
 
-    // ── Encoding: a pin row matches the allowlist entry of its hash ──────────
+    // ── Pin width: full matches, prefix twins and incomplete records ──────────
 
-    /// A pin row carrying the 16-character first-8 of a revoked hash triggers
-    /// the advisory for its rule, and the advisory row names the rule, the
-    /// pinned first-8 and the revoked status.
+    /// A full pin of a revoked hash triggers the advisory for its rule, and
+    /// the advisory row names the rule, the labeled first-8 projection of the
+    /// pinned hash and the revoked status.
     #[test]
-    fn advisory_fires_for_a_pin_row_in_the_16_character_first8_form() {
+    fn advisory_fires_for_a_full_pin_of_a_revoked_hash() {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
-        write_context_rule_created(
-            &writer,
-            4,
-            "CDABC...12345",
-            vec!["abababababababab".to_owned()],
-        );
+        write_context_rule_created(&writer, 4, "CDABC...12345", vec![h(0xab)]);
         drop(writer);
         let allowlist = [VerifierAllowlistEntry::new_for_test(
             [0xAB; 32],
@@ -800,6 +834,7 @@ mod tests {
         let result = run_startup_advisory_with_allowlist(&path, &allowlist);
 
         assert_eq!(result.triggered_rule_ids, vec![4]);
+        assert!(result.incomplete_pin_rule_ids.is_empty());
         let advisories: Vec<(u32, String, VerifierAdvisoryKind)> = std::fs::read_to_string(&path)
             .unwrap()
             .lines()
@@ -822,6 +857,95 @@ mod tests {
                 "abababababababab".to_owned(),
                 VerifierAdvisoryKind::Revoked
             )]
+        );
+    }
+
+    /// A pinned hash that shares the first eight bytes of a revoked or
+    /// retired entry and differs after them is assigned no status: the
+    /// lookup compares all 32 bytes, and the exact hashes still match.
+    #[test]
+    fn advisory_does_not_assign_a_status_to_an_equal_prefix_twin() {
+        let revoked = [0x42u8; 32];
+        let retired = [0x52u8; 32];
+        let twin = |hash: [u8; 32]| {
+            let mut twin = hash;
+            twin[8..].fill(0x43);
+            WasmHashPin::new(twin)
+        };
+        let allowlist = [
+            VerifierAllowlistEntry::new_for_test(
+                revoked,
+                VerifierAuditStatus::Revoked {
+                    revoked_at: "2026-01-01",
+                    reason: "twin fixture",
+                },
+            ),
+            VerifierAllowlistEntry::new_for_test(
+                retired,
+                VerifierAuditStatus::Retired {
+                    revoked_at: "2024-01-01",
+                    retired_at: "2026-01-01",
+                },
+            ),
+        ];
+        assert_eq!(find_advisory_kind_in(&twin(revoked), &allowlist), None);
+        assert_eq!(find_advisory_kind_in(&twin(retired), &allowlist), None);
+        assert_eq!(
+            find_advisory_kind_in(&WasmHashPin::new(revoked), &allowlist),
+            Some(VerifierAdvisoryKind::Revoked)
+        );
+        assert_eq!(
+            find_advisory_kind_in(&WasmHashPin::new(retired), &allowlist),
+            Some(VerifierAdvisoryKind::Retired)
+        );
+
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        write_context_rule_created(&writer, 4, "CDABC...12345", vec![twin(revoked)]);
+        write_context_rule_created(&writer, 5, "CDABC...12345", vec![twin(retired)]);
+        drop(writer);
+        let result = run_startup_advisory_with_allowlist(&path, &allowlist);
+        assert!(result.triggered_rule_ids.is_empty(), "{result:?}");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("sa_verifier_allowlist_advisory")
+        );
+    }
+
+    /// A pin record of eight-byte prefixes is reported as incomplete, and no
+    /// allowlist status is looked up for its prefix, even one that equals a
+    /// revoked entry's first eight bytes.
+    #[test]
+    fn advisory_reports_an_incomplete_pin_record_without_a_status_lookup() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        write_prefix_context_rule_created(
+            &writer,
+            4,
+            "CDABC...12345",
+            vec!["abababababababab".to_owned()],
+        );
+        drop(writer);
+        let allowlist = [VerifierAllowlistEntry::new_for_test(
+            [0xAB; 32],
+            VerifierAuditStatus::Revoked {
+                revoked_at: "2026-01-01",
+                reason: "prefix fixture",
+            },
+        )];
+
+        let result = run_startup_advisory_with_allowlist(&path, &allowlist);
+
+        assert!(result.triggered_rule_ids.is_empty(), "{result:?}");
+        assert_eq!(result.incomplete_pin_rule_ids, vec![4]);
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("sa_verifier_allowlist_advisory"),
+            "an incomplete record writes no advisory row"
         );
     }
 
@@ -853,9 +977,14 @@ mod tests {
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
 
-        // Write a SaContextRuleCreated row referencing the revoked hash.
-        let revoked_first8 = "deadbeefabababab".to_owned();
-        write_context_rule_created(&writer, 4, "CDABC...12345", vec![revoked_first8.clone()]);
+        // Write a SaContextRuleCreatedV2 row referencing the revoked hash.
+        let revoked_first8 = WasmHashPin::new(revoked_hash).first8_display();
+        write_context_rule_created(
+            &writer,
+            4,
+            "CDABC...12345",
+            vec![WasmHashPin::new(revoked_hash)],
+        );
         drop(writer);
 
         let result = run_startup_advisory_with_allowlist(&path, &synthetic_allowlist);
@@ -916,8 +1045,12 @@ mod tests {
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
 
-        let retired_first8 = "cafebabecdcdcdcd".to_owned();
-        write_context_rule_created(&writer, 7, "CDEFG...67890", vec![retired_first8.clone()]);
+        write_context_rule_created(
+            &writer,
+            7,
+            "CDEFG...67890",
+            vec![WasmHashPin::new(retired_hash)],
+        );
         drop(writer);
 
         let result = run_startup_advisory_with_allowlist(&path, &synthetic_allowlist);
@@ -967,13 +1100,15 @@ mod tests {
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
 
-        let revoked_first8 = "aabbccdd11111111".to_owned();
         // Pin the same hash TWICE in the pinned_verifier list for one rule.
         write_context_rule_created(
             &writer,
             2,
             "CAAAA...00001",
-            vec![revoked_first8.clone(), revoked_first8.clone()],
+            vec![
+                WasmHashPin::new(revoked_hash),
+                WasmHashPin::new(revoked_hash),
+            ],
         );
         drop(writer);
 
@@ -996,6 +1131,62 @@ mod tests {
         assert_eq!(
             advisory_count, 1,
             "audit log must contain exactly 1 advisory row for a duplicate-hash rule; got {advisory_count}"
+        );
+    }
+
+    /// Deduplication compares all 32 bytes: two revoked hashes that share
+    /// their first eight bytes are two pins, each reported with its own
+    /// stderr line and audit row, although both rows carry the same labeled
+    /// first-8 display.
+    #[test]
+    fn advisory_keeps_equal_prefix_pins_distinct_when_deduplicating() {
+        let pinned = [0x42u8; 32];
+        let mut twin = pinned;
+        twin[8..].fill(0x43);
+        let revoked = |hash: [u8; 32]| {
+            VerifierAllowlistEntry::new_for_test(
+                hash,
+                VerifierAuditStatus::Revoked {
+                    revoked_at: "2026-02-01",
+                    reason: "equal-prefix dedup fixture",
+                },
+            )
+        };
+        let synthetic_allowlist = vec![revoked(pinned), revoked(twin)];
+
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        write_context_rule_created(
+            &writer,
+            4,
+            "CAAAA...00004",
+            vec![
+                WasmHashPin::new(pinned),
+                WasmHashPin::new(twin),
+                WasmHashPin::new(pinned),
+            ],
+        );
+        drop(writer);
+
+        let result = run_startup_advisory_with_allowlist(&path, &synthetic_allowlist);
+        assert_eq!(result.triggered_rule_ids, vec![4]);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let advisory_rows: Vec<&str> = content
+            .lines()
+            .filter(|line| line.contains("sa_verifier_allowlist_advisory"))
+            .collect();
+        assert_eq!(
+            advisory_rows.len(),
+            2,
+            "one advisory row per distinct full hash: {advisory_rows:?}"
+        );
+        let display = WasmHashPin::new(pinned).first8_display();
+        assert_eq!(display, WasmHashPin::new(twin).first8_display());
+        assert!(
+            advisory_rows.iter().all(|row| row.contains(&display)),
+            "{advisory_rows:?}"
         );
     }
 
@@ -1040,13 +1231,13 @@ mod tests {
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
 
-        let first8_a = "f00dbad022222222".to_owned();
-        let first8_b = "beefcafe33333333".to_owned();
+        let first8_a = WasmHashPin::new(hash_a).first8_display();
+        let first8_b = WasmHashPin::new(hash_b).first8_display();
 
         // Rule 3 references hash_a (Revoked).
-        write_context_rule_created(&writer, 3, "CAAAA...00002", vec![first8_a.clone()]);
+        write_context_rule_created(&writer, 3, "CAAAA...00002", vec![WasmHashPin::new(hash_a)]);
         // Rule 5 references hash_b (Retired).
-        write_context_rule_created(&writer, 5, "CAAAA...00003", vec![first8_b.clone()]);
+        write_context_rule_created(&writer, 5, "CAAAA...00003", vec![WasmHashPin::new(hash_b)]);
         drop(writer);
 
         let result = run_startup_advisory_with_allowlist(&path, &synthetic_allowlist);

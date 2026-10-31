@@ -71,8 +71,8 @@ use stellar_agent_core::approval::user_id::process_uid_for_attestation;
 use stellar_agent_core::approval::{
     DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF, RuleProposalGateError, open_with_retry,
 };
-use stellar_agent_core::audit_log::ExecutableRefPin;
 use stellar_agent_core::audit_log::writer::AuditWriter;
+use stellar_agent_core::audit_log::{ExecutableRefPin, WasmHashPin};
 use stellar_agent_core::timefmt::now_unix_ms;
 use stellar_agent_network::keyring::enrolled_keyring_signer;
 use stellar_agent_smart_account::error::SaError;
@@ -1071,8 +1071,6 @@ impl WalletServer {
             "requires_operator_approval": requires_operator_approval,
             "proposal_sha256_hex": proposal_sha256.iter().map(|b| format!("{b:02x}")).collect::<String>(),
             "latest_ledger": simulate_output.latest_ledger,
-            "pinned_verifier_wasm_hashes_first8": simulate_output.pin_result.pinned_verifier_hashes_first8(),
-            "pinned_policy_wasm_hashes_first8": simulate_output.pin_result.pinned_policy_hashes_first8(),
             "mutable_override": simulate_output.pin_result.mutable_override,
             "unknown_override": simulate_output.pin_result.unknown_override,
             "summary": {
@@ -1086,6 +1084,11 @@ impl WalletServer {
                 "summary_line": &summary_line,
             },
         });
+        insert_pin_fields(
+            &mut view,
+            &simulate_output.pin_result.pinned_verifier_hashes(),
+            &simulate_output.pin_result.pinned_policy_hashes(),
+        );
         insert_executable_refs(
             &mut view,
             simulate_output.pin_result.verifier_executable_refs(),
@@ -1148,7 +1151,8 @@ impl WalletServer {
                        rule_lock. A deadline that elapses during the baseline read or the comparison uses \
                        that code at baseline_read or signer_set_compare. Pin refusals are \
                        sa.verifier_hash_drift, sa.policy_hash_drift, sa.pinned_policy_absent, \
-                       sa.pinned_verifier_absent, and sa.pin_check_unavailable. A version 1 authorizing \
+                       sa.pinned_verifier_absent, sa.wasm_pin_incomplete, and sa.pin_check_unavailable. \
+                       A version 1 authorizing \
                        rule compares through its projection. Its own refusals are \
                        sa.threshold_policy_not_installed, sa.threshold_policy_identification_failed, and \
                        sa.deployment_failed. After the install confirms, the observed rule's signer \
@@ -1593,8 +1597,19 @@ impl WalletServer {
     }
 }
 
+/// Adds the pinned verifier and policy hashes to a rule-create view, each in
+/// full as 64 lowercase hex characters.
+fn insert_pin_fields(
+    view: &mut serde_json::Value,
+    verifier_hashes: &[WasmHashPin],
+    policy_hashes: &[WasmHashPin],
+) {
+    view["pinned_verifier_wasm_hashes"] = json!(verifier_hashes);
+    view["pinned_policy_wasm_hashes"] = json!(policy_hashes);
+}
+
 /// Adds the executable-reference pins to a rule-create view: each list is
-/// aligned with its first-8 list and present only when at least one pinned
+/// aligned with its hash list and present only when at least one pinned
 /// contract is an external reference.
 fn insert_executable_refs(
     view: &mut serde_json::Value,
@@ -1700,8 +1715,41 @@ mod tests {
     )]
     use super::*;
 
+    /// The rule-create view carries both hash lists in full: two hashes that
+    /// share their first eight bytes stay distinct, and no `_first8` field
+    /// appears.
+    #[test]
+    fn insert_pin_fields_adds_full_hash_lists() {
+        let pinned = [0x42u8; 32];
+        let mut twin = pinned;
+        twin[8..].fill(0x43);
+        let mut view = serde_json::json!({ "mutable_override": false });
+        insert_pin_fields(
+            &mut view,
+            &[WasmHashPin::new(pinned)],
+            &[WasmHashPin::new(twin)],
+        );
+        assert_eq!(
+            view["pinned_verifier_wasm_hashes"],
+            serde_json::json!([hex::encode(pinned)])
+        );
+        assert_eq!(
+            view["pinned_policy_wasm_hashes"],
+            serde_json::json!([hex::encode(twin)])
+        );
+        assert_eq!(
+            view["pinned_verifier_wasm_hashes"][0]
+                .as_str()
+                .map(str::len),
+            Some(64)
+        );
+        assert!(view.get("pinned_verifier_wasm_hashes_first8").is_none());
+        assert!(view.get("pinned_policy_wasm_hashes_first8").is_none());
+    }
+
     /// The rule-create view carries each executable-reference list only when
-    /// it is non-empty, aligned with its first-8 list.
+    /// it is non-empty, aligned with its hash list, with the full resolved
+    /// hash.
     #[test]
     fn insert_executable_refs_adds_only_non_empty_lists() {
         use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
@@ -1726,6 +1774,10 @@ mod tests {
         assert_eq!(
             view["pinned_policy_executable_refs"][1]["owner_redacted"],
             "CAAAA...ABSC4"
+        );
+        assert_eq!(
+            view["pinned_policy_executable_refs"][1]["resolved_hash"],
+            "42".repeat(32)
         );
     }
 

@@ -8,9 +8,9 @@
 //!
 //! # Design
 //!
-//! 1. Write a `SaContextRuleCreated` audit entry whose
-//!    `pinned_policy_wasm_hashes_first8` is `["0202020202020202"]` (a
-//!    sentinel that will not match the mock RPC's response).
+//! 1. Write a `SaContextRuleCreatedV2` audit entry whose
+//!    `pinned_policy_wasm_hashes` is `[[0x02; 32]]` (a sentinel that will
+//!    not match the mock RPC's response).
 //! 2. Mount a mock RPC that returns a contract instance with wasm hash
 //!    `THRESHOLD_POLICY_WASM_HASHES[0]` — different from the audit-pinned
 //!    sentinel.
@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::schema::{EventKind, WasmHashPin};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_smart_account::error::SaError;
 use stellar_agent_smart_account::managers::signers::ObservedExecutable;
@@ -79,12 +79,12 @@ async fn policy_wasm_hash_drift_detected_and_audit_row_emitted() {
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
 
-    // ── Step 2: Write fake SaContextRuleCreated with a DIFFERENT pinned policy hash
-    let fake_pinned_first8 = "0202020202020202".to_owned();
+    // ── Step 2: Write fake SaContextRuleCreatedV2 with a DIFFERENT pinned policy hash
+    let fake_pinned = WasmHashPin::new([0x02; 32]);
     let rule_id: u32 = 1;
     let request_id = Uuid::new_v4().to_string();
 
-    let fake_entry = AuditEntry::new_sa_context_rule_created(
+    let fake_entry = AuditEntry::new_sa_context_rule_created_v2(
         ZERO_CONTRACT_REDACTED,
         rule_id,
         "default",
@@ -94,7 +94,7 @@ async fn policy_wasm_hash_drift_detected_and_audit_row_emitted() {
         "stellar:testnet",
         &request_id,
         vec![],
-        vec![fake_pinned_first8.clone()],
+        vec![fake_pinned],
         false,
         false,
         vec![],
@@ -149,4 +149,74 @@ async fn policy_wasm_hash_drift_detected_and_audit_row_emitted() {
         drift_entry.request_id, request_id,
         "SaPolicyHashDrift row must carry the same request_id as the verify call"
     );
+}
+
+/// A live policy whose hash shares the pinned hash's first eight bytes
+/// refuses as drift, naming both full hashes, although neither hash is in
+/// the policy allowlist; the exact pinned hash passes.
+#[tokio::test]
+async fn an_equal_prefix_policy_twin_refuses_as_drift_outside_the_allowlist() {
+    let pinned = [0x42u8; 32];
+    let mut twin = pinned;
+    twin[8..].fill(0x43);
+    for (live, drift) in [(twin, true), (pinned, false)] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(JsonRpcResultResponder(
+                build_ledger_entries_contract_instance(&policy_addr(), live),
+            ))
+            .mount(&server)
+            .await;
+        let (audit, path, _dir) = tmp_audit_writer();
+        let manager = manager_one_url(&server.uri(), Arc::clone(&audit), path);
+        audit
+            .lock()
+            .unwrap()
+            .write_entry(AuditEntry::new_sa_context_rule_created_v2(
+                ZERO_CONTRACT_REDACTED,
+                1,
+                "default",
+                1,
+                1,
+                None,
+                "stellar:testnet",
+                "policy-twin",
+                vec![],
+                vec![WasmHashPin::new(pinned)],
+                false,
+                true,
+                vec![],
+                vec![],
+            ))
+            .unwrap();
+        let outcome = test_helpers::verify_pinned_policy_against_chain(
+            &manager,
+            policy_addr(),
+            1,
+            ZERO_CONTRACT_REDACTED,
+            "policy-twin",
+            &mut HashMap::new(),
+        )
+        .await;
+        if drift {
+            match outcome {
+                Err(SaError::PolicyHashDrift {
+                    pinned_hash,
+                    observed_hash,
+                    ..
+                }) => {
+                    assert_eq!(pinned_hash, WasmHashPin::new(pinned));
+                    assert_eq!(observed_hash, Some(WasmHashPin::new(twin)));
+                }
+                other => panic!("expected PolicyHashDrift, got {other:?}"),
+            }
+            assert!(
+                verified_audit_entries(&audit)
+                    .iter()
+                    .any(|entry| matches!(entry.event_kind, EventKind::SaPolicyHashDrift { .. }))
+            );
+        } else {
+            assert!(outcome.is_ok(), "{outcome:?}");
+        }
+    }
 }

@@ -113,10 +113,12 @@ pub fn decode_hex32(hex: &str) -> Result<[u8; 32], HexDecodeError> {
 /// Renders the first 8 bytes of a 32-byte Wasm hash as 16 lowercase hex
 /// characters.
 ///
-/// This is the encoding of every `*_first8` value in the smart-account pin
-/// records, the drift errors and the CLI envelopes; a pinned value and a hash
-/// compared against it are both rendered here, so they compare equal exactly
-/// when the 8-byte prefixes do.
+/// This is the encoding of every `*_first8` display value: audit fields,
+/// log fields and error details whose name carries the `first8` label. Two
+/// hashes that share their first eight bytes render equal, so a rendering
+/// identifies a hash for display only and never takes part in a pin
+/// comparison; pins compare all 32 bytes
+/// ([`crate::audit_log::WasmHashPin`]).
 ///
 /// # Examples
 ///

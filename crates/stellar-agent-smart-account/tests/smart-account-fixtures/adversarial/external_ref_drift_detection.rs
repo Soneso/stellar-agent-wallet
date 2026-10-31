@@ -3,8 +3,8 @@
 //! Scenario: a rule pins a verifier or policy. At signing time the drift
 //! check compares the live executable against the pin by kind, by reference
 //! and by hash. With an external-reference pin the live executable must be
-//! the pinned reference resolving to the pinned hash; without one, a live
-//! external reference is drift whatever it resolves to.
+//! the pinned reference resolving to the pinned hash in all 32 bytes;
+//! without one, a live external reference is drift whatever it resolves to.
 //!
 //! Every drift case MUST return `sa.verifier_hash_drift` /
 //! `sa.policy_hash_drift` with `observed_executable` describing the live
@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::{EventKind, ExecutableRefPin};
+use stellar_agent_core::audit_log::schema::{EventKind, ExecutableRefPin, WasmHashPin};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::error::SaError;
@@ -53,8 +53,8 @@ fn owner_scaddress() -> ScAddress {
     ))))
 }
 
-fn first8(hash: &[u8; 32]) -> String {
-    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
+fn full(hash: &[u8; 32]) -> WasmHashPin {
+    WasmHashPin::new(*hash)
 }
 
 fn pin_for(tag: &[u8], resolved: [u8; 32]) -> ExecutableRefPin {
@@ -110,11 +110,11 @@ struct CheckOutcome {
     cached: Option<ObservedExecutable>,
 }
 
-/// Pins `pinned_first8` (with `pinned_ref` at the same position) for a rule
-/// of `kind`, serves `live`, and runs the signing-time drift check.
+/// Pins `pinned` (with `pinned_ref` at the same position) for a rule of
+/// `kind`, serves `live`, and runs the signing-time drift check.
 async fn check(
     kind: Kind,
-    pinned_first8: String,
+    pinned: WasmHashPin,
     pinned_ref: Option<ExecutableRefPin>,
     live: KeyedLedgerEntriesResponder,
 ) -> CheckOutcome {
@@ -122,11 +122,11 @@ async fn check(
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
     let request_id = Uuid::new_v4().to_string();
-    let (verifier_first8, verifier_refs, policy_first8, policy_refs) = match kind {
-        Kind::Verifier => (vec![pinned_first8], vec![pinned_ref], vec![], vec![]),
-        Kind::Policy => (vec![], vec![], vec![pinned_first8], vec![pinned_ref]),
+    let (verifier_hashes, verifier_refs, policy_hashes, policy_refs) = match kind {
+        Kind::Verifier => (vec![pinned], vec![pinned_ref], vec![], vec![]),
+        Kind::Policy => (vec![], vec![], vec![pinned], vec![pinned_ref]),
     };
-    let created = AuditEntry::new_sa_context_rule_created(
+    let created = AuditEntry::new_sa_context_rule_created_v2(
         ZERO_CONTRACT_REDACTED,
         RULE_ID,
         "default",
@@ -135,8 +135,8 @@ async fn check(
         None,
         "stellar:testnet",
         &request_id,
-        verifier_first8,
-        policy_first8,
+        verifier_hashes,
+        policy_hashes,
         true,
         false,
         verifier_refs,
@@ -208,43 +208,46 @@ async fn check(
     }
 }
 
-/// Asserts that `outcome` is drift for `kind` with the given observed
-/// first-8 and observed-executable summary, and that exactly one matching
-/// drift row was written.
+/// Asserts that `outcome` is drift for `kind` with the given full pinned and
+/// observed hashes and observed-executable summary, and that exactly one
+/// matching drift row, carrying the labeled first-8 projections, was
+/// written. An expected observed hash of `None` is absent Wasm code or an
+/// unresolved reference: the error carries no observed hash and the row
+/// carries `none`.
 fn assert_drift(
     kind: Kind,
     case: &str,
     outcome: &CheckOutcome,
-    pinned_first8: &str,
-    observed_first8: &str,
+    expected_pinned: &WasmHashPin,
+    expected_observed: Option<&WasmHashPin>,
     observed_executable: &str,
 ) {
     let (pinned, observed, executable, wire_code) = match (&outcome.result, kind) {
         (
             Err(SaError::VerifierHashDrift {
-                pinned_hash_first8,
-                observed_hash_first8,
+                pinned_hash,
+                observed_hash,
                 observed_executable,
                 ..
             }),
             Kind::Verifier,
         ) => (
-            pinned_hash_first8,
-            observed_hash_first8,
+            pinned_hash,
+            observed_hash,
             observed_executable,
             "sa.verifier_hash_drift",
         ),
         (
             Err(SaError::PolicyHashDrift {
-                pinned_hash_first8,
-                observed_hash_first8,
+                pinned_hash,
+                observed_hash,
                 observed_executable,
                 ..
             }),
             Kind::Policy,
         ) => (
-            pinned_hash_first8,
-            observed_hash_first8,
+            pinned_hash,
+            observed_hash,
             observed_executable,
             "sa.policy_hash_drift",
         ),
@@ -252,8 +255,8 @@ fn assert_drift(
     };
     let error = outcome.result.as_ref().expect_err("drift");
     assert_eq!(error.wire_code(), wire_code, "{kind:?}, {case}");
-    assert_eq!(pinned, pinned_first8, "{kind:?}, {case}");
-    assert_eq!(observed, observed_first8, "{kind:?}, {case}");
+    assert_eq!(pinned, expected_pinned, "{kind:?}, {case}");
+    assert_eq!(observed.as_ref(), expected_observed, "{kind:?}, {case}");
     assert_eq!(
         executable.as_deref(),
         Some(observed_executable),
@@ -266,8 +269,8 @@ fn assert_drift(
     assert_eq!(
         outcome.drift_rows,
         vec![(
-            pinned_first8.to_owned(),
-            observed_first8.to_owned(),
+            expected_pinned.first8_display(),
+            expected_observed.map_or_else(|| "none".to_owned(), WasmHashPin::first8_display),
             Some(observed_executable.to_owned())
         )],
         "{kind:?}, {case}: one drift row with the same fields"
@@ -281,7 +284,7 @@ fn resolved_hash(kind: Kind) -> [u8; 32] {
     }
 }
 
-fn reference_summary(tag: &str, resolved: &str) -> String {
+fn reference_summary(tag: &str, resolved: impl std::fmt::Display) -> String {
     format!("external reference owner GAAAA...AAWHF tag \"{tag}\" resolved {resolved}")
 }
 
@@ -295,7 +298,7 @@ async fn pinned_external_ref_matches_while_tag_holds_pinned_hash() {
         let resolved = resolved_hash(kind);
         let outcome = check(
             kind,
-            first8(&resolved),
+            full(&resolved),
             Some(pin_for(TAG, resolved)),
             live_reference(TAG, Some(resolved)),
         )
@@ -322,7 +325,7 @@ async fn owner_repointing_the_tag_is_drift() {
         let resolved = resolved_hash(kind);
         let outcome = check(
             kind,
-            first8(&resolved),
+            full(&resolved),
             Some(pin_for(TAG, resolved)),
             live_reference(TAG, Some(repointed)),
         )
@@ -331,9 +334,36 @@ async fn owner_repointing_the_tag_is_drift() {
             kind,
             "repointed tag",
             &outcome,
-            &first8(&resolved),
-            &first8(&repointed),
-            &reference_summary("verifier-v1", &first8(&repointed)),
+            &full(&resolved),
+            Some(&full(&repointed)),
+            &reference_summary("verifier-v1", full(&repointed)),
+        );
+    }
+}
+
+/// The owner repointing the tag to a hash that shares the pinned hash's
+/// first eight bytes is drift naming both full hashes; the summary shows the
+/// full resolved hash.
+#[tokio::test]
+async fn owner_repointing_the_tag_to_an_equal_prefix_twin_is_drift() {
+    for kind in [Kind::Verifier, Kind::Policy] {
+        let resolved = resolved_hash(kind);
+        let mut twin = resolved;
+        twin[8..].iter_mut().for_each(|byte| *byte ^= 0xff);
+        let outcome = check(
+            kind,
+            full(&resolved),
+            Some(pin_for(TAG, resolved)),
+            live_reference(TAG, Some(twin)),
+        )
+        .await;
+        assert_drift(
+            kind,
+            "equal-prefix twin",
+            &outcome,
+            &full(&resolved),
+            Some(&full(&twin)),
+            &reference_summary("verifier-v1", full(&twin)),
         );
     }
 }
@@ -346,7 +376,7 @@ async fn reference_converted_to_wasm_with_the_pinned_hash_is_drift() {
         let resolved = resolved_hash(kind);
         let outcome = check(
             kind,
-            first8(&resolved),
+            full(&resolved),
             Some(pin_for(TAG, resolved)),
             live_wasm(resolved),
         )
@@ -355,22 +385,22 @@ async fn reference_converted_to_wasm_with_the_pinned_hash_is_drift() {
             kind,
             "converted to wasm",
             &outcome,
-            &first8(&resolved),
-            &first8(&resolved),
+            &full(&resolved),
+            Some(&full(&resolved)),
             "wasm",
         );
     }
 }
 
-/// An expired tag entry is drift, reported as resolved `unset` with the zero
-/// hash.
+/// An expired tag entry is drift, reported as resolved `unset` with no
+/// observed hash.
 #[tokio::test]
 async fn expired_tag_entry_is_drift() {
     for kind in [Kind::Verifier, Kind::Policy] {
         let resolved = resolved_hash(kind);
         let outcome = check(
             kind,
-            first8(&resolved),
+            full(&resolved),
             Some(pin_for(TAG, resolved)),
             live_reference(TAG, None),
         )
@@ -379,8 +409,8 @@ async fn expired_tag_entry_is_drift() {
             kind,
             "expired tag entry",
             &outcome,
-            &first8(&resolved),
-            "0000000000000000",
+            &full(&resolved),
+            None,
             &reference_summary("verifier-v1", "unset"),
         );
     }
@@ -394,7 +424,7 @@ async fn different_tag_resolving_to_the_same_hash_is_drift() {
         let resolved = resolved_hash(kind);
         let outcome = check(
             kind,
-            first8(&resolved),
+            full(&resolved),
             Some(pin_for(TAG, resolved)),
             live_reference(b"verifier-v2", Some(resolved)),
         )
@@ -403,9 +433,9 @@ async fn different_tag_resolving_to_the_same_hash_is_drift() {
             kind,
             "different tag",
             &outcome,
-            &first8(&resolved),
-            &first8(&resolved),
-            &reference_summary("verifier-v2", &first8(&resolved)),
+            &full(&resolved),
+            Some(&full(&resolved)),
+            &reference_summary("verifier-v2", full(&resolved)),
         );
     }
 }
@@ -417,51 +447,49 @@ async fn pinned_wasm_becoming_a_reference_to_the_same_hash_is_drift() {
     for kind in [Kind::Verifier, Kind::Policy] {
         let pinned = resolved_hash(kind);
         // Control: the pinned Wasm executable itself matches.
-        let outcome = check(kind, first8(&pinned), None, live_wasm(pinned)).await;
+        let outcome = check(kind, full(&pinned), None, live_wasm(pinned)).await;
         assert!(outcome.result.is_ok(), "{kind:?}: {:?}", outcome.result);
 
-        let outcome = check(
-            kind,
-            first8(&pinned),
-            None,
-            live_reference(TAG, Some(pinned)),
-        )
-        .await;
+        let outcome = check(kind, full(&pinned), None, live_reference(TAG, Some(pinned))).await;
         assert_drift(
             kind,
             "wasm became a reference",
             &outcome,
-            &first8(&pinned),
-            &first8(&pinned),
-            &reference_summary("verifier-v1", &first8(&pinned)),
+            &full(&pinned),
+            Some(&full(&pinned)),
+            &reference_summary("verifier-v1", full(&pinned)),
         );
     }
 }
 
-/// With a zero pin (an absent contract admitted under the unknown-hash
-/// override), an unresolved external reference is drift even though its
-/// effective hash reads as the zero hash.
+/// Absent Wasm code never matches a pin, the zero pin included: an absent
+/// contract and an unresolved external reference are drift against a zero
+/// pin and report no observed hash.
 #[tokio::test]
-async fn zero_pin_against_an_unresolved_reference_is_drift() {
-    let zero = "0000000000000000";
+async fn absent_code_against_a_zero_pin_is_drift() {
+    let zero = full(&[0u8; 32]);
     for kind in [Kind::Verifier, Kind::Policy] {
-        // Control: the absent contract itself matches the zero pin.
-        let outcome = check(
-            kind,
-            zero.to_owned(),
-            None,
-            KeyedLedgerEntriesResponder::new(),
-        )
-        .await;
+        // Control: Wasm code whose hash is the pinned zero hash matches.
+        let outcome = check(kind, zero, None, live_wasm([0u8; 32])).await;
         assert!(outcome.result.is_ok(), "{kind:?}: {:?}", outcome.result);
 
-        let outcome = check(kind, zero.to_owned(), None, live_reference(TAG, None)).await;
+        let outcome = check(kind, zero, None, KeyedLedgerEntriesResponder::new()).await;
+        assert_drift(
+            kind,
+            "zero pin, absent contract",
+            &outcome,
+            &zero,
+            None,
+            "no code",
+        );
+
+        let outcome = check(kind, zero, None, live_reference(TAG, None)).await;
         assert_drift(
             kind,
             "zero pin, unresolved reference",
             &outcome,
-            zero,
-            zero,
+            &zero,
+            None,
             &reference_summary("verifier-v1", "unset"),
         );
     }
@@ -494,11 +522,11 @@ impl wiremock::Respond for RuleAndLedgerResponder {
 }
 
 /// Runs `verify_rule_wasm_pins` for a rule of `kind` that references
-/// `contract_addr()` and whose created row pins `pinned_first8` with
+/// `contract_addr()` and whose created row pins `pinned` with
 /// `pinned_ref`, against `live`.
 async fn verify_pins_report(
     kind: Kind,
-    pinned_first8: String,
+    pinned: WasmHashPin,
     pinned_ref: Option<ExecutableRefPin>,
     live: KeyedLedgerEntriesResponder,
 ) -> stellar_agent_smart_account::managers::rules::VerifyPinsResult {
@@ -529,14 +557,14 @@ async fn verify_pins_report(
         .await;
 
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
-    let (verifier_first8, verifier_refs, policy_first8, policy_refs) = match kind {
-        Kind::Verifier => (vec![pinned_first8], vec![pinned_ref], vec![], vec![]),
-        Kind::Policy => (vec![], vec![], vec![pinned_first8], vec![pinned_ref]),
+    let (verifier_hashes, verifier_refs, policy_hashes, policy_refs) = match kind {
+        Kind::Verifier => (vec![pinned], vec![pinned_ref], vec![], vec![]),
+        Kind::Policy => (vec![], vec![], vec![pinned], vec![pinned_ref]),
     };
     audit_writer
         .lock()
         .expect("audit writer")
-        .write_entry(AuditEntry::new_sa_context_rule_created(
+        .write_entry(AuditEntry::new_sa_context_rule_created_v2(
             ZERO_CONTRACT_REDACTED,
             RULE_ID,
             "default",
@@ -545,8 +573,8 @@ async fn verify_pins_report(
             None,
             "stellar:testnet",
             "req-created",
-            verifier_first8,
-            policy_first8,
+            verifier_hashes,
+            policy_hashes,
             true,
             false,
             verifier_refs,
@@ -583,8 +611,8 @@ async fn verify_pins_report(
 }
 
 /// A rule pinned to an external reference reports the pin and the observed
-/// reference summary, aligned with the first-8 lists, for a verifier and for
-/// a policy.
+/// reference summary, aligned with the hash lists, for a verifier and for a
+/// policy.
 #[tokio::test]
 async fn verify_pins_reports_the_pinned_and_observed_external_reference() {
     use stellar_agent_smart_account::managers::rules::PinStatus;
@@ -598,7 +626,7 @@ async fn verify_pins_reports_the_pinned_and_observed_external_reference() {
         let pin = pin_for(TAG, resolved);
         let report = verify_pins_report(
             kind,
-            first8(&resolved),
+            full(&resolved),
             Some(pin.clone()),
             live_reference(TAG, Some(resolved)),
         )
@@ -606,7 +634,7 @@ async fn verify_pins_reports_the_pinned_and_observed_external_reference() {
 
         let summary = format!(
             "external reference owner GAAAA...AAWHF tag \"verifier-v1\" resolved {}",
-            first8(&resolved)
+            full(&resolved)
         );
         let (
             status,
@@ -618,7 +646,7 @@ async fn verify_pins_reports_the_pinned_and_observed_external_reference() {
         ) = match kind {
             Kind::Verifier => (
                 &report.verifier_pin_status,
-                &report.observed_verifier_first8,
+                &report.observed_verifier_hashes,
                 &report.observed_verifier_executable,
                 &report.pinned_verifier_executable_refs,
                 &report.observed_policy_executable,
@@ -626,7 +654,7 @@ async fn verify_pins_reports_the_pinned_and_observed_external_reference() {
             ),
             Kind::Policy => (
                 &report.policy_pin_status,
-                &report.observed_policy_first8,
+                &report.observed_policy_hashes,
                 &report.observed_policy_executable,
                 &report.pinned_policy_executable_refs,
                 &report.observed_verifier_executable,
@@ -634,7 +662,7 @@ async fn verify_pins_reports_the_pinned_and_observed_external_reference() {
             ),
         };
         assert_eq!(*status, PinStatus::Match, "{kind:?}");
-        assert_eq!(observed_first8, &vec![first8(&resolved)], "{kind:?}");
+        assert_eq!(observed_first8, &vec![Some(full(&resolved))], "{kind:?}");
         assert_eq!(observed_executable, &vec![Some(summary)], "{kind:?}");
         assert_eq!(pinned_refs, &vec![Some(pin)], "{kind:?}");
         assert!(other_executable.is_empty(), "{kind:?}");
@@ -652,14 +680,58 @@ async fn verify_pins_reports_live_wasm_against_a_reference_pin_as_none() {
     let pin = pin_for(TAG, resolved);
     let report = verify_pins_report(
         Kind::Verifier,
-        first8(&resolved),
+        full(&resolved),
         Some(pin.clone()),
         live_wasm(resolved),
     )
     .await;
 
     assert_eq!(report.verifier_pin_status, PinStatus::Drift);
-    assert_eq!(report.observed_verifier_first8, vec![first8(&resolved)]);
+    assert_eq!(report.observed_verifier_hashes, vec![Some(full(&resolved))]);
     assert_eq!(report.observed_verifier_executable, vec![None]);
     assert_eq!(report.pinned_verifier_executable_refs, vec![Some(pin)]);
+}
+
+/// A pinned contract with no Wasm code on chain is drift, and the report carries
+/// no observed hash for it: the entry is JSON `null` beside the `"no code"`
+/// executable summary, never a zero hash.
+#[tokio::test]
+async fn verify_pins_reports_absent_code_as_null() {
+    use stellar_agent_smart_account::managers::rules::PinStatus;
+
+    for kind in [Kind::Verifier, Kind::Policy] {
+        let pinned = resolved_hash(kind);
+        let report = verify_pins_report(
+            kind,
+            full(&pinned),
+            None,
+            KeyedLedgerEntriesResponder::new(),
+        )
+        .await;
+
+        let (status, observed, executable, field) = match kind {
+            Kind::Verifier => (
+                &report.verifier_pin_status,
+                &report.observed_verifier_hashes,
+                &report.observed_verifier_executable,
+                "observed_verifier_hashes",
+            ),
+            Kind::Policy => (
+                &report.policy_pin_status,
+                &report.observed_policy_hashes,
+                &report.observed_policy_executable,
+                "observed_policy_hashes",
+            ),
+        };
+        assert_eq!(*status, PinStatus::Drift, "{kind:?}");
+        assert_eq!(observed, &vec![None], "{kind:?}");
+        assert_eq!(executable, &vec![Some("no code".to_owned())], "{kind:?}");
+
+        let json = serde_json::to_value(&report).expect("report serializes");
+        assert_eq!(json[field], serde_json::json!([null]), "{kind:?}");
+        assert!(
+            !json.to_string().contains(&"0".repeat(64)),
+            "{kind:?}: absent code never reads as a zero hash: {json}"
+        );
+    }
 }

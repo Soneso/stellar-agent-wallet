@@ -42,7 +42,9 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::reader::AuditReader;
-use stellar_agent_core::audit_log::schema::{EventKind, ExecutableRefPin, PinsUpdateReason};
+use stellar_agent_core::audit_log::schema::{
+    EventKind, ExecutableRefPin, PinsUpdateReason, WasmHashPin,
+};
 use stellar_agent_core::audit_log::signer_set::{
     BaselineReason, ObservedSignerSet, SignerEntryV2, SignerIdentityV2, SignerPubkey,
     SignerSetSnapshotV2, SignerSetView, ThresholdObservation, account_digest,
@@ -127,8 +129,8 @@ fn policy_p() -> ScAddress {
     contract(0x30)
 }
 
-fn first8(hash: &[u8; 32]) -> String {
-    hex::encode(&hash[..8])
+fn full(hash: &[u8; 32]) -> WasmHashPin {
+    WasmHashPin::new(*hash)
 }
 
 /// The allowlisted WebAuthn v0.7.2 verifier hash.
@@ -141,8 +143,8 @@ fn ed25519_hash() -> [u8; 32] {
     VERIFIER_ALLOWLIST[2].wasm_hash
 }
 
-/// A first-8 no live contract in these fixtures has.
-const FOREIGN_FIRST8: &str = "0101010101010101";
+/// A hash no live contract in these fixtures has.
+const FOREIGN_HASH: WasmHashPin = WasmHashPin::new([0x01; 32]);
 
 fn smart_account_redacted() -> String {
     redact_strkey_first5_last5(&strkey(&smart_account()))
@@ -1465,26 +1467,26 @@ impl Harness {
             .unwrap();
     }
 
-    /// Writes the `SaContextRuleCreated` pin record of `rule_id`.
+    /// Writes the `SaContextRuleCreatedV2` pin record of `rule_id`.
     fn pin_created(
         &self,
         rule_id: u32,
-        verifier_first8: Vec<String>,
-        policy_first8: Vec<String>,
+        verifier_hashes: Vec<WasmHashPin>,
+        policy_hashes: Vec<WasmHashPin>,
         verifier_refs: Vec<Option<ExecutableRefPin>>,
         policy_refs: Vec<Option<ExecutableRefPin>>,
     ) {
-        self.write(AuditEntry::new_sa_context_rule_created(
+        self.write(AuditEntry::new_sa_context_rule_created_v2(
             smart_account_redacted(),
             rule_id,
             "default",
             1,
-            u32::try_from(policy_first8.len()).unwrap(),
+            u32::try_from(policy_hashes.len()).unwrap(),
             None,
             CHAIN_ID,
             "req-install",
-            verifier_first8,
-            policy_first8,
+            verifier_hashes,
+            policy_hashes,
             false,
             false,
             verifier_refs,
@@ -1503,7 +1505,7 @@ impl Harness {
     fn pins_updated_rows(&self) -> Vec<AuditEntry> {
         self.rows()
             .into_iter()
-            .filter(|e| matches!(e.event_kind, EventKind::SaContextRulePinsUpdated { .. }))
+            .filter(|e| matches!(e.event_kind, EventKind::SaContextRulePinsUpdatedV2 { .. }))
             .collect()
     }
 
@@ -1781,8 +1783,8 @@ async fn verifier_drift_refuses_before_simulation_with_the_callers_request_id() 
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![FOREIGN_FIRST8.to_owned()],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![FOREIGN_HASH],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -1794,14 +1796,14 @@ async fn verifier_drift_refuses_before_simulation_with_the_callers_request_id() 
     match &err {
         SaError::VerifierHashDrift {
             rule_id,
-            pinned_hash_first8,
-            observed_hash_first8,
+            pinned_hash,
+            observed_hash,
             request_id,
             ..
         } => {
             assert_eq!(*rule_id, 1);
-            assert_eq!(pinned_hash_first8, FOREIGN_FIRST8);
-            assert_eq!(observed_hash_first8, &first8(&webauthn_hash()));
+            assert_eq!(*pinned_hash, FOREIGN_HASH);
+            assert_eq!(observed_hash.as_ref(), Some(&full(&webauthn_hash())));
             assert_eq!(request_id, "req-verifier-drift");
         }
         other => panic!("expected VerifierHashDrift; got {other:?}"),
@@ -1836,8 +1838,8 @@ async fn policy_drift_refuses_before_simulation_with_the_callers_request_id() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![FOREIGN_FIRST8.to_owned()],
+        vec![full(&webauthn_hash())],
+        vec![FOREIGN_HASH],
         vec![],
         vec![],
     );
@@ -1846,14 +1848,14 @@ async fn policy_drift_refuses_before_simulation_with_the_callers_request_id() {
     match &err {
         SaError::PolicyHashDrift {
             rule_id,
-            pinned_hash_first8,
-            observed_hash_first8,
+            pinned_hash,
+            observed_hash,
             request_id,
             ..
         } => {
             assert_eq!(*rule_id, 1);
-            assert_eq!(pinned_hash_first8, FOREIGN_FIRST8);
-            assert_eq!(observed_hash_first8, &first8(&KNOWN_WASM_HASH));
+            assert_eq!(*pinned_hash, FOREIGN_HASH);
+            assert_eq!(observed_hash.as_ref(), Some(&full(&KNOWN_WASM_HASH)));
             assert_eq!(request_id, "req-policy-drift");
         }
         other => panic!("expected PolicyHashDrift; got {other:?}"),
@@ -1895,7 +1897,7 @@ async fn a_repointed_external_reference_refuses_with_the_observed_executable() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
+        vec![full(&webauthn_hash())],
         vec![],
         vec![Some(reference_pin(webauthn_hash()))],
         vec![],
@@ -1904,18 +1906,18 @@ async fn a_repointed_external_reference_refuses_with_the_observed_executable() {
     let err = h.submit(&[1], Some("req-ref-drift")).await.unwrap_err();
     match &err {
         SaError::VerifierHashDrift {
-            pinned_hash_first8,
-            observed_hash_first8,
+            pinned_hash,
+            observed_hash,
             observed_executable: Some(observed_executable),
             ..
         } => {
-            assert_eq!(pinned_hash_first8, &first8(&webauthn_hash()));
-            assert_eq!(observed_hash_first8, &first8(&ed25519_hash()));
+            assert_eq!(pinned_hash, &full(&webauthn_hash()));
+            assert_eq!(observed_hash.as_ref(), Some(&full(&ed25519_hash())));
             assert!(
                 observed_executable.starts_with("external reference owner ")
                     && observed_executable.contains(&format!(
                         "tag \"verifier\" resolved {}",
-                        first8(&ed25519_hash())
+                        full(&ed25519_hash())
                     )),
                 "{observed_executable}"
             );
@@ -1937,8 +1939,8 @@ async fn an_rpc_failure_during_the_check_refuses_and_sends_nothing() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -1976,8 +1978,8 @@ async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash()), first8(&ed25519_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash()), full(&ed25519_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -1994,8 +1996,8 @@ async fn multiple_pins_and_an_audit_integrity_error_refuse_as_unavailable() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -2055,19 +2057,19 @@ async fn a_newer_pins_updated_row_is_the_record_the_check_reads() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
-    h.write(AuditEntry::new_sa_context_rule_pins_updated(
+    h.write(AuditEntry::new_sa_context_rule_pins_updated_v2(
         smart_account_redacted(),
         1,
         PinsUpdateReason::VerifierMigrated,
         CHAIN_ID,
         "req-migration",
-        vec![first8(&ed25519_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&ed25519_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         false,
         false,
         vec![],
@@ -2094,8 +2096,8 @@ async fn a_verifier_shared_by_two_rules_is_observed_once() {
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
     h.baseline_v2(2);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
-    h.pin_created(2, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(2, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
 
     h.submit_invocation("pair", &[1, 2], Some("req-shared"), None)
         .await
@@ -2223,8 +2225,8 @@ async fn signer_add_harness(pinned: bool) -> Harness {
     if pinned {
         h.pin_created(
             1,
-            vec![first8(&webauthn_hash())],
-            vec![first8(&KNOWN_WASM_HASH)],
+            vec![full(&webauthn_hash())],
+            vec![full(&KNOWN_WASM_HASH)],
             vec![],
             vec![],
         );
@@ -2290,22 +2292,24 @@ async fn add_signer_value(
         .await
 }
 
-fn pins_updated_fields(entry: &AuditEntry) -> (Vec<String>, Vec<String>, bool, PinsUpdateReason) {
+fn pins_updated_fields(
+    entry: &AuditEntry,
+) -> (Vec<WasmHashPin>, Vec<WasmHashPin>, bool, PinsUpdateReason) {
     match &entry.event_kind {
-        EventKind::SaContextRulePinsUpdated {
+        EventKind::SaContextRulePinsUpdatedV2 {
             rule_id: 1,
-            pinned_verifier_wasm_hashes_first8,
-            pinned_policy_wasm_hashes_first8,
+            pinned_verifier_wasm_hashes,
+            pinned_policy_wasm_hashes,
             unknown_override,
             reason,
             ..
         } => (
-            pinned_verifier_wasm_hashes_first8.clone(),
-            pinned_policy_wasm_hashes_first8.clone(),
+            pinned_verifier_wasm_hashes.clone(),
+            pinned_policy_wasm_hashes.clone(),
             *unknown_override,
             *reason,
         ),
-        other => panic!("expected SaContextRulePinsUpdated for rule 1; got {other:?}"),
+        other => panic!("expected SaContextRulePinsUpdatedV2 for rule 1; got {other:?}"),
     }
 }
 
@@ -2322,8 +2326,8 @@ async fn a_signer_on_the_existing_verifier_keeps_the_pins_and_writes_the_row() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].request_id, "req-add-same");
     let (verifiers, policies, unknown_override, reason) = pins_updated_fields(&rows[0]);
-    assert_eq!(verifiers, vec![first8(&webauthn_hash())]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(verifiers, vec![full(&webauthn_hash())]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert!(!unknown_override);
     assert_eq!(reason, PinsUpdateReason::SignerAdded);
 }
@@ -2342,9 +2346,9 @@ async fn a_signer_on_a_second_verifier_writes_two_pins_and_the_next_verb_refuses
     let (verifiers, policies, _, reason) = pins_updated_fields(&rows[0]);
     assert_eq!(
         verifiers,
-        vec![first8(&webauthn_hash()), first8(&ed25519_hash())]
+        vec![full(&webauthn_hash()), full(&ed25519_hash())]
     );
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::SignerAdded);
 
     let err = h.submit(&[1], Some("req-after-second")).await.unwrap_err();
@@ -2375,10 +2379,10 @@ async fn a_passkey_signer_added_to_a_pinned_rule_pins_its_verifier() {
     let (verifiers, policies, _, reason) = pins_updated_fields(&rows[0]);
     assert_eq!(
         verifiers,
-        vec![first8(&webauthn_hash())],
+        vec![full(&webauthn_hash())],
         "the passkey's verifier has the pin verifier V has"
     );
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::SignerAdded);
     assert!(verifier_refs_of(&rows[0]).is_empty());
 
@@ -2429,10 +2433,7 @@ async fn an_unknown_new_verifier_needs_the_override() {
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 1);
     let (verifiers, _, unknown_override, _) = pins_updated_fields(&rows[0]);
-    assert_eq!(
-        verifiers,
-        vec![first8(&webauthn_hash()), first8(&[0xdd; 32])]
-    );
+    assert_eq!(verifiers, vec![full(&webauthn_hash()), full(&[0xdd; 32])]);
     assert!(unknown_override);
 }
 
@@ -2464,7 +2465,7 @@ async fn a_signer_add_writes_the_override_row_between_the_add_and_the_pins() {
         vec![
             "sa_signer_added_v2",
             "unknown_override(rule Some(1))",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
 }
@@ -2612,7 +2613,7 @@ fn migration_step(
 ) -> SignerMigrationStep {
     SignerMigrationStep::new_for_test(
         signer_id,
-        first8(&from),
+        from,
         remove_signer_call(signer_id),
         add_signer_call(external_signer(add_verifier, key)),
     )
@@ -2625,7 +2626,7 @@ fn plan_of(from: [u8; 32], to: [u8; 32], steps: Vec<SignerMigrationStep>) -> Mig
         from,
         to,
         verifier_w(),
-        vec![RuleMigration::new_for_test(1, first8(&from), steps)],
+        vec![RuleMigration::new_for_test(1, from, steps)],
         VerifierAuditStatus::Unaudited,
         "req-migration-plan",
     )
@@ -2713,18 +2714,18 @@ fn the_row(h: &Harness, request_id: &str, kind: &str) -> AuditEntry {
 /// The verifier executable-reference pins of a pins-updated row.
 fn verifier_refs_of(entry: &AuditEntry) -> Vec<Option<ExecutableRefPin>> {
     match &entry.event_kind {
-        EventKind::SaContextRulePinsUpdated {
+        EventKind::SaContextRulePinsUpdatedV2 {
             pinned_verifier_executable_refs,
             ..
         } => pinned_verifier_executable_refs.clone(),
-        other => panic!("expected SaContextRulePinsUpdated; got {other:?}"),
+        other => panic!("expected SaContextRulePinsUpdatedV2; got {other:?}"),
     }
 }
 
 /// The rows of a completed pair, in order.
 const PAIR_ROWS: [&str; 4] = [
     "sa_signer_removed_v2",
-    "sa_context_rule_pins_updated",
+    "sa_context_rule_pins_updated_v2",
     "sa_signer_added_v2",
     "sa_verifier_migrated",
 ];
@@ -2809,10 +2810,10 @@ async fn a_migration_pair_records_its_rows_in_order_under_the_rule_lock() {
         added.event_kind
     );
 
-    let pins = the_row(&h, "req-pair", "sa_context_rule_pins_updated");
+    let pins = the_row(&h, "req-pair", "sa_context_rule_pins_updated_v2");
     let (verifiers, policies, _, reason) = pins_updated_fields(&pins);
-    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(verifiers, vec![full(&ed25519_hash())]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
     assert!(verifier_refs_of(&pins).is_empty());
 
@@ -3002,7 +3003,7 @@ async fn an_add_refused_after_the_removal_returns_the_pending_add_that_completes
     );
     assert_eq!(
         row_kinds(&h.rows(), "req-add-refused"),
-        vec!["sa_signer_removed_v2", "sa_context_rule_pins_updated"]
+        vec!["sa_signer_removed_v2", "sa_context_rule_pins_updated_v2"]
     );
 
     h.set_simulated_return("add_signer", ScVal::U32(SIMULATED_SIGNER_ID));
@@ -3023,12 +3024,12 @@ async fn an_add_refused_after_the_removal_returns_the_pending_add_that_completes
     assert_eq!(id, SIMULATED_SIGNER_ID);
     assert_eq!(
         row_kinds(&h.rows(), "req-recovery"),
-        vec!["sa_signer_added_v2", "sa_context_rule_pins_updated"]
+        vec!["sa_signer_added_v2", "sa_context_rule_pins_updated_v2"]
     );
-    let pins = the_row(&h, "req-recovery", "sa_context_rule_pins_updated");
+    let pins = the_row(&h, "req-recovery", "sa_context_rule_pins_updated_v2");
     let (verifiers, policies, _, reason) = pins_updated_fields(&pins);
-    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(verifiers, vec![full(&ed25519_hash())]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::SignerAdded);
 
     h.submit(&[1], Some("req-after-recovery")).await.unwrap();
@@ -3117,14 +3118,18 @@ async fn the_refresh_drops_the_dead_source_pin_and_the_recovery_add_signs() {
         vec![
             "sa_signer_set_diverged",
             "sa_signer_set_baselined_v2",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
-    let dropped = the_row(&h, "req-refresh-dead-pin", "sa_context_rule_pins_updated");
+    let dropped = the_row(
+        &h,
+        "req-refresh-dead-pin",
+        "sa_context_rule_pins_updated_v2",
+    );
     let (verifiers, policies, _, reason) = pins_updated_fields(&dropped);
     assert!(verifiers.is_empty(), "the dead source pin is dropped");
     assert!(verifier_refs_of(&dropped).is_empty());
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::BaselineRefreshed);
 
     let signer = SoftwareSigningKey::new_from_bytes(SEED);
@@ -3143,12 +3148,12 @@ async fn the_refresh_drops_the_dead_source_pin_and_the_recovery_add_signs() {
     let pinned = the_row(
         &h,
         "req-recovery-after-refresh",
-        "sa_context_rule_pins_updated",
+        "sa_context_rule_pins_updated_v2",
     );
     let (verifiers, _, _, reason) = pins_updated_fields(&pinned);
     assert_eq!(
         verifiers,
-        vec![first8(&ed25519_hash())],
+        vec![full(&ed25519_hash())],
         "the destination is the rule's only verifier pin"
     );
     assert_eq!(reason, PinsUpdateReason::SignerAdded);
@@ -3159,9 +3164,9 @@ async fn the_refresh_drops_the_dead_source_pin_and_the_recovery_add_signs() {
 
 /// The verifier, policy and override fields of a pins-updated row.
 struct PinRecordFields {
-    verifiers: Vec<String>,
+    verifiers: Vec<WasmHashPin>,
     verifier_refs: Vec<Option<ExecutableRefPin>>,
-    policies: Vec<String>,
+    policies: Vec<WasmHashPin>,
     policy_refs: Vec<Option<ExecutableRefPin>>,
     mutable_override: bool,
     unknown_override: bool,
@@ -3170,25 +3175,25 @@ struct PinRecordFields {
 
 fn pin_record_fields(entry: &AuditEntry) -> PinRecordFields {
     match &entry.event_kind {
-        EventKind::SaContextRulePinsUpdated {
-            pinned_verifier_wasm_hashes_first8,
+        EventKind::SaContextRulePinsUpdatedV2 {
+            pinned_verifier_wasm_hashes,
             pinned_verifier_executable_refs,
-            pinned_policy_wasm_hashes_first8,
+            pinned_policy_wasm_hashes,
             pinned_policy_executable_refs,
             mutable_override,
             unknown_override,
             reason,
             ..
         } => PinRecordFields {
-            verifiers: pinned_verifier_wasm_hashes_first8.clone(),
+            verifiers: pinned_verifier_wasm_hashes.clone(),
             verifier_refs: pinned_verifier_executable_refs.clone(),
-            policies: pinned_policy_wasm_hashes_first8.clone(),
+            policies: pinned_policy_wasm_hashes.clone(),
             policy_refs: pinned_policy_executable_refs.clone(),
             mutable_override: *mutable_override,
             unknown_override: *unknown_override,
             reason: *reason,
         },
-        other => panic!("expected SaContextRulePinsUpdated; got {other:?}"),
+        other => panic!("expected SaContextRulePinsUpdatedV2; got {other:?}"),
     }
 }
 
@@ -3218,7 +3223,7 @@ async fn the_dead_pin_drop_keeps_the_policy_pins_references_and_override_flags()
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
     let policy_refs = vec![Some(reference_pin(KNOWN_WASM_HASH))];
-    h.write(AuditEntry::new_sa_context_rule_created(
+    h.write(AuditEntry::new_sa_context_rule_created_v2(
         smart_account_redacted(),
         1,
         "default",
@@ -3227,8 +3232,8 @@ async fn the_dead_pin_drop_keeps_the_policy_pins_references_and_override_flags()
         None,
         CHAIN_ID,
         "req-install-references",
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         true,
         true,
         vec![Some(reference_pin(webauthn_hash()))],
@@ -3267,13 +3272,13 @@ async fn the_dead_pin_drop_keeps_the_policy_pins_references_and_override_flags()
         vec![
             "sa_signer_set_diverged",
             "sa_signer_set_baselined_v2",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
     let dropped = pin_record_fields(&the_row(
         &h,
         "req-refresh-references",
-        "sa_context_rule_pins_updated",
+        "sa_context_rule_pins_updated_v2",
     ));
     assert!(dropped.verifiers.is_empty(), "{:?}", dropped.verifiers);
     assert!(
@@ -3281,7 +3286,7 @@ async fn the_dead_pin_drop_keeps_the_policy_pins_references_and_override_flags()
         "{:?}",
         dropped.verifier_refs
     );
-    assert_eq!(dropped.policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(dropped.policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(dropped.policy_refs, policy_refs);
     assert!(
         dropped.mutable_override,
@@ -3316,9 +3321,9 @@ async fn the_dead_pin_drop_keeps_the_policy_pins_references_and_override_flags()
     let pinned = pin_record_fields(&the_row(
         &h,
         "req-recovery-references",
-        "sa_context_rule_pins_updated",
+        "sa_context_rule_pins_updated_v2",
     ));
-    assert_eq!(pinned.verifiers, vec![first8(&ed25519_hash())]);
+    assert_eq!(pinned.verifiers, vec![full(&ed25519_hash())]);
     assert_eq!(pinned.policy_refs, policy_refs);
     h.submit(&[1], Some("req-after-references")).await.unwrap();
     assert_eq!(h.sends(), 3);
@@ -3340,8 +3345,8 @@ async fn a_refresh_keeps_a_two_verifier_record_of_a_rule_without_external_signer
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash()), first8(&ed25519_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash()), full(&ed25519_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -3372,8 +3377,8 @@ async fn a_refresh_keeps_the_verifier_pin_of_a_rule_with_a_live_external_signer(
     let h = signer_add_harness(false).await;
     h.pin_created(
         1,
-        vec![FOREIGN_FIRST8.to_owned()],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![FOREIGN_HASH],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -3426,11 +3431,11 @@ async fn a_removal_whose_confirmed_state_is_wrong_stops_with_the_record_repointe
     );
     assert_eq!(
         row_kinds(&h.rows(), "req-remove-wrong"),
-        vec!["sa_signer_set_diverged", "sa_context_rule_pins_updated"]
+        vec!["sa_signer_set_diverged", "sa_context_rule_pins_updated_v2"]
     );
-    let pins = the_row(&h, "req-remove-wrong", "sa_context_rule_pins_updated");
+    let pins = the_row(&h, "req-remove-wrong", "sa_context_rule_pins_updated_v2");
     let (verifiers, _, _, reason) = pins_updated_fields(&pins);
-    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
+    assert_eq!(verifiers, vec![full(&ed25519_hash())]);
     assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
 }
 
@@ -3573,7 +3578,7 @@ async fn two_pairs_on_one_rule_each_compare_against_the_newest_row() {
         row_kinds(&h.rows(), "req-two-pairs"),
         vec![
             "sa_signer_removed_v2",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_signer_added_v2",
             "sa_verifier_migrated",
             "sa_signer_removed_v2",
@@ -3597,9 +3602,9 @@ async fn two_pairs_on_one_rule_each_compare_against_the_newest_row() {
         final_state.signers[2].identity,
         external_identity(&verifier_w(), &[0x12; 32])
     );
-    let pins = the_row(&h, "req-two-pairs", "sa_context_rule_pins_updated");
+    let pins = the_row(&h, "req-two-pairs", "sa_context_rule_pins_updated_v2");
     let (verifiers, _, _, reason) = pins_updated_fields(&pins);
-    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
+    assert_eq!(verifiers, vec![full(&ed25519_hash())]);
     assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
 }
 
@@ -3633,8 +3638,8 @@ async fn a_migration_skips_the_verifier_check_of_the_migrating_rule() {
     let h = signer_add_harness(false).await;
     h.pin_created(
         1,
-        vec![FOREIGN_FIRST8.to_owned()],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![FOREIGN_HASH],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -3662,8 +3667,8 @@ async fn a_migration_skips_the_verifier_check_of_the_migrating_rule() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].request_id, "req-migrate");
     let (verifiers, policies, _, reason) = pins_updated_fields(&rows[0]);
-    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(verifiers, vec![full(&ed25519_hash())]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
 }
 
@@ -3674,8 +3679,8 @@ async fn a_migration_still_checks_the_migrating_rules_policies() {
     let h = signer_add_harness(false).await;
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![FOREIGN_FIRST8.to_owned()],
+        vec![full(&webauthn_hash())],
+        vec![FOREIGN_HASH],
         vec![],
         vec![],
     );
@@ -3776,8 +3781,8 @@ async fn an_unresolved_removal_repoints_the_record_and_returns_the_pending_add()
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -3813,11 +3818,15 @@ async fn an_unresolved_removal_repoints_the_record_and_returns_the_pending_add()
     assert!(result.failed_step_remove_tx_hash.is_none());
     assert_eq!(
         row_kinds(&h.rows(), "req-remove-unresolved"),
-        vec!["sa_context_rule_pins_updated"]
+        vec!["sa_context_rule_pins_updated_v2"]
     );
-    let pins = the_row(&h, "req-remove-unresolved", "sa_context_rule_pins_updated");
+    let pins = the_row(
+        &h,
+        "req-remove-unresolved",
+        "sa_context_rule_pins_updated_v2",
+    );
     let (verifiers, _, _, reason) = pins_updated_fields(&pins);
-    assert_eq!(verifiers, vec![first8(&ed25519_hash())]);
+    assert_eq!(verifiers, vec![full(&ed25519_hash())]);
     assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
 }
 
@@ -4003,20 +4012,20 @@ async fn remove_policy_under(
         .await
 }
 
-fn policy_pins_of(entry: &AuditEntry) -> (Vec<String>, bool, PinsUpdateReason) {
+fn policy_pins_of(entry: &AuditEntry) -> (Vec<WasmHashPin>, bool, PinsUpdateReason) {
     match &entry.event_kind {
-        EventKind::SaContextRulePinsUpdated {
+        EventKind::SaContextRulePinsUpdatedV2 {
             rule_id: 1,
-            pinned_policy_wasm_hashes_first8,
+            pinned_policy_wasm_hashes,
             unknown_override,
             reason,
             ..
         } => (
-            pinned_policy_wasm_hashes_first8.clone(),
+            pinned_policy_wasm_hashes.clone(),
             *unknown_override,
             *reason,
         ),
-        other => panic!("expected SaContextRulePinsUpdated for rule 1; got {other:?}"),
+        other => panic!("expected SaContextRulePinsUpdatedV2 for rule 1; got {other:?}"),
     }
 }
 
@@ -4036,7 +4045,7 @@ fn after_threshold_attach(policies: Vec<ScAddress>) -> AfterSend {
 async fn a_policy_added_to_a_pinned_rule_is_pinned_and_checked() {
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.after_send_state(&after_threshold_attach(vec![policy_p()]));
     add_policy(&h, &policy_p(), "req-policy-add", false)
         .await
@@ -4046,7 +4055,7 @@ async fn a_policy_added_to_a_pinned_rule_is_pinned_and_checked() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].request_id, "req-policy-add");
     let (policies, _, reason) = policy_pins_of(&rows[0]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
 
     h.set_entry(wasm_instance(&policy_p(), [0xab; 32]));
@@ -4069,8 +4078,8 @@ async fn a_second_policy_writes_two_pins_and_the_next_verb_refuses() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4084,7 +4093,7 @@ async fn a_second_policy_writes_two_pins_and_the_next_verb_refuses() {
     let (policies, _, reason) = policy_pins_of(&rows[0]);
     assert_eq!(
         policies,
-        vec![first8(&KNOWN_WASM_HASH), first8(&spending_limit_hash())]
+        vec![full(&KNOWN_WASM_HASH), full(&spending_limit_hash())]
     );
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
 
@@ -4108,7 +4117,7 @@ async fn a_second_policy_writes_two_pins_and_the_next_verb_refuses() {
 async fn an_unknown_new_policy_needs_the_override() {
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     let err = add_policy(&h, &policy_r(), "req-policy-unknown", false)
         .await
         .unwrap_err();
@@ -4147,7 +4156,7 @@ async fn an_unknown_new_policy_needs_the_override() {
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 1);
     let (policies, unknown_override, _) = policy_pins_of(&rows[0]);
-    assert_eq!(policies, vec![first8(&[0xdd; 32])]);
+    assert_eq!(policies, vec![full(&[0xdd; 32])]);
     assert!(unknown_override);
 }
 
@@ -4170,7 +4179,7 @@ async fn a_policy_add_on_an_unpinned_rule_writes_no_row() {
 async fn a_policy_add_writes_the_override_row_before_the_policy_row() {
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.after_send(1, rule_one_with_policies(vec![policy_r()]));
     add_policy(&h, &policy_r(), "req-policy-order", true)
         .await
@@ -4180,7 +4189,7 @@ async fn a_policy_add_writes_the_override_row_before_the_policy_row() {
         row_kinds(&h.rows(), "req-policy-order"),
         vec![
             "unknown_override(rule Some(1))",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_added",
             "sa_raw_invocation",
         ]
@@ -4196,8 +4205,8 @@ async fn removing_the_pinned_policy_clears_its_pin() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4217,7 +4226,7 @@ async fn removing_the_pinned_policy_clears_its_pin() {
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 2);
     let (policies, _, reason) = policy_pins_of(&rows[1]);
-    assert_eq!(policies, vec![first8(&spending_limit_hash())]);
+    assert_eq!(policies, vec![full(&spending_limit_hash())]);
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
 
     h.submit(&[1], Some("req-after-replace")).await.unwrap();
@@ -4231,8 +4240,8 @@ async fn removing_a_drifted_only_policy_drops_its_pin() {
     let h = policy_harness(vec![policy_p()]).await;
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4264,7 +4273,7 @@ async fn removing_a_drifted_only_policy_drops_its_pin() {
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 2);
     let (policies, _, reason) = policy_pins_of(&rows[1]);
-    assert_eq!(policies, vec![first8(&spending_limit_hash())]);
+    assert_eq!(policies, vec![full(&spending_limit_hash())]);
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
 
     h.baseline_v2(1);
@@ -4284,8 +4293,8 @@ async fn removing_an_unreadable_only_policy_refuses_before_submission() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4314,8 +4323,8 @@ async fn removing_one_of_two_policies_drops_the_pin_of_its_hash() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH), first8(&spending_limit_hash())],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH), full(&spending_limit_hash())],
         vec![],
         vec![],
     );
@@ -4326,7 +4335,7 @@ async fn removing_one_of_two_policies_drops_the_pin_of_its_hash() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].request_id, "req-remove-second");
     let (policies, _, reason) = policy_pins_of(&rows[0]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::PolicyRemoved);
 
     h.submit(&[1], Some("req-after-remove-second"))
@@ -4343,8 +4352,8 @@ async fn removing_an_unpinned_policy_beside_a_pinned_one_keeps_the_pin() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4373,8 +4382,8 @@ async fn removing_a_policy_no_pin_of_two_matches_writes_no_row() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH), first8(&spending_limit_hash())],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH), full(&spending_limit_hash())],
         vec![],
         vec![],
     );
@@ -4414,8 +4423,8 @@ async fn a_policy_pin_with_no_live_policy_refuses_and_sends_nothing() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4446,7 +4455,7 @@ async fn a_policy_pin_with_no_live_policy_refuses_and_sends_nothing() {
 async fn a_rule_without_policies_or_policy_pins_signs() {
     let h = policy_harness(vec![]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.submit(&[1], Some("req-no-policy")).await.unwrap();
     assert_eq!(h.sends(), 1);
 }
@@ -4459,8 +4468,8 @@ async fn a_policy_added_with_no_live_policy_replaces_a_stale_pin() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4473,7 +4482,7 @@ async fn a_policy_added_with_no_live_policy_replaces_a_stale_pin() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].request_id, "req-repin");
     let (policies, _, reason) = policy_pins_of(&rows[0]);
-    assert_eq!(policies, vec![first8(&spending_limit_hash())]);
+    assert_eq!(policies, vec![full(&spending_limit_hash())]);
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
     assert_eq!(h.sends(), 1);
 
@@ -4489,8 +4498,8 @@ async fn a_policy_added_after_the_last_of_two_pinned_policies_replaces_both_pins
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH), first8(&spending_limit_hash())],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH), full(&spending_limit_hash())],
         vec![],
         vec![],
     );
@@ -4502,7 +4511,7 @@ async fn a_policy_added_after_the_last_of_two_pinned_policies_replaces_both_pins
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 1);
     let (policies, _, reason) = policy_pins_of(&rows[0]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::PolicyAdded);
 
     h.submit(&[1], Some("req-after-repin-two")).await.unwrap();
@@ -4519,8 +4528,8 @@ async fn a_policy_added_with_no_live_policy_drops_a_stale_reference_pin() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![Some(reference_pin(KNOWN_WASM_HASH))],
     );
@@ -4532,16 +4541,16 @@ async fn a_policy_added_with_no_live_policy_drops_a_stale_reference_pin() {
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 1);
     match &rows[0].event_kind {
-        EventKind::SaContextRulePinsUpdated {
+        EventKind::SaContextRulePinsUpdatedV2 {
             rule_id: 1,
-            pinned_policy_wasm_hashes_first8,
+            pinned_policy_wasm_hashes,
             pinned_policy_executable_refs,
             reason,
             ..
         } => {
             assert_eq!(
-                pinned_policy_wasm_hashes_first8,
-                &vec![first8(&spending_limit_hash())]
+                pinned_policy_wasm_hashes,
+                &vec![full(&spending_limit_hash())]
             );
             assert!(
                 pinned_policy_executable_refs.is_empty(),
@@ -4549,7 +4558,7 @@ async fn a_policy_added_with_no_live_policy_drops_a_stale_reference_pin() {
             );
             assert_eq!(*reason, PinsUpdateReason::PolicyAdded);
         }
-        other => panic!("expected SaContextRulePinsUpdated for rule 1; got {other:?}"),
+        other => panic!("expected SaContextRulePinsUpdatedV2 for rule 1; got {other:?}"),
     }
 
     h.submit(&[1], Some("req-after-repin-reference"))
@@ -4569,8 +4578,8 @@ async fn verify_pins_names_the_verifier_failure_beside_a_drifted_policy() {
     h.set_entry(undecodable_instance(&undecodable_policy));
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![FOREIGN_FIRST8.to_owned()],
+        vec![full(&webauthn_hash())],
+        vec![FOREIGN_HASH],
         vec![],
         vec![],
     );
@@ -4588,10 +4597,10 @@ async fn verify_pins_names_the_verifier_failure_beside_a_drifted_policy() {
         .unwrap();
     assert_eq!(result.verifier_pin_status, PinStatus::Unavailable);
     assert_eq!(result.policy_pin_status, PinStatus::Drift);
-    assert!(result.observed_verifier_first8.is_empty());
+    assert!(result.observed_verifier_hashes.is_empty());
     assert_eq!(
-        result.observed_policy_first8,
-        vec![first8(&KNOWN_WASM_HASH)]
+        result.observed_policy_hashes,
+        vec![Some(full(&KNOWN_WASM_HASH))]
     );
     assert_eq!(result.unavailable_wire_code, Some("sa.deployment_failed"));
     assert_eq!(h.sends(), 0);
@@ -4604,8 +4613,8 @@ async fn verify_pins_reports_drift_for_a_policy_pin_with_no_live_policy() {
     let h = policy_harness(vec![]).await;
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -4621,9 +4630,9 @@ async fn verify_pins_reports_drift_for_a_policy_pin_with_no_live_policy() {
         .unwrap();
     assert_eq!(result.verifier_pin_status, PinStatus::Match);
     assert_eq!(result.policy_pin_status, PinStatus::Drift);
-    assert!(result.observed_policy_first8.is_empty());
+    assert!(result.observed_policy_hashes.is_empty());
     assert!(result.observed_policy_executable.is_empty());
-    assert_eq!(result.pinned_policy_first8, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(result.pinned_policy_hashes, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(result.unavailable_wire_code, None);
     assert_eq!(h.sends(), 0);
 }
@@ -4651,8 +4660,8 @@ async fn a_migration_refuses_a_rule_whose_pinned_policy_is_absent() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -5296,7 +5305,7 @@ async fn verifierless_pinned_rule() -> Harness {
         .with_threshold(&policy_p(), 1, 1);
     let h = Harness::with_timeout(chain, Duration::from_secs(2)).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
     h
 }
 
@@ -5420,14 +5429,14 @@ async fn a_confirmed_passkey_add_that_fails_to_record_still_pins_its_verifier() 
         assert_eq!(h.sends(), 1, "batch {batch}");
         assert_eq!(
             row_kinds(&h.rows(), &request_id),
-            vec!["sa_context_rule_pins_updated"],
+            vec!["sa_context_rule_pins_updated_v2"],
             "batch {batch}"
         );
         let rows = h.pins_updated_rows();
         assert_eq!(rows.len(), 1, "batch {batch}");
         let (verifiers, policies, _, reason) = pins_updated_fields(&rows[0]);
-        assert_eq!(verifiers, vec![first8(&webauthn_hash())], "batch {batch}");
-        assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)], "batch {batch}");
+        assert_eq!(verifiers, vec![full(&webauthn_hash())], "batch {batch}");
+        assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)], "batch {batch}");
         assert_eq!(reason, PinsUpdateReason::SignerAdded, "batch {batch}");
 
         // The secondary catches up; both endpoints now serve the confirmed
@@ -5471,12 +5480,12 @@ async fn a_confirmed_passkey_add_that_fails_to_record_still_pins_its_verifier() 
             .unwrap_err();
         match &err {
             SaError::VerifierHashDrift {
-                pinned_hash_first8,
-                observed_hash_first8,
+                pinned_hash,
+                observed_hash,
                 ..
             } => {
-                assert_eq!(pinned_hash_first8, &first8(&webauthn_hash()));
-                assert_eq!(observed_hash_first8, &first8(&ed25519_hash()));
+                assert_eq!(pinned_hash, &full(&webauthn_hash()));
+                assert_eq!(observed_hash.as_ref(), Some(&full(&ed25519_hash())));
             }
             other => panic!("batch {batch}: expected VerifierHashDrift; got {other:?}"),
         }
@@ -6218,7 +6227,7 @@ fn install_state_mismatch(err: &SaError) -> (Option<u32>, &str) {
     }
 }
 
-/// A confirmed install writes the override row, the `SaContextRuleCreated`
+/// A confirmed install writes the override row, the `SaContextRuleCreatedV2`
 /// row, the baseline with reason `confirmed_install` recording the served
 /// rule at the confirmation ledger, then `sa.ok`; the next `signers list`
 /// matches the baseline.
@@ -6249,7 +6258,7 @@ async fn a_confirmed_install_records_its_baseline_after_the_created_row() {
         row_kinds(&h.rows(), "req-install"),
         vec![
             "unknown_override(rule Some(1))",
-            "sa_context_rule_created",
+            "sa_context_rule_created_v2",
             "sa_signer_set_baselined_v2",
             "sa_raw_invocation",
         ]
@@ -6313,7 +6322,7 @@ fn assert_mismatch_without_baseline(h: &Harness, err: &SaError, request_id: &str
     assert_eq!(err.wire_code(), "sa.install_state_mismatch");
     assert_eq!(
         row_kinds(&h.rows(), request_id),
-        vec!["sa_context_rule_created", "sa_raw_invocation"]
+        vec!["sa_context_rule_created_v2", "sa_raw_invocation"]
     );
     assert_eq!(raw_wire_code(h, request_id), "sa.install_state_mismatch");
     assert_eq!(h.sends(), 1);
@@ -6464,7 +6473,7 @@ async fn an_install_whose_baseline_row_is_refused_fails_at_stage_write() {
     assert!(h.manager.audit_writer_degraded());
     assert_eq!(
         row_kinds(&h.rows(), "req-install-poisoned"),
-        vec!["sa_context_rule_created"]
+        vec!["sa_context_rule_created_v2"]
     );
     assert_eq!(h.sends(), 1);
 }
@@ -6501,7 +6510,7 @@ async fn an_install_whose_secondary_stays_behind_fails_at_stage_observe() {
     }
     assert_eq!(
         row_kinds(&h.rows(), "req-install-behind"),
-        vec!["sa_context_rule_created", "sa_raw_invocation"]
+        vec!["sa_context_rule_created_v2", "sa_raw_invocation"]
     );
     assert_eq!(
         raw_wire_code(&h, "req-install-behind"),
@@ -6788,7 +6797,7 @@ fn observation(policy: &ScAddress, threshold: u32) -> Option<ThresholdObservatio
 async fn a_threshold_attach_records_the_threshold_before_the_policy_row() {
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.after_send_state(&rule_one_after(vec![policy_p()], &[(policy_p(), 2)]));
     let policy_id = add_policy_with(&h, &policy_p(), threshold_param(2), "req-attach", false)
         .await
@@ -6798,7 +6807,7 @@ async fn a_threshold_attach_records_the_threshold_before_the_policy_row() {
         row_kinds(&h.rows(), "req-attach"),
         vec![
             "sa_threshold_changed_v2",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_added",
             "sa_raw_invocation",
         ]
@@ -6919,7 +6928,7 @@ async fn a_threshold_attach_with_a_malformed_parameter_refuses() {
 async fn a_confirmed_threshold_attach_whose_threshold_differs_refuses_with_the_hash() {
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.after_send_state(&rule_one_after(vec![policy_p()], &[(policy_p(), 3)]));
     let err = add_policy_with(
         &h,
@@ -6945,7 +6954,7 @@ async fn a_confirmed_threshold_attach_whose_threshold_differs_refuses_with_the_h
         row_kinds(&h.rows(), "req-attach-differs"),
         vec![
             "sa_signer_set_diverged",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_added",
             "sa_raw_invocation",
         ]
@@ -6964,7 +6973,7 @@ async fn a_confirmed_threshold_attach_whose_threshold_differs_refuses_with_the_h
 async fn a_threshold_attach_whose_simulated_return_is_not_a_u32_refuses_before_signing() {
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.set_simulated_return("add_policy", ScVal::Void);
     h.after_send_state(&rule_one_after(vec![policy_p()], &[(policy_p(), 2)]));
     let err = add_policy_with(
@@ -7026,7 +7035,7 @@ async fn a_threshold_attach_without_a_version_2_baseline_refuses() {
 async fn a_direct_attach_whose_simulated_return_is_not_a_u32_refuses_before_signing() {
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.set_simulated_return("add_policy", ScVal::Void);
     h.after_send(1, rule_one_with_policies(vec![policy_q()]));
     let err = add_policy_with(&h, &policy_q(), ScVal::Void, "req-direct-void", false)
@@ -7049,7 +7058,7 @@ async fn a_direct_attach_whose_simulated_return_is_not_a_u32_refuses_before_sign
 async fn a_spending_limit_attach_writes_no_state_row_and_keeps_its_pin_rows() {
     let h = threshold_policy_harness(vec![], &[]).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![first8(&webauthn_hash())], vec![], vec![], vec![]);
+    h.pin_created(1, vec![full(&webauthn_hash())], vec![], vec![], vec![]);
     h.after_send(1, rule_one_with_policies(vec![policy_q()]));
     add_policy_with(&h, &policy_q(), ScVal::Void, "req-attach-limit", false)
         .await
@@ -7057,7 +7066,7 @@ async fn a_spending_limit_attach_writes_no_state_row_and_keeps_its_pin_rows() {
     assert_eq!(
         row_kinds(&h.rows(), "req-attach-limit"),
         vec![
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_added",
             "sa_raw_invocation",
         ]
@@ -7126,8 +7135,8 @@ async fn a_threshold_detach_records_the_cleared_threshold_before_the_policy_row(
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -7137,7 +7146,7 @@ async fn a_threshold_detach_records_the_cleared_threshold_before_the_policy_row(
         row_kinds(&h.rows(), "req-detach"),
         vec![
             "sa_threshold_changed_v2",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_removed",
             "sa_raw_invocation",
         ]
@@ -7165,8 +7174,8 @@ async fn a_confirmed_threshold_detach_whose_threshold_stays_refuses_with_the_has
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -7187,7 +7196,7 @@ async fn a_confirmed_threshold_detach_whose_threshold_stays_refuses_with_the_has
         row_kinds(&h.rows(), "req-detach-stays"),
         vec![
             "sa_signer_set_diverged",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_removed",
             "sa_raw_invocation",
         ]
@@ -7818,7 +7827,7 @@ async fn the_submit_path_releases_its_locks_before_the_send() {
 async fn coexisting_faults_refuse_in_the_check_order() {
     let h = Harness::new(two_rule_chain()).await;
     h.baseline_v2(2);
-    h.pin_created(2, vec![FOREIGN_FIRST8.to_owned()], vec![], vec![], vec![]);
+    h.pin_created(2, vec![FOREIGN_HASH], vec![], vec![], vec![]);
     let err = h
         .submit_invocation("pair", &[1, 2], Some("req-baseline-first"), None)
         .await
@@ -7841,7 +7850,7 @@ async fn coexisting_faults_refuse_in_the_check_order() {
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
     h.baseline_v2(2);
-    h.pin_created(1, vec![FOREIGN_FIRST8.to_owned()], vec![], vec![], vec![]);
+    h.pin_created(1, vec![FOREIGN_HASH], vec![], vec![], vec![]);
     h.set_rule(2, &rule_two_with_another_key());
     let err = h
         .submit_invocation("pair", &[1, 2], Some("req-drift-first"), None)
@@ -7971,7 +7980,7 @@ async fn a_refused_submission_leaves_no_record_and_a_sent_one_does() {
 
     let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![FOREIGN_FIRST8.to_owned()], vec![], vec![], vec![]);
+    h.pin_created(1, vec![FOREIGN_HASH], vec![], vec![], vec![]);
     let drift = h
         .submit_invocation("noop", &[1], Some("req-record-drift"), Some(&recorder))
         .await
@@ -8294,9 +8303,9 @@ async fn add_racing_signer(h: &Harness, request_id: &str) -> Result<u32, SaError
         .await
 }
 
-/// The verifier and policy pins of the newest `SaContextRulePinsUpdated` row
+/// The verifier and policy pins of the newest `SaContextRulePinsUpdatedV2` row
 /// of rule 1.
-fn last_rule_one_pins(h: &Harness) -> (Vec<String>, Vec<String>) {
+fn last_rule_one_pins(h: &Harness) -> (Vec<WasmHashPin>, Vec<WasmHashPin>) {
     let rows = h.pins_updated_rows();
     let last = rows.last().expect("rule 1 has a pins-updated row");
     let (verifiers, policies, _, _) = pins_updated_fields(last);
@@ -8338,14 +8347,14 @@ fn assert_the_added_verifier_pin_survives(h: &Harness, removal: &str, add: &str)
     let (verifiers, policies) = last_rule_one_pins(h);
     assert_eq!(
         verifiers,
-        vec![first8(&webauthn_hash())],
+        vec![full(&webauthn_hash())],
         "the newest pin record keeps the added verifier's pin"
     );
     assert!(policies.is_empty(), "{policies:?}");
     let mut blocks = contiguous_blocks(h, &[removal, add]);
     assert_eq!(
         blocks[1],
-        vec!["sa_signer_added_v2", "sa_context_rule_pins_updated"]
+        vec!["sa_signer_added_v2", "sa_context_rule_pins_updated_v2"]
     );
     blocks.swap_remove(0)
 }
@@ -8362,7 +8371,7 @@ async fn a_direct_removal_racing_a_verifier_add_keeps_the_added_pin() {
     h.pin_created(
         1,
         vec![],
-        vec![first8(&spending_limit_hash())],
+        vec![full(&spending_limit_hash())],
         vec![],
         vec![],
     );
@@ -8393,7 +8402,7 @@ async fn a_direct_removal_racing_a_verifier_add_keeps_the_added_pin() {
     assert_eq!(
         removal_block,
         vec![
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_removed",
             "sa_raw_invocation",
         ]
@@ -8417,7 +8426,7 @@ fn threshold_race_chain() -> Chain {
 #[tokio::test]
 async fn a_threshold_detach_racing_a_verifier_add_keeps_the_added_pin() {
     let h = Harness::new(threshold_race_chain()).await;
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
     h.baseline_v2(1);
     h.baseline_v2(2);
     h.delay_entry_read(
@@ -8449,7 +8458,7 @@ async fn a_threshold_detach_racing_a_verifier_add_keeps_the_added_pin() {
         removal_block,
         vec![
             "sa_threshold_changed_v2",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
             "sa_policy_removed",
             "sa_raw_invocation",
         ]
@@ -8466,7 +8475,7 @@ async fn a_signer_add_racing_a_direct_removal_keeps_its_pin() {
     h.pin_created(
         1,
         vec![],
-        vec![first8(&spending_limit_hash())],
+        vec![full(&spending_limit_hash())],
         vec![],
         vec![],
     );
@@ -8614,7 +8623,7 @@ fn absent_verifier_pin_chain() -> Chain {
 async fn absent_verifier_pin_harness() -> Harness {
     let h = Harness::new(absent_verifier_pin_chain()).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
     h
 }
 
@@ -8685,7 +8694,7 @@ async fn verify_pins_reports_drift_for_a_live_verifier_the_record_does_not_pin()
         .await
         .unwrap();
     assert_eq!(result.verifier_pin_status, PinStatus::Drift);
-    assert!(result.observed_verifier_first8.is_empty());
+    assert!(result.observed_verifier_hashes.is_empty());
     assert_eq!(result.policy_pin_status, PinStatus::Match);
     assert_eq!(result.unavailable_wire_code, None);
     assert_eq!(h.sends(), 0);
@@ -8703,11 +8712,14 @@ async fn a_refresh_pins_the_live_verifier_of_a_record_that_pins_none() {
         .unwrap();
     assert_eq!(
         row_kinds(&h.rows(), "req-repair"),
-        vec!["sa_signer_set_baselined_v2", "sa_context_rule_pins_updated"]
+        vec![
+            "sa_signer_set_baselined_v2",
+            "sa_context_rule_pins_updated_v2"
+        ]
     );
     let (verifiers, policies, _, reason) = pins_updated_fields(&h.pins_updated_rows()[0]);
-    assert_eq!(verifiers, vec![first8(&webauthn_hash())]);
-    assert_eq!(policies, vec![first8(&KNOWN_WASM_HASH)]);
+    assert_eq!(verifiers, vec![full(&webauthn_hash())]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
     assert_eq!(reason, PinsUpdateReason::BaselineRefreshed);
     assert_eq!(outcome.previous_baseline, PreviousBaseline::Matched);
     assert!(outcome.verifier_pinned);
@@ -8754,11 +8766,11 @@ async fn a_diverged_refresh_pins_the_live_verifier_only_with_the_flag() {
         vec![
             "sa_signer_set_diverged",
             "sa_signer_set_baselined_v2",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
     let (verifiers, _, _, _) = pins_updated_fields(&h.pins_updated_rows()[0]);
-    assert_eq!(verifiers, vec![first8(&webauthn_hash())]);
+    assert_eq!(verifiers, vec![full(&webauthn_hash())]);
     h.submit(&[1], Some("req-after-diverged-repair"))
         .await
         .unwrap();
@@ -8775,8 +8787,8 @@ async fn a_refresh_leaves_a_record_with_a_verifier_pin_or_no_record_alone() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&webauthn_hash())],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&webauthn_hash())],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -8793,8 +8805,8 @@ async fn a_refresh_leaves_a_record_with_a_verifier_pin_or_no_record_alone() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![FOREIGN_FIRST8.to_owned()],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![FOREIGN_HASH],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -8842,7 +8854,7 @@ async fn two_signers_on_one_verifier_are_pinned_once() {
     );
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
     let outcome = refresh(&h, RefreshOptions::new(false), "req-refresh-shared")
         .await
         .unwrap();
@@ -8850,7 +8862,7 @@ async fn two_signers_on_one_verifier_are_pinned_once() {
     let rows = h.pins_updated_rows();
     assert_eq!(rows.len(), 1);
     let (verifiers, _, _, _) = pins_updated_fields(&rows[0]);
-    assert_eq!(verifiers, vec![first8(&webauthn_hash())]);
+    assert_eq!(verifiers, vec![full(&webauthn_hash())]);
     h.submit(&[1], Some("req-after-shared-refresh"))
         .await
         .unwrap();
@@ -8890,7 +8902,7 @@ async fn a_refresh_pins_an_unknown_verifier_only_with_its_override() {
     ))
     .await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
 
     let err = refresh(&h, RefreshOptions::new(false), "req-refresh-unknown-no")
         .await
@@ -8915,11 +8927,11 @@ async fn a_refresh_pins_an_unknown_verifier_only_with_its_override() {
         vec![
             "sa_signer_set_baselined_v2",
             "unknown_override(rule Some(1))",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
     let (verifiers, _, unknown_override, _) = pins_updated_fields(&h.pins_updated_rows()[0]);
-    assert_eq!(verifiers, vec![first8(&unknown)]);
+    assert_eq!(verifiers, vec![full(&unknown)]);
     assert!(unknown_override);
     h.submit(&[1], Some("req-after-unknown-refresh"))
         .await
@@ -8941,7 +8953,7 @@ async fn a_refresh_pins_a_mutable_verifier_only_with_its_override() {
     ))
     .await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
 
     let err = refresh(&h, RefreshOptions::new(false), "req-refresh-mutable-no")
         .await
@@ -8965,27 +8977,24 @@ async fn a_refresh_pins_a_mutable_verifier_only_with_its_override() {
         vec![
             "sa_signer_set_baselined_v2",
             "mutable_override(rule Some(1))",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
     match &h.pins_updated_rows()[0].event_kind {
-        EventKind::SaContextRulePinsUpdated {
-            pinned_verifier_wasm_hashes_first8,
+        EventKind::SaContextRulePinsUpdatedV2 {
+            pinned_verifier_wasm_hashes,
             pinned_verifier_executable_refs,
             mutable_override,
             ..
         } => {
-            assert_eq!(
-                pinned_verifier_wasm_hashes_first8,
-                &vec![first8(&webauthn_hash())]
-            );
+            assert_eq!(pinned_verifier_wasm_hashes, &vec![full(&webauthn_hash())]);
             assert_eq!(
                 pinned_verifier_executable_refs,
                 &vec![Some(reference_pin(webauthn_hash()))]
             );
             assert!(*mutable_override);
         }
-        other => panic!("expected SaContextRulePinsUpdated; got {other:?}"),
+        other => panic!("expected SaContextRulePinsUpdatedV2; got {other:?}"),
     }
     h.submit(&[1], Some("req-after-mutable-refresh"))
         .await
@@ -9017,7 +9026,7 @@ async fn a_refresh_refuses_a_wasm_verifier_and_a_reference_on_one_hash() {
         .with_entry(tag_entry(webauthn_hash()));
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
 
     let err = refresh(&h, RefreshOptions::new(false), "req-refresh-mixed-pins-no")
         .await
@@ -9072,7 +9081,7 @@ async fn two_references_on_one_tag_share_one_pin_and_record_both_overrides() {
         .with_entry(tag_entry(webauthn_hash()));
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
 
     let outcome = refresh(
         &h,
@@ -9087,27 +9096,24 @@ async fn two_references_on_one_tag_share_one_pin_and_record_both_overrides() {
             "sa_signer_set_baselined_v2",
             "mutable_override(rule Some(1))",
             "mutable_override(rule Some(1))",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
     match &h.pins_updated_rows()[0].event_kind {
-        EventKind::SaContextRulePinsUpdated {
-            pinned_verifier_wasm_hashes_first8,
+        EventKind::SaContextRulePinsUpdatedV2 {
+            pinned_verifier_wasm_hashes,
             pinned_verifier_executable_refs,
             mutable_override,
             ..
         } => {
-            assert_eq!(
-                pinned_verifier_wasm_hashes_first8,
-                &vec![first8(&webauthn_hash())]
-            );
+            assert_eq!(pinned_verifier_wasm_hashes, &vec![full(&webauthn_hash())]);
             assert_eq!(
                 pinned_verifier_executable_refs,
                 &vec![Some(reference_pin(webauthn_hash()))]
             );
             assert!(*mutable_override);
         }
-        other => panic!("expected SaContextRulePinsUpdated; got {other:?}"),
+        other => panic!("expected SaContextRulePinsUpdatedV2; got {other:?}"),
     }
     assert!(outcome.verifier_pinned);
     h.submit(&[1], Some("req-after-one-tag-refresh"))
@@ -9130,7 +9136,7 @@ async fn two_signers_on_one_mutable_verifier_are_probed_once() {
     };
     let single = Harness::new(absent_verifier_pin_chain_on(&verifier_v(), entries())).await;
     single.baseline_v2(1);
-    single.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    single.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
     refresh(
         &single,
         RefreshOptions::new(false).with_accept_mutable_verifier(true),
@@ -9158,7 +9164,7 @@ async fn two_signers_on_one_mutable_verifier_are_probed_once() {
     }
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
     let outcome = refresh(
         &h,
         RefreshOptions::new(false).with_accept_mutable_verifier(true),
@@ -9172,11 +9178,11 @@ async fn two_signers_on_one_mutable_verifier_are_probed_once() {
         vec![
             "sa_signer_set_baselined_v2",
             "mutable_override(rule Some(1))",
-            "sa_context_rule_pins_updated",
+            "sa_context_rule_pins_updated_v2",
         ]
     );
     let (verifiers, _, _, _) = pins_updated_fields(&h.pins_updated_rows()[0]);
-    assert_eq!(verifiers, vec![first8(&webauthn_hash())]);
+    assert_eq!(verifiers, vec![full(&webauthn_hash())]);
     assert!(outcome.verifier_pinned);
     h.submit(&[1], Some("req-after-one-address-refresh"))
         .await
@@ -9205,7 +9211,7 @@ async fn a_refresh_refuses_live_verifiers_running_two_executables() {
         .with_entry(wasm_instance(&verifier_w(), [0xdd; 32]));
     let h = Harness::new(chain).await;
     h.baseline_v2(1);
-    h.pin_created(1, vec![], vec![first8(&KNOWN_WASM_HASH)], vec![], vec![]);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
 
     let err = refresh(
         &h,
@@ -9236,8 +9242,8 @@ async fn a_revoked_pinned_verifier_refuses_before_simulation() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&[0xee; 32])],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&[0xee; 32])],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -9270,8 +9276,8 @@ async fn a_revoked_new_verifier_is_refused_with_every_override() {
         if pinned {
             h.pin_created(
                 1,
-                vec![first8(&webauthn_hash())],
-                vec![first8(&KNOWN_WASM_HASH)],
+                vec![full(&webauthn_hash())],
+                vec![full(&KNOWN_WASM_HASH)],
                 vec![],
                 vec![],
             );
@@ -9316,8 +9322,8 @@ async fn a_migration_away_from_a_revoked_verifier_signs() {
     h.baseline_v2(1);
     h.pin_created(
         1,
-        vec![first8(&[0xee; 32])],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&[0xee; 32])],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -9348,8 +9354,8 @@ async fn quorum_collection_refuses_a_revoked_signing_rule() {
     let h = Harness::new(chain_with_rule_one([0xee; 32])).await;
     h.pin_created(
         1,
-        vec![first8(&[0xee; 32])],
-        vec![first8(&KNOWN_WASM_HASH)],
+        vec![full(&[0xee; 32])],
+        vec![full(&KNOWN_WASM_HASH)],
         vec![],
         vec![],
     );
@@ -9400,4 +9406,351 @@ async fn quorum_collection_refuses_a_revoked_signing_rule() {
     );
     assert_eq!(error.wire_code(), "sa.verifier_wasm_revoked");
     assert_eq!(signer.key_accesses(), 0);
+}
+
+// ── Pins that share an eight-byte prefix ─────────────────────────────────────
+
+/// A pinned executable hash outside every allowlist.
+const PINNED: [u8; 32] = [0x42; 32];
+
+/// `hash` with every byte from position 8 onward set to `fill`: an executable
+/// that shares the eight-byte display prefix of `hash` and is another code.
+fn twin_of(hash: [u8; 32], fill: u8) -> [u8; 32] {
+    let mut twin = hash;
+    twin[8..].fill(fill);
+    twin
+}
+
+/// A migration whose destination shares the source's eight-byte prefix
+/// repoints the record to the destination's full hash. The destination
+/// then signs, and the source executable on the destination address
+/// refuses as drift naming both full hashes.
+#[tokio::test]
+async fn a_migration_to_an_equal_prefix_destination_pins_its_full_hash() {
+    let twin = twin_of(PINNED, 0x43);
+    let h = Harness::new(
+        signer_add_chain()
+            .with_wasm(&verifier_v(), PINNED)
+            .with_wasm(&verifier_w(), twin),
+    )
+    .await;
+    h.baseline_v2(1);
+    h.pin_created(
+        1,
+        vec![full(&PINNED)],
+        vec![full(&KNOWN_WASM_HASH)],
+        vec![],
+        vec![],
+    );
+    on_send_one_pair(&h);
+
+    let result = migrate(&h, &migration_plan(PINNED, twin), "req-migrate-twin").await;
+    assert!(
+        result.failed_step_error.is_none(),
+        "{:?}",
+        result.failed_step_error
+    );
+    assert_eq!(row_kinds(&h.rows(), "req-migrate-twin"), PAIR_ROWS);
+    let pins = the_row(&h, "req-migrate-twin", "sa_context_rule_pins_updated_v2");
+    let (verifiers, policies, _, reason) = pins_updated_fields(&pins);
+    assert_eq!(verifiers, vec![full(&twin)]);
+    assert_eq!(policies, vec![full(&KNOWN_WASM_HASH)]);
+    assert_eq!(reason, PinsUpdateReason::VerifierMigrated);
+
+    h.submit(&[1], Some("req-after-twin-migration"))
+        .await
+        .unwrap();
+    assert_eq!(h.sends(), 3);
+
+    h.set_entry(wasm_instance(&verifier_w(), PINNED));
+    let err = h
+        .submit(&[1], Some("req-source-after-migration"))
+        .await
+        .unwrap_err();
+    match &err {
+        SaError::VerifierHashDrift {
+            rule_id: 1,
+            pinned_hash,
+            observed_hash,
+            ..
+        } => {
+            assert_eq!(pinned_hash, &full(&twin));
+            assert_eq!(observed_hash.as_ref(), Some(&full(&PINNED)));
+        }
+        other => panic!("expected VerifierHashDrift; got {other:?}"),
+    }
+    assert_eq!(h.sends(), 3);
+}
+
+/// Two live verifiers whose hashes share an eight-byte prefix are two
+/// executables: the refresh refuses with the multi-pin refusal before it
+/// writes the baseline or any other row.
+#[tokio::test]
+async fn a_refresh_refuses_live_verifiers_whose_hashes_share_only_a_prefix() {
+    let twin = twin_of(PINNED, 0x43);
+    let chain = Chain::default()
+        .with_rule(
+            1,
+            rule_with_ids(
+                1,
+                vec![
+                    (0, delegated_signer()),
+                    (1, external_signer(&verifier_v(), &[0x22; 32])),
+                    (2, external_signer(&verifier_w(), &[0x23; 32])),
+                ],
+                vec![policy_p()],
+            ),
+        )
+        .with_wasm(&verifier_v(), PINNED)
+        .with_wasm(&verifier_w(), twin)
+        .with_wasm(&policy_p(), KNOWN_WASM_HASH)
+        .with_threshold(&policy_p(), 1, 1);
+    let h = Harness::new(chain).await;
+    h.baseline_v2(1);
+    h.pin_created(1, vec![], vec![full(&KNOWN_WASM_HASH)], vec![], vec![]);
+
+    let err = refresh(
+        &h,
+        RefreshOptions::new(false).with_accept_unknown_verifier(true),
+        "req-refresh-twins",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SaError::MultiplePinnedHashesUnsupported {
+                kind: "verifier",
+                rule_id: 1,
+                count: 2,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(row_kinds(&h.rows(), "req-refresh-twins").is_empty());
+    assert!(h.pins_updated_rows().is_empty());
+}
+
+/// A signer add, single or batched, on a verifier whose hash shares only a
+/// prefix with a recorded pin appends a distinct full pin.
+#[tokio::test]
+async fn signer_adds_keep_equal_prefix_verifier_pins_distinct() {
+    let twin = twin_of(PINNED, 0x43);
+    let second_twin = twin_of(PINNED, 0x44);
+    let third = contract(0x26);
+    for batch in [false, true] {
+        let h = Harness::new(
+            signer_add_chain()
+                .with_wasm(&verifier_v(), PINNED)
+                .with_wasm(&verifier_w(), twin)
+                .with_wasm(&third, second_twin),
+        )
+        .await;
+        h.baseline_v2(1);
+        h.pin_created(
+            1,
+            vec![full(&PINNED)],
+            vec![full(&KNOWN_WASM_HASH)],
+            vec![],
+            vec![],
+        );
+        let request_id = format!("req-add-twin-{batch}");
+        let expected = if batch {
+            let added = vec![
+                external_signer(&verifier_w(), &[0x33; 32]),
+                external_signer(&third, &[0x34; 32]),
+            ];
+            h.after_send(
+                1,
+                signer_add_rule_after(vec![(7, added[0].clone()), (8, added[1].clone())]),
+            );
+            let signer = SoftwareSigningKey::new_from_bytes(SEED);
+            h.manager
+                .batch_add_signers(
+                    smart_account(),
+                    1,
+                    added,
+                    &signer,
+                    request_id.clone(),
+                    false,
+                    true,
+                )
+                .await
+                .unwrap();
+            vec![full(&PINNED), full(&twin), full(&second_twin)]
+        } else {
+            add_external_signer(&h, &verifier_w(), &request_id, true)
+                .await
+                .unwrap();
+            vec![full(&PINNED), full(&twin)]
+        };
+        let rows = h.pins_updated_rows();
+        assert_eq!(rows.len(), 1, "batch {batch}");
+        let (verifiers, _, unknown_override, reason) = pins_updated_fields(&rows[0]);
+        assert_eq!(verifiers, expected, "batch {batch}");
+        assert!(unknown_override, "batch {batch}");
+        assert_eq!(reason, PinsUpdateReason::SignerAdded, "batch {batch}");
+    }
+}
+
+/// From two policy pins that share an eight-byte prefix, the removal drops
+/// only the pin equal to the removed policy's full hash, with the reference
+/// aligned to it. The policy that stays signs against its kept pin.
+#[tokio::test]
+async fn removing_a_policy_drops_only_the_full_hash_match_of_two_equal_prefix_pins() {
+    let twin = twin_of(PINNED, 0x43);
+    let policy_s = contract(0x33);
+    let chain = Chain::default()
+        .with_rule(
+            1,
+            rule_one_with_policies(vec![policy_r(), policy_s.clone()]),
+        )
+        .with_entry(wasm_instance(&verifier_v(), webauthn_hash()))
+        .with_entry(wasm_instance(&policy_r(), PINNED))
+        .with_entry(external_ref_instance(&policy_s))
+        .with_entry(tag_entry(twin));
+    let h = Harness::new(chain).await;
+    h.baseline_v2(1);
+    let twin_reference = Some(reference_pin(twin));
+    h.pin_created(
+        1,
+        vec![full(&webauthn_hash())],
+        vec![full(&twin), full(&PINNED)],
+        vec![],
+        vec![twin_reference.clone(), None],
+    );
+    h.after_send(1, rule_one_with_policies(vec![policy_s.clone()]));
+    remove_policy(&h, 0, "req-remove-twin-policy")
+        .await
+        .unwrap();
+
+    let rows = h.pins_updated_rows();
+    assert_eq!(rows.len(), 1);
+    let kept = pin_record_fields(&rows[0]);
+    assert_eq!(kept.policies, vec![full(&twin)]);
+    assert_eq!(kept.policy_refs, vec![twin_reference]);
+    assert_eq!(kept.reason, PinsUpdateReason::PolicyRemoved);
+
+    h.submit(&[1], Some("req-after-twin-policy-removal"))
+        .await
+        .unwrap();
+}
+
+// ── Incomplete pin records ───────────────────────────────────────────────────
+
+/// Writes a version-1 `SaContextRuleCreated` row for `rule_id` pinning the
+/// eight-byte prefixes of `verifier` and `policy`: an incomplete record.
+fn pin_created_prefix(h: &Harness, rule_id: u32, verifier: [u8; 32], policy: [u8; 32]) {
+    h.write(AuditEntry::new_sa_context_rule_created(
+        smart_account_redacted(),
+        rule_id,
+        "default",
+        1,
+        1,
+        None,
+        CHAIN_ID,
+        "req-install-prefix",
+        vec![hex::encode(&verifier[..8])],
+        vec![hex::encode(&policy[..8])],
+        false,
+        false,
+        vec![],
+        vec![],
+    ));
+}
+
+/// Signing under a rule whose pin record holds eight-byte prefixes refuses
+/// with `sa.wasm_pin_incomplete` before the signer signs anything and before
+/// anything is simulated or sent, although the live code matches the
+/// prefixes.
+#[tokio::test]
+async fn an_incomplete_pin_record_refuses_signing_with_no_signature_and_no_send() {
+    let h = Harness::new(chain_with_rule_one(webauthn_hash())).await;
+    h.baseline_v2(1);
+    pin_created_prefix(&h, 1, webauthn_hash(), KNOWN_WASM_HASH);
+
+    let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new(SEED);
+    let rule_ids = [ContextRuleId::new(1)];
+    let smart_account = strkey(&smart_account());
+    let uri = h.primary.uri();
+    let err = submit_signed_invoke(
+        SubmitInvokeArgs::builder()
+            .target_contract(&smart_account)
+            .auth_rule_ids(&rule_ids)
+            .host_function(noop())
+            .signer(&signer)
+            .primary_rpc_url(&uri)
+            .network_passphrase(PASSPHRASE)
+            .chain_id(CHAIN_ID)
+            .timeout(h.timeouts.budget)
+            .op_label("pin_check_mock")
+            .pin_check(PinCheck {
+                signers_manager: &h.manager,
+                request_id: "req-incomplete-sign",
+                migrating_rule: None,
+            })
+            .build(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err.wire_code(), "sa.wasm_pin_incomplete", "{err:?}");
+    assert!(
+        matches!(err, SaError::WasmPinIncomplete { rule_id: 1, .. }),
+        "{err:?}"
+    );
+    // The submission reads the source account from the signer's public key
+    // before its checks; no signing method is ever called.
+    assert_eq!(signer.sign_calls(), 0, "the signer signs nothing");
+    assert!(!h.simulated("noop"), "the invocation is never simulated");
+    assert_eq!(h.sends(), 0, "nothing is sent");
+    assert!(
+        !h.rows().iter().any(|row| matches!(
+            row.event_kind,
+            EventKind::SaVerifierHashDrift { .. } | EventKind::SaPolicyHashDrift { .. }
+        )),
+        "an incomplete record is not drift"
+    );
+}
+
+/// A migration of a rule whose pin record holds eight-byte prefixes refuses
+/// its first pair with `sa.wasm_pin_incomplete` before the signer signs
+/// anything and before the removal is sent, and writes no signer or pin row.
+#[tokio::test]
+async fn an_incomplete_pin_record_refuses_a_migration_with_no_signature_and_no_send() {
+    let h = signer_add_harness(false).await;
+    pin_created_prefix(&h, 1, webauthn_hash(), KNOWN_WASM_HASH);
+    on_send_one_pair(&h);
+
+    let signer = stellar_agent_network::signing::test_doubles::CountingSigner::new(SEED);
+    let result = migration_plan(webauthn_hash(), ed25519_hash())
+        .submit(&signer, &h.manager, "req-incomplete-migrate")
+        .await;
+
+    assert_first_pair_refused_unsent(
+        &h,
+        &result,
+        "sa.wasm_pin_incomplete",
+        "req-incomplete-migrate",
+    );
+    assert!(
+        matches!(
+            result.failed_step_error,
+            Some(SaError::WasmPinIncomplete { rule_id: 1, .. })
+        ),
+        "{:?}",
+        result.failed_step_error
+    );
+    // The submission reads the source account from the signer's public key
+    // before its checks; no signing method is ever called.
+    assert_eq!(signer.sign_calls(), 0, "the signer signs nothing");
+    assert!(
+        !h.simulated("remove_signer"),
+        "the removal is never simulated"
+    );
+    assert!(
+        h.pins_updated_rows().is_empty(),
+        "no pin row repoints an incomplete record"
+    );
 }

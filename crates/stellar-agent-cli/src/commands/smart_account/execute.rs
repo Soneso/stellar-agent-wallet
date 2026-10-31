@@ -44,9 +44,9 @@
 //! `sa.auth_entry_construction_failed`, at `rule_lock`, `baseline_read`, or
 //! `signer_set_compare`. On a rule with a pin record, each live verifier is
 //! compared with the verifier pin, and each live policy with the policy pins.
-//! The first eight bytes of the live code hash must equal the pinned value;
-//! the record stores that prefix. A CAP-85 external reference must also match
-//! its pinned owner, tag, and resolved hash prefix. An empty policy-pin list
+//! All 32 bytes of the live code hash must equal the pinned hash. A CAP-85
+//! external reference must also match its pinned owner, tag, and full
+//! resolved hash. An empty policy-pin list
 //! checks no policy code, so pins do not detect a policyless rule gaining a
 //! policy outside the wallet. During a `migrate-verifier` pair, the migrating
 //! rule skips its verifier pin check. Drift refuses with
@@ -55,7 +55,10 @@
 //! policy pins while the rule has no policy on chain refuses with
 //! `sa.pinned_policy_absent`. A rule holding an `External` signer while its
 //! record pins no verifier refuses with `sa.pinned_verifier_absent`, which
-//! `signers refresh` repairs. A rule without a pin record has no code check.
+//! `signers refresh` repairs. A rule whose record holds eight-byte hash
+//! prefixes refuses with `sa.wasm_pin_incomplete` until it is reinstalled
+//! through an independently authorized rule. A rule without a pin record has
+//! no code check.
 //!
 //! # Mainnet defence
 //!
@@ -74,6 +77,7 @@
 //! - `sa.policy_hash_drift`: `SaError::PolicyHashDrift`
 //! - `sa.pinned_policy_absent`: `SaError::PinnedPolicyAbsent`
 //! - `sa.pinned_verifier_absent`: `SaError::PinnedVerifierAbsent`
+//! - `sa.wasm_pin_incomplete`: `SaError::WasmPinIncomplete`
 //! - `sa.pin_check_unavailable`: `SaError::PinCheckUnavailable`
 //! - `sa.threshold_policy_not_installed`: `SaError::ThresholdPolicyNotInstalled`
 //! - `sa.threshold_policy_identification_failed`: `SaError::ThresholdPolicyIdentificationFailed`

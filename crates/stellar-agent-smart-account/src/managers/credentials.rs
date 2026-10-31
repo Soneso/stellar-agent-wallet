@@ -608,7 +608,9 @@ pub enum CredentialsError {
     /// whose pin record holds policy pins while the rule has no policy on
     /// chain. It carries `SaError::PinnedVerifierAbsent` too, the refusal of
     /// a rule holding a live `External` signer whose pin record pins no
-    /// verifier. No drift row is written for either.
+    /// verifier, and `SaError::WasmPinIncomplete`, the refusal of a rule
+    /// whose pin record holds eight-byte hash prefixes. No drift row is
+    /// written for any of them.
     ///
     /// The WebAuthn ceremony is aborted (fail-closed) BEFORE any bridge I/O.
     /// No `SaVerifierHashDrift` / `SaPolicyHashDrift` audit row is emitted
@@ -2167,7 +2169,31 @@ impl CredentialsManager {
                 let pinned_hashes = match audit_reader
                     .find_latest_context_rule_pinned_hashes(rule_id, &smart_account_redacted)
                 {
-                    Ok(Some(ph)) => ph,
+                    Ok(Some(
+                        stellar_agent_core::audit_log::reader::ContextRulePinRecord::Complete(ph),
+                    )) => ph,
+                    Ok(Some(_)) => {
+                        // A pin record of eight-byte prefixes cannot name the
+                        // rule's verifier parties, and no override admits
+                        // it: the ceremony aborts before any bridge I/O.
+                        warn!(
+                            rule_id,
+                            "sign_with_passkey_rule: the rule's pin record holds eight-byte \
+                             hash prefixes; aborting signing (fail closed)"
+                        );
+                        return (
+                            Err(drift_err_route(crate::SaError::WasmPinIncomplete {
+                                rule_id,
+                                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                                    smart_account_redacted.as_str(),
+                                ),
+                                request_id: divergence_request_id.clone(),
+                            })),
+                            String::new(),
+                            String::new(),
+                            Some(divergence_request_id),
+                        );
+                    }
                     Ok(None) => {
                         tracing::info!(
                             rule_id = %rule_id,
@@ -2863,8 +2889,10 @@ async fn check_passkey_rules(
 /// respectively.  All other `SaError` variants from those functions
 /// (infrastructure failures: `NetworkRpcDivergence`, `DeploymentFailed`,
 /// `MultiplePinnedHashesUnsupported`, `AuditLog`) emit no drift row. Neither
-/// do `PinnedVerifierAbsent` from `verify_pinned_verifier_against_chain` and
-/// `PinnedPolicyAbsent` from `verify_policy_pins_present`. Wrapping them in
+/// do `PinnedVerifierAbsent` from `verify_pinned_verifier_against_chain`,
+/// `PinnedPolicyAbsent` from `verify_policy_pins_present`, and
+/// `WasmPinIncomplete` from any reader of a pin record of eight-byte
+/// prefixes. Wrapping them in
 /// `WasmHashDrift` would break the result-tag ↔ audit-row join that operator
 /// tooling relies on.
 ///
@@ -4449,8 +4477,10 @@ registered_at_unix_ms = 1700000000000
             rule_id: 1,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
             deploy_address_redacted: RedactedStrkey::from_already_redacted("CVERIF...ADDR1"),
-            pinned_hash_first8: "abcdef01".to_owned(),
-            observed_hash_first8: "12345678".to_owned(),
+            pinned_hash: stellar_agent_core::audit_log::schema::WasmHashPin::new([0xab; 32]),
+            observed_hash: Some(stellar_agent_core::audit_log::schema::WasmHashPin::new(
+                [0x12; 32],
+            )),
             observed_executable: None,
             request_id: "req-id-1".to_owned(),
         };
@@ -4477,8 +4507,10 @@ registered_at_unix_ms = 1700000000000
             rule_id: 2,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
             deploy_address_redacted: RedactedStrkey::from_already_redacted("CPOLI...ADDR1"),
-            pinned_hash_first8: "deadbeef".to_owned(),
-            observed_hash_first8: "cafebabe".to_owned(),
+            pinned_hash: stellar_agent_core::audit_log::schema::WasmHashPin::new([0xde; 32]),
+            observed_hash: Some(stellar_agent_core::audit_log::schema::WasmHashPin::new(
+                [0xca; 32],
+            )),
             observed_executable: None,
             request_id: "req-id-2".to_owned(),
         };
@@ -4548,6 +4580,30 @@ registered_at_unix_ms = 1700000000000
                 crate::SaError::PinnedVerifierAbsent { rule_id: 4, .. }
             ),
             "inner source must be PinnedVerifierAbsent: {source:?}"
+        );
+    }
+
+    /// A pin record of eight-byte prefixes is no drift row: it routes to
+    /// `DriftCheckUnavailable`, a pre-submission refusal.
+    #[test]
+    fn drift_err_route_wasm_pin_incomplete_routes_to_drift_check_unavailable() {
+        use stellar_agent_core::observability::RedactedStrkey;
+
+        let sa_err = crate::SaError::WasmPinIncomplete {
+            rule_id: 4,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...AAAAA"),
+            request_id: "req-id-pin-incomplete".to_owned(),
+        };
+        let result = drift_err_route(sa_err);
+        let CredentialsError::DriftCheckUnavailable { ref source } = result else {
+            panic!("WasmPinIncomplete must route to DriftCheckUnavailable: {result:?}");
+        };
+        assert!(
+            matches!(
+                source.as_ref(),
+                crate::SaError::WasmPinIncomplete { rule_id: 4, .. }
+            ),
+            "inner source must be WasmPinIncomplete: {source:?}"
         );
     }
 

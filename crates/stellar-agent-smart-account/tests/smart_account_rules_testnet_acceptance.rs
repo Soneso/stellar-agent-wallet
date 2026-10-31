@@ -46,7 +46,7 @@
 //!
 //! - `install_rule` invoked with `audit_writer: None` and
 //!   `self.audit_writer = Some(arc)` (the production CLI pattern) emits a
-//!   `SaContextRuleCreated` row, the rule's `SaSignerSetBaselinedV2` row and a
+//!   `SaContextRuleCreatedV2` row, the rule's `SaSignerSetBaselinedV2` row and a
 //!   `SaRawInvocation(Success)` row on the audit log via the
 //!   `self.audit_writer` fallback path.
 //! - A rule mutation authorized by the rule itself runs in the production
@@ -74,7 +74,9 @@ use common::{TESTNET_PASSPHRASE, TESTNET_RPC_URL, fund_via_friendbot};
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::{EventKind, PinsUpdateReason, SaInvocationResult};
+use stellar_agent_core::audit_log::schema::{
+    EventKind, PinsUpdateReason, SaInvocationResult, WasmHashPin,
+};
 use stellar_agent_core::audit_log::signer_set::BaselineReason;
 use stellar_agent_core::audit_log::test_helpers::{verified_audit_entries, verified_audit_lines};
 use stellar_agent_core::audit_log::writer::AuditWriter;
@@ -494,7 +496,7 @@ async fn full_metadata_only_lifecycle_on_testnet() {
 
 /// `install_rule` called with `audit_writer: None` and
 /// `self.audit_writer = Some(arc)` (the production CLI pattern) emits both a
-/// `SaContextRuleCreated` row AND a `SaRawInvocation(Success)` row on the
+/// `SaContextRuleCreatedV2` row AND a `SaRawInvocation(Success)` row on the
 /// audit log via `self.audit_writer`.
 ///
 /// # Why this matters
@@ -510,12 +512,12 @@ async fn full_metadata_only_lifecycle_on_testnet() {
 /// 1. Deploy a fresh smart-account.
 /// 2. Construct a manager with `self.audit_writer = Some(arc)`.
 /// 3. Call `install_rule` with `audit_writer: None`.
-/// 4. Assert that the audit log contains a `SaContextRuleCreated` row with
+/// 4. Assert that the audit log contains a `SaContextRuleCreatedV2` row with
 ///    the expected `rule_id` and `context_type = "default"`.
 /// 5. Assert that the audit log contains a `SaRawInvocation` row with
 ///    `wire_code = "sa.ok"` and `result = SaInvocationResult::Success`.
 /// 6. Assert that the `chain_id` field on both rows matches `CHAIN_ID`.
-/// 7. Assert that the install's rows, in order, are `SaContextRuleCreated`,
+/// 7. Assert that the install's rows, in order, are `SaContextRuleCreatedV2`,
 ///    the rule's `SaSignerSetBaselinedV2` with reason `confirmed_install`,
 ///    and the `sa.ok` `SaRawInvocation`.
 #[tokio::test(flavor = "multi_thread")]
@@ -585,13 +587,13 @@ async fn e1_install_rule_emits_audit_rows_via_self_audit_writer() {
         "audit log must contain at least one entry after install_rule; log is empty"
     );
 
-    // ── Assert SaContextRuleCreated row ────────────────────────────────────────
+    // ── Assert SaContextRuleCreatedV2 row ────────────────────────────────────────
     let rule_created_count = entries
         .iter()
         .filter(|e| {
             matches!(
                 &e.event_kind,
-                EventKind::SaContextRuleCreated {
+                EventKind::SaContextRuleCreatedV2 {
                     rule_id: rid,
                     context_type,
                     ..
@@ -601,29 +603,29 @@ async fn e1_install_rule_emits_audit_rows_via_self_audit_writer() {
         .count();
     assert_eq!(
         rule_created_count, 1,
-        "exactly one SaContextRuleCreated row with rule_id={rule_id} and \
+        "exactly one SaContextRuleCreatedV2 row with rule_id={rule_id} and \
          context_type=\"default\" must be present; found {rule_created_count}"
     );
 
-    // Verify chain_id on the SaContextRuleCreated row.
+    // Verify chain_id on the SaContextRuleCreatedV2 row.
     let entry = entries
         .iter()
         .find(|e| {
             matches!(
                 &e.event_kind,
-                EventKind::SaContextRuleCreated { rule_id: rid, .. } if *rid == rule_id
+                EventKind::SaContextRuleCreatedV2 { rule_id: rid, .. } if *rid == rule_id
             )
         })
-        .expect("install_rule must emit SaContextRuleCreated with matching rule_id");
+        .expect("install_rule must emit SaContextRuleCreatedV2 with matching rule_id");
     assert_eq!(
         entry.chain_id.as_deref(),
         Some(CHAIN_ID),
-        "SaContextRuleCreated row must carry chain_id = \"{CHAIN_ID}\"; got {:?}",
+        "SaContextRuleCreatedV2 row must carry chain_id = \"{CHAIN_ID}\"; got {:?}",
         entry.chain_id
     );
     assert_eq!(
         entry.request_id, request_id,
-        "SaContextRuleCreated row must carry the request_id used in the call"
+        "SaContextRuleCreatedV2 row must carry the request_id used in the call"
     );
 
     // ── Assert SaRawInvocation(Success) row ────────────────────────────────────
@@ -681,7 +683,7 @@ async fn e1_install_rule_emits_audit_rows_via_self_audit_writer() {
         matches!(
             install_rows.as_slice(),
             [
-                EventKind::SaContextRuleCreated { rule_id: created, .. },
+                EventKind::SaContextRuleCreatedV2 { rule_id: created, .. },
                 EventKind::SaSignerSetBaselinedV2 {
                     rule_id: baselined,
                     baseline_reason: BaselineReason::ConfirmedInstall,
@@ -879,7 +881,7 @@ async fn e2_metadata_updates_emit_typed_forensic_rows() {
 /// 1. Deploy a smart account and a simple-threshold policy.
 /// 2. Install a Default rule whose sole signer is the bootstrap signer, with
 ///    the policy at threshold 1, authorized by rule 0. The install pins the
-///    policy's Wasm hash in `SaContextRuleCreated`.
+///    policy's Wasm hash in `SaContextRuleCreatedV2`.
 /// 3. Assert the install recorded one `SaSignerSetBaselinedV2` row with reason
 ///    `confirmed_install`, which the next `list_signers` matches.
 /// 4. Rename the rule with `auth_rule_ids = [rule_id]`: the divergence check
@@ -887,7 +889,7 @@ async fn e2_metadata_updates_emit_typed_forensic_rows() {
 ///    compares the live policy hash against the pin, before signing.
 /// 5. Assert one `SaContextRuleNameUpdated` row carrying the rename's request
 ///    id and no `SaVerifierHashDrift` / `SaPolicyHashDrift` row.
-/// 6. Write a `SaContextRulePinsUpdated` row whose policy pin differs from
+/// 6. Write a `SaContextRulePinsUpdatedV2` row whose policy pin differs from
 ///    the deployed policy, rename again under `[rule_id]`, and assert the
 ///    rename is refused with `PolicyHashDrift` for the rule and one
 ///    `SaPolicyHashDrift` row carrying that rename's request id.
@@ -1024,25 +1026,26 @@ async fn e3_self_authorized_rename_through_the_production_manager_shape() {
     let (created_smart_account, created_verifier_pins, created_policy_pins) = entries
         .iter()
         .find_map(|e| match &e.event_kind {
-            EventKind::SaContextRuleCreated {
+            EventKind::SaContextRuleCreatedV2 {
                 smart_account,
                 rule_id: rid,
-                pinned_verifier_wasm_hashes_first8,
-                pinned_policy_wasm_hashes_first8,
+                pinned_verifier_wasm_hashes,
+                pinned_policy_wasm_hashes,
                 ..
             } if *rid == rule_id => Some((
                 smart_account.clone(),
-                pinned_verifier_wasm_hashes_first8.clone(),
-                pinned_policy_wasm_hashes_first8.clone(),
+                pinned_verifier_wasm_hashes.clone(),
+                pinned_policy_wasm_hashes.clone(),
             )),
             _ => None,
         })
-        .expect("install_rule must write SaContextRuleCreated for the rule");
-    // The pin is the hash's first 8 bytes, 16 hex characters.
-    let deployed_policy_first8 = policy.policy_wasm_sha256[..16].to_owned();
+        .expect("install_rule must write SaContextRuleCreatedV2 for the rule");
+    // The pin is the full hash.
+    let deployed_policy_hash =
+        WasmHashPin::parse(&policy.policy_wasm_sha256).expect("deployed hash is 64 hex");
     assert_eq!(
         created_policy_pins,
-        vec![deployed_policy_first8.clone()],
+        vec![deployed_policy_hash],
         "the install must pin the deployed policy's Wasm hash"
     );
 
@@ -1079,19 +1082,19 @@ async fn e3_self_authorized_rename_through_the_production_manager_shape() {
 
     // A pin record whose policy pin differs from the deployed policy: the
     // next rename under the rule's own authority is refused before signing.
-    let wrong_policy_first8 = "0101010101010101".to_owned();
-    assert_ne!(wrong_policy_first8, deployed_policy_first8);
+    let wrong_policy_hash = WasmHashPin::new([0x01; 32]);
+    assert_ne!(wrong_policy_hash, deployed_policy_hash);
     audit_arc
         .lock()
         .expect("audit writer lock")
-        .write_entry(AuditEntry::new_sa_context_rule_pins_updated(
+        .write_entry(AuditEntry::new_sa_context_rule_pins_updated_v2(
             created_smart_account,
             rule_id,
             PinsUpdateReason::PolicyAdded,
             CHAIN_ID,
             rid(),
             created_verifier_pins,
-            vec![wrong_policy_first8.clone()],
+            vec![wrong_policy_hash],
             false,
             false,
             vec![],
@@ -1115,13 +1118,13 @@ async fn e3_self_authorized_rename_through_the_production_manager_shape() {
     match &err {
         SaError::PolicyHashDrift {
             rule_id: drift_rule_id,
-            pinned_hash_first8,
-            observed_hash_first8,
+            pinned_hash,
+            observed_hash,
             ..
         } => {
             assert_eq!(*drift_rule_id, rule_id);
-            assert_eq!(pinned_hash_first8, &wrong_policy_first8);
-            assert_eq!(observed_hash_first8, &deployed_policy_first8);
+            assert_eq!(pinned_hash, &wrong_policy_hash);
+            assert_eq!(observed_hash.as_ref(), Some(&deployed_policy_hash));
         }
         other => panic!("expected PolicyHashDrift for rule {rule_id}; got {other:?}"),
     }
@@ -1150,7 +1153,7 @@ async fn e3_self_authorized_rename_through_the_production_manager_shape() {
             ..
         } => {
             assert_eq!(*row_rule_id, rule_id);
-            assert_eq!(pinned_hash_first8, &wrong_policy_first8);
+            assert_eq!(*pinned_hash_first8, wrong_policy_hash.first8_display());
         }
         other => panic!("expected SaPolicyHashDrift; got {other:?}"),
     }

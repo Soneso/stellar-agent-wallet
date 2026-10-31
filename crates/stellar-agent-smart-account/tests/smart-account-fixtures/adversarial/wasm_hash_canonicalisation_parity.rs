@@ -24,8 +24,8 @@
 //!    `fetch_observed_executable` path returns the `[u8; 32]` inside
 //!    `ObservedExecutable::Wasm`: no
 //!    string-encoding, no XDR re-wrapping, no normalisation. The fixture's
-//!    pinned `_first8` audit-row + matching mock-served full hash exercises
-//!    this end-to-end with no intermediate transformation.
+//!    full-hash audit row and matching mock-served hash exercise this
+//!    end-to-end with no intermediate transformation.
 //!
 //! # Why this is materially different from `verifier_wasm_drift_detection`
 //!
@@ -46,41 +46,30 @@
 //! `[u8; 32]` from `stellar_agent_network::fetch_contract_wasm_hash` (called inside
 //! `fetch_observed_executable` at
 //! `crates/stellar-agent-smart-account/src/managers/signers.rs`)
-//! through to the byte-level comparison at the audit-log first-8 boundary.
-//! The audit-log row stores `pinned_verifier_wasm_hashes_first8: Vec<String>`
-//! (first-8-hex) at `crates/stellar-agent-core/src/audit_log/schema.rs:372`;
-//! the comparison reduces both sides to first-8-hex via the same
-//! `format!("{b:02x}")` formatter. There is no normalisation function the
-//! pipeline could quietly invoke. This fixture regression-locks that
-//! property by asserting byte-identical pinned-vs-observed produces
-//! no drift.
+//! through to the comparison with the pin, which compares all 32 bytes.
+//! The audit row stores `pinned_verifier_wasm_hashes: Vec<WasmHashPin>`,
+//! whose wire form is 64 lowercase hex characters and whose parser refuses
+//! every other form. There is no normalisation function the pipeline could
+//! quietly invoke. This fixture regression-locks that property by asserting
+//! byte-identical pinned-vs-observed produces no drift.
 //!
-//! # Scope: formatter round-trip substitution
+//! # Scope: wire-form round trip
 //!
-//! There is no canonicalisation function to round-trip — the wallet's pipeline
-//! is bytes-in/bytes-out as documented above. The formatter-determinism test
-//! (`first8_hex_formatter_is_deterministic_and_idempotent`) captures the
-//! practical equivalent of an idempotence assertion: the ONLY string-shaping
-//! step in the audit-log first-8 comparison is the format-string `"{b:02x}"`,
-//! and the test asserts that step is deterministic and idempotent. A future
-//! refactor introducing a real canonicalisation step (e.g., a
-//! `normalise_wasm_hash` function) must extend this fixture with the
-//! literal round-trip assertion at that point.
+//! The only string-shaping step is the pin's wire form. The round-trip test
+//! (`wasm_hash_pin_wire_form_is_deterministic_and_round_trips`) asserts that
+//! step is deterministic, lowercase, 64 characters long and parses back to
+//! the same 32 bytes.
 //!
 //! # Scope: deploy-time path coverage
 //!
 //! This fixture exercises the re-fetch half end-to-end via
 //! `verify_pinned_verifier_against_chain` (which internally invokes
 //! `fetch_observed_executable`). The deploy-time half is modelled by writing
-//! the `SaContextRuleCreated` audit row directly with the canonical
-//! `pinned_first8` shape, bypassing the actual install-path code at
-//! `crates/stellar-agent-smart-account/src/managers/verifiers.rs:410-423`
-//! (`identify_verifier` → push to `pinned_verifier_wasm_hashes`). This is a
-//! deliberate isolation discipline: the install-path's happy direction is
-//! covered by `verifier_wasm_not_in_allowlist.rs` (refusal path) plus the
-//! install-path testnet acceptance suite. The byte-shape of the
-//! `pinned_first8` written here is faithful to what `verifiers.rs:423`
-//! produces because both sides use the same `first8_hex` formatter contract.
+//! the `SaContextRuleCreatedV2` audit row directly with the full pinned
+//! hash, bypassing the install-path code. This is a deliberate isolation
+//! discipline: the install-path's happy direction is covered by
+//! `verifier_wasm_not_in_allowlist.rs` (refusal path) plus the install-path
+//! testnet acceptance suite.
 //!
 //! # Implements
 //!
@@ -93,7 +82,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::schema::{EventKind, WasmHashPin};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_smart_account::VERIFIER_ALLOWLIST;
 use stellar_agent_smart_account::managers::signers::ObservedExecutable;
@@ -118,13 +107,6 @@ fn verifier_addr() -> ScAddress {
     ScAddress::Contract(ContractId(Hash([0x20u8; 32])))
 }
 
-/// Returns the canonical `first8` hex form of a 32-byte hash, matching the
-/// formatter used by the install path at `verifiers.rs:423` and the drift
-/// path at `verify_pinned_verifier_against_chain`.
-fn first8_hex(hash: &[u8; 32]) -> String {
-    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
-}
-
 // ── Test: byte-identical no-drift contract + idempotence ──────────────────────
 
 /// When the mock RPC returns the same wasm-hash bytes that were pinned at
@@ -140,7 +122,6 @@ fn first8_hex(hash: &[u8; 32]) -> String {
 async fn wasm_hash_canonicalisation_parity_byte_identical_no_drift_and_idempotent() {
     let verifier = verifier_addr();
     let pinned_hash = VERIFIER_ALLOWLIST[0].wasm_hash;
-    let pinned_first8 = first8_hex(&pinned_hash);
 
     // ── Step 1: Set up mock RPC returning the SAME bytes as the pinned hash ──
     let ledger_entries = build_ledger_entries_contract_instance(&verifier, pinned_hash);
@@ -154,11 +135,11 @@ async fn wasm_hash_canonicalisation_parity_byte_identical_no_drift_and_idempoten
     let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
     let manager = manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
 
-    // ── Step 2: Write SaContextRuleCreated with pinned_first8 matching mock ──
+    // ── Step 2: Write SaContextRuleCreatedV2 pinning the mock-served hash ────
     let rule_id: u32 = 1;
     let request_id = Uuid::new_v4().to_string();
 
-    let pin_entry = AuditEntry::new_sa_context_rule_created(
+    let pin_entry = AuditEntry::new_sa_context_rule_created_v2(
         ZERO_CONTRACT_REDACTED,
         rule_id,
         "default",
@@ -167,7 +148,7 @@ async fn wasm_hash_canonicalisation_parity_byte_identical_no_drift_and_idempoten
         None,
         "stellar:testnet",
         &request_id,
-        vec![pinned_first8.clone()],
+        vec![WasmHashPin::new(pinned_hash)],
         vec![],
         false,
         false,
@@ -235,38 +216,34 @@ async fn wasm_hash_canonicalisation_parity_byte_identical_no_drift_and_idempoten
     );
 }
 
-// ── Test: first8 round-trip determinism (formatter regression-lock) ───────────
+// ── Test: pin wire-form determinism (formatter regression-lock) ───────────────
 
-/// Asserts the first-8-hex formatter (`format!("{b:02x}")`) used on BOTH the
-/// install path (`verifiers.rs:423` derives `pinned_*_first8` for the audit row)
-/// AND the drift-check path (compares pinned `_first8` against
-/// `first8(fetch_observed_executable().effective_hash())`) is deterministic and idempotent.
+/// Asserts the pin's wire form, used by the audit row the install writes
+/// and the record the drift check reads, is deterministic, 64 lowercase hex
+/// characters, and parses back to the same 32 bytes.
 ///
-/// This guards against a future refactor that swaps `format!("{b:02x}")` for
-/// (say) `hex::encode_upper` or `base64` on one side but not the other —
-/// the pipeline would then report perpetual drift on byte-identical input
-/// because the string comparison would differ even though the bytes are equal.
+/// This guards against a refactor that swaps the encoding (for example to
+/// uppercase hex or base64) on one side: the reader refuses any other form,
+/// so a record written in another form does not read.
 #[test]
-fn first8_hex_formatter_is_deterministic_and_idempotent() {
+fn wasm_hash_pin_wire_form_is_deterministic_and_round_trips() {
     let h = VERIFIER_ALLOWLIST[0].wasm_hash;
 
-    let first = first8_hex(&h);
-    let second = first8_hex(&h);
+    let first = WasmHashPin::new(h).to_hex();
+    let second = WasmHashPin::new(h).to_hex();
 
     assert_eq!(
         first, second,
-        "first8 formatter must be deterministic on the same input",
+        "the wire form must be deterministic on the same input",
     );
-
-    // Format-shape invariants matching the comparators at `signers.rs:1645`
-    // and the audit-row stored shape at `verifiers.rs:423`.
-    assert_eq!(first.len(), 16, "first-8-hex must be 16 ASCII chars");
+    assert_eq!(first.len(), 64, "the wire form must be 64 ASCII chars");
     assert!(
         first
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
-        "first-8-hex must be all lowercase ASCII hex digits; got {first:?}",
+        "the wire form must be all lowercase ASCII hex digits; got {first:?}",
     );
+    assert_eq!(WasmHashPin::parse(&first).unwrap().as_bytes(), &h);
 }
 
 // ── Test: pinned bytes survive end-to-end without transformation ──────────────
@@ -293,9 +270,8 @@ async fn wasm_hash_cache_carries_bytes_unmodified_from_rpc() {
 
     let rule_id: u32 = 7;
     let request_id = Uuid::new_v4().to_string();
-    let pinned_first8 = first8_hex(&pinned_hash);
 
-    let pin_entry = AuditEntry::new_sa_context_rule_created(
+    let pin_entry = AuditEntry::new_sa_context_rule_created_v2(
         ZERO_CONTRACT_REDACTED,
         rule_id,
         "default",
@@ -304,7 +280,7 @@ async fn wasm_hash_cache_carries_bytes_unmodified_from_rpc() {
         None,
         "stellar:testnet",
         &request_id,
-        vec![pinned_first8],
+        vec![WasmHashPin::new(pinned_hash)],
         vec![],
         false,
         false,

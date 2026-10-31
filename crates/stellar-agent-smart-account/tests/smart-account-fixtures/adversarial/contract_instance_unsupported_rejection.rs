@@ -1,24 +1,20 @@
 //! Adversarial fixture: `contract_instance_unsupported_rejection`.
 //!
 //! Scenario: a verifier or policy contract's instance entry exists but does
-//! not decode as contract-instance data, its executable is not Wasm, or its
-//! executable is a CAP-85 external reference whose owner holds no live tag
-//! entry.  Such a contract has no hash the wallet can pin: the signing-time
-//! drift check could not observe a change to its code.
+//! not decode as contract-instance data, the contract has no Wasm code
+//! (no instance at the address, or a built-in executable such as the
+//! Stellar Asset Contract), or its executable is a CAP-85 external reference
+//! whose owner holds no live tag entry.  Such a contract has no hash the
+//! wallet can pin: the signing-time drift check could not observe a change
+//! to its code, and absent Wasm code never matches a pin.
 //! `pin_referenced_contracts` MUST return
 //! `SaError::ContractInstanceUnsupported` with
 //! `wire_code = "sa.contract_instance_unsupported"` whatever override flags
 //! are set, and MUST write no audit row.
 //!
-//! Where the refusal happens:
-//!
-//! - A Stellar Asset Contract instance has no Wasm hash, so identification
-//!   reports an allowlist miss; with `accept_unknown_verifier` the pin
-//!   applies the unknown-hash override and the mutability probe then
-//!   refuses, so the refused install writes no override row.
-//! - An undecodable instance and an unresolved external reference are
-//!   refused by identification itself, before either override flag is
-//!   consulted.
+//! Each refusal comes from identification, before either override flag is
+//! consulted and before the mutability probe: reason `UndecodableInstance`,
+//! `NoWasmCode` or `ExternalRefUnresolved`.
 
 use std::sync::Arc;
 
@@ -99,10 +95,10 @@ fn ledger_entries(contract: &ScAddress, entry_xdr: &str) -> serde_json::Value {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// Both instance shapes, for both contract kinds, with and without
-/// `accept_mutable_verifier`, are refused with
-/// `sa.contract_instance_unsupported` and write no audit row. The SAC
-/// instance reaches the mutability probe through the unknown-hash override;
-/// the undecodable instance is refused at identification.
+/// `accept_mutable_verifier` and with `accept_unknown_verifier`, are refused
+/// with `sa.contract_instance_unsupported` and write no audit row: the
+/// undecodable instance as `UndecodableInstance`, the SAC instance, a
+/// built-in executable with no Wasm code, as `NoWasmCode`.
 #[tokio::test]
 async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
     let contract = contract_addr();
@@ -113,7 +109,7 @@ async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
         ),
         (
             non_wasm_instance_xdr(&contract),
-            AdminOrOwnerKey::NonWasmExecutable,
+            AdminOrOwnerKey::NoWasmCode,
         ),
     ] {
         for contract_kind in [ContractKind::Verifier, ContractKind::Policy] {
@@ -167,7 +163,7 @@ async fn unpinnable_instance_rejected_regardless_of_mutable_override() {
                     None,
                     SOURCE_G,
                     accept_mutable_verifier,
-                    true, // accept_unknown_verifier: reach the mutability step
+                    true, // accept_unknown_verifier: past the allowlist decision
                     Uuid::new_v4().to_string(),
                 )
                 .await;
@@ -312,6 +308,146 @@ async fn external_ref_without_live_tag_entry_rejected_before_any_override() {
                 verified_audit_entries(&audit_writer).is_empty(),
                 "{case}: a refused pin writes no audit row"
             );
+        }
+    }
+}
+
+/// Returns the JSON-RPC method of every request `server` received.
+async fn received_methods(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).unwrap_or(serde_json::json!({}));
+            body["method"].as_str().unwrap_or_default().to_owned()
+        })
+        .collect()
+}
+
+/// A verifier or policy contract with no Wasm code, either no
+/// instance at the address or a Stellar Asset Contract instance, is refused
+/// with `ContractInstanceUnsupported { reason: NoWasmCode }` under
+/// every combination of the two override flags. The refusal comes from
+/// identification: the only RPC requests are the instance reads at the two
+/// endpoints, so no mutability probe runs and no transaction is built or
+/// simulated, no audit row is written and no pin is returned.
+#[tokio::test]
+async fn contract_without_wasm_code_is_refused_under_every_override_combination() {
+    let contract = contract_addr();
+    for (shape, entries) in [
+        (
+            "absent instance",
+            serde_json::json!({ "entries": [], "latestLedger": 1000 }),
+        ),
+        (
+            "Stellar Asset Contract",
+            ledger_entries(&contract, &non_wasm_instance_xdr(&contract)),
+        ),
+    ] {
+        for contract_kind in [ContractKind::Verifier, ContractKind::Policy] {
+            for (accept_mutable_verifier, accept_unknown_verifier) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/"))
+                    .respond_with(JsonRpcResultResponder(entries.clone()))
+                    .mount(&server)
+                    .await;
+
+                let (audit_writer, audit_log_path, _dir) = tmp_audit_writer();
+                let manager =
+                    manager_one_url(&server.uri(), Arc::clone(&audit_writer), audit_log_path);
+
+                let (signers, policies) = if contract_kind == ContractKind::Policy {
+                    (
+                        vec![ContextRuleSignerInput::Delegated {
+                            address: ScAddress::Account(stellar_xdr::AccountId(
+                                stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(
+                                    [0x11u8; 32],
+                                )),
+                            )),
+                        }],
+                        vec![ContextRulePolicy::new(contract.clone(), ScVal::Void)],
+                    )
+                } else {
+                    (
+                        vec![ContextRuleSignerInput::External {
+                            verifier: contract.clone(),
+                            pubkey_data: vec![0xbbu8; 32],
+                        }],
+                        vec![],
+                    )
+                };
+                let definition = ContextRuleDefinition::new(
+                    RuleContext::Default,
+                    "no-wasm-code".to_owned(),
+                    None,
+                    signers,
+                    policies,
+                );
+
+                let result = pin_referenced_contracts(
+                    &manager,
+                    smart_account_addr(),
+                    ZERO_CONTRACT_REDACTED,
+                    &definition,
+                    None,
+                    SOURCE_G,
+                    accept_mutable_verifier,
+                    accept_unknown_verifier,
+                    Uuid::new_v4().to_string(),
+                )
+                .await;
+
+                let case = format!(
+                    "{shape}, kind={contract_kind}, \
+                     accept_mutable_verifier={accept_mutable_verifier}, \
+                     accept_unknown_verifier={accept_unknown_verifier}"
+                );
+                let error = result.expect_err(&case);
+                assert_eq!(
+                    error.wire_code(),
+                    "sa.contract_instance_unsupported",
+                    "{case}: {error:?}"
+                );
+                assert!(
+                    matches!(
+                        &error,
+                        SaError::ContractInstanceUnsupported {
+                            rule_id: None,
+                            contract_kind: actual_kind,
+                            reason: AdminOrOwnerKey::NoWasmCode,
+                            ..
+                        } if *actual_kind == contract_kind
+                    ),
+                    "{case}: {error:?}"
+                );
+                assert!(
+                    error.to_string().contains("no Wasm code"),
+                    "{case}: {error}"
+                );
+                assert_eq!(
+                    serde_json::to_value(&error).unwrap()["context"]["reason"],
+                    "NoWasmCode",
+                    "{case}"
+                );
+
+                // Identification reads the instance once at each endpoint;
+                // the manager's two endpoints share this server.
+                assert_eq!(
+                    received_methods(&server).await,
+                    ["getLedgerEntries", "getLedgerEntries"],
+                    "{case}: only the identification reads run before the refusal"
+                );
+                assert!(
+                    verified_audit_entries(&audit_writer).is_empty(),
+                    "{case}: a refused pin writes no audit row"
+                );
+            }
         }
     }
 }

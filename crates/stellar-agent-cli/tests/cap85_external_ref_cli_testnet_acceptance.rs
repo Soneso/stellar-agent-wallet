@@ -554,8 +554,13 @@ async fn rules_create_pins_the_reference_and_verify_pins_reports_the_repoint() {
     );
     assert_eq!(pinned[0]["tag"].as_str(), Some(TAG));
     assert_eq!(
-        pinned[0]["resolved_hash_first8"].as_str(),
-        Some(hex::encode(&ed25519_hash[..8]).as_str())
+        pinned[0]["resolved_hash"].as_str(),
+        Some(hex::encode(ed25519_hash).as_str())
+    );
+    assert_eq!(
+        envelope["data"]["pinned_verifier_wasm_hashes"],
+        serde_json::json!([hex::encode(ed25519_hash)]),
+        "the full verifier pin: {envelope}"
     );
     assert_eq!(
         pinned[0]["owner_redacted"].as_str(),

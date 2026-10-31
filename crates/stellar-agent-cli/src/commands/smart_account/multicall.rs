@@ -46,7 +46,9 @@
 //! pin record too. A deadline that elapses during the baseline read or the
 //! comparison refuses with `sa.auth_entry_construction_failed` at stage
 //! `baseline_read` or `signer_set_compare`; during the pin check, with
-//! `sa.pin_check_unavailable`. Refusals render as `sa.multicall_failed`. Most
+//! `sa.pin_check_unavailable`; a rule whose pin record holds eight-byte hash
+//! prefixes refuses with `sa.wasm_pin_incomplete`. Refusals render as
+//! `sa.multicall_failed`. Most
 //! refusals render at phase `policy_gate`; a `sa.deployment_failed` keeps its
 //! `simulate` or `submit` phase. A version 1 authorizing rule with a contract
 //! delegate cannot form its projection and refuses at phase `simulate`. A

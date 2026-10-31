@@ -76,54 +76,50 @@ use sha2::{Digest as _, Sha256};
 use super::{
     chain::{ZERO_BLOCK_HASH, compute_entry_hash},
     entry::AuditEntry,
-    schema::{EventKind, ExecutableRefPin, ValueLegRecord},
+    schema::{EventKind, ExecutableRefPin, ExecutableRefPinFirst8, ValueLegRecord, WasmHashPin},
     signer_set::{ObservedSignerSet, SignerSetSnapshotV2, SignerSetView, SignerSetViewPayload},
     verify::VerifyError,
     writer::{AuditWriter, is_rotated_sibling, wait_out_transient_rotation_window},
 };
 
-/// Pinned wasm-hash record for one rule, extracted from the newest
-/// `SaContextRuleCreated` or `SaContextRulePinsUpdated` audit row for it.
+/// The complete pin record of one rule: every pinned verifier and policy
+/// hash in full, the executable-reference pins aligned with them, and the
+/// override flags.
 ///
-/// Carries first-8-hex projections of the pinned wasm hashes, recorded at
-/// rule install and rewritten when a wallet mutation changes the rule's live
-/// verifier set, plus the override flags so `smart-account rules verify-pins`
-/// output can convey whether a pin was established under an opt-in override.
+/// Read from the rule's newest pin row when that row is a version-2 row
+/// (`SaContextRuleCreatedV2`, `SaContextRulePinsUpdatedV2`), or a version-1
+/// row that pins no hash. The signing-time drift check compares a live
+/// executable with these hashes in all 32 bytes.
 ///
-/// # Backward-compatibility
+/// # Invariants
 ///
-/// Override fields use `#[serde(default)]` on the schema side, so reading an
-/// audit row that predates their addition yields `mutable_override = false` /
-/// `unknown_override = false` — the conservative safe default.
-#[derive(Clone, Debug, Default)]
+/// An executable-reference list is empty or has the length of its hash
+/// list, and each `Some` entry's resolved hash equals the aligned hash; the
+/// reader refuses a row that breaks either as a parse error.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PinnedHashesRecord {
-    /// First-8-hex of each pinned verifier wasm hash. Empty when no `External`
-    /// signers were present, or for audit rows that predate verifier pinning.
-    pub pinned_verifier_first8: Vec<String>,
-    /// First-8-hex of each pinned policy wasm hash. Empty when no policies
-    /// were present, or for audit rows that predate policy pinning.
-    pub pinned_policy_first8: Vec<String>,
-    /// `true` if `--accept-mutable-verifier` was set at install time.
-    /// Rows that predate this field deserialise as `false`.
+    /// Full hash of each pinned verifier. Empty when the rule pins no
+    /// verifier.
+    pub pinned_verifier_hashes: Vec<WasmHashPin>,
+    /// Full hash of each pinned policy. Empty when the rule pins no policy.
+    pub pinned_policy_hashes: Vec<WasmHashPin>,
+    /// `true` if `--accept-mutable-verifier` admitted a pinned contract.
     pub mutable_override: bool,
-    /// `true` if `--accept-unknown-verifier` was set at install time.
-    /// Rows that predate this field deserialise as `false`.
+    /// `true` if `--accept-unknown-verifier` admitted a pinned contract.
     pub unknown_override: bool,
     /// Executable-reference pins aligned by position with
-    /// `pinned_verifier_first8`, or empty when no pinned verifier is an
-    /// external reference. A non-empty list has the length of
-    /// `pinned_verifier_first8`, and each `Some` entry's resolved first-8
-    /// equals the aligned first-8 entry.
+    /// `pinned_verifier_hashes`, or empty when no pinned verifier is an
+    /// external reference.
     pub pinned_verifier_executable_refs: Vec<Option<ExecutableRefPin>>,
     /// Executable-reference pins aligned by position with
-    /// `pinned_policy_first8`, with the same invariants as
+    /// `pinned_policy_hashes`, with the same invariants as
     /// `pinned_verifier_executable_refs`.
     pub pinned_policy_executable_refs: Vec<Option<ExecutableRefPin>>,
 }
 
 impl PinnedHashesRecord {
     /// Returns the executable-reference pin recorded for the verifier at
-    /// `position` in `pinned_verifier_first8`, or `None` when that verifier
+    /// `position` in `pinned_verifier_hashes`, or `None` when that verifier
     /// was pinned by its Wasm hash.
     #[must_use]
     pub fn verifier_executable_ref(&self, position: usize) -> Option<&ExecutableRefPin> {
@@ -133,7 +129,7 @@ impl PinnedHashesRecord {
     }
 
     /// Returns the executable-reference pin recorded for the policy at
-    /// `position` in `pinned_policy_first8`, or `None` when that policy was
+    /// `position` in `pinned_policy_hashes`, or `None` when that policy was
     /// pinned by its Wasm hash.
     #[must_use]
     pub fn policy_executable_ref(&self, position: usize) -> Option<&ExecutableRefPin> {
@@ -143,23 +139,75 @@ impl PinnedHashesRecord {
     }
 }
 
-/// The pin fields of one `SaContextRuleCreated` or `SaContextRulePinsUpdated`
-/// row.
+/// The inspection-only form of a version-1 pin record that holds at least
+/// one hash: each pinned hash is known by its first eight bytes only.
+///
+/// The missing 24 bytes of each hash cannot be recovered from the chain or
+/// from the allowlist, so no signature is made against this record; the
+/// signing-time check refuses the rule until it is reinstalled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IncompletePinRecord {
+    /// Wire tag of the row that carries the record.
+    pub row_kind: &'static str,
+    /// First eight bytes of each pinned verifier hash, as 16 hex characters.
+    pub pinned_verifier_hashes_first8: Vec<String>,
+    /// First eight bytes of each pinned policy hash, as 16 hex characters.
+    pub pinned_policy_hashes_first8: Vec<String>,
+    /// The row's mutable-contract override flag.
+    pub mutable_override: bool,
+    /// The row's unknown-hash override flag.
+    pub unknown_override: bool,
+    /// The row's verifier executable-reference pins, aligned with
+    /// `pinned_verifier_hashes_first8` or empty.
+    pub pinned_verifier_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
+    /// The row's policy executable-reference pins, aligned with
+    /// `pinned_policy_hashes_first8` or empty.
+    pub pinned_policy_executable_refs: Vec<Option<ExecutableRefPinFirst8>>,
+}
+
+/// The pin record of one rule, as its newest pin row records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ContextRulePinRecord {
+    /// Every pinned hash is known in full.
+    Complete(PinnedHashesRecord),
+    /// The newest pin row is a version-1 row that pins at least one hash by
+    /// its first eight bytes only.
+    Incomplete(IncompletePinRecord),
+}
+
+/// The pin lists of one pin row, in the row's version.
+enum PinRowLists<'a> {
+    /// A version-1 row: first-8 projections.
+    First8 {
+        verifier: &'a [String],
+        policy: &'a [String],
+        verifier_refs: &'a [Option<ExecutableRefPinFirst8>],
+        policy_refs: &'a [Option<ExecutableRefPinFirst8>],
+    },
+    /// A version-2 row: full hashes.
+    Full {
+        verifier: &'a [WasmHashPin],
+        policy: &'a [WasmHashPin],
+        verifier_refs: &'a [Option<ExecutableRefPin>],
+        policy_refs: &'a [Option<ExecutableRefPin>],
+    },
+}
+
+/// The pin fields of one `SaContextRuleCreated`, `SaContextRuleCreatedV2`,
+/// `SaContextRulePinsUpdated` or `SaContextRulePinsUpdatedV2` row.
 struct PinRow<'a> {
     rule_id: u32,
     smart_account: &'a str,
     /// Wire tag of the row kind, named in parse-error details.
     row_kind: &'static str,
-    pinned_verifier_first8: &'a [String],
-    pinned_policy_first8: &'a [String],
     mutable_override: bool,
     unknown_override: bool,
-    pinned_verifier_executable_refs: &'a [Option<ExecutableRefPin>],
-    pinned_policy_executable_refs: &'a [Option<ExecutableRefPin>],
+    lists: PinRowLists<'a>,
 }
 
 impl<'a> PinRow<'a> {
-    /// Returns the pin fields of `event_kind` when it is one of the two row
+    /// Returns the pin fields of `event_kind` when it is one of the four row
     /// kinds that carry a rule's pin record, `None` for every other kind.
     fn from_event_kind(event_kind: &'a EventKind) -> Option<Self> {
         match event_kind {
@@ -177,12 +225,14 @@ impl<'a> PinRow<'a> {
                 rule_id: *rule_id,
                 smart_account,
                 row_kind: "sa_context_rule_created",
-                pinned_verifier_first8: pinned_verifier_wasm_hashes_first8,
-                pinned_policy_first8: pinned_policy_wasm_hashes_first8,
                 mutable_override: *mutable_override,
                 unknown_override: *unknown_override,
-                pinned_verifier_executable_refs,
-                pinned_policy_executable_refs,
+                lists: PinRowLists::First8 {
+                    verifier: pinned_verifier_wasm_hashes_first8,
+                    policy: pinned_policy_wasm_hashes_first8,
+                    verifier_refs: pinned_verifier_executable_refs,
+                    policy_refs: pinned_policy_executable_refs,
+                },
             }),
             EventKind::SaContextRulePinsUpdated {
                 rule_id,
@@ -198,110 +248,207 @@ impl<'a> PinRow<'a> {
                 rule_id: *rule_id,
                 smart_account,
                 row_kind: "sa_context_rule_pins_updated",
-                pinned_verifier_first8: pinned_verifier_wasm_hashes_first8,
-                pinned_policy_first8: pinned_policy_wasm_hashes_first8,
                 mutable_override: *mutable_override,
                 unknown_override: *unknown_override,
+                lists: PinRowLists::First8 {
+                    verifier: pinned_verifier_wasm_hashes_first8,
+                    policy: pinned_policy_wasm_hashes_first8,
+                    verifier_refs: pinned_verifier_executable_refs,
+                    policy_refs: pinned_policy_executable_refs,
+                },
+            }),
+            EventKind::SaContextRuleCreatedV2 {
+                rule_id,
+                smart_account,
+                pinned_verifier_wasm_hashes,
+                pinned_policy_wasm_hashes,
+                mutable_override,
+                unknown_override,
                 pinned_verifier_executable_refs,
                 pinned_policy_executable_refs,
+                ..
+            } => Some(Self {
+                rule_id: *rule_id,
+                smart_account,
+                row_kind: "sa_context_rule_created_v2",
+                mutable_override: *mutable_override,
+                unknown_override: *unknown_override,
+                lists: PinRowLists::Full {
+                    verifier: pinned_verifier_wasm_hashes,
+                    policy: pinned_policy_wasm_hashes,
+                    verifier_refs: pinned_verifier_executable_refs,
+                    policy_refs: pinned_policy_executable_refs,
+                },
+            }),
+            EventKind::SaContextRulePinsUpdatedV2 {
+                rule_id,
+                smart_account,
+                pinned_verifier_wasm_hashes,
+                pinned_policy_wasm_hashes,
+                mutable_override,
+                unknown_override,
+                pinned_verifier_executable_refs,
+                pinned_policy_executable_refs,
+                ..
+            } => Some(Self {
+                rule_id: *rule_id,
+                smart_account,
+                row_kind: "sa_context_rule_pins_updated_v2",
+                mutable_override: *mutable_override,
+                unknown_override: *unknown_override,
+                lists: PinRowLists::Full {
+                    verifier: pinned_verifier_wasm_hashes,
+                    policy: pinned_policy_wasm_hashes,
+                    verifier_refs: pinned_verifier_executable_refs,
+                    policy_refs: pinned_policy_executable_refs,
+                },
             }),
             _ => None,
         }
     }
 
-    /// Builds the [`PinnedHashesRecord`] this row carries; see
-    /// [`pinned_hashes_record_from_row`].
-    fn record(&self, line: usize) -> Result<PinnedHashesRecord, AuditLogIntegrityError> {
-        pinned_hashes_record_from_row(
-            line,
-            self.row_kind,
-            self.pinned_verifier_first8,
-            self.pinned_policy_first8,
-            self.mutable_override,
-            self.unknown_override,
-            self.pinned_verifier_executable_refs,
-            self.pinned_policy_executable_refs,
-        )
+    /// Builds the [`ContextRulePinRecord`] this row carries, refusing a
+    /// record the wallet never writes.
+    ///
+    /// An executable-reference list must be empty or aligned with its hash
+    /// list, and every pin must have the shape its constructor produces. In
+    /// a version-2 row every pin's resolved hash must equal the aligned hash
+    /// in all 32 bytes; in a version-1 row its first-8 must equal the
+    /// aligned first-8. The signing-time drift check reads the pin at the
+    /// position it checks, so a misaligned or inconsistent record could pair
+    /// a hash with the wrong reference; it is refused as a parse error at
+    /// `line` naming the row kind.
+    ///
+    /// A version-1 row that pins a hash is [`ContextRulePinRecord::Incomplete`];
+    /// one that pins none carries no truncated value and is complete.
+    fn record(&self, line: usize) -> Result<ContextRulePinRecord, AuditLogIntegrityError> {
+        match self.lists {
+            PinRowLists::Full {
+                verifier,
+                policy,
+                verifier_refs,
+                policy_refs,
+            } => {
+                for (kind, hashes, refs) in [
+                    ("verifier", verifier, verifier_refs),
+                    ("policy", policy, policy_refs),
+                ] {
+                    self.check_alignment(line, kind, hashes.len(), refs.len())?;
+                    for (position, pin) in refs.iter().enumerate() {
+                        let Some(pin) = pin else { continue };
+                        self.check_pin(
+                            line,
+                            kind,
+                            position,
+                            pin.is_well_formed(),
+                            hashes.get(position) == Some(&pin.resolved_hash),
+                        )?;
+                    }
+                }
+                Ok(ContextRulePinRecord::Complete(PinnedHashesRecord {
+                    pinned_verifier_hashes: verifier.to_vec(),
+                    pinned_policy_hashes: policy.to_vec(),
+                    mutable_override: self.mutable_override,
+                    unknown_override: self.unknown_override,
+                    pinned_verifier_executable_refs: verifier_refs.to_vec(),
+                    pinned_policy_executable_refs: policy_refs.to_vec(),
+                }))
+            }
+            PinRowLists::First8 {
+                verifier,
+                policy,
+                verifier_refs,
+                policy_refs,
+            } => {
+                for (kind, first8, refs) in [
+                    ("verifier", verifier, verifier_refs),
+                    ("policy", policy, policy_refs),
+                ] {
+                    self.check_alignment(line, kind, first8.len(), refs.len())?;
+                    for (position, pin) in refs.iter().enumerate() {
+                        let Some(pin) = pin else { continue };
+                        self.check_pin(
+                            line,
+                            kind,
+                            position,
+                            pin.is_well_formed(),
+                            first8.get(position) == Some(&pin.resolved_hash_first8),
+                        )?;
+                    }
+                }
+                if verifier.is_empty() && policy.is_empty() {
+                    return Ok(ContextRulePinRecord::Complete(PinnedHashesRecord {
+                        mutable_override: self.mutable_override,
+                        unknown_override: self.unknown_override,
+                        ..PinnedHashesRecord::default()
+                    }));
+                }
+                Ok(ContextRulePinRecord::Incomplete(IncompletePinRecord {
+                    row_kind: self.row_kind,
+                    pinned_verifier_hashes_first8: verifier.to_vec(),
+                    pinned_policy_hashes_first8: policy.to_vec(),
+                    mutable_override: self.mutable_override,
+                    unknown_override: self.unknown_override,
+                    pinned_verifier_executable_refs: verifier_refs.to_vec(),
+                    pinned_policy_executable_refs: policy_refs.to_vec(),
+                }))
+            }
+        }
     }
-}
 
-/// Builds a [`PinnedHashesRecord`] from the pin fields of one
-/// `SaContextRuleCreated` or `SaContextRulePinsUpdated` row, refusing a
-/// record the wallet never writes.
-///
-/// An executable-reference list must be empty or aligned with its first-8
-/// list, every pin must have the shape [`ExecutableRefPin::new`] produces,
-/// and every pin's resolved first-8 must equal the aligned first-8 entry. The
-/// signing-time drift check reads the pin at the position it checks, so a
-/// misaligned or inconsistent record could pair a hash with the wrong
-/// reference; it is refused as a parse error at `line` naming `row_kind`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the pin fields of one row, validated together"
-)]
-fn pinned_hashes_record_from_row(
-    line: usize,
-    row_kind: &str,
-    pinned_verifier_first8: &[String],
-    pinned_policy_first8: &[String],
-    mutable_override: bool,
-    unknown_override: bool,
-    pinned_verifier_executable_refs: &[Option<ExecutableRefPin>],
-    pinned_policy_executable_refs: &[Option<ExecutableRefPin>],
-) -> Result<PinnedHashesRecord, AuditLogIntegrityError> {
-    for (kind, first8, refs) in [
-        (
-            "verifier",
-            pinned_verifier_first8,
-            pinned_verifier_executable_refs,
-        ),
-        (
-            "policy",
-            pinned_policy_first8,
-            pinned_policy_executable_refs,
-        ),
-    ] {
-        if !refs.is_empty() && refs.len() != first8.len() {
+    /// Refuses a non-empty reference list whose length differs from its
+    /// hash list's.
+    fn check_alignment(
+        &self,
+        line: usize,
+        kind: &str,
+        hashes: usize,
+        refs: usize,
+    ) -> Result<(), AuditLogIntegrityError> {
+        if refs != 0 && refs != hashes {
             return Err(AuditLogIntegrityError::ParseError {
                 line,
                 detail: format!(
-                    "{row_kind}: {} {kind} executable-reference pins for {} \
-                     pinned {kind} hashes",
-                    refs.len(),
-                    first8.len()
+                    "{}: {refs} {kind} executable-reference pins for {hashes} pinned {kind} \
+                     hashes",
+                    self.row_kind
                 ),
             });
         }
-        for (position, pin) in refs.iter().enumerate() {
-            let Some(pin) = pin else { continue };
-            if !pin.is_well_formed() {
-                return Err(AuditLogIntegrityError::ParseError {
-                    line,
-                    detail: format!(
-                        "{row_kind}: malformed {kind} executable-reference pin \
-                         at position {position}"
-                    ),
-                });
-            }
-            if first8.get(position) != Some(&pin.resolved_hash_first8) {
-                return Err(AuditLogIntegrityError::ParseError {
-                    line,
-                    detail: format!(
-                        "{row_kind}: {kind} executable-reference pin at position \
-                         {position} does not match the pinned {kind} hash"
-                    ),
-                });
-            }
-        }
+        Ok(())
     }
-    Ok(PinnedHashesRecord {
-        pinned_verifier_first8: pinned_verifier_first8.to_vec(),
-        pinned_policy_first8: pinned_policy_first8.to_vec(),
-        mutable_override,
-        unknown_override,
-        pinned_verifier_executable_refs: pinned_verifier_executable_refs.to_vec(),
-        pinned_policy_executable_refs: pinned_policy_executable_refs.to_vec(),
-    })
+
+    /// Refuses a malformed reference pin, or one whose resolved hash differs
+    /// from the aligned hash.
+    fn check_pin(
+        &self,
+        line: usize,
+        kind: &str,
+        position: usize,
+        well_formed: bool,
+        matches_aligned_hash: bool,
+    ) -> Result<(), AuditLogIntegrityError> {
+        if !well_formed {
+            return Err(AuditLogIntegrityError::ParseError {
+                line,
+                detail: format!(
+                    "{}: malformed {kind} executable-reference pin at position {position}",
+                    self.row_kind
+                ),
+            });
+        }
+        if !matches_aligned_hash {
+            return Err(AuditLogIntegrityError::ParseError {
+                line,
+                detail: format!(
+                    "{}: {kind} executable-reference pin at position {position} does not match \
+                     the pinned {kind} hash",
+                    self.row_kind
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Re-export of [`VerifyError`] under a reader-oriented name.
@@ -569,24 +716,25 @@ impl AuditReader {
     }
 
     /// Scans the rotated chain for the rule's pin record: the most-recent
-    /// `SaContextRuleCreated` or `SaContextRulePinsUpdated` row matching
-    /// `(rule_id, smart_account_redacted)`, and returns its pinned verifier and
-    /// policy wasm-hash first-8 hex strings.
+    /// pin row matching `(rule_id, smart_account_redacted)`, of either
+    /// version (`SaContextRuleCreated`, `SaContextRulePinsUpdated`,
+    /// `SaContextRuleCreatedV2`, `SaContextRulePinsUpdatedV2`).
     ///
     /// Used by `managers::verifiers::verify_pinned_verifier_against_chain` and
     /// `verify_pinned_policy_against_chain` to derive the audit-log-expected hash
-    /// at signing time. A log that predates `SaContextRulePinsUpdated` reads
-    /// its newest `SaContextRuleCreated` row.
+    /// at signing time. Only the newest matching row is the record: an
+    /// incomplete newest row is returned as such and never replaced by an
+    /// older row.
     ///
     /// # Returns
     ///
-    /// - `Ok(Some(record))`: the most-recent pin-record row for the given
-    ///   `(rule_id, smart_account_redacted)` pair was found; the record carries
-    ///   the first-8-hex strings of the pinned verifier and policy wasm hashes.
-    ///   Either or both may be empty if the rule had no `External` signers / no
-    ///   policies, or if the rule was installed before pinning was added
-    ///   (`#[serde(default)]` yields empty vecs on earlier entries).
-    /// - `Ok(None)`: no matching row of either kind found. Callers treat this
+    /// - `Ok(Some(ContextRulePinRecord::Complete(record)))`: the newest pin
+    ///   row is a version-2 row, or a version-1 row that pins no hash; the
+    ///   record carries every pinned hash in full. Either list may be empty.
+    /// - `Ok(Some(ContextRulePinRecord::Incomplete(record)))`: the newest pin
+    ///   row is a version-1 row that pins at least one hash by its first
+    ///   eight bytes.
+    /// - `Ok(None)`: no matching row of any pin kind found. Callers treat this
     ///   as "no pin recorded" and may skip drift-detection.
     ///
     /// # Integrity contract
@@ -603,7 +751,7 @@ impl AuditReader {
         &self,
         rule_id: u32,
         smart_account_redacted: &str,
-    ) -> Result<Option<PinnedHashesRecord>, AuditLogIntegrityError> {
+    ) -> Result<Option<ContextRulePinRecord>, AuditLogIntegrityError> {
         let writer_guard = self.writer.lock().map_err(|_| {
             AuditLogIntegrityError::Io(std::io::Error::other(
                 "audit-log writer mutex is poisoned; a prior write path panicked \
@@ -617,7 +765,7 @@ impl AuditReader {
         let files_newest_first = collect_files_newest_first(&log_path)?;
         let has_rotated_siblings = files_newest_first.len() > 1;
 
-        let mut best: Option<PinnedHashesRecord> = None;
+        let mut best: Option<ContextRulePinRecord> = None;
 
         for path in &files_newest_first {
             if !path.exists() {
@@ -666,9 +814,9 @@ impl AuditReader {
         Ok(best)
     }
 
-    /// Scans the full rotated chain and returns ALL pin records
-    /// (`SaContextRuleCreated` and `SaContextRulePinsUpdated` rows),
-    /// deduplicated to the most-recent row per `(rule_id, smart_account_redacted)`.
+    /// Scans the full rotated chain and returns ALL pin records (the pin rows
+    /// of both versions), deduplicated to the most-recent row per
+    /// `(rule_id, smart_account_redacted)`.
     ///
     /// Used by the startup advisory to identify every context rule referencing
     /// a revoked or retired verifier wasm hash. Unlike
@@ -685,7 +833,7 @@ impl AuditReader {
     ///
     /// # Returns
     ///
-    /// A `Vec` of `(rule_id, smart_account_redacted, PinnedHashesRecord)` tuples,
+    /// A `Vec` of `(rule_id, smart_account_redacted, ContextRulePinRecord)` tuples,
     /// deduplicated to the most-recent row per `(rule_id, smart_account)` — the
     /// newest file wins on conflict — and sorted by `(rule_id, smart_account)`
     /// ascending for deterministic output. Empty when the log is absent or
@@ -698,7 +846,7 @@ impl AuditReader {
     /// `ParseError`, `Io`.
     pub fn scan_all_context_rule_pin_records(
         &self,
-    ) -> Result<Vec<(u32, String, PinnedHashesRecord)>, AuditLogIntegrityError> {
+    ) -> Result<Vec<(u32, String, ContextRulePinRecord)>, AuditLogIntegrityError> {
         let writer_guard = self.writer.lock().map_err(|_| {
             AuditLogIntegrityError::Io(std::io::Error::other(
                 "audit-log writer mutex is poisoned; a prior write path panicked \
@@ -716,7 +864,7 @@ impl AuditReader {
         // Files are scanned newest-first; within each file entries are collected
         // in read order (oldest-to-newest). Use a HashMap to deduplicate to the
         // most-recent row per (rule_id, smart_account) key.
-        let mut latest: std::collections::HashMap<(u32, String), PinnedHashesRecord> =
+        let mut latest: std::collections::HashMap<(u32, String), ContextRulePinRecord> =
             std::collections::HashMap::new();
 
         for path in &files_newest_first {
@@ -749,7 +897,7 @@ impl AuditReader {
                 None
             };
 
-            let mut this_file: std::collections::HashMap<(u32, String), PinnedHashesRecord> =
+            let mut this_file: std::collections::HashMap<(u32, String), ContextRulePinRecord> =
                 std::collections::HashMap::new();
             scan_file_for_all_pin_records(path, hmac_key, expected_first_row_prev, &mut this_file)?;
             // Files are scanned newest-first; keep the first-seen (newest) row
@@ -760,7 +908,7 @@ impl AuditReader {
         }
 
         // Collect into a stable-ordered Vec (rule_id ascending for deterministic output).
-        let mut result: Vec<(u32, String, PinnedHashesRecord)> = latest
+        let mut result: Vec<(u32, String, ContextRulePinRecord)> = latest
             .into_iter()
             .map(|((rid, sa), rec)| (rid, sa, rec))
             .collect();
@@ -771,8 +919,9 @@ impl AuditReader {
     /// Returns the set of context-rule IDs that the local audit log records as
     /// installed on `sa_address_redacted` but NOT subsequently deleted.
     ///
-    /// Scans the full rotated chain for all `SaContextRuleCreated` rows whose
-    /// `smart_account` field matches `sa_address_redacted`, then subtracts any
+    /// Scans the full rotated chain for all `SaContextRuleCreated` and
+    /// `SaContextRuleCreatedV2` rows whose `smart_account` field matches
+    /// `sa_address_redacted`, then subtracts any
     /// `rule_id` that also has a matching `SaContextRuleDeleted` row for the
     /// same address. The result is the audit-log's best view of "live" rule IDs
     /// on this smart account.
@@ -1408,8 +1557,8 @@ fn open_regular_file(path: &Path) -> Result<std::fs::File, AuditLogIntegrityErro
     std::fs::File::open(path).map_err(AuditLogIntegrityError::Io)
 }
 
-/// Scans a single log file for the most-recent `SaContextRuleCreated` or
-/// `SaContextRulePinsUpdated` row matching `(rule_id, smart_account_redacted)`.
+/// Scans a single log file for the most-recent pin row of either version
+/// matching `(rule_id, smart_account_redacted)`.
 ///
 /// Mirrors `scan_file_for_signer_set` structurally: reads all entries with full
 /// hash-chain integrity verification, then returns the pin record of the LAST
@@ -1423,22 +1572,22 @@ fn open_regular_file(path: &Path) -> Result<std::fs::File, AuditLogIntegrityErro
 ///
 /// # Return
 ///
-/// `Ok(Some(PinnedHashesRecord))` on match;
-/// `Ok(None)` if no row of either kind matches the filter.
+/// `Ok(Some(ContextRulePinRecord))` on match;
+/// `Ok(None)` if no pin row matches the filter.
 fn scan_file_for_context_rule_pins(
     path: &Path,
     rule_id: u32,
     smart_account_redacted: &str,
     hmac_key: Option<&[u8; 32]>,
     expected_first_row_prev: Option<&str>,
-) -> Result<Option<PinnedHashesRecord>, AuditLogIntegrityError> {
+) -> Result<Option<ContextRulePinRecord>, AuditLogIntegrityError> {
     use super::chain::verify_chain_root;
     use super::writer::hmac_sidecar_path;
 
     let file = open_regular_file(path)?;
     let reader = BufReader::new(file);
 
-    let mut best: Option<PinnedHashesRecord> = None;
+    let mut best: Option<ContextRulePinRecord> = None;
     let mut is_first_entry = true;
     let mut prev_computed_hash: Option<String> = None;
 
@@ -1547,8 +1696,8 @@ fn scan_file_for_context_rule_pins(
 }
 
 /// Scans a single log file and inserts/updates `(rule_id, smart_account_redacted)`
-/// → [`PinnedHashesRecord`] entries in `out` for every `SaContextRuleCreated`
-/// and `SaContextRulePinsUpdated` row found.
+/// → [`ContextRulePinRecord`] entries in `out` for every pin row of either
+/// version found.
 ///
 /// Mirrors `scan_file_for_context_rule_pins` structurally but collects ALL
 /// pin-record rows instead of filtering by `(rule_id, smart_account)`.
@@ -1565,7 +1714,7 @@ fn scan_file_for_all_pin_records(
     path: &Path,
     hmac_key: Option<&[u8; 32]>,
     expected_first_row_prev: Option<&str>,
-    out: &mut std::collections::HashMap<(u32, String), PinnedHashesRecord>,
+    out: &mut std::collections::HashMap<(u32, String), ContextRulePinRecord>,
 ) -> Result<(), AuditLogIntegrityError> {
     use super::chain::verify_chain_root;
     use super::writer::hmac_sidecar_path;
@@ -1680,8 +1829,9 @@ fn scan_file_for_all_pin_records(
     Ok(())
 }
 
-/// Scans a single log file for `SaContextRuleCreated` and `SaContextRuleDeleted`
-/// rows matching `sa_address_redacted`, inserting rule IDs into the provided
+/// Scans a single log file for `SaContextRuleCreated`, `SaContextRuleCreatedV2`
+/// and `SaContextRuleDeleted` rows matching `sa_address_redacted`, inserting
+/// rule IDs into the provided
 /// `created_ids` and `deleted_ids` sets.
 ///
 /// Used by [`AuditReader::find_installed_context_rule_ids`] to determine which
@@ -1801,8 +1951,14 @@ fn scan_file_for_context_rule_lifecycle(
         })?;
         prev_computed_hash = Some(current_hash);
 
-        // Collect SaContextRuleCreated rows for the target smart account.
+        // Collect the creation rows of both versions for the target smart
+        // account.
         if let EventKind::SaContextRuleCreated {
+            rule_id: rid,
+            smart_account: sa,
+            ..
+        }
+        | EventKind::SaContextRuleCreatedV2 {
             rule_id: rid,
             smart_account: sa,
             ..
@@ -3437,29 +3593,101 @@ mod tests {
         }
     }
 
-    // ── Helper: build a SaContextRuleCreated EventKind ───────────────────────
+    // ── Helpers: build pin rows of both versions ─────────────────────────────
+
+    /// A full pin whose 32 bytes all equal `byte`.
+    fn h(byte: u8) -> WasmHashPin {
+        WasmHashPin::new([byte; 32])
+    }
+
+    /// The pinned hash of the pin-width tests and a hash sharing its first
+    /// eight bytes that differs in every later byte.
+    fn pinned_and_twin() -> ([u8; 32], [u8; 32]) {
+        let pinned = [0x42u8; 32];
+        let mut twin = pinned;
+        twin[8..].fill(0x43);
+        (pinned, twin)
+    }
 
     fn context_rule_created_event(
         rule_id: u32,
         sa_redacted: &str,
-        verifier_hashes: Vec<String>,
-        policy_hashes: Vec<String>,
+        verifier_hashes: Vec<WasmHashPin>,
+        policy_hashes: Vec<WasmHashPin>,
         mutable_override: bool,
         unknown_override: bool,
     ) -> EventKind {
-        EventKind::SaContextRuleCreated {
+        EventKind::SaContextRuleCreatedV2 {
             smart_account: sa_redacted.to_owned(),
             rule_id,
             context_type: "default".to_owned(),
             signers_count: 1,
             policies_count: policy_hashes.len() as u32,
             valid_until: None,
-            pinned_verifier_wasm_hashes_first8: verifier_hashes,
-            pinned_policy_wasm_hashes_first8: policy_hashes,
+            pinned_verifier_wasm_hashes: verifier_hashes,
+            pinned_policy_wasm_hashes: policy_hashes,
             mutable_override,
             unknown_override,
             pinned_verifier_executable_refs: vec![],
             pinned_policy_executable_refs: vec![],
+        }
+    }
+
+    fn v1_created_event(
+        rule_id: u32,
+        sa_redacted: &str,
+        verifier_first8: Vec<String>,
+        policy_first8: Vec<String>,
+        verifier_refs: Vec<Option<ExecutableRefPinFirst8>>,
+    ) -> EventKind {
+        EventKind::SaContextRuleCreated {
+            smart_account: sa_redacted.to_owned(),
+            rule_id,
+            context_type: "default".to_owned(),
+            signers_count: 1,
+            policies_count: policy_first8.len() as u32,
+            valid_until: None,
+            pinned_verifier_wasm_hashes_first8: verifier_first8,
+            pinned_policy_wasm_hashes_first8: policy_first8,
+            mutable_override: true,
+            unknown_override: false,
+            pinned_verifier_executable_refs: verifier_refs,
+            pinned_policy_executable_refs: vec![],
+        }
+    }
+
+    fn v1_pins_updated_event(
+        rule_id: u32,
+        sa_redacted: &str,
+        verifier_first8: Vec<String>,
+        policy_first8: Vec<String>,
+    ) -> EventKind {
+        EventKind::SaContextRulePinsUpdated {
+            smart_account: sa_redacted.to_owned(),
+            rule_id,
+            pinned_verifier_wasm_hashes_first8: verifier_first8,
+            pinned_policy_wasm_hashes_first8: policy_first8,
+            mutable_override: false,
+            unknown_override: true,
+            pinned_verifier_executable_refs: vec![],
+            pinned_policy_executable_refs: vec![],
+            reason: crate::audit_log::schema::PinsUpdateReason::SignerAdded,
+        }
+    }
+
+    /// Unwraps a found, complete pin record.
+    fn complete(record: Option<ContextRulePinRecord>) -> PinnedHashesRecord {
+        match record.expect("the rule has a pin record") {
+            ContextRulePinRecord::Complete(record) => record,
+            other => panic!("expected a complete record, got {other:?}"),
+        }
+    }
+
+    /// Unwraps a found, incomplete pin record.
+    fn incomplete(record: Option<ContextRulePinRecord>) -> IncompletePinRecord {
+        match record.expect("the rule has a pin record") {
+            ContextRulePinRecord::Incomplete(record) => record,
+            other => panic!("expected an incomplete record, got {other:?}"),
         }
     }
 
@@ -3618,6 +3846,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
+        let (pinned, twin) = pinned_and_twin();
 
         {
             let mut w = writer.lock().unwrap();
@@ -3626,8 +3855,8 @@ mod tests {
                 context_rule_created_event(
                     5,
                     "CDABC...12345",
-                    vec!["aabbccdd".to_owned()],
-                    vec!["11223344".to_owned()],
+                    vec![WasmHashPin::new(pinned)],
+                    vec![WasmHashPin::new(twin)],
                     false,
                     false,
                 ),
@@ -3635,21 +3864,13 @@ mod tests {
         }
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
-        let result = reader
-            .find_latest_context_rule_pinned_hashes(5, "CDABC...12345")
-            .unwrap();
-
-        let record = result.expect("should find SaContextRuleCreated row");
-        assert_eq!(
-            record.pinned_verifier_first8,
-            vec!["aabbccdd"],
-            "verifier hash must be returned verbatim"
+        let record = complete(
+            reader
+                .find_latest_context_rule_pinned_hashes(5, "CDABC...12345")
+                .unwrap(),
         );
-        assert_eq!(
-            record.pinned_policy_first8,
-            vec!["11223344"],
-            "policy hash must be returned verbatim"
-        );
+        assert_eq!(record.pinned_verifier_hashes[0].as_bytes(), &pinned);
+        assert_eq!(record.pinned_policy_hashes[0].as_bytes(), &twin);
         assert!(!record.mutable_override);
         assert!(!record.unknown_override);
     }
@@ -3664,22 +3885,32 @@ mod tests {
         .unwrap()
     }
 
+    fn first8_ref_pin(tag: &[u8], resolved: [u8; 32]) -> ExecutableRefPinFirst8 {
+        use stellar_xdr::{ContractId, Hash, ScAddress, ScString};
+        ExecutableRefPinFirst8::new(
+            &ScAddress::Contract(ContractId(Hash([9u8; 32]))),
+            &ScString(tag.to_vec().try_into().unwrap()),
+            &resolved,
+        )
+        .unwrap()
+    }
+
     fn context_rule_created_event_with_refs(
         rule_id: u32,
-        verifier_hashes: Vec<String>,
+        verifier_hashes: Vec<WasmHashPin>,
         verifier_refs: Vec<Option<ExecutableRefPin>>,
-        policy_hashes: Vec<String>,
+        policy_hashes: Vec<WasmHashPin>,
         policy_refs: Vec<Option<ExecutableRefPin>>,
     ) -> EventKind {
-        let EventKind::SaContextRuleCreated {
+        let EventKind::SaContextRuleCreatedV2 {
             smart_account,
             rule_id,
             context_type,
             signers_count,
             policies_count,
             valid_until,
-            pinned_verifier_wasm_hashes_first8,
-            pinned_policy_wasm_hashes_first8,
+            pinned_verifier_wasm_hashes,
+            pinned_policy_wasm_hashes,
             mutable_override,
             unknown_override,
             ..
@@ -3692,17 +3923,17 @@ mod tests {
             false,
         )
         else {
-            unreachable!("context_rule_created_event builds SaContextRuleCreated");
+            unreachable!("context_rule_created_event builds SaContextRuleCreatedV2");
         };
-        EventKind::SaContextRuleCreated {
+        EventKind::SaContextRuleCreatedV2 {
             smart_account,
             rule_id,
             context_type,
             signers_count,
             policies_count,
             valid_until,
-            pinned_verifier_wasm_hashes_first8,
-            pinned_policy_wasm_hashes_first8,
+            pinned_verifier_wasm_hashes,
+            pinned_policy_wasm_hashes,
             mutable_override,
             unknown_override,
             pinned_verifier_executable_refs: verifier_refs,
@@ -3725,19 +3956,20 @@ mod tests {
                 &mut w,
                 context_rule_created_event_with_refs(
                     5,
-                    vec!["1111111111111111".to_owned(), "aaaaaaaaaaaaaaaa".to_owned()],
+                    vec![h(0x11), h(0xaa)],
                     vec![None, Some(verifier_pin.clone())],
-                    vec!["bbbbbbbbbbbbbbbb".to_owned()],
+                    vec![h(0xbb)],
                     vec![Some(policy_pin.clone())],
                 ),
             );
         }
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
-        let record = reader
-            .find_latest_context_rule_pinned_hashes(5, "CDABC...12345")
-            .unwrap()
-            .expect("row must be found");
+        let record = complete(
+            reader
+                .find_latest_context_rule_pinned_hashes(5, "CDABC...12345")
+                .unwrap(),
+        );
         assert_eq!(
             record.pinned_verifier_executable_refs,
             vec![None, Some(verifier_pin.clone())]
@@ -3750,26 +3982,29 @@ mod tests {
         let all = reader.scan_all_context_rule_pin_records().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(
-            all[0].2.pinned_policy_executable_refs,
+            complete(Some(all[0].2.clone())).pinned_policy_executable_refs,
             vec![Some(policy_pin)]
         );
     }
 
-    /// A record whose executable-reference list is misaligned with its first-8
-    /// list, whose pin disagrees with the aligned first-8 entry, or whose pin
-    /// does not have the constructor's shape is refused as a parse error by
-    /// both readers.
+    /// A record whose executable-reference list is misaligned with its hash
+    /// list, whose pin's resolved hash differs from the aligned hash (an
+    /// equal-prefix twin included), or whose pin does not have the
+    /// constructor's shape is refused as a parse error by both readers, in
+    /// both row versions.
     #[test]
     fn find_latest_context_rule_pinned_hashes_refuses_malformed_executable_refs() {
-        let pin = executable_ref_pin(b"verifier", [0xaau8; 32]);
+        let (pinned, twin) = pinned_and_twin();
+        let pin = executable_ref_pin(b"verifier", pinned);
         let mut malformed_pin = pin.clone();
         malformed_pin.ref_key_hex = "zz".to_owned();
+        let first8_pin = first8_ref_pin(b"verifier", pinned);
         let cases = [
             (
                 "misaligned verifier list",
                 context_rule_created_event_with_refs(
                     5,
-                    vec!["1111111111111111".to_owned(), "aaaaaaaaaaaaaaaa".to_owned()],
+                    vec![h(0x11), WasmHashPin::new(pinned)],
                     vec![Some(pin.clone())],
                     vec![],
                     vec![],
@@ -3780,10 +4015,20 @@ mod tests {
                 context_rule_created_event_with_refs(5, vec![], vec![], vec![], vec![None]),
             ),
             (
-                "pin disagrees with first-8",
+                "pin disagrees with the aligned hash",
                 context_rule_created_event_with_refs(
                     5,
-                    vec!["1111111111111111".to_owned()],
+                    vec![h(0x11)],
+                    vec![Some(pin.clone())],
+                    vec![],
+                    vec![],
+                ),
+            ),
+            (
+                "pin resolves to an equal-prefix twin of the aligned hash",
+                context_rule_created_event_with_refs(
+                    5,
+                    vec![WasmHashPin::new(twin)],
                     vec![Some(pin.clone())],
                     vec![],
                     vec![],
@@ -3793,10 +4038,30 @@ mod tests {
                 "malformed pin",
                 context_rule_created_event_with_refs(
                     5,
-                    vec!["aaaaaaaaaaaaaaaa".to_owned()],
+                    vec![WasmHashPin::new(pinned)],
                     vec![Some(malformed_pin)],
                     vec![],
                     vec![],
+                ),
+            ),
+            (
+                "version-1 pin disagrees with its first-8",
+                v1_created_event(
+                    5,
+                    "CDABC...12345",
+                    vec!["1111111111111111".to_owned()],
+                    vec![],
+                    vec![Some(first8_pin.clone())],
+                ),
+            ),
+            (
+                "misaligned version-1 list",
+                v1_created_event(
+                    5,
+                    "CDABC...12345",
+                    vec!["4242424242424242".to_owned(), "1111111111111111".to_owned()],
+                    vec![],
+                    vec![Some(first8_pin)],
                 ),
             ),
         ];
@@ -3824,6 +4089,40 @@ mod tests {
         }
     }
 
+    /// A version-2 row holding a 16-character hash is a parse error for both
+    /// readers: the row is never read as a pin record.
+    #[test]
+    fn a_version_2_row_with_a_prefix_hash_is_a_parse_error() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(
+                &mut w,
+                context_rule_created_event(5, "CDABC...12345", vec![h(0x42)], vec![], false, false),
+            );
+        }
+        // The only row of the log keeps its zero predecessor, so the read
+        // reaches the row content and refuses the 16-character hash there.
+        let written = std::fs::read_to_string(&path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
+        value["pinned_verifier_wasm_hashes"] = serde_json::json!(["4242424242424242"]);
+        std::fs::write(&path, serde_json::to_string(&value).unwrap() + "\n").unwrap();
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let err = reader
+            .find_latest_context_rule_pinned_hashes(5, "CDABC...12345")
+            .expect_err("a prefix hash in a version-2 row is refused");
+        assert!(
+            matches!(err, AuditLogIntegrityError::ParseError { line: 1, .. }),
+            "{err:?}"
+        );
+        assert!(matches!(
+            reader.scan_all_context_rule_pin_records(),
+            Err(AuditLogIntegrityError::ParseError { line: 1, .. })
+        ));
+    }
+
     // ── 14. find_latest_context_rule_pinned_hashes: mutable/unknown overrides ──
 
     #[test]
@@ -3836,22 +4135,16 @@ mod tests {
             let mut w = writer.lock().unwrap();
             write_event(
                 &mut w,
-                context_rule_created_event(
-                    7,
-                    "CDABC...12345",
-                    vec!["aabb0011".to_owned()],
-                    vec![],
-                    true,
-                    true,
-                ),
+                context_rule_created_event(7, "CDABC...12345", vec![h(0xab)], vec![], true, true),
             );
         }
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
-        let record = reader
-            .find_latest_context_rule_pinned_hashes(7, "CDABC...12345")
-            .unwrap()
-            .expect("should find the row");
+        let record = complete(
+            reader
+                .find_latest_context_rule_pinned_hashes(7, "CDABC...12345")
+                .unwrap(),
+        );
 
         assert!(
             record.mutable_override,
@@ -3863,7 +4156,7 @@ mod tests {
         );
     }
 
-    // ── 14b. SaContextRulePinsUpdated: the newest pin-record row wins ─────────
+    // ── 14b. SaContextRulePinsUpdatedV2: the newest pin-record row wins ───────
 
     #[allow(
         clippy::too_many_arguments,
@@ -3872,18 +4165,18 @@ mod tests {
     fn pins_updated_event(
         rule_id: u32,
         sa_redacted: &str,
-        verifier_hashes: Vec<String>,
-        policy_hashes: Vec<String>,
+        verifier_hashes: Vec<WasmHashPin>,
+        policy_hashes: Vec<WasmHashPin>,
         mutable_override: bool,
         unknown_override: bool,
         verifier_refs: Vec<Option<ExecutableRefPin>>,
         reason: crate::audit_log::schema::PinsUpdateReason,
     ) -> EventKind {
-        EventKind::SaContextRulePinsUpdated {
+        EventKind::SaContextRulePinsUpdatedV2 {
             smart_account: sa_redacted.to_owned(),
             rule_id,
-            pinned_verifier_wasm_hashes_first8: verifier_hashes,
-            pinned_policy_wasm_hashes_first8: policy_hashes,
+            pinned_verifier_wasm_hashes: verifier_hashes,
+            pinned_policy_wasm_hashes: policy_hashes,
             mutable_override,
             unknown_override,
             pinned_verifier_executable_refs: verifier_refs,
@@ -3892,10 +4185,10 @@ mod tests {
         }
     }
 
-    /// A `SaContextRulePinsUpdated` row written after the rule's
-    /// `SaContextRuleCreated` row is the rule's pin record for both readers,
-    /// with its own override flags and reference pins; a pins-updated row for
-    /// another rule or another smart account changes nothing.
+    /// A pins-updated row written after the rule's created row is the rule's
+    /// pin record for both readers, with its own override flags and
+    /// reference pins; a pins-updated row for another rule or another smart
+    /// account changes nothing.
     #[test]
     fn pin_record_reads_a_newer_pins_updated_row() {
         use crate::audit_log::schema::PinsUpdateReason;
@@ -3911,8 +4204,8 @@ mod tests {
                 context_rule_created_event(
                     5,
                     "CDABC...12345",
-                    vec!["aaaaaaaaaaaaaaaa".to_owned()],
-                    vec!["1111111111111111".to_owned()],
+                    vec![h(0xaa)],
+                    vec![h(0x11)],
                     false,
                     false,
                 ),
@@ -3922,8 +4215,8 @@ mod tests {
                 pins_updated_event(
                     5,
                     "CDABC...12345",
-                    vec!["bbbbbbbbbbbbbbbb".to_owned()],
-                    vec!["1111111111111111".to_owned()],
+                    vec![h(0xbb)],
+                    vec![h(0x11)],
                     true,
                     false,
                     vec![Some(pin.clone())],
@@ -3935,7 +4228,7 @@ mod tests {
                 pins_updated_event(
                     6,
                     "CDABC...12345",
-                    vec!["cccccccccccccccc".to_owned()],
+                    vec![h(0xcc)],
                     vec![],
                     false,
                     true,
@@ -3948,7 +4241,7 @@ mod tests {
                 pins_updated_event(
                     5,
                     "CDXYZ...99999",
-                    vec!["dddddddddddddddd".to_owned()],
+                    vec![h(0xdd)],
                     vec![],
                     false,
                     false,
@@ -3959,12 +4252,13 @@ mod tests {
         }
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
-        let record = reader
-            .find_latest_context_rule_pinned_hashes(5, "CDABC...12345")
-            .unwrap()
-            .expect("the rule has a pin record");
-        assert_eq!(record.pinned_verifier_first8, vec!["bbbbbbbbbbbbbbbb"]);
-        assert_eq!(record.pinned_policy_first8, vec!["1111111111111111"]);
+        let record = complete(
+            reader
+                .find_latest_context_rule_pinned_hashes(5, "CDABC...12345")
+                .unwrap(),
+        );
+        assert_eq!(record.pinned_verifier_hashes, vec![h(0xbb)]);
+        assert_eq!(record.pinned_policy_hashes, vec![h(0x11)]);
         assert!(record.mutable_override);
         assert!(!record.unknown_override);
         assert_eq!(record.verifier_executable_ref(0), Some(&pin));
@@ -3974,12 +4268,15 @@ mod tests {
             .iter()
             .find(|(rid, sa, _)| *rid == 5 && sa == "CDABC...12345")
             .expect("rule 5 is listed");
-        assert_eq!(rule5.2.pinned_verifier_first8, vec!["bbbbbbbbbbbbbbbb"]);
+        assert_eq!(
+            complete(Some(rule5.2.clone())).pinned_verifier_hashes,
+            vec![h(0xbb)]
+        );
         assert_eq!(all.len(), 3, "one record per (rule, smart account)");
     }
 
-    /// A `SaContextRuleCreated` row written after a pins-updated row for the
-    /// same key is the newer record and wins.
+    /// A created row written after a pins-updated row for the same key is the
+    /// newer record and wins.
     #[test]
     fn pin_record_reads_a_created_row_that_postdates_a_pins_updated_row() {
         use crate::audit_log::schema::PinsUpdateReason;
@@ -3994,7 +4291,7 @@ mod tests {
                 pins_updated_event(
                     5,
                     "CDABC...12345",
-                    vec!["bbbbbbbbbbbbbbbb".to_owned()],
+                    vec![h(0xbb)],
                     vec![],
                     true,
                     true,
@@ -4004,22 +4301,16 @@ mod tests {
             );
             write_event(
                 &mut w,
-                context_rule_created_event(
-                    5,
-                    "CDABC...12345",
-                    vec!["aaaaaaaaaaaaaaaa".to_owned()],
-                    vec![],
-                    false,
-                    false,
-                ),
+                context_rule_created_event(5, "CDABC...12345", vec![h(0xaa)], vec![], false, false),
             );
         }
         let reader = AuditReader::new(Arc::clone(&writer), None);
-        let record = reader
-            .find_latest_context_rule_pinned_hashes(5, "CDABC...12345")
-            .unwrap()
-            .expect("the rule has a pin record");
-        assert_eq!(record.pinned_verifier_first8, vec!["aaaaaaaaaaaaaaaa"]);
+        let record = complete(
+            reader
+                .find_latest_context_rule_pinned_hashes(5, "CDABC...12345")
+                .unwrap(),
+        );
+        assert_eq!(record.pinned_verifier_hashes, vec![h(0xaa)]);
         assert!(!record.mutable_override);
     }
 
@@ -4037,22 +4328,15 @@ mod tests {
             let mut w = writer.lock().unwrap();
             write_event(
                 &mut w,
-                context_rule_created_event(
-                    4,
-                    "CDABC...12345",
-                    vec![],
-                    vec!["1111111111111111".to_owned()],
-                    false,
-                    false,
-                ),
+                context_rule_created_event(4, "CDABC...12345", vec![], vec![h(0x11)], false, false),
             );
             write_event(
                 &mut w,
                 pins_updated_event(
                     4,
                     "CDABC...12345",
-                    vec!["aaaaaaaaaaaaaaaa".to_owned()],
-                    vec!["1111111111111111".to_owned()],
+                    vec![h(0xaa)],
+                    vec![h(0x11)],
                     false,
                     true,
                     vec![],
@@ -4061,16 +4345,20 @@ mod tests {
             );
         }
         let reader = AuditReader::new(Arc::clone(&writer), None);
-        let record = reader
-            .find_latest_context_rule_pinned_hashes(4, "CDABC...12345")
-            .unwrap()
-            .expect("the rule has a pin record");
-        assert_eq!(record.pinned_verifier_first8, vec!["aaaaaaaaaaaaaaaa"]);
-        assert_eq!(record.pinned_policy_first8, vec!["1111111111111111"]);
+        let record = complete(
+            reader
+                .find_latest_context_rule_pinned_hashes(4, "CDABC...12345")
+                .unwrap(),
+        );
+        assert_eq!(record.pinned_verifier_hashes, vec![h(0xaa)]);
+        assert_eq!(record.pinned_policy_hashes, vec![h(0x11)]);
         assert!(record.unknown_override);
         let all = reader.scan_all_context_rule_pin_records().unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].2.pinned_verifier_first8, vec!["aaaaaaaaaaaaaaaa"]);
+        assert_eq!(
+            complete(Some(all[0].2.clone())).pinned_verifier_hashes,
+            vec![h(0xaa)]
+        );
     }
 
     /// A pins-updated row in the newer file of a rotated chain wins over the
@@ -4086,14 +4374,7 @@ mod tests {
             let mut w = writer.lock().unwrap();
             write_event(
                 &mut w,
-                context_rule_created_event(
-                    1,
-                    "CDABC...12345",
-                    vec!["aaaaaaaaaaaaaaaa".to_owned()],
-                    vec![],
-                    false,
-                    false,
-                ),
+                context_rule_created_event(1, "CDABC...12345", vec![h(0xaa)], vec![], false, false),
             );
             w.force_rotate_for_test().unwrap();
             write_event(
@@ -4101,7 +4382,7 @@ mod tests {
                 pins_updated_event(
                     1,
                     "CDABC...12345",
-                    vec!["bbbbbbbbbbbbbbbb".to_owned()],
+                    vec![h(0xbb)],
                     vec![],
                     false,
                     false,
@@ -4111,14 +4392,18 @@ mod tests {
             );
         }
         let reader = AuditReader::new(Arc::clone(&writer), None);
-        let record = reader
-            .find_latest_context_rule_pinned_hashes(1, "CDABC...12345")
-            .unwrap()
-            .expect("the rule has a pin record");
-        assert_eq!(record.pinned_verifier_first8, vec!["bbbbbbbbbbbbbbbb"]);
+        let record = complete(
+            reader
+                .find_latest_context_rule_pinned_hashes(1, "CDABC...12345")
+                .unwrap(),
+        );
+        assert_eq!(record.pinned_verifier_hashes, vec![h(0xbb)]);
         let all = reader.scan_all_context_rule_pin_records().unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].2.pinned_verifier_first8, vec!["bbbbbbbbbbbbbbbb"]);
+        assert_eq!(
+            complete(Some(all[0].2.clone())).pinned_verifier_hashes,
+            vec![h(0xbb)]
+        );
     }
 
     /// A malformed pins-updated row written after a valid created row for the
@@ -4136,21 +4421,14 @@ mod tests {
             let mut w = writer.lock().unwrap();
             write_event(
                 &mut w,
-                context_rule_created_event(
-                    5,
-                    "CDABC...12345",
-                    vec!["aaaaaaaaaaaaaaaa".to_owned()],
-                    vec![],
-                    false,
-                    false,
-                ),
+                context_rule_created_event(5, "CDABC...12345", vec![h(0xaa)], vec![], false, false),
             );
             write_event(
                 &mut w,
                 pins_updated_event(
                     5,
                     "CDABC...12345",
-                    vec!["1111111111111111".to_owned()],
+                    vec![h(0x11)],
                     vec![],
                     false,
                     false,
@@ -4176,7 +4454,7 @@ mod tests {
         );
     }
 
-    /// A pins-updated row whose reference pin disagrees with its first-8 list
+    /// A pins-updated row whose reference pin disagrees with its hash list
     /// is refused as a parse error naming its own row kind.
     #[test]
     fn pin_record_refuses_a_malformed_pins_updated_row() {
@@ -4193,7 +4471,7 @@ mod tests {
                 pins_updated_event(
                     5,
                     "CDABC...12345",
-                    vec!["1111111111111111".to_owned()],
+                    vec![h(0x11)],
                     vec![],
                     false,
                     false,
@@ -4208,10 +4486,186 @@ mod tests {
             .expect_err("an inconsistent record is refused");
         match err {
             AuditLogIntegrityError::ParseError { line: 1, detail } => assert!(
-                detail.starts_with("sa_context_rule_pins_updated:"),
+                detail.starts_with("sa_context_rule_pins_updated_v2:"),
                 "{detail}"
             ),
             other => panic!("expected ParseError at line 1, got {other:?}"),
+        }
+    }
+
+    // ── 14c. Version-1 rows: incomplete records and mixed-format selection ─────
+
+    /// A version-1 row that pins a hash reads as an incomplete record holding
+    /// its first-8 values for inspection, in both readers; a version-1 row
+    /// that pins no hash reads as a complete, empty record with its flags.
+    #[test]
+    fn a_version_1_row_with_hashes_is_an_incomplete_record() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_log(&dir);
+        let writer = open_writer(path.clone());
+        let (pinned, _) = pinned_and_twin();
+        let first8_pin = first8_ref_pin(b"verifier", pinned);
+        {
+            let mut w = writer.lock().unwrap();
+            write_event(
+                &mut w,
+                v1_created_event(
+                    5,
+                    "CDABC...12345",
+                    vec!["4242424242424242".to_owned()],
+                    vec!["1111111111111111".to_owned()],
+                    vec![Some(first8_pin.clone())],
+                ),
+            );
+            write_event(
+                &mut w,
+                v1_created_event(6, "CDABC...12345", vec![], vec![], vec![]),
+            );
+            write_event(
+                &mut w,
+                v1_pins_updated_event(
+                    7,
+                    "CDABC...12345",
+                    vec![],
+                    vec!["1111111111111111".to_owned()],
+                ),
+            );
+        }
+        let reader = AuditReader::new(Arc::clone(&writer), None);
+        let record = incomplete(
+            reader
+                .find_latest_context_rule_pinned_hashes(5, "CDABC...12345")
+                .unwrap(),
+        );
+        assert_eq!(record.row_kind, "sa_context_rule_created");
+        assert_eq!(
+            record.pinned_verifier_hashes_first8,
+            vec!["4242424242424242"]
+        );
+        assert_eq!(record.pinned_policy_hashes_first8, vec!["1111111111111111"]);
+        assert_eq!(
+            record.pinned_verifier_executable_refs,
+            vec![Some(first8_pin)]
+        );
+        assert!(record.mutable_override);
+
+        let empty = complete(
+            reader
+                .find_latest_context_rule_pinned_hashes(6, "CDABC...12345")
+                .unwrap(),
+        );
+        assert!(empty.pinned_verifier_hashes.is_empty());
+        assert!(empty.pinned_policy_hashes.is_empty());
+        assert!(empty.mutable_override, "the flags of the row are kept");
+
+        let policy_only = incomplete(
+            reader
+                .find_latest_context_rule_pinned_hashes(7, "CDABC...12345")
+                .unwrap(),
+        );
+        assert_eq!(policy_only.row_kind, "sa_context_rule_pins_updated");
+
+        let all = reader.scan_all_context_rule_pin_records().unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(matches!(all[0].2, ContextRulePinRecord::Incomplete(_)));
+        assert!(matches!(all[1].2, ContextRulePinRecord::Complete(_)));
+        assert!(matches!(all[2].2, ContextRulePinRecord::Incomplete(_)));
+    }
+
+    /// Selection takes the newest pin row across both versions, in one file
+    /// and across rotation, and an incomplete newest record is returned as
+    /// such: the read never falls back to an older complete row.
+    #[test]
+    fn pin_record_selection_spans_both_versions_without_fallback() {
+        use crate::audit_log::schema::PinsUpdateReason;
+
+        let full_then_prefix = |w: &mut AuditWriter, rotate: bool| {
+            write_event(
+                w,
+                context_rule_created_event(5, "CDABC...12345", vec![h(0x42)], vec![], false, false),
+            );
+            if rotate {
+                w.force_rotate_for_test().unwrap();
+            }
+            write_event(
+                w,
+                v1_pins_updated_event(
+                    5,
+                    "CDABC...12345",
+                    vec!["4242424242424242".to_owned()],
+                    vec![],
+                ),
+            );
+        };
+        let prefix_then_full = |w: &mut AuditWriter, rotate: bool| {
+            write_event(
+                w,
+                v1_created_event(
+                    5,
+                    "CDABC...12345",
+                    vec!["4242424242424242".to_owned()],
+                    vec![],
+                    vec![],
+                ),
+            );
+            if rotate {
+                w.force_rotate_for_test().unwrap();
+            }
+            write_event(
+                w,
+                pins_updated_event(
+                    5,
+                    "CDABC...12345",
+                    vec![h(0x42)],
+                    vec![],
+                    false,
+                    false,
+                    vec![],
+                    PinsUpdateReason::BaselineRefreshed,
+                ),
+            );
+        };
+        for rotate in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let writer = open_writer(tmp_log(&dir));
+            full_then_prefix(&mut writer.lock().unwrap(), rotate);
+            let reader = AuditReader::new(Arc::clone(&writer), None);
+            let record = incomplete(
+                reader
+                    .find_latest_context_rule_pinned_hashes(5, "CDABC...12345")
+                    .unwrap(),
+            );
+            assert_eq!(
+                record.row_kind, "sa_context_rule_pins_updated",
+                "rotate={rotate}"
+            );
+            let all = reader.scan_all_context_rule_pin_records().unwrap();
+            assert_eq!(all.len(), 1);
+            assert!(
+                matches!(all[0].2, ContextRulePinRecord::Incomplete(_)),
+                "rotate={rotate}"
+            );
+
+            let dir = TempDir::new().unwrap();
+            let writer = open_writer(tmp_log(&dir));
+            prefix_then_full(&mut writer.lock().unwrap(), rotate);
+            let reader = AuditReader::new(Arc::clone(&writer), None);
+            let record = complete(
+                reader
+                    .find_latest_context_rule_pinned_hashes(5, "CDABC...12345")
+                    .unwrap(),
+            );
+            assert_eq!(
+                record.pinned_verifier_hashes,
+                vec![h(0x42)],
+                "rotate={rotate}"
+            );
+            let all = reader.scan_all_context_rule_pin_records().unwrap();
+            assert_eq!(all.len(), 1);
+            assert!(
+                matches!(all[0].2, ContextRulePinRecord::Complete(_)),
+                "rotate={rotate}"
+            );
         }
     }
 
@@ -4246,28 +4700,28 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
+        let (pinned, twin) = pinned_and_twin();
 
         {
             let mut w = writer.lock().unwrap();
-            // First install — verifier hash "aaaaaaaa".
             write_event(
                 &mut w,
                 context_rule_created_event(
                     1,
                     "CDABC...12345",
-                    vec!["aaaaaaaa".to_owned()],
+                    vec![WasmHashPin::new(pinned)],
                     vec![],
                     false,
                     false,
                 ),
             );
-            // Reinstall (rule_id same) — verifier hash "bbbbbbbb". More recent.
+            // Reinstall under the same rule id with an equal-prefix twin.
             write_event(
                 &mut w,
                 context_rule_created_event(
                     1,
                     "CDABC...12345",
-                    vec!["bbbbbbbb".to_owned()],
+                    vec![WasmHashPin::new(twin)],
                     vec![],
                     false,
                     false,
@@ -4276,14 +4730,15 @@ mod tests {
         }
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
-        let record = reader
-            .find_latest_context_rule_pinned_hashes(1, "CDABC...12345")
-            .unwrap()
-            .expect("should find a row");
+        let record = complete(
+            reader
+                .find_latest_context_rule_pinned_hashes(1, "CDABC...12345")
+                .unwrap(),
+        );
 
         assert_eq!(
-            record.pinned_verifier_first8,
-            vec!["bbbbbbbb"],
+            record.pinned_verifier_hashes,
+            vec![WasmHashPin::new(twin)],
             "most-recent reinstall hash must win"
         );
     }
@@ -4301,25 +4756,11 @@ mod tests {
             // Rule 1 on account A — installed twice; most-recent wins.
             write_event(
                 &mut w,
-                context_rule_created_event(
-                    1,
-                    "CAAA1...11111",
-                    vec!["aaaaaaaa".to_owned()],
-                    vec![],
-                    false,
-                    false,
-                ),
+                context_rule_created_event(1, "CAAA1...11111", vec![h(0xaa)], vec![], false, false),
             );
             write_event(
                 &mut w,
-                context_rule_created_event(
-                    1,
-                    "CAAA1...11111",
-                    vec!["bbbbbbbb".to_owned()],
-                    vec![],
-                    false,
-                    false,
-                ),
+                context_rule_created_event(1, "CAAA1...11111", vec![h(0xbb)], vec![], false, false),
             );
             // Rule 2 on account B — installed once.
             write_event(
@@ -4327,8 +4768,8 @@ mod tests {
                 context_rule_created_event(
                     2,
                     "CBBB2...22222",
-                    vec!["cccccccc".to_owned()],
-                    vec!["dddddddd".to_owned()],
+                    vec![h(0xcc)],
+                    vec![h(0xdd)],
                     false,
                     false,
                 ),
@@ -4346,16 +4787,17 @@ mod tests {
         assert_eq!(*r0_id, 1);
         assert_eq!(r0_sa, "CAAA1...11111");
         assert_eq!(
-            r0_rec.pinned_verifier_first8,
-            vec!["bbbbbbbb"],
+            complete(Some(r0_rec.clone())).pinned_verifier_hashes,
+            vec![h(0xbb)],
             "most-recent reinstall must win for rule 1"
         );
 
         let (r1_id, r1_sa, r1_rec) = &results[1];
         assert_eq!(*r1_id, 2);
         assert_eq!(r1_sa, "CBBB2...22222");
-        assert_eq!(r1_rec.pinned_verifier_first8, vec!["cccccccc"]);
-        assert_eq!(r1_rec.pinned_policy_first8, vec!["dddddddd"]);
+        let r1_rec = complete(Some(r1_rec.clone()));
+        assert_eq!(r1_rec.pinned_verifier_hashes, vec![h(0xcc)]);
+        assert_eq!(r1_rec.pinned_policy_hashes, vec![h(0xdd)]);
     }
 
     // ── 18. scan_all_context_rule_pin_records: empty log returns empty vec ─────────
@@ -4366,7 +4808,7 @@ mod tests {
         let path = tmp_log(&dir);
         let writer = open_writer(path.clone());
 
-        // Write a non-contextRuleCreated row so the log file exists but has no
+        // Write a row of another kind so the log file exists but has no
         // matching rows.
         {
             let mut w = writer.lock().unwrap();
@@ -4375,10 +4817,7 @@ mod tests {
 
         let reader = AuditReader::new(Arc::clone(&writer), None);
         let results = reader.scan_all_context_rule_pin_records().unwrap();
-        assert!(
-            results.is_empty(),
-            "no SaContextRuleCreated rows → empty result"
-        );
+        assert!(results.is_empty(), "no pin rows → empty result");
     }
 
     // ── 19. find_installed_context_rule_ids: basic lifecycle ──────────────────
@@ -4866,30 +5305,16 @@ mod tests {
 
         {
             let mut w = writer.lock().unwrap();
-            // Install rule 1 with verifier hash "aaaaaaaa" in the first (to-be-rotated) file.
+            // Install rule 1 with an 0xaa verifier hash in the first (to-be-rotated) file.
             write_event(
                 &mut w,
-                context_rule_created_event(
-                    1,
-                    "CDABC...12345",
-                    vec!["aaaaaaaa".to_owned()],
-                    vec![],
-                    false,
-                    false,
-                ),
+                context_rule_created_event(1, "CDABC...12345", vec![h(0xaa)], vec![], false, false),
             );
             w.force_rotate_for_test().unwrap();
-            // Reinstall rule 1 with verifier hash "bbbbbbbb" in the new active file.
+            // Reinstall rule 1 with an 0xbb verifier hash in the new active file.
             write_event(
                 &mut w,
-                context_rule_created_event(
-                    1,
-                    "CDABC...12345",
-                    vec!["bbbbbbbb".to_owned()],
-                    vec![],
-                    false,
-                    false,
-                ),
+                context_rule_created_event(1, "CDABC...12345", vec![h(0xbb)], vec![], false, false),
             );
         }
 
@@ -4900,8 +5325,8 @@ mod tests {
         assert_eq!(results.len(), 1, "deduped to one entry");
         let (_, _, rec) = &results[0];
         assert_eq!(
-            rec.pinned_verifier_first8,
-            vec!["bbbbbbbb"],
+            complete(Some(rec.clone())).pinned_verifier_hashes,
+            vec![h(0xbb)],
             "reinstall in newer file must win over older file's entry"
         );
     }

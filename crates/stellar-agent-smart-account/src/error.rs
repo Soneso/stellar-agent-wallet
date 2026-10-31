@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::signers::types::{ThresholdAffectingOp, WasmHashSummary};
-use stellar_agent_core::audit_log::schema::ContractKind;
+use stellar_agent_core::audit_log::schema::{ContractKind, WasmHashPin};
 use stellar_agent_core::audit_log::signer_set::SignerSetView;
 pub use stellar_agent_core::error::AuthMismatchReason;
 use stellar_agent_core::observability::RedactedStrkey;
@@ -32,8 +32,9 @@ use stellar_agent_core::observability::RedactedStrkey;
 /// `admin_or_owner_key` field on [`SaError::VerifierMutable`] and
 /// [`SaError::PolicyMutable`]: the operator can admit such a contract with
 /// `--accept-mutable-verifier`. `UndecodableInstance`, `NonWasmExecutable`,
-/// `ExternalRefUnresolved` and `ExecutableChanged` populate the `reason` field
-/// on [`SaError::ContractInstanceUnsupported`], which no flag overrides.
+/// `ExternalRefUnresolved`, `ExecutableChanged` and `NoWasmCode`
+/// populate the `reason` field on [`SaError::ContractInstanceUnsupported`],
+/// which no flag overrides.
 ///
 /// # Wire format
 ///
@@ -66,15 +67,18 @@ pub enum AdminOrOwnerKey {
     /// observed by the mutability probe differ in kind or in external
     /// reference, so the install has no single observation to pin.
     ExecutableChanged,
+    /// No instance at the address, or a built-in executable such as the
+    /// Stellar Asset Contract. Neither has a Wasm hash to pin, and absent
+    /// Wasm code never matches a pin.
+    NoWasmCode,
 }
 
 impl AdminOrOwnerKey {
     /// Returns `true` for an instance whose code the wallet cannot pin.
     ///
-    /// An existing instance that does not decode as a Wasm contract instance
-    /// has no Wasm hash to pin, and the signing-time drift check compares
-    /// against the zero hash, so a later code change stays invisible. An
-    /// external reference with no live tag entry resolves to no hash. An
+    /// An existing instance that does not decode as a Wasm contract
+    /// instance, a contract with no Wasm code, and an external
+    /// reference with no live tag entry have no Wasm code hash to pin. An
     /// executable that changed between the identification fetch and the
     /// mutability probe leaves no single observation to pin. Rule install
     /// refuses such a contract with no override.
@@ -88,7 +92,8 @@ impl AdminOrOwnerKey {
             Self::UndecodableInstance
             | Self::NonWasmExecutable
             | Self::ExternalRefUnresolved
-            | Self::ExecutableChanged => true,
+            | Self::ExecutableChanged
+            | Self::NoWasmCode => true,
             Self::Admin | Self::Owner | Self::ExternalRefExecutable => false,
         }
     }
@@ -104,6 +109,7 @@ impl std::fmt::Display for AdminOrOwnerKey {
             Self::ExternalRefExecutable => f.write_str("owner-managed external reference"),
             Self::ExternalRefUnresolved => f.write_str("external reference with no live tag entry"),
             Self::ExecutableChanged => f.write_str("executable changed during install"),
+            Self::NoWasmCode => f.write_str("no Wasm code"),
         }
     }
 }
@@ -159,6 +165,13 @@ fn paren_suffix(detail: &Option<String>) -> String {
     detail
         .as_deref()
         .map_or_else(String::new, |detail| format!(" ({detail})"))
+}
+
+/// Renders an observed code hash in full, or `none` when the contract has
+/// no Wasm code or an external reference resolved to no hash.
+fn hash_or_none(hash: &Option<WasmHashPin>) -> String {
+    hash.as_ref()
+        .map_or_else(|| "none".to_owned(), ToString::to_string)
 }
 
 /// Byte cap of [`SaError::PinCheckUnavailable`]'s `reason`.
@@ -352,13 +365,15 @@ pub enum SaError {
     ///
     /// `smart_account_redacted` and `deploy_address_redacted` MUST be passed
     /// through `stellar_agent_core::observability::redact_strkey_first5_last5`
-    /// at the call site.  `pinned_hash_first8` and
-    /// `observed_hash_first8` carry the first-8 hex chars (16 hex characters)
-    /// of the respective 32-byte wasm hashes — sufficient for forensic
-    /// correlation without leaking the full preimage.
+    /// at the call site.  `pinned_hash` and `observed_hash` carry the full
+    /// 32-byte hashes, so two hashes that share a prefix stay
+    /// distinguishable; a Wasm hash is a digest of public code.
+    /// `observed_hash` is absent when the contract has no Wasm code or an
+    /// external reference resolved to no hash.
     #[error(
         "verifier wasm-hash drift detected for rule {rule_id}: \
-         pinned={pinned_hash_first8}, observed={observed_hash_first8}{}",
+         pinned={pinned_hash}, observed={}{}",
+        hash_or_none(.observed_hash),
         paren_suffix(.observed_executable)
     )]
     #[serde(rename = "sa.verifier_hash_drift")]
@@ -376,16 +391,17 @@ pub enum SaError {
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         deploy_address_redacted: RedactedStrkey,
-        /// First-8 hex chars of the wasm hash pinned at rule-install time.
-        pinned_hash_first8: String,
-        /// First-8 hex chars of the effective hash observed on-chain via
-        /// two-RPC re-fetch: the Wasm hash, the hash an external reference
-        /// resolved to, or the zero hash for no code or an unresolved
-        /// reference.
-        observed_hash_first8: String,
+        /// The full wasm hash of the rule's pin.
+        pinned_hash: WasmHashPin,
+        /// The full effective hash observed on-chain via two-RPC re-fetch:
+        /// the Wasm hash or the hash an external reference resolved to.
+        /// Absent for no Wasm code and for an unresolved reference, which have
+        /// no hash; omitted from JSON then.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_hash: Option<WasmHashPin>,
         /// Bounded summary of the observed executable (`wasm`, `no code`, or
         /// `external reference owner <redacted> tag "<bounded>" resolved
-        /// <first-8 or unset>`); appended to the Display when present.
+        /// <full hash or unset>`); appended to the Display when present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         observed_executable: Option<String>,
         /// Per-request correlation identifier (UUIDv4).
@@ -403,10 +419,13 @@ pub enum SaError {
     ///
     /// `smart_account_redacted` and `deploy_address_redacted` MUST be passed
     /// through `stellar_agent_core::observability::redact_strkey_first5_last5`
-    /// at the call site.
+    /// at the call site.  `pinned_hash` and `observed_hash` carry the full
+    /// 32-byte hashes. `observed_hash` is absent when the contract has no
+    /// code or an external reference resolved to no hash.
     #[error(
         "policy wasm-hash drift detected for rule {rule_id}: \
-         pinned={pinned_hash_first8}, observed={observed_hash_first8}{}",
+         pinned={pinned_hash}, observed={}{}",
+        hash_or_none(.observed_hash),
         paren_suffix(.observed_executable)
     )]
     #[serde(rename = "sa.policy_hash_drift")]
@@ -424,16 +443,17 @@ pub enum SaError {
         /// MUST be redacted at the call site via
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         deploy_address_redacted: RedactedStrkey,
-        /// First-8 hex chars of the wasm hash pinned at rule-install time.
-        pinned_hash_first8: String,
-        /// First-8 hex chars of the effective hash observed on-chain via
-        /// two-RPC re-fetch: the Wasm hash, the hash an external reference
-        /// resolved to, or the zero hash for no code or an unresolved
-        /// reference.
-        observed_hash_first8: String,
+        /// The full wasm hash of the rule's pin.
+        pinned_hash: WasmHashPin,
+        /// The full effective hash observed on-chain via two-RPC re-fetch:
+        /// the Wasm hash or the hash an external reference resolved to.
+        /// Absent for no Wasm code and for an unresolved reference, which have
+        /// no hash; omitted from JSON then.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_hash: Option<WasmHashPin>,
         /// Bounded summary of the observed executable (`wasm`, `no code`, or
         /// `external reference owner <redacted> tag "<bounded>" resolved
-        /// <first-8 or unset>`); appended to the Display when present.
+        /// <full hash or unset>`); appended to the Display when present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         observed_executable: Option<String>,
         /// Per-request correlation identifier (UUIDv4).
@@ -446,8 +466,7 @@ pub enum SaError {
     /// Fired at signing time by `verify_pinned_verifier_against_chain` or
     /// `verify_pinned_policy_against_chain` when the audit-log pin record for
     /// `(rule_id, smart_account_redacted)` contains more than one entry in the
-    /// `pinned_verifier_wasm_hashes_first8` or `pinned_policy_wasm_hashes_first8`
-    /// list.  Multi-hash rules can arise if a future install path creates
+    /// `pinned_verifier_wasm_hashes` or `pinned_policy_wasm_hashes` list.  Multi-hash rules can arise if a future install path creates
     /// multiple distinct verifier or policy addresses in a single rule.
     ///
     /// # Why a typed variant instead of `DeploymentFailed { phase: "pin_check" }`
@@ -560,6 +579,41 @@ pub enum SaError {
         request_id: String,
     },
 
+    /// The rule's selected pin record holds eight-byte hash prefixes, not
+    /// full 32-byte hashes.
+    ///
+    /// A prefix pin cannot authenticate the code a verifier or policy runs:
+    /// two different hashes can share the prefix. Every reader of the rule's
+    /// pin record refuses it before anything is signed or written: the
+    /// signing-time drift check, `verify-pins`, `signers refresh`, signer
+    /// addition, policy addition and removal, and verifier migration. No
+    /// override flag bypasses it, and no byte of a pin is taken from an RPC
+    /// observation, an allowlist entry or a prefix match. Recovery is a
+    /// reviewed reinstall of the rule, authorized under an independently
+    /// authorized rule such as rule `0`, after checking the intended full
+    /// hashes; the reinstall runs the allowlist and mutability checks of any
+    /// install.
+    ///
+    /// # Forensic spine
+    ///
+    /// `smart_account_redacted` MUST be passed through
+    /// `stellar_agent_core::observability::redact_strkey_first5_last5`
+    /// at the call site.
+    #[error(
+        "rule {rule_id} has a pin record of eight-byte hash prefixes, which cannot \
+         authenticate the code it pins; nothing was signed. Review the intended full hashes \
+         and reinstall the rule under an independently authorized rule such as rule 0"
+    )]
+    #[serde(rename = "sa.wasm_pin_incomplete")]
+    WasmPinIncomplete {
+        /// Context-rule identifier whose pin record is incomplete.
+        rule_id: u32,
+        /// Redacted smart-account contract address (first-5-last-5 C-strkey).
+        smart_account_redacted: RedactedStrkey,
+        /// Per-request correlation identifier (UUIDv4).
+        request_id: String,
+    },
+
     /// The pre-signing drift check of a rule-authorized submission could not
     /// run to a verdict.
     ///
@@ -571,9 +625,9 @@ pub enum SaError {
     /// (`sa.multiple_pinned_hashes_unsupported`), an unpinnable instance, or
     /// the check exceeding the pre-submit budget. Nothing is signed. The
     /// check's own refusals, [`SaError::VerifierHashDrift`],
-    /// [`SaError::PolicyHashDrift`], [`SaError::PinnedPolicyAbsent`] and
-    /// [`SaError::PinnedVerifierAbsent`], propagate as themselves and are
-    /// never folded into this variant. The
+    /// [`SaError::PolicyHashDrift`], [`SaError::PinnedPolicyAbsent`],
+    /// [`SaError::PinnedVerifierAbsent`] and [`SaError::WasmPinIncomplete`],
+    /// propagate as themselves and are never folded into this variant. The
     /// signer-set steps that run beside the pin check propagate as themselves
     /// too: [`SaError::SignerSetMissingBaseline`],
     /// [`SaError::SignerSetDiverged`], [`SaError::NetworkRpcDivergence`] and
@@ -763,8 +817,8 @@ pub enum SaError {
         /// `stellar_agent_core::observability::redact_strkey_first5_last5`.
         contract_address_redacted: RedactedStrkey,
         /// Instance shape that prevents pinning (`UndecodableInstance`,
-        /// `NonWasmExecutable`, `ExternalRefUnresolved` or
-        /// `ExecutableChanged`).
+        /// `NonWasmExecutable`, `ExternalRefUnresolved`, `ExecutableChanged`
+        /// or `NoWasmCode`).
         reason: AdminOrOwnerKey,
         /// Per-request correlation identifier (UUIDv4).
         request_id: String,
@@ -3048,6 +3102,7 @@ impl SaError {
             Self::MultiplePinnedHashesUnsupported { .. } => "sa.multiple_pinned_hashes_unsupported",
             Self::PinnedPolicyAbsent { .. } => "sa.pinned_policy_absent",
             Self::PinnedVerifierAbsent { .. } => "sa.pinned_verifier_absent",
+            Self::WasmPinIncomplete { .. } => "sa.wasm_pin_incomplete",
             Self::PinCheckUnavailable { .. } => "sa.pin_check_unavailable",
             Self::VerifierMutable { .. } => "sa.verifier_mutable",
             Self::PolicyMutable { .. } => "sa.policy_mutable",
@@ -3217,8 +3272,8 @@ mod tests {
                     rule_id: 1,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                    pinned_hash_first8: "aabbccdd".to_owned(),
-                    observed_hash_first8: "11223344".to_owned(),
+                    pinned_hash: WasmHashPin::new([0xaa; 32]),
+                    observed_hash: Some(WasmHashPin::new([0x11; 32])),
                     observed_executable: None,
                     request_id: "test-req-drift-001".to_owned(),
                 },
@@ -3229,8 +3284,8 @@ mod tests {
                     rule_id: 2,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                    pinned_hash_first8: "aabbccdd".to_owned(),
-                    observed_hash_first8: "11223344".to_owned(),
+                    pinned_hash: WasmHashPin::new([0xaa; 32]),
+                    observed_hash: Some(WasmHashPin::new([0x11; 32])),
                     observed_executable: None,
                     request_id: "test-req-drift-002".to_owned(),
                 },
@@ -3300,6 +3355,14 @@ mod tests {
                     verifier_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     request_id: "test-req-verifier-absent-001".to_owned(),
+                },
+            ),
+            (
+                "sa.wasm_pin_incomplete",
+                SaError::WasmPinIncomplete {
+                    rule_id: 7,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    request_id: "test-req-pin-incomplete-001".to_owned(),
                 },
             ),
             (
@@ -3910,8 +3973,8 @@ mod tests {
                     rule_id: 1,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                    pinned_hash_first8: "aabbccdd".to_owned(),
-                    observed_hash_first8: "11223344".to_owned(),
+                    pinned_hash: WasmHashPin::new([0xaa; 32]),
+                    observed_hash: Some(WasmHashPin::new([0x11; 32])),
                     observed_executable: None,
                     request_id: "test-req-drift-001".to_owned(),
                 },
@@ -3919,8 +3982,8 @@ mod tests {
                     "rule_id",
                     "smart_account_redacted",
                     "deploy_address_redacted",
-                    "pinned_hash_first8",
-                    "observed_hash_first8",
+                    "pinned_hash",
+                    "observed_hash",
                     "request_id",
                 ],
             ),
@@ -3930,8 +3993,8 @@ mod tests {
                     rule_id: 2,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                    pinned_hash_first8: "aabbccdd".to_owned(),
-                    observed_hash_first8: "11223344".to_owned(),
+                    pinned_hash: WasmHashPin::new([0xaa; 32]),
+                    observed_hash: Some(WasmHashPin::new([0x11; 32])),
                     observed_executable: None,
                     request_id: "test-req-drift-002".to_owned(),
                 },
@@ -3939,8 +4002,8 @@ mod tests {
                     "rule_id",
                     "smart_account_redacted",
                     "deploy_address_redacted",
-                    "pinned_hash_first8",
-                    "observed_hash_first8",
+                    "pinned_hash",
+                    "observed_hash",
                     "request_id",
                 ],
             ),
@@ -3990,8 +4053,8 @@ mod tests {
                     rule_id: 1,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                    pinned_hash_first8: "aabbccdd00112233".to_owned(),
-                    observed_hash_first8: "aabbccdd00112233".to_owned(),
+                    pinned_hash: WasmHashPin::new([0xaa; 32]),
+                    observed_hash: Some(WasmHashPin::new([0xaa; 32])),
                     observed_executable: Some("wasm".to_owned()),
                     request_id: "test-req-drift-003".to_owned(),
                 },
@@ -3999,8 +4062,8 @@ mod tests {
                     "rule_id",
                     "smart_account_redacted",
                     "deploy_address_redacted",
-                    "pinned_hash_first8",
-                    "observed_hash_first8",
+                    "pinned_hash",
+                    "observed_hash",
                     "observed_executable",
                     "request_id",
                 ],
@@ -4011,8 +4074,8 @@ mod tests {
                     rule_id: 2,
                     smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                     deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                    pinned_hash_first8: "aabbccdd00112233".to_owned(),
-                    observed_hash_first8: "0000000000000000".to_owned(),
+                    pinned_hash: WasmHashPin::new([0xaa; 32]),
+                    observed_hash: None,
                     observed_executable: Some("no code".to_owned()),
                     request_id: "test-req-drift-004".to_owned(),
                 },
@@ -4020,8 +4083,7 @@ mod tests {
                     "rule_id",
                     "smart_account_redacted",
                     "deploy_address_redacted",
-                    "pinned_hash_first8",
-                    "observed_hash_first8",
+                    "pinned_hash",
                     "observed_executable",
                     "request_id",
                 ],
@@ -4135,6 +4197,15 @@ mod tests {
                     "smart_account_redacted",
                     "request_id",
                 ],
+            ),
+            (
+                "sa.wasm_pin_incomplete",
+                SaError::WasmPinIncomplete {
+                    rule_id: 77,
+                    smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                    request_id: "test-req-pin-incomplete-002".to_owned(),
+                },
+                &["rule_id", "smart_account_redacted", "request_id"],
             ),
             (
                 "sa.pin_check_unavailable",
@@ -4725,8 +4796,8 @@ mod tests {
             rule_id: 2,
             smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
             deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-            pinned_hash_first8: "1111111111111111".to_owned(),
-            observed_hash_first8: "1111111111111111".to_owned(),
+            pinned_hash: WasmHashPin::new([0x11; 32]),
+            observed_hash: Some(WasmHashPin::new([0x11; 32])),
             observed_executable: observed.map(ToOwned::to_owned),
             request_id: "req".to_owned(),
         };
@@ -4753,17 +4824,18 @@ mod tests {
             without["context"].get("observed_executable").is_none(),
             "{without}"
         );
+        let full = "11".repeat(32);
         assert_eq!(
             drift(None).to_string(),
-            "policy wasm-hash drift detected for rule 2: \
-             pinned=1111111111111111, observed=1111111111111111"
+            format!("policy wasm-hash drift detected for rule 2: pinned={full}, observed={full}")
         );
         let with = serde_json::to_value(drift(Some("wasm"))).unwrap();
         assert_eq!(with["context"]["observed_executable"], "wasm");
         assert_eq!(
             drift(Some("wasm")).to_string(),
-            "policy wasm-hash drift detected for rule 2: \
-             pinned=1111111111111111, observed=1111111111111111 (wasm)"
+            format!(
+                "policy wasm-hash drift detected for rule 2: pinned={full}, observed={full} (wasm)"
+            )
         );
 
         // The optional rule id of the pre-install refusals.
@@ -4932,6 +5004,118 @@ mod tests {
         );
     }
 
+    /// The incomplete-pin refusal names the rule, states that nothing was
+    /// signed and names the recovery.
+    #[test]
+    fn wasm_pin_incomplete_display_names_the_rule_and_the_recovery() {
+        let err = SaError::WasmPinIncomplete {
+            rule_id: 3,
+            smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+            request_id: "req".to_owned(),
+        };
+        assert_eq!(err.wire_code(), "sa.wasm_pin_incomplete");
+        assert_eq!(
+            err.to_string(),
+            "rule 3 has a pin record of eight-byte hash prefixes, which cannot authenticate \
+             the code it pins; nothing was signed. Review the intended full hashes and \
+             reinstall the rule under an independently authorized rule such as rule 0"
+        );
+    }
+
+    /// The drift refusals carry both full hashes, so an observed hash that
+    /// shares the pinned hash's first eight bytes stays distinguishable in
+    /// the Display and in the serialized context.
+    #[test]
+    fn drift_errors_carry_full_hashes_that_distinguish_an_equal_prefix_twin() {
+        let pinned = [0x42u8; 32];
+        let mut twin = pinned;
+        twin[8..].fill(0x43);
+        let errors = [
+            SaError::VerifierHashDrift {
+                rule_id: 1,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+                pinned_hash: WasmHashPin::new(pinned),
+                observed_hash: Some(WasmHashPin::new(twin)),
+                observed_executable: Some("wasm".to_owned()),
+                request_id: "req".to_owned(),
+            },
+            SaError::PolicyHashDrift {
+                rule_id: 1,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+                pinned_hash: WasmHashPin::new(pinned),
+                observed_hash: Some(WasmHashPin::new(twin)),
+                observed_executable: Some("wasm".to_owned()),
+                request_id: "req".to_owned(),
+            },
+        ];
+        for err in errors {
+            let display = err.to_string();
+            assert!(
+                display.contains(&format!("pinned={}", hex::encode(pinned))),
+                "{display}"
+            );
+            assert!(
+                display.contains(&format!("observed={}", hex::encode(twin))),
+                "{display}"
+            );
+            let value = serde_json::to_value(&err).unwrap();
+            assert_eq!(value["context"]["pinned_hash"], hex::encode(pinned));
+            assert_eq!(value["context"]["observed_hash"], hex::encode(twin));
+            assert!(
+                value["context"].get("pinned_hash_first8").is_none(),
+                "{value}"
+            );
+            assert!(
+                value["context"].get("observed_hash_first8").is_none(),
+                "{value}"
+            );
+        }
+    }
+
+    /// A drift refusal against a contract with no Wasm code carries no observed
+    /// hash: the Display reads `observed=none` and the serialized context
+    /// omits `observed_hash`, so absent Wasm code never reads as a zero hash.
+    #[test]
+    fn drift_errors_report_absent_code_without_an_observed_hash() {
+        let pinned = [0x42u8; 32];
+        let errors = [
+            SaError::VerifierHashDrift {
+                rule_id: 1,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+                pinned_hash: WasmHashPin::new(pinned),
+                observed_hash: None,
+                observed_executable: Some("no code".to_owned()),
+                request_id: "req".to_owned(),
+            },
+            SaError::PolicyHashDrift {
+                rule_id: 1,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
+                pinned_hash: WasmHashPin::new(pinned),
+                observed_hash: None,
+                observed_executable: Some("no code".to_owned()),
+                request_id: "req".to_owned(),
+            },
+        ];
+        for err in errors {
+            let display = err.to_string();
+            assert!(
+                display.contains(&format!(
+                    "pinned={}, observed=none (no code)",
+                    hex::encode(pinned)
+                )),
+                "{display}"
+            );
+            assert!(!display.contains(&"0".repeat(64)), "{display}");
+            let value = serde_json::to_value(&err).unwrap();
+            assert!(value["context"].get("observed_hash").is_none(), "{value}");
+            assert_eq!(value["context"]["observed_executable"], "no code");
+        }
+    }
+
     /// The pin-check reason leads with the inner wire code, carries the
     /// inner Display, and is capped at `PIN_CHECK_REASON_MAX_BYTES`.
     #[test]
@@ -4987,8 +5171,8 @@ mod tests {
                 rule_id: 1,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                pinned_hash_first8: "aabbccdd".to_owned(),
-                observed_hash_first8: "11223344".to_owned(),
+                pinned_hash: WasmHashPin::new([0xaa; 32]),
+                observed_hash: Some(WasmHashPin::new([0x11; 32])),
                 observed_executable: None,
                 request_id: "test-req-drift-001".to_owned(),
             },
@@ -4996,8 +5180,8 @@ mod tests {
                 rule_id: 2,
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 deploy_address_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
-                pinned_hash_first8: "aabbccdd".to_owned(),
-                observed_hash_first8: "11223344".to_owned(),
+                pinned_hash: WasmHashPin::new([0xaa; 32]),
+                observed_hash: Some(WasmHashPin::new([0x11; 32])),
                 observed_executable: None,
                 request_id: "test-req-drift-002".to_owned(),
             },
@@ -5019,6 +5203,11 @@ mod tests {
                 verifier_redacted: RedactedStrkey::from_already_redacted("CBBBB...YYYYY"),
                 smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
                 request_id: "test-req-verifier-absent-003".to_owned(),
+            },
+            SaError::WasmPinIncomplete {
+                rule_id: 88,
+                smart_account_redacted: RedactedStrkey::from_already_redacted("CAAAA...ZZZZZ"),
+                request_id: "test-req-pin-incomplete-003".to_owned(),
             },
             SaError::PinCheckUnavailable {
                 rule_id: 88,
@@ -5413,6 +5602,7 @@ mod tests {
             "sa.multiple_pinned_hashes_unsupported",
             "sa.pinned_policy_absent",
             "sa.pinned_verifier_absent",
+            "sa.wasm_pin_incomplete",
             "sa.pin_check_unavailable",
             "sa.verifier_mutable",
             "sa.policy_mutable",
@@ -5517,7 +5707,7 @@ mod tests {
             );
         }
 
-        assert_eq!(seen.len(), 81, "closed set must have exactly 81 wire codes");
+        assert_eq!(seen.len(), 82, "closed set must have exactly 82 wire codes");
     }
 
     /// Verifies the sub-code closed set is exhaustively matched by tests.
@@ -5603,6 +5793,7 @@ mod tests {
         "owner-managed external reference",
         "external reference with no live tag entry",
         "executable changed during install",
+        "no Wasm code",
     ];
 
     #[test]
@@ -5615,6 +5806,7 @@ mod tests {
             AdminOrOwnerKey::ExternalRefExecutable,
             AdminOrOwnerKey::ExternalRefUnresolved,
             AdminOrOwnerKey::ExecutableChanged,
+            AdminOrOwnerKey::NoWasmCode,
         ]
         .iter()
         .map(std::string::ToString::to_string)
@@ -5626,6 +5818,14 @@ mod tests {
         assert_eq!(
             rendered, expected,
             "mutability reason Display output must match the emitted reason set"
+        );
+        assert_eq!(
+            serde_json::to_value(AdminOrOwnerKey::NoWasmCode).unwrap(),
+            "NoWasmCode"
+        );
+        assert_eq!(
+            serde_json::from_str::<AdminOrOwnerKey>(r#""NoWasmCode""#).unwrap(),
+            AdminOrOwnerKey::NoWasmCode
         );
     }
 
@@ -5640,6 +5840,7 @@ mod tests {
         assert!(AdminOrOwnerKey::NonWasmExecutable.is_unpinnable_instance());
         assert!(AdminOrOwnerKey::ExternalRefUnresolved.is_unpinnable_instance());
         assert!(AdminOrOwnerKey::ExecutableChanged.is_unpinnable_instance());
+        assert!(AdminOrOwnerKey::NoWasmCode.is_unpinnable_instance());
     }
 
     /// Verifies that every `stage: "<literal>"` emit site in the crate's

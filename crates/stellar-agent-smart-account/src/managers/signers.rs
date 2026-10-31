@@ -100,7 +100,7 @@ use stellar_agent_core::audit_log::AuditLogIntegrityError;
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::health::{AuditWriterHealth, AuditWriterHealthHandle};
 use stellar_agent_core::audit_log::reader::PinnedHashesRecord;
-use stellar_agent_core::audit_log::schema::{ContractKind, PinsUpdateReason};
+use stellar_agent_core::audit_log::schema::{ContractKind, PinsUpdateReason, WasmHashPin};
 use stellar_agent_core::audit_log::signer_set::{
     BaselineReason, ObservedSignerSet, SignerEntryV2, SignerIdentityV2, SignerPubkey,
     SignerSetSnapshotV2, SignerSetView, SignerSetViewPayload, ThresholdObservation, account_digest,
@@ -895,8 +895,8 @@ impl SignersManager {
     ///
     /// Called by [`crate::managers::migration::MigrationPlan::submit`] once
     /// per pair. `remove_args` and `add_args` are the invoke arguments of the
-    /// pair's two host functions; `from_hash_first8` and `to_hash_first8`
-    /// name the source and destination verifier hashes.
+    /// pair's two host functions; `from_hash` and `to_hash` are the full
+    /// source and destination verifier hashes.
     ///
     /// # Order
     ///
@@ -909,7 +909,9 @@ impl SignersManager {
     /// 2. The plan is checked before anything is sent. The compared set
     ///    holds signer `signer_id` with an `External` identity, `add_args`
     ///    add the same key data on the destination verifier, and
-    ///    `remove_args` remove signer `signer_id` of rule `rule_id`.
+    ///    `remove_args` remove signer `signer_id` of rule `rule_id`. A rule
+    ///    whose pin record holds eight-byte hash prefixes is refused here,
+    ///    so the repoint never rewrites an unauthenticated record.
     /// 3. The removal's preconditions of [`Self::remove_signer`] apply: a
     ///    rule with policies and no simple-threshold policy, and a rule whose
     ///    threshold the removal would make unreachable, are refused. The
@@ -927,7 +929,7 @@ impl SignersManager {
     ///    `SaSignerAddedV2` records it.
     /// 8. `SaVerifierMigrated` records the completed pair.
     ///
-    /// A completed pair writes `[SaSignerRemovedV2, SaContextRulePinsUpdated,
+    /// A completed pair writes `[SaSignerRemovedV2, SaContextRulePinsUpdatedV2,
     /// SaSignerAddedV2, SaVerifierMigrated]`; the pins row is written only
     /// for a rule with a pin record that does not already name the
     /// destination alone. The pins row and `SaVerifierMigrated` are logged
@@ -936,15 +938,15 @@ impl SignersManager {
     ///
     /// # Pin record
     ///
-    /// The repoint replaces the record's verifier pins by `to_hash_first8`
-    /// with no executable-reference pin, the policy pins and override flags
+    /// The repoint replaces the record's verifier pins by the full
+    /// `to_hash` with no executable-reference pin, the policy pins and override flags
     /// unchanged. The migration preflight identified the destination,
     /// required it in the allowlist and refused a mutable one, which
     /// includes every external reference. It runs as soon as the removal
     /// was sent and before the add, so a pair that stops after the send
     /// leaves a record that already names the destination. A rule without a
     /// pin record stays unpinned, and a record that already names the
-    /// destination alone is not rewritten.
+    /// destination alone, compared in all 32 bytes, is not rewritten.
     ///
     /// # Pending add
     ///
@@ -987,6 +989,8 @@ impl SignersManager {
     ///   disagree.
     /// - [`SaError::VerifierMigrationFailed`] at phase `plan_build`: the
     ///   plan check of step 2.
+    /// - [`SaError::WasmPinIncomplete`]: the rule's pin record holds
+    ///   eight-byte hash prefixes; nothing is sent.
     /// - [`SaError::AuthEntryConstructionFailed`] at stage `rule_lock`: the
     ///   lock was not acquired within its budget.
     /// - The errors of [`Self::submit_migration_step`] for either step.
@@ -1001,8 +1005,8 @@ impl SignersManager {
         rule_id: u32,
         signer_id: u32,
         to_verifier_addr: &ScAddress,
-        from_hash_first8: &str,
-        to_hash_first8: &str,
+        from_hash: WasmHashPin,
+        to_hash: WasmHashPin,
         remove_args: Vec<ScVal>,
         add_args: Vec<ScVal>,
         signer: &(dyn Signer + Send + Sync),
@@ -1057,6 +1061,19 @@ impl SignersManager {
         })?;
         check_remove_preconditions(&compared[0], signer_id, &smart_account_redacted, request_id)
             .map_err(without_pending_add)?;
+        // A record of eight-byte prefixes refuses before the removal is sent:
+        // the repoint after the send would otherwise replace a record whose
+        // pins never authenticated the code they name.
+        if let Err(error @ SaError::WasmPinIncomplete { .. }) =
+            crate::managers::verifiers::read_pinned_hashes_for_rule(
+                self,
+                rule_id,
+                &smart_account_redacted,
+                request_id,
+            )
+        {
+            return Err(without_pending_add(error));
+        }
 
         let pending = |remove_tx_hash: &str, remove_confirmed: bool| {
             PendingAddStep::new(
@@ -1097,7 +1114,7 @@ impl SignersManager {
                         self.repoint_migrated_pins(
                             rule_id,
                             &smart_account_redacted,
-                            to_hash_first8,
+                            to_hash,
                             request_id,
                         );
                         Some(pending(tx_hash, false))
@@ -1128,7 +1145,7 @@ impl SignersManager {
             .await;
         // The removal is on chain: the record names the destination whatever
         // its recording returned.
-        self.repoint_migrated_pins(rule_id, &smart_account_redacted, to_hash_first8, request_id);
+        self.repoint_migrated_pins(rule_id, &smart_account_redacted, to_hash, request_id);
         recorded.map_err(stopped)?;
 
         // The add's comparison, against the removal's state row.
@@ -1206,8 +1223,8 @@ impl SignersManager {
         self.write_verifier_migrated_row(
             rule_id,
             &smart_account_redacted,
-            from_hash_first8,
-            to_hash_first8,
+            from_hash,
+            to_hash,
             &mutation.tx_hash,
             request_id,
         );
@@ -1296,16 +1313,17 @@ impl SignersManager {
         &self,
         rule_id: u32,
         smart_account_redacted: &str,
-        to_hash_first8: &str,
+        to_hash: WasmHashPin,
         request_id: &str,
     ) {
         match crate::managers::verifiers::read_pinned_hashes_for_rule(
             self,
             rule_id,
             smart_account_redacted,
+            request_id,
         ) {
             Ok(Some(record)) => {
-                if record.pinned_verifier_first8 == [to_hash_first8]
+                if record.pinned_verifier_hashes == [to_hash]
                     && record.pinned_verifier_executable_refs.is_empty()
                 {
                     debug!(
@@ -1317,7 +1335,7 @@ impl SignersManager {
                     return;
                 }
                 let mut update = PlannedPinUpdate::unchanged(record);
-                update.record.pinned_verifier_first8 = vec![to_hash_first8.to_owned()];
+                update.record.pinned_verifier_hashes = vec![to_hash];
                 update.record.pinned_verifier_executable_refs = Vec::new();
                 self.write_pin_rows(
                     rule_id,
@@ -1337,13 +1355,14 @@ impl SignersManager {
                 error = %e,
                 request_id,
                 "migrate_signer_pair: the pin record is unreadable after the removal was sent; \
-                 SaContextRulePinsUpdated row not written"
+                 SaContextRulePinsUpdatedV2 row not written"
             ),
         }
     }
 
     /// Writes the `SaVerifierMigrated` row of a completed migration pair,
-    /// carrying the redacted hash of its add transaction.
+    /// carrying the redacted hash of its add transaction. The row's hash
+    /// fields are labeled first-8 display projections of the full hashes.
     ///
     /// The pair's state rows carry its integrity, so a row the audit log
     /// refuses is logged, and a poisoned writer marks the session degraded.
@@ -1351,8 +1370,8 @@ impl SignersManager {
         &self,
         rule_id: u32,
         smart_account_redacted: &str,
-        from_hash_first8: &str,
-        to_hash_first8: &str,
+        from_hash: WasmHashPin,
+        to_hash: WasmHashPin,
         add_tx_hash: &str,
         request_id: &str,
     ) {
@@ -1361,8 +1380,8 @@ impl SignersManager {
             AuditEntry::new_sa_verifier_migrated(
                 rule_id,
                 RedactedStrkey::from_already_redacted(smart_account_redacted),
-                from_hash_first8,
-                to_hash_first8,
+                from_hash.first8_display(),
+                to_hash.first8_display(),
                 &add_tx_hash_redacted,
                 self.chain_id.as_str(),
                 request_id,
@@ -2078,6 +2097,7 @@ impl SignersManager {
             self,
             rule_id,
             smart_account_redacted,
+            request_id,
         )?
         else {
             debug!(
@@ -2087,15 +2107,15 @@ impl SignersManager {
             return Ok(RefreshPinPlan::Unchanged);
         };
         if live_verifiers.is_empty() {
-            if record.pinned_verifier_first8.len() != 1 {
+            if record.pinned_verifier_hashes.len() != 1 {
                 return Ok(RefreshPinPlan::Unchanged);
             }
             let mut update = PlannedPinUpdate::unchanged(record);
-            update.record.pinned_verifier_first8 = Vec::new();
+            update.record.pinned_verifier_hashes = Vec::new();
             update.record.pinned_verifier_executable_refs = Vec::new();
             return Ok(RefreshPinPlan::DropDeadPin(update));
         }
-        if !record.pinned_verifier_first8.is_empty() {
+        if !record.pinned_verifier_hashes.is_empty() {
             return Ok(RefreshPinPlan::Unchanged);
         }
 
@@ -2112,13 +2132,13 @@ impl SignersManager {
                 request_id,
             )
             .await?;
-            if update.record.pinned_verifier_first8.is_empty() {
+            if update.record.pinned_verifier_hashes.is_empty() {
                 update.append_pin(PinnedKind::Verifier, pin);
-            } else if update.record.pinned_verifier_first8.first() == Some(&pin.hash_first8)
+            } else if update.record.pinned_verifier_hashes.first() == Some(&pin.hash)
                 && update.record.verifier_executable_ref(0) == pin.executable_ref.as_ref()
             {
-                // Another address whose pin equals the recorded one, in hash
-                // and executable reference. The signing check compares it
+                // Another address whose pin equals the recorded one, in all
+                // 32 bytes of the hash and in executable reference. The signing check compares it
                 // with that pin and accepts it, so it adds no pin, and the
                 // overrides applied to it are recorded.
                 update.fold_overrides(
@@ -3077,9 +3097,10 @@ impl SignersManager {
                 rule_id,
                 smart_account_redacted,
                 policy_id,
-                &observation.effective_hash,
+                observation.effective_hash.as_ref(),
                 rule_policy_count,
                 budget,
+                request_id,
             )
         })
         .await??;
@@ -3241,9 +3262,10 @@ impl SignersManager {
                 rule_id,
                 smart_account_redacted,
                 policy_id,
-                &removed_hash,
+                Some(&removed_hash),
                 rule_policy_count,
                 budget,
+                request_id,
             )
         })
         .await??;
@@ -3325,6 +3347,8 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::WasmPinIncomplete`]: the pin record holds eight-byte
+    ///   hash prefixes.
     /// - [`SaError::AuditLog`]: the pin record could not be read.
     /// - The refusals of `pin_added_contract` for the policy.
     async fn plan_policy_add_pin_update(
@@ -3340,6 +3364,7 @@ impl SignersManager {
             self,
             rule_id,
             smart_account_redacted,
+            request_id,
         )?
         else {
             debug!(
@@ -3368,7 +3393,7 @@ impl SignersManager {
             // policy of the rule; the row pins exactly the policy set the
             // add produces. The override flags stay, since they record
             // overrides applied to the rule's contracts.
-            update.record.pinned_policy_first8.clear();
+            update.record.pinned_policy_hashes.clear();
             update.record.pinned_policy_executable_refs.clear();
         }
         update.append_pin(PinnedKind::Policy, pin);
@@ -3379,12 +3404,15 @@ impl SignersManager {
     /// once the removal confirms.
     ///
     /// `removed_hash` is the removed policy's effective hash as observed
-    /// under the rule's lock, and `rule_policy_count` the number of policies
-    /// the rule held there. Returns `None` without a pin record, or when no
-    /// policy pin is the removed policy's. A pin is the removed policy's when
-    /// it equals `removed_hash`. When the policy is the rule's only policy
-    /// and the record holds one policy pin, that pin is the removed policy's
-    /// whatever the hash: it can only be that policy's. The rule then ends
+    /// under the rule's lock, `None` when the policy has no Wasm code, and
+    /// `rule_policy_count` the number of policies the rule held there.
+    /// Returns `None` without a pin record, or when no policy pin is the
+    /// removed policy's. A pin is the removed policy's when it equals
+    /// `removed_hash` in all 32 bytes; a pin sharing only a prefix with it is
+    /// another policy's, and absent Wasm code matches no pin. When the policy
+    /// is the rule's only policy and the record holds one policy pin, that pin
+    /// is the removed policy's whatever the hash: it can only be that policy's.
+    /// The rule then ends
     /// with no policy and no policy pin, the state of a rule installed
     /// without a policy.
     ///
@@ -3393,22 +3421,31 @@ impl SignersManager {
     ///
     /// # Errors
     ///
+    /// - [`SaError::WasmPinIncomplete`] when the pin record holds eight-byte
+    ///   hash prefixes.
     /// - [`SaError::AuditLog`] when the pin record cannot be read.
     /// - [`SaError::AuthEntryConstructionFailed`] (stage `auth_payload`, the
     ///   reason naming `pin_plan`) when `budget` elapsed during the scan.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the rule, the removed policy and its hash, the policy count, the budget and \
+                  the correlation id"
+    )]
     fn plan_policy_remove_pin_update(
         &self,
         rule_id: u32,
         smart_account_redacted: &str,
         policy_id: u32,
-        removed_hash: &[u8; 32],
+        removed_hash: Option<&[u8; 32]>,
         rule_policy_count: usize,
         budget: PreSubmitBudget,
+        request_id: &str,
     ) -> Result<Option<PinnedHashesRecord>, SaError> {
         let record = crate::managers::verifiers::read_pinned_hashes_for_rule(
             self,
             rule_id,
             smart_account_redacted,
+            request_id,
         )?;
         budget.check_at("pin_plan", "auth_payload")?;
         let Some(mut record) = record else {
@@ -3418,25 +3455,25 @@ impl SignersManager {
             );
             return Ok(None);
         };
-        let removed_first8 = hash_first8_hex(removed_hash);
-        let position = match record
-            .pinned_policy_first8
-            .iter()
-            .position(|pinned| *pinned == removed_first8)
-        {
+        let position = match removed_hash.and_then(|removed| {
+            record
+                .pinned_policy_hashes
+                .iter()
+                .position(|pinned| pinned.matches(removed))
+        }) {
             Some(position) => position,
-            None if rule_policy_count == 1 && record.pinned_policy_first8.len() == 1 => 0,
+            None if rule_policy_count == 1 && record.pinned_policy_hashes.len() == 1 => 0,
             None => {
                 debug!(
                     rule_id,
                     policy_id,
-                    removed_first8 = %removed_first8,
+                    removed_hash = %removed_hash.map_or_else(|| "none".to_owned(), hex::encode),
                     "remove_policy: no policy pin is the removed policy's; no pin update is written"
                 );
                 return Ok(None);
             }
         };
-        record.pinned_policy_first8.remove(position);
+        record.pinned_policy_hashes.remove(position);
         if position < record.pinned_policy_executable_refs.len() {
             record.pinned_policy_executable_refs.remove(position);
         }
@@ -5587,7 +5624,12 @@ impl SignersManager {
             )
             .await?;
 
-        if !observation.allowlisted {
+        // No code is never allowlisted, so an allowlisted observation always
+        // carries its hash.
+        let Some(effective_hash) = observation
+            .effective_hash
+            .filter(|_| observation.allowlisted)
+        else {
             return Err(SaError::VerifierWasmNotInAllowlist {
                 rule_id: Some(rule_id),
                 smart_account_redacted: RedactedStrkey::from_already_redacted(
@@ -5596,16 +5638,16 @@ impl SignersManager {
                 observed_hash_first8: observation.observed_hash_first8(),
                 request_id,
             });
-        }
+        };
 
         crate::verifier_allowlist::refuse_revoked_or_retired_verifier(
-            &observation.effective_hash,
+            &effective_hash,
             Some(rule_id),
             &smart_account_redacted,
             &request_id,
         )?;
 
-        Ok(observation.effective_hash)
+        Ok(effective_hash)
     }
 
     /// Observes a deployed verifier or policy contract and decides whether
@@ -5616,8 +5658,9 @@ impl SignersManager {
     /// reference with no live tag entry is refused before any allowlist
     /// decision, because it names no code the wallet can pin. Otherwise the
     /// returned [`ContractObservation`] carries the executable, its effective
-    /// hash (zero for no code) and whether `is_allowlisted` accepts that
-    /// hash; no code is never allowlisted.
+    /// hash (`None` for no Wasm code) and whether `is_allowlisted` accepts that
+    /// hash. Absent Wasm code is never allowlisted, and a caller that pins
+    /// the contract refuses it.
     ///
     /// `contract_kind` names the role of `contract_addr` in a refusal.
     /// `rule_id` is `None` before install, when the rule has no on-chain id
@@ -5677,10 +5720,10 @@ impl SignersManager {
             });
         }
 
-        let effective = observed.effective_hash();
+        let effective_hash = observed.effective_hash();
         let observation = ContractObservation {
-            allowlisted: effective.is_some_and(|hash| is_allowlisted(&hash)),
-            effective_hash: effective.unwrap_or([0u8; 32]),
+            allowlisted: effective_hash.is_some_and(|hash| is_allowlisted(&hash)),
+            effective_hash,
             observed,
         };
 
@@ -6330,13 +6373,18 @@ impl SignersManager {
                 )
                 .await?;
             if first_first8.is_none()
-                && let Some(hash) = observation.observed.effective_hash()
+                && let Some(hash) = observation.effective_hash
             {
                 let mut first8 = [0u8; 8];
                 first8.copy_from_slice(&hash[..8]);
                 first_first8 = Some(first8);
             }
-            if observation.allowlisted {
+            // No code is never allowlisted, so an allowlisted observation
+            // always carries its hash.
+            if let Some(executable_hash) = observation
+                .effective_hash
+                .filter(|_| observation.allowlisted)
+            {
                 let ScAddress::Contract(ContractId(Hash(policy_id))) = policy else {
                     return Err(SaError::DeploymentFailed {
                         phase: "simulate",
@@ -6348,7 +6396,7 @@ impl SignersManager {
                 matches.push(ThresholdPolicyMatch {
                     address: policy.clone(),
                     contract_id: *policy_id,
-                    executable_hash: observation.effective_hash,
+                    executable_hash,
                 });
             }
         }
@@ -7147,17 +7195,22 @@ impl SignersManager {
                     request_id,
                 )
                 .await?;
-            crate::verifier_allowlist::refuse_revoked_or_retired_verifier(
-                &observation.effective_hash,
-                Some(rule_id),
-                smart_account_redacted,
-                request_id,
-            )?;
+            // No code has no allowlist status; when the rule has a pin
+            // record, pinning the verifier below refuses it.
+            if let Some(hash) = &observation.effective_hash {
+                crate::verifier_allowlist::refuse_revoked_or_retired_verifier(
+                    hash,
+                    Some(rule_id),
+                    smart_account_redacted,
+                    request_id,
+                )?;
+            }
         }
         let Some(record) = crate::managers::verifiers::read_pinned_hashes_for_rule(
             self,
             rule_id,
             smart_account_redacted,
+            request_id,
         )?
         else {
             debug!(
@@ -7193,13 +7246,19 @@ impl SignersManager {
                 request_id,
             )
             .await?;
-            let recorded = update.record.pinned_verifier_first8.iter().enumerate().any(
-                |(position, first8)| {
-                    *first8 == pin.hash_first8
-                        && update.record.verifier_executable_ref(position)
-                            == pin.executable_ref.as_ref()
-                },
-            );
+            // A pin is already recorded only when all 32 bytes of its hash
+            // and its executable reference equal a recorded position's.
+            let recorded =
+                update
+                    .record
+                    .pinned_verifier_hashes
+                    .iter()
+                    .enumerate()
+                    .any(|(position, hash)| {
+                        *hash == pin.hash
+                            && update.record.verifier_executable_ref(position)
+                                == pin.executable_ref.as_ref()
+                    });
             if recorded {
                 update.fold_overrides(
                     pin.mutable_override,
@@ -8755,7 +8814,8 @@ impl ObservedExecutable {
 
     /// Returns a bounded summary for drift rows and errors: `wasm`,
     /// `no code`, or `external reference owner <redacted> tag "<bounded>"
-    /// resolved <first-8 hex or unset>`.
+    /// resolved <full hash hex or unset>`. The resolved hash is shown in
+    /// full so two resolutions that share a prefix stay distinguishable.
     #[must_use]
     pub fn summary(&self) -> String {
         match self {
@@ -8767,7 +8827,7 @@ impl ObservedExecutable {
                 external.tag_display(),
                 external
                     .resolved
-                    .map_or_else(|| "unset".to_owned(), |hash| hash_first8_hex(&hash)),
+                    .map_or_else(|| "unset".to_owned(), hex::encode),
             ),
         }
     }
@@ -8794,7 +8854,8 @@ pub(crate) fn policy_hash_allowlisted(hash: &[u8; 32]) -> bool {
         || hex::encode(hash) == crate::spending_limit_policy::SPENDING_LIMIT_POLICY_WASM_SHA256
 }
 
-/// The first-8 projection of a hash the audit rows, pins and errors carry.
+/// The labeled first-8 display projection of a hash that drift rows,
+/// override rows and allowlist errors carry; pins carry the full hash.
 pub(crate) use stellar_agent_core::hex::wasm_hash_first8_hex as hash_first8_hex;
 
 /// Identification result of one verifier or policy contract: the observed
@@ -8803,8 +8864,9 @@ pub(crate) use stellar_agent_core::hex::wasm_hash_first8_hex as hash_first8_hex;
 pub(crate) struct ContractObservation {
     /// The executable both endpoints agreed on.
     pub(crate) observed: ObservedExecutable,
-    /// The effective hash, or the zero hash for no code.
-    pub(crate) effective_hash: [u8; 32],
+    /// The effective hash: the Wasm hash or the hash an external reference
+    /// resolved to; `None` for no Wasm code, which has no hash.
+    pub(crate) effective_hash: Option<[u8; 32]>,
     /// `true` when the instance has code and its effective hash is in the
     /// caller's allowlist.
     pub(crate) allowlisted: bool,
@@ -8814,10 +8876,9 @@ impl ContractObservation {
     /// First-8 hex of the effective hash, or `"none"` for no code; the form
     /// the allowlist-miss errors and override rows carry.
     pub(crate) fn observed_hash_first8(&self) -> String {
-        match self.observed {
-            ObservedExecutable::NoCode => "none".to_owned(),
-            _ => hash_first8_hex(&self.effective_hash),
-        }
+        self.effective_hash
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), hash_first8_hex)
     }
 }
 
@@ -11680,7 +11741,7 @@ pub(crate) mod tests {
                 observed.summary(),
                 format!(
                     "external reference owner GAAAA...AAWHF tag \"verifier\" resolved {}",
-                    hash_first8_hex(&allowlisted)
+                    hex::encode(allowlisted)
                 )
             );
         }
@@ -11770,7 +11831,7 @@ pub(crate) mod tests {
             .expect("resolved reference is observed");
 
         assert!(observation.allowlisted);
-        assert_eq!(observation.effective_hash, allowlisted);
+        assert_eq!(observation.effective_hash, Some(allowlisted));
         assert_eq!(
             observation.observed_hash_first8(),
             hash_first8_hex(&allowlisted)
@@ -11803,7 +11864,7 @@ pub(crate) mod tests {
             .expect("resolved reference is observed");
 
         assert!(!observation.allowlisted);
-        assert_eq!(observation.effective_hash, unknown);
+        assert_eq!(observation.effective_hash, Some(unknown));
         assert_eq!(observation.observed_hash_first8(), "d1d1d1d1d1d1d1d1");
     }
 

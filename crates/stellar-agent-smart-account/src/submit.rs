@@ -229,7 +229,9 @@ pub struct Ed25519RuleSigner<'a> {
 /// - a rule with no policy on chain whose pin record holds policy pins
 ///   refuses with [`SaError::PinnedPolicyAbsent`]. A rule with a live
 ///   `External` signer whose pin record pins no verifier refuses with
-///   [`SaError::PinnedVerifierAbsent`]. Neither writes a drift row;
+///   [`SaError::PinnedVerifierAbsent`]. A rule whose pin record holds
+///   eight-byte hash prefixes refuses with [`SaError::WasmPinIncomplete`].
+///   None of them writes a drift row;
 /// - any other failure of the address fetch or of a check (RPC failure or
 ///   divergence, audit-log integrity error, a record with more than one
 ///   verifier or policy pin, an unpinnable instance, the pre-submit budget
@@ -978,6 +980,8 @@ pub struct SubmitInvokeArgs<'a> {
 ///   policy pins while the rule has no policy on chain.
 /// - [`SaError::PinnedVerifierAbsent`]: a checked rule holds a live
 ///   `External` signer while its pin record pins no verifier.
+/// - [`SaError::WasmPinIncomplete`]: a checked rule's pin record holds
+///   eight-byte hash prefixes.
 /// - [`SaError::PinCheckUnavailable`]: the drift check of a rule could not
 ///   run to a verdict.
 /// - [`SaError::SubmitCheckMissing`] — a name in `required_checks` maps to a
@@ -2311,8 +2315,8 @@ async fn run_rule_checks(
 /// # Errors
 ///
 /// - [`SaError::VerifierHashDrift`] / [`SaError::PolicyHashDrift`] /
-///   [`SaError::PinnedPolicyAbsent`] / [`SaError::PinnedVerifierAbsent`]
-///   unchanged from the check.
+///   [`SaError::PinnedPolicyAbsent`] / [`SaError::PinnedVerifierAbsent`] /
+///   [`SaError::WasmPinIncomplete`] unchanged from the check.
 /// - [`SaError::VerifierWasmRevoked`] / [`SaError::VerifierWasmRetired`]
 ///   unchanged from the status gate, with no drift row.
 /// - [`SaError::PinCheckUnavailable`] for every other failure, including the
@@ -2352,6 +2356,7 @@ async fn run_pin_check(
                 | SaError::PolicyHashDrift { .. }
                 | SaError::PinnedPolicyAbsent { .. }
                 | SaError::PinnedVerifierAbsent { .. }
+                | SaError::WasmPinIncomplete { .. }
                 | SaError::VerifierWasmRevoked { .. }
                 | SaError::VerifierWasmRetired { .. }),
             )) => {

@@ -94,10 +94,12 @@ use std::collections::HashMap;
 
 use sha2::{Digest as _, Sha256};
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::reader::{AuditReader, PinnedHashesRecord};
+use stellar_agent_core::audit_log::reader::{
+    AuditReader, ContextRulePinRecord, PinnedHashesRecord,
+};
 use stellar_agent_core::audit_log::schema::ContractKind;
 use stellar_agent_core::audit_log::schema::{
-    ExecutableRefPin, PinsUpdateReason, executable_refs_or_empty,
+    ExecutableRefPin, PinsUpdateReason, WasmHashPin, executable_refs_or_empty,
 };
 use stellar_agent_core::observability::{RedactedStrkey, redact_strkey_first5_last5};
 use stellar_agent_network::{ExternalRefExecutable, StellarRpcClient};
@@ -109,8 +111,8 @@ use crate::managers::rules::{
     xdr_scaddress_to_strkey_or_sentinel,
 };
 use crate::managers::signers::{
-    ObservedExecutable, SignersManager, fetch_observed_executable, hash_first8_hex,
-    policy_hash_allowlisted, verifier_hash_allowlisted,
+    ObservedExecutable, SignersManager, fetch_observed_executable, policy_hash_allowlisted,
+    verifier_hash_allowlisted,
 };
 use crate::{AdminOrOwnerKey, SaError};
 
@@ -120,15 +122,15 @@ use crate::{AdminOrOwnerKey, SaError};
 ///
 /// Carries the pinned wasm hashes, the executable-reference pins aligned with
 /// them, and the mutability/unknown override flags, embedded into the
-/// `EventKind::SaContextRuleCreated` audit row by
+/// `EventKind::SaContextRuleCreatedV2` audit row by
 /// `ContextRuleManager::install_rule`, and the overrides applied while
 /// pinning, which the install writes as override rows once it confirms.
 ///
 /// # Redaction
 ///
-/// Full 32-byte hashes are stored here (returned to the caller for JSON
-/// envelope emission via `--output json`).  The audit row stores only the
-/// first-8-hex projection.
+/// Full 32-byte hashes are stored here, returned to the caller for JSON
+/// envelope emission via `--output json`, and the audit row stores them in
+/// full: a pin authenticates the whole hash.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct PinResult {
@@ -164,32 +166,32 @@ pub struct PinResult {
     /// pinning order. The install writes each as a
     /// `SaMutableContractOverride` or `SaUnknownContractOverride` row
     /// carrying the new rule's id after the install confirms, before the
-    /// `SaContextRuleCreated` row; a refused install writes none.
+    /// `SaContextRuleCreatedV2` row; a refused install writes none.
     pub pending_overrides: Vec<PendingOverride>,
 }
 
 impl PinResult {
-    /// Returns the pinned verifier wasm hashes as first-8-hex strings for
-    /// audit-log emission.
+    /// Returns the pinned verifier wasm hashes, all 32 bytes of each, for
+    /// the audit row and the JSON envelopes.
     ///
     /// The order matches `pinned_verifier_wasm_hashes`.
     #[must_use]
-    pub fn pinned_verifier_hashes_first8(&self) -> Vec<String> {
+    pub fn pinned_verifier_hashes(&self) -> Vec<WasmHashPin> {
         self.pinned_verifier_wasm_hashes
             .iter()
-            .map(|(_, h)| hash_first8_hex(h))
+            .map(|(_, h)| WasmHashPin::new(*h))
             .collect()
     }
 
-    /// Returns the pinned policy wasm hashes as first-8-hex strings for
-    /// audit-log emission.
+    /// Returns the pinned policy wasm hashes, all 32 bytes of each, for the
+    /// audit row and the JSON envelopes.
     ///
     /// The order matches `pinned_policy_wasm_hashes`.
     #[must_use]
-    pub fn pinned_policy_hashes_first8(&self) -> Vec<String> {
+    pub fn pinned_policy_hashes(&self) -> Vec<WasmHashPin> {
         self.pinned_policy_wasm_hashes
             .iter()
-            .map(|(_, h)| hash_first8_hex(h))
+            .map(|(_, h)| WasmHashPin::new(*h))
             .collect()
     }
 
@@ -209,8 +211,8 @@ impl PinResult {
         executable_refs_or_empty(self.pinned_policy_executable_refs.clone())
     }
 
-    /// Builds the `SaContextRuleCreated` audit row that records this pin for
-    /// the installed rule `rule_id`.
+    /// Builds the `SaContextRuleCreatedV2` audit row that records this pin,
+    /// with every hash in full, for the installed rule `rule_id`.
     ///
     /// `smart_account_redacted` MUST be the first-5-last-5 redacted
     /// smart-account strkey.
@@ -223,7 +225,7 @@ impl PinResult {
         chain_id: &str,
         request_id: &str,
     ) -> AuditEntry {
-        AuditEntry::new_sa_context_rule_created(
+        AuditEntry::new_sa_context_rule_created_v2(
             smart_account_redacted,
             rule_id,
             rule_definition.context_type_label(),
@@ -232,8 +234,8 @@ impl PinResult {
             rule_definition.valid_until,
             chain_id,
             request_id,
-            self.pinned_verifier_hashes_first8(),
-            self.pinned_policy_hashes_first8(),
+            self.pinned_verifier_hashes(),
+            self.pinned_policy_hashes(),
             self.mutable_override,
             self.unknown_override,
             self.pinned_verifier_executable_refs.clone(),
@@ -334,19 +336,23 @@ impl PendingOverride {
 ///    and matches its effective hash against `VERIFIER_ALLOWLIST` (verifier)
 ///    or the vendored policy Wasms (policy: simple-threshold,
 ///    weighted-threshold and spending-limit). An external reference with
-///    no live tag entry is refused with `SaError::ContractInstanceUnsupported`
-///    before any override flag is consulted. An allowlist miss returns
+///    no live tag entry (reason `ExternalRefUnresolved`) and a contract with
+///    no Wasm code, an absent instance or a built-in executable such
+///    as the Stellar Asset Contract (reason `NoWasmCode`), are refused
+///    with `SaError::ContractInstanceUnsupported` before any override flag
+///    is consulted: neither has a code hash to pin. An allowlist miss returns
 ///    `SaError::VerifierWasmNotInAllowlist` / `SaError::PolicyWasmNotInAllowlist`
 ///    UNLESS `accept_unknown_verifier` is set, in which case an unknown-hash
-///    [`PendingOverride`] is recorded and the effective hash (zero for no
-///    code) is pinned with `unknown_override = true`.
+///    [`PendingOverride`] is recorded and the effective hash is pinned with
+///    `unknown_override = true`.
 ///
 /// 2. **Mutability detection**: [`detect_contract_mutability`] (two-RPC
 ///    instance probe). An existing instance that is undecodable or has a
 ///    non-Wasm, non-reference executable returns
 ///    `SaError::ContractInstanceUnsupported` regardless of
-///    `accept_mutable_verifier`: its pin is the zero hash, so the signing-time
-///    drift check cannot observe a change to its code. A probe that observes
+///    `accept_mutable_verifier`: it has no Wasm code hash to pin, so the
+///    signing-time drift check could not observe a change to its code. A
+///    probe that observes
 ///    a different executable kind or external reference than identification
 ///    is refused the same way (reason `ExecutableChanged`). An active admin
 ///    or owner key, or an external-reference executable, returns
@@ -355,9 +361,9 @@ impl PendingOverride {
 ///    [`PendingOverride`] is recorded (naming the owner and tag of an
 ///    external reference) and `mutable_override = true`.
 ///
-/// 3. **Pin**: the effective hash is pinned; an external reference also
-///    records an [`ExecutableRefPin`] (owner, tag, tag-key digest and resolved
-///    first-8) at the same position, so the signing-time drift check refuses
+/// 3. **Pin**: the effective hash is pinned in full; an external reference
+///    also records an [`ExecutableRefPin`] (owner, tag, tag-key digest and
+///    full resolved hash) at the same position, so the signing-time drift check refuses
 ///    when the owner repoints the tag, the reference changes or the executable
 ///    kind changes.
 ///
@@ -400,9 +406,9 @@ impl PendingOverride {
 ///   external-reference executable and `accept_mutable_verifier` is `false`.
 /// - [`SaError::PolicyMutable`]: the same for a policy.
 /// - [`SaError::ContractInstanceUnsupported`]: a verifier or policy instance
-///   is undecodable, has a non-Wasm executable, is an external reference with
-///   no live tag entry, or changed executable between identification and the
-///   mutability probe; no flag overrides it.
+///   is undecodable, has no Wasm code or a non-Wasm executable, is an
+///   external reference with no live tag entry, or changed executable between
+///   identification and the mutability probe; no flag overrides it.
 /// - [`SaError::VerifierWasmNotInAllowlist`]: verifier effective hash not in
 ///   allowlist and `accept_unknown_verifier` is `false`.
 /// - [`SaError::PolicyWasmNotInAllowlist`]: policy effective hash not in
@@ -504,8 +510,8 @@ pub async fn pin_referenced_contracts(
 /// rule.
 #[derive(Clone, Debug)]
 pub(crate) struct AddedContractPin {
-    /// First-8 hex of the contract's effective hash.
-    pub(crate) hash_first8: String,
+    /// The contract's full effective hash.
+    pub(crate) hash: WasmHashPin,
     /// Pin of an external-reference executable; `None` otherwise.
     pub(crate) executable_ref: Option<ExecutableRefPin>,
     /// The mutable-contract override was applied.
@@ -554,7 +560,7 @@ pub(crate) async fn pin_added_contract(
     };
     let pinned = pin_contract(&context, contract, kind).await?;
     Ok(AddedContractPin {
-        hash_first8: hash_first8_hex(&pinned.hash),
+        hash: WasmHashPin::new(pinned.hash),
         executable_ref: pinned.executable_ref,
         mutable_override: pinned.mutable_override,
         unknown_override: pinned.unknown_override,
@@ -566,7 +572,7 @@ pub(crate) async fn pin_added_contract(
 /// the overrides applied while pinning the contracts it adds.
 #[derive(Clone, Debug)]
 pub(crate) struct PlannedPinUpdate {
-    /// The record the `SaContextRulePinsUpdated` row carries.
+    /// The record the `SaContextRulePinsUpdatedV2` row carries.
     pub(crate) record: PinnedHashesRecord,
     /// The overrides written, as override rows, before that row.
     pub(crate) pending_overrides: Vec<PendingOverride>,
@@ -581,28 +587,28 @@ impl PlannedPinUpdate {
         }
     }
 
-    /// Appends `pin` to the record's pin lists of `kind`: its first-8 to the
-    /// first-8 list and its executable-reference pin to the aligned reference
-    /// list, which stays empty while no pin of the kind is a reference and is
-    /// otherwise aligned with the first-8 list. Folds its override flags into
-    /// the record's and queues its pending overrides.
+    /// Appends `pin` to the record's pin lists of `kind`: its full hash to
+    /// the hash list and its executable-reference pin to the aligned
+    /// reference list, which stays empty while no pin of the kind is a
+    /// reference and is otherwise aligned with the hash list. Folds its
+    /// override flags into the record's and queues its pending overrides.
     pub(crate) fn append_pin(&mut self, kind: PinnedKind, pin: AddedContractPin) {
         let record = &mut self.record;
-        let (first8, refs) = match kind {
+        let (hashes, refs) = match kind {
             PinnedKind::Verifier => (
-                &mut record.pinned_verifier_first8,
+                &mut record.pinned_verifier_hashes,
                 &mut record.pinned_verifier_executable_refs,
             ),
             PinnedKind::Policy => (
-                &mut record.pinned_policy_first8,
+                &mut record.pinned_policy_hashes,
                 &mut record.pinned_policy_executable_refs,
             ),
         };
         if !refs.is_empty() || pin.executable_ref.is_some() {
-            refs.resize(first8.len(), None);
+            refs.resize(hashes.len(), None);
             refs.push(pin.executable_ref);
         }
-        first8.push(pin.hash_first8);
+        hashes.push(pin.hash);
         self.fold_overrides(
             pin.mutable_override,
             pin.unknown_override,
@@ -625,8 +631,8 @@ impl PlannedPinUpdate {
     }
 }
 
-/// Writes `record` as the `SaContextRulePinsUpdated` row of rule `rule_id`
-/// through the manager's audit writer.
+/// Writes `record` as the `SaContextRulePinsUpdatedV2` row of rule `rule_id`,
+/// every hash in full, through the manager's audit writer.
 ///
 /// Runs after the mutation confirmed on-chain, so a failed write cannot undo
 /// it: the failure is logged, and a poisoned writer marks the session
@@ -640,14 +646,14 @@ pub(crate) fn write_pins_updated_row(
     record: &PinnedHashesRecord,
     request_id: &str,
 ) {
-    let entry = AuditEntry::new_sa_context_rule_pins_updated(
+    let entry = AuditEntry::new_sa_context_rule_pins_updated_v2(
         smart_account_redacted,
         rule_id,
         reason,
         signers_manager.chain_id(),
         request_id,
-        record.pinned_verifier_first8.clone(),
-        record.pinned_policy_first8.clone(),
+        record.pinned_verifier_hashes.clone(),
+        record.pinned_policy_hashes.clone(),
         record.mutable_override,
         record.unknown_override,
         record.pinned_verifier_executable_refs.clone(),
@@ -739,9 +745,8 @@ struct PinContext<'a> {
 
 /// The pin of one verifier or policy contract.
 struct PinnedContract {
-    /// Effective hash: the Wasm hash, the resolved hash of an external
-    /// reference, or the zero hash for an absent contract admitted under the
-    /// unknown-hash override.
+    /// Effective hash: the Wasm hash or the resolved hash of an external
+    /// reference. A contract with no Wasm code is refused before it is pinned.
     hash: [u8; 32],
     /// Pin of an external-reference executable; `None` otherwise.
     executable_ref: Option<ExecutableRefPin>,
@@ -781,9 +786,29 @@ async fn pin_contract(
         )
         .await?;
 
+    // A contract with no Wasm code has no hash to pin, and absent Wasm code
+    // never matches a pin, so it is refused before any override flag is
+    // consulted, as an unresolved external reference is.
+    let Some(effective_hash) = observation.effective_hash else {
+        warn!(
+            contract_redacted = %contract_redacted,
+            contract_kind = %contract_kind,
+            rule_id,
+            "pin_referenced_contracts: the contract has no Wasm code; refusing"
+        );
+        return Err(unsupported_instance(
+            contract_kind,
+            rule_id,
+            smart_account_redacted,
+            &contract_redacted,
+            AdminOrOwnerKey::NoWasmCode,
+            request_id,
+        ));
+    };
+
     if kind == PinnedKind::Verifier && observation.allowlisted {
         crate::verifier_allowlist::refuse_revoked_or_retired_verifier(
-            &observation.effective_hash,
+            &effective_hash,
             rule_id,
             smart_account_redacted,
             request_id,
@@ -864,8 +889,9 @@ async fn pin_contract(
     } = &mutability
         && admin_or_owner_key.is_unpinnable_instance()
     {
-        // An unpinnable instance is refused before the override branch: its
-        // pin is the zero hash, so the drift check cannot see a code change.
+        // An unpinnable instance is refused before the override branch: it
+        // has no Wasm code hash to pin, so the drift check could not see a code
+        // change.
         return Err(unsupported_instance(
             contract_kind,
             rule_id,
@@ -935,7 +961,7 @@ async fn pin_contract(
     }
 
     Ok(PinnedContract {
-        hash: observation.effective_hash,
+        hash: effective_hash,
         executable_ref,
         mutable_override,
         unknown_override,
@@ -1098,18 +1124,22 @@ pub(crate) fn scaddress_cache_key(addr: &ScAddress) -> Result<Vec<u8>, SaError> 
 /// `(rule_id, smart_account_redacted)` from the audit log.
 ///
 /// Wraps [`AuditReader::find_latest_context_rule_pinned_hashes`] with the
-/// shared `Arc<Mutex<AuditWriter>>` from `SignersManager`.
+/// shared `Arc<Mutex<AuditWriter>>` from `SignersManager`. Every reader of a
+/// rule's pin record goes through this function, so an incomplete record
+/// refuses every operation that compares or rewrites the rule's pins.
 ///
 /// # Returns
 ///
-/// - `Ok(Some(record))`: the rule's pin record, its newest
-///   `SaContextRuleCreated` or `SaContextRulePinsUpdated` row, was found; the
-///   returned [`PinnedHashesRecord`] carries first-8-hex strings of the
-///   pinned hashes plus the override flags.
+/// - `Ok(Some(record))`: the rule's pin record, its newest pin row of either
+///   version, holds full hashes; the returned [`PinnedHashesRecord`] carries
+///   all 32 bytes of each pinned hash plus the override flags.
 /// - `Ok(None)` — no matching rule entry found; drift-detection is skipped.
 ///
 /// # Errors
 ///
+/// - [`SaError::WasmPinIncomplete`]: the newest pin row holds eight-byte
+///   hash prefixes. No older row is used in its place and no override flag
+///   bypasses the refusal.
 /// - [`SaError::AuditLog`] — audit-log integrity error (chain break, rotation gap,
 ///   HMAC mismatch, parse error, I/O failure).
 ///
@@ -1117,70 +1147,115 @@ pub(crate) fn read_pinned_hashes_for_rule(
     signers_manager: &SignersManager,
     rule_id: u32,
     smart_account_redacted: &str,
+    request_id: &str,
 ) -> Result<Option<PinnedHashesRecord>, SaError> {
     let reader = AuditReader::new(signers_manager.audit_writer(), None);
-    reader
+    let record = reader
         .find_latest_context_rule_pinned_hashes(rule_id, smart_account_redacted)
-        .map_err(SaError::AuditLog)
+        .map_err(SaError::AuditLog)?;
+    match record {
+        None => Ok(None),
+        Some(ContextRulePinRecord::Complete(record)) => Ok(Some(record)),
+        Some(other) => {
+            // Only a record holding full hashes is complete; every other
+            // record form refuses.
+            let row_kind = match &other {
+                ContextRulePinRecord::Incomplete(incomplete) => incomplete.row_kind,
+                _ => "unrecognized",
+            };
+            warn!(
+                rule_id,
+                smart_account_redacted,
+                row_kind,
+                "the rule's pin record holds eight-byte hash prefixes; refusing until the \
+                 rule is reinstalled with full pins"
+            );
+            Err(SaError::WasmPinIncomplete {
+                rule_id,
+                smart_account_redacted: RedactedStrkey::from_already_redacted(
+                    smart_account_redacted,
+                ),
+                request_id: request_id.to_owned(),
+            })
+        }
+    }
 }
 
 /// Comparison of a live executable against one pinned position.
 #[derive(Debug, PartialEq, Eq)]
 struct PinComparison {
-    /// The live executable matches the pin in kind, reference and hash.
+    /// The live executable matches the pin in kind, reference and all 32
+    /// bytes of the hash.
     matches: bool,
-    /// First-8 hex of the observed effective hash (zero hash for no code or
-    /// an unresolved reference).
-    observed_hash_first8: String,
+    /// The full observed effective hash; `None` for no Wasm code and for an
+    /// unresolved reference, which have no hash.
+    observed_hash: Option<WasmHashPin>,
     /// Bounded summary of the observed executable.
     observed_executable: String,
 }
 
 /// Compares the live executable against the pin at one position.
 ///
-/// The executable kind is checked before any hash:
+/// The executable kind is checked before any hash, and every hash
+/// comparison covers all 32 bytes:
 /// - With an executable-reference pin, the live executable must be an
 ///   external reference with the pinned tag key whose tag resolves to the
-///   pinned first-8. Wasm code, no code, a different reference or an
-///   unresolved reference is drift even when the effective hash equals the
-///   pinned first-8.
+///   pin's full resolved hash. Wasm code, no Wasm code, a different reference or
+///   an unresolved reference is drift even when the effective hash equals
+///   the pinned hash; a resolved hash that shares the pinned hash's prefix
+///   and differs in any later byte is drift.
 /// - Without one, a live external reference is drift even when it resolves
-///   to the pinned hash, because the pin never covered the owner's authority;
-///   this includes a zero pin (absent contract admitted under the
-///   unknown-hash override) against an unresolved reference. Otherwise the
-///   effective hash (zero for no code) must equal the pinned first-8.
+///   to the pinned hash, because the pin never covered the owner's authority.
+///   Otherwise the live executable must be Wasm code whose hash equals the
+///   pinned hash in full.
+///
+/// Absent Wasm code has no hash, so it never matches a pin and is drift
+/// against every pin, the zero hash included.
 ///
 /// # Errors
 ///
 /// [`SaError::ScAddressEncodingFailed`] when the live reference's tag key
 /// cannot be encoded for its digest.
 fn compare_against_pin(
-    pinned_first8: &str,
+    pinned: &WasmHashPin,
     pinned_ref: Option<&ExecutableRefPin>,
     observed: &ObservedExecutable,
 ) -> Result<PinComparison, SaError> {
-    let observed_hash_first8 = hash_first8_hex(&observed.effective_hash().unwrap_or([0u8; 32]));
+    let observed_hash = observed.effective_hash().map(WasmHashPin::new);
     let matches = match (pinned_ref, observed) {
         (Some(pin), ObservedExecutable::ExternalRef(external)) => {
-            let observed_ref_key: String = tag_key_digest(external)?
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            // The audit reader refuses a record whose pin disagrees with the
-            // aligned first-8 entry, so the pin's resolved first-8 is the
-            // pinned hash.
+            let observed_ref_key = hex::encode(tag_key_digest(external)?);
+            // The audit reader refuses a record whose pin's resolved hash
+            // differs from the aligned pinned hash, so the pin's resolved
+            // hash is the pinned hash.
             observed_ref_key == pin.ref_key_hex
-                && external.resolved.is_some()
-                && observed_hash_first8 == pin.resolved_hash_first8
+                && external
+                    .resolved
+                    .is_some_and(|resolved| pin.resolved_hash.matches(&resolved))
         }
-        (Some(_), _) | (None, ObservedExecutable::ExternalRef(_)) => false,
-        (None, _) => observed_hash_first8 == pinned_first8,
+        (None, ObservedExecutable::Wasm(hash)) => pinned.matches(hash),
+        (Some(_), _) | (None, ObservedExecutable::ExternalRef(_) | ObservedExecutable::NoCode) => {
+            false
+        }
     };
     Ok(PinComparison {
         matches,
-        observed_hash_first8,
+        observed_hash,
         observed_executable: observed.summary(),
     })
+}
+
+/// Renders an observed hash in full for a log line, or `none` for absent
+/// code.
+fn observed_hash_display(hash: Option<&WasmHashPin>) -> String {
+    hash.map_or_else(|| "none".to_owned(), WasmHashPin::to_hex)
+}
+
+/// Renders the labeled first-8 display of an observed hash for a drift row,
+/// or `none` for absent Wasm code, the sentinel the allowlist-miss errors and
+/// override rows carry.
+fn observed_hash_first8_display(hash: Option<&WasmHashPin>) -> String {
+    hash.map_or_else(|| "none".to_owned(), WasmHashPin::first8_display)
 }
 
 /// Returns the live executable of `contract_addr`, from the per-call cache
@@ -1291,7 +1366,7 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
 
     // Read the pin from the audit log.
     let Some(record) =
-        read_pinned_hashes_for_rule(signers_manager, rule_id, smart_account_redacted)?
+        read_pinned_hashes_for_rule(signers_manager, rule_id, smart_account_redacted, request_id)?
     else {
         // No pin record: the rule was installed outside the wallet, and the
         // wallet does not pin against non-wallet installs; skip drift-detect.
@@ -1303,9 +1378,9 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
         );
         return Ok(());
     };
-    let verifier_hashes_first8 = &record.pinned_verifier_first8;
+    let verifier_hashes = &record.pinned_verifier_hashes;
 
-    if verifier_hashes_first8.is_empty() {
+    if verifier_hashes.is_empty() {
         // The rule holds a live External signer, since this check runs once
         // per live verifier, and the record pins no verifier: the verifier
         // would sign unchecked.
@@ -1333,16 +1408,16 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
     // position would not align with `[0]` for the second and subsequent
     // verifiers. Fail closed to avoid silently checking the wrong pin (a
     // false-negative security risk).
-    if verifier_hashes_first8.len() > 1 {
+    if verifier_hashes.len() > 1 {
         return Err(SaError::MultiplePinnedHashesUnsupported {
             kind: "verifier",
             rule_id,
-            count: verifier_hashes_first8.len(),
+            count: verifier_hashes.len(),
             smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
             request_id: request_id.to_owned(),
         });
     }
-    let pinned_hash_first8 = verifier_hashes_first8[0].clone();
+    let pinned_hash = verifier_hashes[0];
 
     let observed = observe_with_cache(
         signers_manager,
@@ -1354,17 +1429,14 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
         wasm_hash_cache,
     )
     .await?;
-    let comparison = compare_against_pin(
-        &pinned_hash_first8,
-        record.verifier_executable_ref(0),
-        &observed,
-    )?;
+    let comparison =
+        compare_against_pin(&pinned_hash, record.verifier_executable_ref(0), &observed)?;
 
     if comparison.matches {
         debug!(
             rule_id,
             verifier_redacted = %verifier_redacted,
-            observed_hash_first8 = %comparison.observed_hash_first8,
+            observed_hash = %observed_hash_display(comparison.observed_hash.as_ref()),
             observed_executable = %comparison.observed_executable,
             "verify_pinned_verifier_against_chain: executable matches pin (no drift)"
         );
@@ -1386,18 +1458,20 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
         rule_id,
         smart_account_redacted,
         verifier_redacted = %verifier_redacted,
-        pinned_hash_first8 = %pinned_hash_first8,
-        observed_hash_first8 = %comparison.observed_hash_first8,
+        pinned_hash = %pinned_hash,
+        observed_hash = %observed_hash_display(comparison.observed_hash.as_ref()),
         observed_executable = %comparison.observed_executable,
         "verify_pinned_verifier_against_chain: executable DRIFT detected; aborting signing"
     );
 
+    // The drift row keeps its labeled first-8 display fields, `none` for
+    // absent Wasm code; the summary and the returned error carry the full hashes.
     let drift_entry = AuditEntry::new_sa_verifier_hash_drift(
         rule_id,
         RedactedStrkey::from_already_redacted(smart_account_redacted),
         RedactedStrkey::from_already_redacted(&verifier_redacted),
-        &pinned_hash_first8,
-        &comparison.observed_hash_first8,
+        pinned_hash.first8_display(),
+        observed_hash_first8_display(comparison.observed_hash.as_ref()),
         Some(comparison.observed_executable.clone()),
         signers_manager.chain_id(),
         request_id,
@@ -1408,8 +1482,8 @@ pub(crate) async fn verify_pinned_verifier_against_chain(
         rule_id,
         smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
         deploy_address_redacted: RedactedStrkey::from_already_redacted(verifier_redacted),
-        pinned_hash_first8,
-        observed_hash_first8: comparison.observed_hash_first8,
+        pinned_hash,
+        observed_hash: comparison.observed_hash,
         observed_executable: Some(comparison.observed_executable),
         request_id: request_id.to_owned(),
     })
@@ -1451,7 +1525,7 @@ pub(crate) async fn verify_pinned_policy_against_chain(
 
     // Read the pin from the audit log.
     let Some(record) =
-        read_pinned_hashes_for_rule(signers_manager, rule_id, smart_account_redacted)?
+        read_pinned_hashes_for_rule(signers_manager, rule_id, smart_account_redacted, request_id)?
     else {
         debug!(
             rule_id,
@@ -1461,9 +1535,9 @@ pub(crate) async fn verify_pinned_policy_against_chain(
         );
         return Ok(());
     };
-    let policy_hashes_first8 = &record.pinned_policy_first8;
+    let policy_hashes = &record.pinned_policy_hashes;
 
-    if policy_hashes_first8.is_empty() {
+    if policy_hashes.is_empty() {
         debug!(
             rule_id,
             policy_redacted = %policy_redacted,
@@ -1477,16 +1551,16 @@ pub(crate) async fn verify_pinned_policy_against_chain(
     // The check supports at most one distinct policy address per rule.
     // SaError::MultiplePinnedHashesUnsupported is the typed variant for a
     // signing-time guard (not a deployment failure).
-    if policy_hashes_first8.len() > 1 {
+    if policy_hashes.len() > 1 {
         return Err(SaError::MultiplePinnedHashesUnsupported {
             kind: "policy",
             rule_id,
-            count: policy_hashes_first8.len(),
+            count: policy_hashes.len(),
             smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
             request_id: request_id.to_owned(),
         });
     }
-    let pinned_hash_first8 = policy_hashes_first8[0].clone();
+    let pinned_hash = policy_hashes[0];
 
     let observed = observe_with_cache(
         signers_manager,
@@ -1506,23 +1580,19 @@ pub(crate) async fn verify_pinned_policy_against_chain(
         warn!(
             rule_id,
             policy_redacted = %policy_redacted,
-            observed_hash_first8 = %hash_first8_hex(&hash),
+            observed_hash = %hex::encode(hash),
             "verify_pinned_policy_against_chain: observed policy wasm hash not in allowlist \
              (will still check against pinned value)"
         );
     }
 
-    let comparison = compare_against_pin(
-        &pinned_hash_first8,
-        record.policy_executable_ref(0),
-        &observed,
-    )?;
+    let comparison = compare_against_pin(&pinned_hash, record.policy_executable_ref(0), &observed)?;
 
     if comparison.matches {
         debug!(
             rule_id,
             policy_redacted = %policy_redacted,
-            observed_hash_first8 = %comparison.observed_hash_first8,
+            observed_hash = %observed_hash_display(comparison.observed_hash.as_ref()),
             observed_executable = %comparison.observed_executable,
             "verify_pinned_policy_against_chain: executable matches pin (no drift)"
         );
@@ -1534,8 +1604,8 @@ pub(crate) async fn verify_pinned_policy_against_chain(
         rule_id,
         smart_account_redacted,
         policy_redacted = %policy_redacted,
-        pinned_hash_first8 = %pinned_hash_first8,
-        observed_hash_first8 = %comparison.observed_hash_first8,
+        pinned_hash = %pinned_hash,
+        observed_hash = %observed_hash_display(comparison.observed_hash.as_ref()),
         observed_executable = %comparison.observed_executable,
         "verify_pinned_policy_against_chain: executable DRIFT detected; aborting signing"
     );
@@ -1544,8 +1614,8 @@ pub(crate) async fn verify_pinned_policy_against_chain(
         rule_id,
         RedactedStrkey::from_already_redacted(smart_account_redacted),
         RedactedStrkey::from_already_redacted(&policy_redacted),
-        &pinned_hash_first8,
-        &comparison.observed_hash_first8,
+        pinned_hash.first8_display(),
+        observed_hash_first8_display(comparison.observed_hash.as_ref()),
         Some(comparison.observed_executable.clone()),
         signers_manager.chain_id(),
         request_id,
@@ -1556,8 +1626,8 @@ pub(crate) async fn verify_pinned_policy_against_chain(
         rule_id,
         smart_account_redacted: RedactedStrkey::from_already_redacted(smart_account_redacted),
         deploy_address_redacted: RedactedStrkey::from_already_redacted(policy_redacted),
-        pinned_hash_first8,
-        observed_hash_first8: comparison.observed_hash_first8,
+        pinned_hash,
+        observed_hash: comparison.observed_hash,
         observed_executable: Some(comparison.observed_executable),
         request_id: request_id.to_owned(),
     })
@@ -1585,6 +1655,8 @@ pub(crate) async fn verify_pinned_policy_against_chain(
 ///
 /// - [`SaError::PinnedPolicyAbsent`]: `policy_addrs` is empty and the
 ///   rule's pin record holds at least one policy pin.
+/// - [`SaError::WasmPinIncomplete`]: `policy_addrs` is empty and the rule's
+///   pin record holds eight-byte hash prefixes.
 /// - [`SaError::AuditLog`]: the pin record could not be read.
 pub(crate) fn verify_policy_pins_present(
     signers_manager: &SignersManager,
@@ -1597,8 +1669,8 @@ pub(crate) fn verify_policy_pins_present(
         return Ok(());
     }
     let pinned_count =
-        read_pinned_hashes_for_rule(signers_manager, rule_id, smart_account_redacted)?
-            .map_or(0, |record| record.pinned_policy_first8.len());
+        read_pinned_hashes_for_rule(signers_manager, rule_id, smart_account_redacted, request_id)?
+            .map_or(0, |record| record.pinned_policy_hashes.len());
     if pinned_count == 0 {
         debug!(
             rule_id,
@@ -2156,13 +2228,24 @@ mod tests {
         ExecutableRefPin::new(&reference.owner, &reference.tag, &resolved).expect("pin builds")
     }
 
+    /// The pinned hash of the pin-width tests and a hash sharing its first
+    /// eight bytes that differs in every later byte.
+    fn pinned_and_twin() -> ([u8; 32], [u8; 32]) {
+        let pinned = [0x42u8; 32];
+        let mut twin = pinned;
+        twin[8..].fill(0x43);
+        (pinned, twin)
+    }
+
     /// With an executable-reference pin, only the pinned reference resolving
-    /// to the pinned hash matches; every other kind or reference is drift,
-    /// including those whose effective hash equals the pin.
+    /// to the pinned hash in all 32 bytes matches; every other kind or
+    /// reference is drift, including those whose effective hash equals the
+    /// pin, and the pinned reference resolving to an equal-prefix twin.
     #[test]
     fn compare_against_pin_with_reference_pin_checks_kind_reference_and_hash() {
-        let pinned = [0x42u8; 32];
-        let pinned_first8 = hash_first8_hex(&pinned);
+        let (pinned, twin) = pinned_and_twin();
+        let mut last_byte = pinned;
+        last_byte[31] = 0x00;
         let pin = ref_pin(b"v1", pinned);
         let cases = [
             (
@@ -2173,6 +2256,16 @@ mod tests {
             (
                 "repointed tag",
                 ObservedExecutable::ExternalRef(external(b"v1", Some([0x43u8; 32]))),
+                false,
+            ),
+            (
+                "tag resolves to an equal-prefix twin",
+                ObservedExecutable::ExternalRef(external(b"v1", Some(twin))),
+                false,
+            ),
+            (
+                "tag resolves to a hash differing in byte 31",
+                ObservedExecutable::ExternalRef(external(b"v1", Some(last_byte))),
                 false,
             ),
             (
@@ -2193,56 +2286,95 @@ mod tests {
             ("no code", ObservedExecutable::NoCode, false),
         ];
         for (case, observed, matches) in cases {
-            let comparison = compare_against_pin(&pinned_first8, Some(&pin), &observed).unwrap();
+            let comparison =
+                compare_against_pin(&WasmHashPin::new(pinned), Some(&pin), &observed).unwrap();
             assert_eq!(comparison.matches, matches, "{case}");
             assert_eq!(comparison.observed_executable, observed.summary(), "{case}");
             assert_eq!(
-                comparison.observed_hash_first8,
-                hash_first8_hex(&observed.effective_hash().unwrap_or([0u8; 32])),
+                comparison.observed_hash,
+                observed.effective_hash().map(WasmHashPin::new),
                 "{case}"
             );
         }
     }
 
+    /// A direct Wasm pin matches only the hash equal in all 32 bytes: an
+    /// equal-prefix twin and a hash differing only in byte 31 are drift, and
+    /// the comparison reports the full observed hash.
+    #[test]
+    fn compare_against_pin_compares_all_32_bytes_of_a_wasm_hash() {
+        let (pinned, twin) = pinned_and_twin();
+        let mut last_byte = pinned;
+        last_byte[31] = 0x00;
+        let pin = WasmHashPin::new(pinned);
+        let matched = compare_against_pin(&pin, None, &ObservedExecutable::Wasm(pinned)).unwrap();
+        assert!(matched.matches);
+        let drifted = compare_against_pin(&pin, None, &ObservedExecutable::Wasm(twin)).unwrap();
+        assert!(!drifted.matches, "an equal-prefix twin is drift");
+        assert_eq!(drifted.observed_hash, Some(WasmHashPin::new(twin)));
+        assert_ne!(drifted.observed_hash, Some(pin));
+        let drifted =
+            compare_against_pin(&pin, None, &ObservedExecutable::Wasm(last_byte)).unwrap();
+        assert!(!drifted.matches, "a hash differing in byte 31 is drift");
+    }
+
     /// Without an executable-reference pin, any live external reference is
     /// drift (even one resolving to the pinned hash, and an unresolved one
-    /// against a zero pin); Wasm and no code compare by effective hash.
+    /// against a zero pin); Wasm compares by its full hash, and no Wasm code is
+    /// drift against every pin, the zero pin included.
     #[test]
     fn compare_against_pin_without_reference_pin_refuses_any_reference() {
-        let pinned = [0x42u8; 32];
-        let zero_first8 = hash_first8_hex(&[0u8; 32]);
+        let pinned = WasmHashPin::new([0x42u8; 32]);
+        let zero = WasmHashPin::new([0u8; 32]);
         let cases = [
+            (pinned, ObservedExecutable::Wasm([0x42u8; 32]), true),
+            (pinned, ObservedExecutable::Wasm([0x43u8; 32]), false),
+            (zero, ObservedExecutable::Wasm([0u8; 32]), true),
+            (zero, ObservedExecutable::NoCode, false),
+            (pinned, ObservedExecutable::NoCode, false),
             (
-                hash_first8_hex(&pinned),
-                ObservedExecutable::Wasm(pinned),
-                true,
-            ),
-            (
-                hash_first8_hex(&pinned),
-                ObservedExecutable::Wasm([0x43u8; 32]),
-                false,
-            ),
-            (zero_first8.clone(), ObservedExecutable::NoCode, true),
-            (hash_first8_hex(&pinned), ObservedExecutable::NoCode, false),
-            (
-                hash_first8_hex(&pinned),
-                ObservedExecutable::ExternalRef(external(b"v1", Some(pinned))),
+                pinned,
+                ObservedExecutable::ExternalRef(external(b"v1", Some([0x42u8; 32]))),
                 false,
             ),
             (
-                zero_first8,
+                zero,
                 ObservedExecutable::ExternalRef(external(b"v1", None)),
                 false,
             ),
         ];
-        for (pinned_first8, observed, matches) in cases {
-            let comparison = compare_against_pin(&pinned_first8, None, &observed).unwrap();
+        for (pin, observed, matches) in cases {
+            let comparison = compare_against_pin(&pin, None, &observed).unwrap();
             assert_eq!(
                 comparison.matches,
                 matches,
-                "pin {pinned_first8} vs {}",
+                "pin {pin} vs {}",
                 observed.summary()
             );
+        }
+    }
+
+    /// Absent Wasm code reports no observed hash and never matches a pin.
+    /// It is drift against a Wasm pin of any value, the zero hash included,
+    /// and against an executable-reference pin.
+    #[test]
+    fn compare_against_pin_never_matches_absent_code() {
+        let (pinned, twin) = pinned_and_twin();
+        for hash in [[0u8; 32], [0xffu8; 32], pinned, twin] {
+            let pin = WasmHashPin::new(hash);
+            let comparison = compare_against_pin(&pin, None, &ObservedExecutable::NoCode).unwrap();
+            assert!(!comparison.matches, "no Wasm code against pin {pin}");
+            assert_eq!(comparison.observed_hash, None, "pin {pin}");
+            assert_eq!(comparison.observed_executable, "no code");
+
+            let reference = ref_pin(b"v1", hash);
+            let comparison =
+                compare_against_pin(&pin, Some(&reference), &ObservedExecutable::NoCode).unwrap();
+            assert!(
+                !comparison.matches,
+                "no Wasm code against reference pin {pin}"
+            );
+            assert_eq!(comparison.observed_hash, None, "reference pin {pin}");
         }
     }
 
@@ -2828,97 +2960,31 @@ mod tests {
 
     // ── PinResult projection tests ────────────────────────────────────────────
 
-    /// `pinned_verifier_hashes_first8` returns the correct first-8-hex for each
-    /// pinned verifier wasm hash in order.
-    ///
-    /// Correctness: the expected values are the first 8 bytes of the respective
-    /// hash arrays rendered as lowercase hex, derived independently of the
-    /// implementation under test.
+    /// `pinned_verifier_hashes` and `pinned_policy_hashes` return every
+    /// pinned hash in all 32 bytes, in order.
     #[test]
-    fn pin_result_pinned_verifier_hashes_first8_returns_correct_projections() {
-        let addr_a = ScAddress::Contract(ContractId(Hash([0x0au8; 32])));
-        let addr_b = ScAddress::Contract(ContractId(Hash([0x0bu8; 32])));
-        let hash_a: [u8; 32] = {
-            let mut h = [0u8; 32];
-            h[0] = 0xde;
-            h[1] = 0xad;
-            h[2] = 0xbe;
-            h[3] = 0xef;
-            h[4] = 0x01;
-            h[5] = 0x02;
-            h[6] = 0x03;
-            h[7] = 0x04;
-            h
-        };
-        let hash_b: [u8; 32] = {
-            let mut h = [0xffu8; 32];
-            h[0] = 0xaa;
-            h[1] = 0xbb;
-            h
-        };
+    fn pin_result_hash_lists_keep_all_32_bytes() {
+        let (pinned, twin) = pinned_and_twin();
+        let addr = ScAddress::Contract(ContractId(Hash([0x0au8; 32])));
         let pin = PinResult {
-            pinned_verifier_wasm_hashes: vec![(addr_a, hash_a), (addr_b, hash_b)],
-            pinned_policy_wasm_hashes: vec![],
+            pinned_verifier_wasm_hashes: vec![(addr.clone(), pinned), (addr.clone(), twin)],
+            pinned_policy_wasm_hashes: vec![(addr, twin)],
             pinned_verifier_executable_refs: vec![],
             pinned_policy_executable_refs: vec![],
             mutable_override: false,
             unknown_override: false,
             pending_overrides: vec![],
         };
-
-        let result = pin.pinned_verifier_hashes_first8();
-
-        // Expected: first 8 bytes of hash_a and hash_b as lowercase hex.
-        assert_eq!(result.len(), 2, "two verifier hashes → two projections");
         assert_eq!(
-            result[0], "deadbeef01020304",
-            "first hash projection must match first 8 bytes of hash_a"
+            pin.pinned_verifier_hashes(),
+            vec![WasmHashPin::new(pinned), WasmHashPin::new(twin)]
         );
-        assert_eq!(
-            result[1], "aabbffffffffffff",
-            "second hash projection must match first 8 bytes of hash_b"
-        );
+        assert_eq!(pin.pinned_policy_hashes(), vec![WasmHashPin::new(twin)]);
     }
 
-    /// `pinned_policy_hashes_first8` returns the correct first-8-hex for each
-    /// pinned policy wasm hash in order.
+    /// Empty `PinResult`: both hash lists are empty.
     #[test]
-    fn pin_result_pinned_policy_hashes_first8_returns_correct_projections() {
-        let addr_p = ScAddress::Contract(ContractId(Hash([0x0cu8; 32])));
-        let hash_p: [u8; 32] = {
-            let mut h = [0x00u8; 32];
-            h[0] = 0x11;
-            h[1] = 0x22;
-            h[2] = 0x33;
-            h[3] = 0x44;
-            h[4] = 0x55;
-            h[5] = 0x66;
-            h[6] = 0x77;
-            h[7] = 0x88;
-            h
-        };
-        let pin = PinResult {
-            pinned_verifier_wasm_hashes: vec![],
-            pinned_policy_wasm_hashes: vec![(addr_p, hash_p)],
-            pinned_verifier_executable_refs: vec![],
-            pinned_policy_executable_refs: vec![],
-            mutable_override: false,
-            unknown_override: false,
-            pending_overrides: vec![],
-        };
-
-        let result = pin.pinned_policy_hashes_first8();
-
-        assert_eq!(result.len(), 1, "one policy hash → one projection");
-        assert_eq!(
-            result[0], "1122334455667788",
-            "policy hash projection must match first 8 bytes"
-        );
-    }
-
-    /// Empty `PinResult` — both projections return empty vecs.
-    #[test]
-    fn pin_result_empty_both_projections_are_empty() {
+    fn pin_result_empty_both_hash_lists_are_empty() {
         let pin = PinResult {
             pinned_verifier_wasm_hashes: vec![],
             pinned_policy_wasm_hashes: vec![],
@@ -2928,14 +2994,154 @@ mod tests {
             unknown_override: false,
             pending_overrides: vec![],
         };
-        assert!(
-            pin.pinned_verifier_hashes_first8().is_empty(),
-            "empty verifier hashes → empty projection"
-        );
-        assert!(
-            pin.pinned_policy_hashes_first8().is_empty(),
-            "empty policy hashes → empty projection"
-        );
+        assert!(pin.pinned_verifier_hashes().is_empty());
+        assert!(pin.pinned_policy_hashes().is_empty());
+    }
+
+    /// Builds a contract instance entry with no storage whose Wasm hash is
+    /// `hash`.
+    fn instance_entry_xdr_with_hash(contract: &ScAddress, hash: [u8; 32]) -> String {
+        use stellar_xdr::{
+            ContractDataDurability, ContractDataEntry, ContractExecutable, ExtensionPoint,
+            LedgerEntryData, ScContractInstance, WriteXdr,
+        };
+        LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract.clone(),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::ContractInstance(ScContractInstance {
+                executable: ContractExecutable::Wasm(Hash(hash)),
+                storage: None,
+            }),
+        })
+        .to_xdr_base64(stellar_xdr::Limits::none())
+        .expect("ContractInstance XDR must encode")
+    }
+
+    /// A rule-install pin and an added-contract pin keep every byte of a
+    /// contract's hash through the pin, the version-2 audit row and the
+    /// audit read, for a verifier and for a policy. The contract's hash
+    /// shares its first eight bytes with another hash, so any truncation
+    /// would read back a different pin.
+    #[tokio::test]
+    async fn install_and_added_pins_keep_every_byte_through_the_audit_row() {
+        use crate::managers::signers::SignersManagerConfig;
+        use stellar_agent_core::audit_log::reader::ContextRulePinRecord;
+
+        let (_, twin) = pinned_and_twin();
+        let contract = ScAddress::Contract(ContractId(Hash([0x0b; 32])));
+        let entry_xdr = instance_entry_xdr_with_hash(&contract, twin);
+        for kind in [PinnedKind::Verifier, PinnedKind::Policy] {
+            let contract_kind = kind.contract_kind();
+            let (outcome, _) =
+                pin_single_contract(&contract, &entry_xdr, contract_kind, false).await;
+            let pin_result =
+                outcome.expect("an immutable contract pins under the unknown override");
+            let hashes = match kind {
+                PinnedKind::Verifier => pin_result.pinned_verifier_hashes(),
+                PinnedKind::Policy => pin_result.pinned_policy_hashes(),
+            };
+            assert_eq!(hashes, vec![WasmHashPin::new(twin)], "{kind:?}");
+
+            let server = instance_rpc(&contract, Some(&entry_xdr)).await;
+            let directory = tempfile::tempdir().unwrap();
+            let audit_path = directory.path().join("audit.jsonl");
+            let writer = Arc::new(Mutex::new(
+                AuditWriter::open(audit_path.clone(), None).unwrap(),
+            ));
+            let manager = SignersManager::new(SignersManagerConfig::new(
+                server.uri(),
+                server.uri(),
+                Arc::clone(&writer),
+                audit_path,
+                "Test SDF Network ; September 2015".to_owned(),
+                "probe".to_owned(),
+                std::time::Duration::from_secs(5),
+                "stellar:testnet".to_owned(),
+            ))
+            .unwrap();
+
+            let signers = match kind {
+                PinnedKind::Verifier => vec![ContextRuleSignerInput::External {
+                    verifier: contract.clone(),
+                    pubkey_data: vec![0xbb; 32],
+                }],
+                PinnedKind::Policy => vec![],
+            };
+            let policies = match kind {
+                PinnedKind::Verifier => vec![],
+                PinnedKind::Policy => vec![crate::managers::rules::ContextRulePolicy::new(
+                    contract.clone(),
+                    ScVal::Void,
+                )],
+            };
+            let definition = ContextRuleDefinition::new(
+                crate::managers::rules::RuleContext::Default,
+                "probe".to_owned(),
+                None,
+                signers,
+                policies,
+            );
+            writer
+                .lock()
+                .unwrap()
+                .write_entry(pin_result.context_rule_created_entry(
+                    "CAAAA...ABSC4",
+                    5,
+                    &definition,
+                    "stellar:testnet",
+                    "probe",
+                ))
+                .unwrap();
+            let reader = AuditReader::new(Arc::clone(&writer), None);
+            let Some(ContextRulePinRecord::Complete(created)) = reader
+                .find_latest_context_rule_pinned_hashes(5, "CAAAA...ABSC4")
+                .unwrap()
+            else {
+                panic!("the created row reads as a complete record");
+            };
+            let read_back = match kind {
+                PinnedKind::Verifier => &created.pinned_verifier_hashes,
+                PinnedKind::Policy => &created.pinned_policy_hashes,
+            };
+            assert_eq!(read_back, &vec![WasmHashPin::new(twin)], "{kind:?}");
+
+            let added = pin_added_contract(
+                &manager,
+                &contract,
+                kind,
+                6,
+                "CAAAA...ABSC4",
+                false,
+                true,
+                "probe",
+            )
+            .await
+            .expect("the added contract pins under the unknown override");
+            assert_eq!(added.hash, WasmHashPin::new(twin), "{kind:?}");
+            let mut update = PlannedPinUpdate::unchanged(PinnedHashesRecord::default());
+            update.append_pin(kind, added);
+            write_pins_updated_row(
+                &manager,
+                "CAAAA...ABSC4",
+                6,
+                PinsUpdateReason::SignerAdded,
+                &update.record,
+                "probe",
+            );
+            let Some(ContextRulePinRecord::Complete(updated)) = reader
+                .find_latest_context_rule_pinned_hashes(6, "CAAAA...ABSC4")
+                .unwrap()
+            else {
+                panic!("the pins-updated row reads as a complete record");
+            };
+            let read_back = match kind {
+                PinnedKind::Verifier => &updated.pinned_verifier_hashes,
+                PinnedKind::Policy => &updated.pinned_policy_hashes,
+            };
+            assert_eq!(read_back, &vec![WasmHashPin::new(twin)], "{kind:?}");
+        }
     }
 
     // ── scaddress_cache_key tests ─────────────────────────────────────────────
@@ -3814,9 +4020,10 @@ mod tests {
         (outcome, audit_log)
     }
 
-    /// An undecodable instance and a non-Wasm executable are refused with
-    /// `sa.contract_instance_unsupported` with and without
-    /// `accept_mutable_verifier`, and pinning writes no audit row.
+    /// An undecodable instance and a built-in executable, which has no
+    /// Wasm code, are refused with `sa.contract_instance_unsupported`
+    /// with and without `accept_mutable_verifier`, and pinning writes no
+    /// audit row.
     async fn assert_unpinnable_instance_refused(contract_kind: ContractKind) {
         let contract = ScAddress::Contract(ContractId(Hash([0x0b; 32])));
         let contract_redacted =
@@ -3828,7 +4035,7 @@ mod tests {
             ),
             (
                 non_wasm_instance_entry_xdr(&contract),
-                AdminOrOwnerKey::NonWasmExecutable,
+                AdminOrOwnerKey::NoWasmCode,
             ),
         ] {
             for accept_mutable_verifier in [false, true] {
@@ -4128,8 +4335,14 @@ pub mod test_helpers {
         signers_manager: &SignersManager,
         rule_id: u32,
         smart_account_redacted: &str,
+        request_id: &str,
     ) -> Result<Option<PinnedHashesRecord>, SaError> {
-        super::read_pinned_hashes_for_rule(signers_manager, rule_id, smart_account_redacted)
+        super::read_pinned_hashes_for_rule(
+            signers_manager,
+            rule_id,
+            smart_account_redacted,
+            request_id,
+        )
     }
 
     /// Exposed version of [`super::verify_pinned_verifier_against_chain`] for

@@ -84,7 +84,9 @@ use rand_core::{OsRng, RngCore as _};
 use sha2::{Digest as _, Sha256};
 use soroban_spec_tools::Spec;
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::{ContractKind, EventKind, ExecutableRefPin};
+use stellar_agent_core::audit_log::schema::{
+    ContractKind, EventKind, ExecutableRefPin, WasmHashPin,
+};
 use stellar_agent_core::audit_log::signer_set::BaselineReason;
 use stellar_agent_core::audit_log::writer::AuditWriter;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
@@ -768,7 +770,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
         ),
         tag: TAG.to_owned(),
         ref_key_hex: hex::encode(Sha256::digest(&ref_key_xdr)),
-        resolved_hash_first8: first8_hex(&fixture.ed25519_hash),
+        resolved_hash: WasmHashPin::new(fixture.ed25519_hash),
     };
     assert_eq!(
         installed.pin_result.pinned_verifier_executable_refs,
@@ -778,7 +780,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     let entries = read_audit_entries(&audit_log_path);
     // The override row is written after the install confirms, carrying the
     // installed rule's id: the install's rows are the override row, then
-    // SaContextRuleCreated, then the baseline the confirmed rule records,
+    // SaContextRuleCreatedV2, then the baseline the confirmed rule records,
     // then the `sa.ok` raw-invocation row.
     let install_rows: Vec<&EventKind> = entries
         .iter()
@@ -790,7 +792,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
             install_rows.as_slice(),
             [
                 EventKind::SaMutableContractOverride { .. },
-                EventKind::SaContextRuleCreated { .. },
+                EventKind::SaContextRuleCreatedV2 { .. },
                 EventKind::SaSignerSetBaselinedV2 {
                     rule_id: baselined_rule_id,
                     baseline_reason: BaselineReason::ConfirmedInstall,
@@ -849,21 +851,21 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     let created = entries
         .iter()
         .find_map(|entry| match &entry.event_kind {
-            EventKind::SaContextRuleCreated {
+            EventKind::SaContextRuleCreatedV2 {
                 rule_id: created_rule_id,
-                pinned_verifier_wasm_hashes_first8,
+                pinned_verifier_wasm_hashes,
                 pinned_verifier_executable_refs,
                 mutable_override,
                 ..
             } if *created_rule_id == rule_id && entry.request_id == install_request_id => Some((
-                pinned_verifier_wasm_hashes_first8.clone(),
+                pinned_verifier_wasm_hashes.clone(),
                 pinned_verifier_executable_refs.clone(),
                 *mutable_override,
             )),
             _ => None,
         })
-        .expect("SaContextRuleCreated row for the installed rule and the install request");
-    assert_eq!(created.0, vec![first8_hex(&fixture.ed25519_hash)]);
+        .expect("SaContextRuleCreatedV2 row for the installed rule and the install request");
+    assert_eq!(created.0, vec![WasmHashPin::new(fixture.ed25519_hash)]);
     assert_eq!(created.1, vec![Some(expected_pin)]);
     assert!(created.2, "the created row must carry mutable_override");
 
@@ -947,7 +949,7 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
     assert_proxy_resolves_to(&fixture, &fixture.webauthn_hash).await;
     let expected_observed = format!(
         "external reference owner {beacon_redacted} tag \"{TAG}\" resolved {}",
-        first8_hex(&fixture.webauthn_hash)
+        hex::encode(fixture.webauthn_hash)
     );
 
     // ── Proof 3: the execute path refuses on drift before signing ──────────
@@ -990,16 +992,16 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
         SaError::VerifierHashDrift {
             rule_id: drift_rule_id,
             ref deploy_address_redacted,
-            ref pinned_hash_first8,
-            ref observed_hash_first8,
+            pinned_hash,
+            observed_hash,
             observed_executable: Some(ref observed_executable),
             ref request_id,
             ..
         } => {
             assert_eq!(drift_rule_id, rule_id);
             assert_eq!(deploy_address_redacted.as_str(), proxy_redacted);
-            assert_eq!(pinned_hash_first8, &first8_hex(&fixture.ed25519_hash));
-            assert_eq!(observed_hash_first8, &first8_hex(&fixture.webauthn_hash));
+            assert_eq!(pinned_hash, WasmHashPin::new(fixture.ed25519_hash));
+            assert_eq!(observed_hash, Some(WasmHashPin::new(fixture.webauthn_hash)));
             assert_eq!(observed_executable, &expected_observed);
             assert_eq!(request_id, &drift_request_id);
         }
@@ -1060,15 +1062,18 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
             SaError::VerifierHashDrift {
                 rule_id: drift_rule_id,
                 deploy_address_redacted,
-                pinned_hash_first8,
-                observed_hash_first8,
+                pinned_hash,
+                observed_hash,
                 observed_executable: Some(observed_executable),
                 ..
             } => {
                 assert_eq!(*drift_rule_id, rule_id);
                 assert_eq!(deploy_address_redacted.as_str(), proxy_redacted);
-                assert_eq!(pinned_hash_first8, &first8_hex(&fixture.ed25519_hash));
-                assert_eq!(observed_hash_first8, &first8_hex(&fixture.webauthn_hash));
+                assert_eq!(*pinned_hash, WasmHashPin::new(fixture.ed25519_hash));
+                assert_eq!(
+                    *observed_hash,
+                    Some(WasmHashPin::new(fixture.webauthn_hash))
+                );
                 assert_eq!(observed_executable, &expected_observed);
             }
             other => panic!(
@@ -1130,12 +1135,12 @@ async fn install_pins_the_reference_and_signing_detects_the_repoint() {
         .expect("verify_rule_wasm_pins must return a report");
     assert_eq!(pins.verifier_pin_status, PinStatus::Drift);
     assert_eq!(
-        pins.pinned_verifier_first8,
-        vec![first8_hex(&fixture.ed25519_hash)]
+        pins.pinned_verifier_hashes,
+        vec![WasmHashPin::new(fixture.ed25519_hash)]
     );
     assert_eq!(
-        pins.observed_verifier_first8,
-        vec![first8_hex(&fixture.webauthn_hash)]
+        pins.observed_verifier_hashes,
+        vec![Some(WasmHashPin::new(fixture.webauthn_hash))]
     );
     assert_eq!(pins.policy_pin_status, PinStatus::Match);
 }

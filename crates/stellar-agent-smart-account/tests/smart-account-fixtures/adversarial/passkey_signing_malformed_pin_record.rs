@@ -1,10 +1,15 @@
 //! Adversarial fixture: passkey signing with a malformed pin record.
 //!
-//! Scenario: the `SaContextRuleCreated` row for the signing rule carries
+//! Scenario: the `SaContextRuleCreatedV2` row for the signing rule carries
 //! executable-reference pins that the install path never writes: a pin whose
-//! tag exceeds the bounded rendering, a pin list misaligned with its first-8
-//! list, or a pin whose resolved first-8 disagrees with the aligned first-8
-//! entry. The audit reader refuses such a record as an integrity error.
+//! tag exceeds the bounded rendering, a pin list misaligned with its hash
+//! list, or a pin whose resolved hash disagrees with the aligned hash, also
+//! in bytes after the first eight. The audit reader refuses such a record as
+//! an integrity error.
+//!
+//! A version-1 row of eight-byte prefixes is a well-formed but incomplete
+//! record: signing refuses it with `SaError::WasmPinIncomplete`, routed to
+//! `CredentialsError::DriftCheckUnavailable`, before any ceremony.
 //!
 //! # Invariant
 //!
@@ -23,7 +28,9 @@ use std::time::Duration;
 
 use stellar_agent_core::audit_log::AuditLogIntegrityError;
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::{EventKind, ExecutableRefPin};
+use stellar_agent_core::audit_log::schema::{
+    EventKind, ExecutableRefPin, ExecutableRefPinFirst8, WasmHashPin,
+};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
 use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
@@ -47,7 +54,7 @@ fn testnet_entry() -> PartialSorobanAuthorizationEntry {
     )
     .expect("fixture auth entry builds")
 }
-const PINNED_FIRST8: &str = "4242424242424242";
+const PINNED_HASH: WasmHashPin = WasmHashPin::new([0x42; 32]);
 
 fn pin() -> ExecutableRefPin {
     ExecutableRefPin::new(
@@ -66,14 +73,19 @@ async fn malformed_pin_record_routes_to_drift_check_unavailable() {
     let mut long_tag = pin();
     long_tag.tag = "t".repeat(65);
     let mut disagreeing = pin();
-    disagreeing.resolved_hash_first8 = "1111111111111111".to_owned();
-    // Each case pins one policy with first-8 `PINNED_FIRST8`.
-    let cases: [(&str, Vec<Option<ExecutableRefPin>>); 3] = [
+    disagreeing.resolved_hash = WasmHashPin::new([0x11; 32]);
+    let mut twin = [0x42u8; 32];
+    twin[8..].fill(0x43);
+    let mut twin_disagreeing = pin();
+    twin_disagreeing.resolved_hash = WasmHashPin::new(twin);
+    // Each case pins one policy with the hash `PINNED_HASH`.
+    let cases: [(&str, Vec<Option<ExecutableRefPin>>); 4] = [
         ("malformed pin shape", vec![Some(long_tag)]),
-        // The pin at position 0 matches the aligned first-8; only the
-        // extra entry makes the list longer than the first-8 list.
+        // The pin at position 0 matches the aligned hash; only the extra
+        // entry makes the list longer than the hash list.
         ("misaligned list", vec![Some(pin()), None]),
-        ("first-8 disagreement", vec![Some(disagreeing)]),
+        ("resolved hash disagreement", vec![Some(disagreeing)]),
+        ("equal-prefix resolved hash", vec![Some(twin_disagreeing)]),
     ];
 
     for (case, policy_refs) in cases {
@@ -81,7 +93,7 @@ async fn malformed_pin_record_routes_to_drift_check_unavailable() {
             let (audit_writer, audit_log_path, dir) = tmp_audit_writer();
             let smart_account_strkey = format!("{}", stellar_strkey::Contract([0u8; 32]));
             let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
-            let created = AuditEntry::new_sa_context_rule_created(
+            let created = AuditEntry::new_sa_context_rule_created_v2(
                 &smart_account_redacted,
                 RULE_ID,
                 "default",
@@ -91,7 +103,7 @@ async fn malformed_pin_record_routes_to_drift_check_unavailable() {
                 "stellar:testnet",
                 uuid::Uuid::new_v4().to_string(),
                 vec![],
-                vec![PINNED_FIRST8.to_owned()],
+                vec![PINNED_HASH],
                 true,
                 false,
                 vec![],
@@ -159,5 +171,95 @@ async fn malformed_pin_record_routes_to_drift_check_unavailable() {
                 "{label}: no diversification override row may be written"
             );
         }
+    }
+}
+
+/// A version-1 pin record of eight-byte prefixes aborts passkey signing with
+/// `SaError::WasmPinIncomplete` routed to `DriftCheckUnavailable`, before any
+/// ceremony and any RPC, whether or not the single-verifier override is set.
+/// No override admits an incomplete record.
+#[tokio::test]
+async fn an_incomplete_pin_record_refuses_passkey_signing_before_any_ceremony() {
+    for accept_single_verifier in [false, true] {
+        let (audit_writer, audit_log_path, dir) = tmp_audit_writer();
+        let smart_account_strkey = format!("{}", stellar_strkey::Contract([0u8; 32]));
+        let smart_account_redacted = redact_strkey_first5_last5(&smart_account_strkey);
+        let first8_pin = ExecutableRefPinFirst8::new(
+            &ScAddress::Contract(ContractId(Hash([0x0cu8; 32]))),
+            &ScString(b"policy-v1".to_vec().try_into().expect("tag fits")),
+            &[0x42u8; 32],
+        )
+        .expect("pin builds");
+        let created = AuditEntry::new_sa_context_rule_created(
+            &smart_account_redacted,
+            RULE_ID,
+            "default",
+            1,
+            1,
+            None,
+            "stellar:testnet",
+            uuid::Uuid::new_v4().to_string(),
+            vec![],
+            vec!["4242424242424242".to_owned()],
+            true,
+            true,
+            vec![],
+            vec![Some(first8_pin)],
+        );
+        audit_writer
+            .lock()
+            .expect("audit writer poisoned")
+            .write_entry(created)
+            .expect("context-rule-created row must write");
+
+        let signers_manager = Arc::new(manager_one_url(
+            "http://127.0.0.1:1",
+            Arc::clone(&audit_writer),
+            audit_log_path,
+        ));
+        let manager =
+            CredentialsManager::new(dir.path().join("passkeys"), "default", "localhost", None);
+        let ceremony_started = AtomicBool::new(false);
+        let result = manager
+            .sign_with_passkey_rule(
+                "laptop-passkey",
+                &testnet_entry(),
+                signers_manager,
+                "127.0.0.1:0".parse().expect("socket addr parses"),
+                Duration::from_millis(10),
+                |_| ceremony_started.store(true, Ordering::SeqCst),
+                accept_single_verifier,
+            )
+            .await;
+
+        let label = format!("accept_single_verifier={accept_single_verifier}");
+        match &result {
+            Err(CredentialsError::DriftCheckUnavailable { source }) => {
+                assert!(
+                    matches!(
+                        source.as_ref(),
+                        SaError::WasmPinIncomplete {
+                            rule_id: RULE_ID,
+                            ..
+                        }
+                    ),
+                    "{label}: source must be the incomplete-pin refusal; got {source:?}"
+                );
+                assert_eq!(source.wire_code(), "sa.wasm_pin_incomplete", "{label}");
+            }
+            other => panic!("{label}: expected DriftCheckUnavailable; got {other:?}"),
+        }
+        assert!(
+            !ceremony_started.load(Ordering::SeqCst),
+            "{label}: no signing ceremony may start"
+        );
+        let entries = verified_audit_entries(&audit_writer);
+        assert!(
+            !entries.iter().any(|entry| matches!(
+                entry.event_kind,
+                EventKind::SaVerifierDiversificationOverride { .. }
+            )),
+            "{label}: no diversification override row may be written"
+        );
     }
 }

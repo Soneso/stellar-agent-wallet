@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
-use stellar_agent_core::audit_log::schema::EventKind;
+use stellar_agent_core::audit_log::schema::{EventKind, WasmHashPin};
 use stellar_agent_core::audit_log::test_helpers::verified_audit_entries;
 use stellar_agent_core::constants::SIMULATE_SENTINEL_G;
 use stellar_agent_core::observability::redact_strkey_first5_last5;
@@ -135,12 +135,9 @@ async fn policy_rpc_divergence_routes_to_drift_check_unavailable() {
     // keeping this fixture out of the runtime drift-check lock sequence.
     write_baseline(&audit_writer, RULE_ID, &smart_account_redacted, &signer_set);
 
-    let pinned_policy_first8 = KNOWN_WASM_HASH[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let pinned_policy = WasmHashPin::new(KNOWN_WASM_HASH);
     {
-        let entry = AuditEntry::new_sa_context_rule_created(
+        let entry = AuditEntry::new_sa_context_rule_created_v2(
             &smart_account_redacted,
             RULE_ID,
             "default",
@@ -150,7 +147,7 @@ async fn policy_rpc_divergence_routes_to_drift_check_unavailable() {
             "stellar:testnet",
             uuid::Uuid::new_v4().to_string(),
             vec![],
-            vec![pinned_policy_first8],
+            vec![pinned_policy],
             false,
             false,
             vec![],
