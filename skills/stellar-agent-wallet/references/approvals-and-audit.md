@@ -88,6 +88,7 @@ with `policy.engine_required`. Newly minted profiles default to the V1 engine.
 Evaluates a signed policy document against typed Criteria. The document carries
 an ed25519 owner signature over its canonical form; an invalid signature, or a
 signature from a key rotated after signing, is rejected.
+A policy without a `[signature]` table refuses with `policy.policy_file_parse_failed` and a message naming `stellar-agent profile sign-policy --profile <name>` for the selected profile.
 
 Evaluation is **first-match, default-deny**:
 
@@ -107,12 +108,15 @@ Counterparty allowlists match classic accounts, contract accounts, asset issuers
 or resolved home domains. The `SEP10_IDENTITY` and `ONE_TIME_ADDRESS` kinds are
 reserved and are not evaluated.
 Bundle-level checks cover inner-count caps, aggregate caps, and rejection of
-unrecognized inner shapes. Criteria also check quorum satisfaction, resolved
-home domains, and active SEP-10 or SEP-45 sessions.
+unrecognized inner shapes.
 The home-domain-resolved guard requires a live cached binding for the
 destination's on-chain `home_domain`.
-Criteria receive external state as injected views at the dispatch site.
-A required session or cache view that is absent fails closed.
+The loader also accepts `quorum_satisfied`, `sep10_session_active`, and
+`sep45_session_active`, but shipped CLI and MCP dispatch paths supply none of
+their required views. A matched rule containing any of these criteria refuses
+every call.
+Reserve, identity, and counterparty-cache criteria receive external state
+through injected views; a missing required view refuses the call.
 
 `approval_above` permits amounts at or below its threshold and requests
 approval above it. It uses `asset` and `max_stroops`, with the same units and
@@ -155,6 +159,8 @@ The MCP payment tool stores the pending request with a reason naming
 `approval_above` and its threshold. Operators approve through the CLI approvals
 commands, terminal, inbox, or remote approver. The CLI `pay` command returns
 `policy.approval_required` and directs the caller to MCP.
+
+MCP pay/create-account/trustline/claim commits and CLI `pay` and `claim` with `--sign-only` or `--submit-only` include envelope fees in `minimum_reserve`. A debit leaving only reserve plus margin refuses `policy.deny.minimum_reserve_breached`. Full CLI pipelines, `--build-only`, and MCP simulations count no fee.
 
 A `HOME_DOMAIN` binding is evidence for one hour from its fetch. An entry
 whose fetch time lies more than five minutes in the future counts as expired.

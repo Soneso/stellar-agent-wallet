@@ -63,9 +63,10 @@ each tagged release, and the workspace crates are published to
 - Smart accounts: deploy and govern OpenZeppelin smart accounts with WebAuthn
   passkey signers. Delegate to an agent that holds its own key, within scoped
   rules and spending limits the contract enforces.
-- SEP protocols: the wallet supports SEP-6, SEP-7, SEP-10, SEP-24, SEP-43,
-  SEP-45, SEP-47, SEP-48, and SEP-53. They cover anchor flows, payment URIs,
-  web authentication, wallet signing, message signing, and contract interfaces.
+- SEP protocols: the wallet exposes SEP-6, SEP-7, SEP-24, SEP-43, SEP-47,
+  SEP-48, and SEP-53 for anchor flows, payment URIs, wallet signing, message
+  signing, and contract interfaces. SEP-10 serves the x402 identity gate;
+  SEP-45 is library-only and has no CLI command or MCP tool.
 - Machine payments: pay as an x402 client, and authorize Machine Payments
   Protocol (MPP) sponsored charges on testnet.
 - Operator control: approve or reject pending agent actions from a terminal or

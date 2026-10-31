@@ -2,7 +2,7 @@
 
 This document describes the cryptographic primitives behind the Stellar Agent Wallet guardrail spine: the approval attestation, the hash-chained audit log, the wallet unlock window, the nonce scheme, the V1 policy evaluator, and the smart-account auth digest. It is written for a maintainer or security reviewer who needs the byte-level detail, not the operator-facing model. For the model itself see [Concepts](../concepts.md); for how the crates fit together see [Architecture](architecture.md).
 
-Both surfaces (the `stellar-agent` CLI and the `stellar-agent-mcp` server) share the attestation, audit hash-chain, nonce, policy-evaluator, and auth-digest primitives below. The wallet unlock window (mlock plus TTL) is the exception: it protects the CLI's `--secret-env` signing path, where the seed is loaded into pinned memory. The MCP server does not call `Wallet::unlock`; its signing goes through keyring signer handles, so the [Wallet unlock lifecycle](#wallet-unlock-lifecycle) section below applies to the CLI surface only. testnet (`stellar:testnet`) is the default. Every write or signing command structurally refuses mainnet (`stellar:mainnet`) with wire code `network.mainnet_write_forbidden`, except MPP, which refuses with `mpp.network_forbidden`. This covers `--network` commands and the profile-driven write commands before any RPC call or signing. At the submit layer it covers both a declared mainnet network passphrase and a known mainnet RPC URL, each at zero RPC cost. The submit layer additionally establishes the endpoint's own network identity and binds every signature on the envelope to it; see [Submit-layer network binding](#submit-layer-network-binding).
+Both surfaces (the `stellar-agent` CLI and the `stellar-agent-mcp` server) share the attestation, audit hash-chain, nonce, policy-evaluator, and auth-digest primitives below. The CLI environment-seed path enters a memory-lock and TTL window, then copies the seed into an unpinned transaction signer and disposes the window. `profile sign-policy` signs while the window is open. The MCP server does not call `Wallet::unlock`; its signing goes through keyring signer handles, so the [Wallet unlock lifecycle](#wallet-unlock-lifecycle) section below applies to the CLI surface only. testnet (`stellar:testnet`) is the default. Every write or signing command structurally refuses mainnet (`stellar:mainnet`) with wire code `network.mainnet_write_forbidden`, except MPP, which refuses with `mpp.network_forbidden`. This covers `--network` commands and the profile-driven write commands before any RPC call or signing. At the submit layer it covers both a declared mainnet network passphrase and a known mainnet RPC URL, each at zero RPC cost. The submit layer additionally establishes the endpoint's own network identity and binds every signature on the envelope to it; see [Submit-layer network binding](#submit-layer-network-binding).
 
 ## Two sessions on one profile
 
@@ -330,7 +330,7 @@ Each profile command that writes long-lived key material to the keyring records 
 
 ## Wallet unlock lifecycle
 
-The unlock window holds a 32-byte signing seed in pinned, zeroize-on-drop memory for a bounded TTL. It is entered by the CLI secret-env signing path; the MCP server signs through keyring signer handles and never enters it. The lifecycle manager is `Wallet` in `crates/stellar-agent-core/src/wallet/lifecycle.rs`; the locked seed holder is `LockedSeed` in `wallet/mlock.rs`.
+The unlock window holds a 32-byte signing seed in pinned, zeroize-on-drop memory for a bounded TTL. The CLI secret-env transaction path copies the seed into an unpinned, zeroize-on-drop `SoftwareSigningKey` and disposes the window before signing. `profile sign-policy` signs while the window is open. MCP keyring signers never enter it. The lifecycle manager is `Wallet` in `crates/stellar-agent-core/src/wallet/lifecycle.rs`; the locked seed holder is `LockedSeed` in `wallet/mlock.rs`.
 
 ### Zeroizing seed and eager pin
 
@@ -354,7 +354,7 @@ On `mlock` failure the module emits a structured `tracing::warn!` carrying `prof
 
 The default TTL is `DEFAULT_TTL_SECONDS` (30); the hard cap is `MAX_TTL_SECONDS` (600). `unlock` rejects `ttl_seconds == 0` or `ttl_seconds > 600` with `WalletLifecycleError::TtlInvalid`. The profile field `wallet.unlock_ttl_seconds` is validated against that range when the window is constructed: a value of 0 or above 600 is refused, never clamped.
 
-A background `tokio` task sleeps for the TTL and then marks the wallet disposed. A shared `AtomicBool` cancel flag lets an early `dispose()` short-circuit the timer. On every drop path (normal return, `?` propagation, or panic-unwind), `Drop` calls `dispose()` unconditionally, zeroizing the seed and releasing the lock. `Wallet` is intentionally **not** `Send + Sync`; callers needing shared access wrap it in `Arc<Mutex<Wallet>>` or use the MCP server's per-request ownership model.
+A background `tokio` task sleeps for the TTL and then marks the wallet disposed. The timer governs the window, not the unpinned copy used for CLI transaction signing. A shared `AtomicBool` cancel flag lets an early `dispose()` short-circuit the timer. On every drop path (normal return, `?` propagation, or panic-unwind), `Drop` calls `dispose()` unconditionally, zeroizing the seed and releasing the lock. `Wallet` is intentionally **not** `Send + Sync`; callers needing shared access wrap it in `Arc<Mutex<Wallet>>` or use the MCP server's per-request ownership model.
 
 ## Headless keyring store
 
@@ -535,6 +535,7 @@ absence; the fee bid; and time bounds. An included transaction that fails an
 apply-time check can still cost its fee.
 The witness also protects policy reserve and balance views, destination identity,
 and SEP-29 decisions before signing.
+Warnings for unexpected SEP-29 `config.memo_required` values report the value length and entry kind without including the returned bytes.
 
 A skipped or not-required outcome makes no oracle comparison of any kind.
 With an oracle configured, a memo-less payment requires a comparison even below
@@ -677,10 +678,10 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | `bundle_per_period_cap` | Per-period cap across a bundle (implicitly enforces the Generic-rejection check above, on any rule that carries it) |
 | `bundle_per_tx_cap` | Per-tx cap applied to each inner (implicitly enforces the Generic-rejection check above, on any rule that carries it) |
 | `bundle_rate_limit` | Rate limit across a bundle |
-| `quorum_satisfied` | Smart-account signer-group quorum |
+| `quorum_satisfied` | Refuses in shipped CLI and MCP dispatch paths because no quorum view is supplied |
 | `home_domain_resolved` | Counterparty `stellar.toml` resolved/cached (contract counterparties only, see below) |
-| `sep10_session_active` | Active SEP-10 session for the account |
-| `sep45_session_active` | Active SEP-45 session for the contract |
+| `sep10_session_active` | Refuses in shipped CLI and MCP dispatch paths because no SEP-10 session view is supplied |
+| `sep45_session_active` | Refuses in shipped CLI and MCP dispatch paths because no SEP-45 session view is supplied |
 
 `approval_above` shares `per_tx_cap` amount extraction and fail-closed value
 checks. Its `asset` and positive `max_stroops` threshold apply only to `allow`
@@ -711,7 +712,7 @@ Stateful criteria derive window entries from the same `ValueEffects` used by eva
 
 ### Injected views fail closed when absent
 
-Several criteria need state the core crate cannot fetch itself (account reserves, identity, counterparty cache, SEP-10/SEP-45 sessions, quorum). To avoid a circular dependency on the network and smart-account crates, these arrive as optional trait objects on `EvalContext` (`AccountReservesView`, `AccountIdentityView`, `CounterpartyCacheView`, `Sep10SessionView`, `Sep45SessionView`, `QuorumView`), populated by adapters in `stellar-agent-mcp` at the dispatch site. When a configured criterion's required view is `None`, the criterion returns `Err(PolicyError::CriterionEvaluationFailed)` rather than silently passing: `minimum_reserve` with no `account_view`, `sep10_session_active` with no session view, and `home_domain_resolved` with no counterparty cache all fail closed. `AccountIdentityView` is deliberately a separate trait with no default methods so a missing `home_domain` cannot become a silent allow.
+Several criteria need state the core crate cannot fetch itself (account reserves, identity, counterparty cache, SEP-10/SEP-45 sessions, quorum). The optional views on `EvalContext` are `AccountReservesView`, `AccountIdentityView`, `CounterpartyCacheView`, `Sep10SessionView`, `Sep45SessionView`, and `QuorumView`. They keep core independent of the network and smart-account crates. `stellar-agent-network::policy_view` provides the account adapters used by CLI and MCP handlers, and `network::counterparty` provides the cache snapshot. Shipped dispatch paths populate no session or quorum views, so criteria requiring them refuse. When a configured criterion's required view is `None`, the criterion returns `Err(PolicyError::CriterionEvaluationFailed)` rather than silently passing: `minimum_reserve` with no `account_view`, `sep10_session_active` with no session view, and `home_domain_resolved` with no counterparty cache all fail closed. `AccountIdentityView` is deliberately a separate trait with no default methods so a missing `home_domain` cannot become a silent allow.
 
 ### HOME_DOMAIN allowlist verification
 

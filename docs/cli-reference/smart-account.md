@@ -33,7 +33,7 @@ Every command prints one JSON envelope on stdout and returns exit code `0` on su
 
 ## Signer source
 
-The write verbs use the shared signer-source group: exactly one of `--signer-secret-env <VAR>` (an env-var name holding the source-account S-strkey) or `--sign-with-ledger` (the two are mutually exclusive, and the command refuses if neither is supplied), with `--account-index <INDEX>` selecting the Ledger BIP-44 index (default `0`). See [signer source](index.md#signer-source). All signing in this group goes through the smart-account auth-entry digest path: the signer signs the [auth digest](../concepts.md), which binds the authorizing context-rule ids.
+The write verbs use the shared signer-source group: exactly one of `--signer-secret-env <VAR>` (an env-var name holding the source-account S-strkey) or `--sign-with-ledger` (the two are mutually exclusive, and the command refuses if neither is supplied), with `--account-index <INDEX>` selecting the Ledger BIP-44 index (default `0`). See [signer source](index.md#signer-source). Operations authorized by smart-account context rules sign the [auth digest](../concepts.md), which binds the authorizing rule ids. Timelock writes use direct G-key Soroban authorization for the proposer, canceller, or executor.
 
 The examples on this page that sign with `--signer-secret-env WALLET_SK` read the source-account seed from `WALLET_SK`. Before the first of them, run this line on its own, paste the seed when prompted, and press Enter (see [Pass a secret seed](../getting-started.md#pass-a-secret-seed)):
 
@@ -878,7 +878,7 @@ Flags:
 - `--timeout-seconds <SECONDS>`: default `60`; covers the full enumeration, the baseline reads included.
 - `--output <FORMAT>`: `json` default; `table` mode is deferred (the flag is accepted but renders the JSON envelope).
 
-Each entry of `rules` carries `rule_id`, `name`, `context_type_label`, `signer_count`, `policy_count`, `valid_until` (omitted for a permanent rule) and `baseline`. `baseline` is the rule's signer-set baseline in the profile's audit log: `none` (no state row), `v1`, `v2`, `unreadable` (an audit-log integrity error for that rule) or `unknown` (the log was not read). Every signature under a rule other than `0` needs the baseline: a rule reporting `none` refuses with `sa.signer_set_missing_baseline` until one `signers list --rule-id N` records it. Rule `0` reports its own state like any rule. A rule the shared context-rule decoder refuses fails the listing with `sa.deployment_failed`, and the reason names the rule id.
+Each entry of `rules` carries `rule_id`, `name`, `context_type_label`, `signer_count`, `policy_count`, `valid_until` (omitted for a permanent rule) and `baseline`. `baseline` is the rule's signer-set baseline in the profile's audit log: `none` (no state row), `v1`, `v2`, `unreadable` (an audit-log integrity error for that rule) or `unknown` (the log was not read). Every signature under a rule other than `0` needs the baseline: a rule reporting `none` refuses with `sa.signer_set_missing_baseline` until one `signers list --rule-id N` records it. Rule `0` reports its own state like any rule. A rule the shared context-rule decoder refuses fails the listing with `sa.deployment_failed`, and the reason names the rule id. Rule reads refuse `sa.deployment_failed` for a `Delegated` signer with more than two items or an `External` signer with more than three. They also refuse invalid `policies`/`policy_ids` lists (required, equally sized, unique addresses/`u32` ids). Migration planning also refuses these cases.
 
 ```bash
 stellar-agent smart-account list-rules --account CABC...WXYZ
@@ -954,7 +954,7 @@ stellar-agent smart-account timelock schedule \
   --function upgrade \
   --delay-ledgers 100 \
   --signer-secret-env PROPOSER_SK
-# Save the "salt" field from the JSON output: required for execute and cancel.
+# Save "salt" for execute and "operation_id_full_hex" for execute or cancel.
 ```
 
 #### `smart-account timelock cancel`

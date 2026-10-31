@@ -116,11 +116,11 @@ When a CLI command signs with a seed read from a `--*-secret-env` variable, the
 32-byte signing seed is loaded into a short unlock window. Keyring signers, the
 Ledger, and the MCP server never enter it. A keyring signer loads its key for
 each signature into a zeroize-on-drop buffer without a memory lock. The unlock
-window works as follows:
+window itself works as follows:
 
 - The seed is moved into a zeroize-on-drop buffer, and its backing page is pinned
   in physical RAM via `mlock` (Linux/macOS) or `VirtualLock` (Windows). Pinning the
-  page keeps the seed out of swap. The pin is eager: pages are populated and locked
+  page keeps that buffer out of swap when pinning succeeds. The pin is eager: pages are populated and locked
   at lock time, so there is no pre-first-fault swap-disclosure window.
 - The window is TTL-bounded. The default is 30 seconds; `wallet.unlock_ttl_seconds`
   honors any value from 1 through 600 seconds. `ttl_seconds == 0` or `> 600` is
@@ -149,11 +149,12 @@ mlock_required = true       # default on Linux/macOS
 unlock_ttl_seconds = 30     # default; 1 through 600 honored
 ```
 
-Operational implication for an agent: the window is short. Do not assume an unlock
-persists between unrelated calls; each signing action stands up its own bounded
-window.
+CLI transaction signing copies the seed into an unpinned, zeroize-on-drop
+`SoftwareSigningKey` and disposes the window before returning the signer.
+The TTL does not bound that copy. `profile sign-policy` signs while the window
+is open. Keyring signers and Ledger signing do not use an unlock window.
 
-## The mainnet write gate (read-only by default under Noop)
+## The mainnet write gate (structurally read-only)
 
 Two structural rules apply across all surfaces:
 
@@ -163,9 +164,8 @@ Two structural rules apply across all surfaces:
    except MPP, which refuses with `mpp.network_forbidden`. `stellar:mainnet`
    stays accepted for read-only commands.
 
-The policy engine selected per profile in `[policy]` enforces the gate. When no
-full engine is configured, the Noop engine is the binding gate, with fixed
-behaviour:
+Mainnet writes are structurally refused regardless of the engine selected in
+`[policy]`. The Noop engine also applies these fixed policy decisions:
 
 | Profile | Tool | Result |
 |---------|------|--------|
@@ -173,11 +173,11 @@ behaviour:
 | mainnet | read-only (`destructive_hint = false`) | Allow |
 | mainnet | destructive | refused with `policy.engine_required` |
 
-A destructive tool on a mainnet profile cannot pass the Noop engine. Newly minted
-profiles default to the V1 engine (signature-verified typed criteria, first-match
-default-deny); profiles carried over from an older schema are set to Noop
-explicitly so the mainnet gate stays in place until the operator stands up a V1
-owner key.
+A destructive tool on a mainnet profile cannot pass the Noop engine. New profiles
+default to V1, which verifies signed policies and evaluates typed criteria with
+first-match, default-deny rules.
+Enrolling a V1 owner key changes policy evaluation but does not enable mainnet
+writes.
 
 There are no consent-gated mainnet write exceptions: every write surface refuses
 mainnet structurally. Friendbot funding is scoped to `testnet` and `futurenet`
