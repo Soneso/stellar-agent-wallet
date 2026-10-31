@@ -1,13 +1,18 @@
 # Security and safe operation
 
-This wallet places fixed controls between every tool call an agent makes and any
-network or signing action. The agent is not assumed to be correct or honest: a
-policy engine evaluates calls and operator approval covers gated cases.
+The wallet evaluates policy on gated signing paths and enforces approvals on
+its two-phase MCP actions. Use those tools for agent payments, account creation,
+trustlines, and claims; the CLI serves reads, setup, and operator ceremonies.
+CLI signing coverage varies by verb; see
+[signing coverage](cli-reference.md#signing-and-approval-coverage).
 Approval is cryptographically bound to the exact transaction. The audit log
 records transaction submissions, signed authorizations, approvals, and explicit
 key-management and lifecycle events. MCP balance reads add no audit rows. A payment
 simulation adds no invocation row; under V1 it can reconcile overdue
-reservations and write their settlement rows. The signing seed stays out of the agent's reach.
+reservations and write their settlement rows. MCP tools expose no signing seed
+or operator approval command. A process running as the operator's OS user holds
+the operator's authority; the wallet does not distinguish it from the operator.
+See the [trust model](../SKILL.md#overview) for the current limits.
 This file describes the security
 model an operator should understand and the safe-operation rules an agent must
 follow. For the tool list and argument shapes see `./mcp-tools.md`.

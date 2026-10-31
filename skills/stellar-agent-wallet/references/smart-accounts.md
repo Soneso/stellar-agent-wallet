@@ -4,6 +4,15 @@ The `smart-account` CLI group (alias `sa`) governs an on-chain OpenZeppelin smar
 
 This file is self-contained. For the MCP tool surface and result-envelope shape see `./mcp-tools.md`. For the value-transfer / DeFi verbs see `./defi.md`.
 
+The operator runs the governance and deployment examples on this page.
+Agents propose rules through MCP's two-phase rule tools and wait for operator
+approval. Delegated execution runs through the CLI's operator authority under
+the on-chain rules of the agent's key.
+Administration and deployment bypass the wallet policy engine; multicall
+requires V1 and accepts only Allow. Its approval refusal exposes
+`sa.multicall_failed`, with audit code `multicall.approval_required`.
+See [signing coverage](cli-reference.md#signing-and-approval-coverage).
+
 ## Output envelope and amount/asset conventions
 
 - Envelope: `{ ok, data | error, request_id }`. On success `ok: true` with a `data` object; on error `ok: false` with an `error` object carrying a wire code (for example `network.mainnet_write_forbidden`, `validation.rule_name_too_long`, `sa.threshold_policy_identification_failed`).

@@ -72,10 +72,13 @@ stellar-agent mpp charge authorize --profile default --input-stdin < challenge.j
 ```
 
 If policy allows, this command prepares, atomically claims, signs, re-simulates,
-audits, and returns one credential. If policy requires consent, it returns
-`mpp.approval_required`, an authorization ID, and an approval ID. The operator
-reviews and approves it through the normal `approve` command or approval inbox;
-then resume only the stored authorization:
+audits, and returns one credential. If the prepare policy requires consent, it
+creates pending approval and returns `mpp.approval_required`, an authorization
+ID, and an approval ID. When only the commit rule requires approval, CLI MPP
+refuses with `mpp.approval_invalid` and creates no pending approval entry.
+
+The operator reviews and approves a pending request through the normal
+`approve` command or approval inbox; then resume only the stored authorization:
 
 ```bash
 stellar-agent approve --id <approval-id> --profile <name>
