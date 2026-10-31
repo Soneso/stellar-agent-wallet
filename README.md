@@ -107,7 +107,7 @@ bare crate name matches stable versions only.
 `cargo binstall` downloads the prebuilt release archive for your platform:
 
 ```bash
-cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.12 stellar-agent-mcp@0.1.0-alpha.12
+cargo binstall --locked --disable-strategies quick-install,compile stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
 ```
 
 ### cargo install (from crates.io)
@@ -115,7 +115,7 @@ cargo binstall --locked --disable-strategies quick-install,compile stellar-agent
 `cargo install` builds both binaries from the sources on crates.io:
 
 ```bash
-cargo install --locked stellar-agent-cli@0.1.0-alpha.12 stellar-agent-mcp@0.1.0-alpha.12
+cargo install --locked stellar-agent-cli@0.1.0-alpha.13 stellar-agent-mcp@0.1.0-alpha.13
 ```
 
 ### Build from source
@@ -123,7 +123,7 @@ cargo install --locked stellar-agent-cli@0.1.0-alpha.12 stellar-agent-mcp@0.1.0-
 Clone the release tag and build with its committed `Cargo.lock`:
 
 ```bash
-git clone --branch v0.1.0-alpha.12 https://github.com/Soneso/stellar-agent-wallet.git
+git clone --branch v0.1.0-alpha.13 https://github.com/Soneso/stellar-agent-wallet.git
 cd stellar-agent-wallet
 cargo build --release --locked
 ```

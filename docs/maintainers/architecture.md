@@ -6,7 +6,7 @@ For concept-level background read [../concepts.md](../concepts.md). For build an
 
 ## Workspace overview
 
-The repository is a single Cargo workspace (`resolver = "2"`) with 37 member crates under `crates/`, all named `stellar-agent-*`. Shared package metadata is inherited from `[workspace.package]`: version `0.1.0-alpha.12`, Rust edition `2024`, license `Apache-2.0`, repository `https://github.com/Soneso/stellar-agent-wallet`, author `Soneso`. Of these, 36 are published on crates.io at the shared workspace version, in dependency order from the tagged release commit. The unpublished `stellar-agent-smart-account-acceptance` member holds the smart-account live suites that need a browser, the MCP server, the WebAuthn bridge, or the SEP-48, DeFi, DeFindex, and soroban-spec-tools crates.
+The repository is a single Cargo workspace (`resolver = "2"`) with 37 member crates under `crates/`, all named `stellar-agent-*`. Shared package metadata is inherited from `[workspace.package]`: version `0.1.0-alpha.13`, Rust edition `2024`, license `Apache-2.0`, repository `https://github.com/Soneso/stellar-agent-wallet`, author `Soneso`. Of these, 36 are published on crates.io at the shared workspace version, in dependency order from the tagged release commit. The unpublished `stellar-agent-smart-account-acceptance` member holds the smart-account live suites that need a browser, the MCP server, the WebAuthn bridge, or the SEP-48, DeFi, DeFindex, and soroban-spec-tools crates.
 
 Shared dependency pins live in `[workspace.dependencies]` in the root `Cargo.toml` and are added when a crate first needs them, so the workspace only carries dependencies it actually uses.
 
