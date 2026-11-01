@@ -761,7 +761,7 @@ Each criterion is a `Box<dyn Criterion>` (`Send + Sync`) with a snake_case kind 
 | `per_tx_cap` | Per-transaction value cap |
 | `approval_above` | Per-transaction approval threshold on `allow` rules |
 | `per_period_cap` | Sliding-window per-period value cap |
-| `rate_limit` | Sliding-window call-rate limit |
+| `rate_limit` | Sliding-window count of recorded calls, one shared count per profile and window |
 | `counterparty_allowlist` | Destination allowlist (`G_ACCOUNT` / `C_ACCOUNT` / `KNOWN_ISSUER` / `HOME_DOMAIN`; `SEP10_IDENTITY` and `ONE_TIME_ADDRESS` are reserved, not evaluated); `KNOWN_ISSUER` checks debit legs only unless the criterion's `gate_inflows = true` opt-in extends it to inflow legs too |
 | `minimum_reserve` | Minimum-reserve guard (classic-account tools only, see below) |
 | `inner_invocation_count_cap` | Multicall inner-count cap |
@@ -788,6 +788,8 @@ Multicall bundles also carry a hard floor independent of policy: `evaluate_bundl
 ### Persisted window-state store
 
 `per_period_cap`, `rate_limit`, `bundle_per_period_cap`, and `bundle_rate_limit` are stateful: their evaluation reads accumulated history from `PolicyStateStore` (`policy/v1/criteria/state_store.rs`), an in-memory `Mutex<HashMap<StateKey, VecDeque<StateEntry>>>` of timestamp, amount, and pending flag. A pending entry counts whatever its age; a confirmed entry is dated from the close time of the ledger that applied it and leaves the window from there. In-memory state alone would reset to empty on every process start (and every CLI invocation is its own process), so a durable backing store is required for these criteria to actually accumulate across calls.
+
+`rate_limit` and `bundle_rate_limit` key their entries by profile name, the fixed scope specificity `1`, the bucket `rate_limit`, and the window. Neither the rule nor the tool is part of the key. Every rate-limit criterion of a profile with the same window reads one shared count. Each criterion compares that count against its own `max_calls`. An entry is written only when a submission is reserved immediately before its send (`record_pending`) or an x402 or MPP authorization is recorded (`record_authorized`). The CLI and MCP dispatch gates evaluate without recording. A release on an on-chain failure or a refused send removes the entry. A confirmed entry stays.
 
 `PersistedWindowStore` is one file per profile at `<canonical_data_root>/policy/<profile>.window`. It lives in `stellar-agent-network::policy_state`, not `stellar-agent-core`; see the crate-placement rationale in that module's rustdoc. The store needs the keyring primitives that live in `stellar-agent-network`, and `stellar-agent-core` must not depend on `stellar-agent-network`.
 

@@ -101,7 +101,13 @@ with `policy.engine_required`. Newly minted profiles default to the V1 engine.
 Evaluates a signed policy document against typed Criteria. The document carries
 an ed25519 owner signature over its canonical form; an invalid signature, or a
 signature from a key rotated after signing, is rejected.
-A policy without a `[signature]` table refuses with `policy.policy_file_parse_failed` and a message naming `stellar-agent profile sign-policy --profile <name>` for the selected profile.
+A policy without a `[signature]` table fails to load with a message naming `stellar-agent profile sign-policy --profile <name>` for the selected profile.
+CLI `pay` and the other value verbs report a policy that fails its initial load, an unknown key included, as `policy.engine_unavailable`.
+The message carries the loader's detail.
+On that load, `trustline` reports `trustline.policy_engine_unavailable`, and `mpp charge` reports `mpp.state_unavailable`.
+The MCP server does not start and logs the loader's detail.
+CLI `pay`, `claim`, sponsored `accounts create`, `vault`, `trade`, and `trustline` load the policy again to record the submission before the send.
+`trustline` reports a failure of that reload as `trustline.submit_failed`, and the others as `submission.record_unavailable`.
 
 Evaluation is **first-match, default-deny**:
 
@@ -136,8 +142,9 @@ approval above it. It uses `asset` and `max_stroops`, with the same units and
 asset matching as `per_tx_cap`. One XLM is 10,000,000 stroops.
 The threshold must be positive and the rule's decision must be `allow`.
 The threshold must be below every `per_tx_cap` on the same asset
-in that rule. Invalid decisions or bounds produce
-`policy.policy_file_parse_failed`, naming the criterion and conflicting bounds.
+in that rule. Invalid decisions or bounds fail the policy load, and the
+loader's detail names the criterion and conflicting bounds. `profile sign-policy`
+refuses such a body with `sign_policy.policy_body_invalid`.
 
 The commit tool's rule is binding, so the example carries the criterion on both pay tools.
 The threshold applies to its configured asset.
@@ -172,6 +179,39 @@ The MCP payment tool stores the pending request with a reason naming
 `approval_above` and its threshold. Operators approve through the CLI approvals
 commands, terminal, inbox, or remote approver. The CLI `pay` command returns
 `policy.approval_required` and directs the caller to MCP.
+
+`rate_limit` caps how many counted calls a rolling window holds:
+
+```toml
+criteria = [{ kind = "rate_limit", window = "1h", max_calls = 10 }]
+```
+
+`window` is `1m`, `5m`, `1h`, `1d`, or `1w`. `max_calls` is a non-negative
+integer within the `u32` range. A call is denied with
+`policy.deny.rate_limit_exceeded` when the window already holds `max_calls`
+counted calls.
+A submission counts when the wallet reserves it immediately before the send.
+An x402 or MPP payment counts when the wallet records its authorization, before
+it signs.
+The policy gate only reads the count, so simulations and read-only calls do not
+count.
+A call refused before its submission is reserved or its authorization is
+recorded does not count either.
+A recorded x402 or MPP authorization stays counted when a later step fails,
+such as signing or delivering the credential.
+For x402 that includes a refused endpoint identity check.
+A submission that fails on chain or is refused at the send stops counting.
+One without a confirmed outcome counts until reconciliation settles it or an
+operator clears its receipt with `tx receipt clear`.
+A confirmed submission leaves the window measured from the close time of the
+ledger that applied it.
+Without a usable close time in the confirmation, the reservation stays pending
+and keeps counting.
+The count is kept per profile and window, in the profile's window-state store.
+Every `rate_limit` and `bundle_rate_limit` criterion of the profile with the
+same window reads one shared count, whichever rule carries it.
+Each criterion compares that shared count against its own `max_calls`.
+`bundle_rate_limit` counts each inner call of a multicall bundle.
 
 MCP pay/create-account/trustline/claim commits and CLI `pay` and `claim` with `--sign-only` or `--submit-only` include envelope fees in `minimum_reserve`. A debit leaving only reserve plus margin refuses `policy.deny.minimum_reserve_breached`. Full CLI pipelines, `--build-only`, and MCP simulations count no fee.
 
