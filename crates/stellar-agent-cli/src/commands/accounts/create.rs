@@ -78,6 +78,13 @@
 //! mode is not gated: it funds an eligible account from the external Friendbot
 //! faucet and debits no wallet-held funds, and touches no keyring.
 //!
+//! # Halted profile (both modes)
+//!
+//! Right after the profile resolves, a halted profile refuses both modes with
+//! `profile.halted`, or `profile.halt_unreadable` for a marker that cannot be
+//! read, before any keyring access, signer read, or network request. The MCP
+//! `stellar_friendbot` tool refuses the same way.
+//!
 //! # Audit pre-flight (sponsored mode only; fail-closed for a persisted
 //! profile, fail-open for the synthesized zero-config profile)
 //!
@@ -491,6 +498,13 @@ where
             return 1;
         }
     };
+    // Halt check, both modes: a halted profile refuses the sponsored creation
+    // and the Friendbot funding before any keyring access, signer read, or
+    // network request, as the MCP `stellar_friendbot` tool refuses.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name) {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
     let context = match network_context_for_command(
         &profile,
         &resolved.name,
@@ -2575,15 +2589,22 @@ mod tests {
     /// gate's owner-key read (`build_v1_policy_engine`), on the sponsored
     /// path (`run_sponsored`). Both dependencies are injected, so no OS
     /// keychain or on-disk profile is touched and no process-global keyring
-    /// store is registered — hence this test needs no `#[serial]`. The
-    /// injected initialiser returns an error so the run bails at that step,
-    /// before `sponsored_create` (and its RPC calls) ever runs, proving the
-    /// initialisation happens ahead of any network build.
+    /// store is registered. The halt check before the keyring initialiser
+    /// reads the marker under the data root, so the test redirects the data
+    /// root to a temporary directory and clears the profile variable; both
+    /// are process-global, hence `#[serial]`. The injected initialiser returns
+    /// an error so the run bails at that step, before `sponsored_create` (and
+    /// its RPC calls) ever runs, proving the initialisation happens ahead of
+    /// any network build.
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_initialises_keyring_store_before_policy_gate() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let profile_loaded = Arc::new(AtomicBool::new(false));
         let init_invoked = Arc::new(AtomicBool::new(false));
 
@@ -2639,12 +2660,19 @@ mod tests {
     /// initialiser IS invoked — the origin-aware audit pre-flight
     /// (`require_value_audit_writer_for_origin`) reads the profile's audit
     /// chain-root HMAC key from the platform keyring regardless of the policy
-    /// engine, so `run_sponsored` registers the store unconditionally.
+    /// engine, so `run_sponsored` registers the store unconditionally. The
+    /// halt check reads the marker under the data root, so the data root is a
+    /// temporary directory and the profile variable is cleared, under
+    /// `#[serial]`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_initialises_keyring_even_when_engine_is_noop() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
+        let home = tempfile::tempdir().expect("home");
+        let _home = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
+        let _profile_var = stellar_agent_test_support::ProfileEnvVarGuard::cleared();
         let init_invoked = Arc::new(AtomicBool::new(false));
         let init_writer = Arc::clone(&init_invoked);
 

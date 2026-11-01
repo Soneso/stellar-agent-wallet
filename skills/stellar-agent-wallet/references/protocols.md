@@ -62,6 +62,7 @@ Does NOT: sign a URI; auto-POST to a `callback`; auto-submit. Origin-domain veri
 Client-side Web Auth: fetch the challenge transaction, run the 13-point challenge validation, submit the signed challenge to obtain a JWT session. A per-request ephemeral ed25519 key flow is provided. There is no standalone SEP-10 MCP tool; it is consumed internally by the x402 identity gate. The anchor tools take a caller-supplied JWT.
 
 Does NOT: verify the server-issued JWT signature (the JWT is trusted via TLS). Challenge validation is fail-closed on every check. Ephemeral keys are generated fresh per call from the OS RNG and zeroized on drop.
+A mismatched SEP-10 challenge passphrase is reported as the public testnet or mainnet passphrase, or `<other network>`, including for multibyte input.
 
 Ordinary ephemeral authentication refuses a mainnet passphrase before key generation. Mainnet challenge signing requires the authorized completion used by bound x402 identity authentication.
 

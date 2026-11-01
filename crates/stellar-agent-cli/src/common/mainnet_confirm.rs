@@ -8,7 +8,7 @@
 //! and both challenge deadlines again under the store lock. No terminal input
 //! is consent.
 
-use super::consent::{ConsentSink, acquire_consent_sink};
+use super::consent::{OperatorRowSink, acquire_operator_row_sink};
 use super::mainnet_presence::acquire_mainnet_presence;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::io::Write;
@@ -309,7 +309,7 @@ pub(crate) async fn confirm_mainnet_write(
         &profile.attestation_key_id,
         &OwnerKeyContext::for_profile(name, profile),
     )?;
-    drop(acquire_consent_sink(profile, name)?);
+    drop(acquire_operator_row_sink(profile, name)?);
     {
         let mut store = open_store(store_path)?;
         store
@@ -411,10 +411,10 @@ fn persist_confirmation(
         &profile.attestation_key_id,
         &OwnerKeyContext::for_profile(name, profile),
     )?;
-    let sink = acquire_consent_sink(profile, name)?;
+    let sink = acquire_operator_row_sink(profile, name)?;
     let binding = AttestationBinding::new(name, context.chain().caip2_str());
     match sink {
-        ConsentSink::Writer(writer) => {
+        OperatorRowSink::Writer(writer) => {
             let mut guard = writer.lock().map_err(|_| {
                 WalletError::from(ValidationError::AuditWriterOpenFailed {
                     profile: name.to_owned(),
@@ -431,7 +431,7 @@ fn persist_confirmation(
                 presence,
             )?;
         }
-        ConsentSink::Outbox(outbox) => attest_mainnet_confirmation(
+        OperatorRowSink::Outbox(outbox) => attest_mainnet_confirmation(
             &mut pending,
             entry,
             &key,

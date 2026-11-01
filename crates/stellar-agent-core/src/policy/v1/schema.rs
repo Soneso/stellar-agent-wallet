@@ -58,6 +58,7 @@ const MATCH_KEYS: &[&str] = &["tool", "chain"];
 pub(crate) const CRITERION_KEY_SETS: &[(&str, &[&str])] = &[
     ("asset_allowlist", &["kind", "assets"]),
     ("per_tx_cap", &["kind", "asset", "max_stroops"]),
+    ("approval_above", &["kind", "asset", "max_stroops"]),
     (
         "per_period_cap",
         &["kind", "asset", "window", "max_stroops"],

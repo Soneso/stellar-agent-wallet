@@ -404,8 +404,12 @@ fn minimum_deny_rules_need_no_value_restrictions() {
         rule(&mut doc).remove("reason");
         rule(&mut doc).remove("ttl_secs");
         rule(&mut doc)["criteria"] = value(toml_edit::Array::new());
-        stellar_agent_core::policy::v1::validate_unsigned_policy(&doc.to_string(), "operator")
-            .unwrap();
+        stellar_agent_core::policy::v1::validate_unsigned_policy(
+            &doc.to_string(),
+            "operator",
+            &profile.network_passphrase,
+        )
+        .unwrap();
         mainnet_minimum::validate(&doc, &profile, "operator").unwrap();
     }
 }
@@ -1492,11 +1496,13 @@ fn threshold_aliases_and_duplicate_identities_refuse() {
 #[test]
 fn verified_sequence_is_a_positive_toml_integer() {
     use stellar_agent_core::policy::v1::validate_unsigned_policy;
+    use stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE;
     for value in ["0", "-1", "\"1\"", "1.0"] {
         assert!(
             validate_unsigned_policy(
                 &without_mainnet().replace("sequence = 7", &format!("sequence = {value}")),
-                "operator"
+                "operator",
+                MAINNET_PASSPHRASE,
             )
             .is_err()
         );
@@ -1504,7 +1510,8 @@ fn verified_sequence_is_a_positive_toml_integer() {
     assert!(
         validate_unsigned_policy(
             &without_mainnet().replace("sequence = 7", "sequence = 9223372036854775807"),
-            "operator"
+            "operator",
+            MAINNET_PASSPHRASE,
         )
         .is_ok()
     );
@@ -1571,7 +1578,12 @@ fn home_domain_criteria_are_valid_but_fail_the_minimum() {
     ] {
         let (dir, profile, key) = fixture();
         let body = with_criterion(criterion);
-        stellar_agent_core::policy::v1::validate_unsigned_policy(&body, "operator").unwrap();
+        stellar_agent_core::policy::v1::validate_unsigned_policy(
+            &body,
+            "operator",
+            &profile.network_passphrase,
+        )
+        .unwrap();
         let failures =
             mainnet_minimum::failures(&body.parse::<DocumentMut>().unwrap(), &profile, "operator");
         assert!(

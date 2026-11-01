@@ -20,7 +20,8 @@
 //! declaration order; the first rule whose `RuleMatch` matches the tool
 //! call is selected.  All criteria in that rule are then evaluated in order;
 //! the first failing criterion produces a [`crate::policy::Decision::Deny`].  If all
-//! criteria pass, the rule's `decision` is returned.  If no rule matches,
+//! criteria pass, the rule's `decision` is returned. An escalation on an `Allow` rule with no
+//! failing criterion returns `RequireApproval`. If no rule matches,
 //! the engine returns `Decision::Deny(DenyReason::NoMatchingRule)`
 //! (default-deny).
 //!
@@ -1348,13 +1349,21 @@ impl PolicyEngineV1 {
                 bundle: None,
             };
 
+            let mut escalation = None;
             for criterion in &rule.criteria {
-                if let Some(deny) = criterion.evaluate(&ctx)? {
-                    return Ok(Decision::Deny(deny));
+                match criterion.evaluate_decision(&ctx)? {
+                    Decision::Allow => {}
+                    Decision::Deny(deny) => return Ok(Decision::Deny(deny)),
+                    Decision::RequireApproval(request) => {
+                        escalation.get_or_insert(request);
+                    }
                 }
             }
 
-            return Ok(rule.decision.clone());
+            return Ok(match (&rule.decision, escalation) {
+                (Decision::Allow, Some(request)) => Decision::RequireApproval(request),
+                _ => rule.decision.clone(),
+            });
         }
 
         // No matching rule — default-deny.
@@ -1498,13 +1507,12 @@ impl PolicyEngineV1 {
     ///    - Run ONLY criteria where [`Criterion::is_bundle_level`] returns `false`
     ///      against the per-inner context.  Bundle-level criteria are skipped here.
     ///    - On first Deny → return `Deny(BundleDenied { inner_index, deny_reason })`.
-    ///    - On Allow → call `criterion.accumulate_overlay(ctx, inner, overlay)` on
-    ///      each non-bundle-level criterion; each criterion accumulates its own key.
+    ///    - On pass or escalation, accumulate each criterion's overlay state.
     /// 5. Phase 2 — bundle-level criteria with full view.
     ///    Run ONLY criteria where [`Criterion::is_bundle_level`] returns `true`
     ///    against a final `BundleView` with the fully-populated overlay.  First
     ///    Deny → return `Deny(deny_reason)`.
-    /// 6. All pass → return `rule.decision`.
+    /// 6. Escalate an `Allow` rule when requested; otherwise return `rule.decision`.
     ///
     /// # Phase-dispatch rationale
     ///
@@ -1582,6 +1590,7 @@ impl PolicyEngineV1 {
         // records=4, max=5 — Phase 1 allows (4 < 5), accumulates +1 to overlay.
         // Without this guard, Phase 2 would re-evaluate rate_limit with overlay
         // total 5 ≥ 5 and deny incorrectly.
+        let mut escalation = None;
         for (idx, inner) in bundle.inners.iter().enumerate() {
             // Construct a fresh BundleView for this iteration.  The immutable
             // borrow of `overlay` ends at the close of this block; `overlay` is
@@ -1620,9 +1629,15 @@ impl PolicyEngineV1 {
                     if criterion.is_bundle_level() {
                         continue;
                     }
-                    if let Some(deny) = criterion.evaluate(&ctx)? {
-                        per_inner_deny = Some(deny);
-                        break;
+                    match criterion.evaluate_decision(&ctx)? {
+                        Decision::Allow => {}
+                        Decision::Deny(deny) => {
+                            per_inner_deny = Some(deny);
+                            break;
+                        }
+                        Decision::RequireApproval(request) => {
+                            escalation.get_or_insert(request);
+                        }
                     }
                 }
                 per_inner_deny
@@ -1733,12 +1748,19 @@ impl PolicyEngineV1 {
             if !criterion.is_bundle_level() {
                 continue;
             }
-            if let Some(deny) = criterion.evaluate(&final_ctx)? {
-                return Ok(Decision::Deny(deny));
+            match criterion.evaluate_decision(&final_ctx)? {
+                Decision::Allow => {}
+                Decision::Deny(deny) => return Ok(Decision::Deny(deny)),
+                Decision::RequireApproval(request) => {
+                    escalation.get_or_insert(request);
+                }
             }
         }
 
-        Ok(rule.decision.clone())
+        Ok(match (&rule.decision, escalation) {
+            (Decision::Allow, Some(request)) => Decision::RequireApproval(request),
+            _ => rule.decision.clone(),
+        })
     }
 
     /// Records a CONFIRMED multicall bundle submit's contribution into the
@@ -2179,6 +2201,149 @@ mod tests {
         assert_eq!(result, Decision::Allow);
     }
 
+    #[test]
+    fn approval_above_escalates_only_above_threshold_and_preserves_hard_cap() {
+        use criteria::{ApprovalAboveCriterion, PerTxCapCriterion};
+
+        for with_cap in [false, true] {
+            for reverse in [false, true] {
+                let mut criteria: Vec<Box<dyn Criterion>> =
+                    vec![Box::new(ApprovalAboveCriterion::new("native".into(), 100))];
+                if with_cap {
+                    criteria.push(Box::new(PerTxCapCriterion::new("native".into(), 500)));
+                }
+                if reverse {
+                    criteria.reverse();
+                }
+                let mut doc = allow_all_doc_with_criteria(criteria);
+                // First match governs even when a later rule denies.
+                doc.rules.push(PolicyRule {
+                    r#match: RuleMatch {
+                        tool: "*".into(),
+                        chain: "*".into(),
+                    },
+                    criteria: vec![],
+                    decision: Decision::Deny(DenyReason::ExplicitRuleDeny),
+                    allow_opaque_signing: false,
+                });
+                let engine = PolicyEngineV1::new(doc, "alice".into());
+                for amount in [25, 100, 101, 150, 500, 600] {
+                    let args = serde_json::json!({"amount_stroops": amount.to_string(), "asset": "native"});
+                    let result = engine
+                        .evaluate(
+                            &tool("stellar_pay", "stellar:testnet"),
+                            &args,
+                            &testnet_profile(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                    let expected = if with_cap && amount > 500 {
+                        Decision::Deny(DenyReason::PerTxCapExceeded {
+                            asset: "native".into(),
+                            max_stroops: 500,
+                            attempted_stroops: amount,
+                        })
+                    } else if amount > 100 {
+                        Decision::RequireApproval(crate::policy::ApprovalRequest::new(
+                            String::new(), loader::DEFAULT_APPROVAL_TTL_SECONDS,
+                        ).with_reason(format!(
+                            "approval_above: {amount} stroops of native exceeds threshold 100 stroops"
+                        )))
+                    } else {
+                        Decision::Allow
+                    };
+                    assert_eq!(
+                        result, expected,
+                        "amount={amount}, cap={with_cap}, reverse={reverse}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn approval_above_preserves_non_allow_rule_decisions() {
+        for decision in [
+            Decision::Deny(DenyReason::ExplicitRuleDeny),
+            Decision::RequireApproval(
+                crate::policy::ApprovalRequest::new("operator-nonce".into(), 42)
+                    .with_reason("operator reason".into()),
+            ),
+        ] {
+            let mut doc = allow_all_doc_with_criteria(vec![Box::new(
+                criteria::ApprovalAboveCriterion::new("native".into(), 100),
+            )]);
+            doc.rules[0].decision = decision.clone();
+            let engine = PolicyEngineV1::new(doc, "alice".into());
+            for amount in [25, 100, 150] {
+                let args =
+                    serde_json::json!({"amount_stroops": amount.to_string(), "asset": "native"});
+                assert_eq!(
+                    engine
+                        .evaluate(
+                            &tool("stellar_pay", "stellar:testnet"),
+                            &args,
+                            &testnet_profile(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    decision
+                );
+                let inners = [token_transfer_inner(amount)];
+                let overlay = BundleStateOverlay::default();
+                let view = BundleView {
+                    inners: &inners,
+                    overlay: &overlay,
+                };
+                assert_eq!(
+                    engine
+                        .evaluate_bundle(
+                            &tool("stellar_multicall", "stellar:testnet"),
+                            &Value::Null,
+                            &testnet_profile(),
+                            &view,
+                        )
+                        .unwrap(),
+                    decision
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn approval_above_preserves_value_errors_and_asset_matching() {
+        use criteria::ApprovalAboveCriterion;
+        let engine = PolicyEngineV1::new(
+            allow_all_doc_with_criteria(vec![Box::new(ApprovalAboveCriterion::new(
+                "native".into(),
+                100,
+            ))]),
+            "alice".into(),
+        );
+        let td = tool("stellar_pay", "stellar:testnet");
+        let profile = testnet_profile();
+        let args = serde_json::json!({"amount_stroops": "150", "asset": "USDC:GISSUER"});
+        assert_eq!(
+            engine
+                .evaluate(&td, &args, &profile, None, None, None, None, None)
+                .unwrap(),
+            Decision::Allow
+        );
+        let result = engine.evaluate(&td, &Value::Null, &profile, None, None, None, None, None);
+        assert!(
+            matches!(result, Err(PolicyError::CriterionEvaluationFailed { .. })),
+            "{result:?}"
+        );
+    }
+
     // ── PolicyEngineV1::evaluate_bundle ───────────────────────────────────────
 
     /// Helper: build a minimal allow-all document.
@@ -2264,6 +2429,63 @@ mod tests {
             from: "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".into(),
             to: "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".into(),
             amount,
+        }
+    }
+
+    #[test]
+    fn approval_above_bundle_escalation_yields_to_later_denial() {
+        use criteria::{
+            ApprovalAboveCriterion, InnerInvocationCountCapCriterion, PerTxCapCriterion,
+        };
+        for (amount, count_cap) in [(150, 2), (600, 2), (150, 1)] {
+            let engine = PolicyEngineV1::new(
+                allow_all_doc_with_criteria(vec![
+                    Box::new(ApprovalAboveCriterion::new("native".into(), 100)),
+                    Box::new(PerTxCapCriterion::new("native".into(), 500)),
+                    Box::new(InnerInvocationCountCapCriterion {
+                        max_count: count_cap,
+                    }),
+                ]),
+                "alice".into(),
+            );
+            let inners = [token_transfer_inner(150), token_transfer_inner(amount)];
+            let overlay = BundleStateOverlay::default();
+            let view = BundleView {
+                inners: &inners,
+                overlay: &overlay,
+            };
+            let result = engine
+                .evaluate_bundle(
+                    &tool("stellar_multicall", "stellar:testnet"),
+                    &Value::Null,
+                    &testnet_profile(),
+                    &view,
+                )
+                .unwrap();
+            if amount > 500 {
+                assert!(
+                    matches!(
+                        result,
+                        Decision::Deny(DenyReason::BundleDenied { inner_index: 1, .. })
+                    ),
+                    "{result:?}"
+                );
+            } else if count_cap < 2 {
+                assert!(
+                    matches!(
+                        result,
+                        Decision::Deny(DenyReason::InnerInvocationCountCapExceeded { .. })
+                    ),
+                    "{result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Decision::RequireApproval(ref request) if request.reason.as_deref() == Some(
+                        "approval_above: 150 stroops of native exceeds threshold 100 stroops"
+                    )),
+                    "{result:?}"
+                );
+            }
         }
     }
 

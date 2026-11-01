@@ -487,6 +487,17 @@ async fn run_loaded<InitKeyring>(
 where
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    // ── Halt check ────────────────────────────────────────────────────────────
+    // A halted profile refuses every stage that signs or submits before any
+    // keyring access, signer read, or network request. `--build-only` signs
+    // and submits nothing and stays usable.
+    if !args.build_only
+        && let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name)
+    {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
+
     let context = match network_context_for_command(
         profile,
         &resolved.name,

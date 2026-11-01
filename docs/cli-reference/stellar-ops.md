@@ -662,6 +662,8 @@ When the settlement lookup cannot read the retained audit history, the verb
 logs the error and appends no settled row. A later run retries the lookup
 and appends any row still owed.
 
+Reconciliation writes the receipt before settling the spending window; a failed receipt write keeps the reservation pending for another status pass.
+
 Automatic reconciliation applies the same chain and retention checks when the
 receipts file is absent. A definitive chain answer or a release on chain
 evidence restores the receipt's transaction identity from its reservation.

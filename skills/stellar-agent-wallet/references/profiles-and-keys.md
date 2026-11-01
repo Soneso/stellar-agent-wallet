@@ -552,6 +552,50 @@ Consequences:
   envelope; keyring references appear as opaque `{service, account}` objects,
   never the secret.
 
+## Halt marker
+
+`stellar-agent profile halt <name> [--reason <text>]` writes
+`profiles/<name>.halt` beside the profile file. It is a TOML file with two keys:
+
+```toml
+halted_at = "2026-10-31T12:00:00Z"
+reason = "agent sent unexpected payments"
+```
+
+`halted_at` is an RFC 3339 UTC timestamp in whole seconds, naming a date that
+exists, from 1970 to 2099. `reason` is
+optional, at most 128 characters, with no control characters. No other key is
+accepted, and the file is at most 4096 bytes.
+
+While the file exists, every action that signs or submits refuses with
+`profile.halted`, in the MCP server and in the CLI, and so does every MCP tool
+that is not read-only. The CLI verbs that only record or reconcile local state
+(`mpp receipt record`, `mpp settlement reconcile`, `mpp state prune`,
+`tx status`) stay usable for the operator. A file that exists but cannot be
+read, parsed, or validated refuses the same actions with
+`profile.halt_unreadable`, and so does `stellar-agent profile resume <name>`:
+repair the file or remove the marker path by hand.
+`profile halt` writes the marker through a temporary file and a rename,
+`profile resume` removes it, and neither holds it open, so a reader on any
+platform sees the old marker, the new one, or none. `profile show` reports `halted`, `halted_at`, and `halt_reason`.
+
+`profile resume` on a halted profile writes its `profile_resumed` audit row
+first and removes the marker only after the row is committed, so a resume that
+took effect is always recorded. A `profile_resumed` row records that the
+command ran; the marker file decides the state. Exit code `1` means the profile
+is still halted. Two failures leave a `profile_resumed` row on a profile that
+stays halted: a marker that cannot be removed after the row, and an append that
+reports an error after its row landed. Run `profile resume` again once the
+cause is fixed.
+
+Prefer the two commands over editing the file: they validate the profile and
+the reason, and they record `profile_halted` and `profile_resumed` audit rows.
+The file carries no signature, so anyone who can write the data directory can
+remove it. See
+[cli-reference.md](cli-reference.md#profile-halt-and-resume) for the
+refused verbs and [mcp-tools.md](mcp-tools.md#transport-and-identity) for the
+refused tools.
+
 ### Headless deployments: the opt-in file-backed keyring store
 
 The platform keyring is unreachable in some deployment shapes — most notably

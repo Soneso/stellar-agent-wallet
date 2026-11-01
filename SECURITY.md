@@ -191,7 +191,7 @@ properties:
   rejection takes effect only after its audit row is durable, in the log or in the
   log's outbox. A queued row reaches the log before the consumer of the approval loads
   a signing key. Queued rows are committed by count and SHA-256 chain head in the
-  platform keyring, and only committed consent rows drain. A removed, changed, or
+  platform keyring, and only committed operator rows drain. A removed, changed, or
   reordered committed row, a line past the commitment, or a committed row of
   another kind refuses keyed acquisition until `audit acknowledge-outbox-loss`
   records the loss and revokes decided approvals and toolset grants. An absent outbox state reads as zero;

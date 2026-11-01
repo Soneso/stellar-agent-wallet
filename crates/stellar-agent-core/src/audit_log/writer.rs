@@ -1423,7 +1423,7 @@ impl AuditWriter {
     /// commitment, checks that the complete lines are exactly the committed
     /// prefix, discards a final segment with no terminating newline (an append
     /// that never returned `Ok`) with a `warn`, and parses every complete line
-    /// as a consent row before appending any. Each entry keeps the consent
+    /// as an operator row before appending any. Each entry keeps the
     /// timestamp it was queued with. Only after every entry is appended is the
     /// commitment reset to zero, and only then is the outbox truncated to zero.
     ///
@@ -1451,7 +1451,7 @@ impl AuditWriter {
     ///   is appended and the outbox is left unchanged.
     /// - [`WriterError::OutboxUnusable`] when a complete line does not parse,
     ///   and [`WriterError::OutboxRowKindRefused`] when it holds a row other
-    ///   than a consent row. Nothing is appended and the outbox is left
+    ///   than an operator row. Nothing is appended and the outbox is left
     ///   unchanged.
     /// - Every error of the append, for example
     ///   [`WriterError::TipAnchorMismatch`]. The outbox is left unchanged.
@@ -1507,7 +1507,7 @@ impl AuditWriter {
     ///
     /// `Ok(None)` means the outbox holds exactly its committed prefix,
     /// unchanged and in order. When it does not, the committed prefix, if it
-    /// is intact, is parsed as consent rows too, so a loss whose
+    /// is intact, is parsed as operator rows too, so a loss whose
     /// acknowledgement would refuse on one of those lines refuses here, before
     /// the caller revokes anything.
     ///
@@ -1517,8 +1517,8 @@ impl AuditWriter {
     /// - [`WriterError::OutboxBusy`] when the outbox lock stays held.
     /// - [`WriterError::TipAnchorStore`] when the commitment cannot be read.
     /// - [`WriterError::OutboxUnusable`] / [`WriterError::OutboxRowKindRefused`]
-    ///   when a loss exists and a line of the intact committed prefix is not a
-    ///   consent row.
+    ///   when a loss exists and a line of the intact committed prefix is not an
+    ///   operator row.
     /// - [`WriterError::Io`] when the outbox cannot be read.
     pub fn outbox_loss(&self) -> Result<Option<super::outbox::OutboxLoss>, WriterError> {
         let store = self
@@ -1542,7 +1542,7 @@ impl AuditWriter {
     /// the drain the loss refuses. The caller revokes the profile's decided
     /// approvals and grants first and passes their counts in `revoked`.
     ///
-    /// An intact committed prefix is parsed as consent rows before the
+    /// An intact committed prefix is parsed as operator rows before the
     /// `audit_outbox_loss_acknowledged` row is appended, so an unusable line
     /// in it refuses with nothing written. After the row, those entries are
     /// appended in queue order, the commitment is reset to zero, and the
@@ -1562,7 +1562,7 @@ impl AuditWriter {
     /// - [`WriterError::OutboxLossNotFound`] when the outbox holds its
     ///   committed prefix. Nothing is written.
     /// - [`WriterError::OutboxUnusable`] / [`WriterError::OutboxRowKindRefused`]
-    ///   when a line of the intact committed prefix is not a consent row.
+    ///   when a line of the intact committed prefix is not an operator row.
     ///   Nothing is written.
     /// - Every error of the appends, and [`WriterError::Io`] when the outbox
     ///   cannot be truncated.
@@ -2167,7 +2167,7 @@ impl AuditWriter {
     /// incremented once, so every row of one run carries the same count. A
     /// rollback row names this path's superseded anchor; a binding-change row
     /// names the anchor the caller supplies for the previous binding's path.
-    /// Queued consent rows drain after every acknowledgement row is appended.
+    /// Queued operator rows drain after every acknowledgement row is appended.
     /// A drain refusal leaves the repair in force and is reported in
     /// [`ReanchorReport::outbox_refusal`].
     ///
@@ -5615,7 +5615,7 @@ pub enum WriterError {
     #[error(
         "audit.outbox_busy: the audit outbox lock stayed held for {} ms; another \
          process is appending to or draining the outbox",
-        super::outbox::OUTBOX_LOCK_WAIT.as_millis()
+        super::outbox::outbox_lock_wait().as_millis()
     )]
     OutboxBusy,
 
@@ -5660,7 +5660,7 @@ pub enum WriterError {
     },
     /// The outbox does not contain its committed prefix unchanged and in order.
     #[error(
-        "audit.outbox_rows_missing: the audit outbox does not hold the {recorded} queued rows the keyring records, unchanged and in order ({found} complete lines found); queued consent rows were removed or changed outside the wallet; see `stellar-agent audit acknowledge-outbox-loss`"
+        "audit.outbox_rows_missing: the audit outbox does not hold the {recorded} queued rows the keyring records, unchanged and in order ({found} complete lines found); queued operator rows were removed or changed outside the wallet; see `stellar-agent audit acknowledge-outbox-loss`"
     )]
     OutboxRowsMissing {
         /// Number of rows committed in the keyring.
@@ -5674,16 +5674,17 @@ pub enum WriterError {
     )]
     OutboxLossNotFound,
 
-    /// A complete line of the audit outbox holds a row other than a consent
+    /// A complete line of the audit outbox holds a row other than an operator
     /// row.
     ///
-    /// The outbox carries only `approval_attested` and
-    /// `approval_attested_remote` rows; any other kind there was not queued by
-    /// the wallet. The drain refused and left the outbox unchanged. Recovery
-    /// is in `docs/maintainers/audit-log-recovery.md`.
+    /// The outbox carries only `approval_attested`,
+    /// `approval_attested_remote`, `profile_halted`, and `profile_resumed`
+    /// rows; any other kind there was not queued by the wallet. The drain
+    /// refused and left the outbox unchanged. Recovery is in
+    /// `docs/maintainers/audit-log-recovery.md`.
     #[error(
-        "audit.outbox_unusable: line {line} of the audit outbox holds a row that is not a \
-         consent row; the outbox is left unchanged"
+        "audit.outbox_unusable: line {line} of the audit outbox holds a row that is not an \
+         operator row; the outbox is left unchanged"
     )]
     OutboxRowKindRefused {
         /// One-based number of the line.

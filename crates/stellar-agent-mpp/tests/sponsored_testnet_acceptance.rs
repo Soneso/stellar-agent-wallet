@@ -678,8 +678,13 @@ async fn owner_signed_v1_period_cap_refuses_charge_before_signing() {
         format!("{body}\n[signature]\nowner_id = \"{owner_id}\"\nsig = \"{signature}\"\n"),
     )
     .expect("signed policy");
-    let document = load_signed_policy(&policy_path, name, &owner.verifying_key().to_bytes())
-        .expect("owner signature and policy load");
+    let document = load_signed_policy(
+        &policy_path,
+        name,
+        &owner.verifying_key().to_bytes(),
+        TESTNET_PASSPHRASE,
+    )
+    .expect("owner signature and policy load");
     let engine = PolicyEngineV1::new(document, name.to_owned());
     let mut profile = Profile::builder_testnet("svc", name, "nonce-svc", name).build();
     profile.policy.engine = PolicyEngineKind::V1;

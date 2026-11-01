@@ -56,6 +56,7 @@ use stellar_agent_core::policy::v1::criteria::state_store::{PolicyStateStore, St
 use stellar_agent_core::policy::v1::loader::{PolicyDocument, load_signed_policy};
 use stellar_agent_core::policy::v1::signature::digest;
 use stellar_agent_core::policy::{Decision, PolicyEngine, ToolDescriptor};
+use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
 use stellar_agent_core::profile::schema::Profile;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -282,18 +283,21 @@ fn load_policy_body(case_path: &Path) -> String {
         .unwrap_or_else(|e| panic!("Could not read TOML at {}: {e}", toml_path.display()))
 }
 
-/// Writes a signed policy to a temp file and loads it via `load_signed_policy`.
+/// Writes a signed policy to a temp file and loads it via `load_signed_policy`
+/// for `profile`, the profile the case evaluates under.
 fn load_doc_signed(
     toml_body: &str,
     seed: &[u8; 32],
     pk: &[u8; 32],
     profile_name: &str,
+    profile: &Profile,
     dir: &TempDir,
 ) -> PolicyDocument {
     let signed_toml = make_signed_toml(toml_body, seed, "TEST_OWNER_ID");
     let path = dir.path().join("policy.toml");
     std::fs::write(&path, &signed_toml).expect("write policy");
-    load_signed_policy(&path, profile_name, pk).expect("load_signed_policy must succeed")
+    load_signed_policy(&path, profile_name, pk, &profile.network_passphrase)
+        .expect("load_signed_policy must succeed")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -433,8 +437,11 @@ fn run_evaluate_case(case_path: &Path, meta: &CaseMeta, policy_body: &str) -> Re
     let (sk, pk) = make_keypair();
     let dir = TempDir::new().map_err(|e| format!("tempdir creation failed: {e}"))?;
 
-    // Sign the TOML body and load it.
-    let doc = load_doc_signed(policy_body, &sk, &pk, profile_name, &dir);
+    // Build the Profile.
+    let profile = profile_from_case(profile_name, &tool_meta.chain_id);
+
+    // Sign the TOML body and load it for that profile.
+    let doc = load_doc_signed(policy_body, &sk, &pk, profile_name, &profile, &dir);
 
     // Build state store and optionally seed it.
     let store = PolicyStateStore::new();
@@ -449,9 +456,6 @@ fn run_evaluate_case(case_path: &Path, meta: &CaseMeta, policy_body: &str) -> Re
 
     // Build the ToolDescriptor.
     let tool = tool_descriptor_from_meta(tool_meta);
-
-    // Build the Profile.
-    let profile = profile_from_case(profile_name, &tool_meta.chain_id);
 
     // Build the optional identity_view for HOME_DOMAIN tests.  home_domain
     // lives on AccountIdentityView; engine.evaluate accepts an identity_view
@@ -646,7 +650,7 @@ fn run_load_failure_case(
             let signed_toml = make_signed_toml(policy_body, &sk_correct, "TEST_OWNER");
             let path = dir.path().join("policy.toml");
             std::fs::write(&path, &signed_toml).expect("write");
-            let result = load_signed_policy(&path, "default", &pk_correct);
+            let result = load_signed_policy(&path, "default", &pk_correct, TESTNET_PASSPHRASE);
             if expect_ok {
                 result.map(|_| ()).map_err(|e| {
                     format!(
@@ -674,7 +678,7 @@ fn run_load_failure_case(
             let signed_toml = make_signed_toml(policy_body, &sk_rotated, "TEST_OWNER_ROTATED");
             let path = dir.path().join("policy.toml");
             std::fs::write(&path, &signed_toml).expect("write");
-            let result = load_signed_policy(&path, "default", &pk_rotated);
+            let result = load_signed_policy(&path, "default", &pk_rotated, TESTNET_PASSPHRASE);
             if expect_ok {
                 result.map(|_| ()).map_err(|e| {
                     format!(
@@ -702,7 +706,7 @@ fn run_load_failure_case(
             let signed_toml = make_signed_toml(policy_body, &sk_correct, "TEST_OWNER");
             let path = dir.path().join("policy.toml");
             std::fs::write(&path, &signed_toml).expect("write");
-            let result = load_signed_policy(&path, "default", &pk_stale);
+            let result = load_signed_policy(&path, "default", &pk_stale, TESTNET_PASSPHRASE);
             check_load_error(case_path, meta, result, "owner_signature_invalid")
         }
 
@@ -712,7 +716,7 @@ fn run_load_failure_case(
             let tampered = tamper_sig_byte(&signed_toml)?;
             let path = dir.path().join("policy.toml");
             std::fs::write(&path, &tampered).expect("write");
-            let result = load_signed_policy(&path, "default", &pk_correct);
+            let result = load_signed_policy(&path, "default", &pk_correct, TESTNET_PASSPHRASE);
             check_load_error(case_path, meta, result, "owner_signature_invalid")
         }
 
@@ -722,7 +726,7 @@ fn run_load_failure_case(
             let truncated = truncate_sig(&signed_toml)?;
             let path = dir.path().join("policy.toml");
             std::fs::write(&path, &truncated).expect("write");
-            let result = load_signed_policy(&path, "default", &pk_correct);
+            let result = load_signed_policy(&path, "default", &pk_correct, TESTNET_PASSPHRASE);
             check_load_error(case_path, meta, result, "owner_signature_invalid")
         }
 
@@ -731,7 +735,7 @@ fn run_load_failure_case(
             let signed_toml = make_signed_toml(policy_body, &sk_correct, "TEST_OWNER");
             let path = dir.path().join("policy.toml");
             std::fs::write(&path, &signed_toml).expect("write");
-            let result = load_signed_policy(&path, "default", &pk_correct);
+            let result = load_signed_policy(&path, "default", &pk_correct, TESTNET_PASSPHRASE);
             check_load_error(case_path, meta, result, "policy_file_parse_failed")
         }
 

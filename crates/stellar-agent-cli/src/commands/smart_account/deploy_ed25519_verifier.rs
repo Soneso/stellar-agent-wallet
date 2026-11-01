@@ -191,6 +191,11 @@ pub async fn run(args: &DeployEd25519VerifierArgs) -> i32 {
             return 1;
         }
     };
+    // Halt check: before the deployer key, the signer and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name) {
+        print_error(&Envelope::<()>::err(&e), args.output);
+        return 1;
+    }
     let context = match network_context_for_command(
         &profile,
         &resolved.name,

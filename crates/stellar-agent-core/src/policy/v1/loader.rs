@@ -66,12 +66,13 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, Item, TableLike, Value};
 
 use crate::counterparty::is_valid_ldh_home_domain;
+use crate::policy::v1::asset_equivalence::assets_equivalent;
 use crate::policy::v1::canonical::{OPTIONAL_RULE_KEYS, canonical_bytes};
 use crate::policy::v1::criteria::counterparty_allowlist::CounterpartyKind;
 use crate::policy::v1::criteria::per_period_cap::Window;
 use crate::policy::v1::criteria::{
-    BundleAggregateCapCriterion, BundlePerPeriodCapCriterion, BundlePerTxCapCriterion,
-    BundleRateLimitCriterion, CounterpartyAllowlistCriterion, Criterion,
+    ApprovalAboveCriterion, BundleAggregateCapCriterion, BundlePerPeriodCapCriterion,
+    BundlePerTxCapCriterion, BundleRateLimitCriterion, CounterpartyAllowlistCriterion, Criterion,
     InnerInvocationCountCapCriterion, MinimumReserveCriterion, PerPeriodCapCriterion,
     PerTxCapCriterion, RateLimitCriterion, RestrictBundleToRecognisedKindsCriterion,
 };
@@ -96,7 +97,8 @@ const MIN_POLICY_VERSION: u32 = 1;
 const MAX_POLICY_VERSION: u32 = 2;
 
 /// Default approval time-to-live for `require_approval` policy decisions, in seconds.
-const DEFAULT_APPROVAL_TTL_SECONDS: u32 = (crate::approval::store::DEFAULT_TTL_MS / 1_000) as u32;
+pub(super) const DEFAULT_APPROVAL_TTL_SECONDS: u32 =
+    (crate::approval::store::DEFAULT_TTL_MS / 1_000) as u32;
 
 /// Longest accepted `require_approval` lifetime, in seconds (seven days).
 const MAX_APPROVAL_TTL_SECONDS: u32 = 604_800;
@@ -281,6 +283,7 @@ impl ScopeId {
 /// Rules are evaluated in declaration order; the first rule whose
 /// [`RuleMatch`] matches the tool call wins.  If all criteria in the rule
 /// pass, `decision` is returned.  If any criterion fails, the call is denied.
+/// An escalation requires approval when no criterion fails.
 #[derive(Debug)]
 pub struct PolicyRule {
     /// The tool + chain-id match clause.
@@ -414,6 +417,10 @@ impl RuleMatch {
 /// 6. Verify the ed25519 signature against the digest using `owner_pubkey`.
 /// 7. Parse `version`, `scope`, and `[[rules]]` into runtime form.
 ///
+/// `network_passphrase` is the passphrase of the profile the policy governs.
+/// Rule checks that compare assets use it to match a classic asset with its
+/// Stellar Asset Contract address, as evaluation does for that profile.
+///
 /// ## Owner-key contract
 ///
 /// This function does NOT fetch the owner public key from the keyring.
@@ -454,17 +461,19 @@ impl RuleMatch {
 ///     Path::new("/home/user/.local/share/stellar-agent/policies/alice.toml"),
 ///     "alice",
 ///     &owner_pubkey,
+///     "Test SDF Network ; September 2015",
 /// );
 /// ```
 pub fn load_signed_policy(
     path: &Path,
     profile_name: &str,
     owner_pubkey: &[u8; 32],
+    network_passphrase: &str,
 ) -> Result<PolicyDocument, PolicyError> {
     // Step 1: read the file.
     let raw = read_policy_file(path)?;
 
-    load_signed_policy_text(&raw, profile_name, owner_pubkey)
+    load_signed_policy_text(&raw, profile_name, owner_pubkey, network_passphrase)
 }
 
 /// Reads a policy file, naming its file name and the I/O cause on failure.
@@ -486,6 +495,8 @@ pub(crate) fn read_policy_file(path: &Path) -> Result<String, PolicyError> {
 /// Verifies and parses one in-memory policy using the file loader's checks.
 ///
 /// Callers can apply further authorization checks to these same bytes.
+/// `network_passphrase` is the governed profile's passphrase, as for
+/// [`load_signed_policy`].
 ///
 /// # Errors
 /// Returns the signature, scope, and schema errors of [`load_signed_policy`].
@@ -493,6 +504,7 @@ pub fn load_signed_policy_text(
     raw: &str,
     profile_name: &str,
     owner_pubkey: &[u8; 32],
+    network_passphrase: &str,
 ) -> Result<PolicyDocument, PolicyError> {
     // Step 2: canonical bytes (excludes [signature] table).
     let canon = canonical_bytes(raw)?;
@@ -537,7 +549,7 @@ pub fn load_signed_policy_text(
         version,
         scope,
         rules,
-    } = parse_policy_body(&doc, profile_name)?;
+    } = parse_policy_body(&doc, profile_name, network_passphrase)?;
 
     Ok(PolicyDocument {
         version,
@@ -566,8 +578,9 @@ pub fn load_signed_policy_text(
 /// signature never blocks re-signing.
 ///
 /// `profile_name` is the resolved profile name the loader compares the scope
-/// against. `stellar-agent profile sign-policy` calls this before it signs, so
-/// it never signs a body the loader refuses.
+/// against, and `network_passphrase` is that profile's passphrase.
+/// `stellar-agent profile sign-policy` calls this before it signs, so it never
+/// signs a body the loader refuses.
 ///
 /// # Errors
 ///
@@ -578,22 +591,27 @@ pub fn load_signed_policy_text(
 ///
 /// ```
 /// use stellar_agent_core::policy::v1::validate_unsigned_policy;
+/// use stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE;
 ///
 /// let body = "version = 1\nscope = \"profile:alice\"\n\n[[rules]]\n\
 ///             match = { tool = \"stellar_balances\", chain = \"*\" }\n\
 ///             criteria = []\ndecision = \"allow\"\n";
-/// assert!(validate_unsigned_policy(body, "alice").is_ok());
+/// assert!(validate_unsigned_policy(body, "alice", TESTNET_PASSPHRASE).is_ok());
 /// // The scope names another profile.
-/// assert!(validate_unsigned_policy(body, "bob").is_err());
+/// assert!(validate_unsigned_policy(body, "bob", TESTNET_PASSPHRASE).is_err());
 /// ```
-pub fn validate_unsigned_policy(raw: &str, profile_name: &str) -> Result<(), PolicyError> {
+pub fn validate_unsigned_policy(
+    raw: &str,
+    profile_name: &str,
+    network_passphrase: &str,
+) -> Result<(), PolicyError> {
     canonical_bytes(raw)?;
     let mut doc = DocumentMut::from_str(raw).map_err(|e| PolicyError::PolicyFileParseFailed {
         detail: e.to_string(),
     })?;
     doc.remove("signature");
     validate_policy_keys(&doc)?;
-    parse_policy_body(&doc, profile_name).map(|_| ())
+    parse_policy_body(&doc, profile_name, network_passphrase).map(|_| ())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -613,7 +631,11 @@ struct PolicyBody {
 ///
 /// The one body parser of the signed and the unsigned path, so both refuse
 /// the same bodies.
-fn parse_policy_body(doc: &DocumentMut, profile_name: &str) -> Result<PolicyBody, PolicyError> {
+fn parse_policy_body(
+    doc: &DocumentMut,
+    profile_name: &str,
+    network_passphrase: &str,
+) -> Result<PolicyBody, PolicyError> {
     let version = extract_version(doc)?;
     if version == 2 {
         super::verified::sequence(doc)?;
@@ -621,7 +643,7 @@ fn parse_policy_body(doc: &DocumentMut, profile_name: &str) -> Result<PolicyBody
     super::signature::parse_owner_rotation(doc)?;
     let scope = extract_scope(doc)?;
     reject_scope_profile_mismatch(&scope, profile_name)?;
-    let rules = extract_rules(doc)?;
+    let rules = extract_rules(doc, network_passphrase)?;
     Ok(PolicyBody {
         version,
         scope,
@@ -822,7 +844,10 @@ fn parse_scope_string(s: &str) -> Result<ScopeId, PolicyError> {
 /// Extracts and parses the `[[rules]]` array.
 ///
 /// Returns an empty vec when no `rules` key is present.
-fn extract_rules(doc: &DocumentMut) -> Result<Vec<PolicyRule>, PolicyError> {
+fn extract_rules(
+    doc: &DocumentMut,
+    network_passphrase: &str,
+) -> Result<Vec<PolicyRule>, PolicyError> {
     let rules_item = match doc.get("rules") {
         Some(item) => item,
         None => return Ok(vec![]),
@@ -839,7 +864,7 @@ fn extract_rules(doc: &DocumentMut) -> Result<Vec<PolicyRule>, PolicyError> {
 
     let mut rules = Vec::with_capacity(aot.len());
     for (i, table) in aot.iter().enumerate() {
-        rules.push(parse_rule(table, i)?);
+        rules.push(parse_rule(table, i, network_passphrase)?);
     }
     Ok(rules)
 }
@@ -851,7 +876,11 @@ fn extract_rules(doc: &DocumentMut) -> Result<Vec<PolicyRule>, PolicyError> {
 /// Returns [`PolicyError::PolicyFileParseFailed`] when the table is missing
 /// required keys, a criterion is unrecognised or malformed, or the decision
 /// value is unknown.
-fn parse_rule(table: &toml_edit::Table, idx: usize) -> Result<PolicyRule, PolicyError> {
+fn parse_rule(
+    table: &toml_edit::Table,
+    idx: usize,
+    network_passphrase: &str,
+) -> Result<PolicyRule, PolicyError> {
     // match clause
     let match_item = table
         .get("match")
@@ -874,6 +903,7 @@ fn parse_rule(table: &toml_edit::Table, idx: usize) -> Result<PolicyRule, Policy
     let reason = parse_optional_reason(table, idx)?;
     let ttl_secs = parse_optional_ttl_secs(table, idx)?;
     let decision = parse_decision(decision_str, idx, reason, ttl_secs)?;
+    validate_approval_above(&criteria, idx, &decision, network_passphrase)?;
 
     // Optional opaque-signing exemption (design §2.4). Absent → false; present
     // but not a boolean → parse error (fail-closed on a malformed exemption).
@@ -892,6 +922,52 @@ fn parse_rule(table: &toml_edit::Table, idx: usize) -> Result<PolicyRule, Policy
         decision,
         allow_opaque_signing,
     })
+}
+
+/// Validates approval thresholds against the decision and hard ceilings.
+///
+/// A threshold must be below every `per_tx_cap` of the same asset in its
+/// rule. Asset identity is the one evaluation applies on the governed
+/// profile's network: native aliases match, and a classic asset matches its
+/// Stellar Asset Contract address under `network_passphrase`.
+fn validate_approval_above(
+    criteria: &[Box<dyn Criterion>],
+    rule_idx: usize,
+    decision: &Decision,
+    network_passphrase: &str,
+) -> Result<(), PolicyError> {
+    for (criterion_idx, criterion) in criteria.iter().enumerate() {
+        let Some(threshold) =
+            (criterion.as_ref() as &dyn std::any::Any).downcast_ref::<ApprovalAboveCriterion>()
+        else {
+            continue;
+        };
+        let loc = format!("rule[{rule_idx}].criteria[{criterion_idx}]: `approval_above`");
+        if !matches!(decision, Decision::Allow) {
+            return Err(PolicyError::PolicyFileParseFailed {
+                detail: format!("{loc} requires decision = \"allow\""),
+            });
+        }
+        for criterion in criteria {
+            let Some(cap) =
+                (criterion.as_ref() as &dyn std::any::Any).downcast_ref::<PerTxCapCriterion>()
+            else {
+                continue;
+            };
+            if assets_equivalent(&threshold.asset, cap.asset(), network_passphrase)
+                && threshold.max_stroops >= cap.max_stroops()
+            {
+                return Err(PolicyError::PolicyFileParseFailed {
+                    detail: format!(
+                        "{loc} threshold {} must be less than `per_tx_cap` bound {}",
+                        threshold.max_stroops,
+                        cap.max_stroops()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Iterates the `criteria` TOML array and instantiates each criterion.
@@ -940,6 +1016,7 @@ fn parse_criteria(
 /// | `kind`                     | Criterion type                       |
 /// |----------------------------|--------------------------------------|
 /// | `"per_tx_cap"`             | [`PerTxCapCriterion`]                |
+/// | `"approval_above"`         | [`ApprovalAboveCriterion`]           |
 /// | `"per_period_cap"`         | [`PerPeriodCapCriterion`]            |
 /// | `"rate_limit"`             | [`RateLimitCriterion`]               |
 /// | `"counterparty_allowlist"` | [`CounterpartyAllowlistCriterion`]   |
@@ -1018,6 +1095,18 @@ fn parse_criterion(
             Ok(Box::new(
                 super::criteria::asset_allowlist::AssetAllowlistCriterion::new(assets)?,
             ))
+        }
+        "approval_above" => {
+            let asset = require_str(table, "asset", &loc)?;
+            let max_stroops = require_i128(table, "max_stroops", &loc)?;
+            if max_stroops <= 0 {
+                return Err(PolicyError::PolicyFileParseFailed {
+                    detail: format!(
+                        "{loc}: `approval_above` `max_stroops` must be positive, got {max_stroops}"
+                    ),
+                });
+            }
+            Ok(Box::new(ApprovalAboveCriterion::new(asset, max_stroops)))
         }
         "per_tx_cap" => {
             let asset = require_str(table, "asset", &loc)?;
@@ -1253,8 +1342,8 @@ fn unknown_criterion_kind(loc: &str, kind: &str) -> PolicyError {
     PolicyError::PolicyFileParseFailed {
         detail: format!(
             "{loc}: unknown criterion kind `{kind}`; accepted kinds: \
-             asset_allowlist, per_tx_cap, per_period_cap, rate_limit, counterparty_allowlist, \
-             minimum_reserve, inner_invocation_count_cap, \
+             asset_allowlist, per_tx_cap, approval_above, per_period_cap, rate_limit, \
+             counterparty_allowlist, minimum_reserve, inner_invocation_count_cap, \
              bundle_aggregate_cap, restrict_bundle_to_recognised_kinds, \
              bundle_per_period_cap, bundle_per_tx_cap, bundle_rate_limit, \
              quorum_satisfied, home_domain_resolved, sep10_session_active, \
@@ -1564,6 +1653,7 @@ mod tests {
     use crate::policy::v1::criteria::PolicyStateStore;
     use crate::policy::v1::{AccountReserveLookupError, AccountReservesView, EvalContext};
     use crate::policy::{DenyReason, McpToolRegistration, ToolDescriptor};
+    use crate::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
     use crate::profile::schema::Profile;
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -1677,7 +1767,7 @@ decision = "allow"
         let toml = make_signed_toml(BODY_WITH_RULES, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.version, 1);
         assert!(doc.signature.is_some());
         assert_eq!(doc.rules.len(), 1);
@@ -1695,7 +1785,7 @@ decision = "allow"
         let path = write_policy(&dir, "alice.toml", &toml);
 
         // Use the wrong public key — verification must fail.
-        let err = load_signed_policy(&path, "alice", &pk2).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk2, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1715,7 +1805,7 @@ decision = "allow"
         let path = write_policy(&dir, "alice.toml", MINIMAL_BODY);
 
         assert_parse_failure(
-            load_signed_policy(&path, "alice", &pk),
+            load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE),
             "policy file has no `[signature]` table; sign it with \
              `stellar-agent profile sign-policy --profile alice`",
         );
@@ -1729,7 +1819,7 @@ decision = "allow"
         let dir = TempDir::new().unwrap();
         let path = write_policy(&dir, "alice.toml", "not valid toml [[[");
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { .. }),
             "invalid TOML must produce PolicyFileParseFailed, got {err:?}"
@@ -1744,7 +1834,7 @@ decision = "allow"
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("does_not_exist.toml");
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileLoadFailed { .. }),
             "missing file must produce PolicyFileLoadFailed, got {err:?}"
@@ -1758,7 +1848,7 @@ decision = "allow"
         let parent = dir.path().join("operator-pii-parent");
         let path = parent.join("alice.toml");
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         let detail = match err {
             PolicyError::PolicyFileLoadFailed { detail } => detail,
             other => return Err(format!("expected PolicyFileLoadFailed, got {other:?}")),
@@ -1784,7 +1874,7 @@ decision = "allow"
         let toml = make_signed_toml(MINIMAL_BODY, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert!(doc.rules.is_empty(), "zero-rule document must be accepted");
         assert_eq!(doc.version, 1);
     }
@@ -1884,7 +1974,7 @@ decision = "allow"
         let toml = make_signed_toml(body, &sk, "GABCDE");
         let path = write_policy(&dir, "bob.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1903,7 +1993,7 @@ decision = "allow"
         let toml = make_signed_toml(body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice-p1.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert!(
             matches!(
                 doc.scope,
@@ -2049,7 +2139,7 @@ decision = "allow"
         let toml = make_signed_toml(body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("minimum")),
             "version 0 should be rejected with PolicyFileParseFailed (minimum version), got {err:?}"
@@ -2064,7 +2154,7 @@ decision = "allow"
         let toml = make_signed_toml(body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("maximum")),
             "version 3 should be rejected with PolicyFileParseFailed (maximum version), got {err:?}"
@@ -2109,7 +2199,7 @@ criteria = []
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules.len(), 1);
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "per_tx_cap");
@@ -2124,7 +2214,7 @@ criteria = []
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria[0].kind(), "per_tx_cap");
 
         let tool = test_tool("stellar_pay");
@@ -2153,7 +2243,7 @@ criteria = []
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria[0].kind(), "per_tx_cap");
     }
 
@@ -2191,7 +2281,7 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "per_period_cap");
     }
@@ -2206,7 +2296,7 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria[0].kind(), "per_period_cap");
 
         let tool = test_tool("stellar_pay");
@@ -2227,7 +2317,7 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "rate_limit");
     }
@@ -2243,7 +2333,7 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "counterparty_allowlist");
     }
@@ -2291,7 +2381,7 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         let result = eval_first_criterion_with_inflow_leg(
             &doc,
             "MYTOKEN:GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
@@ -2315,7 +2405,7 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         let result = eval_first_criterion_with_inflow_leg(
             &doc,
             "MYTOKEN:GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
@@ -2338,7 +2428,7 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let result = load_signed_policy(&path, "alice", &pk);
+        let result = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE);
         assert!(
             matches!(result, Err(PolicyError::PolicyFileParseFailed { .. })),
             "a non-boolean gate_inflows must fail to load, got {result:?}"
@@ -2354,7 +2444,7 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "minimum_reserve");
     }
@@ -2367,7 +2457,7 @@ garbage = "not-a-number"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria[0].kind(), "minimum_reserve");
 
         let tool = test_tool("stellar_pay");
@@ -2465,7 +2555,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("made_up_thing")),
             "unknown criterion kind should produce PolicyFileParseFailed, got {err:?}"
@@ -2485,7 +2575,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("soroban_resource_fee_cap")),
             "a policy referencing soroban_resource_fee_cap must be rejected as an \
@@ -2502,7 +2592,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("max_stroops")),
             "missing max_stroops should produce PolicyFileParseFailed mentioning the field, got {err:?}"
@@ -2518,7 +2608,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { .. }),
             "negative max_stroops should produce PolicyFileParseFailed, got {err:?}"
@@ -2534,7 +2624,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("never")),
             "invalid window string should produce PolicyFileParseFailed, got {err:?}"
@@ -2551,7 +2641,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { .. }),
             "unknown counterparty kind should produce PolicyFileParseFailed, got {err:?}"
@@ -2575,7 +2665,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2601,7 +2691,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2626,7 +2716,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2651,7 +2741,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2673,7 +2763,7 @@ chain = "*"
             );
             let signed = make_signed_toml(&body, &sk, "GABCDE");
             let path = write_policy(&dir, "alice.toml", &signed);
-            let result = load_signed_policy(&path, "alice", &pk);
+            let result = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE);
             if accepted {
                 let doc = result.expect("bounded TTL must load");
                 assert!(matches!(
@@ -2706,7 +2796,7 @@ chain = "*"
             );
             let signed = make_signed_toml(&body, &sk, "GABCDE");
             let path = write_policy(&dir, "alice.toml", &signed);
-            let result = load_signed_policy(&path, "alice", &pk);
+            let result = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE);
             if count == 512 {
                 let doc = result.expect("512 characters must load");
                 assert!(matches!(
@@ -2737,7 +2827,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         let req = match &doc.rules[0].decision {
             Decision::RequireApproval(req) => req,
             other => return Err(format!("expected RequireApproval, got {other:?}")),
@@ -2757,7 +2847,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         let req = match &doc.rules[0].decision {
             Decision::RequireApproval(req) => req,
             other => return Err(format!("expected RequireApproval, got {other:?}")),
@@ -2776,7 +2866,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         let req = match &doc.rules[0].decision {
             Decision::RequireApproval(req) => req,
             other => return Err(format!("expected RequireApproval, got {other:?}")),
@@ -2795,7 +2885,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("only valid")),
             "allow rule with reason should produce PolicyFileParseFailed, got {err:?}"
@@ -2810,7 +2900,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("ttl_secs")),
             "invalid ttl_secs should produce PolicyFileParseFailed, got {err:?}"
@@ -2830,7 +2920,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(
             doc.rules[0].criteria[0].kind(),
@@ -2850,7 +2940,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("max_count")),
             "out-of-u32-range max_count must be rejected with PolicyFileParseFailed, got {err:?}"
@@ -2868,7 +2958,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "bundle_aggregate_cap");
     }
@@ -2883,7 +2973,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria[0].kind(), "bundle_aggregate_cap");
     }
 
@@ -2898,7 +2988,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("max_amount")),
             "non-parseable max_amount must be rejected, got {err:?}"
@@ -2914,7 +3004,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { .. }),
             "negative max_amount must be rejected, got {err:?}"
@@ -2932,7 +3022,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(
             doc.rules[0].criteria[0].kind(),
@@ -2949,7 +3039,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("enabled")),
             "missing enabled field must be rejected mentioning 'enabled', got {err:?}"
@@ -2969,7 +3059,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "bundle_per_period_cap");
     }
@@ -2985,7 +3075,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("max_stroops")),
             "negative max_stroops must be rejected, got {err:?}"
@@ -3003,7 +3093,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("window")),
             "unsupported window must be rejected mentioning 'window', got {err:?}"
@@ -3021,7 +3111,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "bundle_per_tx_cap");
     }
@@ -3037,7 +3127,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("max_stroops")),
             "negative max_stroops must be rejected, got {err:?}"
@@ -3054,7 +3144,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules[0].criteria.len(), 1);
         assert_eq!(doc.rules[0].criteria[0].kind(), "bundle_rate_limit");
     }
@@ -3070,7 +3160,7 @@ chain = "*"
         let toml = make_signed_toml(&body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let err = load_signed_policy(&path, "alice", &pk).unwrap_err();
+        let err = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail } if detail.contains("window")),
             "unsupported window must be rejected mentioning 'window', got {err:?}"
@@ -3094,7 +3184,7 @@ decision = "deny"
         let toml = make_signed_toml(body, &sk, "GABCDE");
         let path = write_policy(&dir, "alice.toml", &toml);
 
-        let doc = load_signed_policy(&path, "alice", &pk).unwrap();
+        let doc = load_signed_policy(&path, "alice", &pk, TESTNET_PASSPHRASE).unwrap();
         assert_eq!(doc.rules.len(), 1);
         assert!(
             matches!(
@@ -3123,7 +3213,7 @@ decision = "require_approval"
     #[test]
     fn unsigned_validator_checks_the_body_and_ignores_the_previous_signature() {
         let unknown_key = format!("foo = 1\n{APPROVAL_BODY}");
-        let err = validate_unsigned_policy(&unknown_key, "alice").unwrap_err();
+        let err = validate_unsigned_policy(&unknown_key, "alice", TESTNET_PASSPHRASE).unwrap_err();
         assert!(
             matches!(err, PolicyError::PolicyFileParseFailed { ref detail }
                 if detail.contains("`foo`")),
@@ -3132,10 +3222,10 @@ decision = "require_approval"
 
         let missing_criteria = APPROVAL_BODY.replace("criteria = []\n", "");
         let doc = DocumentMut::from_str(&missing_criteria).unwrap();
-        assert!(parse_policy_body(&doc, "alice").is_ok());
+        assert!(parse_policy_body(&doc, "alice", TESTNET_PASSPHRASE).is_ok());
         assert!(
             matches!(
-                validate_unsigned_policy(&missing_criteria, "alice"),
+                validate_unsigned_policy(&missing_criteria, "alice", TESTNET_PASSPHRASE),
                 Err(PolicyError::PolicyFileParseFailed { ref detail })
                     if detail == "rule missing required `criteria` key"
             ),
@@ -3146,7 +3236,7 @@ decision = "require_approval"
             "{APPROVAL_BODY}\n[signature]\nowner_id = \"GOLD\"\n\
              sig = \"stale\"\nnote = \"replace this table\"\n"
         );
-        assert!(validate_unsigned_policy(&stale_signature, "alice").is_ok());
+        assert!(validate_unsigned_policy(&stale_signature, "alice", TESTNET_PASSPHRASE).is_ok());
     }
 
     /// One `require_approval` rule carrying all three signed optional keys.
@@ -3181,9 +3271,18 @@ decision = "deny"
 
     /// Writes `toml` and loads it for profile `alice` under `pk`.
     fn load_alice(toml: &str, pk: &[u8; 32]) -> Result<PolicyDocument, PolicyError> {
+        load_alice_on(toml, pk, TESTNET_PASSPHRASE)
+    }
+
+    /// Loads `toml` for `alice` on the network of `network_passphrase`.
+    fn load_alice_on(
+        toml: &str,
+        pk: &[u8; 32],
+        network_passphrase: &str,
+    ) -> Result<PolicyDocument, PolicyError> {
         let dir = TempDir::new().unwrap();
         let path = write_policy(&dir, "alice.toml", toml);
-        load_signed_policy(&path, "alice", pk)
+        load_signed_policy(&path, "alice", pk, network_passphrase)
     }
 
     /// Asserts that `result` is an owner-signature failure for `alice`.
@@ -3430,6 +3529,7 @@ decision = "deny"
         let criteria = [
             r#"{ kind = "asset_allowlist", assets = ["native"] }"#,
             r#"{ kind = "per_tx_cap", asset = "native", max_stroops = 100 }"#,
+            r#"{ kind = "approval_above", asset = "native", max_stroops = 100 }"#,
             r#"{ kind = "per_period_cap", asset = "native", window = "1d", max_stroops = 100 }"#,
             r#"{ kind = "rate_limit", window = "1h", max_calls = 5 }"#,
             concat!(
@@ -3475,6 +3575,151 @@ decision = "deny"
                 loaded.err()
             );
         }
+    }
+
+    #[test]
+    fn approval_above_rejects_non_allow_decisions() {
+        for decision in ["deny", "require_approval"] {
+            let body = body_with_criterion(
+                r#"{ kind = "approval_above", asset = "native", max_stroops = 100 }"#,
+            )
+            .replace(
+                "decision = \"allow\"",
+                &format!("decision = \"{decision}\""),
+            );
+            assert_parse_failure(
+                load_signed_body_after(&body, |signed| signed),
+                "rule[0].criteria[0]: `approval_above` requires decision = \"allow\"",
+            );
+            assert!(matches!(
+                validate_unsigned_policy(&body, "alice", TESTNET_PASSPHRASE),
+                Err(PolicyError::PolicyFileParseFailed { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn approval_above_rejects_nonpositive_thresholds() {
+        for threshold in [0, -1] {
+            let body = body_with_criterion(&format!(
+                "{{ kind = \"approval_above\", asset = \"native\", max_stroops = {threshold} }}"
+            ));
+            assert_parse_failure(
+                load_signed_body_after(&body, |signed| signed),
+                &format!(
+                    "rule[0].criteria[0]: `approval_above` `max_stroops` must be positive, got {threshold}"
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn approval_above_requires_threshold_below_every_same_asset_per_tx_cap() {
+        for threshold in [99, 100, 101] {
+            for reverse in [false, true] {
+                let mut criteria = [
+                    format!(
+                        "{{ kind = \"approval_above\", asset = \"native\", max_stroops = {threshold} }}"
+                    ),
+                    r#"{ kind = "per_tx_cap", asset = "native", max_stroops = 500 }"#.into(),
+                    r#"{ kind = "per_tx_cap", asset = "native", max_stroops = 100 }"#.into(),
+                ];
+                if reverse {
+                    criteria.reverse();
+                }
+                let body = body_with_criterion(&criteria.join(", "));
+                let result = load_signed_body_after(&body, |signed| signed);
+                if threshold < 100 {
+                    assert!(result.is_ok(), "{result:?}");
+                } else {
+                    let criterion_idx = if reverse { 2 } else { 0 };
+                    assert_parse_failure(
+                        result,
+                        &format!(
+                            "rule[0].criteria[{criterion_idx}]: `approval_above` threshold {threshold} must be less than `per_tx_cap` bound 100"
+                        ),
+                    );
+                }
+            }
+        }
+
+        // A classic asset and its Stellar Asset Contract address on the
+        // profile's network are one asset, in either order. On another
+        // network the contract address names a different asset.
+        const NATIVE_SAC_TESTNET: &str = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        const USDC_TESTNET: &str = "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+        const USDC_SAC_TESTNET: &str = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
+        for (threshold_asset, cap_asset) in [
+            ("native", NATIVE_SAC_TESTNET),
+            (NATIVE_SAC_TESTNET, "native"),
+            (USDC_TESTNET, USDC_SAC_TESTNET),
+            (USDC_SAC_TESTNET, USDC_TESTNET),
+        ] {
+            let body = body_with_criterion(&format!(
+                "{{ kind = \"approval_above\", asset = \"{threshold_asset}\", max_stroops = 500 }}, \
+                 {{ kind = \"per_tx_cap\", asset = \"{cap_asset}\", max_stroops = 400 }}"
+            ));
+            let (sk, pk) = make_keypair();
+            let signed = make_signed_toml(&body, &sk, "GABCDE");
+            assert_parse_failure(
+                load_alice_on(&signed, &pk, TESTNET_PASSPHRASE),
+                "rule[0].criteria[0]: `approval_above` threshold 500 must be less than `per_tx_cap` bound 400",
+            );
+            let mainnet = load_alice_on(&signed, &pk, MAINNET_PASSPHRASE);
+            assert!(
+                mainnet.is_ok(),
+                "{threshold_asset} and {cap_asset} on mainnet: {mainnet:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_above_compares_only_normalized_same_asset_caps() {
+        let threshold =
+            r#"{ kind = "approval_above", asset = "native", max_stroops = 500_0000000 }"#;
+        for asset in ["native", "XLM", "xLm", "USDC:GISSUER"] {
+            let cap = format!(
+                "{{ kind = \"per_tx_cap\", asset = \"{asset}\", max_stroops = 400_0000000 }}"
+            );
+            let body = body_with_criterion(&format!("{cap}, {threshold}"));
+            let result = load_signed_body_after(&body, |signed| signed);
+            if asset == "USDC:GISSUER" {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                assert_parse_failure(
+                    result,
+                    "rule[0].criteria[1]: `approval_above` threshold 5000000000 must be less than `per_tx_cap` bound 4000000000",
+                );
+            }
+        }
+        let body = body_with_criterion(&format!(
+            r#"{threshold}, {{ kind = "per_tx_cap", asset = "USDC:GISSUER", max_stroops = 100_0000000 }}"#
+        ));
+        let result = load_signed_body_after(&body, |signed| signed);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn approval_above_fields_are_signed() {
+        let body = body_with_criterion(
+            r#"{ kind = "approval_above", asset = "native", max_stroops = 100 }"#,
+        );
+        for (from, to) in [
+            ("max_stroops = 100", "max_stroops = 200"),
+            ("native", "XLM"),
+        ] {
+            let result = load_signed_body_after(&body, |signed| signed.replace(from, to));
+            assert!(
+                matches!(result, Err(PolicyError::OwnerSignatureInvalid { .. })),
+                "{result:?}"
+            );
+        }
+        assert_parse_failure(
+            load_signed_body_after(&body, |signed| {
+                signed.replace("max_stroops = 100", "max_stroops = 100, extra = 1")
+            }),
+            "rule[0].criteria[0]: unknown key `extra`; a `approval_above` criterion accepts kind, asset, max_stroops",
+        );
     }
 
     /// Every kind with a closed key set is parsed by the loader, and the

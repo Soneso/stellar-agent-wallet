@@ -1,6 +1,9 @@
 //! `stellar-agent profile show <name>` prints a profile's resolved configuration.
 //!
 //! Loads the named profile with env-var overlays and prints a JSON envelope.
+//! The envelope also carries the profile's halt state: `halted`, `halted_at`,
+//! and `halt_reason`, plus `halt_marker_error` when a marker exists and cannot
+//! be read.
 //! URL fields are printed as scheme, host, and port only. Keyring entry
 //! references are printed as opaque `{service, account}` objects.
 //!
@@ -20,7 +23,10 @@
 //!     "mcp_nonce_key_alias": { "service": "...", "account": "..." },
 //!     "cross_check_threshold_stroops": 10000000000000,
 //!     "audit_log_path": "...",
-//!     "mcp_disabled": false
+//!     "mcp_disabled": false,
+//!     "halted": false,
+//!     "halted_at": null,
+//!     "halt_reason": null
 //!   },
 //!   "request_id": "..."
 //! }
@@ -31,6 +37,7 @@
 //! Returns exit code `1` when the profile is not found or cannot be loaded.
 
 use clap::{ArgGroup, Args};
+use serde::Serialize;
 use stellar_agent_core::envelope::Envelope;
 use stellar_agent_core::error::WalletError;
 use stellar_agent_core::profile::loader;
@@ -72,6 +79,16 @@ impl ShowArgs {
     }
 }
 
+/// Success payload of `profile show`: the redacted profile and its halt
+/// state, flattened into one object.
+#[derive(Debug, Serialize)]
+struct ShowData<P: Serialize> {
+    #[serde(flatten)]
+    profile: P,
+    #[serde(flatten)]
+    halt: super::halt::HaltStateView,
+}
+
 /// Runs `stellar-agent profile show <name>`.
 ///
 /// Returns `0` on success, `1` on error.
@@ -97,13 +114,17 @@ pub async fn run(args: &ShowArgs) -> i32 {
     //
     // The exemption is safe because `show` performs no keyed operation: it
     // opens no store, mints no key, signs nothing, and derives no per-profile
-    // path from the loaded contents.
+    // path from the loaded contents. The halt marker it reports is located by
+    // the requested name, not by the loaded contents.
     //
     // `crates/stellar-agent-cli/tests/cli/profile_reconciliation_discipline.rs`
     // pins this file as the sole allowlist entry.
     match loader::load(args.profile_name(), None) {
         Ok(profile) => {
-            render::render_json(&Envelope::ok(profile.redacted()));
+            render::render_json(&Envelope::ok(ShowData {
+                profile: profile.redacted(),
+                halt: super::halt::halt_state_view(args.profile_name()),
+            }));
             0
         }
         Err(err) => {

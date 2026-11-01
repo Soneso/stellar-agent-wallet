@@ -12,6 +12,8 @@
 //!   and [`crate::profile::schema::PolicyConfig`].
 //! - `loader` — figment-backed loader (TOML + env-var + CLI overlay).
 //! - `migrate` — version-dispatched migration command (`v1 → v2`).
+//! - `halt`: the per-profile emergency stop, the halt marker beside the
+//!   profile file, and the check every agent surface runs before it acts.
 //! - `name` — profile-name resolution ([`crate::profile::name::resolve_profile_name`],
 //!   which reports the name's provenance) and the path-component safety rule
 //!   ([`crate::profile::name::validate_path_component_ascii_safe`]) both
@@ -48,6 +50,7 @@
 //! secret-material defence).
 
 pub mod caip2;
+pub mod halt;
 pub mod key_scope;
 pub mod loader;
 pub mod migrate;

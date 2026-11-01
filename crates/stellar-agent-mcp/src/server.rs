@@ -82,7 +82,8 @@ use serde_json::json;
 use stellar_agent_core::profile::name::OWNER_KEY_SERVICE_PREFIX;
 use stellar_agent_core::{
     audit_log::BindingCheck,
-    policy::{BuildRegistryError, PolicyEngine, ToolDescriptor},
+    policy::{BuildRegistryError, PolicyEngine, ToolDescriptor, ToolValueKind},
+    profile::halt::{self, HaltState},
     profile::loader,
     profile::schema::{KeyringEntryRef, PolicyEngineKind, Profile},
     timefmt::{Clock, default_clock},
@@ -110,6 +111,11 @@ struct ProfileMetadataResource {
     rpc_url: String,
     network_passphrase: String,
     mcp_disabled: bool,
+    /// Whether agent actions on the profile refuse: a halt marker exists,
+    /// valid or not.
+    halted: bool,
+    /// The marker's `halted_at`, when a valid marker exists.
+    halted_at: Option<String>,
     cross_check_threshold_stroops: u64,
 }
 
@@ -131,16 +137,61 @@ impl AccountDirectoryResource {
     }
 }
 
-impl From<&Profile> for ProfileMetadataResource {
-    fn from(profile: &Profile) -> Self {
+impl ProfileMetadataResource {
+    fn new(profile: &Profile, halt: &HaltState) -> Self {
         Self {
             chain_id: profile.chain_id.caip2_str().to_owned(),
             rpc_url: stellar_agent_core::redact::redact_url_authority(&profile.rpc_url),
             network_passphrase: profile.network_passphrase.clone(),
             mcp_disabled: profile.mcp_disabled,
+            halted: halt.is_halted(),
+            halted_at: halt.halted_at().map(str::to_owned),
             cross_check_threshold_stroops: profile.cross_check_threshold_stroops,
         }
     }
+}
+
+/// Whether a call of the tool `descriptor` describes reads the halt marker.
+///
+/// Only a tool that declares itself read-only on both axes, `read_only_hint`
+/// and a [`ToolValueKind::ReadOnly`] value kind, skips the check. Every other
+/// tool signs, submits, writes wallet state, or asks a service to act, and a
+/// name with no descriptor is treated the same way.
+#[must_use]
+pub(crate) fn halt_check_applies(descriptor: Option<&ToolDescriptor>) -> bool {
+    descriptor.is_none_or(|descriptor| {
+        !(descriptor.read_only_hint && descriptor.value_kind == ToolValueKind::ReadOnly)
+    })
+}
+
+/// The toolset dispatcher, whose halt check is decided by the tool its
+/// `action` argument routes to.
+///
+/// The dispatcher is destructive so that a mainnet profile on the Noop engine
+/// refuses it, yet a read-only routed action stays usable on a halted
+/// profile.
+const ROUTED_HALT_CHECK_TOOL: &str = "stellar_toolset_invoke";
+
+/// The name of the tool whose descriptor decides the halt check of a call of
+/// `tool` with `arguments`.
+///
+/// For [`ROUTED_HALT_CHECK_TOOL`] with a string `action` this is that action,
+/// sanitized as the dispatcher sanitizes it before it routes; a name with no
+/// descriptor is refused like any unknown tool. Every other call, a
+/// dispatcher call without a string `action` included, is decided by `tool`
+/// itself.
+fn halt_checked_tool_name<'a>(
+    tool: &'a str,
+    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> std::borrow::Cow<'a, str> {
+    if tool == ROUTED_HALT_CHECK_TOOL
+        && let Some(action) = arguments
+            .and_then(|arguments| arguments.get("action"))
+            .and_then(serde_json::Value::as_str)
+    {
+        return std::borrow::Cow::Owned(stellar_agent_toolsets::sanitise_display(action, 128));
+    }
+    std::borrow::Cow::Borrowed(tool)
 }
 
 fn profile_resource_uri(name: &str) -> String {
@@ -163,8 +214,8 @@ fn profile_resource_for_name(name: &str) -> rmcp::model::Resource {
     .no_annotation()
 }
 
-fn profile_metadata_json(profile: &Profile) -> Result<String, rmcp::ErrorData> {
-    serde_json::to_string_pretty(&ProfileMetadataResource::from(profile))
+fn profile_metadata_json(profile: &Profile, halt: &HaltState) -> Result<String, rmcp::ErrorData> {
+    serde_json::to_string_pretty(&ProfileMetadataResource::new(profile, halt))
         .map_err(|_| rmcp::ErrorData::internal_error("profile_resource_serialize_failed", None))
 }
 
@@ -1092,6 +1143,31 @@ impl WalletServer {
             .or_else(|| self.context.secondary_rpc_url.clone()))
     }
 
+    /// Returns the halt refusal for a call of `tool_name`, or `None` when the
+    /// call may proceed.
+    ///
+    /// The check applies to every tool [`halt_check_applies`] selects; it
+    /// reads the halt marker of [`Self::profile_name_for_approval`] and
+    /// refuses for a valid marker and for one that cannot be read.
+    pub(crate) fn halt_refusal_for_tool(
+        &self,
+        tool_name: &str,
+    ) -> Option<rmcp::model::CallToolResult> {
+        if !halt_check_applies(self.tool_registry.get(tool_name)) {
+            return None;
+        }
+        halt::ensure_not_halted(&self.profile_name_for_approval())
+            .err()
+            .map(|error| {
+                tracing::warn!(
+                    tool = %tool_name,
+                    code = error.code(),
+                    "stellar-agent-mcp: tool call refused: the profile is halted"
+                );
+                crate::tools::common::business_error_result(error.code(), error.to_string())
+            })
+    }
+
     /// Resolves the pending-approval store directory, honoring the test-only
     /// override so integration tests never write into the operator's real
     /// approval directory.
@@ -1268,6 +1344,31 @@ impl WalletServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for WalletServer {
+    /// Dispatches one `tools/call` request.
+    ///
+    /// Every tool call passes here. The halt check is the first step: a tool
+    /// whose descriptor is not read-only refuses with `profile.halted` or
+    /// `profile.halt_unreadable` before its handler runs, so before any
+    /// keyring access, policy evaluation, store reload, or network request of
+    /// the call. A `stellar_toolset_invoke` call is decided by the
+    /// descriptor of the tool its action routes to. The server checks before
+    /// dispatch. The toolset handler checks the routed action again before its
+    /// gates. The marker is read at each check, so a halt set while the server
+    /// runs takes effect at the next check, and a lifted halt without a
+    /// restart.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let checked = halt_checked_tool_name(&request.name, request.arguments.as_ref());
+        if let Some(refusal) = self.halt_refusal_for_tool(&checked) {
+            return Ok(refusal);
+        }
+        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(call).await
+    }
+
     fn get_info(&self) -> InitializeResult {
         // The static portion of the instructions string describing tools and resources.
         const INSTRUCTIONS_STATIC: &str = "Stellar agent wallet MCP server. \
@@ -1499,7 +1600,7 @@ impl ServerHandler for WalletServer {
 
                 let profile =
                     loader::load(name, None).map_err(|_| profile_resource_load_error(name))?;
-                let content = profile_metadata_json(&profile)?;
+                let content = profile_metadata_json(&profile, &halt::halt_state(name))?;
                 Ok(ReadResourceResult::new(vec![
                     ResourceContents::text(content, uri).with_mime_type("application/json"),
                 ]))
@@ -1893,7 +1994,8 @@ mod tests {
 
     #[test]
     fn profile_metadata_json_is_exact_allowlist() {
-        let text = profile_metadata_json(&test_profile()).expect("metadata serializes");
+        let text = profile_metadata_json(&test_profile(), &HaltState::Running)
+            .expect("metadata serializes");
         let value: Value = serde_json::from_str(&text).expect("valid json");
         let object = value.as_object().expect("metadata object");
         let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
@@ -1903,6 +2005,8 @@ mod tests {
             [
                 "chain_id",
                 "cross_check_threshold_stroops",
+                "halted",
+                "halted_at",
                 "mcp_disabled",
                 "network_passphrase",
                 "rpc_url",
@@ -1910,6 +2014,8 @@ mod tests {
         );
         assert_eq!(value["chain_id"], "stellar:testnet");
         assert_eq!(value["mcp_disabled"], false);
+        assert_eq!(value["halted"], false);
+        assert!(value["halted_at"].is_null());
         assert_eq!(value["cross_check_threshold_stroops"], MINIMUM_FLOOR + 42);
 
         assert!(!text.contains("stellar-agent-signer"));
@@ -1924,10 +2030,38 @@ mod tests {
         let profile = Profile::builder_testnet("svc", "acct", "nonce", "acct")
             .rpc_url("https://user:SENTINEL-CRED@rpc.example:8443/SENTINEL-PATH?key=SENTINEL-QUERY")
             .build();
-        let text = profile_metadata_json(&profile).expect("metadata serializes");
+        let text =
+            profile_metadata_json(&profile, &HaltState::Running).expect("metadata serializes");
         let value: Value = serde_json::from_str(&text).expect("valid json");
         assert_eq!(value["rpc_url"], "https://rpc.example:8443");
         assert!(!text.contains("SENTINEL"), "{text}");
+    }
+
+    #[test]
+    fn profile_metadata_reports_the_halt_state() {
+        let marker = halt::HaltMarker::new(
+            "2026-10-31T12:00:00Z".to_owned(),
+            Some("incident".to_owned()),
+        )
+        .unwrap();
+        let text = profile_metadata_json(&test_profile(), &HaltState::Halted(marker))
+            .expect("metadata serializes");
+        let value: Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(value["halted"], true);
+        assert_eq!(value["halted_at"], "2026-10-31T12:00:00Z");
+        assert!(
+            !text.contains("incident"),
+            "the reason is not a resource field: {text}"
+        );
+
+        let text = profile_metadata_json(
+            &test_profile(),
+            &HaltState::Unreadable("is a directory".to_owned()),
+        )
+        .expect("metadata serializes");
+        let value: Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(value["halted"], true);
+        assert!(value["halted_at"].is_null());
     }
 
     #[test]

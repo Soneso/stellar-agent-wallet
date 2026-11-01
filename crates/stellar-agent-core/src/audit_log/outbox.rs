@@ -1,12 +1,17 @@
-//! The audit outbox: consent rows queued beside the log while a draining
+//! The audit outbox: operator rows queued beside the log while a draining
 //! writer in another process holds the log's sidecar lock.
+//!
+//! The rows queued here are the consent rows of `stellar-agent approve` and
+//! the halt and resume rows of `stellar-agent profile halt` and
+//! `stellar-agent profile resume`, each queued while a running MCP server or
+//! `approve serve` inbox holds the log.
 //!
 //! # Files
 //!
 //! Three files sit beside `<audit_log_path>`:
 //!
 //! - `<audit_log_path>.outbox`: JSON lines, one serialized [`AuditEntry`] per
-//!   line, mode `0600` on Unix. Each entry is built at the moment of consent
+//!   line, mode `0600` on Unix. Each entry is built when the operator acts
 //!   and keeps its own timestamp.
 //! - `<audit_log_path>.outbox.lock`: the lock every append and every drain
 //!   holds while it touches the outbox.
@@ -37,10 +42,10 @@
 //! it, and stores the new count and chain head. Any write or state error
 //! truncates the file back to its length before the append and returns the
 //! error, so a refused append leaves the file as it found it. If that
-//! truncate-back also fails, a complete line can remain for a consent that
-//! was refused; it drains as a consent row that did not take effect, which
-//! the at-least-once delivery below covers. Truncation is always in place:
-//! the writer refuses to open beside a `*.tmp` file in the audit directory.
+//! truncate-back also fails, a complete line from the refused operator-row
+//! append can remain; the delivery limits below cover it. Truncation is
+//! always in place: the writer refuses to open beside a `*.tmp` file in the
+//! audit directory.
 //!
 //! # Drain
 //!
@@ -48,21 +53,26 @@
 //! takes the outbox lock, reads the file, discards a torn final segment,
 //! checks that the complete lines are exactly the committed prefix, parses
 //! every complete line strictly, appends each entry to the log, stores the
-//! zero state, and truncates the outbox to zero. A complete line that does not
-//! parse, or that holds a row other than a consent row (`approval_attested`,
-//! `approval_attested_remote`), refuses the drain with `audit.outbox_unusable`
-//! and leaves the file unchanged. A refused append also leaves the file
+//! zero state, and truncates the outbox to zero. A complete line that does
+//! not parse, or that holds a row other than an operator row
+//! (`approval_attested`, `approval_attested_remote`, `profile_halted`,
+//! `profile_resumed`), refuses the drain with `audit.outbox_unusable` and
+//! leaves the file unchanged. A refused append also leaves the file
 //! unchanged, and the entries appended before it are appended again by the
 //! next drain.
 //!
 //! # Delivery and its limits
 //!
-//! Only committed consent rows drain. A complete line past the committed
+//! Only committed operator rows drain. A complete line past the committed
 //! prefix refuses every drain and every append with `audit.outbox_rows_missing`
 //! until `audit acknowledge-outbox-loss` discards it: nothing that was not
-//! committed under the outbox lock enters the log through the outbox, and a
-//! line synced by an append that stopped before its commitment records a
-//! consent that never took effect.
+//! committed under the outbox lock enters the log through the outbox.
+//!
+//! An interrupted append can leave an uncommitted operator row. Approval
+//! consent and resuming a halted profile require the row to commit first, so
+//! such a row records an approval or a resume that never took effect. A halt
+//! marker takes effect before its audit row is queued, so an uncommitted
+//! `profile_halted` row can record a halt that is in effect.
 //!
 //! Delivery is at least once. A crash between the appends and the reset of
 //! the commitment repeats those rows on the next drain; a repeated row keeps
@@ -188,25 +198,29 @@ fn committed_prefix<'l, 'b>(lines: &'l [&'b [u8]], state: &OutboxState) -> Optio
         .filter(|prefix| OutboxState::over(prefix).head == state.head)
 }
 
-/// Whether `entry` is a consent row, the only kind the outbox carries.
+/// Whether `entry` is an operator row, the only kinds the outbox carries.
 ///
 /// The CLI queues exactly these when a draining writer in another process
-/// holds the log: the attested approval, local or remote.
-fn is_consent_row(entry: &AuditEntry) -> bool {
+/// holds the log: the attested approval, local or remote, and the halt and
+/// resume rows of `profile halt` and `profile resume`.
+fn is_operator_row(entry: &AuditEntry) -> bool {
     matches!(
         entry.event_kind,
-        EventKind::ApprovalAttested { .. } | EventKind::ApprovalAttestedRemote { .. }
+        EventKind::ApprovalAttested { .. }
+            | EventKind::ApprovalAttestedRemote { .. }
+            | EventKind::ProfileHalted { .. }
+            | EventKind::ProfileResumed { .. }
     )
 }
 
-/// Parses `lines`, numbered from one, as consent rows.
+/// Parses `lines`, numbered from one, as operator rows.
 ///
 /// # Errors
 ///
 /// [`WriterError::OutboxUnusable`] for a line that does not parse as an
 /// [`AuditEntry`], and [`WriterError::OutboxRowKindRefused`] for one that
 /// holds another kind of row.
-fn parse_consent_rows(lines: &[&[u8]]) -> Result<Vec<AuditEntry>, WriterError> {
+fn parse_operator_rows(lines: &[&[u8]]) -> Result<Vec<AuditEntry>, WriterError> {
     lines
         .iter()
         .enumerate()
@@ -218,7 +232,7 @@ fn parse_consent_rows(lines: &[&[u8]]) -> Result<Vec<AuditEntry>, WriterError> {
                     reason: parse_failure_class(&e),
                 }
             })?;
-            if is_consent_row(&entry) {
+            if is_operator_row(&entry) {
                 Ok(entry)
             } else {
                 Err(WriterError::OutboxRowKindRefused { line: index + 1 })
@@ -260,6 +274,30 @@ pub fn check_outbox_commitment(
 /// How long an append or a drain waits for the outbox lock before refusing
 /// with [`WriterError::OutboxBusy`].
 pub const OUTBOX_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Environment variable that replaces [`OUTBOX_LOCK_WAIT`] with its value in
+/// milliseconds.
+///
+/// Compiled only with the `test-helpers` feature, so a release binary always
+/// waits [`OUTBOX_LOCK_WAIT`]. A subprocess test sets it to keep an append
+/// waiting long enough to observe the process during the wait.
+#[cfg(any(test, feature = "test-helpers"))]
+pub const OUTBOX_LOCK_WAIT_ENV: &str = "STELLAR_AGENT_TEST_OUTBOX_LOCK_WAIT_MS";
+
+/// The wait [`lock_outbox`] applies: [`OUTBOX_LOCK_WAIT`], or with the
+/// `test-helpers` feature the value of `STELLAR_AGENT_TEST_OUTBOX_LOCK_WAIT_MS`
+/// when it parses as a whole number of milliseconds.
+#[must_use]
+pub(crate) fn outbox_lock_wait() -> Duration {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Some(millis) = std::env::var(OUTBOX_LOCK_WAIT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(millis);
+    }
+    OUTBOX_LOCK_WAIT
+}
 
 /// Delay between two attempts on the outbox lock.
 pub(crate) const OUTBOX_LOCK_STEP: Duration = Duration::from_millis(20);
@@ -335,19 +373,33 @@ pub(crate) fn acquire_drain_lock(log_path: &Path) -> Result<AuditWriterLock, Wri
     }
 }
 
-/// Takes the outbox lock at `lock_path`, waiting up to [`OUTBOX_LOCK_WAIT`].
+/// Takes the outbox lock at `lock_path`, waiting up to [`outbox_lock_wait`].
+///
+/// The first attempt that finds the lock held emits one debug event, so an
+/// operator can tell a command that waits on another appender from one that
+/// stalls elsewhere.
 ///
 /// # Errors
 ///
 /// [`WriterError::OutboxBusy`] when the lock stays held for the whole wait,
 /// and [`WriterError::Io`] for any other failure.
 pub(crate) fn lock_outbox(lock_path: &Path) -> Result<AuditWriterLock, WriterError> {
-    let deadline = Instant::now() + OUTBOX_LOCK_WAIT;
+    let wait = outbox_lock_wait();
+    let deadline = Instant::now() + wait;
+    let mut waiting = false;
     loop {
         match AuditWriterLock::acquire(lock_path) {
             Err(WriterError::FileLocked) => {
                 if Instant::now() >= deadline {
                     return Err(WriterError::OutboxBusy);
+                }
+                if !waiting {
+                    waiting = true;
+                    tracing::debug!(
+                        lock = %basename(lock_path),
+                        wait_ms = wait.as_millis(),
+                        "audit outbox: the outbox lock is held; waiting for it"
+                    );
                 }
                 std::thread::sleep(OUTBOX_LOCK_STEP);
             }
@@ -356,7 +408,7 @@ pub(crate) fn lock_outbox(lock_path: &Path) -> Result<AuditWriterLock, WriterErr
     }
 }
 
-/// The outbox of one audit log, to which a consent row is appended while a
+/// The outbox of one audit log, to which an operator row is appended while a
 /// draining writer in another process holds the log.
 ///
 /// Every append takes the outbox lock for its own duration.
@@ -480,7 +532,7 @@ impl PreparedOutboxAppend<'_> {
                     outbox = %basename(&self.outbox.path),
                     error = %rollback,
                     "audit outbox: a refused append could not be truncated back; a line \
-                     for a consent that did not take effect may remain"
+                     from the refused operator-row append may remain"
                 );
             }
             return Err(error);
@@ -701,16 +753,16 @@ impl OutboxBatch {
             .collect()
     }
 
-    /// The committed prefix as consent rows, when it is intact, or `None`
+    /// The committed prefix as operator rows, when it is intact, or `None`
     /// when committed lines are missing, changed, or reordered.
     ///
     /// # Errors
     ///
-    /// Every error of the consent-row parse, for a line of the intact prefix.
+    /// Every error of the operator-row parse, for a line of the intact prefix.
     pub(crate) fn committed_entries(&self) -> Result<Option<Vec<AuditEntry>>, WriterError> {
         let lines = parse_lines(&self.bytes).lines;
         committed_prefix(&lines, &self.state)
-            .map(parse_consent_rows)
+            .map(parse_operator_rows)
             .transpose()
     }
 
@@ -730,7 +782,7 @@ impl OutboxBatch {
         committed_prefix_loss(&parse_lines(&self.bytes).lines, &self.state)
     }
 
-    /// Parses every complete line, in queue order, as a consent row before the
+    /// Parses every complete line, in queue order, as an operator row before the
     /// caller appends any of them. A torn final segment is discarded with a
     /// `warn`.
     ///
@@ -738,7 +790,7 @@ impl OutboxBatch {
     ///
     /// [`WriterError::OutboxUnusable`] when a complete line does not parse as
     /// an [`AuditEntry`], and [`WriterError::OutboxRowKindRefused`] when it
-    /// holds a row other than a consent row. The file is left unchanged.
+    /// holds a row other than an operator row. The file is left unchanged.
     pub(crate) fn parse_entries(&self) -> Result<Vec<AuditEntry>, WriterError> {
         let parsed = parse_lines(&self.bytes);
         if parsed.torn_bytes > 0 {
@@ -749,7 +801,7 @@ impl OutboxBatch {
                  completed"
             );
         }
-        parse_consent_rows(&parsed.lines)
+        parse_operator_rows(&parsed.lines)
     }
 
     /// Truncates the outbox to zero and syncs it, then releases the lock.
@@ -1728,7 +1780,7 @@ mod tests {
         assert_eq!(store.load_outbox_state().unwrap(), state);
     }
 
-    /// A committed line of a kind other than a consent row refuses the drain
+    /// A committed line of a kind other than an operator row refuses the drain
     /// at its line; a remote consent row drains.
     #[test]
     fn a_queued_value_row_is_refused() {
@@ -1785,6 +1837,42 @@ mod tests {
             .unwrap();
         assert_eq!(writer.drain_outbox().unwrap(), 1);
         assert_eq!(request_ids(&path), ["remote-consent"]);
+    }
+
+    /// The halt and resume rows `profile halt` and `profile resume` queue
+    /// beside a draining writer drain in queue order, after a consent row.
+    #[test]
+    fn queued_halt_and_resume_rows_drain() {
+        let dir = TempDir::new().unwrap();
+        let path = log_path(&dir);
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let mut writer = open_draining(&path, &store);
+        let outbox = AuditOutbox::for_log(&path, store.clone());
+        outbox.append(&row("consent")).unwrap();
+        outbox
+            .append(&AuditEntry::new_profile_halted(
+                "default",
+                "2026-10-31T12:00:00Z",
+                Some("incident"),
+                "queued-halt",
+            ))
+            .unwrap();
+        outbox
+            .append(&AuditEntry::new_profile_resumed(
+                "default",
+                true,
+                "queued-resume",
+            ))
+            .unwrap();
+        assert_eq!(writer.drain_outbox().unwrap(), 3);
+        assert_eq!(
+            request_ids(&path),
+            ["consent", "queued-halt", "queued-resume"]
+        );
+        assert!(
+            outbox_bytes(&path).is_empty(),
+            "the drain truncates the outbox"
+        );
     }
 
     #[test]

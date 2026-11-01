@@ -94,6 +94,8 @@ pub enum IoSource {
     MulticallRegistrySave,
     /// Audit-writer file setup.
     AuditWriterSetup,
+    /// Halt marker write or removal by `profile halt` and `profile resume`.
+    HaltMarker,
 }
 
 impl IoSource {
@@ -107,6 +109,7 @@ impl IoSource {
             Self::MulticallRegistryLoad => "io.multicall_registry_load",
             Self::MulticallRegistrySave => "io.multicall_registry_save",
             Self::AuditWriterSetup => "io.audit_writer_setup",
+            Self::HaltMarker => "io.halt_marker",
         }
     }
 
@@ -117,6 +120,7 @@ impl IoSource {
             Self::MulticallRegistryLoad => "multicall registry load",
             Self::MulticallRegistrySave => "multicall registry save",
             Self::AuditWriterSetup => "audit writer setup",
+            Self::HaltMarker => "halt marker",
         }
     }
 }
@@ -199,6 +203,7 @@ pub enum WalletError {
     /// | [`IoSource::MulticallRegistryLoad`] | `io.multicall_registry_load` |
     /// | [`IoSource::MulticallRegistrySave`] | `io.multicall_registry_save` |
     /// | [`IoSource::AuditWriterSetup`] | `io.audit_writer_setup` |
+    /// | [`IoSource::HaltMarker`] | `io.halt_marker` |
     #[error("io ({}): {message}", source_kind.label())]
     Io {
         /// Closed-set source for the failing I/O site.
@@ -1369,6 +1374,47 @@ pub enum ValidationError {
         field: &'static str,
     },
 
+    /// The profile is halted: its halt marker exists and is valid.
+    ///
+    /// Every action that signs or submits, on the CLI and on the MCP server,
+    /// and every MCP tool that is not read-only, refuses with this error until
+    /// `stellar-agent profile resume` removes the marker.
+    ///
+    /// # Wire code
+    ///
+    /// `"profile.halted"`.
+    #[error(
+        "profile \"{profile}\" is halted since {halted_at}{}; run \"stellar-agent profile resume --profile {profile}\" to lift it",
+        reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default()
+    )]
+    ProfileHalted {
+        /// The halted profile.
+        profile: String,
+        /// When the halt was set, RFC 3339 UTC.
+        halted_at: String,
+        /// The operator's reason, when one was given.
+        reason: Option<String>,
+    },
+
+    /// The profile's halt marker exists and cannot be read as a valid marker.
+    ///
+    /// Refuses every action a halt refuses: a marker that cannot be read
+    /// fails closed. `profile resume` refuses it too: a resume reads the
+    /// marker before it records the row and removes the marker.
+    ///
+    /// # Wire code
+    ///
+    /// `"profile.halt_unreadable"`.
+    #[error(
+        "the halt marker of profile \"{profile}\" cannot be read ({detail}); agent actions and \"stellar-agent profile resume --profile {profile}\" stay refused until the marker file is repaired or the marker path is removed by hand"
+    )]
+    ProfileHaltUnreadable {
+        /// The profile whose marker cannot be read.
+        profile: String,
+        /// The read failure.
+        detail: String,
+    },
+
     /// A mainnet profile was selected without an explicit profile flag.
     #[error("profile `{name}` is a mainnet profile and loads only with `--profile {name}`; {}", named_by.mainnet_selection_description())]
     MainnetRequiresExplicitProfile {
@@ -1417,7 +1463,7 @@ pub enum ValidationError {
         detail: String,
     },
 
-    /// Committed queued consent rows are missing, changed, or reordered.
+    /// Committed queued operator rows are missing, changed, or reordered.
     #[error("{detail}")]
     AuditOutboxRowsMissing {
         /// Diagnostic led by the outbox-loss code and its recovery command.
@@ -2059,6 +2105,8 @@ impl ValidationError {
             Self::MainnetRequiresExplicitProfile { .. } => {
                 "profile.mainnet_requires_explicit_profile"
             }
+            Self::ProfileHalted { .. } => crate::profile::halt::HALTED_CODE,
+            Self::ProfileHaltUnreadable { .. } => crate::profile::halt::HALT_UNREADABLE_CODE,
             // Audit taxonomy code on a validation-class variant: see
             // `AuditLogNotFound` above for the same rationale.
             Self::AuditChainKeyUnavailable { .. } => "audit.chain_key_unavailable",
@@ -3848,6 +3896,21 @@ mod tests {
                 "profile.mainnet_requires_explicit_profile",
             ),
             (
+                ValidationError::ProfileHalted {
+                    profile: "alice".to_owned(),
+                    halted_at: "2026-10-31T12:00:00Z".to_owned(),
+                    reason: None,
+                },
+                "profile.halted",
+            ),
+            (
+                ValidationError::ProfileHaltUnreadable {
+                    profile: "alice".to_owned(),
+                    detail: "is a directory".to_owned(),
+                },
+                "profile.halt_unreadable",
+            ),
+            (
                 ValidationError::ProfileNameMismatch {
                     detail: "profile 'alice' was selected, but its \
                              policy_owner_key_id.service is \
@@ -4164,6 +4227,21 @@ mod tests {
                 }
                 ValidationError::ProfileNameMismatch { detail } => {
                     ValidationError::ProfileNameMismatch {
+                        detail: detail.clone(),
+                    }
+                }
+                ValidationError::ProfileHalted {
+                    profile,
+                    halted_at,
+                    reason,
+                } => ValidationError::ProfileHalted {
+                    profile: profile.clone(),
+                    halted_at: halted_at.clone(),
+                    reason: reason.clone(),
+                },
+                ValidationError::ProfileHaltUnreadable { profile, detail } => {
+                    ValidationError::ProfileHaltUnreadable {
+                        profile: profile.clone(),
                         detail: detail.clone(),
                     }
                 }
@@ -5773,6 +5851,7 @@ mod tests {
             IoSource::MulticallRegistryLoad,
             IoSource::MulticallRegistrySave,
             IoSource::AuditWriterSetup,
+            IoSource::HaltMarker,
         ];
 
         for source in cases {
@@ -5781,7 +5860,8 @@ mod tests {
             match source {
                 IoSource::MulticallRegistryLoad
                 | IoSource::MulticallRegistrySave
-                | IoSource::AuditWriterSetup => (),
+                | IoSource::AuditWriterSetup
+                | IoSource::HaltMarker => (),
             }
             let err = WalletError::Io {
                 source_kind: source,

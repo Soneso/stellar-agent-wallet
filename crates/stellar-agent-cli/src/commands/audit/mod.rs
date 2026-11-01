@@ -147,7 +147,7 @@ pub enum AuditSubcommand {
     /// Exits 0 on success; exits 1 without a required acknowledgement and on
     /// any failure.
     Reanchor(reanchor::ReanchorArgs),
-    /// Acknowledge lost queued consent and revoke the profile's permissions.
+    /// Acknowledge lost queued operator rows and revoke the profile's permissions.
     AcknowledgeOutboxLoss(acknowledge_outbox_loss::AcknowledgeOutboxLossArgs),
 }
 

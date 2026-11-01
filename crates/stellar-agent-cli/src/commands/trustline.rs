@@ -302,6 +302,12 @@ where
         }
     };
 
+    // ── Halt check ────────────────────────────────────────────────────────────
+    // Before the keyring store, the signer, and any RPC request.
+    if let Err(e) = stellar_agent_core::profile::halt::ensure_not_halted(&profile_name) {
+        return write_envelope(out, &Envelope::<()>::err(&e), 1);
+    }
+
     let context = NetworkContext::from_profile(&profile);
 
     // ── Mainnet: its own pipeline from the write context ─────────────────────

@@ -5,10 +5,11 @@ Usage: check-install-surface.py [ROOT]
 
 ROOT defaults to the current directory and must be a git work tree. The check
 reads the Markdown files `git ls-files '*.md'` lists, except `CHANGELOG.md`,
-`crates/*/vendor/**`, and `crates/*/tests/fixtures/**`, plus the root
-`Cargo.toml` and the manifests of the two wallet crates. It prints one line per
-violation and exits 1 when it finds any, 0 when it finds none, and 2 when it
-cannot run.
+`crates/*/vendor/**`, `crates/*/tests/fixtures/**`, and
+`.github/scripts/fixtures/**`, which describe recorded artifacts rather than
+the install surface, plus the root `Cargo.toml` and the manifests of the two
+wallet crates. It prints one line per violation and exits 1 when it finds any,
+0 when it finds none, and 2 when it cannot run.
 
 Fenced blocks. A fence opens on a line of three or more backticks or tildes,
 after optional indentation and list markers such as `-` or `1.`. A backtick
@@ -241,6 +242,8 @@ def is_scanned(path: str) -> bool:
         return False
     parts = path.split("/")
     if len(parts) > 3 and parts[0] == "crates" and parts[2] == "vendor":
+        return False
+    if len(parts) > 3 and parts[:3] == [".github", "scripts", "fixtures"]:
         return False
     return not (len(parts) > 4 and parts[0] == "crates" and parts[2:4] == ["tests", "fixtures"])
 
