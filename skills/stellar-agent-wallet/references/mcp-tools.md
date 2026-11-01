@@ -159,6 +159,16 @@ read (`auth.keyring_*`). A witness refusal leaves the nonce usable.
 The nonce expiry is checked against the clock read after the witness, so a nonce
 that expires while the oracle answers refuses `nonce.expired`.
 
+### Cross-check status and reason
+
+The `cross_check` result carries a `status` and an optional `reason`. Only a passed
+comparison supplies an oracle witness.
+
+| Status | Reason | Meaning |
+| --- | --- | --- |
+| `skipped`|`oracle_not_configured` | A required comparison can be skipped on testnet when no oracle is configured; no oracle comparison was performed and no oracle witness is supplied. |
+| `not_required`|`below_threshold` | The amount is below its configured threshold and no memo observation or unvalued operation independently requires a comparison. No oracle witness is supplied; amount thresholds do not override memo or unvalued requirements. |
+
 `stellar_trustline_commit` reads the issuer again and verifies the stored
 clawback opt-in for that trustline. An absent issuer refuses `trustline.gate_refused`.
 Other issuer read errors keep their own codes and scrubbed messages.
