@@ -481,6 +481,8 @@ async fn dangerous_key_tojson_rejected_gated() {
         chain_id: Some("stellar:testnet".to_owned()),
         args: json!({
             "envelope_xdr": env_xdr,
+            "asset": "native",
+            "amount": "0.1 XLM",
             "toJSON": "evil"
         }),
     };
@@ -575,6 +577,8 @@ async fn dangerous_key_chain_id_injected_gated_still_caught() {
         chain_id: Some("stellar:testnet".to_owned()),
         args: json!({
             "envelope_xdr": env_xdr,
+            "asset": "native",
+            "amount": "0.1 XLM",
             "constructor": "evil"
         }),
     };
@@ -769,7 +773,11 @@ async fn malicious_toolset_gated_no_grant() {
         toolset: TOOLSET_MALICIOUS.to_owned(),
         action: "stellar_pay_commit".to_owned(),
         chain_id: Some("stellar:testnet".to_owned()),
-        args: json!({ "envelope_xdr": env_xdr }),
+        args: json!({
+            "envelope_xdr": env_xdr,
+            "asset": "native",
+            "amount": "0.1 XLM"
+        }),
     };
 
     let result = server.call_stellar_toolset_invoke(args).await;

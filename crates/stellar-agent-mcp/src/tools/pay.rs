@@ -20,11 +20,8 @@ use crate::tools::common::{
     resolve_classic_fee_per_op_stroops, submit_timeout, total_classic_fee_stroops,
     validate_g_strkey, verify_attestation_gate,
 };
-// McpAmountArgument import: kept as a single-line full path so the
-// amount-boundary lint does not treat the `amount:` token in a multi-line use
-// block as a field-name declaration.
 use stellar_agent_core::amount::McpMemoTextArgument;
-use stellar_agent_core::amount::{McpAmountArgument, StellarAmount};
+use stellar_agent_core::amount::StellarAmount;
 use stellar_agent_core::approval::store::PendingApproval;
 use stellar_agent_core::approval::user_id::process_uid_for_attestation;
 use stellar_agent_core::approval::{
@@ -67,10 +64,8 @@ use stellar_agent_network::{
 ///
 /// # Amount boundary
 ///
-/// `amount` MUST be `McpAmountArgument` when used so unit-label enforcement
-/// runs at deserialization time. `amount_in_stroops`
-/// is the explicit raw-stroop alternative and is mutually exclusive with
-/// `amount`.
+/// `amount` is a decimal string whose unit matches the parsed asset.
+/// `amount_in_stroops` is the unit-free alternative; the fields are mutually exclusive.
 ///
 /// # SEP-29
 ///
@@ -113,10 +108,11 @@ pub struct StellarPayArgs {
 
     /// Payment amount with explicit unit suffix.
     ///
-    /// Example: `"10 XLM"`.  The `McpAmountArgument` wrapper enforces the
-    /// unit label at the deserialization boundary.
+    /// Use `"10 XLM"` for native or the exact asset code for issued assets,
+    /// such as `"10.5 USDC"` with `USDC:<issuer>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub amount: Option<McpAmountArgument>,
+    #[schemars(extend("x-amount-unit" = "ui", "x-amount-decimals" = 7))]
+    pub amount: Option<String>,
 
     /// Payment amount as a raw stroop integer, decimal-string encoded.
     ///
@@ -215,7 +211,8 @@ pub struct StellarPayCommitArgs {
 
     /// Payment amount with explicit unit suffix (same as simulate step).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub amount: Option<McpAmountArgument>,
+    #[schemars(extend("x-amount-unit" = "ui", "x-amount-decimals" = 7))]
+    pub amount: Option<String>,
 
     /// Payment amount as a raw stroop integer (same as simulate step).
     ///
@@ -356,9 +353,45 @@ fn memo_summary(memo: &Memo) -> Option<String> {
     }
 }
 
-fn resolve_payment_amount(
-    amount: Option<McpAmountArgument>,
+/// Parses the caller's asset descriptor and resolves the payment amount
+/// against it.
+///
+/// The simulate step, the direct commit route, and the toolset resolver ahead
+/// of the gated commit route call this before any request, key access, or
+/// approval processing. Invalid assets and amounts receive the same refusal on
+/// each route.
+///
+/// # Errors
+///
+/// Returns `invalid asset: <code>` for an unparseable descriptor, and the
+/// refusals of [`resolve_payment_amount`] for the amount.
+pub(crate) fn parse_asset_and_amount(
+    asset: &str,
+    amount: Option<String>,
     amount_in_stroops: Option<String>,
+) -> Result<(Asset, StellarAmount), rmcp::ErrorData> {
+    let asset = Asset::parse(asset).map_err(|error| {
+        rmcp::ErrorData::invalid_params(format!("invalid asset: {}", error.code()), None)
+    })?;
+    let amount = resolve_payment_amount(amount, amount_in_stroops, &asset)?;
+    Ok((asset, amount))
+}
+
+impl StellarPayCommitArgs {
+    /// Validates the caller's asset and amount through [`parse_asset_and_amount`].
+    fn parse_asset_and_amount(&self) -> Result<(Asset, StellarAmount), rmcp::ErrorData> {
+        parse_asset_and_amount(
+            &self.asset,
+            self.amount.clone(),
+            self.amount_in_stroops.clone(),
+        )
+    }
+}
+
+fn resolve_payment_amount(
+    amount: Option<String>,
+    amount_in_stroops: Option<String>,
+    asset: &Asset,
 ) -> Result<StellarAmount, rmcp::ErrorData> {
     match (amount, amount_in_stroops) {
         (Some(_), Some(_)) => Err(rmcp::ErrorData::invalid_params(
@@ -369,7 +402,12 @@ fn resolve_payment_amount(
             "amount or amount_in_stroops is required",
             None,
         )),
-        (Some(amount), None) => Ok(amount.into_stellar_amount()),
+        (Some(amount), None) => asset.parse_amount(&amount).map_err(|error| {
+            rmcp::ErrorData::invalid_params(
+                format!("{}: {error}", error.code()),
+                Some(json!({ "code": error.code() })),
+            )
+        }),
         (None, Some(raw)) => {
             // Non-negativity is enforced here by parsing into `u64` (the
             // bound the field's Rust type used to carry before it became a
@@ -566,14 +604,19 @@ impl WalletServer {
         // Starting at entry bounds the primary identity check by the action budget.
         let pay_deadline: tokio::time::Instant =
             tokio::time::Instant::now() + submit_timeout(&self.profile);
+        // ── Parse asset and amount ────────────────────────────────────────────
+        let (asset, payment_amount) = parse_asset_and_amount(
+            &args.asset,
+            args.amount.clone(),
+            args.amount_in_stroops.clone(),
+        )?;
+
         // ── Dispatch gate ─────────────────────────────────────────────────────
-        let payment_amount =
-            resolve_payment_amount(args.amount.clone(), args.amount_in_stroops.clone())?;
         let args_value = json!({
             "chain_id": &args.chain_id,
             "source": &args.source,
             "destination": &args.destination,
-            "amount": args.amount.as_ref().map(ToString::to_string),
+            "amount": &args.amount,
             "amount_in_stroops": &args.amount_in_stroops,
             "amount_stroops": payment_amount.as_stroops().to_string(),
             "asset": &args.asset,
@@ -581,17 +624,6 @@ impl WalletServer {
         // ── Validate G-strkeys ────────────────────────────────────────────────
         validate_g_strkey(&args.source, "source")?;
         validate_g_strkey(&args.destination, "destination")?;
-
-        // ── Parse asset ───────────────────────────────────────────────────────
-        let asset = match Asset::parse(&args.asset) {
-            Ok(a) => a,
-            Err(err) => {
-                return Err(rmcp::ErrorData::invalid_params(
-                    format!("invalid asset: {}", err.code()),
-                    None,
-                ));
-            }
-        };
 
         // ── Parse memo (mutual exclusivity check) ─────────────────────────────
         let memo = match parse_memo_fields(
@@ -1172,6 +1204,8 @@ impl WalletServer {
             return Ok(super::common::mainnet_write_forbidden_result());
         }
 
+        let (asset, payment_amount) = args.parse_asset_and_amount()?;
+
         // ── Re-derive authoritative args from HMAC-bound envelope_xdr ────────
         //
         // The policy engine MUST evaluate the fields that are actually encoded
@@ -1409,18 +1443,6 @@ impl WalletServer {
             Ok(n) => n,
             Err(_) => return Ok(commit_path_error_result("nonce parse failed")),
         };
-
-        // ── Parse asset ───────────────────────────────────────────────────────
-        let asset = match Asset::parse(&args.asset) {
-            Ok(a) => a,
-            Err(err) => {
-                return Err(rmcp::ErrorData::invalid_params(
-                    format!("invalid asset: {}", err.code()),
-                    None,
-                ));
-            }
-        };
-        let payment_amount = resolve_payment_amount(args.amount.clone(), args.amount_in_stroops)?;
 
         // ── Parse memo ────────────────────────────────────────────────────────
         let memo = match parse_memo_fields(
@@ -1787,6 +1809,10 @@ impl WalletServer {
     /// Invokes `stellar_pay_commit` for a toolset-gated signing-adjacent path
     /// with the per-action `PaymentSimulated` approval FORCED ON unconditionally.
     ///
+    /// The toolset resolver has validated the asset and amount through
+    /// [`parse_asset_and_amount`] before either gate, so an invalid amount
+    /// reaches no approval.
+    ///
     /// Unlike direct `stellar_pay_commit` which is a no-op when policy returns
     /// `Allow`, this wrapper FORCES the `RequireApproval` path by:
     ///
@@ -2105,12 +2131,66 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used, reason = "test assertions")]
+    fn payment_amount_units_follow_asset_for_simulate_and_commit() {
+        let issuer = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        for (code, unit, accepted) in [
+            ("TST", "TST", true),
+            ("TST", "XLM", false),
+            ("TST", "tst", false),
+            ("XLM", "xlm", false),
+            ("XLM", "XLM", true),
+        ] {
+            let value = json!({
+                "chain_id": "stellar:testnet", "source": issuer, "destination": issuer,
+                "asset": format!("{code}:{issuer}"), "amount": format!("100 {unit}"),
+                "nonce": "nonce", "expires_at_unix_ms": 1, "envelope_xdr": "envelope"
+            });
+            let simulate: StellarPayArgs = serde_json::from_value(value.clone()).unwrap();
+            let commit: StellarPayCommitArgs = serde_json::from_value(value).unwrap();
+            for (amount, raw, asset) in [
+                (simulate.amount, simulate.amount_in_stroops, simulate.asset),
+                (commit.amount, commit.amount_in_stroops, commit.asset),
+            ] {
+                let result = resolve_payment_amount(amount, raw, &Asset::parse(&asset).unwrap());
+                if accepted {
+                    assert_eq!(result.unwrap().as_stroops(), 1_000_000_000);
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.data.unwrap()["code"], "validation.amount_malformed");
+                    assert_eq!(
+                        error.message,
+                        format!(
+                            "validation.amount_malformed: amount '100 {unit}' has unit '{unit}'; expected unit '{code}'"
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, reason = "test assertions")]
+    fn payment_amount_schema_keeps_string_units_and_precision() {
+        for schema in [
+            schemars::schema_for!(StellarPayArgs),
+            schemars::schema_for!(StellarPayCommitArgs),
+        ] {
+            let value = serde_json::to_value(schema).unwrap();
+            let amount = &value["properties"]["amount"];
+            assert_eq!(amount["x-amount-unit"], "ui");
+            assert_eq!(amount["x-amount-decimals"], 7);
+            assert_eq!(amount["type"], json!(["string", "null"]));
+        }
+    }
+
+    #[test]
     fn resolve_payment_amount_rejects_both_forms() {
         let amount = match serde_json::from_str(r#""1 XLM""#) {
             Ok(amount) => amount,
             Err(err) => panic!("valid amount must parse: {err}"),
         };
-        let err = match resolve_payment_amount(Some(amount), Some("1".to_owned())) {
+        let err = match resolve_payment_amount(Some(amount), Some("1".to_owned()), &Asset::Native) {
             Ok(amount) => panic!("both amount forms must reject, got {amount}"),
             Err(err) => err,
         };
@@ -2121,7 +2201,7 @@ mod tests {
 
     #[test]
     fn resolve_payment_amount_rejects_missing_forms() {
-        let err = match resolve_payment_amount(None, None) {
+        let err = match resolve_payment_amount(None, None, &Asset::Native) {
             Ok(amount) => panic!("missing amount forms must reject, got {amount}"),
             Err(err) => err,
         };
@@ -2132,7 +2212,7 @@ mod tests {
 
     #[test]
     fn resolve_payment_amount_accepts_stroops() {
-        let amount = match resolve_payment_amount(None, Some("123".to_owned())) {
+        let amount = match resolve_payment_amount(None, Some("123".to_owned()), &Asset::Native) {
             Ok(amount) => amount,
             Err(err) => panic!("stroops amount must parse: {err}"),
         };
@@ -2145,17 +2225,19 @@ mod tests {
         // 2^53 + 1: the first integer an f64-backed JSON number cannot
         // represent exactly. The decimal-string field must round-trip it
         // byte-for-byte.
-        let amount = match resolve_payment_amount(None, Some("9007199254740993".to_owned())) {
-            Ok(amount) => amount,
-            Err(err) => panic!("stroops amount must parse: {err}"),
-        };
+        let amount =
+            match resolve_payment_amount(None, Some("9007199254740993".to_owned()), &Asset::Native)
+            {
+                Ok(amount) => amount,
+                Err(err) => panic!("stroops amount must parse: {err}"),
+            };
 
         assert_eq!(amount.as_stroops(), 9_007_199_254_740_993_i64);
     }
 
     #[test]
     fn resolve_payment_amount_rejects_zero_stroops() {
-        let err = match resolve_payment_amount(None, Some("0".to_owned())) {
+        let err = match resolve_payment_amount(None, Some("0".to_owned()), &Asset::Native) {
             Ok(amount) => panic!("zero stroops must reject, got {amount}"),
             Err(err) => err,
         };
@@ -2166,7 +2248,7 @@ mod tests {
 
     #[test]
     fn resolve_payment_amount_rejects_u64_overflow() {
-        let err = match resolve_payment_amount(None, Some(u64::MAX.to_string())) {
+        let err = match resolve_payment_amount(None, Some(u64::MAX.to_string()), &Asset::Native) {
             Ok(amount) => panic!("u64 overflow must reject, got {amount}"),
             Err(err) => err,
         };
@@ -2177,7 +2259,7 @@ mod tests {
 
     #[test]
     fn resolve_payment_amount_rejects_negative_stroops() {
-        let err = match resolve_payment_amount(None, Some("-5".to_owned())) {
+        let err = match resolve_payment_amount(None, Some("-5".to_owned()), &Asset::Native) {
             Ok(amount) => panic!("negative stroops must reject, got {amount}"),
             Err(err) => err,
         };
@@ -2187,10 +2269,11 @@ mod tests {
 
     #[test]
     fn resolve_payment_amount_rejects_malformed_decimal_string() {
-        let err = match resolve_payment_amount(None, Some("not-a-number".to_owned())) {
-            Ok(amount) => panic!("malformed stroops string must reject, got {amount}"),
-            Err(err) => err,
-        };
+        let err =
+            match resolve_payment_amount(None, Some("not-a-number".to_owned()), &Asset::Native) {
+                Ok(amount) => panic!("malformed stroops string must reject, got {amount}"),
+                Err(err) => err,
+            };
 
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }

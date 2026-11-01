@@ -47,6 +47,15 @@
 //!     `toolset.first_invoke_approval_required` and queues the approval beside the proposal.
 //! 15. **rule_create_pending_proposal_with_grant_reaches_signer_load**: a matching
 //!     grant and valid proposal attestation reach the signer load.
+//! 16. **grant_present_missing_amount_unit_refuses_without_pending_entry** and
+//!     **grant_present_issued_amount_with_xlm_unit_refuses_without_pending_entry**:
+//!     with a current grant, a bare number or an issued-asset amount labeled
+//!     `XLM` refuses with the amount code and queues no per-action approval.
+//! 17. **no_grant_missing_amount_unit_refuses_without_first_invoke_entry**:
+//!     without a grant, the same refusal queues no first-invoke approval.
+//! 18. **missing_envelope_and_asset_reports_missing_envelope_without_pending_entry**:
+//!     args without `envelope_xdr` or payment fields answer
+//!     `toolset.gated_missing_envelope` and queue nothing.
 //!
 //! # `#[serial]` requirement
 //!
@@ -815,6 +824,163 @@ async fn grant_present_creates_per_action_queue_entry() {
     assert_eq!(
         pending_count, 1,
         "exactly one PaymentSimulated pending approval must have been queued"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn grant_present_missing_amount_unit_refuses_without_pending_entry() {
+    assert_invalid_amount_does_not_queue(
+        Grant::Present,
+        "native",
+        "1",
+        "validation.amount_units_required",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn grant_present_issued_amount_with_xlm_unit_refuses_without_pending_entry() {
+    assert_invalid_amount_does_not_queue(
+        Grant::Present,
+        &format!("TST:{DEST_G}"),
+        "1 XLM",
+        "validation.amount_malformed",
+        Some("validation.amount_malformed: amount '1 XLM' has unit 'XLM'; expected unit 'TST'"),
+    )
+    .await;
+}
+
+/// Without a grant, the asset and amount refuse before the first-invoke gate
+/// queues its approval: an invalid amount leaves the pending store empty.
+#[tokio::test]
+#[serial]
+async fn no_grant_missing_amount_unit_refuses_without_first_invoke_entry() {
+    assert_invalid_amount_does_not_queue(
+        Grant::Absent,
+        "native",
+        "1",
+        "validation.amount_units_required",
+        None,
+    )
+    .await;
+}
+
+/// Whether the invalid-amount fixture holds a current grant for the toolset.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Grant {
+    Present,
+    Absent,
+}
+
+async fn assert_invalid_amount_does_not_queue(
+    grant: Grant,
+    descriptor: &str,
+    amount: &str,
+    expected_code: &str,
+    expected_message: Option<&str>,
+) {
+    use stellar_agent_core::StellarAmount;
+    use stellar_agent_network::{Asset, ClassicOpBuilder};
+
+    let key = setup_mock_keyring();
+    let toolsets_dir = TempDir::new().unwrap();
+    let approval_dir = TempDir::new().unwrap();
+    let grant_file = approval_dir.path().join("grants.toml");
+    write_pin_with_sign_payment(toolsets_dir.path(), TOOLSET_NAME);
+    let grant_asset = if descriptor == "native" {
+        ASSET_XLM
+    } else {
+        descriptor
+    };
+    if grant == Grant::Present {
+        insert_valid_grant(
+            &grant_file,
+            TOOLSET_NAME,
+            CAPABILITY,
+            DEST_G,
+            grant_asset,
+            0,
+            10_000_000,
+            &key,
+        );
+    }
+    let envelope_xdr = if descriptor == "native" {
+        payment_envelope_xdr(SOURCE_G, DEST_G, 10_000_000)
+    } else {
+        let mut builder = ClassicOpBuilder::new(SOURCE_G, 100, TESTNET_PASSPHRASE, 100);
+        builder
+            .payment(
+                DEST_G,
+                StellarAmount::from_stroops(10_000_000),
+                &Asset::parse(descriptor).unwrap(),
+            )
+            .unwrap();
+        builder.build().unwrap()
+    };
+    let server = build_allow_server(approval_dir.path(), &grant_file, toolsets_dir.path());
+    let result = server
+        .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+            toolset: TOOLSET_NAME.to_owned(),
+            action: "stellar_pay_commit".to_owned(),
+            chain_id: Some("stellar:testnet".to_owned()),
+            args: serde_json::json!({
+                "envelope_xdr": envelope_xdr,
+                "source": SOURCE_G,
+                "destination": DEST_G,
+                "nonce": "fake-nonce",
+                "expires_at_unix_ms": 9_999_999_999_u64,
+                "asset": descriptor,
+                "amount": amount,
+                "chain_id": "stellar:testnet"
+            }),
+        })
+        .await;
+    assert_eq!(
+        count_pending_approvals(approval_dir.path(), TEST_PROFILE_NAME),
+        0
+    );
+    let error = result.unwrap_err();
+    assert_eq!(error.data.unwrap()["code"], expected_code);
+    if let Some(message) = expected_message {
+        assert_eq!(error.message, message);
+    }
+}
+
+/// An args object without `envelope_xdr` reports the missing envelope even
+/// when it also lacks the payment fields, and queues no approval.
+#[tokio::test]
+#[serial]
+async fn missing_envelope_and_asset_reports_missing_envelope_without_pending_entry() {
+    setup_mock_keyring();
+    let toolsets_dir = TempDir::new().unwrap();
+    let approval_dir = TempDir::new().unwrap();
+    let grant_file = approval_dir.path().join("grants.toml");
+    write_pin_with_sign_payment(toolsets_dir.path(), TOOLSET_NAME);
+    let server = build_allow_server(approval_dir.path(), &grant_file, toolsets_dir.path());
+    let result = server
+        .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+            toolset: TOOLSET_NAME.to_owned(),
+            action: "stellar_pay_commit".to_owned(),
+            chain_id: Some("stellar:testnet".to_owned()),
+            args: serde_json::json!({
+                "source": SOURCE_G,
+                "destination": DEST_G,
+                "chain_id": "stellar:testnet"
+            }),
+        })
+        .await;
+    assert_eq!(
+        count_pending_approvals(approval_dir.path(), TEST_PROFILE_NAME),
+        0
+    );
+    let error = result.unwrap_err();
+    assert!(
+        error.message.starts_with("toolset.gated_missing_envelope:"),
+        "expected the missing-envelope refusal, got: {}",
+        error.message
     );
 }
 

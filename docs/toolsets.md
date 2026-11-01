@@ -223,10 +223,12 @@ symlinked leaf, and removes the directory and pin.
 `stellar_pay_commit` is reachable only through the gated resolver, never the
 ungated path. The gated resolver enforces, in order:
 
-1. The four-part check against the gated matrix: the toolset declares `sign-payment`,
+1. The caller's `asset` and its `amount` or `amount_in_stroops` are validated; an
+   invalid or missing value refuses before any approval is queued.
+2. The four-part check against the gated matrix: the toolset declares `sign-payment`,
    the action maps to the gated `stellar_pay_commit` constant, and the tool is
    within `allowed_tools`.
-2. The first-invoke gate: it looks for a current matching grant in the per-profile
+3. The first-invoke gate: it looks for a current matching grant in the per-profile
    grant store. Matching is computed from the authoritative destination, asset, and
    amount decoded from the transaction envelope, never from toolset-supplied
    arguments. A non-positive authoritative amount is refused before any grant
@@ -393,7 +395,8 @@ No signing, key, or policy tool is reachable through an ungated capability, so a
 `action` naming a signing tool returns `toolset.unknown_action` (the tool is not in
 the matrix to resolve). The two gated tools are the exception. For a `sign-payment` toolset, `action: "stellar_pay_commit"` is routed
 through the gated resolver instead: `args` must carry the `envelope_xdr` produced by
-a prior `stellar_pay` simulate call, from which the destination, asset, and amount
-are decoded authoritatively. If the first-invoke gate fires, the call returns
+a prior `stellar_pay` simulate call, and its `asset` with `amount` or
+`amount_in_stroops`. The destination, asset, and amount are decoded authoritatively
+from that envelope. If the first-invoke gate fires, the call returns
 `toolset.first_invoke_approval_required` with the approval nonce; once a grant exists,
 the per-action payment approval is still forced on for the commit.

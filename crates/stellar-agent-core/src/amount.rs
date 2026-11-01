@@ -1,7 +1,7 @@
 //! Typed Stellar amount value and unit-enforcing parsers.
 //!
 //! The central type is [`StellarAmount`], which stores amounts internally as
-//! `i64` stroops and requires an explicit unit label (`XLM`) on every
+//! `i64` base units and requires an explicit unit label on every
 //! human-supplied input string.  A 100-stroop payment cannot be silently
 //! interpreted as 100 XLM, since bare-number inputs are rejected with
 //! [`ValidationError::AmountUnitsRequired`].
@@ -12,9 +12,9 @@
 //! numeric constants derived from the Stellar XDR `Amount` type definition
 //! (`i64` units of `1/10^7 XLM`).
 //!
-//! Only the `XLM` unit label is recognised.  Asset-code units
-//! (e.g. `"100 USDC:issuer"`) belong to the asset-parsing layer and are
-//! not handled here.
+//! Human amounts use `<decimal> <UNIT>`: `XLM` for native amounts, or the
+//! exact, case-sensitive asset code for issued amounts, such as `"100 USDC"`.
+//! The caller supplies the expected unit from its parsed asset.
 
 use std::fmt;
 
@@ -73,8 +73,9 @@ const _: () = {
 ///
 /// Construct via [`StellarAmount::from_stroops`] for programmatic construction,
 /// [`StellarAmount::parse_with_unit`] for human-supplied strings (requires
-/// an explicit `XLM` unit label), or [`StellarAmount::parse_stroops`] when
-/// the input is already in base units.
+/// an explicit native `XLM` label), [`StellarAmount::parse_with_unit_for`]
+/// for `<decimal> <UNIT>` with an exact asset code, or
+/// [`StellarAmount::parse_stroops`] for input in base units.
 ///
 /// # Negative amounts
 ///
@@ -82,9 +83,10 @@ const _: () = {
 /// rejection (e.g. payment operations that require a positive amount) is the
 /// caller's responsibility.
 ///
-/// Only `XLM` is accepted as a unit label.  Asset-code units
-/// (`"100 USDC:GA…"`) are not handled by this type; they live in the
-/// asset-parsing layer.
+/// Issued amounts use the asset code as their unit, such as `"100 USDC"`.
+/// Native `XLM` labels are case-insensitive for compatibility. Issued codes
+/// match exactly because Stellar asset codes are case-sensitive.
+/// The caller retains the asset identity; this type stores only the quantity.
 ///
 /// # Examples
 ///
@@ -161,12 +163,12 @@ impl StellarAmount {
     ///
     /// # Errors
     ///
-    /// - [`ValidationError::AmountUnitsRequired`] — no unit label present.
-    /// - [`ValidationError::AmountMalformed`] — the numeric part is invalid,
-    ///   the unit is not `XLM`, multiple dots, or empty input.
-    /// - [`ValidationError::AmountPrecisionExceeded`] — more than seven
+    /// - [`ValidationError::AmountUnitsRequired`]: no unit label present.
+    /// - [`ValidationError::AmountMalformed`]: invalid decimal or grammar.
+    /// - [`ValidationError::AmountUnitMismatch`]: the unit is not `XLM`.
+    /// - [`ValidationError::AmountPrecisionExceeded`]: more than seven
     ///   fractional digits.
-    /// - [`ValidationError::AmountOutOfRange`] — value overflows `i64`.
+    /// - [`ValidationError::AmountOutOfRange`]: value overflows `i64`.
     ///
     /// # Examples
     ///
@@ -190,43 +192,66 @@ impl StellarAmount {
     /// ));
     /// ```
     pub fn parse_with_unit(s: &str) -> Result<Self, ValidationError> {
-        let s = s.trim();
+        Self::parse_unit(s, "XLM", true)
+    }
 
-        // Split at the first ASCII whitespace character.  Everything before is
-        // the numeric part; everything after (trimmed) is the unit label.
-        let ws_pos = s.as_bytes().iter().position(|b| b.is_ascii_whitespace());
+    /// Parses `<decimal> <UNIT>` using the exact, case-sensitive expected unit.
+    ///
+    /// Callers obtain `expected_unit` from the parsed asset's code, or use
+    /// `XLM` for native amounts. Decimal parsing uses integer arithmetic and
+    /// the seven-decimal precision rules of [`Self::parse_with_unit`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::AmountUnitsRequired`] for a bare number,
+    /// [`ValidationError::AmountUnitMismatch`] for a different unit, and
+    /// [`ValidationError::AmountMalformed`] for an invalid decimal or grammar.
+    /// Excess precision returns [`ValidationError::AmountPrecisionExceeded`];
+    /// overflow returns [`ValidationError::AmountOutOfRange`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stellar_agent_core::StellarAmount;
+    ///
+    /// let amount = StellarAmount::parse_with_unit_for("100 TST", "TST").unwrap();
+    /// assert_eq!(amount.as_stroops(), 1_000_000_000);
+    /// assert!(StellarAmount::parse_with_unit_for("100 XLM", "TST").is_err());
+    /// ```
+    pub fn parse_with_unit_for(s: &str, expected_unit: &str) -> Result<Self, ValidationError> {
+        Self::parse_unit(s, expected_unit, false)
+    }
 
-        let (numeric_str, unit_str) = match ws_pos {
-            None => {
-                // No whitespace at all.  If the input looks purely numeric we
-                // return AmountUnitsRequired; otherwise AmountMalformed.
-                if looks_like_bare_number(s) {
-                    return Err(ValidationError::AmountUnitsRequired);
-                }
-                return Err(ValidationError::AmountMalformed {
-                    input: s.to_owned(),
-                });
-            }
-            Some(pos) => {
-                let numeric = &s[..pos];
-                let rest = s[pos..].trim();
-                (numeric, rest)
-            }
-        };
-
-        // Validate unit label (case-insensitive; only XLM is accepted).
-        if !unit_str.eq_ignore_ascii_case("xlm") {
-            // If the unit is empty (trailing whitespace only) we check if the
-            // numeric part could be a bare number.
-            if unit_str.is_empty() && looks_like_bare_number(numeric_str) {
+    fn parse_unit(
+        input: &str,
+        expected_unit: &str,
+        case_insensitive: bool,
+    ) -> Result<Self, ValidationError> {
+        let mut tokens = input.trim().split_ascii_whitespace();
+        let (numeric_str, unit_str) = match (tokens.next(), tokens.next(), tokens.next()) {
+            (Some(numeric), Some(unit), None) => (numeric, unit),
+            (Some(numeric), None, None) if looks_like_bare_number(numeric) => {
                 return Err(ValidationError::AmountUnitsRequired);
             }
-            return Err(ValidationError::AmountMalformed {
-                input: s.to_owned(),
+            _ => {
+                return Err(ValidationError::AmountMalformed {
+                    input: input.to_owned(),
+                });
+            }
+        };
+        let unit_matches = if case_insensitive {
+            unit_str.eq_ignore_ascii_case(expected_unit)
+        } else {
+            unit_str == expected_unit
+        };
+        if !unit_matches {
+            return Err(ValidationError::AmountUnitMismatch {
+                input: input.to_owned(),
+                expected: expected_unit.to_owned(),
+                supplied: unit_str.to_owned(),
             });
         }
-
-        parse_decimal_to_stroops(numeric_str, s)
+        parse_decimal_to_stroops(numeric_str, input)
     }
 
     /// Parses a bare stroop integer string (for `--amount-base <stroops>`).
@@ -360,9 +385,8 @@ impl fmt::Display for StellarAmount {
 /// dual-unit metadata (`x-amount-unit`, `x-amount-decimals`) for codegen
 /// tooling.
 ///
-/// Every MCP tool argument whose name matches `*_amount`, `*_fee`,
-/// `*_starting_balance`, or similar patterns MUST use this type (or
-/// `Option<McpAmountArgument>`).
+/// Native-only MCP amounts use this type. Asset-scoped amounts validate their
+/// unit with [`crate::asset_id::CanonicalAsset::parse_amount`] after parsing the asset.
 ///
 /// # Examples
 ///
@@ -782,14 +806,11 @@ pub enum AnchorAmountError {
 /// would violate the SEP-24 wire contract.  `AnchorAmount` captures exactly
 /// this domain without the XLM semantics.
 ///
-/// # Amount-field naming
+/// # Amount-field schemas
 ///
-/// Any field whose name contains `amount`, `fee`, `balance`, or `charge` as a
-/// `_`-separated token MUST be typed `McpAmountArgument` or
-/// `Option<McpAmountArgument>` so the dual-unit metadata is always present. The
-/// SEP-24 field is named `deposit_hint` — none of those trigger tokens appear —
-/// so `AnchorAmount` is the correct type for it. The field name MUST NOT be
-/// changed to contain those trigger words without revisiting that typing rule.
+/// Native MCP amounts use [`McpAmountArgument`]. Asset-scoped amounts validate
+/// the unit against the asset and retain the schema's unit and precision metadata.
+/// Anchor deposit hints use [`AnchorAmount`] and the anchor's asset precision.
 ///
 /// # Examples
 ///
@@ -1353,6 +1374,69 @@ mod tests {
         assert_eq!(amt, StellarAmount::from_stroops(10_000));
     }
 
+    #[test]
+    fn asset_unit_parser_accepts_exact_code_and_decimals() {
+        for (input, expected) in [
+            ("100 TST", 1_000_000_000),
+            ("10.5 TST", 105_000_000),
+            ("0.0000001 TST", 1),
+            ("1.1234567 TST", 11_234_567),
+            ("100. TST", 1_000_000_000),
+            ("-5 TST", -50_000_000),
+        ] {
+            assert_eq!(
+                StellarAmount::parse_with_unit_for(input, "TST")
+                    .unwrap()
+                    .as_stroops(),
+                expected,
+                "{input}"
+            );
+        }
+        assert_eq!(
+            StellarAmount::parse_with_unit_for("1 tst", "tst")
+                .unwrap()
+                .as_stroops(),
+            10_000_000
+        );
+    }
+
+    #[test]
+    fn asset_unit_parser_refuses_mismatched_units() {
+        for (input, expected, supplied) in [
+            ("100 XLM", "TST", "XLM"),
+            ("100 USDC", "XLM", "USDC"),
+            ("100 tst", "TST", "tst"),
+            ("100 xlm", "XLM", "xlm"),
+        ] {
+            let error = StellarAmount::parse_with_unit_for(input, expected).unwrap_err();
+            assert_eq!(error.code(), "validation.amount_malformed");
+            assert_eq!(
+                error.to_string(),
+                format!("amount '{input}' has unit '{supplied}'; expected unit '{expected}'")
+            );
+        }
+    }
+
+    #[test]
+    fn asset_unit_parser_preserves_decimal_refusals() {
+        for (input, code) in [
+            ("100", "validation.amount_units_required"),
+            ("0.00000001 TST", "validation.amount_precision_exceeded"),
+            ("99999999999999999999 TST", "validation.amount_out_of_range"),
+            ("+100 TST", "validation.amount_malformed"),
+            (".5 TST", "validation.amount_malformed"),
+            ("100TST", "validation.amount_malformed"),
+        ] {
+            assert_eq!(
+                StellarAmount::parse_with_unit_for(input, "TST")
+                    .unwrap_err()
+                    .code(),
+                code,
+                "{input}"
+            );
+        }
+    }
+
     // ── Unit-case insensitivity ───────────────────────────────────────────────
 
     #[test]
@@ -1633,15 +1717,64 @@ mod tests {
 
     #[test]
     fn amount_malformed_input_field_holds_the_raw_input() {
-        // Regression guard: the AmountMalformed.input field must carry the
-        // full raw input (not just the numeric portion) so callers rendering
-        // error messages see what the user actually typed.
-        let result = StellarAmount::parse_with_unit("abc XLM");
-        match result {
-            Err(ValidationError::AmountMalformed { input }) => {
-                assert_eq!(input, "abc XLM", "input should be the raw full string");
+        for raw in [
+            "abc XLM",
+            "1 000 xlm",
+            "+1 xlm",
+            "1.2.3 xlm",
+            " 1 000 xlm ",
+            " +1 xlm ",
+            " 1.2.3 xlm ",
+            " ",
+            " abc ",
+        ] {
+            let error = StellarAmount::parse_with_unit(raw).unwrap_err();
+            assert!(matches!(&error, ValidationError::AmountMalformed { input } if input == raw));
+            assert_eq!(
+                error.to_string(),
+                format!("amount '{raw}' could not be parsed as a valid amount")
+            );
+            let error =
+                serde_json::from_value::<McpAmountArgument>(serde_json::json!(raw)).unwrap_err();
+            assert!(error.to_string().contains(&format!(
+                "amount '{raw}' could not be parsed as a valid amount"
+            )));
+        }
+    }
+
+    #[test]
+    fn amount_errors_preserve_untrimmed_input() {
+        for (raw, expected_code) in [
+            (" 0.00000001 xlm ", "validation.amount_precision_exceeded"),
+            (
+                " 99999999999999999999 xlm ",
+                "validation.amount_out_of_range",
+            ),
+            (" 10 usdc ", "validation.amount_malformed"),
+        ] {
+            let error = StellarAmount::parse_with_unit(raw).unwrap_err();
+            assert_eq!(error.code(), expected_code);
+            assert!(error.to_string().contains(&format!("'{raw}'")));
+            match &error {
+                ValidationError::AmountPrecisionExceeded { amount }
+                | ValidationError::AmountOutOfRange { amount } => assert_eq!(amount, raw),
+                ValidationError::AmountUnitMismatch { input, .. } => assert_eq!(input, raw),
+                other => panic!("unexpected error: {other}"),
             }
-            other => panic!("expected AmountMalformed, got {other:?}"),
+            let error =
+                serde_json::from_value::<McpAmountArgument>(serde_json::json!(raw)).unwrap_err();
+            assert!(error.to_string().contains(&format!("'{raw}'")));
+        }
+        for raw in ["10 usdc", " 10 usdc "] {
+            let error = StellarAmount::parse_with_unit_for(raw, "USDC").unwrap_err();
+            assert!(
+                matches!(&error, ValidationError::AmountUnitMismatch { input, supplied, expected }
+                if input == raw && supplied == "usdc" && expected == "USDC")
+            );
+        }
+        for raw in [" 1 000 USDC ", " +1 USDC ", " 1.2.3 USDC "] {
+            let error = StellarAmount::parse_with_unit_for(raw, "USDC").unwrap_err();
+            assert!(matches!(&error, ValidationError::AmountMalformed { input } if input == raw));
         }
     }
 
@@ -1672,13 +1805,16 @@ mod tests {
 
     #[test]
     fn wrong_unit_is_malformed() {
-        for input in &["100 BTC", "100 USDC", "100 EUR"] {
+        for unit in ["BTC", "USDC", "EUR"] {
+            let error = StellarAmount::parse_with_unit(&format!("100 {unit}")).unwrap_err();
+            assert_eq!(error.code(), "validation.amount_malformed");
             assert!(
                 matches!(
-                    StellarAmount::parse_with_unit(input),
-                    Err(ValidationError::AmountMalformed { .. }),
+                    &error,
+                    ValidationError::AmountUnitMismatch { input, expected, supplied }
+                        if input == &format!("100 {unit}") && expected == "XLM" && supplied == unit
                 ),
-                "expected AmountMalformed for '{input}'"
+                "{error}"
             );
         }
     }

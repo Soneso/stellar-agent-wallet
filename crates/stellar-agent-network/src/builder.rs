@@ -88,6 +88,16 @@ pub enum Asset {
 }
 
 impl Asset {
+    /// Parses a human amount using the canonical asset's unit rules.
+    ///
+    /// Native `XLM` labels are case-insensitive; issued asset codes match exactly.
+    ///
+    /// # Errors
+    /// Returns [`WalletError::Validation`] for an invalid asset or amount.
+    pub fn parse_amount(&self, input: &str) -> Result<StellarAmount, WalletError> {
+        self.to_canonical()?.parse_amount(input).map_err(Into::into)
+    }
+
     /// Converts this asset to the canonical identity used by cross-checks.
     ///
     /// # Errors

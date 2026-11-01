@@ -675,8 +675,8 @@ Signer source (one of the following, mutually exclusive):
 Other common flags:
 
 - `<DESTINATION>` (positional), destination account G-strkey (required).
-- `<AMOUNT>` (positional), amount with units, for example `"10 XLM"` or
-  `"10.5 USDC"`.
+- `<AMOUNT>` (positional), `"10 XLM"` for native or the exact, case-sensitive
+  asset code for issued assets, such as `"10.5 USDC"` with `USDC:<issuer>`.
 - `[ASSET]` (positional), `native`, `XLM`, or `CODE:ISSUER_GSTRKEY`; defaults to
   `native`.
 - `--source <G_STRKEY>`: source account; required for signing.
