@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at the primary endpoint. It also names the commands that read
   `classic_fee_per_op_stroops`.
 
+### Security
+
+- `follow-redirects` 1.16.1 to 1.16.2 in the MPP and `@stellar/stellar-sdk`
+  17 interoperability harnesses, which resolves one advisory.
+  GHSA-mrwp-f3q8-3g9p affects `follow-redirects` before 1.16.2. The
+  harnesses compare the wallet's fixtures with the released JavaScript SDKs
+  in CI, and no wallet crate depends on them.
+
 ## [0.1.0-alpha.13] - 2026-10-31
 
 The `approval_above` policy criterion requests approval above a per-payment threshold, and `profile halt` and `profile resume` stop and restore the actions of one profile that sign or submit. Value-moving submits can cross-check a witness from an independent RPC endpoint before signing, and the audit log's settlement and receipt-clear lookups report a history they cannot read or verify. A V1 policy signed by an earlier release needs a new signature when its rules carry `reason`, `ttl_secs` or `allow_opaque_signing`. Dependency updates resolve five RustSec advisories in the wallet crates and eight advisories in the JavaScript test harnesses. This release had internal review only; no external security audit has taken place.
