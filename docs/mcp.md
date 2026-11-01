@@ -260,6 +260,51 @@ Notes:
 After the client connects it issues an MCP `initialize`, then `tools/list` and
 `resources/list`. The tool catalog below is what `tools/list` returns.
 
+### Manual JSON-RPC requests
+
+Send newline-delimited JSON-RPC messages to the server's stdio input. MCP clients
+usually initialize the connection automatically. For a manual session, send
+`initialize` first, then the `notifications/initialized` notification. Replace
+each placeholder with a value from the selected profile or an earlier response.
+Use a funded testnet account for payment calls. The selected profile needs
+populated signer, nonce-key and audit chain key entries in the keyring, and the
+signer must match the payment source. Amounts are strings with a unit:
+`"10 XLM"` for native, or the exact, case-sensitive asset code for an issued
+asset, such as `"10.5 USDC"` with `USDC:<issuer>`.
+
+Initialize the connection:
+
+```json
+{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "manual-client", "version": "1.0.0"}}}
+```
+
+After the initialize response, send this notification:
+
+```json
+{"jsonrpc": "2.0", "method": "notifications/initialized"}
+```
+
+Then send these five tool requests, one per line and one at a time:
+
+```json
+{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "stellar_balances", "arguments": {"chain_id": "stellar:testnet", "account_id": "<G-strkey-account>"}}}
+{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "stellar_friendbot", "arguments": {"chain_id": "stellar:testnet", "account_id": "<testnet-account-to-fund>"}}}
+{"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "stellar_pay", "arguments": {"chain_id": "stellar:testnet", "source": "<funded-source-G-strkey>", "destination": "<destination-G-strkey>", "amount": "10 XLM", "asset": "native"}}}
+{"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "stellar_pay_commit", "arguments": {"chain_id": "stellar:testnet", "source": "<same-source>", "destination": "<same-destination>", "amount": "10 XLM", "asset": "native", "nonce": "<nonce-from-stellar_pay>", "expires_at_unix_ms": 1893456000000, "envelope_xdr": "<envelope_xdr-from-stellar_pay>"}}}
+{"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "stellar_transaction_status", "arguments": {"chain_id": "stellar:testnet", "tx_hash": "<64-lowercase-hex-transaction-hash>"}}}
+```
+
+The commit request needs values from the simulation response, and the status
+request needs the transaction hash from the commit response. Use the same
+payment arguments in `stellar_pay` and `stellar_pay_commit`. Copy
+`nonce`, `expires_at_unix_ms`, and `envelope_xdr` unchanged from the simulation
+response; replace the example expiry with its returned integer. The commit call
+signs and submits the payment. When policy requires operator approval, the
+simulation response carries `approval_nonce` in its `approval` object. The
+operator runs `stellar-agent approve --id <approval_nonce> --profile <name>` as
+the same local user as the server. The commit request then carries that nonce
+and the `approval_attestation` the approval returned.
+
 ## Resources
 
 The server exposes three MCP resources. None contains a secret.
