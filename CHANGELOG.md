@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The agents guide explains shell access, approval authority, and Claude Code
   permission modes. The wallet skill routes agent payments through MCP and
   identifies CLI signing exceptions and operator ceremonies.
+- The profile and governance reference states when an MCP server holds the
+  audit writer that `profile reset-window-state` needs. The concepts page
+  documents the `rate_limit` criterion with its fields, its shared count per
+  profile and window, and when a call counts and stops counting. The security
+  internals page states the same shared count and counting. The concepts and
+  profiles pages name the code each surface reports when the policy fails its
+  initial load or its reload before the send. The profiles page names the codes
+  for a native key in `[cross_check_thresholds]` and for a failed read or send
+  at the primary endpoint. It also names the commands that read
+  `classic_fee_per_op_stroops`.
 
 ## [0.1.0-alpha.13] - 2026-10-31
 

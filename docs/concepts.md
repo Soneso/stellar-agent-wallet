@@ -130,7 +130,13 @@ profile with `policy.engine_required`, and on mainnet it refuses earlier with
 
 The V1 engine evaluates a signed policy document against typed Criteria. The document carries an ed25519 owner signature over its canonical form, produced with `profile sign-policy` and verified against the owner public key enrolled with `profile enroll-owner-key`; an invalid signature, or a signature from a key that was re-enrolled after signing, is rejected. The online agent holds only the owner public key. The seed stays with the operator and is supplied to `sign-policy` at sign time.
 
-The signature covers every key the loader reads except the `[signature]` table itself. These are `version`, `scope`, and each rule's `match`, `criteria`, and `decision`, plus `reason`, `ttl_secs`, and `allow_opaque_signing` when the rule carries them. Each level of the file accepts a closed set of keys, and each criterion kind has its own set. The loader refuses any other key with `policy.policy_file_parse_failed`, naming the key and its location, before it checks the signature.
+The signature covers every key the loader reads except the `[signature]` table itself. These are `version`, `scope`, and each rule's `match`, `criteria`, and `decision`, plus `reason`, `ttl_secs`, and `allow_opaque_signing` when the rule carries them. Each level of the file accepts a closed set of keys, and each criterion kind has its own set. The loader refuses any other key, naming the key and its location, before it checks the signature.
+CLI `pay`, `claim`, `accounts create`, `vault`, `trade`, and `smart-account multicall` report a policy that fails its initial load as `policy.engine_unavailable`.
+The message carries the loader's detail.
+On that load, `trustline` reports `trustline.policy_engine_unavailable`, and `mpp charge` reports `mpp.state_unavailable`.
+The MCP server does not start and logs the loader's detail.
+CLI `pay`, `claim`, sponsored `accounts create`, `vault`, `trade`, and `trustline` load the policy again to record the submission before the send.
+`trustline` reports a failure of that reload as `trustline.submit_failed`, and the others as `submission.record_unavailable`.
 
 Evaluation is **first-match, default-deny**:
 
@@ -165,8 +171,9 @@ approval above it. It uses `asset` and `max_stroops`, with the same units and
 asset matching as `per_tx_cap`. One XLM is 10,000,000 stroops.
 The threshold must be positive and the rule's decision must be `allow`.
 The threshold must be below every `per_tx_cap` on the same asset
-in that rule. Invalid decisions or bounds produce
-`policy.policy_file_parse_failed`, naming the criterion and conflicting bounds.
+in that rule. Invalid decisions or bounds fail the policy load, and the
+loader's detail names the criterion and conflicting bounds. `profile sign-policy`
+refuses such a body with `sign_policy.policy_body_invalid`.
 
 The commit tool's rule is binding, so the example carries the criterion on both pay tools.
 The threshold applies to its configured asset.
@@ -201,6 +208,39 @@ The MCP payment tool stores the pending request with a reason naming
 `approval_above` and its threshold. Operators approve through the CLI approvals
 commands, terminal, inbox, or remote approver. The CLI `pay` command returns
 `policy.approval_required` and directs the caller to MCP.
+
+`rate_limit` caps how many counted calls a rolling window holds:
+
+```toml
+criteria = [{ kind = "rate_limit", window = "1h", max_calls = 10 }]
+```
+
+`window` is `1m`, `5m`, `1h`, `1d`, or `1w`. `max_calls` is a non-negative
+integer within the `u32` range. A call is denied with
+`policy.deny.rate_limit_exceeded` when the window already holds `max_calls`
+counted calls.
+A submission counts when the wallet reserves it immediately before the send.
+An x402 or MPP payment counts when the wallet records its authorization, before
+it signs.
+The policy gate only reads the count, so simulations and read-only calls do not
+count.
+A call refused before its submission is reserved or its authorization is
+recorded does not count either.
+A recorded x402 or MPP authorization stays counted when a later step fails,
+such as signing or delivering the credential.
+For x402 that includes a refused endpoint identity check.
+A submission that fails on chain or is refused at the send stops counting.
+One without a confirmed outcome counts until reconciliation settles it or an
+operator clears its receipt with `tx receipt clear`.
+A confirmed submission leaves the window measured from the close time of the
+ledger that applied it.
+Without a usable close time in the confirmation, the reservation stays pending
+and keeps counting.
+The count is kept per profile and window, in the profile's window-state store.
+Every `rate_limit` and `bundle_rate_limit` criterion of the profile with the
+same window reads one shared count, whichever rule carries it.
+Each criterion compares that shared count against its own `max_calls`.
+`bundle_rate_limit` counts each inner call of a multicall bundle.
 
 Value criteria size a call through a typed value descriptor derived at the dispatch gate. A rule matching a value-moving tool constrains every debit leg, and per-asset caps aggregate across legs. A matched call whose value cannot be sized (including raw signing tools) denies fail-closed with `policy.deny.unsizable_value_effect` unless the rule sets `allow_opaque_signing = true`. `minimum_reserve` counts only native-XLM outflow legs. MCP pay/create-account/trustline/claim commits and CLI `pay` and `claim` with `--sign-only` or `--submit-only` include envelope fees in `minimum_reserve`. A debit leaving only reserve plus margin refuses `policy.deny.minimum_reserve_breached`. Full CLI pipelines, `--build-only`, and MCP simulations count no fee. Cap amounts are i128 and cross the wire as decimal strings.
 

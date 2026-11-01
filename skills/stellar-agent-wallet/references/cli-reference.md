@@ -656,7 +656,9 @@ It is also unverifiable without a usable key: an absent key, a key that is not
 valid base64, or a key that is not 32 bytes. The reset replaces such a key after
 the row. A store file that exists but cannot be read refuses before the row.
 
-A running MCP server holds the audit writer. Reset then refuses with
+An MCP server acquires the profile's audit writer at the first operation that
+needs it, such as a commit preflight. It normally holds the writer until the
+server exits. While a server holds it, reset refuses with
 `audit.chain_key_unavailable` and the message sub-code `audit.writer_locked`.
 An append failure also refuses with its audit code, leaving the window file,
 key and generation untouched. A first-use key mint is recorded through the held

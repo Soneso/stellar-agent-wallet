@@ -198,7 +198,7 @@ secret.
 |-------|------|----------|---------|-------------|
 | `cross_check_threshold_stroops` | integer | no | `0` | Native threshold; see below. |
 | `[cross_check_thresholds]` | table | no | empty | Asset thresholds; testnet-only overlay. |
-| `classic_fee_per_op_stroops` | integer | no | unset (protocol default) | Per-operation base fee for classic transactions, in stroops. When unset, classic tools use the built-in default. |
+| `classic_fee_per_op_stroops` | integer | no | unset (`100`) | Per-operation fee, in stroops, when no fee is passed. MCP `stellar_pay`, `stellar_create_account`, and `stellar_trustline` use it without `classic_base`. MCP `stellar_claim` takes no `classic_base` and always uses it. CLI `trustline` uses it without `--fee`, and `pool init` uses it. CLI `pay`, `claim`, and sponsored `accounts create` do not read it and use their command default of 100. When unset, the readers use 100. |
 | `classic_max_fee_per_op_stroops` | integer | mainnet, at action time | unset (no cap) | Per-operation fee cap, in stroops; see below. |
 | `submit_timeout_seconds` | integer | no | `60` | How long the wallet polls for transaction confirmation. |
 
@@ -243,6 +243,7 @@ names across the file, environment, or CLI sources refuses as a duplicate field.
 `[cross_check_thresholds]` sets per-asset thresholds in base units. Keys are
 case-sensitive `CODE:ISSUER` identities or canonical contract addresses (`C...`).
 Native aliases, including `native` and `xlm` in any case, are refused.
+CLI `pay`, `claim`, and `accounts create` report the refusal as `profile.load_failed`, and `profile show` as `validation.config_invalid`.
 Use `cross_check_threshold_stroops` for native XLM and its SAC.
 A classic key also covers its Stellar Asset Contract on the profile's network.
 Naming both identities for one asset refuses the load.
@@ -402,6 +403,12 @@ A missing entry reports `auth.keyring_not_found` naming `service/account`.
 A stored value that is empty, longer than 1024 bytes, or holds a control character reports `network.rpc_credential_refused`.
 An endpoint that answers a request with HTTP 401 or 403 reports the same code.
 That request is not retried.
+The network layer reports a JSON-RPC error object from the primary endpoint as `network.rpc_unreachable` on a read before a submission is recorded.
+A command or tool that wraps such a read reports its own code instead, for example `trustline.source_account_fetch_failed` for the source account read of CLI `trustline`.
+On the endpoint identity check the network layer reports `network.endpoint_identity_unavailable`, and from the oracle `network.witness_unavailable`.
+The network layer reports a recorded send whose outcome it cannot determine as `submission.tx_timeout`.
+The confirmation poll retries a JSON-RPC error until the submit timeout, which reports the same code.
+The network layer reports a server hash that differs from the local one as `submission.hash_mismatch`.
 The client removes the stored value and the form it sends from every error text it returns, before it shortens URLs to host and port.
 A key the endpoint re-encodes, truncates, or splits is not caught.
 
