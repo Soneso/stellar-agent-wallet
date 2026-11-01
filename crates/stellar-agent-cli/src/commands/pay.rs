@@ -311,8 +311,9 @@ pub struct PayArgs {
     pub destination: String,
 
     /// Amount to send with explicit units, e.g. `"10 XLM"` or `"10.0000000 XLM"`.
-    /// For non-native assets: `"10.5 USDC"` etc. Raw stroop numeric strings
-    /// are not accepted; use `"0.0000001 XLM"` for the minimum unit.
+    /// The unit is `XLM` for native and the asset code of `ASSET` for an issued
+    /// asset, for example `"10.5 USDC"` with `USDC:<issuer>`.
+    /// Raw stroop numeric strings are not accepted.
     #[arg(value_name = "AMOUNT")]
     pub amount: String,
 
@@ -1265,6 +1266,14 @@ where
         return 1;
     }
 
+    let (asset, amount) = match parse_asset_and_amount(args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            print_error(&Envelope::<()>::err(&error), args.output);
+            return 1;
+        }
+    };
+
     // ── Unconditionally attempt to initialise the platform keyring ────────────
     // Unconditional (see `init_keyring_for_origin`'s rustdoc). The
     // origin-aware audit pre-flight below reads the profile's audit chain-root
@@ -1307,8 +1316,9 @@ where
     };
     // The endpoint check precedes the reconcile, the first request whose
     // answer shapes the policy decision; the same client carries the build
-    // reads and the send. The reconcile settles reservations whatever the
-    // build arguments say, so the `--source` and `--fee` checks follow it.
+    // reads and the send. The asset and amount refuse before any request. The
+    // reconcile settles reservations whatever `--fee` says, so the `--fee`
+    // check follows it.
     let client = match checked_client(context, args).await {
         Ok(client) => client,
         Err(e) => {
@@ -1326,7 +1336,7 @@ where
     .await;
 
     // 1. Build (includes SEP-29 check).
-    let built = match build_inputs(args) {
+    let built = match build_inputs(args, asset, amount) {
         Ok(inputs) => build_unsigned_envelope(&client, context, args, inputs).await,
         Err(e) => Err(e),
     };
@@ -1470,13 +1480,17 @@ where
 // Build helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The build arguments a stage checks before its first request.
-#[derive(Debug, Clone, Copy)]
+/// The parsed arguments needed to build a payment.
+#[derive(Debug)]
 struct BuildInputs<'a> {
     /// The `--source` account.
     source: &'a str,
     /// The parsed `--fee` choice.
     fee_choice: ClassicFeeChoice,
+    /// The parsed payment asset.
+    asset: Asset,
+    /// The amount validated against the asset's unit.
+    amount: StellarAmount,
 }
 
 /// Checks the build arguments that need no request: `--source` is present and
@@ -1486,14 +1500,23 @@ struct BuildInputs<'a> {
 ///
 /// Returns `validation.address_invalid` when `--source` is absent, or the
 /// refusal of [`parse_classic_fee_choice`].
-fn build_inputs(args: &PayArgs) -> Result<BuildInputs<'_>, WalletError> {
+fn build_inputs(
+    args: &PayArgs,
+    asset: Asset,
+    amount: StellarAmount,
+) -> Result<BuildInputs<'_>, WalletError> {
     let source = args.source.as_deref().ok_or_else(|| {
         WalletError::Validation(stellar_agent_core::error::ValidationError::AddressInvalid {
             input: "--source is required for building a transaction".to_owned(),
         })
     })?;
     let fee_choice = parse_classic_fee_choice(args.fee.as_deref())?;
-    Ok(BuildInputs { source, fee_choice })
+    Ok(BuildInputs {
+        source,
+        fee_choice,
+        asset,
+        amount,
+    })
 }
 
 /// Builds the client a stage reads and sends through, and checks that its
@@ -1521,14 +1544,31 @@ async fn checked_client(
 ///
 /// # Errors
 ///
-/// Returns the refusal of [`build_inputs`] or of [`checked_client`].
+/// Returns the refusal of [`parse_asset_and_amount`], [`build_inputs`], or [`checked_client`].
 async fn checked_client_and_build_inputs<'a>(
     context: &NetworkContext,
     args: &'a PayArgs,
 ) -> Result<(StellarRpcClient, BuildInputs<'a>), WalletError> {
-    let inputs = build_inputs(args)?;
+    let (asset, amount) = parse_asset_and_amount(args)?;
+    let inputs = build_inputs(args, asset, amount)?;
     let client = checked_client(context, args).await?;
     Ok((client, inputs))
+}
+
+/// Parses the asset and its human amount before constructing the payment.
+fn parse_asset_and_amount(args: &PayArgs) -> Result<(Asset, StellarAmount), WalletError> {
+    let asset = Asset::parse(&args.asset)?;
+    // Keep the detailed unit refusal; other amount failures use the CLI's
+    // malformed-amount response with the supplied input.
+    let amount = asset
+        .parse_amount(&args.amount)
+        .map_err(|error| match error {
+            WalletError::Validation(ValidationError::AmountUnitMismatch { .. }) => error,
+            _ => WalletError::Validation(ValidationError::AmountMalformed {
+                input: args.amount.clone(),
+            }),
+        })?;
+    Ok((asset, amount))
 }
 
 /// Constructs and returns the unsigned transaction envelope XDR.
@@ -1542,7 +1582,12 @@ async fn build_unsigned_envelope(
     args: &PayArgs,
     inputs: BuildInputs<'_>,
 ) -> Result<BuiltPaymentEnvelope, WalletError> {
-    let BuildInputs { source, fee_choice } = inputs;
+    let BuildInputs {
+        source,
+        fee_choice,
+        asset,
+        amount,
+    } = inputs;
     let fee_selection =
         resolve_classic_fee_selection(client, DEFAULT_FEE_STROOPS, fee_choice).await?;
 
@@ -1554,19 +1599,6 @@ async fn build_unsigned_envelope(
     // calls `Account::increment_sequence_number` internally. An explicit +1
     // here would produce CURRENT+2 → TxBadSeq.
     let sequence_number = source_account.sequence_number;
-
-    // Boundary discipline: parse_with_unit is the only permitted parser for
-    // human-supplied amounts at CLI boundaries. Raw stroop numeric strings are
-    // explicitly rejected to enforce unit discipline. If stroop-level input is
-    // required in the future, add a dedicated `--amount-in-stroops` flag.
-    let amount = StellarAmount::parse_with_unit(&args.amount).map_err(|_| {
-        WalletError::Validation(ValidationError::AmountMalformed {
-            input: args.amount.clone(),
-        })
-    })?;
-
-    // Parse asset.
-    let asset = Asset::parse(&args.asset)?;
 
     // Parse memo.
     let memo = parse_memo(args)?;
@@ -2168,7 +2200,8 @@ mod tests {
         args: &PayArgs,
     ) -> Result<BuiltPaymentEnvelope, WalletError> {
         let client = StellarRpcClient::new(&context.rpc_url)?;
-        build_unsigned_envelope(&client, context, args, build_inputs(args)?).await
+        let (asset, amount) = parse_asset_and_amount(args)?;
+        build_unsigned_envelope(&client, context, args, build_inputs(args, asset, amount)?).await
     }
 
     async fn mount_pay_build_rpc(p95: &str) -> MockServer {
@@ -2674,6 +2707,76 @@ mod tests {
         assert!(
             ignored.received_requests().await.unwrap().is_empty(),
             "the args endpoint must remain unused"
+        );
+    }
+
+    #[test]
+    fn pay_issued_amount_builds_matching_asset_and_quantity() {
+        use stellar_agent_core::envelope_decode::decode_authoritative_args;
+
+        let descriptor = format!("TST:{DEST_G}");
+        let args = try_parse_pay(&[
+            "pay",
+            DEST_G,
+            "100 TST",
+            &descriptor,
+            "--source",
+            SOURCE_G,
+            "--build-only",
+        ])
+        .expect("documented issued payment form parses");
+        let (asset, amount) = parse_asset_and_amount(&args).expect("matching asset unit");
+        let context = flag_context(&args);
+        let mut builder = ClassicOpBuilder::new(SOURCE_G, 100, context.network_passphrase(), 100);
+        builder.payment(DEST_G, amount, &asset).unwrap();
+        let envelope = builder.build().unwrap();
+        let decoded = decode_authoritative_args(&envelope, "stellar_pay_commit").unwrap();
+        assert_eq!(decoded["asset"], descriptor);
+        assert_eq!(decoded["amount_stroops"], "1000000000");
+    }
+
+    #[test]
+    fn pay_issued_amount_refuses_wrong_unit() {
+        let mut args = minimal_args();
+        args.asset = format!("TST:{DEST_G}");
+        for unit in ["XLM", "tst"] {
+            args.amount = format!("100 {unit}");
+            let error = parse_asset_and_amount(&args).unwrap_err();
+            assert_eq!(error.code(), "validation.amount_malformed");
+            assert_eq!(
+                error.to_string(),
+                format!("amount '100 {unit}' has unit '{unit}'; expected unit 'TST'")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pay_issued_amount_reaches_build_pipeline() {
+        let server = mount_pay_build_rpc("333").await;
+        let mut args = minimal_args();
+        args.source = Some(SOURCE_G.to_owned());
+        args.destination = DEST_G.to_owned();
+        args.asset = format!("TST:{DEST_G}");
+        args.amount = "100 TST".to_owned();
+        args.rpc_url = Some(server.uri());
+        let built = build_with_client(&flag_context(&args), &args)
+            .await
+            .unwrap();
+        let decoded = stellar_agent_core::envelope_decode::decode_authoritative_args(
+            &built.envelope_xdr,
+            "stellar_pay_commit",
+        )
+        .unwrap();
+        assert_eq!(decoded["asset"], args.asset);
+        assert_eq!(decoded["amount_stroops"], "1000000000");
+        args.amount = "100 XLM".to_owned();
+        let error = build_with_client(&flag_context(&args), &args)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "validation.amount_malformed");
+        assert_eq!(
+            error.to_string(),
+            "amount '100 XLM' has unit 'XLM'; expected unit 'TST'"
         );
     }
 
@@ -3875,7 +3978,7 @@ mod tests {
 
         fn credit(args: &mut PayArgs) {
             args.asset = format!("USD:{ISSUER}");
-            args.amount = "5 XLM".to_owned();
+            args.amount = "5 USD".to_owned();
         }
 
         /// The source's USD trustline as the primary reports it.
@@ -4114,9 +4217,9 @@ mod tests {
         #[serial_test::serial]
         async fn full_witness_values_the_send_leg() {
             for (amount, expected, var) in [
-                ("5 XLM", "passed", "PAY_WITNESS_FULL_VALUE_AT_SK"),
+                ("5 USD", "passed", "PAY_WITNESS_FULL_VALUE_AT_SK"),
                 (
-                    "4.9999999 XLM",
+                    "4.9999999 USD",
                     "not_required",
                     "PAY_WITNESS_FULL_VALUE_BELOW_SK",
                 ),

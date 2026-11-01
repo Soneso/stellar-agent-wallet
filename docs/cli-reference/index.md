@@ -139,7 +139,7 @@ Read-only commands, `pay --build-only`, `claim --build-only`, `smart-account mig
 
 `pay`, `claim`, sponsored `accounts create`, `trustline`, and `pool init` read the values they sign or gate on through one client per run. That client asks the endpoint which network it serves before its first such request. The requests it precedes include the fee statistics, the account sequence, the claim entry, the policy views, and the reservation reconcile. Every later read and the send use the same client, and the submit layer checks it again before the send. The refusals carry the codes of [Submit-layer network binding](#submit-layer-network-binding).
 
-- The full pipeline and `--submit-only` check before the reservation reconcile. The full `pay` pipeline checks `--source` and `--fee` after the reconcile.
+- The full pipeline and `--submit-only` check before the reservation reconcile. The full payment pipeline validates the asset and amount before endpoint identity and reservation reconciliation. Fee validation follows reconciliation.
 - `--build-only` checks before the fee and sequence reads.
 - `--sign-only` checks before the account reads of an envelope it decodes. It signs an envelope it cannot decode without any request.
 - `pool init --resume` makes no request when the profile already holds the pool or the checkpoint records its completion. Every other resume checks before its first read, whether or not it sends.

@@ -9,6 +9,9 @@ use stellar_xdr::{
     HashIdPreimage, HashIdPreimageContractId, Limits, PublicKey, Uint256, WriteXdr,
 };
 
+use crate::amount::StellarAmount;
+use crate::error::ValidationError;
+
 /// A native asset, classic asset, or token contract, preserving asset-code case.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CanonicalAsset {
@@ -48,6 +51,24 @@ pub enum AssetIdError {
 }
 
 impl CanonicalAsset {
+    /// Parses a human amount using this asset's unit.
+    ///
+    /// Native `XLM` labels are case-insensitive for compatibility. Issued asset
+    /// codes match exactly because Stellar asset codes are case-sensitive.
+    ///
+    /// # Errors
+    /// Returns the amount parser's validation error, or
+    /// [`ValidationError::AssetInvalid`] for a contract without a classic unit.
+    pub fn parse_amount(&self, input: &str) -> Result<StellarAmount, ValidationError> {
+        match self {
+            Self::Native => StellarAmount::parse_with_unit(input),
+            Self::Classic { code, .. } => StellarAmount::parse_with_unit_for(input, code),
+            Self::Contract(_) => Err(ValidationError::AssetInvalid {
+                input: self.to_string(),
+            }),
+        }
+    }
+
     /// Parses a classic identity without trimming or changing code case.
     ///
     /// # Errors
@@ -168,6 +189,44 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test assertions")]
     use super::*;
     use crate::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
+
+    #[test]
+    fn amount_units_follow_canonical_asset() {
+        for unit in ["XLM", "xlm", "Xlm"] {
+            assert_eq!(
+                CanonicalAsset::Native
+                    .parse_amount(&format!("100 {unit}"))
+                    .unwrap()
+                    .as_stroops(),
+                1_000_000_000
+            );
+        }
+        let issuer = stellar_strkey::ed25519::PublicKey([7; 32]).to_string();
+        for code in ["TST", "tst", "XLM"] {
+            let asset = CanonicalAsset::classic(code, &issuer).unwrap();
+            assert_eq!(
+                asset
+                    .parse_amount(&format!("100 {code}"))
+                    .unwrap()
+                    .as_stroops(),
+                1_000_000_000
+            );
+            let supplied = if code == "tst" { "TST" } else { "xlm" };
+            let error = asset.parse_amount(&format!("100 {supplied}")).unwrap_err();
+            assert_eq!(error.code(), "validation.amount_malformed");
+            assert_eq!(
+                error.to_string(),
+                format!("amount '100 {supplied}' has unit '{supplied}'; expected unit '{code}'")
+            );
+        }
+        let contract = stellar_strkey::Contract([7; 32]).to_string();
+        assert!(matches!(
+            CanonicalAsset::contract(&contract)
+                .unwrap()
+                .parse_amount("100 XLM"),
+            Err(ValidationError::AssetInvalid { .. })
+        ));
+    }
 
     #[test]
     fn native_sac_known_answer() {

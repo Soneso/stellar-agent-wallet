@@ -798,6 +798,17 @@ pub enum ValidationError {
         input: String,
     },
 
+    /// An amount label differs from the unit required by its asset.
+    #[error("amount '{input}' has unit '{supplied}'; expected unit '{expected}'")]
+    AmountUnitMismatch {
+        /// The supplied amount string.
+        input: String,
+        /// The unit required by the parsed asset.
+        expected: String,
+        /// The unit supplied with the amount.
+        supplied: String,
+    },
+
     /// An amount is outside the representable `i64` stroop range.
     ///
     /// Reserved for **parse-level overflow** only — i.e. the numeric value
@@ -1666,7 +1677,9 @@ impl ValidationError {
             Self::AddressInvalid { .. } => "validation.address_invalid",
             Self::AssetInvalid { .. } => "validation.asset_invalid",
             Self::ProfileNotFound { .. } => "validation.profile_not_found",
-            Self::AmountMalformed { .. } => "validation.amount_malformed",
+            Self::AmountMalformed { .. } | Self::AmountUnitMismatch { .. } => {
+                "validation.amount_malformed"
+            }
             Self::AmountOutOfRange { .. } => "validation.amount_out_of_range",
             Self::OutputFormatInvalid { .. } => "validation.output_format_invalid",
             Self::InvalidPluginName { .. } => "validation.invalid_plugin_name",
@@ -3212,6 +3225,14 @@ mod tests {
                 "validation.amount_malformed",
             ),
             (
+                ValidationError::AmountUnitMismatch {
+                    input: "100 XLM".to_owned(),
+                    expected: "TST".to_owned(),
+                    supplied: "XLM".to_owned(),
+                },
+                "validation.amount_malformed",
+            ),
+            (
                 ValidationError::AmountOutOfRange {
                     amount: "99999999999999999999".to_owned(),
                 },
@@ -3506,6 +3527,15 @@ mod tests {
                 }
                 ValidationError::AmountMalformed { input } => ValidationError::AmountMalformed {
                     input: input.clone(),
+                },
+                ValidationError::AmountUnitMismatch {
+                    input,
+                    expected,
+                    supplied,
+                } => ValidationError::AmountUnitMismatch {
+                    input: input.clone(),
+                    expected: expected.clone(),
+                    supplied: supplied.clone(),
                 },
                 ValidationError::AmountOutOfRange { amount } => ValidationError::AmountOutOfRange {
                     amount: amount.clone(),

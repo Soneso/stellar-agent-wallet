@@ -17,10 +17,9 @@
 //! For `stellar_pay` / `stellar_pay_commit`: reads `args["amount_stroops"]`
 //! (a decimal string; a legacy JSON number is tolerated for version-crossing)
 //! and `args["asset"]` (e.g. `"native"` or `"CODE:Gissuer"`). Falls back to
-//! the legacy `args["amount"]` (a `"N.NNNNNNN XLM"` string) only when
-//! `amount_stroops` is absent — every args shape this criterion actually
-//! receives in production (simulate-time `args_value` and commit-time
-//! `authoritative_args`) carries `amount_stroops`.
+//! the legacy `args["amount"]` (a decimal with the asset's unit) only when
+//! `amount_stroops` is absent. Production simulate-time `args_value` and
+//! commit-time `authoritative_args` carry `amount_stroops`.
 //!
 //! For `stellar_create_account` / `stellar_create_account_commit`: reads
 //! `args["starting_balance_stroops"]` the same way (falling back to the
@@ -300,7 +299,7 @@ mod tests {
         // Cap is configured for "native" but payment is in USDC.
         let criterion = PerTxCapCriterion::new("native".into(), 1_000_000_000);
         let args = json!({
-            "amount": "50 XLM",
+            "amount": "50 USDC",
             "asset": "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
         });
         let ctx = make_ctx(&tool, &profile, &args, &store);

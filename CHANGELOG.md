@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   harnesses compare the wallet's fixtures with the released JavaScript SDKs
   in CI, and no wallet crate depends on them.
 
+### Fixed
+
+- CLI `pay`, `stellar_pay` and `stellar_pay_commit` accept the asset code as the
+  amount unit for an issued asset and refuse any other label. The documented
+  form `"100 TST"` with `TST:<issuer>` works.
+
 ## [0.1.0-alpha.13] - 2026-10-31
 
 The `approval_above` policy criterion requests approval above a per-payment threshold, and `profile halt` and `profile resume` stop and restore the actions of one profile that sign or submit. Value-moving submits can cross-check a witness from an independent RPC endpoint before signing, and the audit log's settlement and receipt-clear lookups report a history they cannot read or verify. A V1 policy signed by an earlier release needs a new signature when its rules carry `reason`, `ttl_secs` or `allow_opaque_signing`. Dependency updates resolve five RustSec advisories in the wallet crates and eight advisories in the JavaScript test harnesses. This release had internal review only; no external security audit has taken place.

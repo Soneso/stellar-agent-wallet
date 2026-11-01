@@ -468,7 +468,7 @@ fn checked_site_invocations(rpc_url: &str) -> Vec<(&'static str, Vec<String>)> {
             owned(&[
                 "pay",
                 ACCOUNT_G,
-                "1",
+                "1 XLM",
                 "--profile",
                 PROFILE,
                 "--source",
@@ -1066,7 +1066,7 @@ fn an_operator_ceremony_and_read_only_verbs_work_while_halted() {
     let build_only = f.run(&[
         "pay",
         ACCOUNT_G,
-        "1",
+        "1 XLM",
         "--profile",
         PROFILE,
         "--build-only",

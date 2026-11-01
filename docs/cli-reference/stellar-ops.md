@@ -222,7 +222,7 @@ Argument groups (enforced by the parser):
 | Flag / arg | Meaning | Required | Default |
 |---|---|---|---|
 | `<DESTINATION>` (positional) | Destination account G-strkey | yes | none |
-| `<AMOUNT>` (positional) | Amount with explicit units, e.g. `"10 XLM"`, `"10.5 USDC"` (raw stroop strings rejected) | yes | none |
+| `<AMOUNT>` (positional) | Use `"10 XLM"` for native or the exact, case-sensitive asset code for issued assets, such as `"10.5 USDC"` with `USDC:<issuer>` (raw stroop strings rejected). | yes | none |
 | `[ASSET]` (positional) | `native`, `XLM`, or `CODE:ISSUER_GSTRKEY` | optional | `native` |
 | `--profile <NAME>` | Profile to evaluate operator policy against | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--source <G_STRKEY>` | Source account; required for signing | conditional | none |

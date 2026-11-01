@@ -777,8 +777,7 @@ where
         }
     };
 
-    // Boundary discipline: parse_with_unit is the only permitted parser for
-    // human-supplied amounts at CLI boundaries.
+    // Starting balances use the native XLM unit at this CLI boundary.
     let starting_balance = match StellarAmount::parse_with_unit(&starting_balance_str) {
         Ok(a) => a,
         Err(_) => {

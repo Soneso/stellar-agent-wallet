@@ -129,7 +129,7 @@ const SYNTHESIS_BACKED_VERBS: &[(&str, &[&str])] = &[
             "--source",
             SOURCE_G,
             DEST_G,
-            "1",
+            "1 XLM",
             "--build-only",
             "--rpc-url",
             UNREACHABLE_RPC,

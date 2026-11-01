@@ -533,6 +533,13 @@ claimable-balance record. It does not re-read the source trustline at commit.
 
 ### Payments and accounts
 
+For `stellar_pay` and `stellar_pay_commit`:
+
+| Field | Amount units |
+| --- | --- |
+| `amount` | Use `"10 XLM"` for native or the exact, case-sensitive asset code for issued assets, such as `"10.5 USDC"` with `USDC:<issuer>`. |
+| `amount_in_stroops` | Raw base units without a unit label; mutually exclusive with `amount`. |
+
 | Tool | Purpose | Gating |
 | --- | --- | --- |
 | `stellar_pay` | Simulate a payment: build the Payment envelope, run the SEP-29 memo-required check, mint a single-use nonce. | No signing; no submission. Not annotated read-only (mints the single-use nonce the commit step consumes). |

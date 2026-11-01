@@ -247,7 +247,7 @@ their own `x402.*` code before the `chain_id` check.
 ## Amount and asset conventions
 
 - Dual-unit amount fields (`amount`, `starting_balance`) are decimal strings with
-  an explicit unit suffix, never JSON numbers. Example: `"10 XLM"`, `"1 XLM"`.
+  an explicit unit suffix, never JSON numbers. Starting balances use `XLM`.
 - Asset descriptors: `"native"` or `"XLM"` (case-insensitive) for XLM, or
   `"CODE:GISSUER"` for non-native assets.
 - Every value-denominated field is a decimal string, never a JSON number, on
@@ -287,7 +287,7 @@ their own `x402.*` code before the `chain_id` check.
 | `chain_id` | string | yes | CAIP-2; must match profile. |
 | `source` | string | yes | G-strkey of the funding account. |
 | `destination` | string | yes | G-strkey of the recipient. |
-| `amount` | string | one of amount/stroops | Decimal + unit, e.g. `"10 XLM"`. |
+| `amount` | string | one of amount/stroops | Use `"10 XLM"` for native or the exact, case-sensitive asset code for issued assets, such as `"10.5 USDC"` with `USDC:<issuer>`. |
 | `amount_in_stroops` | decimal string | one of amount/stroops | Raw stroops, no unit; mutually exclusive with `amount`; rejected if negative, malformed, or > i64::MAX. |
 | `asset` | string | yes | `"native"`/`"XLM"` or `"CODE:GISSUER"`. |
 | `memo_text` | string | no | UTF-8, at most 28 bytes; mutually exclusive with other memo fields. |

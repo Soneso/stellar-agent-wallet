@@ -397,6 +397,19 @@ impl WalletServer {
 // Gated resolver routing
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The payment fields of a toolset-routed `sign-payment` call, typed as
+/// `StellarPayCommitArgs` types them, for the validation that precedes the
+/// gated resolver.
+#[derive(serde::Deserialize)]
+#[serde(crate = "rmcp::serde")]
+struct GatedPaymentFields {
+    asset: String,
+    #[serde(default)]
+    amount: Option<String>,
+    #[serde(default)]
+    amount_in_stroops: Option<String>,
+}
+
 impl WalletServer {
     /// Route a toolset-routed `sign-payment` action through the GATED resolver.
     ///
@@ -404,12 +417,18 @@ impl WalletServer {
     /// `route_to_matrix_tool` arm.
     ///
     /// Enforcement order:
-    /// 1. Four-part check via the gated matrix.
-    /// 2. First-invoke gate check (via `resolve_toolset_sign_payment_gated`).
-    /// 3. On `GatedResolveOutcome::Resolved` → route to `stellar_pay_commit`
+    /// 1. `args.envelope_xdr` is present; an args object without it refuses
+    ///    with `toolset.gated_missing_envelope`.
+    /// 2. The caller's `asset`, `amount`, and `amount_in_stroops` are validated
+    ///    through [`super::pay::parse_asset_and_amount`], so an invalid input
+    ///    refuses before the envelope decode and before any gate creates an
+    ///    approval.
+    /// 3. Four-part check via the gated matrix.
+    /// 4. First-invoke gate check (via `resolve_toolset_sign_payment_gated`).
+    /// 5. On `GatedResolveOutcome::Resolved` → route to `stellar_pay_commit`
     ///    with per-action `PaymentSimulated` approval FORCED ON (Override
     ///    `Allow → RequireApproval`).
-    /// 4. On `GatedResolveOutcome::FirstInvokeApprovalRequired` → return
+    /// 6. On `GatedResolveOutcome::FirstInvokeApprovalRequired` → return
     ///    `FirstInvokeApprovalRequired` typed error with `approval_nonce`.
     ///
     /// # Authoritative params
@@ -428,7 +447,9 @@ impl WalletServer {
     /// (inside `route_to_gated_commit`).  The `FirstInvokeApprovalRequired`
     /// branch returns an error without reaching `from_value`, so no guard is
     /// needed there — a dangerous-key payload is harmless until it reaches the
-    /// deserialisation boundary.
+    /// deserialisation boundary.  The asset and amount validation that precedes
+    /// both branches deserializes a map holding only the `asset`, `amount`, and
+    /// `amount_in_stroops` entries, never the caller's full args map.
     ///
     /// # Errors
     ///
@@ -478,6 +499,36 @@ impl WalletServer {
                 ));
             }
         };
+
+        // ── Validate the caller's asset and amount ────────────────────────────
+        //
+        // Both gate outcomes below can persist an approval (the first-invoke
+        // entry here, the per-action entry on the commit route), so the asset
+        // and amount refuse before the envelope decode and before either gate
+        // runs. Only the three payment fields are copied out of the args map;
+        // the dangerous-key guard still runs on the full map before it is
+        // deserialized on the commit route.
+        let payment_fields: serde_json::Map<String, serde_json::Value> =
+            ["asset", "amount", "amount_in_stroops"]
+                .into_iter()
+                .filter_map(|key| {
+                    tool_args_obj
+                        .get(key)
+                        .map(|value| (key.to_owned(), value.clone()))
+                })
+                .collect();
+        let payment_fields: GatedPaymentFields =
+            serde_json::from_value(serde_json::Value::Object(payment_fields)).map_err(|e| {
+                rmcp::ErrorData::invalid_params(
+                    format!("toolset.gated_args_deserialise: stellar_pay_commit: {e}"),
+                    None,
+                )
+            })?;
+        super::pay::parse_asset_and_amount(
+            &payment_fields.asset,
+            payment_fields.amount,
+            payment_fields.amount_in_stroops,
+        )?;
 
         // Decode authoritative args — destination, asset, amount.
         // Use "stellar_pay_commit" as the tool name: that is the gated tool
