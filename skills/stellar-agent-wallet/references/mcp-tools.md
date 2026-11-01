@@ -71,6 +71,37 @@ A generic client stanza points the spawn command at the binary:
 
 Omit the `args` entries to serve the `default` profile.
 
+## Manual JSON-RPC requests
+
+Send newline-delimited JSON-RPC messages to the server's stdio input. MCP clients
+usually initialize the connection automatically. For a manual session, send
+`initialize` first, then the `notifications/initialized` notification. Replace
+each placeholder with a value from the selected profile or an earlier response.
+Use a funded testnet account for payment calls. The selected profile must have
+the required signer and nonce key. Amounts are strings, such as `"10"`.
+
+Initialize the connection:
+
+```json
+{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "manual-client", "version": "1.0.0"}}}
+```
+
+Then send these five complete tool requests, one per line:
+
+```json
+{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "stellar_balances", "arguments": {"chain_id": "stellar:testnet", "account_id": "<G-strkey-account>"}}}
+{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "stellar_friendbot", "arguments": {"chain_id": "stellar:testnet", "account_id": "<testnet-account-to-fund>"}}}
+{"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "stellar_pay", "arguments": {"chain_id": "stellar:testnet", "source": "<funded-source-G-strkey>", "destination": "<destination-G-strkey>", "amount": "10", "asset": "native"}}}
+{"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "stellar_pay_commit", "arguments": {"chain_id": "stellar:testnet", "source": "<same-source>", "destination": "<same-destination>", "amount": "10", "asset": "native", "nonce": "<nonce-from-stellar_pay>", "expires_at_unix_ms": 1893456000000, "envelope_xdr": "<envelope_xdr-from-stellar_pay>"}}}
+{"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "stellar_transaction_status", "arguments": {"chain_id": "stellar:testnet", "tx_hash": "<64-lowercase-hex-transaction-hash>"}}}
+```
+
+Use the same payment arguments in `stellar_pay` and `stellar_pay_commit`. Copy
+`nonce`, `expires_at_unix_ms`, and `envelope_xdr` unchanged from the simulation
+response; replace the example expiry with its returned integer. The commit call
+signs and submits the payment. When policy requires operator approval, include
+the `approval_nonce` and `approval_attestation` returned by the approval flow.
+
 ## The result envelope
 
 Every tool returns the same JSON envelope, with five success-path exceptions:
