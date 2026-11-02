@@ -571,8 +571,8 @@ comparison supplies an oracle witness.
 
 | Status | Reason | Meaning |
 | --- | --- | --- |
-| `skipped`|`oracle_not_configured` | A required comparison can be skipped on testnet when no oracle is configured; no oracle comparison was performed and no oracle witness is supplied. |
-| `not_required`|`below_threshold` | The amount is below its configured threshold and no memo observation or unvalued operation independently requires a comparison. No oracle witness is supplied; amount thresholds do not override memo or unvalued requirements. |
+| `skipped` | `oracle_not_configured` | A required comparison can be skipped on testnet when no oracle is configured. No oracle comparison takes place. No oracle witness is supplied. |
+| `not_required` | `below_threshold` | The amount is below its effective threshold and no memo observation or unvalued operation independently requires a comparison. No oracle witness is supplied; amount thresholds do not override memo or unvalued requirements. |
 
 `stellar_trustline_commit` reads the issuer again and verifies the stored
 clawback opt-in for that trustline. An absent issuer refuses `trustline.gate_refused`.
