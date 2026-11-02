@@ -4,7 +4,7 @@ This page documents four `stellar-agent` command groups: `profile`, `credentials
 
 For the conventions shared by every command (profile and network resolution, the signer-source flags, the JSON output envelope, exit codes, and the mainnet-write refusal), see the [CLI reference index](index.md). For the underlying concepts (the policy engine, the approval spine, attestations, the audit log, and toolset gating), see [concepts](../concepts.md). For profile file structure, see [profiles](../profiles.md), and for toolset gating see [toolsets](../toolsets.md).
 
-All four groups operate on local state — TOML files and platform-keyring entries. None of them submits a Stellar transaction, so the network flags and the mainnet-write gate do not apply here. Every command prints JSON on stdout and exits `0` on success or `1` on any error, using the standard `{ok, data, request_id}` envelope.
+All four groups operate on local state (TOML files and platform-keyring entries). None of them submits a Stellar transaction, so the network flags and the mainnet-write gate do not apply here. Every command prints JSON on stdout and exits `0` on success or `1` on any error, using the standard `{ok, data, request_id}` envelope.
 
 ## Profile selection and refused overlays
 
@@ -31,7 +31,7 @@ The eight key-writing commands (`enroll-signer`, `enroll-owner-key`, `enroll-rpc
 
 `profile list` lists all profile names and takes no profile selector. Every other `profile` subcommand accepts `--profile <NAME>`. For `init`, `enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, `reset-window-state`, `reset-mpp-state`, `halt`, and `resume`, supply exactly one positional `<NAME>` or `--profile <NAME>`. These commands require an explicit selection. `reset-mpp-state` requires `--acknowledge`; the other profile verbs have no confirmation flag.
 
-The name itself becomes a path component and is validated before any path is built — charset, length, no leading `-`, and no Windows reserved device name. The rules and the recovery path for a file that already carries a refused name are in [Profile names](../profiles.md#profile-names).
+The name itself becomes a path component and is validated before any path is built: charset, length, no leading `-`, and no Windows reserved device name. The rules and the recovery path for a file that already carries a refused name are in [Profile names](../profiles.md#profile-names).
 
 Every subcommand except `init`, `list`, `migrate`, and `show` also reconciles the selected name against the one the loaded file carries, refusing with `profile.name_mismatch` when the two disagree (see the [index](index.md#profile)). The key-writing commands are not exempt: `sign-policy` writes `<policy_dir>/<derived>.toml` and `enroll-owner-key` writes the `stellar-agent-owner-<derived>` keyring entry, so running either against a copied profile file would replace a DIFFERENT profile's root of trust. Neither is needed to repair a mismatch: the refusal names the recovery path, and `profile show <name>` still displays the file so the offending field can be read. `init` and `list` load no profile at all. `migrate` builds the v2 profile from the v1 file and the requested name, deriving the security-substrate key references from the name, not from the file's contents.
 
@@ -41,10 +41,10 @@ Every subcommand except `init`, `list`, `migrate`, and `show` also reconciles th
 stellar-agent profile init --profile default --network testnet
 ```
 
-State-changing (writes the profile file; no network, no keyring). Creates and persists a new profile TOML with per-profile-derived keyring entry references, then reports the enrollment steps needed before the profile can sign. Mints no key material and emits no audit row — the key-writing commands documented below mint their own keys.
+State-changing (writes the profile file; no network, no keyring). Creates and persists a new profile TOML with per-profile-derived keyring entry references, then reports the enrollment steps needed before the profile can sign. Mints no key material and emits no audit row. The key-writing commands documented below mint their own keys.
 
 - `--profile <NAME>`: profile name to create (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
-- `--network <testnet|mainnet>` — target network (default `testnet`).
+- `--network <testnet|mainnet>`: target network (default `testnet`).
 - `--rpc-url <URL>`: optional on testnet, where an omitted value takes the testnet endpoint; required with `--network mainnet`, which has no default endpoint. The URL must use `http` or `https`, and `https` on mainnet. The flag parser refuses credentials.
 - `--engine <v1|noop>`: policy engine (default `v1`). See the `[policy]` block in [profiles.md](../profiles.md). On a V1 profile, the MCP server starts once the owner key is enrolled and the owner-signed policy loads; the rest of the [V1 setup](../profiles.md#opt-in-to-v1) gates approvals and signing. For V1, `next_steps` adds `profile enroll-owner-key`, `profile rotate-attestation-key`, a step to [create the policy file](../profiles.md#create-the-v1-policy-file) `policies/<name>.toml`, then `profile sign-policy`. A testnet `noop` profile supports server startup and read access immediately. Mint the audit key with `profile rotate-audit-key` before `profile enroll-signer` so enrollment writes its audit row. Then run `profile rotate-nonce-key` before MCP payment simulation.
 
@@ -67,7 +67,7 @@ the oracle: before the payer signs, the oracle simulates the same unsigned
 transfer, and the answers are compared. Opaque staged envelopes and the SEP-43
 signing tools remain uncovered.
 
-The signer and nonce keyring coordinates are named `stellar-agent-signer-<name>` / `stellar-agent-nonce-<name>`, each seeded with the placeholder account `"default"` — the signer's eventual G-strkey is not known until a seed is enrolled (see `profile enroll-signer` below). The five security-substrate references (`audit_log_hash_chain_key_id`, `policy_owner_key_id`, `attestation_key_id`, `counterparty_cache_key_id`, `policy_window_state_key_id`) are derived from the profile name the same way `profile migrate` derives them.
+The signer and nonce keyring coordinates are named `stellar-agent-signer-<name>` / `stellar-agent-nonce-<name>`, each seeded with the placeholder account `"default"`. The signer's eventual G-strkey is not known until a seed is enrolled (see `profile enroll-signer` below). The five security-substrate references (`audit_log_hash_chain_key_id`, `policy_owner_key_id`, `attestation_key_id`, `counterparty_cache_key_id`, `policy_window_state_key_id`) are derived from the profile name the same way `profile migrate` derives them.
 
 `init` writes the `audit_log_hash_chain_key_id` coordinate; `profile rotate-audit-key <name>` mints the key material. On both engines, `next_steps` lists `rotate-audit-key`, then `enroll-signer`, then `rotate-nonce-key`. The audit key must exist before the first key-writing command so its audit row is written. Every value-moving signing verb requires the audit key before signing or submitting, refusing `audit.chain_key_unavailable` otherwise. MCP payment simulation requires the commit-nonce key.
 
@@ -108,7 +108,7 @@ URL fields (`rpc_url`, `secondary_rpc_url`, `oracle_provider_url`) are printed a
 
 Read-only. Loads the named profile (applying any environment-variable overlays) and prints its resolved configuration as a JSON envelope. Keyring entry references appear as opaque `{service, account}` objects; the secret material they name is never read or printed. Provider records print in full, including `credential` references and `placement`; the credential value is never read.
 
-- `<NAME>` (positional) or `--profile <NAME>` — the profile to display. Supply exactly one; supplying both, or neither, is a usage error.
+- `<NAME>` (positional) or `--profile <NAME>`: the profile to display. Supply exactly one; supplying both, or neither, is a usage error.
 
 The result also carries the profile's halt state: `halted`, `halted_at`, and `halt_reason` from the halt marker (see [`profile halt`](#profile-halt-name---reason-reason)). A marker that exists but cannot be read shows `halted: true`, null `halted_at` and `halt_reason`, and a `halt_marker_error` that says why.
 
@@ -122,7 +122,7 @@ stellar-agent profile migrate default
 
 State-changing (local file). Reads the named profile, applies any pending schema migrations, and writes the result atomically (temp-file plus rename). If the profile is already at the current version, the command is a no-op and the file is left untouched.
 
-- `<NAME>` (positional) or `--profile <NAME>` — the profile to migrate. Supply exactly one; supplying both, or neither, is a usage error.
+- `<NAME>` (positional) or `--profile <NAME>`: the profile to migrate. Supply exactly one; supplying both, or neither, is a usage error.
 
 On a no-op it reports `status` `no_op` and the current version; on a migration it reports `status` `migrated` with `from_version`, `to_version`, and the file path:
 
@@ -162,10 +162,10 @@ enrollment, without network access. It reads the seed from a named environment
 variable through the shared mlock-protected ceremony and stores it verbatim.
 The seed is never printed, logged, or returned.
 
-- `--secret-env <VAR>` (required) — name of the environment variable holding the signer's `S...` strkey. The flag takes the variable name, never the secret.
+- `--secret-env <VAR>` (required): name of the environment variable holding the signer's `S...` strkey. The flag takes the variable name, never the secret.
 - `--profile <NAME>`: profile whose `mcp_signer_default` entry is written (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
-- `--expected-address <G_STRKEY>` — refuse unless the seed derives to this address.
-- `--force` — replace an already-enrolled entry (refused without it when one exists).
+- `--expected-address <G_STRKEY>`: refuse unless the seed derives to this address.
+- `--force`: replace an already-enrolled entry (refused without it when one exists).
 
 The coordinate's `account` field is the signer identity: `signer_from_keyring` verifies the loaded seed derives to it, so `account` must equal the seed's public address. Enrollment classifies the field from its raw on-disk value (environment overlays never influence what gets persisted) and resolves three cases. A profile fresh from `profile init`, or a v1-migrated profile, can hold the literal placeholder `"default"`. Enrollment pins the derived address into `account`, patching only that key in the profile TOML before writing the keyring entry. Once `account` holds a G-strkey, enrollment refuses on a mismatch and prints the address to set `account` to. The profile TOML is left untouched. Any other value (a typo'd or truncated pin) is refused with `enroll_signer.account_malformed` rather than replaced. Every refusal, including an unset secret variable, leaves the file unmodified. A keyring write that fails after the pin leaves the pinned address; a re-run retries the write. On success the data object reports the derived `public_address`, the `keyring_service`/`keyring_account` written, `replaced` (with `previous_address` when an entry was replaced), and `account_populated` (`true` when the placeholder was just pinned):
 
@@ -229,10 +229,10 @@ unset WALLET_OWNER_SK
 
 Enrolls the policy-file owner PUBLIC key into the profile's `policy_owner_key_id` keyring entry, the key the V1 policy engine verifies every policy file against. The owner key is the root of trust for policy: whoever can sign a policy file can authorize any action the policy permits. `enroll-owner-key` and `sign-policy` read the owner seed from the environment of the shell that runs them. Supply it with the read line only for those commands, as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) describes, and unset it afterward. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment. State-changing (keyring), no network. The command passes the seed through the shared mlock-protected ceremony, stores only the derived public key, and never prints, logs, or returns the seed.
 
-- `--secret-env <VAR>` (required) — name of the environment variable holding the owner `S...` strkey. The flag takes the variable name, never the secret.
+- `--secret-env <VAR>` (required): name of the environment variable holding the owner `S...` strkey. The flag takes the variable name, never the secret.
 - `--profile <NAME>`: profile whose owner coordinate is written (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
-- `--expected-address <G_STRKEY>` — refuse unless the seed derives to this address.
-- `--force` — replace an already-enrolled owner key (refused without it when one exists; replacing invalidates every policy file signed by the previous owner key).
+- `--expected-address <G_STRKEY>`: refuse unless the seed derives to this address.
+- `--force`: replace an already-enrolled owner key (refused without it when one exists; replacing invalidates every policy file signed by the previous owner key).
 
 The owner coordinate's `account` is the literal `"default"` (the value the engine reads); the stored value is the public key's G-strkey. A G-strkey decodes as URL-safe base64 to 42 bytes, so no 32-byte symmetric-key loader accepts it. Every owner reader also accepts the older form, URL-safe base64 of the 32 key bytes. The V1 engine build rewrites an older-form entry as its G-strkey, best effort, and the first build in a process also rewrites every other profile's older-form owner entry in the profile directory. This command rewrites them too. Under `headless-dpapi` an older-form owner entry can be moved to another coordinate until it is rewritten, so run one V1 verb or this command after upgrading. On success the data object reports the derived `owner_address`, the `keyring_service`/`keyring_account` written, and `replaced`. The prior key's stored value is never decoded or reported. A prior entry at this coordinate may have held an owner seed in the older encoding, so rendering it could print a private key. `replaced: true` conveys that a prior entry existed.
 
@@ -262,9 +262,9 @@ unset WALLET_OWNER_SK
 
 Signs a V1 policy file so the engine accepts it. The engine loads `<state_dir>/policies/<profile>.toml`, recomputes the canonical form (the `[signature]` table excluded), and verifies the signature against the enrolled owner public key. This command produces that `[signature]` table: it computes the same canonical BLAKE3 digest the loader computes, signs it with the owner seed, and writes `owner_id` (the owner G-strkey) and `sig` (hex) back into the file. State-changing (writes the policy file), no network. The owner seed is read from a named environment variable and held only in zeroizing memory; it is never printed, logged, or written to disk.
 
-- `--secret-env <VAR>` (required) — name of the environment variable holding the owner `S...` strkey.
+- `--secret-env <VAR>` (required): name of the environment variable holding the owner `S...` strkey.
 - `--profile <NAME>`: profile whose policy file is signed (default: `STELLAR_AGENT_PROFILE`, else `default`). Loading a mainnet profile requires an explicit `--profile <NAME>`.
-- `--file <PATH>` — sign a policy file at a non-default path (default `<state_dir>/policies/<profile>.toml`, the only location the engine loads).
+- `--file <PATH>`: sign a policy file at a non-default path (default `<state_dir>/policies/<profile>.toml`, the only location the engine loads).
 
 Before writing, the seed's derived public key is cross-checked against the enrolled owner key; a seed that does not match is refused (`sign_policy.owner_key_mismatch`) so a file the engine would reject is never produced. Before signing, the command also checks the body as the engine loads it, with the `scope` compared against the profile, and refuses a body the engine would reject. A refusal leaves the file unchanged. Signing does not require a valid previous signature: re-signing a file with a stale or malformed `[signature]` table replaces that table in place, dropping any extra key in it, and reports `replaced: true` with the previous `owner_id`. On success the data object reports the `owner_address`, the `policy_path`, the `digest` (hex), and the `signature` (hex):
 
@@ -302,7 +302,7 @@ The registry normally caches the writer and holds its lock until process exit. A
 While held, the lock blocks rotation with `audit.writer_locked` in the error
 detail, even if the operation that acquired it later fails.
 
-Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, encodes it as URL-safe base64 (no padding), and atomically replaces one keyring entry the profile names. The raw bytes never leave the keyring, are never logged, and are never returned. Every rotation subcommand takes the profile as either a positional `<NAME>` argument or a `--profile <NAME>` flag — exactly one of the two, and supplying both, or neither, is a usage error — changes keyring state (no network), and is not reversible. Rotate deliberately, because each one invalidates material minted under the old key. (The policy-file owner ed25519 key is not rotated here; it is enrolled with `enroll-owner-key`.)
+Each rotation subcommand generates a fresh 32-byte secret from the OS CSPRNG, encodes it as URL-safe base64 (no padding), and atomically replaces one keyring entry the profile names. The raw bytes never leave the keyring, are never logged, and are never returned. Every rotation subcommand takes the profile as either a positional `<NAME>` argument or a `--profile <NAME>` flag (exactly one of the two; supplying both, or neither, is a usage error), changes keyring state (no network), and is not reversible. Rotate deliberately, because each one invalidates material minted under the old key. (The policy-file owner ed25519 key is not rotated here; it is enrolled with `enroll-owner-key`.)
 
 | Subcommand | Keyring entry rotated | Key kind | Effect on outstanding material |
 |---|---|---|---|
@@ -494,22 +494,22 @@ The `credentials` group manages the WebAuthn passkey lifecycle for a profile. Pa
 
 Two flags are common to every subcommand:
 
-- `--profile <NAME>` — the profile whose passkey registry to use. Optional; resolves from `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
-- `--rp-id <DOMAIN>` — the WebAuthn relying-party ID. Default `localhost`, the correct loopback value for a local wallet. For a self-hosted deployment, set the deployment domain (for example `wallet.example.com`). The RP-ID must be a valid DNS domain string; IP literals are rejected by browser WebAuthn implementations. Changing the RP-ID after registration renders existing passkeys unusable.
+- `--profile <NAME>`: the profile whose passkey registry to use. Optional; resolves from `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+- `--rp-id <DOMAIN>`: the WebAuthn relying-party ID. Default `localhost`, the correct loopback value for a local wallet. For a self-hosted deployment, set the deployment domain (for example `wallet.example.com`). The RP-ID must be a valid DNS domain string; IP literals are rejected by browser WebAuthn implementations. Changing the RP-ID after registration renders existing passkeys unusable.
 
 `credential_id` values are redacted to first-five-last-five base64url everywhere they are printed.
 
-Every subcommand's failure `error.code` is one of a closed set: the verb-specific codes noted under each subcommand below, plus these codes shared across the whole group: `credentials.invalid_profile_name` (any subcommand given a malformed `--profile`), and — from the underlying `CredentialsError` — `credentials.not_found`, `credentials.duplicate_name`, `credentials.invalid_name`, `credentials.io_error`, `credentials.registry_parse_failed`, `credentials.registry_serialise_failed`, `credentials.state_dir_unavailable`, `credentials.approval_store_error`, `credentials.approval_store_unavailable`, `credentials.bridge_start_failed`, `credentials.bridge_shutdown_failed`, `credentials.atomic_write_failed`, `credentials.signing_failed`, `credentials.missing_public_key`, `credentials.malformed_public_key`, and a generic `credentials.error` fallback for any other internal variant. `add-passkey` additionally emits `credentials.approval_store_dir_unavailable`, `credentials.approval_store_open_failed`, and `credentials.unknown_registration_outcome`. An agent can switch on `error.code` alone; `error.message` carries the human-readable detail only.
+Every subcommand's failure `error.code` is one of a closed set: the verb-specific codes noted under each subcommand below, plus these codes shared across the whole group: `credentials.invalid_profile_name` (any subcommand given a malformed `--profile`), and (from the underlying `CredentialsError`) `credentials.not_found`, `credentials.duplicate_name`, `credentials.invalid_name`, `credentials.io_error`, `credentials.registry_parse_failed`, `credentials.registry_serialise_failed`, `credentials.state_dir_unavailable`, `credentials.approval_store_error`, `credentials.approval_store_unavailable`, `credentials.bridge_start_failed`, `credentials.bridge_shutdown_failed`, `credentials.atomic_write_failed`, `credentials.signing_failed`, `credentials.missing_public_key`, `credentials.malformed_public_key`, and a generic `credentials.error` fallback for any other internal variant. `add-passkey` additionally emits `credentials.approval_store_dir_unavailable`, `credentials.approval_store_open_failed`, and `credentials.unknown_registration_outcome`. An agent can switch on `error.code` alone; `error.message` carries the human-readable detail only.
 
 ### `credentials add-passkey <NAME>`
 
 State-changing (writes the registry; performs a browser WebAuthn ceremony). Opens the OS default browser to the wallet-owned bridge registration URL and polls the approval store until the browser-side ceremony completes or the deadline elapses. On success it writes the credential metadata to the registry. If the browser cannot be launched, the URL is printed to stderr and polling continues.
 
-- `<NAME>` (positional, required) — a name for the credential. 1 to 64 printable ASCII characters; `/`, `\`, and `:` are not allowed.
-- `--profile <NAME>` — profile override (see above).
-- `--rp-id <DOMAIN>` — relying-party ID (default `localhost`).
-- `--timeout-seconds <SECS>` — registration deadline. Default `300`.
-- `--accept-rp-id-binding-risk` — skip the first-registration RP-ID binding warning.
+- `<NAME>` (positional, required): a name for the credential. 1 to 64 printable ASCII characters; `/`, `\`, and `:` are not allowed.
+- `--profile <NAME>`: profile override (see above).
+- `--rp-id <DOMAIN>`: relying-party ID (default `localhost`).
+- `--timeout-seconds <SECS>`: registration deadline. Default `300`.
+- `--accept-rp-id-binding-risk`: skip the first-registration RP-ID binding warning.
 
 On the first registration for a profile (the registry is empty), the command prints an RP-ID binding warning and prompts `[y/N]` before starting the ceremony, unless `--accept-rp-id-binding-risk` is set. Declining exits `1`.
 
@@ -537,8 +537,8 @@ stellar-agent credentials list
 
 Read-only. Lists the registered passkeys for the resolved profile and RP-ID.
 
-- `--profile <NAME>` — profile override.
-- `--rp-id <DOMAIN>` — relying-party ID (default `localhost`).
+- `--profile <NAME>`: profile override.
+- `--rp-id <DOMAIN>`: relying-party ID (default `localhost`).
 
 ```json
 {"ok":true,"data":{"credentials":[{"credential_id":"AABBC...IJJKK","credential_name":"laptop-key","rp_id":"localhost","registered_at_unix_ms":0}]},"request_id":"..."}
@@ -552,9 +552,9 @@ stellar-agent credentials show laptop-key
 
 Read-only. Prints the metadata for one named passkey, including its transports. No secret material is included.
 
-- `<NAME>` (positional, required) — the credential to show.
-- `--profile <NAME>` — profile override.
-- `--rp-id <DOMAIN>` — relying-party ID (default `localhost`).
+- `<NAME>` (positional, required): the credential to show.
+- `--profile <NAME>`: profile override.
+- `--rp-id <DOMAIN>`: relying-party ID (default `localhost`).
 
 Exits `1` with `error.code` `credentials.not_found` when the credential is not found.
 
@@ -566,10 +566,10 @@ stellar-agent credentials delete laptop-key --yes
 
 State-changing (removes the registry entry). Verifies the credential exists, prompts `[y/N]` for confirmation, then deletes it. Deleting a passkey does not remove it as a signer from any on-chain rule.
 
-- `<NAME>` (positional, required) — the credential to delete.
-- `--profile <NAME>` — profile override.
-- `--rp-id <DOMAIN>` — relying-party ID (default `localhost`).
-- `--yes`, `-y` — skip the confirmation prompt.
+- `<NAME>` (positional, required): the credential to delete.
+- `--profile <NAME>`: profile override.
+- `--rp-id <DOMAIN>`: relying-party ID (default `localhost`).
+- `--yes`, `-y`: skip the confirmation prompt.
 
 Declining the prompt exits `1` with `error.code` `credentials.delete_canceled`; a missing credential exits `1` with `credentials.not_found`.
 
@@ -611,9 +611,9 @@ Authentication, validation, and audit failures on approval paths carry their own
 
 State-changing (records an attestation or a grant in the on-disk pending-approval store).
 
-- `--id <NONCE>` (required in this form) — the approval nonce printed in the agent surface's simulate response.
-- `--profile <NAME>` — the profile whose attestation key and pending-approval store to use. Optional; resolves from `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
-- `--yes` — non-interactive auto-approve. Bypasses the stdin prompt; the wallet-controlled summary is still printed so there is a visible record. Intended for trusted automation and tests, not routine operator use.
+- `--id <NONCE>` (required in this form): the approval nonce printed in the agent surface's simulate response.
+- `--profile <NAME>`: the profile whose attestation key and pending-approval store to use. Optional; resolves from `--profile`, then `STELLAR_AGENT_PROFILE`, then `"default"`.
+- `--yes`: non-interactive auto-approve. Bypasses the stdin prompt; the wallet-controlled summary is still printed so there is a visible record. Intended for trusted automation and tests, not routine operator use.
 
 Interactively, the command prints the summary and prompts `Approve? [y/N]:`; anything other than `y`/`yes` denies. It exits `1` when the nonce is unknown, expired, already attested, created by a different local user, denied at the prompt, or on an I/O error.
 
@@ -639,7 +639,7 @@ stellar-agent approve gc --profile default
 
 State-changing (removes expired entries). Opens the pending-approval store and evicts every entry whose TTL has elapsed, then reports the count.
 
-- `--profile <NAME>` — the profile whose store to garbage-collect. Optional; same resolution as above.
+- `--profile <NAME>`: the profile whose store to garbage-collect. Optional; same resolution as above.
 
 When the `gc` subcommand is present, any `--id` is ignored. Evicting zero entries is a success.
 
@@ -657,9 +657,9 @@ Read-only. Enumerates the profile's pending approvals with their
 wallet-controlled summaries and expiry, so the operator does not depend on the
 agent relaying a nonce.
 
-- `--include-expired` — also show entries whose TTL has elapsed (they are
+- `--include-expired`: also show entries whose TTL has elapsed (they are
   counted in `expired_count` either way).
-- `--output json|table` — envelope JSON (default) or one sanitized row per
+- `--output json|table`: envelope JSON (default) or one sanitized row per
   entry with an expires-in countdown.
 
 ```json
@@ -700,13 +700,13 @@ exchanges it for an HttpOnly session cookie and the token dies. All state
 mutation requires that cookie plus a per-action CSRF header; the server binds
 `127.0.0.1` only and refuses non-loopback hosts and origins.
 
-- `--port <PORT>` — fixed port (default: ephemeral). Use a fixed port when
+- `--port <PORT>`: fixed port (default: ephemeral). Use a fixed port when
   tunneling.
-- `--no-open` — print the URL instead of opening a browser (default on
+- `--no-open`: print the URL instead of opening a browser (default on
   headless hosts).
-- `--notify on|off` — best-effort OS notification on new entries (count only,
+- `--notify on|off`: best-effort OS notification on new entries (count only,
   never amounts or addresses); `--bell` adds a terminal bell.
-- `--include-expired` — grey-list expired entries in the inbox.
+- `--include-expired`: grey-list expired entries in the inbox.
 
 Run `serve` as the same OS user as the agent's MCP server: approvals are
 bound to the user that parked them, and a different user's consent is
@@ -732,7 +732,7 @@ stellar-agent approve serve --remote --confirm-remote-exposure --profile default
 ```
 
 Binds a TLS-protected, passkey-authenticated listener beyond loopback instead
-of the local inbox above — for approving from a device other than the wallet
+of the local inbox above, for approving from a device other than the wallet
 host, without an SSH tunnel. Requires the profile's `[remote_approval]` block
 with `enabled = true` AND `--confirm-remote-exposure` as a separate, explicit
 consent flag; either alone refuses to start. See
@@ -743,7 +743,7 @@ walkthrough.
 
 Writes a WebAuthn credential to the profile's dedicated operator-approval
 credential store, for use with `approve serve --remote`. Enrollment alone
-never authorizes anything — the credential still has to be added to the
+never authorizes anything. The credential still has to be added to the
 profile's `[remote_approval] allowed_credentials` list, a separate,
 operator-controlled step. Runs entirely locally in both modes below; neither
 touches the network.
@@ -751,7 +751,7 @@ touches the network.
 A WebAuthn credential is bound to its `rp.id` at creation time, and that
 binding is what decides which of the two modes applies:
 
-- **`--interactive`** — for a loopback or SSH-tunnelled `approve serve
+- **`--interactive`**: for a loopback or SSH-tunnelled `approve serve
   --remote` listener. Starts a one-shot local server, prints (and by default
   opens) an enrollment page, and persists the credential automatically once
   your authenticator completes the ceremony. The printed URL contains a
@@ -760,10 +760,10 @@ binding is what decides which of the two modes applies:
   that persists the credential require that cookie, so a local non-browser
   process cannot drive the ceremony. The server binds `127.0.0.1` only and
   refuses non-loopback hosts and origins. Always produces a credential bound
-  to `rp_id: "localhost"` — the only effective domain a loopback origin can
+  to `rp_id: "localhost"`, the only effective domain a loopback origin can
   claim.
 - **`--credential-id` / `--public-key` / `--rp-id` / `--label`** (all four
-  together) — for a domain-configured remote listener. Imports the id and
+  together): for a domain-configured remote listener. Imports the id and
   public key from a WebAuthn ceremony run elsewhere: normally the remote
   listener's own `GET /enroll` page, which has to be served from
   `https://<rp_id>` for the resulting credential to bind to that domain. See
@@ -780,12 +780,12 @@ stellar-agent approve operator enroll \
   --label laptop --sign-count <N>
 ```
 
-- `--no-open` — print the enrollment URL instead of opening a browser
+- `--no-open`: print the enrollment URL instead of opening a browser
   (interactive mode only).
-- `--timeout-seconds <SECS>` — interactive-ceremony timeout (default: 300).
-- `--sign-count <U32>` — seeds the clone-detection baseline from a counter
+- `--timeout-seconds <SECS>`: interactive-ceremony timeout (default: 300).
+- `--sign-count <U32>`: seeds the clone-detection baseline from a counter
   read at enrollment time (argument mode only; interactive mode extracts
-  this automatically). Advisory only — a caller reporting a false value only
+  this automatically). Advisory only: a caller reporting a false value only
   weakens that credential's own clone-detection baseline and never affects
   authorization, which is decided solely by `allowed_credentials`.
 
@@ -804,9 +804,9 @@ The tip anchor is checked only when `--profile` is supplied AND `<LOG_PATH>` is 
 Verifier failures use `audit.chain_broken`, `audit.rotation_gap`, `audit.hmac_mismatch`, `audit.hmac_sidecar_missing`, `audit.too_many_rotated_files`, `audit.non_regular_file_log_path`, `audit.parse_error`, `audit.path_contract`, `audit.log_not_found`, `audit.io_error`, `audit.signer_set_canonical_body`, `audit.partial_rotation`, `audit.tip_anchor_mismatch`; see [security internals](../maintainers/security-internals.md#audit-hash-chain).
 Profile and ownership pre-checks carry their own codes.
 
-- `<LOG_PATH>` (positional, required) — path to the audit log file. By default this is `~/.local/share/stellar-agent/audit/<profile>.jsonl` on Linux, `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl` on macOS, and `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` on Windows.
+- `<LOG_PATH>` (positional, required): path to the audit log file. By default this is `~/.local/share/stellar-agent/audit/<profile>.jsonl` on Linux, `~/Library/Application Support/Soneso.stellar-agent/audit/<profile>.jsonl` on macOS, and `%LOCALAPPDATA%\Soneso\stellar-agent\data\audit\<profile>.jsonl` on Windows.
 - `--profile <NAME>`: the profile whose chain-root HMAC key verifies the sidecars. Optional; when omitted, only the hash chain is verified. The profile's audit binding is read and never written: a changed or unparseable binding exits `1` with `audit.log_binding_changed`.
-- `--output <FORMAT>` — output format. `json` is the default and only stable format.
+- `--output <FORMAT>`: output format. `json` is the default and only stable format.
 
 On Unix, the command refuses to verify a log whose parent directory is owned by a different user, since such a directory could be used to substitute log files or sidecars. It exits `0` when the chain is intact and `1` on any integrity violation (a broken chain, a rotation gap, an HMAC mismatch, a missing sidecar, an unparseable line, or a tip-anchor mismatch), a path-contract failure, or an I/O error.
 
