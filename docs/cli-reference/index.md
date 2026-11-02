@@ -218,7 +218,7 @@ Before dispatching any command, the CLI runs a local-only startup advisory: it s
 | `trustline` | Create or remove a classic trustline (`ChangeTrust`) behind the ordered trust gate. | [stellar-ops](stellar-ops.md) |
 | `friendbot` | Fund a testnet or futurenet account via the Friendbot endpoint (unsigned faucet funding; mainnet refused). | [stellar-ops](stellar-ops.md) |
 | `fees` | Fetch Stellar RPC fee statistics for classic fee selection (read-only). | [stellar-ops](stellar-ops.md) |
-| `counterparty` | Manage the cached `stellar.toml` bindings that back the counterparty allowlist policy. | [profile-and-governance](profile-and-governance.md) |
+| `counterparty` | Manage the cached `stellar.toml` bindings that back the counterparty allowlist policy. | [stellar-ops](stellar-ops.md) |
 | `vault` | Deposit into or withdraw from a DeFindex vault via the smart-account (signing). | [defi-and-pool](defi-and-pool.md) |
 | `trade` | Swap tokens via the Soroswap router-direct path via the smart-account (signing). | [defi-and-pool](defi-and-pool.md) |
 | `pool` | Initialise and inspect a channel-account pool for parallel transaction submission. | [defi-and-pool](defi-and-pool.md) |
