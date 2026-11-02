@@ -23,6 +23,7 @@ ignore = [
     "RUSTSEC-2026-0367", # zip: SUID and SGID bits preserved on extraction
     "RUSTSEC-2026-0368", # zip: symlink targets outside the extraction directory
     "RUSTSEC-2026-0369", # zip: permissions applied through extracted symlinks
+    "RUSTSEC-2026-0429", # zip: extract aborts on a symlink entry with a large declared size
     # RUSTSEC-2026-0387: crypto-bigint before 0.7.6 can execute secret-dependent
     # branches in operations intended to be constant-time. The fix is only in
     # 0.7.6, which elliptic-curve 0.14 uses. soroban-env-host, reached through
