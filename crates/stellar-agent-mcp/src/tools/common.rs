@@ -7225,6 +7225,46 @@ pub(crate) mod tests {
             }
         }
 
+        /// The direct pay commit refuses a mismatched amount unit after
+        /// admission and before the freshness check reads the owner key. The
+        /// owner entry is removed, so a freshness check that ran first would
+        /// answer the restart refusal instead; the valid commit afterwards
+        /// shows that it does.
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn mainnet_pay_commit_refuses_a_mismatched_unit_before_the_freshness_check() {
+            let run = ClassicRun::new(Tool::Pay).await;
+            let owner = KeyringEntryRef::default_owner_key("operator");
+            keyring_core::Entry::new(&owner.service, &owner.account)
+                .unwrap()
+                .delete_credential()
+                .unwrap();
+            let mut mismatched = run.args.clone();
+            let fields = mismatched.as_object_mut().unwrap();
+            fields.remove("amount_in_stroops");
+            fields.insert("amount".to_owned(), serde_json::json!("1 USD"));
+            fields.insert("asset".to_owned(), serde_json::json!("native"));
+            let error = run.commit_raw(mismatched).await.unwrap_err();
+            assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert_eq!(error.data.unwrap()["code"], "validation.amount_malformed");
+            assert_eq!(
+                error.message,
+                "validation.amount_malformed: amount '1 USD' has unit 'USD'; expected unit 'XLM'"
+            );
+            assert_eq!(run.seed_reads(), 0);
+            assert!(run.control.methods().is_empty());
+            assert!(run.oracle_control.methods().is_empty());
+            assert!(authorizations(&run.f).is_empty());
+
+            let result = run.commit().await;
+            assert_restart_refusal(
+                "owner entry removed",
+                &result,
+                &run.f,
+                run.control.methods().len() + run.oracle_control.methods().len(),
+            );
+        }
+
         #[tokio::test]
         #[serial_test::serial(keyring)]
         async fn mainnet_classic_commits_probe_the_endpoint_before_reading() {

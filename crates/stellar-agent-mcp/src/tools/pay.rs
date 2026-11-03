@@ -1222,21 +1222,23 @@ impl WalletServer {
         forced_dispatch_outcome: Option<super::common::DispatchOutcome>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let mainnet = if self.context.chain_id.is_mainnet() {
-            let guard = match self
+            match self
                 .mainnet_write_admission(stellar_agent_network::mainnet::MainnetConsumer::McpPay)
             {
-                Ok(guard) => guard,
+                Ok(guard) => Some(guard),
                 Err(result) => return Ok(result),
-            };
-            if let Err(result) = self.verify_mainnet_freshness(&guard) {
-                return Ok(result);
             }
-            Some(guard)
         } else {
             None
         };
 
         let (asset, payment_amount) = args.parse_asset_and_amount()?;
+
+        if let Some(guard) = &mainnet
+            && let Err(result) = self.verify_mainnet_freshness(guard)
+        {
+            return Ok(result);
+        }
 
         // ── Re-derive authoritative args from HMAC-bound envelope_xdr ────────
         //

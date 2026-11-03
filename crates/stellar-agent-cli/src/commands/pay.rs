@@ -2097,9 +2097,9 @@ fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
 /// the write context, and every later step reads it from the context. The
 /// steps up to the witness are this verb's: the relayer gate, the engine
 /// kind, the asset and amount, the keyring, the checked client, the
-/// reconcile, the build, the
-/// verified policy with the built fee, the signed fee cap, the audit
-/// pre-flight and the bound witness. [`authorize_and_submit`] runs the rest.
+/// reconcile, the build, the verified policy with the built fee, the signed
+/// fee cap, the audit pre-flight and the bound witness.
+/// [`authorize_and_submit`] runs the rest.
 async fn run_mainnet_pipeline<InitKeyring>(
     args: &PayArgs,
     resolved: &ResolvedProfileName,
@@ -6040,6 +6040,29 @@ mod tests {
             assert_eq!(run.code, 1);
             assert_eq!(run.code(), "network.mainnet_write_forbidden");
             assert!(run.message().contains("Noop"), "{}", run.message());
+            assert_eq!(fixture.initializer_calls(), 0);
+            assert!(fixture.primary_methods().await.is_empty());
+        }
+
+        /// Asset and amount: a unit that does not match the asset refuses
+        /// with the detailed unit refusal, before the keyring and before any
+        /// request.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_mismatched_amount_unit_refuses_before_the_keyring() {
+            let fixture = Spec::new("mainnet-pay-unit-mismatch").build().await;
+            let mut args = memo_args(&fixture);
+            args.asset = format!("USD:{ISSUER}");
+            args.amount = "1 XLM".to_owned();
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 1);
+            assert_eq!(run.code(), "validation.amount_malformed");
+            assert_eq!(
+                run.message(),
+                "amount '1 XLM' has unit 'XLM'; expected unit 'USD'"
+            );
             assert_eq!(fixture.initializer_calls(), 0);
             assert!(fixture.primary_methods().await.is_empty());
         }

@@ -41,8 +41,9 @@
 //!     the toolset's own dispatch gate.
 //! 12. **mainnet_rule_create_refuses_before_any_approval_is_queued**: the same
 //!     for the rule-create action over a pending rule proposal.
-//! 13. **mainnet_read_only_toolset_action_still_succeeds**: a read-only action
-//!     stays allowed on mainnet.
+//! 13. **mainnet_read_only_toolset_action_is_refused_under_the_default_engine**:
+//!     the dispatcher refuses the read-only action with `policy.engine_required`
+//!     on mainnet and sends no request.
 //! 14. **rule_create_pending_proposal_without_grant_queues_first_invoke_approval**:
 //!     with a pending rule proposal and no grant, the route answers
 //!     `toolset.first_invoke_approval_required` and queues the approval beside the proposal.
@@ -1217,6 +1218,8 @@ attestation_version = 3
             chain_id: Some("stellar:testnet".to_owned()),
             args: serde_json::json!({
                 "envelope_xdr": payment_envelope_xdr(SOURCE_G, DEST_G, 10_000_000),
+                "asset": "native",
+                "amount": "1 XLM",
                 "chain_id": "stellar:testnet"
             }),
         })
