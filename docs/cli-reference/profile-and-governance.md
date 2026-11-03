@@ -797,7 +797,7 @@ Every subcommand's failure `error.code` is one of a closed set: the verb-specifi
 
 State-changing (writes the registry; performs a browser WebAuthn ceremony). The command requires terminals on stdin and stderr for the confirmation code. Without both terminals it exits `1` with `credentials.registration_tty_required`. It also requires the profile's keyed audit writer. If the audit chain key, audit binding or tip anchor is not in order, it refuses with the matching `audit.*` code before the ceremony starts.
 
-The command prints the wallet-owned bridge registration URL to stderr and opens it in the OS default browser. It polls the approval store until the bridge accepts the browser's response or the deadline elapses. The bridge verifies the response against the challenge it served on the page, the page's exact origin and the relying-party ID. It checks user presence and verification, and matches the posted credential ID and key against the authenticator's response. Once the bridge accepts the response, the page shows a confirmation code. The command asks for it at the terminal until the same deadline. Nothing is registered until the code typed at the terminal matches. The command then writes the `passkey_registered` audit row, followed by the credential metadata in the registry. A wrong code exits `1` with `credentials.registration_confirmation_mismatch`. The deadline at the prompt gives `credentials.registration_confirmation_expired`; end of input or Ctrl-C gives `credentials.registration_confirmation_canceled`. None of these refusals registers anything.
+The command prints the wallet-owned bridge registration URL to stderr and opens it in the OS default browser. The URL names `localhost`, so the bridge binds `127.0.0.1` and `[::1]` on one port before it serves the page and closes both together; when either cannot be held, the command exits `1` with `credentials.bridge_start_failed` and a message that states why the pair could not be held. It polls the approval store until the bridge accepts the browser's response or the deadline elapses. The bridge verifies the response against the challenge it served on the page, the page's exact origin and the relying-party ID. It checks user presence and verification, and matches the posted credential ID and key against the authenticator's response. Once the bridge accepts the response, the page shows a confirmation code. The command asks for it at the terminal until the same deadline. Nothing is registered until the code typed at the terminal matches. The command then writes the `passkey_registered` audit row, followed by the credential metadata in the registry. A wrong code exits `1` with `credentials.registration_confirmation_mismatch`. The deadline at the prompt gives `credentials.registration_confirmation_expired`; end of input or Ctrl-C gives `credentials.registration_confirmation_canceled`. None of these refusals registers anything.
 
 The browser opens through a private redirect file that only the current user can read. The browser launcher receives only that file's address, never the registration URL. The file is removed when the browser phase ends. If the browser cannot be launched, or does not show the page, open the printed URL yourself; polling continues either way. Anyone with the URL can attempt registration while the bridge accepts it. Registration requires the code from the operator's own page to match the code typed at the terminal. Keep the URL out of shared logs. Ctrl-C during polling stops the bridge, removes the redirect file, and exits `1` with `credentials.registration_user_canceled`.
 
@@ -1038,8 +1038,12 @@ The printed URL contains a single-use bootstrap token: the first visit
 exchanges it for an HttpOnly session cookie and an origin-scoped session
 proof, and the token dies. The page keeps the proof in the tab's session
 storage. Mutating requests require the session cookie, an origin-scoped
-session proof, and a CSRF value. The server binds `127.0.0.1` only and
-refuses non-loopback hosts and origins.
+session proof, and a CSRF value. A testnet inbox binds `127.0.0.1` only. A
+mainnet inbox, whose URL names `localhost`, binds `127.0.0.1` and `[::1]` on
+one port before it creates the token, serves the same session on both, and
+closes both together; when either cannot be held it exits `1` with
+`internal.unexpected_state` and `approve.serve_bind` in the message. The
+server refuses non-loopback hosts and origins.
 
 The inbox session expires after 15 minutes without operator activity or 8 hours after bootstrap. Background polling does not extend it. Restart `approve serve` to establish a new session.
 
@@ -1077,6 +1081,10 @@ browser:
 ```bash
 ssh -L 8791:127.0.0.1:8791 wallet-user@agent-host   # then start: approve serve --port 8791 --no-open
 ```
+
+The tunnel serves a testnet inbox, whose URL names `127.0.0.1`. A mainnet
+inbox refuses `--no-open`, and its `--port` must be free on both `127.0.0.1`
+and `[::1]`.
 
 There is no OS-notification push for remote operators; the open inbox page
 updates itself and the serve terminal prints a count line when new approvals
@@ -1167,8 +1175,10 @@ binding is what decides which of the two modes applies:
   when the command ends. If the browser cannot be opened, open the printed
   URL yourself. Until its first use or until the command ends, the printed
   URL grants an enrollment session to whoever opens it, so keep it out of
-  shared logs. The server binds `127.0.0.1` only and refuses non-loopback
-  hosts and origins. Always produces a credential bound to
+  shared logs. The server binds `127.0.0.1` and `[::1]` on one port before it
+  mints the bootstrap token, serves the same session on both, closes both
+  together, and does not start when either cannot be held. It refuses
+  non-loopback hosts and origins. Always produces a credential bound to
   `rp_id: "localhost"`, the only effective domain a loopback origin can
   claim. The stored sign count comes from the authenticator data the server
   verified.
@@ -1275,9 +1285,11 @@ the policy; see [Approval credentials](../profiles.md#approval-credentials).
   the terminal code, from 1 to 600 (default 300).
 
 The command needs a terminal on stdin and stderr and a local browser. It
-starts a one-shot server on `127.0.0.1` and opens the page at
-`http://localhost:<port>` through a private redirect file; the bearer URL is
-never printed. The page creates a passkey with relying-party ID `localhost`
+starts a one-shot server on `127.0.0.1` and `[::1]`, one port for both, and
+opens the page at `http://localhost:<port>` through a private redirect file;
+the bearer URL is never printed. When either address cannot be held, the
+command exits `1` with `approve.credential_enroll_unavailable`.
+The page creates a passkey with relying-party ID `localhost`
 over the server's single-use challenge, and the server verifies the
 registration as `approve operator enroll --interactive` does, user presence
 and user verification included. The page then shows a 16-hex-digit

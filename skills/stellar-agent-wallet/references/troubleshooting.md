@@ -293,7 +293,7 @@ or `trustline.policy_engine_unavailable`.
 | `approval.presence_changed` | The pending request or policy differs from the displayed consent; reload it. |
 | `approval.presence_expired` | The presence deadline expires; start a fresh consent. |
 | `approval.presence_consumed` | The challenge is consumed; start a fresh consent. |
-| `approval.presence_unavailable` | The presence ceremony cannot complete; check the local browser and authenticator. |
+| `approval.presence_unavailable` | The presence ceremony cannot start or complete; check the local browser and authenticator. The consent page binds `127.0.0.1` and `[::1]` on one port, so a host without IPv6 loopback cannot start it. |
 | `approval.presence_canceled` | The presence ceremony is canceled; no approval is recorded. |
 | `approval.presence_browser_required` | The ceremony requires a local browser; no approval is recorded. |
 
@@ -669,6 +669,20 @@ These failures carry `approval.*` codes:
 | `approval.remote_authorization_unavailable` | The profile's remote-approval authorization or the operator-credential store cannot be read, or the profile does not enable remote approval for that chain and relying-party ID. A remote approval cannot be honored while this holds. | Report the code. Have the operator repair the profile or the credential store, then request fresh consent. |
 | `approval.entry_inconsistent` | The pending payment, claim, or trustline request's stored digest is not the digest of its stored envelope, or its envelope does not decode; or the pending MPP charge shows terms that do not match what it would authorize, holds no binding digests, or at commit shows another transport, authority, or target than the prepared request. No surface approves it. | Stop. Report it: the approval store was changed outside the wallet. Request a fresh simulation for the intended action. |
 | `approval.clock_error`, `approval.sha256_hex_error`, `approval.key_decode_failed`, `approval.key_length_error`, `approval.binding_mismatch`, `approval.grant_persist`, `approval.wrong_kind`, `approval.record_failed`, `approval.uid_unavailable`, `approval.store_dir_error`, `approval.permission_denied`, `approval.invalid_nonce_length`, `approval.writer_locked`, `approval.store_open_failed`, `approval.gc_failed` | Approval validation, attestation, storage, or expired-entry collection refuses. | Report the code and diagnostic. Have the operator resolve the approval state, key, identity, clock, or store condition before requesting fresh consent. |
+
+A localhost ceremony binds `127.0.0.1` and `[::1]` on one port and does not
+start when either address cannot be held. It keeps its own refusal code:
+`approval.presence_unavailable` for mainnet consent,
+`approve.credential_enroll_unavailable` for approval credential enrollment,
+`internal.unexpected_state` with `approve.serve_bind` in the message for the
+mainnet inbox, `internal.unexpected_state` with
+`approve.operator_enroll_interactive_start_failed` in the message for
+operator enrollment, and `credentials.bridge_start_failed` for passkey
+registration. The last three messages describe the pair refusal: a held
+fixed `--port` names the family and the port, a missing loopback family
+names the family and the error kind, and an exhausted search for a free
+port reports the attempt count. Free the port on both families, or run the
+ceremony on a host with IPv6 loopback.
 
 ## Audit-key code
 

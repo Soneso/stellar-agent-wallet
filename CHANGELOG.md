@@ -139,6 +139,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `accounts create` with `validation.mainnet_secret_env_refused`, and these
   verbs sign with the enrolled seed in the keyring when no signer flag is
   given. Testnet signing is unchanged.
+- A host without IPv6 loopback cannot run the mainnet presence, mainnet
+  inbox, enrollment and passkey registration ceremonies.
+  `stellar-agent-loopback-http` gains `LoopbackPair`, `PairServer`,
+  `PairBindError` and `LoopbackFamily`. `ServeStartError`,
+  `OperatorEnrollStartError` and `BridgeStartError` gain `LoopbackPair`;
+  `ServeStartError::loopback_pair` returns it. The handles of these servers
+  close both listeners when dropped.
+- `OperatorEnrollStartError::Bind` and `BridgeStartError::Bind` are removed;
+  their start functions report `LoopbackPair`.
 - `MintRequest::chain_deadline_ms` caps authorization expiry at the signed
   envelope's deadline. `MainnetPrecondition` includes `DeadlineMissing`,
   `DeadlineElapsed` and `DeadlineTooFar`. `ClassicOpBuilder::with_mainnet_deadline`
@@ -603,6 +612,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attach to it, and refuses to run with `wallet.process_hardening_failed` when
   it cannot. A CLI that cannot start its async runtime refuses to run with
   `wallet.runtime_unavailable`.
+- Mainnet presence, the mainnet inbox, approval credential and operator
+  enrollment, and passkey registration bind `127.0.0.1` and `[::1]` on the
+  same port before any token exists, and refuse to start when either cannot
+  be held, so another local account cannot serve a page under the wallet's
+  `localhost` origin. Both listeners close together, also when either one
+  ends unexpectedly. Each ceremony keeps its refusal code.
 - Classic mainnet envelopes built by `pay`, `claim`, `accounts create`,
   `trustline` and their MCP tools carry an on-chain deadline 120 seconds after
   they are built. The operator's consent covers it, the authorization expires

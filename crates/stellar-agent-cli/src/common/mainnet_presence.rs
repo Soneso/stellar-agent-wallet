@@ -57,6 +57,9 @@ pub(crate) async fn acquire_mainnet_presence(
     let handle = stellar_agent_approval_ui::start_mainnet_presence(config)
         .await
         .map_err(|error| {
+            if let Some(pair) = error.loopback_pair() {
+                crate::common::log_pair_refusal("mainnet presence", pair);
+            }
             WalletError::Approval(
                 error
                     .presence_failure()

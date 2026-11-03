@@ -882,6 +882,143 @@ async fn start_serve_end_to_end_over_real_tcp_bind() {
         .expect("shutdown must join both tasks cleanly");
 }
 
+/// One HTTP/1.1 request over `addr` with `host: localhost:<port>`, returning
+/// the raw response text.
+async fn localhost_request(addr: SocketAddr, path: &str, cookie: Option<&str>) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .unwrap_or_else(|error| panic!("{addr} must accept: {error}"));
+    let cookie = cookie.map_or_else(String::new, |value| format!("cookie: {value}\r\n"));
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nhost: localhost:{}\r\n{cookie}connection: close\r\n\r\n",
+        addr.port()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// The mainnet inbox hands out a `localhost` URL, so it holds `127.0.0.1`
+/// and `[::1]` on that port: a bootstrap exchanged over `[::1]` opens the
+/// session the inbox serves over `127.0.0.1`, no other socket can bind
+/// `[::1]` there, and shutdown releases both.
+#[tokio::test]
+#[serial]
+async fn the_mainnet_inbox_binds_both_families() {
+    use stellar_agent_core::approval::mainnet_fixtures::MainnetConsentFixture;
+    let fixture = MainnetConsentFixture::new("inbox-pair");
+    let context = DecisionContext::new(
+        stellar_agent_core::approval::ApprovalContext::from_profile(
+            fixture.name(),
+            fixture.profile(),
+        ),
+        fixture.store_path(),
+        fixture.profile().attestation_key_id.clone(),
+        stellar_agent_core::profile::owner_key::OwnerKeyContext::for_profile(
+            fixture.name(),
+            fixture.profile(),
+        ),
+        Arc::new(StdMutex::new(fixture.audit_writer())),
+        None,
+    )
+    .with_mainnet_authority(fixture.authority());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    let handle = start_serve(ServeConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        context,
+        tx,
+        false,
+    ))
+    .await
+    .unwrap();
+    let port = handle.local_addr().port();
+    assert_eq!(
+        handle.local_addr(),
+        SocketAddr::from(([127, 0, 0, 1], port))
+    );
+    let token = handle.bootstrap_token_hex().to_owned();
+    assert_eq!(
+        handle.bootstrap_url(),
+        format!("http://localhost:{port}/bootstrap/{token}")
+    );
+    let ipv6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+    let bootstrap = localhost_request(ipv6, &format!("/bootstrap/{token}"), None).await;
+    assert!(bootstrap.starts_with("HTTP/1.1 200"), "{bootstrap}");
+    let cookie = bootstrap
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("set-cookie: ")
+                .or_else(|| line.strip_prefix("Set-Cookie: "))
+        })
+        .and_then(|value| value.split(';').next())
+        .expect("the bootstrap over [::1] sets the session cookie")
+        .to_owned();
+    let inbox = localhost_request(handle.local_addr(), "/inbox", Some(&cookie)).await;
+    assert!(
+        inbox.starts_with("HTTP/1.1 200"),
+        "the session opened over [::1] is served over 127.0.0.1: {inbox}"
+    );
+    assert_eq!(
+        std::net::TcpListener::bind(ipv6).unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    handle.shutdown().await.unwrap();
+    for addr in [SocketAddr::from(([127, 0, 0, 1], port)), ipv6] {
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "{addr} closed after shutdown"
+        );
+    }
+}
+
+/// The testnet inbox hands out a `127.0.0.1` URL, the address an SSH
+/// tunnel forwards, and keeps its single IPv4 listener: it starts on a port
+/// another socket holds on `[::1]`, binds nothing there, and still serves
+/// its bootstrap over `127.0.0.1`.
+#[tokio::test]
+#[serial]
+async fn the_testnet_inbox_keeps_one_listener() {
+    stellar_agent_test_support::keyring_mock::install().unwrap();
+    let dir = TempDir::new().unwrap();
+    let (held_v6, port) = (0..64)
+        .find_map(|_| {
+            let held = std::net::TcpListener::bind("[::1]:0").unwrap();
+            let port = held.local_addr().unwrap().port();
+            std::net::TcpListener::bind(("127.0.0.1", port))
+                .is_ok()
+                .then_some((held, port))
+        })
+        .expect("a port free on 127.0.0.1 among 64 held on ::1");
+    let handle = start_serve(config_for(
+        SocketAddr::from(([127, 0, 0, 1], port)),
+        dir.path().join("default.toml"),
+        dir.path().join("audit.log"),
+    ))
+    .await
+    .expect("the testnet inbox needs only 127.0.0.1");
+    assert_eq!(
+        handle.local_addr(),
+        SocketAddr::from(([127, 0, 0, 1], port))
+    );
+    let token = handle.bootstrap_token_hex().to_owned();
+    assert_eq!(
+        handle.bootstrap_url(),
+        format!("http://127.0.0.1:{port}/bootstrap/{token}")
+    );
+    drop(held_v6);
+    let ipv6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+    assert!(
+        std::net::TcpListener::bind(ipv6).is_ok(),
+        "the testnet inbox binds nothing on [::1]"
+    );
+    let bootstrap =
+        localhost_request(handle.local_addr(), &format!("/bootstrap/{token}"), None).await;
+    assert!(bootstrap.starts_with("HTTP/1.1 200"), "{bootstrap}");
+    handle.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 #[serial]
 async fn oversized_post_body_is_rejected() {

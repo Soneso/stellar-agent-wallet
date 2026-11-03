@@ -8,8 +8,13 @@
 //!
 //! The bridge:
 //!
-//! - Binds exclusively to a loopback address (`127.0.0.1:0` by default; the
-//!   OS assigns a random port per session, preventing port-scan guessing).
+//! - Binds exclusively to loopback: `127.0.0.1` and `[::1]` on one port
+//!   (OS-assigned per session by default, preventing port-scan guessing),
+//!   both held before the bridge serves anything and closed together. The
+//!   browser opens the bridge at `http://localhost:<port>`, which may reach
+//!   either address, so a family the bridge left free could serve another
+//!   account's page under the bridge's origin; the bridge does not start
+//!   when it cannot hold both.
 //! - Enforces a layered defence stack (see below).
 //! - Exposes two public entry points: [`start_bridge_register_only`] for
 //!   registration-only sessions (no signing-time pubkey lookup wired) and
@@ -89,8 +94,9 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{Router, extract::DefaultBodyLimit};
 use stellar_agent_core::approval::store::PendingApprovalStore;
+use stellar_agent_loopback_http::{LoopbackPair, PairServer};
 use stellar_agent_smart_account::managers::credentials::CredentialsManager;
-use tokio::{net::TcpListener, sync::Mutex, sync::oneshot, task::JoinHandle};
+use tokio::sync::Mutex;
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::instrument;
 
@@ -119,6 +125,7 @@ pub use stellar_agent_loopback_http::brand::PageIdentity;
 pub use stellar_agent_loopback_http::host_header::HostHeaderAllowlistLayer;
 pub use stellar_agent_loopback_http::origin_header::OriginHeaderAllowlistLayer;
 pub use stellar_agent_loopback_http::security_headers::SecurityHeadersLayer;
+pub use stellar_agent_loopback_http::{LoopbackFamily, PairBindError};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -250,13 +257,14 @@ pub(crate) struct BridgeState {
 ///
 /// # Drop behaviour
 ///
-/// Dropping the `BridgeHandle` without calling [`BridgeHandle::shutdown`]
-/// leaves the server task running.  Always call `shutdown` before the process
-/// exits to ensure the `tokio::JoinHandle` is resolved.
+/// Dropping the handle without calling [`BridgeHandle::shutdown`] drops its
+/// [`PairServer`], whose drop aborts both listener tasks at once: both
+/// addresses stop accepting without waiting for open connections. Call
+/// `shutdown` to let open connections finish and to wait for both
+/// listeners.
 pub struct BridgeHandle {
     local_addr: SocketAddr,
-    shutdown_tx: oneshot::Sender<()>,
-    join_handle: JoinHandle<()>,
+    server: PairServer,
 }
 
 impl std::fmt::Debug for BridgeHandle {
@@ -268,34 +276,33 @@ impl std::fmt::Debug for BridgeHandle {
 }
 
 impl BridgeHandle {
-    /// Return the actual bound socket address.
+    /// Return the IPv4 address of the listener pair, `127.0.0.1:<port>`.
     ///
-    /// When `bind_addr` was `127.0.0.1:0`, this returns the OS-assigned port.
-    /// Consumers call this to assemble the approval URL emitted to the agent.
+    /// When `bind_addr` named port `0`, this carries the OS-assigned port;
+    /// `[::1]` is bound on the same port. Consumers call this to assemble
+    /// the `http://localhost:<port>` URL emitted to the agent.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
-    /// Trigger graceful shutdown and wait for the server task to stop.
+    /// Trigger graceful shutdown and wait for both listeners to stop.
     ///
-    /// Sends a shutdown signal, then waits up to 5 seconds for the server task
-    /// to finish.  Returns [`BridgeShutdownError::Timeout`] if the task does
-    /// not stop within the deadline, or [`BridgeShutdownError::JoinFailed`] if
-    /// the task panicked.
+    /// Sends a shutdown signal, then waits up to 5 seconds for both listener
+    /// tasks to finish.  Returns [`BridgeShutdownError::Timeout`] if they do
+    /// not stop within the deadline, in which case both are aborted, or
+    /// [`BridgeShutdownError::JoinFailed`] if a task panicked or ended with an
+    /// I/O error.
     ///
     /// # Errors
     ///
-    /// - [`BridgeShutdownError::Timeout`] — the server task did not stop
-    ///   within 5 seconds.
-    /// - [`BridgeShutdownError::JoinFailed`] — the server task panicked.
+    /// - [`BridgeShutdownError::Timeout`]: the listeners did not stop within
+    ///   5 seconds.
+    /// - [`BridgeShutdownError::JoinFailed`]: a listener task panicked or
+    ///   ended with an I/O error.
     pub async fn shutdown(self) -> Result<(), BridgeShutdownError> {
-        // Signal the server to stop.  If the receiver has already dropped
-        // (e.g. the server task exited early), that is not an error.
-        let _ = self.shutdown_tx.send(());
-
-        // Wait for the server task to finish, with a timeout.
-        match tokio::time::timeout(SHUTDOWN_DEADLINE, self.join_handle).await {
+        self.server.shutdown();
+        match tokio::time::timeout(SHUTDOWN_DEADLINE, self.server.join()).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(join_err)) => Err(BridgeShutdownError::JoinFailed {
                 detail: join_err.to_string(),
@@ -311,13 +318,13 @@ impl BridgeHandle {
 
 /// Start the WebAuthn browser-handoff bridge HTTP server.
 ///
-/// Binds to `bind_addr` (typically `127.0.0.1:0` for a random loopback port),
-/// builds the axum router with the full middleware stack, and spawns a
-/// server task. IPv6 loopback binds are accepted by the runtime loopback
-/// guard; wallet-emitted browser URLs still use `localhost` to preserve
-/// WebAuthn RP-ID binding, and the Host-header allowlist also accepts
-/// `[::1]:<port>`. Returns a [`BridgeHandle`] giving the actual bound address
-/// and a graceful-shutdown handle.
+/// Uses only the port of `bind_addr` (typically `127.0.0.1:0` for a random
+/// loopback port) and binds `127.0.0.1` and `[::1]` on it, builds the axum
+/// router with the full middleware stack, and serves it on both listeners.
+/// Wallet-emitted browser URLs use `localhost` to preserve WebAuthn RP-ID
+/// binding, and a browser may reach either loopback address for that name,
+/// so both are held for the life of the bridge. Returns a [`BridgeHandle`]
+/// giving the IPv4 address and a graceful-shutdown handle.
 ///
 /// # State ownership
 ///
@@ -332,8 +339,9 @@ impl BridgeHandle {
 /// - [`BridgeStartError::NonLoopbackBind`] — `bind_addr.ip()` is not a
 ///   loopback address.  The bridge enforces loopback-only at runtime as a
 ///   defence-in-depth measure on top of the loopback-only bind invariant.
-/// - [`BridgeStartError::Bind`] — `TcpListener::bind(bind_addr)` failed (OS
-///   error, port already in use, etc.).
+/// - [`BridgeStartError::LoopbackPair`]: `127.0.0.1` and `[::1]` could not
+///   both be held on the port (port already in use on either family, a host
+///   without IPv6 loopback, etc.).
 ///
 /// # Examples
 ///
@@ -385,10 +393,14 @@ pub async fn start_bridge_register_only(
 /// `/approve/<nonce>/assertion` handler can resolve the registered credential
 /// public key before running `pre_verify_assertion`.
 ///
+/// Uses only the port of `bind_addr` and binds `127.0.0.1` and `[::1]` on
+/// it, as [`start_bridge_register_only`] describes.
+///
 /// # Errors
 ///
-/// Returns [`BridgeStartError`] when `bind_addr` is not loopback or the TCP
-/// listener cannot be bound.
+/// Returns [`BridgeStartError::NonLoopbackBind`] when `bind_addr` is not
+/// loopback and [`BridgeStartError::LoopbackPair`] when both loopback
+/// addresses cannot be held on its port.
 #[instrument(skip(approval_store, pubkey_lookup), fields(bind_addr = %bind_addr))]
 pub async fn start_bridge_with_pubkey_lookup(
     approval_store: Arc<Mutex<PendingApprovalStore>>,
@@ -401,15 +413,12 @@ pub async fn start_bridge_with_pubkey_lookup(
         return Err(BridgeStartError::NonLoopbackBind { addr: bind_addr });
     }
 
-    // Bind the TCP listener before spawning the task so bind errors surface
-    // immediately to the caller (before any async work).
-    let listener = TcpListener::bind(bind_addr)
+    // Hold both loopback families on the port before serving anything, so
+    // bind errors surface immediately to the caller.
+    let pair = LoopbackPair::bind(bind_addr.port())
         .await
-        .map_err(|source| BridgeStartError::Bind { source })?;
-
-    let local_addr = listener
-        .local_addr()
-        .map_err(|source| BridgeStartError::Bind { source })?;
+        .map_err(BridgeStartError::LoopbackPair)?;
+    let local_addr = pair.v4_addr();
 
     // Build the router with all Clone-capable middleware layers applied.
     let router = build_router(approval_store, pubkey_lookup, local_addr, page_identity);
@@ -418,37 +427,14 @@ pub async fn start_bridge_with_pubkey_lookup(
     // here: tower's `ConcurrencyLimit` / `RateLimit` services are not `Clone`
     // and cannot be applied at `Router::layer`; see the crate-level docs.
 
-    // Oneshot channel: sending () triggers graceful shutdown.
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-
-    // Spawn the server task.
-    let join_handle = tokio::spawn(async move {
-        let serve_result = axum::serve(listener, router.into_make_service())
-            .with_graceful_shutdown(async move {
-                // Await the shutdown signal; if the sender drops without
-                // sending, treat that as a shutdown request too.
-                let _ = shutdown_rx.await;
-            })
-            .await;
-
-        if let Err(err) = serve_result {
-            tracing::error!(
-                error.message = %err,
-                "bridge server task exited with error"
-            );
-        }
-    });
+    let server = pair.serve(router);
 
     tracing::info!(
         local_addr = %local_addr,
         "bridge HTTP server started"
     );
 
-    Ok(BridgeHandle {
-        local_addr,
-        shutdown_tx,
-        join_handle,
-    })
+    Ok(BridgeHandle { local_addr, server })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -644,25 +630,95 @@ mod tests {
         handle.shutdown().await.expect("shutdown should succeed");
     }
 
-    // IPv6 loopback address is_loopback() returns true; verify it is accepted
-    // by start_bridge_register_only (the bind itself may fail if IPv6 is unavailable).
+    /// `GET /healthz` over `addr` the way a browser at
+    /// `http://localhost:<port>` sends it.
+    async fn healthz_over(addr: SocketAddr) -> reqwest::Response {
+        reqwest::Client::builder()
+            .build()
+            .expect("reqwest client")
+            .get(format!("http://{addr}/healthz"))
+            .header("Host", format!("localhost:{}", addr.port()))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{addr} must answer: {error}"))
+    }
+
+    /// The registration and signing URLs name `localhost`, so the bridge
+    /// holds `127.0.0.1` and `[::1]` on one port: both answer, no other
+    /// socket can bind `[::1]` there, and shutdown releases both. An IPv6
+    /// bind address uses its port the same way.
     #[tokio::test]
-    async fn ipv6_loopback_is_accepted_if_available() {
-        let (store, _dir) = test_store();
-        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
-        match start_bridge_register_only(store, addr, PageIdentity::neutral()).await {
-            Ok(handle) => {
-                // IPv6 available: verify it is loopback.
-                assert!(handle.local_addr().ip().is_loopback());
-                handle.shutdown().await.expect("clean shutdown");
+    async fn the_bridge_binds_both_families_on_one_port() {
+        for bind_addr in [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        ] {
+            let (store, _dir) = test_store();
+            let handle = start_bridge_with_pubkey_lookup(
+                store,
+                bind_addr,
+                Arc::new(MissingApprovalPubkeyLookup),
+                PageIdentity::neutral(),
+            )
+            .await
+            .expect("both loopback families are available");
+            let port = handle.local_addr().port();
+            let ipv4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+            let ipv6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port);
+            assert_eq!(handle.local_addr(), ipv4);
+            for addr in [ipv4, ipv6] {
+                assert_eq!(healthz_over(addr).await.status().as_u16(), 200, "{addr}");
             }
-            Err(BridgeStartError::Bind { .. }) => {
-                // IPv6 unavailable on this host — acceptable.
-            }
-            Err(other) => {
-                panic!("unexpected error for IPv6 loopback: {other}");
+            assert_eq!(
+                std::net::TcpListener::bind(ipv6).unwrap_err().kind(),
+                std::io::ErrorKind::AddrInUse,
+                "no other socket can bind [::1]:{port}"
+            );
+            handle.shutdown().await.expect("clean shutdown");
+            for addr in [ipv4, ipv6] {
+                assert!(
+                    tokio::net::TcpStream::connect(addr).await.is_err(),
+                    "{addr} closed after shutdown"
+                );
             }
         }
+    }
+
+    /// Another socket on `[::1]` at the requested port makes the bridge
+    /// refuse with the IPv6 family named, and the refusal leaves nothing
+    /// bound on `127.0.0.1`.
+    #[tokio::test]
+    async fn the_bridge_refuses_when_ipv6_is_held() {
+        let (competitor, port) = (0..64)
+            .find_map(|_| {
+                let held = std::net::TcpListener::bind("[::1]:0").unwrap();
+                let port = held.local_addr().unwrap().port();
+                std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+                    .is_ok()
+                    .then_some((held, port))
+            })
+            .expect("a port free on 127.0.0.1 among 64 held on ::1");
+        let (store, _dir) = test_store();
+        let err = start_bridge_register_only(
+            store,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            PageIdentity::neutral(),
+        )
+        .await
+        .expect_err("the bridge must refuse while [::1] is held");
+        match err {
+            BridgeStartError::LoopbackPair(pair) => assert_eq!(
+                pair,
+                PairBindError::PortUnavailable {
+                    port,
+                    family: LoopbackFamily::V6,
+                    kind: std::io::ErrorKind::AddrInUse,
+                }
+            ),
+            other => panic!("expected a loopback pair refusal, got: {other}"),
+        }
+        assert!(std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
+        drop(competitor);
     }
 
     // ─── ApprovalPubkeyLookupError ────────────────────────────────────────────

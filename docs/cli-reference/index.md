@@ -145,6 +145,10 @@ with an owner-pinned credential. Headless consent, `--yes`, `--no-open` on the
 mainnet inbox, and remote mainnet approval refuse. Ledger signing also requires
 this passkey ceremony.
 
+A localhost ceremony binds `127.0.0.1` and `[::1]` on one port before it
+creates any token, serves the same session on both, and closes both together.
+When either family cannot be held, the ceremony does not start.
+
 An MCP mainnet commit accepts only a version 5 approval with its verified
 presence receipt. An invalid proof refuses with `policy.approval_required`.
 Each challenge lasts at most 120 seconds. The command waits until pending

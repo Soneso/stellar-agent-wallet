@@ -2,6 +2,8 @@
 
 use std::net::SocketAddr;
 
+use stellar_agent_loopback_http::PairBindError;
+
 /// Error returned by [`crate::start_serve`] when the server cannot be started.
 ///
 /// `#[non_exhaustive]`: future bind-time validation may add variants without a
@@ -37,15 +39,32 @@ pub enum ServeStartError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A listener the browser reaches at `http://localhost:<port>` could not
+    /// hold both `127.0.0.1` and `[::1]` on its port, so it does not start.
+    ///
+    /// Display contains structured refusal details, never OS detail.
+    #[error("approval listener cannot hold both loopback addresses: {0}")]
+    LoopbackPair(PairBindError),
 }
 
 impl ServeStartError {
     /// The approval failure a mainnet presence refusal reports, or `None`
-    /// for a bind refusal.
+    /// for a bind or loopback pair refusal.
     #[must_use]
     pub fn presence_failure(&self) -> Option<stellar_agent_core::ApprovalFailure> {
         match self {
             Self::Presence(refusal) => Some(refusal.failure()),
+            _ => None,
+        }
+    }
+
+    /// The loopback pair refusal, when the listener could not hold both
+    /// loopback addresses.
+    #[must_use]
+    pub fn loopback_pair(&self) -> Option<&PairBindError> {
+        match self {
+            Self::LoopbackPair(error) => Some(error),
             _ => None,
         }
     }

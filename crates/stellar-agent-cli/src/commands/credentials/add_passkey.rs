@@ -11,7 +11,10 @@
 //! 4. Open `PendingApprovalStore` exactly once; wrap in `Arc<Mutex<>>`.
 //! 5. Construct `CredentialsManager::new` with the shared store Arc.
 //! 6. First-registration RP-ID binding prompt (if no prior passkeys).
-//! 7. Start the WebAuthn bridge with the same shared store Arc.
+//! 7. Start the WebAuthn bridge with the same shared store Arc. The bridge
+//!    holds `127.0.0.1` and `[::1]` on one port, because the registration
+//!    URL names `localhost`; when either cannot be held the command refuses
+//!    with `credentials.bridge_start_failed`.
 //! 8. Insert `PendingApproval { kind: RegisterPasskey }`, which carries a
 //!    fresh registration challenge, via `CredentialsManager`.
 //! 9. Print the registration URL to stderr and open the browser through a
@@ -75,7 +78,7 @@ use stellar_agent_smart_account::managers::credentials::{
     AddPasskeyOutcome, CredentialsError, CredentialsManager, PendingPasskeyRegistration,
     UnconfirmedEnd,
 };
-use stellar_agent_webauthn_bridge::{BridgeHandle, start_bridge_register_only};
+use stellar_agent_webauthn_bridge::{BridgeHandle, BridgeStartError, start_bridge_register_only};
 use tokio::sync::Mutex;
 
 use crate::commands::credentials::credentials_error_code;
@@ -291,10 +294,8 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
     {
         Ok(h) => h,
         Err(e) => {
-            return emit_error(
-                "credentials.bridge_start_failed",
-                format!("bridge start failed: {e}"),
-            );
+            let (code, message) = bridge_start_refusal(&e);
+            return emit_error(code, message);
         }
     };
     let bridge_addr = bridge.local_addr();
@@ -649,6 +650,20 @@ fn print_registration_handoff(url: &str) {
     );
 }
 
+/// The code and message of a bridge that did not start: every start error,
+/// a loopback pair the bridge could not hold included, is
+/// `credentials.bridge_start_failed`. A pair refusal is logged at `debug`
+/// with its address family and error kind.
+fn bridge_start_refusal(error: &BridgeStartError) -> (&'static str, String) {
+    if let BridgeStartError::LoopbackPair(pair) = error {
+        crate::common::log_pair_refusal("passkey registration", pair);
+    }
+    (
+        "credentials.bridge_start_failed",
+        format!("bridge start failed: {error}"),
+    )
+}
+
 fn emit_error(code: &'static str, message: String) -> i32 {
     render_json(&Envelope::<()>::err_raw(code, message));
     1
@@ -705,6 +720,31 @@ mod tests {
             Some(Arc::clone(&store)),
         );
         (bridge, mgr, store)
+    }
+
+    /// A bridge that cannot hold both loopback addresses refuses with the
+    /// code of every bridge start failure, and its message names the family
+    /// and the port.
+    #[test]
+    fn add_passkey_maps_a_pair_refusal_to_bridge_start_failed() {
+        let pair = stellar_agent_webauthn_bridge::PairBindError::PortUnavailable {
+            port: 7823,
+            family: stellar_agent_webauthn_bridge::LoopbackFamily::V6,
+            kind: std::io::ErrorKind::AddrInUse,
+        };
+        let (code, message) = bridge_start_refusal(&BridgeStartError::LoopbackPair(pair));
+        assert_eq!(code, "credentials.bridge_start_failed");
+        assert!(
+            message.contains("IPv6") && message.contains("7823"),
+            "{message}"
+        );
+        let (code, _) = bridge_start_refusal(&BridgeStartError::LoopbackPair(
+            stellar_agent_webauthn_bridge::PairBindError::FamilyUnavailable {
+                family: stellar_agent_webauthn_bridge::LoopbackFamily::V6,
+                kind: std::io::ErrorKind::AddrNotAvailable,
+            },
+        ));
+        assert_eq!(code, "credentials.bridge_start_failed");
     }
 
     /// The software authenticator the browser side of the tests uses.

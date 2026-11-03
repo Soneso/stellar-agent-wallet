@@ -30,8 +30,8 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use stellar_agent_approval_ui::operator_enroll::{
-    OperatorEnrollAwaitError, OperatorEnrollHandle, OperatorEnrollmentConfirmationError,
-    start_mainnet_approval_enroll,
+    OperatorEnrollAwaitError, OperatorEnrollHandle, OperatorEnrollStartError,
+    OperatorEnrollmentConfirmationError, start_mainnet_approval_enroll,
 };
 use stellar_agent_core::approval::{MAINNET_APPROVAL_RP_ID, MainnetApprovalCredential};
 use stellar_agent_core::envelope::Envelope;
@@ -181,6 +181,9 @@ async fn run_enroll(args: EnrollApprovalCredentialArgs) -> i32 {
     {
         Ok(handle) => handle,
         Err(error) => {
+            if let OperatorEnrollStartError::LoopbackPair(pair) = &error {
+                crate::common::log_pair_refusal("approval credential enrollment", pair);
+            }
             tracing::debug!(error = %error, "approval credential enrollment did not start");
             return refuse(UNAVAILABLE);
         }
