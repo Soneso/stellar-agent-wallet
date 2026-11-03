@@ -1446,7 +1446,7 @@ fn pay_refused_after_the_reconcile_pass(home: &Path) -> (i32, Value) {
         &[
             "pay",
             &destination,
-            "1",
+            "1 XLM",
             "--source",
             SOURCE,
             "--fee",
@@ -1455,6 +1455,18 @@ fn pay_refused_after_the_reconcile_pass(home: &Path) -> (i32, Value) {
             PROFILE,
         ],
     )
+}
+
+/// Asserts that a run of [`pay_refused_after_the_reconcile_pass`] ended on its
+/// unparseable fee.
+fn assert_refused_on_the_fee(code: i32, envelope: &Value) {
+    assert_eq!(code, 1, "{envelope}");
+    assert_eq!(
+        envelope["error"]["code"], "validation.amount_malformed",
+        "the run refuses on the fee: {envelope}"
+    );
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(message.contains("not-a-fee"), "{message}");
 }
 
 /// The gate pass a value verb runs releases a due reservation on chain
@@ -1470,7 +1482,7 @@ async fn the_gate_pass_settles_on_evidence_and_never_sends() {
 
     let (code, envelope) = pay_refused_after_the_reconcile_pass(home.path());
 
-    assert_eq!(code, 1, "{envelope}");
+    assert_refused_on_the_fee(code, &envelope);
     assert!(
         window.pending_reservations(&profile).unwrap().is_empty(),
         "the pass released the reservation"
@@ -1499,7 +1511,7 @@ async fn a_release_reason_left_by_a_gate_pass_is_written_by_tx_status() {
 
     let (code, envelope) = pay_refused_after_the_reconcile_pass(home.path());
 
-    assert_eq!(code, 1, "{envelope}");
+    assert_refused_on_the_fee(code, &envelope);
     assert!(window.pending_reservations(&profile).unwrap().is_empty());
     assert_eq!(
         receipt(home.path()).release_code,

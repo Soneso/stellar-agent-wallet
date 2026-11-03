@@ -451,6 +451,42 @@ async fn the_endpoint_check_precedes_the_reconcile_lookup_of_a_due_reservation()
     }
 }
 
+#[test]
+fn pay_issued_amount_refuses_xlm_unit_before_rpc() {
+    let source = account_id_for_seed([0x36; 32]);
+    let descriptor = format!("TST:{DEST_G}");
+    for stage in [Some("--build-only"), None] {
+        let home = tempfile::tempdir().unwrap();
+        let mut argv = vec![
+            "pay",
+            DEST_G,
+            "100 XLM",
+            &descriptor,
+            "--source",
+            &source,
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://127.0.0.1:1",
+            "--output",
+            "json",
+        ];
+        if let Some(stage) = stage {
+            argv.push(stage);
+        }
+        let (code, envelope) = run_cli(home.path(), &argv);
+        assert_eq!(code, 1, "{envelope}");
+        assert_eq!(
+            envelope["error"]["code"], "validation.amount_malformed",
+            "{envelope}"
+        );
+        assert_eq!(
+            envelope["error"]["message"],
+            "amount '100 XLM' has unit 'XLM'; expected unit 'TST'"
+        );
+    }
+}
+
 /// The full payment pipeline checks the endpoint, then reconciles, then
 /// checks `--fee`. On a V1 profile with a due reservation and a malformed
 /// `--fee`, an endpoint serving another network ends the run on the mismatch

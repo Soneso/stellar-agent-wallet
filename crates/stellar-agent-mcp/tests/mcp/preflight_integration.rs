@@ -392,12 +392,12 @@ fn mock_result_account_only(account_xdr: &str, account_key: &str) -> serde_json:
     })
 }
 
-fn make_non_native_pay_args(amount_xlm_str: &str) -> StellarPayArgs {
+fn make_non_native_pay_args(amount_str: &str) -> StellarPayArgs {
     StellarPayArgs {
         chain_id: "stellar:testnet".to_owned(),
         source: SOURCE_G.to_owned(),
         destination: DEST_G.to_owned(),
-        amount: Some(serde_json::from_str(amount_xlm_str).unwrap()),
+        amount: Some(serde_json::from_str(amount_str).unwrap()),
         amount_in_stroops: None,
         asset: format!("USDC:{USDC_ISSUER_G}"),
         memo_text: None,
@@ -445,7 +445,7 @@ async fn pay_nonnative_preflight_trustline_missing() {
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     let result = server
-        .call_stellar_pay(make_non_native_pay_args(r#""10 XLM""#))
+        .call_stellar_pay(make_non_native_pay_args(r#""10 USDC""#))
         .await;
     assert_tool_error(result, "ledger.trustline_missing");
 }
@@ -468,10 +468,10 @@ async fn pay_nonnative_preflight_trustline_balance_insufficient() {
     let mock_server = MockServer::start().await;
 
     // Source has ample XLM (20 XLM, 0 subentries) but USDC trustline has only
-    // 5_000_000 stroops (0.5 USDC), while payment requests 10 XLM worth.
+    // 5_000_000 stroops (0.5 USDC), while payment requests 10 USDC.
     let account_xdr = account_entry_xdr(SOURCE_G, 200_000_000, 0);
     let account_key = account_ledger_key_xdr(SOURCE_G);
-    // Trustline balance: 5_000_000 (below the 10_000_000 requested as "10 XLM").
+    // Trustline balance: 5_000_000 (below the 100_000_000 requested as "10 USDC").
     let tl_xdr = trustline_entry_xdr(SOURCE_G, "USDC", USDC_ISSUER_G, 5_000_000);
     let tl_key = trustline_ledger_key_xdr(SOURCE_G, "USDC", USDC_ISSUER_G);
 
@@ -490,7 +490,7 @@ async fn pay_nonnative_preflight_trustline_balance_insufficient() {
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     let result = server
-        .call_stellar_pay(make_non_native_pay_args(r#""10 XLM""#))
+        .call_stellar_pay(make_non_native_pay_args(r#""10 USDC""#))
         .await;
     assert_tool_error(result, "ledger.insufficient_balance");
 }
@@ -539,7 +539,7 @@ async fn pay_nonnative_preflight_xlm_fee_insufficient() {
 
     // Request a small amount to ensure trustline balance check would pass.
     let result = server
-        .call_stellar_pay(make_non_native_pay_args(r#""0.0000001 XLM""#))
+        .call_stellar_pay(make_non_native_pay_args(r#""0.0000001 USDC""#))
         .await;
     // The XLM fee check must fire first, surfacing as XLM insufficient_balance.
     assert_tool_error(result, "ledger.insufficient_balance");
@@ -898,7 +898,58 @@ async fn pay_nonnative_preflight_succeeds_when_trustline_balance_sufficient_and_
     let server = WalletServer::new(profile).expect("WalletServer::new");
 
     let result = server
-        .call_stellar_pay(make_non_native_pay_args(r#""1 XLM""#))
+        .call_stellar_pay(make_non_native_pay_args(r#""1 USDC""#))
         .await;
     assert_tool_success(result);
+}
+
+#[tokio::test]
+#[serial]
+async fn pay_issued_amount_simulates_tst_envelope() {
+    use base64::Engine;
+    use keyring_core::Entry;
+
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    Entry::new("n-svc", "n-acct")
+        .unwrap()
+        .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([3u8; 32]))
+        .unwrap();
+    let rpc = MockServer::start().await;
+    crate::common::mount_testnet_identity(&rpc).await;
+    Mock::given(method("POST"))
+        .respond_with(EchoIdResponder::new(mock_result_with_trustline(
+            &account_entry_xdr(SOURCE_G, 200_000_000, 1),
+            &account_ledger_key_xdr(SOURCE_G),
+            &trustline_entry_xdr(SOURCE_G, "TST", USDC_ISSUER_G, 1_000_000_000),
+            &trustline_ledger_key_xdr(SOURCE_G, "TST", USDC_ISSUER_G),
+        )))
+        .up_to_n_times(1)
+        .mount(&rpc)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(EchoIdResponder::new(
+            serde_json::json!({ "entries": [], "latestLedger": 1001 }),
+        ))
+        .mount(&rpc)
+        .await;
+    let server = WalletServer::new(testnet_profile_with_rpc(&rpc.uri())).unwrap();
+    let asset = format!("TST:{USDC_ISSUER_G}");
+    let args: StellarPayArgs = serde_json::from_value(serde_json::json!({
+        "chain_id": "stellar:testnet", "source": SOURCE_G, "destination": DEST_G,
+        "amount": "100 TST", "asset": asset
+    }))
+    .unwrap();
+    let result = server.call_stellar_pay(args).await.unwrap();
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let text = result.content[0].as_text().unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text.text).unwrap();
+    let envelope = value["data"]["envelope_xdr"].as_str().unwrap();
+    let decoded = stellar_agent_core::envelope_decode::decode_authoritative_args(
+        envelope,
+        "stellar_pay_commit",
+    )
+    .unwrap();
+    assert_eq!(decoded["asset"], asset);
+    assert_eq!(decoded["amount_stroops"], "1000000000");
 }
