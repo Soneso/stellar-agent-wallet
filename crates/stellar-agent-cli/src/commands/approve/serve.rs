@@ -9,7 +9,12 @@
 //! # Flow
 //!
 //! On start the server mints a single-use bootstrap token and prints the
-//! `http://127.0.0.1:<port>/bootstrap/<token>` URL. Opening it exchanges the
+//! bootstrap URL: `http://127.0.0.1:<port>/bootstrap/<token>` for a testnet
+//! profile, `http://localhost:<port>/bootstrap/<token>` for a mainnet one.
+//! A mainnet inbox binds `127.0.0.1` and `[::1]` on the port before it
+//! creates the token, because a browser may reach either address for
+//! `localhost`, and does not start when either cannot be held. Opening the
+//! URL exchanges the
 //! token for an `HttpOnly` session cookie and a session proof the page keeps
 //! in the tab, then shows the inbox; every other route requires the cookie,
 //! and approve and reject also require the proof. The session ends after 15
@@ -83,6 +88,8 @@ pub struct ServeArgs {
     pub profile: Option<String>,
 
     /// TCP port to bind on `127.0.0.1` (default: `0`, an OS-assigned port).
+    /// A mainnet profile binds it on `127.0.0.1` and `[::1]`, so it must be
+    /// free on both.
     #[arg(long = "port", default_value_t = 0, value_name = "PORT")]
     pub port: u16,
 
@@ -481,7 +488,10 @@ fn print_remote_startup(rp_id: &str, port: u16, fingerprint_sha256_hex: &str) {
 
 /// Maps a [`ServeStartError`] to a wallet error for the JSON envelope.
 ///
-/// A mainnet presence refusal keeps its approval code and fixed message.
+/// A mainnet presence refusal keeps its approval code and fixed message. A
+/// mainnet inbox that cannot hold both loopback addresses reports
+/// `internal.unexpected_state` with `approve.serve_bind` and the pair refusal
+/// in the message, and logs the family and error kind at `debug`.
 fn start_error_to_wallet_error(e: &ServeStartError) -> WalletError {
     if let Some(failure) = e.presence_failure() {
         return WalletError::Approval(failure);
@@ -492,6 +502,10 @@ fn start_error_to_wallet_error(e: &ServeStartError) -> WalletError {
         }
         ServeStartError::Bind { .. } => {
             format!("approve.serve_bind: could not bind the requested port ({e})")
+        }
+        ServeStartError::LoopbackPair(pair) => {
+            crate::common::log_pair_refusal("approval inbox", pair);
+            format!("approve.serve_bind: {e}")
         }
         // `ServeStartError` is `#[non_exhaustive]`; a future variant maps to the
         // same generic serve-start error code.
@@ -575,6 +589,20 @@ mod tests {
             source: std::io::Error::from(std::io::ErrorKind::AddrInUse),
         });
         assert!(bind.to_string().contains("approve.serve_bind"), "{bind}");
+        let pair = start_error_to_wallet_error(&ServeStartError::LoopbackPair(
+            stellar_agent_approval_ui::PairBindError::PortUnavailable {
+                port: 7823,
+                family: stellar_agent_approval_ui::LoopbackFamily::V6,
+                kind: std::io::ErrorKind::AddrInUse,
+            },
+        ));
+        assert!(
+            pair.to_string().contains(
+                "approve.serve_bind: approval listener cannot hold both loopback addresses: \
+                 loopback port 7823 cannot be held on IPv6: AddrInUse"
+            ),
+            "{pair}"
+        );
     }
 
     /// Minimal parser wrapper so `ServeArgs` can be exercised through clap.

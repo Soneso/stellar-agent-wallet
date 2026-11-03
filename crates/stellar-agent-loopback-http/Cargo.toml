@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Shared tower/axum defence-in-depth middleware and page presentation for the Stellar agent wallet's browser-facing HTTP listeners (Host allowlist, Origin allowlist, hardened security headers, brand stylesheet and inline mark)."
+description = "Shared tower/axum defence-in-depth middleware, paired loopback listeners and page presentation for the Stellar agent wallet's browser-facing HTTP listeners (Host allowlist, Origin allowlist, hardened security headers, IPv4 and IPv6 loopback pair, brand stylesheet and inline mark)."
 readme = "README.md"
 keywords = ["stellar", "http", "middleware", "tower", "axum"]
 categories = ["web-programming::http-server", "network-programming"]
@@ -15,9 +15,14 @@ name = "stellar_agent_loopback_http"
 
 [dependencies]
 # HTTP framework types (Request/Response/StatusCode/header) the middleware
-# operates on; no server or router surface is exposed from this crate.
-# `matched-path`: the route template `request_trace::route_label` records.
+# operates on, and `axum::serve`, which runs a router on both listeners of a
+# loopback pair. `matched-path`: the route template
+# `request_trace::route_label` records.
 axum = { workspace = true, features = ["matched-path"] }
+
+# The two loopback listeners of a pair (`net`), their shared shutdown signal
+# (`sync`), and the task per listener (`rt`).
+tokio = { workspace = true, features = ["net", "sync", "rt"] }
 
 # Layer/Service traits the middleware implements.
 tower = { workspace = true }
@@ -29,8 +34,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-# oneshot() driver + Router test harness for the middleware unit tests.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# oneshot() driver + Router test harness for the middleware unit tests;
+# timeouts and raw socket requests for the loopback pair tests.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "io-util"] }
 
 [lints]
 workspace = true

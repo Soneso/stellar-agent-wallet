@@ -47,7 +47,8 @@ use stellar_agent_core::{
         verify_mainnet_presence,
     },
 };
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+use stellar_agent_loopback_http::{LoopbackPair, PairBindError, PairServer};
+use tokio::sync::oneshot;
 
 /// Trusted inputs for a single mainnet consent page.
 pub struct MainnetPresenceConfig {
@@ -283,11 +284,21 @@ impl PresenceState {
 }
 
 /// A private listener whose completion carries verified presence to its owner.
+///
+/// The listener holds `127.0.0.1` and `[::1]` on one port for as long as the
+/// handle lives; shutting it down or dropping it closes both.
+///
+/// # Drop behaviour
+///
+/// Dropping the handle without calling [`MainnetPresenceHandle::shutdown`]
+/// drops its [`PairServer`], whose drop aborts both listener tasks at once:
+/// both addresses stop accepting without waiting for open connections.
+/// Call `shutdown` to let open connections finish and to wait for both
+/// listeners.
 pub struct MainnetPresenceHandle {
     bootstrap_url: String,
     completion: Option<oneshot::Receiver<Result<VerifiedMainnetPresence, WalletError>>>,
-    shutdown_tx: Option<oneshot::Sender<()>>,
-    server_task: Option<JoinHandle<Result<(), std::io::Error>>>,
+    server: Option<PairServer>,
 }
 
 impl std::fmt::Debug for MainnetPresenceHandle {
@@ -322,35 +333,20 @@ impl MainnetPresenceHandle {
             .map_err(|_| failure(Failure::PresenceUnavailable))?
     }
 
-    /// Stops the listener and waits for its task within five seconds.
+    /// Stops both loopback listeners and waits for them within five seconds.
     ///
     /// # Errors
-    /// Returns presence unavailable if shutdown fails or exceeds its deadline.
+    /// Returns presence unavailable if shutdown fails or exceeds its deadline;
+    /// both listeners are closed either way.
     pub async fn shutdown(&mut self) -> Result<(), WalletError> {
-        if let Some(sender) = self.shutdown_tx.take() {
-            let _ = sender.send(());
-        }
-        if let Some(mut task) = self.server_task.take() {
-            match tokio::time::timeout(crate::SHUTDOWN_DEADLINE, &mut task).await {
-                Ok(Ok(Ok(()))) => {}
-                _ => {
-                    task.abort();
-                    return Err(failure(Failure::PresenceUnavailable));
-                }
+        if let Some(server) = self.server.take() {
+            server.shutdown();
+            match tokio::time::timeout(crate::SHUTDOWN_DEADLINE, server.join()).await {
+                Ok(Ok(())) => {}
+                _ => return Err(failure(Failure::PresenceUnavailable)),
             }
         }
         Ok(())
-    }
-}
-
-impl Drop for MainnetPresenceHandle {
-    fn drop(&mut self) {
-        if let Some(sender) = self.shutdown_tx.take() {
-            let _ = sender.send(());
-        }
-        if let Some(task) = self.server_task.take() {
-            task.abort();
-        }
     }
 }
 
@@ -378,6 +374,11 @@ fn start_refusal(error: &WalletError) -> ServeStartError {
 
 /// Starts a localhost-only presence listener without holding the pending store.
 ///
+/// The listener binds `127.0.0.1` and `[::1]` on one OS-assigned port before
+/// it creates the bootstrap token, because the page runs at
+/// `http://localhost:<port>` and a browser may reach either address. Both
+/// serve the same session and close together.
+///
 /// The stored entry must be the one `config` presents: its consent view
 /// digest under the current policy must equal that of `config.entry`.
 ///
@@ -387,13 +388,26 @@ fn start_refusal(error: &WalletError) -> ServeStartError {
 /// policy cannot be verified for the profile,
 /// [`PresenceStartRefusal::Changed`] when the stored entry is not the
 /// presented one, and [`PresenceStartRefusal::Unavailable`] when the store
-/// cannot be read; [`ServeStartError::Bind`] for an unavailable loopback
-/// listener.
+/// cannot be read; [`ServeStartError::LoopbackPair`] when both loopback
+/// addresses cannot be held on one port.
 pub async fn start_mainnet_presence(
     config: MainnetPresenceConfig,
 ) -> Result<MainnetPresenceHandle, ServeStartError> {
-    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(bind_error)?;
-    let address = listener.local_addr().map_err(bind_error)?;
+    start_mainnet_presence_with(config, || LoopbackPair::bind(0)).await
+}
+
+/// [`start_mainnet_presence`] with the loopback pair from `bind_pair`, which
+/// runs before anything else, so no token exists unless the pair does.
+async fn start_mainnet_presence_with<B, F>(
+    config: MainnetPresenceConfig,
+    bind_pair: B,
+) -> Result<MainnetPresenceHandle, ServeStartError>
+where
+    B: FnOnce() -> F,
+    F: Future<Output = Result<LoopbackPair, PairBindError>>,
+{
+    let pair = bind_pair().await.map_err(ServeStartError::LoopbackPair)?;
+    let address = pair.v4_addr();
     let token = OpaqueToken::generate();
     let bootstrap_url = format!(
         "{}/bootstrap/{}",
@@ -461,27 +475,11 @@ pub async fn start_mainnet_presence(
             }),
         );
     let router = layers(router, address);
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let task = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await
-    });
     Ok(MainnetPresenceHandle {
         bootstrap_url,
         completion: Some(completion),
-        shutdown_tx: Some(shutdown_tx),
-        server_task: Some(task),
+        server: Some(pair.serve(router)),
     })
-}
-
-fn bind_error(source: std::io::Error) -> ServeStartError {
-    ServeStartError::Bind {
-        kind: source.kind(),
-        source,
-    }
 }
 
 pub(crate) fn layers(router: Router, address: SocketAddr) -> Router {

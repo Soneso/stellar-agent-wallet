@@ -24,6 +24,8 @@
 //!   browser auto-launch, shared by every subcommand that offers one.
 //! - `interrupted`: resolves when the operator interrupts a ceremony wait,
 //!   shared by every subcommand that holds a browser handoff while it waits.
+//! - `log_pair_refusal`: the `debug` record of a localhost ceremony that
+//!   cannot hold both loopback addresses, shared by every such ceremony.
 //!
 //! # Re-exports
 //!
@@ -88,6 +90,26 @@ pub(crate) async fn interrupted(signal: impl Future<Output = std::io::Result<()>
         );
         std::future::pending::<()>().await;
     }
+}
+
+/// Records at `debug` why the localhost ceremony named `ceremony` cannot
+/// hold both loopback addresses: the family whose bind failed, or `both`
+/// when no port could be held on the two together, and the error kind.
+///
+/// The caller reports its own refusal code; this only adds the detail the
+/// code does not carry.
+pub(crate) fn log_pair_refusal(
+    ceremony: &'static str,
+    pair: &stellar_agent_loopback_http::PairBindError,
+) {
+    tracing::debug!(
+        ceremony,
+        family = pair
+            .family()
+            .map_or("both", stellar_agent_loopback_http::LoopbackFamily::as_str),
+        kind = ?pair.kind(),
+        "the ceremony cannot hold both loopback addresses"
+    );
 }
 
 /// Profile-name resolution and path-component validation, re-exported from

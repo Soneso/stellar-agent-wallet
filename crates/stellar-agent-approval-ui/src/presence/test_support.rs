@@ -109,6 +109,15 @@ impl PresenceClient {
         })
     }
 
+    /// This session, sending its later requests to `addr`: another socket of
+    /// the same listener, such as `[::1]` on the port of a `localhost`
+    /// ceremony.
+    #[must_use]
+    pub fn at(mut self, addr: SocketAddr) -> Self {
+        self.addr = addr;
+        self
+    }
+
     /// The assertion origin of this listener.
     #[must_use]
     pub fn origin(&self) -> String {

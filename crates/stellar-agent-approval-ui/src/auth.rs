@@ -74,9 +74,24 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Clone)]
 pub(crate) struct OpaqueToken([u8; 32]);
 
+#[cfg(test)]
+thread_local! {
+    /// Tokens generated on this thread, so a test can tell whether a start
+    /// path created a token before it refused.
+    static GENERATED_ON_THIS_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of tokens [`OpaqueToken::generate`] created on this thread.
+#[cfg(test)]
+pub(crate) fn tokens_generated_on_this_thread() -> u64 {
+    GENERATED_ON_THIS_THREAD.with(std::cell::Cell::get)
+}
+
 impl OpaqueToken {
     /// Generate a fresh 32-byte token from `rand_core::OsRng`.
     pub(crate) fn generate() -> Self {
+        #[cfg(test)]
+        GENERATED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
         let mut bytes = [0u8; 32];
         OsRng.fill_bytes(&mut bytes);
         Self(bytes)

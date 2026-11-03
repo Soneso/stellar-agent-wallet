@@ -66,6 +66,16 @@
 //! `crate::auth`); the ceremony timeout of the caller is normally the shorter
 //! limit.
 //!
+//! # Both loopback families
+//!
+//! The page runs at `http://localhost:<port>`, and a browser may reach either
+//! loopback address for that name. The server therefore binds `127.0.0.1` and
+//! `[::1]` on one port before it mints the bootstrap token, serves the same
+//! session on both, and closes both together. When either address cannot be
+//! held the ceremony does not start
+//! ([`OperatorEnrollStartError::LoopbackPair`]), so no other local account can
+//! serve the enrollment page under the wallet's origin.
+//!
 //! # Defence stack
 //!
 //! Shares the `stellar-agent-loopback-http` middleware stack with
@@ -105,9 +115,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use axum::{Router, extract::DefaultBodyLimit};
-use tokio::net::TcpListener;
+use stellar_agent_loopback_http::{LoopbackPair, PairServer};
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 use stellar_agent_core::approval::operator_credentials::OperatorApprovalCredentialStore;
@@ -236,8 +245,10 @@ struct Ceremony {
 /// # Drop behaviour
 ///
 /// Dropping the handle without calling [`OperatorEnrollHandle::shutdown`]
-/// leaves the server task running. Always call `shutdown` before process
-/// exit.
+/// drops its [`PairServer`], whose drop aborts both listener tasks at once:
+/// both addresses stop accepting without waiting for open connections.
+/// Call `shutdown` to let open connections finish and to wait for both
+/// listeners.
 pub struct OperatorEnrollHandle {
     local_addr: SocketAddr,
     bootstrap_token_hex: String,
@@ -245,8 +256,8 @@ pub struct OperatorEnrollHandle {
     /// second call has a clear, typed error rather than reusing an already
     /// resolved future.
     completion_rx: Option<oneshot::Receiver<StagedEnrollment>>,
-    shutdown_tx: oneshot::Sender<()>,
-    join_handle: JoinHandle<()>,
+    /// The `127.0.0.1` and `[::1]` listeners on the ceremony's port.
+    server: PairServer,
 }
 
 impl std::fmt::Debug for OperatorEnrollHandle {
@@ -258,8 +269,9 @@ impl std::fmt::Debug for OperatorEnrollHandle {
 }
 
 impl OperatorEnrollHandle {
-    /// The actual bound socket address (the OS-assigned port when `0` was
-    /// requested).
+    /// The IPv4 address of the listener pair, `127.0.0.1:<port>` (the
+    /// OS-assigned port when `0` was requested). `[::1]` is bound on the same
+    /// port.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
@@ -338,17 +350,17 @@ impl OperatorEnrollHandle {
         }
     }
 
-    /// Trigger graceful shutdown and wait for the server task to stop.
+    /// Trigger graceful shutdown and wait for both listeners to stop.
     ///
     /// # Errors
     ///
-    /// - [`OperatorEnrollShutdownError::Timeout`] — the server task did not
-    ///   stop within 5 seconds.
-    /// - [`OperatorEnrollShutdownError::JoinFailed`] — the server task
-    ///   panicked.
+    /// - [`OperatorEnrollShutdownError::Timeout`]: the listeners did not
+    ///   stop within 5 seconds; both are closed when this returns.
+    /// - [`OperatorEnrollShutdownError::JoinFailed`]: a listener task
+    ///   panicked or ended with an I/O error.
     pub async fn shutdown(self) -> Result<(), OperatorEnrollShutdownError> {
-        let _ = self.shutdown_tx.send(());
-        match tokio::time::timeout(SHUTDOWN_DEADLINE, self.join_handle).await {
+        self.server.shutdown();
+        match tokio::time::timeout(SHUTDOWN_DEADLINE, self.server.join()).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(join_err)) => Err(OperatorEnrollShutdownError::JoinFailed {
                 detail: join_err.to_string(),
@@ -364,9 +376,10 @@ impl OperatorEnrollHandle {
 
 /// Start the interactive operator-enrollment HTTP server.
 ///
-/// Binds `bind_addr` (typically `127.0.0.1:0` for a random loopback port),
-/// mints a single-use bootstrap token, builds the axum router with the full
-/// middleware stack, and spawns a server task. Returns an
+/// Uses only the port of `bind_addr` (typically `127.0.0.1:0` for a random
+/// loopback port) and binds `127.0.0.1` and `[::1]` on it, then mints a
+/// single-use bootstrap token, builds the axum router with the full
+/// middleware stack, and serves it on both listeners. Returns an
 /// [`OperatorEnrollHandle`] giving the actual bound address, the bootstrap
 /// URL ([`OperatorEnrollHandle::enroll_url`]), the single-use completion
 /// signal, and a graceful-shutdown handle.
@@ -389,8 +402,9 @@ impl OperatorEnrollHandle {
 ///   a credential created against a non-loopback origin could never carry
 ///   rp-id `"localhost"` anyway, so a non-loopback bind here can only be a
 ///   misconfiguration.
-/// - [`OperatorEnrollStartError::Bind`] — `TcpListener::bind(bind_addr)`
-///   failed (OS error, port already in use, etc.).
+/// - [`OperatorEnrollStartError::LoopbackPair`]: `127.0.0.1` and `[::1]`
+///   could not both be held on the port (port already in use on either
+///   family, a host without IPv6 loopback, etc.).
 pub async fn start_operator_enroll_server(
     store_path: PathBuf,
     profile: impl Into<String>,
@@ -410,7 +424,8 @@ pub async fn start_operator_enroll_server(
 }
 
 /// Start the enrollment server for an approval credential of the
-/// owner-signed mainnet policy, bound to `127.0.0.1:0`.
+/// owner-signed mainnet policy, bound to `127.0.0.1` and `[::1]` on one
+/// OS-assigned port.
 ///
 /// The ceremony is the one [`start_operator_enroll_server`] runs, under
 /// [`EnrollmentPurpose::MainnetApproval`]: its own session purpose and
@@ -420,8 +435,8 @@ pub async fn start_operator_enroll_server(
 ///
 /// # Errors
 ///
-/// [`OperatorEnrollStartError::Bind`] when the loopback listener cannot be
-/// bound.
+/// [`OperatorEnrollStartError::LoopbackPair`] when both loopback addresses
+/// cannot be held on one port.
 pub async fn start_mainnet_approval_enroll(
     profile: String,
     label_prefill: Option<String>,
@@ -438,7 +453,8 @@ pub async fn start_mainnet_approval_enroll(
     .await
 }
 
-/// Binds the listener and spawns the server of one ceremony for `purpose`.
+/// Binds the loopback pair on the port of `bind_addr`, then mints the
+/// bootstrap token and serves the ceremony for `purpose` on both listeners.
 async fn start(
     purpose: EnrollmentPurpose,
     store: Option<OperatorApprovalCredentialStore>,
@@ -451,19 +467,10 @@ async fn start(
         return Err(OperatorEnrollStartError::NonLoopbackBind { addr: bind_addr });
     }
 
-    let listener =
-        TcpListener::bind(bind_addr)
-            .await
-            .map_err(|source| OperatorEnrollStartError::Bind {
-                kind: source.kind(),
-                source,
-            })?;
-    let local_addr = listener
-        .local_addr()
-        .map_err(|source| OperatorEnrollStartError::Bind {
-            kind: source.kind(),
-            source,
-        })?;
+    let pair = LoopbackPair::bind(bind_addr.port())
+        .await
+        .map_err(OperatorEnrollStartError::LoopbackPair)?;
+    let local_addr = pair.v4_addr();
 
     let bootstrap = OpaqueToken::generate();
     let bootstrap_token_hex = bootstrap.to_hex();
@@ -484,21 +491,7 @@ async fn start(
     });
 
     let router = build_router(state, local_addr);
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let join_handle = tokio::spawn(async move {
-        let serve_result = axum::serve(listener, router.into_make_service())
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await;
-        if let Err(err) = serve_result {
-            tracing::error!(
-                error.message = %err,
-                "operator-enroll server task exited with error"
-            );
-        }
-    });
+    let server = pair.serve(router);
 
     tracing::info!(local_addr = %local_addr, "operator-enroll server started");
 
@@ -506,8 +499,7 @@ async fn start(
         local_addr,
         bootstrap_token_hex,
         completion_rx: Some(completion_rx),
-        shutdown_tx,
-        join_handle,
+        server,
     })
 }
 
@@ -658,27 +650,87 @@ mod tests {
         handle.shutdown().await.expect("clean shutdown");
     }
 
+    /// The response head of `GET /enroll` over `addr`, sent the way a
+    /// browser at `http://localhost:<port>` sends it.
+    async fn enroll_page_head(addr: SocketAddr) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|error| panic!("{addr} must accept: {error}"));
+        let request = format!(
+            "GET /enroll HTTP/1.1\r\nhost: localhost:{}\r\nconnection: close\r\n\r\n",
+            addr.port()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        text.split("\r\n\r\n").next().unwrap().to_ascii_lowercase()
+    }
+
+    /// Both purposes hand out a `localhost` URL, so both hold `127.0.0.1`
+    /// and `[::1]` on the URL's port: the wallet answers on both, no other
+    /// socket can bind `[::1]` there, and shutdown releases both. An IPv6
+    /// bind address uses its port the same way.
     #[tokio::test]
-    async fn ipv6_loopback_is_accepted_if_available() {
+    async fn both_enrollment_purposes_bind_both_families() {
         let dir = tempfile::tempdir().unwrap();
-        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
-        match start_operator_enroll_server(
+        let operator = start_operator_enroll_server(
             store_path(&dir),
             "default",
-            addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             None,
             PageIdentity::neutral(),
         )
         .await
-        {
-            Ok(handle) => {
-                assert!(handle.local_addr().ip().is_loopback());
-                handle.shutdown().await.expect("clean shutdown");
+        .unwrap();
+        let mainnet =
+            start_mainnet_approval_enroll("main".to_owned(), None, PageIdentity::neutral())
+                .await
+                .unwrap();
+        let from_ipv6 = start_operator_enroll_server(
+            store_path(&dir),
+            "default",
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+            None,
+            PageIdentity::neutral(),
+        )
+        .await
+        .unwrap();
+        for handle in [operator, mainnet, from_ipv6] {
+            let port = handle.local_addr().port();
+            assert_eq!(
+                handle.local_addr(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+            );
+            assert!(
+                handle
+                    .enroll_url()
+                    .starts_with(&format!("http://localhost:{port}/"))
+            );
+            let ipv6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port);
+            for addr in [handle.local_addr(), ipv6] {
+                let head = enroll_page_head(addr).await;
+                assert!(
+                    head.starts_with("http/1.1 404") && head.contains("content-security-policy:"),
+                    "the wallet's enrollment server answers on {addr}: {head}"
+                );
             }
-            Err(OperatorEnrollStartError::Bind { .. }) => {
-                // IPv6 unavailable on this host — acceptable.
-            }
-            Err(other) => panic!("unexpected error for IPv6 loopback: {other}"),
+            assert_eq!(
+                std::net::TcpListener::bind(ipv6).unwrap_err().kind(),
+                std::io::ErrorKind::AddrInUse,
+                "no other socket can bind [::1]:{port}"
+            );
+            handle.shutdown().await.expect("clean shutdown");
+            assert!(tokio::net::TcpStream::connect(ipv6).await.is_err());
+            assert!(
+                tokio::net::TcpStream::connect(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    port
+                ))
+                .await
+                .is_err()
+            );
         }
     }
 
@@ -760,8 +812,8 @@ mod tests {
         let Some(rx) = handle.completion_rx else {
             panic!("completion_rx must be present before first await");
         };
-        handle.shutdown_tx.send(()).ok();
-        let _ = tokio::time::timeout(SHUTDOWN_DEADLINE, handle.join_handle).await;
+        handle.server.shutdown();
+        let _ = tokio::time::timeout(SHUTDOWN_DEADLINE, handle.server.join()).await;
         let result = rx.await;
         assert!(result.is_err(), "sender must have dropped without sending");
     }

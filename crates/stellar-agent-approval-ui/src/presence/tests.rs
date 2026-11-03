@@ -997,6 +997,133 @@ async fn start_refusals_keep_their_codes() {
     handle.shutdown().await.unwrap();
 }
 
+/// A listener on `[::1]:P` for a port P that is free on `127.0.0.1` when
+/// this returns.
+fn ipv6_competitor() -> (std::net::TcpListener, u16) {
+    for _ in 0..64 {
+        let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return (listener, port);
+        }
+    }
+    panic!("no port free on 127.0.0.1 among 64 held on ::1");
+}
+
+/// A competitor holding `[::1]` on the ceremony's port makes the start
+/// refuse before any token exists: the pair binder runs with no token
+/// generated, the refusal names the IPv6 family, and no token is generated
+/// after it.
+#[tokio::test]
+#[serial_test::serial]
+async fn presence_refuses_when_ipv6_is_held_and_mints_no_token() {
+    let fixture = MainnetConsentFixture::new("pair-refusal");
+    let entry = fixture.payment(600_000);
+    let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+    store.insert(entry.clone(), now_ms().unwrap()).unwrap();
+    drop(store);
+    let (_competitor, port) = ipv6_competitor();
+    let before = crate::auth::tokens_generated_on_this_thread();
+    let at_bind = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&at_bind);
+    let result = start_mainnet_presence_with(
+        MainnetPresenceConfig {
+            entry: entry.clone(),
+            context: ApprovalContext::from_profile(fixture.name(), fixture.profile()),
+            authority: fixture.authority(),
+            store_path: fixture.store_path(),
+            page_identity: PageIdentity::neutral(),
+        },
+        move || {
+            *record.lock().unwrap() = Some(crate::auth::tokens_generated_on_this_thread());
+            LoopbackPair::bind(port)
+        },
+    )
+    .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("presence must refuse while [::1]:{port} is held"),
+    };
+    assert_eq!(
+        error.loopback_pair(),
+        Some(&PairBindError::PortUnavailable {
+            port,
+            family: crate::LoopbackFamily::V6,
+            kind: std::io::ErrorKind::AddrInUse,
+        })
+    );
+    assert!(error.presence_failure().is_none());
+    assert_eq!(
+        *at_bind.lock().unwrap(),
+        Some(before),
+        "the pair is bound before any token is generated"
+    );
+    assert_eq!(
+        crate::auth::tokens_generated_on_this_thread(),
+        before,
+        "a refused start generates no token"
+    );
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+        "the refused start releases its IPv4 listener"
+    );
+}
+
+/// The session the bootstrap opens over `127.0.0.1` is the session the
+/// listener serves over `[::1]`: the challenge and the assertion sent there
+/// complete the command's wait, and shutdown closes both addresses.
+#[tokio::test]
+#[serial_test::serial]
+async fn presence_serves_one_session_on_both_families() {
+    let fixture = MainnetConsentFixture::new("pair-session");
+    let entry = fixture.payment(600_000);
+    let mut store = PendingApprovalStore::open(fixture.store_path()).unwrap();
+    store.insert(entry.clone(), now_ms().unwrap()).unwrap();
+    drop(store);
+    let mut handle = start_mainnet_presence(MainnetPresenceConfig {
+        entry: entry.clone(),
+        context: ApprovalContext::from_profile(fixture.name(), fixture.profile()),
+        authority: fixture.authority(),
+        store_path: fixture.store_path(),
+        page_identity: PageIdentity::neutral(),
+    })
+    .await
+    .unwrap();
+    let client =
+        test_support::PresenceClient::connect(handle.bootstrap_url(), &entry.approval_nonce)
+            .await
+            .unwrap();
+    let port: u16 = handle
+        .bootstrap_url()
+        .strip_prefix("http://localhost:")
+        .and_then(|rest| rest.split('/').next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let ipv6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+    let client = client.at(ipv6);
+    let challenge = client.challenge().await.unwrap();
+    assert_eq!(challenge.status, 200, "{}", challenge.body);
+    let options = challenge.json();
+    let response = client
+        .post("assertion", &signed(&options, &client.origin(), 5))
+        .await
+        .unwrap();
+    assert_eq!(response.status, 200, "{}", response.body);
+    let presence = handle
+        .await_presence(Instant::now() + std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(presence.approval_nonce(), entry.approval_nonce);
+    handle.shutdown().await.unwrap();
+    for addr in [SocketAddr::from(([127, 0, 0, 1], port)), ipv6] {
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "{addr} closed after shutdown"
+        );
+    }
+}
+
 /// Every presence refusal answers its code in one body shape with the
 /// status of its kind, and a failure that is not one is a server error.
 #[test]

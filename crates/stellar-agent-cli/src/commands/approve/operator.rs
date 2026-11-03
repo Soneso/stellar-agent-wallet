@@ -62,7 +62,8 @@ use clap::{ArgGroup, Args, Subcommand};
 
 use stellar_agent_approval_ui::operator_enroll::{
     ConfirmedOperatorEnrollment, OperatorEnrollAwaitError, OperatorEnrollHandle,
-    OperatorEnrollmentConfirmationError, PendingOperatorEnrollment, start_operator_enroll_server,
+    OperatorEnrollStartError, OperatorEnrollmentConfirmationError, PendingOperatorEnrollment,
+    start_operator_enroll_server,
 };
 use stellar_agent_core::approval::error::ApprovalError;
 use stellar_agent_core::approval::operator_credentials::{
@@ -436,6 +437,9 @@ async fn run_enroll_interactive(resolved: ResolvedProfileName, args: EnrollArgs)
     {
         Ok(h) => h,
         Err(e) => {
+            if let OperatorEnrollStartError::LoopbackPair(pair) = &e {
+                crate::common::log_pair_refusal("operator enrollment", pair);
+            }
             let err = WalletError::Internal(InternalError::UnexpectedState {
                 detail: format!("approve.operator_enroll_interactive_start_failed: {e}"),
             });
