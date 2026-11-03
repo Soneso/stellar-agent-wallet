@@ -36,12 +36,12 @@ use stellar_agent_core::error::AuthError;
 pub enum NonceError {
     /// The HMAC tag on the nonce does not match the recomputed tag.
     ///
-    /// Causes: wrong envelope_xdr, wrong tool_name, wrong chain_id, a process
-    /// restart (boot_nonce changed), or key rotation since mint time.
+    /// Causes: a wrong envelope_xdr, expiry or tool_name, a changed salt or
+    /// tag, a process restart (boot_nonce changed), or key rotation since mint
+    /// time.
     ///
-    /// Map to `nonce.expired` when the salt is fresh to the replay window
-    /// (indicating a post-restart verification); map to `nonce.hmac_mismatch`
-    /// otherwise.
+    /// Wire code: `nonce.expired`, indistinguishable from `Expired` regardless
+    /// of replay-window state.
     #[error("nonce HMAC tag does not match")]
     HmacMismatch,
 
@@ -51,7 +51,8 @@ pub enum NonceError {
     #[error("nonce has expired")]
     Expired,
 
-    /// The nonce salt has already been seen in the replay window.
+    /// The full 48-byte nonce (salt and tag) is already present in the replay
+    /// window.
     ///
     /// Wire code: `nonce.replayed`.
     #[error("nonce has already been used (replay detected)")]

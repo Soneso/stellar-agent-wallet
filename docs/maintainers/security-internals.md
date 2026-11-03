@@ -15,7 +15,7 @@ The table distinguishes tested properties from operational claims that are not p
 
 | Mechanism | Scope | Lock lifetime | Result under contention | Across a restart | Exceptions and evidence per claim |
 |---|---|---|---|---|---|
-| Nonce replay window | Per `WalletServer` instance; one server per process. Instance scope: not pinned. | In-process mutex for replay-window access; lifetime: not pinned. | Reusing a nonce refuses: `replay_rejected` in nonce `replay_rejected.rs`. Mint and verify: `mint_verify_round_trip_happy_path` in `crates/stellar-agent-nonce/tests/nonce/mint_verify_round_trip.rs`. | Every mint in one process shares one boot salt: `boot_nonce_stable_within_process` and `boot_nonce_must_be_identical_across_instances` in `crates/stellar-agent-nonce/tests/nonce/boot_nonce_invalidates_pre_restart.rs`. A fresh salt per process: not pinned. | A different boot salt changes the HMAC: `mint::tests::compute_tag_differs_on_boot_nonce`. A nonce from another boot therefore fails authentication; an actual process restart is not pinned. |
+| Nonce replay window | Per `WalletServer` instance; one server per process. Instance scope: not pinned. | In-process mutex for replay-window access; lifetime: not pinned. | Reusing a nonce refuses: `replay_rejected` in nonce `replay_rejected.rs`. Mint and verify: `mint_verify_round_trip_happy_path` in `crates/stellar-agent-nonce/tests/nonce/mint_verify_round_trip.rs`. | Every mint in one process shares one boot salt: `boot_nonce_stable_within_process` and `boot_nonce_must_be_identical_across_instances` in `crates/stellar-agent-nonce/tests/nonce/boot_nonce_invalidates_pre_restart.rs`. A fresh salt per process: not pinned. | A different boot salt changes the HMAC: `mint::tests::compute_tag_differs_on_boot_nonce`. A nonce from another boot therefore fails authentication; an actual process restart is not pinned. A changed salt fails authentication: `a_changed_salt_byte_fails_verification` in `crates/stellar-agent-nonce/tests/nonce/salt_binding.rs`. |
 | Sequence floor | Advisory per MCP server and source account. Scope: not pinned. | In-process mutex during tracker access; lifetime: not pinned. | Bounded catch-up never invents a sequence: `sequence_floor::tests::proceeds_with_stale_value_after_window_exhausted` in network. An outer bad sequence maps to `submission.sequence_number_stale`: `get_failed_outer_tx_bad_seq_yields_sequence_number_stale` in network `submit_integration.rs`. | The advisory floor is lost; restart behavior: not pinned. | A race between processes can still reach submission and fail stale; that process race is not pinned. |
 | Pool allocator | One shared `ChannelPool` instance. | Exclusive in-process lease until release: `n4_m8_exactly_n_succeed_m_minus_n_exhausted_immediately` in `crates/stellar-agent-pool/tests/concurrency.rs`. | Full pool refuses immediately: `acquire_returns_exhausted_immediately_when_full` in the same file. | Two processes using one pool state can lease the same channel; not pinned. | A collision surfaces as a sequence refusal at submit, with no authorization effect; cross-process behavior: not pinned. |
 | Keyring store registration and entries | Registration is per process, last writer wins; not pinned. Persistent entries are shared. | Backend registration has no cross-process exclusion; not pinned. | A rotation through one headless handle is read by another at its next read: network `keyring::tests::a_rotation_is_visible_to_another_headless_store_handle`. | Entries persist; an actual restart is not pinned by the two-handle test. | Platform-keyring rotation visibility is not pinned by the headless test. |
@@ -642,12 +642,14 @@ bytes[0..16]  = random salt (OsRng)
 bytes[16..48] = HMAC-SHA256 tag (32 bytes)
 ```
 
-The salt does not feed either side of the HMAC. Its role is uniqueness (two calls with the same envelope in the same millisecond still produce different nonces) and, as part of the full 48-byte nonce (salt plus tag), keying the replay window's HashMap.
+The tag covers the salt. The salt gives uniqueness (two calls with the same envelope in the same millisecond still produce different nonces) and, as part of the full 48-byte nonce (salt plus tag), keys the replay window's HashMap. Because the tag authenticates the salt, every byte of that key is authenticated: a nonce with a changed salt byte fails verification with `HmacMismatch`, which the MCP reports as `nonce.expired`, before it is recorded in the replay window.
 
 ### HMAC input domain
 
 ```text
 HMAC-SHA256( profile_nonce_key,
+    NONCE_TAG_DOMAIN        ||   // 27 bytes, "stellar-agent-nonce-tag:v2\0"
+    salt                    ||   // 16 bytes, bytes[0..16] of the nonce
     boot_nonce              ||   // 16 bytes, process-scoped
     SHA-256(envelope_xdr)   ||   // 32 bytes
     expiry_unix_ms          ||   // 8 bytes big-endian u64
@@ -657,7 +659,7 @@ HMAC-SHA256( profile_nonce_key,
     chain_id )                   // variable-length UTF-8
 ```
 
-The length prefixes on `tool_name` and `chain_id` prevent boundary collisions between different `(tool_name, chain_id)` pairs.
+The domain constant versions the preimage layout, so a tag computed over any other layout does not verify. The length prefixes on `tool_name` and `chain_id` prevent boundary collisions between different `(tool_name, chain_id)` pairs.
 
 ### In-memory replay window and boot_nonce fail-closed
 

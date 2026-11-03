@@ -180,8 +180,8 @@ pub struct StellarTrustlineArgs {
 ///    `envelope_xdr` and presents those values to the policy engine — NOT the
 ///    caller-supplied args.
 /// 2. **Nonce verification:** HMAC-verified against `envelope_xdr` before signing.
-/// 3. **Replay prevention:** the nonce salt is recorded in the in-memory
-///    `ReplayWindow` after verification.
+/// 3. **Replay prevention:** the full 48-byte nonce (salt and tag) is
+///    recorded in the in-memory `ReplayWindow` after verification.
 /// 4. **Mainnet refusal:** `destructive_hint = true`.
 ///
 /// # Examples

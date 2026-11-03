@@ -261,8 +261,9 @@ through a single-use replay window.
 
 - A nonce is 48 bytes, transmitted as URL-safe base64 with no padding (a 16-byte
   random salt plus a 32-byte HMAC tag). Treat it as an opaque token.
-- The HMAC binds the envelope, the tool name, the `chain_id`, an expiry, and a
-  per-process boot value. Change any of those and the nonce no longer verifies.
+- The HMAC binds the salt, the envelope, the tool name, the `chain_id`, an
+  expiry, and a per-process boot value. Change any of those and the nonce does
+  not verify.
 - It is single-use: presenting the same nonce twice is rejected.
 - It is fail-closed on restart: the per-process boot value is never persisted, so a
   nonce minted before a server restart is rejected (`HmacMismatch`) afterward.
