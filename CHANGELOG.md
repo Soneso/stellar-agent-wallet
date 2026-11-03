@@ -132,6 +132,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `MintRequest::chain_deadline_ms` caps authorization expiry at the signed
+  envelope's deadline. `MainnetPrecondition` includes `DeadlineMissing`,
+  `DeadlineElapsed` and `DeadlineTooFar`. `ClassicOpBuilder::with_mainnet_deadline`
+  chooses the mainnet deadline; `with_presented_deadline` copies it, and
+  `check_classic_deadline` validates it. `SubmissionReceiptCleared` and its
+  constructor carry `unbounded_exposure`, omitted when false.
+
 - The agents guide explains shell access, approval authority, and Claude Code
   permission modes. The wallet skill routes agent payments through MCP and
   identifies CLI signing exceptions and operator ceremonies.
@@ -568,6 +575,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   form `"100 TST"` with `TST:<issuer>` works.
 
 ### Security
+
+- Classic mainnet envelopes built by `pay`, `claim`, `accounts create`,
+  `trustline` and their MCP tools carry an on-chain deadline 120 seconds after
+  they are built. The operator's consent covers it, the authorization expires
+  no later than it, and the network refuses the signed transaction after it.
+  A confirmation that completes after the deadline refuses with
+  `network.mainnet_authorization_refused` (`deadline_elapsed`); run the command
+  again for a fresh envelope. An MCP commit whose envelope carries no valid
+  deadline refuses with `simulation.deadline_invalid`. On a mainnet profile,
+  `tx receipt clear` on a sent `pending` or `ambiguous` receipt, a restored
+  orphan included, without a time bound requires `--acknowledge-unbounded`
+  beside `--acknowledge` and records the exposure in the clear row.
 
 - Audit entries carry a keyed `entry_tag` derived from the profile's audit
   key. Once a log holds its `audit_entry_tags_started` row, keyed writers

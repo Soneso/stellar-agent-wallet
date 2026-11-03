@@ -237,6 +237,16 @@ A denied rule retains `policy.deny.*`; an unknown decision uses
 `policy.unexpected_decision`. None of these refusals persists an approval.
 Each commit forces confirmation before attestation validation.
 
+Classic mainnet previews carry an on-chain deadline 120 seconds after they are
+built, bound into consent and the protocol nonce. Commits copy this deadline
+into the rebuild. A commit whose envelope carries no valid deadline refuses
+with `simulation.deadline_invalid`; simulate again for a fresh envelope.
+
+| Classic commit code | Meaning |
+|---|---|
+| `simulation.divergence` | The rebuilt envelope differs from the presented bytes. |
+| `simulation.deadline_invalid` | The mainnet envelope has no valid on-chain deadline. Simulate again for a fresh envelope. |
+
 Feature-on startup loads the mainnet write context for a verified enabled
 profile. Failed enablement or policy checks abort startup. Admission refusals
 use `network.mainnet_write_forbidden` for unsupported tools or missing V1 engine,

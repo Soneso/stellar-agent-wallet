@@ -44,6 +44,12 @@ pub enum MainnetPrecondition {
     EnvelopeShape,
     /// The envelope already carries signatures.
     EnvelopePreSigned,
+    /// The classic envelope has no valid zero-minimum time bound.
+    DeadlineMissing,
+    /// The classic envelope's deadline has elapsed.
+    DeadlineElapsed,
+    /// The classic envelope's deadline exceeds the authorization ceiling.
+    DeadlineTooFar,
     /// The envelope fee exceeds its effective cap.
     FeeAboveCap,
     /// The source account cannot be read.
@@ -244,6 +250,9 @@ impl MainnetPrecondition {
             Self::FeeBumpRefused => "fee_bump_refused",
             Self::EnvelopeShape => "envelope_shape",
             Self::EnvelopePreSigned => "envelope_pre_signed",
+            Self::DeadlineMissing => "deadline_missing",
+            Self::DeadlineElapsed => "deadline_elapsed",
+            Self::DeadlineTooFar => "deadline_too_far",
             Self::FeeAboveCap => "fee_above_cap",
             Self::AccountUnavailable => "account_unavailable",
             Self::PolicyEvaluationFailed => "policy_evaluation_failed",
@@ -471,6 +480,9 @@ mod tests {
             P::FeeBumpRefused,
             P::EnvelopeShape,
             P::EnvelopePreSigned,
+            P::DeadlineMissing,
+            P::DeadlineElapsed,
+            P::DeadlineTooFar,
             P::FeeAboveCap,
             P::AccountUnavailable,
             P::PolicyEvaluationFailed,
@@ -573,6 +585,9 @@ mod tests {
                 | P::EnablementHostMismatch
                 | P::FeeBumpRefused
                 | P::EnvelopeShape
+                | P::DeadlineMissing
+                | P::DeadlineElapsed
+                | P::DeadlineTooFar
                 | P::EnvelopePreSigned
                 | P::FeeAboveCap
                 | P::AccountUnavailable
@@ -686,6 +701,9 @@ mod tests {
             "fee_bump_refused",
             "envelope_shape",
             "envelope_pre_signed",
+            "deadline_missing",
+            "deadline_elapsed",
+            "deadline_too_far",
             "fee_above_cap",
             "account_unavailable",
             "policy_evaluation_failed",

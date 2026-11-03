@@ -105,6 +105,11 @@ exact consent, request, profile, chain and policy. The wallet verifies it before
 recording consent and again before mainnet authorization. Terminal input and a
 same-user process identity provide no mainnet presence proof.
 
+A classic mainnet envelope carries an on-chain deadline chosen before the consent
+and covered by it. The authorization expires no later than that deadline, and the
+network refuses the signed transaction after it. The authorization lifetime bounds
+when the wallet sends; the deadline bounds when the chain applies.
+
 User verification is the authenticator's signed statement that its configured
 verification ceremony succeeds. It does not prove that a human reads or understands
 the transaction. The browser displays the transaction; the authenticator need not

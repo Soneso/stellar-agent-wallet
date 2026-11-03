@@ -2938,6 +2938,7 @@ mod tests {
                 transaction_hash_redacted: "abcd1234...5678efgh".to_owned(),
                 cleared_from: "ambiguous".to_owned(),
                 reservation_released: true,
+                unbounded_exposure: false,
                 evidence: Some("submission.sequence_consumed".to_owned()),
             },
             EventKind::X402PaymentAuthorized {
@@ -4083,6 +4084,7 @@ mod tests {
                     "abcd1234...5678efgh",
                     "ambiguous",
                     true,
+                    false,
                     evidence,
                     None,
                     "evidence-request",

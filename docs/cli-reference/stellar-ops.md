@@ -646,10 +646,13 @@ passphrase, which the verb checks first. An oracle that reports another
 network, whose identity cannot be read, or that cannot answer, and a mainnet
 profile without an oracle, leave the record pending.
 
-`submission.time_bound_passed` needs a transaction with a time bound. The
-wallet builds classic envelopes without one, so on those the evidence is a
-consumed sequence. An envelope handed to `pay --submit-only` can carry a time
-bound, and so can the inner transaction of a fee-bump.
+Classic mainnet envelopes carry a deadline 120 seconds after they are built,
+covered by the operator's consent. `submission.time_bound_passed` settles them
+once the deadline passes on the observed ledger. Testnet envelopes carry no
+bound. An envelope handed to `pay --submit-only` can carry a time bound, and
+so can the inner transaction of a fee-bump. A confirmation that completes
+after the deadline refuses with `network.mainnet_authorization_refused`
+(`deadline_elapsed`); run the command again for a fresh envelope.
 
 The receipt keeps its `release_code` when the reservation is released, so
 later runs can retry any settled row still owed. The code names the evidence
@@ -687,9 +690,10 @@ against the window, and its receipt stays `failed`.
 On a mainnet profile no second endpoint confirms a refusal at the send, so the
 verb that sent reports `submission.tx_timeout`, and the receipt, the pending
 row and the reservation stand until this verb settles them on the oracle's
-answers. A refused envelope without a time bound stays pending until another
-transaction consumes its sequence or the operator clears it with
-`tx receipt clear`.
+answers. A refused classic mainnet envelope settles with
+`submission.time_bound_passed` once its deadline passes. An untimed envelope
+stays pending until another transaction consumes
+its sequence or the operator clears it with `tx receipt clear`.
 
 The JSON output carries `tx_hash`, `chain_status`, `ledger`, `record` and
 `reservation`. `record` is the wallet's receipt: `envelope_hash`, `status`,
@@ -736,6 +740,11 @@ Without `--acknowledge` nothing is reconciled or written, and the verb exits 1
 with `submission.acknowledgement_required`. The message names the next step,
 computed from the record: while a sent transaction's time bound is still open,
 wait for it to pass or run `tx status`; otherwise pass `--acknowledge`.
+On mainnet, a sent `pending` or `ambiguous` receipt whose receipt or held
+reservation has no time bound also requires `--acknowledge-unbounded`, and so
+does an orphan whose held reservation has none. This states that the
+transaction can still apply and its spend stops counting against the window;
+the clear row records `unbounded_exposure: true`.
 
 With `--acknowledge` the verb takes the audit writer, restores a missing
 receipt from its reservation, reconciles the submission the way `tx status`
@@ -746,10 +755,11 @@ does, and decides:
 | The reconciled outcome could not be recorded on its receipt | Refused with `submission.record_unavailable`, naming the receipt-store error. Run `stellar-agent tx status` again. |
 | The receipt disagrees with its reconciliation | Refused with `submission.record_unavailable`. Run `stellar-agent tx status` again. |
 | Released on chain evidence: the receipt carries `release_code`, and this run's reconciliation released the reservation under it or the spending window no longer holds the reservation | The `value_action_failed` row is written under that code first; once it is in the log, the receipt is cleared and the clear row records the evidence. A settled row that cannot be written refuses with the audit error and leaves the receipt clearable. |
-| `ambiguous` without evidence (retention window closed), `ambiguous` with a `release_code` the spending window does not bear out, `pending` with no time bound, `pending` and never sent, or a restored orphan | The reservation is released and the receipt cleared. The clear row records no evidence: the outcome is unknown. |
+| A sent `pending` or `ambiguous` mainnet receipt, a restored orphan included, whose receipt or held reservation has no time bound, without `--acknowledge-unbounded` | Refused with `submission.unbounded_exposure`. Pass both acknowledgement flags to clear and record the exposure. |
+| `ambiguous` without evidence (retention window closed), `ambiguous` with a `release_code` the spending window does not bear out, `pending` with no time bound, `pending` and never sent, or a restored orphan, each with the required acknowledgement flags | The reservation is released and the receipt cleared. The clear row records no evidence: the outcome is unknown. |
 | `pending`, sent, with a time bound that has not passed on the endpoint's latest ledger and a sequence that is unconsumed | Refused with `submission.still_pending`, naming the time bound. Nothing changes. |
 | A mainnet profile without an oracle, and a `pending`, sent receipt whose time bound has not passed on this host's clock | Refused with `submission.still_pending`, naming the time bound. Nothing changes. |
-| A mainnet profile without an oracle, and any other `pending` receipt | The reservation is released and the receipt cleared on the acknowledgement. The clear row records no evidence. |
+| A mainnet profile without an oracle, and any other `pending` receipt with the required acknowledgement flags | The reservation is released and the receipt cleared on the acknowledgement. The clear row records no evidence. |
 | A ledger-time read failed for a sent, timed submission, or another reconciliation read of the endpoint or the oracle failed, and the reservation stood | Refused with `network.rpc_unreachable`. Nothing changes. |
 | A reconciliation read of the oracle was still open at the verb's oracle deadline, and the reservation stood | Refused with `network.rpc_unreachable`. Nothing changes. |
 
@@ -785,6 +795,7 @@ not already carry it for the submission.
 | `<ENVELOPE_HASH>` (positional) | Envelope hash of the submission, 64 lowercase hex characters: `tx status` reports it as `record.envelope_hash` | yes | none |
 | `--profile <NAME>` | Profile whose record and spending window are cleared | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--acknowledge` | State that the transaction did not move value, and reconcile before clearing | yes | `false` |
+| `--acknowledge-unbounded` | State that this untimed transaction can still apply and that its spend is then not counted | for sent `pending` or `ambiguous` mainnet receipts and restored orphans whose receipt or held reservation has no time bound | `false` |
 | `--output <FORMAT>` | `json` or `table` | optional | `json` |
 
 `--acknowledge` is required because clearing a record whose outcome is unknown

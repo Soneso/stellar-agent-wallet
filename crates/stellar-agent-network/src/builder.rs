@@ -331,7 +331,9 @@ pub const SHORT_TIMEBOUNDS_DELTA_SECS: u64 = 30;
 /// By default the built transaction carries no time bounds
 /// (`Preconditions::None`). Callers that want mempool-replay protection should
 /// call [`ClassicOpBuilder::with_short_timebounds`] with the current ledger
-/// close time, which sets `max_time = close_time + 30s`.
+/// close time, which sets `max_time = close_time + 30s`. Classic mainnet writes
+/// call [`ClassicOpBuilder::with_mainnet_deadline`] before consent and carry
+/// its on-chain deadline.
 ///
 /// # Signing
 ///
@@ -1041,6 +1043,32 @@ impl ClassicOpBuilder {
         Ok(self)
     }
 
+    /// On the mainnet passphrase, sets `min_time = 0` and `max_time` to the
+    /// mainnet clock's seconds plus
+    /// [`MAINNET_CLASSIC_DEADLINE_SECONDS`](crate::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS);
+    /// other passphrases keep their preconditions.
+    ///
+    /// # Errors
+    ///
+    /// Returns the mainnet clock error when the current time is unavailable.
+    pub fn with_mainnet_deadline(&mut self) -> Result<&mut Self, WalletError> {
+        if self.network_passphrase == stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE {
+            let now_ms = crate::mainnet::clock::now_ms()?;
+            self.with_time_bounds(
+                0,
+                (now_ms / 1000)
+                    .saturating_add(crate::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS),
+            );
+        }
+        Ok(self)
+    }
+
+    /// Sets the time bounds to `0..=max_time`, the deadline the presented
+    /// envelope carries.
+    pub fn with_presented_deadline(&mut self, max_time: u64) -> &mut Self {
+        self.with_time_bounds(0, max_time)
+    }
+
     /// Sets explicit time bounds on the built transaction.
     ///
     /// Both `min_time` and `max_time` are **absolute** unix seconds.
@@ -1445,6 +1473,37 @@ mod tests {
                 assert_eq!(v1.signatures[0].signature.0.len(), 64);
             }
             other => panic!("expected Tx envelope, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn with_mainnet_deadline_sets_the_window_on_mainnet_only() {
+        use stellar_agent_core::profile::caip2::{MAINNET_PASSPHRASE, TESTNET_PASSPHRASE};
+        use stellar_xdr::{Limits, Preconditions, ReadXdr as _, TransactionEnvelope};
+        let now = 1_800_000_000_123;
+        let _clock = crate::mainnet::clock::set_now_ms_for_test(now);
+        for passphrase in [MAINNET_PASSPHRASE, TESTNET_PASSPHRASE] {
+            let mut builder = ClassicOpBuilder::new(TEST_SOURCE, 101, passphrase, 100);
+            builder
+                .payment(TEST_DEST, StellarAmount::from_stroops(10), &Asset::Native)
+                .unwrap();
+            builder.with_mainnet_deadline().unwrap();
+            let TransactionEnvelope::Tx(tx) =
+                TransactionEnvelope::from_xdr_base64(builder.build().unwrap(), Limits::none())
+                    .unwrap()
+            else {
+                panic!("classic envelope expected");
+            };
+            if passphrase == MAINNET_PASSPHRASE {
+                let Preconditions::Time(bounds) = tx.tx.cond else {
+                    panic!("deadline expected")
+                };
+                assert_eq!(bounds.min_time.0, 0);
+                assert_eq!(bounds.max_time.0, now / 1000 + 120);
+            } else {
+                assert_eq!(tx.tx.cond, Preconditions::None);
+            }
         }
     }
 

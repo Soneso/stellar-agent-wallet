@@ -392,9 +392,12 @@ What `stellar_transaction_status` reports, and what it means:
   settled. The transaction can still apply. Wait and call again.
 - On a mainnet profile, `chain_status` is the primary endpoint's answer, and
   its `FAILED` or `NOT_FOUND` settles nothing until the oracle confirms it. A
-  profile without `oracle_provider_url` keeps such a record `pending`, and a
-  refused send without a time bound stays `pending` too, until the operator
-  clears it with `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`.
+  profile without `oracle_provider_url` keeps such a record `pending` until the
+  operator clears it with
+  `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`; a sent record
+  without a time bound also needs `--acknowledge-unbounded`. With an oracle, a
+  refused classic mainnet send settles with `submission.time_bound_passed` once
+  its deadline passes.
 - `chain_status: "NOT_FOUND"` with `record.status: "ambiguous"` and a
   `record.release_code`: the transaction can no longer apply.
   `submission.sequence_consumed` means another transaction used its sequence;
@@ -426,7 +429,10 @@ oracle, and refuses with `submission.not_clearable` when the oracle does not
 report the mainnet passphrase, reports `SUCCESS` or `FAILED`, or cannot
 answer. Without an oracle the endpoint's `FAILED` does not refuse the clear. A failed ledger-time read refuses sent, timed
 submissions with `network.rpc_unreachable`; other failed reconciliation reads
-also refuse. Both are operator conditions: wait, or ask the operator.
+also refuse. Both are operator conditions: wait, or ask the operator. On a
+mainnet profile it refuses a sent `pending` or `ambiguous` record without a
+time bound with `submission.unbounded_exposure` unless `--acknowledge-unbounded`
+is passed too.
 
 An operator policy that lists tools explicitly must include
 `stellar_transaction_status`, or a timed-out submission cannot be resolved
@@ -475,6 +481,7 @@ signing tools remain uncovered.
 | Code | Meaning | Agent action |
 |---|---|---|
 | `simulation.divergence` | Entry or envelope disagreement. | Re-simulate; see below. |
+| `simulation.deadline_invalid` | The commit's envelope has no valid on-chain deadline, or it has passed. | Simulate again and commit the fresh envelope. |
 | `network.witness_unavailable` | Required oracle witness unavailable. | See below. |
 
 For a cross-check, `simulation.divergence` means the primary and oracle disagree

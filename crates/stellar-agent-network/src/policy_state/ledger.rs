@@ -566,6 +566,8 @@ pub struct MintRequest {
     pub approval_nonce: String,
     /// The approval's expiry, in Unix milliseconds.
     pub approval_expires_at_ms: u64,
+    /// The signed envelope's on-chain deadline; the authorization expires no later.
+    pub chain_deadline_ms: Option<u64>,
     /// The authorization's lifetime, in milliseconds.
     pub authorization_ttl_ms: u64,
     /// Per-proof fact digests. The reservation must be absent; mint computes it.
@@ -1204,7 +1206,9 @@ impl PersistedWindowStore {
         let ttl_end = now
             .checked_add(request.authorization_ttl_ms)
             .ok_or_else(|| refused(P::LifetimeInvalid))?;
-        let expires = ttl_end.min(request.approval_expires_at_ms);
+        let expires = ttl_end
+            .min(request.approval_expires_at_ms)
+            .min(request.chain_deadline_ms.unwrap_or(u64::MAX));
         check(expires > now, P::LifetimeInvalid)?;
 
         pin::compare(
@@ -1656,6 +1660,7 @@ mod tests {
                 policy_digest: [7; 32],
                 approval_nonce: format!("nonce-{n}"),
                 approval_expires_at_ms: T0 + APPROVAL_MS,
+                chain_deadline_ms: None,
                 authorization_ttl_ms: TTL_MS,
                 bindings: BindingFacts {
                     endpoint: None,
@@ -1932,6 +1937,18 @@ mod tests {
         let open = l.store.open_authorizations(&l.profile, T0).unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, minted.id);
+    }
+
+    #[test]
+    #[serial]
+    fn mint_caps_the_authorization_at_the_chain_deadline() {
+        let ledger = Ledger::new();
+        let mut request = ledger.request(message(1), vec![]);
+        request.authorization_ttl_ms = 120_000;
+        request.chain_deadline_ms = Some(T0 + 30_000);
+        let minted = ledger.mint(&request).unwrap();
+        assert_eq!(minted.expires_at_ms, T0 + 30_000);
+        assert_eq!(ledger.record(minted.id).expires_ms, T0 + 30_000);
     }
 
     #[test]

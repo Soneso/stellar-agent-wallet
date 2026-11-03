@@ -2454,7 +2454,9 @@ impl AuditEntry {
     /// whether a spending-window reservation was released with it.
     /// `evidence` is the wire code of the chain evidence on which
     /// reconciliation released the reservation, and `None` when the outcome
-    /// is unknown. `transaction_hash_redacted` MUST be pre-redacted to
+    /// is unknown. `unbounded_exposure` records that the operator
+    /// acknowledged untimed bytes that can still apply after their spend
+    /// stops counting. `transaction_hash_redacted` MUST be pre-redacted to
     /// first-8-last-8 at the call site; `envelope_hash` carries the full
     /// envelope hash the operator addressed.
     #[must_use]
@@ -2468,6 +2470,7 @@ impl AuditEntry {
         transaction_hash_redacted: impl Into<String>,
         cleared_from: impl Into<String>,
         reservation_released: bool,
+        unbounded_exposure: bool,
         evidence: Option<String>,
         envelope_hash: Option<String>,
         request_id: impl Into<String>,
@@ -2488,6 +2491,7 @@ impl AuditEntry {
                 transaction_hash_redacted: transaction_hash_redacted.into(),
                 cleared_from: cleared_from.into(),
                 reservation_released,
+                unbounded_exposure,
                 evidence,
             },
             previous_entry_hash: String::new(),
@@ -4770,6 +4774,72 @@ mod tests {
         let key = derive_entry_tag_key(&[0x5a; 32]);
         entry.entry_tag = Some(compute_entry_tag(&key, &hash).unwrap());
         (entry, hash)
+    }
+
+    #[test]
+    fn the_clear_row_records_the_unbounded_exposure() {
+        use crate::audit_log::chain::{
+            compute_entry_hash, compute_entry_tag, derive_entry_tag_key,
+        };
+        let row = |exposure| {
+            AuditEntry::new_submission_receipt_cleared(
+                "tx receipt clear",
+                "stellar:mainnet",
+                "abcd...1234",
+                "pending",
+                true,
+                exposure,
+                None,
+                None,
+                "clear",
+            )
+        };
+        let json = serde_json::to_value(row(true)).unwrap();
+        assert_eq!(json["unbounded_exposure"], true);
+        let (untimed, hash) = tagged(row(false));
+        let json = serde_json::to_string(&untimed).unwrap();
+        assert!(!json.contains("unbounded_exposure"));
+        let decoded: AuditEntry = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded.event_kind,
+            EventKind::SubmissionReceiptCleared {
+                unbounded_exposure: false,
+                ..
+            }
+        ));
+        let verified = compute_entry_hash(
+            &decoded.canonical_json_body().unwrap(),
+            &decoded.previous_entry_hash,
+        )
+        .unwrap();
+        assert_eq!(verified, hash);
+        assert_eq!(
+            decoded.entry_tag,
+            Some(compute_entry_tag(&derive_entry_tag_key(&[0x5a; 32]), &verified).unwrap())
+        );
+
+        // The flag is inside the authenticated body: a row whose exposure is
+        // flipped to false hashes differently and fails its keyed tag.
+        let (exposed, exposed_hash) = tagged(row(true));
+        let mut tampered = exposed.clone();
+        let EventKind::SubmissionReceiptCleared {
+            unbounded_exposure, ..
+        } = &mut tampered.event_kind
+        else {
+            panic!("a clear row is expected");
+        };
+        *unbounded_exposure = false;
+        let tampered_hash = compute_entry_hash(
+            &tampered.canonical_json_body().unwrap(),
+            &tampered.previous_entry_hash,
+        )
+        .unwrap();
+        assert_ne!(tampered_hash, exposed_hash);
+        assert_ne!(
+            tampered.entry_tag,
+            Some(compute_entry_tag(&derive_entry_tag_key(&[0x5a; 32]), &tampered_hash).unwrap()),
+            "the keyed tag of the exposed row does not verify the tampered one"
+        );
     }
 
     #[test]

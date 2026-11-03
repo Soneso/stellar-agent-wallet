@@ -40,6 +40,7 @@ pkg-fmt = "zip"
 
 [dependencies]
 stellar-agent-core       = { workspace = true }
+stellar-agent-xdr-limits = { workspace = true }
 stellar-agent-network    = { workspace = true }
 stellar-agent-mpp        = { workspace = true }
 # Smart-account rules observability — SignersManager / ContextRuleManager for

@@ -2087,6 +2087,7 @@ mod tests {
                 policy_digest,
                 approval_nonce: approval.nonce().to_owned(),
                 approval_expires_at_ms: approval.expires_at_ms(),
+                chain_deadline_ms: None,
                 authorization_ttl_ms: 60_000,
                 bindings: facts,
                 holds: holds.clone(),

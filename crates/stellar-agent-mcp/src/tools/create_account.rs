@@ -544,6 +544,9 @@ impl WalletServer {
                 None,
             ));
         }
+        builder.with_mainnet_deadline().map_err(|err| {
+            rmcp::ErrorData::internal_error(format!("envelope_build_error: {err}"), None)
+        })?;
         let envelope_xdr = match builder.build() {
             Ok(xdr) => xdr,
             Err(err) => {
@@ -976,6 +979,14 @@ impl WalletServer {
         ) {
             return Ok(ledger_err_result(&err));
         }
+        let presented_deadline = if self.context.chain_id.is_mainnet() {
+            match crate::tools::common::presented_classic_deadline(&args.envelope_xdr) {
+                Ok(max_time) => Some(max_time),
+                Err(result) => return Ok(result),
+            }
+        } else {
+            None
+        };
         let mut builder = ClassicOpBuilder::new(
             &args.source,
             source_sequence,
@@ -991,6 +1002,9 @@ impl WalletServer {
             args.starting_balance.into_stellar_amount(),
         ) {
             return Ok(commit_path_error_result(err));
+        }
+        if let Some(max_time) = presented_deadline {
+            builder.with_presented_deadline(max_time);
         }
         let rebuilt_envelope_xdr = match builder.build() {
             Ok(xdr) => xdr,

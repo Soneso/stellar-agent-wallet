@@ -3314,7 +3314,8 @@ pub enum EventKind {
     ///
     /// Additive under `#[non_exhaustive]`; hash-chain integrity preserved.
     /// `evidence` is absent from a row that carries none, so such a row keeps
-    /// its serialized form.
+    /// its serialized form. `unbounded_exposure` is absent when false, so a
+    /// row without it keeps its serialized form.
     SubmissionReceiptCleared {
         /// Transaction hash of the cleared submission, redacted first-8-last-8.
         transaction_hash_redacted: String,
@@ -3326,6 +3327,10 @@ pub enum EventKind {
         /// or the clear. False when no reservation is held while it runs.
         /// An evidence release is recorded in `evidence`.
         reservation_released: bool,
+        /// True when the operator acknowledges that untimed bytes can still apply
+        /// after their spend stops counting against the window.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unbounded_exposure: bool,
         /// The wire code of the chain evidence on which reconciliation
         /// released the reservation (`"submission.sequence_consumed"` or
         /// `"submission.time_bound_passed"`); absent when the outcome is
@@ -7272,6 +7277,7 @@ mod tests {
             transaction_hash_redacted: "abcd...wxyz".to_owned(),
             cleared_from: "ambiguous".to_owned(),
             reservation_released: true,
+            unbounded_exposure: false,
             evidence: Some("submission.time_bound_passed".to_owned()),
         };
         let json = serde_json::to_string(&with_evidence).unwrap();

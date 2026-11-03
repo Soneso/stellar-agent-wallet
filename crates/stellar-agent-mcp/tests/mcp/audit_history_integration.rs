@@ -97,6 +97,7 @@ async fn settle_then_rotate(seed: [u8; 32]) -> RotatedSettlement {
             "other",
             "pending",
             false,
+            false,
             None,
             Some("other".to_owned()),
             "filler",
