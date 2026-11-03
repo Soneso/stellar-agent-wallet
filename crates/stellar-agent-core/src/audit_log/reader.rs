@@ -5628,20 +5628,37 @@ mod tests {
     }
 
     impl crate::audit_log::TipAnchorStore for WritesFailFrom {
+        fn load_carrier_record(
+            &self,
+        ) -> Result<
+            Option<crate::audit_log::tip_anchor::CarrierRecord>,
+            crate::audit_log::TipAnchorStoreError,
+        > {
+            self.inner.load_carrier_record()
+        }
+        fn store_carrier_record(
+            &self,
+            record: &crate::audit_log::tip_anchor::CarrierRecord,
+        ) -> Result<(), crate::audit_log::TipAnchorStoreError> {
+            self.inner.store_carrier_record(record)
+        }
+
         fn load_outbox_state(
             &self,
+            generation: u64,
         ) -> Result<
             Option<crate::audit_log::outbox::OutboxState>,
             crate::audit_log::TipAnchorStoreError,
         > {
-            self.inner.load_outbox_state()
+            self.inner.load_outbox_state(generation)
         }
         fn store_outbox_state(
             &self,
+            generation: u64,
             state: &crate::audit_log::outbox::OutboxState,
         ) -> Result<(), crate::audit_log::TipAnchorStoreError> {
             self.write()?;
-            self.inner.store_outbox_state(state)
+            self.inner.store_outbox_state(generation, state)
         }
         fn load_anchor(
             &self,

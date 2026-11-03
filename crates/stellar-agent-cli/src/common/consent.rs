@@ -36,10 +36,13 @@ fn is_sidecar_contention(error: &KeyedAcquireError) -> bool {
 /// The keyed writer is acquired through the registry, which drains any queued
 /// rows at open. Sidecar contention is retried with the approval store's
 /// bounded retry, since a CLI command's startup advisory holds the lock
-/// briefly. Still locked, one `try_lock` on the drain lock, released at once,
-/// decides. Held means a draining writer owns the log, such as a running MCP
-/// server, and the row is queued. Free means the holder does not drain, and
-/// the row is refused with `audit.writer_locked`.
+/// briefly. Still locked, a probe of the drain lock through the carrier record
+/// decides. The probe try-locks once. If it acquires the lock, it compares the
+/// held identity with the carrier record before releasing it. Contention
+/// returns a held result without a record check. Held means a draining writer
+/// owns the log, such as a running MCP server, and the row is queued. Free means the holder does not drain, and the row is refused
+/// with `audit.writer_locked`. A free drain lock file that is not the recorded
+/// one refuses with its carrier code instead.
 ///
 /// # Errors
 ///
@@ -63,7 +66,13 @@ pub(crate) fn acquire_operator_row_sink(
             Err(error) => return Err(error.into_wallet_error(profile_name)),
         }
     };
-    match drain_lock_is_held(&profile.audit_log_path) {
+    match drain_lock_is_held(
+        &profile.audit_log_path,
+        &stellar_agent_network::keyring::KeyringTipAnchorStore::new(
+            &profile.audit_log_hash_chain_key_id,
+            &profile.audit_log_path,
+        ),
+    ) {
         Ok(true) => Ok(OperatorRowSink::Outbox(AuditOutbox::for_log(
             &profile.audit_log_path,
             stellar_agent_network::keyring::KeyringTipAnchorStore::shared(

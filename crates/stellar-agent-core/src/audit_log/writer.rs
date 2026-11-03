@@ -137,21 +137,25 @@ use zeroize::Zeroizing;
 
 use super::{
     binding::BindingHistory,
+    carriers,
     chain::{
         EntryTagCheck, EntryTagKey, ZERO_BLOCK_HASH, check_entry_tag, compute_entry_tag,
         decode_hash, derive_entry_tag_key, encode_hash, sign_chain_root,
     },
     entry::AuditEntry,
+    lock::{AuditWriterLock, Carrier},
     rotation::{
         MarkerNamesNoBoundary, PruneMarker, PruneMarkerData, PruneSeed, oldest_retained_seed,
         read_prune_marker,
     },
     schema::{EntryTagsRekeyCause, EventKind, TipAnchorReason},
     tip_anchor::{
-        KeyedAuditAccess, PriorAnchoring, TipAnchor, TipAnchorStore, TipAnchorStoreError,
+        CarrierRecord, KeyedAuditAccess, PriorAnchoring, RetiredOutbox, TipAnchor, TipAnchorStore,
+        TipAnchorStoreError,
     },
     verify::{EntryTagWalk, TagRowClass, shows_anchoring},
 };
+use crate::file_lock::FileIdentity;
 use crate::timefmt::current_iso8601_utc;
 
 // Re-export rotation constants at the writer module level for crate-internal
@@ -294,25 +298,18 @@ const LOG_UNAUTHENTICATED_TAIL_REASON: &str =
 pub struct AuditWriter {
     /// Path to the active log file.
     path: PathBuf,
-    /// The drain lock `<path>.drain.lock`, held for the writer's whole life
-    /// when the writer drains the audit outbox, and `None` otherwise.
+    /// The coordination carriers, held for the writer's whole life: the
+    /// sidecar `<path>.lock` always, the drain lock `<path>.drain.lock` by
+    /// every writer with an anchor store, recovery writers included, and the
+    /// outbox lock `<path>.outbox.lock` by a recovery writer. See
+    /// [`HeldCarriers`].
     ///
-    /// Taken only after the sidecar lock, so a writer that lost the sidecar
-    /// never holds it. Another process that finds the sidecar lock held reads
-    /// this lock to learn whether the holder drains. Declared before `_lock`
-    /// because fields drop in declaration order: the drain lock is released
-    /// first, so a held drain lock never outlives the sidecar lock it vouches
-    /// for.
-    _drain_lock: Option<crate::audit_log::lock::AuditWriterLock>,
-    /// Exclusive advisory lock on the sidecar `<path>.lock` file.
-    ///
-    /// Held for the entire `AuditWriter` lifetime, including across every
-    /// rotation — never released or re-acquired until the writer drops.  The
-    /// log file at `path` itself carries no lock; see the module-level
-    /// "Single-writer invariant" and "Why the sidecar, not the log file"
-    /// sections.  This field is never read; its only purpose is to hold the
-    /// lock for as long as the `AuditWriter` lives.
-    _lock: crate::audit_log::lock::AuditWriterLock,
+    /// The sidecar lock is held for the entire `AuditWriter` lifetime,
+    /// including across every rotation, and is never released or re-acquired
+    /// until the writer drops. The log file at `path` itself carries no lock; see the
+    /// module-level "Single-writer invariant" and "Why the sidecar, not the log
+    /// file" sections.
+    carriers: HeldCarriers,
     /// `true` for checked and acknowledgement writers with a tip-anchor store.
     ///
     /// A draining writer drains the outbox at open after anchor
@@ -328,6 +325,10 @@ pub struct AuditWriter {
     /// [`AuditWriter::verify_tip_anchor`] is deferred, and only such a writer
     /// acknowledges a loss.
     acknowledge_outbox: bool,
+    /// `true` for a writer from [`AuditWriter::open_for_carrier_binding`] or
+    /// [`AuditWriter::open_for_carrier_binding_unkeyed`]. Only such a writer
+    /// binds carriers, and it never drains: the binding moves the queue.
+    carrier_binding: bool,
     /// The single OS handle used for every read and write against the active
     /// log file.
     ///
@@ -429,6 +430,14 @@ pub struct AuditWriter {
     /// outbox truncation: the drain appends and returns without truncating.
     #[cfg(test)]
     skip_outbox_truncate: bool,
+    /// Test-only seam run by a drain after it reads the outbox and before it
+    /// appends, modelling a holder that acts while the drain is stopped.
+    #[cfg(test)]
+    drain_after_snapshot: Option<Box<dyn FnOnce() + Send>>,
+    /// Test-only seam run by a binding after it reads the outbox and before it
+    /// stages the next generation.
+    #[cfg(test)]
+    binding_after_snapshot: Option<Box<dyn FnOnce() + Send>>,
     /// Test-only fault seam that stops a prune after its durable marker write,
     /// modelling a crash before the archive's deletion.
     #[cfg(test)]
@@ -543,6 +552,219 @@ pub struct OutboxLossReport {
     pub revoked_grants: usize,
 }
 
+/// The carriers an [`AuditWriter`] holds.
+///
+/// Each variant releases its carriers in field order when it drops: the outbox
+/// lock first, then the drain lock, then the sidecar. A held drain lock
+/// therefore never outlives the sidecar lock it vouches for.
+enum HeldCarriers {
+    /// A writer without an anchor store holds the sidecar only. It neither
+    /// drains nor queues, so it takes the sidecar at its path.
+    Writer {
+        /// The sidecar `<path>.lock`, held only for its lock.
+        _writer: AuditWriterLock,
+    },
+    /// A writer with an anchor store also holds the drain lock. Both were
+    /// checked against the carrier record under their locks.
+    ///
+    /// The drain lock is taken only after the sidecar lock, so a writer that
+    /// lost the sidecar never holds it. Another process that finds the sidecar
+    /// held reads the drain lock to learn whether the holder drains.
+    Anchored {
+        /// The drain lock `<path>.drain.lock`, held only for its lock.
+        _drain: AuditWriterLock,
+        /// The sidecar `<path>.lock`, held only for its lock.
+        _writer: AuditWriterLock,
+    },
+    /// A recovery open (binding, re-anchor, acknowledgement) takes all three
+    /// carriers at their paths without the record, refusing a held one with
+    /// `audit.carriers_busy`, so it can repair a replaced or unbound carrier.
+    Recovery {
+        /// The outbox lock `<path>.outbox.lock`, shared with every batch the
+        /// writer reads.
+        outbox: Arc<AuditWriterLock>,
+        /// The drain lock `<path>.drain.lock`.
+        drain: AuditWriterLock,
+        /// The sidecar `<path>.lock`.
+        writer: AuditWriterLock,
+        /// The comparison of the held carriers with the record: `None` when
+        /// every one is the recorded file, otherwise the refusal a re-anchor
+        /// reports in place of its drain. A recovery writer never drains a
+        /// queue whose carriers do not match.
+        refusal: Option<String>,
+    },
+}
+
+/// The carriers a binding records: the identities of the three it holds, and
+/// the outbox carrier its batches read under.
+struct BindingCarriers {
+    outbox: Arc<AuditWriterLock>,
+    writer: FileIdentity,
+    drain: FileIdentity,
+    outbox_lock: FileIdentity,
+}
+
+/// The carriers an open takes before it reads the log.
+enum OpenedCarriers {
+    /// Carriers checked against the record, or a writer without a store.
+    Held(HeldCarriers),
+    /// No record exists: all three carriers taken at their paths. The open
+    /// records them when the log holds no keyed evidence and refuses
+    /// otherwise.
+    Unenrolled {
+        store: Arc<dyn TipAnchorStore>,
+        outbox: AuditWriterLock,
+        drain: AuditWriterLock,
+        writer: AuditWriterLock,
+    },
+}
+
+/// Maps contention on a carrier a recovery open or an enrollment takes with
+/// one try-lock to `audit.carriers_busy`.
+fn carrier_busy(error: WriterError) -> WriterError {
+    match error {
+        WriterError::FileLocked => WriterError::CarriersBusy,
+        other => other,
+    }
+}
+
+/// Takes the carriers of the log at `path` for an open with an anchor store.
+///
+/// A recovery open takes all three at their paths and compares them with the
+/// record afterwards, keeping a mismatch as the refusal it reports in place of
+/// a drain. An ordinary open takes the sidecar and the drain lock through the
+/// record. Without a record it takes all three at their paths for the initial
+/// enrollment; a record that appears meanwhile is checked under the sidecar
+/// lock instead.
+fn acquire_anchored_carriers(
+    path: &Path,
+    store: &Arc<dyn TipAnchorStore>,
+    recovery: bool,
+) -> Result<OpenedCarriers, WriterError> {
+    let lock_path = lock_sidecar_path(path);
+    let drain_path = super::outbox::drain_lock_path(path);
+    let outbox_path = super::outbox::outbox_lock_path(path);
+    if recovery {
+        let writer = AuditWriterLock::acquire(&lock_path).map_err(carrier_busy)?;
+        let drain = AuditWriterLock::acquire(&drain_path).map_err(carrier_busy)?;
+        let outbox = AuditWriterLock::acquire(&outbox_path).map_err(carrier_busy)?;
+        let refusal = match store.load_carrier_record()? {
+            Some(record) => writer
+                .check_identity(Carrier::Writer, &record)
+                .and_then(|()| drain.check_identity(Carrier::Drain, &record))
+                .and_then(|()| outbox.check_identity(Carrier::Outbox, &record))
+                .err()
+                .map(|error| error.to_string()),
+            None => Some(WriterError::CarriersUnbound.to_string()),
+        };
+        return Ok(OpenedCarriers::Held(HeldCarriers::Recovery {
+            outbox: Arc::new(outbox),
+            drain,
+            writer,
+            refusal,
+        }));
+    }
+    let writer = match AuditWriterLock::acquire_bound(&lock_path, Carrier::Writer, store.as_ref()) {
+        Ok(bound) => bound.into_lock(),
+        Err(WriterError::CarriersUnbound) => {
+            let writer = AuditWriterLock::acquire(&lock_path)?;
+            if let Some(record) = store.load_carrier_record()? {
+                writer.check_identity(Carrier::Writer, &record)?;
+                writer
+            } else {
+                return Ok(OpenedCarriers::Unenrolled {
+                    store: Arc::clone(store),
+                    drain: AuditWriterLock::acquire(&drain_path).map_err(carrier_busy)?,
+                    outbox: AuditWriterLock::acquire(&outbox_path).map_err(carrier_busy)?,
+                    writer,
+                });
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    let drain = super::outbox::acquire_drain_lock(path, store.as_ref())?;
+    Ok(OpenedCarriers::Held(HeldCarriers::Anchored {
+        _drain: drain,
+        _writer: writer,
+    }))
+}
+
+/// Records the carriers of a log at its first keyed open, or refuses.
+///
+/// The initial enrollment applies only to a log without keyed evidence: no
+/// tip anchor, no generation-0 commitment, no outbox file, entry tags not in
+/// force, and no entry of the whole file chain carrying an entry tag. Such a
+/// log has had no keyed drain or outbox holder, so recording the carriers
+/// held now admits no stale holder. Any other log refuses with
+/// `audit.carriers_unbound` until `audit bind-carriers` runs.
+///
+/// The three lock files and their directory are synced before the record is
+/// stored, so a recorded identity always names a durable file.
+fn enroll_at_open(
+    path: &Path,
+    store: &dyn TipAnchorStore,
+    active_holds_keyed_evidence: bool,
+    carriers: [&AuditWriterLock; 3],
+) -> Result<(), WriterError> {
+    if active_holds_keyed_evidence
+        || store.load_raw()?.is_some()
+        || store.load_outbox_state(0)?.is_some()
+        || super::outbox::outbox_path(path).try_exists()?
+        || archived_segment_holds_tagged_entry(path)?
+    {
+        return Err(WriterError::CarriersUnbound);
+    }
+    let [writer, drain, outbox] = carriers;
+    for carrier in carriers {
+        carrier.sync_all()?;
+    }
+    super::outbox::sync_parent_dir(path)?;
+    store.store_carrier_record(&CarrierRecord {
+        generation: 1,
+        writer: writer.identity()?,
+        drain: drain.identity()?,
+        outbox_lock: outbox.identity()?,
+        retired: None,
+    })?;
+    Ok(())
+}
+
+/// Whether a rotated segment of the log's file chain holds an entry that
+/// carries an entry tag.
+///
+/// Reads each archive once, line by line, and parses every non-blank line, so
+/// a field name spelled with JSON escapes is found as well. A line that does
+/// not parse counts as tagged, so an unreadable row never passes for an
+/// unkeyed one.
+fn archived_segment_holds_tagged_entry(path: &Path) -> Result<bool, WriterError> {
+    #[derive(serde::Deserialize)]
+    struct TagProbe {
+        #[serde(default)]
+        entry_tag: Option<serde::de::IgnoredAny>,
+    }
+    let chain = super::verify::collect_file_chain(path)?;
+    let archives = chain.split_last().map_or(&[][..], |(_, archives)| archives);
+    for archive in archives {
+        let mut reader = BufReader::new(File::open(archive)?);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let tagged = serde_json::from_slice::<TagProbe>(strip_line_terminator(&line))
+                .map_or(true, |probe| probe.entry_tag.is_some());
+            if tagged {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// How [`AuditWriter::open`] treats an attached tip-anchor store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TipAnchorOpenMode {
@@ -553,6 +775,9 @@ enum TipAnchorOpenMode {
     Check,
     /// Check the anchor and hold the drain lock, deferring the initial drain.
     Acknowledge,
+    /// Check the anchor, take all three carriers at their paths, and defer the
+    /// drain, for [`AuditWriter::bind_carriers`].
+    BindCarriers,
     /// Skip the check so a refused file can be opened for repair. Only
     /// [`AuditWriter::open_for_reanchor`] uses this; the caller must follow it
     /// with [`AuditWriter::reanchor`].
@@ -949,7 +1174,10 @@ impl AuditWriter {
     ///
     /// # Errors
     ///
-    /// Everything [`AuditWriter::open`] returns.
+    /// Everything [`AuditWriter::open`] returns. Returns
+    /// [`WriterError::CarriersBusy`] when any carrier is held and
+    /// [`WriterError::CarrierBindingIncomplete`] when a staged generation
+    /// exists.
     pub fn open_for_reanchor(
         path: PathBuf,
         hmac_key: Option<Zeroizing<[u8; 32]>>,
@@ -968,7 +1196,11 @@ impl AuditWriter {
     /// The drain lock is held, and the initial outbox drain is deferred.
     ///
     /// # Errors
+    ///
     /// Returns the errors of a checked writer open, except outbox drain errors.
+    /// Returns [`WriterError::CarriersBusy`] when any carrier is held and
+    /// [`WriterError::CarrierBindingIncomplete`] when a staged generation
+    /// exists.
     pub fn open_for_outbox_acknowledgement(
         path: PathBuf,
         hmac_key: Option<Zeroizing<[u8; 32]>>,
@@ -981,6 +1213,60 @@ impl AuditWriter {
             Some(tip_anchor),
             binding,
             TipAnchorOpenMode::Acknowledge,
+        )
+    }
+
+    /// Opens the log for [`AuditWriter::bind_carriers`], run with every wallet
+    /// process stopped.
+    ///
+    /// Takes all three carriers at their paths with one try-lock each, checks
+    /// the tip anchor, and defers the drain. Before the data file is created,
+    /// the queue of the current generation must hold exactly its committed
+    /// prefix, unless a staged generation the record already names awaits
+    /// its installation.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::CarriersBusy`] when another process holds a carrier.
+    /// - [`WriterError::OutboxRowsMissing`] when the queue does not hold its
+    ///   committed prefix. Nothing is created or changed.
+    /// - Every error of an anchored open, for example
+    ///   [`WriterError::TipAnchorMismatch`].
+    pub fn open_for_carrier_binding(
+        path: PathBuf,
+        access: KeyedAuditAccess,
+    ) -> Result<Self, WriterError> {
+        let binding = access.binding_history();
+        let (key, store) = access.into_parts();
+        Self::open_inner(
+            path,
+            Some(key),
+            Some(store),
+            binding,
+            TipAnchorOpenMode::BindCarriers,
+        )
+    }
+
+    /// Opens the log for [`AuditWriter::bind_carriers`] before the profile's
+    /// first audit key exists.
+    ///
+    /// The anchor check and the checks that refuse a keyless open of a keyed
+    /// log still apply.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`AuditWriter::open_for_carrier_binding`], and
+    /// [`WriterError::KeyedLogNeedsKey`] when the log shows keyed history.
+    pub fn open_for_carrier_binding_unkeyed(
+        path: PathBuf,
+        store: Arc<dyn TipAnchorStore>,
+    ) -> Result<Self, WriterError> {
+        Self::open_inner(
+            path,
+            None,
+            Some(store),
+            BindingHistory::NotRecorded,
+            TipAnchorOpenMode::BindCarriers,
         )
     }
 
@@ -1022,20 +1308,48 @@ impl AuditWriter {
         // data file.  The log file itself is never locked — see the
         // module-level "Single-writer invariant" and "Why the sidecar, not
         // the log file" sections.
-        let lock_path = lock_sidecar_path(&path);
-        let lock = crate::audit_log::lock::AuditWriterLock::acquire(&lock_path)?;
-
-        // A draining writer takes the drain lock here, while it holds the
-        // sidecar lock. An opener that lost the sidecar never holds it, so a
-        // held drain lock always means a draining writer owns the log. The
-        // repair writer and writers without an anchor store do not drain and
-        // do not take it.
-        let drains = tip_anchor.is_some() && anchor_mode != TipAnchorOpenMode::Repair;
-        let drain_lock = if drains {
-            Some(super::outbox::acquire_drain_lock(&path)?)
-        } else {
-            None
+        //
+        // A writer with an anchor store also takes the drain lock while it
+        // holds the sidecar lock, so an opener that lost the sidecar never
+        // holds it. Writers without an anchor store neither drain nor queue
+        // and take the sidecar alone. See `acquire_anchored_carriers` for how
+        // the carriers are checked against the carrier record.
+        let recovery = anchor_mode != TipAnchorOpenMode::Check;
+        let opened = match tip_anchor.as_ref() {
+            Some(store) => acquire_anchored_carriers(&path, store, recovery)?,
+            None => OpenedCarriers::Held(HeldCarriers::Writer {
+                _writer: AuditWriterLock::acquire(&lock_sidecar_path(&path))?,
+            }),
         };
+        // A staged generation is a binding that has not finished; only the
+        // binding verb may open beside it.
+        if anchor_mode != TipAnchorOpenMode::BindCarriers
+            && !carriers::staged_files(&path)?.is_empty()
+        {
+            return Err(WriterError::CarrierBindingIncomplete);
+        }
+        let drains = tip_anchor.is_some() && anchor_mode != TipAnchorOpenMode::Repair;
+
+        // A binding refuses a damaged queue before the data file exists, so
+        // the refusal changes nothing. A staged file of the recorded
+        // generation is the queue the binding installs instead.
+        if anchor_mode == TipAnchorOpenMode::BindCarriers
+            && let OpenedCarriers::Held(HeldCarriers::Recovery { outbox, .. }) = &opened
+            && let Some(store) = tip_anchor.as_ref()
+        {
+            let generation = store
+                .load_carrier_record()?
+                .map_or(0, |record| record.generation);
+            if !carriers::generation_path(&path, generation).try_exists()? {
+                super::outbox::OutboxBatch::read_for_recovery(
+                    &path,
+                    store.as_ref(),
+                    generation,
+                    outbox,
+                )?
+                .committed_bytes()?;
+            }
+        }
 
         // Open the data file. No lock is placed on it; see above. This is the
         // single handle used for every subsequent read and write against the
@@ -1084,12 +1398,36 @@ impl AuditWriter {
         #[cfg(test)]
         let appends_before_fault = take_appends_before_fault_at_open(&path);
 
+        let carriers = match opened {
+            OpenedCarriers::Held(carriers) => carriers,
+            OpenedCarriers::Unenrolled {
+                store,
+                outbox,
+                drain,
+                writer,
+            } => {
+                enroll_at_open(
+                    &path,
+                    store.as_ref(),
+                    entry_tags_in_force || scan.holds_tagged_row,
+                    [&writer, &drain, &outbox],
+                )?;
+                // The outbox lock is released once the record names it: an
+                // ordinary writer takes it per batch, through the record.
+                drop(outbox);
+                HeldCarriers::Anchored {
+                    _drain: drain,
+                    _writer: writer,
+                }
+            }
+        };
+
         let mut writer = Self {
             path,
-            _drain_lock: drain_lock,
-            _lock: lock,
+            carriers,
             drains,
             acknowledge_outbox: anchor_mode == TipAnchorOpenMode::Acknowledge,
+            carrier_binding: anchor_mode == TipAnchorOpenMode::BindCarriers,
             file,
             last_hash: scan.last_hash,
             segment_start_hash,
@@ -1115,6 +1453,10 @@ impl AuditWriter {
             appends_before_fault,
             #[cfg(test)]
             skip_outbox_truncate: false,
+            #[cfg(test)]
+            drain_after_snapshot: None,
+            #[cfg(test)]
+            binding_after_snapshot: None,
             #[cfg(test)]
             skip_prune_removal: false,
             #[cfg(test)]
@@ -1444,6 +1786,11 @@ impl AuditWriter {
     ///
     /// - [`WriterError::TipAnchorUnavailable`] without an attached store.
     /// - [`WriterError::OutboxBusy`] when the outbox lock stays held.
+    /// - The carrier refusals of the outbox acquisition, for example
+    ///   [`WriterError::CarrierReplaced`] and
+    ///   [`WriterError::RetiredOutboxChanged`]. On a recovery writer whose
+    ///   carriers are not the recorded ones,
+    ///   [`WriterError::CarrierRecoveryRequired`].
     /// - [`WriterError::TipAnchorStore`] when the commitment cannot be read or
     ///   reset.
     /// - [`WriterError::OutboxRowsMissing`] when committed rows are missing,
@@ -1461,7 +1808,24 @@ impl AuditWriter {
             .tip_anchor
             .clone()
             .ok_or(WriterError::TipAnchorUnavailable)?;
-        let batch = super::outbox::OutboxBatch::read_locked(&self.path, store.as_ref())?;
+        // A recovery writer took the carriers at their paths; it drains only
+        // when they are the recorded ones and the retired watch holds, which
+        // an ordinary writer's bound outbox acquisition checks itself.
+        if let HeldCarriers::Recovery { refusal, .. } = &self.carriers {
+            if let Some(refusal) = refusal {
+                return Err(WriterError::CarrierRecoveryRequired {
+                    detail: refusal.clone(),
+                });
+            }
+            if let Some(record) = store.load_carrier_record()? {
+                super::lock::check_retired(store.as_ref(), &record)?;
+            }
+        }
+        let batch = self.read_outbox(store.as_ref())?;
+        #[cfg(test)]
+        if let Some(hook) = self.drain_after_snapshot.take() {
+            hook();
+        }
         if let Some(delivered) = batch.uncommitted_entries()
             && self.active_file_ends_with(&delivered)?
         {
@@ -1485,7 +1849,7 @@ impl AuditWriter {
             self.append_checked(entry)?;
         }
         store
-            .store_outbox_state(&super::outbox::OutboxState::default())
+            .store_outbox_state(batch.generation(), &super::outbox::OutboxState::default())
             .map_err(WriterError::TipAnchorStore)?;
         #[cfg(test)]
         if self.skip_outbox_truncate {
@@ -1502,31 +1866,288 @@ impl AuditWriter {
         Ok(drained)
     }
 
-    /// Reports a loss of committed outbox rows, checked under the outbox lock
-    /// and released before it returns.
+    /// Records the held carriers and moves the committed operator rows to a
+    /// new outbox generation.
+    ///
+    /// Only a writer from [`AuditWriter::open_for_carrier_binding`] binds, with
+    /// every wallet process stopped. From the current generation G (0 for a
+    /// log without a record) the binding:
+    ///
+    /// 1. checks that the outbox holds exactly its committed prefix;
+    /// 2. writes those lines to `<log>.outbox.g<G+1>`, syncs it and its
+    ///    directory, and stores the commitment of G+1 over them;
+    /// 3. appends an `audit_carriers_bound` row;
+    /// 4. stores the record: generation G+1, the identities of the three held
+    ///    carriers, and the retired generation G with its commitment and the
+    ///    file name its outbox is retired to;
+    /// 5. renames the outbox to that retired file, the staged file into the
+    ///    outbox's place, and syncs the directory.
+    ///
+    /// A rerun after an interruption converges. Before step 4 the record
+    /// still names G: the rerun removes the staged files and starts again.
+    /// After step 4 the record names G+1: a staged file that holds exactly
+    /// the rows the commitment of G+1 counts is installed by step 5 alone,
+    /// with the retired watch left for the next ordinary acquisition. One
+    /// that does not is rewritten in place from the rows of the retired
+    /// generation, read from the retired file once the first rename of step 5
+    /// completed and from the outbox before that, and steps 2 to 5 repeat for
+    /// G+1. Those rows are verified before anything changes, and the stage
+    /// exists throughout, so the binding stays marked incomplete until step 5
+    /// installs it.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::Io`] of kind `InvalidInput` on a writer opened any
+    ///   other way, before anything is read or written.
+    /// - [`WriterError::TipAnchorUnavailable`] without an attached store.
+    /// - [`WriterError::RetiredOutboxChanged`] when the generation an earlier
+    ///   binding retired changed; acknowledge that loss first.
+    /// - [`WriterError::OutboxRowsMissing`] when the file the rows are read
+    ///   from does not hold its committed prefix. Nothing is changed.
+    /// - [`WriterError::CarrierIdentityUnavailable`] when a held carrier
+    ///   cannot be identified.
+    /// - Every error of the append, and [`WriterError::TipAnchorStore`] and
+    ///   [`WriterError::Io`] for the store and the files.
+    pub fn bind_carriers(&mut self) -> Result<carriers::CarrierBindingReport, WriterError> {
+        self.bind_carriers_inner(None)
+    }
+
+    /// [`AuditWriter::bind_carriers`] stopped with an error right after step
+    /// `step` (1 to 5), for crash tests. Step 1 ends once the rows are
+    /// verified, before the stage is written.
+    ///
+    /// # Errors
+    ///
+    /// Every error of [`AuditWriter::bind_carriers`], and a simulated
+    /// interruption after the selected step.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn bind_carriers_with_fault(
+        &mut self,
+        step: u8,
+    ) -> Result<carriers::CarrierBindingReport, WriterError> {
+        self.bind_carriers_inner(Some(step))
+    }
+
+    fn bind_carriers_inner(
+        &mut self,
+        stop_after: Option<u8>,
+    ) -> Result<carriers::CarrierBindingReport, WriterError> {
+        let held = match &self.carriers {
+            HeldCarriers::Recovery {
+                outbox,
+                drain,
+                writer,
+                ..
+            } if self.carrier_binding => BindingCarriers {
+                outbox: Arc::clone(outbox),
+                writer: writer.identity()?,
+                drain: drain.identity()?,
+                outbox_lock: outbox.identity()?,
+            },
+            _ => {
+                return Err(WriterError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "carriers are bound only through a writer opened for the binding",
+                )));
+            }
+        };
+        let store = self
+            .tip_anchor
+            .clone()
+            .ok_or(WriterError::TipAnchorUnavailable)?;
+        let current = store.load_carrier_record()?;
+        let stages = carriers::staged_files(&self.path)?;
+        if let Some(record) = &current
+            && let Some(retired) = &record.retired
+            && stages.contains(&carriers::generation_path(&self.path, record.generation))
+        {
+            // The record names the staged generation: step 4 completed. The
+            // retired watch is not checked here; it stays for every ordinary
+            // acquisition, which refuses until a changed retired commitment is
+            // acknowledged.
+            let staged = carriers::generation_path(&self.path, record.generation);
+            let state = store
+                .load_outbox_state(record.generation)?
+                .unwrap_or_default();
+            if carriers::stage_holds(&staged, &state)? {
+                carriers::finish(&self.path, record.generation, retired.file.as_deref())?;
+                return Ok(carriers::CarrierBindingReport {
+                    generation: record.generation,
+                    carried_rows: state.pending,
+                    retired_file: retired.file.clone(),
+                });
+            }
+            // The stage stays, marking the binding incomplete, while it is
+            // staged again.
+            return self.bind_generation(
+                &held,
+                store.as_ref(),
+                retired.generation,
+                record.generation,
+                Some(retired.clone()),
+                stop_after,
+            );
+        }
+        for stage in &stages {
+            fs::remove_file(stage)?;
+        }
+        super::outbox::sync_parent_dir(&self.path)?;
+        let generation = match &current {
+            Some(record) => {
+                super::lock::check_retired(store.as_ref(), record)?;
+                record.generation
+            }
+            None => 0,
+        };
+        let next = generation.checked_add(1).ok_or_else(|| {
+            WriterError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the carrier record names the last outbox generation",
+            ))
+        })?;
+        self.bind_generation(&held, store.as_ref(), generation, next, None, stop_after)
+    }
+
+    /// Steps 1 to 5 of [`AuditWriter::bind_carriers`], from generation `from`
+    /// to generation `next`.
+    ///
+    /// `retired` is the retired entry of a record that already names `next`,
+    /// kept unchanged so a change of the retired commitment since that record
+    /// was stored stays visible to the watch. Without one, the binding
+    /// captures the commitment of `from` as it reads it and picks the retired
+    /// file name.
+    ///
+    /// The rows of `from` are read from the outbox, or from the retired file
+    /// that `retired` names once the first rename of step 5 created it, and
+    /// verified against the commitment of `from` before anything is written.
+    fn bind_generation(
+        &mut self,
+        held: &BindingCarriers,
+        store: &dyn TipAnchorStore,
+        from: u64,
+        next: u64,
+        retired: Option<RetiredOutbox>,
+        stop_after: Option<u8>,
+    ) -> Result<carriers::CarrierBindingReport, WriterError> {
+        let retired_file = retired
+            .as_ref()
+            .and_then(|retired| retired.file.as_deref())
+            .map(|name| self.path.with_file_name(name));
+        let source = match retired_file {
+            Some(file) if file.try_exists()? => file,
+            _ => super::outbox::outbox_path(&self.path),
+        };
+        let batch =
+            super::outbox::OutboxBatch::read_file_for_recovery(&source, store, from, &held.outbox)?;
+        let bytes = batch.committed_bytes()?;
+        #[cfg(test)]
+        if let Some(hook) = self.binding_after_snapshot.take() {
+            hook();
+        }
+        let retired = match retired {
+            Some(retired) => retired,
+            None => RetiredOutbox {
+                generation: from,
+                state: batch.stored_state().to_owned(),
+                file: carriers::retired_name(&self.path, from)?,
+            },
+        };
+        let fault = |step| -> Result<(), WriterError> {
+            if stop_after == Some(step) {
+                return Err(WriterError::Io(io::Error::other(
+                    "carrier binding interrupted",
+                )));
+            }
+            Ok(())
+        };
+        let carried_rows = batch.state().pending;
+        fault(1)?;
+        carriers::write_stage(&self.path, next, &bytes)?;
+        store.store_outbox_state(next, batch.state())?;
+        fault(2)?;
+        self.append_checked(AuditEntry::new_audit_carriers_bound(
+            next,
+            from,
+            carried_rows,
+            retired.file.clone(),
+        ))?;
+        fault(3)?;
+        store.store_carrier_record(&CarrierRecord {
+            generation: next,
+            writer: held.writer.clone(),
+            drain: held.drain.clone(),
+            outbox_lock: held.outbox_lock.clone(),
+            retired: Some(retired.clone()),
+        })?;
+        fault(4)?;
+        carriers::finish(&self.path, next, retired.file.as_deref())?;
+        fault(5)?;
+        Ok(carriers::CarrierBindingReport {
+            generation: next,
+            carried_rows,
+            retired_file: retired.file,
+        })
+    }
+
+    /// Reads the outbox under its lock: through the carrier record for an
+    /// ordinary writer, and under the outbox carrier taken at its path, at the
+    /// recorded generation, for a recovery writer.
+    fn read_outbox(
+        &self,
+        store: &dyn TipAnchorStore,
+    ) -> Result<super::outbox::OutboxBatch, WriterError> {
+        match &self.carriers {
+            HeldCarriers::Recovery { outbox, .. } => {
+                let generation = store
+                    .load_carrier_record()?
+                    .map_or(0, |record| record.generation);
+                super::outbox::OutboxBatch::read_for_recovery(&self.path, store, generation, outbox)
+            }
+            HeldCarriers::Writer { .. } | HeldCarriers::Anchored { .. } => {
+                super::outbox::OutboxBatch::read_locked(&self.path, store)
+            }
+        }
+    }
+
+    /// Reports a loss under the outbox lock. Recovery writers retain that lock
+    /// until they drop.
     ///
     /// `Ok(None)` means the outbox holds exactly its committed prefix,
-    /// unchanged and in order. When it does not, the committed prefix, if it
-    /// is intact, is parsed as operator rows too, so a loss whose
-    /// acknowledgement would refuse on one of those lines refuses here, before
-    /// the caller revokes anything.
+    /// unchanged and in order, and the retired watch holds. A loss in the
+    /// active queue is reported first. Otherwise a changed commitment of the
+    /// generation the last binding retired is the loss, counted as the rows
+    /// that commitment held at retirement against the rows it holds now. When
+    /// the active queue is not intact, its committed prefix, if intact, is
+    /// parsed as operator rows too, so a loss whose acknowledgement would
+    /// refuse on one of those lines refuses here, before the caller revokes
+    /// anything.
     ///
     /// # Errors
     ///
     /// - [`WriterError::TipAnchorUnavailable`] without an attached store.
     /// - [`WriterError::OutboxBusy`] when the outbox lock stays held.
-    /// - [`WriterError::TipAnchorStore`] when the commitment cannot be read.
+    /// - [`WriterError::TipAnchorStore`] when the commitment or the carrier
+    ///   record cannot be read.
     /// - [`WriterError::OutboxUnusable`] / [`WriterError::OutboxRowKindRefused`]
     ///   when a loss exists and a line of the intact committed prefix is not an
     ///   operator row.
     /// - [`WriterError::Io`] when the outbox cannot be read.
+    /// - On an ordinary writer, also returns the carrier refusals of the bound
+    ///   outbox acquisition.
     pub fn outbox_loss(&self) -> Result<Option<super::outbox::OutboxLoss>, WriterError> {
         let store = self
             .tip_anchor
             .as_ref()
             .ok_or(WriterError::TipAnchorUnavailable)?;
-        let batch = super::outbox::OutboxBatch::read_locked(&self.path, store.as_ref())?;
-        let Some(loss) = batch.loss() else {
+        let batch = self.read_outbox(store.as_ref())?;
+        let retired = match store.load_carrier_record()? {
+            Some(record) => super::lock::retired_changed(store.as_ref(), &record)?,
+            None => None,
+        };
+        let Some(loss) = batch
+            .loss()
+            .or_else(|| retired.as_ref().map(super::lock::RetiredChange::loss))
+        else {
             return Ok(None);
         };
         batch.committed_entries()?;
@@ -1550,6 +2171,11 @@ impl AuditWriter {
     /// every line when the prefix is not intact. A refusal after the row
     /// leaves the commitment and the outbox in place, so the loss still holds
     /// and a rerun records it again.
+    ///
+    /// A changed commitment of the retired generation is a loss too (see
+    /// [`AuditWriter::outbox_loss`]). The acknowledgement then resets the
+    /// retired watch to the commitment it observed, so the next acquisition
+    /// compares against that value. It never changes a carrier identity.
     ///
     /// # Errors
     ///
@@ -1582,8 +2208,16 @@ impl AuditWriter {
             .tip_anchor
             .clone()
             .ok_or(WriterError::TipAnchorUnavailable)?;
-        let batch = super::outbox::OutboxBatch::read_locked(&self.path, store.as_ref())?;
-        let loss = batch.loss().ok_or(WriterError::OutboxLossNotFound)?;
+        let batch = self.read_outbox(store.as_ref())?;
+        let record = store.load_carrier_record()?;
+        let retired = match &record {
+            Some(record) => super::lock::retired_changed(store.as_ref(), record)?,
+            None => None,
+        };
+        let loss = batch
+            .loss()
+            .or_else(|| retired.as_ref().map(super::lock::RetiredChange::loss))
+            .ok_or(WriterError::OutboxLossNotFound)?;
         let entries = batch.committed_entries()?.unwrap_or_default();
         let discarded = batch.complete_lines().saturating_sub(entries.len());
         self.append_checked(AuditEntry::new_audit_outbox_loss_acknowledged(
@@ -1598,9 +2232,15 @@ impl AuditWriter {
             self.append_checked(entry)?;
         }
         store
-            .store_outbox_state(&super::outbox::OutboxState::default())
+            .store_outbox_state(batch.generation(), &super::outbox::OutboxState::default())
             .map_err(WriterError::TipAnchorStore)?;
         batch.clear()?;
+        if let (Some(mut record), Some(change)) = (record, retired)
+            && let Some(watched) = record.retired.as_mut()
+        {
+            watched.state = change.observed;
+            store.store_carrier_record(&record)?;
+        }
         self.acknowledge_outbox = false;
         Ok(OutboxLossReport {
             expected_rows: loss.expected_rows,
@@ -3261,6 +3901,7 @@ impl AuditWriter {
     ) -> Result<(), WriterError> {
         if self.drains
             && !self.acknowledge_outbox
+            && !self.carrier_binding
             && let Err(refusal) = self.drain_outbox()
         {
             self.record_adoption(outcome, entry_count);
@@ -4009,6 +4650,10 @@ pub(super) fn lock_sidecar_path(log_path: &Path) -> PathBuf {
 /// keeps its writer alive, so the lock is always held and the fast give-up
 /// branch is reachable only through writer-independent entry points
 /// (`verify::verify_log`).
+///
+/// The probe takes the sidecar at its path, not through the carrier record.
+/// A probe acts on no queue; a held replacement and a held original read the
+/// same, and an unheld one ends the wait either way.
 pub(super) fn sidecar_lock_is_held(log_path: &Path) -> bool {
     matches!(
         crate::audit_log::lock::AuditWriterLock::acquire(&lock_sidecar_path(log_path)),
@@ -5398,6 +6043,68 @@ fn parse_entry_hash_from_line(line: &[u8]) -> Result<String, WriterError> {
 /// Errors that can occur during audit log writing.
 #[derive(Debug, thiserror::Error)]
 pub enum WriterError {
+    /// A recovery writer whose carriers are not the recorded ones does not
+    /// drain. `audit reanchor` reports the carrier refusal it carries as a
+    /// warning and skips its drain.
+    #[error("{detail}")]
+    CarrierRecoveryRequired {
+        /// The carrier refusal, led by its own `audit.*` code.
+        detail: String,
+    },
+    /// The locked lock file of a carrier is not the file the carrier record
+    /// names: it was renamed, replaced, or restored after the record was
+    /// written.
+    #[error(
+        "audit.carrier_replaced: the audit {carrier} lock file is not the one the keyring records; stop every wallet process and run `stellar-agent audit bind-carriers`"
+    )]
+    CarrierReplaced {
+        /// The carrier whose lock file differs.
+        carrier: super::lock::Carrier,
+    },
+    /// A binding started a new outbox generation between this holder's
+    /// outbox lock and its open of the outbox file. The holder's generation is
+    /// retired, and a new acquisition takes the current one.
+    #[error(
+        "audit.carrier_replaced: the audit outbox moved from generation {held} to generation {current} while this holder waited; retry the operation"
+    )]
+    CarrierGenerationChanged {
+        /// The generation the holder's lock was taken under.
+        held: u64,
+        /// The generation the carrier record names now.
+        current: u64,
+    },
+    /// A keyed log holds keyed evidence but has no carrier record, so its
+    /// first keyed open cannot be the initial enrollment.
+    #[error(
+        "audit.carriers_unbound: stop every wallet process and run `stellar-agent audit bind-carriers`"
+    )]
+    CarriersUnbound,
+    /// The platform reports no identity for a held lock file.
+    #[error(
+        "audit.carrier_identity_unavailable: the platform cannot identify the held audit lock file"
+    )]
+    CarrierIdentityUnavailable,
+    /// A recovery open, or an initial enrollment, could not take every
+    /// carrier with one try-lock.
+    #[error("audit.carriers_busy: stop every wallet process before audit carrier recovery")]
+    CarriersBusy,
+    /// A staged outbox generation exists: a binding has not finished. Only
+    /// `audit bind-carriers` opens the log until it does.
+    #[error(
+        "audit.carrier_binding_incomplete: stop every wallet process and rerun `stellar-agent audit bind-carriers`"
+    )]
+    CarrierBindingIncomplete,
+    /// The commitment of the generation the last binding retired changed
+    /// after the binding: a holder of that generation wrote after it was
+    /// retired.
+    #[error(
+        "audit.outbox_rows_missing: the commitment of retired audit outbox generation {generation} changed after carrier binding; a holder of that generation wrote after it was retired; see `stellar-agent audit acknowledge-outbox-loss`"
+    )]
+    RetiredOutboxChanged {
+        /// The retired generation whose commitment changed.
+        generation: u64,
+    },
+
     /// An I/O error occurred.
     #[error("audit log I/O error: {0}")]
     Io(#[from] io::Error),
@@ -5773,6 +6480,14 @@ pub fn audit_log_unusable_detail(e: &WriterError) -> Option<String> {
         // These carry their own `audit.*` code at the head of their Display.
         WriterError::RotationBridgeUnusable { .. }
         | WriterError::IntegrityViolation(_)
+        | WriterError::CarrierRecoveryRequired { .. }
+        | WriterError::CarrierReplaced { .. }
+        | WriterError::CarrierGenerationChanged { .. }
+        | WriterError::CarriersUnbound
+        | WriterError::CarrierIdentityUnavailable
+        | WriterError::CarriersBusy
+        | WriterError::CarrierBindingIncomplete
+        | WriterError::RetiredOutboxChanged { .. }
         | WriterError::OutboxBusy
         | WriterError::OutboxUnusable { .. }
         | WriterError::RowTooLarge { .. }
@@ -7613,6 +8328,7 @@ mod tests {
 
     /// Opens a keyed writer with an anchor store on `path`.
     fn open_keyed_anchored(path: &Path, store: &Arc<InMemoryTipAnchorStore>) -> AuditWriter {
+        crate::audit_log::test_helpers::enroll_carriers(path, store.as_ref()).unwrap();
         let access = KeyedAuditAccess::new(
             Zeroizing::new(PRUNE_TEST_KEY),
             Arc::clone(store) as Arc<dyn TipAnchorStore>,
@@ -10133,6 +10849,7 @@ mod tests {
         path: &Path,
         store: &Arc<InMemoryTipAnchorStore>,
     ) -> Result<AuditWriter, WriterError> {
+        crate::audit_log::test_helpers::enroll_carriers(path, store.as_ref()).unwrap();
         AuditWriter::open_with_tip_anchor(
             path.to_path_buf(),
             None,
@@ -10780,6 +11497,7 @@ mod tests {
         store: &Arc<InMemoryTipAnchorStore>,
         binding: BindingHistory,
     ) -> Result<AuditWriter, WriterError> {
+        crate::audit_log::test_helpers::enroll_carriers(path, store.as_ref()).unwrap();
         let access = KeyedAuditAccess::new(
             Zeroizing::new([0x2c_u8; 32]),
             Arc::clone(store) as Arc<dyn TipAnchorStore>,
@@ -11090,6 +11808,7 @@ mod tests {
         assert!(!hmac_sidecar_path(&path).exists());
 
         let store = Arc::new(InMemoryTipAnchorStore::new());
+        crate::audit_log::test_helpers::enroll_carriers(&path, store.as_ref()).unwrap();
         let writer = AuditWriter::open_with_tip_anchor(
             path.clone(),
             Some(Zeroizing::new([3u8; 32])),
@@ -11927,17 +12646,34 @@ mod tests {
             armed: AtomicBool,
         }
         impl TipAnchorStore for InterruptedStore {
+            fn load_carrier_record(
+                &self,
+            ) -> Result<
+                Option<crate::audit_log::tip_anchor::CarrierRecord>,
+                crate::audit_log::TipAnchorStoreError,
+            > {
+                self.inner.load_carrier_record()
+            }
+            fn store_carrier_record(
+                &self,
+                record: &crate::audit_log::tip_anchor::CarrierRecord,
+            ) -> Result<(), crate::audit_log::TipAnchorStoreError> {
+                self.inner.store_carrier_record(record)
+            }
+
             fn load_outbox_state(
                 &self,
+                generation: u64,
             ) -> Result<Option<super::super::outbox::OutboxState>, TipAnchorStoreError>
             {
-                self.inner.load_outbox_state()
+                self.inner.load_outbox_state(generation)
             }
             fn store_outbox_state(
                 &self,
+                generation: u64,
                 state: &super::super::outbox::OutboxState,
             ) -> Result<(), TipAnchorStoreError> {
-                self.inner.store_outbox_state(state)
+                self.inner.store_outbox_state(generation, state)
             }
 
             fn load_anchor(&self) -> Result<Option<TipAnchor>, TipAnchorStoreError> {
@@ -14182,3 +14918,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "carrier_tests.rs"]
+mod carrier_tests;

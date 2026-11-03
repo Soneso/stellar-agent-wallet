@@ -1351,7 +1351,7 @@ A `pruned_prefix` warning reports `first_file`, the oldest file walked, and
 entry and is authenticated when an audit key is supplied. Verification checks
 every retained entry and bridge, and the warning leaves the verdict successful.
 
-`outbox_pending` counts complete queued consent, halt, and resume lines. With `--profile` and the profile's log path, verification checks the keyring commitment under the outbox lock after the chain walk. A missing or changed committed prefix, or a complete line past it, fails with `audit.outbox_rows_missing`; a held lock fails with `audit.outbox_busy`. Without a profile, no commitment is checked. The separate count inspection can report `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` warnings.
+`outbox_pending` counts complete queued consent, halt, and resume lines. With `--profile` and the profile's log path, verification checks the keyring commitment under the outbox lock after the chain walk. A missing or changed committed prefix, or a complete line past it, fails with `audit.outbox_rows_missing`; a held lock fails with `audit.outbox_busy`. The outbox lock is taken through the carrier record, so the check also fails with `audit.carrier_replaced`, `audit.carriers_unbound` or `audit.carrier_identity_unavailable` at the head of the detail, and with `audit.outbox_rows_missing` when the retired generation's commitment changed. Without a profile, no commitment is checked. The separate count inspection can report `outbox_torn_tail`, `outbox_unparseable`, or `outbox_unreadable` warnings.
 
 An `outbox_loss_acknowledged` warning names each loss acknowledgement's file, line, `expected_rows`, and `found_rows`. It leaves the chain verdict unchanged.
 
@@ -1388,7 +1388,7 @@ After the operator investigates, reanchor accepts an intact prefix with the requ
 
 Queued consent, halt, and resume rows follow the repair rows and are counted in `outbox_drained`. A drain refusal leaves the repair in force and exits `0`. It omits `outbox_drained`, since every queued row stays queued, and lists the refusal under `warnings`: `audit.outbox_unusable`, `audit.outbox_busy`, `audit.outbox_rows_missing`, or the condition an append refused on, such as `audit.io_error`.
 
-The command takes the audit writer's exclusive lock. Stop an MCP server that holds this profile's writer before a rollback repair. See [Key-rotation subcommands](#key-rotation-subcommands) for acquisition and replacement eviction. A binding change needs no stop: a server running the edited profile refuses before it opens the new path, so it holds no lock there. A server still running the old profile refuses after the acknowledgement until it restarts.
+Recovery takes all three audit carriers with immediate try-locks and refuses with `audit.carriers_busy` when any is held. Stop an MCP server that holds this profile's writer before a rollback repair. See [Key-rotation subcommands](#key-rotation-subcommands) for acquisition and replacement eviction. A binding change needs no stop: a server running the edited profile refuses before it opens the new path, so it holds no lock there. A server still running the old profile refuses after the acknowledgement until it restarts.
 
 ```bash
 stellar-agent audit reanchor --profile default                          # report only, exits 1
@@ -1414,13 +1414,36 @@ It records `audit_outbox_loss_acknowledged`, appends the committed prefix when i
 Approve affected actions again to record fresh consent.
 
 The result contains `profile`, `expected_rows`, `found_rows`, `drained`, `discarded`, `revoked_approvals`, and `revoked_grants`; `discarded` counts the complete lines dropped without being appended.
-No loss returns `audit.outbox_loss_not_found` without an acknowledgement; a held writer returns `audit.writer_locked`; a log rolled back behind its tip anchor returns `audit.tip_anchor_mismatch`.
+A changed commitment of the outbox generation the last `audit bind-carriers` retired is a loss too, reported after any loss in the active queue: `expected_rows` is the rows that commitment held at retirement and `found_rows` the rows it holds now, and the acknowledgement resets the retired watch to the commitment it observed.
+No loss returns `audit.outbox_loss_not_found` without an acknowledgement, and a log rolled back behind its tip anchor returns `audit.tip_anchor_mismatch`. Recovery takes all three audit carriers with immediate try-locks and refuses with `audit.carriers_busy` when any is held.
 An intact committed row that does not parse, or that is not an operator row, returns `audit.outbox_unusable` before anything is revoked or written.
 A row that cannot append leaves the queue and commitment in place for inspection and retry.
 
 ```bash
 stellar-agent audit acknowledge-outbox-loss --profile default --reason "Queue inspected; fresh approval required"
 ```
+
+### `audit bind-carriers`
+
+```bash
+stellar-agent audit bind-carriers --profile <NAME>
+```
+
+Stop every wallet process before this operator-only command. It takes all
+three audit lock files with one try-lock each and refuses with
+`audit.carriers_busy` when any is held. It verifies the committed operator
+rows, copies them into a new outbox generation, appends `audit_carriers_bound`,
+records all three carrier identities in the keyring, and renames the old outbox
+to `<log>.outbox.retired-g<G>`, or to `<log>.outbox.retired-g<G>.<n>` when an
+earlier binding already used that name.
+The result contains `profile`, `generation`, `carried_rows` and `retired_file`.
+`retired_file` is the retired file's name, or `null` when the log had no outbox
+file. When a retired file exists, keep it while investigating stale holders.
+A log with keyed history refuses keyed use with `audit.carriers_unbound` until
+this command runs once; a log without keyed evidence enrolls at its first keyed
+open. Replaced carriers refuse with `audit.carrier_replaced`. A staged
+generation refuses with `audit.carrier_binding_incomplete`; rerun this command
+to finish it.
 
 ## The governance loop
 

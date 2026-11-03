@@ -368,6 +368,46 @@ mod tests {
                 "audit.outbox_unusable",
             ),
             (
+                WriterError::CarrierReplaced {
+                    carrier: stellar_agent_core::audit_log::Carrier::Outbox,
+                },
+                "audit.chain_key_unavailable",
+                "audit.carrier_replaced",
+            ),
+            (
+                WriterError::CarrierGenerationChanged {
+                    held: 1,
+                    current: 2,
+                },
+                "audit.chain_key_unavailable",
+                "audit.carrier_replaced",
+            ),
+            (
+                WriterError::RetiredOutboxChanged { generation: 1 },
+                "audit.chain_key_unavailable",
+                "audit.outbox_rows_missing",
+            ),
+            (
+                WriterError::CarriersUnbound,
+                "audit.chain_key_unavailable",
+                "audit.carriers_unbound",
+            ),
+            (
+                WriterError::CarrierIdentityUnavailable,
+                "audit.chain_key_unavailable",
+                "audit.carrier_identity_unavailable",
+            ),
+            (
+                WriterError::CarriersBusy,
+                "audit.chain_key_unavailable",
+                "audit.carriers_busy",
+            ),
+            (
+                WriterError::CarrierBindingIncomplete,
+                "audit.chain_key_unavailable",
+                "audit.carrier_binding_incomplete",
+            ),
+            (
                 WriterError::OutboxRowsMissing {
                     recorded: 2,
                     found: 1,

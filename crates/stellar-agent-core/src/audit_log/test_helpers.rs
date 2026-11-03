@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use super::lock::AuditWriterLock;
+use super::tip_anchor::CarrierRecord;
 use super::{AuditEntry, AuditWriter, verify_log};
 
 /// Returns every row of the verified audit chain in chain order.
@@ -222,6 +224,67 @@ fn parse_rows(rows: &[String]) -> Vec<AuditEntry> {
     rows.iter()
         .map(|row| serde_json::from_str(row).expect("audit row must parse"))
         .collect()
+}
+
+/// Records the current carriers of `log` as generation 1 when `store` holds
+/// no carrier record, for a fixture whose subject is not the enrollment.
+///
+/// Takes the three lock files at their paths, as `audit bind-carriers` does,
+/// and creates them when absent.
+///
+/// # Errors
+///
+/// Returns lock, identity, or store errors; [`super::WriterError::FileLocked`]
+/// when a live holder holds a carrier.
+pub fn enroll_carriers(
+    log: &std::path::Path,
+    store: &dyn super::TipAnchorStore,
+) -> Result<(), super::WriterError> {
+    if store.load_carrier_record()?.is_some() {
+        return Ok(());
+    }
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let writer = AuditWriterLock::acquire(&super::writer::lock_sidecar_path(log))?;
+    let drain = AuditWriterLock::acquire(&super::outbox::drain_lock_path(log))?;
+    let outbox = AuditWriterLock::acquire(&super::outbox::outbox_lock_path(log))?;
+    store.store_carrier_record(&CarrierRecord {
+        generation: 1,
+        writer: writer.identity()?,
+        drain: drain.identity()?,
+        outbox_lock: outbox.identity()?,
+        retired: None,
+    })?;
+    Ok(())
+}
+
+/// An audit lock file held at its path, as a running holder of a carrier holds
+/// it. Released when dropped.
+#[derive(Debug)]
+pub struct HeldAuditLock(AuditWriterLock);
+
+impl HeldAuditLock {
+    /// The identity of the held file.
+    ///
+    /// # Errors
+    ///
+    /// [`super::WriterError::CarrierIdentityUnavailable`] when the platform
+    /// cannot identify the file.
+    pub fn identity(&self) -> Result<crate::file_lock::FileIdentity, super::WriterError> {
+        self.0.identity()
+    }
+}
+
+/// Locks the audit lock file at `path` with one try-lock, creating it when
+/// absent, without consulting the carrier record.
+///
+/// # Errors
+///
+/// [`super::WriterError::FileLocked`] when another holder holds it, and
+/// [`super::WriterError::Io`] for any other failure.
+pub fn hold_audit_lock(path: &std::path::Path) -> Result<HeldAuditLock, super::WriterError> {
+    AuditWriterLock::acquire(path).map(HeldAuditLock)
 }
 
 #[cfg(test)]

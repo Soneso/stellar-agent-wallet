@@ -707,6 +707,11 @@ mod tests {
         // another store does not restore keyring provenance.
         let copied = InMemoryTipAnchorStore::new();
         copied.set(proof.expected.load_anchor().unwrap());
+        stellar_agent_core::audit_log::test_helpers::enroll_carriers(
+            &profile.audit_log_path,
+            &copied,
+        )
+        .unwrap();
         let replacement = AuditWriter::open_with_tip_anchor(
             profile.audit_log_path.clone(),
             crate::keyring::read_secret_32(&profile.audit_log_hash_chain_key_id).unwrap(),
@@ -742,6 +747,18 @@ mod tests {
         // A copy of the log matches the profile's anchor at another path.
         let other = dir.path().join("other.jsonl");
         std::fs::copy(&profile.audit_log_path, &other).unwrap();
+        AuditWriter::open_for_carrier_binding(
+            other.clone(),
+            stellar_agent_core::audit_log::KeyedAuditAccess::new(
+                crate::keyring::read_secret_32(&profile.audit_log_hash_chain_key_id)
+                    .unwrap()
+                    .unwrap(),
+                Arc::new(proof.expected.clone()),
+            ),
+        )
+        .unwrap()
+        .bind_carriers()
+        .unwrap();
         let replacement = AuditWriter::open_with_tip_anchor(
             other,
             crate::keyring::read_secret_32(&profile.audit_log_hash_chain_key_id).unwrap(),

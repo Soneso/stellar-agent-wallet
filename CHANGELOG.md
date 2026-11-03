@@ -148,6 +148,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   close both listeners when dropped.
 - `OperatorEnrollStartError::Bind` and `BridgeStartError::Bind` are removed;
   their start functions report `LoopbackPair`.
+- An audit log with keyed history refuses keyed use with
+  `audit.carriers_unbound` until `stellar-agent audit bind-carriers --profile
+  <NAME>` runs once with every wallet process stopped. A log without keyed
+  evidence enrolls its lock files at its first keyed open. `audit reanchor`
+  and `audit acknowledge-outbox-loss` refuse with `audit.carriers_busy` while
+  any wallet process holds an audit lock file. `TipAnchorStore` gains the
+  carrier record and a generation parameter on the outbox commitment.
+
 - `MintRequest::chain_deadline_ms` caps authorization expiry at the signed
   envelope's deadline. `MainnetPrecondition` includes `DeadlineMissing`,
   `DeadlineElapsed` and `DeadlineTooFar`. `ClassicOpBuilder::with_mainnet_deadline`
@@ -618,6 +626,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be held, so another local account cannot serve a page under the wallet's
   `localhost` origin. Both listeners close together, also when either one
   ends unexpectedly. Each ceremony keeps its refusal code.
+- Audit appends, drains and keyed writers refuse a lock file that is not the one
+  the keyring records (`audit.carrier_replaced`), so replacing a lock file cannot
+  let a stale drain erase an operator row queued after it. `audit bind-carriers`
+  records the lock files and starts a new outbox generation.
+
 - Classic mainnet envelopes built by `pay`, `claim`, `accounts create`,
   `trustline` and their MCP tools carry an on-chain deadline 120 seconds after
   they are built. The operator's consent covers it, the authorization expires

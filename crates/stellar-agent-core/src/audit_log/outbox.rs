@@ -15,21 +15,36 @@
 //!   and keeps its own timestamp.
 //! - `<audit_log_path>.outbox.lock`: the lock every append and every drain
 //!   holds while it touches the outbox.
-//! - `<audit_log_path>.drain.lock`: held for its whole life by every draining
-//!   writer, so another process can tell a draining writer from one that does
-//!   not drain.
+//! - `<audit_log_path>.drain.lock`: held for its whole life by every writer
+//!   with an anchor store, recovery writers included, so another process can
+//!   tell a draining writer from one that does not drain.
 //!
 //! # Locks
 //!
-//! The approval store lock and the outbox lock are the two locks callers wait
-//! on. They are taken in that order, never the reverse. The outbox lock waits
-//! for up to [`OUTBOX_LOCK_WAIT`] in 20 ms steps and then refuses with
+//! Normal operator-row appends acquire the approval-store lock before the
+//! outbox lock. Recovery holds all three audit carriers and uses nonblocking
+//! acquisition of the permission stores. The outbox lock waits for up to
+//! [`OUTBOX_LOCK_WAIT`] in 20 ms steps and then refuses with
 //! [`WriterError::OutboxBusy`], whose detail is `audit.outbox_busy`. Every
 //! writer open takes the writer's sidecar lock with one `try_lock`; only
 //! `stellar-agent approve --id` retries it, within the approval store's retry
 //! bound. A draining writer then takes the drain lock with a short bounded
 //! retry. Neither lock is waited on indefinitely, so no cycle of waiters can
 //! form.
+//!
+//! # Carriers and generations
+//!
+//! The writer sidecar, the drain lock and the outbox lock are the carriers of
+//! the log. For a keyed log the protected audit state records the identity of
+//! each, and every acquisition here locks the file at the path and then
+//! compares the identity of the locked handle with that record, refusing a
+//! replaced file with `audit.carrier_replaced`. The record also names the
+//! outbox generation: each generation's commitment is a separate keyring
+//! entry, and a holder reads and writes only the commitment of the generation
+//! its lock was taken under. `audit bind-carriers` starts a new generation and
+//! watches the commitment of the one it retires, so a holder of the retired
+//! generation cannot change the new queue without the change refusing the
+//! next outbox acquisition with `audit.outbox_rows_missing`.
 //!
 //! # Append
 //!
@@ -98,7 +113,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::entry::AuditEntry;
-use super::lock::AuditWriterLock;
+use super::lock::{AuditWriterLock, BoundCarrierLock, Carrier};
 use super::schema::EventKind;
 use super::writer::{WriterError, basename_lossy_path as basename, sidecar_path};
 
@@ -158,7 +173,7 @@ impl OutboxState {
         self.pending += 1;
     }
 
-    fn over(lines: &[&[u8]]) -> Self {
+    pub(crate) fn over(lines: &[&[u8]]) -> Self {
         let mut state = Self::default();
         for line in lines {
             state.push(line);
@@ -241,6 +256,13 @@ fn parse_operator_rows(lines: &[&[u8]]) -> Result<Vec<AuditEntry>, WriterError> 
         .collect()
 }
 
+/// Whether `bytes` are exactly the rows `state` commits: complete lines only,
+/// the committed prefix, and nothing past it.
+pub(super) fn holds_exactly_committed(bytes: &[u8], state: &OutboxState) -> bool {
+    let parsed = parse_lines(bytes);
+    parsed.torn_bytes == 0 && committed_prefix_loss(&parsed.lines, state).is_none()
+}
+
 fn check_committed_prefix(lines: &[&[u8]], state: &OutboxState) -> Result<(), WriterError> {
     match committed_prefix_loss(lines, state) {
         None => Ok(()),
@@ -251,18 +273,28 @@ fn check_committed_prefix(lines: &[&[u8]], state: &OutboxState) -> Result<(), Wr
     }
 }
 
-fn load_state(store: &dyn TipAnchorStore) -> Result<OutboxState, WriterError> {
+fn load_state(store: &dyn TipAnchorStore, generation: u64) -> Result<OutboxState, WriterError> {
     store
-        .load_outbox_state()
+        .load_outbox_state(generation)
         .map(Option::unwrap_or_default)
         .map_err(WriterError::TipAnchorStore)
 }
 
-/// Checks the outbox's committed prefix under its lock.
+/// Checks the outbox's committed prefix under its lock, taken through the
+/// carrier record.
 ///
 /// # Errors
-/// Returns a writer error on lock contention, unavailable state, unreadable
-/// files, or a missing or changed committed prefix.
+///
+/// - [`WriterError::OutboxBusy`] when the outbox lock stays held.
+/// - The carrier refusals of the acquisition: [`WriterError::CarrierReplaced`],
+///   [`WriterError::CarrierGenerationChanged`], [`WriterError::CarriersUnbound`],
+///   [`WriterError::CarrierIdentityUnavailable`], and
+///   [`WriterError::RetiredOutboxChanged`] for a changed retired commitment.
+/// - [`WriterError::TipAnchorStore`] when the commitment or the record cannot
+///   be read.
+/// - [`WriterError::Io`] when the outbox cannot be read.
+/// - [`WriterError::OutboxRowsMissing`] for a missing or changed committed
+///   prefix, or a complete line past it.
 pub fn check_outbox_commitment(
     log_path: &Path,
     store: &dyn TipAnchorStore,
@@ -305,8 +337,9 @@ pub(crate) const OUTBOX_LOCK_STEP: Duration = Duration::from_millis(20);
 /// Number of `try_lock` attempts a draining writer's open makes on the drain
 /// lock before it refuses.
 ///
-/// The only other holder of the drain lock besides a draining writer is a
-/// one-shot probe, which releases it at once, so a short bound suffices.
+/// Every writer that holds the drain lock, a recovery writer included, takes
+/// it while it holds the sidecar lock, so a writer's open finds it held only
+/// by a one-shot probe, which releases it at once. A short bound suffices.
 pub(crate) const DRAIN_LOCK_ATTEMPTS: u32 = 5;
 
 /// Delay between two attempts on the drain lock.
@@ -333,15 +366,24 @@ pub(crate) fn drain_lock_path(log_path: &Path) -> PathBuf {
 /// Returns `true` when a draining writer holds the drain lock of the log at
 /// `log_path`.
 ///
-/// One `try_lock`, released before this function returns. A lock that could
-/// be taken is not held by any draining writer.
+/// One `try_lock` through the carrier record, released before this function
+/// returns. A lock that could be taken is not held by any draining writer. A
+/// free lock file that is not the recorded one fails the probe closed with
+/// [`WriterError::CarrierReplaced`] instead of reading as free.
 ///
 /// # Errors
 ///
-/// [`WriterError::Io`] when the lock file cannot be opened or locked for a
-/// reason other than contention.
-pub fn drain_lock_is_held(log_path: &Path) -> Result<bool, WriterError> {
-    match AuditWriterLock::acquire(&drain_lock_path(log_path)) {
+/// - [`WriterError::CarrierReplaced`], [`WriterError::CarriersUnbound`] and
+///   [`WriterError::CarrierIdentityUnavailable`] when a free lock file does
+///   not match the record.
+/// - [`WriterError::TipAnchorStore`] when the record cannot be read.
+/// - [`WriterError::Io`] when the lock file cannot be opened or locked for a
+///   reason other than contention.
+pub fn drain_lock_is_held(
+    log_path: &Path,
+    store: &dyn TipAnchorStore,
+) -> Result<bool, WriterError> {
+    match AuditWriterLock::acquire_bound(&drain_lock_path(log_path), Carrier::Drain, store) {
         Ok(lock) => {
             drop(lock);
             Ok(false)
@@ -351,44 +393,59 @@ pub fn drain_lock_is_held(log_path: &Path) -> Result<bool, WriterError> {
     }
 }
 
-/// Takes the drain lock of the log at `log_path` for a draining writer.
+/// Takes the drain lock of the log at `log_path` for a draining writer,
+/// checked against the carrier record.
 ///
 /// Bounded: [`DRAIN_LOCK_ATTEMPTS`] attempts, [`DRAIN_LOCK_BACKOFF`] apart.
 ///
 /// # Errors
 ///
-/// [`WriterError::FileLocked`] when every attempt finds the lock held, and
-/// [`WriterError::Io`] for any other failure.
-pub(crate) fn acquire_drain_lock(log_path: &Path) -> Result<AuditWriterLock, WriterError> {
+/// - [`WriterError::FileLocked`] when every attempt finds the lock held.
+/// - The refusals of
+///   [`AuditWriterLock::acquire_bound`](super::lock::AuditWriterLock::acquire_bound)
+///   when the locked file does not match the record.
+/// - [`WriterError::Io`] for any other failure.
+pub(crate) fn acquire_drain_lock(
+    log_path: &Path,
+    store: &dyn TipAnchorStore,
+) -> Result<AuditWriterLock, WriterError> {
     let path = drain_lock_path(log_path);
     let mut attempt = 0_u32;
     loop {
         attempt += 1;
-        match AuditWriterLock::acquire(&path) {
+        match AuditWriterLock::acquire_bound(&path, Carrier::Drain, store) {
             Err(WriterError::FileLocked) if attempt < DRAIN_LOCK_ATTEMPTS => {
                 std::thread::sleep(DRAIN_LOCK_BACKOFF);
             }
-            other => return other,
+            other => return other.map(BoundCarrierLock::into_lock),
         }
     }
 }
 
-/// Takes the outbox lock at `lock_path`, waiting up to [`outbox_lock_wait`].
+/// Takes the outbox lock at `lock_path`, checked against the carrier record,
+/// waiting up to [`outbox_lock_wait`].
 ///
 /// The first attempt that finds the lock held emits one debug event, so an
 /// operator can tell a command that waits on another appender from one that
-/// stalls elsewhere.
+/// stalls elsewhere. Only contention is retried; a refusal of the record
+/// returns at once.
 ///
 /// # Errors
 ///
-/// [`WriterError::OutboxBusy`] when the lock stays held for the whole wait,
-/// and [`WriterError::Io`] for any other failure.
-pub(crate) fn lock_outbox(lock_path: &Path) -> Result<AuditWriterLock, WriterError> {
+/// - [`WriterError::OutboxBusy`] when the lock stays held for the whole wait.
+/// - The refusals of
+///   [`AuditWriterLock::acquire_bound`](super::lock::AuditWriterLock::acquire_bound)
+///   for an outbox acquisition, the retired watch included.
+/// - [`WriterError::Io`] for any other failure.
+pub(crate) fn lock_outbox(
+    lock_path: &Path,
+    store: &dyn TipAnchorStore,
+) -> Result<BoundCarrierLock, WriterError> {
     let wait = outbox_lock_wait();
     let deadline = Instant::now() + wait;
     let mut waiting = false;
     loop {
-        match AuditWriterLock::acquire(lock_path) {
+        match AuditWriterLock::acquire_bound(lock_path, Carrier::Outbox, store) {
             Err(WriterError::FileLocked) => {
                 if Instant::now() >= deadline {
                     return Err(WriterError::OutboxBusy);
@@ -452,6 +509,12 @@ impl AuditOutbox {
     /// # Errors
     ///
     /// - [`WriterError::OutboxBusy`] when the outbox lock stays held.
+    /// - [`WriterError::CarrierReplaced`], [`WriterError::CarriersUnbound`] or
+    ///   [`WriterError::CarrierIdentityUnavailable`] when the outbox lock file
+    ///   is not the recorded one, and [`WriterError::CarrierGenerationChanged`]
+    ///   when a binding started a new generation while the append waited.
+    /// - [`WriterError::RetiredOutboxChanged`] when the retired generation's
+    ///   commitment changed after the binding.
     /// - [`WriterError::OutboxRowsMissing`] when committed rows are lost or
     ///   changed, a missing file included, or when a complete line follows
     ///   them. The file is neither created nor changed.
@@ -468,8 +531,18 @@ impl AuditOutbox {
         if let Some(parent) = self.path.parent() {
             create_private_dir(parent)?;
         }
-        let lock = lock_outbox(&self.lock_path)?;
-        let state = load_state(self.state.as_ref())?;
+        let lock = lock_outbox(&self.lock_path, self.state.as_ref())?;
+        self.prepare_append_locked(lock)
+    }
+
+    /// Loads the state of one append under an outbox lock already held.
+    ///
+    /// The commitment is the one of the generation `lock` was taken under.
+    pub(crate) fn prepare_append_locked(
+        &self,
+        lock: BoundCarrierLock,
+    ) -> Result<PreparedOutboxAppend<'_>, WriterError> {
+        let state = load_state(self.state.as_ref(), lock.generation())?;
         let created = !self.path.try_exists()?;
         if created && state.pending > 0 {
             return Err(WriterError::OutboxRowsMissing {
@@ -478,6 +551,9 @@ impl AuditOutbox {
             });
         }
         let mut file = open_outbox_0600(&self.path)?;
+        // Recovery can replace a renamed carrier before this data handle opens.
+        // Once the handle is open, a matching generation fixes which file it holds.
+        lock.check_generation(self.state.as_ref())?;
         // The check reads the bytes as they are: the torn-tail repair would
         // cut a committed line that lost its newline, turning a restorable
         // file into a loss. A complete line past the commitment refuses too,
@@ -494,7 +570,7 @@ impl AuditOutbox {
             file,
             committed: OutboxState::over(&lines),
             created,
-            _lock: lock,
+            lock,
         })
     }
 }
@@ -506,7 +582,9 @@ pub(crate) struct PreparedOutboxAppend<'a> {
     committed: OutboxState,
     before: u64,
     created: bool,
-    _lock: AuditWriterLock,
+    /// The outbox lock, held until the append returns; its generation selects
+    /// the commitment the append stores.
+    lock: BoundCarrierLock,
 }
 
 impl PreparedOutboxAppend<'_> {
@@ -523,7 +601,7 @@ impl PreparedOutboxAppend<'_> {
             }
             self.outbox
                 .state
-                .store_outbox_state(&self.committed)
+                .store_outbox_state(self.lock.generation(), &self.committed)
                 .map_err(WriterError::TipAnchorStore)
         });
         if let Err(error) = appended {
@@ -582,7 +660,7 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// Syncs the directory holding `path`, so the creation of `path` is durable.
-fn sync_parent_dir(path: &Path) -> io::Result<()> {
+pub(super) fn sync_parent_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;
@@ -650,26 +728,49 @@ fn read_all(file: &mut File) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// The outbox lock an [`OutboxBatch`] holds for its whole life.
+enum BatchGuard {
+    /// The lock the batch took itself, checked against the carrier record.
+    Bound(BoundCarrierLock),
+    /// The outbox carrier a recovery writer took at its path. The batch shares
+    /// ownership of it, so the carrier stays locked while the batch lives even
+    /// when the writer that took it drops first.
+    Recovery {
+        /// Held only to keep the carrier locked; never read.
+        _held: Arc<AuditWriterLock>,
+    },
+}
+
 /// The raw bytes of an outbox and its commitment, read together under the
 /// outbox lock and held under it until the drain either clears the file or
 /// drops it unchanged.
 pub(crate) struct OutboxBatch {
-    _lock: AuditWriterLock,
+    /// The outbox lock, held for the batch's whole life.
+    _guard: BatchGuard,
+    /// The generation whose commitment the batch read.
+    generation: u64,
     path: PathBuf,
     file: Option<File>,
     bytes: Vec<u8>,
     state: OutboxState,
+    /// The commitment as the store held it, in its keyring form, or the empty
+    /// string for an absent entry.
+    stored_state: String,
 }
 
 impl OutboxBatch {
-    /// Takes the outbox lock of the log at `log_path`, then reads the
-    /// commitment from `store` and the outbox file as it is.
+    /// Takes the outbox lock of the log at `log_path` through the carrier
+    /// record, then reads the commitment of the lock's generation from
+    /// `store` and the outbox file as it is.
     ///
     /// A missing file reads as no bytes. Nothing is checked or parsed.
     ///
     /// # Errors
     ///
     /// - [`WriterError::OutboxBusy`] when the outbox lock stays held.
+    /// - The carrier refusals of [`lock_outbox`], and
+    ///   [`WriterError::CarrierGenerationChanged`] when a binding started a
+    ///   new generation before the file opened.
     /// - [`WriterError::TipAnchorStore`] when the commitment cannot be read.
     /// - [`WriterError::Io`] when the file cannot be opened or read for a
     ///   reason other than its absence.
@@ -677,22 +778,130 @@ impl OutboxBatch {
         log_path: &Path,
         store: &dyn TipAnchorStore,
     ) -> Result<Self, WriterError> {
-        let lock = lock_outbox(&outbox_lock_path(log_path))?;
-        let state = load_state(store)?;
-        let path = outbox_path(log_path);
+        let lock = lock_outbox(&outbox_lock_path(log_path), store)?;
+        let generation = lock.generation();
+        Self::read_generation(
+            outbox_path(log_path),
+            store,
+            generation,
+            BatchGuard::Bound(lock),
+        )
+    }
+
+    /// Reads the commitment of `generation` and the outbox file under the
+    /// outbox carrier a recovery writer holds at its path.
+    ///
+    /// A recovery writer took the carrier without the record, so the caller
+    /// names the generation. The batch keeps `held` locked for its whole life.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::TipAnchorStore`] when the commitment cannot be read.
+    /// - [`WriterError::Io`] when the file cannot be opened or read for a
+    ///   reason other than its absence.
+    pub(crate) fn read_for_recovery(
+        log_path: &Path,
+        store: &dyn TipAnchorStore,
+        generation: u64,
+        held: &Arc<AuditWriterLock>,
+    ) -> Result<Self, WriterError> {
+        Self::read_file_for_recovery(&outbox_path(log_path), store, generation, held)
+    }
+
+    /// Reads the commitment of `generation` and the queue file at `file`
+    /// under the outbox carrier a recovery writer holds at its path.
+    ///
+    /// A carrier binding reads the rows of the generation it retires from the
+    /// retired file once the outbox has been renamed to it, and from the
+    /// outbox before that. The batch keeps `held` locked for its whole life.
+    ///
+    /// # Errors
+    ///
+    /// - [`WriterError::TipAnchorStore`] when the commitment cannot be read.
+    /// - [`WriterError::Io`] when the file cannot be opened or read for a
+    ///   reason other than its absence.
+    pub(crate) fn read_file_for_recovery(
+        file: &Path,
+        store: &dyn TipAnchorStore,
+        generation: u64,
+        held: &Arc<AuditWriterLock>,
+    ) -> Result<Self, WriterError> {
+        Self::read_generation(
+            file.to_path_buf(),
+            store,
+            generation,
+            BatchGuard::Recovery {
+                _held: Arc::clone(held),
+            },
+        )
+    }
+
+    fn read_generation(
+        path: PathBuf,
+        store: &dyn TipAnchorStore,
+        generation: u64,
+        guard: BatchGuard,
+    ) -> Result<Self, WriterError> {
+        let stored = store.load_outbox_state(generation)?;
+        let stored_state = stored
+            .as_ref()
+            .map(OutboxState::to_keyring_value)
+            .unwrap_or_default();
+        let state = stored.unwrap_or_default();
         let mut file = match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(file) => Some(file),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(WriterError::Io(e)),
         };
+        // A binding can retire the generation between the lock and the open;
+        // a matching generation after the open fixes which file the handle
+        // holds.
+        if let BatchGuard::Bound(lock) = &guard {
+            lock.check_generation(store)?;
+        }
         let bytes = file.as_mut().map(read_all).transpose()?.unwrap_or_default();
         Ok(Self {
-            _lock: lock,
+            _guard: guard,
+            generation,
             path,
             file,
             bytes,
             state,
+            stored_state,
         })
+    }
+
+    /// The generation whose commitment the batch read.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The committed lines, each with its newline, after checking that the
+    /// complete lines are exactly the committed prefix.
+    ///
+    /// # Errors
+    ///
+    /// [`WriterError::OutboxRowsMissing`] when they are not.
+    pub(crate) fn committed_bytes(&self) -> Result<Vec<u8>, WriterError> {
+        let lines = parse_lines(&self.bytes).lines;
+        check_committed_prefix(&lines, &self.state)?;
+        let mut bytes = Vec::new();
+        for line in lines {
+            bytes.extend_from_slice(line);
+            bytes.push(b'\n');
+        }
+        Ok(bytes)
+    }
+
+    /// The commitment as the store held it, in its keyring form, or the
+    /// empty string for an absent entry.
+    pub(crate) fn stored_state(&self) -> &str {
+        &self.stored_state
+    }
+
+    /// The commitment, zero for an absent entry.
+    pub(crate) fn state(&self) -> &OutboxState {
+        &self.state
     }
 
     /// Reads the outbox under its lock and checks that its complete lines are
@@ -954,6 +1163,12 @@ mod tests {
     use crate::audit_log::tip_anchor::{InMemoryTipAnchorStore, KeyedAuditAccess, TipAnchorStore};
     use crate::audit_log::writer::{AuditWriter, AuditWriterRegistry};
 
+    fn bound_store(path: &Path) -> Arc<InMemoryTipAnchorStore> {
+        let store = Arc::new(InMemoryTipAnchorStore::new());
+        drop(open_draining(path, &store));
+        store
+    }
+
     /// A consent-shaped row with a fixed request id.
     fn row(request_id: &str) -> AuditEntry {
         AuditEntry::new_approval_attested(
@@ -1018,7 +1233,7 @@ mod tests {
         let bytes = outbox_bytes(path);
         let lines = parse_lines(&bytes).lines;
         store
-            .store_outbox_state(&OutboxState::over(&lines))
+            .store_outbox_state(1, &OutboxState::over(&lines))
             .unwrap();
     }
 
@@ -1036,7 +1251,7 @@ mod tests {
     fn append_and_drain_round_trip() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let outbox = AuditOutbox::for_log(&path, store.clone());
         outbox.append(&row("queued-1")).unwrap();
         outbox.append(&row("queued-2")).unwrap();
@@ -1066,7 +1281,7 @@ mod tests {
     fn a_failing_append_leaves_the_outbox_byte_identical() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let outbox = AuditOutbox::for_log(&path, store.clone());
         outbox.append(&row("kept")).unwrap();
         let before = outbox_bytes(&path);
@@ -1089,15 +1304,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let consumed = AuditOutbox::for_log(
             &dir.path().join("consumed").join("audit.jsonl"),
-            Arc::new(InMemoryTipAnchorStore::new()),
+            bound_store(&dir.path().join("consumed").join("audit.jsonl")),
         );
         let kept = AuditOutbox::for_log(
             &dir.path().join("kept").join("audit.jsonl"),
-            Arc::new(InMemoryTipAnchorStore::new()),
+            bound_store(&dir.path().join("kept").join("audit.jsonl")),
         );
         let disarmed = AuditOutbox::for_log(
             &dir.path().join("disarmed").join("audit.jsonl"),
-            Arc::new(InMemoryTipAnchorStore::new()),
+            bound_store(&dir.path().join("disarmed").join("audit.jsonl")),
         );
         test_seam::arm_partial_write(consumed.path(), 3);
         test_seam::arm_partial_write(kept.path(), 3);
@@ -1128,7 +1343,7 @@ mod tests {
     fn a_torn_tail_is_dropped_by_the_next_append_and_only_that_append_drains() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let outbox = AuditOutbox::for_log(&path, store.clone());
         // An append that never returned: a partial line, no newline.
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1144,7 +1359,7 @@ mod tests {
     fn a_torn_final_line_at_drain_is_discarded_and_the_complete_lines_drain() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let outbox = AuditOutbox::for_log(&path, store.clone());
         outbox.append(&row("complete-1")).unwrap();
         outbox.append(&row("complete-2")).unwrap();
@@ -1169,7 +1384,7 @@ mod tests {
     fn a_complete_unparseable_line_fails_the_drain_and_leaves_the_outbox_untouched() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let outbox = AuditOutbox::for_log(&path, store.clone());
         outbox.append(&row("good")).unwrap();
         let mut file = OpenOptions::new()
@@ -1220,7 +1435,7 @@ mod tests {
             );
             let dir = TempDir::new().unwrap();
             let path = log_path(&dir);
-            let store = Arc::new(InMemoryTipAnchorStore::new());
+            let store = bound_store(&path);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(outbox_path(&path), line.as_bytes()).unwrap();
             commit_every_line(&path, &store);
@@ -1266,7 +1481,7 @@ mod tests {
     fn a_refusal_on_the_second_of_three_appends_leaves_the_outbox_byte_identical() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let outbox = AuditOutbox::for_log(&path, store.clone());
         for id in ["one", "two", "three"] {
             outbox.append(&row(id)).unwrap();
@@ -1293,7 +1508,7 @@ mod tests {
     fn concurrent_appends_from_two_threads_both_drain() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         // The outbox lock is not fair, and unbounded contention can outlast
         // `OUTBOX_LOCK_WAIT`. Each round lets a worker wait for at most one append
         // of the other.
@@ -1345,7 +1560,7 @@ mod tests {
     fn a_draining_writer_drains_at_open_before_any_append() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         AuditOutbox::for_log(&path, store.clone())
             .append(&row("queued-while-closed"))
             .unwrap();
@@ -1358,12 +1573,12 @@ mod tests {
         );
         assert!(outbox_bytes(&path).is_empty());
         assert!(
-            drain_lock_is_held(&path).unwrap(),
+            drain_lock_is_held(&path, store.as_ref()).unwrap(),
             "the writer holds the drain lock"
         );
         drop(writer);
         assert!(
-            !drain_lock_is_held(&path).unwrap(),
+            !drain_lock_is_held(&path, store.as_ref()).unwrap(),
             "released with the writer"
         );
     }
@@ -1372,12 +1587,12 @@ mod tests {
     fn a_writer_without_an_anchor_store_neither_drains_nor_holds_the_drain_lock() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         AuditOutbox::for_log(&path, store.clone())
             .append(&row("queued"))
             .unwrap();
         let mut writer = AuditWriter::open(path.clone(), None).unwrap();
-        assert!(!drain_lock_is_held(&path).unwrap());
+        assert!(!drain_lock_is_held(&path, store.as_ref()).unwrap());
         writer.write_entry(own_row("own")).unwrap();
         assert_eq!(request_ids(&path), vec!["own"], "write_entry did not drain");
         assert_eq!(inspect_outbox(&path).unwrap().pending, 1);
@@ -1407,7 +1622,7 @@ mod tests {
     fn a_registry_cache_hit_drains_with_no_append_of_its_own() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let key = || Zeroizing::new([0x42_u8; 32]);
         let access = || KeyedAuditAccess::new(key(), store.clone() as Arc<dyn TipAnchorStore>);
         let profile = "outbox-cache-hit";
@@ -1429,7 +1644,7 @@ mod tests {
     fn drained_rows_precede_the_writers_own_row_and_keep_their_consent_timestamps() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let mut writer = open_draining(&path, &store);
         let mut queued = row("consent");
         queued.ts = "2026-01-02T03:04:05.000Z".to_owned();
@@ -1455,7 +1670,7 @@ mod tests {
     fn a_drain_whose_commitment_reset_fails_repeats_its_rows_once() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         {
             let mut writer = open_draining(&path, &store);
             AuditOutbox::for_log(&path, store.clone())
@@ -1480,7 +1695,7 @@ mod tests {
     fn a_crash_between_the_reset_and_the_truncate_appends_the_rows_once() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         {
             let mut writer = open_draining(&path, &store);
             AuditOutbox::for_log(&path, store.clone())
@@ -1560,7 +1775,7 @@ mod tests {
     fn write_built_names_the_drained_row_as_its_predecessor() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let mut writer = open_draining(&path, &store);
         writer.write_entry(own_row("first")).unwrap();
         AuditOutbox::for_log(&path, store.clone())
@@ -1586,7 +1801,7 @@ mod tests {
     fn write_built_names_its_predecessor_across_a_rotation() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let mut writer = open_draining(&path, &store);
         writer.write_entry(own_row("first")).unwrap();
         AuditOutbox::for_log(&path, store.clone())
@@ -1625,8 +1840,9 @@ mod tests {
     fn an_outbox_lock_held_past_the_wait_is_outbox_busy() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let outbox = AuditOutbox::for_log(&path, store.clone());
+        let mut writer = open_draining(&path, &store);
         outbox.append(&row("queued")).unwrap();
         let held = AuditWriterLock::acquire(&outbox_lock_path(&path)).unwrap();
 
@@ -1636,7 +1852,6 @@ mod tests {
         assert!(started.elapsed() >= OUTBOX_LOCK_WAIT);
         assert!(err.to_string().starts_with("audit.outbox_busy"), "{err}");
 
-        let mut writer = AuditWriter::open_for_reanchor(path.clone(), None, store.clone()).unwrap();
         let err = writer.drain_outbox().unwrap_err();
         assert!(matches!(err, WriterError::OutboxBusy), "{err:?}");
         drop(held);
@@ -1646,7 +1861,7 @@ mod tests {
     fn committed_pair() -> (TempDir, PathBuf, Arc<InMemoryTipAnchorStore>, AuditWriter) {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let writer = open_draining(&path, &store);
         let outbox = AuditOutbox::for_log(&path, store.clone());
         outbox.append(&row("one")).unwrap();
@@ -1657,7 +1872,7 @@ mod tests {
     #[test]
     fn append_commits_the_count_and_the_head() {
         let (_dir, path, store, _writer) = committed_pair();
-        let state = store.load_outbox_state().unwrap().unwrap();
+        let state = store.load_outbox_state(1).unwrap().unwrap();
         assert_eq!(state.pending, 2);
         let mut head = [0; 32];
         for line in outbox_bytes(&path).split_inclusive(|b| *b == b'\n') {
@@ -1675,12 +1890,12 @@ mod tests {
         change(&outbox_path(&path));
         let bytes = fs::read(outbox_path(&path)).ok();
         let log = fs::read(&path).unwrap();
-        let state = store.load_outbox_state().unwrap();
+        let state = store.load_outbox_state(1).unwrap();
         assert!(matches!(writer.drain_outbox(),
             Err(WriterError::OutboxRowsMissing { recorded: 2, found: n }) if n == found));
         assert_eq!(fs::read(outbox_path(&path)).ok(), bytes);
         assert_eq!(fs::read(&path).unwrap(), log);
-        assert_eq!(store.load_outbox_state().unwrap(), state);
+        assert_eq!(store.load_outbox_state(1).unwrap(), state);
     }
 
     fn remove_first_line(path: &Path) {
@@ -1733,7 +1948,7 @@ mod tests {
         let (_dir, path, store, _writer) = committed_pair();
         remove_first_line(&outbox_path(&path));
         let bytes = outbox_bytes(&path);
-        let state = store.load_outbox_state().unwrap();
+        let state = store.load_outbox_state(1).unwrap();
         assert!(matches!(
             AuditOutbox::for_log(&path, store.clone()).append(&row("three")),
             Err(WriterError::OutboxRowsMissing {
@@ -1742,21 +1957,21 @@ mod tests {
             })
         ));
         assert_eq!(outbox_bytes(&path), bytes);
-        assert_eq!(store.load_outbox_state().unwrap(), state);
+        assert_eq!(store.load_outbox_state(1).unwrap(), state);
     }
 
     #[test]
     fn a_state_store_failure_truncates_the_line_back() {
         let (_dir, path, store, _writer) = committed_pair();
         let bytes = outbox_bytes(&path);
-        let state = store.load_outbox_state().unwrap();
+        let state = store.load_outbox_state(1).unwrap();
         store.set_outbox_failing(false, true);
         assert!(matches!(
             AuditOutbox::for_log(&path, store.clone()).append(&row("three")),
             Err(WriterError::TipAnchorStore(_))
         ));
         assert_eq!(outbox_bytes(&path), bytes);
-        assert_eq!(store.load_outbox_state().unwrap(), state);
+        assert_eq!(store.load_outbox_state(1).unwrap(), state);
     }
 
     /// A complete line past the committed prefix, synced without a
@@ -1767,7 +1982,7 @@ mod tests {
         plant_uncommitted(&path, &serde_json::to_vec(&row("uncommitted")).unwrap());
         let outbox = outbox_bytes(&path);
         let log = fs::read(&path).unwrap();
-        let state = store.load_outbox_state().unwrap();
+        let state = store.load_outbox_state(1).unwrap();
         assert!(matches!(
             writer.drain_outbox(),
             Err(WriterError::OutboxRowsMissing {
@@ -1777,7 +1992,7 @@ mod tests {
         ));
         assert_eq!(fs::read(&path).unwrap(), log, "nothing is appended");
         assert_eq!(outbox_bytes(&path), outbox, "the outbox is unchanged");
-        assert_eq!(store.load_outbox_state().unwrap(), state);
+        assert_eq!(store.load_outbox_state(1).unwrap(), state);
     }
 
     /// A committed line of a kind other than an operator row refuses the drain
@@ -1786,7 +2001,7 @@ mod tests {
     fn a_queued_value_row_is_refused() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let mut writer = open_draining(&path, &store);
         let failed = AuditEntry::new_value_action_failed(
             "stellar_pay",
@@ -1823,7 +2038,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let mut writer = open_draining(&path, &store);
         AuditOutbox::for_log(&path, store.clone())
             .append(&AuditEntry::new_approval_attested_remote(
@@ -1845,7 +2060,7 @@ mod tests {
     fn queued_halt_and_resume_rows_drain() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let mut writer = open_draining(&path, &store);
         let outbox = AuditOutbox::for_log(&path, store.clone());
         outbox.append(&row("consent")).unwrap();
@@ -1881,7 +2096,7 @@ mod tests {
         writer.set_skip_outbox_truncate(true);
         assert_eq!(writer.drain_outbox().unwrap(), 2);
         assert_eq!(
-            store.load_outbox_state().unwrap(),
+            store.load_outbox_state(1).unwrap(),
             Some(OutboxState::default())
         );
         drop(writer);
@@ -1896,12 +2111,12 @@ mod tests {
     fn an_outbox_line_without_a_state_refuses_the_drain() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let mut writer = open_draining(&path, &store);
         let mut line = serde_json::to_vec(&row("upgrade")).unwrap();
         line.push(b'\n');
         fs::write(outbox_path(&path), &line).unwrap();
-        assert_eq!(store.load_outbox_state().unwrap(), None);
+        assert_eq!(store.load_outbox_state(1).unwrap(), None);
         assert!(matches!(
             writer.drain_outbox(),
             Err(WriterError::OutboxRowsMissing {
@@ -1911,14 +2126,14 @@ mod tests {
         ));
         assert!(log_rows(&path).is_empty());
         assert_eq!(outbox_bytes(&path), line);
-        assert_eq!(store.load_outbox_state().unwrap(), None);
+        assert_eq!(store.load_outbox_state(1).unwrap(), None);
     }
 
     #[test]
     fn a_keyed_open_after_a_loss_refuses() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         let access = || KeyedAuditAccess::new(Zeroizing::new([0x42; 32]), store.clone());
         let writer = AuditWriter::open(path.clone(), Some(access())).unwrap();
         AuditOutbox::for_log(&path, store.clone())
@@ -1954,7 +2169,7 @@ mod tests {
     fn acknowledging_without_a_loss_writes_nothing() {
         let dir = TempDir::new().unwrap();
         let path = log_path(&dir);
-        let store = Arc::new(InMemoryTipAnchorStore::new());
+        let store = bound_store(&path);
         open_draining(&path, &store)
             .write_entry(own_row("kept"))
             .unwrap();
@@ -1973,7 +2188,7 @@ mod tests {
         remove_first_line(&outbox_path(&path));
         drop(writer);
         let mut writer = open_acknowledging(&path, &store);
-        assert!(drain_lock_is_held(&path).unwrap());
+        assert!(drain_lock_is_held(&path, store.as_ref()).unwrap());
         let report = writer
             .acknowledge_outbox_loss(
                 "queue inspection",
@@ -2000,7 +2215,7 @@ mod tests {
         assert_eq!(rows[0]["revoked_approvals"], 3);
         assert_eq!(rows[0]["revoked_grants"], 4);
         assert_eq!(
-            store.load_outbox_state().unwrap(),
+            store.load_outbox_state(1).unwrap(),
             Some(OutboxState::default())
         );
         assert!(outbox_bytes(&path).is_empty());
@@ -2018,7 +2233,7 @@ mod tests {
         let intact = outbox_bytes(&path);
         let cut = &intact[..intact.len() - 1];
         fs::write(outbox_path(&path), cut).unwrap();
-        let state = store.load_outbox_state().unwrap();
+        let state = store.load_outbox_state(1).unwrap();
 
         assert!(matches!(
             outbox.append(&row("three")),
@@ -2028,7 +2243,7 @@ mod tests {
             })
         ));
         assert_eq!(outbox_bytes(&path), cut, "the outbox is byte-identical");
-        assert_eq!(store.load_outbox_state().unwrap(), state);
+        assert_eq!(store.load_outbox_state(1).unwrap(), state);
 
         fs::write(outbox_path(&path), &intact).unwrap();
         outbox.append(&row("three")).unwrap();
@@ -2042,7 +2257,7 @@ mod tests {
     fn an_append_after_a_deleted_outbox_refuses_without_creating_it() {
         let (_dir, path, store, _writer) = committed_pair();
         fs::remove_file(outbox_path(&path)).unwrap();
-        let state = store.load_outbox_state().unwrap();
+        let state = store.load_outbox_state(1).unwrap();
         assert!(matches!(
             AuditOutbox::for_log(&path, store.clone()).append(&row("three")),
             Err(WriterError::OutboxRowsMissing {
@@ -2051,7 +2266,7 @@ mod tests {
             })
         ));
         assert!(!outbox_path(&path).exists(), "no outbox is created");
-        assert_eq!(store.load_outbox_state().unwrap(), state);
+        assert_eq!(store.load_outbox_state(1).unwrap(), state);
     }
 
     /// An append over a line synced past the commitment refuses: the
@@ -2062,7 +2277,7 @@ mod tests {
         let (_dir, path, store, _writer) = committed_pair();
         plant_uncommitted(&path, &serde_json::to_vec(&row("uncommitted")).unwrap());
         let bytes = outbox_bytes(&path);
-        let state = store.load_outbox_state().unwrap();
+        let state = store.load_outbox_state(1).unwrap();
         assert!(matches!(
             AuditOutbox::for_log(&path, store.clone()).append(&row("four")),
             Err(WriterError::OutboxRowsMissing {
@@ -2071,7 +2286,7 @@ mod tests {
             })
         ));
         assert_eq!(outbox_bytes(&path), bytes, "the outbox is unchanged");
-        assert_eq!(store.load_outbox_state().unwrap(), state);
+        assert_eq!(store.load_outbox_state(1).unwrap(), state);
     }
 
     /// The state parser accepts exactly the value the store writes: a zero
@@ -2118,7 +2333,7 @@ mod tests {
         drop(writer);
         let outbox = outbox_bytes(&path);
         let log = fs::read(&path).unwrap();
-        let state = store.load_outbox_state().unwrap();
+        let state = store.load_outbox_state(1).unwrap();
 
         let mut writer = open_acknowledging(&path, &store);
         assert!(matches!(
@@ -2131,7 +2346,7 @@ mod tests {
         ));
         assert_eq!(fs::read(&path).unwrap(), log, "no acknowledgement row");
         assert_eq!(outbox_bytes(&path), outbox);
-        assert_eq!(store.load_outbox_state().unwrap(), state);
+        assert_eq!(store.load_outbox_state(1).unwrap(), state);
     }
 
     /// Only the acknowledgement writer acknowledges: a repair writer, which
@@ -2142,7 +2357,7 @@ mod tests {
         let (_dir, path, store, writer) = committed_pair();
         remove_first_line(&outbox_path(&path));
         let outbox = outbox_bytes(&path);
-        let state = store.load_outbox_state().unwrap();
+        let state = store.load_outbox_state(1).unwrap();
         let refuses = |writer: &mut AuditWriter| {
             let log = fs::read(&path).unwrap();
             let err = writer
@@ -2154,7 +2369,7 @@ mod tests {
             );
             assert_eq!(fs::read(&path).unwrap(), log, "no acknowledgement row");
             assert_eq!(outbox_bytes(&path), outbox);
-            assert_eq!(store.load_outbox_state().unwrap(), state);
+            assert_eq!(store.load_outbox_state(1).unwrap(), state);
         };
         let mut checked = writer;
         refuses(&mut checked);

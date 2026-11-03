@@ -1323,7 +1323,7 @@ async fn split_mpp_approval_prepare_records_commit_request() {
     use stellar_agent_core::approval::{
         AttestationBinding, ConsentAudit, PendingApprovalStore, Surface, attest_and_persist,
     };
-    use stellar_agent_core::audit_log::AuditOutbox;
+    use stellar_agent_core::audit_log::{AuditOutbox, AuditWriterRegistry};
     use stellar_agent_core::policy::v1::criteria::per_period_cap::{PerPeriodCapCriterion, Window};
     use stellar_agent_core::policy::{ApprovalRequest, Decision};
     use stellar_agent_core::{PolicyDocument, PolicyEngineV1, PolicyRule, RuleMatch, ScopeId};
@@ -1377,6 +1377,17 @@ async fn split_mpp_approval_prepare_records_commit_request() {
     .unwrap()
     .set_password(&URL_SAFE_NO_PAD.encode(key))
     .unwrap();
+    // An earlier keyed call caches the writer in this process, so the row the
+    // third attempt queues waits beside a live keyed writer that enrolled the log.
+    let access = stellar_agent_network::keyring::keyed_audit_access(
+        &fixture.profile,
+        NAME,
+        stellar_agent_core::audit_log::BindingCheck::Enforce,
+    )
+    .expect("access");
+    let _cached =
+        AuditWriterRegistry::get_or_open_keyed(NAME, &fixture.profile.audit_log_path, access)
+            .expect("writer cached");
     for attempt in 0..3 {
         let result = fixture
             .server

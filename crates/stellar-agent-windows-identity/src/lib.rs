@@ -272,6 +272,29 @@ pub fn dpapi_unprotect_with_entropy(
     Err(DpapiError::UnsupportedPlatform)
 }
 
+/// Reads the volume serial number and the 64-bit file index of the file behind
+/// an open handle, which together identify the file on its volume
+/// independently of its path.
+///
+/// # Errors
+///
+/// [`WindowsIdentityError::Win32`] when `GetFileInformationByHandle` fails.
+#[cfg(target_os = "windows")]
+pub fn file_identity(file: &std::fs::File) -> Result<(u32, u64), WindowsIdentityError> {
+    windows::file_identity(file)
+}
+
+/// Non-Windows stub for [`file_identity`].
+///
+/// # Errors
+///
+/// Always returns [`WindowsIdentityError::UnsupportedPlatform`] on non-Windows
+/// targets.
+#[cfg(not(target_os = "windows"))]
+pub fn file_identity(_file: &std::fs::File) -> Result<(u32, u64), WindowsIdentityError> {
+    Err(WindowsIdentityError::UnsupportedPlatform)
+}
+
 // The Win32 FFI is the only place in the crate that needs unsafe; the workspace
 // `unsafe_code = "deny"` lint stays in force everywhere else.
 #[cfg(target_os = "windows")]
@@ -279,6 +302,7 @@ pub fn dpapi_unprotect_with_entropy(
 mod windows {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::AsRawHandle as _;
     use std::path::Path;
     use std::ptr::null_mut;
 
@@ -295,11 +319,29 @@ mod windows {
         IsValidSid, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
         TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
-    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, GetFileInformationByHandle,
+    };
     use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use super::WindowsIdentityError;
+
+    /// See [`super::file_identity`].
+    pub(super) fn file_identity(file: &std::fs::File) -> Result<(u32, u64), WindowsIdentityError> {
+        // SAFETY: BY_HANDLE_FILE_INFORMATION contains integer fields and
+        // FILETIME values, for which all-zero bytes are valid.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: file owns a live handle, and info is a valid writable output
+        // buffer for the call.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(last_error("GetFileInformationByHandle"));
+        }
+        Ok((
+            info.dwVolumeSerialNumber,
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
+    }
 
     /// Owns a `LocalAlloc`-backed allocation returned by a Win32 API and
     /// releases it with `LocalFree` exactly once, on drop.
@@ -1049,6 +1091,29 @@ mod tests {
     fn current_user_sid_string_is_windows_only() {
         assert!(matches!(
             current_user_sid_string(),
+            Err(WindowsIdentityError::UnsupportedPlatform)
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn file_identity_names_the_file_not_the_handle() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let first = std::fs::File::open(&exe).expect("open test binary");
+        let second = std::fs::File::open(&exe).expect("reopen test binary");
+        assert_eq!(
+            file_identity(&first).expect("identity"),
+            file_identity(&second).expect("identity")
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn file_identity_is_windows_only() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let file = std::fs::File::open(exe).expect("open test binary");
+        assert!(matches!(
+            file_identity(&file),
             Err(WindowsIdentityError::UnsupportedPlatform)
         ));
     }

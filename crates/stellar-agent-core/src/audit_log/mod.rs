@@ -134,6 +134,7 @@
 //! degrades under `MlockRequired::Warn`.
 
 pub mod binding;
+mod carriers;
 pub mod chain;
 pub mod entry;
 pub mod health;
@@ -155,11 +156,13 @@ pub mod writer;
 pub use binding::{
     AuditBinding, AuditBindingParseError, BindingCheck, BindingHistory, RecordedBinding,
 };
+pub use carriers::CarrierBindingReport;
 pub use chain::{
     EntryTagCheck, EntryTagKey, check_entry_tag, compute_entry_tag, derive_entry_tag_key,
 };
 pub use entry::{AuditEntry, NewToolInvocation};
 pub use health::{AuditWriterHealth, AuditWriterHealthHandle};
+pub use lock::Carrier;
 pub use outbox::{
     AuditOutbox, OutboxInspection, OutboxLoss, OutboxState, check_outbox_commitment,
     drain_lock_is_held, inspect_outbox, outbox_path,

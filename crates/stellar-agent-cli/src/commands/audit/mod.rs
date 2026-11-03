@@ -14,6 +14,7 @@
 //! to [`run`], which delegates to the appropriate subcommand handler.
 
 pub mod acknowledge_outbox_loss;
+mod bind_carriers;
 pub mod reanchor;
 pub mod verify;
 
@@ -73,7 +74,7 @@ pub(crate) fn audit_writer_error(
                 evidence: evidence.describe().to_owned(),
             })
         }
-        WriterError::OutboxRowsMissing { .. } => {
+        WriterError::OutboxRowsMissing { .. } | WriterError::RetiredOutboxChanged { .. } => {
             WalletError::Validation(ValidationError::AuditOutboxRowsMissing {
                 detail: e.to_string(),
             })
@@ -93,6 +94,13 @@ pub(crate) fn audit_writer_error(
         // codes in one detail and an agent matching on the first would read the
         // wrong one.
         WriterError::RotationBridgeUnusable { .. }
+        | WriterError::CarrierReplaced { .. }
+        | WriterError::CarrierGenerationChanged { .. }
+        | WriterError::CarriersUnbound
+        | WriterError::CarrierIdentityUnavailable
+        | WriterError::CarriersBusy
+        | WriterError::CarrierBindingIncomplete
+        | WriterError::CarrierRecoveryRequired { .. }
         | WriterError::OutboxBusy
         | WriterError::OutboxUnusable { .. }
         | WriterError::OutboxRowKindRefused { .. }
@@ -149,6 +157,8 @@ pub enum AuditSubcommand {
     Reanchor(reanchor::ReanchorArgs),
     /// Acknowledge lost queued operator rows and revoke the profile's permissions.
     AcknowledgeOutboxLoss(acknowledge_outbox_loss::AcknowledgeOutboxLossArgs),
+    /// Record the carrier identities with every wallet process stopped.
+    BindCarriers(bind_carriers::BindCarriersArgs),
 }
 
 /// Runs the `audit` subcommand group.
@@ -167,6 +177,7 @@ pub enum AuditSubcommand {
 pub async fn run(args: &AuditArgs) -> i32 {
     match &args.subcommand {
         AuditSubcommand::Verify(a) => verify::run(a).await,
+        AuditSubcommand::BindCarriers(a) => bind_carriers::run(a).await,
         AuditSubcommand::Reanchor(a) => reanchor::run(a).await,
         AuditSubcommand::AcknowledgeOutboxLoss(a) => acknowledge_outbox_loss::run(a).await,
     }
@@ -185,6 +196,7 @@ impl AuditArgs {
         match &self.subcommand {
             AuditSubcommand::Verify(a) => a.profile.as_deref(),
             AuditSubcommand::Reanchor(a) => Some(a.profile.as_str()),
+            AuditSubcommand::BindCarriers(a) => Some(a.profile.as_str()),
             AuditSubcommand::AcknowledgeOutboxLoss(a) => Some(a.profile.as_str()),
         }
     }
@@ -258,6 +270,17 @@ mod tests {
                 "audit.outbox_rows_missing",
             ),
             (
+                WriterError::RetiredOutboxChanged { generation: 1 },
+                "audit.outbox_rows_missing",
+            ),
+            (
+                WriterError::CarrierGenerationChanged {
+                    held: 1,
+                    current: 2,
+                },
+                "audit.carrier_replaced",
+            ),
+            (
                 WriterError::OutboxLossNotFound,
                 "audit.outbox_loss_not_found",
             ),
@@ -280,7 +303,9 @@ mod tests {
             let err = audit_writer_error(writer_error, "audit.reanchor_failed", "default");
             if matches!(
                 writer_error,
-                WriterError::OutboxRowsMissing { .. } | WriterError::OutboxLossNotFound
+                WriterError::OutboxRowsMissing { .. }
+                    | WriterError::RetiredOutboxChanged { .. }
+                    | WriterError::OutboxLossNotFound
             ) {
                 assert_eq!(err.code(), *own_code);
             }

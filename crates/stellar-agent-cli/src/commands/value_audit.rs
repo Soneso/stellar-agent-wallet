@@ -787,6 +787,46 @@ mod tests {
                 "audit.outbox_unusable",
             ),
             (
+                WriterError::CarrierReplaced {
+                    carrier: stellar_agent_core::audit_log::Carrier::Outbox,
+                },
+                "audit.chain_key_unavailable",
+                "audit.carrier_replaced",
+            ),
+            (
+                WriterError::CarrierGenerationChanged {
+                    held: 1,
+                    current: 2,
+                },
+                "audit.chain_key_unavailable",
+                "audit.carrier_replaced",
+            ),
+            (
+                WriterError::RetiredOutboxChanged { generation: 1 },
+                "audit.chain_key_unavailable",
+                "audit.outbox_rows_missing",
+            ),
+            (
+                WriterError::CarriersUnbound,
+                "audit.chain_key_unavailable",
+                "audit.carriers_unbound",
+            ),
+            (
+                WriterError::CarrierIdentityUnavailable,
+                "audit.chain_key_unavailable",
+                "audit.carrier_identity_unavailable",
+            ),
+            (
+                WriterError::CarriersBusy,
+                "audit.chain_key_unavailable",
+                "audit.carriers_busy",
+            ),
+            (
+                WriterError::CarrierBindingIncomplete,
+                "audit.chain_key_unavailable",
+                "audit.carrier_binding_incomplete",
+            ),
+            (
                 WriterError::OutboxRowsMissing {
                     recorded: 2,
                     found: 1,
@@ -992,6 +1032,14 @@ mod tests {
     /// Appends one value row to `profile`'s log through a writer that holds
     /// no anchor store: keyed when `key` is given, unkeyed otherwise.
     fn seed_unanchored_log(profile: &Profile, key: Option<zeroize::Zeroizing<[u8; 32]>>) {
+        stellar_agent_core::audit_log::test_helpers::enroll_carriers(
+            &profile.audit_log_path,
+            &stellar_agent_network::keyring::KeyringTipAnchorStore::new(
+                &profile.audit_log_hash_chain_key_id,
+                &profile.audit_log_path,
+            ),
+        )
+        .unwrap();
         let path = profile.audit_log_path.clone();
         let mut writer = match key {
             Some(key) => {
@@ -1019,8 +1067,7 @@ mod tests {
             .expect("append");
     }
 
-    /// A log only unkeyed writers wrote is adopted on its first keyed use with
-    /// no operator action, and the adoption is recorded in the log itself.
+    /// A log with enrolled carriers and no anchor adopts its tip on keyed use.
     /// Nothing shows such a log was anchored: no binding, no chain-root
     /// sidecar, no `audit_tip_anchored` row.
     #[test]
