@@ -381,7 +381,9 @@ mod authorized {
     /// The mainnet transaction payload is the transaction hash the
     /// authorization binds.
     #[test]
+    #[serial]
     fn the_mainnet_transaction_payload_is_the_bound_hash() {
+        let _clock = set_now_ms_for_test(NOW);
         let case = Case::new();
         let payload = TxSigningPayload::authorized(
             &unsigned_mainnet_envelope(),
@@ -396,7 +398,9 @@ mod authorized {
 
     /// An authorization for another transaction hash builds no payload.
     #[test]
+    #[serial]
     fn another_transaction_hash_is_refused() {
+        let _clock = set_now_ms_for_test(NOW);
         let case = Case::new();
         let authorization = case.transaction(|_, binding| {
             if let DomainBinding::Transaction { tx_hash, .. } = binding {
@@ -412,7 +416,9 @@ mod authorized {
     /// An authorization bound to a chain other than mainnet builds no
     /// payload.
     #[test]
+    #[serial]
     fn a_non_mainnet_authorization_is_refused() {
+        let _clock = set_now_ms_for_test(NOW);
         let case = Case::new();
         let authorization = case.transaction(|header, _| header.chain = Caip2::Testnet);
         assert!(matches!(
@@ -424,7 +430,9 @@ mod authorized {
     /// A fee bump is a domain of its own and builds no transaction
     /// payload under a transaction authorization.
     #[test]
+    #[serial]
     fn a_fee_bump_is_refused_under_a_transaction_authorization() {
+        let _clock = set_now_ms_for_test(NOW);
         let case = Case::new();
         assert!(matches!(
             TxSigningPayload::authorized(&kat_fee_bump_envelope(), &case.transaction(|_, _| {})),

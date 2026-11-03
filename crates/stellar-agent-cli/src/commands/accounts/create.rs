@@ -1222,6 +1222,7 @@ fn build_sponsored_unsigned_envelope(
         fee_per_op,
     );
     builder.create_account(new_account, starting_balance)?;
+    builder.with_mainnet_deadline()?;
     builder.build()
 }
 
@@ -3247,8 +3248,8 @@ mod tests {
 
         use crate::common::mainnet_write::invalidations_on_this_thread;
         use crate::common::mainnet_write_fixture::{
-            AGENT_SEED, AGENT_VAR, DESTINATION, ISSUER, MainnetFixture, NEW_ACCOUNT, Spec,
-            create_rule, install_ledger_double, minimum_reserve, open_authorizations_of,
+            AGENT_SEED, AGENT_VAR, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, NEW_ACCOUNT,
+            Spec, create_rule, install_ledger_double, minimum_reserve, open_authorizations_of,
         };
         use crate::test_rpc::{ClassicRpc, last_rendered};
 
@@ -3369,21 +3370,16 @@ mod tests {
         async fn accept_below_the_threshold() {
             let fixture = Spec::new("mainnet-create-accept").build().await;
 
+            let built_at_ms =
+                stellar_agent_network::mainnet::clock::now_ms().unwrap() + CLOCK_LEAD_MS;
+            let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(built_at_ms);
             let run = run(&fixture, &mainnet_args(&fixture)).await;
 
             assert_eq!(run.code, 0, "{}", run.envelope);
             let sent = fixture.sent_envelopes().await;
             assert_eq!(sent.len(), 1);
             fixture.assert_signed_by_agent(&sent[0]);
-            {
-                use stellar_xdr::{Limits, Preconditions, ReadXdr as _, TransactionEnvelope};
-                let TransactionEnvelope::Tx(v1) =
-                    TransactionEnvelope::from_xdr_base64(&sent[0], Limits::none()).unwrap()
-                else {
-                    panic!("not a v1 envelope");
-                };
-                assert_eq!(v1.tx.cond, Preconditions::None);
-            }
+            crate::common::mainnet_write_fixture::assert_deadline_bound(&sent[0], built_at_ms);
             let data = &run.envelope["data"];
             assert_eq!(data["account_id"], NEW_ACCOUNT, "{}", run.envelope);
             assert_eq!(data["mode"], "sponsored");

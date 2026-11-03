@@ -1890,6 +1890,7 @@ mod tests {
             "hash...tail",
             "pending",
             true,
+            false,
             None,
             Some(SETTLE_ENVELOPE.to_owned()),
             "clear",

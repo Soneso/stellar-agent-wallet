@@ -204,6 +204,7 @@ pub(crate) fn soroban_authorization(
 pub(crate) fn unsigned_envelope() -> SignedTestEnvelope {
     SignedTestEnvelope::builder(SIGNER_SEED)
         .network_passphrase(MAINNET_PASSPHRASE)
+        .time_bounds(0, super::clock::now_ms().unwrap() / 1000 + 120)
         .sequence(SEQUENCE)
         .unsigned()
         .build()
@@ -213,6 +214,7 @@ pub(crate) fn unsigned_envelope() -> SignedTestEnvelope {
 pub(crate) fn signed_envelope() -> SignedTestEnvelope {
     SignedTestEnvelope::builder(SIGNER_SEED)
         .network_passphrase(MAINNET_PASSPHRASE)
+        .time_bounds(0, super::clock::now_ms().unwrap() / 1000 + 120)
         .sequence(SEQUENCE)
         .build()
 }
@@ -345,6 +347,7 @@ impl LedgerFixture {
                     policy_digest: POLICY_DIGEST,
                     approval_nonce: nonce.to_owned(),
                     approval_expires_at_ms: header.approval.expires_at_ms,
+                    chain_deadline_ms: None,
                     authorization_ttl_ms: TTL_MS,
                     bindings: BindingFacts {
                         endpoint: Some([1; 32]),
@@ -510,6 +513,7 @@ impl ResolverFixture {
         // transaction carries sequence 2.
         let source = SignedTestEnvelope::builder(SIGNER_SEED)
             .network_passphrase(MAINNET_PASSPHRASE)
+            .time_bounds(0, super::clock::now_ms().unwrap() / 1000 + 120)
             .amount_stroops(10)
             .sequence(2)
             .unsigned()

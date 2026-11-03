@@ -1657,6 +1657,7 @@ async fn build_unsigned_envelope(
     builder.payment(&args.destination, amount, &asset)?;
     builder.memo(&memo)?;
 
+    builder.with_mainnet_deadline()?;
     let envelope_xdr = builder.build()?;
 
     // Destination-derived identity view for the policy gate's
@@ -5658,7 +5659,7 @@ mod tests {
             invalidations_on_this_thread,
         };
         use crate::common::mainnet_write_fixture::{
-            AGENT_SEED, AGENT_VAR, DESTINATION, ISSUER, MainnetFixture, Spec,
+            AGENT_SEED, AGENT_VAR, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, Spec,
             install_ledger_double, minimum_reserve, open_authorizations_of, pay_rule,
             pay_rule_capped,
         };
@@ -5673,10 +5674,6 @@ mod tests {
         const RESERVE: i64 = 10_000_000;
         /// The amount of [`mainnet_args`]: 1 XLM.
         const AMOUNT: i64 = 10_000_000;
-        /// How far a test's fixed mainnet clock runs ahead of the system
-        /// clock: the confirmation entry is created on the system clock, and
-        /// the resolver refuses an entry created after its own now.
-        const CLOCK_LEAD_MS: u64 = 5_000;
 
         /// A 1 XLM payment from the agent to the allowlisted destination on
         /// the fixture's profile, signed from [`AGENT_VAR`].
@@ -5793,18 +5790,6 @@ mod tests {
                 })
                 .map(|event| event.get("precondition").cloned().unwrap_or_default())
                 .collect()
-        }
-
-        /// Asserts that `envelope` carries no time bounds or other
-        /// preconditions.
-        fn assert_no_preconditions(envelope: &str) {
-            use stellar_xdr::{Limits, Preconditions, ReadXdr as _, TransactionEnvelope};
-            let TransactionEnvelope::Tx(v1) =
-                TransactionEnvelope::from_xdr_base64(envelope, Limits::none()).unwrap()
-            else {
-                panic!("not a v1 envelope");
-            };
-            assert_eq!(v1.tx.cond, Preconditions::None);
         }
 
         /// The agent account at `balance` as `getLedgerEntries` answers it.
@@ -5955,13 +5940,16 @@ mod tests {
         async fn accept_with_a_memo_below_the_threshold() {
             let fixture = Spec::new("mainnet-pay-accept-memo").build().await;
 
+            let built_at_ms =
+                stellar_agent_network::mainnet::clock::now_ms().unwrap() + CLOCK_LEAD_MS;
+            let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(built_at_ms);
             let run = run(&fixture, &memo_args(&fixture)).await;
 
             assert_eq!(run.code, 0, "{}", run.envelope);
             let sent = fixture.sent_envelopes().await;
             assert_eq!(sent.len(), 1);
             fixture.assert_signed_by_agent(&sent[0]);
-            assert_no_preconditions(&sent[0]);
+            crate::common::mainnet_write_fixture::assert_deadline_bound(&sent[0], built_at_ms);
             let data = &run.envelope["data"];
             assert_eq!(data["envelope_xdr"], sent[0]);
             assert_eq!(data["stage"], "build+sign+submit");
@@ -6437,12 +6425,10 @@ mod tests {
             }
         }
 
-        /// Slow confirmation: the readiness proof is taken after the
-        /// confirmation, so a confirmation slower than its lifetime still
-        /// submits.
+        /// A confirmation beyond the envelope deadline refuses before signing.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn a_slow_confirmation_keeps_the_readiness_fresh() {
+        async fn a_confirmation_slower_than_the_deadline_refuses_before_signing() {
             let mut fixture = Spec::new("mainnet-pay-slow-confirm").build().await;
             let clock = Rc::new(stellar_agent_network::mainnet::clock::set_now_ms_for_test(
                 now() + CLOCK_LEAD_MS,
@@ -6450,23 +6436,34 @@ mod tests {
             let advance = Rc::clone(&clock);
             let mut answer = driver::fixture_credential();
             fixture.present_with(move |ceremony| {
-                // The operator answers one second past the readiness lifetime
-                // of a proof made when the ceremony started.
+                // The operator answers one second past the envelope's
+                // on-chain deadline, chosen when the envelope was built.
                 let prompted_at = stellar_agent_network::mainnet::clock::now_ms().unwrap();
                 advance.set(
                     prompted_at
-                        + (stellar_agent_network::mainnet::resolve::MAINNET_AUDIT_READINESS_TTL_SECONDS
+                        + (stellar_agent_network::mainnet::resolve::MAINNET_CLASSIC_DEADLINE_SECONDS
                             + 1)
                             * 1000,
                 );
                 answer(ceremony)
             });
 
-            let run = run(&fixture, &memo_args(&fixture)).await;
+            let (_ledger, calls) = install_ledger_double(|| Ok(()), || Ok(()));
+            let (capture, _guard) = WarningCapture::capture(None);
+            let run = run(&fixture, &ledger_args(&fixture)).await;
 
             drop(clock);
-            assert_eq!(run.code, 0, "{}", run.envelope);
-            assert_eq!(fixture.sent_envelopes().await.len(), 1);
+            assert_withheld_before_the_mint(
+                &fixture,
+                &run,
+                "network.mainnet_authorization_refused",
+            )
+            .await;
+            assert_eq!(
+                refusal_warnings(&capture, "resolve_tx_sign"),
+                vec!["\"deadline_elapsed\"".to_owned()]
+            );
+            assert!(!calls.lock().unwrap().contains(&"sign_tx_payload"));
         }
 
         /// Fee cap: the signed cap below the profile's governs.

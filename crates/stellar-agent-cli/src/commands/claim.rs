@@ -1505,6 +1505,7 @@ async fn guard_and_build(
         fee_per_op,
     );
     builder.claim_claimable_balance(&id.to_hex64())?;
+    builder.with_mainnet_deadline()?;
     let envelope_xdr = builder.build()?;
 
     Ok(GuardedClaim {
@@ -4329,8 +4330,8 @@ mod tests {
             bound_recorders_on_this_thread, invalidations_on_this_thread,
         };
         use crate::common::mainnet_write_fixture::{
-            AGENT_SEED, AGENT_VAR, DESTINATION, ISSUER, MainnetFixture, Spec, claim_rule,
-            install_ledger_double, minimum_reserve, open_authorizations_of,
+            AGENT_SEED, AGENT_VAR, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, Spec,
+            claim_rule, install_ledger_double, minimum_reserve, open_authorizations_of,
         };
         use crate::test_rpc::ClassicRpc;
 
@@ -4467,21 +4468,16 @@ mod tests {
         async fn accept() {
             let fixture = spec("mainnet-claim-accept").build().await;
 
+            let built_at_ms =
+                stellar_agent_network::mainnet::clock::now_ms().unwrap() + CLOCK_LEAD_MS;
+            let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(built_at_ms);
             let run = run(&fixture, &mainnet_args(&fixture)).await;
 
             assert_eq!(run.code, 0, "{}", run.envelope);
             let sent = fixture.sent_envelopes().await;
             assert_eq!(sent.len(), 1);
             fixture.assert_signed_by_agent(&sent[0]);
-            {
-                use stellar_xdr::{Limits, Preconditions, ReadXdr as _, TransactionEnvelope};
-                let TransactionEnvelope::Tx(v1) =
-                    TransactionEnvelope::from_xdr_base64(&sent[0], Limits::none()).unwrap()
-                else {
-                    panic!("not a v1 envelope");
-                };
-                assert_eq!(v1.tx.cond, Preconditions::None);
-            }
+            crate::common::mainnet_write_fixture::assert_deadline_bound(&sent[0], built_at_ms);
             assert_eq!(
                 run.envelope["data"]["envelope_xdr"], sent[0],
                 "{}",

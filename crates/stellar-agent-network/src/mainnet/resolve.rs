@@ -7,6 +7,7 @@
 //! requires_clone::<IntentUseReceipt>();
 //! ```
 
+use super::MainnetPrecondition;
 use super::audit_readiness::AuditReadiness;
 use super::authorization::{
     MainnetMessageSignAuthorization, MainnetSignedSorobanIntent, MainnetSorobanIntentAuthorization,
@@ -21,10 +22,41 @@ use crate::{
 use std::time::Duration;
 use stellar_agent_core::approval::witness::{ApprovalWitness, ApprovedKind};
 use stellar_agent_core::mainnet::{enablement::EnablementRecord, verified_policy::VerifiedPolicy};
-use stellar_xdr::{SorobanAuthorizationEntry, SorobanAuthorizedInvocation};
+use stellar_xdr::{Preconditions, SorobanAuthorizationEntry, SorobanAuthorizedInvocation};
 
 /// Default lifetime of a mainnet authorization, in seconds.
 pub const MAINNET_AUTHORIZATION_TTL_SECONDS_DEFAULT: u32 = 120;
+/// On-chain lifetime of a classic mainnet envelope, counted from its build time.
+/// This equals the authorization ceiling that `authorization_ttl_seconds` may not exceed.
+pub const MAINNET_CLASSIC_DEADLINE_SECONDS: u64 = MAINNET_AUTHORIZATION_TTL_SECONDS_DEFAULT as u64;
+
+/// Checks the on-chain deadline of a classic mainnet envelope and returns its Unix seconds.
+///
+/// # Errors
+///
+/// Refuses missing or nonzero minimum bounds, elapsed deadlines, and deadlines
+/// beyond the authorization ceiling.
+pub fn check_classic_deadline(
+    cond: &Preconditions,
+    now_ms: u64,
+) -> Result<u64, MainnetPrecondition> {
+    use MainnetPrecondition as P;
+    let max_time = match cond {
+        Preconditions::Time(bounds) if bounds.min_time.0 == 0 && bounds.max_time.0 > 0 => {
+            bounds.max_time.0
+        }
+        _ => return Err(P::DeadlineMissing),
+    };
+    let deadline_ms = max_time.saturating_mul(1000);
+    if now_ms >= deadline_ms {
+        return Err(P::DeadlineElapsed);
+    }
+    if deadline_ms > now_ms.saturating_add(MAINNET_CLASSIC_DEADLINE_SECONDS.saturating_mul(1000)) {
+        return Err(P::DeadlineTooFar);
+    }
+    Ok(max_time)
+}
+
 /// Maximum age of an audit readiness proof, in seconds.
 pub const MAINNET_AUDIT_READINESS_TTL_SECONDS: u64 = 120;
 
@@ -824,6 +856,7 @@ mod enabled {
         witness: Option<&CrossCheckWitness>,
         audit: &AuditReadiness,
         holds: Vec<WindowEntry>,
+        chain_deadline_ms: Option<u64>,
     ) -> MintRequest {
         MintRequest {
             chain: context.chain(),
@@ -833,6 +866,7 @@ mod enabled {
             policy_digest: policy.digest(),
             approval_nonce: approval.nonce().to_owned(),
             approval_expires_at_ms: approval.expires_at_ms(),
+            chain_deadline_ms,
             authorization_ttl_ms: u64::from(
                 body.authorization_ttl_seconds
                     .unwrap_or(MAINNET_AUTHORIZATION_TTL_SECONDS_DEFAULT),
@@ -859,6 +893,11 @@ mod enabled {
             MuxedAccount::MuxedEd25519(_) => None,
         }
     }
+    /// Authorizes the signature of one classic mainnet transaction.
+    ///
+    /// The envelope's shape, its signatures and its on-chain deadline are
+    /// checked before the endpoint identity probe, so an envelope refused on
+    /// them triggers no request.
     pub(super) async fn tx(
         req: TxSignRequest<'_>,
         detail: &mut Option<String>,
@@ -867,7 +906,6 @@ mod enabled {
         let deadline = tokio::time::Instant::now() + req.probe_deadline;
         let body = policy_body(req.context, req.policy, req.enablement)?;
         let (decoder_tool, policy_tool, kind) = classic_tools(req.consumer)?;
-        let endpoint = endpoint(req.context, req.client, deadline, req.enablement).await?;
         let envelope = decode(req.unsigned_envelope_xdr, P::EnvelopeShape)?;
         let tx = match &envelope {
             TransactionEnvelope::Tx(tx) => tx,
@@ -881,6 +919,8 @@ mod enabled {
             },
         )?;
         require(tx.signatures.is_empty(), P::EnvelopePreSigned)?;
+        let chain_deadline = check_classic_deadline(&tx.tx.cond, now).map_err(refused)?;
+        let endpoint = endpoint(req.context, req.client, deadline, req.enablement).await?;
         let hash =
             crate::submit::compute_local_tx_hash_hex(&envelope, req.context.network_passphrase())
                 .map_err(|_| refused(P::EnvelopeShape))?;
@@ -992,6 +1032,7 @@ mod enabled {
             req.witness,
             &req.audit,
             entries,
+            Some(chain_deadline.saturating_mul(1000)),
         );
         let minted = req
             .store
@@ -1157,6 +1198,7 @@ mod enabled {
             req.witness,
             &req.audit,
             entries,
+            None,
         );
         // The ledger checks, under its lock, that the parent is the used
         // message record of the same approval.
@@ -1247,6 +1289,7 @@ mod enabled {
             policy_digest: req.policy.digest(),
             approval_nonce: approval.nonce().to_owned(),
             approval_expires_at_ms: approval.expires_at_ms(),
+            chain_deadline_ms: None,
             authorization_ttl_ms: u64::from(
                 body.authorization_ttl_seconds
                     .unwrap_or(MAINNET_AUTHORIZATION_TTL_SECONDS_DEFAULT),
@@ -1419,6 +1462,7 @@ mod enabled {
             policy_digest: header.policy.digest,
             approval_nonce: header.approval.nonce.clone(),
             approval_expires_at_ms: header.approval.expires_at_ms,
+            chain_deadline_ms: None,
             authorization_ttl_ms: req.receipt.authorization_ttl_ms,
             bindings: req.receipt.facts,
             holds: vec![],
@@ -1508,6 +1552,80 @@ mod tests {
             audit: f.audit(),
             store: &f.window,
         }
+    }
+
+    /// A transport no request can reach: nothing listens on port 0, so a
+    /// request to it fails and the resolver refuses on the endpoint.
+    const UNREACHABLE_TRANSPORT: &str = "http://127.0.0.1:0";
+
+    /// Resolves the fixture's payment with its time bounds replaced and
+    /// asserts the refusal `expected`. The primary routes to
+    /// [`UNREACHABLE_TRANSPORT`], so the deadline refusal also shows that no
+    /// request was made: the endpoint probe would have refused first.
+    async fn deadline_refusal(min_time: u64, offset: Option<i64>, expected: P) {
+        let f = ResolverFixture::new();
+        let context = f.context_with_routes(&[("rpc.example.invalid", UNREACHABLE_TRANSPORT)]);
+        let client = context.primary_client().unwrap();
+        let envelope = changed_envelope(&f, |tx| {
+            tx.tx.cond = offset.map_or(Preconditions::None, |seconds| {
+                Preconditions::Time(stellar_xdr::TimeBounds {
+                    min_time: stellar_xdr::TimePoint(min_time),
+                    max_time: stellar_xdr::TimePoint(
+                        (f.now / 1000).checked_add_signed(seconds).unwrap(),
+                    ),
+                })
+            });
+        });
+        let approval = f.approval(&envelope, f.now, 600_000);
+        let before = f.wire();
+        let mut req = request(&f, &context, &client, &approval);
+        req.unsigned_envelope_xdr = &envelope;
+        let signer =
+            crate::signing::test_doubles::CountingSigner::new(super::super::fixtures::SIGNER_SEED);
+        let result = resolve_tx_sign(req).await;
+        if let Ok(authorization) = &result {
+            crate::signing::envelope_signing::attach_signature_authorized(
+                &envelope,
+                &signer,
+                context.network_passphrase(),
+                MainnetConsumer::CliPay,
+                authorization,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(signer.sign_calls(), 0, "refusal withholds the signature");
+        assert_refused(result, expected, &f, &before);
+        assert!(
+            f.window
+                .open_authorizations(&f.profile, f.now)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tx_refuses_an_envelope_without_a_deadline() {
+        deadline_refusal(0, None, P::DeadlineMissing).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tx_refuses_an_elapsed_deadline() {
+        deadline_refusal(0, Some(-1), P::DeadlineElapsed).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tx_refuses_a_deadline_beyond_the_ceiling() {
+        deadline_refusal(0, Some(121), P::DeadlineTooFar).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tx_refuses_a_min_time_bound() {
+        deadline_refusal(1, Some(120), P::DeadlineMissing).await;
     }
 
     #[tokio::test]
@@ -1881,14 +1999,22 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn future_created_approval_refuses() {
-        let f = ResolverFixture::new();
+        let mut f = ResolverFixture::new();
         let server = f.server().await;
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let client = context.primary_client().unwrap();
         let created = stellar_agent_core::timefmt::now_unix_ms().unwrap();
-        let approval = f.approval(&f.envelope, created, 600_000);
         let time = created - 8 * 24 * 60 * 60 * 1000;
         f.clock.set(time);
+        f.envelope = changed_envelope(&f, |tx| {
+            tx.tx.cond = Preconditions::Time(stellar_xdr::TimeBounds {
+                min_time: stellar_xdr::TimePoint(0),
+                max_time: stellar_xdr::TimePoint(
+                    super::super::clock::now_ms().unwrap() / 1000 + 120,
+                ),
+            });
+        });
+        let approval = f.approval(&f.envelope, created, 600_000);
         let before = f.wire();
         assert_refused(
             resolve_tx_sign(request(&f, &context, &client, &approval)).await,
@@ -1901,12 +2027,20 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn expired_approval_refuses() {
-        let f = ResolverFixture::new();
+        let mut f = ResolverFixture::new();
         let server = f.server().await;
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
         let client = context.primary_client().unwrap();
-        let approval = f.approval(&f.envelope, f.now, 600_000);
         f.clock.set(f.now + 600_000);
+        f.envelope = changed_envelope(&f, |tx| {
+            tx.tx.cond = Preconditions::Time(stellar_xdr::TimeBounds {
+                min_time: stellar_xdr::TimePoint(0),
+                max_time: stellar_xdr::TimePoint(
+                    super::super::clock::now_ms().unwrap() / 1000 + 120,
+                ),
+            });
+        });
+        let approval = f.approval(&f.envelope, f.now, 600_000);
         let before = f.wire();
         assert_refused(
             resolve_tx_sign(request(&f, &context, &client, &approval)).await,
@@ -5142,5 +5276,60 @@ mod tests {
             "{result:?}"
         );
         authenticated_intent_case(&f, "create_plain").await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use MainnetPrecondition as P;
+
+    #[test]
+    fn the_deadline_equals_the_authorization_ceiling() {
+        assert_eq!(MAINNET_CLASSIC_DEADLINE_SECONDS, 120);
+    }
+
+    #[test]
+    fn classic_deadline_checks_shape_edges_and_saturation() {
+        let time = |min, max| {
+            Preconditions::Time(stellar_xdr::TimeBounds {
+                min_time: stellar_xdr::TimePoint(min),
+                max_time: stellar_xdr::TimePoint(max),
+            })
+        };
+        assert_eq!(
+            check_classic_deadline(&Preconditions::None, 1000),
+            Err(P::DeadlineMissing)
+        );
+        assert_eq!(
+            check_classic_deadline(&Preconditions::V2(Default::default()), 1000),
+            Err(P::DeadlineMissing)
+        );
+        assert_eq!(
+            check_classic_deadline(&time(1, 121), 1000),
+            Err(P::DeadlineMissing)
+        );
+        assert_eq!(
+            check_classic_deadline(&time(0, 0), 1000),
+            Err(P::DeadlineMissing)
+        );
+        assert_eq!(
+            check_classic_deadline(&time(0, 1), 1000),
+            Err(P::DeadlineElapsed)
+        );
+        assert_eq!(check_classic_deadline(&time(0, 2), 1000), Ok(2));
+        assert_eq!(check_classic_deadline(&time(0, 121), 1000), Ok(121));
+        assert_eq!(
+            check_classic_deadline(&time(0, 122), 1000),
+            Err(P::DeadlineTooFar)
+        );
+        assert_eq!(
+            check_classic_deadline(&time(0, u64::MAX), 1000),
+            Err(P::DeadlineTooFar)
+        );
+        assert_eq!(
+            check_classic_deadline(&time(0, u64::MAX), u64::MAX),
+            Err(P::DeadlineElapsed)
+        );
     }
 }

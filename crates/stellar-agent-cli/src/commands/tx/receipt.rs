@@ -1,6 +1,12 @@
 //! `stellar-agent tx receipt clear <ENVELOPE_HASH> --acknowledge`: close a
 //! submission record after reconciling it against the chain.
 //!
+//! On mainnet, clearing a sent receipt the operator can clear, `pending` or
+//! `ambiguous` and a recovered orphan alike, whose receipt or held reservation
+//! has no time bound requires both `--acknowledge` and `--acknowledge-unbounded`.
+//! The clear row records that the bytes can still apply while their spend stops
+//! counting against the window.
+//!
 //! # When this is needed
 //!
 //! A submission whose outcome never came back leaves a receipt behind and,
@@ -39,7 +45,9 @@
 //! with `submission.acknowledgement_required`, and the message names the next
 //! step, computed from the record. While a sent transaction's time bound is
 //! open, that is to wait for it to pass or run `tx status`; otherwise it is
-//! `--acknowledge`.
+//! `--acknowledge`, plus `--acknowledge-unbounded` for a sent mainnet receipt,
+//! `pending` or `ambiguous`, whose receipt or held reservation has no time
+//! bound, and for an orphan whose held reservation has none.
 //!
 //! With `--acknowledge` the verb acquires the audit writer, restores an
 //! orphan's receipt from its reservation, reconciles the submission with the
@@ -65,9 +73,12 @@
 //!   the rows below, as an unknown outcome.
 //! - **Outcome unknown.** An `ambiguous` receipt without evidence (the
 //!   endpoint's retention window closed), a `pending` receipt with no time
-//!   bound, a `pending` receipt that was never sent, or a recovered orphan.
-//!   The reservation is released and the receipt cleared; the clear row
-//!   records no evidence.
+//!   bound, cleared with the required acknowledgement flags, an unsent
+//!   `pending` receipt, or a recovered orphan. On a mainnet profile the
+//!   required flags include `--acknowledge-unbounded` for each sent one whose
+//!   receipt or held reservation has no time bound, and the clear row records
+//!   that exposure. The reservation is released and the receipt cleared; the
+//!   clear row records no evidence.
 //! - **Still able to apply.** A sent `pending` receipt with a time bound that
 //!   has not passed on the endpoint's latest ledger and a sequence that is
 //!   unconsumed. Refused with `submission.still_pending`, naming the time
@@ -182,6 +193,10 @@ pub struct ClearArgs {
     /// the next step, reconciles nothing, changes nothing, and exits 1.
     #[arg(long)]
     pub acknowledge: bool,
+
+    /// State that this untimed transaction can still apply and that its spend is then not counted.
+    #[arg(long)]
+    pub acknowledge_unbounded: bool,
 
     /// Output format.
     #[arg(long, value_parser = OutputFormat::parse, default_value = "json")]
@@ -441,6 +456,7 @@ async fn run_clear(args: &ClearArgs) -> i32 {
             held.as_ref(),
             &tx_hash,
             now_ms,
+            context.chain_id.is_mainnet(),
         ));
         return 1;
     }
@@ -542,8 +558,18 @@ async fn run_clear(args: &ClearArgs) -> i32 {
         Err(code) => return code,
     };
 
-    let evidence = match clear_decision(&receipt, &report, held_now.as_ref(), now_ms) {
-        ClearDecision::Clear { evidence } => evidence,
+    let (evidence, exposure) = match clear_decision(
+        &receipt,
+        &report,
+        held_now.as_ref(),
+        now_ms,
+        context.chain_id.is_mainnet(),
+        args.acknowledge_unbounded,
+    ) {
+        ClearDecision::Clear {
+            evidence,
+            unbounded_exposure,
+        } => (evidence, unbounded_exposure),
         ClearDecision::Refuse(envelope) => {
             render_json(&envelope);
             return 1;
@@ -571,6 +597,7 @@ async fn run_clear(args: &ClearArgs) -> i32 {
         &receipt,
         evidence,
         reservation_released,
+        exposure,
         context.chain_id.caip2_str(),
     ) {
         Ok(data) => {
@@ -629,6 +656,7 @@ fn record_and_mark_clear(
     receipt: &SubmissionReceipt,
     evidence: Option<stellar_agent_core::profile::receipt::ReleaseEvidence>,
     reservation_released: bool,
+    unbounded_exposure: bool,
     chain_id: &str,
 ) -> Result<ClearData, Envelope<()>> {
     let cleared_from = receipt.status.label().to_owned();
@@ -667,6 +695,7 @@ fn record_and_mark_clear(
                 tx_hash_redacted.as_str(),
                 cleared_from.as_str(),
                 reservation_released,
+                unbounded_exposure,
                 evidence.map(|e| e.code().to_owned()),
                 Some(receipt.envelope_hash.clone()),
                 &request_id,
@@ -725,9 +754,27 @@ enum ClearDecision {
     Clear {
         /// The release evidence the receipt carries.
         evidence: Option<stellar_agent_core::profile::receipt::ReleaseEvidence>,
+        /// Whether the operator acknowledged that the untimed bytes can still
+        /// apply once their spend stops counting; the clear row records it.
+        unbounded_exposure: bool,
     },
     /// Refuse with this envelope; nothing more changes.
     Refuse(Envelope<()>),
+}
+
+/// Whether a sent, operator-clearable mainnet transaction has untimed exposure.
+///
+/// Either time bound counts: the receipt's, and the one the window holds for
+/// the reservation.
+fn unbounded_exposure(
+    receipt: &SubmissionReceipt,
+    held: Option<&SubmissionHold>,
+    mainnet: bool,
+) -> bool {
+    mainnet
+        && receipt.status.is_operator_clearable()
+        && receipt.submitted
+        && (receipt.max_time == 0 || held.is_some_and(|hold| hold.max_time == 0))
 }
 
 /// Applies the decision table to the receipt as reconciliation left it.
@@ -742,6 +789,8 @@ fn clear_decision(
     report: &ReconcileReport,
     held_now: Option<&SubmissionHold>,
     now_ms: u64,
+    mainnet: bool,
+    acknowledge_unbounded: bool,
 ) -> ClearDecision {
     // A definitive answer that arrived during reconciliation settles the
     // submission; reconciliation's own surface writes its row.
@@ -786,6 +835,7 @@ fn clear_decision(
     {
         return ClearDecision::Clear {
             evidence: Some(code),
+            unbounded_exposure: false,
         };
     }
     // On a mainnet profile without an oracle, reconciliation reports the
@@ -804,6 +854,25 @@ fn clear_decision(
         return ClearDecision::Refuse(Envelope::<()>::err(
             &stellar_agent_core::error::WalletError::Network(failure.to_network_error()),
         ));
+    }
+    if unbounded_exposure(receipt, held_now, mainnet) {
+        if !acknowledge_unbounded {
+            return ClearDecision::Refuse(Envelope::<()>::err_raw(
+                "submission.unbounded_exposure",
+                format!(
+                    "transaction {} carries no time bound and can apply for as long as \
+                     sequence {} of its source stays unconsumed; clearing stops counting its \
+                     spend against the window. Pass --acknowledge --acknowledge-unbounded to \
+                     clear it and record that exposure",
+                    stellar_agent_network::redact_tx_hash(&receipt.tx_hash),
+                    receipt.sequence,
+                ),
+            ));
+        }
+        return ClearDecision::Clear {
+            evidence: None,
+            unbounded_exposure: true,
+        };
     }
     // Without a witness nothing establishes whether a timed transaction can
     // still apply, so its time bound is read on the host clock: it can apply
@@ -846,7 +915,10 @@ fn clear_decision(
     }
     // The outcome is unknown and nothing more can establish it: the
     // operator's acknowledgement decides.
-    ClearDecision::Clear { evidence: None }
+    ClearDecision::Clear {
+        evidence: None,
+        unbounded_exposure: false,
+    }
 }
 
 /// Checks that the oracle serves mainnet and asks it what became of
@@ -931,6 +1003,7 @@ fn acknowledgement_required(
     held: Option<&stellar_agent_network::policy_state::SubmissionHold>,
     tx_hash: &str,
     now_ms: u64,
+    mainnet: bool,
 ) -> Envelope<()> {
     let label = existing.map_or("orphaned", |r| r.status.label());
     let redacted = stellar_agent_network::redact_tx_hash(tx_hash);
@@ -946,14 +1019,26 @@ fn acknowledgement_required(
             && now_ms / 1_000 <= r.max_time)
             .then_some(r.max_time)
     });
-    let next = match open_bound {
-        Some(max_time) => format!(
-            "its time bound (maxTime {max_time}) is still open, so it can still apply: wait for \
-             the bound to pass, or run 'stellar-agent tx status {redacted}'"
-        ),
-        None => "pass --acknowledge to state that the transaction did not move value; the clear \
-                 reconciles the submission first"
-            .to_owned(),
+    // An orphan's receipt is recovered from its reservation, so the held
+    // time bound decides for it.
+    let exposure = existing.map_or_else(
+        || mainnet && held.is_some_and(|hold| hold.max_time == 0),
+        |receipt| unbounded_exposure(receipt, held, mainnet),
+    );
+    let next = if exposure {
+        "pass --acknowledge --acknowledge-unbounded to state that this untimed transaction can \
+         still apply and its spend stops counting against the window"
+            .to_owned()
+    } else {
+        match open_bound {
+            Some(max_time) => format!(
+                "its time bound (maxTime {max_time}) is still open, so it can still apply: wait \
+                 for the bound to pass, or run 'stellar-agent tx status {redacted}'"
+            ),
+            None => "pass --acknowledge to state that the transaction did not move value; the \
+                     clear reconciles the submission first"
+                .to_owned(),
+        }
     };
     Envelope::<()>::err_raw(
         "submission.acknowledgement_required",
@@ -1034,6 +1119,7 @@ mod tests {
                 &receipt,
                 None,
                 true,
+                false,
                 "stellar:testnet",
             )
             .expect("the clear is recorded");
@@ -1118,6 +1204,7 @@ mod tests {
             &receipt,
             Some(ReleaseEvidence::SequenceConsumed),
             false,
+            false,
             "stellar:testnet",
         )
         .expect_err("a settled row that cannot be appended refuses the clear");
@@ -1149,6 +1236,7 @@ mod tests {
             &receipts,
             &receipt,
             Some(ReleaseEvidence::SequenceConsumed),
+            false,
             false,
             "stellar:testnet",
         )
@@ -1264,6 +1352,7 @@ mod tests {
             &receipt,
             None,
             false,
+            false,
             "stellar:testnet",
         )
         .expect_err("a clear lookup that cannot read the history refuses the clear");
@@ -1317,6 +1406,7 @@ mod tests {
                 "9c9c9c9c...9c9c9c9c",
                 "pending",
                 false,
+                false,
                 None,
                 Some(envelope_hash.clone()),
                 "req-forged-clear",
@@ -1333,6 +1423,7 @@ mod tests {
             &receipts,
             &receipt,
             None,
+            false,
             false,
             "stellar:testnet",
         )
@@ -1394,6 +1485,7 @@ mod tests {
             &receipt,
             None,
             false,
+            false,
             "stellar:testnet",
         )
         .expect("a clear without a writer skips the broken history");
@@ -1441,7 +1533,7 @@ mod tests {
             ..ReconcileReport::default()
         };
         for report in [failed, disagrees] {
-            let decision = clear_decision(&receipt, &report, None, 0);
+            let decision = clear_decision(&receipt, &report, None, 0, false, false);
             assert!(matches!(decision, ClearDecision::Refuse(_)));
             if let ClearDecision::Refuse(refusal) = decision {
                 assert_eq!(
@@ -1453,6 +1545,70 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every sent receipt the operator can clear on mainnet, `pending` or
+    /// `ambiguous`, needs the second flag while the receipt or its held
+    /// reservation has no time bound, and the decision carries the exposure
+    /// for the clear row. Testnet clears are unchanged.
+    #[test]
+    fn a_mainnet_untimed_sent_receipt_needs_the_unbounded_acknowledgement() {
+        for status in [ReceiptStatus::Pending, ReceiptStatus::Ambiguous] {
+            for (receipt_max, hold_max) in [(0, 0), (123, 0), (0, 123)] {
+                let mut receipt = submitted_receipt(receipt_max);
+                receipt.status = status.clone();
+                let mut held = held_for(&receipt);
+                held.max_time = hold_max;
+                let report = ReconcileReport::default();
+                let refused = clear_decision(&receipt, &report, Some(&held), 0, true, false);
+                let (code, message) = refusal_of(refused).expect("unbounded exposure refuses");
+                assert_eq!(code, "submission.unbounded_exposure", "{status:?}");
+                assert!(message.contains("--acknowledge --acknowledge-unbounded"));
+                assert!(message.contains("sequence 7"));
+                let decision = clear_decision(&receipt, &report, Some(&held), 0, true, true);
+                assert!(
+                    matches!(
+                        decision,
+                        ClearDecision::Clear {
+                            evidence: None,
+                            unbounded_exposure: true
+                        }
+                    ),
+                    "{status:?}: {decision:?}"
+                );
+                let hint = acknowledgement_required(
+                    Some(&receipt),
+                    Some(&held),
+                    &receipt.tx_hash,
+                    0,
+                    true,
+                );
+                assert!(
+                    hint.error
+                        .expect("hint")
+                        .message
+                        .contains("--acknowledge-unbounded")
+                );
+            }
+        }
+        let receipt = submitted_receipt(0);
+        let held = held_for(&receipt);
+        let orphan_hint = acknowledgement_required(None, Some(&held), &receipt.tx_hash, 0, true);
+        assert!(
+            orphan_hint
+                .error
+                .expect("hint")
+                .message
+                .contains("--acknowledge --acknowledge-unbounded"),
+            "an untimed orphan names the second flag"
+        );
+        assert!(matches!(
+            clear_decision(&receipt, &ReconcileReport::default(), None, 0, false, false),
+            ClearDecision::Clear {
+                evidence: None,
+                unbounded_exposure: false
+            }
+        ));
     }
 
     /// A submitted receipt for `clear_decision`, read back from a store.
@@ -1505,9 +1661,22 @@ mod tests {
         receipt.release_code = Some(ReleaseEvidence::SequenceConsumed);
         let held = held_for(&receipt);
 
-        let decision = clear_decision(&receipt, &ReconcileReport::default(), Some(&held), 0);
+        let decision = clear_decision(
+            &receipt,
+            &ReconcileReport::default(),
+            Some(&held),
+            0,
+            false,
+            false,
+        );
         assert!(
-            matches!(decision, ClearDecision::Clear { evidence: None }),
+            matches!(
+                decision,
+                ClearDecision::Clear {
+                    evidence: None,
+                    unbounded_exposure: false
+                }
+            ),
             "{decision:?}"
         );
 
@@ -1522,23 +1691,25 @@ mod tests {
             }],
             ..ReconcileReport::default()
         };
-        let decision = clear_decision(&receipt, &released_now, Some(&held), 0);
+        let decision = clear_decision(&receipt, &released_now, Some(&held), 0, false, false);
         assert!(
             matches!(
                 decision,
                 ClearDecision::Clear {
-                    evidence: Some(ReleaseEvidence::SequenceConsumed)
+                    evidence: Some(ReleaseEvidence::SequenceConsumed),
+                    unbounded_exposure: false
                 }
             ),
             "{decision:?}"
         );
 
-        let decision = clear_decision(&receipt, &ReconcileReport::default(), None, 0);
+        let decision = clear_decision(&receipt, &ReconcileReport::default(), None, 0, false, false);
         assert!(
             matches!(
                 decision,
                 ClearDecision::Clear {
-                    evidence: Some(ReleaseEvidence::SequenceConsumed)
+                    evidence: Some(ReleaseEvidence::SequenceConsumed),
+                    unbounded_exposure: false
                 }
             ),
             "{decision:?}"
@@ -1568,20 +1739,47 @@ mod tests {
         let unwitnessed = report(ReconcileFailureKind::OracleNotConfigured);
 
         for now_s in [max_time - 60, max_time] {
-            let decision = clear_decision(&receipt, &unwitnessed, Some(&held), now_s * 1_000);
+            let decision = clear_decision(
+                &receipt,
+                &unwitnessed,
+                Some(&held),
+                now_s * 1_000,
+                false,
+                false,
+            );
             let (code, message) = refusal_of(decision).expect("a bound not yet passed refuses");
             assert_eq!(code, "submission.still_pending");
             assert!(message.contains("host's clock"), "{message}");
         }
 
-        let decision = clear_decision(&receipt, &unwitnessed, Some(&held), (max_time + 1) * 1_000);
+        let decision = clear_decision(
+            &receipt,
+            &unwitnessed,
+            Some(&held),
+            (max_time + 1) * 1_000,
+            false,
+            false,
+        );
         assert!(
-            matches!(decision, ClearDecision::Clear { evidence: None }),
+            matches!(
+                decision,
+                ClearDecision::Clear {
+                    evidence: None,
+                    unbounded_exposure: false
+                }
+            ),
             "{decision:?}"
         );
 
         let unreachable = report(ReconcileFailureKind::Unreachable);
-        let decision = clear_decision(&receipt, &unreachable, Some(&held), (max_time + 1) * 1_000);
+        let decision = clear_decision(
+            &receipt,
+            &unreachable,
+            Some(&held),
+            (max_time + 1) * 1_000,
+            false,
+            false,
+        );
         let (code, _) = refusal_of(decision).expect("an endpoint that could not answer refuses");
         assert_eq!(code, "network.rpc_unreachable");
     }
@@ -1864,17 +2062,88 @@ mod tests {
                 .expect("reservation");
         }
 
-        /// Runs `tx receipt clear --acknowledge` on the seeded submission.
-        async fn clear(fixture: &MainnetFixture) -> (i32, Value) {
+        /// Runs `tx receipt clear --acknowledge` on the seeded submission,
+        /// with `--acknowledge-unbounded` when `acknowledge_unbounded` is set.
+        async fn clear(fixture: &MainnetFixture, acknowledge_unbounded: bool) -> (i32, Value) {
             crate::common::render::take_rendered_for_test();
             let code = run_clear(&ClearArgs {
                 envelope_hash: ENVELOPE_HASH.to_owned(),
                 profile: Some(fixture.name.to_owned()),
                 acknowledge: true,
+                acknowledge_unbounded,
                 output: OutputFormat::Json,
             })
             .await;
             (code, last_rendered())
+        }
+
+        /// A mainnet endpoint funding the agent that answers every
+        /// `getTransaction` with `NOT_FOUND` and whose retention floor lies
+        /// above the seeded submission's ledger.
+        fn past_retention() -> ClassicRpc {
+            let agent =
+                stellar_agent_test_support::signed_envelope::account_id_for_seed(AGENT_SEED);
+            ClassicRpc::mainnet(&[&agent]).with_script(|method, _, _| match method {
+                "getTransaction" => Some(json!({
+                    "status": "NOT_FOUND",
+                    "latestLedger": 2000,
+                    "oldestLedger": 1500
+                })),
+                "getHealth" => Some(json!({
+                    "status": "healthy",
+                    "latestLedger": 2000,
+                    "oldestLedger": 1500,
+                    "ledgerRetentionWindow": 500
+                })),
+                _ => None,
+            })
+        }
+
+        /// The profile's audit log as it stands, empty while it is absent.
+        fn audit_log(fixture: &MainnetFixture) -> String {
+            std::fs::read_to_string(&fixture.profile().audit_log_path).unwrap_or_default()
+        }
+
+        /// Runs the clear on the seeded untimed submission twice: without
+        /// `--acknowledge-unbounded` it refuses with
+        /// `submission.unbounded_exposure` and leaves the receipt in `status`,
+        /// the reservation and the audit log as they were; with it the
+        /// reservation is released, the receipt cleared and the clear row
+        /// records the exposure.
+        async fn assert_clear_needs_the_unbounded_acknowledgement(
+            fixture: &MainnetFixture,
+            status: ReceiptStatus,
+        ) {
+            let log_before = audit_log(fixture);
+
+            let (code, envelope) = clear(fixture, false).await;
+
+            assert_eq!(code, 1, "{envelope}");
+            assert_eq!(
+                envelope["error"]["code"], "submission.unbounded_exposure",
+                "{envelope}"
+            );
+            assert_eq!(fixture.pending_reservations(), 1, "the reservation stands");
+            assert_eq!(receipt_status(fixture), status);
+            assert_eq!(audit_log(fixture), log_before, "the audit log is untouched");
+
+            let (code, envelope) = clear(fixture, true).await;
+
+            assert_eq!(code, 0, "{envelope}");
+            assert_eq!(
+                envelope["data"]["cleared_from"],
+                status.label(),
+                "{envelope}"
+            );
+            assert_eq!(
+                fixture.pending_reservations(),
+                0,
+                "the reservation is released"
+            );
+            assert_eq!(receipt_status(fixture), ReceiptStatus::ClearedByOperator);
+            let rows = fixture.audit_rows("submission_receipt_cleared");
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["unbounded_exposure"], true, "{}", rows[0]);
         }
 
         /// The seeded submission's receipt status.
@@ -1910,7 +2179,7 @@ mod tests {
                 .await;
             seed_submission(&fixture, now_secs() + 600);
 
-            let run = clear(&fixture).await;
+            let run = clear(&fixture, false).await;
 
             assert_refused_untouched(&fixture, &run, "submission.still_pending");
             let message = run.1["error"]["message"].as_str().expect("message");
@@ -1931,7 +2200,7 @@ mod tests {
                 .await;
             seed_submission(&fixture, now_secs() - 10);
 
-            let (code, envelope) = clear(&fixture).await;
+            let (code, envelope) = clear(&fixture, false).await;
 
             assert_eq!(code, 0, "{envelope}");
             assert_eq!(envelope["data"]["cleared_from"], "pending", "{envelope}");
@@ -1959,7 +2228,7 @@ mod tests {
                 .await;
             seed_submission(&fixture, now_secs() - 10);
 
-            let run = clear(&fixture).await;
+            let run = clear(&fixture, false).await;
 
             assert_refused_untouched(&fixture, &run, "submission.not_clearable");
         }
@@ -1976,7 +2245,7 @@ mod tests {
                 .await;
             seed_submission(&fixture, now_secs() - 10);
 
-            let run = clear(&fixture).await;
+            let run = clear(&fixture, false).await;
 
             assert_refused_untouched(&fixture, &run, "submission.not_clearable");
             let message = run.1["error"]["message"].as_str().expect("message");
@@ -2002,7 +2271,7 @@ mod tests {
             seed_submission(&fixture, 0);
             let asked_before = fixture.oracle_methods().await.len();
 
-            let run = clear(&fixture).await;
+            let run = clear(&fixture, false).await;
 
             assert_refused_untouched(&fixture, &run, "submission.not_clearable");
             let message = run.1["error"]["message"].as_str().expect("message");
@@ -2040,7 +2309,7 @@ mod tests {
             let asked_before = fixture.oracle_methods().await.len();
 
             let started = std::time::Instant::now();
-            let run = clear(&fixture).await;
+            let run = clear(&fixture, false).await;
             let elapsed = started.elapsed();
 
             assert_refused_untouched(&fixture, &run, "network.rpc_unreachable");
@@ -2063,6 +2332,42 @@ mod tests {
             assert!(writer.try_lock().is_ok(), "the audit writer is free");
         }
 
+        /// Without an oracle, a sent untimed submission the primary reports
+        /// `FAILED` stays pending, and its clear needs the unbounded
+        /// acknowledgement.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_untimed_pending_submission_needs_the_unbounded_acknowledgement() {
+            let fixture = Spec::new("clear-mainnet-untimed-pending")
+                .without_oracle()
+                .primary(answering("FAILED"))
+                .build()
+                .await;
+            seed_submission(&fixture, 0);
+
+            assert_clear_needs_the_unbounded_acknowledgement(&fixture, ReceiptStatus::Pending)
+                .await;
+            assert!(fixture.oracle_methods().await.is_empty());
+        }
+
+        /// A sent untimed submission below the oracle's retention floor is
+        /// reconciled to `ambiguous` with its reservation kept. Its bytes can
+        /// still apply, so its clear needs the unbounded acknowledgement as a
+        /// pending one does.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn an_untimed_submission_past_retention_needs_the_unbounded_acknowledgement() {
+            let fixture = Spec::new("clear-mainnet-untimed-ambiguous")
+                .primary(answering("NOT_FOUND"))
+                .oracle(past_retention())
+                .build()
+                .await;
+            seed_submission(&fixture, 0);
+
+            assert_clear_needs_the_unbounded_acknowledgement(&fixture, ReceiptStatus::Ambiguous)
+                .await;
+        }
+
         /// On testnet a primary `FAILED` refuses the clear, as it always
         /// has: the endpoint's answer settles the submission there.
         #[tokio::test(flavor = "current_thread")]
@@ -2077,7 +2382,7 @@ mod tests {
                 .await;
             seed_submission(&fixture, now_secs() - 10);
 
-            let run = clear(&fixture).await;
+            let run = clear(&fixture, false).await;
 
             assert_refused_untouched(&fixture, &run, "submission.not_clearable");
         }

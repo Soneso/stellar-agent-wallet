@@ -242,12 +242,14 @@ impl SignedTestEnvelope {
 
 /// Builds a [`SignedTestEnvelope`].
 ///
-/// Defaults: sequence 1, a single native payment to a fixed destination, one
-/// signature by the source account's own key under the testnet passphrase, and
-/// a ledger body reporting every source account with no extra signers.
+/// Defaults: sequence 1, no time bounds, a single native payment to a fixed
+/// destination, one signature by the source account's own key under the
+/// testnet passphrase, and a ledger body reporting every source account with
+/// no extra signers.
 pub struct SignedTestEnvelopeBuilder {
     source_seed: [u8; 32],
     sequence: i64,
+    time_bounds: Option<(u64, u64)>,
     destination: [u8; 32],
     amount_stroops: i64,
     network_passphrase: String,
@@ -272,6 +274,7 @@ impl SignedTestEnvelopeBuilder {
         Self {
             source_seed,
             sequence: 1,
+            time_bounds: None,
             destination: strkey_bytes(DEFAULT_DESTINATION),
             amount_stroops: DEFAULT_AMOUNT_STROOPS,
             network_passphrase: TESTNET_PASSPHRASE.to_owned(),
@@ -289,6 +292,13 @@ impl SignedTestEnvelopeBuilder {
     #[must_use]
     pub fn sequence(mut self, sequence: i64) -> Self {
         self.sequence = sequence;
+        self
+    }
+
+    /// Sets the transaction's minimum and maximum Unix time in seconds.
+    #[must_use]
+    pub fn time_bounds(mut self, min_time: u64, max_time: u64) -> Self {
+        self.time_bounds = Some((min_time, max_time));
         self
     }
 
@@ -486,7 +496,14 @@ impl SignedTestEnvelopeBuilder {
             },
             fee: 100,
             seq_num: SequenceNumber(self.sequence),
-            cond: Preconditions::None,
+            cond: self
+                .time_bounds
+                .map_or(Preconditions::None, |(min_time, max_time)| {
+                    Preconditions::Time(stellar_xdr::TimeBounds {
+                        min_time: stellar_xdr::TimePoint(min_time),
+                        max_time: stellar_xdr::TimePoint(max_time),
+                    })
+                }),
             memo: Memo::None,
             operations: vec![operation]
                 .try_into()

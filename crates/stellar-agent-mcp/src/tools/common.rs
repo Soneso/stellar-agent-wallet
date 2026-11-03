@@ -395,6 +395,46 @@ pub(crate) fn ledger_err_result(
 // business_error_result — documented business-error envelope
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Validates the deadline a mainnet commit copies into its rebuilt envelope
+/// and returns its `max_time` in Unix seconds.
+///
+/// # Errors
+///
+/// `simulation.deadline_invalid` naming `envelope_shape` for an envelope that
+/// does not decode as a classic `Tx` envelope, and naming the deadline's own
+/// label (`deadline_missing`, `deadline_elapsed` or `deadline_too_far`) for an
+/// envelope whose deadline [`check_classic_deadline`] refuses; the wallet error
+/// of a mainnet clock that cannot be read.
+///
+/// [`check_classic_deadline`]: stellar_agent_network::mainnet::resolve::check_classic_deadline
+pub(crate) fn presented_classic_deadline(
+    envelope_xdr: &str,
+) -> Result<u64, rmcp::model::CallToolResult> {
+    use stellar_agent_network::mainnet::{
+        MainnetPrecondition, clock, resolve::check_classic_deadline,
+    };
+    use stellar_xdr::{ReadXdr as _, TransactionEnvelope};
+    let invalid = |label: &str| {
+        business_error_result(
+            "simulation.deadline_invalid",
+            format!(
+                "envelope_xdr carries no valid on-chain deadline ({label}); simulate again for \
+                 a fresh envelope"
+            ),
+        )
+    };
+    let envelope = TransactionEnvelope::from_xdr_base64(
+        envelope_xdr,
+        stellar_agent_xdr_limits::untrusted_decode_limits(envelope_xdr.len()),
+    )
+    .map_err(|_| invalid(MainnetPrecondition::EnvelopeShape.label()))?;
+    let TransactionEnvelope::Tx(tx) = envelope else {
+        return Err(invalid(MainnetPrecondition::EnvelopeShape.label()));
+    };
+    let now = clock::now_ms().map_err(|error| ledger_err_result(&error))?;
+    check_classic_deadline(&tx.tx.cond, now).map_err(|error| invalid(error.label()))
+}
+
 /// Builds the documented result envelope `{ ok: false, error: { code, message },
 /// request_id }` for a **business error** and returns a `CallToolResult` with
 /// `is_error = Some(true)`.
@@ -2531,6 +2571,111 @@ pub(crate) mod tests {
         atomic::{AtomicBool, AtomicU32, Ordering},
     };
     use stellar_agent_core::AuthError;
+
+    // ── presented_classic_deadline ──────────────────────────────────────────────
+
+    /// How far a test's fixed mainnet clock runs ahead of the system clock:
+    /// an approval entry is created on the system clock, and the resolver
+    /// refuses an entry created after its own now.
+    const CLOCK_LEAD_MS: u64 = 5_000;
+
+    /// A classic envelope whose time bounds are `min_time..=max_time`.
+    fn timed_envelope(min_time: u64, max_time: u64) -> String {
+        stellar_agent_test_support::SignedTestEnvelope::builder([8; 32])
+            .unsigned()
+            .time_bounds(min_time, max_time)
+            .build()
+            .envelope_xdr()
+            .to_owned()
+    }
+
+    /// The code and message of the refusal `presented_classic_deadline` returns.
+    fn deadline_refusal(envelope_xdr: &str) -> (String, String) {
+        let refusal = presented_classic_deadline(envelope_xdr).unwrap_err();
+        let (code, message, _) = assert_business_envelope(&refusal);
+        (code, message)
+    }
+
+    /// Bytes that do not decode as an envelope, and an envelope that is not a
+    /// classic `Tx` one although its time bounds are valid, refuse naming the
+    /// envelope's shape, before the clock is read.
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn a_presented_envelope_of_the_wrong_shape_names_the_shape() {
+        use stellar_xdr::{
+            Limits, Memo, SequenceNumber, TimeBounds, TimePoint, TransactionEnvelope,
+            TransactionV0, TransactionV0Envelope, TransactionV0Ext, Uint256, VecM, WriteXdr as _,
+        };
+        let _failing = stellar_agent_network::mainnet::clock::set_clock_error_for_test();
+        let now_s = stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000;
+        let v0 = TransactionEnvelope::TxV0(TransactionV0Envelope {
+            tx: TransactionV0 {
+                source_account_ed25519: Uint256([8; 32]),
+                fee: 100,
+                seq_num: SequenceNumber(2),
+                time_bounds: Some(TimeBounds {
+                    min_time: TimePoint(0),
+                    max_time: TimePoint(now_s + 60),
+                }),
+                memo: Memo::None,
+                operations: VecM::default(),
+                ext: TransactionV0Ext::V0,
+            },
+            signatures: VecM::default(),
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+        for envelope_xdr in ["not an envelope", "AAAA", v0.as_str()] {
+            let (code, message) = deadline_refusal(envelope_xdr);
+            assert_eq!(code, "simulation.deadline_invalid", "{envelope_xdr}");
+            assert!(message.contains("(envelope_shape)"), "{message}");
+        }
+    }
+
+    /// A classic envelope refuses with the label of its deadline's fault:
+    /// none or a minimum time, an elapsed one, one beyond the ceiling. A
+    /// valid one returns its `max_time`.
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn a_presented_deadline_refuses_with_its_label() {
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
+        let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
+        let now_s = now / 1000;
+        let untimed = stellar_agent_test_support::SignedTestEnvelope::builder([8; 32])
+            .unsigned()
+            .build()
+            .envelope_xdr()
+            .to_owned();
+        for (envelope_xdr, label) in [
+            (untimed, "deadline_missing"),
+            (timed_envelope(1, now_s + 60), "deadline_missing"),
+            (timed_envelope(0, now_s), "deadline_elapsed"),
+            (timed_envelope(0, now_s + 121), "deadline_too_far"),
+        ] {
+            let (code, message) = deadline_refusal(&envelope_xdr);
+            assert_eq!(code, "simulation.deadline_invalid", "{label}");
+            assert!(
+                message.contains(&format!("({label})")),
+                "{label}: {message}"
+            );
+        }
+        assert_eq!(
+            presented_classic_deadline(&timed_envelope(0, now_s + 120)).unwrap(),
+            now_s + 120
+        );
+    }
+
+    /// A mainnet clock that cannot be read refuses with the wallet's clock
+    /// error, not a deadline label.
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn a_presented_deadline_keeps_the_clock_error() {
+        let now_s = stellar_agent_core::timefmt::now_unix_ms().unwrap() / 1000;
+        let _failing = stellar_agent_network::mainnet::clock::set_clock_error_for_test();
+        let (code, message) = deadline_refusal(&timed_envelope(0, now_s + 60));
+        assert_eq!(code, "wallet.clock_error", "{message}");
+        assert!(!message.contains("deadline"), "{message}");
+    }
 
     // ── decode_payment_required_input ───────────────────────────────────────────
 
@@ -4843,6 +4988,10 @@ pub(crate) mod tests {
                 stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test("operator");
                 let envelope = SignedTestEnvelope::builder([42; 32])
                     .network_passphrase(stellar_agent_core::profile::caip2::MAINNET_PASSPHRASE)
+                    .time_bounds(
+                        0,
+                        stellar_agent_network::mainnet::clock::now_ms().unwrap() / 1000 + 120,
+                    )
                     .amount_stroops(10)
                     .sequence(2)
                     .unsigned()
@@ -6839,7 +6988,7 @@ pub(crate) mod tests {
         }
 
         /// Asserts that `sent` carries exactly the approved transaction of
-        /// `approved` with one signature and no time bounds.
+        /// `approved` with one signature and the consent-bound deadline.
         fn assert_approved_bytes_sent(approved: &str, sent: &str) {
             use stellar_xdr::{Limits, Preconditions, ReadXdr as _, TransactionEnvelope};
             let decode = |xdr: &str| match TransactionEnvelope::from_xdr_base64(xdr, Limits::none())
@@ -6854,7 +7003,9 @@ pub(crate) mod tests {
                 "the sent transaction is the approved one"
             );
             assert_eq!(sent.signatures.len(), 1);
-            assert!(matches!(sent.tx.cond, Preconditions::None));
+            assert!(
+                matches!(sent.tx.cond, Preconditions::Time(bounds) if bounds.min_time.0 == 0 && bounds.max_time.0 > 0)
+            );
         }
 
         /// The confirmed window rows each classic accept leaves: the count of
@@ -6919,6 +7070,65 @@ pub(crate) mod tests {
                 "{tool:?}"
             );
             assert_eq!(run.seed_reads(), 1, "{tool:?}");
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn mainnet_previews_carry_the_deadline() {
+            let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
+            let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
+            for tool in Tool::ALL {
+                let run = ClassicRun::new(tool).await;
+                let max_time =
+                    presented_classic_deadline(run.args["envelope_xdr"].as_str().unwrap()).unwrap();
+                assert_eq!(max_time, now / 1000 + 120, "{tool:?}");
+                assert_eq!(run.seed_reads(), 0);
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn commit_copies_the_presented_deadline_across_elapsed_time() {
+            let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
+            let clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
+            for tool in Tool::ALL {
+                clock.set(now);
+                let run = ClassicRun::new(tool).await;
+                let approved = run.args["envelope_xdr"].as_str().unwrap();
+                assert_eq!(
+                    presented_classic_deadline(approved).unwrap(),
+                    now / 1000 + 120
+                );
+                clock.set(now + 10_000);
+                let result = run.commit().await;
+                assert_eq!(result["ok"], true, "{tool:?}: {result}");
+                let sent = run.control.sent();
+                assert_eq!(sent.len(), 1);
+                assert_approved_bytes_sent(approved, &sent[0]);
+                assert_eq!(
+                    presented_classic_deadline(&sent[0]).unwrap(),
+                    now / 1000 + 120
+                );
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(keyring)]
+        async fn commit_refuses_an_untimed_envelope() {
+            let now = stellar_agent_core::timefmt::now_unix_ms().unwrap() + CLOCK_LEAD_MS;
+            let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(now);
+            for tool in Tool::ALL {
+                let run = ClassicRun::new(tool).await;
+                let args = run.crafted(|tx| tx.cond = stellar_xdr::Preconditions::None);
+                let result = run.commit_with(args).await;
+                assert_refused_before_mint(&run, &result, "simulation.deadline_invalid");
+                assert!(
+                    result["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("deadline_missing")
+                );
+            }
         }
 
         #[tokio::test]

@@ -2497,11 +2497,16 @@ mod tests {
 
         impl Case {
             async fn new(label: &str) -> Self {
-                Self::with_envelope(label, fixtures::signed_envelope()).await
+                let fx = LedgerFixture::new(label, NOW);
+                let envelope = fixtures::signed_envelope();
+                Self::with_fixture(fx, envelope).await
             }
 
             async fn with_envelope(label: &str, envelope: SignedTestEnvelope) -> Self {
-                let fx = LedgerFixture::new(label, NOW);
+                Self::with_fixture(LedgerFixture::new(label, NOW), envelope).await
+            }
+
+            async fn with_fixture(fx: LedgerFixture, envelope: SignedTestEnvelope) -> Self {
                 let server = MockServer::start().await;
                 let client = StellarRpcClient::new(&server.uri()).unwrap();
                 let holds = vec![fixtures::hold(&fx.name, NOW, 100)];
@@ -2927,6 +2932,7 @@ mod tests {
         async fn an_envelope_without_the_grant_signer_is_refused_before_the_send() {
             let envelope = SignedTestEnvelope::builder(SIGNER_SEED)
                 .network_passphrase(MAINNET_PASSPHRASE)
+                .time_bounds(0, NOW / 1000 + 120)
                 .sequence(SEQUENCE)
                 .sign(OTHER_SEED, MAINNET_PASSPHRASE)
                 .ed25519_signer(&fixtures::account(SIGNER_SEED), OTHER_SEED)

@@ -801,6 +801,9 @@ async fn build_change_trust(
     builder
         .change_trust(&asset, args.limit_stroops)
         .map_err(envelope_build_failed)?;
+    builder
+        .with_mainnet_deadline()
+        .map_err(envelope_build_failed)?;
     let envelope_xdr = builder.build().map_err(envelope_build_failed)?;
 
     // NEVER log the envelope XDR at info.
@@ -2748,7 +2751,7 @@ mod tests {
 
         use crate::common::mainnet_write::invalidations_on_this_thread;
         use crate::common::mainnet_write_fixture::{
-            AGENT_SEED, DESTINATION, ISSUER, MainnetFixture, Spec, TRUSTLINE_ASSET,
+            AGENT_SEED, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, Spec, TRUSTLINE_ASSET,
             minimum_reserve, trustline_rule,
         };
         use crate::test_rpc::{ACCOUNT_SEQUENCE, ClassicRpc, account_key, account_xdr};
@@ -2891,21 +2894,16 @@ mod tests {
         async fn accept() {
             let fixture = spec("mainnet-trustline-accept").build().await;
 
+            let built_at_ms =
+                stellar_agent_network::mainnet::clock::now_ms().unwrap() + CLOCK_LEAD_MS;
+            let _clock = stellar_agent_network::mainnet::clock::set_now_ms_for_test(built_at_ms);
             let run = run(&fixture, &mainnet_args(&fixture)).await;
 
             assert_eq!(run.code, 0, "{}", run.envelope);
             let sent = fixture.sent_envelopes().await;
             assert_eq!(sent.len(), 1);
             fixture.assert_signed_by_agent(&sent[0]);
-            {
-                use stellar_xdr::{Limits, Preconditions, ReadXdr as _, TransactionEnvelope};
-                let TransactionEnvelope::Tx(v1) =
-                    TransactionEnvelope::from_xdr_base64(&sent[0], Limits::none()).unwrap()
-                else {
-                    panic!("not a v1 envelope");
-                };
-                assert_eq!(v1.tx.cond, Preconditions::None);
-            }
+            crate::common::mainnet_write_fixture::assert_deadline_bound(&sent[0], built_at_ms);
             let data = &run.envelope["data"];
             assert_eq!(data["status"], "submitted", "{}", run.envelope);
             assert_eq!(data["action"], "change_trust");

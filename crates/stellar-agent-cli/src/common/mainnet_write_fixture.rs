@@ -61,6 +61,27 @@ use crate::common::signer_ceremony::{LedgerSignerFactoryGuard, set_ledger_signer
 use crate::common::tty::tests::{TestTty, test_tty, tty_checks_on_this_thread};
 use crate::test_rpc::{ClassicRpc, EnvSigner, methods};
 
+/// How far a test's fixed mainnet clock runs ahead of the system clock: the
+/// confirmation entry is created on the system clock, and the resolver
+/// refuses an entry created after its own now.
+pub(crate) const CLOCK_LEAD_MS: u64 = 5_000;
+
+/// Asserts that the signed envelope carries the deadline chosen at build time.
+pub(crate) fn assert_deadline_bound(envelope: &str, built_at_ms: u64) {
+    use stellar_xdr::{Limits, Preconditions, ReadXdr as _, TransactionEnvelope};
+    let TransactionEnvelope::Tx(tx) =
+        TransactionEnvelope::from_xdr_base64(envelope, Limits::none()).unwrap()
+    else {
+        panic!("classic envelope expected");
+    };
+    let Preconditions::Time(bounds) = tx.tx.cond else {
+        panic!("deadline expected")
+    };
+    assert_eq!(bounds.min_time.0, 0);
+    assert!(bounds.max_time.0 > built_at_ms / 1000);
+    assert!(bounds.max_time.0 <= built_at_ms / 1000 + 120);
+}
+
 /// The host of the profile's primary endpoint.
 pub(crate) const PRIMARY_HOST: &str = "rpc.example.invalid";
 /// The host of the profile's oracle endpoint.

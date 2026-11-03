@@ -998,6 +998,12 @@ mod tests {
         }]
         .try_into()
         .unwrap();
+        tx.tx.cond = Preconditions::Time(TimeBounds {
+            min_time: TimePoint(0),
+            max_time: TimePoint(
+                stellar_agent_network::mainnet::clock::now_ms().unwrap() / 1000 + 120,
+            ),
+        });
         let encoded = TransactionEnvelope::Tx(tx)
             .to_xdr_base64(Limits::none())
             .unwrap();
