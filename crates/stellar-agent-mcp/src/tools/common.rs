@@ -4983,6 +4983,7 @@ pub(crate) mod tests {
                 edit: impl FnOnce(String) -> String,
                 profile_edit: impl FnOnce(&mut Profile),
             ) -> Self {
+                use stellar_agent_core::profile::signer_identity::SignerIdentityRecord;
                 let dir = tempfile::tempdir().unwrap();
                 let home = StellarAgentHomeGuard::new(dir.path());
                 stellar_agent_core::audit_log::AuditWriterRegistry::remove_for_test("operator");
@@ -5071,12 +5072,16 @@ pub(crate) mod tests {
                 );
                 put(
                     &signer_identity_entry_ref(&profile.mcp_signer_default),
-                    &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+                    &SignerIdentityRecord::signed_for_test(
                         ed25519_dalek::SigningKey::from_bytes(&[42; 32])
                             .verifying_key()
                             .to_bytes(),
+                        "operator",
+                        &profile,
+                        &owner,
                     )
-                    .render(),
+                    .render()
+                    .unwrap(),
                 );
                 for key in [
                     &profile.policy_window_state_key_id,
@@ -7855,6 +7860,7 @@ pub(crate) mod tests {
         #[tokio::test]
         #[serial_test::serial(keyring)]
         async fn mainnet_classic_commits_refuse_a_changed_enrollment() {
+            use stellar_agent_core::profile::signer_identity::SignerIdentityRecord;
             for tool in Tool::ALL {
                 for change in ["missing", "other"] {
                     let run = ClassicRun::new(tool).await;
@@ -7868,12 +7874,16 @@ pub(crate) mod tests {
                     } else {
                         entry
                             .set_password(
-                                &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+                                &SignerIdentityRecord::signed_for_test(
                                     ed25519_dalek::SigningKey::from_bytes(&[43; 32])
                                         .verifying_key()
                                         .to_bytes(),
+                                    "operator",
+                                    run.f.server.security_profile(),
+                                    &ed25519_dalek::SigningKey::from_bytes(&[11; 32]),
                                 )
-                                .render(),
+                                .render()
+                                .unwrap(),
                             )
                             .unwrap();
                     }

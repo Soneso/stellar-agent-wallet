@@ -18,7 +18,8 @@ use std::{
 use stellar_agent_core::profile::{
     loader,
     receipt::{ReceiptStatus, ReceiptStore},
-    schema::Profile,
+    schema::{Profile, signer_identity_entry_ref},
+    signer_identity::SignerIdentityRecord,
 };
 use stellar_agent_headless_keyring::{crypto::ProtectionMode, store::HeadlessStore};
 use stellar_agent_test_support::signed_envelope::{
@@ -319,6 +320,19 @@ async fn fixture_with_fee(fee_per_op: Option<u32>) -> (tempfile::TempDir, MockSe
                 .as_str(),
         )
         .unwrap();
+    stellar_agent_network::keyring::write_keyring_string(
+        &signer_identity_entry_ref(&p.mcp_signer_default),
+        &SignerIdentityRecord::agent(
+            ed25519_dalek::SigningKey::from_bytes(&FUNDER_SEED)
+                .verifying_key()
+                .to_bytes(),
+            NAME,
+            p.chain_id,
+        )
+        .render()
+        .unwrap(),
+    )
+    .unwrap();
     let (code, output) = cli(home.path(), &["profile", "rotate-audit-key", NAME]);
     assert_eq!(code, 0, "{output}");
     (home, server, state)

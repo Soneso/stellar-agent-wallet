@@ -161,6 +161,20 @@ fn build_test_server_with(
     entry
         .set_password(&s_strkey)
         .expect("keyring mock set_password must succeed");
+    // The identity record an enrollment stores beside the seed.
+    stellar_agent_network::keyring::write_keyring_string(
+        &stellar_agent_core::profile::schema::signer_identity_entry_ref(signer_ref),
+        &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+            ed25519_dalek::SigningKey::from_bytes(seed)
+                .verifying_key()
+                .to_bytes(),
+            stellar_agent_core::profile::name::profile_name_for_approval(&profile),
+            profile.chain_id,
+        )
+        .render()
+        .expect("an agent record renders"),
+    )
+    .expect("set identity record");
 
     // Audit chain-root key. Signing verbs prove the keyed audit writer
     // acquirable before any signing (audit.chain_key_unavailable otherwise),

@@ -1046,7 +1046,16 @@ mod tests {
         let identity = signer_identity_entry_ref(&profile.mcp_signer_default);
         keyring_core::Entry::new(&identity.service, &identity.account)
             .unwrap()
-            .set_password(&SignerIdentityRecord::agent(public).render())
+            .set_password(
+                &SignerIdentityRecord::signed_for_test(
+                    public,
+                    name,
+                    &profile,
+                    &ed25519_dalek::SigningKey::from_bytes(&[11; 32]),
+                )
+                .render()
+                .unwrap(),
+            )
             .unwrap();
         let source = SignedTestEnvelope::builder([8; 32]).unsigned().build();
         let enablement = verify_enablement(
@@ -1064,6 +1073,7 @@ mod tests {
             &profile,
             keyring::EnrolledRole::Agent,
             &public,
+            &policy.owner(),
         )
         .unwrap();
         let mut servers = Vec::new();

@@ -138,6 +138,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chooses the mainnet deadline; `with_presented_deadline` copies it, and
   `check_classic_deadline` validates it. `SubmissionReceiptCleared` and its
   constructor carry `unbounded_exposure`, omitted when false.
+- `SignerIdentityRecord` uses version 2 and `SignerBinding`; its `agent`
+  constructor takes the profile and chain. `render` returns a `Result` and
+  refuses a record without a binding, `bind_owner` signs the owner binding,
+  and `SignerIdentityRecord::binding_digest` and `verify_owner_signature`
+  cover the binding. `enrolled_signer` takes the owner parameter,
+  `enrolled_keyring_signer` takes the established owner as an `Option`,
+  `check_signer_binding` checks the custody binding, and
+  `read_and_check_signer_binding` reads and checks the record without reading
+  the seed. `enroll-signer` refuses `identity_bound_elsewhere` and
+  `coordinate_not_canonical`.
 
 - The agents guide explains shell access, approval authority, and Claude Code
   permission modes. The wallet skill routes agent payments through MCP and
@@ -587,6 +597,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tx receipt clear` on a sent `pending` or `ambiguous` receipt, a restored
   orphan included, without a time bound requires `--acknowledge-unbounded`
   beside `--acknowledge` and records the exposure in the clear row.
+- The signer identity record names its profile, chain and owner, signed by
+  the owner. Every signing path checks the record before it reads the seed,
+  and refuses a signer bound to another profile; mainnet refuses a record
+  without an owner binding. A seed without its record, as an interrupted
+  enrollment leaves it, refuses on every chain.
+  `profile bind-signer --owner-secret-env` binds an existing signer to its
+  profile and pinned owner, and rebinds it after an owner rotation. Existing
+  mainnet profiles need `bind-signer` once before they sign; testnet profiles
+  with a version 1 record warn until the signer is enrolled again.
 
 - Audit entries carry a keyed `entry_tag` derived from the profile's audit
   key. Once a log holds its `audit_entry_tags_started` row, keyed writers

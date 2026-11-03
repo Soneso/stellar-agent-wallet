@@ -203,6 +203,7 @@ impl WalletServer {
             &self.profile_name_for_approval(),
             &self.profile,
             account,
+            self.established_owner().as_ref(),
         )
         .await
         {
@@ -213,6 +214,7 @@ impl WalletServer {
                     stellar_agent_core::error::WalletError::Auth(
                         stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
                             | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. }
+                            | stellar_agent_core::error::AuthError::EnrolledIdentityUnusable { .. }
                     )
                 ) {
                     return Ok(crate::tools::common::business_error_result(
@@ -505,6 +507,7 @@ mod tests {
                     .to_string(),
             )
             .unwrap();
+        crate::tools::identity_fixture::store_signer_identity(&profile, [0x51; 32]);
         let audit = &profile.audit_log_hash_chain_key_id;
         keyring_core::Entry::new(&audit.service, &audit.account)
             .unwrap()
@@ -594,6 +597,65 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(keyring)]
+    async fn a_mainnet_bound_signer_refuses_testnet_message_signing() {
+        let mut fixture = crate::tools::message_signing_tests::Fixture::new();
+        let reads = fixture.transplant_from_mainnet_victim();
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(message_args())
+            .await
+            .unwrap();
+        crate::tools::message_signing_tests::assert_refusal(
+            &result,
+            "auth.enrolled_identity_unusable",
+        );
+        let (_, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert!(message.contains("bound_elsewhere"), "{message}");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// An interrupted enrollment leaves a seed without its identity record.
+    /// A testnet profile naming that coordinate gets no signature: the
+    /// absent record refuses before the seed is read.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn an_interrupted_enrollment_refuses_message_signing() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&reads);
+        let seed = &fixture.profile.mcp_signer_default;
+        stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
+            stellar_agent_test_support::keyring_mock::ReadHook::new(
+                &seed.service,
+                &seed.account,
+                Arc::new(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }),
+            ),
+        ])
+        .unwrap();
+        fixture.seed_signer_without_identity();
+        fixture.seed_audit();
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(message_args())
+            .await
+            .unwrap();
+        crate::tools::message_signing_tests::assert_refusal(
+            &result,
+            "auth.enrolled_identity_unusable",
+        );
+        let (_, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert!(message.contains("(missing)"), "{message}");
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
     async fn message_signing_records_one_redacted_row_and_verifies() {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let fixture = crate::tools::message_signing_tests::Fixture::new();
@@ -618,6 +680,7 @@ mod tests {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut fixture = crate::tools::message_signing_tests::Fixture::new();
         fixture.seed_audit();
+        fixture.seed_identity();
         fixture.profile.audit_log_path = fixture.dir.path().to_path_buf();
         let result = fixture
             .server()

@@ -694,7 +694,46 @@ then refuses with `validation.config_invalid`. The rule requires `http` or
 `https`, and on mainnet `https` with no username or password. A failed write
 exits `1` with an internal error.
 
-`enroll-signer` reads the signer seed, and `enroll-owner-key` and `sign-policy` read the owner seed, from the environment of the shell that runs them. The operator supplies each seed as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows, only for those commands, and unsets it afterward. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment.
+`enroll-signer` reads the signer seed from the shell environment. `enroll-owner-key`, `sign-policy`, and `bind-signer` read the owner seed from that environment. The operator supplies each seed as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows, only for those commands, and unsets it afterward. Of the policy owner key, the MCP server holds only the enrolled public key. It reads no seed from its environment.
+
+### `profile bind-signer`
+
+```bash
+stellar-agent profile bind-signer --profile operator --owner-secret-env WALLET_OWNER_SK
+unset WALLET_OWNER_SK
+```
+
+Binds an enrolled mainnet signer to its profile, chain, seed coordinate and
+established owner. Both flags are required: `--profile <NAME>` selects the
+profile and `--owner-secret-env <VAR>` names the environment variable holding
+the owner's S-strkey. The owner signs the binding through the protected seed
+ceremony. The agent seed is never read. A valid binding to this owner stays
+unchanged and returns `bound: false`; a write returns `bound: true`.
+
+The signer service must be `stellar-agent-signer-<NAME>` and its account must
+pin a G-strkey. The record must name that key, and any v2 binding must name
+this profile and chain. The owner seed must match the policy pin's owner when
+a pin exists, otherwise the enrolled owner public key. A profile rename or
+copy cannot adopt the signer's binding.
+
+The five binding refusals are:
+
+- `profile.bind_signer_mainnet_required`: the profile is not mainnet.
+- `profile.bind_signer_coordinate_not_canonical`: the signer service is not canonical.
+- `profile.bind_signer_record_conflict`: the account is not a G-strkey pin, the record is absent or malformed, or it names another key, profile or chain.
+- `profile.bind_signer_owner_mismatch`: the owner seed differs from the established owner.
+- `profile.bind_signer_owner_is_signer`: the owner key equals the agent key.
+
+Seed-loading errors also refuse. A keyring failure keeps its `auth.keyring_*`
+code; a window-state lock, policy pin or owner-entry content failure refuses
+with `profile.bind_signer_storage`. After an owner rotation advances
+the policy pin through the verified rotation statement, run this verb with
+the new owner's seed to rebind. The old owner's seed refuses. The
+`signer_identity_enrolled` audit row uses tool `profile_bind_signer`.
+
+Mainnet setup runs `enroll-signer`, `enroll-owner-key`, `sign-policy`,
+`bind-signer`, then `enable-mainnet`. Existing mainnet enrollments need
+`bind-signer` once before signing or starting an enabled MCP server.
 
 ### `profile enable-mainnet`
 
@@ -817,6 +856,13 @@ pinned owner, or the enrolled owner when no pin exists.
 
 `profile enroll-signer --repair-identity` repairs the seed-free identity record.
 It requires the stored public-key pin and verifies the existing seed against it.
+A version 1 record refuses because repair does not prove ownership. On testnet
+it needs a new enrollment with `--force`; on mainnet it needs
+`profile bind-signer`. A record that names another key or role, or holds
+malformed data, refuses and the repair writes nothing. Remove that entry, then
+run the repair again. Enrollment refuses a foreign binding even with `--force`
+(`enroll_signer.identity_bound_elsewhere`) and a noncanonical mainnet signer
+service (`enroll_signer.coordinate_not_canonical`).
 Incomplete identity uses `profile.enroll_signer_identity_incomplete`.
 Missing pin uses `enroll_signer.repair_unpinned`; conflicts use
 `enroll_signer.identity_conflict`. Enrollment and repair record

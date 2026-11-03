@@ -2520,8 +2520,8 @@ pub fn mainnet_enablement_entry_ref(window_key: &KeyringEntryRef) -> KeyringEntr
 /// The keyring coordinate of the enrolled signer's identity record: the
 /// signer's service and the account [`SIGNER_IDENTITY_ACCOUNT`].
 ///
-/// The record holds the enrolled public key and role, never the seed; the
-/// seed stays at the signer coordinate itself.
+/// The record holds the enrolled public key, role, profile, chain and owner
+/// binding, never the seed. The seed stays at the signer coordinate itself.
 ///
 /// # Examples
 ///

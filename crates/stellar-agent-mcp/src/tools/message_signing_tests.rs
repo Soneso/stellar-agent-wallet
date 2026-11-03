@@ -7,9 +7,15 @@
     reason = "test assertions"
 )]
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use base64::Engine as _;
 use stellar_agent_core::profile::loader::{load_with_overlay_from_dir, save_to_dir};
-use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile};
+use stellar_agent_core::profile::schema::{KeyringEntryRef, Profile, signer_identity_entry_ref};
+use stellar_agent_core::profile::signer_identity::SignerIdentityRecord;
 use stellar_agent_test_support::StellarAgentHomeGuard;
 
 pub(super) const MESSAGE: &str = "synthetic message signing challenge";
@@ -91,7 +97,19 @@ impl Fixture {
         assert!(self.profile.is_overlaid("mcp_signer_default"));
     }
 
+    /// Stores the signer seed and its identity record, as an enrollment does.
     pub fn seed_signer(&self) {
+        self.seed_signer_without_identity();
+        self.seed_identity();
+    }
+
+    /// Stores the signer's identity record alone, without its seed.
+    pub fn seed_identity(&self) {
+        super::identity_fixture::store_signer_identity(&self.profile, SEED);
+    }
+
+    /// Stores the signer seed alone, as an interrupted enrollment leaves it.
+    pub fn seed_signer_without_identity(&self) {
         let entry = &self.profile.mcp_signer_default;
         keyring_core::Entry::new(&entry.service, &entry.account)
             .unwrap()
@@ -101,6 +119,61 @@ impl Fixture {
                     .to_string(),
             )
             .unwrap();
+    }
+
+    /// Points this testnet profile at the canonical signer coordinate of
+    /// mainnet profile `v`, whose seed is stored with a record bound to `v`
+    /// and its owner, and moves `v.toml` out of the profiles directory.
+    /// Returns the count of reads of the seed entry.
+    pub fn transplant_from_mainnet_victim(&mut self) -> Arc<AtomicUsize> {
+        self.profile.mcp_signer_default.service = "stellar-agent-signer-v".into();
+        let name = stellar_agent_core::profile::name::profile_name_for_approval(&self.profile);
+        save_to_dir(&name, &self.profile, &self.dir.path().join("profiles")).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&reads);
+        let seed = self.profile.mcp_signer_default.clone();
+        stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
+            stellar_agent_test_support::keyring_mock::ReadHook::new(
+                &seed.service,
+                &seed.account,
+                Arc::new(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }),
+            ),
+        ])
+        .unwrap();
+        self.seed_signer_without_identity();
+        self.seed_audit();
+        let victim = Profile::builder_mainnet_named(
+            "v",
+            "https://rpc.example.invalid",
+            "stellar-agent-signer-v",
+            &self.account,
+            "stellar-agent-nonce-v",
+            "default",
+        )
+        .build();
+        save_to_dir("v", &victim, &self.dir.path().join("profiles")).unwrap();
+        std::fs::rename(
+            self.dir.path().join("profiles/v.toml"),
+            self.dir.path().join("v.toml"),
+        )
+        .unwrap();
+        let record = SignerIdentityRecord::signed_for_test(
+            stellar_strkey::ed25519::PublicKey::from_string(&self.account)
+                .unwrap()
+                .0,
+            "v",
+            &victim,
+            &ed25519_dalek::SigningKey::from_bytes(&[11; 32]),
+        );
+        stellar_agent_network::keyring::write_keyring_string(
+            &signer_identity_entry_ref(&seed),
+            &record.render().unwrap(),
+        )
+        .unwrap();
+        assert!(!self.dir.path().join("profiles/v.toml").exists());
+        reads
     }
 
     pub fn seed_audit(&self) {

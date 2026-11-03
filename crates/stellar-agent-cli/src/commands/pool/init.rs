@@ -401,7 +401,7 @@ where
                 .ok_or_else(|| unavailable("pool size is required"))?;
             precheck_init_fee(fee_per_op, size, &profile, name)?;
             let signer =
-                enrolled_keyring_signer(name, &profile, &profile.mcp_signer_default.account)
+                enrolled_keyring_signer(name, &profile, &profile.mcp_signer_default.account, None)
                     .await?;
             let seed = fresh_seed();
             let pending = PoolInitialization {
@@ -553,7 +553,7 @@ where
     )
     .await?;
     let signer =
-        enrolled_keyring_signer(name, &profile, &profile.mcp_signer_default.account).await?;
+        enrolled_keyring_signer(name, &profile, &profile.mcp_signer_default.account, None).await?;
     if signer.public_key().to_string().as_str() != pending.funder {
         return Err(unavailable(
             "the profile signer is not the recorded pool funder",
@@ -1187,6 +1187,7 @@ mod tests {
                 .as_str(),
         )
         .unwrap();
+        crate::common::identity_fixture::store_signer_identity_of_seed(NAME, &profile, FUNDER_SEED);
         KeyringEntry::new(
             &profile.audit_log_hash_chain_key_id.service,
             &profile.audit_log_hash_chain_key_id.account,
@@ -1511,6 +1512,9 @@ mod tests {
                         .as_str(),
                 )
                 .unwrap();
+                crate::common::identity_fixture::store_signer_identity_of_seed(
+                    &name, &profile, [0x91; 32],
+                );
             }
             if resumed {
                 KeyringEntry::new(&master.service, &master.account)

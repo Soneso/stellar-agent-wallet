@@ -273,6 +273,7 @@ impl WalletServer {
             &self.profile_name_for_approval(),
             &self.profile,
             account,
+            self.established_owner().as_ref(),
         )
         .await
         {
@@ -283,6 +284,7 @@ impl WalletServer {
                     stellar_agent_core::error::WalletError::Auth(
                         stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
                             | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. }
+                            | stellar_agent_core::error::AuthError::EnrolledIdentityUnusable { .. }
                     )
                 ) {
                     return Ok(crate::tools::common::business_error_result(
@@ -905,10 +907,29 @@ mod tests {
         }
     }
 
+    /// The call of every test below: a mainnet chain id over a placeholder
+    /// envelope, which the signer load refuses before any decode.
+    fn mainnet_submit_args() -> Sep43SignAndSubmitTransactionArgs {
+        Sep43SignAndSubmitTransactionArgs {
+            chain_id: "stellar:mainnet".into(),
+            transaction_xdr: "AAAAAQAA".into(),
+            network_passphrase: None,
+            address: None,
+        }
+    }
+
+    /// A testnet context over a mainnet profile passes the entry refusal,
+    /// which keys on the context, and reaches the enrolled-signer load, which
+    /// keys on the profile. Without a verified policy the server has no
+    /// established owner, so the identity check refuses before the seed is
+    /// read.
     #[tokio::test]
     #[serial_test::serial(keyring)]
-    async fn enrolled_signer_mismatch_survives_sep43_sign_and_submit_mapping() {
-        stellar_agent_test_support::keyring_mock::install().unwrap();
+    async fn a_mainnet_profile_without_an_established_owner_refuses_before_the_seed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use stellar_agent_core::profile::{
+            schema::signer_identity_entry_ref, signer_identity::SignerIdentityRecord,
+        };
         let dir = tempfile::tempdir().unwrap();
         let key = |seed: [u8; 32]| {
             stellar_strkey::ed25519::PublicKey(
@@ -931,35 +952,84 @@ mod tests {
         .audit_log_path(dir.path().join("audit.jsonl"))
         .with_noop_engine()
         .build();
+        let reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&reads);
+        stellar_agent_test_support::keyring_mock::install_with_read_hooks(vec![
+            stellar_agent_test_support::keyring_mock::ReadHook::new(
+                &profile.mcp_signer_default.service,
+                &pin,
+                std::sync::Arc::new(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }),
+            ),
+        ])
+        .unwrap();
         stellar_agent_network::keyring::rotate_keyring_secret_32(
             &profile.audit_log_hash_chain_key_id.service,
             &profile.audit_log_hash_chain_key_id.account,
         )
         .unwrap();
-        let secret = stellar_strkey::ed25519::PrivateKey([2; 32])
-            .as_unredacted()
-            .to_string()
-            .to_string();
         keyring_core::Entry::new(&profile.mcp_signer_default.service, &pin)
             .unwrap()
-            .set_password(&secret)
+            .set_password(
+                &stellar_strkey::ed25519::PrivateKey([1; 32])
+                    .as_unredacted()
+                    .to_string(),
+            )
             .unwrap();
+        stellar_agent_network::keyring::write_keyring_string(
+            &signer_identity_entry_ref(&profile.mcp_signer_default),
+            &SignerIdentityRecord::signed_for_test(
+                ed25519_dalek::SigningKey::from_bytes(&[1; 32])
+                    .verifying_key()
+                    .to_bytes(),
+                "sep43-enrolled",
+                &profile,
+                &ed25519_dalek::SigningKey::from_bytes(&[11; 32]),
+            )
+            .render()
+            .unwrap(),
+        )
+        .unwrap();
         let mut server = crate::server::WalletServer::new(profile).unwrap();
         server.policy_engine = std::sync::Arc::new(EnrolledAllowEngine);
-        // A testnet context over the mainnet profile passes the entry refusal,
-        // which keys on the context, and reaches the enrolled-signer check,
-        // which keys on the profile. The mapping it pins stays reachable.
         server.context = stellar_agent_network::NetworkContext::new(
             stellar_agent_core::profile::caip2::Caip2::Testnet,
             "https://rpc.example.invalid".into(),
         );
         let result = server
-            .call_stellar_sep43_sign_and_submit_transaction(Sep43SignAndSubmitTransactionArgs {
-                chain_id: "stellar:mainnet".into(),
-                transaction_xdr: "AAAAAQAA".into(),
-                network_passphrase: None,
-                address: None,
-            })
+            .call_stellar_sep43_sign_and_submit_transaction(mainnet_submit_args())
+            .await
+            .unwrap();
+        assert_eq!(result_code(&result), "auth.enrolled_identity_unusable");
+        let (_, message, _) = crate::tools::common::assert_business_envelope(&result);
+        assert!(message.contains("(owner_required)"), "{message}");
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "no seed read");
+    }
+
+    /// With a verified policy whose owner the identity record names, a seed
+    /// that derives to another key than the pin refuses with the enrolled
+    /// signer mismatch, and the tool reports that code as it is.
+    #[cfg(feature = "mainnet-write")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn enrolled_signer_mismatch_survives_sep43_sign_and_submit_mapping() {
+        use crate::tools::common::tests::mainnet::{Fixture, put};
+        let mut fixture = Fixture::new(|raw| raw);
+        put(
+            &fixture.server.profile.mcp_signer_default,
+            &stellar_strkey::ed25519::PrivateKey([2; 32])
+                .as_unredacted()
+                .to_string(),
+        );
+        fixture.server.policy_engine = std::sync::Arc::new(EnrolledAllowEngine);
+        fixture.server.context = stellar_agent_network::NetworkContext::new(
+            stellar_agent_core::profile::caip2::Caip2::Testnet,
+            "https://rpc.example.invalid".into(),
+        );
+        let result = fixture
+            .server
+            .call_stellar_sep43_sign_and_submit_transaction(mainnet_submit_args())
             .await
             .unwrap();
         assert_eq!(result_code(&result), "auth.enrolled_signer_mismatch");

@@ -65,6 +65,19 @@ async fn split_pay_approval_through_operator_cli() {
                 .as_ref(),
         )
         .unwrap();
+    stellar_agent_network::keyring::write_keyring_string(
+        &stellar_agent_core::profile::schema::signer_identity_entry_ref(
+            &profile.mcp_signer_default,
+        ),
+        &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+            signer.verifying_key().to_bytes(),
+            NAME,
+            profile.chain_id,
+        )
+        .render()
+        .unwrap(),
+    )
+    .unwrap();
     for (coordinate, bytes) in [
         (&profile.mcp_nonce_key_alias, [9; 32]),
         (&profile.attestation_key_id, [0x42; 32]),

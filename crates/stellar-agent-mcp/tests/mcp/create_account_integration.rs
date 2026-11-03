@@ -1526,6 +1526,7 @@ async fn create_account_commit_full_round_trip_succeeds_with_string_encoded_amou
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     // 10_000_000 XLM: comfortably covers the starting balance, base reserve, and fee.
@@ -1678,6 +1679,7 @@ async fn create_account_two_phase_round_trip_succeeds_under_satisfied_minimum_re
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     // 10_000_000 XLM: comfortably covers the starting balance, base reserve,
@@ -1946,6 +1948,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
@@ -2067,6 +2070,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
     let mock_server = MockServer::start().await;
     crate::common::require_rpc_credential(&mock_server).await;
     Mock::given(method("POST"))
@@ -2162,6 +2166,7 @@ async fn witness_create_case(amount: &str, mode: &str, expected: &str) {
         .unwrap()
         .set_password(&sstrkey_for_seed(seed))
         .unwrap();
+    crate::common::store_signer_identity("svc", &account, seed);
     let primary = MockServer::start().await;
     let oracle = MockServer::start().await;
     for (endpoint, sequence) in [

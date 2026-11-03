@@ -277,7 +277,7 @@ or `trustline.policy_engine_unavailable`.
 | `profile.enroll_signer_identity_incomplete` | Follow the reported repair or enrollment remedy. |
 | `enroll_signer.repair_unpinned` | Identity repair requires the stored public-key pin. |
 | `enroll_signer.identity_conflict` | The stored identity conflicts with the enrolled signer. |
-| `auth.enrolled_identity_unusable` | The enrolled identity cannot establish the signer proof. Ledger enrollment is unavailable. |
+| `auth.enrolled_identity_unusable` | `missing` means no record beside the seed, as an interrupted enrollment leaves it; `bound_elsewhere` means another profile or chain; `unbound` means no mainnet owner binding; `owner_required` means the mainnet check ran without an established owner; `owner_mismatch` means another owner; `binding_signature_invalid` means the owner signature does not verify. Use the original profile for a foreign binding. Run `stellar-agent profile enroll-signer --profile <NAME> --repair-identity` for a missing or malformed record, or `stellar-agent profile bind-signer --profile <NAME> --owner-secret-env <VAR>` with the established owner for an unbound signer or a rotated owner. Ledger enrollment is unavailable. |
 | `profile.reset_window_state_newer_version` | This build cannot reset an unsupported newer state format. |
 | `policy.window_state_unverifiable` | Enabled-mainnet state cannot be verified. Follow the operator recovery procedure. |
 | `profile.reset_window_state_open_authorizations` | Effective open authorizations prevent reset. |
@@ -607,9 +607,11 @@ the operator. A running MCP server applies a halt from its next call.
 | `auth.keyring_config_invalid` | The headless keyring store cannot be set up from the environment. `STELLAR_AGENT_KEYRING_BACKEND` names an unknown backend, or `STELLAR_AGENT_HEADLESS_KEYRING_KEY` is missing or malformed: base64 padding, the standard alphabet, or not 32 bytes. The backend may also be unsupported on the platform, or the state directory undeterminable. The message names the cause, never the key. | Not agent-recoverable. Report the message; the operator fixes the environment variable, for example by encoding the key as URL-safe base64 without padding (43 characters). |
 | `io.audit_writer_setup` | A smart-account verb could not load its profile file: the file is missing, unreadable, malformed, or of an unsupported schema version. A name mismatch, a non-overlayable field, the mainnet rules, and the endpoint rule keep their own codes. | Not agent-recoverable. Report the message; the operator corrects the profile file. An audit directory that cannot be created, or a writer lock another process holds, reports `audit.chain_key_unavailable` with the `audit.io_error` or `audit.writer_locked` detail instead. |
 
-A missing or empty **signer** keyring entry on a single-shot SEP-43 sign tool
-surfaces as `sep43.wallet_unlock_failed` under the standard envelope, not a
-`keyring.*` code. At the auth layer a missing keyring entry maps to
+The enrolled-signer loader reports `auth.enrolled_identity_unusable`
+(`missing`) when the **signer** identity record is absent. After the record
+passes validation, a missing or empty signer keyring entry on a single-shot
+SEP-43 sign tool surfaces as `sep43.wallet_unlock_failed` under the standard
+envelope, not a `keyring.*` code. At the auth layer a missing seed maps to
 `auth.keyring_not_found`. In every case the operator must enroll the secret for
 the active profile. An RPC credential entry reports `auth.keyring_not_found`
 with its `service/account`; the operator stores it with

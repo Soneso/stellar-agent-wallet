@@ -785,8 +785,9 @@ async fn property4c_expired_approval_entry_returns_approval_required() {
 /// `PaymentSimulated` entry, computes the HMAC blob the operator's `approve`
 /// surfaces, and asserts the commit proceeds *past* the attestation gate. The
 /// audit key is seeded and the nonce verifies, so the commit reaches the
-/// signer load, which refuses because no signer key is seeded. That refusal,
-/// three stages past the gate, is the proof the surfaced blob was accepted.
+/// signer load. The signer's identity record is stored and its seed is not,
+/// so the load refuses at the seed read. That refusal, three stages past the
+/// gate, is the proof the surfaced blob was accepted.
 #[tokio::test]
 #[serial]
 async fn valid_attestation_passes_gate() {
@@ -809,6 +810,7 @@ async fn valid_attestation_passes_gate() {
         .expect("Entry::new for attestation key")
         .set_password(&attestation_key_b64)
         .expect("set_password for attestation key");
+    crate::common::store_signer_identity("svc", "acct", [0x5c; 32]);
 
     let temp = TempDir::new().expect("TempDir::new");
     let mock = MockServer::start().await;

@@ -303,6 +303,17 @@ fn mainnet_oracle_required_refuses_a_payment_of_an_enabled_installation_without_
         PinMode::Advance,
     )
     .expect("the signed policy loads and pins");
+    home.run_ok(
+        &[
+            "profile",
+            "bind-signer",
+            "--profile",
+            PROFILE,
+            "--owner-secret-env",
+            "BIND_OWNER_SEED",
+        ],
+        &[("BIND_OWNER_SEED", owner.secret())],
+    );
     keyring_core::Entry::new(
         &mainnet_enablement_entry_ref(&profile.policy_window_state_key_id).service,
         &mainnet_enablement_entry_ref(&profile.policy_window_state_key_id).account,
@@ -335,6 +346,7 @@ fn mainnet_oracle_required_refuses_a_payment_of_an_enabled_installation_without_
         &profile,
         EnrolledRole::Agent,
         &signer_key,
+        &owner_key,
     )
     .expect("the signer is enrolled");
 

@@ -3541,11 +3541,12 @@ pub enum EventKind {
         public_address: Option<RedactedStrkey>,
     },
 
-    /// `profile enroll-signer` recorded the enrolled signer's identity record
-    /// beside its seed.
+    /// `profile enroll-signer` or `profile bind-signer` recorded the enrolled
+    /// signer's identity record beside its seed.
     ///
-    /// Emitted after the identity record write succeeds, on enrollment and on
-    /// `--repair-identity`. Records the coordinate of the identity record, the
+    /// Emitted after the identity record write succeeds: on enrollment, on
+    /// `--repair-identity`, and when `bind-signer` writes the owner binding
+    /// (tool `profile_bind_signer`). Records the coordinate of the identity record, the
     /// redacted public address it names, and its role, never the seed or any
     /// key material.
     ///

@@ -249,6 +249,7 @@ async fn exercise_approval_consumption(fail_once: bool) {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-consumed", seed);
     keyring_core::Entry::new("n-svc", "n-acct")
         .expect("Entry::new")
         .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xC1_u8; 32]))
@@ -503,6 +504,7 @@ async fn a_refused_commit_leaves_its_approval_untouched() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-rejected", seed);
     keyring_core::Entry::new("n-svc", "n-acct")
         .expect("Entry::new")
         .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xC5_u8; 32]))
@@ -679,6 +681,7 @@ async fn pay_commit_logs_a_queued_consent_row_before_the_signer_loads() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", ACCOUNT, seed);
     keyring_core::Entry::new("n-svc", "n-acct")
         .expect("Entry::new")
         .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xC2_u8; 32]))

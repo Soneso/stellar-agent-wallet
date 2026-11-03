@@ -993,6 +993,7 @@ async fn claim_commit_full_round_trip_succeeds_with_string_encoded_amount() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let id = test_balance_id();
     let cb_key_xdr = claim_key_xdr(&id);
@@ -1136,6 +1137,7 @@ async fn claim_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rul
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let id = test_balance_id();
     let cb_key_xdr = claim_key_xdr(&id);
@@ -1390,6 +1392,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let id = test_balance_id();
     let cb_key_xdr = claim_key_xdr(&id);
@@ -1498,6 +1501,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
     let id = test_balance_id();
     let mock_server = MockServer::start().await;
     crate::common::require_rpc_credential(&mock_server).await;
@@ -1635,6 +1639,7 @@ async fn claim_endpoint(seed: [u8; 32]) -> (MockServer, String) {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
     let id = test_balance_id();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1832,6 +1837,7 @@ async fn witness_claim_case(case: ClaimCase, expected: &str) {
         .unwrap()
         .set_password(&sstrkey_for_seed([0x74; 32]))
         .unwrap();
+    crate::common::store_signer_identity("svc", &account, [0x74; 32]);
     let id = test_balance_id();
     let entries = vec![
         (

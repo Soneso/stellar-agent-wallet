@@ -607,6 +607,52 @@ pub fn own_signer_account(prefix: &str) -> String {
     format!("{prefix}-{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Stores the identity record an enrollment writes beside the signer seed at
+/// (`service`, `account`): an owner-free testnet record for the agent key of
+/// `seed`, naming profile `account`, the name `Profile::builder_testnet`
+/// derives from its signer account.
+///
+/// # Panics
+///
+/// Panics if the record cannot be written.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub fn store_signer_identity(service: &str, account: &str, seed: [u8; 32]) {
+    store_named_signer_identity(account, service, account, seed);
+}
+
+/// [`store_signer_identity`] for a profile named `name`, as
+/// `Profile::builder_testnet_named` builds it.
+///
+/// # Panics
+///
+/// Panics if the record cannot be written.
+#[allow(
+    dead_code,
+    reason = "shared across integration-test binaries; unused in some"
+)]
+pub fn store_named_signer_identity(name: &str, service: &str, account: &str, seed: [u8; 32]) {
+    use stellar_agent_core::profile::{
+        caip2::Caip2,
+        schema::{KeyringEntryRef, signer_identity_entry_ref},
+        signer_identity::SignerIdentityRecord,
+    };
+    let record = SignerIdentityRecord::agent(
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes(),
+        name,
+        Caip2::Testnet,
+    );
+    stellar_agent_network::keyring::write_keyring_string(
+        &signer_identity_entry_ref(&KeyringEntryRef::new(service, account)),
+        &record.render().expect("an agent record renders"),
+    )
+    .expect("the identity record is written");
+}
+
 /// A testnet profile with the `Noop` engine under `account`, with the test
 /// audit key installed.
 ///

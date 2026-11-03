@@ -2849,18 +2849,22 @@ pub enum AuthError {
 
     /// The enrolled signer identity cannot serve as a mainnet signer: the
     /// stored profile disagrees with the loaded one, or the identity record
-    /// is absent, unreadable, or names another key or role.
+    /// is absent, unreadable, or names another key, role, profile, chain or owner.
     ///
     /// `reason` is one of `disk_disagreement`, `missing`, `malformed`,
     /// `unsupported_version`, `malformed_key`, `unsupported_role`,
-    /// `pin_mismatch`, `public_key_mismatch`, or `fee_source_mismatch`.
+    /// `pin_mismatch`, `public_key_mismatch`, `fee_source_mismatch`,
+    /// `bound_elsewhere`, `unbound`, `owner_required`, `owner_mismatch`, or
+    /// `binding_signature_invalid`.
     ///
     /// # Wire code
     ///
     /// `"auth.enrolled_identity_unusable"`.
     #[error(
-        "the enrolled signer identity of profile `{profile}` cannot be used ({reason}); run \
-         `stellar-agent profile enroll-signer --profile {profile} --repair-identity`"
+        "the enrolled signer identity of profile `{profile}` cannot be used ({reason}); \
+         run `stellar-agent profile enroll-signer --profile {profile} --repair-identity` \
+         for a missing or malformed record, or `stellar-agent profile bind-signer \
+         --profile {profile} --owner-secret-env <VAR>` for an unbound signer or a rotated owner"
     )]
     EnrolledIdentityUnusable {
         /// The selected profile name.

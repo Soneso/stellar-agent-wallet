@@ -318,6 +318,7 @@ async fn assert_approved_submission_audit(
                 .as_ref(),
         )
         .unwrap();
+    crate::common::store_signer_identity("svc", name, [0x61; 32]);
     let rpc = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(
@@ -1890,7 +1891,8 @@ async fn rule_create_pending_proposal_without_grant_queues_first_invoke_approval
 }
 
 /// A matching grant and valid attestation reach the signer load.
-/// The signer coordinate stays unseeded on purpose, so the call stops before RPC access.
+/// The signer's identity record is stored and its seed is not, so the call
+/// stops at the seed read before RPC access.
 #[tokio::test]
 #[serial]
 async fn rule_create_pending_proposal_with_grant_reaches_signer_load() {
@@ -1913,6 +1915,7 @@ async fn rule_create_pending_proposal_with_grant_reaches_signer_load() {
     profile.rpc_url = rpc.uri();
     crate::common::install_test_audit_key(&mut profile);
     seed_attestation_key(&profile, &key);
+    crate::common::store_signer_identity("svc", "acct", [0x61; 32]);
     let server = allow_server_for(
         profile,
         approval_dir.path(),
@@ -2036,6 +2039,12 @@ async fn rule_create_retry_after_a_failed_install_is_refused_as_consumed() {
                 .to_string(),
         )
         .expect("seed signer");
+    crate::common::store_named_signer_identity(
+        &stellar_agent_core::profile::name::profile_name_for_approval(&profile),
+        &profile.mcp_signer_default.service,
+        &signer_g,
+        seed,
+    );
     let server = allow_server_for(
         profile,
         approval_dir.path(),

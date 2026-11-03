@@ -99,6 +99,12 @@ window-state entry, and a mainnet profile that names another entry is refused.
 Raw deletion of the pin, enablement, and owner entry outside the wallet rests
 on the platform keyring.
 
+The identity record beside an enrolled signer's seed names the profile, chain
+and owner it serves, signed by that owner. On mainnet the wallet signs only
+for that profile under that owner, and message signing on any chain refuses
+a signer bound to another profile. Binding or rebinding a signer needs the
+owner's seed; the signer's own seed never proves its binding.
+
 Mainnet consent requires a fresh WebAuthn assertion with user presence and user
 verification from a credential in the owner-signed policy. The assertion binds the
 exact consent, request, profile, chain and policy. The wallet verifies it before

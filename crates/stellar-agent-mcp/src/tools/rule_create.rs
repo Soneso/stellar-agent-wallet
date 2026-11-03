@@ -1499,6 +1499,7 @@ impl WalletServer {
             &self.profile_name_for_approval(),
             &self.profile,
             &source_g,
+            self.established_owner().as_ref(),
         )
         .await
         {
@@ -2737,6 +2738,7 @@ mod tests {
             ),
         ])
         .unwrap();
+        crate::tools::identity_fixture::store_signer_identity_of_account(&profile);
         {
             use base64::Engine as _;
             let coord = &profile.audit_log_hash_chain_key_id;
@@ -2980,6 +2982,7 @@ mod tests {
                     .to_string(),
             )
             .unwrap();
+        crate::tools::identity_fixture::store_signer_identity(&profile, seed);
         {
             let coord = &profile.audit_log_hash_chain_key_id;
             keyring_core::Entry::new(&coord.service, &coord.account)

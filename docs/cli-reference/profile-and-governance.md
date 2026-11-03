@@ -22,7 +22,7 @@ The loader still applies the overlay classes on that read.
 | `profile.network_flag_mismatch` | `--network` differs from the loaded chain. Remove the flag or select a profile on that chain. |
 | `auth.enrolled_signer_unpinned` | Mainnet enrollment is a placeholder or malformed. Correct a malformed `mcp_signer_default.account`, then run `stellar-agent profile enroll-signer --profile <name>`. |
 | `auth.enrolled_signer_mismatch` | The derived key differs from the enrolled identity. Use the enrolled seed, Ledger account, or keyring entry. |
-| `auth.enrolled_identity_unusable` | The signer identity record beside the seed is missing or unreadable, names another key or role, or the stored profile's signer differs from the loaded one. Run `stellar-agent profile enroll-signer --profile <name> --repair-identity`. |
+| `auth.enrolled_identity_unusable` | The identity is missing, malformed, inconsistent with the pin or stored profile, or fails its binding. `missing` means no record beside the seed, as an interrupted enrollment leaves it; `bound_elsewhere` means another profile or chain; `unbound` means no mainnet owner binding; `owner_required` means the mainnet check ran without an established owner; `owner_mismatch` means another owner; `binding_signature_invalid` means the owner signature does not verify. Use the original profile for a foreign binding. Run `stellar-agent profile enroll-signer --profile <NAME> --repair-identity` for a missing or malformed record, or `stellar-agent profile bind-signer --profile <NAME> --owner-secret-env <VAR>` with the established owner for an unbound signer or a rotated owner. |
 | `profile.mainnet_requires_explicit_profile` | A mainnet profile was selected by the environment or the default source. Supply `--profile <name>`. |
 
 Unset the `STELLAR_AGENT_*` variable the refusal names. On every chain that covers `STELLAR_AGENT_CHAIN_ID`, `STELLAR_AGENT_AUDIT_LOG_PATH`, every `*_KEY_ID` variable, and every other key outside the overlay classes. On mainnet it also covers `STELLAR_AGENT_RPC_URL`, `STELLAR_AGENT_SECONDARY_RPC_URL`, `STELLAR_AGENT_ORACLE_PROVIDER_URL`, `STELLAR_AGENT_MCP_SIGNER_DEFAULT`, and the other testnet-only keys. Remove refused keys from programmatic overlays too, and set needed values in the profile file. Then run `stellar-agent profile show --profile <name>` to confirm the file's chain and endpoint. Correct the profile file if either value differs from the intended configuration.
@@ -31,9 +31,9 @@ Unset the `STELLAR_AGENT_*` variable the refusal names. On every chain that cove
 
 The `profile` group creates, lists, shows, and migrates profiles, rotates the keyring-backed keys a profile names, and halts and resumes a profile's agent actions. A profile is a per-environment TOML config (schema version 2) binding a CAIP-2 chain id, an RPC endpoint, keyring entry references, thresholds, and the active policy engine. Wallet keys stay in the keyring, and the profile only names their entries. An endpoint URL can still embed a credential.
 
-The eight key-writing commands (`enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and the five key-rotation subcommands) each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `enroll-signer` also writes a `signer_identity_enrolled` row, with the record's keyring coordinate, the redacted public address, and the role, after it writes the signer identity record; `enroll-signer --repair-identity` writes that row alone. `reset-window-state` writes the `keyring_key_written` row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
+The eight key-writing commands (`enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and the five key-rotation subcommands) each write a `keyring_key_written` audit row recording the key purpose and, where applicable, the redacted public address. `enroll-signer` also writes a `signer_identity_enrolled` row, with the record's keyring coordinate, the redacted public address, and the role, after it writes the signer identity record; `enroll-signer --repair-identity` writes that row alone. `bind-signer` writes it with tool `profile_bind_signer` when the owner signs a binding. `reset-window-state` writes the `keyring_key_written` row when the reset mints the window-state key on first use. `init` mints no key material and emits no audit row.
 
-`profile list` lists all profile names and takes no profile selector. Every other `profile` subcommand accepts `--profile <NAME>`. `enable-mainnet` requires an explicit nondefault mainnet profile. For `init`, `enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, `reset-window-state`, `reset-mpp-state`, `halt`, and `resume`, supply exactly one positional `<NAME>` or `--profile <NAME>`. These commands require an explicit selection. `reset-mpp-state` requires `--acknowledge`; the other profile verbs have no confirmation flag.
+`profile list` lists all profile names and takes no profile selector. Every other `profile` subcommand accepts `--profile <NAME>`. `enable-mainnet` requires an explicit nondefault mainnet profile. `bind-signer` requires `--profile <NAME>`. For `init`, `enroll-signer`, `enroll-owner-key`, `enroll-rpc-credential`, and `sign-policy` it is the only form and resolves in the order the index documents: the flag, then `STELLAR_AGENT_PROFILE`, then `"default"`. For `show`, `migrate`, the `rotate-*` subcommands, `reset-window-state`, `reset-mpp-state`, `halt`, and `resume`, supply exactly one positional `<NAME>` or `--profile <NAME>`. These commands require an explicit selection. `reset-mpp-state` requires `--acknowledge`; the other profile verbs have no confirmation flag.
 
 The name itself becomes a path component and is validated before any path is built: charset, length, no leading `-`, and no Windows reserved device name. The rules and the recovery path for a file that already carries a refused name are in [Profile names](../profiles.md#profile-names).
 
@@ -159,8 +159,10 @@ unset WALLET_SK
 
 Imports an operator-held ed25519 seed into the profile's `mcp_signer_default`
 keyring entry. MCP fund-movement tools and keyring-signing CLI verbs
-(`trustline`, `trade`, `vault`) resolve this signer. On a clean install that
-entry is absent, so those paths fail with `auth.keyring_not_found`.
+(`trustline`, `trade`, `vault`) resolve this signer. On a clean install those
+paths fail. The enrolled-signer loader reports `auth.enrolled_identity_unusable`
+(`missing`) when the identity record is absent. After the record passes
+validation, a missing seed reports `auth.keyring_not_found`.
 This command populates the entry and updates the profile TOML on first signer
 enrollment, without network access. It reads the seed from a named environment
 variable through the shared mlock-protected ceremony and stores it verbatim.
@@ -178,9 +180,9 @@ The coordinate's `account` field is the signer identity: `signer_from_keyring` v
 {"ok":true,"data":{"profile":"default","enrolled":true,"public_address":"G...","keyring_service":"stellar-agent-signer-default","keyring_account":"G...","replaced":false,"account_populated":true,"identity_keyring_account":"enrolled-identity"},"request_id":"..."}
 ```
 
-After the seed, enrollment writes the signer identity record `{"v":1,"public_key":"G...","role":"agent"}` at the same keyring service, account `enrolled-identity`. Mainnet authorization reads the enrolled key from this record, never from the seed. Success is reported only after the record is written. When that write fails, the seed and the pin stay as written and the command exits `1` with `profile.enroll_signer_identity_incomplete`, naming the repair below. A `--force` replacement removes the old record before it writes the seed. If the removal succeeds and the seed write fails, the command exits `1` with the same code and leaves the seed coordinate unchanged. A previous seed kept there can be repaired with the repair below when it derives to the pinned address, or replaced by a re-run with `--force`. With no previous seed, a plain re-run enrolls. When the removal finds no record, a failed seed write reports its keyring error code.
+After the seed, enrollment writes the signer identity record `{"v":2,"public_key":"G...","role":"agent","profile":"<name>","chain":"<CAIP-2>"}` at the same keyring service, account `enrolled-identity`. Mainnet authorization reads the enrolled key from this record, never from the seed. Success is reported only after the record is written. When that write fails, the seed and the pin stay as written and the command exits `1` with `profile.enroll_signer_identity_incomplete`, naming the repair below. Before any write, enrollment refuses a record bound to another profile or chain with `enroll_signer.identity_bound_elsewhere`, including with `--force`. Mainnet also requires the canonical signer service, otherwise `enroll_signer.coordinate_not_canonical`. An admitted `--force` replacement removes the identity record before it writes the seed. If the removal succeeds and the seed write fails, the command exits `1` with the same code and leaves the seed coordinate unchanged. A previous seed kept there can be repaired with the repair below when it derives to the pinned address, or replaced by a re-run with `--force`. With no previous seed, a plain re-run enrolls. When the removal finds no record, a failed seed write reports its keyring error code.
 
-`--repair-identity` writes the record for an existing enrollment. It loads the stored seed, requires it to derive to the pinned `mcp_signer_default.account`, and writes only the record; the seed and the profile file are never written. A record that already names the pinned key is left as it is, and the command reports `written: false`. A stored record that names another key, another role, or contains malformed data refuses with `enroll_signer.identity_conflict` and is left as it is; remove that entry, then run the repair again. A keyring read failure retains its keyring error code.
+`--repair-identity` writes the record for an existing enrollment. It loads the stored seed, requires it to derive to the pinned `mcp_signer_default.account`, and writes only the record; the seed and the profile file are never written. A v2 record that names this profile, chain and pinned key is left as it is, and the command reports `written: false`. A stored record that names another key, another role, or contains malformed data refuses with `enroll_signer.identity_conflict` and is left as it is; the repair writes nothing. Remove that entry, then run the repair again. A version 1 record refuses with `enroll_signer.identity_conflict`, because a seed cannot prove its owner. On testnet it needs a new enrollment with `--force`; on mainnet it needs `profile bind-signer`. A keyring read failure retains its keyring error code.
 
 ```bash
 stellar-agent profile enroll-signer --profile default --repair-identity
@@ -207,6 +209,45 @@ Mainnet requires the signer identity to be enrolled, including when a command
 selects `--secret-env` or Ledger. `profile enroll-signer` accepts `--secret-env`
 only. A Ledger key cannot be enrolled as the mainnet signer.
 `auth.enrolled_identity_unusable` identifies an unusable enrolled proof.
+
+### `profile bind-signer`
+
+```bash
+stellar-agent profile bind-signer --profile operator --owner-secret-env WALLET_OWNER_SK
+unset WALLET_OWNER_SK
+```
+
+Binds an enrolled mainnet signer to its profile, chain, seed coordinate and
+established owner. Both flags are required: `--profile <NAME>` selects the
+profile and `--owner-secret-env <VAR>` names the environment variable holding
+the owner's S-strkey. The owner signs the binding through the protected seed
+ceremony. The agent seed is never read. A valid binding to this owner stays
+unchanged and returns `bound: false`; a write returns `bound: true`.
+
+The signer service must be `stellar-agent-signer-<NAME>` and its account must
+pin a G-strkey. The record must name that key, and any v2 binding must name
+this profile and chain. The owner seed must match the policy pin's owner when
+a pin exists, otherwise the enrolled owner public key. A profile rename or
+copy cannot adopt the signer's binding.
+
+The five binding refusals are:
+
+- `profile.bind_signer_mainnet_required`: the profile is not mainnet.
+- `profile.bind_signer_coordinate_not_canonical`: the signer service is not canonical.
+- `profile.bind_signer_record_conflict`: the account is not a G-strkey pin, the record is absent or malformed, or it names another key, profile or chain.
+- `profile.bind_signer_owner_mismatch`: the owner seed differs from the established owner.
+- `profile.bind_signer_owner_is_signer`: the owner key equals the agent key.
+
+Seed-loading errors also refuse. A keyring failure keeps its `auth.keyring_*`
+code; a window-state lock, policy pin or owner-entry content failure refuses
+with `profile.bind_signer_storage`. After an owner rotation advances
+the policy pin through the verified rotation statement, run this verb with
+the new owner's seed to rebind. The old owner's seed refuses. The
+`signer_identity_enrolled` audit row uses tool `profile_bind_signer`.
+
+Mainnet setup runs `enroll-signer`, `enroll-owner-key`, `sign-policy`,
+`bind-signer`, then `enable-mainnet`. Existing mainnet enrollments need
+`bind-signer` once before signing or starting an enabled MCP server.
 
 ### `profile enroll-rpc-credential`
 

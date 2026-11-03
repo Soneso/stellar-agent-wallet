@@ -561,7 +561,14 @@ impl ResolverFixture {
         );
         put(
             &signer_identity_entry_ref(&profile.mcp_signer_default),
-            &SignerIdentityRecord::agent(public_key(SIGNER_SEED)).render(),
+            &SignerIdentityRecord::signed_for_test(
+                public_key(SIGNER_SEED),
+                "operator",
+                &profile,
+                &owner,
+            )
+            .render()
+            .unwrap(),
         );
         for key in [
             &profile.policy_window_state_key_id,
@@ -634,6 +641,7 @@ impl ResolverFixture {
             &profile,
             crate::keyring::EnrolledRole::Agent,
             &public_key(SIGNER_SEED),
+            &policy.owner(),
         )
         .unwrap();
         let context = crate::NetworkContext::mainnet_write(

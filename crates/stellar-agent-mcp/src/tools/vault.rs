@@ -544,6 +544,7 @@ impl WalletServer {
             &self.profile_name_for_approval(),
             &self.profile,
             expected_g_strkey,
+            self.established_owner().as_ref(),
         )
         .await
         {
@@ -1020,6 +1021,7 @@ impl WalletServer {
             &self.profile_name_for_approval(),
             &self.profile,
             expected_g_strkey,
+            self.established_owner().as_ref(),
         )
         .await
         {

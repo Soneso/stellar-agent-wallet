@@ -583,7 +583,9 @@ Write a v2 policy body for the profile, with `version = 2` and without a
 ceremony refuses a v1 or unsigned policy, because it pins the signed policy
 before it stores the installation nonce.
 
-Run `profile enable-mainnet --profile <NAME>` to bind this installation.
+Run `profile bind-signer --profile <NAME> --owner-secret-env <VAR>` with the
+policy owner's seed to bind the enrolled signer to this profile and owner.
+Then run `profile enable-mainnet --profile <NAME>` to bind this installation.
 Complete the [v2 policy body](profiles.md#mainnet-policy-body), including rules
 for each prepare and commit name. Run `profile sign-policy`, then
 `profile enable-mainnet --check`, and restart the MCP server.
@@ -598,8 +600,11 @@ configuration file. These versions are independent.
 
 The MCP fund-movement tools and the keyring-signing CLI verbs (`trustline`,
 `trade`, `vault`) resolve their signer from the profile's
-`mcp_signer_default` keyring entry. On a fresh install that entry is empty, so
-those paths fail with `auth.keyring_not_found` until you enroll a seed. Enrollment
+`mcp_signer_default` keyring entry. On a fresh install those paths fail until
+you enroll a seed. The enrolled-signer loader reports
+`auth.enrolled_identity_unusable` (`missing`) when the identity record is
+absent. After the record passes validation, a missing seed reports
+`auth.keyring_not_found`. Enrollment
 reads the `S...` secret from a named environment variable, derives its public
 address, and stores it in the platform keyring. The secret is never printed.
 These same three verbs also require the profile's audit chain-root key to be

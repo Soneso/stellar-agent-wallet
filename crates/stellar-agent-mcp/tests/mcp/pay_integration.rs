@@ -2308,6 +2308,7 @@ async fn pay_commit_full_round_trip_succeeds_with_string_encoded_amounts() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     // 10_000_000 XLM: comfortably covers the 100 XLM payment, base reserve, and fee.
@@ -2443,6 +2444,7 @@ async fn pay_two_phase_round_trip_succeeds_under_satisfied_minimum_reserve_rule(
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     // 10_000_000 XLM: comfortably covers the 100 XLM payment, base reserve,
@@ -2764,6 +2766,7 @@ async fn pay_two_phase_per_period_cap_second_call_denied_by_persisted_window() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     // 10_000_000 XLM: comfortably covers two 60 XLM payments, base reserve,
@@ -2906,6 +2909,7 @@ async fn pay_commit_refuses_with_audit_chain_key_unavailable_when_key_unminted()
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc-issue88-unminted", "acct-issue88-unminted", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
@@ -3084,6 +3088,7 @@ async fn pay_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_back() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc-anchor-rollback", "acct-anchor-rollback", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
@@ -3239,6 +3244,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
@@ -3555,6 +3561,7 @@ async fn a_timed_out_commit_records_the_submission_and_reports_the_hash() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-f2-timeout", seed);
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -3649,6 +3656,7 @@ async fn a_standing_reservation_denies_a_second_payment_under_the_cap() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-f2-cap", seed);
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -3702,6 +3710,7 @@ async fn a_rebuilt_envelope_at_the_same_sequence_is_refused() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-f2-dup", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
@@ -3770,6 +3779,7 @@ async fn a_submission_that_cannot_be_recorded_sends_nothing() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-f2-unwritable", seed);
 
     let mock_server = MockServer::start().await;
     let send_guard = Mock::given(method("POST"))
@@ -3968,6 +3978,7 @@ async fn transaction_status_confirms_a_timed_out_submission() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-f2-status", seed);
 
     let responder = PayReconcileRpcResponder::new(&source_g, 100_000_000_000_000, 41);
     let confirm = Arc::clone(&responder.confirm);
@@ -4078,6 +4089,7 @@ async fn transaction_status_releases_a_submission_the_chain_never_took() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-f2-release", seed);
 
     let responder = PayReconcileRpcResponder::new(&source_g, 100_000_000_000_000, 41);
     let advance = Arc::clone(&responder.advance_sequence);
@@ -4218,6 +4230,7 @@ async fn a_resend_after_a_lost_receipt_is_refused_and_the_original_settles_later
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct-lost-receipt", seed);
 
     let responder = PayReconcileRpcResponder::new(&source_g, 100_000_000_000_000, 41);
     let confirm = Arc::clone(&responder.confirm);
@@ -4445,6 +4458,7 @@ async fn pay_commit_refused_at_the_reservation_reports_the_gate_code_and_sends_n
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let account_key_xdr = account_ledger_key_xdr(&source_g);
     let account_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
@@ -4602,6 +4616,7 @@ async fn round_trip_endpoint(
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(
@@ -4864,6 +4879,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
     let mock_server = MockServer::start().await;
     crate::common::require_rpc_credential(&mock_server).await;
     Mock::given(method("POST"))
@@ -5193,6 +5209,7 @@ async fn witness_payment_case(
         .unwrap()
         .set_password(&sstrkey_for_seed(seed))
         .unwrap();
+    crate::common::store_signer_identity("svc", &account, seed);
     let mut entries = vec![(
         account_ledger_key_xdr(&source),
         account_entry_xdr_with_balance(&source, 100_000_000_000_000),
@@ -5400,6 +5417,7 @@ async fn pay_prepare_makes_no_oracle_request() {
         .unwrap()
         .set_password(&sstrkey_for_seed(seed))
         .unwrap();
+    crate::common::store_signer_identity("svc", &account, seed);
     let entries = vec![(
         account_ledger_key_xdr(&source),
         account_entry_xdr_with_balance(&source, 100_000_000_000_000),

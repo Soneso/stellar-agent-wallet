@@ -1469,15 +1469,23 @@ pub async fn signer_from_keyring(
 
 /// The profile's enrolled keyring signer; on mainnet the pin must be valid and the stored key must derive to it.
 ///
+/// The identity record beside the seed must serve this profile and chain,
+/// and on mainnet the established `owner`, before the seed is read: see
+/// [`read_and_check_signer_binding`]. Testnet callers pass `None`.
+///
 /// # Errors
-/// Refuses invalid enrollment, a different stored key, or a keyring load failure.
+/// Refuses invalid enrollment, an identity record that is absent or serves
+/// another profile, chain or owner (`auth.enrolled_identity_unusable`), a
+/// different stored key, or a keyring load failure.
 pub async fn enrolled_keyring_signer(
     profile_name: &str,
     profile: &stellar_agent_core::profile::Profile,
     expected_source_g: &str,
+    owner: Option<&[u8; 32]>,
 ) -> Result<KeyringSignHandle, WalletError> {
     use stellar_agent_core::profile::enrolled_signer_pin;
     let pin = enrolled_signer_pin(profile_name, profile)?;
+    read_and_check_signer_binding(profile_name, profile, owner)?;
     let result = signer_from_keyring(&profile.mcp_signer_default, expected_source_g).await;
     if let Some(enrolled) = pin {
         let derived = match &result {
@@ -1655,6 +1663,99 @@ fn identity_unusable(profile: &str, reason: &'static str) -> WalletError {
     })
 }
 
+/// Checks that an identity serves this profile, chain and established owner.
+///
+/// On mainnet the caller names the established owner; the record's own
+/// owner claim never stands in for it.
+///
+/// # Errors
+/// Returns `bound_elsewhere`, `unbound`, `owner_required`, `owner_mismatch`,
+/// or `binding_signature_invalid` for `auth.enrolled_identity_unusable`.
+pub fn check_signer_binding(
+    name: &str,
+    profile: &Profile,
+    record: &stellar_agent_core::profile::signer_identity::SignerIdentityRecord,
+    owner: Option<&[u8; 32]>,
+) -> Result<(), &'static str> {
+    if let Some(binding) = &record.binding
+        && (binding.profile != name || binding.chain != profile.chain_id)
+    {
+        return Err("bound_elsewhere");
+    }
+    if profile.chain_id.is_mainnet() {
+        let Some((bound_owner, _)) = record.binding.as_ref().and_then(|b| b.owner) else {
+            return Err("unbound");
+        };
+        let Some(owner) = owner else {
+            return Err("owner_required");
+        };
+        if *owner != bound_owner {
+            return Err("owner_mismatch");
+        }
+        record
+            .verify_owner_signature(&profile.mcp_signer_default)
+            .map_err(|_| "binding_signature_invalid")?;
+    } else if record.binding.is_none() {
+        tracing::warn!(target: "profile.signer_identity",
+            "the signer identity record of profile '{name}' names no profile; enroll the signer again to bind it");
+    }
+    Ok(())
+}
+
+/// The identity record stored beside the seed at `seed_ref`, parsed; `None`
+/// when no record is stored. The seed itself is never read.
+///
+/// # Errors
+/// Returns a classified keyring error, or `auth.enrolled_identity_unusable`
+/// with `unsupported_version`, `malformed_key`, `unsupported_role` or
+/// `malformed` for a record that does not parse.
+fn read_identity_record(
+    name: &str,
+    seed_ref: &KeyringEntryRef,
+) -> Result<Option<stellar_agent_core::profile::signer_identity::SignerIdentityRecord>, WalletError>
+{
+    use stellar_agent_core::profile::schema::signer_identity_entry_ref;
+    use stellar_agent_core::profile::signer_identity::{
+        SignerIdentityRecord, SignerIdentityRecordError,
+    };
+    let Some(raw) = read_keyring_string(&signer_identity_entry_ref(seed_ref))? else {
+        return Ok(None);
+    };
+    SignerIdentityRecord::parse(&raw)
+        .map(Some)
+        .map_err(|error| {
+            identity_unusable(
+                name,
+                match error {
+                    SignerIdentityRecordError::UnsupportedVersion(_) => "unsupported_version",
+                    SignerIdentityRecordError::MalformedKey => "malformed_key",
+                    SignerIdentityRecordError::UnsupportedRole => "unsupported_role",
+                    _ => "malformed",
+                },
+            )
+        })
+}
+
+/// Reads and checks the protected identity without reading the seed.
+///
+/// Every chain requires the record: a seed without one, as an interrupted
+/// enrollment leaves it, signs for no profile. `owner` is the established
+/// owner on mainnet and `None` on testnet.
+///
+/// # Errors
+/// Returns a classified keyring error or `auth.enrolled_identity_unusable`
+/// with `missing`, a parse reason, or a [`check_signer_binding`] reason.
+pub fn read_and_check_signer_binding(
+    name: &str,
+    profile: &Profile,
+    owner: Option<&[u8; 32]>,
+) -> Result<(), WalletError> {
+    let record = read_identity_record(name, &profile.mcp_signer_default)?
+        .ok_or_else(|| identity_unusable(name, "missing"))?;
+    check_signer_binding(name, profile, &record, owner)
+        .map_err(|reason| identity_unusable(name, reason))
+}
+
 /// Produces the enrolled signer of profile `name` for `role`, requiring its
 /// key to be `expected_key`.
 ///
@@ -1662,7 +1763,7 @@ fn identity_unusable(profile: &str, reason: &'static str) -> WalletError {
 /// `profiles_dir`, with no overlay, and requires it to equal the reference
 /// of `merged_profile` exactly. Its account must be a G-strkey pin. Then
 /// reads the identity record at the signer's service, account
-/// `enrolled-identity`, and requires it to be a version 1 agent record whose
+/// `enrolled-identity`, and requires it to be an owner-signed agent record whose
 /// public key is the pin's and `expected_key`. The seed coordinate is
 /// returned, never read. For [`EnrolledRole::FeePayer`], `expected_key` is the
 /// fee source a fee bump names, so the fee payer is the enrolled agent key.
@@ -1677,7 +1778,8 @@ fn identity_unusable(profile: &str, reason: &'static str) -> WalletError {
 /// - `auth.enrolled_identity_unusable` naming the rule the identity breaks:
 ///   `disk_disagreement`, `missing`, `malformed`, `unsupported_version`,
 ///   `malformed_key`, `unsupported_role`, `pin_mismatch`,
-///   `public_key_mismatch`, or `fee_source_mismatch`.
+///   `public_key_mismatch`, `fee_source_mismatch`, `bound_elsewhere`,
+///   `unbound`, `owner_mismatch`, or `binding_signature_invalid`.
 /// - The classified keyring error when the record cannot be read.
 pub fn enrolled_signer(
     name: &str,
@@ -1685,12 +1787,9 @@ pub fn enrolled_signer(
     merged_profile: &Profile,
     role: EnrolledRole,
     expected_key: &[u8; 32],
+    owner: &[u8; 32],
 ) -> Result<EnrolledSigner, WalletError> {
     use stellar_agent_core::profile::loader::{ProfileLoadError, read_signer_ref_on_disk};
-    use stellar_agent_core::profile::schema::signer_identity_entry_ref;
-    use stellar_agent_core::profile::signer_identity::{
-        SignerIdentityRecord, SignerIdentityRecordError,
-    };
 
     let stored = read_signer_ref_on_disk(name, profiles_dir).map_err(|error| match error {
         ProfileLoadError::NotFound { name, .. } => {
@@ -1719,20 +1818,10 @@ pub fn enrolled_signer(
             reason: "malformed",
         })
     })?;
-    let identity_ref = signer_identity_entry_ref(&stored);
-    let raw =
-        read_keyring_string(&identity_ref)?.ok_or_else(|| identity_unusable(name, "missing"))?;
-    let record = SignerIdentityRecord::parse(&raw).map_err(|error| {
-        identity_unusable(
-            name,
-            match error {
-                SignerIdentityRecordError::UnsupportedVersion(_) => "unsupported_version",
-                SignerIdentityRecordError::MalformedKey => "malformed_key",
-                SignerIdentityRecordError::UnsupportedRole => "unsupported_role",
-                _ => "malformed",
-            },
-        )
-    })?;
+    let record =
+        read_identity_record(name, &stored)?.ok_or_else(|| identity_unusable(name, "missing"))?;
+    check_signer_binding(name, merged_profile, &record, Some(owner))
+        .map_err(|reason| identity_unusable(name, reason))?;
     if record.public_key() != pin.0 {
         return Err(identity_unusable(name, "pin_mismatch"));
     }
@@ -2146,6 +2235,39 @@ mod tests {
         );
     }
 
+    /// Stores the identity record of `profile`'s signer for the agent key of
+    /// `seed`: owner-signed on mainnet, owner-free on testnet.
+    fn bind_identity(profile: &stellar_agent_core::profile::Profile, seed: [u8; 32]) {
+        use stellar_agent_core::profile::{
+            schema::signer_identity_entry_ref, signer_identity::SignerIdentityRecord,
+        };
+        let key = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let record = if profile.chain_id.is_mainnet() {
+            SignerIdentityRecord::signed_for_test(
+                key,
+                "enrolled",
+                profile,
+                &ed25519_dalek::SigningKey::from_bytes(&[11; 32]),
+            )
+        } else {
+            SignerIdentityRecord::agent(key, "enrolled", profile.chain_id)
+        };
+        write_keyring_string(
+            &signer_identity_entry_ref(&profile.mcp_signer_default),
+            &record.render().unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The owner [`bind_identity`] signs mainnet records with.
+    fn identity_owner() -> [u8; 32] {
+        ed25519_dalek::SigningKey::from_bytes(&[11; 32])
+            .verifying_key()
+            .to_bytes()
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn enrolled_mainnet_placeholder_refuses_before_store_read() {
@@ -2155,7 +2277,7 @@ mod tests {
         store_sstrkey(entry, &sstrkey_for_seed([1; 32]));
         keyring_mock::inject_error(&entry.service, &entry.account, keyring_core::Error::NoEntry)
             .unwrap();
-        let error = enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32]))
+        let error = enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32]), None)
             .await
             .err()
             .expect("refusal");
@@ -2176,7 +2298,7 @@ mod tests {
         store_sstrkey(entry, &sstrkey_for_seed([1; 32]));
         keyring_mock::inject_error(&entry.service, &entry.account, keyring_core::Error::NoEntry)
             .unwrap();
-        let error = enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32]))
+        let error = enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32]), None)
             .await
             .err()
             .expect("refusal");
@@ -2193,9 +2315,15 @@ mod tests {
     async fn enrolled_stored_b_expected_a() {
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
+        bind_identity(&profile, [1; 32]);
         store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([2; 32]));
-        let result =
-            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32])).await;
+        let result = enrolled_keyring_signer(
+            "enrolled",
+            &profile,
+            &gstrkey_for_seed([1; 32]),
+            Some(&identity_owner()),
+        )
+        .await;
         assert_eq!(
             result.err().expect("refusal").code(),
             "auth.enrolled_signer_mismatch"
@@ -2207,9 +2335,15 @@ mod tests {
     async fn enrolled_stored_b_expected_b() {
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
+        bind_identity(&profile, [1; 32]);
         store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([2; 32]));
-        let result =
-            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([2; 32])).await;
+        let result = enrolled_keyring_signer(
+            "enrolled",
+            &profile,
+            &gstrkey_for_seed([2; 32]),
+            Some(&identity_owner()),
+        )
+        .await;
         assert_eq!(
             result.err().expect("refusal").code(),
             "auth.enrolled_signer_mismatch"
@@ -2221,9 +2355,15 @@ mod tests {
     async fn enrolled_stored_a_expected_b() {
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
+        bind_identity(&profile, [1; 32]);
         store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([1; 32]));
-        let result =
-            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([2; 32])).await;
+        let result = enrolled_keyring_signer(
+            "enrolled",
+            &profile,
+            &gstrkey_for_seed([2; 32]),
+            Some(&identity_owner()),
+        )
+        .await;
         assert_eq!(
             result.err().expect("refusal").code(),
             "auth.signer_key_mismatch"
@@ -2235,9 +2375,15 @@ mod tests {
     async fn enrolled_stored_a_expected_a() {
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(true, &gstrkey_for_seed([1; 32]));
+        bind_identity(&profile, [1; 32]);
         store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([1; 32]));
-        let result =
-            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32])).await;
+        let result = enrolled_keyring_signer(
+            "enrolled",
+            &profile,
+            &gstrkey_for_seed([1; 32]),
+            Some(&identity_owner()),
+        )
+        .await;
         assert_eq!(
             result.expect("handle").public_key().to_string().to_string(),
             gstrkey_for_seed([1; 32])
@@ -2249,9 +2395,10 @@ mod tests {
     async fn enrolled_testnet_stored_a_expected_a() {
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(false, &gstrkey_for_seed([1; 32]));
+        bind_identity(&profile, [1; 32]);
         store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([1; 32]));
         let result =
-            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32])).await;
+            enrolled_keyring_signer("enrolled", &profile, &gstrkey_for_seed([1; 32]), None).await;
         assert_eq!(
             result.expect("handle").public_key().to_string().to_string(),
             gstrkey_for_seed([1; 32])
@@ -2263,13 +2410,14 @@ mod tests {
     async fn enrolled_testnet_placeholder_preserves_keyring_errors() {
         keyring_mock::install().unwrap();
         let profile = enrolled_profile(false, "default");
-        let result = enrolled_keyring_signer("enrolled", &profile, "default").await;
+        bind_identity(&profile, [1; 32]);
+        let result = enrolled_keyring_signer("enrolled", &profile, "default", None).await;
         assert_eq!(
             result.err().expect("absent key").code(),
             "auth.keyring_not_found"
         );
         store_sstrkey(&profile.mcp_signer_default, &sstrkey_for_seed([1; 32]));
-        let result = enrolled_keyring_signer("enrolled", &profile, "default").await;
+        let result = enrolled_keyring_signer("enrolled", &profile, "default", None).await;
         assert_eq!(
             result.err().expect("source mismatch").code(),
             "auth.signer_key_mismatch"
@@ -3477,7 +3625,14 @@ mod tests {
             role: EnrolledRole,
             expected: [u8; 32],
         ) -> Result<EnrolledSigner, WalletError> {
-            enrolled_signer("enrolled", dir.path(), profile, role, &expected)
+            enrolled_signer(
+                "enrolled",
+                dir.path(),
+                profile,
+                role,
+                &expected,
+                &owner().verifying_key().to_bytes(),
+            )
         }
 
         fn unusable(result: Result<EnrolledSigner, WalletError>) -> &'static str {
@@ -3489,8 +3644,223 @@ mod tests {
             }
         }
 
+        fn owner() -> ed25519_dalek::SigningKey {
+            ed25519_dalek::SigningKey::from_bytes(&[11; 32])
+        }
+        #[test]
+        #[serial_test::serial]
+        fn a_transplanted_signer_refuses_before_seed_access() {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[21; 32])
+                .verifying_key()
+                .to_bytes();
+            let address = stellar_strkey::ed25519::PublicKey(key)
+                .to_string()
+                .to_string();
+            let victim = Profile::builder_mainnet_named(
+                "v",
+                "https://rpc.example.invalid",
+                "stellar-agent-signer-v",
+                &address,
+                "stellar-agent-nonce-v",
+                "default",
+            )
+            .build();
+            let evil = Profile::builder_mainnet_named(
+                "evil",
+                "https://rpc.example.invalid",
+                "stellar-agent-signer-v",
+                &address,
+                "stellar-agent-nonce-evil",
+                "default",
+            )
+            .build();
+            SEED_READS.store(0, Ordering::SeqCst);
+            keyring_mock::install_with_read_hooks(vec![ReadHook::new(
+                &victim.mcp_signer_default.service,
+                &address,
+                std::sync::Arc::new(|| {
+                    SEED_READS.fetch_add(1, Ordering::SeqCst);
+                }),
+            )])
+            .unwrap();
+            let dir = TempDir::new().unwrap();
+            let profiles = dir.path().join("profiles");
+            save_to_dir("v", &victim, &profiles).unwrap();
+            save_to_dir("evil", &evil, &profiles).unwrap();
+            std::fs::rename(profiles.join("v.toml"), dir.path().join("v.toml")).unwrap();
+            write_keyring_string(
+                &victim.mcp_signer_default,
+                &stellar_strkey::ed25519::PrivateKey([21; 32])
+                    .as_unredacted()
+                    .to_string(),
+            )
+            .unwrap();
+            let record = SignerIdentityRecord::signed_for_test(key, "v", &victim, &owner());
+            write_keyring_string(
+                &signer_identity_entry_ref(&victim.mcp_signer_default),
+                &record.render().unwrap(),
+            )
+            .unwrap();
+            assert!(!profiles.join("v.toml").exists());
+            let findings = stellar_agent_core::profile::key_scope::key_scope_findings_in_dir(
+                &evil, "evil", &profiles,
+            );
+            assert!(findings.is_empty(), "{findings:?}");
+            let result = enrolled_signer(
+                "evil",
+                &profiles,
+                &evil,
+                EnrolledRole::Agent,
+                &key,
+                &ed25519_dalek::SigningKey::from_bytes(&[12; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            );
+            assert_eq!(unusable(result), "bound_elsewhere");
+            assert_eq!(SEED_READS.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn an_unbound_record_refuses_on_mainnet() {
+            let raw = format!(r#"{{"v":1,"public_key":"{}","role":"agent"}}"#, pin());
+            let (dir, profile) = stored(&pin(), Some(&raw));
+            assert_eq!(
+                unusable(produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY)),
+                "unbound"
+            );
+            let raw = SignerIdentityRecord::agent(PUBLIC_KEY, "enrolled", profile.chain_id)
+                .render()
+                .unwrap();
+            write_keyring_string(
+                &signer_identity_entry_ref(&profile.mcp_signer_default),
+                &raw,
+            )
+            .unwrap();
+            assert_eq!(
+                unusable(produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY)),
+                "unbound"
+            );
+            assert_eq!(SEED_READS.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn the_owner_must_match_and_sign() {
+            let (dir, profile) = stored(&pin(), Some(&agent_record()));
+            assert_eq!(
+                unusable(enrolled_signer(
+                    "enrolled",
+                    dir.path(),
+                    &profile,
+                    EnrolledRole::Agent,
+                    &PUBLIC_KEY,
+                    &[12; 32]
+                )),
+                "owner_mismatch"
+            );
+            let mut record = SignerIdentityRecord::parse(&agent_record()).unwrap();
+            record.binding.as_mut().unwrap().owner.as_mut().unwrap().1[0] ^= 1;
+            write_keyring_string(
+                &signer_identity_entry_ref(&profile.mcp_signer_default),
+                &record.render().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                unusable(produce(&dir, &profile, EnrolledRole::Agent, PUBLIC_KEY)),
+                "binding_signature_invalid"
+            );
+            assert_eq!(SEED_READS.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_mainnet_check_needs_the_established_owner() {
+            let profile = profile_with(&pin());
+            let record = SignerIdentityRecord::parse(&agent_record()).unwrap();
+            assert_eq!(
+                check_signer_binding("enrolled", &profile, &record, None),
+                Err("owner_required")
+            );
+            assert_eq!(
+                check_signer_binding(
+                    "enrolled",
+                    &profile,
+                    &record,
+                    Some(&owner().verifying_key().to_bytes())
+                ),
+                Ok(())
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn a_seed_without_its_record_signs_for_no_profile() {
+            let profile =
+                Profile::builder_testnet_named("enrolled", SERVICE, &pin(), "n", "a").build();
+            SEED_READS.store(0, Ordering::SeqCst);
+            keyring_mock::install_with_read_hooks(vec![ReadHook::new(
+                SERVICE,
+                &pin(),
+                std::sync::Arc::new(|| {
+                    SEED_READS.fetch_add(1, Ordering::SeqCst);
+                }),
+            )])
+            .unwrap();
+            write_keyring_string(
+                &profile.mcp_signer_default,
+                &stellar_strkey::ed25519::PrivateKey([0x21; 32])
+                    .as_unredacted()
+                    .to_string(),
+            )
+            .unwrap();
+            let result = enrolled_keyring_signer("enrolled", &profile, &pin(), None).await;
+            let Err(error) = result else {
+                panic!("a seed without its record produced a signer");
+            };
+            assert!(
+                matches!(
+                    &error,
+                    WalletError::Auth(AuthError::EnrolledIdentityUnusable {
+                        reason: "missing",
+                        ..
+                    })
+                ),
+                "{error:?}"
+            );
+            assert_eq!(SEED_READS.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn a_testnet_v1_record_warns_and_passes() {
+            let raw = format!(r#"{{"v":1,"public_key":"{}","role":"agent"}}"#, pin());
+            let record = SignerIdentityRecord::parse(&raw).unwrap();
+            let profile =
+                Profile::builder_testnet_named("enrolled", SERVICE, &pin(), "n", "a").build();
+            let logs = stellar_agent_test_support::with_captured_logs(|| {
+                assert_eq!(
+                    check_signer_binding("enrolled", &profile, &record, None),
+                    Ok(())
+                );
+            });
+            assert!(logs.contains("WARN"), "{logs}");
+            assert!(logs.contains("profile.signer_identity"), "{logs}");
+            assert!(
+                logs.contains("names no profile; enroll the signer again to bind it"),
+                "{logs}"
+            );
+        }
+
         fn agent_record() -> String {
-            SignerIdentityRecord::agent(PUBLIC_KEY).render()
+            SignerIdentityRecord::signed_for_test(
+                PUBLIC_KEY,
+                "enrolled",
+                &profile_with(&pin()),
+                &owner(),
+            )
+            .render()
+            .unwrap()
         }
 
         #[test]
@@ -3522,7 +3892,7 @@ mod tests {
                 (
                     "unsupported_version",
                     Some(format!(
-                        "{{\"v\":2,\"public_key\":\"{}\",\"role\":\"agent\"}}",
+                        "{{\"v\":3,\"public_key\":\"{}\",\"role\":\"agent\"}}",
                         pin()
                     )),
                 ),
@@ -3539,7 +3909,16 @@ mod tests {
                 ),
                 (
                     "pin_mismatch",
-                    Some(SignerIdentityRecord::agent([0x22; 32]).render()),
+                    Some(
+                        SignerIdentityRecord::signed_for_test(
+                            [0x22; 32],
+                            "enrolled",
+                            &profile_with(&pin()),
+                            &owner(),
+                        )
+                        .render()
+                        .unwrap(),
+                    ),
                 ),
             ];
             for (reason, record) in records {
@@ -3602,6 +3981,7 @@ mod tests {
                 &profile,
                 EnrolledRole::Agent,
                 &PUBLIC_KEY,
+                &owner().verifying_key().to_bytes(),
             )
             .unwrap_err();
             assert_eq!(missing.code(), "validation.profile_not_found");
