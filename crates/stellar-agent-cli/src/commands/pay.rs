@@ -52,8 +52,10 @@
 //! [`stellar_agent_core::wallet::Wallet::unlock`], and consumed by
 //! [`stellar_agent_network::signing::wallet::signer_from_wallet`].  The
 //! signer owns the wallet's stable seed home until drop, which zeroizes
-//! before unlocking and freeing it. Mainnet unlocks per signature; testnet
-//! retains the signer for the command, which can outlast the unlock TTL.
+//! before unlocking and freeing it. Testnet retains the signer for the
+//! command, which can outlast the unlock TTL. A mainnet profile refuses
+//! `--secret-env` before the write context and signs with the enrolled seed
+//! in the keyring.
 //!
 //! # mlock-protected signing window
 //!
@@ -163,7 +165,7 @@ use crate::commands::policy_engine::{
 };
 use crate::common::mainnet_write::{
     MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
-    require_v1_engine,
+    mainnet_write_build_refusal, require_v1_engine,
 };
 use crate::common::network::{
     EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity, mainnet_mode_refusal,
@@ -361,7 +363,8 @@ pub struct PayArgs {
     pub source: Option<String>,
 
     /// Name of the environment variable that holds the S-strkey secret key.
-    /// The value of the variable is never logged.
+    /// The value of the variable is never logged. Refused on a mainnet
+    /// profile, which signs with the enrolled seed in the keyring.
     #[arg(long, value_name = "VAR", group = "signer_group")]
     pub secret_env: Option<String>,
 
@@ -2094,12 +2097,14 @@ fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
 
 /// Runs the full pipeline on a mainnet profile.
 ///
-/// The stored profile of the explicit selection replaces the merged one at
-/// the write context, and every later step reads it from the context. The
-/// steps up to the witness are this verb's: the relayer gate, the engine
-/// kind, the asset and amount, the keyring, the checked client, the
-/// reconcile, the build, the verified policy with the built fee, the signed
-/// fee cap, the audit pre-flight and the bound witness.
+/// A build without mainnet writes refuses first. The signer choice from the
+/// flags follows and refuses `--secret-env` before anything else runs. The
+/// stored profile of the explicit selection replaces the merged one at the
+/// write context, and every later step reads it from the context. The steps
+/// up to the witness are this verb's: the relayer gate, the engine kind, the
+/// asset and amount, the keyring, the checked client, the reconcile, the
+/// build, the verified policy with the built fee, the signed fee cap, the
+/// audit pre-flight and the bound witness.
 /// [`authorize_and_submit`] runs the rest.
 async fn run_mainnet_pipeline<InitKeyring>(
     args: &PayArgs,
@@ -2113,6 +2118,20 @@ where
     let fail = |envelope: &Envelope<()>| {
         print_error(envelope, args.output);
         1
+    };
+    if let Some(e) = mainnet_write_build_refusal() {
+        return fail(&Envelope::<()>::err(&e));
+    }
+    // The signer comes from the flags alone, before the write context, the
+    // keyring and any request, so a refused `--secret-env` writes and sends
+    // nothing.
+    let signer = match MainnetSignerChoice::from_flags(
+        args.sign_with_ledger,
+        args.account_index,
+        args.secret_env.as_deref(),
+    ) {
+        Ok(signer) => signer,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
     let context = match mainnet_context(
         profile,
@@ -2280,15 +2299,6 @@ where
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
 
-    let signer = match MainnetSignerChoice::from_flags(
-        args.sign_with_ledger,
-        args.account_index,
-        args.secret_env.as_deref(),
-        "pay-commit",
-    ) {
-        Ok(signer) => signer,
-        Err(e) => return fail(&Envelope::<()>::err(&e)),
-    };
     match authorize_and_submit(MainnetWriteRequest {
         context: &context,
         profiles_dir: &profiles_dir,
@@ -5655,17 +5665,15 @@ mod tests {
 
         use crate::common::mainnet_presence::driver;
         use crate::common::mainnet_write::{
-            bound_recorders_on_this_thread, bound_request_ids_on_this_thread,
-            invalidations_on_this_thread,
+            bound_recorders_on_this_thread, invalidations_on_this_thread,
+            submission_kinds_on_this_thread,
         };
         use crate::common::mainnet_write_fixture::{
             AGENT_SEED, AGENT_VAR, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, Spec,
             install_ledger_double, minimum_reserve, open_authorizations_of, pay_rule,
             pay_rule_capped,
         };
-        use crate::common::signer_ceremony::{
-            env_signatures_on_this_thread, signer_resolutions_on_this_thread,
-        };
+        use crate::common::signer_ceremony::signer_resolutions_on_this_thread;
         use crate::test_rpc::{ACCOUNT_SEQUENCE, ClassicRpc, last_rendered};
 
         /// The native balance the mocked endpoints report for every account.
@@ -5676,7 +5684,8 @@ mod tests {
         const AMOUNT: i64 = 10_000_000;
 
         /// A 1 XLM payment from the agent to the allowlisted destination on
-        /// the fixture's profile, signed from [`AGENT_VAR`].
+        /// the fixture's profile, with no signer flag: a mainnet profile
+        /// signs with the enrolled seed in the keyring.
         pub(super) fn mainnet_args(fixture: &MainnetFixture) -> PayArgs {
             let mut args = minimal_args();
             args.profile = Some(fixture.name.to_owned());
@@ -5685,7 +5694,6 @@ mod tests {
             args.source = Some(fixture.agent.g.clone());
             args.destination = DESTINATION.to_owned();
             args.amount = "1 XLM".to_owned();
-            args.secret_env = Some(AGENT_VAR.to_owned());
             args
         }
 
@@ -5812,125 +5820,6 @@ mod tests {
             ClassicRpc::mainnet(&[&agent, DESTINATION, ISSUER])
         }
 
-        #[tokio::test(flavor = "current_thread")]
-        #[serial_test::serial]
-        async fn a_degraded_mainnet_env_signature_writes_the_mlock_row() {
-            use crate::common::signer_ceremony::{SignerCeremonyOutcome, set_env_ceremony_factory};
-            use stellar_agent_core::wallet::MlockDegradation;
-            for degraded in [true, false] {
-                // The audit writer registry is process-wide and keyed by
-                // profile name, so each fixture home needs its own name.
-                let name = if degraded {
-                    "mainnet-pay-mlock-degraded"
-                } else {
-                    "mainnet-pay-mlock-healthy"
-                };
-                let fixture = Spec::new(name).build().await;
-                let _factory = set_env_ceremony_factory(std::rc::Rc::new(move || {
-                    Ok(SignerCeremonyOutcome {
-                        signer: stellar_agent_network::SoftwareSigningKey::new_from_bytes(
-                            AGENT_SEED,
-                        ),
-                        mlock_degradation: degraded.then(|| MlockDegradation {
-                            reason: "test lock failure".to_owned(),
-                            errno: Some(12),
-                        }),
-                    })
-                }));
-                let run = run(&fixture, &memo_args(&fixture)).await;
-                assert_eq!(run.code, 0, "{}", run.envelope);
-                let rows: Vec<Value> = std::fs::read_to_string(&fixture.profile().audit_log_path)
-                    .unwrap()
-                    .lines()
-                    .map(|line| serde_json::from_str(line).unwrap())
-                    .collect();
-                let failures: Vec<_> = rows
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, row)| row["kind"] == "wallet_mlock_failed")
-                    .collect();
-                assert_eq!(failures.len(), usize::from(degraded));
-                if degraded {
-                    let (failure_index, failure) = failures[0];
-                    let submitted_index = rows
-                        .iter()
-                        .rposition(|row| row["kind"] == "value_action_submitted")
-                        .unwrap();
-                    assert!(failure_index > submitted_index);
-                    assert!(
-                        failure["request_id"]
-                            .as_str()
-                            .is_some_and(|id| !id.is_empty())
-                    );
-                    assert_eq!(failure["request_id"], rows[submitted_index]["request_id"]);
-                    assert_eq!(failure["reason"], "test lock failure");
-                    assert_eq!(failure["errno"], 12);
-                }
-            }
-        }
-
-        /// A degraded environment ceremony whose seed is not the enrolled
-        /// key: the attach refuses with the key mismatch, and the refusal
-        /// arm writes one `wallet_mlock_failed` row with the recorder's
-        /// request id. A healthy ceremony on the same arm writes none.
-        #[tokio::test(flavor = "current_thread")]
-        #[serial_test::serial]
-        async fn a_degraded_env_signer_refused_at_the_attach_writes_the_mlock_row() {
-            use crate::common::signer_ceremony::{SignerCeremonyOutcome, set_env_ceremony_factory};
-            use stellar_agent_core::wallet::MlockDegradation;
-            for degraded in [true, false] {
-                let name = if degraded {
-                    "mainnet-pay-mlock-attach-degraded"
-                } else {
-                    "mainnet-pay-mlock-attach-healthy"
-                };
-                let fixture = Spec::new(name).build().await;
-                let _factory = set_env_ceremony_factory(std::rc::Rc::new(move || {
-                    Ok(SignerCeremonyOutcome {
-                        signer: stellar_agent_network::SoftwareSigningKey::new_from_bytes(
-                            [0x5c; 32],
-                        ),
-                        mlock_degradation: degraded.then(|| MlockDegradation {
-                            reason: "test lock failure".to_owned(),
-                            errno: Some(12),
-                        }),
-                    })
-                }));
-                let invalidations_before = invalidations_on_this_thread().len();
-                let bound_before = bound_request_ids_on_this_thread().len();
-                let signatures_before = env_signatures_on_this_thread();
-
-                let run = run(&fixture, &memo_args(&fixture)).await;
-
-                assert_eq!(run.code, 1, "{}", run.envelope);
-                assert_eq!(run.code(), "auth.signer_key_mismatch", "{}", run.envelope);
-                assert_eq!(env_signatures_on_this_thread(), signatures_before);
-                assert_eq!(
-                    invalidations_on_this_thread()[invalidations_before..],
-                    [("sign_refused", Ok(()))]
-                );
-                assert!(fixture.sent_envelopes().await.is_empty());
-                let bound = bound_request_ids_on_this_thread();
-                assert_eq!(bound.len(), bound_before + 1, "one recorder is bound");
-                let request_id = &bound[bound_before];
-                let rows: Vec<Value> = std::fs::read_to_string(&fixture.profile().audit_log_path)
-                    .unwrap()
-                    .lines()
-                    .map(|line| serde_json::from_str(line).unwrap())
-                    .collect();
-                let failures: Vec<&Value> = rows
-                    .iter()
-                    .filter(|row| row["kind"] == "wallet_mlock_failed")
-                    .collect();
-                assert_eq!(failures.len(), usize::from(degraded), "{rows:?}");
-                if degraded {
-                    assert_eq!(failures[0]["request_id"], request_id.as_str());
-                    assert_eq!(failures[0]["reason"], "test lock failure");
-                    assert_eq!(failures[0]["errno"], 12);
-                }
-            }
-        }
-
         /// Accept: a payment with a memo below the threshold needs no
         /// witness. It is sent once, signed by the enrolled key over the
         /// mainnet payload, consumes its authorization, tombstones its
@@ -5998,7 +5887,6 @@ mod tests {
                 .build()
                 .await;
             let resolutions = signer_resolutions_on_this_thread();
-            let signatures = env_signatures_on_this_thread();
 
             let run = run(&fixture, &memo_args(&fixture)).await;
 
@@ -6012,7 +5900,6 @@ mod tests {
             assert!(fixture.primary_methods().await.is_empty());
             assert!(fixture.oracle_methods().await.is_empty());
             assert_eq!(signer_resolutions_on_this_thread(), resolutions);
-            assert_eq!(env_signatures_on_this_thread(), signatures);
             fixture.assert_no_consent_ceremony();
         }
 
@@ -6162,7 +6049,6 @@ mod tests {
             let fixture = Spec::new("mainnet-pay-ledger-unpinned").build().await;
             fixture.unpin_signer();
             let mut args = memo_args(&fixture);
-            args.secret_env = None;
             args.sign_with_ledger = true;
 
             let run = run(&fixture, &args).await;
@@ -6177,18 +6063,73 @@ mod tests {
             );
         }
 
-        /// Signer choice: no signer flag refuses before the confirmation.
+        /// Signer choice: no signer flag signs with the enrolled seed in the
+        /// keyring. With the agent's seed variable removed from the
+        /// environment, the payment is sent once, signed by the agent, so the
+        /// seed came from the keyring. The submit call receives the keyring
+        /// signer kind, and the run resolves one signer, the mainnet signer,
+        /// and runs no environment ceremony.
         #[tokio::test(flavor = "current_thread")]
         #[serial_test::serial]
-        async fn no_signer_flag_refuses_before_the_confirmation() {
-            let fixture = Spec::new("mainnet-pay-no-signer").build().await;
-            let mut args = memo_args(&fixture);
-            args.secret_env = None;
+        async fn a_mainnet_payment_without_a_signer_flag_signs_with_the_keyring() {
+            let fixture = Spec::new("mainnet-pay-keyring").build().await;
+            let args = memo_args(&fixture);
+            assert!(args.secret_env.is_none() && !args.sign_with_ledger);
+            fixture.remove_agent_seed_variable();
+            assert!(std::env::var_os(AGENT_VAR).is_none());
+            let resolutions = signer_resolutions_on_this_thread();
+            let kinds = submission_kinds_on_this_thread().len();
 
             let run = run(&fixture, &args).await;
 
-            assert_refused_before_confirmation(&fixture, &run, "validation.signer_source_required")
-                .await;
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1);
+            fixture.assert_signed_by_agent(&sent[0]);
+            assert_eq!(
+                submission_kinds_on_this_thread()[kinds..],
+                [stellar_agent_network::SubmissionSignerKind::Keyring]
+            );
+            assert_eq!(
+                signer_resolutions_on_this_thread(),
+                resolutions + 1,
+                "one mainnet signer and no environment ceremony"
+            );
+        }
+
+        /// Signer choice: `--secret-env` on a mainnet profile refuses with
+        /// `validation.mainnet_secret_env_refused` before anything else
+        /// runs, with the variable set: no request, no keyring
+        /// initialization, no seed read, no signer, no pending entry, no
+        /// authorization record and no audit row.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_secret_env_refuses_before_any_request() {
+            let fixture = Spec::new("mainnet-pay-secret-env").build().await;
+            assert!(
+                std::env::var_os(AGENT_VAR).is_some(),
+                "the seed is exported"
+            );
+            let mut args = memo_args(&fixture);
+            args.secret_env = Some(AGENT_VAR.to_owned());
+            let audit_rows = fixture.audit_row_count();
+            let resolutions = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &args).await;
+
+            assert_refused_before_confirmation(
+                &fixture,
+                &run,
+                "validation.mainnet_secret_env_refused",
+            )
+            .await;
+            assert!(!run.message().contains(AGENT_VAR), "{}", run.message());
+            assert!(fixture.primary_methods().await.is_empty());
+            assert!(fixture.oracle_methods().await.is_empty());
+            assert_eq!(fixture.initializer_calls(), 0);
+            assert_eq!(signer_resolutions_on_this_thread(), resolutions);
+            assert_eq!(fixture.audit_row_count(), audit_rows);
+            fixture.assert_no_consent_ceremony();
         }
 
         /// Asserts a confirmation refusal with `code`: one ceremony started,
@@ -6629,127 +6570,9 @@ mod tests {
             assert!(invalidations_on_this_thread().is_empty());
         }
 
-        /// Seed deferral: with the variable unset, the confirmation still
-        /// refuses first, so the seed is not read before it.
-        #[tokio::test(flavor = "current_thread")]
-        #[serial_test::serial]
-        async fn an_unset_seed_variable_is_not_read_before_the_confirmation() {
-            let mut fixture = Spec::new("mainnet-pay-seed-order").build().await;
-            fixture.present_with(|_| Err(WalletError::Approval(ApprovalFailure::PresenceCanceled)));
-            let mut args = memo_args(&fixture);
-            args.secret_env = Some("STELLAR_AGENT_MAINNET_FIXTURE_UNSET_SK".to_owned());
-            let before = signer_resolutions_on_this_thread();
-
-            let run = run(&fixture, &args).await;
-
-            assert_eq!(run.code(), "approval.presence_canceled", "{}", run.envelope);
-            assert_eq!(signer_resolutions_on_this_thread(), before);
-        }
-
-        /// Seed deferral: with the variable unset, the run reaches the
-        /// signing call, which refuses after the mint.
-        #[tokio::test(flavor = "current_thread")]
-        #[serial_test::serial]
-        async fn an_unset_seed_variable_refuses_at_the_signing_call() {
-            let fixture = Spec::new("mainnet-pay-seed-unset").build().await;
-            let mut args = memo_args(&fixture);
-            args.secret_env = Some("STELLAR_AGENT_MAINNET_FIXTURE_UNSET_SK".to_owned());
-
-            let run = run(&fixture, &args).await;
-
-            assert_eq!(
-                run.code(),
-                "validation.secret_env_not_set",
-                "{}",
-                run.envelope
-            );
-            assert!(
-                run.message()
-                    .ends_with(" The signature was withheld and nothing was sent.")
-            );
-            assert_invalidated("sign_refused", Ok(()));
-            assert!(fixture.sent_envelopes().await.is_empty());
-        }
-
-        /// Runs a payment whose seed variable holds `secret`.
-        async fn run_with_seed(name: &'static str, secret: &str) -> (MainnetFixture, Run) {
-            let fixture = Spec::new(name).build().await;
-            let var = "STELLAR_AGENT_MAINNET_FIXTURE_OTHER_SK";
-            #[allow(
-                unsafe_code,
-                reason = "test-only env mutation; serialised by #[serial]"
-            )]
-            // SAFETY: the test is #[serial]; no other thread reads the
-            // environment while it changes.
-            unsafe {
-                std::env::set_var(var, secret);
-            }
-            let mut args = memo_args(&fixture);
-            args.secret_env = Some(var.to_owned());
-            let run = run(&fixture, &args).await;
-            #[allow(unsafe_code, reason = "test-only env cleanup")]
-            // SAFETY: same as above.
-            unsafe {
-                std::env::remove_var(var);
-            }
-            (fixture, run)
-        }
-
-        /// Env seed: a value that is not a secret seed refuses at the signing
-        /// call.
-        #[tokio::test(flavor = "current_thread")]
-        #[serial_test::serial]
-        async fn an_invalid_seed_refuses_at_the_signing_call() {
-            let (fixture, run) = run_with_seed("mainnet-pay-seed-invalid", "not-a-seed").await;
-
-            assert_eq!(
-                run.code(),
-                "validation.secret_env_invalid",
-                "{}",
-                run.envelope
-            );
-            assert_invalidated("sign_refused", Ok(()));
-            assert!(fixture.sent_envelopes().await.is_empty());
-        }
-
-        /// Env seed: a public key in place of the seed refuses at the signing
-        /// call.
-        #[tokio::test(flavor = "current_thread")]
-        #[serial_test::serial]
-        async fn a_public_key_in_place_of_the_seed_refuses() {
-            let (fixture, run) = run_with_seed("mainnet-pay-seed-public", DESTINATION).await;
-
-            assert_eq!(
-                run.code(),
-                "validation.secret_env_invalid",
-                "{}",
-                run.envelope
-            );
-            assert_invalidated("sign_refused", Ok(()));
-            assert!(fixture.sent_envelopes().await.is_empty());
-        }
-
-        /// Env seed: the seed of another key refuses before it signs.
-        #[tokio::test(flavor = "current_thread")]
-        #[serial_test::serial]
-        async fn the_seed_of_another_key_refuses_before_it_signs() {
-            let other = stellar_strkey::ed25519::PrivateKey([0x5c; 32])
-                .as_unredacted()
-                .to_string()
-                .to_string();
-            let before = env_signatures_on_this_thread();
-            let (fixture, run) = run_with_seed("mainnet-pay-seed-other", &other).await;
-
-            assert_eq!(run.code(), "auth.signer_key_mismatch", "{}", run.envelope);
-            assert_eq!(env_signatures_on_this_thread(), before);
-            assert_invalidated("sign_refused", Ok(()));
-            assert!(fixture.sent_envelopes().await.is_empty());
-        }
-
         /// [`memo_args`] signing with the Ledger at index 0.
         fn ledger_args(fixture: &MainnetFixture) -> PayArgs {
             let mut args = memo_args(fixture);
-            args.secret_env = None;
             args.sign_with_ledger = true;
             args
         }
@@ -7331,6 +7154,7 @@ mod tests {
         fn testnet_args(fixture: &MainnetFixture) -> PayArgs {
             let mut args = memo_args(fixture);
             args.network = None;
+            args.secret_env = Some(AGENT_VAR.to_owned());
             args
         }
 

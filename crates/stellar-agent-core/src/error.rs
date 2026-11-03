@@ -1838,6 +1838,23 @@ pub enum ValidationError {
         detail: String,
     },
 
+    /// A mainnet signing verb was given `--secret-env`.
+    ///
+    /// Mainnet signing never reads a seed from the process environment: an
+    /// exported seed stays readable in the environment of the process and of
+    /// every process the shell starts for their whole life. The verb refuses
+    /// before the write context, any keyring read or any request. The message
+    /// names no variable.
+    ///
+    /// # Wire code
+    ///
+    /// `"validation.mainnet_secret_env_refused"`.
+    #[error(
+        "mainnet signing does not read a seed from the environment; omit --secret-env to \
+         sign with the enrolled seed in the keyring, or pass --sign-with-ledger"
+    )]
+    MainnetSecretEnvRefused,
+
     /// A mainnet profile sets no per-operation classic fee cap.
     ///
     /// A classic stage on a mainnet profile checks its per-operation fee
@@ -2152,6 +2169,7 @@ impl ValidationError {
             Self::SecretEnvNotSet { .. } => "validation.secret_env_not_set",
             Self::SecretEnvInvalid { .. } => "validation.secret_env_invalid",
             Self::SignerSourceRequired { .. } => "validation.signer_source_required",
+            Self::MainnetSecretEnvRefused => "validation.mainnet_secret_env_refused",
             Self::MainnetEnablementInvalid { .. } => "profile.mainnet_enablement_invalid",
             // Profile taxonomy code on a validation-class variant: see
             // `ProfileNameMismatch` above for the same rationale.
@@ -4058,6 +4076,10 @@ mod tests {
                 "validation.signer_source_required",
             ),
             (
+                ValidationError::MainnetSecretEnvRefused,
+                "validation.mainnet_secret_env_refused",
+            ),
+            (
                 ValidationError::MainnetFeeCapRequired,
                 "validation.mainnet_fee_cap_required",
             ),
@@ -4368,6 +4390,9 @@ mod tests {
                     ValidationError::SignerSourceRequired {
                         detail: detail.clone(),
                     }
+                }
+                ValidationError::MainnetSecretEnvRefused => {
+                    ValidationError::MainnetSecretEnvRefused
                 }
                 ValidationError::MainnetFeeCapRequired => ValidationError::MainnetFeeCapRequired,
                 ValidationError::FeeAboveCap {
@@ -5278,6 +5303,7 @@ mod tests {
                          or --sign-with-ledger"
                     .to_owned(),
             }),
+            WalletError::Validation(ValidationError::MainnetSecretEnvRefused),
         ];
         for err in &cases {
             let msg = err.message();

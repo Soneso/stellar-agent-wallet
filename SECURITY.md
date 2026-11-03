@@ -156,8 +156,15 @@ properties:
   The seed stays in a zeroize-on-drop page, locked when the lock succeeds, until
   its wallet or signer drops it. Drop zeroizes before unlocking and freeing,
   including during unwind.
-  Mainnet environment signers unlock once per signature and drop the seed afterward.
-  Testnet environment signers keep it for the command, which can outlast the TTL.
+  Testnet environment signers keep the seed for the command, which can outlast
+  the TTL.
+  An exported seed stays in the environment of the process and of every process
+  the shell starts, for their whole life; copying and dropping it inside the wallet
+  does not erase it. Mainnet signing refuses `--secret-env` and signs with the
+  enrolled seed in the keyring or with a Ledger. On Linux the CLI marks itself
+  non-dumpable before it starts any thread, so other processes of the same user
+  cannot read its memory or environment or attach to it; the shell that exported
+  the variable is not protected. On macOS and Windows the CLI sets no such flag.
   Keyring signers, the Ledger, and the MCP server never enter the window. A keyring
   signer loads its key for each signature into a zeroize-on-drop buffer without a
   memory lock.

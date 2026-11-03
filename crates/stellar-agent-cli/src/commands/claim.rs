@@ -64,7 +64,9 @@
 //! mlock-protected software signing ceremony via
 //! `resolve_software_signer_from_env`) or `--sign-with-ledger` (hardware
 //! signer; no seed ever in process memory). The public key derived from the
-//! signer is compared against `--source` before any signing.
+//! signer is compared against `--source` before any signing. On a mainnet
+//! profile `--secret-env` is refused and no signer flag signs with the
+//! enrolled seed in the keyring.
 //!
 //! # Operator policy evaluation
 //!
@@ -166,7 +168,7 @@ use crate::commands::policy_engine::{
 };
 use crate::common::mainnet_write::{
     MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
-    require_v1_engine,
+    mainnet_write_build_refusal, require_v1_engine,
 };
 use crate::common::network::{
     EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity, mainnet_mode_refusal,
@@ -350,7 +352,8 @@ pub struct ClaimArgs {
     pub fee: Option<String>,
 
     /// Name of the environment variable that holds the S-strkey secret key.
-    /// The value of the variable is never logged.
+    /// The value of the variable is never logged. Refused on a mainnet
+    /// profile, which signs with the enrolled seed in the keyring.
     #[arg(long, value_name = "VAR", group = "signer_group")]
     pub secret_env: Option<String>,
 
@@ -1806,12 +1809,14 @@ fn render_claim_table(
 
 /// Runs the full pipeline on a mainnet profile.
 ///
-/// The stored profile of the explicit selection replaces the merged one at
-/// the write context, and every later step reads it from the context. The
-/// claim builds before its reconcile, as on testnet, with the context's
-/// primary client; the probe runs inside the build. The verified policy with
-/// the built fee, the signed fee cap, the audit pre-flight and the bound
-/// witness follow, and [`authorize_and_submit`] runs the rest.
+/// A build without mainnet writes refuses first. The signer choice from the
+/// flags follows and refuses `--secret-env` before anything else runs. The
+/// stored profile of the explicit selection replaces the merged one at the
+/// write context, and every later step reads it from the context. The claim
+/// builds before its reconcile, as on testnet, with the context's primary
+/// client; the probe runs inside the build. The verified policy with the
+/// built fee, the signed fee cap, the audit pre-flight and the bound witness
+/// follow, and [`authorize_and_submit`] runs the rest.
 async fn run_mainnet_pipeline<InitKeyring>(
     args: &ClaimArgs,
     resolved: &ResolvedProfileName,
@@ -1821,6 +1826,20 @@ async fn run_mainnet_pipeline<InitKeyring>(
 where
     InitKeyring: Fn() -> Result<(), WalletError>,
 {
+    if let Some(e) = mainnet_write_build_refusal() {
+        return ClaimOutcome::failed(Envelope::<()>::err(&e));
+    }
+    // The signer comes from the flags alone, before the write context, the
+    // keyring and any request, so a refused `--secret-env` writes and sends
+    // nothing.
+    let signer = match MainnetSignerChoice::from_flags(
+        args.sign_with_ledger,
+        args.account_index,
+        args.secret_env.as_deref(),
+    ) {
+        Ok(signer) => signer,
+        Err(e) => return ClaimOutcome::failed(Envelope::<()>::err(&e)),
+    };
     let context = match mainnet_context(
         profile,
         resolved,
@@ -1951,15 +1970,6 @@ where
         Err(e) => return failed(Envelope::<()>::err(&e)),
     };
 
-    let signer = match MainnetSignerChoice::from_flags(
-        args.sign_with_ledger,
-        args.account_index,
-        args.secret_env.as_deref(),
-        "claim-commit",
-    ) {
-        Ok(signer) => signer,
-        Err(e) => return failed(Envelope::<()>::err(&e)),
-    };
     let timeout = Duration::from_secs(args.timeout_seconds);
     match authorize_and_submit(MainnetWriteRequest {
         context: &context,
@@ -4328,11 +4338,13 @@ mod tests {
 
         use crate::common::mainnet_write::{
             bound_recorders_on_this_thread, invalidations_on_this_thread,
+            submission_kinds_on_this_thread,
         };
         use crate::common::mainnet_write_fixture::{
             AGENT_SEED, AGENT_VAR, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, Spec,
             claim_rule, install_ledger_double, minimum_reserve, open_authorizations_of,
         };
+        use crate::common::signer_ceremony::signer_resolutions_on_this_thread;
         use crate::test_rpc::ClassicRpc;
 
         /// The native balance the mocked endpoints report for every account.
@@ -4365,8 +4377,9 @@ mod tests {
                 .oracle(ledger(true, 100_000_000))
         }
 
-        /// A claim of the agent's balance on the fixture's profile, signed
-        /// from [`AGENT_VAR`].
+        /// A claim of the agent's balance on the fixture's profile, with no
+        /// signer flag: a mainnet profile signs with the enrolled seed in the
+        /// keyring.
         pub(super) fn mainnet_args(fixture: &MainnetFixture) -> ClaimArgs {
             let mut args = minimal_args();
             args.profile = Some(fixture.name.to_owned());
@@ -4374,6 +4387,13 @@ mod tests {
             args.rpc_url = None;
             args.balance_id = CLAIM_RPC_BALANCE_HEX64.to_owned();
             args.source = fixture.agent.g.clone();
+            args
+        }
+
+        /// [`mainnet_args`] on a testnet profile, which signs from the seed
+        /// in [`AGENT_VAR`].
+        fn testnet_args(fixture: &MainnetFixture) -> ClaimArgs {
+            let mut args = mainnet_args(fixture);
             args.secret_env = Some(AGENT_VAR.to_owned());
             args
         }
@@ -4407,7 +4427,7 @@ mod tests {
             for (name, flags) in [("claim-browser-no-uv", 1), ("claim-browser-uv", 5)] {
                 let mut fixture = spec(name).build().await;
                 fixture.present_in_browser(flags);
-                let before = crate::common::signer_ceremony::signer_resolutions_on_this_thread();
+                let before = signer_resolutions_on_this_thread();
                 let result = run(&fixture, &mainnet_args(&fixture)).await;
                 if flags == 1 {
                     assert_eq!(
@@ -4419,10 +4439,7 @@ mod tests {
                     assert!(records(&fixture).is_empty());
                     assert!(fixture.sent_envelopes().await.is_empty());
                     assert!(fixture.audit_rows("approval_attested").is_empty());
-                    assert_eq!(
-                        crate::common::signer_ceremony::signer_resolutions_on_this_thread(),
-                        before
-                    );
+                    assert_eq!(signer_resolutions_on_this_thread(), before);
                 } else {
                     assert_eq!(result.code, 0, "{}", result.envelope);
                     assert_eq!(fixture.sent_envelopes().await.len(), 1);
@@ -4458,6 +4475,76 @@ mod tests {
                 "no confirmation entry"
             );
             assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+        }
+
+        /// Signer choice: `--secret-env` on a mainnet profile refuses with
+        /// `validation.mainnet_secret_env_refused` before anything else
+        /// runs, with the variable set: no request, no keyring
+        /// initialization, no seed read, no signer, no pending entry, no
+        /// authorization record and no audit row.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_secret_env_refuses_before_any_request() {
+            let fixture = spec("mainnet-claim-secret-env").build().await;
+            assert!(
+                std::env::var_os(AGENT_VAR).is_some(),
+                "the seed is exported"
+            );
+            let mut args = mainnet_args(&fixture);
+            args.secret_env = Some(AGENT_VAR.to_owned());
+            let audit_rows = fixture.audit_row_count();
+            let resolutions = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &args).await;
+
+            assert_refused_before_confirmation(
+                &fixture,
+                &run,
+                "validation.mainnet_secret_env_refused",
+            )
+            .await;
+            let message = run.envelope["error"]["message"].as_str().unwrap();
+            assert!(!message.contains(AGENT_VAR), "{message}");
+            assert!(fixture.primary_methods().await.is_empty());
+            assert!(fixture.oracle_methods().await.is_empty());
+            assert_eq!(fixture.initializer_calls(), 0);
+            assert_eq!(signer_resolutions_on_this_thread(), resolutions);
+            assert_eq!(fixture.audit_row_count(), audit_rows);
+            fixture.assert_no_consent_ceremony();
+        }
+
+        /// Signer choice: no signer flag signs with the enrolled seed in the
+        /// keyring. With the agent's seed variable removed from the
+        /// environment, the claim is sent once, signed by the agent, so the
+        /// seed came from the keyring. The submit call receives the keyring
+        /// signer kind, and the run resolves one signer, the mainnet signer,
+        /// and runs no environment ceremony.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_mainnet_claim_without_a_signer_flag_signs_with_the_keyring() {
+            let fixture = spec("mainnet-claim-keyring").build().await;
+            let args = mainnet_args(&fixture);
+            assert!(args.secret_env.is_none() && !args.sign_with_ledger);
+            fixture.remove_agent_seed_variable();
+            assert!(std::env::var_os(AGENT_VAR).is_none());
+            let resolutions = signer_resolutions_on_this_thread();
+            let kinds = submission_kinds_on_this_thread().len();
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1);
+            fixture.assert_signed_by_agent(&sent[0]);
+            assert_eq!(
+                submission_kinds_on_this_thread()[kinds..],
+                [stellar_agent_network::SubmissionSignerKind::Keyring]
+            );
+            assert_eq!(
+                signer_resolutions_on_this_thread(),
+                resolutions + 1,
+                "one mainnet signer and no environment ceremony"
+            );
         }
 
         /// Accept: the claim is witnessed through the routed oracle, sent
@@ -4605,7 +4692,6 @@ mod tests {
                 || Ok(()),
             );
             let mut args = mainnet_args(&fixture);
-            args.secret_env = None;
             args.sign_with_ledger = true;
 
             let run = run(&fixture, &args).await;
@@ -4708,7 +4794,6 @@ mod tests {
                 || Ok(()),
             );
             let mut args = mainnet_args(&fixture);
-            args.secret_env = None;
             args.sign_with_ledger = true;
 
             let run = run(&fixture, &args).await;
@@ -4772,7 +4857,7 @@ mod tests {
                 .build()
                 .await;
 
-            let run = run(&fixture, &mainnet_args(&fixture)).await;
+            let run = run(&fixture, &testnet_args(&fixture)).await;
 
             assert_eq!(
                 run.code(),
@@ -4798,7 +4883,6 @@ mod tests {
                 .await;
             let mut args = mainnet_args(&fixture);
             args.build_only = true;
-            args.secret_env = None;
 
             let run = run(&fixture, &args).await;
             assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");

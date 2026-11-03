@@ -47,9 +47,7 @@ use crate::commands::policy_engine::{MainnetEvaluation, MainnetPolicy, MainnetVe
 use crate::commands::submission_record::{error_envelope, prepare_mainnet_recorder};
 use crate::commands::value_audit::drain_consent_rows_before_signing;
 use crate::common::mainnet_confirm::{ConfirmDecision, MainnetWriteSummary, confirm_mainnet_write};
-use crate::common::signer_ceremony::{
-    MainnetSignerChoice, mainnet_signer, record_mlock_degradation,
-};
+use crate::common::signer_ceremony::{MainnetSignerChoice, mainnet_signer};
 
 /// The message of `network.mainnet_authorization_refused` when the signature
 /// was withheld.
@@ -82,6 +80,28 @@ pub(crate) fn mainnet_profiles_dir() -> Result<PathBuf, WalletError> {
             detail: format!("could not determine profile directory: {err}"),
         })
     })
+}
+
+/// The structural refusal of a build without mainnet writes.
+///
+/// A verb checks it before the signer choice, so such a build reports one
+/// code, `network.mainnet_write_forbidden`, for every mainnet run whatever
+/// signer flags it carries. A build with mainnet writes returns `None`.
+#[cfg(not(feature = "mainnet-write"))]
+pub(crate) fn mainnet_write_build_refusal() -> Option<WalletError> {
+    Some(WalletError::Network(
+        stellar_agent_core::error::NetworkError::MainnetWriteForbidden,
+    ))
+}
+
+/// The structural refusal of a build without mainnet writes.
+///
+/// A verb checks it before the signer choice, so such a build reports one
+/// code, `network.mainnet_write_forbidden`, for every mainnet run whatever
+/// signer flags it carries. A build with mainnet writes returns `None`.
+#[cfg(feature = "mainnet-write")]
+pub(crate) fn mainnet_write_build_refusal() -> Option<WalletError> {
+    None
 }
 
 /// Builds the mainnet write context of the explicitly selected stored
@@ -431,8 +451,6 @@ pub(crate) async fn authorize_and_submit(
     )
     .map_err(|e| refused(PipelineStep::RecorderPreparation, &e, "", verb, None))?;
 
-    let audit_writer = std::sync::Arc::clone(readiness.writer());
-    let request_id = prepared.request_id().to_owned();
     let window_store = PersistedWindowStore::for_profile(name);
     let auth = resolve_tx_sign(TxSignRequest {
         context,
@@ -466,9 +484,9 @@ pub(crate) async fn authorize_and_submit(
     };
 
     let recorder = prepared.bind_authorized(&auth);
-    record_bound_recorder(&recorder, &request_id);
+    record_bound_recorder(&recorder);
 
-    let signer = mainnet_signer(&choice, profile, &enrolled, source)
+    let signer = mainnet_signer(&choice, &enrolled, source)
         .await
         .map_err(|e| {
             refused(
@@ -488,7 +506,7 @@ pub(crate) async fn authorize_and_submit(
     )
     .await
     .map_err(|e| {
-        let refusal = refused(
+        refused(
             PipelineStep::Attach {
                 handle_failed: signer.handle_failed(),
             },
@@ -496,36 +514,24 @@ pub(crate) async fn authorize_and_submit(
             "",
             verb,
             Some(&minted),
-        );
-        record_mlock_degradation(
-            &audit_writer,
-            signer.mlock_degradation().as_ref(),
-            name,
-            &request_id,
-        );
-        refusal
+        )
     })?;
 
+    let signer_kind = choice.submission_kind();
+    record_submission_kind(signer_kind);
     let result = submit_authorized_transaction_and_wait(
         client,
         oracle.as_ref(),
         &signed_xdr,
         submit_timeout,
         context.network_passphrase(),
-        Some(choice.submission_kind()),
+        Some(signer_kind),
         &recorder,
         consumer,
         MainnetSubmitGrant::Tx(auth),
     )
-    .await;
-    // Audit appends can rotate the segment, so record only after submit returns.
-    record_mlock_degradation(
-        &audit_writer,
-        signer.mlock_degradation().as_ref(),
-        name,
-        &request_id,
-    );
-    let result = result.map_err(|e| {
+    .await
+    .map_err(|e| {
         refused(
             PipelineStep::Submit {
                 pre_send_entered: recorder.pre_send_entered(),
@@ -552,14 +558,14 @@ fn apply_test_routes(context: MainnetWriteContext) -> MainnetWriteContext {
 fn record_invalidation(_stage: InvalidationStage, _result: &Result<(), MainnetAuthorizationError>) {
 }
 
-/// Hands the bound recorder and its request id to the test seam; production
-/// does nothing.
+/// Hands the bound recorder to the test seam; production does nothing.
 #[cfg(not(test))]
-fn record_bound_recorder(
-    _recorder: &crate::commands::submission_record::StageMarkedRecorder<'_>,
-    _request_id: &str,
-) {
-}
+fn record_bound_recorder(_recorder: &crate::commands::submission_record::StageMarkedRecorder<'_>) {}
+
+/// Hands the signer kind the verb passes to the submit call to the test
+/// seam; production does nothing.
+#[cfg(not(test))]
+fn record_submission_kind(_kind: stellar_agent_network::SubmissionSignerKind) {}
 
 #[cfg(test)]
 thread_local! {
@@ -572,8 +578,8 @@ thread_local! {
     /// The `Debug` form of every recorder bound on this thread.
     static BOUND_RECORDERS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    /// The request id of every recorder bound on this thread.
-    static BOUND_REQUEST_IDS: std::cell::RefCell<Vec<String>> =
+    /// The signer kind every verb on this thread passed to the submit call.
+    static SUBMISSION_KINDS: std::cell::RefCell<Vec<stellar_agent_network::SubmissionSignerKind>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -616,10 +622,14 @@ pub(crate) fn bound_recorders_on_this_thread() -> Vec<String> {
     BOUND_RECORDERS.with(|recorded| recorded.borrow().clone())
 }
 
-/// The request ids of the recorders bound on this thread, oldest first.
+/// The signer kinds the verbs on this thread passed to the submit call,
+/// oldest first.
+///
+/// It records the argument before the submit runs, not a stored record.
 #[cfg(all(test, feature = "mainnet-write"))]
-pub(crate) fn bound_request_ids_on_this_thread() -> Vec<String> {
-    BOUND_REQUEST_IDS.with(|recorded| recorded.borrow().clone())
+pub(crate) fn submission_kinds_on_this_thread() -> Vec<stellar_agent_network::SubmissionSignerKind>
+{
+    SUBMISSION_KINDS.with(|recorded| recorded.borrow().clone())
 }
 
 /// Returns `context` with the test route map of this thread, when a test set
@@ -658,15 +668,17 @@ fn record_invalidation(stage: InvalidationStage, result: &Result<(), MainnetAuth
     INVALIDATIONS.with(|recorded| recorded.borrow_mut().push((label, result.clone())));
 }
 
-/// Appends the `Debug` form and the request id of the bound recorder to this
-/// thread's record.
+/// Appends the `Debug` form of the bound recorder to this thread's record.
 #[cfg(test)]
-fn record_bound_recorder(
-    recorder: &crate::commands::submission_record::StageMarkedRecorder<'_>,
-    request_id: &str,
-) {
+fn record_bound_recorder(recorder: &crate::commands::submission_record::StageMarkedRecorder<'_>) {
     BOUND_RECORDERS.with(|recorded| recorded.borrow_mut().push(format!("{recorder:?}")));
-    BOUND_REQUEST_IDS.with(|recorded| recorded.borrow_mut().push(request_id.to_owned()));
+}
+
+/// Records the signer kind the verb passes to the submit call for the test
+/// seam.
+#[cfg(test)]
+fn record_submission_kind(kind: stellar_agent_network::SubmissionSignerKind) {
+    SUBMISSION_KINDS.with(|recorded| recorded.borrow_mut().push(kind));
 }
 
 #[cfg(test)]
@@ -674,7 +686,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, reason = "test assertions")]
 
     use super::*;
-    use stellar_agent_core::error::{NetworkError, SubmissionError};
+    use stellar_agent_core::error::{AuthError, NetworkError, SubmissionError};
     use stellar_agent_core::policy::DenyReason;
     use stellar_agent_network::mainnet::MainnetPrecondition;
     use stellar_agent_test_support::WarningCapture;
@@ -769,20 +781,21 @@ mod tests {
     /// before the signature left and stays unchanged after signing.
     #[test]
     fn another_code_keeps_its_message() {
-        let err = WalletError::Validation(ValidationError::SecretEnvNotSet {
-            var: "AGENT_SK".to_owned(),
+        let err = WalletError::Auth(AuthError::SignerKeyMismatch {
+            expected: "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned(),
+            got: "GBPXXOA5N4JYPESHAADMQKBPWZWQDQ64ZV6ZL2S3LAGW4SY7NTCMWIVL".to_owned(),
         });
         let message = err.message();
         assert_eq!(
             rendered(&err, RenderStage::SignatureWithheld, ""),
             (
-                "validation.secret_env_not_set".to_owned(),
+                "auth.signer_key_mismatch".to_owned(),
                 format!("{message}. The signature was withheld and nothing was sent.")
             )
         );
         assert_eq!(
             rendered(&err, RenderStage::AfterSigning, "AAAA"),
-            ("validation.secret_env_not_set".to_owned(), message)
+            ("auth.signer_key_mismatch".to_owned(), message)
         );
     }
 

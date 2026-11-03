@@ -771,10 +771,9 @@ fn identifier_call(line: &str, needle: &str) -> bool {
 /// The testnet-shaped resolvers call `require_enrolled_signer` after
 /// selecting the signer. The mainnet ceremony is held to the key the
 /// enrolled proof read before the confirmation: `ledger_signer` opens the
-/// Ledger against the enrolled source, and the deferred environment signer's
-/// `ceremony` reads the seed for its only caller, `sign_tx_payload`, which
-/// compares the derived key with the enrolled one before it signs. Those two
-/// are the only resolvers without the call.
+/// Ledger against the enrolled source, and is the only resolver without the
+/// call. Mainnet reads no seed from the environment, so no mainnet resolver
+/// calls `resolve_software_signer_from_env`.
 #[test]
 fn every_seed_and_ledger_resolver_checks_enrollment() {
     use std::collections::BTreeSet;
@@ -817,16 +816,10 @@ fn every_seed_and_ledger_resolver_checks_enrollment() {
             }
         }
     }
-    let held_to_the_enrolled_proof = BTreeSet::from([
-        (
-            "common/signer_ceremony.rs".to_owned(),
-            "ledger_signer".to_owned(),
-        ),
-        (
-            "common/signer_ceremony.rs".to_owned(),
-            "ceremony".to_owned(),
-        ),
-    ]);
+    let held_to_the_enrolled_proof = BTreeSet::from([(
+        "common/signer_ceremony.rs".to_owned(),
+        "ledger_signer".to_owned(),
+    )]);
     assert!(
         checks.is_disjoint(&held_to_the_enrolled_proof),
         "the mainnet ceremony compares with the enrolled proof, not with a second fetch"
@@ -836,7 +829,7 @@ fn every_seed_and_ledger_resolver_checks_enrollment() {
         resolvers, expected,
         "each seed and Ledger resolver must check enrollment once after selecting the signer"
     );
-    assert_eq!(resolvers.len(), 8, "exact resolver inventory");
+    assert_eq!(resolvers.len(), 7, "exact resolver inventory");
 }
 
 #[test]

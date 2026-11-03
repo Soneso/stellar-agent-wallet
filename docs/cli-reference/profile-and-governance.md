@@ -205,9 +205,12 @@ Exits `1` on refusal:
 - `auth.signer_key_mismatch`: `--repair-identity` found a seed that does not derive to the pinned address.
 - A keyring error: the platform keyring is unavailable, or `--repair-identity` found no stored seed.
 
-Mainnet requires the signer identity to be enrolled, including when a command
-selects `--secret-env` or Ledger. `profile enroll-signer` accepts `--secret-env`
-only. A Ledger key cannot be enrolled as the mainnet signer.
+Mainnet requires the signer identity to be enrolled. Mainnet `pay`, `claim` and
+`accounts create` sign with the enrolled seed in the keyring when no signer flag
+is given and refuse `--secret-env`. `profile enroll-signer` accepts
+`--secret-env` only. It reads the seed to derive its public address and again
+to store it in the keyring; unset the variable afterward. A Ledger key cannot
+be enrolled as the mainnet signer.
 `auth.enrolled_identity_unusable` identifies an unusable enrolled proof.
 
 ### `profile bind-signer`

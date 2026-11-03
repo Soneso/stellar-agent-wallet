@@ -11,9 +11,16 @@
 //! 4. Borrow the seed into `Wallet::unlock`, which copies into a stable home
 //!    after the resolved profile's configured lock attempt.
 //! 5. Transfer that home into `SoftwareSigningKey` via `signer_from_wallet`.
-//!    The signer zeroizes before unlocking and freeing its home on drop.
-//!    Mainnet drops it after each signature; testnet keeps it for the command,
-//!    which can outlast the wallet's clock-checked unlock TTL.
+//!    The signer zeroizes before unlocking and freeing its home on drop. The
+//!    command keeps it for its run, which can outlast the wallet's
+//!    clock-checked unlock TTL.
+//!
+//! The ceremony erases the wallet's own copies only. The inherited process
+//! environment keeps the exported seed for the life of the process. Mainnet
+//! transaction signing refuses `--secret-env` through
+//! [`MainnetSignerChoice::from_flags`]. Testnet software signing and
+//! enrollment use this ceremony. Policy signing, signer binding and
+//! window-state resets read owner seeds through `commands::profile::owner_seed`.
 //!
 //! [`resolve_software_signer_from_env`] is the single call site for this
 //! ceremony. Every CLI verb that resolves a signer from an env var routes
@@ -28,8 +35,7 @@
 //! audit writer when it resolves the signer writes the `WalletMlockFailed`
 //! entry through [`record_mlock_degradation`]: the smart-account handler
 //! context, `execute`, `multicall`, the timelock verbs, and `accounts
-//! deploy-c` with `--profile`, and the mainnet write pipeline after submission
-//! or an attach refusal. Every other caller relies on the
+//! deploy-c` with `--profile`. Every other caller relies on the
 //! `tracing::warn!` that `Wallet::unlock` emits.
 //!
 //! # Enrolled signer identity
@@ -44,7 +50,7 @@ use std::sync::{Arc, Mutex};
 
 use stellar_agent_core::audit_log::entry::AuditEntry;
 use stellar_agent_core::audit_log::writer::AuditWriter;
-use stellar_agent_core::error::{AuthError, ValidationError, WalletError, WalletStateError};
+use stellar_agent_core::error::{ValidationError, WalletError, WalletStateError};
 use stellar_agent_core::profile::Profile;
 #[cfg(test)]
 use stellar_agent_core::wallet::{DEFAULT_TTL_SECONDS, MlockRequired};
@@ -77,17 +83,24 @@ pub(crate) struct SignerCeremonyOutcome {
 thread_local! {
     /// Calls to [`resolve_software_signer_from_env`] on this thread.
     static SIGNER_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Calls to [`mainnet_signer`] on this thread.
+    static MAINNET_SIGNERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// How many times [`resolve_software_signer_from_env`] ran on the calling
-/// thread.
+/// How many signer resolutions the calling thread attempted: the
+/// environment ceremonies of [`resolve_software_signer_from_env`] plus the
+/// mainnet signers [`mainnet_signer`] constructs.
+///
+/// An attempt counts when it starts, before it succeeds or fails. The lazy
+/// keyring signer of [`mainnet_signer`] opens its seed only at the
+/// signature, so a counted keyring resolution has read no seed yet.
 ///
 /// A command test on a current-thread runtime reads it before and after one
-/// command: an unchanged count proves the command refused before it loaded a
-/// signing key.
+/// command: an unchanged count proves the command refused before it resolved
+/// any signer, from the environment, the keyring or a Ledger.
 #[cfg(test)]
 pub(crate) fn signer_resolutions_on_this_thread() -> usize {
-    SIGNER_RESOLUTIONS.with(std::cell::Cell::get)
+    SIGNER_RESOLUTIONS.with(std::cell::Cell::get) + MAINNET_SIGNERS.with(std::cell::Cell::get)
 }
 
 /// Builds the Ledger signer in place of the device, for a test on this
@@ -101,8 +114,6 @@ thread_local! {
     /// The Ledger signer factory a test set on this thread.
     static LEDGER_SIGNER_FACTORY: std::cell::RefCell<Option<LedgerSignerFactory>> =
         const { std::cell::RefCell::new(None) };
-    /// Signatures the deferred env signer produced on this thread.
-    static ENV_SIGNATURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Restores the previous Ledger signer factory when dropped.
@@ -122,39 +133,6 @@ impl Drop for LedgerSignerFactoryGuard {
 #[cfg(all(test, feature = "mainnet-write"))]
 pub(crate) fn set_ledger_signer_factory(factory: LedgerSignerFactory) -> LedgerSignerFactoryGuard {
     LedgerSignerFactoryGuard(LEDGER_SIGNER_FACTORY.with(|slot| slot.replace(Some(factory))))
-}
-
-/// Supplies a deferred environment ceremony on the calling test thread.
-#[cfg(all(test, feature = "mainnet-write"))]
-pub(crate) type EnvCeremonyFactory =
-    std::rc::Rc<dyn Fn() -> Result<SignerCeremonyOutcome, WalletError>>;
-
-#[cfg(all(test, feature = "mainnet-write"))]
-thread_local! {
-    static ENV_CEREMONY_FACTORY: std::cell::RefCell<Option<EnvCeremonyFactory>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Restores the thread's ceremony factory on drop.
-#[cfg(all(test, feature = "mainnet-write"))]
-pub(crate) struct EnvCeremonyFactoryGuard(Option<EnvCeremonyFactory>);
-
-#[cfg(all(test, feature = "mainnet-write"))]
-impl Drop for EnvCeremonyFactoryGuard {
-    fn drop(&mut self) {
-        ENV_CEREMONY_FACTORY.with(|slot| *slot.borrow_mut() = self.0.take());
-    }
-}
-
-/// Override the deferred environment ceremony until the returned guard drops.
-#[cfg(all(test, feature = "mainnet-write"))]
-pub(crate) fn set_env_ceremony_factory(factory: EnvCeremonyFactory) -> EnvCeremonyFactoryGuard {
-    EnvCeremonyFactoryGuard(ENV_CEREMONY_FACTORY.with(|slot| slot.replace(Some(factory))))
-}
-
-/// How many signatures [`DeferredEnvSigner`] produced on the calling thread.
-#[cfg(all(test, feature = "mainnet-write"))]
-pub(crate) fn env_signatures_on_this_thread() -> usize {
-    ENV_SIGNATURES.with(std::cell::Cell::get)
 }
 
 /// Derives a software signer using the loaded profile's wallet controls.
@@ -322,43 +300,36 @@ pub(crate) enum MainnetSignerChoice {
         /// The BIP-44 account index.
         account_index: u32,
     },
-    /// The seed in the environment variable `var_name`, read at signing.
-    Env {
-        /// The environment variable holding the S-strkey.
-        var_name: String,
-        /// The wallet label the seed is unlocked under, the one the verb's
-        /// testnet signing passes.
-        label: &'static str,
-    },
     /// The profile's enrolled agent seed in the keyring, read at signing.
     Keyring,
 }
 
 impl MainnetSignerChoice {
-    /// The choice of a verb that takes `--sign-with-ledger` first and
-    /// `--secret-env` second, as its testnet signing does; an environment
-    /// seed is unlocked under `env_label`.
+    /// The mainnet signer of a verb that takes `--sign-with-ledger` and
+    /// `--secret-env`, chosen from the flags alone:
+    ///
+    /// - `--sign-with-ledger` selects the Ledger at `account_index`, also
+    ///   when `--secret-env` is given beside it.
+    /// - `--secret-env` without `--sign-with-ledger` is refused: mainnet
+    ///   signing never reads a seed from the process environment, which
+    ///   keeps an exported seed for the life of the process.
+    /// - No signer flag selects the profile's enrolled seed in the keyring.
+    ///
+    /// The variable named by `secret_env` is never read.
     ///
     /// # Errors
     ///
-    /// `validation.signer_source_required` when neither flag is given.
+    /// `validation.mainnet_secret_env_refused` when `secret_env` is given
+    /// without `sign_with_ledger`.
     pub(crate) fn from_flags(
         sign_with_ledger: bool,
         account_index: u32,
         secret_env: Option<&str>,
-        env_label: &'static str,
     ) -> Result<Self, WalletError> {
         match (sign_with_ledger, secret_env) {
             (true, _) => Ok(Self::Ledger { account_index }),
-            (false, Some(var_name)) => Ok(Self::Env {
-                var_name: var_name.to_owned(),
-                label: env_label,
-            }),
-            (false, None) => Err(ValidationError::SignerSourceRequired {
-                detail: "no signer flag specified; pass --secret-env <VAR> or --sign-with-ledger"
-                    .to_owned(),
-            }
-            .into()),
+            (false, Some(_)) => Err(ValidationError::MainnetSecretEnvRefused.into()),
+            (false, None) => Ok(Self::Keyring),
         }
     }
 
@@ -367,7 +338,6 @@ impl MainnetSignerChoice {
     pub(crate) fn submission_kind(&self) -> stellar_agent_network::SubmissionSignerKind {
         match self {
             Self::Ledger { .. } => stellar_agent_network::SubmissionSignerKind::Hardware,
-            Self::Env { .. } => stellar_agent_network::SubmissionSignerKind::Software,
             Self::Keyring => stellar_agent_network::SubmissionSignerKind::Keyring,
         }
     }
@@ -378,72 +348,50 @@ impl MainnetSignerChoice {
 /// `handle_failure` is set for the keyring choice only: it records whether
 /// the lazy keyring handle returned an error from a signing call, the one
 /// refusal of the authorized attach that means the signer was unavailable.
-pub(crate) struct MainnetSigner<'a> {
-    signer: Box<dyn Signer + Send + Sync + 'a>,
+pub(crate) struct MainnetSigner {
+    signer: Box<dyn Signer + Send + Sync>,
     handle_failure: Option<Arc<AtomicBool>>,
-    mlock_degradation: Option<Arc<Mutex<Option<MlockDegradation>>>>,
 }
 
-impl<'a> MainnetSigner<'a> {
+impl MainnetSigner {
     /// The signer the authorized attach signs with.
     #[must_use]
-    pub(crate) fn signer(&self) -> &(dyn Signer + Send + Sync + 'a) {
+    pub(crate) fn signer(&self) -> &(dyn Signer + Send + Sync) {
         self.signer.as_ref()
     }
 
-    /// Whether the keyring handle returned an error; `false` for the Ledger
-    /// and the environment seed.
+    /// Whether the keyring handle returned an error; `false` for the Ledger.
     #[must_use]
     pub(crate) fn handle_failed(&self) -> bool {
         self.handle_failure
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::SeqCst))
     }
-
-    /// The environment ceremony's tolerated lock failure, if any.
-    pub(crate) fn mlock_degradation(&self) -> Option<MlockDegradation> {
-        self.mlock_degradation.as_ref().and_then(|value| {
-            value
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone()
-        })
-    }
 }
 
 /// Constructs the signer `choice` names for the enrolled agent `enrolled`.
 ///
 /// Runs after the authorization is minted. The Ledger is opened here and its
-/// key compared with `source`. The environment seed and the keyring seed are
-/// not read here: each is read inside the signing call, after the authorized
-/// attach checked the authorization.
+/// key compared with `source`. The keyring seed is not read here: it is read
+/// inside the signing call, after the authorized attach checked the
+/// authorization.
 ///
 /// # Errors
 ///
 /// The device errors and `auth.signer_key_mismatch` for the Ledger, and the
 /// refusal of [`lazy_signer_from_keyring`] for the keyring.
-pub(crate) async fn mainnet_signer<'a>(
+pub(crate) async fn mainnet_signer(
     choice: &MainnetSignerChoice,
-    profile: &'a Profile,
     enrolled: &EnrolledSigner,
     source: &str,
-) -> Result<MainnetSigner<'a>, WalletError> {
+) -> Result<MainnetSigner, WalletError> {
+    #[cfg(test)]
+    MAINNET_SIGNERS.with(|count| count.set(count.get() + 1));
     match choice {
         MainnetSignerChoice::Ledger { account_index } => Ok(MainnetSigner {
             signer: ledger_signer(*account_index, source).await?,
             handle_failure: None,
-            mlock_degradation: None,
         }),
-        MainnetSignerChoice::Env { var_name, label } => {
-            let signer =
-                DeferredEnvSigner::new(var_name.clone(), label, profile, enrolled.public_key());
-            let mlock_degradation = Arc::clone(&signer.mlock_degradation);
-            Ok(MainnetSigner {
-                signer: Box::new(signer),
-                handle_failure: None,
-                mlock_degradation: Some(mlock_degradation),
-            })
-        }
         MainnetSignerChoice::Keyring => {
             let handle = lazy_signer_from_keyring(enrolled.seed_entry(), source)?;
             let failed = Arc::new(AtomicBool::new(false));
@@ -453,7 +401,6 @@ pub(crate) async fn mainnet_signer<'a>(
                     failed: Arc::clone(&failed),
                 }),
                 handle_failure: Some(failed),
-                mlock_degradation: None,
             })
         }
     }
@@ -469,123 +416,6 @@ async fn ledger_signer(
         return factory(account_index, source);
     }
     Ok(Box::new(signer_from_ledger(account_index, source).await?))
-}
-
-/// A software signer whose seed is read from the environment inside the
-/// transaction signing call.
-///
-/// Its public key is the enrolled one, so the authorized attach compares the
-/// authorization's signer with the enrolled key before any seed is read. The
-/// signing call derives the key from the seed and refuses a seed of any
-/// other key before it signs.
-pub(crate) struct DeferredEnvSigner<'a> {
-    var_name: String,
-    label: &'static str,
-    profile: &'a Profile,
-    expected: [u8; 32],
-    mlock_degradation: Arc<Mutex<Option<MlockDegradation>>>,
-}
-
-impl<'a> DeferredEnvSigner<'a> {
-    /// A signer that reads `var_name` under the wallet `label` and the
-    /// `[wallet]` controls of `profile`, and signs only as `expected`.
-    #[must_use]
-    pub(crate) fn new(
-        var_name: String,
-        label: &'static str,
-        profile: &'a Profile,
-        expected: [u8; 32],
-    ) -> Self {
-        Self {
-            var_name,
-            label,
-            profile,
-            expected,
-            mlock_degradation: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    fn refused(requested_primitive: &'static str) -> WalletError {
-        WalletError::Auth(AuthError::SignerKindMismatch {
-            signer_kind: "env-seed",
-            requested_primitive,
-        })
-    }
-
-    /// Runs the environment ceremony for one signature.
-    async fn ceremony(&self) -> Result<SignerCeremonyOutcome, WalletError> {
-        #[cfg(all(test, feature = "mainnet-write"))]
-        if let Some(factory) = ENV_CEREMONY_FACTORY.with(|slot| slot.borrow().clone()) {
-            return factory();
-        }
-        resolve_software_signer_from_env(&self.var_name, self.label, self.profile).await
-    }
-}
-
-#[async_trait::async_trait]
-impl Signer for DeferredEnvSigner<'_> {
-    async fn sign_tx_payload(&self, payload: &TxSigningPayload) -> Result<[u8; 64], WalletError> {
-        let SignerCeremonyOutcome {
-            signer,
-            mlock_degradation,
-        } = self.ceremony().await?;
-        // The first degraded ceremony stays recorded: a later healthy
-        // signature does not clear the record of an unprotected one.
-        {
-            let mut recorded = self
-                .mlock_degradation
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if recorded.is_none() {
-                *recorded = mlock_degradation;
-            }
-        }
-        let derived = signer.public_key().await?;
-        if derived.0 != self.expected {
-            return Err(AuthError::SignerKeyMismatch {
-                expected: stellar_strkey::ed25519::PublicKey(self.expected)
-                    .to_string()
-                    .to_string(),
-                got: derived.to_string().to_string(),
-            }
-            .into());
-        }
-        #[cfg(test)]
-        ENV_SIGNATURES.with(|count| count.set(count.get() + 1));
-        signer.sign_tx_payload(payload).await
-    }
-
-    async fn sign_auth_digest(
-        &self,
-        _digest: &SmartAccountAuthDigest,
-    ) -> Result<[u8; 64], WalletError> {
-        Err(Self::refused("sign_auth_digest"))
-    }
-
-    async fn sign_soroban_address_auth_payload(
-        &self,
-        _payload: &SorobanAuthPayload,
-    ) -> Result<[u8; 64], WalletError> {
-        Err(Self::refused("sign_soroban_address_auth_payload"))
-    }
-
-    /// The environment ceremony signs transactions only; a message is
-    /// refused before any seed is read.
-    async fn sign_message(&self, _payload: &MessagePayload) -> Result<[u8; 64], WalletError> {
-        Err(Self::refused("sign_message"))
-    }
-
-    async fn sign_webauthn_assertion(
-        &self,
-        _auth_digest: &SmartAccountAuthDigest,
-        _credential_id: &[u8],
-    ) -> Result<WebAuthnAssertion, WalletError> {
-        Err(Self::refused("sign_webauthn_assertion"))
-    }
-
-    async fn public_key(&self) -> Result<stellar_strkey::ed25519::PublicKey, WalletError> {
-        Ok(stellar_strkey::ed25519::PublicKey(self.expected))
-    }
 }
 
 /// The lazy keyring handle of the enrolled agent seed, recording whether a
@@ -927,30 +757,6 @@ mod tests {
         .unwrap()
     }
 
-    /// The environment signer refuses a message before it reads its
-    /// variable: the refusal names the message primitive, not a missing
-    /// variable.
-    #[tokio::test]
-    async fn deferred_env_signer_refuses_a_message_before_the_ceremony() {
-        let profile = test_profile();
-        let deferred =
-            DeferredEnvSigner::new(unique_var("MESSAGE_UNSET"), "test", &profile, [0x42; 32]);
-        let err = deferred
-            .sign_message(&MessagePayload::sep53(b"not a transaction"))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                WalletError::Auth(AuthError::SignerKindMismatch {
-                    signer_kind: "env-seed",
-                    requested_primitive: "sign_message",
-                })
-            ),
-            "{err:?}"
-        );
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial]
     #[allow(
@@ -1149,90 +955,28 @@ mod tests {
         assert!(result.is_err(), "TTL above MAX_TTL_SECONDS must be refused");
     }
 
-    #[cfg(feature = "mainnet-write")]
-    #[tokio::test]
-    async fn deferred_env_signer_reports_its_degradation() {
-        for degraded in [true, false] {
-            let _factory = set_env_ceremony_factory(std::rc::Rc::new(move || {
-                Ok(SignerCeremonyOutcome {
-                    signer: SoftwareSigningKey::new_from_bytes([42; 32]),
-                    mlock_degradation: degraded.then(|| MlockDegradation {
-                        reason: "test lock failure".to_owned(),
-                        errno: Some(12),
-                    }),
-                })
-            }));
-            let profile = test_profile();
-            let expected = ed25519_dalek::SigningKey::from_bytes(&[42; 32])
-                .verifying_key()
-                .to_bytes();
-            let deferred =
-                DeferredEnvSigner::new("TEST_ENV".to_owned(), "test", &profile, expected);
-            let degradation = Arc::clone(&deferred.mlock_degradation);
-            let signer = MainnetSigner {
-                signer: Box::new(deferred),
-                handle_failure: None,
-                mlock_degradation: Some(degradation),
-            };
-            assert!(signer.mlock_degradation().is_none());
-            signer
-                .signer()
-                .sign_tx_payload(&tx_payload(7))
-                .await
-                .unwrap();
-            let observed = signer.mlock_degradation();
-            assert_eq!(observed.is_some(), degraded);
-            if let Some(observed) = observed {
-                assert_eq!(observed.reason, "test lock failure");
-                assert_eq!(observed.errno, Some(12));
-            }
-        }
-    }
+    // ── MainnetSignerChoice::from_flags ─────────────────────────────────────
 
-    /// A healthy signature after a degraded one keeps the degraded record.
-    #[cfg(feature = "mainnet-write")]
-    #[tokio::test]
-    async fn a_later_healthy_signature_keeps_the_first_degradation() {
-        let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
-        let factory_calls = std::rc::Rc::clone(&calls);
-        let _factory = set_env_ceremony_factory(std::rc::Rc::new(move || {
-            let call = factory_calls.get();
-            factory_calls.set(call + 1);
-            Ok(SignerCeremonyOutcome {
-                signer: SoftwareSigningKey::new_from_bytes([42; 32]),
-                mlock_degradation: (call == 0).then(|| MlockDegradation {
-                    reason: "first lock failure".to_owned(),
-                    errno: Some(12),
-                }),
-            })
-        }));
-        let profile = test_profile();
-        let expected = ed25519_dalek::SigningKey::from_bytes(&[42; 32])
-            .verifying_key()
-            .to_bytes();
-        let deferred = DeferredEnvSigner::new("TEST_ENV".to_owned(), "test", &profile, expected);
-        let degradation = Arc::clone(&deferred.mlock_degradation);
-        let signer = MainnetSigner {
-            signer: Box::new(deferred),
-            handle_failure: None,
-            mlock_degradation: Some(degradation),
-        };
-        signer
-            .signer()
-            .sign_tx_payload(&tx_payload(7))
-            .await
-            .unwrap();
-        signer
-            .signer()
-            .sign_tx_payload(&tx_payload(8))
-            .await
-            .unwrap();
-        assert_eq!(calls.get(), 2, "each signature runs its own ceremony");
-        let observed = signer
-            .mlock_degradation()
-            .expect("the degraded first signature stays recorded");
-        assert_eq!(observed.reason, "first lock failure");
-        assert_eq!(observed.errno, Some(12));
+    /// `--secret-env` alone is refused without reading the variable, no
+    /// signer flag selects the enrolled keyring seed, and `--sign-with-ledger`
+    /// selects the Ledger even beside `--secret-env`.
+    #[test]
+    fn mainnet_choice_maps_the_three_flag_cases() {
+        let refused = MainnetSignerChoice::from_flags(false, 0, Some("PROBE_SEED_VAR"))
+            .expect_err("an environment seed is refused on mainnet");
+        assert_eq!(refused.code(), "validation.mainnet_secret_env_refused");
+        assert!(
+            !refused.message().contains("PROBE_SEED_VAR"),
+            "the refusal names no variable: {refused}"
+        );
+        assert_eq!(
+            MainnetSignerChoice::from_flags(false, 0, None).expect("no flag is the keyring"),
+            MainnetSignerChoice::Keyring
+        );
+        assert_eq!(
+            MainnetSignerChoice::from_flags(true, 3, Some("X")).expect("the Ledger is chosen"),
+            MainnetSignerChoice::Ledger { account_index: 3 }
+        );
     }
 
     // ── mlock-degradation detection ─────────────────────────────────────────

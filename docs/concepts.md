@@ -68,7 +68,8 @@ When a CLI command signs with a seed read from a `--*-secret-env` variable, the 
 - The wallet allocates a zeroed, isolated home, attempts the configured memory lock, then copies the borrowed seed into it. A successful lock keeps the page out of swap.
 - The clock bounds wallet seed access and transfer to the unlock window. The default is 30 seconds; `wallet.unlock_ttl_seconds` accepts 1 to 600 seconds and refuses other values.
 - The seed stays in a zeroize-on-drop page, locked when the lock succeeds, until its wallet or signer drops it. Drop zeroizes before unlocking and freeing, including on errors and panic unwind.
-- Mainnet environment signers unlock once per signature and drop the seed afterward. Testnet environment signers keep it for the command, which can outlast the TTL.
+- Testnet environment signers keep the seed for the command, which can outlast the TTL.
+- An exported seed stays in the environment of the process and of every process the shell starts, for their whole life; copying and dropping it inside the wallet does not erase it. Mainnet signing refuses `--secret-env` and signs with the enrolled seed in the keyring or with a Ledger. On Linux the CLI marks itself non-dumpable before it starts any thread, so other processes of the same user cannot read its memory or environment or attach to it; the shell that exported the variable is not protected. On macOS and Windows the CLI sets no such flag.
 
 The `mlock_required` posture in `[wallet]` controls what happens when pinning fails. The value `true` (default on Linux/macOS) fails closed and aborts the unlock; `"warn"` (default on Windows) proceeds with unprotected memory and emits a warning; `false` proceeds silently, with the operator accepting the swap-disclosure risk. The posture is set in the profile file and is not overlayable. No path logs the seed.
 

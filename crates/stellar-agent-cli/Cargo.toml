@@ -113,6 +113,11 @@ tempfile = { workspace = true }
 # (profile/enroll_rpc_credential.rs).
 rpassword = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Raw prctl(2) that marks the CLI process non-dumpable before its async runtime
+# starts (process_hardening.rs).
+libc = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 # The current-user-only directory that holds the private browser redirect file
 # (common/private_open.rs).

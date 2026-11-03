@@ -16,8 +16,12 @@ For the concepts referenced below (profiles, the policy engine, the approval spi
 Only full-mode `pay`, `claim`, sponsored `accounts create`, and `trustline`
 enter the authorized mainnet pipeline. Staged modes remain excluded.
 [Confirmation and setup](index.md#mainnet-write-behavior) apply to every action.
-Ledger and `--secret-env` signers require an enrolled identity. Enrollment takes
-`--secret-env` only, so a Ledger key cannot be enrolled for mainnet.
+On a mainnet profile `pay`, `claim` and `accounts create` refuse `--secret-env`
+with `validation.mainnet_secret_env_refused` before the write context, any
+keyring read or any request, and without a signer flag they sign with the
+enrolled seed in the keyring. A Ledger signer requires an enrolled identity.
+Enrollment takes `--secret-env` only, so a Ledger key cannot be enrolled for
+mainnet.
 
 The four full-mode verbs include numeric `total_fee_stroops`, equal to unsigned
 `tx.fee`, in policy arguments on both networks. `pay --build-only` and
@@ -90,7 +94,7 @@ Argument groups (enforced by the parser):
 | `--profile <NAME>` | Profile supplying the chain and endpoints for either funding mode | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--sponsor <G_STRKEY>` | Sponsor/source account for the `CreateAccount` op | one of the mode group | none |
 | `--starting-balance <AMOUNT>` | Starting balance with explicit units, e.g. `"5 XLM"` (bare numbers rejected) | sponsored mode | none |
-| `--secret-env <VAR>` | Env-var name holding the sponsor S-strkey | signer group (sponsored) | none |
+| `--secret-env <VAR>` | Env-var name holding the sponsor S-strkey; refused on a mainnet profile, which signs with the enrolled seed in the keyring | signer group (sponsored) | none |
 | `--sign-with-ledger` | Sign with a connected Ledger | signer group (sponsored) | `false` |
 | `--account-index <INDEX>` | Ledger BIP-44 account index | optional | `0` |
 | `--fund-with-friendbot` | Fund the account via Friendbot (testnet only) | one of the mode group | `false` |
@@ -271,7 +275,7 @@ Argument groups (enforced by the parser):
 | `--memo-id <U64>` | Memo ID (u64 decimal) | one of the memo group | none |
 | `--memo-hash <64_HEX>` | Memo hash (64 hex chars / 32 bytes) | one of the memo group | none |
 | `--memo-return <64_HEX>` | Memo return hash (64 hex chars / 32 bytes) | one of the memo group | none |
-| `--secret-env <VAR>` | Env-var name holding the source S-strkey | signer group | none |
+| `--secret-env <VAR>` | Env-var name holding the source S-strkey; refused on a mainnet profile, which signs with the enrolled seed in the keyring | signer group | none |
 | `--sign-with-ledger` | Sign with a connected Ledger | signer group | `false` |
 | `--account-index <INDEX>` | Ledger BIP-44 account index | optional | `0` |
 | `--build-only` | Emit the unsigned envelope XDR and exit | stage group | `false` |
@@ -384,7 +388,7 @@ The respective refusals are `claim.not_claimant`, `claim.predicate_not_satisfied
 | `<BALANCE_ID>` (positional) | Claimable balance ID (72-hex, 64-hex, or `B...` strkey) | yes | none |
 | `--profile <NAME>` | Profile to evaluate operator policy against | optional | `STELLAR_AGENT_PROFILE`, else `default` |
 | `--source <G_STRKEY>` | Claiming account; must be a claimant | yes | none |
-| `--secret-env <VAR>` | Env-var name holding the source S-strkey | signer group | none |
+| `--secret-env <VAR>` | Env-var name holding the source S-strkey; refused on a mainnet profile, which signs with the enrolled seed in the keyring | signer group | none |
 | `--sign-with-ledger` | Sign with a connected Ledger | signer group | `false` |
 | `--account-index <INDEX>` | Ledger BIP-44 account index | optional | `0` |
 | `--build-only` | Emit the unsigned envelope XDR and exit | stage group | `false` |

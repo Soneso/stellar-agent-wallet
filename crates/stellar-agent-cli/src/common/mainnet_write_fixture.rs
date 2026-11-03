@@ -88,7 +88,8 @@ pub(crate) const PRIMARY_HOST: &str = "rpc.example.invalid";
 pub(crate) const ORACLE_HOST: &str = "oracle.example.invalid";
 /// The seed of the enrolled agent signer.
 pub(crate) const AGENT_SEED: [u8; 32] = [0x41; 32];
-/// The variable holding the agent seed for `--secret-env`.
+/// The variable holding the agent seed: the enrollment ceremony and testnet
+/// signing read it, and a mainnet verb given it as `--secret-env` refuses.
 pub(crate) const AGENT_VAR: &str = "STELLAR_AGENT_MAINNET_FIXTURE_AGENT_SK";
 /// The seed of the enrolled policy owner.
 const OWNER_SEED: [u8; 32] = [0x42; 32];
@@ -746,6 +747,20 @@ impl MainnetFixture {
         std::fs::write(self.policy_path(), bytes).unwrap();
     }
 
+    /// Removes [`AGENT_VAR`] from the process environment, so a later run
+    /// that signs as the agent can only have read the seed from the keyring.
+    #[allow(
+        unsafe_code,
+        reason = "test-only process environment mutation; serialised by #[serial]"
+    )]
+    pub(crate) fn remove_agent_seed_variable(&self) {
+        // SAFETY: every test that builds the fixture is `#[serial]`, so no
+        // other test thread reads or writes the environment meanwhile.
+        unsafe {
+            std::env::remove_var(AGENT_VAR);
+        }
+    }
+
     /// Deletes the keyring entry at `coordinate`.
     pub(crate) fn delete_keyring_entry(&self, coordinate: &KeyringEntryRef) {
         keyring_core::Entry::new(&coordinate.service, &coordinate.account)
@@ -801,6 +816,15 @@ impl MainnetFixture {
     /// The audit rows of `kind`, oldest first.
     pub(crate) fn audit_rows(&self, kind: &str) -> Vec<Value> {
         crate::test_rpc::audit_rows(&self.profile(), kind)
+    }
+
+    /// The number of rows of every kind in the audit log; zero when the log
+    /// does not exist.
+    pub(crate) fn audit_row_count(&self) -> usize {
+        std::fs::read_to_string(&self.profile().audit_log_path)
+            .unwrap_or_default()
+            .lines()
+            .count()
     }
 
     /// The JSON-RPC methods the primary received.

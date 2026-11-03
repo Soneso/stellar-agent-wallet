@@ -5,9 +5,10 @@
 //!
 //! ## Mode A — sponsored `CreateAccount`
 //!
-//! Required flags: `--sponsor <G-strkey>`, a signer source
-//! (`--secret-env <VAR>` or `--sign-with-ledger`), and
-//! `--starting-balance <amount>`.
+//! Required flags: `--sponsor <G-strkey>` and `--starting-balance <amount>`.
+//! On testnet a signer source (`--secret-env <VAR>` or `--sign-with-ledger`)
+//! is required; on a mainnet profile no signer flag signs with the enrolled
+//! seed in the keyring and `--secret-env` is refused.
 //!
 //! The new account public key is supplied as a positional `<new-G-strkey>`
 //! argument OR generated in-process with `--generate`. The sponsor's public
@@ -156,7 +157,7 @@ use crate::commands::policy_engine::{
 };
 use crate::common::mainnet_write::{
     MainnetWriteRequest, authorize_and_submit, mainnet_context, mainnet_profiles_dir,
-    require_v1_engine,
+    mainnet_write_build_refusal, require_v1_engine,
 };
 use crate::common::network::{
     EndpointFlags, EndpointUrlFlag, TargetNetwork, check_endpoint_identity,
@@ -383,7 +384,8 @@ pub struct CreateArgs {
 
     /// Name of the environment variable holding the sponsor's S-strkey.
     ///
-    /// The value is never logged.
+    /// The value is never logged. Refused on a mainnet profile, which signs
+    /// with the enrolled seed in the keyring.
     #[arg(long, value_name = "VAR", group = "signer_group")]
     pub secret_env: Option<String>,
 
@@ -1153,8 +1155,9 @@ struct SignedBy<'a> {
 /// - `--secret-env VAR`: mlock-protected signing window. The S-strkey is
 ///   parsed from the env var and borrowed into a `Wallet`. `signer_from_wallet`
 ///   transfers the stable seed home into the signer. Drop zeroizes before
-///   unlocking and freeing. Mainnet unlocks per signature; testnet keeps the
-///   signer for the command, which can outlast the unlock TTL.
+///   unlocking and freeing. Testnet keeps the signer for the command, which
+///   can outlast the unlock TTL. Mainnet transaction signing uses the
+///   enrolled keyring seed or a Ledger.
 ///
 /// # Errors
 ///
@@ -1306,8 +1309,10 @@ fn print_error(envelope: &Envelope<()>, format: OutputFormat) {
 
 /// Runs sponsored mode on a mainnet profile.
 ///
-/// The stored profile of the explicit selection replaces the merged one at
-/// the write context, and every later step reads it from the context.
+/// A build without mainnet writes refuses first. The signer choice from the
+/// flags follows and refuses `--secret-env` before anything else runs. The
+/// stored profile of the explicit selection replaces the merged one at the
+/// write context, and every later step reads it from the context.
 /// `--generate` is refused: a mainnet account is created for a key the
 /// operator already holds. The verb's own steps run up to the bound witness,
 /// and [`authorize_and_submit`] runs the rest.
@@ -1323,6 +1328,20 @@ where
     let fail = |envelope: &Envelope<()>| {
         print_error(envelope, args.output);
         1
+    };
+    if let Some(e) = mainnet_write_build_refusal() {
+        return fail(&Envelope::<()>::err(&e));
+    }
+    // The signer comes from the flags alone, before the write context, the
+    // keyring and any request, so a refused `--secret-env` writes and sends
+    // nothing.
+    let signer = match MainnetSignerChoice::from_flags(
+        args.sign_with_ledger,
+        args.account_index,
+        args.secret_env.as_deref(),
+    ) {
+        Ok(signer) => signer,
+        Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
     let context = match mainnet_context(
         profile,
@@ -1496,15 +1515,6 @@ where
         Err(e) => return fail(&Envelope::<()>::err(&e)),
     };
 
-    let signer = match MainnetSignerChoice::from_flags(
-        args.sign_with_ledger,
-        args.account_index,
-        args.secret_env.as_deref(),
-        "create-account-commit",
-    ) {
-        Ok(signer) => signer,
-        Err(e) => return fail(&Envelope::<()>::err(&e)),
-    };
     match authorize_and_submit(MainnetWriteRequest {
         context: &context,
         profiles_dir: &profiles_dir,
@@ -2009,7 +2019,7 @@ mod tests {
             generate: false,
             starting_balance: Some("5 XLM".to_owned()),
             sponsor: Some("GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned()),
-            secret_env: Some("SPONSOR_SECRET".to_owned()),
+            secret_env: None,
             sign_with_ledger: false,
             account_index: 0,
             fund_with_friendbot: false,
@@ -2170,8 +2180,9 @@ mod tests {
         assert_implicit_selection_refused(crate::test_rpc::ImplicitSource::Default).await;
     }
 
-    /// Without `mainnet-write`, `--generate` on a mainnet profile refuses at
-    /// the write context, which comes before the generate check.
+    /// Without `mainnet-write`, the build refusal precedes the signer choice,
+    /// write context and generate check. The run passes `--secret-env` and
+    /// receives `network.mainnet_write_forbidden`.
     #[cfg(not(feature = "mainnet-write"))]
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
@@ -3246,11 +3257,14 @@ mod tests {
 
         use serde_json::Value;
 
-        use crate::common::mainnet_write::invalidations_on_this_thread;
+        use crate::common::mainnet_write::{
+            invalidations_on_this_thread, submission_kinds_on_this_thread,
+        };
         use crate::common::mainnet_write_fixture::{
             AGENT_SEED, AGENT_VAR, CLOCK_LEAD_MS, DESTINATION, ISSUER, MainnetFixture, NEW_ACCOUNT,
             Spec, create_rule, install_ledger_double, minimum_reserve, open_authorizations_of,
         };
+        use crate::common::signer_ceremony::signer_resolutions_on_this_thread;
         use crate::test_rpc::{ClassicRpc, last_rendered};
 
         /// The native balance the mocked endpoints report for every account.
@@ -3260,8 +3274,9 @@ mod tests {
         /// The starting balance of [`mainnet_args`]: 2 XLM.
         const STARTING_BALANCE: i64 = 20_000_000;
 
-        /// A sponsored create of [`NEW_ACCOUNT`] with 2 XLM, sponsored and
-        /// signed by the agent from [`AGENT_VAR`].
+        /// A sponsored create of [`NEW_ACCOUNT`] with 2 XLM, sponsored by the
+        /// agent, with no signer flag: a mainnet profile signs with the
+        /// enrolled seed in the keyring.
         fn mainnet_args(fixture: &MainnetFixture) -> CreateArgs {
             CreateArgs {
                 profile: Some(fixture.name.to_owned()),
@@ -3269,7 +3284,7 @@ mod tests {
                 generate: false,
                 starting_balance: Some("2 XLM".to_owned()),
                 sponsor: Some(fixture.agent.g.clone()),
-                secret_env: Some(AGENT_VAR.to_owned()),
+                secret_env: None,
                 sign_with_ledger: false,
                 account_index: 0,
                 fund_with_friendbot: false,
@@ -3309,7 +3324,7 @@ mod tests {
             for (name, flags) in [("create-browser-no-uv", 1), ("create-browser-uv", 5)] {
                 let mut fixture = Spec::new(name).build().await;
                 fixture.present_in_browser(flags);
-                let before = crate::common::signer_ceremony::signer_resolutions_on_this_thread();
+                let before = signer_resolutions_on_this_thread();
                 let result = run(&fixture, &mainnet_args(&fixture)).await;
                 if flags == 1 {
                     assert_eq!(
@@ -3321,10 +3336,7 @@ mod tests {
                     assert!(records(&fixture).is_empty());
                     assert!(fixture.sent_envelopes().await.is_empty());
                     assert!(fixture.audit_rows("approval_attested").is_empty());
-                    assert_eq!(
-                        crate::common::signer_ceremony::signer_resolutions_on_this_thread(),
-                        before
-                    );
+                    assert_eq!(signer_resolutions_on_this_thread(), before);
                 } else {
                     assert_eq!(result.code, 0, "{}", result.envelope);
                     assert_eq!(fixture.sent_envelopes().await.len(), 1);
@@ -3360,6 +3372,76 @@ mod tests {
                 "no confirmation entry"
             );
             assert!(fixture.sent_envelopes().await.is_empty(), "nothing is sent");
+        }
+
+        /// Signer choice: `--secret-env` on a mainnet profile refuses with
+        /// `validation.mainnet_secret_env_refused` before anything else
+        /// runs, with the variable set: no request, no keyring
+        /// initialization, no seed read, no signer, no pending entry, no
+        /// authorization record and no audit row.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_secret_env_refuses_before_any_request() {
+            let fixture = Spec::new("mainnet-create-secret-env").build().await;
+            assert!(
+                std::env::var_os(AGENT_VAR).is_some(),
+                "the seed is exported"
+            );
+            let mut args = mainnet_args(&fixture);
+            args.secret_env = Some(AGENT_VAR.to_owned());
+            let audit_rows = fixture.audit_row_count();
+            let resolutions = signer_resolutions_on_this_thread();
+
+            let run = run(&fixture, &args).await;
+
+            assert_refused_before_confirmation(
+                &fixture,
+                &run,
+                "validation.mainnet_secret_env_refused",
+            )
+            .await;
+            let message = run.envelope["error"]["message"].as_str().unwrap();
+            assert!(!message.contains(AGENT_VAR), "{message}");
+            assert!(fixture.primary_methods().await.is_empty());
+            assert!(fixture.oracle_methods().await.is_empty());
+            assert_eq!(fixture.initializer_calls(), 0);
+            assert_eq!(signer_resolutions_on_this_thread(), resolutions);
+            assert_eq!(fixture.audit_row_count(), audit_rows);
+            fixture.assert_no_consent_ceremony();
+        }
+
+        /// Signer choice: no signer flag signs with the enrolled seed in the
+        /// keyring. With the agent's seed variable removed from the
+        /// environment, the create is sent once, signed by the agent, so the
+        /// seed came from the keyring. The submit call receives the keyring
+        /// signer kind, and the run resolves one signer, the mainnet signer,
+        /// and runs no environment ceremony.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial_test::serial]
+        async fn a_mainnet_create_without_a_signer_flag_signs_with_the_keyring() {
+            let fixture = Spec::new("mainnet-create-keyring").build().await;
+            let args = mainnet_args(&fixture);
+            assert!(args.secret_env.is_none() && !args.sign_with_ledger);
+            fixture.remove_agent_seed_variable();
+            assert!(std::env::var_os(AGENT_VAR).is_none());
+            let resolutions = signer_resolutions_on_this_thread();
+            let kinds = submission_kinds_on_this_thread().len();
+
+            let run = run(&fixture, &args).await;
+
+            assert_eq!(run.code, 0, "{}", run.envelope);
+            let sent = fixture.sent_envelopes().await;
+            assert_eq!(sent.len(), 1);
+            fixture.assert_signed_by_agent(&sent[0]);
+            assert_eq!(
+                submission_kinds_on_this_thread()[kinds..],
+                [stellar_agent_network::SubmissionSignerKind::Keyring]
+            );
+            assert_eq!(
+                signer_resolutions_on_this_thread(),
+                resolutions + 1,
+                "one mainnet signer and no environment ceremony"
+            );
         }
 
         /// Accept: a sponsored create below the threshold needs no witness,
@@ -3516,7 +3598,6 @@ mod tests {
                 || Ok(()),
             );
             let mut args = mainnet_args(&fixture);
-            args.secret_env = None;
             args.sign_with_ledger = true;
 
             let run = run(&fixture, &args).await;
@@ -3569,8 +3650,10 @@ mod tests {
                 .rules(vec![create_rule(&minimum_reserve(FEE_CROSSING_MARGIN))])
                 .build()
                 .await;
+            let mut args = mainnet_args(&fixture);
+            args.secret_env = Some(AGENT_VAR.to_owned());
 
-            let run = run(&fixture, &mainnet_args(&fixture)).await;
+            let run = run(&fixture, &args).await;
 
             assert_eq!(
                 run.code(),
