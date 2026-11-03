@@ -410,7 +410,7 @@ pub enum CredentialsError {
     /// TOML deserialisation error on the passkeys registry.
     #[error("passkeys registry TOML parse error: {detail}")]
     RegistryParse {
-        /// Human-readable parse error from the TOML deserialiser.
+        /// The TOML parse failure position, without source text.
         detail: String,
     },
 
@@ -426,27 +426,19 @@ pub enum CredentialsError {
     StateDirUnavailable,
 
     /// The named credential does not exist in the passkeys registry.
-    #[error("credential '{name}' not found")]
-    NotFound {
-        /// The name that was looked up.
-        name: String,
-    },
+    #[error("the requested credential was not found")]
+    NotFound,
 
     /// A credential with the given name already exists.
     #[error(
-        "credential '{name}' already exists; choose a different name or delete the existing one"
+        "the requested credential already exists; choose a different name or delete the existing one"
     )]
-    DuplicateName {
-        /// The name that already exists in the registry.
-        name: String,
-    },
+    DuplicateName,
 
     /// Credential name fails the naming rules (non-empty, <= 64 chars,
     /// printable ASCII only).
-    #[error("invalid credential name '{name}': {reason}")]
+    #[error("the credential name is not valid: {reason}")]
     InvalidName {
-        /// The name that failed validation.
-        name: String,
         /// A human-readable description of why the name is invalid.
         reason: &'static str,
     },
@@ -1040,7 +1032,13 @@ impl CredentialsManager {
         }
         let content = fs::read_to_string(&path)?;
         toml::from_str(&content).map_err(|e| CredentialsError::RegistryParse {
-            detail: e.to_string(),
+            detail: format!(
+                "not valid TOML: {}",
+                stellar_agent_core::profile::toml_diagnostic::toml_error_position(
+                    &content,
+                    e.span().map(|s| s.start)
+                )
+            ),
         })
     }
 
@@ -1165,7 +1163,7 @@ impl CredentialsManager {
     ///
     /// let mgr = CredentialsManager::from_defaults_readonly("default", "localhost").unwrap();
     /// let err = mgr.show("nonexistent").unwrap_err();
-    /// assert!(matches!(err, CredentialsError::NotFound { .. }));
+    /// assert!(matches!(err, CredentialsError::NotFound));
     /// ```
     pub fn show(&self, name: &str) -> Result<CredentialMetadata, CredentialsError> {
         let registry = self.load_registry()?;
@@ -1173,9 +1171,7 @@ impl CredentialsManager {
             .credentials
             .into_iter()
             .find(|c| c.credential_name == name)
-            .ok_or_else(|| CredentialsError::NotFound {
-                name: name.to_owned(),
-            })
+            .ok_or(CredentialsError::NotFound)
     }
 
     /// Returns the registered SEC1 public key for `credential_id`.
@@ -1220,9 +1216,7 @@ impl CredentialsManager {
         let before = registry.credentials.len();
         registry.credentials.retain(|c| c.credential_name != name);
         if registry.credentials.len() == before {
-            return Err(CredentialsError::NotFound {
-                name: name.to_owned(),
-            });
+            return Err(CredentialsError::NotFound);
         }
         self.persist_registry(&registry)
     }
@@ -1283,9 +1277,7 @@ impl CredentialsManager {
             .iter()
             .any(|c| c.credential_name == credential_name)
         {
-            return Err(CredentialsError::DuplicateName {
-                name: credential_name.to_owned(),
-            });
+            return Err(CredentialsError::DuplicateName);
         }
 
         // Generate CSRF token + user handle.
@@ -1617,9 +1609,7 @@ impl CredentialsManager {
             .iter()
             .any(|c| c.credential_name == pending.credential_name)
         {
-            return Err(CredentialsError::DuplicateName {
-                name: pending.credential_name,
-            });
+            return Err(CredentialsError::DuplicateName);
         }
 
         let metadata = CredentialMetadata {
@@ -1963,7 +1953,7 @@ impl CredentialsManager {
             Ok(SignWithPasskeyOutcome::Timeout) => "failure:timeout",
             Ok(SignWithPasskeyOutcome::UserCanceled) => "failure:user_canceled",
             Ok(SignWithPasskeyOutcome::EntryMissing) => "failure:entry_missing",
-            Err(CredentialsError::NotFound { .. }) => "failure:credential_not_found",
+            Err(CredentialsError::NotFound) => "failure:credential_not_found",
             Err(CredentialsError::Signing { .. }) => "failure:signer_error",
             // Per-signing divergence check fired before the WebAuthn ceremony.
             Err(CredentialsError::SignerSetDivergence { .. }) => "failure:signer_set_diverged",
@@ -2934,26 +2924,22 @@ fn drift_err_route(sa_err: crate::SaError) -> CredentialsError {
 pub(crate) fn validate_credential_name(name: &str) -> Result<(), CredentialsError> {
     if name.is_empty() {
         return Err(CredentialsError::InvalidName {
-            name: name.to_owned(),
             reason: "must not be empty",
         });
     }
     if name.len() > 64 {
         return Err(CredentialsError::InvalidName {
-            name: name.to_owned(),
             reason: "must be at most 64 characters",
         });
     }
     for ch in name.chars() {
         if !ch.is_ascii() || ch.is_ascii_control() {
             return Err(CredentialsError::InvalidName {
-                name: name.to_owned(),
                 reason: "must contain only printable ASCII characters",
             });
         }
         if matches!(ch, '/' | '\\' | ':') {
             return Err(CredentialsError::InvalidName {
-                name: name.to_owned(),
                 reason: r"must not contain '/', '\', or ':' characters",
             });
         }
@@ -2997,6 +2983,52 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn credential_registry_and_name_markers_are_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+        let dir = TempDir::new().unwrap();
+        let manager = test_manager_readonly(&dir);
+        let missing = manager.show(CREDENTIAL_MARKER).unwrap_err();
+        assert_no_marker(&missing, CREDENTIAL_MARKER);
+        assert_eq!(
+            missing.to_string(),
+            "the requested credential was not found"
+        );
+        let invalid = validate_credential_name(&format!("{CREDENTIAL_MARKER}/x")).unwrap_err();
+        assert_no_marker(&invalid, CREDENTIAL_MARKER);
+        fs::create_dir_all(manager.registry_path().parent().unwrap()).unwrap();
+        fs::write(
+            manager.registry_path(),
+            format!("credentials = {CREDENTIAL_MARKER} here\n"),
+        )
+        .unwrap();
+        for error in [
+            manager.list().unwrap_err(),
+            manager.show(CREDENTIAL_MARKER).unwrap_err(),
+        ] {
+            assert_no_marker(&error, CREDENTIAL_MARKER);
+            assert!(matches!(error, CredentialsError::RegistryParse { .. }));
+            assert!(error.to_string().contains("not valid TOML: line 1, column"));
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_credential_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+        let dir = TempDir::new().unwrap();
+        let manager = test_manager(&dir);
+        let mut registry = RegistryFile::default();
+        registry.credentials.push(make_metadata(CREDENTIAL_MARKER));
+        manager.persist_registry(&registry).unwrap();
+        let error = manager
+            .prepare_registration(CREDENTIAL_MARKER, "127.0.0.1:1".parse().unwrap(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CredentialsError::DuplicateName));
+        assert_no_marker(&error, CREDENTIAL_MARKER);
+    }
+
     use serde_json::Value as JsonValue;
     use tempfile::TempDir;
 
@@ -3070,7 +3102,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
         let err = mgr.show("ghost").unwrap_err();
-        assert!(matches!(err, CredentialsError::NotFound { name } if name == "ghost"));
+        assert!(matches!(err, CredentialsError::NotFound));
     }
 
     #[test]
@@ -3146,7 +3178,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mgr = test_manager(&dir);
         let err = mgr.delete("nonexistent").unwrap_err();
-        assert!(matches!(err, CredentialsError::NotFound { .. }));
+        assert!(matches!(err, CredentialsError::NotFound));
     }
 
     // ── is_empty ──────────────────────────────────────────────────────────────
@@ -3814,7 +3846,7 @@ registered_at_unix_ms = 1700000000000
             .await;
 
         assert!(
-            matches!(result, Err(CredentialsError::NotFound { .. })),
+            matches!(result, Err(CredentialsError::NotFound)),
             "expected NotFound, got {result:?}"
         );
 
@@ -4700,23 +4732,18 @@ registered_at_unix_ms = 1700000000000
             ),
             (CredentialsError::StateDirUnavailable, "passkeys directory"),
             (
-                CredentialsError::NotFound {
-                    name: "mykey".to_owned(),
-                },
-                "mykey",
+                CredentialsError::NotFound,
+                "the requested credential was not found",
             ),
             (
-                CredentialsError::DuplicateName {
-                    name: "dupkey".to_owned(),
-                },
-                "dupkey",
+                CredentialsError::DuplicateName,
+                "the requested credential already exists; choose a different name or delete the existing one",
             ),
             (
                 CredentialsError::InvalidName {
-                    name: "bad/name".to_owned(),
                     reason: "must not contain",
                 },
-                "bad/name",
+                "the credential name is not valid: must not contain",
             ),
             (
                 CredentialsError::ApprovalStore {
@@ -4778,6 +4805,14 @@ registered_at_unix_ms = 1700000000000
 
         for (err, expected_substr) in errors {
             let msg = format!("{err}");
+            if matches!(
+                err,
+                CredentialsError::NotFound
+                    | CredentialsError::DuplicateName
+                    | CredentialsError::InvalidName { .. }
+            ) {
+                assert_eq!(msg, expected_substr);
+            }
             assert!(
                 msg.contains(expected_substr),
                 "Display for {err:?} must contain '{expected_substr}'; got: {msg}"

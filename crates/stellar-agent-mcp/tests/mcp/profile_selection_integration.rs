@@ -388,17 +388,33 @@ fn named_but_missing_profile_refuses_instead_of_falling_back() {
     let output = run_with_initialize(home.command(&["--profile", MISSING_PROFILE]));
     let stderr = assert_refused_with(&output, 1);
     assert!(
-        stderr.contains(MISSING_PROFILE),
-        "the refusal must name the profile: {stderr}"
+        stderr.contains("the profile named by the --profile flag has no profile file"),
+        "the refusal must name the input that supplied the name: {stderr}"
     );
     assert!(
-        stderr.contains("profiles") && stderr.contains(".toml"),
-        "the refusal must name the path searched: {stderr}"
+        !stderr.contains(MISSING_PROFILE),
+        "the refusal must not repeat the requested name: {stderr}"
     );
     assert!(
-        stderr.contains("profile init"),
+        stderr.contains("profile init --profile <name>"),
         "the refusal must name the command that creates it: {stderr}"
     );
+}
+
+/// A secret seed passed as the profile name is a valid path component, so
+/// it reaches the profile lookup; the refusal for the absent file does not
+/// print it.
+#[test]
+fn a_seed_as_a_missing_profile_name_is_not_printed_on_stderr() {
+    let marker = stellar_agent_test_support::rejected_value::seed_marker();
+    let home = ProfileHome::new();
+    let output = run_with_initialize(home.command(&["--profile", &marker]));
+    let stderr = assert_refused_with(&output, 1);
+    assert!(
+        stderr.contains("has no profile file"),
+        "the refusal must state the absent file: {stderr}"
+    );
+    stellar_agent_test_support::rejected_value::assert_no_marker_in_text(&stderr, &marker);
 }
 
 /// A profile named through the environment variable is never replaced either.
@@ -409,11 +425,11 @@ fn environment_named_but_missing_profile_refuses_instead_of_falling_back() {
     command.env("STELLAR_AGENT_PROFILE", MISSING_PROFILE);
     let stderr = assert_refused_with(&run_with_initialize(command), 1);
     assert!(
-        stderr.contains(MISSING_PROFILE),
-        "the refusal must name the profile: {stderr}"
+        !stderr.contains(MISSING_PROFILE),
+        "the refusal must not repeat the requested name: {stderr}"
     );
     assert!(
-        stderr.contains("STELLAR_AGENT_PROFILE"),
+        stderr.contains("the profile named by STELLAR_AGENT_PROFILE has no profile file"),
         "the refusal must say the name came from the environment: {stderr}"
     );
 }
@@ -512,8 +528,8 @@ fn unknown_flag_is_refused() {
     let output = run_with_initialize(home.command(&["--profil", "mainnet-prod"]));
     let stderr = assert_refused_with(&output, 2);
     assert!(
-        stderr.contains("unrecognised argument '--profil'"),
-        "the refusal must quote the offending token: {stderr}"
+        stderr.contains("unrecognised command-line argument"),
+        "the refusal must identify the argument class: {stderr}"
     );
     assert!(
         stderr.contains("--profile <NAME>"),
@@ -574,11 +590,15 @@ fn noop_profile_copied_from_another_profile_refuses_to_serve_under_the_new_name(
 
     let stderr = assert_refused(&run_with_initialize(home.command(&["--profile", "alice"])));
     assert!(
-        stderr.contains("alice") && stderr.contains("stellar-agent-owner-default"),
-        "the refusal must name the selected profile and the offending field: {stderr}"
+        stderr.contains("policy_owner_key_id.service names a different profile"),
+        "the refusal must name the offending field: {stderr}"
     );
     assert!(
-        stderr.contains("profile init --profile alice"),
+        !stderr.contains("stellar-agent-owner-default"),
+        "the refusal must not repeat the stored service: {stderr}"
+    );
+    assert!(
+        stderr.contains("profile init --profile <name>"),
         "the refusal must name the recovery command: {stderr}"
     );
 }
@@ -601,8 +621,12 @@ fn profile_without_a_derivable_owner_key_name_refuses() {
 
     let stderr = assert_refused(&run_with_initialize(home.command(&["--profile", "alice"])));
     assert!(
-        stderr.contains("hand-written-owner-service"),
-        "the refusal must quote the offending policy_owner_key_id.service: {stderr}"
+        stderr.contains("does not carry the 'stellar-agent-owner-' prefix"),
+        "the refusal must name the rule policy_owner_key_id.service breaks: {stderr}"
+    );
+    assert!(
+        !stderr.contains("hand-written-owner-service"),
+        "the refusal must not repeat the stored service: {stderr}"
     );
 }
 
@@ -626,7 +650,7 @@ fn environment_variable_never_selects_a_mainnet_profile() {
     );
     assert!(stderr.contains("STELLAR_AGENT_PROFILE"), "{stderr}");
     assert!(
-        stderr.contains("stellar-agent-mcp --profile mainnet"),
+        stderr.contains("stellar-agent-mcp --profile <name>"),
         "{stderr}"
     );
 }
@@ -663,7 +687,7 @@ fn a_mainnet_default_profile_needs_the_flag() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("stellar-agent-mcp --profile default"),
+        stderr.contains("stellar-agent-mcp --profile <name>"),
         "{stderr}"
     );
     let mut session = McpSession::start(home.command(&["--profile", "default"]));
@@ -761,14 +785,11 @@ fn shared_key_entry_refuses_mainnet_startup_with_its_wire_code() {
         .env("STELLAR_AGENT_LOG", "info")
         .env("HOME", "/synthetic-home");
     let stderr = assert_refused_with(&run_with_initialize(command), 1);
-    for text in [
-        "profile.key_scope_conflict",
-        "attestation_key_id",
-        "shared-entry/default",
-        "bob",
-    ] {
+    for text in ["profile.key_scope_conflict", "attestation_key_id", "bob"] {
         assert!(stderr.contains(text), "{stderr}");
     }
+    // The refusal never repeats the shared keyring coordinate.
+    assert!(!stderr.contains("shared-entry"), "{stderr}");
 }
 
 #[test]
@@ -786,11 +807,12 @@ fn shared_key_entry_warns_and_testnet_startup_answers_initialize() {
         stderr.contains("WARN") && stderr.contains("profile.key_scope"),
         "{stderr}"
     );
-    assert!(stderr.contains("shared-entry/default"), "{stderr}");
+    assert!(stderr.contains("attestation_key_id"), "{stderr}");
+    assert!(!stderr.contains("shared-entry"), "{stderr}");
 }
 
 #[test]
-fn startup_diagnostics_bound_and_redact_shared_scope_and_owner_parts() {
+fn startup_diagnostics_omit_shared_scope_and_owner_parts() {
     let part = format!("/synthetic-home/{}HIDDEN_MARKER", "x".repeat(300));
     for kind in ["shared", "scope", "owner"] {
         let home = ProfileHome::new();
@@ -842,10 +864,73 @@ fn startup_diagnostics_bound_and_redact_shared_scope_and_owner_parts() {
         } else {
             assert_refused_with(&output, 1)
         };
-        assert!(stderr.contains("<HOME>"), "{kind}: {stderr}");
-        assert!(stderr.contains("..."), "{kind}: {stderr}");
+        // Neither the raw coordinate part nor its redacted form is rendered.
+        assert!(stderr.contains("profile.key_scope"), "{kind}: {stderr}");
+        assert!(!stderr.contains("<HOME>"), "{kind}: {stderr}");
         assert!(!stderr.contains("synthetic-home"), "{kind}: {stderr}");
         assert!(!stderr.contains("HIDDEN_MARKER"), "{kind}: {stderr}");
         assert!(!stderr.contains(&"x".repeat(128)), "{kind}: {stderr}");
     }
+}
+
+#[test]
+fn an_invalid_profile_name_is_not_printed_on_stderr() {
+    let marker = stellar_agent_test_support::rejected_value::seed_marker();
+    let home = ProfileHome::new();
+    let output = home
+        .command(&["--profile", &format!("{marker}/x")])
+        .output()
+        .unwrap();
+    let stderr = assert_refused_with(&output, 2);
+    assert!(!stderr.contains(&marker));
+    assert!(stderr.contains("the profile name from --profile is not a valid profile name"));
+}
+
+#[test]
+fn profile_selection_refusal_logs_omit_credential_markers() {
+    let home = ProfileHome::new();
+    for args in [vec!["--profile", "CREDMARKER7"], vec!["--CREDMARKER7"]] {
+        let output = run_with_initialize(home.command(&args));
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("CREDMARKER7"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("CREDMARKER7"));
+    }
+}
+
+#[test]
+fn profile_selection_mismatch_omits_loaded_and_refusal_names() {
+    let home = ProfileHome::new();
+    home.write_profile(
+        "CREDMARKER7",
+        &noop_profile_toml(
+            "default",
+            "stellar:testnet",
+            "https://testnet.example.invalid",
+        ),
+    );
+    let output = run_with_initialize(home.command(&["--profile", "CREDMARKER7"]));
+    let stderr = assert_refused(&output);
+    assert!(stderr.contains("policy_owner_key_id.service names a different profile"));
+    assert!(!stderr.contains("CREDMARKER7"));
+    assert!(!stderr.contains("stellar-agent-mcp: profile loaded"));
+}
+
+#[test]
+fn profile_selection_mainnet_env_refusal_omits_the_requested_name() {
+    let home = ProfileHome::new();
+    home.write_profile(
+        "CREDMARKER7",
+        &noop_profile_toml(
+            "CREDMARKER7",
+            "stellar:mainnet",
+            "https://mainnet.example.invalid",
+        ),
+    );
+    let mut command = home.command(&[]);
+    command.env("STELLAR_AGENT_PROFILE", "CREDMARKER7");
+    let stderr = assert_refused_with(&run_with_initialize(command), 1);
+    assert!(stderr.contains("profile.mainnet_requires_explicit_profile"));
+    assert!(stderr.contains("STELLAR_AGENT_PROFILE"));
+    assert!(stderr.contains("stellar-agent-mcp --profile <name>"));
+    assert!(!stderr.contains("CREDMARKER7"));
 }

@@ -51,28 +51,25 @@ pub enum SharedRecovery {
 }
 
 /// One failure of profile keyring ownership.
+///
+/// A finding names the fields, the sibling profile and the derived default it
+/// compares against, and never a coordinate read from a profile file: the
+/// coordinate is the configuration the finding refuses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyScopeKind {
     /// An overlay derives a service outside the selected profile's scope.
     OutOfScope {
         /// Profile reference field.
         field: &'static str,
-        /// Rendered reference.
-        coordinate: Coordinate,
         /// Rendered canonical service.
         expected_service: String,
     },
     /// The owner reader always uses the canonical account.
-    OwnerAccountOverride {
-        /// Rendered overridden account.
-        account: String,
-    },
+    OwnerAccountOverride,
     /// A mainnet profile's window-state key is not the profile's default
     /// entry. The policy pin and the mainnet enablement nonce derive from this
     /// coordinate, so another entry selects another pin and nonce.
     WindowStateKeyOverride {
-        /// Rendered configured entry.
-        coordinate: Coordinate,
         /// Rendered default entry for the profile name.
         expected: Coordinate,
     },
@@ -82,8 +79,6 @@ pub enum KeyScopeKind {
     InstallationEntry {
         /// Profile role.
         field: &'static str,
-        /// Rendered reference.
-        coordinate: Coordinate,
     },
     /// Two roles within the profile share an entry.
     SelfCollision {
@@ -91,8 +86,6 @@ pub enum KeyScopeKind {
         field: &'static str,
         /// Second role in enumeration order.
         other_field: &'static str,
-        /// Rendered reference.
-        coordinate: Coordinate,
     },
     /// A sibling names a coordinate the selected profile uses.
     SharedWithSibling {
@@ -102,8 +95,6 @@ pub enum KeyScopeKind {
         sibling: String,
         /// Rendered sibling role.
         sibling_field: String,
-        /// Rendered reference.
-        coordinate: Coordinate,
         /// Which file needs correction.
         recovery: SharedRecovery,
     },
@@ -114,7 +105,7 @@ pub enum KeyScopeKind {
     },
     /// A sibling cannot be compared.
     SiblingUnreadable {
-        /// Bounded sibling name; absent for a directory entry without one.
+        /// Bounded sibling name; absent for a directory entry that is not a file.
         sibling: Option<String>,
     },
     /// The selected document exists but cannot be read again.
@@ -147,66 +138,61 @@ impl KeyScopeKind {
 pub struct KeyScopeFinding {
     /// Ownership failure, carrying the rendered parts its text names.
     pub kind: KeyScopeKind,
+    resolved_profile: bool,
 }
 
 impl KeyScopeFinding {
     /// Renders the finding with the selected profile's name.
     #[must_use]
     pub fn message(&self, name: &str) -> String {
-        let name = render_part(name);
+        let name = if self.resolved_profile {
+            render_part(name)
+        } else {
+            "selected".to_owned()
+        };
         match &self.kind {
             KeyScopeKind::OutOfScope {
                 field,
-                coordinate,
                 expected_service,
             } => format!(
-                "profile '{name}': {field} names keyring service '{}', which is not this \
-                 profile's service '{expected_service}'. Set {field} in the profile file",
-                coordinate.service,
+                "profile '{name}': {field} names a keyring service that is not this \
+                 profile's service '{expected_service}'. Set {field} in the profile file"
             ),
-            KeyScopeKind::OwnerAccountOverride { account } => format!(
-                "profile '{name}': policy_owner_key_id names account '{account}'; the owner \
-                 key is read from account 'default'. Set the account to 'default' in the \
+            KeyScopeKind::OwnerAccountOverride => format!(
+                "profile '{name}': policy_owner_key_id names an account other than \
+                 'default'; the owner key is read from account 'default'. Set the account to \
+                 'default' in the profile file"
+            ),
+            KeyScopeKind::WindowStateKeyOverride { expected } => format!(
+                "profile '{name}': policy_window_state_key_id names a keyring entry other \
+                 than its default entry '{expected}'; a mainnet profile keeps its policy pin \
+                 and enablement nonce beside that entry. Set policy_window_state_key_id to \
+                 that entry in the profile file"
+            ),
+            KeyScopeKind::InstallationEntry { field } => format!(
+                "profile '{name}': {field} names a keyring entry that belongs to the \
+                 installation's toolset pin key; give this profile an entry of its own in its \
                  profile file"
             ),
-            KeyScopeKind::WindowStateKeyOverride {
-                coordinate,
-                expected,
-            } => format!(
-                "profile '{name}': policy_window_state_key_id names keyring entry \
-                 '{coordinate}'; a mainnet profile keeps its policy pin and enablement nonce \
-                 beside its default entry '{expected}'. Set policy_window_state_key_id to that \
-                 entry in the profile file"
-            ),
-            KeyScopeKind::InstallationEntry { field, coordinate } => format!(
-                "profile '{name}': {field} names keyring entry '{coordinate}', which belongs \
-                 to the installation's toolset pin key; give this profile an entry of its own \
-                 in its profile file"
-            ),
-            KeyScopeKind::SelfCollision {
-                field,
-                other_field,
-                coordinate,
-            } => format!(
-                "profile '{name}': {field} and {other_field} name the same keyring entry \
-                 '{coordinate}'; give each its own entry in the profile file"
+            KeyScopeKind::SelfCollision { field, other_field } => format!(
+                "profile '{name}': {field} and {other_field} name the same keyring entry; \
+                 give each its own entry in the profile file"
             ),
             KeyScopeKind::SharedWithSibling {
                 field,
                 sibling,
                 sibling_field,
-                coordinate,
                 recovery,
             } => match recovery {
                 SharedRecovery::GiveThisProfileItsOwnEntry => format!(
-                    "profile '{name}': {field} names keyring entry '{coordinate}', which \
-                     profile '{sibling}' also names as {sibling_field}; give this profile \
-                     an entry of its own in its profile file"
+                    "profile '{name}': {field} names a keyring entry that profile \
+                     '{sibling}' also names as {sibling_field}; give this profile an entry \
+                     of its own in its profile file"
                 ),
                 SharedRecovery::CorrectTheSiblingFile => format!(
-                    "profile '{name}': its entry '{coordinate}' ({field}) is also named \
-                     by profile '{sibling}' as {sibling_field}; correct that profile's \
-                     file, this entry is the default for this profile's name"
+                    "profile '{name}': its entry for {field} is also named by profile \
+                     '{sibling}' as {sibling_field}; correct that profile's file, this entry \
+                     is the default for this profile's name"
                 ),
             },
             KeyScopeKind::MainnetSignerIdentity { sibling } => format!(
@@ -220,10 +206,10 @@ impl KeyScopeFinding {
                 );
                 format!("{subject} could not be read for the keyring-entry comparison")
             }
-            KeyScopeKind::SelectedDocumentUnreadable => format!(
-                "profile '{name}': its profile file could not be read again for the \
-                 keyring-entry comparison"
-            ),
+            KeyScopeKind::SelectedDocumentUnreadable => {
+                "the selected profile file cannot be read for the keyring-entry comparison"
+                    .to_owned()
+            }
             KeyScopeKind::ProfilesDirUnreadable => {
                 "the profiles directory could not be listed for the keyring-entry comparison"
                     .to_owned()
@@ -461,7 +447,10 @@ fn same_ed25519_account(a: &str, b: &str) -> bool {
 }
 
 fn finding(kind: KeyScopeKind) -> KeyScopeFinding {
-    KeyScopeFinding { kind }
+    KeyScopeFinding {
+        kind,
+        resolved_profile: false,
+    }
 }
 
 /// Computes key-scope findings without reading the keyring or contacting endpoints.
@@ -500,16 +489,13 @@ fn scope_findings_in_dir(
         }
     };
     if profile.policy_owner_key_id.account != "default" {
-        findings.push(finding(KeyScopeKind::OwnerAccountOverride {
-            account: render_part(&profile.policy_owner_key_id.account),
-        }));
+        findings.push(finding(KeyScopeKind::OwnerAccountOverride));
     }
     // An explicit reference in the file does not exempt this field: the pin
     // and the enablement nonce of a mainnet profile stay at its default entry.
     let window_default = KeyringEntryRef::default_policy_window_state_key(name);
     if profile.chain_id == Caip2::Mainnet && profile.policy_window_state_key_id != window_default {
         findings.push(finding(KeyScopeKind::WindowStateKeyOverride {
-            coordinate: (&profile.policy_window_state_key_id).into(),
             expected: (&window_default).into(),
         }));
     }
@@ -525,7 +511,6 @@ fn scope_findings_in_dir(
             {
                 findings.push(finding(KeyScopeKind::OutOfScope {
                     field,
-                    coordinate: entry.into(),
                     expected_service: render_part(&canonical.service),
                 }));
             }
@@ -536,10 +521,7 @@ fn scope_findings_in_dir(
     // joined `account.service` alias of the pin key splits only one way.
     for (field, entry) in &selected {
         if entry.service.eq_ignore_ascii_case(TOOLSET_PIN_KEY_SERVICE) {
-            findings.push(finding(KeyScopeKind::InstallationEntry {
-                field,
-                coordinate: entry.into(),
-            }));
+            findings.push(finding(KeyScopeKind::InstallationEntry { field }));
         }
     }
     for (i, (field, entry)) in selected.iter().enumerate() {
@@ -550,11 +532,7 @@ fn scope_findings_in_dir(
                 && !(provider(field) && provider(other_field))
                 && same_entry(entry, other)
             {
-                findings.push(finding(KeyScopeKind::SelfCollision {
-                    field,
-                    other_field,
-                    coordinate: entry.into(),
-                }));
+                findings.push(finding(KeyScopeKind::SelfCollision { field, other_field }));
             }
         }
     }
@@ -578,7 +556,7 @@ fn scope_findings_in_dir(
             Ok(Some(document)) => document,
             _ => {
                 findings.push(finding(KeyScopeKind::SiblingUnreadable {
-                    sibling: Some(render_part(&sibling)),
+                    sibling: sibling_path.is_file().then(|| render_part(&sibling)),
                 }));
                 continue;
             }
@@ -614,11 +592,22 @@ fn scope_findings_in_dir(
                         field,
                         sibling: render_part(&sibling),
                         sibling_field: render_part(sibling_field),
-                        coordinate: entry.into(),
                         recovery,
                     }));
                 }
             }
+        }
+    }
+    let resolved_profile = path.is_file();
+    for finding in &mut findings {
+        finding.resolved_profile = resolved_profile;
+        if !resolved_profile
+            && let KeyScopeKind::WindowStateKeyOverride { expected } = &mut finding.kind
+        {
+            *expected = Coordinate {
+                service: "the selected profile's service".to_owned(),
+                account: "default".to_owned(),
+            };
         }
     }
     findings
@@ -637,7 +626,7 @@ pub fn key_scope_findings(profile: &Profile, name: &str) -> Vec<KeyScopeFinding>
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{detail}")]
 pub struct KeyScopeConflict {
-    /// Selected profile name.
+    /// Resolved profile name, or empty when the requested name has no file.
     pub profile: String,
     /// Snake-case kind of the refusing finding.
     pub kind: &'static str,
@@ -674,7 +663,11 @@ pub fn enforce_key_scope(profile: &Profile, name: &str) -> Result<(), KeyScopeCo
         let refuses = profile.chain_id == Caip2::Mainnet && !skipped;
         if refuses && refusal.is_none() {
             refusal = Some(KeyScopeConflict {
-                profile: name.to_owned(),
+                profile: if finding.resolved_profile {
+                    name.to_owned()
+                } else {
+                    String::new()
+                },
                 kind: finding.kind.as_str(),
                 detail,
             });
@@ -702,7 +695,7 @@ pub fn enforce_message_signing_scope(
     name: &str,
 ) -> Result<(), KeyScopeConflict> {
     let dir = default_profile_dir().map_err(|_| KeyScopeConflict {
-        profile: name.to_owned(),
+        profile: String::new(),
         kind: KeyScopeKind::ProfilesDirUnreadable.as_str(),
         detail: finding(KeyScopeKind::ProfilesDirUnreadable).message(name),
     })?;
@@ -736,12 +729,17 @@ pub fn enforce_message_signing_scope_in_dir(
             | KeyScopeKind::SiblingUnreadable { .. }
             | KeyScopeKind::SelectedDocumentUnreadable
             | KeyScopeKind::ProfilesDirUnreadable => true,
-            KeyScopeKind::OwnerAccountOverride { .. }
-            | KeyScopeKind::WindowStateKeyOverride { .. } => false,
+            KeyScopeKind::OwnerAccountOverride | KeyScopeKind::WindowStateKeyOverride { .. } => {
+                false
+            }
         };
         if refuses {
             return Err(KeyScopeConflict {
-                profile: name.to_owned(),
+                profile: if finding.resolved_profile {
+                    name.to_owned()
+                } else {
+                    String::new()
+                },
                 kind: finding.kind.as_str(),
                 detail: finding.message(name),
             });
@@ -862,14 +860,14 @@ mod tests {
             "profile.key_scope_conflict"
         );
         let message = error.to_string();
-        for text in [
-            "attestation_key_id",
-            "shared/entry",
-            "bob",
-            "mcp_nonce_key_alias",
-        ] {
-            assert!(message.contains(text), "{message}");
-        }
+        // The message names both fields and the sibling, never the shared
+        // keyring coordinate.
+        assert_eq!(
+            message,
+            "profile 'alice': attestation_key_id names a keyring entry that profile 'bob' also \
+             names as mcp_nonce_key_alias; give this profile an entry of its own in its profile \
+             file"
+        );
         a.chain_id = Caip2::Testnet;
         let warning = warn_output(&a, "alice");
         assert!(warning.contains("profile.key_scope"));
@@ -986,10 +984,7 @@ mod tests {
             .findings("alice", &a)
             .iter()
             .filter_map(|finding| match &finding.kind {
-                KeyScopeKind::InstallationEntry { field, coordinate } => {
-                    assert_eq!(coordinate.service, "stellar-agent-toolsets");
-                    Some(*field)
-                }
+                KeyScopeKind::InstallationEntry { field } => Some(*field),
                 _ => None,
             })
             .collect();
@@ -1071,12 +1066,16 @@ mod tests {
                 "profile.key_scope_conflict"
             );
             assert!(
-                refusal.detail.contains(&format!(
-                    "names keyring entry '{}/{}'",
-                    moved.service, moved.account
-                )),
+                refusal
+                    .detail
+                    .contains("names a keyring entry other than its default entry"),
                 "{refusal}"
             );
+            if moved.service == default.service {
+                assert!(!refusal.detail.contains("/moved"), "{refusal}");
+            } else {
+                assert!(!refusal.detail.contains(&moved.service), "{refusal}");
+            }
             assert!(
                 refusal
                     .detail
@@ -1226,7 +1225,6 @@ mod tests {
                 field: label,
                 sibling: "bob".to_owned(),
                 sibling_field: "attestation_key_id".to_owned(),
-                coordinate: Coordinate::from(&expected),
                 recovery: SharedRecovery::CorrectTheSiblingFile,
             }
         );
@@ -1303,9 +1301,9 @@ mod tests {
                     field: "policy_owner_key_id",
                     sibling: "bob".to_owned(),
                     sibling_field: "attestation_key_id".to_owned(),
-                    coordinate: Coordinate::from(&a.policy_owner_key_id),
                     recovery: SharedRecovery::CorrectTheSiblingFile,
                 },
+                resolved_profile: true,
             }]
         );
     }
@@ -1322,9 +1320,12 @@ mod tests {
         let refusal = result.unwrap_err();
         assert_eq!(refusal.kind, "owner_account_override");
         assert!(
-            refusal.detail.contains("names account 'override'"),
+            refusal
+                .detail
+                .contains("policy_owner_key_id names an account other than 'default'"),
             "{refusal}"
         );
+        assert!(!refusal.detail.contains("override"), "{refusal}");
         assert!(output.contains("profile.key_scope"), "{output}");
         assert!(
             output.contains(
@@ -1333,7 +1334,60 @@ mod tests {
             ),
             "{output}"
         );
-        assert!(!output.contains("names account 'override'"), "{output}");
+        assert!(!output.contains("override"), "{output}");
+    }
+
+    /// Every finding a coordinate in a profile file or an environment overlay
+    /// can raise names the fields, the sibling and the derived default, and
+    /// neither the mainnet refusal nor the warnings that follow it carry the
+    /// coordinate.
+    #[test]
+    #[serial_test::serial]
+    fn key_scope_coordinate_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
+        };
+
+        let f = Fixture::new();
+        let marked = KeyringEntryRef::new(format!("svc-{CREDENTIAL_MARKER}"), CREDENTIAL_MARKER);
+        let mut a = profile("alice");
+        a.policy_owner_key_id.account = CREDENTIAL_MARKER.to_owned();
+        a.policy_window_state_key_id = marked.clone();
+        a.attestation_key_id = marked.clone();
+        a.counterparty_cache_key_id =
+            KeyringEntryRef::new(TOOLSET_PIN_KEY_SERVICE, CREDENTIAL_MARKER);
+        let mut b = profile("bob");
+        b.attestation_key_id = marked.clone();
+        f.save("alice", &a);
+        f.save("bob", &b);
+        // The saved file does not hold this service, as with an overlay.
+        a.mcp_signer_default.service = format!("overlay-{CREDENTIAL_MARKER}");
+
+        let kinds: Vec<&str> = f
+            .findings("alice", &a)
+            .iter()
+            .map(|finding| finding.kind.as_str())
+            .collect();
+        for kind in [
+            "owner_account_override",
+            "out_of_scope",
+            "window_state_key_override",
+            "installation_entry",
+            "self_collision",
+            "shared_with_sibling",
+        ] {
+            assert!(kinds.contains(&kind), "{kind} missing from {kinds:?}");
+        }
+        let (result, output) = capture_enforce(&a, "alice");
+        let refusal = result.unwrap_err();
+        assert_no_marker(&refusal, CREDENTIAL_MARKER);
+        assert_no_marker(&ValidationError::from(refusal), CREDENTIAL_MARKER);
+        assert!(output.contains("profile.key_scope"), "{output}");
+        assert_no_marker_in_text(&output, CREDENTIAL_MARKER);
+        for finding in f.findings("alice", &a) {
+            assert_no_marker_in_text(&format!("{finding:?}"), CREDENTIAL_MARKER);
+            assert_no_marker_in_text(&finding.message("alice"), CREDENTIAL_MARKER);
+        }
     }
 
     #[test]
@@ -1372,9 +1426,8 @@ mod tests {
         assert_eq!(
             f.findings("alice", &a),
             vec![KeyScopeFinding {
-                kind: KeyScopeKind::SiblingUnreadable {
-                    sibling: Some("bob".to_owned()),
-                },
+                kind: KeyScopeKind::SiblingUnreadable { sibling: None },
+                resolved_profile: true,
             }]
         );
         assert!(warn_output(&a, "alice").contains("could not be read"));
@@ -1557,7 +1610,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn rendered_parts_are_redacted_and_bounded_at_envelopes_and_warns() {
+    fn rendered_findings_omit_the_coordinate_at_envelopes_and_warns() {
         let f = Fixture::new();
         if std::env::var("KEY_SCOPE_RENDER_CHILD").as_deref() != Ok("1") {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1565,7 +1618,7 @@ mod tests {
                     "--exact",
                     concat!(
                         "profile::key_scope::tests::",
-                        "rendered_parts_are_redacted_and_bounded_at_envelopes_and_warns"
+                        "rendered_findings_omit_the_coordinate_at_envelopes_and_warns"
                     ),
                     "--nocapture",
                 ])
@@ -1604,9 +1657,10 @@ mod tests {
                     .unwrap();
             a.chain_id = Caip2::Testnet;
             let warning = warn_output(&a, "alice");
+            // Neither the raw coordinate nor its redacted form is rendered.
             for rendered in [typed, raw, warning] {
-                assert!(rendered.contains("<HOME>"), "{rendered}");
-                assert!(rendered.contains("..."), "{rendered}");
+                assert!(rendered.contains("key_scope"), "{rendered}");
+                assert!(!rendered.contains("<HOME>"), "{rendered}");
                 assert!(!rendered.contains("synthetic-home"), "{rendered}");
                 assert!(!rendered.contains("HIDDEN_MARKER"), "{rendered}");
                 assert!(!rendered.contains(&"x".repeat(128)), "{rendered}");
@@ -1819,5 +1873,52 @@ mod tests {
             "window_state_key_override"
         );
         enforce_message_signing_scope_in_dir(&f.dir, &selected, "message").unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn key_scope_requested_name_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
+        };
+        let f = Fixture::new();
+        let a = profile("alice");
+        for name in [
+            format!("{CREDENTIAL_MARKER}/"),
+            CREDENTIAL_MARKER.to_owned(),
+        ] {
+            if name == CREDENTIAL_MARKER {
+                std::fs::create_dir(f.dir.join(format!("{name}.toml"))).unwrap();
+            }
+            let (result, logs) = capture_enforce(&a, &name);
+            let error = result.unwrap_err();
+            assert_eq!(error.kind, "selected_document_unreadable");
+            assert_eq!(
+                error.to_string(),
+                "the selected profile file cannot be read for the keyring-entry comparison"
+            );
+            assert_no_marker(&error, CREDENTIAL_MARKER);
+            assert_eq!(
+                ValidationError::from(error.clone()).code(),
+                "profile.key_scope_conflict"
+            );
+            assert_no_marker(&ValidationError::from(error), CREDENTIAL_MARKER);
+            assert_no_marker_in_text(&logs, CREDENTIAL_MARKER);
+            for error in [
+                enforce_message_signing_scope(&a, &name).unwrap_err(),
+                enforce_message_signing_scope_in_dir(&f.dir, &a, &name).unwrap_err(),
+            ] {
+                assert_eq!(error.kind, "selected_document_unreadable");
+                assert_eq!(
+                    error.to_string(),
+                    "the selected profile file cannot be read for the keyring-entry comparison"
+                );
+                assert_no_marker(&error, CREDENTIAL_MARKER);
+            }
+        }
+        let mut a = profile(CREDENTIAL_MARKER);
+        a.policy_owner_key_id.account = "override".to_owned();
+        let (_, logs) = capture_enforce(&a, &format!("{CREDENTIAL_MARKER}-missing"));
+        assert_no_marker_in_text(&logs, CREDENTIAL_MARKER);
     }
 }

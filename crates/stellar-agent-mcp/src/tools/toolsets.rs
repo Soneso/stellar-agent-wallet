@@ -356,11 +356,11 @@ impl WalletServer {
         let (tool_name, _pin) =
             resolve_toolset_and_check(&toolset_name, &action, &toolsets_root, pin_key.as_ref())
                 .map_err(|e| match e {
-                    ToolsetRuntimeError::ToolsetNotInstalled { .. }
+                    ToolsetRuntimeError::ToolsetNotInstalled
                     | ToolsetRuntimeError::PinUnverifiable { .. } => {
                         rmcp::ErrorData::invalid_params(e.to_string(), None)
                     }
-                    ToolsetRuntimeError::UnknownToolsetAction { .. }
+                    ToolsetRuntimeError::UnknownToolsetAction
                     | ToolsetRuntimeError::CapabilityNotDeclared { .. }
                     | ToolsetRuntimeError::ToolNotAllowed { .. } => {
                         rmcp::ErrorData::invalid_params(e.to_string(), None)
@@ -608,7 +608,10 @@ impl WalletServer {
         let payment_fields: GatedPaymentFields =
             serde_json::from_value(serde_json::Value::Object(payment_fields)).map_err(|e| {
                 rmcp::ErrorData::invalid_params(
-                    format!("toolset.gated_args_deserialise: stellar_pay_commit: {e}"),
+                    format!(
+                        "toolset.gated_args_deserialise: stellar_pay_commit: {}",
+                        describe_args_error(&e)
+                    ),
                     None,
                 )
             })?;
@@ -707,9 +710,9 @@ impl WalletServer {
             Err(e) => {
                 // Hard errors (toolset not installed, capability not declared, etc.)
                 let err = match e {
-                    ToolsetRuntimeError::ToolsetNotInstalled { .. }
+                    ToolsetRuntimeError::ToolsetNotInstalled
                     | ToolsetRuntimeError::PinUnverifiable { .. }
-                    | ToolsetRuntimeError::UnknownToolsetAction { .. }
+                    | ToolsetRuntimeError::UnknownToolsetAction
                     | ToolsetRuntimeError::CapabilityNotDeclared { .. }
                     | ToolsetRuntimeError::ToolNotAllowed { .. } => {
                         rmcp::ErrorData::invalid_params(e.to_string(), None)
@@ -996,9 +999,9 @@ impl WalletServer {
         match resolve_toolset_sign_payment_gated(&gated_params) {
             Err(e) => {
                 let err = match e {
-                    ToolsetRuntimeError::ToolsetNotInstalled { .. }
+                    ToolsetRuntimeError::ToolsetNotInstalled
                     | ToolsetRuntimeError::PinUnverifiable { .. }
-                    | ToolsetRuntimeError::UnknownToolsetAction { .. }
+                    | ToolsetRuntimeError::UnknownToolsetAction
                     | ToolsetRuntimeError::CapabilityNotDeclared { .. }
                     | ToolsetRuntimeError::ToolNotAllowed { .. } => {
                         rmcp::ErrorData::invalid_params(e.to_string(), None)
@@ -1099,7 +1102,10 @@ impl WalletServer {
                 let typed: super::pay::StellarPayCommitArgs = serde_json::from_value(args)
                     .map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.gated_args_deserialise: stellar_pay_commit: {e}"),
+                            format!(
+                                "toolset.gated_args_deserialise: stellar_pay_commit: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
@@ -1112,7 +1118,8 @@ impl WalletServer {
                     serde_json::from_value(args).map_err(|e| {
                         rmcp::ErrorData::invalid_params(
                             format!(
-                                "toolset.gated_args_deserialise: stellar_rule_create_commit: {e}"
+                                "toolset.gated_args_deserialise: stellar_rule_create_commit: {}",
+                                describe_args_error(&e)
                             ),
                             None,
                         )
@@ -1130,6 +1137,23 @@ impl WalletServer {
                 None,
             )),
         }
+    }
+}
+
+/// Describes why tool arguments did not deserialise, by the error class only.
+///
+/// A `serde_json` data error quotes the offending value (an unknown variant,
+/// an invalid string), and the arguments come from the caller, so the
+/// description names the class and never the value. A deserialisation from a
+/// `serde_json::Value` carries no source position, so none is reported.
+fn describe_args_error(error: &serde_json::Error) -> &'static str {
+    use serde_json::error::Category;
+    match error.classify() {
+        Category::Syntax | Category::Eof => "the arguments are not valid JSON",
+        Category::Data => {
+            "the arguments have a missing field or a field of the wrong type or value"
+        }
+        Category::Io => "the arguments could not be read",
     }
 }
 
@@ -1159,7 +1183,10 @@ impl WalletServer {
                 let typed: super::balances::StellarBalancesArgs = serde_json::from_value(args)
                     .map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.args_deserialise: stellar_balances: {e}"),
+                            format!(
+                                "toolset.args_deserialise: stellar_balances: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
@@ -1169,7 +1196,10 @@ impl WalletServer {
                 let typed: super::pay::StellarPayArgs =
                     serde_json::from_value(args).map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.args_deserialise: stellar_pay: {e}"),
+                            format!(
+                                "toolset.args_deserialise: stellar_pay: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
@@ -1179,7 +1209,10 @@ impl WalletServer {
                 let typed: super::claim::StellarClaimArgs =
                     serde_json::from_value(args).map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.args_deserialise: stellar_claim: {e}"),
+                            format!(
+                                "toolset.args_deserialise: stellar_claim: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
@@ -1189,7 +1222,10 @@ impl WalletServer {
                 let typed: super::rule_create::StellarRuleCreateArgs = serde_json::from_value(args)
                     .map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.args_deserialise: stellar_rule_create: {e}"),
+                            format!(
+                                "toolset.args_deserialise: stellar_rule_create: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
@@ -1199,7 +1235,10 @@ impl WalletServer {
                 let typed: super::sep47_discover::Sep47DiscoverArgs = serde_json::from_value(args)
                     .map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.args_deserialise: stellar_sep47_discover: {e}"),
+                            format!(
+                                "toolset.args_deserialise: stellar_sep47_discover: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
@@ -1210,7 +1249,8 @@ impl WalletServer {
                     serde_json::from_value(args).map_err(|e| {
                         rmcp::ErrorData::invalid_params(
                             format!(
-                                "toolset.args_deserialise: stellar_sep48_preview_invocation: {e}"
+                                "toolset.args_deserialise: stellar_sep48_preview_invocation: {}",
+                                describe_args_error(&e)
                             ),
                             None,
                         )
@@ -1221,7 +1261,10 @@ impl WalletServer {
                 let typed: super::sep7_parse_uri::Sep7ParseUriArgs = serde_json::from_value(args)
                     .map_err(|e| {
                     rmcp::ErrorData::invalid_params(
-                        format!("toolset.args_deserialise: stellar_sep7_parse_uri: {e}"),
+                        format!(
+                            "toolset.args_deserialise: stellar_sep7_parse_uri: {}",
+                            describe_args_error(&e)
+                        ),
                         None,
                     )
                 })?;
@@ -1231,7 +1274,10 @@ impl WalletServer {
                 let typed: super::rules::StellarRulesListArgs = serde_json::from_value(args)
                     .map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.args_deserialise: stellar_rules_list: {e}"),
+                            format!(
+                                "toolset.args_deserialise: stellar_rules_list: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
@@ -1241,7 +1287,10 @@ impl WalletServer {
                 let typed: super::rules::StellarRulesGetArgs = serde_json::from_value(args)
                     .map_err(|e| {
                         rmcp::ErrorData::invalid_params(
-                            format!("toolset.args_deserialise: stellar_rules_get: {e}"),
+                            format!(
+                                "toolset.args_deserialise: stellar_rules_get: {}",
+                                describe_args_error(&e)
+                            ),
                             None,
                         )
                     })?;
@@ -1411,6 +1460,90 @@ mod tests {
         assert_eq!(code, "policy.engine_required");
     }
 
+    /// Routed arguments that do not deserialise into the tool's argument type
+    /// are refused by the tool and the error class, and the refusal repeats
+    /// none of the argument values the deserialiser quotes.
+    #[tokio::test]
+    async fn toolset_args_marker_is_not_echoed() {
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
+        };
+
+        let toolsets = tempfile::TempDir::new().unwrap();
+        stellar_agent_toolsets_install::write_toolset_for_test(
+            toolsets.path(),
+            "balance-reporter",
+            &[
+                "read-balance",
+                "propose-transaction",
+                "suggest-destination",
+                "read-rules",
+                "sign-payment",
+            ],
+            &[],
+            "2026-06-02T00:00:00Z",
+            &pin_key(0x5a),
+        )
+        .unwrap();
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.set_toolsets_root_for_test(toolsets.path().to_path_buf());
+        server.set_toolset_pin_key_for_test(pin_key(0x5a));
+
+        for action in ALL_MATRIX_TOOL_NAMES {
+            let mut invoke = balances_invoke("balance-reporter");
+            invoke.chain_id = Some("stellar:testnet".to_owned());
+            invoke.action = (*action).to_owned();
+            invoke.args =
+                serde_json::json!({"chain_id": "stellar:testnet", "account_id": CREDENTIAL_MARKER});
+            // A string in a required numeric field or a missing required field
+            // reaches each arm's independent deserializer.
+            invoke.args["assets"] = serde_json::json!(CREDENTIAL_MARKER);
+            invoke.args["limit"] = serde_json::json!(CREDENTIAL_MARKER);
+            invoke.args["transaction_xdr"] = serde_json::json!([CREDENTIAL_MARKER]);
+            let err = server
+                .call_stellar_toolset_invoke(invoke)
+                .await
+                .expect_err("arguments are refused");
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert_eq!(
+                err.message,
+                format!(
+                    "toolset.args_deserialise: {action}: the arguments have a missing field or a field of the wrong type or value"
+                )
+            );
+            assert_no_marker(&err, CREDENTIAL_MARKER);
+        }
+        let mut invoke = balances_invoke("balance-reporter");
+        invoke.action = "stellar_pay_commit".to_owned();
+        invoke.chain_id = Some("stellar:testnet".to_owned());
+        invoke.args = serde_json::json!({"envelope_xdr": "unused", "asset": "native", "amount_in_stroops": [CREDENTIAL_MARKER]});
+        let err = server
+            .call_stellar_toolset_invoke(invoke)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            err.message,
+            "toolset.gated_args_deserialise: stellar_pay_commit: the arguments have a missing field or a field of the wrong type or value"
+        );
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        assert_no_marker_in_text(&capture.captured_str(), "CREDMARKER7");
+    }
+
     /// Verify that ALL_MATRIX_TOOL_NAMES lists only names that have a routing arm
     /// in route_to_matrix_tool (i.e. no name exists in the matrix that is missing
     /// from the match — catches the case where a matrix tool is added but the
@@ -1452,6 +1585,243 @@ mod tests {
                  the matrix and the router are out of sync"
             );
         }
+    }
+    #[tokio::test]
+    async fn toolset_name_and_action_marker_is_not_echoed() {
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+        let toolsets = tempfile::tempdir().unwrap();
+        stellar_agent_toolsets_install::write_toolset_for_test(
+            toolsets.path(),
+            "balance-reporter",
+            &["read-balance"],
+            &[],
+            "2026-06-02T00:00:00Z",
+            &pin_key(0x5a),
+        )
+        .unwrap();
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.set_toolsets_root_for_test(toolsets.path().to_path_buf());
+        server.set_toolset_pin_key_for_test(pin_key(0x5a));
+        for (name, action, expected) in [
+            (
+                CREDENTIAL_MARKER,
+                "stellar_balances",
+                "toolset.not_installed: the requested toolset is not installed",
+            ),
+            (
+                "missing",
+                "stellar_balances",
+                "toolset.not_installed: the requested toolset is not installed",
+            ),
+            (
+                "balance-reporter",
+                CREDENTIAL_MARKER,
+                "toolset.unknown_action: the requested action is not in the capability-to-tool matrix",
+            ),
+        ] {
+            let mut invoke = balances_invoke(name);
+            invoke.action = action.to_owned();
+            let error = server
+                .call_stellar_toolset_invoke(invoke)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert_eq!(error.message, expected);
+            stellar_agent_test_support::rejected_value::assert_no_marker(&error, CREDENTIAL_MARKER);
+            assert_no_marker_in_text(&format!("{error:?}"), CREDENTIAL_MARKER);
+        }
+        stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+            &capture.captured_str(),
+            "CREDMARKER7",
+        );
+    }
+    #[cfg(feature = "test-helpers")]
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn gated_toolset_args_marker_is_not_echoed() {
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        use base64::Engine as _;
+        use stellar_agent_core::approval::{
+            AttestationBinding, ContextRuleProposalSnapshot, PendingApproval, PendingApprovalStore,
+            RuleProposalContextType, RuleProposalSigner, TOOLSET_GRANT_DEFAULT_TTL_MS,
+            ToolsetGrantStore, build_attested_grant, process_uid_for_attestation,
+        };
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+        use stellar_xdr::{
+            Asset, Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
+            SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
+            TransactionV1Envelope, Uint256, VecM, WriteXdr,
+        };
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let approval_dir = root.path().join("approvals");
+        std::fs::create_dir(&approval_dir).unwrap();
+        let grant_path = root.path().join("grants.toml");
+        let profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
+            .with_noop_engine()
+            .build();
+        let key = [0x42; 32];
+        keyring_core::Entry::new(
+            &profile.attestation_key_id.service,
+            &profile.attestation_key_id.account,
+        )
+        .unwrap()
+        .set_password(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key))
+        .unwrap();
+        let mut server = WalletServer::new(profile).unwrap();
+        server.set_toolsets_root_for_test(root.path().to_path_buf());
+        server.set_toolset_pin_key_for_test(pin_key(0x5a));
+        server.set_approval_dir_for_test(approval_dir.clone());
+        server.set_grant_store_path_for_test(grant_path.clone());
+        stellar_agent_toolsets_install::write_toolset_for_test(
+            root.path(),
+            "marker-tools",
+            &["sign-payment", "sign-rule-create"],
+            &[],
+            "2026-06-02T00:00:00Z",
+            &pin_key(0x5a),
+        )
+        .unwrap();
+        let dest = stellar_strkey::ed25519::PublicKey([7; 32])
+            .to_string()
+            .to_string();
+        let contract = stellar_strkey::Contract([8; 32]).to_string().to_string();
+        let now = stellar_agent_core::timefmt::now_unix_ms().unwrap();
+        for (capability, destination, asset, amount) in [
+            ("sign-payment", dest.as_str(), "XLM", 1_000_000),
+            (
+                "sign-rule-create",
+                contract.as_str(),
+                stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_ASSET_SENTINEL,
+                stellar_agent_toolsets_runtime::matrix::SIGN_RULE_CREATE_AMOUNT_SENTINEL,
+            ),
+        ] {
+            let grant = build_attested_grant(
+                "marker-tools".to_owned(),
+                capability.to_owned(),
+                destination.to_owned(),
+                asset.to_owned(),
+                0,
+                amount,
+                process_uid_for_attestation().unwrap(),
+                now,
+                TOOLSET_GRANT_DEFAULT_TTL_MS,
+                &key,
+                &AttestationBinding::new("acct", "stellar:testnet"),
+            )
+            .unwrap();
+            ToolsetGrantStore::open(grant_path.clone(), now)
+                .unwrap()
+                .insert(grant)
+                .unwrap();
+        }
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([7; 32])),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::Payment(PaymentOp {
+                        destination: MuxedAccount::Ed25519(Uint256([7; 32])),
+                        asset: Asset::Native,
+                        amount: 1_000_000,
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: VecM::default(),
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap();
+        let entry = PendingApproval::new_rule_proposal_pending(
+            contract,
+            stellar_agent_core::profile::caip2::TESTNET_PASSPHRASE.to_owned(),
+            "stellar:testnet".to_owned(),
+            ContextRuleProposalSnapshot::new(
+                RuleProposalContextType::Default,
+                "daily".to_owned(),
+                None,
+                vec![RuleProposalSigner::delegated(dest.clone(), true)],
+                vec![],
+                vec![0],
+                false,
+                false,
+            ),
+            [0; 32],
+            "rule".to_owned(),
+            process_uid_for_attestation().unwrap(),
+            60_000,
+        )
+        .unwrap();
+        let nonce = entry.approval_nonce.clone();
+        PendingApprovalStore::open(approval_dir.join("acct.toml"))
+            .unwrap()
+            .insert(entry, now)
+            .unwrap();
+        for (action, args) in [
+            (
+                "stellar_pay_commit",
+                serde_json::json!({"source": dest, "destination": dest, "asset": "native",
+                "amount": "0.1 XLM", "envelope_xdr": envelope, "nonce": "unused", "expires_at_unix_ms": CREDENTIAL_MARKER}),
+            ),
+            (
+                "stellar_rule_create_commit",
+                serde_json::json!({"approval_nonce": nonce, "approval_attestation": [CREDENTIAL_MARKER]}),
+            ),
+        ] {
+            let err = server
+                .call_stellar_toolset_invoke(StellarToolsetInvokeArgs {
+                    toolset: "marker-tools".to_owned(),
+                    action: action.to_owned(),
+                    chain_id: Some("stellar:testnet".to_owned()),
+                    args,
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert_eq!(
+                err.message,
+                format!(
+                    "toolset.gated_args_deserialise: {action}: the arguments have a missing field or a field of the wrong type or value"
+                )
+            );
+            assert_no_marker(&err, CREDENTIAL_MARKER);
+        }
+        stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+            &capture.captured_str(),
+            "CREDMARKER7",
+        );
     }
 }
 

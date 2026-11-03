@@ -398,11 +398,13 @@ fn parse_fee_choice_invalid_text_returns_amount_malformed() {
     assert!(
         matches!(
             err,
-            WalletError::Validation(ValidationError::AmountMalformed { ref input })
-                if input == "garbage"
+            WalletError::Validation(ValidationError::AmountMalformed { ref field })
+                if field == "--fee"
         ),
-        "AmountMalformed input must echo the rejected string; got: {err:?}"
+        "AmountMalformed must name the fee argument; got: {err:?}"
     );
+    assert!(!err.to_string().contains("garbage"), "{err}");
+    assert!(!format!("{err:?}").contains("garbage"), "{err:?}");
 }
 
 #[test]
@@ -430,15 +432,16 @@ fn parse_fee_choice_auto_unknown_percentile_returns_amount_malformed() {
     // "auto:p101" is not a recognised percentile label.
     let err = parse_classic_fee_choice(Some("auto:p101")).unwrap_err();
     assert_eq!(err.code(), "validation.amount_malformed");
-    // The rejected input string must include the full "auto:p101" form.
+    // The refusal names the fee argument, never the rejected label.
     assert!(
         matches!(
             err,
-            WalletError::Validation(ValidationError::AmountMalformed { ref input })
-                if input.contains("auto:p101")
+            WalletError::Validation(ValidationError::AmountMalformed { ref field })
+                if field == "--fee"
         ),
-        "AmountMalformed input must reference the rejected label; got: {err:?}"
+        "AmountMalformed must name the fee argument; got: {err:?}"
     );
+    assert!(!format!("{err:?}").contains("p101"), "{err:?}");
 }
 
 #[test]
@@ -762,7 +765,7 @@ fn validate_rpc_url_mainnet_stellar_org_allowed() {
 fn validate_rpc_url_garbage_string_returns_invalid_url() {
     let err = validate_rpc_url("not a url at all %%").unwrap_err();
     assert!(
-        matches!(err, RpcUrlError::InvalidUrl(_)),
+        matches!(err, RpcUrlError::InvalidUrl),
         "unparseable string must yield InvalidUrl; got: {err:?}"
     );
 }
@@ -771,7 +774,7 @@ fn validate_rpc_url_garbage_string_returns_invalid_url() {
 fn validate_rpc_url_empty_string_returns_invalid_url() {
     let err = validate_rpc_url("").unwrap_err();
     assert!(
-        matches!(err, RpcUrlError::InvalidUrl(_)),
+        matches!(err, RpcUrlError::InvalidUrl),
         "empty string must yield InvalidUrl; got: {err:?}"
     );
 }
@@ -781,7 +784,7 @@ fn validate_rpc_url_http_scheme_not_allowed() {
     // HTTP is never permitted for production RPC hosts.
     let err = validate_rpc_url("http://soroban-testnet.stellar.org").unwrap_err();
     assert!(
-        matches!(err, RpcUrlError::NonHttps(_)),
+        matches!(err, RpcUrlError::NonHttps),
         "http:// scheme must yield NonHttps; got: {err:?}"
     );
 }
@@ -789,12 +792,10 @@ fn validate_rpc_url_http_scheme_not_allowed() {
 #[test]
 fn validate_rpc_url_non_listed_https_host_returns_host_not_allowed() {
     let err = validate_rpc_url("https://example.com/rpc").unwrap_err();
+    assert!(!err.to_string().contains("example.com"), "{err}");
+    assert!(!format!("{err:?}").contains("example.com"), "{err:?}");
     match err {
-        RpcUrlError::HostNotAllowed {
-            ref host,
-            ref allowed,
-        } => {
-            assert_eq!(host, "example.com");
+        RpcUrlError::HostNotAllowed { ref allowed } => {
             // The allowed string must contain all three production hosts.
             assert!(
                 allowed.contains("soroban-testnet.stellar.org"),
@@ -832,7 +833,7 @@ fn validate_rpc_url_loopback_http_is_rejected_by_production_validator() {
     // inner function, so it hits NonHttps.
     let err = validate_rpc_url("http://127.0.0.1:8000").unwrap_err();
     assert!(
-        matches!(err, RpcUrlError::NonHttps(_)),
+        matches!(err, RpcUrlError::NonHttps),
         "http://loopback must yield NonHttps from production validator; got: {err:?}"
     );
 }
@@ -919,26 +920,27 @@ mod loopback_tests {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn rpc_url_error_invalid_url_display_contains_url_text() {
+fn rpc_url_error_invalid_url_display_names_the_rule() {
     let err = validate_rpc_url("%%bad").unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("invalid RPC URL"),
         "InvalidUrl display must contain 'invalid RPC URL'; got: {msg}"
     );
+    assert!(!msg.contains("%%bad"), "{msg}");
 }
 
 #[test]
-fn rpc_url_error_non_https_display_contains_url() {
+fn rpc_url_error_non_https_display_names_the_rule_not_the_url() {
     let err = validate_rpc_url("http://soroban-testnet.stellar.org").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("non-HTTPS"),
-        "NonHttps display must mention 'non-HTTPS'; got: {msg}"
+        msg.contains("non-HTTPS") && msg.contains("must use https"),
+        "NonHttps display must name the rule; got: {msg}"
     );
     assert!(
-        msg.contains("soroban-testnet.stellar.org"),
-        "NonHttps display must include the rejected URL; got: {msg}"
+        !msg.contains("soroban-testnet.stellar.org"),
+        "NonHttps display must not repeat the rejected URL; got: {msg}"
     );
 }
 
@@ -953,17 +955,43 @@ fn rpc_url_error_credentials_display_mentions_credentials() {
 }
 
 #[test]
-fn rpc_url_error_host_not_allowed_display_contains_host_and_allowed_list() {
+fn rpc_url_error_host_not_allowed_display_names_the_allowed_list_only() {
     let err = validate_rpc_url("https://rogue.example.com").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("rogue.example.com"),
-        "HostNotAllowed display must contain the rejected host; got: {msg}"
+        !msg.contains("rogue.example.com"),
+        "HostNotAllowed display must not repeat the rejected host; got: {msg}"
     );
     assert!(
         msg.contains("soroban-testnet.stellar.org"),
         "HostNotAllowed display must contain the allowed list; got: {msg}"
     );
+}
+
+/// A credential typed into any part of a rejected RPC URL never reaches the
+/// error, whichever rule refuses the URL.
+#[test]
+fn a_credential_in_a_rejected_rpc_url_is_not_echoed() {
+    use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+    let lower = CREDENTIAL_MARKER.to_ascii_lowercase();
+    for (url, marker) in [
+        (
+            format!("{CREDENTIAL_MARKER} %%"),
+            CREDENTIAL_MARKER.to_owned(),
+        ),
+        (
+            format!("http://soroban-testnet.stellar.org/{CREDENTIAL_MARKER}"),
+            CREDENTIAL_MARKER.to_owned(),
+        ),
+        (
+            format!("https://user:{CREDENTIAL_MARKER}@soroban-testnet.stellar.org"),
+            CREDENTIAL_MARKER.to_owned(),
+        ),
+        (format!("https://{lower}.example/rpc"), lower.clone()),
+    ] {
+        let err = validate_rpc_url(&url).unwrap_err();
+        assert_no_marker(&err, &marker);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

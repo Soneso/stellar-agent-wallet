@@ -363,7 +363,7 @@ async fn duplicate_name_rejected() {
         .await
         .expect_err("second registration with same name must fail");
     assert!(
-        matches!(err, CredentialsError::DuplicateName { .. }),
+        matches!(err, CredentialsError::DuplicateName),
         "expected DuplicateName, got {err:?}"
     );
 }
@@ -392,7 +392,7 @@ async fn delete_removes_credential() {
         .show(credential_name)
         .expect_err("show must fail after delete");
     assert!(
-        matches!(err, CredentialsError::NotFound { .. }),
+        matches!(err, CredentialsError::NotFound),
         "expected NotFound after delete, got {err:?}"
     );
 
@@ -411,8 +411,8 @@ fn show_not_found() {
         .show("nonexistent")
         .expect_err("show must fail for unknown name");
     assert!(
-        matches!(err, CredentialsError::NotFound { ref name } if name == "nonexistent"),
-        "expected NotFound {{ name: \"nonexistent\" }}, got {err:?}"
+        matches!(err, CredentialsError::NotFound),
+        "expected NotFound without a name payload, got {err:?}"
     );
 }
 

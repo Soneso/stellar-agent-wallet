@@ -94,7 +94,6 @@ use stellar_agent_network::StellarRpcClient;
 use stellar_agent_network::cross_check::{
     CrossCheckOutcome, CrossCheckWitness, SorobanCrossCheck, SorobanWitnessInputs,
 };
-use stellar_agent_network::quote_server_text;
 use stellar_agent_network::refuse_mainnet_write;
 use stellar_agent_network::signing::Signer;
 use stellar_agent_sep43::signing::sign_soroban_auth_entry;
@@ -292,20 +291,14 @@ fn validate_requirements_inner(
     legacy_rpc: Option<&str>,
 ) -> Result<i128, X402Error> {
     if requirements.scheme != "exact" {
-        return Err(X402Error::UnsupportedScheme {
-            scheme: quote_server_text(&requirements.scheme),
-        });
+        return Err(X402Error::UnsupportedScheme);
     }
 
     // The x402 wire says "stellar:pubnet" where the wallet's CAIP-2 says
     // "stellar:mainnet"; the passphrase is the common ground.
     let network_passphrase = x402_network_to_passphrase(&requirements.network)?;
     if network_passphrase != profile_passphrase {
-        return Err(X402Error::NetworkPassphraseMismatch {
-            network: requirements.network.clone(),
-            expected_passphrase: network_passphrase,
-            profile_passphrase: profile_passphrase.to_owned(),
-        });
+        return Err(X402Error::NetworkPassphraseMismatch);
     }
 
     // A mainnet passphrase or a mainnet-pattern endpoint never reaches the
@@ -333,22 +326,20 @@ fn validate_requirements_inner(
         requirements
             .amount
             .parse::<i128>()
-            .map_err(|e| X402Error::AmountConversion {
-                detail: format!(
-                    "wire amount {} is not a valid i128: {e}",
-                    quote_server_text(&requirements.amount)
-                ),
+            .map_err(|_| X402Error::AmountConversion {
+                detail: "wire amount must be a positive decimal i128".to_owned(),
             })?;
     if amount <= 0 {
         return Err(X402Error::AmountConversion {
-            detail: format!(
-                "wire amount must be a positive integer (> 0), got {}",
-                requirements.amount
-            ),
+            detail: "wire amount must be a positive decimal i128".to_owned(),
         });
     }
 
-    strkey_to_recipient_sc_address(&requirements.pay_to)?;
+    strkey_to_recipient_sc_address(&requirements.pay_to).map_err(|_| {
+        X402Error::InvalidRecipientAddress {
+            detail: "pay_to must be a G-, C-, or M-strkey".to_owned(),
+        }
+    })?;
 
     if requirements.max_timeout_seconds == 0 {
         return Err(X402Error::InvalidPaymentRequired {
@@ -1850,14 +1841,8 @@ fn unexpected_auth_entries(detail: &str) -> X402Error {
 fn validate_c_strkey(strkey: &str) -> Result<(), X402Error> {
     match Strkey::from_string(strkey) {
         Ok(Strkey::Contract(_)) => Ok(()),
-        Ok(_other) => Err(X402Error::InvalidAssetAddress {
-            detail: format!(
-                "expected C-strkey (contract), got non-contract strkey: {}",
-                quote_server_text(strkey)
-            ),
-        }),
-        Err(e) => Err(X402Error::InvalidAssetAddress {
-            detail: format!("strkey parse failed for {}: {e}", quote_server_text(strkey)),
+        Ok(_) | Err(_) => Err(X402Error::InvalidAssetAddress {
+            detail: "the asset must be a canonical C-strkey (contract)".to_owned(),
         }),
     }
 }

@@ -124,14 +124,14 @@ pub(crate) fn parse_thresholds(
     }
     if let Some(conflict) = threshold_identity_conflict(&identities, passphrase) {
         return Err(parse_error(match conflict {
-            ThresholdIdentityConflict::NativeContract { asset } => format!(
-                "mainnet.cross_check_thresholds: key `{asset}` names the native asset's \
-                 contract; set the `native` key instead"
-            ),
-            ThresholdIdentityConflict::SameAsset { asset, other } => format!(
-                "mainnet.cross_check_thresholds: key `{asset}` names the same asset as key \
-                 `{other}`"
-            ),
+            ThresholdIdentityConflict::NativeContract { .. } => {
+                "mainnet.cross_check_thresholds: an entry names the native asset's contract; \
+                 set the native key instead"
+            }
+            ThresholdIdentityConflict::SameAsset { .. } => {
+                "mainnet.cross_check_thresholds: multiple entries name the same asset; \
+                 configure one threshold per asset"
+            }
         }));
     }
     Ok(Some(result))
@@ -380,7 +380,7 @@ fn read_signed(load: &PolicyLoad<'_>) -> Result<SignedPolicy, PolicyError> {
     )?;
     let doc = raw
         .parse::<DocumentMut>()
-        .map_err(|e| parse_error(e.to_string()))?;
+        .map_err(|e| PolicyError::toml_syntax(&raw, &e))?;
     Ok(SignedPolicy { raw, document, doc })
 }
 

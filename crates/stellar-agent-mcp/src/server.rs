@@ -455,14 +455,15 @@ fn fetch_owner_pubkey_from_keyring(
 /// does not start with [`OWNER_KEY_SERVICE_PREFIX`], which indicates the
 /// profile was constructed without using `KeyringEntryRef::default_owner_key`.
 fn profile_name_from_key_ref(profile: &Profile) -> Result<String, BuildRegistryError> {
-    let service = &profile.policy_owner_key_id.service;
+    // The refusal names the field and the expected prefix; the service text is
+    // the profile-file value the check refuses.
     stellar_agent_core::profile::name::derive_profile_name_from_owner_key(profile)
         .map(ToOwned::to_owned)
         .ok_or_else(|| BuildRegistryError::PolicyEngineError {
             detail: format!(
-                "policy_owner_key_id.service '{service}' does not start with \
-                 expected prefix '{OWNER_KEY_SERVICE_PREFIX}'; cannot derive \
-                 profile name for policy engine construction"
+                "policy_owner_key_id.service does not start with expected prefix \
+                 '{OWNER_KEY_SERVICE_PREFIX}'; cannot derive profile name for policy engine \
+                 construction"
             ),
         })
 }
@@ -2164,5 +2165,31 @@ mod tests {
         assert!(!text.contains("audit_log_hash_chain_key_id"));
         assert!(!text.contains("attestation_key_id"));
         assert!(!text.contains("counterparty_cache_key_id"));
+    }
+
+    /// A V1 profile whose owner-key service lacks the owner prefix refuses
+    /// server construction by the field and the expected prefix, without the
+    /// service text.
+    #[test]
+    #[serial_test::serial(keyring)]
+    fn owner_service_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+
+        stellar_agent_test_support::keyring_mock::install().ok();
+        let mut profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct").build();
+        profile.policy.engine = PolicyEngineKind::V1;
+        profile.policy_owner_key_id = KeyringEntryRef::new(CREDENTIAL_MARKER, "default");
+        let error = WalletServer::new(profile)
+            .err()
+            .expect("a service without the owner prefix must refuse");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "policy engine construction failed at startup: policy_owner_key_id.service does \
+                 not start with expected prefix '{OWNER_KEY_SERVICE_PREFIX}'; cannot derive \
+                 profile name for policy engine construction"
+            )
+        );
+        assert_no_marker(&error, CREDENTIAL_MARKER);
     }
 }

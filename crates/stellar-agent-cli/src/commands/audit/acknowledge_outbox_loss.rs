@@ -74,12 +74,8 @@ pub async fn run(args: &AcknowledgeOutboxLossArgs) -> i32 {
 /// envelope model.
 fn load_profile(profile_name: &str) -> Result<Profile, WalletError> {
     load_profile_reconciled(&ResolvedProfileName::from_flag(profile_name)).map_err(|e| {
-        tracing::debug!(
-            profile = %profile_name,
-            error = %e,
-            "profile access refused for audit acknowledge-outbox-loss"
-        );
-        e.to_wallet_error(profile_name)
+        tracing::debug!(error = %e, "profile access refused for audit acknowledge-outbox-loss");
+        e.to_wallet_error()
     })
 }
 

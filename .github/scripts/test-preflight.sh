@@ -1166,12 +1166,12 @@ case_target_specific_edge() {
 case_dev_dependency_edge() {
   start_case
   edit crates/stellar-agent-test-support/src/lib.rs
-  pin_packages "stellar-agent-test-support stellar-agent-approval-remote stellar-agent-approval-ui \
-stellar-agent-claimable stellar-agent-cli stellar-agent-core stellar-agent-defi stellar-agent-defindex \
-stellar-agent-dex stellar-agent-mcp stellar-agent-mpp stellar-agent-network stellar-agent-nonce \
-stellar-agent-pool stellar-agent-sep43 stellar-agent-sep48 stellar-agent-sep53 stellar-agent-sep7 \
-stellar-agent-smart-account stellar-agent-smart-account-acceptance stellar-agent-stablecoin \
-stellar-agent-toolsets-install stellar-agent-toolsets-runtime stellar-agent-x402" \
+  pin_packages "stellar-agent-test-support stellar-agent-anchor stellar-agent-approval-remote \
+stellar-agent-approval-ui stellar-agent-claimable stellar-agent-cli stellar-agent-core stellar-agent-defi \
+stellar-agent-defindex stellar-agent-dex stellar-agent-headless-keyring stellar-agent-mcp stellar-agent-mpp \
+stellar-agent-network stellar-agent-nonce stellar-agent-pool stellar-agent-sep43 stellar-agent-sep48 \
+stellar-agent-sep53 stellar-agent-sep7 stellar-agent-smart-account stellar-agent-smart-account-acceptance \
+stellar-agent-stablecoin stellar-agent-toolsets-install stellar-agent-toolsets-runtime stellar-agent-x402" \
     test-helpers,test-hooks,test-loopback,verifier-registry crates/stellar-agent-test-support/src/lib.rs
   expect_list "${ALWAYS[@]}" "${PACKAGE_GATES[@]}" test-vendored-release-cfg
 }

@@ -293,10 +293,7 @@ pub async fn run(args: &MulticallArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved_profile) {
         Ok(loaded) => loaded,
         Err(error) => {
-            render_json(&Envelope::<()>::err(&map_access_error(
-                &error,
-                &profile_name,
-            )));
+            render_json(&Envelope::<()>::err(&map_access_error(&error)));
             return 1;
         }
     };
@@ -327,9 +324,9 @@ pub async fn run(args: &MulticallArgs) -> i32 {
         return 1;
     }
     if context.secondary_rpc_url.is_none() {
-        let e = WalletError::Validation(ValidationError::AddressInvalid {
-            input: "secondary_rpc_url is required for multicall: set it in the profile TOML (secondary_rpc_url = \"https://...\") or pass --secondary-rpc-url".to_owned(),
-        });
+        let e = WalletError::Validation(ValidationError::address_check(
+            "secondary_rpc_url is required for multicall: set it in the profile TOML (secondary_rpc_url = \"https://...\") or pass --secondary-rpc-url",
+        ));
         render_json(&Envelope::<()>::err(&e));
         return 1;
     }

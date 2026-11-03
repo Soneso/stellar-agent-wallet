@@ -111,7 +111,7 @@ pub async fn run(args: ListArgs) -> i32 {
     if let Err(reason) = validate_path_component_ascii_safe(&profile_name) {
         let err = WalletError::Validation(ValidationError::ConfigInvalid {
             component: "profile",
-            reason: format!("invalid profile name '{profile_name}': {reason}"),
+            reason: format!("the profile name is not a valid profile name: {reason}"),
         });
         render_json(&Envelope::<()>::err(&err));
         return 1;

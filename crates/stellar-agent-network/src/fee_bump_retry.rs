@@ -515,9 +515,9 @@ fn compute_outer_tx_hash_hex(
     // parse_fee_source helper, but we only need the MuxedAccount here and
     // parse_fee_source is private to fee_bump.rs).
     let pk = stellar_strkey::ed25519::PublicKey::from_string(fee_source).map_err(|e| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("fee_source invalid in outer hash computation: {e}"),
-        })
+        WalletError::Validation(ValidationError::address_check(format!(
+            "fee_source invalid in outer hash computation: {e}"
+        )))
     })?;
     let fee_source_muxed = MuxedAccount::Ed25519(Uint256(pk.0));
 

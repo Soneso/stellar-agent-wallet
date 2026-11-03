@@ -81,13 +81,12 @@ impl FromStr for TargetNetwork {
     /// # Errors
     ///
     /// Returns a `String` error if the input is not `"testnet"` or `"mainnet"`.
+    /// The error names the accepted values and never the refused text.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "testnet" => Ok(Self::Testnet),
             "mainnet" => Ok(Self::Mainnet),
-            other => Err(format!(
-                "unknown network '{other}'; only 'testnet' and 'mainnet' are recognized"
-            )),
+            _ => Err("unknown network; only 'testnet' and 'mainnet' are recognized".to_owned()),
         }
     }
 }
@@ -227,25 +226,28 @@ impl clap::builder::TypedValueParser for EndpointUrlFlag {
         arg: Option<&clap::Arg>,
         value: &std::ffi::OsStr,
     ) -> Result<String, clap::Error> {
-        use clap::error::ErrorKind;
+        use clap::error::{ContextKind, ContextValue, ErrorKind};
         let flag = arg.and_then(clap::Arg::get_long).unwrap_or("endpoint");
-        let value = value.to_str().ok_or_else(|| {
-            clap::Error::raw(
-                ErrorKind::ValueValidation,
-                format!("`--{flag}`: invalid UTF-8"),
-            )
-        })?;
-        let parsed = url::Url::parse(value).map_err(|error| {
-            clap::Error::raw(ErrorKind::ValueValidation, format!("`--{flag}`: {error}"))
-        })?;
+        let refusal = |reason: String| {
+            let mut error = clap::Error::raw(ErrorKind::ValueValidation, reason);
+            if let Some(long) = arg.and_then(clap::Arg::get_long) {
+                error.insert(
+                    ContextKind::InvalidArg,
+                    ContextValue::String(format!("--{long}")),
+                );
+            }
+            error
+        };
+        let value = value
+            .to_str()
+            .ok_or_else(|| refusal(format!("`--{flag}`: invalid UTF-8")))?;
+        let parsed =
+            url::Url::parse(value).map_err(|error| refusal(format!("`--{flag}`: {error}")))?;
         if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(clap::Error::raw(
-                ErrorKind::ValueValidation,
-                format!(
-                    "`--{flag}` {}",
-                    stellar_agent_core::redact::CREDENTIALED_URL_INPUT_REFUSAL
-                ),
-            ));
+            return Err(refusal(format!(
+                "`--{flag}` {}",
+                stellar_agent_core::redact::CREDENTIALED_URL_INPUT_REFUSAL
+            )));
         }
         Ok(value.to_owned())
     }
@@ -289,14 +291,24 @@ mod tests {
         );
     }
 
+    /// An unknown network name is refused by the accepted values, and the
+    /// error carries none of the supplied text.
     #[test]
-    fn target_network_from_str_unknown_is_error() {
-        let err = TargetNetwork::from_str("futurenet").unwrap_err();
-        assert!(
-            err.contains("futurenet"),
-            "error must include the unknown token"
-        );
-        assert!(TargetNetwork::from_str("").is_err());
+    fn target_network_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        for input in [CREDENTIAL_MARKER, "futurenet", ""] {
+            let err = TargetNetwork::from_str(input).unwrap_err();
+            assert_eq!(
+                err,
+                "unknown network; only 'testnet' and 'mainnet' are recognized"
+            );
+        }
+        let err = TargetNetwork::from_str(CREDENTIAL_MARKER).unwrap_err();
+        assert_no_marker_in_text(&err, CREDENTIAL_MARKER);
+        assert_no_marker_in_text(&err, &CREDENTIAL_MARKER.to_lowercase());
     }
 
     #[test]

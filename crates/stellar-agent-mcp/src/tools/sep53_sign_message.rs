@@ -174,18 +174,21 @@ impl WalletServer {
         let message_bytes: Vec<u8> = match encoding {
             "base64" => match base64::engine::general_purpose::STANDARD.decode(&args.message) {
                 Ok(bytes) => bytes,
-                Err(e) => {
+                // The decoder's error quotes an offending byte of the
+                // message, so the refusal names the field and the form only.
+                Err(_) => {
                     return Ok(crate::tools::common::business_error_result(
                         "sep53.invalid_message_base64",
-                        format!("message base64 decode failed: {e}"),
+                        "message must be standard padded base64 when message_encoding is \
+                         'base64'",
                     ));
                 }
             },
             "utf8" => args.message.as_bytes().to_vec(),
-            other => {
+            _ => {
                 return Ok(crate::tools::common::business_error_result(
                     "sep53.invalid_encoding",
-                    format!("unsupported message_encoding: {other:?}; use 'utf8' or 'base64'"),
+                    "message_encoding must be 'utf8' or 'base64'",
                 ));
             }
         };
@@ -701,6 +704,7 @@ mod tests {
         for (encoding, code) in [
             ("base64", "sep53.invalid_message_base64"),
             ("hex", "sep53.invalid_encoding"),
+            ("CREDMARKER7", "sep53.invalid_encoding"),
         ] {
             let result = server
                 .call_stellar_sep53_sign_message(Sep53SignMessageArgs {
@@ -710,7 +714,45 @@ mod tests {
                 })
                 .await
                 .unwrap();
+            assert!(
+                !serde_json::to_string(&result)
+                    .unwrap()
+                    .contains("CREDMARKER7")
+            );
             crate::tools::message_signing_tests::assert_refusal(&result, code);
         }
+    }
+
+    /// A message that is not base64 is refused by the field and the expected
+    /// form; the refusal carries none of the message, including the byte the
+    /// decoder stopped at.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn sep53_sign_base64_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let mut fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.seed_audit();
+        fixture.profile.audit_log_path = fixture.dir.path().to_path_buf();
+        let result = fixture
+            .server()
+            .call_stellar_sep53_sign_message(Sep53SignMessageArgs {
+                message_encoding: Some("base64".to_owned()),
+                message: format!("{CREDENTIAL_MARKER}~"),
+                ..message_args()
+            })
+            .await
+            .unwrap();
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "sep53.invalid_message_base64");
+        assert_eq!(
+            message,
+            "message must be standard padded base64 when message_encoding is 'base64'"
+        );
+        assert_no_marker_in_text(&text, CREDENTIAL_MARKER);
+        assert_no_marker_in_text(&text, "symbol");
     }
 }

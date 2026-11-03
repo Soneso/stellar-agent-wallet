@@ -34,6 +34,9 @@ const MSG_MAX_CHARS: usize = 300;
 /// Per `sep-0007.md`.
 const MAX_CHAIN_DEPTH: u8 = 7;
 
+/// The form every `origin_domain` refusal names, without the refused text.
+const ORIGIN_DOMAIN_FORM: &str = "must be a lowercase RFC 1035 LDH FQDN with at least two labels; IP addresses and numeric-only labels are not allowed";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public output types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -205,9 +208,7 @@ pub fn parse_sep7_uri(uri: &str) -> Result<Sep7Request, Sep7Error> {
     match operation {
         "tx" => parse_tx_params(params).map(Sep7Request::Tx),
         "pay" => parse_pay_params(params).map(Sep7Request::Pay),
-        other => Err(Sep7Error::UnknownOperation {
-            operation: sanitize_operation(other),
-        }),
+        _ => Err(Sep7Error::UnknownOperation),
     }
 }
 
@@ -260,10 +261,11 @@ fn parse_query_params(query: &str) -> Result<std::collections::HashMap<String, S
         })?;
 
         // Reject duplicate parameters — last-value-wins is a parameter injection vector.
+        // The refusal does not name the key, which is text of the refused URI.
         if map.contains_key(&key) {
             return Err(Sep7Error::InvalidParamValue {
                 param: "query",
-                detail: format!("duplicate parameter: {key:?}"),
+                detail: "a parameter name appears more than once".to_owned(),
             });
         }
 
@@ -692,7 +694,7 @@ fn validate_origin_domain_syntax(domain: String) -> Result<String, Sep7Error> {
     // must explicitly check for pure-numeric labels here.
     if domain.parse::<std::net::IpAddr>().is_ok() {
         return Err(Sep7Error::InvalidOriginDomain {
-            detail: format!("'{domain}' is an IP address, not a valid FQDN"),
+            detail: ORIGIN_DOMAIN_FORM.to_owned(),
         });
     }
 
@@ -703,7 +705,7 @@ fn validate_origin_domain_syntax(domain: String) -> Result<String, Sep7Error> {
         .all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()));
     if all_labels_numeric {
         return Err(Sep7Error::InvalidOriginDomain {
-            detail: format!("'{domain}' consists of numeric labels only; must be a valid FQDN"),
+            detail: ORIGIN_DOMAIN_FORM.to_owned(),
         });
     }
 
@@ -715,15 +717,13 @@ fn validate_origin_domain_syntax(domain: String) -> Result<String, Sep7Error> {
     let label_count = domain.split('.').filter(|l| !l.is_empty()).count();
     if label_count < 2 {
         return Err(Sep7Error::InvalidOriginDomain {
-            detail: format!(
-                "'{domain}' is a single-label hostname; a valid FQDN requires at least two labels"
-            ),
+            detail: ORIGIN_DOMAIN_FORM.to_owned(),
         });
     }
 
     if !is_valid_ldh_home_domain(&domain) {
         return Err(Sep7Error::InvalidOriginDomain {
-            detail: format!("'{domain}' is not a valid lowercase RFC 1035 LDH FQDN"),
+            detail: ORIGIN_DOMAIN_FORM.to_owned(),
         });
     }
     Ok(domain)
@@ -811,12 +811,9 @@ fn parse_memo_type(s: &str) -> Result<MemoType, Sep7Error> {
         "MEMO_ID" => Ok(MemoType::MemoId),
         "MEMO_HASH" => Ok(MemoType::MemoHash),
         "MEMO_RETURN" => Ok(MemoType::MemoReturn),
-        other => Err(Sep7Error::InvalidParamValue {
+        _ => Err(Sep7Error::InvalidParamValue {
             param: "memo_type",
-            detail: format!(
-                "unknown memo_type: {other:?}; must be one of \
-                 MEMO_TEXT, MEMO_ID, MEMO_HASH, MEMO_RETURN"
-            ),
+            detail: "must be one of MEMO_TEXT, MEMO_ID, MEMO_HASH, MEMO_RETURN".to_owned(),
         }),
     }
 }
@@ -837,17 +834,6 @@ fn validate_memo_coherence(
         }),
         _ => Ok(()),
     }
-}
-
-/// Sanitises an operation token for inclusion in an error message.
-///
-/// Limits to 16 chars, ASCII-printable only; replaces control chars with `?`.
-fn sanitize_operation(op: &str) -> String {
-    const MAX: usize = 16;
-    op.chars()
-        .take(MAX)
-        .map(|c| if c.is_ascii_graphic() { c } else { '?' })
-        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1081,7 +1067,7 @@ mod tests {
     #[test]
     fn unknown_operation_fails() {
         let err = parse_sep7_uri("web+stellar:sign?foo=bar").unwrap_err();
-        assert!(matches!(err, Sep7Error::UnknownOperation { .. }));
+        assert!(matches!(err, Sep7Error::UnknownOperation));
     }
 
     #[test]
@@ -1667,21 +1653,41 @@ mod tests {
         );
     }
 
-    // sanitize_operation: long or non-ascii operation token is sanitised
+    /// An unknown operation, a duplicate parameter name and an unknown
+    /// memo_type are refused by the rule and the accepted values, and no
+    /// refusal repeats the text of the URI.
     #[test]
-    fn unknown_long_operation_is_sanitized_in_error() {
-        let long_op = "a".repeat(20);
-        let err = parse_sep7_uri(&format!("web+stellar:{long_op}?foo=bar")).unwrap_err();
-        assert!(
-            matches!(err, Sep7Error::UnknownOperation { .. }),
-            "long operation token must fail with UnknownOperation, got: {err:?}"
-        );
-        if let Sep7Error::UnknownOperation { ref operation } = err {
-            assert!(
-                operation.len() <= 16,
-                "sanitised operation must be ≤16 chars, got {len}: {operation}",
-                len = operation.len()
-            );
+    fn sep7_uri_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+
+        let destination = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let cases = [
+            (
+                format!("web+stellar:{CREDENTIAL_MARKER}?foo=bar"),
+                "unknown SEP-7 operation; expected 'tx' or 'pay'".to_owned(),
+            ),
+            (
+                format!(
+                    "web+stellar:pay?destination={destination}&{CREDENTIAL_MARKER}=1&\
+                     {CREDENTIAL_MARKER}=2"
+                ),
+                "SEP-7 invalid parameter value for 'query': a parameter name appears more \
+                 than once"
+                    .to_owned(),
+            ),
+            (
+                format!(
+                    "web+stellar:pay?destination={destination}&memo=1&memo_type={CREDENTIAL_MARKER}"
+                ),
+                "SEP-7 invalid parameter value for 'memo_type': must be one of MEMO_TEXT, \
+                 MEMO_ID, MEMO_HASH, MEMO_RETURN"
+                    .to_owned(),
+            ),
+        ];
+        for (uri, expected) in cases {
+            let err = parse_sep7_uri(&uri).unwrap_err();
+            assert_eq!(err.to_string(), expected);
+            assert_no_marker(&err, CREDENTIAL_MARKER);
         }
     }
 
@@ -1909,6 +1915,24 @@ mod tests {
                 assert_eq!(p.destination, "user*example.com");
             }
             Sep7Request::Tx(_) => panic!("expected Pay"),
+        }
+    }
+
+    #[test]
+    fn origin_domain_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+        for domain in [CREDENTIAL_MARKER, "CREDMARKER7.example", "127.0.0.1", "1.2"] {
+            let uri = format!(
+                "web+stellar:pay?destination=GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY&origin_domain={domain}"
+            );
+            let error = parse_sep7_uri(&uri).unwrap_err();
+            assert!(matches!(error, Sep7Error::InvalidOriginDomain { .. }));
+            assert_eq!(
+                error.to_string(),
+                "SEP-7 origin_domain is not a valid FQDN: must be a lowercase RFC 1035 LDH FQDN with at least two labels; IP addresses and numeric-only labels are not allowed"
+            );
+            assert_no_marker(&error, CREDENTIAL_MARKER);
+            assert_no_marker(&error, domain);
         }
     }
 }

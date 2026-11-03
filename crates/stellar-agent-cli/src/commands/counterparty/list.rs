@@ -151,8 +151,8 @@ pub async fn run(args: &ListArgs) -> i32 {
     let profile = match load_profile_reconciled(&resolved_profile) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
-            render::render_json(&profile_access_envelope(&e, &profile_name));
+            tracing::debug!(error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e));
             return 1;
         }
     };
@@ -272,5 +272,22 @@ mod tests {
         let parsed = ListArgsHarness::parse_from(["test", "--json", "--profile", "default"]);
         assert!(parsed.args.json);
         assert_eq!(parsed.args.profile.as_deref(), Some("default"));
+    }
+
+    /// The refusal event for an absent profile names the failure class and
+    /// never the requested profile name.
+    #[test]
+    #[serial_test::serial]
+    fn absent_profile_refusal_log_omits_the_requested_name() {
+        use crate::common::refusal_log_fixture::{
+            ABSENT_PROFILE_MARKER, assert_refusal_omits_requested_profile,
+            capture_absent_profile_refusal,
+        };
+        let args = ListArgs {
+            json: false,
+            profile: Some(ABSENT_PROFILE_MARKER.to_owned()),
+        };
+        let (code, logs) = capture_absent_profile_refusal(|_| run(&args));
+        assert_refusal_omits_requested_profile(code, &logs, "profile access refused");
     }
 }

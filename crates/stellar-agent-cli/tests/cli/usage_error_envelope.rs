@@ -7,6 +7,7 @@
 
 #![allow(
     clippy::expect_used,
+    clippy::unwrap_used,
     clippy::panic,
     reason = "test-only; assertions panic on violation"
 )]
@@ -69,10 +70,11 @@ fn assert_usage_error(output: &Output) -> String {
 #[test]
 fn an_unknown_flag_is_one_usage_error_envelope() {
     let message = assert_usage_error(&run(&["balances", "--bogus-flag"]));
-    assert!(
-        message.starts_with("unexpected argument '--bogus-flag'"),
-        "{message}"
+    assert_eq!(
+        message,
+        "command-line arguments are not valid; run the command with --help for the accepted arguments"
     );
+    assert!(!message.contains("--bogus-flag"));
 }
 
 #[test]
@@ -97,4 +99,147 @@ fn help_and_version_print_their_text_and_exit_zero() {
         );
         assert!(output.stderr.is_empty(), "{flag}");
     }
+}
+
+#[test]
+fn usage_diagnostic_marker_is_not_echoed() {
+    let marker = "CREDMARKER7";
+    for args in [
+        vec!["smart-account", "list-rules", "--max-scan-id", marker],
+        vec!["balances", "--CREDMARKER7"],
+        vec!["CREDMARKER7"],
+        vec!["balances", "--account", marker, "--output", marker],
+        vec![
+            "profile",
+            "init",
+            "--profile",
+            "fixture",
+            "--rpc-url",
+            "https://CREDMARKER7@example.invalid",
+        ],
+    ] {
+        let output = run(&args);
+        let message = assert_usage_error(&output);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(marker));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(marker));
+        let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+        assert!(!envelope.to_string().contains(marker));
+        assert!(!message.contains(marker));
+        for flag in ["--max-scan-id", "--rpc-url"] {
+            if args.contains(&flag) {
+                assert!(message.contains(flag));
+            }
+        }
+    }
+}
+
+#[test]
+fn friendbot_refused_url_marker_is_not_echoed() {
+    let output = run(&[
+        "friendbot",
+        "--account",
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        "--friendbot-url",
+        "CREDMARKER7",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+    assert_eq!(envelope["error"]["code"], "network.rpc_unreachable");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("the friendbot endpoint")
+    );
+    for text in [
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ] {
+        assert!(!text.contains("CREDMARKER7"));
+    }
+    assert!(!envelope.to_string().contains("CREDMARKER7"));
+}
+
+#[test]
+fn credentials_missing_name_marker_is_not_echoed() {
+    let output = run(&["credentials", "show", "CREDMARKER7"]);
+    assert_eq!(output.status.code(), Some(1));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+    assert_eq!(envelope["error"]["code"], "credentials.not_found");
+    assert_eq!(
+        envelope["error"]["message"],
+        "the requested credential was not found"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("CREDMARKER7"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("CREDMARKER7"));
+    assert!(!envelope.to_string().contains("CREDMARKER7"));
+}
+
+#[test]
+fn credentials_registry_marker_is_not_echoed() {
+    let home = tempfile::tempdir().expect("test home");
+    std::fs::create_dir_all(home.path().join("passkeys")).expect("passkeys directory");
+    std::fs::write(
+        home.path().join("passkeys/default.toml"),
+        "credentials = CREDMARKER7 here\n",
+    )
+    .expect("registry fixture");
+    for args in [
+        vec!["credentials", "list"],
+        vec!["credentials", "show", "fixture"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
+            .args(args)
+            .env("STELLAR_AGENT_HOME", home.path())
+            .env_remove("STELLAR_AGENT_PROFILE")
+            .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+            .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+            .output()
+            .expect("binary runs");
+        assert_eq!(output.status.code(), Some(1));
+        let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+        assert_eq!(
+            envelope["error"]["code"],
+            "credentials.registry_parse_failed"
+        );
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not valid TOML: line 1, column")
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("CREDMARKER7"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("CREDMARKER7"));
+        assert!(!envelope.to_string().contains("CREDMARKER7"));
+    }
+}
+
+#[test]
+fn profile_migration_refusal_omits_the_requested_name() {
+    let home = tempfile::tempdir().expect("test home");
+    std::fs::create_dir_all(home.path().join("profiles")).expect("profiles directory");
+    std::fs::write(
+        home.path().join("profiles/CREDMARKER7.toml"),
+        "version = 987654321\n",
+    )
+    .expect("profile fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_stellar-agent"))
+        .args(["profile", "migrate", "--profile", "CREDMARKER7"])
+        .env("STELLAR_AGENT_HOME", home.path())
+        .env_remove("STELLAR_AGENT_PROFILE")
+        .env("STELLAR_AGENT_KEYRING_BACKEND", "headless-env")
+        .env("STELLAR_AGENT_HEADLESS_KEYRING_KEY", HEADLESS_KEY)
+        .output()
+        .expect("binary runs");
+    assert_eq!(output.status.code(), Some(1));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+    assert_eq!(envelope["error"]["code"], "internal.unexpected_state");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("migration failed:")
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("CREDMARKER7"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("CREDMARKER7"));
 }

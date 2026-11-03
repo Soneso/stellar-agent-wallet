@@ -289,16 +289,12 @@ where
         Err(e @ ProfileAccessError::Load(_)) if !e.requires_refusal() => {
             return write_envelope(
                 out,
-                &Envelope::<()>::err_raw("trustline.profile_load_failed", e.message(&profile_name)),
+                &Envelope::<()>::err_raw("trustline.profile_load_failed", e.message()),
                 1,
             );
         }
         Err(e) => {
-            return write_envelope(
-                out,
-                &Envelope::<()>::err_raw(e.code(), e.message(&profile_name)),
-                1,
-            );
+            return write_envelope(out, &Envelope::<()>::err_raw(e.code(), e.message()), 1);
         }
     };
 

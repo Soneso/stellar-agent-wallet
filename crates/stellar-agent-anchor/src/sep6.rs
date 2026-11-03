@@ -443,7 +443,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, Err(AnchorError::TransferServerHostMismatch { .. })),
+            matches!(result, Err(AnchorError::TransferServerHostMismatch)),
             "host mismatch must return TransferServerHostMismatch; got: {result:?}"
         );
     }

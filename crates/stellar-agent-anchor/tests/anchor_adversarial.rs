@@ -32,7 +32,7 @@ fn ssrf_host_mismatch_is_rejected() {
         Some("testanchor.stellar.org"),
     );
     assert!(
-        matches!(result, Err(AnchorError::TransferServerHostMismatch { .. })),
+        matches!(result, Err(AnchorError::TransferServerHostMismatch)),
         "different host must be rejected; got: {result:?}"
     );
 }
@@ -46,7 +46,7 @@ fn ssrf_evil_anchor_does_not_match_anchor_org() {
     let result =
         assert_same_domain_or_https_fqdn("https://evil-anchor.org/sep6", Some("anchor.org"));
     assert!(
-        matches!(result, Err(AnchorError::TransferServerHostMismatch { .. })),
+        matches!(result, Err(AnchorError::TransferServerHostMismatch)),
         "evil-anchor.org must NOT match anchor.org (leading-dot guard); got: {result:?}"
     );
 }
@@ -80,7 +80,7 @@ fn ssrf_exact_domain_match_accepted() {
 fn ssrf_different_tld_sibling_is_rejected() {
     let result = assert_same_domain_or_https_fqdn("https://notanchor.org/sep6", Some("anchor.org"));
     assert!(
-        matches!(result, Err(AnchorError::TransferServerHostMismatch { .. })),
+        matches!(result, Err(AnchorError::TransferServerHostMismatch)),
         "notanchor.org must be rejected vs anchor.org; got: {result:?}"
     );
 }

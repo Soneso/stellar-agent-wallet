@@ -251,8 +251,8 @@ pub(crate) async fn run_halt(args: &HaltArgs) -> i32 {
     let profile = match load_profile_reconciled(&ResolvedProfileName::from_flag(name)) {
         Ok(profile) => profile,
         Err(e) => {
-            tracing::debug!(profile = %name, error = %e, "profile access refused");
-            print_error(&profile_access_envelope(&e, name), format);
+            tracing::debug!(error = %e, "profile access refused");
+            print_error(&profile_access_envelope(&e), format);
             return 1;
         }
     };
@@ -332,8 +332,8 @@ pub(crate) async fn run_resume(args: &ResumeArgs) -> i32 {
     let profile = match load_profile_reconciled(&ResolvedProfileName::from_flag(name)) {
         Ok(profile) => profile,
         Err(e) => {
-            tracing::debug!(profile = %name, error = %e, "profile access refused");
-            print_error(&profile_access_envelope(&e, name), format);
+            tracing::debug!(error = %e, "profile access refused");
+            print_error(&profile_access_envelope(&e), format);
             return 1;
         }
     };
@@ -491,10 +491,10 @@ fn reason_refusal(reason: &str) -> Result<(), Envelope<()>> {
 /// Maps a marker write or removal failure to `io.halt_marker`.
 fn marker_io_error(error: &HaltError) -> WalletError {
     match error {
-        HaltError::InvalidName { name, reason } => {
+        HaltError::InvalidName { reason } => {
             WalletError::Validation(ValidationError::ConfigInvalid {
                 component: "profile",
-                reason: format!("profile name `{name}` {reason}"),
+                reason: format!("the profile name is not a valid profile name: {reason}"),
             })
         }
         other => WalletError::Io {

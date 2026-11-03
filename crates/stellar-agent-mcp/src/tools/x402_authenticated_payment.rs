@@ -573,13 +573,12 @@ impl WalletServer {
         {
             Ok(s) => s,
             Err(ref err) => {
+                // The event carries the wire code only: the home domain is
+                // the refused argument when the identity gate rejects its
+                // form, and the error details may name URL paths.
                 tracing::warn!(
                     error_code = %err.wire_code(),
-                    home_domain = %args.home_domain,
                     "x402_authenticated_payment: identity gate aborted before payment",
-                    // NEVER log err details that might contain URL paths
-                    // (IdentityError::Display is redaction-safe, but explicit
-                    // redact at the span boundary is belt-and-braces).
                 );
                 return Ok(identity_error_to_tool_result(err));
             }
@@ -598,10 +597,10 @@ impl WalletServer {
         if let Some(ref requested_addr) = args.address
             && requested_addr != account
         {
+            // The refused argument stays out of the detail; the profile
+            // signer is the configured reference of the check.
             let err = stellar_agent_x402::X402Error::InvalidPaymentRequired {
-                detail: format!(
-                    "requested address {requested_addr} does not match profile signer {account}"
-                ),
+                detail: format!("the address argument does not match the profile signer {account}"),
             };
             return Ok(x402_error_to_tool_result(&err));
         }
@@ -1061,10 +1060,11 @@ impl WalletServer {
                 // A refused authorization was logged with its precondition
                 // where it was refused; every other identity failure is
                 // logged here.
+                // The home domain stays out of the event: it is the refused
+                // argument when the identity gate rejects its form.
                 if !matches!(err, IdentityError::MainnetAuthorizationRefused) {
                     tracing::warn!(
                         error_code = %err.wire_code(),
-                        home_domain = %args.home_domain,
                         "x402_authenticated_payment: mainnet identity gate aborted before payment",
                     );
                 }
@@ -1678,6 +1678,46 @@ mod tests {
             !text.contains("\"paymentSignature\"") && !text.contains("\"signature\""),
             "fail-closed approval refusal must not produce a signature; got: {text}"
         );
+    }
+
+    /// A home domain the identity gate refuses for its form aborts before
+    /// payment, and the warning of the abort does not carry the home domain.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(keyring)]
+    async fn x402_home_domain_marker_is_not_logged() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.seed_audit();
+        let server = fixture.server();
+        let (capture, guard) =
+            stellar_agent_test_support::WarningCapture::capture(Some("stellar_agent"));
+        let result = server
+            .call_stellar_x402_authenticated_payment(X402AuthenticatedPaymentArgs {
+                chain_id: "stellar:testnet".to_owned(),
+                home_domain: format!("{CREDENTIAL_MARKER}.example.com"),
+                payment_required: sample_requirements_json(),
+                address: None,
+                approval_nonce: None,
+                approval_attestation: None,
+            })
+            .await
+            .expect("the identity abort is a business envelope");
+        drop(guard);
+        let (code, _message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "identity.home_domain_invalid");
+        assert_no_marker_in_text(&text, CREDENTIAL_MARKER);
+        let warnings = capture.seen();
+        assert!(
+            warnings.iter().any(|fields| fields
+                .get("message")
+                .is_some_and(|m| m.contains("identity gate aborted before payment"))),
+            "the test must reach the abort warning; got: {warnings:?}"
+        );
+        assert_no_marker_in_text(&format!("{warnings:?}"), CREDENTIAL_MARKER);
     }
 
     /// A policy denial precedes the audit pre-flight: with a denying engine

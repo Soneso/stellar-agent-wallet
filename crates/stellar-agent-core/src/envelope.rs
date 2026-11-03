@@ -694,9 +694,7 @@ impl OutputFormat {
         match s.to_ascii_lowercase().as_str() {
             "json" => Ok(Self::Json),
             "table" => Ok(Self::Table),
-            _ => Err(ValidationError::OutputFormatInvalid {
-                input: s.to_owned(),
-            }),
+            _ => Err(ValidationError::OutputFormatInvalid),
         }
     }
 }
@@ -947,8 +945,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::unwrap_used,
-        clippy::panic,
-        reason = "test-only; unwrap_err on expected-Err and panic in else-branch are assertions"
+        reason = "test-only; unwrap_err on expected-Err is an assertion"
     )]
     fn output_format_parse_invalid() {
         for bad in &["xml", "", " json", "json ", "jsOn table", "0"] {
@@ -960,13 +957,30 @@ mod tests {
                 "validation.output_format_invalid",
                 "wrong code for input {bad:?}"
             );
-            // Confirm the input string is preserved.
-            if let ValidationError::OutputFormatInvalid { input } = err {
-                assert_eq!(input, *bad, "input field mismatch for {bad:?}");
-            } else {
-                panic!("wrong variant for input {bad:?}");
-            }
+            assert!(
+                matches!(err, ValidationError::OutputFormatInvalid),
+                "wrong variant for input {bad:?}"
+            );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "test-only; unwrap_err on expected-Err is an assertion"
+    )]
+    fn a_seed_as_the_output_format_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{assert_no_marker, seed_marker};
+        let seed = seed_marker();
+        let err = OutputFormat::parse(&seed).unwrap_err();
+        assert_no_marker(&err, &seed);
+        let wallet = crate::error::WalletError::Validation(err);
+        let envelope = serde_json::to_string(&Envelope::<()>::err(&wallet)).unwrap();
+        assert!(!envelope.contains(&seed), "{envelope}");
+        assert!(
+            envelope.contains("validation.output_format_invalid"),
+            "{envelope}"
+        );
     }
 
     // ── 5. OutputFormat::Display ──────────────────────────────────────────────
@@ -1098,9 +1112,7 @@ mod tests {
         reason = "test-only; panic on unexpected serialisation failure"
     )]
     fn error_envelope_contains_no_secret_bytes() {
-        let err = WalletError::Validation(ValidationError::ProfileNotFound {
-            name: "my-profile".to_owned(),
-        });
+        let err = WalletError::Validation(ValidationError::ProfileNotFound);
         let env = Envelope::err_with_request_id(&err, "sec-test-id".to_owned());
         let json = env.to_json_compact().expect("serialisation must succeed");
         assert_no_secret_bytes(json.as_bytes());

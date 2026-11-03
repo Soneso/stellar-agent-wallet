@@ -53,7 +53,7 @@ use crate::signing::software::SoftwareSigningKey;
 pub(crate) enum SecretStrkeySource<'a> {
     /// The S-strkey was read from the named environment variable. A parse
     /// failure classifies as [`ValidationError::SecretEnvInvalid`].
-    EnvVar(&'a str),
+    EnvVar,
     /// The S-strkey was read from the named keyring entry (service alias). A
     /// parse failure classifies as [`AuthError::KeyringNotFound`] naming the
     /// entry — the keyring stored an unparseable value.
@@ -62,13 +62,10 @@ pub(crate) enum SecretStrkeySource<'a> {
 
 impl SecretStrkeySource<'_> {
     /// Builds the classification error for an S-strkey that failed to parse,
-    /// naming only the source coordinate (variable name or keyring service
-    /// alias) — never the value.
+    /// naming the keyring service only for keyring failures, never the value.
     fn invalid_strkey_error(&self) -> WalletError {
         match self {
-            Self::EnvVar(var) => WalletError::Validation(ValidationError::SecretEnvInvalid {
-                var: (*var).to_owned(),
-            }),
+            Self::EnvVar => WalletError::Validation(ValidationError::SecretEnvInvalid),
             Self::KeyringEntry(service) => WalletError::Auth(AuthError::KeyringNotFound {
                 name: format!("keyring entry '{service}' contains an invalid S-strkey"),
             }),
@@ -175,18 +172,12 @@ pub async fn signer_from_env(
 ) -> Result<SoftwareSigningKey, WalletError> {
     // Wrap the env-var String in Zeroizing so the heap allocation is
     // cleared when this scope exits, regardless of the code path taken.
-    let s_strkey: Zeroizing<String> = Zeroizing::new(std::env::var(var_name).map_err(|_| {
-        WalletError::Validation(ValidationError::SecretEnvNotSet {
-            var: var_name.to_owned(),
-        })
-    })?);
+    let s_strkey: Zeroizing<String> = Zeroizing::new(
+        std::env::var(var_name)
+            .map_err(|_| WalletError::Validation(ValidationError::SecretEnvNotSet))?,
+    );
 
-    signer_from_s_strkey(
-        s_strkey,
-        expected_source_g,
-        SecretStrkeySource::EnvVar(var_name),
-    )
-    .await
+    signer_from_s_strkey(s_strkey, expected_source_g, SecretStrkeySource::EnvVar).await
 }
 
 /// Resolves a hardware signing key from the first connected Ledger device.
@@ -295,9 +286,7 @@ mod tests {
         // the parse failure classifies directly as the typed
         // validation.secret_env_invalid — no magic-string rewrap in the caller.
         let bad = Zeroizing::new("not-a-valid-strkey".to_owned());
-        let result =
-            signer_from_s_strkey(bad, "GDUMMY", SecretStrkeySource::EnvVar("SOURCE_TEST_VAR"))
-                .await;
+        let result = signer_from_s_strkey(bad, "GDUMMY", SecretStrkeySource::EnvVar).await;
         assert!(result.is_err(), "invalid S-strkey must fail");
         // Extract the WalletError via explicit match to avoid the Debug
         // bound on T that unwrap_err() requires (SoftwareSigningKey
@@ -308,8 +297,8 @@ mod tests {
         };
         assert_eq!(err.category(), ErrorCategory::Validation);
         assert_eq!(err.code(), "validation.secret_env_invalid");
-        // The variable name appears; the (malformed) value must never be echoed.
-        assert!(err.message().contains("SOURCE_TEST_VAR"));
+        // The refusal carries neither the variable name nor its malformed value.
+        assert!(!err.message().contains("SOURCE_TEST_VAR"));
         assert!(!err.message().contains("not-a-valid-strkey"));
     }
 
@@ -342,7 +331,7 @@ mod tests {
         let result = signer_from_s_strkey(
             s_strkey,
             "GDUMMYDUMMYDUMMYDUMMYDUMMYDUMMYDUMMYDUMMYDUMMYDUMMYDUMMY",
-            SecretStrkeySource::EnvVar("SOURCE_TEST_VAR"),
+            SecretStrkeySource::EnvVar,
         )
         .await;
         assert!(result.is_err(), "key mismatch must fail");
@@ -360,13 +349,9 @@ mod tests {
         let s_strkey = sstrkey_for_seed(seed);
         let expected_g = gstrkey_for_seed(seed);
 
-        let signer = signer_from_s_strkey(
-            s_strkey,
-            &expected_g,
-            SecretStrkeySource::EnvVar("SOURCE_TEST_VAR"),
-        )
-        .await
-        .expect("matching key must succeed");
+        let signer = signer_from_s_strkey(s_strkey, &expected_g, SecretStrkeySource::EnvVar)
+            .await
+            .expect("matching key must succeed");
 
         // Verify the returned signer's public key matches the expected G-strkey.
         let pk: stellar_strkey::ed25519::PublicKey = signer.public_key().await.unwrap();

@@ -11,11 +11,7 @@ use thiserror::Error;
 
 /// Errors from hex decoding operations.
 ///
-/// All variants carry only non-secret context (lengths, char positions,
-/// char values). No secret material ever flows through hex decode paths in
-/// the deployment module — salt and deployer keys are binary values that
-/// arrive already validated; hex decode is applied only to user-supplied
-/// `--salt-hex` strings and to compile-time WASM-hash constants.
+/// Errors carry only lengths and positions, never input bytes.
 #[derive(Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum HexDecodeError {
@@ -31,15 +27,10 @@ pub enum HexDecodeError {
     /// A character at `offset` is not a valid lowercase or uppercase hex digit.
     ///
     /// `offset` is the 0-based index into the hex string (not into the output).
-    /// `ch` is the invalid character. Neither field carries secret material —
-    /// the offset identifies a position in the user-supplied hex string, and the
-    /// character is the non-hex byte at that position.
-    #[error("invalid hex character '{ch}' at offset {offset}")]
+    #[error("invalid hex digit at offset {offset}")]
     InvalidChar {
         /// 0-based offset into the hex string.
         offset: usize,
-        /// The invalid character.
-        ch: char,
     },
 }
 
@@ -97,14 +88,10 @@ pub fn decode_hex32(hex: &str) -> Result<[u8; 32], HexDecodeError> {
     }
     let mut out = [0u8; 32];
     for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let hi = char_to_nibble(chunk[0]).ok_or_else(|| HexDecodeError::InvalidChar {
-            offset: i * 2,
-            ch: chunk[0] as char,
-        })?;
-        let lo = char_to_nibble(chunk[1]).ok_or_else(|| HexDecodeError::InvalidChar {
-            offset: i * 2 + 1,
-            ch: chunk[1] as char,
-        })?;
+        let hi = char_to_nibble(chunk[0])
+            .ok_or_else(|| HexDecodeError::InvalidChar { offset: i * 2 })?;
+        let lo = char_to_nibble(chunk[1])
+            .ok_or_else(|| HexDecodeError::InvalidChar { offset: i * 2 + 1 })?;
         out[i] = (hi << 4) | lo;
     }
     Ok(out)
@@ -260,7 +247,7 @@ mod tests {
         let hex = format!("00z{}", "0".repeat(61));
         let err = decode_hex32(&hex).unwrap_err();
         assert!(
-            matches!(err, HexDecodeError::InvalidChar { offset: 2, ch: 'z' }),
+            matches!(err, HexDecodeError::InvalidChar { offset: 2 }),
             "got: {err:?}"
         );
     }
@@ -291,9 +278,9 @@ mod tests {
 
     #[test]
     fn hex_decode_error_display_invalid_char() {
-        let err = HexDecodeError::InvalidChar { offset: 5, ch: 'z' };
+        let err = HexDecodeError::InvalidChar { offset: 5 };
         let s = format!("{err}");
-        assert!(s.contains('z'), "char must appear: {s}");
+        assert!(!s.contains('z'), "char must not appear: {s}");
         assert!(s.contains('5'), "offset must appear: {s}");
     }
 
@@ -343,5 +330,25 @@ mod tests {
         assert_eq!(result.len(), 19);
         assert!(result.starts_with("deadbeef"), "{result}");
         assert!(result.ends_with("15161718"), "{result}");
+    }
+
+    #[test]
+    fn hex_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+        for prefix in ["", "0"] {
+            let input = format!(
+                "{prefix}{CREDENTIAL_MARKER}{}",
+                "0".repeat(64 - prefix.len() - CREDENTIAL_MARKER.len())
+            );
+            let error = decode_hex32(&input).unwrap_err();
+            let offset = prefix.len() + 1;
+            assert_eq!(error, HexDecodeError::InvalidChar { offset });
+            assert_eq!(
+                error.to_string(),
+                format!("invalid hex digit at offset {offset}")
+            );
+            assert_no_marker(&error, CREDENTIAL_MARKER);
+            assert_no_marker(&error, "'R'");
+        }
     }
 }

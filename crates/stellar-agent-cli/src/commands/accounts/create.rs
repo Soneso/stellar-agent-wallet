@@ -493,10 +493,7 @@ where
     let (profile, origin) = match load_profile_or_synthesize_testnet_with(&resolved, load_profile) {
         Ok(loaded) => loaded,
         Err(e) => {
-            print_error(
-                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
-                args.output,
-            );
+            print_error(&Envelope::<()>::err_raw(e.code(), e.message()), args.output);
             return 1;
         }
     };
@@ -598,9 +595,7 @@ fn resolve_new_account(args: &CreateArgs) -> Result<NewAccount, WalletError> {
         let addr = args.new_account.as_deref().unwrap_or(""); // clap enforces account_group required; empty is unreachable.
 
         stellar_strkey::ed25519::PublicKey::from_string(addr).map_err(|_| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: addr.to_owned(),
-            })
+            WalletError::Validation(ValidationError::address_argument("new_account"))
         })?;
 
         Ok(NewAccount {
@@ -784,19 +779,19 @@ fn sponsored_inputs(args: &CreateArgs) -> Result<SponsoredInputs, WalletError> {
     // clap mode_group enforces at least one of sponsor/fund_with_friendbot, so
     // a missing sponsor here is a dispatch fault, refused rather than ignored.
     let sponsor = args.sponsor.clone().ok_or_else(|| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: "--sponsor is required for sponsored mode".to_owned(),
-        })
+        WalletError::Validation(ValidationError::address_check(
+            "--sponsor is required for sponsored mode",
+        ))
     })?;
     let starting_balance_str = args.starting_balance.as_deref().ok_or_else(|| {
         WalletError::Validation(ValidationError::AmountMalformed {
-            input: "--starting-balance is required for sponsored mode".to_owned(),
+            field: "--starting-balance (required for sponsored mode)".into(),
         })
     })?;
     // Starting balances use the native XLM unit at this CLI boundary.
     let starting_balance = StellarAmount::parse_with_unit(starting_balance_str).map_err(|_| {
         WalletError::Validation(ValidationError::AmountMalformed {
-            input: starting_balance_str.to_owned(),
+            field: "--starting-balance".into(),
         })
     })?;
     Ok(SponsoredInputs {
@@ -1971,14 +1966,7 @@ mod tests {
         };
         let exit = run_with_dependencies(
             &args,
-            |name| {
-                Err(
-                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
-                        name: name.into(),
-                        path: std::path::PathBuf::from("absent"),
-                    },
-                )
-            },
+            |_| Err(stellar_agent_core::profile::loader::ProfileLoadError::NotFound),
             || panic!("network mismatch must not initialize the keyring"),
         )
         .await;
@@ -2100,14 +2088,7 @@ mod tests {
         };
         let exit = run_with_dependencies(
             &args,
-            |name| {
-                Err(
-                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
-                        name: name.into(),
-                        path: std::path::PathBuf::from("absent"),
-                    },
-                )
-            },
+            |_| Err(stellar_agent_core::profile::loader::ProfileLoadError::NotFound),
             crate::test_rpc::counting_initializer(&calls),
         )
         .await;
@@ -2765,14 +2746,7 @@ mod tests {
         // names no profile, so the choke point synthesizes (zero-config group).
         let code = run_with_dependencies(
             &args,
-            |name| {
-                Err(
-                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
-                        name: name.to_owned(),
-                        path: std::path::PathBuf::from("/nonexistent"),
-                    },
-                )
-            },
+            |_| Err(stellar_agent_core::profile::loader::ProfileLoadError::NotFound),
             || {
                 Err(WalletError::Auth(AuthError::KeyringNotFound {
                     name: "create-zero-config-keyring-init-failure-sentinel".to_owned(),
@@ -3663,5 +3637,45 @@ mod tests {
             );
             assert!(fixture.sent_envelopes().await.is_empty());
         }
+    }
+
+    use stellar_agent_test_support::rejected_value::assert_no_marker;
+    #[test]
+    fn a_seed_as_new_account_is_not_echoed() {
+        let marker = stellar_agent_test_support::rejected_value::seed_marker();
+        let args = CreateArgs {
+            // Zero-config group: `None` is "no profile named", the path that
+            // still synthesizes. `Some("default")` would be an explicitly
+            // named profile and would refuse instead.
+            profile: None,
+            new_account: Some(marker.clone()),
+            generate: false,
+            starting_balance: None,
+            sponsor: None,
+            secret_env: None,
+            sign_with_ledger: false,
+            account_index: 0,
+            fund_with_friendbot: true,
+            network: Some(TargetNetwork::Testnet),
+            friendbot_url: DEFAULT_FRIENDBOT_URL.to_owned(),
+            output: OutputFormat::Json,
+            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            rpc_url: Some(crate::common::network::TESTNET_RPC_URL.to_owned()),
+            fee: None,
+        };
+        let result = resolve_new_account(&args);
+        assert!(result.is_err(), "invalid G-strkey must return an error");
+        let err = result.unwrap_err();
+        assert_no_marker(&err, &marker);
+        let json = serde_json::to_string(&Envelope::<()>::err(&err)).unwrap();
+        assert!(!json.contains(&marker));
+        assert!(json.contains("new_account"));
+        assert!(
+            matches!(
+                err,
+                WalletError::Validation(ValidationError::AddressInvalid { .. })
+            ),
+            "expected AddressInvalid, got: {err:?}"
+        );
     }
 }

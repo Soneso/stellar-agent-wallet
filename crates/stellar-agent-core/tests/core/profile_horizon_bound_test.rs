@@ -141,18 +141,15 @@ fn t7a_u32_max_horizon_rejected() {
         "T-7a: error must be InvalidHorizonBound; got: {err:?}"
     );
 
-    if let ProfileLoadError::InvalidHorizonBound {
-        ref name,
-        value,
-        upper_bound,
-    } = err
-    {
-        assert_eq!(name, "test-profile", "T-7a: name must match");
-        assert_eq!(value, u32::MAX, "T-7a: value must be u32::MAX");
+    if let ProfileLoadError::InvalidHorizonBound { upper_bound } = err {
         assert_eq!(upper_bound, 10_000, "T-7a: upper_bound must be 10,000");
     }
 
     let msg = err.to_string();
+    assert!(
+        !msg.contains(&u32::MAX.to_string()) && !msg.contains("test-profile"),
+        "T-7a: error message must name neither the value nor the profile; got: {msg}"
+    );
     assert!(
         msg.contains("10000") || msg.contains("10,000"),
         "T-7a: error message must reference upper_bound 10_000; got: {msg}"

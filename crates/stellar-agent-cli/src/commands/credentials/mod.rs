@@ -41,8 +41,8 @@ pub(crate) fn credentials_error_code(err: &CredentialsError) -> &'static str {
         CredentialsError::RegistryParse { .. } => "credentials.registry_parse_failed",
         CredentialsError::RegistrySerialise { .. } => "credentials.registry_serialise_failed",
         CredentialsError::StateDirUnavailable => "credentials.state_dir_unavailable",
-        CredentialsError::NotFound { .. } => "credentials.not_found",
-        CredentialsError::DuplicateName { .. } => "credentials.duplicate_name",
+        CredentialsError::NotFound => "credentials.not_found",
+        CredentialsError::DuplicateName => "credentials.duplicate_name",
         CredentialsError::InvalidName { .. } => "credentials.invalid_name",
         CredentialsError::ApprovalStore { .. } => "credentials.approval_store_error",
         CredentialsError::BridgeStart { .. } => "credentials.bridge_start_failed",
@@ -164,23 +164,13 @@ mod tests {
     #[test]
     fn credentials_error_code_covers_common_variants() {
         let cases: &[(CredentialsError, &str)] = &[
+            (CredentialsError::NotFound, "credentials.not_found"),
             (
-                CredentialsError::NotFound {
-                    name: "x".to_owned(),
-                },
-                "credentials.not_found",
-            ),
-            (
-                CredentialsError::DuplicateName {
-                    name: "x".to_owned(),
-                },
+                CredentialsError::DuplicateName,
                 "credentials.duplicate_name",
             ),
             (
-                CredentialsError::InvalidName {
-                    name: "x".to_owned(),
-                    reason: "too long",
-                },
+                CredentialsError::InvalidName { reason: "too long" },
                 "credentials.invalid_name",
             ),
             (

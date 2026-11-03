@@ -91,8 +91,9 @@ pub(crate) const CLI_STATE_LAYOUT: ProfileStateLayout =
 
 /// Why a profile could not be made available to a command.
 ///
-/// Load failures retain their typed cause. Name mismatches retain the selected
-/// and derived identities so each command can render the required recovery.
+/// Load failures retain their typed cause. Name mismatches retain which rule
+/// the stored owner-key coordinate breaks, so each command can render the
+/// required recovery without repeating a profile name.
 #[derive(Debug)]
 pub(crate) enum ProfileAccessError {
     /// The loader refused: the file is absent, malformed, carries an
@@ -151,15 +152,13 @@ impl ProfileAccessError {
     /// The mapping is the one [`profile_access_envelope`] documents; call sites
     /// that already return a [`WalletError`] use this form so the mismatch
     /// keeps its own wire code through their existing rendering.
-    pub(crate) fn to_wallet_error(&self, requested_name: &str) -> WalletError {
+    pub(crate) fn to_wallet_error(&self) -> WalletError {
         match self {
-            Self::Load(load_err) => {
-                WalletError::Validation(load_err.to_validation_error(requested_name))
-            }
+            Self::Load(load_err) => WalletError::Validation(load_err.to_validation_error()),
             Self::KeyScopeConflict(conflict) => WalletError::Validation(conflict.clone().into()),
             Self::NameMismatch(_) => {
                 WalletError::Validation(ValidationError::ProfileNameMismatch {
-                    detail: self.message(requested_name),
+                    detail: self.message(),
                 })
             }
         }
@@ -167,19 +166,13 @@ impl ProfileAccessError {
 
     /// The operator-facing message, with any absolute path redacted.
     ///
-    /// `ProfileLoadError::NotFound`'s `Display` embeds the directory it
-    /// checked, and callers render this string into an envelope on stdout, so
-    /// the redaction happens here rather than at each call site.
-    ///
-    /// The mismatch arm is redacted on the same terms, not because the loader
-    /// puts a path in it but because the message echoes
-    /// `policy_owner_key_id.service` verbatim — an operator-editable field that
-    /// can hold anything, including a home-directory path. Redacting one arm
-    /// and not the other would leave the leak open on whichever arm was
-    /// overlooked.
-    pub(crate) fn message(&self, requested_name: &str) -> String {
+    /// Callers render this string into an envelope on stdout. Neither a
+    /// loader refusal nor a name mismatch repeats the requested name or a
+    /// value from the profile file; the redaction covers any absolute path a
+    /// loader message still holds.
+    pub(crate) fn message(&self) -> String {
         let rendered = match self {
-            Self::Load(e) => format!("profile '{requested_name}' failed to load: {e}"),
+            Self::Load(e) => format!("the requested profile failed to load: {e}"),
             Self::NameMismatch(mismatch) => mismatch.message(CLI_STATE_LAYOUT),
             Self::KeyScopeConflict(conflict) => return conflict.detail.clone(),
         };
@@ -339,11 +332,8 @@ fn reconcile(
 /// collapses to `profile.load_failed` (`trustline` to
 /// `trustline.profile_load_failed`). The mismatch code is uniform across both
 /// paths.
-pub(crate) fn profile_access_envelope(
-    err: &ProfileAccessError,
-    requested_name: &str,
-) -> Envelope<()> {
-    Envelope::err(&err.to_wallet_error(requested_name))
+pub(crate) fn profile_access_envelope(err: &ProfileAccessError) -> Envelope<()> {
+    Envelope::err(&err.to_wallet_error())
 }
 
 /// Origin of a profile resolved by [`load_profile_or_synthesize_testnet`].
@@ -444,9 +434,7 @@ where
         // treated as absent: the synthesis fallback below answers only for a
         // profile that was neither named nor authored.
         Ok(profile) => reconcile(profile, resolved).map(|p| (p, ProfileOrigin::Persisted)),
-        Err(profile_loader::ProfileLoadError::NotFound { .. })
-            if !resolved.source.is_explicit() =>
-        {
+        Err(profile_loader::ProfileLoadError::NotFound) if !resolved.source.is_explicit() => {
             let profile = Profile::builder_testnet_named(
                 name,
                 "stellar-agent-signer",
@@ -541,13 +529,13 @@ mod tests {
     fn protected_load_codes_match_typed_and_raw_routes() {
         for error in protected_load_errors_for_test() {
             if let ProfileAccessError::Load(ref load) = error {
-                assert_eq!(error.code(), load.to_validation_error("mainnet").code());
+                assert_eq!(error.code(), load.to_validation_error().code());
             } else {
                 assert_eq!(error.code(), "profile.key_scope_conflict");
             }
-            assert_eq!(error.to_wallet_error("mainnet").code(), error.code());
-            let value = serde_json::to_value(profile_access_envelope(&error, "mainnet"))
-                .expect("valid test fixture");
+            assert_eq!(error.to_wallet_error().code(), error.code());
+            let value =
+                serde_json::to_value(profile_access_envelope(&error)).expect("valid test fixture");
             assert_eq!(value["error"]["code"], error.code());
         }
     }
@@ -600,10 +588,7 @@ mod tests {
                 "{error:?} must survive an optional read"
             );
         }
-        let not_found = ProfileAccessError::Load(profile_loader::ProfileLoadError::NotFound {
-            name: "absent".to_owned(),
-            path: std::path::PathBuf::from("/nonexistent"),
-        });
+        let not_found = ProfileAccessError::Load(profile_loader::ProfileLoadError::NotFound);
         assert!(!not_found.requires_refusal());
     }
 
@@ -733,20 +718,25 @@ mod tests {
             ProfileNameSource::Flag,
         ))
         .expect_err("a profile named through --profile must not be synthesized");
-        let message = err.message("never-authored");
+        let message = err.message();
+        assert!(!message.contains("default"));
         assert!(
-            message.contains("never-authored"),
-            "the refusal must name the profile the operator asked for: {message}"
+            message.contains("the requested profile was not found in the wallet configuration"),
+            "the refusal must state that the requested profile is absent: {message}"
+        );
+        assert!(
+            !message.contains("never-authored"),
+            "the refusal must not repeat the requested name: {message}"
         );
         assert_eq!(err.code(), "profile.load_failed");
     }
 
-    /// The refusal message carries no un-redacted absolute path.
+    /// The refusal message carries neither the requested name nor any part of
+    /// the profile path.
     ///
-    /// `ProfileLoadError::NotFound`'s `Display` embeds the full path it
-    /// checked, and `pay` / `claim` / `accounts create` render this string
-    /// straight into an operator envelope on stdout, so the home prefix is
-    /// stripped at the one place the message is built.
+    /// `pay`, `claim` and `accounts create` render this string straight into
+    /// an operator envelope on stdout, and the profile path under the home
+    /// directory ends in the requested name.
     #[test]
     #[serial_test::serial]
     fn the_refusal_message_does_not_leak_the_home_directory() {
@@ -761,19 +751,23 @@ mod tests {
             ProfileNameSource::Flag,
         ))
         .expect_err("a named profile with no file must refuse");
-        let message = err.message("redaction-probe");
+        let message = err.message();
+        assert!(!message.contains("default"));
         assert!(
-            message.contains("redaction-probe"),
-            "the refusal must still name the profile: {message}"
+            message.contains("the requested profile was not found in the wallet configuration"),
+            "the refusal must state that the requested profile is absent: {message}"
         );
         assert!(
             !message.contains(&home_dir),
             "the refusal must not carry the operator's home directory: {message}"
         );
         assert!(
-            message.contains("<HOME>"),
-            "the home prefix must be replaced by the redaction marker, proving the \
-             path was rendered and then redacted rather than absent by accident: {message}"
+            !message.contains("redaction-probe"),
+            "the refusal must not repeat the requested name or the store directory: {message}"
+        );
+        assert!(
+            !message.contains(".toml"),
+            "the refusal must not carry the profile file path: {message}"
         );
     }
 
@@ -790,10 +784,15 @@ mod tests {
         let err =
             load_profile_or_synthesize_testnet(&resolved("never-authored", ProfileNameSource::Env))
                 .expect_err("a profile named through the environment must not be synthesized");
-        let message = err.message("never-authored");
+        let message = err.message();
+        assert!(!message.contains("default"));
         assert!(
-            message.contains("never-authored"),
-            "the refusal must name the profile the operator asked for: {message}"
+            message.contains("the requested profile was not found in the wallet configuration"),
+            "the refusal must state that the requested profile is absent: {message}"
+        );
+        assert!(
+            !message.contains("never-authored"),
+            "the refusal must not repeat the requested name: {message}"
         );
     }
 
@@ -809,11 +808,13 @@ mod tests {
 
         let err = load_profile_or_synthesize_testnet(&resolved("default", ProfileNameSource::Flag))
             .expect_err("an explicitly-named `default` must not be synthesized");
-        let message = err.message("default");
+        let message = err.message();
+        assert!(!message.contains("default"));
         assert!(
-            message.contains("default"),
-            "the refusal must name the profile the operator asked for: {message}"
+            message.contains("the requested profile was not found in the wallet configuration"),
+            "the refusal must state that the requested profile is absent: {message}"
         );
+        assert_eq!(err.code(), "profile.load_failed");
     }
 
     /// The decision runs in the caller of the injected loader: a closure that
@@ -826,22 +827,22 @@ mod tests {
         // key-scope check; keep that read inside a temporary data root.
         let home = tempfile::tempdir().expect("valid test fixture");
         let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
-        let not_found = |name: &str| {
-            Err(profile_loader::ProfileLoadError::NotFound {
-                name: name.to_owned(),
-                path: std::path::PathBuf::from("/nonexistent"),
-            })
-        };
+        let not_found = |_: &str| Err(profile_loader::ProfileLoadError::NotFound);
 
         let err = load_profile_or_synthesize_testnet_with(
             &resolved("seam-named", ProfileNameSource::Flag),
             not_found,
         )
         .expect_err("an explicitly-named profile must refuse through the seam too");
-        let message = err.message("seam-named");
+        let message = err.message();
+        assert!(!message.contains("default"));
         assert!(
-            message.contains("seam-named"),
-            "refusal must name it: {message}"
+            message.contains("the requested profile was not found in the wallet configuration"),
+            "the refusal must state that the requested profile is absent: {message}"
+        );
+        assert!(
+            !message.contains("seam-named"),
+            "the refusal must not repeat the requested name: {message}"
         );
 
         let (_profile, origin) = load_profile_or_synthesize_testnet_with(
@@ -876,9 +877,19 @@ mod tests {
 
         assert!(matches!(err, ProfileAccessError::NameMismatch(_)));
         assert_eq!(err.code(), "profile.name_mismatch");
-        let message = err.message("alice");
-        assert!(message.contains("'alice'"), "{message}");
-        assert!(message.contains("stellar-agent-owner-default"), "{message}");
+        let message = err.message();
+        assert!(
+            message.contains("policy_owner_key_id.service names a different profile"),
+            "the refusal must name the offending field: {message}"
+        );
+        assert!(
+            !message.contains("alice"),
+            "the refusal must not repeat the selected name: {message}"
+        );
+        assert!(
+            !message.contains("stellar-agent-owner-default"),
+            "the refusal must not repeat the stored service: {message}"
+        );
     }
 
     /// The same file, requested under an UNNAMED resolution: still refused,
@@ -930,12 +941,7 @@ mod tests {
     fn the_synthesized_profile_reconciles_against_its_own_name() {
         let home = tempfile::tempdir().expect("valid test fixture");
         let _home_guard = stellar_agent_test_support::StellarAgentHomeGuard::new(home.path());
-        let not_found = |name: &str| {
-            Err(profile_loader::ProfileLoadError::NotFound {
-                name: name.to_owned(),
-                path: std::path::PathBuf::from("/nonexistent"),
-            })
-        };
+        let not_found = |_: &str| Err(profile_loader::ProfileLoadError::NotFound);
 
         let (profile, origin) = load_profile_or_synthesize_testnet_with(
             &resolved("default", ProfileNameSource::Default),
@@ -972,12 +978,7 @@ mod tests {
         sibling.attestation_key_id = own_entry.clone();
         profile_loader::save_to_dir("bob", &sibling, &home.path().join("profiles"))
             .expect("valid test fixture");
-        let not_found = |name: &str| {
-            Err(profile_loader::ProfileLoadError::NotFound {
-                name: name.to_owned(),
-                path: std::path::PathBuf::from("/nonexistent"),
-            })
-        };
+        let not_found = |_: &str| Err(profile_loader::ProfileLoadError::NotFound);
 
         let capture = CaptureWriter::new();
         let subscriber = tracing_subscriber::fmt()
@@ -1001,10 +1002,14 @@ mod tests {
         assert!(output.contains("profile.key_scope"), "{output}");
         assert!(
             output.contains(
-                "profile 'default': its entry 'stellar-agent-attestation-default/default' \
-                 (attestation_key_id) is also named by profile 'bob' as attestation_key_id"
+                "profile 'selected': its entry for attestation_key_id is also named by \
+                 profile 'bob' as attestation_key_id"
             ),
             "{output}"
+        );
+        stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+            &output,
+            "profile 'default'",
         );
     }
 
@@ -1054,7 +1059,7 @@ mod tests {
             .expect_err("a prefix-less owner coordinate must refuse");
             assert_eq!(err.code(), "profile.name_mismatch");
             assert!(
-                err.message(requested)
+                err.message()
                     .contains("does not carry the 'stellar-agent-owner-' prefix"),
                 "the refusal must explain the absent prefix"
             );
@@ -1080,17 +1085,17 @@ mod tests {
             copied,
         )
         .expect_err("mismatch must refuse");
-        let message = err.message("alice");
+        let message = err.message();
         assert!(
-            message.contains("stay keyed on 'alice'"),
-            "the CLI message must name the state that follows the requested name: {message}"
+            message.contains("stay keyed on the selected name"),
+            "the CLI message must name the state that follows the selected name: {message}"
         );
         assert!(
-            !message.contains("read and written under the derived name"),
+            !message.contains("read and written under the name that field derives"),
             "the CLI must not ship the MCP's state-layout claim: {message}"
         );
         assert!(
-            message.contains("profile init --profile alice"),
+            message.contains("profile init --profile <name>"),
             "the recovery text is shared by both surfaces: {message}"
         );
     }
@@ -1111,13 +1116,13 @@ mod tests {
         );
     }
 
-    /// The mismatch message is path-redacted, exactly as the load message is.
+    /// The mismatch message never renders the stored service.
     ///
-    /// `policy_owner_key_id.service` is echoed verbatim and is operator-
-    /// editable, so a home-directory path pasted into it would otherwise reach
-    /// stdout through the refusal.
+    /// `policy_owner_key_id.service` is operator-editable, so a home-directory
+    /// path pasted into it must not reach stdout through the refusal, in the
+    /// message or in the `Display` rendering.
     #[test]
-    fn the_mismatch_message_redacts_a_path_in_the_service_field() {
+    fn the_mismatch_message_omits_a_path_in_the_service_field() {
         let home_dir = std::env::var("HOME").expect("HOME is set in the test environment");
         let mut profile = Profile::builder_testnet("svc", "acct", "n-svc", "n-acct")
             .with_profile_name("alice")
@@ -1129,20 +1134,21 @@ mod tests {
 
         let err = reconcile_loaded_profile(Ok(profile), &ResolvedProfileName::from_flag("alice"))
             .expect_err("a prefix-less coordinate must refuse");
-        let message = err.message("alice");
+        let message = err.message();
         assert!(
-            !message.contains(&home_dir),
-            "the refusal must not carry the operator's home directory: {message}"
+            message.contains("does not carry the 'stellar-agent-owner-' prefix"),
+            "the refusal must name the broken rule: {message}"
         );
-        assert!(
-            message.contains("<HOME>"),
-            "the home prefix must be replaced by the redaction marker, proving the field \
-             was rendered and then redacted rather than absent by accident: {message}"
-        );
-        assert!(
-            !err.to_string().contains(&home_dir),
-            "the Display rendering must redact on the same terms: {err}"
-        );
+        for rendered in [message, err.to_string()] {
+            assert!(
+                !rendered.contains(&home_dir),
+                "the refusal must not carry the operator's home directory: {rendered}"
+            );
+            assert!(
+                !rendered.contains("leaked/owner"),
+                "the refusal must not carry the stored service: {rendered}"
+            );
+        }
     }
 
     /// The mismatch keeps its own wire code through the typed-envelope path
@@ -1160,7 +1166,7 @@ mod tests {
         )
         .expect_err("mismatch must refuse");
 
-        let envelope = profile_access_envelope(&err, "alice");
+        let envelope = profile_access_envelope(&err);
         let rendered = envelope.error.as_ref().expect("error envelope");
         assert_eq!(rendered.code, "profile.name_mismatch");
         assert_eq!(rendered.code, err.code());
@@ -1181,10 +1187,7 @@ mod synthesis_posture_tests {
             source: stellar_agent_core::profile::ProfileNameSource::Default,
         };
         let result = load_profile_or_synthesize_testnet_with(&resolved, |_| {
-            Err(profile_loader::ProfileLoadError::NotFound {
-                name: "default".into(),
-                path: std::path::PathBuf::from("absent"),
-            })
+            Err(profile_loader::ProfileLoadError::NotFound)
         });
         let (profile, origin) = result.expect("synthesis");
         assert_eq!(origin, ProfileOrigin::Synthesized);
@@ -1196,6 +1199,53 @@ mod synthesis_posture_tests {
             profile.wallet.unlock_ttl_seconds,
             stellar_agent_core::wallet::DEFAULT_TTL_SECONDS
         );
+    }
+    use stellar_agent_test_support::rejected_value::assert_no_marker;
+
+    #[test]
+    fn profile_access_messages_carry_no_source_text() {
+        let dir = tempfile::tempdir().expect("temporary profile directory");
+        std::fs::write(dir.path().join("position.toml"), "version = 2\nchain_id = \"stellar:testnet\"\n\nrpc_url = \"https://user:CREDMARKER7@rpc.example").expect("profile fixture");
+        let err = super::profile_loader::load_from_dir("position", dir.path(), None)
+            .expect_err("invalid TOML");
+        let err = super::ProfileAccessError::Load(err);
+        let message = err.message();
+        assert!(!message.contains("CREDMARKER7"));
+        assert!(message.contains("the requested profile failed to load"));
+        assert!(message.contains("line 4, column"));
+        assert!(!format!("{err} {err:?}").contains("CREDMARKER7"));
+        if let super::ProfileAccessError::Load(source) = &err {
+            assert_no_marker(source, "CREDMARKER7");
+        }
+    }
+
+    /// An absent profile named by a secret seed is reported, before any
+    /// conversion to a wallet error, without the seed or the path that ends
+    /// in it.
+    #[test]
+    fn an_absent_profile_access_error_names_no_profile() {
+        let seed = stellar_agent_test_support::rejected_value::seed_marker();
+        let dir = tempfile::tempdir().expect("temporary profile directory");
+        let err = super::profile_loader::load_from_dir(&seed, dir.path(), None)
+            .expect_err("no profile file");
+        let err = super::ProfileAccessError::Load(err);
+        let rendered = format!("{err} {err:?}");
+        assert!(
+            !rendered.contains(&seed),
+            "the access error repeats the name"
+        );
+        if let super::ProfileAccessError::Load(source) = &err {
+            assert_no_marker(source, &seed);
+        }
+        let message = err.message();
+        assert!(!message.contains(&seed), "the message repeats the name");
+        assert!(
+            message.contains("the requested profile was not found in the wallet configuration"),
+            "{message}"
+        );
+        let converted = err.to_wallet_error();
+        assert_eq!(converted.code(), "validation.profile_not_found");
+        assert_no_marker(&converted, &seed);
     }
 }
 

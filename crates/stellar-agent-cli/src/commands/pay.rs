@@ -469,10 +469,7 @@ where
     let (profile, origin) = match load_profile_or_synthesize_testnet_with(&resolved, load_profile) {
         Ok(loaded) => loaded,
         Err(e) => {
-            print_error(
-                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
-                args.output,
-            );
+            print_error(&Envelope::<()>::err_raw(e.code(), e.message()), args.output);
             return 1;
         }
     };
@@ -1288,9 +1285,9 @@ where
     // Require both source and a signer for the full pipeline.
     if args.source.is_none() {
         let err =
-            WalletError::Validation(stellar_agent_core::error::ValidationError::AddressInvalid {
-                input: "--source is required for signing".to_owned(),
-            });
+            WalletError::Validation(stellar_agent_core::error::ValidationError::address_check(
+                "--source is required for signing",
+            ));
         let envelope = Envelope::<()>::err(&err);
         print_error(&envelope, args.output);
         return 1;
@@ -1545,9 +1542,9 @@ fn build_inputs(
     amount: StellarAmount,
 ) -> Result<BuildInputs<'_>, WalletError> {
     let source = args.source.as_deref().ok_or_else(|| {
-        WalletError::Validation(stellar_agent_core::error::ValidationError::AddressInvalid {
-            input: "--source is required for building a transaction".to_owned(),
-        })
+        WalletError::Validation(stellar_agent_core::error::ValidationError::address_check(
+            "--source is required for building a transaction",
+        ))
     })?;
     let fee_choice = parse_classic_fee_choice(args.fee.as_deref())?;
     Ok(BuildInputs {
@@ -1597,14 +1594,20 @@ async fn checked_client_and_build_inputs<'a>(
 /// Parses the asset and its human amount before constructing the payment.
 fn parse_asset_and_amount(args: &PayArgs) -> Result<(Asset, StellarAmount), WalletError> {
     let asset = Asset::parse(&args.asset)?;
-    // Keep the detailed unit refusal; other amount failures use the CLI's
-    // malformed-amount response with the supplied input.
+    // A unit refusal names the expected unit; every other amount failure is
+    // the CLI's malformed-amount response. Both name `--amount`, never the
+    // supplied text.
     let amount = asset
         .parse_amount(&args.amount)
         .map_err(|error| match error {
-            WalletError::Validation(ValidationError::AmountUnitMismatch { .. }) => error,
+            WalletError::Validation(ValidationError::AmountUnitMismatch { expected, .. }) => {
+                WalletError::Validation(ValidationError::AmountUnitMismatch {
+                    field: "--amount".into(),
+                    expected,
+                })
+            }
             _ => WalletError::Validation(ValidationError::AmountMalformed {
-                input: args.amount.clone(),
+                field: "--amount".into(),
             }),
         })?;
     Ok((asset, amount))
@@ -1905,9 +1908,9 @@ async fn sign_envelope(
     profile_name: &str,
 ) -> Result<String, WalletError> {
     let source = args.source.as_deref().ok_or_else(|| {
-        WalletError::Validation(stellar_agent_core::error::ValidationError::AddressInvalid {
-            input: "--source is required for signing".to_owned(),
-        })
+        WalletError::Validation(stellar_agent_core::error::ValidationError::address_check(
+            "--source is required for signing",
+        ))
     })?;
 
     let passphrase = context.network_passphrase();
@@ -2821,14 +2824,7 @@ mod tests {
         };
         let exit = run_with_dependencies(
             &args,
-            |name| {
-                Err(
-                    stellar_agent_core::profile::loader::ProfileLoadError::NotFound {
-                        name: name.into(),
-                        path: std::path::PathBuf::from("absent"),
-                    },
-                )
-            },
+            |_| Err(stellar_agent_core::profile::loader::ProfileLoadError::NotFound),
             crate::test_rpc::counting_initializer(&calls),
         )
         .await;
@@ -3241,8 +3237,9 @@ mod tests {
             assert_eq!(error.code(), "validation.amount_malformed");
             assert_eq!(
                 error.to_string(),
-                format!("amount '100 {unit}' has unit '{unit}'; expected unit 'TST'")
+                "--amount has the wrong unit; expected unit 'TST'"
             );
+            assert!(!format!("{error:?}").contains(&format!("100 {unit}")));
         }
     }
 
@@ -3272,7 +3269,7 @@ mod tests {
         assert_eq!(error.code(), "validation.amount_malformed");
         assert_eq!(
             error.to_string(),
-            "amount '100 XLM' has unit 'XLM'; expected unit 'TST'"
+            "--amount has the wrong unit; expected unit 'TST'"
         );
     }
 
@@ -5936,7 +5933,7 @@ mod tests {
             assert_eq!(run.code(), "validation.amount_malformed");
             assert_eq!(
                 run.message(),
-                "amount '1 XLM' has unit 'XLM'; expected unit 'USD'"
+                "--amount has the wrong unit; expected unit 'USD'"
             );
             assert_eq!(fixture.initializer_calls(), 0);
             assert!(fixture.primary_methods().await.is_empty());

@@ -383,11 +383,8 @@ pub(crate) fn zero_config() -> ZeroConfig {
 ///
 /// Whether that becomes a synthesized profile or a refusal is decided by the
 /// caller of the injected closure, keyed on the resolved name's provenance.
-pub(crate) fn absent_profile_file(name: &str) -> Result<Profile, ProfileLoadError> {
-    Err(ProfileLoadError::NotFound {
-        name: name.to_owned(),
-        path: std::path::PathBuf::from("/nonexistent"),
-    })
+pub(crate) fn absent_profile_file(_: &str) -> Result<Profile, ProfileLoadError> {
+    Err(ProfileLoadError::NotFound)
 }
 
 /// The signer of a zero-config run: the account of `seed`, whose secret sits

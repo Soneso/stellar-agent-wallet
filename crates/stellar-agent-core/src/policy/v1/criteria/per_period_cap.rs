@@ -137,11 +137,8 @@ impl Window {
                 secs: 604_800,
                 label: "1w",
             }),
-            other => Err(PolicyError::PolicyFileParseFailed {
-                detail: format!(
-                    "per_period_cap: unsupported window '{}'; accepted: 1m, 5m, 1h, 1d, 1w",
-                    other
-                ),
+            _ => Err(PolicyError::PolicyFileParseFailed {
+                detail: "per_period_cap: unsupported window; accepted: 1m, 5m, 1h, 1d, 1w".into(),
             }),
         }
     }

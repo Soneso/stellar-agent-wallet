@@ -3575,4 +3575,64 @@ mod tests {
             );
         }
     }
+
+    /// A `KNOWN_ISSUER` allowlist refuses a malformed asset argument with a
+    /// detail that names the check, the expected form and the tool, and the
+    /// asset text appears nowhere in the error.
+    #[test]
+    fn counterparty_asset_marker_is_not_echoed() {
+        use crate::policy::v1::criteria::counterparty_allowlist::{
+            CounterpartyAllowlistCriterion, CounterpartyKind,
+        };
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+
+        const ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
+        const DESTINATION: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
+        let cases = [
+            (
+                CREDENTIAL_MARKER.to_owned(),
+                "counterparty_allowlist: non-native asset must be in CODE:Gissuer format for \
+                 tool 'stellar_pay'",
+            ),
+            (
+                format!("USD:{CREDENTIAL_MARKER}"),
+                "counterparty_allowlist: asset issuer must be a valid G-strkey for tool \
+                 'stellar_pay'",
+            ),
+        ];
+        for (asset, expected) in cases {
+            let engine = PolicyEngineV1::new(
+                allow_all_doc_with_criteria(vec![Box::new(CounterpartyAllowlistCriterion::new(
+                    vec![CounterpartyKind::KnownIssuer],
+                    vec![format!("USDC:{ISSUER}")],
+                ))]),
+                "alice".into(),
+            );
+            let args = serde_json::json!({
+                "amount_stroops": "10000000",
+                "asset": asset,
+                "destination": DESTINATION,
+            });
+            let err = engine
+                .evaluate(
+                    &tool("stellar_pay", "stellar:testnet"),
+                    &args,
+                    &testnet_profile(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    PolicyError::CriterionEvaluationFailed { detail } if detail == expected
+                ),
+                "{err:?}"
+            );
+            assert_no_marker(&err, CREDENTIAL_MARKER);
+        }
+    }
 }

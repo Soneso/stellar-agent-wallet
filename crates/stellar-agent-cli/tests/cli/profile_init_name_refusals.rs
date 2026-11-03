@@ -184,9 +184,8 @@ fn profile_init_redacts_rpc_url_and_preserves_saved_url() {
 
 /// A credentialed `--rpc-url` is refused by the flag parser before the
 /// command runs: exit `1` with one `validation.usage_error` envelope on
-/// stdout, nothing on stderr, and no file. The envelope message is the
-/// parser's rendering of the refusal, and neither stream carries the
-/// rejected userinfo.
+/// stdout, nothing on stderr, and no file. The envelope message identifies
+/// the schema-defined argument, and neither stream carries rejected userinfo.
 #[test]
 fn profile_init_refuses_credentialed_rpc_before_creating_file() {
     let home = tempfile::tempdir().expect("temp home");

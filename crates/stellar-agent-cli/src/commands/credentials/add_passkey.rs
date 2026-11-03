@@ -173,7 +173,7 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
     if let Err(reason) = validate_path_component_ascii_safe(&profile) {
         return emit_error(
             "credentials.invalid_profile_name",
-            format!("invalid profile name '{profile}': {reason}"),
+            format!("the profile name is not a valid profile name: {reason}"),
         );
     }
 
@@ -190,7 +190,7 @@ pub async fn run(args: &AddPasskeyArgs) -> i32 {
     let loaded_profile = match load_profile_reconciled(&resolved) {
         Ok(loaded) => loaded,
         Err(e) => {
-            render_json(&profile_access_envelope(&e, &profile));
+            render_json(&profile_access_envelope(&e));
             return 1;
         }
     };

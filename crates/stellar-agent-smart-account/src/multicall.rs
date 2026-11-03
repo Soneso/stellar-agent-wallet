@@ -518,12 +518,14 @@ impl MulticallRegistry {
 
         let file: MulticallRegistryFile =
             toml::from_str(&contents).map_err(|e| SaError::NetworksTomlParse {
-                source: e,
+                position: stellar_agent_core::profile::toml_diagnostic::toml_error_position(
+                    &contents,
+                    e.span().map(|span| span.start),
+                ),
                 path: actual_path.to_path_buf(),
             })?;
 
         const WARNING_CAP: usize = 32;
-        const WARNING_TEXT_CAP: usize = 256;
 
         for (safename, raw) in file.multicall {
             // Validate C-strkey address.
@@ -531,10 +533,7 @@ impl MulticallRegistry {
                 if registry.partial_load_warnings.len() < WARNING_CAP {
                     registry.partial_load_warnings.push(RegistryLoadWarning {
                         network_safename: safename.clone(),
-                        reason: crate::error::truncate_to_byte_cap(
-                            &format!("invalid C-strkey address: {}", raw.address),
-                            WARNING_TEXT_CAP,
-                        ),
+                        reason: "address must be a C-strkey".to_owned(),
                     });
                 }
                 warn!(
@@ -549,10 +548,7 @@ impl MulticallRegistry {
                 if registry.partial_load_warnings.len() < WARNING_CAP {
                     registry.partial_load_warnings.push(RegistryLoadWarning {
                         network_safename: safename.clone(),
-                        reason: crate::error::truncate_to_byte_cap(
-                            &format!("invalid SHA-256 hex: {}", raw.wasm_sha256),
-                            WARNING_TEXT_CAP,
-                        ),
+                        reason: "wasm_sha256 must be 64 hex characters".to_owned(),
                     });
                 }
                 warn!(
@@ -567,15 +563,7 @@ impl MulticallRegistry {
                 if registry.partial_load_warnings.len() < WARNING_CAP {
                     registry.partial_load_warnings.push(RegistryLoadWarning {
                         network_safename: safename.clone(),
-                        reason: crate::error::truncate_to_byte_cap(
-                            &format!(
-                                "wasm_sha256 {} != MULTICALL_WASM_SHA256 {}; \
-                                 lookup will refuse (update wasm_sha256 after re-vendoring)",
-                                &raw.wasm_sha256[..8.min(raw.wasm_sha256.len())],
-                                &MULTICALL_WASM_SHA256[..8],
-                            ),
-                            WARNING_TEXT_CAP,
-                        ),
+                        reason: "wasm_sha256 does not match MULTICALL_WASM_SHA256; lookup will refuse (update wasm_sha256 after re-vendoring)".to_owned(),
                     });
                 }
                 warn!(
@@ -3061,7 +3049,7 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
 
 [multicall.bad-entry]
 network_passphrase = "Bad Network"
-address = "NOT_A_STRKEY"
+address = "CREDMARKER7"
 wasm_sha256 = "{MULTICALL_WASM_SHA256}"
 "#
             ),
@@ -3078,7 +3066,8 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
         );
         let warning = &reg.partial_load_warnings[0];
         assert_eq!(warning.network_safename, "bad-entry");
-        assert_eq!(warning.reason, "invalid C-strkey address: NOT_A_STRKEY");
+        assert_eq!(warning.reason, "address must be a C-strkey");
+        assert!(!format!("{warning:?}").contains("CREDMARKER7"));
     }
 
     // ── cross_rpc_compare_simulate_responses ──────────────────────────────────
@@ -3538,7 +3527,7 @@ wasm_sha256 = "{MULTICALL_WASM_SHA256}"
 [multicall.badsha]
 network_passphrase = "Bad SHA Network"
 address = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-wasm_sha256 = "not-a-sha256-at-all"
+wasm_sha256 = "CREDMARKER7"
 "#,
         )
         .expect("write");
@@ -3552,9 +3541,10 @@ wasm_sha256 = "not-a-sha256-at-all"
         assert!(
             reg.partial_load_warnings[0]
                 .reason
-                .contains("invalid SHA-256 hex"),
-            "warning reason must mention invalid SHA-256 hex"
+                .contains("wasm_sha256 must be 64 hex characters"),
+            "warning reason must state the expected SHA-256 form"
         );
+        assert!(!format!("{:?}", reg.partial_load_warnings).contains("CREDMARKER7"));
     }
 
     // ── load — sha drift (valid 64-char hex but != MULTICALL_WASM_SHA256) ────

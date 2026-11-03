@@ -101,7 +101,7 @@ pub async fn run(args: &FeesStatsArgs) -> i32 {
 fn resolve_rpc_url(args: &FeesStatsArgs) -> Result<FeeStatsEndpoint, WalletError> {
     if let Some(name) = &args.profile {
         let profile = load_profile_reconciled(&ResolvedProfileName::from_flag(name))
-            .map_err(|e| e.to_wallet_error(name))?;
+            .map_err(|e| e.to_wallet_error())?;
         let context = crate::common::network::network_context_for_command(
             &profile,
             name,
@@ -120,10 +120,14 @@ fn resolve_rpc_url(args: &FeesStatsArgs) -> Result<FeeStatsEndpoint, WalletError
     ))
 }
 
+/// Refuses an `--rpc-url` that breaks the RPC URL rule, naming the rule and
+/// never the URL, which can carry a credential.
 fn validate_rpc_url_for_cli(url: &str) -> Result<(), WalletError> {
-    validate_rpc_url(url).map_err(|err| {
-        WalletError::Validation(ValidationError::ProfileNotFound {
-            name: format!("invalid rpc_url: {err}"),
+    validate_rpc_url(url).map_err(|_| {
+        WalletError::Validation(ValidationError::ConfigInvalid {
+            component: "--rpc-url",
+            reason: "the RPC URL must be HTTPS, carry no credentials and name an allow-listed host"
+                .to_owned(),
         })
     })
 }
@@ -190,5 +194,28 @@ mod tests {
             ),
             "the flag's URL without a profile"
         );
+    }
+
+    /// A rejected `--rpc-url` names the URL rule and never the URL.
+    #[test]
+    fn a_rejected_rpc_url_names_the_rule_not_the_url() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+        for url in [
+            format!("http://soroban-testnet.stellar.org/{CREDENTIAL_MARKER}"),
+            format!("https://user:{CREDENTIAL_MARKER}@soroban-testnet.stellar.org"),
+            format!("{CREDENTIAL_MARKER} %%"),
+        ] {
+            let err = validate_rpc_url_for_cli(&url).unwrap_err();
+            assert_eq!(err.code(), "validation.config_invalid");
+            assert!(
+                err.to_string().contains(
+                    "the RPC URL must be HTTPS, carry no credentials and name an allow-listed host"
+                ),
+                "{err}"
+            );
+            assert_no_marker(&err, CREDENTIAL_MARKER);
+            let envelope = serde_json::to_string(&Envelope::<()>::err(&err)).unwrap();
+            assert!(!envelope.contains(CREDENTIAL_MARKER), "{envelope}");
+        }
     }
 }

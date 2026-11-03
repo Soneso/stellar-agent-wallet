@@ -112,9 +112,7 @@ pub fn x402_network_to_caip2(network: &str) -> Result<Caip2, X402Error> {
     match network {
         X402_STELLAR_PUBNET => Ok(Caip2::Mainnet),
         X402_STELLAR_TESTNET => Ok(Caip2::Testnet),
-        other => Err(X402Error::UnsupportedNetwork {
-            network: stellar_agent_network::quote_server_text(other),
-        }),
+        _ => Err(X402Error::UnsupportedNetwork),
     }
 }
 
@@ -175,7 +173,7 @@ mod tests {
     fn caip2_mainnet_string_is_rejected_by_x402_mapper() {
         // "stellar:mainnet" is NOT a valid x402 wire string.
         let err = x402_network_to_caip2("stellar:mainnet").unwrap_err();
-        assert!(matches!(err, X402Error::UnsupportedNetwork { .. }));
+        assert!(matches!(err, X402Error::UnsupportedNetwork));
     }
 
     // ── USDC SAC address format checks ────────────────────────────────────────

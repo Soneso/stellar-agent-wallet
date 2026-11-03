@@ -210,8 +210,8 @@ async fn run_with_dependencies(
     ) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %args.profile_name(), error = %e, "profile access refused");
-            render::render_json(&profile_access_envelope(&e, args.profile_name()));
+            tracing::debug!(error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e));
             return 1;
         }
     };
@@ -241,11 +241,11 @@ async fn run_with_dependencies(
             Ok(code) => code,
             Err(error) => {
                 let error = match error {
-                    OwnerSeedError::NotSet { var } => {
-                        WalletError::Validation(ValidationError::SecretEnvNotSet { var })
+                    OwnerSeedError::NotSet => {
+                        WalletError::Validation(ValidationError::SecretEnvNotSet)
                     }
-                    OwnerSeedError::Invalid { var } => {
-                        WalletError::Validation(ValidationError::SecretEnvInvalid { var })
+                    OwnerSeedError::Invalid => {
+                        WalletError::Validation(ValidationError::SecretEnvInvalid)
                     }
                     OwnerSeedError::Unlock(detail) => {
                         WalletError::WalletState(WalletStateError::UnlockFailed { detail })

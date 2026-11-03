@@ -298,8 +298,8 @@ impl MainnetWriteContext {
         )?;
         let snapshot = load_from_dir_without_overlays(&resolved.name, profiles_dir, None).map_err(
             |error| match error {
-                ProfileLoadError::NotFound { name, .. } => {
-                    WalletError::Validation(ValidationError::ProfileNotFound { name })
+                ProfileLoadError::NotFound => {
+                    WalletError::Validation(ValidationError::ProfileNotFound)
                 }
                 other => WalletError::Validation(ValidationError::ConfigInvalid {
                     component: "profile",

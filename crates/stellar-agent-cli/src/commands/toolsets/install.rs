@@ -148,15 +148,16 @@ pub async fn run(args: &ToolsetInstallArgs) -> i32 {
             0
         }
         Err(e) => {
-            match e.downcast_ref::<WalletError>() {
-                Some(wallet_error) => render_json(&Envelope::err(wallet_error)),
-                None => render_json(&Envelope::<()>::err_raw(
-                    "toolsets.install_failed",
-                    e.to_string(),
-                )),
-            }
+            render_json(&install_failure_envelope(e.as_ref()));
             1
         }
+    }
+}
+
+fn install_failure_envelope(error: &(dyn std::error::Error + 'static)) -> Envelope<()> {
+    match error.downcast_ref::<WalletError>() {
+        Some(wallet_error) => Envelope::err(wallet_error),
+        None => Envelope::err_raw("toolsets.install_failed", error.to_string()),
     }
 }
 
@@ -860,5 +861,21 @@ mod tests {
             error.to_string(),
             "another toolset install holds the installation pin-key lock"
         );
+    }
+
+    use stellar_agent_test_support::rejected_value::assert_no_marker;
+
+    #[test]
+    fn install_output_never_carries_a_rejected_trust_line() {
+        let marker = stellar_agent_test_support::rejected_value::seed_marker();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("trust.txt");
+        std::fs::write(&path, format!("# publishers\n{marker}\n")).unwrap();
+        let err = stellar_agent_toolsets_install::signature::load_trust_set(&path).unwrap_err();
+        assert_no_marker(&err, &marker);
+        let json = serde_json::to_string(&install_failure_envelope(&err)).unwrap();
+        assert!(!json.contains(&marker));
+        assert!(json.contains("toolsets.install_failed"));
+        assert!(json.contains("line 2"));
     }
 }

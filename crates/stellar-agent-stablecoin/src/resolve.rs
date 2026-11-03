@@ -102,14 +102,13 @@ pub enum ResolveError {
     /// Bare code supplied with no pin row for the active network (refusal rule 4).
     ///
     /// EURAU is an example: not pinnable because its live on-chain assets are
-    /// lookalikes.
+    /// lookalikes. Any well-formed code can reach this refusal, so the error
+    /// names the network and never the refused code.
     #[error(
-        "denomination-explicit required — bare code {code:?} has no issuer pin \
-         for network {network:?}; supply code+issuer explicitly"
+        "denomination-explicit required: the bare code has no issuer pin for network \
+         {network:?}; supply code+issuer explicitly"
     )]
     UnpinnedBareCode {
-        /// The bare asset code.
-        code: String,
         /// The active network.
         network: NetworkId,
     },
@@ -129,12 +128,14 @@ pub enum ResolveError {
         address_redacted: String,
     },
 
-    /// The supplied asset code is structurally invalid (not 1–12 ASCII alnum).
-    #[error("invalid asset code {code:?} — must be 1–12 ASCII alphanumeric characters")]
-    InvalidCode {
-        /// The rejected code.
-        code: String,
-    },
+    /// The supplied asset code is structurally invalid (not 1 to 12 ASCII
+    /// alphanumeric characters), or a supplied contract address is not a valid
+    /// C-strkey. The error names the expected form and never the refused input.
+    #[error(
+        "invalid asset code: must be 1 to 12 ASCII alphanumeric characters, or a valid \
+         C-strkey (contract)"
+    )]
+    InvalidCode,
 
     /// The supplied issuer is not a valid G-strkey.
     #[error("invalid issuer — must be a valid Stellar G-strkey")]
@@ -261,7 +262,7 @@ pub fn resolve_denomination(
                 }
                 Err(_) => {
                     // Not a valid C-strkey; treat as invalid.
-                    Err(ResolveError::InvalidCode { code: addr })
+                    Err(ResolveError::InvalidCode)
                 }
             }
         }
@@ -304,10 +305,7 @@ pub fn resolve_denomination(
                 }
                 None => {
                     // No pin row for this code on this network; refuses as unpinned bare code.
-                    Err(ResolveError::UnpinnedBareCode {
-                        code: code_upper,
-                        network,
-                    })
+                    Err(ResolveError::UnpinnedBareCode { network })
                 }
             }
         }
@@ -324,9 +322,7 @@ pub fn resolve_denomination(
 /// longer than 12 chars, and codes containing non-ASCII-alphanumeric characters.
 fn validate_and_upper_code(code: &str) -> Result<String, ResolveError> {
     if code.is_empty() || code.len() > 12 || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(ResolveError::InvalidCode {
-            code: code.to_owned(),
-        });
+        return Err(ResolveError::InvalidCode);
     }
     Ok(code.to_ascii_uppercase())
 }
@@ -556,7 +552,7 @@ mod tests {
         let err = resolve_denomination(DenominationInput::BareCode("EURAU".to_owned()), TESTNET)
             .unwrap_err();
         assert!(
-            matches!(err, ResolveError::UnpinnedBareCode { ref code, .. } if code == "EURAU"),
+            matches!(err, ResolveError::UnpinnedBareCode { network } if network == NetworkId::Testnet),
             "expected UnpinnedBareCode, got: {err:?}"
         );
     }
@@ -685,7 +681,7 @@ mod tests {
             TESTNET,
         )
         .unwrap_err();
-        assert!(matches!(err, ResolveError::InvalidCode { .. }));
+        assert!(matches!(err, ResolveError::InvalidCode));
     }
 
     #[test]
@@ -740,8 +736,42 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, ResolveError::InvalidCode { .. }),
+            matches!(err, ResolveError::InvalidCode),
             "malformed SAC address must produce InvalidCode, got: {err:?}"
         );
+    }
+
+    /// An unpinned bare code, a malformed code and a malformed contract
+    /// address are refused by the rule and the expected form, and no refusal
+    /// repeats the supplied text.
+    #[test]
+    fn denomination_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+
+        let cases = [
+            (
+                DenominationInput::BareCode(CREDENTIAL_MARKER.to_owned()),
+                "denomination-explicit required: the bare code has no issuer pin for network \
+                 Testnet; supply code+issuer explicitly",
+            ),
+            (
+                DenominationInput::CodeAndIssuer {
+                    code: format!("{CREDENTIAL_MARKER}-"),
+                    issuer: UNPINNED_ISSUER.to_owned(),
+                },
+                "invalid asset code: must be 1 to 12 ASCII alphanumeric characters, or a valid \
+                 C-strkey (contract)",
+            ),
+            (
+                DenominationInput::SacAddress(format!("C{CREDENTIAL_MARKER}")),
+                "invalid asset code: must be 1 to 12 ASCII alphanumeric characters, or a valid \
+                 C-strkey (contract)",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = resolve_denomination(input, TESTNET).unwrap_err();
+            assert_eq!(err.to_string(), expected);
+            assert_no_marker(&err, CREDENTIAL_MARKER);
+        }
     }
 }

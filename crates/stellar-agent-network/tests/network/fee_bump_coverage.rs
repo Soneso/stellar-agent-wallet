@@ -230,9 +230,9 @@ fn fee_bump_error_code_all_variants() {
         ),
         (
             "feebump.signing_failed",
-            FeeBumpError::SigningFailed(WalletError::Validation(ValidationError::AddressInvalid {
-                input: "signing error".to_owned(),
-            })),
+            FeeBumpError::SigningFailed(WalletError::Validation(ValidationError::address_check(
+                "signing error",
+            ))),
         ),
         (
             "feebump.mainnet_signing_forbidden",
@@ -401,9 +401,7 @@ fn from_mainnet_signing_forbidden_maps_to_mainnet_write_forbidden() {
 /// `FeeBumpError::SigningFailed(WalletError)` unwraps and propagates the inner `WalletError`.
 #[test]
 fn from_signing_failed_propagates_inner_wallet_error() {
-    let inner = WalletError::Validation(ValidationError::AddressInvalid {
-        input: "signing error payload".to_owned(),
-    });
+    let inner = WalletError::Validation(ValidationError::address_check("signing error payload"));
     let err = FeeBumpError::SigningFailed(inner);
     let wallet_err = WalletError::from(err);
     // Must propagate the INNER error code, not wrap it in a new outer type.

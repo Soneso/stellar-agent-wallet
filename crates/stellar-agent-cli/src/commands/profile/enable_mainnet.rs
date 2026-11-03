@@ -124,6 +124,19 @@ fn precondition(detail: impl Into<String>) -> Failure {
     ("profile.enable_mainnet_precondition", detail.into())
 }
 
+/// Parses the policy body the enablement binds.
+///
+/// A body that is not valid TOML is refused by the position of the failure;
+/// the offending line is not repeated.
+fn parse_policy_body(raw: &str) -> Result<toml_edit::DocumentMut, Failure> {
+    raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        precondition(format!(
+            "policy_file: {}",
+            stellar_agent_core::policy::toml_syntax_detail(raw, &e)
+        ))
+    })
+}
+
 /// Renders a policy error with its wire code once, whether or not its text
 /// already starts with the code.
 fn policy_failure(error: &PolicyError) -> String {
@@ -385,9 +398,7 @@ pub(super) fn execute(
     }
     let raw = std::fs::read_to_string(policy_path)
         .map_err(|e| precondition(format!("policy_file: {e}")))?;
-    let body = raw
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| precondition(format!("policy_file: {e}")))?;
+    let body = parse_policy_body(&raw)?;
     let coordinate = mainnet_enablement_entry_ref(&profile.policy_window_state_key_id);
     let entry = keyring_core::Entry::new(&coordinate.service, &coordinate.account)
         .map_err(|_| precondition("nonce"))?;
@@ -753,6 +764,25 @@ mod tests {
     };
     use stellar_agent_test_support::keyring_mock;
     const FULL: &str = include_str!("../../../../stellar-agent-core/tests/fixtures/policy-v2.toml");
+
+    /// A policy body whose malformed line holds a credential is refused by the
+    /// position of the failure; the line is not repeated.
+    #[test]
+    fn a_malformed_policy_line_is_reported_by_position_only() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+        let body =
+            format!("version = 2\nscope = \"profile:x\"\nsecret = {CREDENTIAL_MARKER} here\n");
+        let (code, detail) = parse_policy_body(&body).unwrap_err();
+        assert_eq!(code, "profile.enable_mainnet_precondition");
+        assert!(
+            detail.starts_with("policy_file: not valid TOML: line 3, column "),
+            "{detail}"
+        );
+        assert_no_marker_in_text(&detail, CREDENTIAL_MARKER);
+        assert!(parse_policy_body(FULL).is_ok());
+    }
 
     struct Fixture {
         dir: tempfile::TempDir,

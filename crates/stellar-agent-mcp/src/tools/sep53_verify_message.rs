@@ -148,18 +148,21 @@ impl WalletServer {
         let message_bytes: Vec<u8> = match encoding {
             "base64" => match base64::engine::general_purpose::STANDARD.decode(&args.message) {
                 Ok(bytes) => bytes,
-                Err(e) => {
+                // The decoder's error quotes an offending byte of the
+                // message, so the refusal names the field and the form only.
+                Err(_) => {
                     return Ok(crate::tools::common::business_error_result(
                         "sep53.invalid_message_base64",
-                        format!("message base64 decode failed: {e}"),
+                        "message must be standard padded base64 when message_encoding is \
+                         'base64'",
                     ));
                 }
             },
             "utf8" => args.message.as_bytes().to_vec(),
-            other => {
+            _ => {
                 return Ok(crate::tools::common::business_error_result(
                     "sep53.invalid_encoding",
-                    format!("unsupported message_encoding: {other:?}; use 'utf8' or 'base64'"),
+                    "message_encoding must be 'utf8' or 'base64'",
                 ));
             }
         };
@@ -178,10 +181,10 @@ impl WalletServer {
         // Decode the base64 signature.
         let sig_bytes = match base64::engine::general_purpose::STANDARD.decode(&args.signature) {
             Ok(bytes) => bytes,
-            Err(e) => {
+            Err(_) => {
                 return Ok(crate::tools::common::business_error_result(
                     "sep53.invalid_signature_base64",
-                    format!("signature base64 decode failed: {e}"),
+                    "signature must be standard padded base64",
                 ));
             }
         };
@@ -359,5 +362,55 @@ mod tests {
             .expect("a failed verification must surface as a business-error envelope, not Err");
         let (code, _message, _text) = crate::tools::common::assert_business_envelope(&result);
         assert_eq!(code, "sep53.verify_failed");
+    }
+
+    /// A malformed base64 message, an unsupported encoding and a malformed
+    /// base64 signature are refused by the field and the expected form, and
+    /// no refusal repeats the argument or the byte the decoder stopped at.
+    #[tokio::test]
+    async fn sep53_verify_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let server = make_server();
+        let marked = format!("{CREDENTIAL_MARKER}~");
+        let signature = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+        let args =
+            |message: &str, encoding: Option<&str>, signature: &str| Sep53VerifyMessageArgs {
+                chain_id: "stellar:testnet".to_owned(),
+                message: message.to_owned(),
+                message_encoding: encoding.map(str::to_owned),
+                signature: signature.to_owned(),
+                public_key: "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned(),
+            };
+        let cases = [
+            (
+                args(&marked, Some("base64"), &signature),
+                "sep53.invalid_message_base64",
+                "message must be standard padded base64 when message_encoding is 'base64'",
+            ),
+            (
+                args("hello", Some(&marked), &signature),
+                "sep53.invalid_encoding",
+                "message_encoding must be 'utf8' or 'base64'",
+            ),
+            (
+                args("hello", None, &marked),
+                "sep53.invalid_signature_base64",
+                "signature must be standard padded base64",
+            ),
+        ];
+        for (args, expected_code, expected_message) in cases {
+            let result = server
+                .call_stellar_sep53_verify_message(args)
+                .await
+                .unwrap();
+            let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(code, expected_code);
+            assert_eq!(message, expected_message);
+            assert_no_marker_in_text(&text, CREDENTIAL_MARKER);
+            assert_no_marker_in_text(&text, "symbol");
+        }
     }
 }

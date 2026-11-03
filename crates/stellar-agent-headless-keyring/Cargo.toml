@@ -32,6 +32,7 @@ chacha20poly1305 = { workspace = true }
 stellar-agent-windows-identity = { workspace = true }
 
 [dev-dependencies]
+stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
 # Dev-only: pins byte-equality between this crate's replicated canonical-root

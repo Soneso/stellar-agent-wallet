@@ -65,7 +65,10 @@
 //!
 //! # Secret-material discipline
 //!
-//! No error variant carries raw secret material.  Fields named `account_id`,
+//! Errors name the rejected argument, field, position or check, never its value.
+//! The rule covers Display, Debug, every source in the error chain, guidance,
+//! logs, MCP stderr and CLI output, including usage diagnostics.
+//! No error variant carries raw secret material. Fields named `account_id`,
 //! `destination`, etc. hold public identifiers only.  No variant accepts or
 //! stores private key bytes, mnemonic words, raw signature bytes, or any
 //! other material classified as secret.  Each field-carrying variant documents
@@ -848,6 +851,67 @@ pub enum CapKind {
 // Validation errors
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// What a [`ValidationError::AddressInvalid`] refusal names: an argument or
+/// field that must hold a Stellar account address, or a fixed sentence that
+/// describes a failed check and the form it expects.
+///
+/// It never holds the rejected value. [`Self::argument`] renders the name
+/// with the expected account-address form; [`Self::check`] renders its
+/// sentence as written, because a check on a hex id, a symbol, a rule id, or
+/// a contract address expects a form other than a `G...` or `M...` strkey.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressField {
+    text: Cow<'static, str>,
+    form: AddressFieldForm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressFieldForm {
+    Argument,
+    Check,
+}
+
+impl AddressField {
+    /// An argument or field that must hold a `G...` or `M...` account
+    /// address, such as `--destination` or `op_source`.
+    #[must_use]
+    pub fn argument(name: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            text: name.into(),
+            form: AddressFieldForm::Argument,
+        }
+    }
+
+    /// A fixed sentence that names the argument or the check and states the
+    /// expected form, such as `--salt must be a 64-char lowercase hex string`.
+    #[must_use]
+    pub fn check(sentence: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            text: sentence.into(),
+            form: AddressFieldForm::Check,
+        }
+    }
+
+    /// The stored argument name or complete check sentence.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for AddressField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.form {
+            AddressFieldForm::Argument => write!(
+                f,
+                "{} is not a valid Stellar account address (expected a G... or M... strkey)",
+                self.text
+            ),
+            AddressFieldForm::Check => f.write_str(&self.text),
+        }
+    }
+}
+
 /// Errors arising from user-supplied input validation.
 ///
 /// These are returned before any network call or signing operation when the
@@ -856,9 +920,10 @@ pub enum CapKind {
 ///
 /// # Secret-material policy
 ///
-/// No field in any variant carries secret material.  All `String` fields hold
-/// user-visible public data (amounts, destination account IDs, asset codes,
-/// rule identifiers, profile names).
+/// No field in any variant carries secret material or a value the wallet
+/// rejected. A refusal of caller input names the argument, the field, or the
+/// check; the `String` fields that remain hold public data the wallet
+/// accepted (destination account IDs, asset codes, rule identifiers).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ValidationError {
@@ -893,11 +958,11 @@ pub enum ValidationError {
     /// The amount string exceeds the seven-decimal-place precision allowed by
     /// the Stellar protocol.
     ///
-    /// `amount` holds the user-entered amount string (e.g. `"1.12345678"`).
-    #[error("amount '{amount}' exceeds the maximum precision of 7 decimal places")]
+    /// `field` names the amount argument or field, never the rejected value.
+    #[error("{field} exceeds the maximum precision of 7 decimal places")]
     AmountPrecisionExceeded {
-        /// The user-entered amount string that exceeded protocol precision.
-        amount: String,
+        /// The amount argument or field. Values never appear.
+        field: Cow<'static, str>,
     },
 
     /// A destination account requires a memo but none was provided.
@@ -910,14 +975,15 @@ pub enum ValidationError {
         destination: String,
     },
 
-    /// The supplied memo type is not valid for the requested operation.
+    /// The supplied memo is not valid for its memo type.
     ///
-    /// `memo_type` holds the memo-type string as supplied by the caller
-    /// (e.g. `"MEMO_HASH"`, `"invalid"`).
+    /// `memo_type` is fixed text naming the memo type and the check it failed
+    /// (e.g. `"HASH (must be exactly 64 hex characters)"`); the memo itself
+    /// never appears.
     #[error("memo type '{memo_type}' is not valid for this operation")]
     MemoInvalidType {
-        /// The memo-type string as supplied by the caller.
-        memo_type: String,
+        /// The memo type and the failed check, as fixed text.
+        memo_type: Cow<'static, str>,
     },
 
     /// More than one memo variant was supplied simultaneously.
@@ -950,60 +1016,56 @@ pub enum ValidationError {
         code_point: String,
     },
 
-    /// A Stellar account address could not be parsed.
+    /// A Stellar address or an address-shaped argument cannot be parsed.
     ///
-    /// `input` holds the raw input string provided by the user or calling
-    /// code (e.g. `"GABC"`).  This is a public identifier; it is safe to
-    /// display.
-    #[error("address '{input}' is not a valid Stellar account address")]
+    /// `field` names the argument or describes the check, never the rejected
+    /// value. An argument renders with the expected `G...` or `M...` form; a
+    /// check renders its own sentence, which states the form it expects.
+    #[error("{field}")]
     AddressInvalid {
-        /// The raw input string that failed to parse as a Stellar address.
-        input: String,
+        /// The argument or the fixed check sentence. Values never appear.
+        field: AddressField,
     },
 
-    /// An asset descriptor could not be parsed.
+    /// An asset descriptor cannot be parsed.
     ///
-    /// `input` holds the raw asset string provided by the user or calling
-    /// code (e.g. `"USDC:invalid"`).
-    #[error("asset '{input}' is not a valid asset descriptor")]
+    /// `field` names the argument or check, never the rejected value.
+    #[error("{field} is not a valid asset descriptor")]
     AssetInvalid {
-        /// The raw input string that failed to parse as an asset descriptor.
-        input: String,
+        /// The argument, field, or fixed check description. Values never appear.
+        field: Cow<'static, str>,
     },
 
-    /// A named profile was not found in the wallet configuration.
-    ///
-    /// `name` holds the profile name as supplied by the caller.
-    #[error("profile '{name}' was not found in the wallet configuration")]
-    ProfileNotFound {
-        /// The profile name that was not found.
-        name: String,
-    },
+    /// The requested profile is absent from the wallet configuration.
+    #[error(
+        "the requested profile was not found in the wallet configuration; `stellar-agent profile list` shows the profiles"
+    )]
+    ProfileNotFound,
 
     /// An amount string failed numeric parsing.
     ///
-    /// `input` holds the raw input string provided by the user or calling
-    /// code (e.g. `"abc XLM"`, `"100.5.0 XLM"`, empty string).  This is
-    /// a user-supplied value with no secret material.
+    /// `field` names the amount argument or field (e.g. `"--amount"`), never
+    /// the rejected value.
     ///
     /// This variant covers syntactic invalidity.  For semantic invalidity
     /// (precision exceeded, out of range) see [`ValidationError::AmountPrecisionExceeded`]
     /// and [`ValidationError::AmountOutOfRange`].
-    #[error("amount '{input}' could not be parsed as a valid amount")]
+    #[error("{field} could not be parsed as a valid amount")]
     AmountMalformed {
-        /// The raw input string that failed to parse.
-        input: String,
+        /// The amount argument or field. Values never appear.
+        field: Cow<'static, str>,
     },
 
     /// An amount label differs from the unit required by its asset.
-    #[error("amount '{input}' has unit '{supplied}'; expected unit '{expected}'")]
+    ///
+    /// The supplied unit is not shown; `expected` is the code of the asset
+    /// the wallet accepted.
+    #[error("{field} has the wrong unit; expected unit '{expected}'")]
     AmountUnitMismatch {
-        /// The supplied amount string.
-        input: String,
+        /// The amount argument or field. Values never appear.
+        field: Cow<'static, str>,
         /// The unit required by the parsed asset.
         expected: String,
-        /// The unit supplied with the amount.
-        supplied: String,
     },
 
     /// An amount is outside the representable `i64` stroop range.
@@ -1016,30 +1078,24 @@ pub enum ValidationError {
     /// checks or the stable wire code `validation.amount_out_of_range`
     /// loses its parse-level semantics.
     ///
-    /// `amount` holds the amount string that overflowed (e.g.
-    /// `"99999999999999999999 XLM"`).  This is a user-supplied value with
-    /// no secret material.
-    #[error("amount '{amount}' is outside the representable i64 stroop range")]
+    /// `field` names the amount argument or field, never the rejected value.
+    #[error("{field} is outside the representable i64 stroop range")]
     AmountOutOfRange {
-        /// The amount string that overflowed the `i64` stroop range.
-        amount: String,
+        /// The amount argument or field. Values never appear.
+        field: Cow<'static, str>,
     },
 
     /// The `--output` flag value is not a recognised output format.
     ///
-    /// `input` holds the raw string supplied by the user or calling code
-    /// (e.g. `"xml"`, `" json"` with a leading space, `""`).  Accepted
-    /// values are `"json"` and `"table"` (case-insensitive).
+    /// Accepted values are `"json"` and `"table"` (case-insensitive); the
+    /// rejected value is not shown.
     ///
     /// This variant is produced by [`crate::envelope::OutputFormat::parse`]
     /// when the supplied string does not match a known format.  It is also
     /// the code emitted in an error envelope when a CLI flag value is
     /// rejected before the command runs.
-    #[error("output format '{input}' is not recognised; accepted values are 'json' and 'table'")]
-    OutputFormatInvalid {
-        /// The raw input string that did not match a known output format.
-        input: String,
-    },
+    #[error("the output format is not recognised; accepted values are 'json' and 'table'")]
+    OutputFormatInvalid,
 
     /// A plugin name failed audit-log construction validation.
     ///
@@ -1216,10 +1272,7 @@ pub enum ValidationError {
     RelayerNotImplemented,
 
     /// The `--valid-until` argument could not be parsed as `none` or a `u32`
-    /// ledger sequence.
-    ///
-    /// `input` holds the raw value provided by the caller (e.g. `"foo"`,
-    /// `"99999999999"`). This is a user-visible non-secret string.
+    /// ledger sequence. The rejected value is not shown.
     ///
     /// Distinct from [`ValidationError::AddressInvalid`]: `--valid-until`
     /// accepts a ledger sequence or the literal `"none"` — it is not an
@@ -1229,11 +1282,8 @@ pub enum ValidationError {
     /// # Wire code
     ///
     /// `"validation.valid_until_invalid"`.
-    #[error("--valid-until '{input}' is not 'none' or a valid u32 ledger sequence")]
-    ValidUntilInvalid {
-        /// The raw input string that failed to parse.
-        input: String,
-    },
+    #[error("--valid-until is not 'none' or a valid u32 ledger sequence")]
+    ValidUntilInvalid,
 
     /// A component configuration value could not be parsed or resolved.
     ///
@@ -1307,14 +1357,9 @@ pub enum ValidationError {
     ///
     /// `"validation.mainnet_rpc_url_required"`.
     #[error(
-        "the mainnet profile `{name}` requires an explicit RPC endpoint; set `rpc_url` in \
-         the profile file, or pass `--rpc-url` to `profile init`; no public mainnet default \
-         exists"
+        "the mainnet profile requires an explicit RPC endpoint; set rpc_url in the profile file, or pass --rpc-url to profile init"
     )]
-    MainnetRpcUrlRequired {
-        /// The mainnet profile that names no RPC endpoint.
-        name: String,
-    },
+    MainnetRpcUrlRequired,
 
     /// A provider attestation requires correction in the profile file.
     #[error("profile '{name}': {source}")]
@@ -1326,8 +1371,7 @@ pub enum ValidationError {
         source: crate::profile::schema::ProviderAttestationError,
     },
 
-    /// A profile-creation command refused to overwrite an existing profile
-    /// file.
+    /// A profile-creation command refuses to overwrite an occupied destination.
     ///
     /// `stellar-agent profile init` never clobbers an existing `<name>.toml`:
     /// the existence check happens before any write, and the write itself
@@ -1340,14 +1384,9 @@ pub enum ValidationError {
     ///
     /// `"validation.profile_already_exists"`.
     #[error(
-        "profile '{name}' already exists at {path}; choose a different --profile name or remove the file"
+        "the profile destination already exists; choose a different --profile name or remove the existing entry"
     )]
-    ProfileAlreadyExists {
-        /// The profile name that already has a persisted TOML file.
-        name: String,
-        /// Display path of the existing profile file.
-        path: String,
-    },
+    ProfileAlreadyExists,
 
     /// The network flag must assert the loaded profile's chain.
     #[error(
@@ -1445,8 +1484,9 @@ pub enum ValidationError {
     /// profile's state while every message names the requested one. The
     /// refusal is produced by
     /// [`profile_name_mismatch_refusal`](crate::profile::name::profile_name_mismatch_refusal);
-    /// `detail` carries its rendered message, which names both profiles,
-    /// quotes the offending field, and states the recovery.
+    /// `detail` carries its rendered message, which names the offending
+    /// field and states the recovery without repeating either profile name or
+    /// the field's stored value.
     ///
     /// # Wire code
     ///
@@ -1458,15 +1498,15 @@ pub enum ValidationError {
     /// another profile". The two have unrelated recovery.
     #[error("{detail}")]
     ProfileNameMismatch {
-        /// The rendered refusal: both names, the offending field, and the
-        /// recovery path.
+        /// The rendered refusal: the offending field and the recovery path,
+        /// without either profile name or the stored field value.
         detail: String,
     },
 
     /// The profile's keyring references conflict with its host-local scope.
     #[error("{detail}")]
     ProfileKeyScopeConflict {
-        /// Selected profile name.
+        /// Resolved profile name, or empty when the requested name has no file.
         profile: String,
         /// Snake-case finding kind.
         kind: &'static str,
@@ -1783,40 +1823,17 @@ pub enum ValidationError {
         field: &'static str,
     },
 
-    /// A signing verb was asked to read a secret from a named environment
-    /// variable, but that variable is not set in this process's environment.
+    /// The secret environment variable named by the argument is not set.
     ///
-    /// `var` holds the environment variable name supplied by the operator
-    /// (e.g. `"DEPLOYER_SECRET"`). It is a non-secret identifier — the name of
-    /// the variable, never its value.
-    ///
-    /// # Wire code
-    ///
-    /// `"validation.secret_env_not_set"`.
-    #[error("environment variable '{var}' is not set in this process's environment")]
-    SecretEnvNotSet {
-        /// The environment variable name that is not set. Names the variable,
-        /// never its value.
-        var: String,
-    },
+    /// Wire code: `validation.secret_env_not_set`.
+    #[error("the secret environment variable named by the argument is not set")]
+    SecretEnvNotSet,
 
-    /// A named environment variable was set but its value is not a valid
-    /// ed25519 `S...` strkey.
+    /// The secret environment variable holds a value that is not an S-strkey.
     ///
-    /// `var` holds the environment variable name supplied by the operator. The
-    /// variable's value is never included in the error — only the variable
-    /// name — so no secret material can leak through the wire envelope even
-    /// when the value is malformed.
-    ///
-    /// # Wire code
-    ///
-    /// `"validation.secret_env_invalid"`.
-    #[error("environment variable '{var}' does not contain a valid S-strkey")]
-    SecretEnvInvalid {
-        /// The environment variable name whose value failed to parse. Names the
-        /// variable, never its value.
-        var: String,
-    },
+    /// Wire code: `validation.secret_env_invalid`.
+    #[error("the secret environment variable named by the argument must contain a valid S-strkey")]
+    SecretEnvInvalid,
 
     /// A value-moving signing verb was invoked without any signer-source flag.
     ///
@@ -2082,6 +2099,24 @@ fn fee_above_cap_text(per_op: u32, cap: u32, fee_source: &FeeSource) -> String {
 }
 
 impl ValidationError {
+    /// An [`Self::AddressInvalid`] that names an argument or field which must
+    /// hold a `G...` or `M...` account address. See [`AddressField::argument`].
+    #[must_use]
+    pub fn address_argument(name: impl Into<Cow<'static, str>>) -> Self {
+        Self::AddressInvalid {
+            field: AddressField::argument(name),
+        }
+    }
+
+    /// An [`Self::AddressInvalid`] whose fixed sentence names the argument or
+    /// the check and the form it expects. See [`AddressField::check`].
+    #[must_use]
+    pub fn address_check(sentence: impl Into<Cow<'static, str>>) -> Self {
+        Self::AddressInvalid {
+            field: AddressField::check(sentence),
+        }
+    }
+
     /// Returns the stable wire-format subcode for this validation error.
     ///
     /// Always prefixed with `"validation."` when accessed through
@@ -2097,12 +2132,12 @@ impl ValidationError {
             Self::MemoControlCharacter { .. } => "validation.memo_control_character",
             Self::AddressInvalid { .. } => "validation.address_invalid",
             Self::AssetInvalid { .. } => "validation.asset_invalid",
-            Self::ProfileNotFound { .. } => "validation.profile_not_found",
+            Self::ProfileNotFound => "validation.profile_not_found",
             Self::AmountMalformed { .. } | Self::AmountUnitMismatch { .. } => {
                 "validation.amount_malformed"
             }
             Self::AmountOutOfRange { .. } => "validation.amount_out_of_range",
-            Self::OutputFormatInvalid { .. } => "validation.output_format_invalid",
+            Self::OutputFormatInvalid => "validation.output_format_invalid",
             Self::InvalidPluginName { .. } => "validation.invalid_plugin_name",
             Self::PasskeyOnlyRuleNoDelegatedFallback { .. } => {
                 "validation.passkey_only_rule_no_delegated_fallback"
@@ -2114,7 +2149,7 @@ impl ValidationError {
             Self::BundleTooLarge { .. } => "validation.bundle_too_large",
             Self::UnsupportedFeeMode { .. } => "validation.unsupported_fee_mode",
             Self::RelayerNotImplemented => "validation.relayer_not_implemented",
-            Self::ValidUntilInvalid { .. } => "validation.valid_until_invalid",
+            Self::ValidUntilInvalid => "validation.valid_until_invalid",
             Self::ConfigInvalid { .. } => "validation.config_invalid",
             Self::RuleNameTooLong { .. } => "validation.rule_name_too_long",
             // Audit taxonomy code on a validation-class variant: the code names
@@ -3742,7 +3777,7 @@ mod tests {
             ),
             (
                 ValidationError::AmountPrecisionExceeded {
-                    amount: "1.12345678".to_owned(),
+                    field: "--amount".into(),
                 },
                 "validation.amount_precision_exceeded",
             ),
@@ -3754,52 +3789,49 @@ mod tests {
             ),
             (
                 ValidationError::MemoInvalidType {
-                    memo_type: "MEMO_HASH".to_owned(),
+                    memo_type: "HASH (must be exactly 64 hex characters)".into(),
                 },
                 "validation.memo_invalid_type",
             ),
             (
-                ValidationError::AddressInvalid {
-                    input: "GABC".to_owned(),
-                },
+                ValidationError::address_argument("address"),
+                "validation.address_invalid",
+            ),
+            (
+                ValidationError::address_check("--salt must be a 64-char lowercase hex string"),
                 "validation.address_invalid",
             ),
             (
                 ValidationError::AssetInvalid {
-                    input: "USDC:bad".to_owned(),
+                    field: "asset".into(),
                 },
                 "validation.asset_invalid",
             ),
             (
-                ValidationError::ProfileNotFound {
-                    name: "default".to_owned(),
-                },
+                ValidationError::ProfileNotFound,
                 "validation.profile_not_found",
             ),
             (
                 ValidationError::AmountMalformed {
-                    input: "abc XLM".to_owned(),
+                    field: "--amount".into(),
                 },
                 "validation.amount_malformed",
             ),
             (
                 ValidationError::AmountUnitMismatch {
-                    input: "100 XLM".to_owned(),
+                    field: "--amount".into(),
                     expected: "TST".to_owned(),
-                    supplied: "XLM".to_owned(),
                 },
                 "validation.amount_malformed",
             ),
             (
                 ValidationError::AmountOutOfRange {
-                    amount: "99999999999999999999".to_owned(),
+                    field: "--amount".into(),
                 },
                 "validation.amount_out_of_range",
             ),
             (
-                ValidationError::OutputFormatInvalid {
-                    input: "xml".to_owned(),
-                },
+                ValidationError::OutputFormatInvalid,
                 "validation.output_format_invalid",
             ),
             (
@@ -3872,9 +3904,7 @@ mod tests {
                 "validation.relayer_not_implemented",
             ),
             (
-                ValidationError::ValidUntilInvalid {
-                    input: "foo".to_owned(),
-                },
+                ValidationError::ValidUntilInvalid,
                 "validation.valid_until_invalid",
             ),
             (
@@ -3909,16 +3939,11 @@ mod tests {
                 "validation.provider_attestation_invalid",
             ),
             (
-                ValidationError::MainnetRpcUrlRequired {
-                    name: "mainnet".to_owned(),
-                },
+                ValidationError::MainnetRpcUrlRequired,
                 "validation.mainnet_rpc_url_required",
             ),
             (
-                ValidationError::ProfileAlreadyExists {
-                    name: "default".to_owned(),
-                    path: "/home/user/.local/share/stellar-agent/profiles/default.toml".to_owned(),
-                },
+                ValidationError::ProfileAlreadyExists,
                 "validation.profile_already_exists",
             ),
             (
@@ -3955,9 +3980,8 @@ mod tests {
             ),
             (
                 ValidationError::ProfileNameMismatch {
-                    detail: "profile 'alice' was selected, but its \
-                             policy_owner_key_id.service is \
-                             'stellar-agent-owner-default'"
+                    detail: "the selected profile's policy_owner_key_id.service names a \
+                             different profile"
                         .to_owned(),
                 },
                 "profile.name_mismatch",
@@ -4056,15 +4080,11 @@ mod tests {
                 "validation.key_matches_owner_public_key",
             ),
             (
-                ValidationError::SecretEnvNotSet {
-                    var: "DEPLOYER_SECRET".to_owned(),
-                },
+                ValidationError::SecretEnvNotSet,
                 "validation.secret_env_not_set",
             ),
             (
-                ValidationError::SecretEnvInvalid {
-                    var: "DEPLOYER_SECRET".to_owned(),
-                },
+                ValidationError::SecretEnvInvalid,
                 "validation.secret_env_invalid",
             ),
             (
@@ -4131,9 +4151,9 @@ mod tests {
                     ValidationError::MainnetOracleRequired { gap: *gap }
                 }
                 ValidationError::AmountUnitsRequired => ValidationError::AmountUnitsRequired,
-                ValidationError::AmountPrecisionExceeded { amount } => {
+                ValidationError::AmountPrecisionExceeded { field } => {
                     ValidationError::AmountPrecisionExceeded {
-                        amount: amount.clone(),
+                        field: field.clone(),
                     }
                 }
                 ValidationError::MemoRequired { destination } => ValidationError::MemoRequired {
@@ -4144,35 +4164,26 @@ mod tests {
                         memo_type: memo_type.clone(),
                     }
                 }
-                ValidationError::AddressInvalid { input } => ValidationError::AddressInvalid {
-                    input: input.clone(),
+                ValidationError::AddressInvalid { field } => ValidationError::AddressInvalid {
+                    field: field.clone(),
                 },
-                ValidationError::AssetInvalid { input } => ValidationError::AssetInvalid {
-                    input: input.clone(),
+                ValidationError::AssetInvalid { field } => ValidationError::AssetInvalid {
+                    field: field.clone(),
                 },
-                ValidationError::ProfileNotFound { name } => {
-                    ValidationError::ProfileNotFound { name: name.clone() }
-                }
-                ValidationError::AmountMalformed { input } => ValidationError::AmountMalformed {
-                    input: input.clone(),
+                ValidationError::ProfileNotFound => ValidationError::ProfileNotFound,
+                ValidationError::AmountMalformed { field } => ValidationError::AmountMalformed {
+                    field: field.clone(),
                 },
-                ValidationError::AmountUnitMismatch {
-                    input,
-                    expected,
-                    supplied,
-                } => ValidationError::AmountUnitMismatch {
-                    input: input.clone(),
-                    expected: expected.clone(),
-                    supplied: supplied.clone(),
-                },
-                ValidationError::AmountOutOfRange { amount } => ValidationError::AmountOutOfRange {
-                    amount: amount.clone(),
-                },
-                ValidationError::OutputFormatInvalid { input } => {
-                    ValidationError::OutputFormatInvalid {
-                        input: input.clone(),
+                ValidationError::AmountUnitMismatch { field, expected } => {
+                    ValidationError::AmountUnitMismatch {
+                        field: field.clone(),
+                        expected: expected.clone(),
                     }
                 }
+                ValidationError::AmountOutOfRange { field } => ValidationError::AmountOutOfRange {
+                    field: field.clone(),
+                },
+                ValidationError::OutputFormatInvalid => ValidationError::OutputFormatInvalid,
                 ValidationError::MemoMutuallyExclusive => ValidationError::MemoMutuallyExclusive,
                 ValidationError::MemoControlCharacter { code_point } => {
                     ValidationError::MemoControlCharacter {
@@ -4225,11 +4236,7 @@ mod tests {
                     }
                 }
                 ValidationError::RelayerNotImplemented => ValidationError::RelayerNotImplemented,
-                ValidationError::ValidUntilInvalid { input } => {
-                    ValidationError::ValidUntilInvalid {
-                        input: input.clone(),
-                    }
-                }
+                ValidationError::ValidUntilInvalid => ValidationError::ValidUntilInvalid,
                 ValidationError::ConfigInvalid { component, reason } => {
                     ValidationError::ConfigInvalid {
                         component,
@@ -4251,15 +4258,8 @@ mod tests {
                         source: source.clone(),
                     }
                 }
-                ValidationError::MainnetRpcUrlRequired { name } => {
-                    ValidationError::MainnetRpcUrlRequired { name: name.clone() }
-                }
-                ValidationError::ProfileAlreadyExists { name, path } => {
-                    ValidationError::ProfileAlreadyExists {
-                        name: name.clone(),
-                        path: path.clone(),
-                    }
-                }
+                ValidationError::MainnetRpcUrlRequired => ValidationError::MainnetRpcUrlRequired,
+                ValidationError::ProfileAlreadyExists => ValidationError::ProfileAlreadyExists,
                 ValidationError::NetworkFlagMismatch {
                     flag,
                     profile,
@@ -4380,12 +4380,8 @@ mod tests {
                 ValidationError::KeyMatchesOwnerPublicKey { field } => {
                     ValidationError::KeyMatchesOwnerPublicKey { field }
                 }
-                ValidationError::SecretEnvNotSet { var } => {
-                    ValidationError::SecretEnvNotSet { var: var.clone() }
-                }
-                ValidationError::SecretEnvInvalid { var } => {
-                    ValidationError::SecretEnvInvalid { var: var.clone() }
-                }
+                ValidationError::SecretEnvNotSet => ValidationError::SecretEnvNotSet,
+                ValidationError::SecretEnvInvalid => ValidationError::SecretEnvInvalid,
                 ValidationError::SignerSourceRequired { detail } => {
                     ValidationError::SignerSourceRequired {
                         detail: detail.clone(),
@@ -5265,23 +5261,19 @@ mod tests {
         let cases = [
             WalletError::Validation(ValidationError::AmountUnitsRequired),
             WalletError::Validation(ValidationError::AmountPrecisionExceeded {
-                amount: "1.12345678".to_owned(),
+                field: "--amount".into(),
             }),
             WalletError::Validation(ValidationError::MemoRequired {
                 destination: "GABCDEFGHIJKLMNOPQRSTUVWXYZ012345678901234567890123456".to_owned(),
             }),
             WalletError::Validation(ValidationError::MemoInvalidType {
-                memo_type: "MEMO_HASH".to_owned(),
+                memo_type: "HASH (must be exactly 64 hex characters)".into(),
             }),
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: "GABC".to_owned(),
-            }),
+            WalletError::Validation(ValidationError::address_argument("address")),
             WalletError::Validation(ValidationError::AssetInvalid {
-                input: "BAD:ASSET".to_owned(),
+                field: "asset".into(),
             }),
-            WalletError::Validation(ValidationError::ProfileNotFound {
-                name: "my-profile".to_owned(),
-            }),
+            WalletError::Validation(ValidationError::ProfileNotFound),
             WalletError::Validation(ValidationError::InvalidPluginName {
                 reason: "invalid character".to_owned(),
             }),
@@ -5292,12 +5284,8 @@ mod tests {
                 reason: "pass an explicit stroops value".to_owned(),
             }),
             WalletError::Validation(ValidationError::RelayerNotImplemented),
-            WalletError::Validation(ValidationError::SecretEnvNotSet {
-                var: "DEPLOYER_SECRET".to_owned(),
-            }),
-            WalletError::Validation(ValidationError::SecretEnvInvalid {
-                var: "DEPLOYER_SECRET".to_owned(),
-            }),
+            WalletError::Validation(ValidationError::SecretEnvNotSet),
+            WalletError::Validation(ValidationError::SecretEnvInvalid),
             WalletError::Validation(ValidationError::SignerSourceRequired {
                 detail: "no signer-source flag specified; pass --secret-env <VAR> \
                          or --sign-with-ledger"
@@ -6026,5 +6014,89 @@ mod tests {
             "profile.reset_window_state_open_authorizations"
         );
         assert!(open.to_string().contains("2 open mainnet"), "{open}");
+    }
+
+    use stellar_agent_test_support::rejected_value::{
+        CREDENTIAL_MARKER, assert_no_marker, seed_marker,
+    };
+
+    #[test]
+    fn address_and_asset_errors_name_the_field() {
+        let address = ValidationError::address_argument("--destination");
+        assert_eq!(
+            address.to_string(),
+            "--destination is not a valid Stellar account address (expected a G... or M... strkey)"
+        );
+        assert_eq!(address.code(), "validation.address_invalid");
+        let check =
+            ValidationError::address_check("--operation-id must be a 64-char lowercase hex string");
+        assert_eq!(
+            check.to_string(),
+            "--operation-id must be a 64-char lowercase hex string"
+        );
+        assert_eq!(check.code(), "validation.address_invalid");
+        let asset = ValidationError::AssetInvalid {
+            field: "asset".into(),
+        };
+        assert_eq!(asset.to_string(), "asset is not a valid asset descriptor");
+        assert_eq!(asset.code(), "validation.asset_invalid");
+        for err in [&address, &check, &asset] {
+            assert_no_marker(err, &seed_marker());
+            assert_no_marker(err, CREDENTIAL_MARKER);
+        }
+    }
+
+    #[test]
+    fn amount_and_flag_errors_name_the_field() {
+        let cases = [
+            (
+                ValidationError::AmountMalformed {
+                    field: "--amount".into(),
+                },
+                "--amount could not be parsed as a valid amount",
+            ),
+            (
+                ValidationError::AmountUnitMismatch {
+                    field: "--amount".into(),
+                    expected: "TST".to_owned(),
+                },
+                "--amount has the wrong unit; expected unit 'TST'",
+            ),
+            (
+                ValidationError::AmountPrecisionExceeded {
+                    field: "--amount".into(),
+                },
+                "--amount exceeds the maximum precision of 7 decimal places",
+            ),
+            (
+                ValidationError::AmountOutOfRange {
+                    field: "--amount".into(),
+                },
+                "--amount is outside the representable i64 stroop range",
+            ),
+            (
+                ValidationError::OutputFormatInvalid,
+                "the output format is not recognised; accepted values are 'json' and 'table'",
+            ),
+            (
+                ValidationError::ValidUntilInvalid,
+                "--valid-until is not 'none' or a valid u32 ledger sequence",
+            ),
+        ];
+        for (err, expected) in &cases {
+            assert_eq!(err.to_string(), *expected);
+            assert_no_marker(err, &seed_marker());
+        }
+    }
+
+    #[test]
+    fn profile_not_found_names_no_profile() {
+        let err = crate::profile::loader::ProfileLoadError::NotFound.to_validation_error();
+        assert_eq!(
+            err.to_string(),
+            "the requested profile was not found in the wallet configuration; `stellar-agent profile list` shows the profiles"
+        );
+        assert_eq!(err.code(), "validation.profile_not_found");
+        assert_no_marker(&err, &seed_marker());
     }
 }

@@ -41,6 +41,7 @@ stellar-agent-network = { workspace = true }
 # to start_sep24_interactive / get_sep6_info, keeping the dep-closure minimal.
 
 [dev-dependencies]
+stellar-agent-test-support = { path = "../stellar-agent-test-support" }
 tokio               = { workspace = true, features = ["rt-multi-thread", "macros"] }
 stellar-agent-sep10 = { path = "../stellar-agent-sep10" }
 stellar-agent-network = { path = "../stellar-agent-network" }

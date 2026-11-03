@@ -1656,18 +1656,14 @@ pub enum SaError {
     /// TOML parse error reading `<canonical_data_root>/networks.toml`
     /// (or the `STELLAR_AGENT_NETWORKS_TOML` override path).
     ///
-    /// `path` is the filesystem path that failed to parse; `source` is the
-    /// underlying `toml::de::Error`.  Neither carries secret material.
-    #[error("networks.toml TOML parse error at {path}: {source}")]
+    /// `path` is the filesystem path that failed to parse; `position` is the
+    /// line and column of the failure. The parser's error is not kept: its
+    /// `Display` prints the offending line, which can hold a credential.
+    #[error("networks.toml is not valid TOML: {position}")]
     #[serde(rename = "sa.networks_toml_parse")]
     NetworksTomlParse {
-        /// The `toml::de::Error` describing the parse failure.
-        ///
-        /// Serialised as a human-readable string because `toml::de::Error` does not
-        /// implement `serde::Serialize`.
-        #[source]
-        #[serde(serialize_with = "serialize_display")]
-        source: toml::de::Error,
+        /// The line and column of the parse failure, without source text.
+        position: String,
         /// Filesystem path whose contents failed to parse.
         path: PathBuf,
     },
@@ -3733,7 +3729,7 @@ mod tests {
             (
                 "sa.networks_toml_parse",
                 SaError::NetworksTomlParse {
-                    source: toml::from_str::<toml::Value>("invalid = ").unwrap_err(),
+                    position: "line 1, column 11".to_owned(),
                     path: PathBuf::from("/mock/path"),
                 },
             ),
@@ -4605,10 +4601,10 @@ mod tests {
             (
                 "sa.networks_toml_parse",
                 SaError::NetworksTomlParse {
-                    source: toml::from_str::<toml::Value>("invalid = ").unwrap_err(),
+                    position: "line 1, column 11".to_owned(),
                     path: PathBuf::from("/mock/path"),
                 },
-                &["source", "path"],
+                &["position", "path"],
             ),
             (
                 "sa.threshold_read_failed",
@@ -5445,7 +5441,7 @@ mod tests {
                 path: PathBuf::from("/mock/path/audit/default.jsonl"),
             },
             SaError::NetworksTomlParse {
-                source: toml::from_str::<toml::Value>("invalid = ").unwrap_err(),
+                position: "line 1, column 11".to_owned(),
                 path: PathBuf::from("/mock/path"),
             },
             SaError::ThresholdPolicyNotInstalled {

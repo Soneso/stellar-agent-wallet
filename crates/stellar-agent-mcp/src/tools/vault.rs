@@ -236,6 +236,9 @@ impl WalletServer {
             return Ok(crate::tools::common::mainnet_write_forbidden_result());
         }
         let secondary_rpc_url = self.secondary_override(args.secondary_rpc_url.as_deref())?;
+        if let Err(refusal) = validate_vault_addresses(&args.vault_address, &args.from_address) {
+            return Ok(refusal);
+        }
         // ── Parse decimal-string amount fields (single decode; feeds BOTH the
         // value-carrying policy gate below and `VaultDepositArgs` handed to
         // the adapter further down) ───────────────────────────────────────────
@@ -722,6 +725,9 @@ impl WalletServer {
             return Ok(crate::tools::common::mainnet_write_forbidden_result());
         }
         let secondary_rpc_url = self.secondary_override(args.secondary_rpc_url.as_deref())?;
+        if let Err(refusal) = validate_vault_addresses(&args.vault_address, &args.from_address) {
+            return Ok(refusal);
+        }
         // ── Parse decimal-string amount fields (single decode; feeds BOTH the
         // value-carrying policy gate below and `VaultWithdrawArgs` handed to
         // the adapter further down) ───────────────────────────────────────────
@@ -1176,6 +1182,28 @@ impl WalletServer {
 // Helper
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Refuses a `vault_address` or `from_address` that is not a C-strkey.
+///
+/// Every later event names both addresses by their first and last five
+/// characters, which is a safe rendering of a contract strkey only, so the
+/// handlers call this before any event. A refusal names the field and the
+/// expected form, never the argument.
+fn validate_vault_addresses(vault_address: &str, from_address: &str) -> Result<(), CallToolResult> {
+    if stellar_strkey::Contract::from_string(vault_address).is_err() {
+        return Err(tool_error_result(
+            "vault.wasm_pin_failed",
+            "vault_address must be a C-strkey (contract)",
+        ));
+    }
+    if stellar_strkey::Contract::from_string(from_address).is_err() {
+        return Err(tool_error_result(
+            "vault.submit_failed",
+            "from_address must be a C-strkey (contract)",
+        ));
+    }
+    Ok(())
+}
+
 /// Builds the documented business-error result envelope (`is_error = true`,
 /// `ok: false`, `error.code`) from a code + message. The `code` string is
 /// preserved verbatim as `error.code`.
@@ -1508,5 +1536,140 @@ mod secondary_rule_tests {
             "{err:?}"
         );
         assert!(rpc.received_requests().await.unwrap().is_empty());
+    }
+
+    /// Both vault tools refuse a non-contract `vault_address` or
+    /// `from_address` before any event or request, by the field and the
+    /// expected form, without the argument.
+    #[tokio::test]
+    async fn vault_address_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let rpc = wiremock::MockServer::start().await;
+        let server = testnet_server(&rpc.uri());
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let cases = [
+            (
+                "vault_address",
+                "vault.wasm_pin_failed",
+                "vault_address must be a C-strkey (contract)",
+            ),
+            (
+                "from_address",
+                "vault.submit_failed",
+                "from_address must be a C-strkey (contract)",
+            ),
+        ];
+        for (field, expected_code, expected) in cases {
+            let mut deposit = serde_json::json!({
+                "chain_id": "stellar:testnet",
+                "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN",
+                "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+                "amounts_desired": ["1"],
+                "amounts_min": ["0"],
+            });
+            deposit[field] = serde_json::Value::String(CREDENTIAL_MARKER.to_owned());
+            let err = server
+                .call_stellar_defindex_vault_deposit(serde_json::from_value(deposit).unwrap())
+                .await
+                .expect("the deposit refusal is a business envelope");
+            let (code, message, text) = crate::tools::common::assert_business_envelope(&err);
+            assert_eq!(code, expected_code);
+            assert_eq!(message, expected, "deposit {field}");
+            assert_no_marker_in_text(&text, CREDENTIAL_MARKER);
+            assert_no_marker_in_text(&format!("{err:?}"), CREDENTIAL_MARKER);
+
+            let mut withdraw = serde_json::json!({
+                "chain_id": "stellar:testnet",
+                "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN",
+                "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+                "withdraw_shares": "1",
+                "min_amounts_out": ["0"],
+            });
+            withdraw[field] = serde_json::Value::String(CREDENTIAL_MARKER.to_owned());
+            let err = server
+                .call_stellar_defindex_vault_withdraw(serde_json::from_value(withdraw).unwrap())
+                .await
+                .expect("the withdrawal refusal is a business envelope");
+            let (code, message, text) = crate::tools::common::assert_business_envelope(&err);
+            assert_eq!(code, expected_code);
+            assert_eq!(message, expected, "withdraw {field}");
+            assert_no_marker_in_text(&text, CREDENTIAL_MARKER);
+            assert_no_marker_in_text(&format!("{err:?}"), CREDENTIAL_MARKER);
+        }
+        assert_no_marker_in_text(&capture.captured_str(), CREDENTIAL_MARKER);
+        assert!(rpc.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn withdraw_shares_marker_is_not_echoed() {
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
+        };
+        let server = testnet_server("http://127.0.0.1:1");
+        for shares in [CREDENTIAL_MARKER, "-7777777", "0"] {
+            let args = serde_json::json!({
+                "chain_id": "stellar:testnet",
+                "vault_address": "CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN",
+                "from_address": "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD",
+                "withdraw_shares": shares, "min_amounts_out": ["0"],
+            });
+            let result = server
+                .call_stellar_defindex_vault_withdraw(serde_json::from_value(args).unwrap())
+                .await;
+            assert_no_marker_in_text(&format!("{result:?}"), CREDENTIAL_MARKER);
+            assert_no_marker_in_text(&format!("{result:?}"), "-7777777");
+            if shares == CREDENTIAL_MARKER {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+                assert_eq!(error.message, "withdraw_shares: not a valid decimal i128");
+            } else {
+                let result = result.expect("the structural refusal is a business envelope");
+                let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+                assert_eq!(code, "vault.invalid_args");
+                assert_eq!(message, "withdraw: withdraw_shares must be positive");
+                assert_no_marker_in_text(&text, "-7777777");
+                let error = VaultWithdrawArgs {
+                    vault_address: String::new(),
+                    from_address: String::new(),
+                    withdraw_shares: shares.parse().unwrap(),
+                    min_amounts_out: vec![0],
+                    override_upgradable: false,
+                }
+                .validate_structure()
+                .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "withdraw: withdraw_shares must be positive"
+                );
+                assert_no_marker(&error, "-7777777");
+            }
+        }
+        stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+            &capture.captured_str(),
+            "CREDMARKER7",
+        );
     }
 }

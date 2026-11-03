@@ -482,7 +482,7 @@ fn pay_issued_amount_refuses_xlm_unit_before_rpc() {
         );
         assert_eq!(
             envelope["error"]["message"],
-            "amount '100 XLM' has unit 'XLM'; expected unit 'TST'"
+            "--amount has the wrong unit; expected unit 'TST'"
         );
     }
 }

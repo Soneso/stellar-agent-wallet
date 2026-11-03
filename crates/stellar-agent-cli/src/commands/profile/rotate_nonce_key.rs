@@ -121,8 +121,8 @@ where
     ) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %args.profile_name(), error = %e, "profile access refused");
-            render::render_json(&profile_access_envelope(&e, args.profile_name()));
+            tracing::debug!(error = %e, "profile access refused");
+            render::render_json(&profile_access_envelope(&e));
             return 1;
         }
     };

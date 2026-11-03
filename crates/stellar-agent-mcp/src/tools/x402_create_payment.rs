@@ -374,10 +374,10 @@ impl WalletServer {
         if let Some(ref requested_addr) = args.address
             && requested_addr != account
         {
+            // The refused argument stays out of the detail; the profile
+            // signer is the configured reference of the check.
             let err = stellar_agent_x402::X402Error::InvalidPaymentRequired {
-                detail: format!(
-                    "requested address {requested_addr} does not match profile signer {account}"
-                ),
+                detail: format!("the address argument does not match the profile signer {account}"),
             };
             return Ok(x402_error_to_tool_result(&err));
         }
@@ -1325,9 +1325,9 @@ fn classify_x402_error(err: &stellar_agent_x402::X402Error) -> &'static str {
     use stellar_agent_x402::X402Error;
     match err {
         X402Error::InvalidPaymentRequired { .. } => "invalid_payment_required",
-        X402Error::UnsupportedScheme { .. } => "unsupported_scheme",
-        X402Error::UnsupportedNetwork { .. } => "unsupported_network",
-        X402Error::NetworkPassphraseMismatch { .. } => "network_passphrase_mismatch",
+        X402Error::UnsupportedScheme => "unsupported_scheme",
+        X402Error::UnsupportedNetwork => "unsupported_network",
+        X402Error::NetworkPassphraseMismatch => "network_passphrase_mismatch",
         X402Error::MainnetSigningForbidden { .. } => "mainnet_signing_forbidden",
         X402Error::InvalidAssetAddress { .. } => "invalid_asset_address",
         X402Error::FeesNotSponsored => "fees_not_sponsored",
@@ -1450,17 +1450,9 @@ mod tests {
             X402Error::InvalidPaymentRequired {
                 detail: "x".to_owned(),
             },
-            X402Error::UnsupportedScheme {
-                scheme: "y".to_owned(),
-            },
-            X402Error::UnsupportedNetwork {
-                network: "z".to_owned(),
-            },
-            X402Error::NetworkPassphraseMismatch {
-                network: "a".to_owned(),
-                expected_passphrase: "b",
-                profile_passphrase: "c".to_owned(),
-            },
+            X402Error::UnsupportedScheme,
+            X402Error::UnsupportedNetwork,
+            X402Error::NetworkPassphraseMismatch,
             X402Error::MainnetSigningForbidden {
                 detail: "network.mainnet_write_forbidden".to_owned(),
             },
@@ -2007,6 +1999,42 @@ mod tests {
             ..args
         };
         assert!(format!("{absent:?}").contains("approval_attestation: None"));
+    }
+
+    /// An address argument that differs from the profile signer is refused by
+    /// the field and the configured signer, without the argument.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn x402_address_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        stellar_agent_test_support::keyring_mock::install().unwrap();
+        let fixture = crate::tools::message_signing_tests::Fixture::new();
+        fixture.seed_audit();
+        let result = fixture
+            .server()
+            .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+                approval_nonce: None,
+                approval_attestation: None,
+                chain_id: "stellar:testnet".to_owned(),
+                payment_required: sample_requirements_json(),
+                address: Some(CREDENTIAL_MARKER.to_owned()),
+            })
+            .await
+            .expect("the mismatch is a business envelope");
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "x402.invalid_payment_required");
+        assert_eq!(
+            message,
+            format!(
+                "invalid payment-required: the address argument does not match the profile \
+                 signer {}",
+                fixture.account
+            )
+        );
+        assert_no_marker_in_text(&text, CREDENTIAL_MARKER);
     }
 
     /// A policy denial precedes the audit pre-flight: with a denying engine
@@ -2595,5 +2623,115 @@ mod tests {
         assert_eq!(code, "policy.deny.counterparty_denied");
         assert!(message.starts_with("payment withheld before signed transmission: "));
         assert!(!message.contains(&address));
+    }
+
+    /// A requirement asset that is not a canonical contract strkey is refused
+    /// by the field and the expected form, without the asset text.
+    #[test]
+    fn x402_asset_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let requirements = stellar_agent_x402::wire::PaymentRequirements {
+            scheme: "exact".to_owned(),
+            network: "stellar:testnet".to_owned(),
+            asset: CREDENTIAL_MARKER.to_owned(),
+            amount: "1000000".to_owned(),
+            pay_to: "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY".to_owned(),
+            max_timeout_seconds: 300,
+            extra: serde_json::json!({ "areFeesSponsored": true }),
+        };
+        let result = x402_canonical_asset(&requirements).expect_err("the asset is refused");
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "x402.invalid_asset_address");
+        assert_eq!(
+            message,
+            "invalid SAC asset address: the asset must be a canonical C-strkey (contract)"
+        );
+        assert_no_marker_in_text(&text, CREDENTIAL_MARKER);
+    }
+
+    #[tokio::test]
+    async fn x402_requirements_marker_is_not_echoed() {
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
+        };
+        let profile = Profile::builder_testnet("svc", "acct", "nonce", "acct")
+            .with_noop_engine()
+            .build();
+        let server = WalletServer::new(profile).unwrap();
+        let cases = [
+            (
+                "payTo",
+                "x402.invalid_recipient_address",
+                "invalid recipient address: pay_to must be a G-, C-, or M-strkey",
+            ),
+            (
+                "scheme",
+                "x402.unsupported_scheme",
+                "unsupported x402 scheme; only \"exact\" is supported",
+            ),
+            (
+                "network",
+                "x402.unsupported_network",
+                "unsupported x402 network; accepted values are \"stellar:pubnet\" and \"stellar:testnet\"",
+            ),
+            (
+                "amount",
+                "x402.amount_conversion",
+                "amount conversion failed: wire amount must be a positive decimal i128",
+            ),
+            (
+                "asset",
+                "x402.invalid_asset_address",
+                "invalid SAC asset address: the asset must be a canonical C-strkey (contract)",
+            ),
+        ];
+        for (field, expected_code, expected) in cases {
+            let mut input: serde_json::Value =
+                serde_json::from_str(&sample_requirements_json()).unwrap();
+            input[field] = serde_json::json!(CREDENTIAL_MARKER);
+            let requirements = serde_json::from_value(input.clone()).unwrap();
+            let error = stellar_agent_x402::exact::validate_requirements(
+                &requirements,
+                server.context.network_passphrase(),
+                &server.context.rpc_url,
+            )
+            .unwrap_err();
+            assert_eq!(error.wire_code(), expected_code);
+            assert_eq!(error.to_string(), expected);
+            assert_no_marker(&error, CREDENTIAL_MARKER);
+            let result = server
+                .call_stellar_x402_create_payment(X402CreatePaymentArgs {
+                    approval_nonce: None,
+                    approval_attestation: None,
+                    chain_id: "stellar:testnet".to_owned(),
+                    payment_required: input.to_string(),
+                    address: None,
+                })
+                .await
+                .expect("validation returns a business envelope");
+            let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(code, expected_code);
+            assert_eq!(message, expected);
+            assert_no_marker_in_text(&text, CREDENTIAL_MARKER);
+            assert_no_marker_in_text(&format!("{result:?}"), CREDENTIAL_MARKER);
+        }
+        stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+            &capture.captured_str(),
+            "CREDMARKER7",
+        );
     }
 }

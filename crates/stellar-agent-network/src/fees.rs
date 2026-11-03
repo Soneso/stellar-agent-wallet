@@ -22,23 +22,24 @@ pub const ALLOWED_RPC_HOSTS: &[&str] = &[
 ];
 
 /// Errors returned by [`validate_rpc_url`].
+///
+/// Each variant names the rule the URL breaks and never the URL or any part
+/// of it, because an RPC URL can carry a credential.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RpcUrlError {
-    /// The URL could not be parsed.
-    #[error("invalid RPC URL: {0}")]
-    InvalidUrl(String),
+    /// The URL could not be parsed as an absolute URL with a host.
+    #[error("invalid RPC URL: it must be an absolute URL with a host")]
+    InvalidUrl,
     /// The URL scheme is not HTTPS.
-    #[error("non-HTTPS RPC URL not allowed: {0}")]
-    NonHttps(String),
+    #[error("non-HTTPS RPC URL not allowed: the URL must use https")]
+    NonHttps,
     /// The URL contains embedded credentials.
     #[error("RPC URL must not contain embedded credentials")]
     CredentialsInUrl,
     /// The URL's host is not in the allow-list.
-    #[error("RPC host '{host}' not in allow-list (allowed: {allowed})")]
+    #[error("the RPC host is not in the allow-list (allowed: {allowed})")]
     HostNotAllowed {
-        /// Rejected host.
-        host: String,
         /// Human-readable list of allowed hosts.
         allowed: String,
     },
@@ -245,6 +246,9 @@ pub struct ClassicFeeSelection {
     pub selected_fee_percentile: String,
 }
 
+/// The argument a refused fee choice names; the rejected text never appears.
+const FEE_FIELD: &str = "--fee";
+
 /// Parses `<integer>`, `auto`, `auto:pNN`, or `None`.
 ///
 /// # Errors
@@ -267,7 +271,7 @@ pub fn parse_classic_fee_choice(raw: Option<&str>) -> Result<ClassicFeeChoice, W
         .map(ClassicFeeChoice::Explicit)
         .map_err(|_| {
             WalletError::Validation(ValidationError::AmountMalformed {
-                input: value.to_owned(),
+                field: FEE_FIELD.into(),
             })
         })
 }
@@ -296,7 +300,7 @@ pub async fn resolve_classic_fee_selection(
             let selected = percentile.select(&stats.inclusion_fee);
             let per_op_stroops = u32::try_from(selected).map_err(|_| {
                 WalletError::Validation(ValidationError::AmountOutOfRange {
-                    amount: selected.to_string(),
+                    field: "the selected percentile fee".into(),
                 })
             })?;
             Ok(ClassicFeeSelection {
@@ -465,20 +469,18 @@ fn parse_percentile(raw: &str) -> Result<FeePercentile, WalletError> {
         "p95" => Ok(FeePercentile::P95),
         "p99" => Ok(FeePercentile::P99),
         _ => Err(WalletError::Validation(ValidationError::AmountMalformed {
-            input: format!("auto:{raw}"),
+            field: FEE_FIELD.into(),
         })),
     }
 }
 
 fn validate_rpc_url_inner(url: &str, allow_loopback: bool) -> Result<(), RpcUrlError> {
-    let parsed = url::Url::parse(url).map_err(|e| RpcUrlError::InvalidUrl(e.to_string()))?;
+    let parsed = url::Url::parse(url).map_err(|_| RpcUrlError::InvalidUrl)?;
     if parsed.username() != "" || parsed.password().is_some() {
         return Err(RpcUrlError::CredentialsInUrl);
     }
 
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| RpcUrlError::InvalidUrl("missing host".to_owned()))?;
+    let host = parsed.host_str().ok_or(RpcUrlError::InvalidUrl)?;
 
     // `url::Url::host_str` returns IPv6 hosts in bracketed form (`[::1]`), so the
     // loopback set matches that form rather than a bare `::1`.
@@ -488,14 +490,13 @@ fn validate_rpc_url_inner(url: &str, allow_loopback: bool) -> Result<(), RpcUrlE
     }
 
     if parsed.scheme() != "https" {
-        return Err(RpcUrlError::NonHttps(url.to_owned()));
+        return Err(RpcUrlError::NonHttps);
     }
 
     if ALLOWED_RPC_HOSTS.contains(&host) {
         Ok(())
     } else {
         Err(RpcUrlError::HostNotAllowed {
-            host: host.to_owned(),
             allowed: ALLOWED_RPC_HOSTS.join(", "),
         })
     }

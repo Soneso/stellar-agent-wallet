@@ -115,14 +115,13 @@ use stellar_agent_smart_account::managers::rules::parse_c_strkey_to_smart_accoun
 use stellar_agent_smart_account::submit::{
     Ed25519RuleSigner, PinCheck, SubmitInvokeArgs, submit_signed_invoke,
 };
-use stellar_agent_smart_account::verifiers::VerifierRegistry;
 use stellar_xdr::{HostFunction, InvokeContractArgs, Limits, ReadXdr as _, ScSymbol, ScVal, VecM};
 use tracing::info;
 use uuid::Uuid;
 
 use crate::commands::smart_account::common::{
     SignerSourceFlags, construct_signers_manager_from_fields, load_command_profile,
-    map_access_error, open_audit_writer, resolve_signer, wrap_sa_error,
+    map_access_error, open_audit_writer, open_verifier_registry, resolve_signer, wrap_sa_error,
 };
 use crate::commands::value_audit::write_row_logged;
 use crate::common::network::{
@@ -319,9 +318,9 @@ fn validate_execute_inputs(
     // ── Client-side refusals before any I/O ────────────────────────────────
 
     if args.function.trim().is_empty() {
-        return Err(WalletError::Validation(ValidationError::AddressInvalid {
-            input: "--function must not be empty".to_owned(),
-        }));
+        return Err(WalletError::Validation(ValidationError::address_check(
+            "--function must not be empty",
+        )));
     }
 
     // Decode each --arg from standard-base64 XDR to validate well-formedness.
@@ -357,20 +356,13 @@ fn validate_execute_inputs(
     let verifier_c_strkey = if let Some(explicit) = &args.verifier {
         explicit.clone()
     } else {
-        let registry = VerifierRegistry::open().map_err(|e| {
-            WalletError::Validation(ValidationError::AddressInvalid {
-                input: format!("could not open verifier registry: {e}"),
-            })
-        })?;
+        let registry = open_verifier_registry()?;
         match registry.ed25519_verifier_for(network_passphrase) {
             Some(entry) => entry.address.clone(),
             None => {
-                return Err(WalletError::Validation(ValidationError::AddressInvalid {
-                    input: format!(
-                        "no Ed25519 verifier registered for network '{network_passphrase}'; \
-                         run: smart-account deploy-ed25519-verifier (or pass --verifier)"
-                    ),
-                }));
+                return Err(WalletError::Validation(ValidationError::address_check(
+                    "network: no Ed25519 verifier registered; run: smart-account deploy-ed25519-verifier (or pass --verifier)",
+                )));
             }
         }
     };
@@ -382,19 +374,15 @@ fn validate_execute_inputs(
     parse_c_strkey("--account", &args.account)?;
 
     let function_name = ScSymbol::try_from(args.function.as_str()).map_err(|()| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!(
-                "--function '{}' invalid: must be a valid Soroban symbol (<=32 bytes, \
-                 alphanumeric/underscore)",
-                args.function
-            ),
-        })
+        WalletError::Validation(ValidationError::address_check(
+            "--function must be a valid Soroban symbol (<=32 bytes, alphanumeric/underscore)",
+        ))
     })?;
     let arg_count = sc_args.len() as u32;
     let args_vecm: VecM<ScVal> = sc_args.try_into().map_err(|e| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("too many --arg values: {e}"),
-        })
+        WalletError::Validation(ValidationError::address_check(format!(
+            "too many --arg values: {e}"
+        )))
     })?;
     let host_function = HostFunction::InvokeContract(InvokeContractArgs {
         contract_address: contract_sc_addr,
@@ -427,7 +415,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved_profile) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved_profile.name);
+            let e = map_access_error(&error);
             return emit_error(&e, args.output, &request_id);
         }
     };
@@ -817,9 +805,7 @@ fn classify_invocation_result(err: &SaError) -> SaInvocationResult {
 /// the refusal message on failure.
 fn parse_c_strkey(flag: &str, s: &str) -> Result<stellar_xdr::ScAddress, WalletError> {
     parse_c_strkey_to_smart_account(s).map_err(|e| {
-        WalletError::Validation(ValidationError::AddressInvalid {
-            input: format!("{flag}: {e}"),
-        })
+        WalletError::Validation(ValidationError::address_check(format!("{flag}: {e}")))
     })
 }
 

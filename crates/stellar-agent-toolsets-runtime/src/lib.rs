@@ -315,11 +315,8 @@ pub fn resolve_toolset_and_check(
     // Validate toolset_name against [a-z0-9-] BEFORE any filesystem access.
     // Rejects `/`, `\`, `.`, `..`, and all other chars outside the charset.
     // Uses the same validator as the install path.
-    stellar_agent_toolsets_install::validate_package_name(toolset_name).map_err(|_| {
-        ToolsetRuntimeError::ToolsetNotInstalled {
-            name: sanitise_display(toolset_name, 64),
-        }
-    })?;
+    stellar_agent_toolsets_install::validate_package_name(toolset_name)
+        .map_err(|_| ToolsetRuntimeError::ToolsetNotInstalled)?;
 
     // Read the pin ONCE — snapshot for the entire check (TOCTOU avoidance).
     let pin = read_verified_pin(toolset_name, toolsets_root, pin_key)?;
@@ -385,9 +382,7 @@ fn read_verified_pin(
 ) -> Result<ToolsetPinRecord, ToolsetRuntimeError> {
     match stellar_agent_toolsets_install::read_pin(toolset_name, toolsets_root, pin_key) {
         Ok(Some(pin)) => Ok(pin),
-        Ok(None) => Err(ToolsetRuntimeError::ToolsetNotInstalled {
-            name: sanitise_display(toolset_name, 64),
-        }),
+        Ok(None) => Err(ToolsetRuntimeError::ToolsetNotInstalled),
         Err(ToolsetInstallError::PinRecordUnverifiable { .. }) => {
             Err(ToolsetRuntimeError::PinUnverifiable {
                 name: sanitise_display(toolset_name, 64),
@@ -588,11 +583,8 @@ pub fn resolve_toolset_sign_payment_gated(
     let action = params.action;
 
     // ── Step 0: Validate toolset_name charset ───────────────────────────────────
-    stellar_agent_toolsets_install::validate_package_name(toolset_name).map_err(|_| {
-        ToolsetRuntimeError::ToolsetNotInstalled {
-            name: sanitise_display(toolset_name, 64),
-        }
-    })?;
+    stellar_agent_toolsets_install::validate_package_name(toolset_name)
+        .map_err(|_| ToolsetRuntimeError::ToolsetNotInstalled)?;
 
     // ── Step 0b: Read and verify pin ONCE (TOCTOU avoidance) ─────────────────
     let pin = read_verified_pin(toolset_name, params.toolsets_root, params.pin_key)?;
@@ -630,9 +622,7 @@ pub fn resolve_toolset_sign_payment_gated(
     // authoritative envelope decode is not trusted to have enforced positivity.
     let amount = params.authoritative_amount_stroops;
     if amount <= 0 {
-        return Err(ToolsetRuntimeError::InvalidAuthoritativeAmount {
-            amount_stroops: amount,
-        });
+        return Err(ToolsetRuntimeError::InvalidAuthoritativeAmount);
     }
 
     // ── Step 2: First-invoke gate check ──────────────────────────────────────
@@ -892,9 +882,7 @@ pub fn resolve_gated_action(
             }
         }
     }
-    Err(ToolsetRuntimeError::UnknownToolsetAction {
-        action: sanitise_display(action, 128),
-    })
+    Err(ToolsetRuntimeError::UnknownToolsetAction)
 }
 
 /// Helper: build the pending-approval store path from profile name.
@@ -968,7 +956,7 @@ mod tests {
         let caps = all_caps();
         let err = check_toolset_action("no-such-action", &caps, &[]).unwrap_err();
         assert!(
-            matches!(err, ToolsetRuntimeError::UnknownToolsetAction { .. }),
+            matches!(err, ToolsetRuntimeError::UnknownToolsetAction),
             "expected UnknownToolsetAction, got: {err:?}"
         );
     }
@@ -1036,7 +1024,7 @@ mod tests {
         for signing_tool in &allowed {
             let err = check_toolset_action(signing_tool, &caps, &allowed).unwrap_err();
             assert!(
-                matches!(err, ToolsetRuntimeError::UnknownToolsetAction { .. }),
+                matches!(err, ToolsetRuntimeError::UnknownToolsetAction),
                 "signing tool {signing_tool}: expected UnknownToolsetAction (not in matrix), got: {err:?}"
             );
         }
@@ -1064,7 +1052,7 @@ mod tests {
         for dispatcher_tool in ["stellar_toolset_list", "stellar_toolset_invoke"] {
             let err = check_toolset_action(dispatcher_tool, &caps, &[]).unwrap_err();
             assert!(
-                matches!(err, ToolsetRuntimeError::UnknownToolsetAction { .. }),
+                matches!(err, ToolsetRuntimeError::UnknownToolsetAction),
                 "dispatcher tool {dispatcher_tool}: expected UnknownToolsetAction, got: {err:?}"
             );
         }
@@ -1170,7 +1158,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
+            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled),
             "expected ToolsetNotInstalled for '../foo', got: {err:?}"
         );
     }
@@ -1182,7 +1170,7 @@ mod tests {
             resolve_toolset_and_check("a/b", "stellar_balances", dir.path(), Some(test_pin_key()))
                 .unwrap_err();
         assert!(
-            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
+            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled),
             "expected ToolsetNotInstalled for 'a/b', got: {err:?}"
         );
     }
@@ -1199,7 +1187,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
+            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled),
             "expected ToolsetNotInstalled for '..\\\\foo', got: {err:?}"
         );
     }
@@ -1211,7 +1199,7 @@ mod tests {
             resolve_toolset_and_check("..", "stellar_balances", dir.path(), Some(test_pin_key()))
                 .unwrap_err();
         assert!(
-            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
+            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled),
             "expected ToolsetNotInstalled for '..', got: {err:?}"
         );
     }
@@ -1223,7 +1211,7 @@ mod tests {
             resolve_toolset_and_check(".", "stellar_balances", dir.path(), Some(test_pin_key()))
                 .unwrap_err();
         assert!(
-            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
+            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled),
             "expected ToolsetNotInstalled for '.', got: {err:?}"
         );
     }
@@ -1239,7 +1227,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
+            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled),
             "expected ToolsetNotInstalled for 'MyToolset', got: {err:?}"
         );
     }
@@ -1255,7 +1243,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
+            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled),
             "expected ToolsetNotInstalled for null-byte name, got: {err:?}"
         );
     }
@@ -1543,7 +1531,7 @@ mod tests {
             resolve_toolset_and_check("absent-toolset", "stellar_balances", toolsets_root, None)
                 .unwrap_err();
         assert!(
-            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
+            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled),
             "{err:?}"
         );
 
@@ -1557,7 +1545,7 @@ mod tests {
         params.toolset_name = "absent-toolset";
         let err = resolve_toolset_sign_payment_gated(&params).unwrap_err();
         assert!(
-            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
+            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled),
             "{err:?}"
         );
     }
@@ -1735,7 +1723,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
+            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled),
             "expected ToolsetNotInstalled, got: {err:?}"
         );
     }
@@ -1757,7 +1745,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
+            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled),
             "expected ToolsetNotInstalled for a valid name with no pin record, got: {err:?}"
         );
     }
@@ -2045,7 +2033,7 @@ attestation_version = 3
 
         let err = resolve_toolset_sign_payment_gated(&params).unwrap_err();
         assert!(
-            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
+            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled),
             "expected ToolsetNotInstalled, got: {err:?}"
         );
     }
@@ -2081,7 +2069,7 @@ attestation_version = 3
 
         let err = resolve_toolset_sign_payment_gated(&params).unwrap_err();
         assert!(
-            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled { .. }),
+            matches!(err, ToolsetRuntimeError::ToolsetNotInstalled),
             "expected ToolsetNotInstalled, got: {err:?}"
         );
     }
@@ -2120,7 +2108,7 @@ attestation_version = 3
 
         let err = resolve_toolset_sign_payment_gated(&params).unwrap_err();
         assert!(
-            matches!(err, ToolsetRuntimeError::UnknownToolsetAction { .. }),
+            matches!(err, ToolsetRuntimeError::UnknownToolsetAction),
             "ungated action must not resolve via gated matrix, got: {err:?}"
         );
     }
@@ -2489,10 +2477,7 @@ attestation_version = 3
         assert_eq!(tool, "stellar_rule_create");
 
         let err = check_toolset_action("stellar_rule_create_commit", &caps, &[]).unwrap_err();
-        assert!(matches!(
-            err,
-            ToolsetRuntimeError::UnknownToolsetAction { .. }
-        ));
+        assert!(matches!(err, ToolsetRuntimeError::UnknownToolsetAction));
     }
 
     // ── Gated resolver: zero amount rejected EVEN WITH a matching grant ───────
@@ -2558,10 +2543,7 @@ attestation_version = 3
 
         let err = resolve_toolset_sign_payment_gated(&params).unwrap_err();
         assert!(
-            matches!(
-                err,
-                ToolsetRuntimeError::InvalidAuthoritativeAmount { amount_stroops: 0 }
-            ),
+            matches!(err, ToolsetRuntimeError::InvalidAuthoritativeAmount),
             "a zero amount must be rejected even when a [0, N] grant exists; got: {err:?}"
         );
     }
@@ -2599,10 +2581,7 @@ attestation_version = 3
 
         let err = resolve_toolset_sign_payment_gated(&params).unwrap_err();
         assert!(
-            matches!(
-                err,
-                ToolsetRuntimeError::InvalidAuthoritativeAmount { amount_stroops: 0 }
-            ),
+            matches!(err, ToolsetRuntimeError::InvalidAuthoritativeAmount),
             "expected InvalidAuthoritativeAmount(0), got: {err:?}"
         );
     }
@@ -2638,12 +2617,14 @@ attestation_version = 3
 
         let err = resolve_toolset_sign_payment_gated(&params).unwrap_err();
         assert!(
-            matches!(
-                err,
-                ToolsetRuntimeError::InvalidAuthoritativeAmount { amount_stroops: -1 }
-            ),
+            matches!(err, ToolsetRuntimeError::InvalidAuthoritativeAmount),
             "expected InvalidAuthoritativeAmount(-1), got: {err:?}"
         );
+        assert_eq!(
+            err.to_string(),
+            "toolset.invalid_authoritative_amount: authoritative_amount_stroops must be > 0"
+        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&err, "-1");
     }
 
     // ── Gated resolver: queued pending carries caller-supplied process_uid ────

@@ -343,10 +343,9 @@ where
     }
     let resolved = resolve_profile_name(args.profile.as_deref());
     // Validate the name and existing profile before constructing the sidecar path.
-    load_profile_reconciled(&resolved).map_err(|error| error.to_wallet_error(&resolved.name))?;
+    load_profile_reconciled(&resolved).map_err(|error| error.to_wallet_error())?;
     let _lock = lifecycle_lock(&resolved.name)?;
-    let profile = load_profile_reconciled(&resolved)
-        .map_err(|error| error.to_wallet_error(&resolved.name))?;
+    let profile = load_profile_reconciled(&resolved).map_err(|error| error.to_wallet_error())?;
     // Halt check: ahead of the fresh and the resume branch, the keyring store,
     // the seed, the signer and any RPC request.
     stellar_agent_core::profile::halt::ensure_not_halted(&resolved.name)?;

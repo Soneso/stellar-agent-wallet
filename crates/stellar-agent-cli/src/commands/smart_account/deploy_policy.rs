@@ -192,10 +192,7 @@ pub async fn run(args: &DeployPolicyArgs) -> i32 {
     let (profile, _origin) = match load_profile_or_synthesize_testnet(&resolved) {
         Ok(loaded) => loaded,
         Err(e) => {
-            print_error(
-                &Envelope::<()>::err_raw(e.code(), e.message(&resolved.name)),
-                args.output,
-            );
+            print_error(&Envelope::<()>::err_raw(e.code(), e.message()), args.output);
             return 1;
         }
     };

@@ -303,8 +303,8 @@ where
     let profile = match reconcile_loaded_profile(load_profile(&profile_name), &resolved) {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(profile = %profile_name, error = %e, "profile access refused");
-            return render::write_envelope(out, &profile_access_envelope(&e, &profile_name), 1);
+            tracing::debug!(error = %e, "profile access refused");
+            return render::write_envelope(out, &profile_access_envelope(&e), 1);
         }
     };
 
@@ -315,8 +315,8 @@ where
     // enrollment persists into the trust root.
     let signer_ref = match read_raw_signer_ref(&profile_name) {
         Ok(r) => r,
-        Err(loader::ProfileLoadError::NotFound { name, .. }) => {
-            let err = WalletError::Validation(ValidationError::ProfileNotFound { name });
+        Err(loader::ProfileLoadError::NotFound) => {
+            let err = WalletError::Validation(ValidationError::ProfileNotFound);
             return render::write_envelope(out, &Envelope::<()>::err(&err), 1);
         }
         // An unreadable or malformed stored document is operator-correctable
@@ -482,12 +482,12 @@ where
             &Envelope::<()>::err_raw(
                 "enroll_signer.account_malformed",
                 format!(
-                    "profile '{profile_name}' names signer account '{}', which is neither the \
-                 placeholder '{PLACEHOLDER_ACCOUNT}' nor a valid G-strkey; a malformed pin is \
-                 refused rather than replaced. Set the profile's mcp_signer_default account to \
-                 '{PLACEHOLDER_ACCOUNT}' (to enroll fresh) or to the signer's G-strkey, then \
-                 re-run; no entry was written and the profile was not modified.",
-                    signer_ref.account
+                    "profile '{profile_name}' names a mcp_signer_default account that is \
+                 neither the placeholder '{PLACEHOLDER_ACCOUNT}' nor a valid G-strkey; a \
+                 malformed pin is refused rather than replaced. Set the profile's \
+                 mcp_signer_default account to '{PLACEHOLDER_ACCOUNT}' (to enroll fresh) or to \
+                 the signer's G-strkey, then re-run; no entry was written and the profile was \
+                 not modified."
                 ),
             ),
             1,
@@ -576,9 +576,7 @@ where
         Err(_) => {
             return render::write_envelope(
                 out,
-                &Envelope::<()>::err(&WalletError::Validation(ValidationError::SecretEnvNotSet {
-                    var: secret_env.to_owned(),
-                })),
+                &Envelope::<()>::err(&WalletError::Validation(ValidationError::SecretEnvNotSet)),
                 1,
             );
         }
@@ -739,15 +737,15 @@ fn check_expected_address(
     if stellar_strkey::ed25519::PublicKey::from_string(expected).is_err() {
         return Err(Envelope::<()>::err_raw(
             "enroll_signer.expected_address_invalid",
-            format!("--expected-address is not a valid G-strkey: {expected}"),
+            "--expected-address is not a valid G-strkey",
         ));
     }
     if expected != derived {
         return Err(Envelope::<()>::err_raw(
             "enroll_signer.expected_address_mismatch",
             format!(
-                "{source} derives to {derived}, which does not match --expected-address \
-                 {expected}; no entry was written"
+                "{source} derives to {derived}, which does not match --expected-address; no \
+                 entry was written"
             ),
         ));
     }
@@ -865,10 +863,9 @@ where
                 "enroll_signer.repair_unpinned",
                 format!(
                     "profile '{profile_name}' pins no signer address at \
-                     `mcp_signer_default.account` ('{}'), so there is no enrollment to repair. \
+                     `mcp_signer_default.account`, so there is no enrollment to repair. \
                      Enroll the signer with `stellar-agent profile enroll-signer --profile \
-                     {profile_name} --secret-env <VAR>`.",
-                    signer_ref.account
+                     {profile_name} --secret-env <VAR>`."
                 ),
             ),
             1,
@@ -1139,6 +1136,69 @@ mod tests {
             entry.get_password().is_err(),
             "no entry must be written on expected-address mismatch"
         );
+    }
+
+    /// A malformed and a mismatched `--expected-address`, a malformed signer
+    /// account in the profile, and a repair of an unpinned account refuse by
+    /// the flag or the field, and no refusal repeats the refused value.
+    #[tokio::test]
+    #[serial]
+    async fn enroll_signer_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let (s_strkey, derived_g) = seed_material([0x24u8; 32]);
+        let (_other_s, other_g) = seed_material([0x35u8; 32]);
+        let var = unique_var("MARKER");
+        let _guard = EnvGuard::set(var.clone(), &s_strkey);
+        let cases = [
+            (
+                args(&var, Some(CREDENTIAL_MARKER), false),
+                derived_g.clone(),
+                CREDENTIAL_MARKER.to_owned(),
+                "enroll_signer.expected_address_invalid",
+            ),
+            (
+                args(&var, Some(&other_g), false),
+                derived_g.clone(),
+                other_g.clone(),
+                "enroll_signer.expected_address_mismatch",
+            ),
+            (
+                args(&var, None, false),
+                CREDENTIAL_MARKER.to_owned(),
+                CREDENTIAL_MARKER.to_owned(),
+                "enroll_signer.account_malformed",
+            ),
+            (
+                repair_args(),
+                CREDENTIAL_MARKER.to_owned(),
+                CREDENTIAL_MARKER.to_owned(),
+                "enroll_signer.repair_unpinned",
+            ),
+        ];
+        for (arguments, account, marker, code) in cases {
+            keyring_mock::install().unwrap();
+            let profile = profile_with_signer_account(&account);
+            let loaded = profile.clone();
+            let mut output = Vec::new();
+            let status = run_with_dependencies(
+                &arguments,
+                move |_n| Ok(loaded.clone()),
+                raw_ref_of(&profile),
+                pin_signer_must_not_be_called,
+                || Ok(()),
+                |name| std::env::var(name),
+                write_identity_must_not_be_called,
+                &mut output,
+            )
+            .await;
+            assert_eq!(status, 1, "{code}");
+            let rendered = render::single_json_document(&output);
+            assert_eq!(rendered["error"]["code"], code, "{rendered}");
+            assert_no_marker_in_text(&rendered.to_string(), &marker);
+        }
     }
 
     #[tokio::test]
@@ -2242,5 +2302,84 @@ mod tests {
                 "validation.installation_key_coordinate"
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn secret_env_name_marker_is_not_echoed() {
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
+        };
+        let (seed, account) = seed_material([0x24u8; 32]);
+        keyring_mock::install().unwrap();
+        for value in [None, Some(seed.as_str()), Some(CREDENTIAL_MARKER)] {
+            let invalid = value == Some(CREDENTIAL_MARKER);
+            let _seed = value.map(|value| EnvGuard::set(CREDENTIAL_MARKER.to_owned(), value));
+            let profile = profile_with_signer_account(&account);
+            let loaded = profile.clone();
+            let mut output = Vec::new();
+            let status = run_with_dependencies(
+                &args(CREDENTIAL_MARKER, None, false),
+                move |_n| Ok(loaded.clone()),
+                raw_ref_of(&profile),
+                pin_signer_must_not_be_called,
+                || Ok(()),
+                |_| Err(std::env::VarError::NotPresent),
+                write_identity_must_not_be_called,
+                &mut output,
+            )
+            .await;
+            assert_eq!(status, 1);
+            let rendered = render::single_json_document(&output);
+            assert_eq!(
+                rendered["error"]["code"],
+                if invalid {
+                    "validation.secret_env_invalid"
+                } else {
+                    "validation.secret_env_not_set"
+                }
+            );
+            assert_eq!(
+                rendered["error"]["message"],
+                if invalid {
+                    "the secret environment variable named by the argument must contain a valid S-strkey"
+                } else {
+                    "the secret environment variable named by the argument is not set"
+                }
+            );
+            assert_no_marker_in_text(&rendered.to_string(), CREDENTIAL_MARKER);
+            if invalid {
+                let error = stellar_agent_network::signing::source::signer_from_env(
+                    CREDENTIAL_MARKER,
+                    &account,
+                )
+                .await
+                .err()
+                .unwrap();
+                assert_eq!(error.code(), "validation.secret_env_invalid");
+                assert_no_marker(&error, CREDENTIAL_MARKER);
+            }
+        }
+        let error =
+            stellar_agent_network::signing::source::signer_from_env(CREDENTIAL_MARKER, &account)
+                .await
+                .err()
+                .unwrap();
+        assert_no_marker(&error, CREDENTIAL_MARKER);
+        stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+            &capture.captured_str(),
+            "CREDMARKER7",
+        );
     }
 }

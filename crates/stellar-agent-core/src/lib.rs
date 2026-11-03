@@ -204,8 +204,9 @@ pub use audit_log::{
 pub use counterparty::is_valid_ldh_home_domain;
 pub use envelope::{Envelope, EnvelopeError, OutputFormat};
 pub use error::{
-    ApprovalFailure, AuthError, AuthMismatchReason, ErrorCategory, InternalError, LedgerError,
-    NetworkError, ProtocolError, SubmissionError, ValidationError, WalletError, WalletStateError,
+    AddressField, ApprovalFailure, AuthError, AuthMismatchReason, ErrorCategory, InternalError,
+    LedgerError, NetworkError, ProtocolError, SubmissionError, ValidationError, WalletError,
+    WalletStateError,
 };
 pub use observability::{
     FormatChoice, InitError, RedactingJsonFormatter, SubscriberConfig, init_subscriber,

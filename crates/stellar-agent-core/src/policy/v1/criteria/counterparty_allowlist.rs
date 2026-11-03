@@ -177,13 +177,11 @@ impl CounterpartyKind {
             "SEP10_IDENTITY" => Ok(Self::Sep10Identity),
             "HOME_DOMAIN" => Ok(Self::HomeDomain),
             "ONE_TIME_ADDRESS" => Ok(Self::OneTimeAddress),
-            other => Err(PolicyError::PolicyFileParseFailed {
-                detail: format!(
-                    "counterparty_allowlist: unknown kind '{}'; \
+            _ => Err(PolicyError::PolicyFileParseFailed {
+                detail: "counterparty_allowlist: unknown kind; \
                      accepted: G_ACCOUNT, C_ACCOUNT, KNOWN_ISSUER, \
-                     SEP10_IDENTITY, HOME_DOMAIN, ONE_TIME_ADDRESS",
-                    other
-                ),
+                     SEP10_IDENTITY, HOME_DOMAIN, ONE_TIME_ADDRESS"
+                    .into(),
             }),
         }
     }
@@ -769,23 +767,26 @@ fn extract_string_field(ctx: &EvalContext<'_>, field: &str) -> Result<String, Po
 }
 
 /// Parses `"CODE:G…ISSUER"` and returns the issuer G-strkey.
+///
+/// A refusal names the check, the expected form and the tool; the asset
+/// string and the strkey parser's error stay out of the detail, because the
+/// asset comes from the tool arguments and a refused value can hold a seed
+/// or a credential.
 fn parse_asset_issuer(asset_str: &str, ctx: &EvalContext<'_>) -> Result<String, PolicyError> {
     let issuer = asset_str.split_once(':').map(|(_, i)| i).ok_or_else(|| {
         PolicyError::CriterionEvaluationFailed {
             detail: format!(
-                "counterparty_allowlist: non-native asset '{}' must be in \
-                 CODE:Gissuer format for tool '{}'",
-                asset_str, ctx.tool.name
+                "counterparty_allowlist: non-native asset must be in CODE:Gissuer format for tool '{}'",
+                ctx.tool.name
             ),
         }
     })?;
 
     // Validate the issuer is a proper G-strkey.
-    PublicKey::from_string(issuer).map_err(|e| PolicyError::CriterionEvaluationFailed {
+    PublicKey::from_string(issuer).map_err(|_| PolicyError::CriterionEvaluationFailed {
         detail: format!(
-            "counterparty_allowlist: invalid issuer G-strkey in asset '{}' \
-             for tool '{}': {e}",
-            asset_str, ctx.tool.name
+            "counterparty_allowlist: asset issuer must be a valid G-strkey for tool '{}'",
+            ctx.tool.name
         ),
     })?;
 

@@ -276,16 +276,9 @@ pub(crate) fn anchor_error_to_wire(
     use stellar_agent_anchor::AnchorError;
     match err {
         AnchorError::InvalidAnchorDomain { detail } => ("anchor.invalid_domain", detail.clone()),
-        AnchorError::TransferServerHostMismatch {
-            anchor_domain,
-            resolved_host,
-        } => (
-            "anchor.transfer_server_host_mismatch",
-            format!(
-                "SSRF bind rejected: resolved host {resolved_host:?} does not match \
-                 anchor domain {anchor_domain:?}"
-            ),
-        ),
+        AnchorError::TransferServerHostMismatch => {
+            ("anchor.transfer_server_host_mismatch", err.to_string())
+        }
         AnchorError::AnchorFetchFailed {
             authority_hint,
             detail,

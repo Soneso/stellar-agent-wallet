@@ -514,19 +514,21 @@ impl FromStr for PolicyEngineKind {
         match s.to_ascii_lowercase().as_str() {
             "noop" => Ok(Self::Noop),
             "v1" => Ok(Self::V1),
-            other => Err(PolicyEngineKindParseError::Unknown(other.to_owned())),
+            _ => Err(PolicyEngineKindParseError::Unknown),
         }
     }
 }
 
 /// Error returned by [`PolicyEngineKind::from_str`] for an unrecognised
 /// engine name.
+///
+/// The error names the accepted values and never the refused text.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PolicyEngineKindParseError {
     /// The supplied string is not `"noop"` or `"v1"`.
-    #[error("unknown policy engine '{0}'; supported values: noop, v1")]
-    Unknown(String),
+    #[error("unknown policy engine; supported values: noop, v1")]
+    Unknown,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4286,6 +4288,23 @@ mod tests {
         );
         assert!(PolicyEngineKind::from_str("v2").is_err());
         assert!(PolicyEngineKind::from_str("").is_err());
+    }
+
+    /// An unknown engine name is refused by the accepted values, and the
+    /// error carries none of the supplied text.
+    #[test]
+    fn policy_engine_marker_is_not_echoed() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+
+        let error = PolicyEngineKind::from_str(CREDENTIAL_MARKER).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unknown policy engine; supported values: noop, v1"
+        );
+        assert_no_marker(&error, CREDENTIAL_MARKER);
+        // The refused text is lowercased before matching; the lowercase form
+        // stays out of the error as well.
+        assert_no_marker(&error, &CREDENTIAL_MARKER.to_ascii_lowercase());
     }
 
     #[test]

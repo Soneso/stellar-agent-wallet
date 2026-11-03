@@ -130,8 +130,8 @@ pub async fn run(args: &ToolsetRunArgs) -> i32 {
         Err(e) => {
             use stellar_agent_toolsets_runtime::ToolsetRuntimeError;
             let code = match &e {
-                ToolsetRuntimeError::ToolsetNotInstalled { .. } => "toolset.not_installed",
-                ToolsetRuntimeError::UnknownToolsetAction { .. } => "toolset.unknown_action",
+                ToolsetRuntimeError::ToolsetNotInstalled => "toolset.not_installed",
+                ToolsetRuntimeError::UnknownToolsetAction => "toolset.unknown_action",
                 ToolsetRuntimeError::CapabilityNotDeclared { .. } => {
                     "toolset.capability_not_declared"
                 }

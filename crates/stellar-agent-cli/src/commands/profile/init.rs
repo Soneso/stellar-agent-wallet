@@ -232,25 +232,20 @@ fn init_refusal(args: &InitArgs, profile_name: &str, profile_dir: &Path) -> Opti
     if let Err(reason) = validate_path_component_ascii_safe(profile_name) {
         return Some(WalletError::Validation(ValidationError::ConfigInvalid {
             component: "profile",
-            reason: format!("invalid profile name '{profile_name}': {reason}"),
+            reason: format!("the profile name is not a valid profile name: {reason}"),
         }));
     }
 
     if args.network == TargetNetwork::Mainnet && args.rpc_url.is_none() {
         return Some(WalletError::Validation(
-            ValidationError::MainnetRpcUrlRequired {
-                name: profile_name.to_owned(),
-            },
+            ValidationError::MainnetRpcUrlRequired,
         ));
     }
 
     let dest = profile_dir.join(format!("{profile_name}.toml"));
     if dest.exists() {
         return Some(WalletError::Validation(
-            ValidationError::ProfileAlreadyExists {
-                name: profile_name.to_owned(),
-                path: dest.display().to_string(),
-            },
+            ValidationError::ProfileAlreadyExists,
         ));
     }
     None
@@ -298,11 +293,9 @@ fn build_profile(args: &InitArgs, profile_name: &str) -> Result<Profile, WalletE
             }
         }
         TargetNetwork::Mainnet => {
-            let rpc_url = args.rpc_url.clone().ok_or_else(|| {
-                WalletError::Validation(ValidationError::MainnetRpcUrlRequired {
-                    name: profile_name.to_owned(),
-                })
-            })?;
+            let rpc_url = args.rpc_url.clone().ok_or(WalletError::Validation(
+                ValidationError::MainnetRpcUrlRequired,
+            ))?;
             Profile::builder_mainnet_named(
                 profile_name,
                 rpc_url,
@@ -357,17 +350,14 @@ fn run_with_dependencies(args: &InitArgs, profile_dir: &Path) -> i32 {
     // ── Persist (no-clobber: atomic refusal if a file appeared meanwhile) ────
     let written_path = match loader::save_new_to_dir(&profile_name, &profile, profile_dir) {
         Ok(p) => p,
-        Err(loader::ProfileSaveError::AlreadyExists { path }) => {
-            let err = WalletError::Validation(ValidationError::ProfileAlreadyExists {
-                name: profile_name.clone(),
-                path: path.display().to_string(),
-            });
+        Err(loader::ProfileSaveError::AlreadyExists { .. }) => {
+            let err = WalletError::Validation(ValidationError::ProfileAlreadyExists);
             render::render_json(&Envelope::<()>::err(&err));
             return 1;
         }
         Err(e) => {
             let err = WalletError::Internal(InternalError::UnexpectedState {
-                detail: format!("failed to write profile '{profile_name}': {e}"),
+                detail: format!("failed to write the profile: {e}"),
             });
             render::render_json(&Envelope::<()>::err(&err));
             return 1;
@@ -821,8 +811,12 @@ mod tests {
             "the refusal must name the profile component: {message}"
         );
         assert!(
-            message.contains("invalid profile name '../escape'"),
-            "the refusal must quote the offending name: {message}"
+            message.contains("the profile name is not a valid profile name: "),
+            "the refusal must state the rule the name breaks: {message}"
+        );
+        assert!(
+            !message.contains("../escape"),
+            "the refusal must not repeat the refused name: {message}"
         );
         let clean = args("clean-name");
         assert!(
@@ -1038,5 +1032,83 @@ mod tests {
             steps[8]
         );
         assert!(!steps[8].contains("skipped"), "{}", steps[8]);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn init_requested_name_marker_is_not_echoed() {
+        let capture = stellar_agent_test_support::log_capture::CaptureWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let _inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker, assert_no_marker_in_text,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("STELLAR_AGENT_HOME".to_owned(), home.path().as_os_str());
+        let mut input = args(CREDENTIAL_MARKER);
+        input.network = TargetNetwork::Mainnet;
+        render::take_rendered_for_test();
+        assert_eq!(run(&input).await, 1);
+        let output = render::take_rendered_for_test();
+        assert_eq!(
+            output[0]["error"]["code"],
+            "validation.mainnet_rpc_url_required"
+        );
+        assert_eq!(
+            output[0]["error"]["message"],
+            "the mainnet profile requires an explicit RPC endpoint; set rpc_url in the profile file, or pass --rpc-url to profile init"
+        );
+        assert_no_marker_in_text(&format!("{output:?}"), CREDENTIAL_MARKER);
+        let error = init_refusal(&input, CREDENTIAL_MARKER, &home.path().join("profiles"))
+            .expect("the command's typed refusal is available");
+        assert_no_marker(&error, CREDENTIAL_MARKER);
+        let error = build_profile(&input, CREDENTIAL_MARKER).unwrap_err();
+        assert_eq!(error.code(), "validation.mainnet_rpc_url_required");
+        assert_no_marker(&error, CREDENTIAL_MARKER);
+        input.network = TargetNetwork::Testnet;
+        let profiles_dir = home.path().join("profiles");
+        let occupied = profiles_dir.join(format!("{CREDENTIAL_MARKER}.toml"));
+        std::fs::create_dir_all(&occupied).unwrap();
+        assert_eq!(run(&input).await, 1);
+        let output = render::take_rendered_for_test();
+        assert_eq!(
+            output[0]["error"]["code"],
+            "validation.profile_already_exists"
+        );
+        assert_eq!(
+            output[0]["error"]["message"],
+            "the profile destination already exists; choose a different --profile name or remove the existing entry"
+        );
+        assert_no_marker_in_text(&format!("{output:?}"), CREDENTIAL_MARKER);
+        let error = init_refusal(&input, CREDENTIAL_MARKER, &profiles_dir).unwrap();
+        assert_no_marker(&error, CREDENTIAL_MARKER);
+        std::fs::remove_dir(&occupied).unwrap();
+        std::fs::remove_dir(&profiles_dir).unwrap();
+        std::fs::write(home.path().join("profiles"), "obstruction").unwrap();
+        assert_eq!(run(&input).await, 1);
+        let output = render::take_rendered_for_test();
+        assert_eq!(output[0]["error"]["code"], "internal.unexpected_state");
+        let profile = build_profile(&input, CREDENTIAL_MARKER).unwrap();
+        let error =
+            loader::save_new_to_dir(CREDENTIAL_MARKER, &profile, &home.path().join("profiles"))
+                .unwrap_err();
+        assert_no_marker(&error, CREDENTIAL_MARKER);
+        assert_eq!(
+            output[0]["error"]["message"],
+            format!("unexpected internal state: failed to write the profile: {error}")
+        );
+        assert_no_marker_in_text(&format!("{output:?}"), CREDENTIAL_MARKER);
+        stellar_agent_test_support::rejected_value::assert_no_marker_in_text(
+            &capture.captured_str(),
+            "CREDMARKER7",
+        );
     }
 }

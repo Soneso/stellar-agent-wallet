@@ -572,7 +572,10 @@ impl VerifierRegistry {
 
         let file: RegistryFile =
             toml::from_str(&contents).map_err(|e| SaError::NetworksTomlParse {
-                source: e,
+                position: stellar_agent_core::profile::toml_diagnostic::toml_error_position(
+                    &contents,
+                    e.span().map(|span| span.start),
+                ),
                 path: path.clone(),
             })?;
 
@@ -1568,6 +1571,38 @@ mod tests {
         );
     }
 
+    /// A registry file whose malformed line holds a credential reports the
+    /// position only: the line is absent from the Display, the Debug, the
+    /// source chain and the serialized form.
+    #[test]
+    fn a_malformed_registry_line_is_reported_by_position_only() {
+        use stellar_agent_test_support::rejected_value::{CREDENTIAL_MARKER, assert_no_marker};
+
+        let (_guard, path) = temp_registry();
+        std::fs::write(
+            &path,
+            format!(
+                "[networks.testnet]\nrpc_url = \"https://user:{CREDENTIAL_MARKER}@rpc.example\n"
+            ),
+        )
+        .expect("write");
+
+        let err = VerifierRegistry::open_at(path).expect_err("must fail");
+        assert!(
+            matches!(err, SaError::NetworksTomlParse { ref position, .. } if position.starts_with("line 2, column ")),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("networks.toml is not valid TOML: line 2, column "),
+            "{err}"
+        );
+        assert!(std::error::Error::source(&err).is_none());
+        assert_no_marker(&err, CREDENTIAL_MARKER);
+        let json = serde_json::to_string(&err).expect("serialize");
+        assert!(!json.contains(CREDENTIAL_MARKER), "{json}");
+    }
+
     /// `default_networks_toml_path_with_override(Some(path))` returns the
     /// env-supplied path verbatim, bypassing canonical-root resolution.
     ///
@@ -1691,7 +1726,7 @@ mod tests {
     #[test]
     fn wire_code_round_trip_config_parse() {
         let err = SaError::NetworksTomlParse {
-            source: toml::from_str::<toml::Value>("bad = ").unwrap_err(),
+            position: "line 1, column 7".to_owned(),
             path: PathBuf::from("/tmp/networks.toml"),
         };
         assert_eq!(err.wire_code(), "sa.networks_toml_parse");

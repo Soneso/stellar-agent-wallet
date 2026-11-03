@@ -168,7 +168,7 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let (profile, origin) = match load_command_profile(&resolved_profile) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let e = map_access_error(&error, &resolved_profile.name);
+            let e = map_access_error(&error);
             let envelope: Envelope<()> = Envelope::err(&e);
             render_json(&envelope);
             return 1;
@@ -212,15 +212,10 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let op_bytes = match decode_hex32(&args.operation_id) {
         Some(b) => b,
         None => {
-            let wallet_err = WalletError::Validation(
-                stellar_agent_core::error::ValidationError::AddressInvalid {
-                    input: format!(
-                        "--operation-id must be a 64-char lowercase hex string; got '{}' ({} chars)",
-                        args.operation_id,
-                        args.operation_id.len()
-                    ),
-                },
-            );
+            let wallet_err =
+                WalletError::Validation(stellar_agent_core::error::ValidationError::address_check(
+                    "--operation-id must be a 64-char lowercase hex string",
+                ));
             let envelope: Envelope<()> = Envelope::err(&wallet_err);
             render_json(&envelope);
             return 1;
@@ -231,15 +226,10 @@ pub async fn run(args: &ExecuteArgs) -> i32 {
     let salt_bytes = match decode_hex32(&args.salt) {
         Some(b) => b,
         None => {
-            let wallet_err = WalletError::Validation(
-                stellar_agent_core::error::ValidationError::AddressInvalid {
-                    input: format!(
-                        "--salt must be a 64-char lowercase hex string; got '{}' ({} chars)",
-                        args.salt,
-                        args.salt.len()
-                    ),
-                },
-            );
+            let wallet_err =
+                WalletError::Validation(stellar_agent_core::error::ValidationError::address_check(
+                    "--salt must be a 64-char lowercase hex string",
+                ));
             let envelope: Envelope<()> = Envelope::err(&wallet_err);
             render_json(&envelope);
             return 1;

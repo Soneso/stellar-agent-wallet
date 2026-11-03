@@ -149,18 +149,13 @@ pub(crate) async fn resolve_software_signer_from_env(
     let mlock_required = profile.wallet.mlock_required;
     let ttl_seconds = profile.wallet.unlock_ttl_seconds;
 
-    let s_strkey: Zeroizing<String> = Zeroizing::new(std::env::var(var_name).map_err(|_| {
-        WalletError::Validation(ValidationError::SecretEnvNotSet {
-            var: var_name.to_owned(),
-        })
-    })?);
+    let s_strkey: Zeroizing<String> = Zeroizing::new(
+        std::env::var(var_name)
+            .map_err(|_| WalletError::Validation(ValidationError::SecretEnvNotSet))?,
+    );
 
-    let mut private_key =
-        stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey).map_err(|_| {
-            WalletError::Validation(ValidationError::SecretEnvInvalid {
-                var: var_name.to_owned(),
-            })
-        })?;
+    let mut private_key = stellar_strkey::ed25519::PrivateKey::from_string(&s_strkey)
+        .map_err(|_| WalletError::Validation(ValidationError::SecretEnvInvalid))?;
     let seed: Zeroizing<[u8; 32]> = Zeroizing::new(private_key.0);
     zeroize::Zeroize::zeroize(&mut private_key.0);
     drop(s_strkey);
@@ -799,39 +794,37 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn unset_env_var_is_refused() {
-        let var = unique_var("UNSET");
+        let var = unique_var("UNSET_CREDMARKER7");
         let err = match resolve_software_signer_from_env(&var, "unit-test", &test_profile()).await {
             Ok(_) => panic!("unset env var must refuse"),
             Err(e) => e,
         };
         assert_eq!(err.code(), "validation.secret_env_not_set");
-        assert!(
-            err.message().contains(&var),
-            "error must name the variable: {err}"
+        assert_eq!(
+            err.message(),
+            "the secret environment variable named by the argument is not set"
         );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&err, "CREDMARKER7");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial]
     #[allow(unsafe_code, reason = "test-only process environment mutation")]
     async fn invalid_s_strkey_is_refused() {
-        let var = unique_var("INVALID");
+        let var = unique_var("INVALID_CREDMARKER7");
         unsafe {
-            std::env::set_var(&var, "not-an-s-strkey");
+            std::env::set_var(&var, "invalid-CREDMARKER7");
         }
         let err = match resolve_software_signer_from_env(&var, "unit-test", &test_profile()).await {
             Ok(_) => panic!("invalid S-strkey must refuse"),
             Err(e) => e,
         };
         assert_eq!(err.code(), "validation.secret_env_invalid");
-        assert!(
-            err.message().contains(&var),
-            "error must name the variable: {err}"
+        assert_eq!(
+            err.message(),
+            "the secret environment variable named by the argument must contain a valid S-strkey"
         );
-        assert!(
-            !err.message().contains("not-an-s-strkey"),
-            "error must not echo the malformed value: {err}"
-        );
+        stellar_agent_test_support::rejected_value::assert_no_marker(&err, "CREDMARKER7");
         unsafe {
             std::env::remove_var(&var);
         }

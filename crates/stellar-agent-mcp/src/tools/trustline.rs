@@ -82,15 +82,6 @@ use crate::tools::common::{
     resolve_classic_fee_per_op_stroops, total_classic_fee_stroops, verify_attestation_gate,
 };
 
-/// Redacts an asset input string (`CODE:ISSUER`, or `native`/`XLM`) for logging:
-/// the asset code is public; the issuer G-strkey is reduced to first-5-last-5.
-fn redact_asset_for_log(asset: &str) -> String {
-    match asset.split_once(':') {
-        Some((code, issuer)) => format!("{code}:{}", redact_strkey_first5_last5(issuer)),
-        None => asset.to_owned(),
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -495,10 +486,11 @@ impl WalletServer {
             match resolve_denomination(input, self.context.network_passphrase()) {
                 Ok(r) => r,
                 Err(e) => {
+                    // The refused asset and the chain id are caller input that
+                    // no check has accepted yet, so the event names the tool
+                    // and the resolver's refusal only.
                     tracing::info!(
                         tool = "stellar_trustline",
-                        chain = %args.chain_id,
-                        asset = %redact_asset_for_log(&args.asset),
                         error = %e,
                         "denomination resolver refused trustline"
                     );
@@ -1644,5 +1636,71 @@ mod tests {
         let mut absent = args.clone();
         absent.approval_attestation = None;
         assert!(format!("{absent:?}").contains("approval_attestation: None"));
+    }
+
+    /// An asset the denomination resolver refuses yields the refusal envelope
+    /// by rule and expected form, and neither the envelope nor the refusal
+    /// event carries the asset or the chain id the caller supplied.
+    #[tokio::test(flavor = "current_thread")]
+    async fn trustline_asset_marker_is_not_echoed() {
+        use stellar_agent_test_support::CaptureWriter;
+        use stellar_agent_test_support::rejected_value::{
+            CREDENTIAL_MARKER, assert_no_marker_in_text,
+        };
+
+        let profile = stellar_agent_core::profile::schema::Profile::builder_testnet(
+            "svc", "acct", "n-svc", "n-acct",
+        )
+        .with_noop_engine()
+        .build();
+        let server = WalletServer::new(profile).unwrap_or_else(|e| panic!("{e}"));
+        let cases = [
+            (
+                CREDENTIAL_MARKER.to_owned(),
+                "denomination-explicit required: the bare code has no issuer pin for network \
+                 Testnet; supply code+issuer explicitly",
+            ),
+            (
+                format!(
+                    "{CREDENTIAL_MARKER}-:GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY"
+                ),
+                "invalid asset code: must be 1 to 12 ASCII alphanumeric characters, or a valid \
+                 C-strkey (contract)",
+            ),
+        ];
+        for (asset, expected) in cases {
+            let args: StellarTrustlineArgs = match serde_json::from_value(serde_json::json!({
+                "chain_id": format!("stellar:{CREDENTIAL_MARKER}"),
+                "from": "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY",
+                "asset": asset,
+            })) {
+                Ok(args) => args,
+                Err(error) => panic!("{error}"),
+            };
+            let capture = CaptureWriter::new();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .with_writer(capture.clone())
+                .finish();
+            let inert = stellar_agent_test_support::log_capture::inert_dispatcher();
+            let guard = tracing::subscriber::set_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
+            let result = server.call_stellar_trustline(args).await;
+            drop(guard);
+            drop(inert);
+
+            let result = result.unwrap_or_else(|e| panic!("{e:?}"));
+            let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+            assert_eq!(code, "trustline.denomination_refused");
+            assert_eq!(message, expected);
+            assert_no_marker_in_text(&text, CREDENTIAL_MARKER);
+            let captured = capture.captured_str();
+            assert!(
+                captured.contains("denomination resolver refused trustline"),
+                "the test must reach the refusal event; got: {captured}"
+            );
+            assert_no_marker_in_text(&captured, CREDENTIAL_MARKER);
+        }
     }
 }
