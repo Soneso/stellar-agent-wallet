@@ -101,9 +101,8 @@ pub struct Sep24InteractiveUrlArgs {
     /// and over-precision strings (cap: [`stellar_agent_core::amount::ANCHOR_AMOUNT_MAX_DECIMAL_PLACES`]
     /// decimal places).
     ///
-    /// Named `deposit_hint` to keep the MCP schema field name distinct from the
-    /// amount-policy trigger word `amount`.  The field name in the MCP schema is
-    /// `deposit_hint`; the form parameter sent to the anchor is `amount`.  See
+    /// The MCP schema field is `deposit_hint`; the form parameter sent to the
+    /// anchor is `amount`. See
     /// [`AnchorAmount`] for the distinction from
     /// [`stellar_agent_core::amount::McpAmountArgument`] (which forces 7-decimal
     /// XLM semantics).
@@ -117,10 +116,7 @@ pub struct Sep24InteractiveUrlArgs {
     /// Whether the client supports receiving deposit transactions as a
     /// claimable balance (optional).
     ///
-    /// The MCP schema field name differs from the SEP-24 wire name
-    /// `claimable_balance_supported` to keep it distinct from the `balance`
-    /// policy trigger word; the form parameter is sent as
-    /// `claimable_balance_supported`.
+    /// The form parameter sent to the anchor is `claimable_balance_supported`.
     ///
     /// Per `sep-0024.md:533`.
     #[serde(default)]

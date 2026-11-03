@@ -766,6 +766,120 @@ async fn simulate_rejects_native_payment_on_insufficient_balance() {
 // Simulate step: non-native asset
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[tokio::test]
+#[serial]
+async fn simulate_issued_amount_refuses_xlm_unit_before_rpc() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    let server = WalletServer::new(testnet_profile_with_rpc("http://127.0.0.1:1")).unwrap();
+    let args: StellarPayArgs = serde_json::from_value(serde_json::json!({
+        "chain_id": "stellar:testnet", "source": SOURCE_G, "destination": DEST_G,
+        "amount": "100 XLM", "asset": format!("TST:{DEST_G}")
+    }))
+    .unwrap();
+    let error = server.call_stellar_pay(args).await.unwrap_err();
+    assert_eq!(error.data.unwrap()["code"], "validation.amount_malformed");
+    assert_eq!(
+        error.message,
+        "validation.amount_malformed: amount '100 XLM' has unit 'XLM'; expected unit 'TST'"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn commit_issued_amount_refuses_xlm_unit_before_rpc() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    let server = WalletServer::new(testnet_profile_with_rpc("http://127.0.0.1:1")).unwrap();
+    let args: StellarPayCommitArgs = serde_json::from_value(serde_json::json!({
+        "chain_id": "stellar:testnet", "source": SOURCE_G, "destination": DEST_G,
+        "amount": "100 XLM", "asset": format!("TST:{DEST_G}"),
+        "nonce": "nonce", "expires_at_unix_ms": 1, "envelope_xdr": "envelope"
+    }))
+    .unwrap();
+    let error = server.call_stellar_pay_commit(args).await.unwrap_err();
+    assert_eq!(error.data.unwrap()["code"], "validation.amount_malformed");
+    assert_eq!(
+        error.message,
+        "validation.amount_malformed: amount '100 XLM' has unit 'XLM'; expected unit 'TST'"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn payment_amount_errors_preserve_raw_input_before_rpc() {
+    let _data_root = crate::common::isolated_data_root();
+    keyring_mock::install().unwrap();
+    let server = WalletServer::new(testnet_profile_with_rpc("http://127.0.0.1:1")).unwrap();
+    for (raw, asset, expected_code, message) in [
+        (
+            "1 000 xlm",
+            "native".to_owned(),
+            "validation.amount_malformed",
+            "amount '1 000 xlm' could not be parsed as a valid amount",
+        ),
+        (
+            "+1 xlm",
+            "native".to_owned(),
+            "validation.amount_malformed",
+            "amount '+1 xlm' could not be parsed as a valid amount",
+        ),
+        (
+            "1.2.3 xlm",
+            "native".to_owned(),
+            "validation.amount_malformed",
+            "amount '1.2.3 xlm' could not be parsed as a valid amount",
+        ),
+        (
+            " 1.2.3 xlm ",
+            "native".to_owned(),
+            "validation.amount_malformed",
+            "amount ' 1.2.3 xlm ' could not be parsed as a valid amount",
+        ),
+        (
+            "10 usdc",
+            format!("USDC:{DEST_G}"),
+            "validation.amount_malformed",
+            "amount '10 usdc' has unit 'usdc'; expected unit 'USDC'",
+        ),
+        (
+            " 10 usdc ",
+            format!("USDC:{DEST_G}"),
+            "validation.amount_malformed",
+            "amount ' 10 usdc ' has unit 'usdc'; expected unit 'USDC'",
+        ),
+        (
+            " 0.00000001 xlm ",
+            "native".to_owned(),
+            "validation.amount_precision_exceeded",
+            "amount ' 0.00000001 xlm ' exceeds the maximum precision of 7 decimal places",
+        ),
+        (
+            " 99999999999999999999 xlm ",
+            "native".to_owned(),
+            "validation.amount_out_of_range",
+            "amount ' 99999999999999999999 xlm ' is outside the representable i64 stroop range",
+        ),
+    ] {
+        let value = serde_json::json!({
+            "chain_id": "stellar:testnet", "source": SOURCE_G, "destination": DEST_G,
+            "amount": raw, "asset": asset,
+            "nonce": "nonce", "expires_at_unix_ms": 1, "envelope_xdr": "envelope"
+        });
+        let simulate = server
+            .call_stellar_pay(serde_json::from_value(value.clone()).unwrap())
+            .await;
+        let commit = server
+            .call_stellar_pay_commit(serde_json::from_value(value).unwrap())
+            .await;
+        for result in [simulate, commit] {
+            let error = result.unwrap_err();
+            assert_eq!(error.data.unwrap()["code"], expected_code);
+            assert_eq!(error.message, format!("{expected_code}: {message}"));
+        }
+    }
+}
+
 /// Simulate step rejects a non-native asset with an invalid issuer G-strkey.
 #[tokio::test]
 #[serial]
@@ -779,7 +893,7 @@ async fn simulate_rejects_non_native_bad_issuer() {
         chain_id: "stellar:testnet".to_owned(),
         source: SOURCE_G.to_owned(),
         destination: DEST_G.to_owned(),
-        amount: Some(serde_json::from_str(r#""10 XLM""#).unwrap()),
+        amount: Some(serde_json::from_str(r#""10 USDC""#).unwrap()),
         amount_in_stroops: None,
         asset: "USDC:NOT_A_VALID_ISSUER".to_owned(),
         memo_text: None,

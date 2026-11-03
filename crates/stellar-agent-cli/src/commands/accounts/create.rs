@@ -791,8 +791,7 @@ fn sponsored_inputs(args: &CreateArgs) -> Result<SponsoredInputs, WalletError> {
             input: "--starting-balance is required for sponsored mode".to_owned(),
         })
     })?;
-    // Boundary discipline: parse_with_unit is the only permitted parser for
-    // human-supplied amounts at CLI boundaries.
+    // Starting balances use the native XLM unit at this CLI boundary.
     let starting_balance = StellarAmount::parse_with_unit(starting_balance_str).map_err(|_| {
         WalletError::Validation(ValidationError::AmountMalformed {
             input: starting_balance_str.to_owned(),

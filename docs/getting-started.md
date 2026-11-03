@@ -191,6 +191,97 @@ Confirm the install:
 stellar-agent --help
 ```
 
+## Create and fund a testnet account
+
+If you hold no account yet, `accounts create` generates one and funds it in a
+single step. `--generate` mints a fresh ed25519 keypair in-process and returns
+both the G-strkey and the secret in the JSON envelope (the secret in
+`data.secret_key`, never in `--output table` and never logged).
+`--fund-with-friendbot` funds it from Friendbot (testnet only):
+
+```bash
+stellar-agent accounts create --generate --fund-with-friendbot
+```
+
+Save the printed secret; the [enroll](#enroll-the-mcp-signer) and
+[payment](#make-a-first-payment-on-testnet) steps read it. The command output
+holds the seed, so do not write it to a log or a shared terminal.
+
+To fund an account you already hold, call Friendbot directly. Friendbot pays an
+existing account only while its XLM balance is below the Friendbot starting
+balance, 10,000 XLM on the SDF testnet, and the command exits `1` with
+`network.friendbot_account_already_funded` otherwise. Mainnet is structurally
+refused (`network.friendbot_mainnet_forbidden`) before any HTTP call.
+
+```bash
+stellar-agent friendbot --account GABC...WXYZ --network testnet
+```
+
+Flags:
+
+- `--account <G_STRKEY>`: the account to fund (required).
+- `--network <NETWORK>`: `testnet` (default) or `futurenet`. The command
+  rejects `mainnet` at dispatch.
+- `--friendbot-url <URL>`: override the Friendbot endpoint; the URL is validated
+  against an allow-list unless `--friendbot-url-unchecked` is set.
+- `--output <FORMAT>`: `json` (default) or `table`.
+
+## Pass a secret seed
+
+Signing commands read a secret seed from the environment variable that
+`--secret-env` names. Read the seed without echo, export it only for the
+commands that need it, and unset it afterward. A seed typed into a command line
+lands in the shell history file.
+
+In bash or zsh, run this line on its own, paste the seed when prompted, and
+press Enter. It prints nothing while you paste:
+
+```bash
+printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
+```
+
+Run the commands that use the seed, then remove it from the shell:
+
+```bash
+unset WALLET_SK
+```
+
+Every program the shell starts while the variable is set inherits it, so unset
+it before you start anything else from that shell, such as an MCP client.
+
+In PowerShell 7.1 and later:
+
+```powershell
+$env:WALLET_SK = Read-Host -MaskInput 'WALLET_SK seed'
+```
+
+In Windows PowerShell 5.1 and later:
+
+```powershell
+$env:WALLET_SK = [System.Net.NetworkCredential]::new('', (Read-Host -AsSecureString 'WALLET_SK seed')).Password
+```
+
+In both, remove the seed when you are done:
+
+```powershell
+Remove-Item Env:WALLET_SK
+```
+
+`cmd.exe` has no input that hides typing, so use PowerShell on Windows.
+
+### Remove a seed from shell history
+
+A seed typed into a command line earlier, for example in an `export` line, is
+in the shell history. To remove it:
+
+1. Close every shell that typed the seed, or clear its in-memory history first.
+   An open shell writes its history to the file when it exits.
+2. Delete the lines that hold the seed from `~/.bash_history` and
+   `~/.zsh_history`. On macOS, also delete them from the files in
+   `~/.zsh_sessions/` and `~/.bash_sessions/` whose names end in `.history`
+   or `.historynew`.
+3. If the account holds value, move it to a new key and enroll that key.
+
 ## Set up a profile
 
 A profile is a per-environment TOML config (schema version 2) that binds a CAIP-2
@@ -294,7 +385,7 @@ and placeholder signer/nonce keyring coordinates. The full setup flow is:
 2. `profile rotate-audit-key`: mint the audit chain-root key, required on every
    engine. The key must exist before signer enrollment so its audit row is written.
    Every signing verb refuses `audit.chain_key_unavailable` until this runs.
-3. [`profile enroll-signer`](#enroll-the-mcp-signer): register the MCP signer seed.
+3. [Create or select a testnet account](#create-and-fund-a-testnet-account), [set its seed](#pass-a-secret-seed), then [enroll the MCP signer](#enroll-the-mcp-signer).
 4. `stellar-agent profile rotate-nonce-key default`: mint the nonce key before
    MCP payment simulation. Without it, simulation fails with `nonce.mint_failed`.
 5. For `v1`, run `profile enroll-owner-key`, then `profile rotate-attestation-key`.
@@ -503,97 +594,6 @@ Engine `v1` evaluates the signed policy body. Policy-body version 2 carries
 mainnet bindings and a sequence. Profile-schema version 2 describes the
 configuration file. These versions are independent.
 
-## Pass a secret seed
-
-Signing commands read a secret seed from the environment variable that
-`--secret-env` names. Read the seed without echo, export it only for the
-commands that need it, and unset it afterward. A seed typed into a command line
-lands in the shell history file.
-
-In bash or zsh, run this line on its own, paste the seed when prompted, and
-press Enter. It prints nothing while you paste:
-
-```bash
-printf 'WALLET_SK seed: ' && read -rs WALLET_SK && echo && export WALLET_SK
-```
-
-Run the commands that use the seed, then remove it from the shell:
-
-```bash
-unset WALLET_SK
-```
-
-Every program the shell starts while the variable is set inherits it, so unset
-it before you start anything else from that shell, such as an MCP client.
-
-In PowerShell 7.1 and later:
-
-```powershell
-$env:WALLET_SK = Read-Host -MaskInput 'WALLET_SK seed'
-```
-
-In Windows PowerShell 5.1 and later:
-
-```powershell
-$env:WALLET_SK = [System.Net.NetworkCredential]::new('', (Read-Host -AsSecureString 'WALLET_SK seed')).Password
-```
-
-In both, remove the seed when you are done:
-
-```powershell
-Remove-Item Env:WALLET_SK
-```
-
-`cmd.exe` has no input that hides typing, so use PowerShell on Windows.
-
-### Remove a seed from shell history
-
-A seed typed into a command line earlier, for example in an `export` line, is
-in the shell history. To remove it:
-
-1. Close every shell that typed the seed, or clear its in-memory history first.
-   An open shell writes its history to the file when it exits.
-2. Delete the lines that hold the seed from `~/.bash_history` and
-   `~/.zsh_history`. On macOS, also delete them from the files in
-   `~/.zsh_sessions/` and `~/.bash_sessions/` whose names end in `.history`
-   or `.historynew`.
-3. If the account holds value, move it to a new key and enroll that key.
-
-## Create and fund a testnet account
-
-If you hold no account yet, `accounts create` generates one and funds it in a
-single step. `--generate` mints a fresh ed25519 keypair in-process and returns
-both the G-strkey and the secret in the JSON envelope (the secret in
-`data.secret_key`, never in `--output table` and never logged).
-`--fund-with-friendbot` funds it from Friendbot (testnet only):
-
-```bash
-stellar-agent accounts create --generate --fund-with-friendbot
-```
-
-Save the printed secret; the [enroll](#enroll-the-mcp-signer) and
-[payment](#make-a-first-payment-on-testnet) steps read it. The command output
-holds the seed, so do not write it to a log or a shared terminal.
-
-To fund an account you already hold, call Friendbot directly. Friendbot pays an
-existing account only while its XLM balance is below the Friendbot starting
-balance, 10,000 XLM on the SDF testnet, and the command exits `1` with
-`network.friendbot_account_already_funded` otherwise. Mainnet is structurally
-refused (`network.friendbot_mainnet_forbidden`) before any HTTP call.
-
-```bash
-stellar-agent friendbot --account GABC...WXYZ --network testnet
-```
-
-Flags:
-
-- `--account <G_STRKEY>`: the account to fund (required).
-- `--network <NETWORK>`: `testnet` (default) or `futurenet`. The command
-  rejects `mainnet` at dispatch.
-- `--friendbot-url <URL>`: override the Friendbot endpoint; the URL is validated
-  against an allow-list unless `--friendbot-url-unchecked` is set.
-- `--output <FORMAT>`: `json` (default) or `table`.
-
 ## Enroll the MCP signer
 
 The MCP fund-movement tools and the keyring-signing CLI verbs (`trustline`,
@@ -710,8 +710,8 @@ Signer source (one of the following, mutually exclusive):
 Other common flags:
 
 - `<DESTINATION>` (positional), destination account G-strkey (required).
-- `<AMOUNT>` (positional), amount with units, for example `"10 XLM"` or
-  `"10.5 USDC"`.
+- `<AMOUNT>` (positional), `"10 XLM"` for native or the exact, case-sensitive
+  asset code for issued assets, such as `"10.5 USDC"` with `USDC:<issuer>`.
 - `[ASSET]` (positional), `native`, `XLM`, or `CODE:ISSUER_GSTRKEY`; defaults to
   `native`.
 - `--source <G_STRKEY>`: source account; required for signing.

@@ -530,6 +530,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must be below every `per_tx_cap` of the same asset in its rule, and a
   classic asset and its Stellar Asset Contract address on that network count
   as the same asset.
+- The profile and governance reference states when an MCP server holds the
+  audit writer that `profile reset-window-state` needs. The concepts page
+  documents the `rate_limit` criterion with its fields, its shared count per
+  profile and window, and when a call counts and stops counting. The security
+  internals page states the same shared count and counting. The concepts and
+  profiles pages name the code each surface reports when the policy fails its
+  initial load or its reload before the send. The profiles page names the codes
+  for a native key in `[cross_check_thresholds]` and for a failed read or send
+  at the primary endpoint. It also names the commands that read
+  `classic_fee_per_op_stroops`.
 
 ### Removed
 
@@ -553,6 +563,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retained file and pruned-file count. Audit-key rotation re-signs the marker.
 - SEP-43 `signMessage` documentation describes the SEP-53 prefixed digest and
   standard base64 signature. Both message tools produce the same signature bytes.
+- CLI `pay`, `stellar_pay` and `stellar_pay_commit` accept the asset code as the
+  amount unit for an issued asset and refuse any other label. The documented
+  form `"100 TST"` with `TST:<issuer>` works.
 
 ### Security
 
@@ -844,6 +857,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher routes, not the native tools the server registers; the caller
   chooses the `toolset` argument, and the operator policy and approvals bound
   native and routed calls alike.
+- `follow-redirects` 1.16.1 to 1.16.2 in the MPP and `@stellar/stellar-sdk`
+  17 interoperability harnesses, which resolves one advisory.
+  GHSA-mrwp-f3q8-3g9p affects `follow-redirects` before 1.16.2. The
+  harnesses compare the wallet's fixtures with the released JavaScript SDKs
+  in CI, and no wallet crate depends on them.
 
 ## [0.1.0-alpha.13] - 2026-10-31
 

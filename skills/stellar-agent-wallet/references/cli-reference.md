@@ -205,7 +205,7 @@ effective signed/profile fee cap and thresholds; the resolver reevaluates them.
 
 The submit layer does not take the declared network on trust. Before sending, it asks the endpoint which network it serves and which protocol it runs, on the client that sends. That answer is authoritative. `pay`, `claim`, sponsored `accounts create`, `trustline`, and `pool init` ask the same question earlier, on that same client, before the first read whose answer they sign or gate on. That read is the fee, the sequence, the claim entry, a policy view, or the reservation reconcile. Ordinary submission refuses a mainnet endpoint with `network.mainnet_write_forbidden`. Authorized submission verifies its bound context. One reporting a different network than declared is refused with `network.endpoint_network_mismatch`. One whose identity cannot be established within the timeout is refused with `network.endpoint_identity_unavailable`. One that answers the identity request with HTTP 401 or 403 is refused with `network.rpc_credential_refused`. The check is retried with bounded backoff inside the caller's timeout and never falls back to the declaration. An answer that does not parse, and a 401 or 403 answer, is not retried.
 
-An endpoint refusal precedes every refusal that follows a read: a missing account or claim entry, a policy denial, the audit pre-flight, and the amount, asset, and fee checks. `pool init` runs its audit pre-flight before the check, and the full `pay` pipeline checks `--source` and `--fee` after the reconcile. A `claim` or `trustline` refused at the early check carries no preview. Each check gets a budget of its own: `--timeout-seconds` on `pay`, `claim`, `accounts create`, and `pool init`, and the profile's `submit_timeout_seconds` on `trustline`. `--build-only` checks before its reads. `--sign-only` checks before the account reads of an envelope it decodes and signs an envelope it cannot decode without any request.
+An endpoint refusal precedes every refusal that follows a read: a missing account or claim entry, a policy denial, the audit pre-flight, and the amount, asset, and fee checks. `pool init` runs its audit pre-flight before the check. The full payment pipeline validates the asset and amount before endpoint identity and reservation reconciliation. Fee validation follows reconciliation. A `claim` or `trustline` refused at the early check carries no preview. Each check gets a budget of its own: `--timeout-seconds` on `pay`, `claim`, `accounts create`, and `pool init`, and the profile's `submit_timeout_seconds` on `trustline`. `--build-only` checks before its reads. `--sign-only` checks before the account reads of an envelope it decodes and signs an envelope it cannot decode without any request.
 
 This release supports protocol version 29. On testnet and other networks, a version outside that range is logged as a warning and the submission continues. On mainnet the same version is refused with `network.unsupported_protocol_version`. Ordinary submission refuses mainnet before this protocol rule.
 
@@ -310,7 +310,7 @@ Staged pipeline (mutually exclusive): `--build-only` emits unsigned envelope XDR
 | Flag / arg | Meaning | Default |
 |---|---|---|
 | `<DESTINATION>` (positional) | Destination G-strkey | — |
-| `<AMOUNT>` (positional) | Amount with units, e.g. `"10 XLM"` | — |
+| `<AMOUNT>` (positional) | Use `"10 XLM"` for native or the exact, case-sensitive asset code for issued assets, such as `"10.5 USDC"` with `USDC:<issuer>` (raw stroop strings rejected). | — |
 | `[ASSET]` (positional) | `native`, `XLM`, or `CODE:ISSUER` | `native` |
 | `--source <G_STRKEY>` | Source account; required for signing | — |
 | `--memo-text <STRING>` | Memo text (UTF-8, up to 28 bytes; control characters, Unicode format characters, and line or paragraph separators are refused with `validation.memo_control_character`) | — |
@@ -901,7 +901,9 @@ It is also unverifiable without a usable key: an absent key, a key that is not
 valid base64, or a key that is not 32 bytes. The reset replaces such a key after
 the row. A store file that exists but cannot be read refuses before the row.
 
-A running MCP server holds the audit writer. Reset then refuses with
+An MCP server acquires the profile's audit writer at the first operation that
+needs it, such as a commit preflight. It normally holds the writer until the
+server exits. While a server holds it, reset refuses with
 `audit.chain_key_unavailable` and the message sub-code `audit.writer_locked`.
 An append failure also refuses with its audit code, leaving the window file,
 key and generation untouched. A first-use key mint is recorded through the held
