@@ -164,9 +164,11 @@ After merging, the loader resolves derived fields and validates:
   engine.
 
 Mainnet selection requires `--profile <NAME>`. Writes require a dedicated
-nondefault profile with matching stored chain and endpoint host. Enrollment
-applies to `--secret-env` and Ledger signers alike. `profile enroll-signer`
-accepts `--secret-env` only, so it cannot enroll a Ledger mainnet signer.
+nondefault profile with matching stored chain and endpoint host. Mainnet `pay`,
+`claim` and `accounts create` refuse `--secret-env` and, without a signer flag,
+sign with the enrolled seed in the keyring; a Ledger signer must match the
+enrolled identity. `profile enroll-signer` accepts `--secret-env` only, so it
+cannot enroll a Ledger mainnet signer.
 Identity repair uses `--repair-identity`, requires the stored public-key pin,
 and checks the existing seed. It does not replace the seed or pin.
 
@@ -489,7 +491,7 @@ transaction.
 
 ### `[wallet]` block
 
-These controls apply to every CLI seed read from a `--*-secret-env` variable, including `pay`, `claim`, and `accounts create`. Keyring signers, the Ledger, and the MCP server never enter the unlock window. The zero-config testnet profile uses the `"warn"` posture and a 30-second TTL.
+These controls apply to every CLI seed read from a `--*-secret-env` variable, including testnet `pay`, `claim`, and `accounts create`; on a mainnet profile those verbs refuse `--secret-env` and sign with the enrolled seed in the keyring. Keyring signers, the Ledger, and the MCP server never enter the unlock window. The zero-config testnet profile uses the `"warn"` posture and a 30-second TTL.
 
 Controls the unlock window: the period in which the unlocked wallet hands out
 its 32-byte signing seed. The seed stays in its zeroize-on-drop home, locked when

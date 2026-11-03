@@ -552,7 +552,7 @@ public data; the pool master seed stays in the keyring.
 
 ### `[wallet]` block
 
-These controls apply to every CLI seed read from a `--*-secret-env` variable, including `pay`, `claim`, and `accounts create`. Keyring signers, the Ledger, and the MCP server never enter the unlock window. The zero-config testnet profile uses the `"warn"` posture and a 30-second TTL.
+These controls apply to every CLI seed read from a `--*-secret-env` variable, including testnet `pay`, `claim`, and `accounts create`; on a mainnet profile those verbs refuse `--secret-env` and sign with the enrolled seed in the keyring. Keyring signers, the Ledger, and the MCP server never enter the unlock window. The zero-config testnet profile uses the `"warn"` posture and a 30-second TTL.
 
 Controls the [unlock window](concepts.md): the period in which the unlocked
 wallet hands out its 32-byte signing seed. The seed stays in its zeroize-on-drop

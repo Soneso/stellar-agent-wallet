@@ -249,6 +249,13 @@ unset WALLET_SK
 Every program the shell starts while the variable is set inherits it, so unset
 it before you start anything else from that shell, such as an MCP client.
 
+Mainnet transaction signing never reads an exported seed: on a mainnet
+profile, `pay`, `claim` and `accounts create` refuse `--secret-env` with
+`validation.mainnet_secret_env_refused` and sign with the enrolled seed in the
+keyring. On a mainnet host, export a seed only for `profile enroll-signer` and
+the owner ceremonies, such as `profile sign-policy` and `profile bind-signer`,
+and unset it when the ceremony is done.
+
 In PowerShell 7.1 and later:
 
 ```powershell
@@ -576,7 +583,10 @@ missing file with `sign_policy.policy_file_unreadable`.
 Use a build whose version marker is `STELLAR_AGENT_BUILD_MAINNET_WRITE=on`.
 Create a dedicated mainnet profile with its HTTPS endpoint stored in the file.
 Initialize the audit, nonce, attestation, and policy-owner keys, then enroll the
-signer with `profile enroll-signer --secret-env`.
+signer with `profile enroll-signer --secret-env` and unset the variable
+afterward. Mainnet `pay`, `claim` and `accounts create` take no signer flag,
+which signs with the enrolled seed in the keyring, or `--sign-with-ledger`;
+they refuse `--secret-env`.
 
 Write a v2 policy body for the profile, with `version = 2` and without a
 `[mainnet]` table, and sign it with `profile sign-policy`. The enablement
@@ -738,10 +748,17 @@ seed into an isolated home after the configured memory-lock attempt. The
 profile's `mlock_required = true` posture fails closed if locking fails.
 
 The seed stays in a zeroize-on-drop page, locked when the lock succeeds, until
-its wallet or signer drops it. Mainnet environment signers unlock once per
-signature and drop the seed afterward. Testnet environment signers keep it for
-the command, which can outlast the TTL. Drop zeroizes before unlocking and
+its wallet or signer drops it. Testnet environment signers keep it for the
+command, which can outlast the TTL. Drop zeroizes before unlocking and
 freeing. The `--sign-with-ledger` path holds no seed in process memory.
+
+The window covers the wallet's own copies only. The exported variable stays in
+the environment of the process and of every process the shell starts, for
+their whole life. Mainnet signing therefore refuses `--secret-env` and signs
+with the enrolled seed in the keyring or with a Ledger. On Linux the CLI marks
+itself non-dumpable before it starts any thread, so other processes of the same
+user cannot read its memory or environment; the exporting shell is not
+protected. On macOS and Windows the CLI sets no such flag.
 
 ### Staged pipeline
 
@@ -814,9 +831,13 @@ run `profile enable-mainnet`, complete the policy, then run `profile sign-policy
 Then restart the MCP server. CLI entry checks can refuse missing engine,
 verified policy, or enablement before the resolver runs.
 
-Ledger and `--secret-env` signers must satisfy the enrolled-identity requirement.
-`profile enroll-signer` accepts `--secret-env` only and cannot enroll a Ledger
-key. Whatever the signer, every mainnet consent also needs a passkey listed in
+Mainnet signing refuses `--secret-env` with
+`validation.mainnet_secret_env_refused`; without a signer flag it signs with the
+enrolled seed in the keyring. A Ledger signer must satisfy the enrolled-identity
+requirement. `profile enroll-signer` accepts `--secret-env` only and cannot
+enroll a Ledger key. It reads the seed to derive its public address and again
+to store it in the keyring; unset the variable afterward. Whatever the signer,
+every mainnet consent also needs a passkey listed in
 the owner-signed policy as an approval credential:
 
 1. Run `stellar-agent approve credential enroll --profile <NAME>`, create the

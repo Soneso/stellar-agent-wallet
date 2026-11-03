@@ -44,6 +44,9 @@ mod output_failure_exit_code;
 mod owner_key_older_form_cli;
 #[path = "cli/pool_init_lifecycle.rs"]
 mod pool_init_lifecycle;
+#[cfg(target_os = "linux")]
+#[path = "cli/process_hardening.rs"]
+mod process_hardening;
 #[path = "cli/profile_env_var_resolution.rs"]
 mod profile_env_var_resolution;
 #[path = "cli/profile_flag_discipline.rs"]

@@ -83,7 +83,7 @@ A configured mainnet secondary requires `providers.secondary`, a host distinct f
 
 Signing commands take a mutually exclusive signer-source group. Exactly one source is selected:
 
-- The secret-env flag: the name of an environment variable holding the source account S-strkey. Set the variable as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows; pass the variable name, never the secret itself. Its spelling is `--secret-env` on `pay` and `accounts create`, `--deployer-secret-env` on `accounts deploy-c`, and `--signer-secret-env` on the `smart-account` commands; the per-group pages give the exact spelling.
+- The secret-env flag: the name of an environment variable holding the source account S-strkey. Set the variable as [Pass a secret seed](../getting-started.md#pass-a-secret-seed) shows; pass the variable name, never the secret itself. Its spelling is `--secret-env` on `pay`, `claim` and `accounts create`, `--deployer-secret-env` on `accounts deploy-c`, and `--signer-secret-env` on the `smart-account` commands; the per-group pages give the exact spelling. On a mainnet profile `pay`, `claim` and `accounts create` refuse `--secret-env` with `validation.mainnet_secret_env_refused` and, without a signer flag, sign with the enrolled seed in the keyring.
 - `--sign-with-ledger`: sign with a connected Ledger hardware device.
 - `--account-index <INDEX>`: the BIP-44 account index for the Ledger derivation path. Default `0`.
 
@@ -110,6 +110,8 @@ for the two recovery paths. `profile show` remains available for diagnosis.
 By default every command prints one JSON envelope on stdout. Exit code `0` means success; exit code `1` means any error. Scripts can branch on the exit code and parse the JSON for details.
 
 An argument the parser refuses, such as an unknown flag or a missing required one, also prints one envelope: `validation.usage_error` with the parser's message, exit code `1`, and nothing on stderr. `--help` and `--version` print their text and exit `0`.
+
+Before it parses the arguments, the CLI on Linux marks its process non-dumpable. When it cannot, it prints one `wallet.process_hardening_failed` envelope, exits `1` and runs no command. A CLI that cannot start its async runtime prints `wallet.runtime_unavailable` the same way.
 
 ```bash
 if stellar-agent balances --account GABC...WXYZ > out.json; then

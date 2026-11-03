@@ -238,6 +238,9 @@ Setup and policy cannot admit excluded signing surfaces.
 | `network.witness_unavailable` | A required independent witness cannot be established. Resolver-detected witness gaps instead use `network.mainnet_authorization_refused`. |
 | `wallet.clock_error` | The authorization clock cannot provide a valid time. |
 | `network.witness_unavailable`: `cross-check refused: the transaction's {part} does not match the observations the witness compares` | The witness binds another envelope or intent. The message names `source`, `sequence`, `operation`, `memo`, `value`, `envelope`, or `authorization` as `{part}`. The wallet refuses signing and sending. Build the action again. |
+| `validation.mainnet_secret_env_refused` | A mainnet `pay`, `claim` or `accounts create` was given `--secret-env`. Mainnet signing reads no seed from the environment; omit the flag to sign with the enrolled seed in the keyring, or pass `--sign-with-ledger`. The refusal occurs before the write context, any keyring read or any request. The startup advisory can still read and append to the local audit log. |
+| `wallet.process_hardening_failed` | On Linux the CLI could not mark its process non-dumpable; the command did not run. The message names the `errno`. |
+| `wallet.runtime_unavailable` | The CLI could not start its async runtime; the command did not run. |
 | `sep43.mainnet_signing_forbidden` | An ordinary SEP-43 library signing path refuses mainnet. |
 | `sep43.mainnet_authorization_refused` | The authorized SEP-43 primitive refuses its bound authority. Public SEP-43 tools remain excluded. |
 | `sep45.mainnet_signing_forbidden` | SEP-45 refuses mainnet signing in either build. |

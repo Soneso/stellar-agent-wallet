@@ -1275,6 +1275,16 @@ const HEX_64: &str = "0101010101010101010101010101010101010101010101010101010101
 
 /// The code the structural refusal emits on the transaction verbs.
 const MAINNET_WRITE_FORBIDDEN: &str = "network.mainnet_write_forbidden";
+/// The code of the `pay`, `claim` and sponsored `accounts create` rows that
+/// carry `--secret-env`. A build with mainnet writes refuses the environment
+/// seed at the signer choice, the first step of their mainnet pipeline.
+#[cfg(feature = "mainnet-write")]
+const SECRET_ENV_ROW_CODE: &str = "validation.mainnet_secret_env_refused";
+/// The code of the `pay`, `claim` and sponsored `accounts create` rows that
+/// carry `--secret-env`. A build without mainnet writes refuses them
+/// structurally before the signer choice.
+#[cfg(not(feature = "mainnet-write"))]
+const SECRET_ENV_ROW_CODE: &str = MAINNET_WRITE_FORBIDDEN;
 
 /// One guarded verb. It holds the name a failing row reports and its argv,
 /// which carries the required arguments and no profile, network, or endpoint
@@ -1315,32 +1325,28 @@ fn guarded_profile_only(name: &'static str, argv: &[&str]) -> GuardedVerb {
 fn guarded_verbs(endpoint: &str) -> Vec<GuardedVerb> {
     let seed = UNSET_SEED;
     let friendbot_url = format!("{endpoint}/friendbot");
-    let mut verbs = vec![
-        guarded(
+    // `pay`, `claim` and sponsored `accounts create` each have two rows: one
+    // with `--secret-env`, and one without a signer flag, which chooses the
+    // keyring and so meets the structural refusal in either build.
+    let signer_choice_verbs: [(&'static str, &'static str, &[&str]); 3] = [
+        (
             "pay",
-            &[
-                "pay",
-                SOURCE_G,
-                "1 XLM",
-                "--source",
-                SOURCE_G,
-                "--secret-env",
-                seed,
-            ],
+            "pay (no signer flag)",
+            &["pay", SOURCE_G, "1 XLM", "--source", SOURCE_G],
         ),
-        guarded(
+        (
             "claim",
+            "claim (no signer flag)",
             &[
                 "claim",
                 "000000000000000000000000000000000000000000000000000000000000000000000000",
                 "--source",
                 SOURCE_G,
-                "--secret-env",
-                seed,
             ],
         ),
-        guarded(
+        (
             "accounts create (sponsored)",
+            "accounts create (sponsored, no signer flag)",
             &[
                 "accounts",
                 "create",
@@ -1349,10 +1355,20 @@ fn guarded_verbs(endpoint: &str) -> Vec<GuardedVerb> {
                 SOURCE_G,
                 "--starting-balance",
                 "1 XLM",
-                "--secret-env",
-                seed,
             ],
         ),
+    ];
+    let mut verbs = Vec::new();
+    for (name, no_signer_flag_name, argv) in signer_choice_verbs {
+        let mut with_secret_env = argv.to_vec();
+        with_secret_env.extend(["--secret-env", seed]);
+        verbs.push(GuardedVerb {
+            mainnet_code: SECRET_ENV_ROW_CODE,
+            ..guarded(name, &with_secret_env)
+        });
+        verbs.push(guarded(no_signer_flag_name, argv));
+    }
+    verbs.extend([
         GuardedVerb {
             mainnet_code: "network.friendbot_mainnet_forbidden",
             ..guarded(
@@ -1389,7 +1405,7 @@ fn guarded_verbs(endpoint: &str) -> Vec<GuardedVerb> {
                 seed,
             ],
         ),
-    ];
+    ]);
     for verb in [
         "deploy-ed25519-verifier",
         "deploy-spending-limit-policy",
@@ -1685,7 +1701,7 @@ fn guarded_table_failures(
 ) -> Vec<String> {
     let mut failures = Vec::new();
     let verbs = guarded_verbs(&endpoint.https_uri());
-    assert_eq!(verbs.len(), 33, "the table covers every guarded path");
+    assert_eq!(verbs.len(), 36, "the table covers every guarded path");
     for verb in &verbs {
         let Some(expected) = expected_code(verb) else {
             continue;
@@ -1713,14 +1729,18 @@ fn guarded_table_failures(
     failures
 }
 
-/// Every guarded path refuses a persisted mainnet profile with its structural
-/// code, and no connection reaches the profile's endpoint. No seed variable
-/// is set, and every later stage on these paths reports a different code.
+/// Every guarded path refuses a persisted mainnet profile with the code
+/// specified below, without contacting its endpoint. No seed variable is set.
 ///
-/// In a build with mainnet writes, `pay`, `claim`, `trustline` and sponsored
-/// `accounts create` run the mainnet pipeline. The fixture names an oracle,
-/// so its `noop` engine refuses there with the same code at the engine-kind
-/// check, which precedes the keyring and every endpoint read.
+/// A build without mainnet writes refuses every row with its structural
+/// code; `pay`, `claim` and sponsored `accounts create` meet that refusal
+/// before their signer choice. In a build with mainnet writes, their rows
+/// with `--secret-env` are refused first by their pipeline with
+/// `validation.mainnet_secret_env_refused`. Their rows without a signer flag
+/// choose the keyring and, like `trustline`, run the mainnet pipeline, where
+/// the fixture's `noop` engine refuses with the structural code at the
+/// engine-kind check, before the keyring and every endpoint read. The fixture
+/// names an oracle, so that check is reached.
 #[test]
 fn every_guarded_path_refuses_a_mainnet_profile_before_endpoint_contact() {
     let endpoint = connection_counter();

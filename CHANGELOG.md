@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ValidationError::MainnetSecretEnvRefused`, wire code
+  `validation.mainnet_secret_env_refused`, refuses an environment seed for
+  mainnet signing; its message names no variable.
 - `stellar_agent_core::audit_log::schema::WasmHashPin` holds a full 32-byte
   Wasm code hash and serializes as 64 lowercase hex characters;
   `WasmHashPin::parse` refuses every other form. The audit event kinds
@@ -132,6 +135,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- On a mainnet profile `--secret-env` is refused by `pay`, `claim` and
+  `accounts create` with `validation.mainnet_secret_env_refused`, and these
+  verbs sign with the enrolled seed in the keyring when no signer flag is
+  given. Testnet signing is unchanged.
 - `MintRequest::chain_deadline_ms` caps authorization expiry at the signed
   envelope's deadline. `MainnetPrecondition` includes `DeadlineMissing`,
   `DeadlineElapsed` and `DeadlineTooFar`. `ClassicOpBuilder::with_mainnet_deadline`
@@ -586,6 +593,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Mainnet `pay`, `claim` and `accounts create` refuse `--secret-env` with
+  `validation.mainnet_secret_env_refused` before the write context, any
+  keyring read or any request, and sign with the enrolled seed in the keyring
+  when no signer flag is given. An exported seed stays in the environment of
+  the process for its whole life, so mainnet signing reads none. On Linux the
+  CLI marks its process non-dumpable before the async runtime starts, so
+  other processes of the same user cannot read its memory or environment or
+  attach to it, and refuses to run with `wallet.process_hardening_failed` when
+  it cannot. A CLI that cannot start its async runtime refuses to run with
+  `wallet.runtime_unavailable`.
 - Classic mainnet envelopes built by `pay`, `claim`, `accounts create`,
   `trustline` and their MCP tools carry an on-chain deadline 120 seconds after
   they are built. The operator's consent covers it, the authorization expires

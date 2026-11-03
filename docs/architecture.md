@@ -254,7 +254,7 @@ flowchart TB
 | --- | --- |
 | Keyring signer | `mcp_signer_default` references the keyring seed used by MCP tools. CLI `trade`, `trustline`, `vault`, and `pool init` use it through `enrolled_keyring_signer`. The handle reads the seed into a zeroizing buffer when it is built and again for each signature, without memory locking. |
 | Channel pool | The keyring holds the pool master seed; channel-account signing keys are derived from it per index when needed. |
-| CLI `--secret-env` | Seed enters an unlock window, a clock-checked in-memory session. It stays in a zeroize-on-drop page, locked when the lock succeeds, until its wallet or signer drops it. Mainnet environment signers unlock once per signature; testnet environment signers keep the seed for the command. |
+| CLI `--secret-env` | Seed enters an unlock window, a clock-checked in-memory session. It stays in a zeroize-on-drop page, locked when the lock succeeds, until its wallet or signer drops it. Testnet environment signers keep the seed for the command. Mainnet signing refuses `--secret-env`, because the exported variable stays in the process environment for the life of the process. |
 | Owner policy signing | Operator supplies the seed; signing runs during the unlock window, then disposes it; only the owner's public key is enrolled. |
 | Memory locking | The profile controls whether locking memory is mandatory; permissive settings can continue after locking fails. The unlock clock bounds seed access and transfer, not the residency of a seed a signer holds. |
 | Ledger and passkeys | Private keys stay on the device or authenticator; the host receives signatures or ceremony results. |

@@ -580,13 +580,13 @@ The unlock window bounds when the CLI environment signing path can access or tra
 
 The posture is set in the profile file and is not overlayable.
 
-A tolerated lock failure emits a structured warning with `profile`, `reason`, and `errno`, and returns those details to the caller. The mainnet environment path appends `wallet_mlock_failed` after submission or attach refusal. This ordering keeps an audit rotation from invalidating the authorization before submission.
+A tolerated lock failure emits a structured warning with `profile`, `reason`, and `errno`, and returns those details to the caller. Callers with an audit writer record `wallet_mlock_failed` through `record_mlock_degradation`.
 
 ### TTL cap and RAII dispose
 
 The default TTL is `DEFAULT_TTL_SECONDS` (30); the hard cap is `MAX_TTL_SECONDS` (600). `unlock` rejects `ttl_seconds == 0` or `ttl_seconds > 600` with `WalletLifecycleError::TtlInvalid`. The profile field `wallet.unlock_ttl_seconds` is validated against that range when the window is constructed: a value of 0 or above 600 is refused, never clamped.
 
-`Wallet::seed` and `Wallet::into_locked_seed` check the clock and refuse access after expiry. The seed stays in a zeroize-on-drop page, locked when the lock succeeds, until its wallet or receiving signer drops it. Mainnet environment signers unlock once per signature and drop the seed afterward. Testnet environment signers keep it for their command, which can outlast the TTL. `Wallet` and `SoftwareSigningKey` are `Send + Sync`; shared mutation requires caller synchronization.
+`Wallet::seed` and `Wallet::into_locked_seed` check the clock and refuse access after expiry. The seed stays in a zeroize-on-drop page, locked when the lock succeeds, until its wallet or receiving signer drops it. Testnet environment signers keep it for their command, which can outlast the TTL. Mainnet signing never reads a seed from the environment: `MainnetSignerChoice::from_flags` refuses `--secret-env` with `validation.mainnet_secret_env_refused` before the write context, any keyring read or any request, because the inherited environment block keeps an exported seed for the life of the process. On Linux the CLI sets `PR_SET_DUMPABLE 0` before its async runtime starts and refuses to run with `wallet.process_hardening_failed` when it cannot. `Wallet` and `SoftwareSigningKey` are `Send + Sync`; shared mutation requires caller synchronization.
 
 ## Headless keyring store
 

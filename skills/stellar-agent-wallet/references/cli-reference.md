@@ -229,7 +229,7 @@ Argument groups (parser-enforced): mode (exactly one) `--sponsor` xor `--fund-wi
 | `--generate` | Mint a fresh ed25519 keypair in-process; returns G- and S-strkey in JSON (`data.secret_key`, never in `table`, never logged) | `false` |
 | `--sponsor <G_STRKEY>` | Sponsor/source for `CreateAccount` | — |
 | `--starting-balance <AMOUNT>` | Starting balance with units, e.g. `"5 XLM"` (sponsored mode) | — |
-| `--secret-env <VAR>` | Env-var name holding sponsor S-strkey | — |
+| `--secret-env <VAR>` | Env-var name holding sponsor S-strkey; refused on a mainnet profile, which signs with the enrolled seed in the keyring | — |
 | `--sign-with-ledger` / `--account-index <INDEX>` | Ledger signer / BIP index | `false` / `0` |
 | `--fund-with-friendbot` | Fund via Friendbot (testnet only) | `false` |
 | `--friendbot-url <URL>` | Friendbot endpoint (Friendbot mode) | `https://friendbot.stellar.org` |
@@ -316,7 +316,7 @@ Staged pipeline (mutually exclusive): `--build-only` emits unsigned envelope XDR
 | `--memo-text <STRING>` | Memo text (UTF-8, up to 28 bytes; control characters, Unicode format characters, and line or paragraph separators are refused with `validation.memo_control_character`) | — |
 | `--memo-id <U64>` | Memo ID (u64 decimal) | — |
 | `--memo-hash <64_HEX>` / `--memo-return <64_HEX>` | Memo hash / return hash (32 bytes) | — |
-| `--secret-env <VAR>` | Env-var name holding source S-strkey | — |
+| `--secret-env <VAR>` | Env-var name holding source S-strkey; refused on a mainnet profile, which signs with the enrolled seed in the keyring | — |
 | `--sign-with-ledger` / `--account-index <INDEX>` | Ledger signer / BIP index | `false` / `0` |
 | `--build-only` / `--sign-only <XDR>` / `--submit-only <XDR>` | Stage selection (at most one) | — |
 | `--profile <NAME>` | Profile whose policy engine, keys, and audit writer to use | `STELLAR_AGENT_PROFILE`, else `default` |
@@ -460,7 +460,7 @@ stellar-agent trustline --from GABC...WXYZ --asset USDC --profile default
 | `<BALANCE_ID>` (positional) | A `B...` strkey, canonical 72-hex id, or bare 64-hex hash | — |
 | `--source <G_STRKEY>` (required) | Claiming account; also the transaction source | — |
 | `--fee <STROOPS\|auto[:pNN]>` | Classic fee selector | profile default |
-| `--secret-env <VAR>` | Env-var name holding source S-strkey | — |
+| `--secret-env <VAR>` | Env-var name holding source S-strkey; refused on a mainnet profile, which signs with the enrolled seed in the keyring | — |
 | `--sign-with-ledger` / `--account-index <INDEX>` | Ledger signer / BIP index | `false` / `0` |
 | `--build-only` / `--sign-only <XDR>` / `--submit-only <XDR>` | Stage selection (at most one) | — |
 | `--profile <NAME>` | Profile whose policy engine, keys, and audit writer to use | `STELLAR_AGENT_PROFILE`, else `default` |

@@ -18,6 +18,7 @@
 mod advisory;
 mod commands;
 pub mod common;
+mod process_hardening;
 mod render;
 #[cfg(test)]
 mod test_rpc;
@@ -299,8 +300,46 @@ impl Commands {
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// Hardens the process, then runs the command on a multi-thread runtime and
+/// exits with its code.
+///
+/// The hardening runs before the runtime exists, so the process is still
+/// single-threaded when it becomes non-dumpable, and a failed hardening ends
+/// the process before any command code runs.
+fn main() {
+    std::process::exit(process_hardening::guarded_start(
+        process_hardening::harden_process,
+        run,
+    ));
+}
+
+/// Builds the multi-thread runtime and runs [`async_main`] on it, returning
+/// the command's exit code.
+///
+/// The runtime is shut down without waiting for its remaining tasks, so a
+/// task still blocked on a terminal or socket read does not hold the exit.
+fn run() -> i32 {
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => {
+            let exit_code = runtime.block_on(async_main());
+            runtime.shutdown_background();
+            exit_code
+        }
+        Err(err) => {
+            common::render::render_json(&stellar_agent_core::envelope::Envelope::<()>::err_raw(
+                "wallet.runtime_unavailable",
+                format!("the async runtime could not be started ({err}); the command did not run"),
+            ));
+            1
+        }
+    }
+}
+
+/// Runs the parsed command and returns its exit code.
+async fn async_main() -> i32 {
     // Install the subscriber first so any subsequent `tracing::*` call
     // participates in the redaction pipeline.
     let init_result = observability::init_subscriber(None);
@@ -318,7 +357,7 @@ async fn main() {
 
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(error) => std::process::exit(report_parse_error(&error)),
+        Err(error) => return report_parse_error(&error),
     };
 
     // ── Startup advisory ────────────────────────────────────────────────────
@@ -336,7 +375,7 @@ async fn main() {
     let _ =
         run_profile_startup_advisory(cli.command.profile_flag(), advisory::run_startup_advisory);
 
-    let exit_code = match cli.command {
+    match cli.command {
         Commands::Vault(args) => commands::vault::run(&args).await,
         Commands::Trade(args) => commands::trade::run(&args).await,
         Commands::Trustline(args) => commands::trustline::run(&args).await,
@@ -356,9 +395,7 @@ async fn main() {
         Commands::Profile(args) => commands::profile::run(&args).await,
         Commands::Toolsets(args) => commands::toolsets::run(&args).await,
         Commands::SmartAccount(args) => commands::smart_account::run(&args).await,
-    };
-
-    std::process::exit(exit_code);
+    }
 }
 
 /// Reports an argument-parsing outcome that ends the process and returns the
