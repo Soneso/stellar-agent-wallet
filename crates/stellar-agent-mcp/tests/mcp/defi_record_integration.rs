@@ -335,6 +335,7 @@ async fn exercise(tool: Tool, initially_confirmed: bool, fault: Option<SignerFau
             .set_password(stored_seed)
             .unwrap();
     }
+    crate::common::store_signer_identity("svc", &source, seed);
     if matches!(fault, Some(SignerFault::StoreFailure)) {
         keyring_mock::inject_error(
             "svc",

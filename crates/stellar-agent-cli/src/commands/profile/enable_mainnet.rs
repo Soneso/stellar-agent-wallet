@@ -325,7 +325,8 @@ pub(super) fn execute(
             let key = stellar_strkey::ed25519::PublicKey::from_string(&pin)
                 .map_err(|e| e.to_string())?
                 .0;
-            enrolled_signer(name, profile_dir, profile, EnrolledRole::Agent, &key)
+            let owner = owner.as_ref().map_err(Clone::clone)?;
+            enrolled_signer(name, profile_dir, profile, EnrolledRole::Agent, &key, owner)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         });
@@ -838,7 +839,9 @@ mod tests {
             );
             put(
                 &signer_identity_entry_ref(&profile.mcp_signer_default),
-                &SignerIdentityRecord::agent([2; 32]).render(),
+                &SignerIdentityRecord::signed_for_test([2; 32], "operator", &profile, &owner)
+                    .render()
+                    .unwrap(),
             );
             let mut body = FULL.parse::<toml_edit::DocumentMut>().unwrap();
             body.remove("mainnet");
@@ -1164,6 +1167,64 @@ mod tests {
     }
     #[test]
     #[serial]
+    fn enablement_refuses_a_transplanted_signer() {
+        let mut f = Fixture::new();
+        let original = f.profile.clone();
+        f.profile.mcp_signer_default.service = KeyringEntryRef::default_signer("v").service;
+        let profiles = f.dir.path().join("profiles");
+        loader::save_to_dir("v", &original, &profiles).unwrap();
+        std::fs::rename(
+            profiles.join("v.toml"),
+            f.dir.path().join("removed-profile"),
+        )
+        .unwrap();
+        loader::save_to_dir("operator", &f.profile, &profiles).unwrap();
+        put(
+            &signer_identity_entry_ref(&f.profile.mcp_signer_default),
+            &SignerIdentityRecord::signed_for_test([2; 32], "v", &f.profile, &f.owner)
+                .render()
+                .unwrap(),
+        );
+        assert!(
+            stellar_agent_core::profile::key_scope::key_scope_findings_in_dir(
+                &f.profile, "operator", &profiles
+            )
+            .is_empty()
+        );
+        f.args.check = true;
+        let result = f.run().unwrap();
+        let (status, detail) = check_of(&result, "enrolled_signer");
+        assert_eq!(status, "failed");
+        assert!(detail.unwrap().contains("bound_elsewhere"));
+        assert_eq!(check_of(&result, "key_scope").0, "passed");
+    }
+
+    #[test]
+    #[serial]
+    fn an_unbound_signer_names_the_bind_signer_remedy() {
+        let mut f = Fixture::new();
+        put(
+            &signer_identity_entry_ref(&f.profile.mcp_signer_default),
+            &SignerIdentityRecord::agent([2; 32], "operator", f.profile.chain_id)
+                .render()
+                .unwrap(),
+        );
+        f.args.check = true;
+        let result = f.run().unwrap();
+        let (status, detail) = check_of(&result, "enrolled_signer");
+        assert_eq!(status, "failed");
+        let detail = detail.unwrap();
+        assert!(detail.contains("(unbound)"), "{detail}");
+        assert!(
+            detail.contains(
+                "stellar-agent profile bind-signer --profile operator --owner-secret-env <VAR>"
+            ),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn check_before_enablement_reports_a_first_use_pin_and_creates_nothing() {
         for window in ["absent/state.window", "state.window"] {
             let mut fixture = Fixture::new();
@@ -1464,7 +1525,7 @@ mod tests {
         for item in &expected_items {
             let (status, detail) = check_of(&output, item);
             let expected = match item.as_str() {
-                "owner_key" | "verified_policy" => (
+                "owner_key" | "verified_policy" | "enrolled_signer" => (
                     "failed",
                     Some(
                         "owner key is in the older base64 form; enroll the owner public key again"
@@ -1935,7 +1996,14 @@ mod tests {
         );
         put(
             &signer_identity_entry_ref(&fixture.profile.mcp_signer_default),
-            &SignerIdentityRecord::agent([2; 32]).render(),
+            &SignerIdentityRecord::signed_for_test(
+                [2; 32],
+                "operator",
+                &fixture.profile,
+                &fixture.owner,
+            )
+            .render()
+            .unwrap(),
         );
         let before = std::fs::read(fixture.path()).unwrap();
         assert_eq!(
@@ -2025,7 +2093,14 @@ mod tests {
                 }
                 "signer" => put(
                     &signer_identity_entry_ref(&fixture.profile.mcp_signer_default),
-                    &SignerIdentityRecord::agent([3; 32]).render(),
+                    &SignerIdentityRecord::signed_for_test(
+                        [3; 32],
+                        "operator",
+                        &fixture.profile,
+                        &fixture.owner,
+                    )
+                    .render()
+                    .unwrap(),
                 ),
                 _ => {
                     fixture.profile.policy_window_state_key_id =

@@ -470,6 +470,7 @@ async fn mpp_charge_commit_refuses_tip_anchor_mismatch_when_the_log_is_rolled_ba
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_named_signer_identity(PROFILE, SIGNER_SERVICE, &payer_g, seed);
 
     let mut profile =
         Profile::builder_testnet_named(PROFILE, SIGNER_SERVICE, &payer_g, "n-svc", "n-acct")
@@ -600,6 +601,7 @@ async fn mpp_accounting_cap_refusal_withholds_the_credential() {
         .unwrap()
         .set_password(&sstrkey_for_seed(seed))
         .unwrap();
+    crate::common::store_named_signer_identity(PROFILE, SIGNER_SERVICE, &payer, seed);
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(SponsoredSimulateResponder::new(payer_sc_address(&payer)))
@@ -681,6 +683,7 @@ async fn x402_accounting_cap_refusal_withholds_the_payment_signature() {
         .unwrap()
         .set_password(&sstrkey_for_seed(seed))
         .unwrap();
+    crate::common::store_named_signer_identity(PROFILE, SIGNER_SERVICE, &payer, seed);
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(SponsoredSimulateResponder::new(payer_sc_address(&payer)))
@@ -793,6 +796,7 @@ async fn mpp_fixture(
             .set_password(&sstrkey_for_seed(seed))
             .expect("set_password");
     }
+    crate::common::store_named_signer_identity(profile_name, SIGNER_SERVICE, &payer, seed);
     let mut profile =
         Profile::builder_testnet_named(profile_name, SIGNER_SERVICE, &payer, "n-svc", "n-acct")
             .with_noop_engine()

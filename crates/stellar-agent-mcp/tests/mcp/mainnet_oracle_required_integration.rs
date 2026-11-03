@@ -154,12 +154,16 @@ fn enable(profile: &Profile) {
     );
     put(
         &signer_identity_entry_ref(&profile.mcp_signer_default),
-        &SignerIdentityRecord::agent(
+        &SignerIdentityRecord::signed_for_test(
             ed25519_dalek::SigningKey::from_bytes(&AGENT_SEED)
                 .verifying_key()
                 .to_bytes(),
+            "operator",
+            profile,
+            &owner,
         )
-        .render(),
+        .render()
+        .unwrap(),
     );
     for key in [
         &profile.policy_window_state_key_id,

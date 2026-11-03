@@ -670,7 +670,7 @@ where
 
     // ── Load signer from keyring ──────────────────────────────────────────────
     let expected_g = profile.mcp_signer_default.account.as_str();
-    let signer_handle = enrolled_keyring_signer(profile_name, profile, expected_g)
+    let signer_handle = enrolled_keyring_signer(profile_name, profile, expected_g, None)
         .await
         .map_err(|e| {
             let (code, message) = signer_load_failure_parts(&e);
@@ -2053,6 +2053,7 @@ mod tests {
                 ),
             )
             .unwrap();
+        crate::common::identity_fixture::store_signer_identity_of_seed(name, &profile, SEED);
         let audit_writer =
             crate::commands::value_audit::require_value_audit_writer(&profile, name).unwrap();
 
@@ -2183,6 +2184,7 @@ mod tests {
                 ),
             )
             .unwrap();
+        crate::common::identity_fixture::store_signer_identity_of_seed(name, &profile, SEED);
         (profile, from, home, home_guard)
     }
 
@@ -2454,6 +2456,7 @@ mod tests {
                     )
                     .unwrap();
             }
+            crate::common::identity_fixture::store_signer_identity_of_account(NAME, &profile);
 
             // An earlier keyed call caches the writer in this process.
             let _cached = AuditWriterRegistry::get_or_open_keyed(
@@ -2616,6 +2619,9 @@ mod tests {
                     .as_str(),
             )
             .unwrap();
+            crate::common::identity_fixture::store_signer_identity_of_seed(
+                &name, &profile, [0x5d; 32],
+            );
             let args = TrustlineArgs {
                 profile: Some(name),
                 from,

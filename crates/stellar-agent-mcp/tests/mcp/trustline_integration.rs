@@ -205,6 +205,7 @@ async fn trustline_commit_full_round_trip_succeeds_with_string_encoded_limit() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let source_key_xdr = account_ledger_key_xdr(&source_g);
     // 10_000_000 XLM: comfortably covers the base reserve and fee.
@@ -428,6 +429,7 @@ async fn simulate_nonce_mint_failed_envelope_shape() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let source_key_xdr = account_ledger_key_xdr(&source_g);
     let source_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
@@ -501,6 +503,7 @@ async fn commit_rejects_invalid_from_strkey_before_any_rpc_call() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let source_key_xdr = account_ledger_key_xdr(&source_g);
     let source_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
@@ -611,6 +614,7 @@ async fn commit_endpoint_network_mismatch_refuses_without_burning_nonce() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
 
     let source_key_xdr = account_ledger_key_xdr(&source_g);
     let source_xdr = account_entry_xdr_with_balance(&source_g, 100_000_000_000_000);
@@ -733,6 +737,7 @@ async fn prepare_and_commit_send_the_primary_credential() {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
     let mock_server = MockServer::start().await;
     crate::common::require_rpc_credential(&mock_server).await;
     Mock::given(method("POST"))
@@ -866,6 +871,7 @@ async fn trustline_endpoint(seed: [u8; 32]) -> (MockServer, String) {
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", "acct", seed);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(TrustlineSubmitSuccessRpcResponder {
@@ -1187,6 +1193,7 @@ async fn witness_trustline_case(case: TrustlineCase, expected: &str) {
         .unwrap()
         .set_password(&sstrkey_for_seed([0x73; 32]))
         .unwrap();
+    crate::common::store_signer_identity("svc", &account, [0x73; 32]);
     let entries = vec![
         (
             account_ledger_key_xdr(&source),

@@ -120,6 +120,7 @@ fn timeout_server(
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_signer_identity("svc", account, seed);
     let profile = crate::common::timeout_profile(mock_uri, account);
     let server = WalletServer::new(profile.clone()).expect("WalletServer::new");
     (profile, server, source_g)

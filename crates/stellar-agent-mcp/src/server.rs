@@ -908,6 +908,20 @@ impl WalletServer {
         } else {
             None
         };
+        if let Some(context) = &mainnet_context {
+            stellar_agent_network::keyring::read_and_check_signer_binding(
+                context.profile_name(),
+                context.profile(),
+                built
+                    .verified
+                    .as_ref()
+                    .map(|policy| policy.owner())
+                    .as_ref(),
+            )
+            .map_err(|error| BuildRegistryError::PolicyEngineError {
+                detail: error.to_string(),
+            })?;
+        }
         let context = mainnet_context.as_ref().map_or_else(
             || stellar_agent_network::NetworkContext::from_profile(&profile),
             |context| context.network_context(),
@@ -1788,6 +1802,13 @@ impl WalletServer {
         Some(guard.policy)
     }
 
+    /// The owner of the policy the server verified, which a mainnet
+    /// profile's signer identity record must name; `None` without a verified
+    /// policy.
+    pub(crate) fn established_owner(&self) -> Option<[u8; 32]> {
+        self.verified_policy.as_ref().map(|policy| policy.owner())
+    }
+
     pub(crate) fn mainnet_enrolled_signer(
         &self,
         guard: &MainnetWriteGuard<'_>,
@@ -1806,6 +1827,7 @@ impl WalletServer {
             &self.profile,
             stellar_agent_network::keyring::EnrolledRole::Agent,
             &pin.0,
+            &guard.policy.owner(),
         )
     }
 
@@ -1855,6 +1877,31 @@ mod tests {
     use stellar_agent_core::profile::schema::{MINIMUM_FLOOR, Profile};
 
     use super::*;
+
+    #[test]
+    #[cfg(feature = "mainnet-write")]
+    #[serial_test::serial(keyring)]
+    fn a_mainnet_server_with_an_unbound_signer_does_not_start() {
+        let f = crate::tools::common::tests::mainnet::Fixture::new(|raw| raw);
+        let profile = (*f.server.profile).clone();
+        let identity = stellar_agent_core::profile::schema::signer_identity_entry_ref(
+            &profile.mcp_signer_default,
+        );
+        let raw = format!(
+            r#"{{"v":1,"public_key":"{}","role":"agent"}}"#,
+            profile.mcp_signer_default.account
+        );
+        stellar_agent_network::keyring::write_keyring_string(&identity, &raw).unwrap();
+        let error = WalletServer::new_with_selection(
+            profile,
+            stellar_agent_core::profile::name::ProfileNameSource::Flag,
+            &stellar_agent_core::profile::schema::default_profile_dir().unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("unbound"), "{error}");
+        assert_eq!(f.seed_reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
 
     const SOURCE_G: &str = "GAQAA5L65LSYH7CQ3VTJ7F3HHLGCL3DSLAR2Y47263D56MNNGHSQSTVY";
 

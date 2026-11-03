@@ -374,13 +374,14 @@ where
     // ── Load signer ───────────────────────────────────────────────────────────
     let signer_entry_ref = &profile.mcp_signer_default;
     let expected_g = signer_entry_ref.account.as_str();
-    let signer_handle = match enrolled_keyring_signer(&profile_name, &profile, expected_g).await {
-        Ok(s) => s,
-        Err(e) => {
-            render_json(&Envelope::<()>::err(&e));
-            return 1;
-        }
-    };
+    let signer_handle =
+        match enrolled_keyring_signer(&profile_name, &profile, expected_g, None).await {
+            Ok(s) => s,
+            Err(e) => {
+                render_json(&Envelope::<()>::err(&e));
+                return 1;
+            }
+        };
 
     // ── Construct DefiAdapterCtx with full submit context ─────────────────────
     // The synthetic DefiContractPin carries the router address and network;

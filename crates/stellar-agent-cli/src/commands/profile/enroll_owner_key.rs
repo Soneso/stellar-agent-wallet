@@ -872,6 +872,7 @@ mod tests {
     impl Enabled {
         fn new() -> Self {
             use sha2::Digest as _;
+            use stellar_agent_core::profile::signer_identity::SignerIdentityRecord;
             use stellar_agent_core::{
                 mainnet::enablement::{read_enablement_nonce, verify_enablement},
                 policy::v1::{
@@ -920,10 +921,14 @@ mod tests {
             KeyringEntry::new(&identity.service, &identity.account)
                 .unwrap()
                 .set_password(
-                    &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+                    &SignerIdentityRecord::signed_for_test(
                         [2; 32],
+                        "operator",
+                        &profile,
+                        &ed25519_dalek::SigningKey::from_bytes(&[31; 32]),
                     )
-                    .render(),
+                    .render()
+                    .unwrap(),
                 )
                 .unwrap();
             let profiles = default_profile_dir().unwrap();

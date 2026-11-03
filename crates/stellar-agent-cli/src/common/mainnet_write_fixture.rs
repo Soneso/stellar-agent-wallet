@@ -51,8 +51,8 @@ use stellar_agent_test_support::{ProfileEnvVarGuard, StellarAgentHomeGuard};
 use wiremock::MockServer;
 
 use crate::commands::profile::{
-    enable_mainnet, enroll_owner_key, enroll_signer, rotate_attestation_key, rotate_audit_key,
-    rotate_nonce_key, sign_policy,
+    bind_signer, enable_mainnet, enroll_owner_key, enroll_signer, rotate_attestation_key,
+    rotate_audit_key, rotate_nonce_key, sign_policy,
 };
 use crate::common::mainnet_confirm::{clear_shown_summaries, shown_summaries};
 use crate::common::mainnet_presence::driver::{self, Ceremony, Driver, DriverGuard};
@@ -573,6 +573,22 @@ impl MainnetFixture {
             file: None,
         };
         require_runner("sign-policy", sign_policy::run(&sign).await);
+        if !spec.testnet {
+            #[derive(clap::Parser)]
+            struct BindSigner {
+                #[command(flatten)]
+                args: bind_signer::BindSignerArgs,
+            }
+            let bind = BindSigner::try_parse_from([
+                "bind-signer",
+                "--profile",
+                name,
+                "--owner-secret-env",
+                OWNER_VAR,
+            ])
+            .unwrap();
+            require_runner("bind-signer", bind_signer::run(&bind.args).await);
+        }
         if !spec.enable {
             return;
         }

@@ -5,9 +5,11 @@
 //! signer via `signer_from_keyring(&profile.mcp_signer_default, …)`.  That entry
 //! stores the seed as an `S…` ed25519 secret-key strkey — the exact form
 //! `signer_from_keyring` parses back with `PrivateKey::from_string`.  No other
-//! shipped command writes it; on a clean install the entry is absent and all
-//! MCP signing fails with `auth.keyring_not_found`.  This command closes that
-//! gap: it reads the operator's S-strkey from a named environment variable,
+//! shipped command writes it, so on a clean install all MCP signing fails.
+//! The enrolled-signer loader reports `auth.enrolled_identity_unusable`
+//! (`missing`) when the identity record is absent.  After the record passes
+//! validation, a missing seed reports `auth.keyring_not_found`.  This command
+//! closes that gap: it reads the operator's S-strkey from a named environment variable,
 //! derives the public address, and stores the S-strkey at the profile's
 //! `mcp_signer_default` coordinate.
 //!
@@ -49,7 +51,7 @@
 //! # Identity record
 //!
 //! After the seed write, enrollment writes the signer identity record
-//! `{"v":1,"public_key":"G...","role":"agent"}` at the signer's service,
+//! with its profile and chain at the signer's service,
 //! account `enrolled-identity`, and records a `signer_identity_enrolled` audit
 //! row. Mainnet authorization reads the enrolled key from that record, never
 //! from the seed. Success is reported only after the record is written. When
@@ -66,9 +68,11 @@
 //!
 //! `--repair-identity` is that remedy. It loads the existing seed through the
 //! zeroizing keyring loader, requires it to derive to the on-disk pin, and
-//! writes only the identity record. A record that already names the pinned key
-//! is left as it is; any other stored record refuses. The seed and the pin are
-//! never written by a repair.
+//! writes only the identity record. A version 2 record is left unchanged only
+//! when it names this profile, chain and pinned key; any other stored record
+//! refuses. A version 1 record requires a new enrollment with `--force` on
+//! testnet or `profile bind-signer` on mainnet. The seed and the pin are never
+//! written by a repair. Seed possession does not prove an owner binding.
 //!
 //! # Secret handling
 //!
@@ -207,6 +211,9 @@ struct EnrollSignerData {
     account_populated: bool,
     /// Keyring account of the signer identity record written beside the seed.
     identity_keyring_account: String,
+    /// The owner ceremony needed before mainnet signing; absent on testnet.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    next_steps: Vec<String>,
 }
 
 /// Success payload for the `enroll-signer --repair-identity` envelope.
@@ -335,6 +342,62 @@ where
     }
     if let Err(e) = init_keyring() {
         return render::write_envelope(out, &Envelope::<()>::err(&e), 1);
+    }
+
+    // The protected record is checked before seed access, deletion or a write.
+    let existing_identity = match read_keyring_string(&signer_identity_entry_ref(&signer_ref)) {
+        Ok(value) => value,
+        Err(error) => return render::write_envelope(out, &Envelope::<()>::err(&error), 1),
+    };
+    if existing_identity
+        .as_deref()
+        .and_then(|raw| SignerIdentityRecord::parse(raw).ok())
+        .and_then(|record| record.binding)
+        .is_some_and(|binding| binding.profile != profile_name || binding.chain != profile.chain_id)
+    {
+        return render::write_envelope(
+            out,
+            &Envelope::<()>::err_raw(
+                "enroll_signer.identity_bound_elsewhere",
+                "the signer identity serves another profile or chain",
+            ),
+            1,
+        );
+    }
+    if profile.chain_id.is_mainnet()
+        && signer_ref.service != KeyringEntryRef::default_signer(&profile_name).service
+    {
+        return render::write_envelope(
+            out,
+            &Envelope::<()>::err_raw(
+                "enroll_signer.coordinate_not_canonical",
+                "mainnet enrollment requires the profile's canonical signer service",
+            ),
+            1,
+        );
+    }
+    if args.repair_identity
+        && existing_identity
+            .as_deref()
+            .and_then(|raw| SignerIdentityRecord::parse(raw).ok())
+            .is_some_and(|record| record.binding.is_none())
+    {
+        let remedy = if profile.chain_id.is_mainnet() {
+            format!(
+                "a version 1 record needs `stellar-agent profile bind-signer --profile \
+                 {profile_name} --owner-secret-env <VAR>`"
+            )
+        } else {
+            format!(
+                "a version 1 record needs a new enrollment: `stellar-agent profile \
+                 enroll-signer --profile {profile_name} --secret-env <VAR> --force`"
+            )
+        };
+        return render::write_envelope(
+            out,
+            &Envelope::<()>::err_raw("enroll_signer.identity_conflict", remedy),
+            1,
+        );
     }
 
     if args.repair_identity {
@@ -599,11 +662,13 @@ where
     // ── The identity record beside the seed ───────────────────────────────────
     // The seed and the pin are committed. A failed record write leaves both,
     // and the operator writes the record alone with `--repair-identity`.
-    let record = match identity_record_for(&derived_g) {
-        Ok(record) => record,
+    let rendered = match identity_record_for(&derived_g, &profile_name, &profile)
+        .and_then(|record| render_identity(&record))
+    {
+        Ok(rendered) => rendered,
         Err(envelope) => return render::write_envelope(out, &envelope, 1),
     };
-    if let Err(error) = write_identity(&identity_ref, &record.render()) {
+    if let Err(error) = write_identity(&identity_ref, &rendered) {
         tracing::debug!(error = %error, "enroll-signer: identity record write failed");
         return render::write_envelope(
             out,
@@ -635,6 +700,13 @@ where
             previous_address,
             account_populated,
             identity_keyring_account: identity_ref.account,
+            next_steps: if profile.chain_id.is_mainnet() {
+                vec![format!(
+                    "stellar-agent profile bind-signer --profile {profile_name} --owner-secret-env <VAR>"
+                )]
+            } else {
+                Vec::new()
+            },
         }),
         0,
     )
@@ -683,14 +755,27 @@ fn check_expected_address(
 }
 
 /// The identity record for the agent key `public_g`.
-fn identity_record_for(public_g: &str) -> Result<SignerIdentityRecord, Envelope<()>> {
+fn identity_record_for(
+    public_g: &str,
+    name: &str,
+    profile: &Profile,
+) -> Result<SignerIdentityRecord, Envelope<()>> {
     stellar_strkey::ed25519::PublicKey::from_string(public_g)
-        .map(|key| SignerIdentityRecord::agent(key.0))
+        .map(|key| SignerIdentityRecord::agent(key.0, name, profile.chain_id))
         .map_err(|_| {
             Envelope::<()>::err(&WalletError::Internal(InternalError::UnexpectedState {
                 detail: "the derived signer address is not a G-strkey".to_owned(),
             }))
         })
+}
+
+/// The stored form of the owner-free record `record`.
+fn render_identity(record: &SignerIdentityRecord) -> Result<String, Envelope<()>> {
+    record.render().map_err(|error| {
+        Envelope::<()>::err(&WalletError::Internal(InternalError::UnexpectedState {
+            detail: format!("the signer identity record cannot be rendered: {error}"),
+        }))
+    })
 }
 
 /// The partial-enrollment refusal: the seed and the pin are written, the
@@ -757,9 +842,9 @@ fn identity_removed_before_failed_seed(
 /// `--repair-identity` asks.
 ///
 /// The on-disk pin must name a G-strkey, and the seed stored at that
-/// coordinate must derive to it. A stored record that names the pin as an
-/// agent key is left as it is; any other stored record refuses. Writes only
-/// the record.
+/// coordinate must derive to it. A version 2 record that names this profile,
+/// chain and pinned key is left as it is; any other stored record refuses.
+/// Writes only the record.
 async fn repair_identity<WriteIdentity>(
     args: &EnrollSignerArgs,
     profile: &Profile,
@@ -801,14 +886,18 @@ where
     ) {
         return render::write_envelope(out, &envelope, 1);
     }
-    let record = match identity_record_for(&derived) {
+    let record = match identity_record_for(&derived, profile_name, profile) {
         Ok(record) => record,
         Err(envelope) => return render::write_envelope(out, &envelope, 1),
     };
     let identity_ref = signer_identity_entry_ref(signer_ref);
     let written = match read_keyring_string(&identity_ref) {
         Ok(None) => {
-            if let Err(error) = write_identity(&identity_ref, &record.render()) {
+            let rendered = match render_identity(&record) {
+                Ok(rendered) => rendered,
+                Err(envelope) => return render::write_envelope(out, &envelope, 1),
+            };
+            if let Err(error) = write_identity(&identity_ref, &rendered) {
                 return render::write_envelope(out, &Envelope::<()>::err(&error), 1);
             }
             let request_id = Uuid::new_v4().to_string();
@@ -823,7 +912,12 @@ where
             true
         }
         Ok(Some(stored)) => {
-            if SignerIdentityRecord::parse(&stored).ok() != Some(record) {
+            if !SignerIdentityRecord::parse(&stored).is_ok_and(|stored| {
+                stored.public_key() == record.public_key()
+                    && stored.binding.as_ref().is_some_and(|binding| {
+                        binding.profile == profile_name && binding.chain == profile.chain_id
+                    })
+            }) {
                 return render::write_envelope(
                     out,
                     &Envelope::<()>::err_raw(
@@ -831,8 +925,7 @@ where
                         format!(
                             "keyring service '{}' account '{}' holds an identity record that \
                              does not name the pinned signer {derived} as the agent key; the \
-                             repair writes nothing. Remove that entry, then run the repair \
-                             again.",
+                             repair writes nothing. Remove that entry, then run the repair again.",
                             identity_ref.service, identity_ref.account
                         ),
                     ),
@@ -1450,8 +1543,11 @@ mod tests {
             stellar_strkey::ed25519::PublicKey::from_string(g)
                 .unwrap()
                 .0,
+            "enroll-signer-test",
+            stellar_agent_core::profile::caip2::Caip2::Testnet,
         )
         .render()
+        .unwrap()
     }
 
     fn repair_args() -> EnrollSignerArgs {
@@ -1509,6 +1605,175 @@ mod tests {
             "enrolled-identity"
         );
         assert_eq!(stored_identity(), Some(agent_record_of(&derived_g)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn enrollment_writes_a_profile_bound_record() {
+        keyring_mock::install().unwrap();
+        let (secret, address) = seed_material([0x61; 32]);
+        let var = unique_var("BOUND");
+        let _env = EnvGuard::set(var.clone(), &secret);
+        let profile = profile_with_signer_account(&address);
+        let mut output = Vec::new();
+        let code = run_with_dependencies(
+            &args(&var, None, false),
+            |_| Ok(profile.clone()),
+            raw_ref_of(&profile),
+            pin_signer_must_not_be_called,
+            || Ok(()),
+            |name| std::env::var(name),
+            write_keyring_string,
+            &mut output,
+        )
+        .await;
+        assert_eq!(code, 0);
+        let record = SignerIdentityRecord::parse(&stored_identity().unwrap()).unwrap();
+        let binding = record.binding.unwrap();
+        assert_eq!(binding.profile, "enroll-signer-test");
+        assert_eq!(binding.chain, profile.chain_id);
+        assert_eq!(binding.owner, None);
+        let json = render::single_json_document(&output);
+        assert!(json["data"].get("next_steps").is_none(), "{json}");
+    }
+
+    /// A mainnet profile for these tests, at the canonical signer service.
+    fn mainnet_profile_with_signer_account(account: &str) -> Profile {
+        let signer = KeyringEntryRef::default_signer("enroll-signer-test");
+        Profile::builder_mainnet_named(
+            "enroll-signer-test",
+            "https://rpc.example.invalid",
+            &signer.service,
+            account,
+            "stellar-agent-nonce-enroll-test",
+            "enroll-signer-test",
+        )
+        .build()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn mainnet_enrollment_names_the_bind_signer_step() {
+        keyring_mock::install().unwrap();
+        let (secret, address) = seed_material([0x65; 32]);
+        let var = unique_var("MAINNET_NEXT");
+        let _env = EnvGuard::set(var.clone(), &secret);
+        let profile = mainnet_profile_with_signer_account(&address);
+        let mut output = Vec::new();
+        let code = run_with_dependencies(
+            &args(&var, None, false),
+            |_| Ok(profile.clone()),
+            raw_ref_of(&profile),
+            pin_signer_must_not_be_called,
+            || Ok(()),
+            |name| std::env::var(name),
+            write_keyring_string,
+            &mut output,
+        )
+        .await;
+        let json = render::single_json_document(&output);
+        assert_eq!(code, 0, "{json}");
+        assert_eq!(
+            json["data"]["next_steps"],
+            serde_json::json!([
+                "stellar-agent profile bind-signer --profile enroll-signer-test --owner-secret-env <VAR>"
+            ])
+        );
+        let stored = read_keyring_string(&signer_identity_entry_ref(&profile.mcp_signer_default))
+            .unwrap()
+            .unwrap();
+        let binding = SignerIdentityRecord::parse(&stored)
+            .unwrap()
+            .binding
+            .unwrap();
+        assert_eq!(binding.chain, profile.chain_id);
+        assert_eq!(binding.owner, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn force_never_removes_a_record_bound_elsewhere() {
+        for force in [true, false] {
+            keyring_mock::install().unwrap();
+            let (secret, address) = seed_material([0x62; 32]);
+            let var = unique_var("FOREIGN");
+            let _env = EnvGuard::set(var.clone(), &secret);
+            let profile = profile_with_signer_account(&address);
+            let record = SignerIdentityRecord::agent([0x63; 32], "v", profile.chain_id)
+                .render()
+                .unwrap();
+            write_keyring_string(&identity_ref(), &record).unwrap();
+            let mut output = Vec::new();
+            let code = run_with_dependencies(
+                &args(&var, None, force),
+                |_| Ok(profile.clone()),
+                raw_ref_of(&profile),
+                pin_signer_must_not_be_called,
+                || Ok(()),
+                |name| std::env::var(name),
+                write_keyring_string,
+                &mut output,
+            )
+            .await;
+            assert_eq!(code, 1);
+            assert_eq!(
+                render::single_json_document(&output)["error"]["code"],
+                "enroll_signer.identity_bound_elsewhere"
+            );
+            assert_eq!(stored_identity(), Some(record));
+            assert!(
+                read_keyring_string(&profile.mcp_signer_default)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    /// A stored v1 record refuses the repair on both chains, unchanged, and
+    /// the refusal names the chain's remedy for the selected profile: a new
+    /// enrollment on testnet, the owner binding on mainnet.
+    #[tokio::test]
+    #[serial]
+    async fn repair_does_not_upgrade_a_v1_record() {
+        let (secret, address) = seed_material([0x64; 32]);
+        for (profile, remedy) in [
+            (
+                profile_with_signer_account(&address),
+                "stellar-agent profile enroll-signer --profile enroll-signer-test --secret-env <VAR> --force",
+            ),
+            (
+                mainnet_profile_with_signer_account(&address),
+                "stellar-agent profile bind-signer --profile enroll-signer-test --owner-secret-env <VAR>",
+            ),
+        ] {
+            keyring_mock::install().unwrap();
+            let identity = signer_identity_entry_ref(&profile.mcp_signer_default);
+            write_keyring_string(&profile.mcp_signer_default, &secret).unwrap();
+            let record = format!(r#"{{"v":1,"public_key":"{address}","role":"agent"}}"#);
+            write_keyring_string(&identity, &record).unwrap();
+            let mut output = Vec::new();
+            let code = run_with_dependencies(
+                &repair_args(),
+                |_| Ok(profile.clone()),
+                raw_ref_of(&profile),
+                pin_signer_must_not_be_called,
+                || Ok(()),
+                |_| panic!("repair reads no environment seed"),
+                write_keyring_string,
+                &mut output,
+            )
+            .await;
+            assert_eq!(code, 1);
+            let json = render::single_json_document(&output);
+            assert_eq!(json["error"]["code"], "enroll_signer.identity_conflict");
+            let message = json["error"]["message"].as_str().unwrap();
+            assert!(message.contains(remedy), "{message}");
+            assert_eq!(
+                read_keyring_string(&identity).unwrap(),
+                Some(record),
+                "the v1 record stays as it is"
+            );
+        }
     }
 
     #[tokio::test]

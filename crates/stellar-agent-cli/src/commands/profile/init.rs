@@ -436,6 +436,9 @@ fn next_steps(profile_name: &str, engine: PolicyEngineKind, network: TargetNetwo
              <VAR>` to sign the V1 policy file."
         ));
         if network == TargetNetwork::Mainnet {
+            steps.push(format!(
+                "Run `stellar-agent profile bind-signer --profile {profile_name} --owner-secret-env <VAR>` before `profile enable-mainnet` to bind the signer to its owner."
+            ));
             steps.push(
                 "Set `oracle_provider_url`, `[providers.oracle]`, and `[providers.primary]` in \
                  the profile file. Choose an independently administered endpoint on a different \
@@ -1019,20 +1022,21 @@ mod tests {
     #[test]
     fn next_steps_for_mainnet_v1_end_with_the_oracle_setting() {
         let steps = next_steps("alpha", PolicyEngineKind::V1, TargetNetwork::Mainnet);
-        assert_eq!(steps.len(), 8, "{steps:#?}");
-        assert!(steps[7].contains("`oracle_provider_url`"), "{}", steps[7]);
-        assert!(steps[7].contains("`[providers.oracle]`"), "{}", steps[7]);
-        assert!(steps[7].contains("`[providers.primary]`"), "{}", steps[7]);
-        assert!(steps[7].contains("different host"), "{}", steps[7]);
+        assert_eq!(steps.len(), 9, "{steps:#?}");
+        assert!(steps[7].contains("profile bind-signer --profile alpha --owner-secret-env <VAR>"));
+        assert!(steps[8].contains("`oracle_provider_url`"), "{}", steps[8]);
+        assert!(steps[8].contains("`[providers.oracle]`"), "{}", steps[8]);
+        assert!(steps[8].contains("`[providers.primary]`"), "{}", steps[8]);
+        assert!(steps[8].contains("different host"), "{}", steps[8]);
         assert!(
-            steps[7].contains(
+            steps[8].contains(
                 "`stellar-agent profile enable-mainnet` and every mainnet write refuse a \
                  mainnet profile without `oracle_provider_url` with \
                  `profile.mainnet_oracle_required`"
             ),
             "{}",
-            steps[7]
+            steps[8]
         );
-        assert!(!steps[7].contains("skipped"), "{}", steps[7]);
+        assert!(!steps[8].contains("skipped"), "{}", steps[8]);
     }
 }

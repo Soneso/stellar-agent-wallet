@@ -205,7 +205,10 @@ coordinates. Read-only tools work under it. The simulate steps of
 report `nonce.mint_failed` until that entry holds a key. `stellar_rule_create`
 mints no envelope nonce: it stores the proposal, and its commit requires that
 proposal's `approval_nonce`. Signer keyring
-access fails until a profile names a populated signer entry. Most tools report `auth.keyring_not_found`.
+access fails until the profile's signer is enrolled. The enrolled-signer loader
+reports `auth.enrolled_identity_unusable` (`missing`) when the identity record
+is absent. After the record passes validation, a missing seed reports
+`auth.keyring_not_found` on most tools.
 The SEP-43 sign tools report `sep43.wallet_unlock_failed`.
 `stellar_sep53_sign_message` reports `sep53.keyring_load_failed`, and
 `stellar_mpp_charge_commit` reports `mpp.signing_failed`.

@@ -374,6 +374,15 @@ impl WalletServer {
         ) {
             return Ok(business_error_result(error.code(), error.to_string()));
         }
+        // The identity record must serve this profile before the lazy handle
+        // can read the seed at the signing call.
+        if let Err(error) = stellar_agent_network::keyring::read_and_check_signer_binding(
+            &profile_name,
+            &self.profile,
+            self.established_owner().as_ref(),
+        ) {
+            return Ok(business_error_result(error.code(), error.to_string()));
+        }
         let signer = match lazy_signer_from_keyring(
             &self.profile.mcp_signer_default,
             &self.profile.mcp_signer_default.account,

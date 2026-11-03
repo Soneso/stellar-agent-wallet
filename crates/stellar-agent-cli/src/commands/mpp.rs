@@ -461,6 +461,13 @@ async fn commit_cli(
     if let Err(error) = drain_consent_rows_before_signing(profile, profile_name) {
         return render_wallet_error(&error);
     }
+    // The identity record must serve this profile before the lazy handle can
+    // read the seed at the signing call. MPP runs on testnet only.
+    if let Err(error) =
+        stellar_agent_network::keyring::read_and_check_signer_binding(profile_name, profile, None)
+    {
+        return render_wallet_error(&error);
+    }
     let signer = match lazy_signer_from_keyring(
         &profile.mcp_signer_default,
         &profile.mcp_signer_default.account,
@@ -1645,6 +1652,7 @@ mod tests {
             .mount(&mock)
             .await;
         let profile = stage_profile(name, &payer, home.path(), &mock.uri());
+        crate::common::identity_fixture::store_signer_identity_of_seed(name, &profile, seed);
         StageCase {
             _home: home,
             _guard: guard,

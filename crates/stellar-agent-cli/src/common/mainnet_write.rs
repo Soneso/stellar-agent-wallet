@@ -393,6 +393,7 @@ pub(crate) async fn authorize_and_submit(
         profile,
         EnrolledRole::Agent,
         &source_key,
+        &policy.verified.owner(),
     )
     .map_err(|e| enrollment_refusal(&e, &choice))?;
 

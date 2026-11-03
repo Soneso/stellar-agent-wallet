@@ -124,7 +124,9 @@ fn a_fresh_v1_profile_through_inits_order_passes_audit_verify() {
             .unwrap()
             .get_password()
             .unwrap(),
-        SignerIdentityRecord::agent(signer_bytes).render(),
+        SignerIdentityRecord::agent(signer_bytes, PROFILE, profile.chain_id)
+            .render()
+            .unwrap(),
         "enroll-signer stores the identity record beside the seed"
     );
 }

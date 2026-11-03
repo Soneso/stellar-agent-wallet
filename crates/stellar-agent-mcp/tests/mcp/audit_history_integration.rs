@@ -55,6 +55,7 @@ async fn settle_then_rotate(seed: [u8; 32]) -> RotatedSettlement {
                 .to_string(),
         )
         .unwrap();
+    crate::common::store_signer_identity("svc", source, seed);
     let rpc = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(

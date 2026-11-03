@@ -29,6 +29,7 @@
 //! to [`run`], which delegates to the appropriate subcommand handler.
 
 pub mod audit_emit;
+pub mod bind_signer;
 pub mod enable_mainnet;
 pub mod enroll_owner_key;
 pub mod enroll_rpc_credential;
@@ -64,6 +65,8 @@ pub struct ProfileArgs {
 #[derive(Debug, Subcommand)]
 #[non_exhaustive]
 pub enum ProfileSubcommand {
+    /// Bind the enrolled mainnet signer to the profile and established owner.
+    BindSigner(bind_signer::BindSignerArgs),
     /// Bind a named mainnet profile to this installation and signed policy.
     EnableMainnet(enable_mainnet::EnableMainnetArgs),
     /// Create and persist a new profile TOML.
@@ -207,6 +210,7 @@ pub enum ProfileSubcommand {
 /// Never panics.
 pub async fn run(args: &ProfileArgs) -> i32 {
     match &args.subcommand {
+        ProfileSubcommand::BindSigner(a) => bind_signer::run(a).await,
         ProfileSubcommand::EnableMainnet(a) => enable_mainnet::run(a),
         ProfileSubcommand::Init(a) => init::run(a).await,
         ProfileSubcommand::List(a) => list::run(a).await,
@@ -243,6 +247,7 @@ impl ProfileArgs {
     /// `required`, so their accessor is returned directly.
     pub(crate) fn profile_flag(&self) -> Option<&str> {
         match &self.subcommand {
+            ProfileSubcommand::BindSigner(a) => Some(&a.profile),
             ProfileSubcommand::EnableMainnet(a) => a.profile.as_deref(),
             ProfileSubcommand::Init(a) => a.profile.as_deref(),
             ProfileSubcommand::EnrollSigner(a) => a.profile.as_deref(),

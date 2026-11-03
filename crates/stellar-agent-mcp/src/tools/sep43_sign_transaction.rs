@@ -185,6 +185,7 @@ impl WalletServer {
             &self.profile_name_for_approval(),
             &self.profile,
             account,
+            self.established_owner().as_ref(),
         )
         .await
         {
@@ -195,6 +196,7 @@ impl WalletServer {
                     stellar_agent_core::error::WalletError::Auth(
                         stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
                             | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. }
+                            | stellar_agent_core::error::AuthError::EnrolledIdentityUnusable { .. }
                     )
                 ) {
                     return Ok(crate::tools::common::business_error_result(
@@ -502,6 +504,44 @@ mod tests {
         );
     }
 
+    /// A testnet profile naming the seed coordinate of mainnet profile `v`
+    /// gets no transaction signature: the record bound to `v` refuses before
+    /// the seed is read, with `v.toml` absent from the profiles directory.
+    #[tokio::test]
+    #[serial_test::serial(keyring)]
+    async fn a_signer_bound_elsewhere_refuses_transaction_signing() {
+        let mut fixture = crate::tools::message_signing_tests::Fixture::new();
+        let reads = fixture.transplant_from_mainnet_victim();
+        let mut builder = stellar_agent_network::builder::ClassicOpBuilder::new(
+            &fixture.account,
+            1,
+            "Test SDF Network ; September 2015",
+            100,
+        );
+        builder
+            .payment(
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                stellar_agent_core::StellarAmount::from_stroops(10_000_000),
+                &stellar_agent_network::builder::Asset::parse("native").expect("native asset"),
+            )
+            .expect("payment op");
+        let result = fixture
+            .server()
+            .call_stellar_sep43_sign_transaction(Sep43SignTransactionArgs {
+                chain_id: "stellar:testnet".to_owned(),
+                transaction_xdr: builder.build().expect("valid envelope"),
+                network_passphrase: None,
+                address: None,
+            })
+            .await
+            .expect("a refusal is a business envelope");
+        let (code, message, text) = crate::tools::common::assert_business_envelope(&result);
+        assert_eq!(code, "auth.enrolled_identity_unusable", "{text}");
+        assert!(message.contains("(bound_elsewhere)"), "{message}");
+        assert!(!text.contains("signedTxXdr"), "{text}");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     /// A successful sign records an `opaque_payload_signed` row carrying the
     /// redacted payload digest at the profile's configured audit log path.
     #[tokio::test]
@@ -542,6 +582,7 @@ mod tests {
             .expect("Entry::new for audit key")
             .set_password(&key_b64)
             .expect("set_password for audit key");
+        crate::tools::identity_fixture::store_signer_identity(&profile, seed);
         let server = crate::server::WalletServer::new(profile).expect("WalletServer::new in tests");
 
         // A minimal valid testnet envelope built offline (source = the

@@ -35,6 +35,8 @@
 
 pub(crate) mod consent;
 #[cfg(test)]
+pub(crate) mod identity_fixture;
+#[cfg(test)]
 pub(crate) mod installation_key_fixture;
 pub(crate) mod mainnet_confirm;
 pub(crate) mod mainnet_presence;

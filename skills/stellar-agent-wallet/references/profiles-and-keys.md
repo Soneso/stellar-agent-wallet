@@ -675,6 +675,12 @@ stellar-agent profile sign-policy --profile operator --secret-env NEW_OWNER_SEED
 stellar-agent profile enroll-owner-key --profile operator --secret-env NEW_OWNER_SEED --force
 ```
 
+The next verified load, at MCP startup or a mainnet write, advances the pin to
+the new owner and refuses with `auth.enrolled_identity_unusable`
+(`owner_mismatch`) until the signer is bound to that owner. Then run
+`stellar-agent profile bind-signer --profile operator --owner-secret-env NEW_OWNER_SEED`
+and restart the MCP server.
+
 Supply each variable through the secret-entry procedure and unset both afterward.
 If signing uses `--file`, install that file at `policies/operator.toml` before
 running enrollment. The previous seed must match the pinned owner, or the
@@ -728,8 +734,10 @@ The signer seed is imported, not minted. `stellar-agent profile enroll-signer`
 reads the operator's `S...` ed25519 secret from a named environment variable and
 stores it verbatim at the profile's `mcp_signer_default` keyring coordinate — the
 signer every MCP fund-movement tool and every keyring-signing CLI verb
-(`trustline`, `trade`, `vault`) resolves. On a clean install that entry
-is absent and those paths fail with `auth.keyring_not_found`.
+(`trustline`, `trade`, `vault`) resolves. On a clean install those paths fail.
+The enrolled-signer loader reports `auth.enrolled_identity_unusable` (`missing`)
+when the identity record is absent. After the record passes validation, a
+missing seed reports `auth.keyring_not_found`.
 
 The operator sets `WALLET_SK` as [Pass a secret seed](https://github.com/Soneso/stellar-agent-wallet/blob/main/docs/getting-started.md#pass-a-secret-seed) shows. In the operator's terminal, run this line on its own, paste the signer seed when prompted, and press Enter. The line reads the seed from the terminal, so the operator runs it, not the agent.
 
@@ -786,7 +794,8 @@ build, enablement, a signed v2 policy, and approval for each action.
 The first enablement requires a signed v2 policy and pins its sequence, digest,
 and owner before storing the nonce. A v1 or unsigned policy is refused and
 nothing is written. Prepare this policy without `[mainnet]`, sign it, run
-`enable-mainnet`, then complete and sign the bound policy. The completed policy
+`bind-signer` with the owner's seed, run `enable-mainnet`, then complete and
+sign the bound policy. The completed policy
 lists at least one [approval credential](#approval-credentials).
 An installation with a stored enablement nonce refuses an absent pin with
 `policy.pin_absent`: every mainnet write and both forms of `enable-mainnet`

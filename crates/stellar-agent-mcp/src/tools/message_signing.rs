@@ -17,9 +17,10 @@ impl WalletServer {
     ///
     /// The order is fixed: an overlaid `mcp_signer_default` refuses with
     /// `profile.non_overlayable_field`, then the message-signing key scope
-    /// refuses with `profile.key_scope_conflict`, then the audit pre-flight
+    /// refuses with `profile.key_scope_conflict`, then the protected signer
+    /// binding refuses with `auth.enrolled_identity_unusable`, then the audit pre-flight
     /// refuses with its `audit.*` code. These checks read profile files and the
-    /// audit chain key only, never the signing key.
+    /// identity record and audit chain key only, never the signing key.
     pub(crate) fn message_signing_preflight(
         &self,
     ) -> Result<Arc<Mutex<AuditWriter>>, CallToolResult> {
@@ -41,6 +42,12 @@ impl WalletServer {
             let error = ValidationError::from(conflict);
             business_error_result(error.code(), error.to_string())
         })?;
+        stellar_agent_network::keyring::read_and_check_signer_binding(
+            &profile_name,
+            &self.profile,
+            self.established_owner().as_ref(),
+        )
+        .map_err(|error| business_error_result(error.code(), error.to_string()))?;
         crate::tools::value_audit::require_value_audit_writer(
             &self.profile,
             &profile_name,

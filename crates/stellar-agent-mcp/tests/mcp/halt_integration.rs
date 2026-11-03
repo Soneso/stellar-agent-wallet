@@ -188,6 +188,14 @@ impl Fixture {
             ))
             .unwrap();
         loader::save(PROFILE, &profile).unwrap();
+        // The signer is enrolled: its identity record is stored, so an
+        // allowed signing call reaches the seed read the hook counts.
+        crate::common::store_named_signer_identity(
+            PROFILE,
+            SIGNER_SERVICE,
+            SIGNER_ACCOUNT,
+            [0x48; 32],
+        );
         Self {
             root,
             _home: home,

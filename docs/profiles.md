@@ -140,16 +140,12 @@ An unusable name is refused before the profile path is built: the CLI exits `1`
 with a typed refusal quoting the name and the rule it broke, and
 `stellar-agent-mcp` exits `2` before serving anything.
 
-A profile file that already carries such a name (possible on Unix, where both
-classes are legal file names) can no longer be selected. The clean recovery is
-`stellar-agent profile init --profile <new-name>` followed by the enrollment
-steps that command prints. Renaming the file works too, but the name is part of
-the profile's identity: correct `policy_owner_key_id.service` to
-`stellar-agent-owner-<new-name>`, and on a `v1` profile also re-run `profile
-enroll-owner-key` and `profile sign-policy` under the new name. The owner key
-is stored under `stellar-agent-owner-<old-name>` and the signed policy file
-carries the old name in its signed scope, so neither is usable under the new
-one.
+A profile file with such a name (possible on Unix, where both classes are legal
+file names) refuses selection. Recover with `stellar-agent profile init
+--profile <new-name>` followed by the enrollment steps that command prints.
+The signer binding, keyring coordinates and signed policy scope name the
+profile they serve. Renaming or copying the file does not transfer them to
+the new profile.
 
 ## Loader source order
 
@@ -272,6 +268,11 @@ secret.
 |-------|------|----------|---------|-------------|
 | `[mcp_signer_default]` | keyring ref | yes | none | Keyring entry for the default MCP signer seed. Its `account` is the signer identity: `signer_from_keyring` verifies the loaded seed derives to it, so `account` must be the signer's G-strkey (public address), not a placeholder. Populate the entry with [`profile enroll-signer`](cli-reference/profile-and-governance.md#profile-enroll-signer). |
 | `[mcp_nonce_key_alias]` | keyring ref | yes | none | Keyring entry for the HMAC nonce key. Here `account` is only a coordinate label. |
+
+The protected identity beside the seed names its profile and chain. On mainnet
+it also names its established owner and carries that owner's signature over
+the binding and seed coordinate. Mainnet signing requires this owner binding;
+message signing on every chain refuses a binding to another profile or chain.
 
 ### Thresholds and fees
 
@@ -724,6 +725,12 @@ stellar-agent profile sign-policy --profile operator --secret-env NEW_OWNER_SEED
 stellar-agent profile enroll-owner-key --profile operator --secret-env NEW_OWNER_SEED --force
 ```
 
+The next verified load, at MCP startup or a mainnet write, advances the pin to
+the new owner and refuses with `auth.enrolled_identity_unusable`
+(`owner_mismatch`) until the signer is bound to that owner. Then run
+`stellar-agent profile bind-signer --profile operator --owner-secret-env NEW_OWNER_SEED`
+and restart the MCP server.
+
 Supply each variable through the secret-entry procedure and unset both afterward.
 If signing uses `--file`, install that file at `policies/operator.toml` before
 running enrollment. The previous seed must match the pinned owner, or the
@@ -781,16 +788,22 @@ unset WALLET_SK
 ```
 
 Enrollment derives the seed's public address and stores the seed in the
-keyring. What happens to `[mcp_signer_default] account` depends on its current
+keyring with a v2 identity naming the profile and chain. After `sign-policy`,
+run `profile bind-signer --profile <name> --owner-secret-env <VAR>` before
+`enable-mainnet` to add the established owner's signature. Version 1 identities
+need this owner ceremony on mainnet; testnet warns until enrollment writes a
+profile binding. What happens to `[mcp_signer_default] account` depends on its current
 value: a profile fresh from `profile init` (and a v1-migrated profile that
 still carries it) holds the
 placeholder `"default"`, which enrollment overwrites in place with the derived
 address; a profile whose `account` already pins a G-strkey (from a prior
 enrollment, or set by hand) is left untouched, and enrollment refuses if the
 seed does not derive to that exact address (printing the address to set
-`account` to). Without an enrolled seed, the MCP tools and the
-keyring-signing CLI verbs (`trustline`, `trade`, `vault`) fail with
-`auth.keyring_not_found`. See
+`account` to). Without an enrollment, the MCP tools and the
+keyring-signing CLI verbs (`trustline`, `trade`, `vault`) fail. The
+enrolled-signer loader reports `auth.enrolled_identity_unusable` (`missing`)
+when the identity record is absent. After the record passes validation, a
+missing seed reports `auth.keyring_not_found`. See
 [cli-reference/profile-and-governance.md](cli-reference/profile-and-governance.md#profile-enroll-signer)
 for flags and the envelope shape.
 
@@ -906,7 +919,8 @@ refuse with `sign_policy.policy_body_invalid`.
 The first enablement requires a signed v2 policy and pins its sequence, digest,
 and owner before storing the nonce. A v1 or unsigned policy is refused and
 nothing is written. Prepare this policy without `[mainnet]`, sign it, run
-`enable-mainnet`, then complete and sign the bound policy. The completed policy
+`bind-signer` with the owner's seed, run `enable-mainnet`, then complete and
+sign the bound policy. The completed policy
 lists at least one [approval credential](#approval-credentials).
 An installation with a stored enablement nonce refuses an absent pin with
 `policy.pin_absent`: every mainnet write and both forms of `enable-mainnet`

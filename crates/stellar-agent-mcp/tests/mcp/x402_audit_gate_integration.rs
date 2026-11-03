@@ -549,6 +549,7 @@ async fn build_fixture(
         .expect("Entry::new")
         .set_password(&sstrkey_for_seed(seed))
         .expect("set_password");
+    crate::common::store_named_signer_identity(profile_name, SIGNER_SERVICE, &payer, seed);
     let mut profile =
         Profile::builder_testnet_named(profile_name, SIGNER_SERVICE, &payer, "n-svc", "n-acct")
             .with_noop_engine()

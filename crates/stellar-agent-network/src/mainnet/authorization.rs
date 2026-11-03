@@ -1855,6 +1855,7 @@ mod tests {
             use stellar_agent_core::policy::v1::criteria::state_store::{
                 StateKey, WindowEntry, WindowLimit,
             };
+            use stellar_agent_core::profile::signer_identity::SignerIdentityRecord;
             use stellar_agent_core::profile::{
                 loader::save_to_dir, schema::signer_identity_entry_ref,
             };
@@ -1905,10 +1906,14 @@ mod tests {
             save_to_dir(&name, &profile, dir.path()).unwrap();
             crate::keyring::write_keyring_string(
                 &signer_identity_entry_ref(&profile.mcp_signer_default),
-                &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+                &SignerIdentityRecord::signed_for_test(
                     public.0,
+                    &name,
+                    &profile,
+                    &ed25519_dalek::SigningKey::from_bytes(&[11; 32]),
                 )
-                .render(),
+                .render()
+                .unwrap(),
             )
             .unwrap();
             let enrolled = crate::keyring::enrolled_signer(
@@ -1917,6 +1922,9 @@ mod tests {
                 &profile,
                 crate::keyring::EnrolledRole::Agent,
                 &public.0,
+                &ed25519_dalek::SigningKey::from_bytes(&[11; 32])
+                    .verifying_key()
+                    .to_bytes(),
             )
             .unwrap();
             let client = crate::StellarRpcClient::new("https://rpc.example").unwrap();

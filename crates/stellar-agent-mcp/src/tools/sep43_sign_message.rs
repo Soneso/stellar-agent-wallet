@@ -155,6 +155,7 @@ impl WalletServer {
             &self.profile_name_for_approval(),
             &self.profile,
             account,
+            self.established_owner().as_ref(),
         )
         .await
         {
@@ -165,6 +166,7 @@ impl WalletServer {
                     stellar_agent_core::error::WalletError::Auth(
                         stellar_agent_core::error::AuthError::EnrolledSignerUnpinned { .. }
                             | stellar_agent_core::error::AuthError::EnrolledSignerMismatch { .. }
+                            | stellar_agent_core::error::AuthError::EnrolledIdentityUnusable { .. }
                     )
                 ) {
                     return Ok(crate::tools::common::business_error_result(
@@ -519,6 +521,7 @@ mod tests {
         stellar_agent_test_support::keyring_mock::install().unwrap();
         let mut fixture = crate::tools::message_signing_tests::Fixture::new();
         fixture.seed_audit();
+        fixture.seed_identity();
         fixture.profile.audit_log_path = fixture.dir.path().to_path_buf();
         let result = fixture
             .server()

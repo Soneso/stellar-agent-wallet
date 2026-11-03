@@ -21,7 +21,10 @@ use stellar_agent_core::{
             signature::{digest, sign},
         },
     },
-    profile::schema::{KeyringEntryRef, Profile, default_policy_dir},
+    profile::{
+        schema::{KeyringEntryRef, Profile, default_policy_dir},
+        signer_identity::SignerIdentityRecord,
+    },
 };
 use stellar_agent_mcp::server::WalletServer;
 use stellar_agent_test_support::{CaptureWriter, StellarAgentHomeGuard, keyring_mock};
@@ -183,8 +186,8 @@ fn selected_startup_verifies_the_installation_binding() {
     let profile = Profile::builder_mainnet_named(
         "operator",
         "https://rpc.example.invalid",
-        "s",
-        "a",
+        "stellar-agent-signer-operator",
+        &stellar_strkey::ed25519::PublicKey([21; 32]).to_string(),
         "n",
         "a",
     )
@@ -201,6 +204,13 @@ fn selected_startup_verifies_the_installation_binding() {
     keyring_core::Entry::new(&owner.service, &owner.account)
         .unwrap()
         .set_password(&stellar_strkey::ed25519::PublicKey(pk).to_string())
+        .unwrap();
+    let identity =
+        stellar_agent_core::profile::schema::signer_identity_entry_ref(&profile.mcp_signer_default);
+    let record = SignerIdentityRecord::signed_for_test([21; 32], "operator", &profile, &key);
+    keyring_core::Entry::new(&identity.service, &identity.account)
+        .unwrap()
+        .set_password(&record.render().unwrap())
         .unwrap();
     let nonce = "installation-nonce";
     let body = include_str!("../../../stellar-agent-core/tests/fixtures/policy-v2.toml").replace(

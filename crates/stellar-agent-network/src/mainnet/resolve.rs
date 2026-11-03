@@ -2922,6 +2922,7 @@ mod tests {
             &f.profile,
             crate::keyring::EnrolledRole::FeePayer,
             &f.signer.public_key(),
+            &f.policy.owner(),
         )
         .unwrap();
         let mut req = request(&f, &context, &client, &approval);
@@ -3705,6 +3706,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn signer_coordinate_refuses() {
+        use stellar_agent_core::profile::signer_identity::SignerIdentityRecord;
         let f = ResolverFixture::new();
         let server = f.server().await;
         let context = f.context_with_routes(&[("rpc.example.invalid", &server.uri())]);
@@ -3718,10 +3720,14 @@ mod tests {
         keyring_core::Entry::new(&identity.service, &identity.account)
             .unwrap()
             .set_password(
-                &stellar_agent_core::profile::signer_identity::SignerIdentityRecord::agent(
+                &SignerIdentityRecord::signed_for_test(
                     f.signer.public_key(),
+                    "operator",
+                    &other,
+                    &ed25519_dalek::SigningKey::from_bytes(&[11; 32]),
                 )
-                .render(),
+                .render()
+                .unwrap(),
             )
             .unwrap();
         let path = f.dir.path().join("other-profiles");
@@ -3732,6 +3738,7 @@ mod tests {
             &other,
             crate::keyring::EnrolledRole::Agent,
             &f.signer.public_key(),
+            &f.policy.owner(),
         )
         .unwrap();
         let before = f.wire();

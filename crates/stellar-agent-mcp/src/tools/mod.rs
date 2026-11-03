@@ -99,4 +99,7 @@ mod x402_authenticated_mainnet_tests;
 mod mainnet_presence_tests;
 
 #[cfg(test)]
+pub(crate) mod identity_fixture;
+
+#[cfg(test)]
 mod message_signing_tests;

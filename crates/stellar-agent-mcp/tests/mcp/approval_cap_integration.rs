@@ -226,6 +226,7 @@ decision = "allow"
                     .as_ref(),
             )
             .unwrap();
+        crate::common::store_signer_identity("svc", name, [0x61; 32]);
         seed_key("n-svc", "n-acct", &[7; 32]);
         let rpc = MockServer::start().await;
         let mut profile = crate::common::timeout_profile(&rpc.uri(), name);
