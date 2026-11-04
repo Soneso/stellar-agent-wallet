@@ -383,6 +383,15 @@ mod tests {
                 "audit.carrier_replaced",
             ),
             (
+                WriterError::RetainedHistoryUnverified(
+                    stellar_agent_core::audit_log::VerifyError::HmacMismatch {
+                        file: "audit.jsonl.pruned".to_owned(),
+                    },
+                ),
+                "audit.chain_key_unavailable",
+                "audit.history_unverified",
+            ),
+            (
                 WriterError::RetiredOutboxChanged { generation: 1 },
                 "audit.chain_key_unavailable",
                 "audit.outbox_rows_missing",

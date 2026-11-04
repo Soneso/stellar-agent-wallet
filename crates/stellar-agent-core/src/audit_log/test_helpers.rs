@@ -83,8 +83,8 @@ pub fn rotated_archives_newest_first(log_path: &Path) -> Vec<PathBuf> {
 ///
 /// The first archived row gets another `request_id`, so the row after it no
 /// longer names that row's hash. The active file and the archive's handoff
-/// row keep their bytes, so a writer and its tip anchor still accept the log;
-/// only a read that verifies the archive's own chain finds the break.
+/// row keep their bytes. A keyed open or acquisition, and a reader that reaches
+/// the archive, detect the broken chain.
 ///
 /// # Panics
 ///

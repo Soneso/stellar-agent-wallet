@@ -177,7 +177,7 @@ It is also not continuous in time. The anchor is written after the entry it cove
 - **Off, no anchor yet.** Until the first keyed append on a log path, nothing is anchored: a new profile, or a log written only by unkeyed writers. A changed `audit_log_path` is refused by the audit binding until it is acknowledged (§4). Adoption takes the file as it finds it. A rollback performed before that first acquisition becomes the baseline, silently, because there is no earlier anchored state to compare it against. Once a keyed writer has run, a deleted anchor no longer returns the log to this state (section 1.1).
 - **Off, freshly rotated file.** From a rotation until the first append into the new file has its anchor write land, the anchor still names the archive's handoff. Any prefix of the new file, down to empty, is accepted if it chains from that handoff. Normally one append wide; a keyring outage spanning that append holds it open.
 
-Entries already in an ARCHIVE are guarded throughout all three: a rolled-back prefix of the pre-rotation file cannot chain from the archive's handoff and is refused. When an anchor is expected and absent, treat the log as unverified rather than clean, and prefer `audit verify --profile` on a log you have reason to doubt: the chain walk covers every file regardless of the anchor's state.
+Entries already in an ARCHIVE are guarded throughout all three: a rolled-back prefix of the pre-rotation file cannot chain from the archive's handoff and is refused. A checked keyed writer verifies the whole retained history at open and every keyed acquisition. A failed history check refuses with `audit.history_unverified`; section 11 describes recovery. Use `audit verify --profile` to inspect a log you have reason to doubt.
 
 ## 4. Scope of the anchor
 
@@ -218,9 +218,14 @@ An anchor agrees when `audit verify` would accept it; a file ahead of its anchor
 
 ## 5. Adoption
 
-A log with no anchor is adopted on first keyed use, with no operator action, when nothing shows an anchor was written: no recorded audit binding, no `.root_hmac` sidecar, and no `audit_tip_anchored` row in the file. A log written entirely by unkeyed writers is the ordinary zero-config state, and minting an audit key later must not be a one-way door. A log with any of the three is refused with `audit.tip_anchor_missing` (section 1.1). A log with keyed history first needs `stellar-agent audit bind-carriers --profile <NAME>` with every wallet process stopped (section 8.5).
+A log with no anchor records adoption on first keyed use when nothing shows prior anchoring: no recorded audit binding, no `.root_hmac` sidecar, and no `audit_tip_anchored` row in the file. A log with any of the three is refused with `audit.tip_anchor_missing` (section 1.1). A log with keyed history first needs `stellar-agent audit bind-carriers --profile <NAME>` with every wallet process stopped (section 8.5).
 
-Adoption replays the whole log first. A broken chain is refused rather than adopted.
+Adoption replays the active file before recording its tip. A broken active
+chain refuses adoption. Adoption signs the active root at byte zero, so an
+unkeyed single-file log passes its first keyed open.
+The keyed open then checks the whole retained history;
+a missing archive root tag refuses use until the operator checks and re-signs
+that history with `profile rotate-audit-key`, as section 11 describes.
 
 On success the current tip becomes the anchor and an `audit_tip_anchored` row with reason `adopted` is appended. An adoption writes its row only for a non-empty file: an empty file stores no anchor and gets no row, and its first append writes the first anchor. A non-empty file gets exactly one such row per adoption.
 
@@ -560,16 +565,32 @@ On a log without entry tags, steps 3 and 5 alone apply: the rotation opens the l
 
 ## 11. Retained history without an authenticated start
 
-The retained history starts where `<log>.pruned` says its oldest archive
-starts, or at the zero seed when no prune has run. A log whose oldest archives
-were deleted outside the writer, for example by a build that pruned without the
-marker, by a log-management tool, or by hand, or whose marker was deleted, has
-an oldest archive that chains from neither. `audit verify` fails at line 1 of
-that archive. Every prune stops with a warning that names this section and
-keeps every archive, so the archives accumulate until open and verify refuse
-past 21 rotated files with `audit.too_many_rotated_files`. The writer never
-adopts such a start on its own: a missing archive or marker looks exactly like
-removed evidence.
+The retained history starts at the seed an authenticated `<log>.pruned`
+records for its oldest file, or at the zero seed without a marker.
+A missing archive, a missing or forged marker, or an edited or substituted
+archive fails verification. A keyed writer refuses such a history at open
+and at every keyed acquisition with `audit.history_unverified`.
+Readers refuse a walk whose oldest file starts at another seed.
+Every prune also stops and keeps the archives when the retained chain fails
+verification. The writer never adopts a missing prefix on its own.
+
+An archive an unkeyed writer rotates carries no chain-root tag. Keyed use
+refuses it with `audit.history_unverified`. After checking the whole history,
+the operator runs `stellar-agent profile rotate-audit-key <name>` to re-sign
+every file. Adoption signs an untagged active root at byte zero; archives
+require re-signing. The rotation's dedicated recovery open checks the anchor.
+With an old key, the command verifies the chains, bridges, retained seed and
+entry tags before replacing the key; a first mint walks nothing.
+It permits root and marker tags to be re-signed, including tags an interrupted
+rotation leaves under the prior key.
+If rotation refuses unbound carriers or missing outbox rows, first run
+`audit bind-carriers` or `audit acknowledge-outbox-loss`, respectively.
+Those recovery opens check chains and entry tags while root and marker tags
+await re-signing.
+Re-signing a forged marker authenticates the shortened history, so a marker
+refusal takes `rotate-audit-key` only after the operator has established that
+an interrupted rotation left that marker under the prior key.
+A broken or shortened history needs the recovery below.
 
 **Recovery.** Establish why the history is short, as for a mismatch (section
 1). Then keep the old log as the record and start a new one at the path:

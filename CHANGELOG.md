@@ -142,6 +142,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `PendingApproval::new_rule_proposal_pending` computes the proposal digest
   from the stored account, network, chain, definition and summary line.
+- A log with an archive that carries no chain-root tag refuses keyed use until
+  `profile rotate-audit-key` re-signs it after an operator checks the history.
+  Each keyed acquisition reads every retained file.
 
 - On a mainnet profile `--secret-env` is refused by `pay`, `claim` and
   `accounts create` with `validation.mainnet_secret_env_refused`, and these
@@ -657,6 +660,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the remote inbox recompute it and show the proposal as inconsistent when
   it differs, and approval refuses with `approval.entry_inconsistent`. Rule
   proposals created by an earlier build show as inconsistent; propose them again.
+- A keyed audit writer verifies the whole retained history at open and every
+  keyed acquisition: every archive's chain, bridge and chain-root tag, the oldest
+  file's start against the authenticated prune marker, and entry tags.
+  A deleted, edited or substituted archive refuses value-moving verbs with
+  `audit.history_unverified`. Audit readers refuse a retained history whose
+  oldest file does not start at the zero seed or the seed its prune marker records.
 
 - Crate publication rebuilds every vendored contract Wasm file of the published
   commit from its pinned source with the pinned tools and compares the bytes

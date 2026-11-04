@@ -352,11 +352,11 @@ pub fn refuse_headless_keyring_backend() -> Result<(), WalletError> {
 /// Refuses a headless keyring backend first, through
 /// [`refuse_headless_keyring_backend`], before any keyring entry is read.
 /// Checks the audit binding and loads the key and the keyring-backed anchor
-/// store, acquires the writer from the registry under `profile_name`,
-/// locks the writer, requires its anchor store to be the keyring-backed store
-/// at the profile's coordinate and its path to match the profile, runs
-/// [`stellar_agent_core::audit_log::AuditWriter::verified_tip_facts`], and
-/// requires the anchor to cover the tip and entry tags to be in force.
+/// store, then acquires the writer and facts through
+/// [`AuditWriterRegistry::keyed_tip_facts`] under one verification guard.
+/// Requires the writer's anchor store to match the profile's keyring coordinate
+/// and its path to match the profile. The anchor must cover the tip and entry
+/// tags must be in force.
 ///
 /// # Errors
 ///
@@ -381,11 +381,11 @@ pub fn audit_readiness(
         &profile.audit_log_hash_chain_key_id,
         &profile.audit_log_path,
     );
-    let writer =
-        AuditWriterRegistry::get_or_open_keyed(profile_name, &profile.audit_log_path, access)
+    let (writer, facts) =
+        AuditWriterRegistry::keyed_tip_facts(profile_name, &profile.audit_log_path, access)
             .map_err(|error| audit_writer_refusal(profile_name, &error))?;
     let facts = {
-        let mut guard = writer.lock().map_err(|_| {
+        let guard = writer.lock().map_err(|_| {
             unusable(
                 profile_name,
                 "audit.io_error: the audit writer mutex is poisoned",
@@ -408,9 +408,6 @@ pub fn audit_readiness(
                 "audit.anchor_provenance_unverified: the writer's path differs from the profile",
             ));
         }
-        let facts = guard
-            .verified_tip_facts()
-            .map_err(|error| audit_writer_refusal(profile_name, &error))?;
         refuse_unless_covered(profile_name, &facts)?;
         facts
     };
@@ -524,6 +521,44 @@ mod tests {
         expected.extend(second.verified_at_ms().to_be_bytes());
         let independent: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&expected).into();
         assert_eq!(second.fact_digest(), independent);
+    }
+
+    #[test]
+    #[serial]
+    fn readiness_refuses_an_edited_middle_archive() {
+        use stellar_agent_core::audit_log::{
+            rotation::test_seam::set_rotation_threshold,
+            test_helpers::rotated_archives_newest_first,
+        };
+        keyring_mock::install().unwrap();
+        let dir = TempDir::new().unwrap();
+        let name = "readiness-edited-archive";
+        let profile = profile(dir.path(), name);
+        let proof = audit_readiness(&profile, name).unwrap();
+        {
+            let mut writer = proof.writer().lock().unwrap();
+            for _ in 0..3 {
+                writer.write_entry(row()).unwrap();
+                let _threshold = set_rotation_threshold(&profile.audit_log_path, 1);
+                writer.write_entry(row()).unwrap();
+            }
+        }
+        let archives = rotated_archives_newest_first(&profile.audit_log_path);
+        assert_eq!(archives.len(), 3);
+        let contents = std::fs::read_to_string(&archives[1]).unwrap();
+        assert!(contents.contains("stellar_pay_commit"));
+        std::fs::write(
+            &archives[1],
+            contents.replacen("stellar_pay_commit", "stellar_pay_edited", 1),
+        )
+        .unwrap();
+        let error = audit_readiness(&profile, name).unwrap_err();
+        assert_eq!(error.code(), "audit.chain_key_unavailable");
+        assert!(
+            error.to_string().contains("audit.history_unverified"),
+            "{error}"
+        );
+        assert!(proof.fresh_facts().is_err());
     }
 
     /// A process whose default keyring store is the headless file store is
